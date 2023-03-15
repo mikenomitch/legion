@@ -17,15 +17,29 @@ struct Args {
 }
 
 fn main() {
+    // SUB-COMMMANDS
+    // AGENT COMMAND
+    let agent_cmd = clap::Command::new("agent").about("Start an agent");
+
+    // JOB COMMAND
+    let job_run_cmd = clap::Command::new("run").about("Run a job");
+    let job_status_cmd = clap::Command::new("status").about("Get job status");
+
+    let job_cmd = clap::Command::new("job")
+        .about("Interact with jobs")
+        .subcommand_required(true)
+        .arg_required_else_help(true)
+        .subcommand(job_run_cmd)
+        .subcommand(job_status_cmd);
+
+    // TOP LEVEL COMMAND
     let cmd = clap::Command::new("legion")
+        .about("A simple, exensible, fast orchestrator")
         .bin_name("legion")
         .subcommand_required(true)
-        .subcommand(
-            clap::command!("example").arg(
-                clap::arg!(--"manifest-path" <PATH>)
-                    .value_parser(clap::value_parser!(std::path::PathBuf)),
-            ),
-        );
+        .arg_required_else_help(true)
+        .subcommand(agent_cmd)
+        .subcommand(job_cmd);
 
     let matches = cmd.get_matches();
     let matches = match matches.subcommand() {
