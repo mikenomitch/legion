@@ -3,6 +3,8 @@ use colored::*;
 
 /// Simple program to greet a person
 #[derive(Parser, Debug)]
+#[command(name = "cargo")]
+#[command(bin_name = "cargo")]
 #[command(author, version, about, long_about = None)]
 struct Args {
     /// Name of the person to greet
@@ -15,9 +17,27 @@ struct Args {
 }
 
 fn main() {
-    let args = Args::parse();
+    let cmd = clap::Command::new("legion")
+        .bin_name("legion")
+        .subcommand_required(true)
+        .subcommand(
+            clap::command!("example").arg(
+                clap::arg!(--"manifest-path" <PATH>)
+                    .value_parser(clap::value_parser!(std::path::PathBuf)),
+            ),
+        );
 
-    for _ in 0..args.count {
-        println!("Hello {}!", args.name.blue())
-    }
+    let matches = cmd.get_matches();
+    let matches = match matches.subcommand() {
+        Some(("example", matches)) => matches,
+        _ => unreachable!("clap should ensure we don't get here"),
+    };
+
+    let manifest_path = matches
+        .get_one::<std::path::PathBuf>("manifest-path")
+        .unwrap()
+        .to_str()
+        .unwrap();
+
+    println!("{}", manifest_path.blue());
 }
