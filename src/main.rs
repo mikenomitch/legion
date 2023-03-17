@@ -9,15 +9,15 @@ fn cli() -> Command {
         .bin_name("legion")
         .subcommand_required(true)
         .arg_required_else_help(true)
-        .subcommand(cmd::agent::config())
         .subcommand(cmd::job::config())
+        .subcommand(cmd::start::config())
 }
 
 fn main() {
     let matches = cli().get_matches();
     match matches.subcommand() {
-        Some(("start", sub_matches)) => cmd::agent::handle(sub_matches),
-        Some(("job", sub_matches)) => cmd::job::handle(sub_matches),
+        Some(("start", sub_matches)) => cmd::job::handle(sub_matches),
+        Some(("job", sub_matches)) => cmd::start::handle(sub_matches),
         Some((ext, sub_matches)) => {
             let args = sub_matches
                 .get_many::<OsString>("")
