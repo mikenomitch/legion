@@ -1,4 +1,10 @@
+use legion::greeter_client::GreeterClient;
+use legion::HelloRequest;
+
 use clap::{arg, Command};
+pub mod legion {
+    tonic::include_proto!("legion");
+}
 
 pub fn config() -> Command {
     let job_run_cmd = Command::new("run")
@@ -14,10 +20,24 @@ pub fn config() -> Command {
         .subcommand(job_status_cmd)
 }
 
-pub fn handle(sub_matches: &clap::ArgMatches) {
+pub async fn handle(sub_matches: &clap::ArgMatches) -> Result<(), Box<dyn std::error::Error>> {
     match sub_matches.subcommand() {
-        Some(("run", _)) => println!("Running job"),
-        Some(("status", _)) => println!("Getting job status"),
+        Some(("run", _)) => get_from_server().await,
+        Some(("status", _)) => get_from_server().await,
         _ => unreachable!(),
     }
+}
+
+async fn get_from_server() -> Result<(), Box<dyn std::error::Error>> {
+    let mut client = GreeterClient::connect("http://[::1]:50052").await?;
+
+    let request = tonic::Request::new(HelloRequest {
+        name: "Mike".into(),
+    });
+
+    let response = client.say_hello(request).await?;
+
+    println!("RESPONSE={:?}", response);
+
+    Ok(())
 }

@@ -13,11 +13,12 @@ fn cli() -> Command {
         .subcommand(cmd::start::config())
 }
 
-fn main() {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let matches = cli().get_matches();
     match matches.subcommand() {
-        Some(("start", sub_matches)) => cmd::job::handle(sub_matches),
-        Some(("job", sub_matches)) => cmd::start::handle(sub_matches),
+        Some(("start", sub_matches)) => cmd::start::handle(sub_matches).await?,
+        Some(("job", sub_matches)) => cmd::job::handle(sub_matches).await?,
         Some((ext, sub_matches)) => {
             let args = sub_matches
                 .get_many::<OsString>("")
@@ -27,5 +28,7 @@ fn main() {
             println!("Calling to {ext:?} with {args:?}");
         }
         _ => unreachable!(),
-    }
+    };
+
+    Ok(())
 }
