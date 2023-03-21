@@ -83,6 +83,7 @@ async fn run_follower(port: &str) -> Res<()> {
     // interpolate port into string with localhost
     let addr = format!("{}://{}:{}", DEFAULT_PROTOCOL, DEFAULT_ADDR, port);
     let cloned_addr = addr.clone();
+
     let mut client = ControlNodeClient::connect(addr).await?;
 
     let request = tonic::Request::new(JoinClusterRequest {
