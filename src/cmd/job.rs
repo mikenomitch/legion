@@ -1,5 +1,7 @@
-use legion::greeter_client::GreeterClient;
-use legion::HelloRequest;
+use legion::control_node_client::ControlNodeClient;
+use legion::JoinClusterRequest;
+
+use crate::types::Res;
 
 use clap::{arg, Command};
 pub mod legion {
@@ -20,7 +22,7 @@ pub fn config() -> Command {
         .subcommand(job_status_cmd)
 }
 
-pub async fn handle(sub_matches: &clap::ArgMatches) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn handle(sub_matches: &clap::ArgMatches) -> Res<()> {
     match sub_matches.subcommand() {
         Some(("run", _)) => get_from_server().await,
         Some(("status", _)) => get_from_server().await,
@@ -28,14 +30,14 @@ pub async fn handle(sub_matches: &clap::ArgMatches) -> Result<(), Box<dyn std::e
     }
 }
 
-async fn get_from_server() -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = GreeterClient::connect("http://[::1]:50052").await?;
+async fn get_from_server() -> Res<()> {
+    let mut client = ControlNodeClient::connect("http://[::1]:50052").await?;
 
-    let request = tonic::Request::new(HelloRequest {
-        name: "Mike".into(),
+    let request = tonic::Request::new(JoinClusterRequest {
+        address: "127.0.0.1:4646".into(),
     });
 
-    let response = client.say_hello(request).await?;
+    let response = client.join_cluster(request).await?;
 
     println!("RESPONSE={:?}", response);
 

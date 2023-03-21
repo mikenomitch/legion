@@ -1,7 +1,8 @@
 mod cmd;
+mod types;
 use clap::Command;
 use std::ffi::OsString;
-// use colored::*;
+use types::Res;
 
 fn cli() -> Command {
     Command::new("legion")
@@ -14,7 +15,7 @@ fn cli() -> Command {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Res<()> {
     let matches = cli().get_matches();
     match matches.subcommand() {
         Some(("start", sub_matches)) => cmd::start::handle(sub_matches).await?,

@@ -1,17 +1,16 @@
 syntax = "proto3";
 package legion;
 
-service Greeter {
-  // Our SayHello rpc accepts HelloRequests and returns HelloReplies
-  rpc SayHello (HelloRequest) returns (HelloReply);
+service ControlNode {
+  rpc JoinCluster (JoinClusterRequest) returns (JoinClusterReply);
 }
 
-message HelloRequest {
-  // Request message contains the name to be greeted
-  string name = 1;
+message JoinClusterRequest {
+  // Request message contains the address of the joining node
+  string address = 1;
 }
 
-message HelloReply {
+message JoinClusterReply {
   // Reply contains the greeting message
   string message = 1;
 }
