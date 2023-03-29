@@ -1,6 +1,7 @@
-use legion::control_node_client::ControlNodeClient;
+use legion::manager_node_client::ManagerNodeClient;
 use legion::JoinClusterRequest;
 
+use crate::constants::{DEFAULT_ADDR, DEFAULT_PORT, DEFAULT_PROTOCOL};
 use crate::types::Res;
 
 use clap::{arg, Command};
@@ -31,7 +32,8 @@ pub async fn handle(sub_matches: &clap::ArgMatches) -> Res<()> {
 }
 
 async fn get_from_server() -> Res<()> {
-    let mut client = ControlNodeClient::connect("http://[::1]:50052").await?;
+    let addr = format!("{}://{}:{}", DEFAULT_PROTOCOL, DEFAULT_ADDR, DEFAULT_PORT);
+    let mut client = ManagerNodeClient::connect(addr).await?;
 
     let request = tonic::Request::new(JoinClusterRequest {
         address: "127.0.0.1:4646".into(),

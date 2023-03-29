@@ -1,7 +1,7 @@
 syntax = "proto3";
 package legion;
 
-service ControlNode {
+service ManagerNode {
   rpc JoinCluster (JoinClusterRequest) returns (JoinClusterReply);
 }
 
