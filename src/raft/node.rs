@@ -1,11 +1,11 @@
 use raft::prelude::*;
 use raft::storage::MemStorage;
 use slog::Logger;
-use std::any::Any;
+// use std::any::Any;
 use std::collections::HashMap;
 use std::sync::mpsc::{self, RecvTimeoutError};
 
-use std::thread;
+// use std::thread;
 use std::time::{Duration, Instant};
 
 use raft::eraftpb::ConfState;
@@ -14,6 +14,8 @@ use crate::cmd::structs::AgentConfig;
 
 type ProposeCallback = Box<dyn Fn() + Send>;
 
+// warning incorrectly
+#[allow(dead_code)]
 enum Msg {
     Propose {
         id: u8,
@@ -26,44 +28,12 @@ enum Msg {
 }
 
 pub fn start_raft(config: AgentConfig) {
-    // Create a storage for Raft, and here we just use a simple memory storage.
-    // You need to build your own persistent storage in your production.
-    // Please check the Storage trait in src/storage.rs to see how to implement one.
-    let storage = MemStorage::new_with_conf_state(ConfState::from((vec![1], vec![])));
-
     let logger = raft::default_logger();
+    let storage = create_storage();
+    let mut r = create_node(config, storage, logger);
 
-    // Create the configuration for the Raft node.
-    let cfg = Config {
-        // The unique ID for the Raft node.
-        id: 1,
-        // Election tick is for how long the follower may campaign again after
-        // it doesn't receive any message from the leader.
-        election_tick: config.manager.election_tick,
-        // Heartbeat tick is for how long the leader needs to send
-        // a heartbeat to keep alive.
-        heartbeat_tick: config.manager.heartbeat_tick,
-        // The max size limits the max size of each appended message. Mostly, 1 MB is enough.
-        max_size_per_msg: 1024 * 1024 * 1024,
-        // Max inflight msgs that the leader sends messages to follower without
-        // receiving ACKs.
-        max_inflight_msgs: 256,
-        // The Raft applied index.
-        // You need to save your applied index when you apply the committed Raft logs.
-        applied: 0,
-        ..Default::default()
-    };
-
-    // Create the Raft node.
-    let mut r = RawNode::new(&cfg, storage, &logger).unwrap();
-
-    let (sender, receiver) = mpsc::channel();
-
-    raft::default_logger().type_id();
-
-    println!("send propose");
-    // Use another thread to propose a Raft request.
-    send_propose(logger.clone(), sender);
+    let (_sender, receiver) = mpsc::channel();
+    // raft::default_logger().type_id();
 
     // Loop forever to drive the Raft.
     let mut t = Instant::now();
@@ -74,10 +44,12 @@ pub fn start_raft(config: AgentConfig) {
 
     loop {
         match receiver.recv_timeout(timeout) {
+            // Client sends a proposal to this node first
             Ok(Msg::Propose { id, cb }) => {
                 cbs.insert(id, cb);
                 r.propose(vec![], vec![id]).unwrap();
             }
+            // Message is received from another node
             Ok(Msg::Raft(m)) => r.step(m).unwrap(),
             Err(RecvTimeoutError::Timeout) => (),
             Err(RecvTimeoutError::Disconnected) => return,
@@ -92,6 +64,7 @@ pub fn start_raft(config: AgentConfig) {
         } else {
             timeout -= d;
         }
+
         on_ready(&mut r, &mut cbs);
     }
 }
@@ -173,32 +146,66 @@ fn on_ready(raft_group: &mut RawNode<MemStorage>, cbs: &mut HashMap<u8, ProposeC
     raft_group.advance_apply();
 }
 
-fn send_propose(logger: Logger, sender: mpsc::Sender<Msg>) {
-    thread::spawn(move || {
-        // Wait some time and send the request to the Raft.
-        thread::sleep(Duration::from_secs(10));
+// // Example making a proposal of something for raft!
+// fn send_propose(logger: Logger, sender: mpsc::Sender<Msg>) {
+//     thread::spawn(move || {
+//         // Wait some time and send the request to the Raft.
+//         thread::sleep(Duration::from_secs(10));
 
-        let (s1, r1) = mpsc::channel::<u8>();
+//         let (s1, r1) = mpsc::channel::<u8>();
 
-        println!("propose a request");
+//         println!("propose a request");
 
-        slog::info!(logger, "propose a request");
+//         slog::info!(logger, "propose a request");
 
-        // Send a command to the Raft, wait for the Raft to apply it
-        // and get the result.
-        sender
-            .send(Msg::Propose {
-                id: 1,
-                cb: Box::new(move || {
-                    s1.send(0).unwrap();
-                }),
-            })
-            .unwrap();
+//         // Send a command to the Raft, wait for the Raft to apply it
+//         // and get the result.
+//         sender
+//             .send(Msg::Propose {
+//                 id: 1,
+//                 cb: Box::new(move || {
+//                     s1.send(0).unwrap();
+//                 }),
+//             })
+//             .unwrap();
 
-        let n = r1.recv().unwrap();
-        assert_eq!(n, 0);
+//         let n = r1.recv().unwrap();
+//         assert_eq!(n, 0);
 
-        println!("receive the propose callback");
-        slog::info!(logger, "receive the propose callback");
-    });
+//         println!("receive the propose callback");
+//         slog::info!(logger, "receive the propose callback");
+//     });
+// }
+
+fn create_storage() -> MemStorage {
+    // Create a storage for Raft, and here we just use a simple memory storage.
+    // You need to build your own persistent storage in your production.
+    // Please check the Storage trait in src/storage.rs to see how to implement one.
+
+    MemStorage::new_with_conf_state(ConfState::from((vec![1], vec![])))
+}
+
+fn create_node(config: AgentConfig, storage: MemStorage, logger: Logger) -> RawNode<MemStorage> {
+    // Create the configuration for the Raft node.
+    let cfg = Config {
+        // The unique ID for the Raft node.
+        id: 1,
+        // Election tick is for how long the follower may campaign again after
+        // it doesn't receive any message from the leader.
+        election_tick: config.manager.election_tick,
+        // Heartbeat tick is for how long the leader needs to send
+        // a heartbeat to keep alive.
+        heartbeat_tick: config.manager.heartbeat_tick,
+        // The max size limits the max size of each appended message. Mostly, 1 MB is enough.
+        max_size_per_msg: 1024 * 1024 * 1024,
+        // Max inflight msgs that the leader sends messages to follower without
+        // receiving ACKs.
+        max_inflight_msgs: 256,
+        // The Raft applied index.
+        // You need to save your applied index when you apply the committed Raft logs.
+        applied: 0,
+        ..Default::default()
+    };
+
+    RawNode::new(&cfg, storage, &logger).unwrap()
 }
