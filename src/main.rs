@@ -1,6 +1,7 @@
 mod cmd;
 mod constants;
 mod manager;
+mod raft;
 mod types;
 use clap::Command;
 use std::ffi::OsString;

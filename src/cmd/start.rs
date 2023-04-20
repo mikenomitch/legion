@@ -1,6 +1,6 @@
 use clap::{arg, Command};
 
-use crate::constants::DEFAULT_PORT;
+use crate::constants::{DEFAULT_CONFIG_PATH, DEFAULT_PORT};
 use crate::manager::start::{run_follower, run_leader};
 use crate::types::Res;
 
@@ -22,7 +22,15 @@ pub fn config() -> Command {
 
 pub async fn handle(sub_matches: &clap::ArgMatches) -> Res<()> {
     match sub_matches.subcommand() {
-        Some(("leader", _)) => run_leader().await,
+        Some(("leader", sms)) => {
+            let config_path = sms.get_one::<String>("config").map(|s| s.as_str());
+
+            match config_path {
+                Some(config_path) => run_leader(config_path).await,
+                None => run_leader(DEFAULT_CONFIG_PATH).await,
+            }
+        }
+
         Some(("follower", sms)) => {
             let port = sms.get_one::<String>("port").map(|s| s.as_str());
 
@@ -31,6 +39,7 @@ pub async fn handle(sub_matches: &clap::ArgMatches) -> Res<()> {
                 None => run_follower(DEFAULT_PORT).await,
             }
         }
-        _ => run_leader().await,
+
+        _ => run_leader(DEFAULT_CONFIG_PATH).await,
     }
 }
