@@ -79,6 +79,7 @@ pub async fn run_follower(config_path: &str, port: &str) -> Res<()> {
 }
 
 fn parse_config(config_path: &str) -> Res<AgentConfig> {
+    // Pluginify jsonnet
     let mut vm = JsonnetVm::new();
     let res = vm.evaluate_file(config_path);
 
