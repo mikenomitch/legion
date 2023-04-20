@@ -10,6 +10,8 @@ use std::time::{Duration, Instant};
 
 use raft::eraftpb::ConfState;
 
+use crate::cmd::structs::AgentConfig;
+
 type ProposeCallback = Box<dyn Fn() + Send>;
 
 enum Msg {
@@ -23,7 +25,7 @@ enum Msg {
     Raft(Message),
 }
 
-pub fn start_raft() {
+pub fn start_raft(config: AgentConfig) {
     // Create a storage for Raft, and here we just use a simple memory storage.
     // You need to build your own persistent storage in your production.
     // Please check the Storage trait in src/storage.rs to see how to implement one.
@@ -37,10 +39,10 @@ pub fn start_raft() {
         id: 1,
         // Election tick is for how long the follower may campaign again after
         // it doesn't receive any message from the leader.
-        election_tick: 10,
+        election_tick: config.manager.election_tick,
         // Heartbeat tick is for how long the leader needs to send
         // a heartbeat to keep alive.
-        heartbeat_tick: 3,
+        heartbeat_tick: config.manager.heartbeat_tick,
         // The max size limits the max size of each appended message. Mostly, 1 MB is enough.
         max_size_per_msg: 1024 * 1024 * 1024,
         // Max inflight msgs that the leader sends messages to follower without

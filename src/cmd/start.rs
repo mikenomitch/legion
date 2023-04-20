@@ -32,12 +32,16 @@ pub async fn handle(sub_matches: &clap::ArgMatches) -> Res<()> {
         }
 
         Some(("follower", sms)) => {
-            let port = sms.get_one::<String>("port").map(|s| s.as_str());
+            let port = sms
+                .get_one::<String>("port")
+                .map(|s| s.as_str())
+                .unwrap_or(DEFAULT_PORT);
+            let config_path = sms
+                .get_one::<String>("config")
+                .map(|s| s.as_str())
+                .unwrap_or(DEFAULT_CONFIG_PATH);
 
-            match port {
-                Some(port) => run_follower(port).await,
-                None => run_follower(DEFAULT_PORT).await,
-            }
+            run_follower(config_path, port).await
         }
 
         _ => run_leader(DEFAULT_CONFIG_PATH).await,

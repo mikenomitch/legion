@@ -4,6 +4,7 @@ use legion::manager_node_client::ManagerNodeClient;
 use legion::manager_node_server::{ManagerNode, ManagerNodeServer};
 use legion::{JoinClusterReply, JoinClusterRequest};
 
+use crate::cmd::structs::AgentConfig;
 use crate::constants::{DEFAULT_ADDR, DEFAULT_PORT, DEFAULT_PROTOCOL};
 use crate::raft::node::start_raft;
 use crate::types::Res;
@@ -13,8 +14,6 @@ use jsonnet::JsonnetVm;
 pub mod legion {
     tonic::include_proto!("legion");
 }
-
-use raft::prelude::Config;
 
 #[derive(Default)]
 pub struct ManagerAgentService {}
@@ -36,28 +35,14 @@ impl ManagerNode for ManagerAgentService {
 }
 
 pub async fn run_leader(config_path: &str) -> Res<()> {
+    let config = parse_config(config_path)?;
     let addr = format!("{}:{}", DEFAULT_ADDR, DEFAULT_PORT)
         .parse()
         .unwrap();
 
-    // parse config file
-    let mut vm = JsonnetVm::new();
-    let res = vm.evaluate_file(config_path);
-    match res {
-        Ok(s) => {
-            // convert s to json using serde_json
-            let config: Config = serde_json::from_str(&s)?;
-            println!("testing: {}", config.election_tick);
-        }
-        Err(e) => println!("Error: {}", e),
-    }
-
     let manager_node = ManagerAgentService::default();
-
     println!("Manager node listening on {}", addr);
-
-    start_raft();
-
+    start_raft(config);
     println!("Started Raft");
 
     Server::builder()
@@ -70,8 +55,9 @@ pub async fn run_leader(config_path: &str) -> Res<()> {
     Ok(())
 }
 
-pub async fn run_follower(port: &str) -> Res<()> {
-    // interpolate port into string with localhost
+pub async fn run_follower(config_path: &str, port: &str) -> Res<()> {
+    let config = parse_config(config_path)?;
+
     let addr = format!("{}://{}:{}", DEFAULT_PROTOCOL, DEFAULT_ADDR, port);
     let cloned_addr = addr.clone();
 
@@ -85,9 +71,22 @@ pub async fn run_follower(port: &str) -> Res<()> {
 
     println!("RESPONSE={:?}", response);
 
-    start_raft();
+    start_raft(config);
 
     println!("Started Raft");
 
     Ok(())
+}
+
+fn parse_config(config_path: &str) -> Res<AgentConfig> {
+    let mut vm = JsonnetVm::new();
+    let res = vm.evaluate_file(config_path);
+
+    match res {
+        Ok(s) => {
+            let config: AgentConfig = serde_json::from_str(&s)?;
+            Ok(config)
+        }
+        Err(_) => Err("Failed to parse config file".into()),
+    }
 }
