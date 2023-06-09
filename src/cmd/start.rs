@@ -1,6 +1,6 @@
 use crate::cmd::structs::AgentConfig;
 use crate::constants::{DEFAULT_CONFIG_PATH};
-use crate::manager::start::{run_follower, run_leader};
+use crate::manager::server::{run_follower, run_leader};
 use crate::types::Res;
 use jsonnet::JsonnetVm;
 
@@ -35,45 +35,40 @@ pub async fn handle(sub_matches: &clap::ArgMatches) -> Res<()> {
 
     let config = parse_config(config_path)?;
 
-    match config.manager.leader {
-        true => {
-            run_leader(config).await
-        }
-        false => {
-            let addr_copy = config.manager.leader_address.clone();
-            run_follower(config, addr_copy).await
-        }
+    if config.manager.leader {
+        run_leader(config).await
+    } else {
+        run_follower(config).await
     }
-
-    // run_leader(config).await
-    // match sub_matches.subcommand() {
-    //     Some(("leader", sms)) => {
-    //         let config_path = sms
-    //             .get_one::<String>("config")
-    //             .map(|s| s.as_str())
-    //             .unwrap_or(DEFAULT_CONFIG_PATH);
-
-    //         run_leader(config_path).await
-    //     }
-
-    //     Some(("follower", sms)) => {
-    //         let port = sms
-    //             .get_one::<String>("port")
-    //             .map(|s| s.as_str())
-    //             .unwrap_or(DEFAULT_PORT);
-
-    //         let config_path = sms
-    //             .get_one::<String>("config")
-    //             .map(|s| s.as_str())
-    //             .unwrap_or(DEFAULT_CONFIG_PATH);
-
-    //         run_follower(config_path, port).await
-    //     }
-
-    //     _ => run_leader(DEFAULT_CONFIG_PATH).await,
-    // }
 }
 
+// run_leader(config).await
+// match sub_matches.subcommand() {
+//     Some(("leader", sms)) => {
+//         let config_path = sms
+//             .get_one::<String>("config")
+//             .map(|s| s.as_str())
+//             .unwrap_or(DEFAULT_CONFIG_PATH);
+
+//         run_leader(config_path).await
+//     }
+
+//     Some(("follower", sms)) => {
+//         let port = sms
+//             .get_one::<String>("port")
+//             .map(|s| s.as_str())
+//             .unwrap_or(DEFAULT_PORT);
+
+//         let config_path = sms
+//             .get_one::<String>("config")
+//             .map(|s| s.as_str())
+//             .unwrap_or(DEFAULT_CONFIG_PATH);
+
+//         run_follower(config_path, port).await
+//     }
+
+//     _ => run_leader(DEFAULT_CONFIG_PATH).await,
+// }
 
 fn parse_config(config_path: &str) -> Res<AgentConfig> {
     // Pluginify jsonnet

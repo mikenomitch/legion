@@ -28,7 +28,7 @@ use tonic::{transport::Server, Request, Response, Status};
 
 // #[derive(Default)]
 pub struct ManagerAgentService {
-    outbox: Arc<Mutex<Sender<Msg>>>,
+    sender: Arc<Mutex<Sender<Msg>>>,
 }
 
 #[tonic::async_trait]
@@ -39,17 +39,41 @@ impl ManagerNode for ManagerAgentService {
     ) -> Result<Response<JoinClusterReply>, Status> {
         println!("Got a request from {:?}", request.remote_addr());
 
-        let outbox = self.outbox.lock().unwrap();
+        let sender = self.sender.lock().unwrap();
 
-        outbox
+        sender
             .send(Msg::Propose {
                 id: 1,
+                message: "JOIN",
                 cb: Box::new(move || println!("wat")),
             })
             .unwrap();
 
         let reply = JoinClusterReply {
             message: format!("Hello {}!", request.into_inner().address),
+        };
+
+        Ok(Response::new(reply))
+    }
+
+    async fn run_job(
+        &self,
+        _request: Request<RunJobRequest>,
+    ) -> Result<Response<RunJobReply>, Status> {
+
+        let sender = self.sender.lock().unwrap();
+
+        sender
+            .send(Msg::Propose {
+                id: 2,
+                message: "JOB",
+                cb: Box::new(move || println!("applied job")),
+            })
+            .unwrap();
+
+
+        let reply = RunJobReply {
+            message: format!("Hello {}!", "jorb"),
         };
 
         Ok(Response::new(reply))
@@ -66,18 +90,6 @@ impl ManagerNode for ManagerAgentService {
 
         Ok(Response::new(reply))
     }
-
-    async fn run_job(
-        &self,
-        _request: Request<RunJobRequest>,
-    ) -> Result<Response<RunJobReply>, Status> {
-
-        let reply = RunJobReply {
-            message: format!("Hello {}!", "jorb"),
-        };
-
-        Ok(Response::new(reply))
-    }
 }
 
 pub async fn run_leader(config: AgentConfig) -> Res<()> {
@@ -90,7 +102,7 @@ pub async fn run_leader(config: AgentConfig) -> Res<()> {
 
     start_raft(receiver, config);
 
-    let manager_node = ManagerAgentService { outbox: sender };
+    let manager_node = ManagerAgentService { sender };
     println!("Manager node starting on {}", addr);
     Server::builder()
         .add_service(ManagerNodeServer::new(manager_node))
@@ -102,8 +114,8 @@ pub async fn run_leader(config: AgentConfig) -> Res<()> {
     Ok(())
 }
 
-pub async fn run_follower(config: AgentConfig, leader_address: String) -> Res<()> {
-    let leader_addr_clone = leader_address.clone();
+pub async fn run_follower(config: AgentConfig) -> Res<()> {
+    let leader_addr_clone = config.manager.leader_address.clone();
 
     // TODO: Parameterize port
     let addr = format!("{}:{}", DEFAULT_ADDR, 4848)
@@ -123,7 +135,7 @@ pub async fn run_follower(config: AgentConfig, leader_address: String) -> Res<()
 
     start_raft(receiver, config);
 
-    let manager_node = ManagerAgentService { outbox: sender };
+    let manager_node = ManagerAgentService { sender };
 
     println!("Manager node starting on {}", addr);
     Server::builder()
@@ -136,32 +148,32 @@ pub async fn run_follower(config: AgentConfig, leader_address: String) -> Res<()
     Ok(())
 }
 
-// fn send_propose(sender: mpsc::Sender<Msg>) {
-//     thread::spawn(move || {
-//         // Wait some time and send the request to the Raft.
-//         thread::sleep(Duration::from_secs(10));
+fn send_propose(sender: mpsc::Sender<Msg>) {
+    thread::spawn(move || {
+        // Wait some time and send the request to the Raft.
+        thread::sleep(Duration::from_secs(10));
 
-// let (s1, r1) = mpsc::channel::<u8>();
+        let (s1, r1) = mpsc::channel::<u8>();
 
-//         println!("propose a request");
+        println!("propose a request");
 
-//         // Send a command to the Raft, wait for the Raft to apply it
-//         // and get the result.
-//         sender
-//             .send(Msg::Propose {
-//                 id: 1,
-//                 cb: Box::new(move || {
-//                     s1.send(0).unwrap();
-//                 }),
-//             })
-//             .unwrap();
+        // Send a command to the Raft, wait for the Raft to apply it
+        // and get the result.
+        sender
+            .send(Msg::Propose {
+                id: 1,
+                cb: Box::new(move || {
+                    s1.send(0).unwrap();
+                }),
+            })
+            .unwrap();
 
-//         let n = r1.recv().unwrap();
-//         assert_eq!(n, 0);
+        let n = r1.recv().unwrap();
+        assert_eq!(n, 0);
 
-//         println!("receive the propose callback");
-//     });
-// }
+        println!("receive the propose callback");
+    });
+}
 
 // I need to...
 // run a long term process in Raft

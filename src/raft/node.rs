@@ -18,6 +18,7 @@ type ProposeCallback = Box<dyn Fn() + Send>;
 pub enum Msg {
     Propose {
         id: u8,
+        message: &str,
         cb: ProposeCallback,
     },
     // Here we don't use Raft Message, so use dead_code to
@@ -49,9 +50,16 @@ fn drive_raft(receiver: Receiver<Msg>, raft_node: &mut RawNode<MemStorage>) {
     loop {
         match receiver.recv_timeout(timeout) {
             // Client sends a proposal to this node first
-            Ok(Msg::Propose { id, cb }) => {
+            Ok(Msg::Propose { id, message, cb }) => {
                 cbs.insert(id, cb);
-                raft_node.propose(vec![], vec![id]).unwrap();
+
+                // NOTE: this is only proposing the request ID
+                // be added to the log, change to include the full request,
+                // and the id would be part of it, the rest is whatever you're adding
+                // to the actual log!
+
+                let new_line = message.as_bytes().to_vec();
+                raft_node.propose(vec![], new_line).unwrap();
             }
             // Message is received from another node
             Ok(Msg::Raft(m)) => raft_node.step(m).unwrap(),
@@ -151,37 +159,7 @@ fn on_ready(raft_group: &mut RawNode<MemStorage>, cbs: &mut HashMap<u8, ProposeC
     raft_group.advance_apply();
 }
 
-// // Example making a proposal of something for raft!
-// fn send_propose(logger: Logger, sender: mpsc::Sender<Msg>) {
-//     thread::spawn(move || {
-//         // Wait some time and send the request to the Raft.
-//         thread::sleep(Duration::from_secs(10));
-
-//         let (s1, r1) = mpsc::channel::<u8>();
-
-//         println!("propose a request");
-
-//         slog::info!(logger, "propose a request");
-
-//         // Send a command to the Raft, wait for the Raft to apply it
-//         // and get the result.
-//         sender
-//             .send(Msg::Propose {
-//                 id: 1,
-//                 cb: Box::new(move || {
-//                     s1.send(0).unwrap();
-//                 }),
-//             })
-//             .unwrap();
-
-//         let n = r1.recv().unwrap();
-//         assert_eq!(n, 0);
-
-//         println!("receive the propose callback");
-//         slog::info!(logger, "receive the propose callback");
-//     });
-// }
-
+// Example making a proposal of something for raft!
 fn create_storage() -> MemStorage {
     // Create a storage for Raft, and here we just use a simple memory storage.
     // You need to build your own persistent storage in your production.
