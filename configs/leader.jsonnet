@@ -1,6 +1,13 @@
 {
+  server: {
+    port: 4747,
+    address: "127.0.0.1",
+  },
   manager: {
-    id: 0,
+    id: 1,
+    leader: true,
+    leaderAddress: "",
+    peers: ["127.0.0.1:4848", "127.0.0.1:4949"],
     electionTick: 30,
     heartbeatTick: 3,
     applied: 0,

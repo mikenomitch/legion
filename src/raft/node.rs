@@ -1,22 +1,21 @@
-use raft::prelude::*;
-use raft::storage::MemStorage;
-use slog::Logger;
+use crate::cmd::structs::AgentConfig;
+
 // use std::any::Any;
 use std::collections::HashMap;
-use std::sync::mpsc::{self, RecvTimeoutError};
-
-// use std::thread;
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use raft::eraftpb::ConfState;
-
-use crate::cmd::structs::AgentConfig;
+use raft::prelude::*;
+use raft::storage::MemStorage;
+use slog::Logger;
 
 type ProposeCallback = Box<dyn Fn() + Send>;
 
 // warning incorrectly
 #[allow(dead_code)]
-enum Msg {
+pub enum Msg {
     Propose {
         id: u8,
         cb: ProposeCallback,
@@ -27,14 +26,19 @@ enum Msg {
     Raft(Message),
 }
 
-pub fn start_raft(config: AgentConfig) {
-    let logger = raft::default_logger();
-    let storage = create_storage();
-    let mut r = create_node(config, storage, logger);
+pub fn start_raft(receiver: Receiver<Msg>, config: AgentConfig) {
+    thread::spawn(move || {
+        println!("Starting raft");
 
-    let (_sender, receiver) = mpsc::channel();
-    // raft::default_logger().type_id();
+        let logger = raft::default_logger();
+        let storage = create_storage();
+        let mut raft_node = create_node(config, storage, logger);
 
+        drive_raft(receiver, &mut raft_node)
+    });
+}
+
+fn drive_raft(receiver: Receiver<Msg>, raft_node: &mut RawNode<MemStorage>) {
     // Loop forever to drive the Raft.
     let mut t = Instant::now();
     let mut timeout = Duration::from_millis(100);
@@ -47,10 +51,10 @@ pub fn start_raft(config: AgentConfig) {
             // Client sends a proposal to this node first
             Ok(Msg::Propose { id, cb }) => {
                 cbs.insert(id, cb);
-                r.propose(vec![], vec![id]).unwrap();
+                raft_node.propose(vec![], vec![id]).unwrap();
             }
             // Message is received from another node
-            Ok(Msg::Raft(m)) => r.step(m).unwrap(),
+            Ok(Msg::Raft(m)) => raft_node.step(m).unwrap(),
             Err(RecvTimeoutError::Timeout) => (),
             Err(RecvTimeoutError::Disconnected) => return,
         }
@@ -60,12 +64,12 @@ pub fn start_raft(config: AgentConfig) {
         if d >= timeout {
             timeout = Duration::from_millis(100);
             // We drive Raft every 100ms.
-            r.tick();
+            raft_node.tick();
         } else {
             timeout -= d;
         }
 
-        on_ready(&mut r, &mut cbs);
+        on_ready(raft_node, &mut cbs);
     }
 }
 
@@ -80,7 +84,7 @@ fn on_ready(raft_group: &mut RawNode<MemStorage>, cbs: &mut HashMap<u8, ProposeC
 
     let handle_messages = |msgs: Vec<Message>| {
         for _msg in msgs {
-            // Send messages to other peers.
+            // TODO: send messages to other peers.
         }
     };
 
@@ -115,6 +119,7 @@ fn on_ready(raft_group: &mut RawNode<MemStorage>, cbs: &mut HashMap<u8, ProposeC
             // TODO: handle EntryConfChange
         }
     };
+
     handle_committed_entries(ready.take_committed_entries());
 
     if !ready.entries().is_empty() {
@@ -189,7 +194,7 @@ fn create_node(config: AgentConfig, storage: MemStorage, logger: Logger) -> RawN
     // Create the configuration for the Raft node.
     let cfg = Config {
         // The unique ID for the Raft node.
-        id: 1,
+        id: config.manager.id,
         // Election tick is for how long the follower may campaign again after
         // it doesn't receive any message from the leader.
         election_tick: config.manager.election_tick,

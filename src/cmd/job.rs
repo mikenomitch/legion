@@ -1,13 +1,13 @@
-use legion::manager_node_client::ManagerNodeClient;
-use legion::JoinClusterRequest;
-
 use crate::constants::{DEFAULT_ADDR, DEFAULT_PORT, DEFAULT_PROTOCOL};
 use crate::types::Res;
 
 use clap::{arg, Command};
+
 pub mod legion {
     tonic::include_proto!("legion");
 }
+use legion::manager_node_client::ManagerNodeClient;
+use legion::{RunJobRequest, GetJobStatusRequest};
 
 pub fn config() -> Command {
     let job_run_cmd = Command::new("run")
@@ -25,21 +25,36 @@ pub fn config() -> Command {
 
 pub async fn handle(sub_matches: &clap::ArgMatches) -> Res<()> {
     match sub_matches.subcommand() {
-        Some(("run", _)) => get_from_server().await,
-        Some(("status", _)) => get_from_server().await,
+        Some(("run", _)) => run_job().await,
+        Some(("status", _)) => get_status().await,
         _ => unreachable!(),
     }
 }
 
-async fn get_from_server() -> Res<()> {
+async fn run_job() -> Res<()> {
     let addr = format!("{}://{}:{}", DEFAULT_PROTOCOL, DEFAULT_ADDR, DEFAULT_PORT);
     let mut client = ManagerNodeClient::connect(addr).await?;
 
-    let request = tonic::Request::new(JoinClusterRequest {
-        address: "127.0.0.1:4646".into(),
+    let request = tonic::Request::new(RunJobRequest {
+        name: "Mike".into(),
     });
 
-    let response = client.join_cluster(request).await?;
+    let response = client.run_job(request).await?;
+
+    println!("RESPONSE={:?}", response);
+
+    Ok(())
+}
+
+async fn get_status() -> Res<()> {
+    let addr = format!("{}://{}:{}", DEFAULT_PROTOCOL, DEFAULT_ADDR, DEFAULT_PORT);
+    let mut client = ManagerNodeClient::connect(addr).await?;
+
+    let request = tonic::Request::new(GetJobStatusRequest {
+        name: "Mike".into(),
+    });
+
+    let response = client.get_job_status(request).await?;
 
     println!("RESPONSE={:?}", response);
 

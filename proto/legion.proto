@@ -3,6 +3,8 @@ package legion;
 
 service ManagerNode {
   rpc JoinCluster (JoinClusterRequest) returns (JoinClusterReply);
+  rpc RunJob (RunJobRequest) returns (RunJobReply);
+  rpc GetJobStatus (GetJobStatusRequest) returns (GetJobStatusReply);
 }
 
 message JoinClusterRequest {
@@ -11,6 +13,26 @@ message JoinClusterRequest {
 }
 
 message JoinClusterReply {
+  // Reply contains the greeting message
+  string message = 1;
+}
+
+message RunJobRequest {
+  // Request message contains the address of the joining node
+  string name = 1;
+}
+
+message RunJobReply {
+  // Reply contains the greeting message
+  string message = 1;
+}
+
+message GetJobStatusRequest {
+  // Request message contains the address of the joining node
+  string name = 1;
+}
+
+message GetJobStatusReply {
   // Reply contains the greeting message
   string message = 1;
 }
