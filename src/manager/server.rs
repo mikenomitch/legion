@@ -1,14 +1,14 @@
 use crate::cmd::structs::AgentConfig;
 use crate::constants::{DEFAULT_ADDR, DEFAULT_PORT};
 use crate::raft::node::{start_raft, Msg};
-use crate::types::Res;
-
-use std::sync::mpsc::{self, Sender};
+use std::error;
+use std::sync::mpsc::{self, Sender, Receiver};
 // use std::thread;
 // use std::time::Duration;
 
 use std::sync::{Arc, Mutex};
 
+#[allow(non_snake_case)]
 pub mod legion {
     tonic::include_proto!("legion");
 }
@@ -28,7 +28,8 @@ use tonic::{transport::Server, Request, Response, Status};
 
 // #[derive(Default)]
 pub struct ManagerAgentService {
-    sender: Arc<Mutex<Sender<Msg>>>,
+    sender_to_raft: Arc<Mutex<Sender<Msg>>>,
+    receiver_from_raft: Arc<Mutex<Receiver<String>>>,
 }
 
 #[tonic::async_trait]
@@ -39,12 +40,12 @@ impl ManagerNode for ManagerAgentService {
     ) -> Result<Response<JoinClusterReply>, Status> {
         println!("Got a request from {:?}", request.remote_addr());
 
-        let sender = self.sender.lock().unwrap();
+        let to_raft = self.sender_to_raft.lock().unwrap();
 
-        sender
+        to_raft
             .send(Msg::Propose {
                 id: 1,
-                message: "JOIN",
+                message: "JOIN".to_string(),
                 cb: Box::new(move || println!("wat")),
             })
             .unwrap();
@@ -61,12 +62,12 @@ impl ManagerNode for ManagerAgentService {
         _request: Request<RunJobRequest>,
     ) -> Result<Response<RunJobReply>, Status> {
 
-        let sender = self.sender.lock().unwrap();
+        let to_raft = self.sender_to_raft.lock().unwrap();
 
-        sender
+        to_raft
             .send(Msg::Propose {
                 id: 2,
-                message: "JOB",
+                message: "JOB".to_string(),
                 cb: Box::new(move || println!("applied job")),
             })
             .unwrap();
@@ -92,17 +93,25 @@ impl ManagerNode for ManagerAgentService {
     }
 }
 
-pub async fn run_leader(config: AgentConfig) -> Res<()> {
+pub async fn run_leader(config: AgentConfig) -> Result<(), Box<dyn error::Error>> {
     let addr = format!("{}:{}", DEFAULT_ADDR, DEFAULT_PORT)
         .parse()
         .unwrap();
 
-    let (sender, receiver) = mpsc::channel();
-    let sender = Arc::new(Mutex::new(sender));
+    let (sender_to_raft, receiver_from_server) = mpsc::channel();
+    let sender_to_raft = Arc::new(Mutex::new(sender_to_raft));
 
-    start_raft(receiver, config);
+    let (sender_to_server, receiver_from_raft) = mpsc::channel();
+    let sender_to_server = Arc::new(Mutex::new(sender_to_server));
+    let receiver_from_raft = Arc::new(Mutex::new(receiver_from_raft));
 
-    let manager_node = ManagerAgentService { sender };
+    start_raft(receiver_from_server, sender_to_server, config);
+
+    let manager_node = ManagerAgentService {
+        sender_to_raft: sender_to_raft,
+        receiver_from_raft: receiver_from_raft
+    };
+
     println!("Manager node starting on {}", addr);
     Server::builder()
         .add_service(ManagerNodeServer::new(manager_node))
@@ -114,28 +123,36 @@ pub async fn run_leader(config: AgentConfig) -> Res<()> {
     Ok(())
 }
 
-pub async fn run_follower(config: AgentConfig) -> Res<()> {
-    let leader_addr_clone = config.manager.leader_address.clone();
+pub async fn run_follower(config: AgentConfig) -> Result<(), Box<dyn error::Error>> {
+    let leader_addr = config.manager.leader_address.clone();
 
-    // TODO: Parameterize port
     let addr = format!("{}:{}", DEFAULT_ADDR, 4848)
-        .parse()
-        .unwrap();
+    .parse()
+    .unwrap();
 
-    let mut client = ManagerNodeClient::connect(leader_address).await?;
+    let mut client = ManagerNodeClient::connect(leader_addr).await?;
+
+    let leader_addr = config.manager.leader_address.clone();
     let request = tonic::Request::new(JoinClusterRequest {
-        address: leader_addr_clone,
+        address: leader_addr,
     });
 
     let response = client.join_cluster(request).await?;
     println!("RESPONSE={:?}", response);
 
-    let (sender, receiver) = mpsc::channel();
-    let sender = Arc::new(Mutex::new(sender));
+    let (sender_to_raft, receiver_from_server) = mpsc::channel();
+    let sender_to_raft = Arc::new(Mutex::new(sender_to_raft));
 
-    start_raft(receiver, config);
+    let (sender_to_server, receiver_from_raft) = mpsc::channel();
+    let sender_to_server = Arc::new(Mutex::new(sender_to_server));
+    let receiver_from_raft = Arc::new(Mutex::new(receiver_from_raft));
 
-    let manager_node = ManagerAgentService { sender };
+    start_raft(receiver_from_server, sender_to_server, config);
+
+    let manager_node = ManagerAgentService {
+        sender_to_raft: sender_to_raft,
+        receiver_from_raft: receiver_from_raft
+    };
 
     println!("Manager node starting on {}", addr);
     Server::builder()
@@ -148,32 +165,32 @@ pub async fn run_follower(config: AgentConfig) -> Res<()> {
     Ok(())
 }
 
-fn send_propose(sender: mpsc::Sender<Msg>) {
-    thread::spawn(move || {
-        // Wait some time and send the request to the Raft.
-        thread::sleep(Duration::from_secs(10));
+// fn send_propose(sender: mpsc::Sender<Msg>) {
+//     thread::spawn(move || {
+//         // Wait some time and send the request to the Raft.
+//         thread::sleep(Duration::from_secs(10));
 
-        let (s1, r1) = mpsc::channel::<u8>();
+//         let (s1, r1) = mpsc::channel::<u8>();
 
-        println!("propose a request");
+//         println!("propose a request");
 
-        // Send a command to the Raft, wait for the Raft to apply it
-        // and get the result.
-        sender
-            .send(Msg::Propose {
-                id: 1,
-                cb: Box::new(move || {
-                    s1.send(0).unwrap();
-                }),
-            })
-            .unwrap();
+//         // Send a command to the Raft, wait for the Raft to apply it
+//         // and get the result.
+//         sender
+//             .send(Msg::Propose {
+//                 id: 1,
+//                 cb: Box::new(move || {
+//                     s1.send(0).unwrap();
+//                 }),
+//             })
+//             .unwrap();
 
-        let n = r1.recv().unwrap();
-        assert_eq!(n, 0);
+//         let n = r1.recv().unwrap();
+//         assert_eq!(n, 0);
 
-        println!("receive the propose callback");
-    });
-}
+//         println!("receive the propose callback");
+//     });
+// }
 
 // I need to...
 // run a long term process in Raft

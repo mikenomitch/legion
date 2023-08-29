@@ -1,11 +1,12 @@
 use crate::cmd::structs::AgentConfig;
-use crate::constants::{DEFAULT_CONFIG_PATH};
+use crate::constants::DEFAULT_CONFIG_PATH;
 use crate::manager::server::{run_follower, run_leader};
-use crate::types::Res;
 use jsonnet::JsonnetVm;
+use std::error;
 
 use clap::{arg, Command};
 
+#[allow(non_snake_case)]
 pub mod legion {
     tonic::include_proto!("legion");
 }
@@ -27,7 +28,7 @@ pub fn config() -> Command {
         // .subcommand(follower_cmd)
 }
 
-pub async fn handle(sub_matches: &clap::ArgMatches) -> Res<()> {
+pub async fn handle(sub_matches: &clap::ArgMatches) -> Result<(), Box<dyn error::Error>> {
     let config_path = sub_matches
         .get_one::<String>("config")
         .map(|s| s.as_str())
@@ -70,7 +71,7 @@ pub async fn handle(sub_matches: &clap::ArgMatches) -> Res<()> {
 //     _ => run_leader(DEFAULT_CONFIG_PATH).await,
 // }
 
-fn parse_config(config_path: &str) -> Res<AgentConfig> {
+fn parse_config(config_path: &str) -> Result<AgentConfig, Box<dyn error::Error>> {
     // Pluginify jsonnet
     let mut vm = JsonnetVm::new();
     let res = vm.evaluate_file(config_path);

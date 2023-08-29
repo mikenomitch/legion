@@ -2,9 +2,10 @@ use crate::cmd::structs::AgentConfig;
 
 // use std::any::Any;
 use std::collections::HashMap;
-use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex};
 
 use raft::eraftpb::ConfState;
 use raft::prelude::*;
@@ -18,7 +19,7 @@ type ProposeCallback = Box<dyn Fn() + Send>;
 pub enum Msg {
     Propose {
         id: u8,
-        message: &str,
+        message: String,
         cb: ProposeCallback,
     },
     // Here we don't use Raft Message, so use dead_code to
@@ -27,7 +28,11 @@ pub enum Msg {
     Raft(Message),
 }
 
-pub fn start_raft(receiver: Receiver<Msg>, config: AgentConfig) {
+pub fn start_raft(
+    receiver_from_server: Receiver<Msg>,
+    sender_to_server: Arc<Mutex<Sender<String>>>,
+    config: AgentConfig,
+) {
     thread::spawn(move || {
         println!("Starting raft");
 
@@ -35,11 +40,11 @@ pub fn start_raft(receiver: Receiver<Msg>, config: AgentConfig) {
         let storage = create_storage();
         let mut raft_node = create_node(config, storage, logger);
 
-        drive_raft(receiver, &mut raft_node)
+        drive_raft(receiver_from_server, &mut raft_node)
     });
 }
 
-fn drive_raft(receiver: Receiver<Msg>, raft_node: &mut RawNode<MemStorage>) {
+fn drive_raft(receiver_from_server: Receiver<Msg>, raft_node: &mut RawNode<MemStorage>) {
     // Loop forever to drive the Raft.
     let mut t = Instant::now();
     let mut timeout = Duration::from_millis(100);
@@ -48,7 +53,7 @@ fn drive_raft(receiver: Receiver<Msg>, raft_node: &mut RawNode<MemStorage>) {
     let mut cbs = HashMap::new();
 
     loop {
-        match receiver.recv_timeout(timeout) {
+        match receiver_from_server.recv_timeout(timeout) {
             // Client sends a proposal to this node first
             Ok(Msg::Propose { id, message, cb }) => {
                 cbs.insert(id, cb);

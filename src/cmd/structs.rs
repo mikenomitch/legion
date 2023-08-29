@@ -1,13 +1,13 @@
 use serde::Deserialize;
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ManagerConfig {
     pub id: u64,
     pub election_tick: usize,
     pub heartbeat_tick: usize,
     pub leader: bool,
-    pub leader_address: String,
+        pub leader_address: String,
     pub peers: Vec<String>,
 }
 

@@ -1,8 +1,8 @@
 use crate::constants::{DEFAULT_ADDR, DEFAULT_PORT, DEFAULT_PROTOCOL};
-use crate::types::Res;
-
+use std::error;
 use clap::{arg, Command};
 
+#[allow(non_snake_case)]
 pub mod legion {
     tonic::include_proto!("legion");
 }
@@ -13,7 +13,9 @@ pub fn config() -> Command {
     let job_run_cmd = Command::new("run")
         .about("Run a job")
         .arg(arg!(path: [PATH]));
-    let job_status_cmd = Command::new("status").about("Get job status");
+
+    let job_status_cmd = Command::new("status")
+        .about("Get job status");
 
     Command::new("job")
         .about("Interact with jobs")
@@ -22,8 +24,7 @@ pub fn config() -> Command {
         .subcommand(job_run_cmd)
         .subcommand(job_status_cmd)
 }
-
-pub async fn handle(sub_matches: &clap::ArgMatches) -> Res<()> {
+pub async fn handle(sub_matches: &clap::ArgMatches) -> Result<(), Box<dyn error::Error>> {
     match sub_matches.subcommand() {
         Some(("run", _)) => run_job().await,
         Some(("status", _)) => get_status().await,
@@ -31,7 +32,7 @@ pub async fn handle(sub_matches: &clap::ArgMatches) -> Res<()> {
     }
 }
 
-async fn run_job() -> Res<()> {
+async fn run_job() -> Result<(), Box<dyn error::Error>> {
     let addr = format!("{}://{}:{}", DEFAULT_PROTOCOL, DEFAULT_ADDR, DEFAULT_PORT);
     let mut client = ManagerNodeClient::connect(addr).await?;
 
@@ -46,7 +47,7 @@ async fn run_job() -> Res<()> {
     Ok(())
 }
 
-async fn get_status() -> Res<()> {
+async fn get_status() -> Result<(), Box<dyn error::Error>> {
     let addr = format!("{}://{}:{}", DEFAULT_PROTOCOL, DEFAULT_ADDR, DEFAULT_PORT);
     let mut client = ManagerNodeClient::connect(addr).await?;
 

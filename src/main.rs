@@ -5,7 +5,7 @@ mod raft;
 mod types;
 use clap::Command;
 use std::ffi::OsString;
-use types::Res;
+use std::error;
 
 fn cli() -> Command {
     Command::new("legion")
@@ -18,7 +18,7 @@ fn cli() -> Command {
 }
 
 #[tokio::main]
-async fn main() -> Res<()> {
+async fn main() -> Result<(), Box<dyn error::Error>> {
     let matches = cli().get_matches();
     match matches.subcommand() {
         Some(("start", sub_matches)) => cmd::start::handle(sub_matches).await?,
