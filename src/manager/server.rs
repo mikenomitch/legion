@@ -30,7 +30,7 @@ use tonic::{transport::Server, Request, Response, Status};
 // #[derive(Default)]
 pub struct ManagerAgentService {
     sender_to_raft: Arc<Mutex<Sender<Msg>>>,
-    _receiver_from_raft: Arc<Mutex<Receiver<String>>>,
+    receiver_from_raft: Arc<Mutex<Receiver<String>>>,
 }
 
 #[tonic::async_trait]
