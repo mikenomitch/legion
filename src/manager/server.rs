@@ -44,11 +44,7 @@ impl ManagerNode for ManagerAgentService {
         let to_raft = self.sender_to_raft.lock().unwrap();
 
         to_raft
-            .send(Msg::Propose {
-                id: 1,
-                message: "JOIN".to_string(),
-                cb: Box::new(move || debug!("wat")),
-            })
+            .send(Msg::Content("LET ME IN".to_string()))
             .unwrap();
 
         let reply = JoinClusterReply {
@@ -66,11 +62,7 @@ impl ManagerNode for ManagerAgentService {
         let to_raft = self.sender_to_raft.lock().unwrap();
 
         to_raft
-            .send(Msg::Propose {
-                id: 2,
-                message: "JOB".to_string(),
-                cb: Box::new(move || debug!("applied job")),
-            })
+            .send(Msg::Content("ADD THE JOB".to_string()))
             .unwrap();
 
 
@@ -165,40 +157,3 @@ pub async fn run_follower(config: AgentConfig) -> Result<(), Box<dyn error::Erro
 
     Ok(())
 }
-
-// fn send_propose(sender: mpsc::Sender<Msg>) {
-//     thread::spawn(move || {
-//         // Wait some time and send the request to the Raft.
-//         thread::sleep(Duration::from_secs(10));
-
-//         let (s1, r1) = mpsc::channel::<u8>();
-
-//         debug!("propose a request");
-
-//         // Send a command to the Raft, wait for the Raft to apply it
-//         // and get the result.
-//         sender
-//             .send(Msg::Propose {
-//                 id: 1,
-//                 cb: Box::new(move || {
-//                     s1.send(0).unwrap();
-//                 }),
-//             })
-//             .unwrap();
-
-//         let n = r1.recv().unwrap();
-//         assert_eq!(n, 0);
-
-//         debug!("receive the propose callback");
-//     });
-// }
-
-// I need to...
-// run a long term process in Raft
-// run a long term server process
-// I need to send messages from the Server to the Raft stuff
-// must have a "sender in the server"
-
-// I need to pass messages from raft to the server?
-// must have a "receiver in the server
-// I.E. raft dies and should kill the server?
