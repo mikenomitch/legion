@@ -1,6 +1,7 @@
 use crate::cmd::structs::AgentConfig;
 use crate::constants::{DEFAULT_ADDR, DEFAULT_PORT};
 use crate::raft::node::{start_raft, Msg};
+use log::debug;
 use std::error;
 use std::sync::mpsc::{self, Sender, Receiver};
 // use std::thread;
@@ -29,7 +30,7 @@ use tonic::{transport::Server, Request, Response, Status};
 // #[derive(Default)]
 pub struct ManagerAgentService {
     sender_to_raft: Arc<Mutex<Sender<Msg>>>,
-    receiver_from_raft: Arc<Mutex<Receiver<String>>>,
+    _receiver_from_raft: Arc<Mutex<Receiver<String>>>,
 }
 
 #[tonic::async_trait]
@@ -38,7 +39,7 @@ impl ManagerNode for ManagerAgentService {
         &self,
         request: Request<JoinClusterRequest>,
     ) -> Result<Response<JoinClusterReply>, Status> {
-        println!("Got a request from {:?}", request.remote_addr());
+        debug!("Got a request from {:?}", request.remote_addr());
 
         let to_raft = self.sender_to_raft.lock().unwrap();
 
@@ -46,7 +47,7 @@ impl ManagerNode for ManagerAgentService {
             .send(Msg::Propose {
                 id: 1,
                 message: "JOIN".to_string(),
-                cb: Box::new(move || println!("wat")),
+                cb: Box::new(move || debug!("wat")),
             })
             .unwrap();
 
@@ -68,7 +69,7 @@ impl ManagerNode for ManagerAgentService {
             .send(Msg::Propose {
                 id: 2,
                 message: "JOB".to_string(),
-                cb: Box::new(move || println!("applied job")),
+                cb: Box::new(move || debug!("applied job")),
             })
             .unwrap();
 
@@ -112,13 +113,13 @@ pub async fn run_leader(config: AgentConfig) -> Result<(), Box<dyn error::Error>
         receiver_from_raft: receiver_from_raft
     };
 
-    println!("Manager node starting on {}", addr);
+    debug!("Manager node starting on {}", addr);
     Server::builder()
         .add_service(ManagerNodeServer::new(manager_node))
         .serve(addr)
         .await?;
 
-    println!("Cleaning Up");
+    debug!("Cleaning Up");
 
     Ok(())
 }
@@ -138,7 +139,7 @@ pub async fn run_follower(config: AgentConfig) -> Result<(), Box<dyn error::Erro
     });
 
     let response = client.join_cluster(request).await?;
-    println!("RESPONSE={:?}", response);
+    debug!("RESPONSE={:?}", response);
 
     let (sender_to_raft, receiver_from_server) = mpsc::channel();
     let sender_to_raft = Arc::new(Mutex::new(sender_to_raft));
@@ -154,13 +155,13 @@ pub async fn run_follower(config: AgentConfig) -> Result<(), Box<dyn error::Erro
         receiver_from_raft: receiver_from_raft
     };
 
-    println!("Manager node starting on {}", addr);
+    debug!("Manager node starting on {}", addr);
     Server::builder()
         .add_service(ManagerNodeServer::new(manager_node))
         .serve(addr)
         .await?;
 
-    println!("Cleaning Up");
+    debug!("Cleaning Up");
 
     Ok(())
 }
@@ -172,7 +173,7 @@ pub async fn run_follower(config: AgentConfig) -> Result<(), Box<dyn error::Erro
 
 //         let (s1, r1) = mpsc::channel::<u8>();
 
-//         println!("propose a request");
+//         debug!("propose a request");
 
 //         // Send a command to the Raft, wait for the Raft to apply it
 //         // and get the result.
@@ -188,7 +189,7 @@ pub async fn run_follower(config: AgentConfig) -> Result<(), Box<dyn error::Erro
 //         let n = r1.recv().unwrap();
 //         assert_eq!(n, 0);
 
-//         println!("receive the propose callback");
+//         debug!("receive the propose callback");
 //     });
 // }
 

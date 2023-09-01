@@ -1,4 +1,5 @@
 use crate::constants::{DEFAULT_ADDR, DEFAULT_PORT, DEFAULT_PROTOCOL};
+use log::debug;
 use std::error;
 use clap::{arg, Command};
 
@@ -42,7 +43,7 @@ async fn run_job() -> Result<(), Box<dyn error::Error>> {
 
     let response = client.run_job(request).await?;
 
-    println!("RESPONSE={:?}", response);
+    debug!("RESPONSE={:?}", response);
 
     Ok(())
 }
@@ -57,7 +58,7 @@ async fn get_status() -> Result<(), Box<dyn error::Error>> {
 
     let response = client.get_job_status(request).await?;
 
-    println!("RESPONSE={:?}", response);
+    debug!("RESPONSE={:?}", response);
 
     Ok(())
 }

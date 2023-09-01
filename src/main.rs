@@ -1,5 +1,6 @@
 mod cmd;
 mod constants;
+use log::debug;
 mod manager;
 mod raft;
 mod types;
@@ -19,6 +20,8 @@ fn cli() -> Command {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn error::Error>> {
+    env_logger::init();
+
     let matches = cli().get_matches();
     match matches.subcommand() {
         Some(("start", sub_matches)) => cmd::start::handle(sub_matches).await?,
@@ -29,7 +32,7 @@ async fn main() -> Result<(), Box<dyn error::Error>> {
                 .into_iter()
                 .flatten()
                 .collect::<Vec<_>>();
-            println!("Calling to {ext:?} with {args:?}");
+            debug!("Calling to {ext:?} with {args:?}");
         }
         _ => unreachable!(),
     };

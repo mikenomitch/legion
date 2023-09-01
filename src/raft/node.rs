@@ -10,7 +10,9 @@ use std::sync::{Arc, Mutex};
 use raft::eraftpb::ConfState;
 use raft::prelude::*;
 use raft::storage::MemStorage;
+// TODO: can remove slog once you go to the new setup
 use slog::Logger;
+use log::debug;
 
 type ProposeCallback = Box<dyn Fn() + Send>;
 
@@ -30,11 +32,11 @@ pub enum Msg {
 
 pub fn start_raft(
     receiver_from_server: Receiver<Msg>,
-    sender_to_server: Arc<Mutex<Sender<String>>>,
+    _sender_to_server: Arc<Mutex<Sender<String>>>,
     config: AgentConfig,
 ) {
     thread::spawn(move || {
-        println!("Starting raft");
+        debug!("Starting raft");
 
         let logger = raft::default_logger();
         let storage = create_storage();
