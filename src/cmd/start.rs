@@ -12,20 +12,20 @@ pub mod legion {
 }
 
 pub fn config() -> Command {
-    // let leader_cmd = Command::new("leader")
-    //     .about("Start a leader manager node")
-    //     .arg(arg!(-c --config [CONFIG] "test"));
+    let leader_cmd = Command::new("leader")
+        .about("Start a leader manager node")
+        .arg(arg!(-c --config [CONFIG] "test"));
 
-    // let follower_cmd = Command::new("follower")
-    //     .about("Start a follower manager node")
-    //     .arg(arg!(port: [PORT]))
-    //     .arg(arg!(-c --config [CONFIG] "path to configuration file agent"));
+    let follower_cmd = Command::new("follower")
+        .about("Start a follower manager node")
+        .arg(arg!(port: [PORT]))
+        .arg(arg!(-c --config [CONFIG] "path to configuration file agent"));
 
     Command::new("start")
         .about("Start an agent")
         .arg(arg!(-c --config [CONFIG] "test"))
-        // .subcommand(leader_cmd)
-        // .subcommand(follower_cmd)
+        .subcommand(leader_cmd)
+        .subcommand(follower_cmd)
 }
 
 pub async fn handle(sub_matches: &clap::ArgMatches) -> Result<(), Box<dyn error::Error>> {
@@ -36,40 +36,14 @@ pub async fn handle(sub_matches: &clap::ArgMatches) -> Result<(), Box<dyn error:
 
     let config = parse_config(config_path)?;
 
-    if config.manager.leader {
+    if let Some(("leader", _)) = sub_matches.subcommand() {
+        run_leader(config).await
+    } else if config.manager.leader {
         run_leader(config).await
     } else {
         run_follower(config).await
     }
 }
-
-// run_leader(config).await
-// match sub_matches.subcommand() {
-//     Some(("leader", sms)) => {
-//         let config_path = sms
-//             .get_one::<String>("config")
-//             .map(|s| s.as_str())
-//             .unwrap_or(DEFAULT_CONFIG_PATH);
-
-//         run_leader(config_path).await
-//     }
-
-//     Some(("follower", sms)) => {
-//         let port = sms
-//             .get_one::<String>("port")
-//             .map(|s| s.as_str())
-//             .unwrap_or(DEFAULT_PORT);
-
-//         let config_path = sms
-//             .get_one::<String>("config")
-//             .map(|s| s.as_str())
-//             .unwrap_or(DEFAULT_CONFIG_PATH);
-
-//         run_follower(config_path, port).await
-//     }
-
-//     _ => run_leader(DEFAULT_CONFIG_PATH).await,
-// }
 
 fn parse_config(config_path: &str) -> Result<AgentConfig, Box<dyn error::Error>> {
     // Pluginify jsonnet
