@@ -10,12 +10,12 @@ pub enum Msg {
     Content(String),
 }
 
-pub fn start_raft(
+pub fn start_storage(
     _receiver_from_server: Receiver<Msg>,
     _sender_to_server: Arc<Mutex<Sender<String>>>,
     _config: AgentConfig,
 ) {
     thread::spawn(move || {
-        debug!("Starting raft!");
+        debug!("Starting store!");
     });
 }

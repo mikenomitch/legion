@@ -1,1 +1,1 @@
-A distributed cluster in Raft
+A distributed scheduler

@@ -2,7 +2,7 @@ mod cmd;
 mod constants;
 use log::debug;
 mod manager;
-mod raft;
+mod storage;
 mod types;
 use clap::Command;
 use std::ffi::OsString;

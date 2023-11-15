@@ -1,6 +1,6 @@
 use crate::cmd::structs::AgentConfig;
 use crate::constants::{DEFAULT_ADDR, DEFAULT_PORT};
-use crate::raft::node::{start_raft, Msg};
+use crate::storage::node::{start_storage, Msg};
 use log::debug;
 use std::error;
 use std::sync::mpsc::{self, Sender, Receiver};
@@ -27,10 +27,11 @@ use legion::{
 
 use tonic::{transport::Server, Request, Response, Status};
 
+#[allow(dead_code)]
 // #[derive(Default)]
 pub struct ManagerAgentService {
-    sender_to_raft: Arc<Mutex<Sender<Msg>>>,
-    receiver_from_raft: Arc<Mutex<Receiver<String>>>,
+    sender_to_store: Arc<Mutex<Sender<Msg>>>,
+    receiver_from_store: Arc<Mutex<Receiver<String>>>,
 }
 
 #[tonic::async_trait]
@@ -41,11 +42,11 @@ impl ManagerNode for ManagerAgentService {
     ) -> Result<Response<JoinClusterReply>, Status> {
         debug!("Got a request from {:?}", request.remote_addr());
 
-        let to_raft = self.sender_to_raft.lock().unwrap();
+        // let to_store = self.sender_to_store.lock().unwrap();
 
-        to_raft
-            .send(Msg::Content("LET ME IN".to_string()))
-            .unwrap();
+        // to_store
+        //     .send(Msg::Content("LET ME IN".to_string()))
+        //     .unwrap();
 
         let reply = JoinClusterReply {
             message: format!("Hello {}!", request.into_inner().address),
@@ -59,12 +60,11 @@ impl ManagerNode for ManagerAgentService {
         _request: Request<RunJobRequest>,
     ) -> Result<Response<RunJobReply>, Status> {
 
-        let to_raft = self.sender_to_raft.lock().unwrap();
+        // let to_store = self.sender_to_store.lock().unwrap();
 
-        to_raft
-            .send(Msg::Content("ADD THE JOB".to_string()))
-            .unwrap();
-
+        // to_store
+        //     .send(Msg::Content("ADD THE JOB".to_string()))
+        //     .unwrap();
 
         let reply = RunJobReply {
             message: format!("Hello {}!", "jorb"),
@@ -91,18 +91,18 @@ pub async fn run_leader(config: AgentConfig) -> Result<(), Box<dyn error::Error>
         .parse()
         .unwrap();
 
-    let (sender_to_raft, receiver_from_server) = mpsc::channel();
-    let sender_to_raft = Arc::new(Mutex::new(sender_to_raft));
+    let (sender_to_store, receiver_from_server) = mpsc::channel();
+    let sender_to_store = Arc::new(Mutex::new(sender_to_store));
 
-    let (sender_to_server, receiver_from_raft) = mpsc::channel();
+    let (sender_to_server, receiver_from_store) = mpsc::channel();
     let sender_to_server = Arc::new(Mutex::new(sender_to_server));
-    let receiver_from_raft = Arc::new(Mutex::new(receiver_from_raft));
+    let receiver_from_store = Arc::new(Mutex::new(receiver_from_store));
 
-    start_raft(receiver_from_server, sender_to_server, config);
+    start_storage(receiver_from_server, sender_to_server, config);
 
     let manager_node = ManagerAgentService {
-        sender_to_raft: sender_to_raft,
-        receiver_from_raft: receiver_from_raft
+        sender_to_store: sender_to_store,
+        receiver_from_store: receiver_from_store
     };
 
     debug!("Manager node starting on {}", addr);
@@ -133,18 +133,18 @@ pub async fn run_follower(config: AgentConfig) -> Result<(), Box<dyn error::Erro
     let response = client.join_cluster(request).await?;
     debug!("RESPONSE={:?}", response);
 
-    let (sender_to_raft, receiver_from_server) = mpsc::channel();
-    let sender_to_raft = Arc::new(Mutex::new(sender_to_raft));
+    let (sender_to_store, receiver_from_server) = mpsc::channel();
+    let sender_to_store = Arc::new(Mutex::new(sender_to_store));
 
-    let (sender_to_server, receiver_from_raft) = mpsc::channel();
+    let (sender_to_server, receiver_from_store) = mpsc::channel();
     let sender_to_server = Arc::new(Mutex::new(sender_to_server));
-    let receiver_from_raft = Arc::new(Mutex::new(receiver_from_raft));
+    let receiver_from_store = Arc::new(Mutex::new(receiver_from_store));
 
-    start_raft(receiver_from_server, sender_to_server, config);
+    start_storage(receiver_from_server, sender_to_server, config);
 
     let manager_node = ManagerAgentService {
-        sender_to_raft: sender_to_raft,
-        receiver_from_raft: receiver_from_raft
+        sender_to_store: sender_to_store,
+        receiver_from_store: receiver_from_store
     };
 
     debug!("Manager node starting on {}", addr);
