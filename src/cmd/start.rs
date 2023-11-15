@@ -1,5 +1,5 @@
 use crate::cmd::structs::{AgentConfig, WorkerConfig};
-use crate::constants::DEFAULT_CONFIG_PATH;
+use crate::constants::{DEFAULT_CONFIG_PATH, DEFAULT_WORKER_CONFIG_PATH};
 use crate::manager::server::{run_follower, run_leader};
 use crate::worker::agent::run_worker;
 use jsonnet::JsonnetVm;
@@ -36,15 +36,18 @@ pub fn config() -> Command {
 }
 
 pub async fn handle(sub_matches: &clap::ArgMatches) -> Result<(), Box<dyn error::Error>> {
-    let config_path = sub_matches
-        .get_one::<String>("config")
-        .map(|s| s.as_str())
-        .unwrap_or(DEFAULT_CONFIG_PATH);
-
     if let Some(("worker", _)) = sub_matches.subcommand() {
+        let config_path = sub_matches
+            .get_one::<String>("config")
+            .map(|s| s.as_str())
+            .unwrap_or(DEFAULT_WORKER_CONFIG_PATH);
         let config = parse_worker_config(config_path)?;
         run_worker(config).await
     } else {
+        let config_path = sub_matches
+            .get_one::<String>("config")
+            .map(|s| s.as_str())
+            .unwrap_or(DEFAULT_CONFIG_PATH);
         let config = parse_config(config_path)?;
         if let Some(("leader", _)) = sub_matches.subcommand() {
             run_leader(config).await

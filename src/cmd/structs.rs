@@ -27,6 +27,13 @@ pub struct AgentConfig {
 
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
+pub struct WorkerConfigFromManager {
+    pub fingerprinters: Vec<String>,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
 pub struct WorkerConfig {
     pub server: ServerConfig,
+    pub worker_config: WorkerConfigFromManager,
 }
