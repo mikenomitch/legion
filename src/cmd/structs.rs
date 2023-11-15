@@ -24,3 +24,9 @@ pub struct AgentConfig {
     pub server: ServerConfig,
     pub manager: ManagerConfig,
 }
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerConfig {
+    pub server: ServerConfig,
+}

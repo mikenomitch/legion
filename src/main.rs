@@ -4,6 +4,7 @@ use log::debug;
 mod manager;
 mod storage;
 mod types;
+mod worker;
 use clap::Command;
 use std::ffi::OsString;
 use std::error;
