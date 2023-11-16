@@ -3,18 +3,19 @@ use crate::constants::{DEFAULT_ADDR, DEFAULT_PORT};
 
 use log::{debug, error};
 use std::error;
+use serde_json::Value;
+use std::collections::HashMap;
 
 pub async fn run_worker(config: WorkerConfig) -> Result<(), Box<dyn error::Error>> {
     let addr: String = format!("{}:{}", DEFAULT_ADDR, DEFAULT_PORT)
         .parse()
         .unwrap();
 
-    config.worker_config.fingerprinters.iter().for_each(|f| {
-        error!("Fingerprinter: {}", f);
-    });
+    let _fingerprint_data = fingerprint_node(&config);
 
     // TODO: USE THIS GUIDE
     // https://michael-f-bryan.github.io/rust-ffi-guide/dynamic_loading.html
+    // using dylib crate type: https://doc.rust-lang.org/reference/linkage.html
 
     // TODO:
     // - Read the config file (if there)
@@ -39,3 +40,73 @@ pub async fn run_worker(config: WorkerConfig) -> Result<(), Box<dyn error::Error
 //         Ok(func())
 //     }
 // }
+
+fn fingerprint_node(config: &WorkerConfig) -> HashMap<String, Value> {
+    let mut fps: Vec<Box<dyn Fingerprinter>> = Vec::new();
+    fps.push(Box::new(ArchFingerprinter{}));
+    fps.push(Box::new(OSFingerprinter{}));
+
+    config.worker_config.additional_fingerprinters.iter().for_each(|f| {
+        error!("Fingerprinter: {}", f);
+    });
+
+    fps.iter().fold(HashMap::new(), |acc, f| {
+        let data = f.fingerprint();
+        acc.into_iter().chain(data).collect()
+    })
+}
+
+
+trait Fingerprinter {
+    fn fingerprint(&self) -> HashMap<String, Value> {
+        let mut map = HashMap::new();
+        map.insert("data".to_string(), serde_json::json!("{}"));
+        map
+    }
+}
+
+struct OSFingerprinter {}
+
+impl Fingerprinter for OSFingerprinter {
+    fn fingerprint(&self) -> HashMap<String, Value> {
+        let mut map = HashMap::new();
+        map.insert("data".to_string(), serde_json::json!({ "os": std::env::consts::OS}));
+        map
+    }
+}
+
+struct ArchFingerprinter {}
+
+impl Fingerprinter for ArchFingerprinter {
+    fn fingerprint(&self) -> HashMap<String, Value> {
+        let mut map = HashMap::new();
+        map.insert("data".to_string(), serde_json::json!({ "arch": std::env::consts::ARCH}));
+        map
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::cmd::structs::{WorkerConfigFromManager, ServerConfig};
+
+    use super::*;
+
+    #[test]
+    fn fingerprint_node_works() {
+        let config = &WorkerConfig{
+            server: ServerConfig{
+                port: 1234,
+                address: "duper".to_string(),
+            },
+            worker_config: WorkerConfigFromManager{
+                additional_fingerprinters: vec![],
+            }
+        };
+        let res = fingerprint_node(config);
+
+        println!("whoa {:?}", res);
+
+        assert_eq!(res["data"]["os"], "macos");
+        assert_eq!(res["data"]["arch"], "aarch64");
+    }
+}
