@@ -28,3 +28,4 @@ pub async fn run_worker(config: WorkerConfig) -> Result<(), Box<dyn error::Error
 
     Ok(())
 }
+
