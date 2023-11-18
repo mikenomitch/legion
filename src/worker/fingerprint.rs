@@ -88,57 +88,53 @@ impl Fingerprinter for KitchenSinkFingerprinter {
         let mut sys = System::new_all();
         sys.refresh_all();
 
+        let mut fingerprint = HashMap::new();
+
         // Network interfaces name, data received and data transmitted:
-        println!("=> networks:");
-        for (interface_name, data) in sys.networks() {
-            println!("interface name: {:?}", interface_name);
+        for (interface_name, _data) in sys.networks() {
+            fingerprint.insert("interface_name".to_string(), interface_name.to_string());
         }
 
-        // Components :
+        // Components:
         for component in sys.components() {
-            println!("label: {:?}", component.label());
+            fingerprint.insert("component_label".to_string(), component.label().to_string());
         }
 
-        println!("signals: {:?}:", sysinfo::System::SUPPORTED_SIGNALS);
+        fingerprint.insert("supported_signals".to_string(), format!("{:?}", sysinfo::System::SUPPORTED_SIGNALS));
 
-        println!("=> system:");
-        // RAM and swap information:
-        println!("total memory: {} bytes", sys.total_memory());
-        println!("available memory: {} bytes", sys.available_memory());
-        println!("used memory : {} bytes", sys.used_memory());
-        println!("total swap  : {} bytes", sys.total_swap());
-        println!("used swap   : {} bytes", sys.used_swap());
+        fingerprint.insert("total_memory".to_string(), sys.total_memory().to_string());
+        fingerprint.insert("available_memory".to_string(), sys.available_memory().to_string());
+        fingerprint.insert("used_memory".to_string(), sys.used_memory().to_string());
+        fingerprint.insert("total_swap".to_string(), sys.total_swap().to_string());
+        fingerprint.insert("used_swap".to_string(), sys.used_swap().to_string());
 
-        // Display system information:
-        println!("System name:             {:?}", sys.name());
-        println!("System kernel version:   {:?}", sys.kernel_version());
-        println!("System OS version:       {:?}", sys.os_version());
-        println!("System host name:        {:?}", sys.host_name());
+        fingerprint.insert("system_name".to_string(), sys.name().unwrap_or("".to_string()));
+        fingerprint.insert("system_kernel_version".to_string(), sys.kernel_version().unwrap_or("".to_string()));
+        fingerprint.insert("system_os_version".to_string(), sys.os_version().unwrap_or("".to_string()));
+        fingerprint.insert("system_host_name".to_string(), sys.host_name().unwrap_or("".to_string()));
 
+        let mut cpus_hash: HashMap<String, HashMap<String, String>> = HashMap::new();
         sys.cpus().iter().for_each(|cpu| {
-            println!("name: {:?}", cpu.name());
-            println!("cpu_usage: {:?}", cpu.cpu_usage());
-            println!("frequency: {:?}", cpu.frequency());
-            println!("vendor_id: {:?}", cpu.vendor_id());
-            println!("brand: {:?}", cpu.brand());
+            let mut cpu_hash: HashMap<String, String> = HashMap::new();
+            cpu_hash.insert("name".to_string(), cpu.name().to_string());
+            cpu_hash.insert("usage".to_string(), cpu.cpu_usage().to_string());
+            cpu_hash.insert("frequency".to_string(), cpu.frequency().to_string());
+            cpu_hash.insert("vendor_id".to_string(), cpu.vendor_id().to_string());
+            cpus_hash.insert(cpu.name().to_string(), cpu_hash);
         });
+        fingerprint.insert("cpus".to_string(), cpus_hash);
 
         sys.disks().iter().for_each(|disk| {
-            println!("name: {:?}", disk.name());
-            println!("file_system: {:?}", disk.file_system());
-            println!("mount_point: {:?}", disk.mount_point());
-            println!("total_space: {:?}", disk.total_space());
-            println!("available_space: {:?}", disk.available_space());
-            println!("is_removable: {:?}", disk.is_removable());
+
+            fingerprint.insert("disk_name".to_string(), disk.name().to_str().unwrap_or("").to_string());
+            // fingerprint.insert("disk_file_system".to_string(), disk.file_system().to_str().unwrap_or("").to_string());
+            fingerprint.insert("disk_mount_point".to_string(), disk.mount_point().to_str().unwrap_or("").to_string());
+            fingerprint.insert("disk_total_space".to_string(), disk.total_space().to_string());
+            fingerprint.insert("disk_available_space".to_string(), disk.available_space().to_string());
+            fingerprint.insert("disk_is_removable".to_string(), disk.is_removable().to_string());
         });
 
-        // Number of CPUs:
-        println!("NB CPUs: {}", sys.cpus().len());
-
-        HashMap::from([
-            ("kernel".to_string(), sys.host_name().unwrap_or("".to_string())),
-            ("host".to_string(), sys.kernel_version().unwrap_or("".to_string())),
-        ])
+        fingerprint
     }
 }
 
