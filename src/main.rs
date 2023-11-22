@@ -17,6 +17,7 @@ fn cli() -> Command {
         .arg_required_else_help(true)
         .subcommand(cmd::job::config())
         .subcommand(cmd::start::config())
+        .subcommand(cmd::join_token::config())
 }
 
 #[tokio::main]
@@ -27,6 +28,7 @@ async fn main() -> Result<(), Box<dyn error::Error>> {
     match matches.subcommand() {
         Some(("start", sub_matches)) => cmd::start::handle(sub_matches).await?,
         Some(("job", sub_matches)) => cmd::job::handle(sub_matches).await?,
+        Some(("join-token", sub_matches)) => cmd::join_token::handle(sub_matches).await?,
         Some((ext, sub_matches)) => {
             let args = sub_matches
                 .get_many::<OsString>("")
