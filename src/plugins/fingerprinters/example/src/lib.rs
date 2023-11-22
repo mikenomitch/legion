@@ -2,13 +2,16 @@
 
 // TODO: GET THE TRAIT FROM LEGION
 
+use serde_json::{Map, Number, Value};
 use std::collections::HashMap;
 
 trait Fingerprinter {
     fn name(&self) -> &'static str;
 
-    fn fingerprint(&self) -> HashMap<String, String> {
-        HashMap::from([("foo".to_string(), "bar".to_string())])
+    fn fingerprint(&self) -> Map<String, Value> {
+        let mut map = Map::new();
+        map.insert("foo".to_string(), Value::String("bar".to_string()));
+        map
     }
 }
 
@@ -17,10 +20,10 @@ struct BasicFingerprinter {}
 impl Fingerprinter for BasicFingerprinter {
     fn name(&self) -> &'static str { "basic" }
 
-    fn fingerprint(&self) -> HashMap<String, String> {
-        HashMap::from([
-            ("basic".to_string(), "output".to_string())
-        ])
+    fn fingerprint(&self) -> Map<String, Value> {
+        let mut map = Map::new();
+        map.insert("basic".to_string(), Value::String("output".to_string()));
+        map
     }
 }
 

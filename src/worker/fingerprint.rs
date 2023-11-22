@@ -1,40 +1,49 @@
 use crate::cmd::structs::WorkerConfig;
-// use log::error;
 use std::error;
-use std::collections::HashMap;
 
 extern crate libloading;
-use std::env::consts::{ARCH, OS};
 use libloading::{Library, Symbol};
-use sysinfo::{DiskExt, ComponentExt, System, SystemExt, CpuExt};
+use std::env::consts::{ARCH, OS};
+use sysinfo::{CpuExt, DiskExt, System, SystemExt, NetworkExt};
+use serde_json::{Map, Value};
+
+// NOTE: Improve current fingerprinters:
+// Network - speed, IP addresses, etc
+
+// NOTE: Potential additional fingerprinters:
+// CNI - which plugins are on the machine
+// Landlock - is it available?
+// Cloud provider fingerprinters?
 
 // Helpful links for reference later:
 // https://michael-f-bryan.github.io/rust-ffi-guide/dynamic_loading.html
 // https://crates.io/crates/sysinfo
 
-pub fn fingerprint_node(config: &WorkerConfig) -> HashMap<String, String> {
-    let fps : Vec<Box<dyn Fingerprinter>> = vec![
-        Box::new(ArchFingerprinter{}),
-        Box::new(OSFingerprinter{}),
-        Box::new(KitchenSinkFingerprinter{}),
+pub fn fingerprint_node(config: &WorkerConfig) -> Map<String, Value> {
+    let fps: Vec<Box<dyn Fingerprinter>> = vec![
+        Box::new(ArchFingerprinter {}),
+        Box::new(OSFingerprinter {}),
+        Box::new(KitchenSinkFingerprinter {}),
     ];
 
-    let mut ret = HashMap::new();
+    let mut ret = Map::new();
 
-    fps.iter().for_each( |f| {
+    fps.iter().for_each(|f| {
         ret.extend(f.fingerprint());
     });
 
-    config.worker_config.additional_fingerprinters.iter().for_each(|path| {
-        match call_dynamic(path) {
+    config
+        .worker_config
+        .additional_fingerprinters
+        .iter()
+        .for_each(|path| match call_dynamic(path) {
             Ok(fp) => {
                 ret.extend(fp.fingerprint());
-            },
+            }
             Err(e) => {
                 println!("Error loading fingerprinter: {}", e);
             }
-        }
-    });
+        });
 
     ret
 }
@@ -42,7 +51,7 @@ pub fn fingerprint_node(config: &WorkerConfig) -> HashMap<String, String> {
 fn call_dynamic(path: &str) -> Result<Box<dyn Fingerprinter>, Box<dyn error::Error>> {
     unsafe {
         let lib = Library::new(path)?;
-        let func: Symbol<unsafe extern fn() -> Box<dyn Fingerprinter>> = lib.get(b"get")?;
+        let func: Symbol<unsafe extern "C" fn() -> Box<dyn Fingerprinter>> = lib.get(b"get")?;
         Ok(func())
     }
 }
@@ -50,89 +59,168 @@ fn call_dynamic(path: &str) -> Result<Box<dyn Fingerprinter>, Box<dyn error::Err
 trait Fingerprinter {
     fn name(&self) -> &'static str;
 
-    fn fingerprint(&self) -> HashMap<String, String> {
-        HashMap::from([("foo".to_string(), "bar".to_string())])
+    fn fingerprint(&self) -> Map<String, Value> {
+        let mut map = Map::new();
+        map.insert("foo".to_string(), Value::String("bar".to_string()));
+        map
     }
 }
 
 struct OSFingerprinter {}
 
 impl Fingerprinter for OSFingerprinter {
-    fn name(&self) -> &'static str { "os" }
+    fn name(&self) -> &'static str {
+        "os"
+    }
 
-    fn fingerprint(&self) -> HashMap<String, String> {
-        HashMap::from([
-            ("os".to_string(), OS.to_string())
-        ])
+    fn fingerprint(&self) -> Map<String, Value> {
+        let mut map = Map::new();
+        map.insert("os".to_string(), Value::String(OS.to_string()));
+        map
     }
 }
 
 struct ArchFingerprinter {}
 
 impl Fingerprinter for ArchFingerprinter {
-    fn name(&self) -> &'static str { "arch" }
+    fn name(&self) -> &'static str {
+        "arch"
+    }
 
-    fn fingerprint(&self) -> HashMap<String, String> {
-        HashMap::from([
-            ("arch".to_string(), ARCH.to_string())
-        ])
+    fn fingerprint(&self) -> Map<String, Value> {
+        let mut map = Map::new();
+        map.insert("arch".to_string(), Value::String(ARCH.to_string()));
+        map
     }
 }
 
 struct KitchenSinkFingerprinter {}
 
 impl Fingerprinter for KitchenSinkFingerprinter {
-    fn name(&self) -> &'static str { "kitchen-sink" }
+    fn name(&self) -> &'static str {
+        "kitchen-sink"
+    }
 
-    fn fingerprint(&self) -> HashMap<String, String> {
+    fn fingerprint(&self) -> Map<String, Value> {
         let mut sys = System::new_all();
         sys.refresh_all();
 
-        let mut fingerprint = HashMap::new();
+        let mut fingerprint = Map::new();
 
+        // === NETWORKS ===
+
+        let mut networks_map: Map<String, Value> = Map::new();
         // Network interfaces name, data received and data transmitted:
-        for (interface_name, _data) in sys.networks() {
-            fingerprint.insert("interface_name".to_string(), interface_name.to_string());
+        for (interface_name, data) in sys.networks() {
+            let mut network_map: Map<String, Value> = Map::new();
+
+            network_map.insert(
+                "name".to_string(),
+                Value::String(interface_name.to_string()),
+            );
+
+            network_map.insert(
+                "mac_address".to_string(),
+                Value::String(data.mac_address().to_string()),
+            );
+
+            networks_map.insert(interface_name.to_string(), Value::Object(network_map));
         }
 
-        // Components:
-        for component in sys.components() {
-            fingerprint.insert("component_label".to_string(), component.label().to_string());
-        }
+        fingerprint.insert("networks".to_string(), Value::Object(networks_map));
 
-        fingerprint.insert("supported_signals".to_string(), format!("{:?}", sysinfo::System::SUPPORTED_SIGNALS));
+        // === CPUS ===
 
-        fingerprint.insert("total_memory".to_string(), sys.total_memory().to_string());
-        fingerprint.insert("available_memory".to_string(), sys.available_memory().to_string());
-        fingerprint.insert("used_memory".to_string(), sys.used_memory().to_string());
-        fingerprint.insert("total_swap".to_string(), sys.total_swap().to_string());
-        fingerprint.insert("used_swap".to_string(), sys.used_swap().to_string());
-
-        fingerprint.insert("system_name".to_string(), sys.name().unwrap_or("".to_string()));
-        fingerprint.insert("system_kernel_version".to_string(), sys.kernel_version().unwrap_or("".to_string()));
-        fingerprint.insert("system_os_version".to_string(), sys.os_version().unwrap_or("".to_string()));
-        fingerprint.insert("system_host_name".to_string(), sys.host_name().unwrap_or("".to_string()));
-
-        let mut cpus_hash: HashMap<String, HashMap<String, String>> = HashMap::new();
+        let mut cpus_hash: Map<String, Value> = Map::new();
         sys.cpus().iter().for_each(|cpu| {
-            let mut cpu_hash: HashMap<String, String> = HashMap::new();
-            cpu_hash.insert("name".to_string(), cpu.name().to_string());
-            cpu_hash.insert("usage".to_string(), cpu.cpu_usage().to_string());
-            cpu_hash.insert("frequency".to_string(), cpu.frequency().to_string());
-            cpu_hash.insert("vendor_id".to_string(), cpu.vendor_id().to_string());
-            cpus_hash.insert(cpu.name().to_string(), cpu_hash);
+            let mut cpu_hash: Map<String, Value> = Map::new();
+            cpu_hash.insert("name".to_string(), Value::String(cpu.name().to_string()));
+            cpu_hash.insert(
+                "usage".to_string(),
+                Value::String(cpu.cpu_usage().to_string()),
+            );
+            cpu_hash.insert(
+                "frequency".to_string(),
+                Value::String(cpu.frequency().to_string()),
+            );
+            cpu_hash.insert(
+                "vendor_id".to_string(),
+                Value::String(cpu.vendor_id().to_string()),
+            );
+            cpus_hash.insert(cpu.name().to_string(), Value::Object(cpu_hash));
         });
-        fingerprint.insert("cpus".to_string(), cpus_hash);
 
+        fingerprint.insert("cpus".to_string(), Value::Object(cpus_hash));
+
+        // === Disks ===
+
+        let mut disks_hash: Map<String, Value> = Map::new();
         sys.disks().iter().for_each(|disk| {
+            let mut disk_hash: Map<String, Value> = Map::new();
+            disk_hash.insert(
+                "disk_name".to_string(),
+                Value::String(disk.name().to_str().unwrap_or("").to_string()),
+            );
+            // disk_hash.insert(
+            //     "disk_file_system".to_string(),
+            //     disk.file_system(),
+            // );
+            disk_hash.insert(
+                "disk_mount_point".to_string(),
+                Value::String(disk.mount_point().to_str().unwrap_or("").to_string()),
+            );
 
-            fingerprint.insert("disk_name".to_string(), disk.name().to_str().unwrap_or("").to_string());
-            // fingerprint.insert("disk_file_system".to_string(), disk.file_system().to_str().unwrap_or("").to_string());
-            fingerprint.insert("disk_mount_point".to_string(), disk.mount_point().to_str().unwrap_or("").to_string());
-            fingerprint.insert("disk_total_space".to_string(), disk.total_space().to_string());
-            fingerprint.insert("disk_available_space".to_string(), disk.available_space().to_string());
-            fingerprint.insert("disk_is_removable".to_string(), disk.is_removable().to_string());
+            fingerprint.insert(
+                "disk_total_space".to_string(),
+                Value::String(disk.total_space().to_string()),
+            );
+            fingerprint.insert(
+                "disk_available_space".to_string(),
+                Value::String(disk.available_space().to_string()),
+            );
+            fingerprint.insert(
+                "disk_is_removable".to_string(),
+                Value::String(disk.is_removable().to_string()),
+            );
+
+            disks_hash.insert(
+                disk.name().to_str().unwrap_or("").to_string(),
+                Value::Object(disk_hash)
+            );
         });
+
+        fingerprint.insert("disks".to_string(), Value::Object(disks_hash));
+
+        // === Memory ===
+
+        fingerprint.insert(
+            "memory_total".to_string(),
+            Value::String(sys.total_memory().to_string()),
+        );
+        fingerprint.insert(
+            "memory_free".to_string(),
+            Value::String(sys.free_memory().to_string()),
+        );
+        fingerprint.insert(
+            "memory_used".to_string(),
+            Value::String(sys.used_memory().to_string()),
+        );
+        fingerprint.insert(
+            "memory_swap_total".to_string(),
+            Value::String(sys.total_swap().to_string()),
+        );
+        fingerprint.insert(
+            "memory_swap_free".to_string(),
+            Value::String(sys.free_swap().to_string()),
+        );
+
+        // === OTHER ===
+
+        let signals = System::SUPPORTED_SIGNALS;
+        fingerprint.insert(
+            "signals".to_string(),
+            Value::Array(signals.iter().map(|s| Value::String(s.to_string())).collect()),
+        );
 
         fingerprint
     }
@@ -140,7 +228,7 @@ impl Fingerprinter for KitchenSinkFingerprinter {
 
 #[cfg(test)]
 mod tests {
-    use crate::cmd::structs::{WorkerConfigFromManager, ServerConfig};
+    use crate::cmd::structs::{ServerConfig, WorkerConfigFromManager};
 
     use super::*;
 
@@ -155,34 +243,20 @@ mod tests {
                 additional_fingerprinters: vec!["/Users/mike/Code/legion/src/plugins/fingerprinters/example/target/release/libexample.dylib".to_string()],
             }
         };
+
         let res = fingerprint_node(config);
+        res.values().for_each(|v| {
+            println!("v: {:?}", v.to_string());
+        });
 
-        println!("res: {:?}", res);
+        let os = res.get("os").unwrap().as_str().unwrap();
+        assert_eq!(res.get("os").unwrap(), os);
 
-        assert_eq!(res.get("os"), Some(&"macos".to_string()));
-        assert_eq!(res.get("arch"), Some(&"aarch64".to_string()));
-        assert_eq!(res.get("basic"), Some(&"output".to_string()));
+        let arch = res.get("arch").unwrap().as_str().unwrap();
+        assert_eq!(res.get("arch").unwrap(), arch);
+
+        // Test that the plugin works
+        let basic = res.get("basic").unwrap().as_str().unwrap();
+        assert_eq!(res.get("basic").unwrap(), basic);
     }
 }
-
-// SOME OF THE FINGERPRINTERS TO ADD
-
-// arch
-    // arch
-// storage
-    // bytes total, bytes free, volumes
-// signals
-    // os.signals
-// CNI
-    // various CNI plugins available
-// Network
-    // speed, interfaces, IP addresses, etc
-// CPU
-    // cores, speed, etc
-// Memory
-    // total, free, etc
-// Landlock
-    // available
-// CPU
-    // cores, modelname, numcores, numcores.perf, numcores.efficiency, totalcompute, 
-// Fingerprinters specific to cloud providers
