@@ -17,6 +17,7 @@ log = "0.4.20"
 env_logger = "0.10.0"
 libloading = "0.8.1"
 sysinfo = "0.29.10"
+jsonwebtoken = "9.1.0"
 
 [build-dependencies]
 tonic-build = "0.8"

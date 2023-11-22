@@ -7,6 +7,20 @@ use std::sync::mpsc::{self, Sender, Receiver};
 // use std::thread;
 // use std::time::Duration;
 
+use serde::{Serialize, Deserialize};
+use jsonwebtoken::{encode, decode, Header, Algorithm, Validation, EncodingKey, DecodingKey};
+
+/// Our claims struct, it needs to derive `Serialize` and/or `Deserialize`
+#[derive(Debug, Serialize, Deserialize)]
+struct Claims {
+    exp: usize,          // Required (validate_exp defaults to true in validation). Expiration time (as UTC timestamp)
+    sub: String,         // Optional. Subject (whom token refers to)
+}
+// aud: String,         // Optional. Audience
+// iat: usize,          // Optional. Issued at (as UTC timestamp)
+// iss: String,         // Optional. Issuer
+// nbf: usize,          // Optional. Not Before (as UTC timestamp)
+
 use std::sync::{Arc, Mutex};
 
 #[allow(non_snake_case)]
@@ -17,12 +31,16 @@ pub mod legion {
 use legion::manager_node_client::ManagerNodeClient;
 use legion::manager_node_server::{ManagerNode, ManagerNodeServer};
 use legion::{
-    JoinClusterReply,
-    JoinClusterRequest,
+    ManagerJoinReply,
+    ManagerJoinRequest,
+    WorkerJoinReply,
+    WorkerJoinRequest,
     RunJobRequest,
     RunJobReply,
     GetJobStatusReply,
-    GetJobStatusRequest
+    GetJobStatusRequest,
+    GetJoinTokenReply,
+    GetJoinTokenRequest,
 };
 
 use tonic::{transport::Server, Request, Response, Status};
@@ -36,10 +54,11 @@ pub struct ManagerAgentService {
 
 #[tonic::async_trait]
 impl ManagerNode for ManagerAgentService {
-    async fn join_cluster(
+    // TODO: Deprecate this once the join token is used for everything
+    async fn manager_join(
         &self,
-        request: Request<JoinClusterRequest>,
-    ) -> Result<Response<JoinClusterReply>, Status> {
+        request: Request<ManagerJoinRequest>,
+    ) -> Result<Response<ManagerJoinReply>, Status> {
         debug!("Got a request from {:?}", request.remote_addr());
 
         // let to_store = self.sender_to_store.lock().unwrap();
@@ -48,8 +67,22 @@ impl ManagerNode for ManagerAgentService {
         //     .send(Msg::Content("LET ME IN".to_string()))
         //     .unwrap();
 
-        let reply = JoinClusterReply {
+        let reply = ManagerJoinReply {
             message: format!("Hello {}!", request.into_inner().address),
+        };
+
+        Ok(Response::new(reply))
+    }
+
+    // TODO: Make this work for servers and workers
+    async fn worker_join(
+        &self,
+        request: Request<WorkerJoinRequest>,
+    ) -> Result<Response<WorkerJoinReply>, Status> {
+        debug!("Got a request from {:?}", request.remote_addr());
+
+        let reply = WorkerJoinReply {
+            message: format!("Replying with token passed to me: {}!", request.into_inner().token),
         };
 
         Ok(Response::new(reply))
@@ -80,6 +113,25 @@ impl ManagerNode for ManagerAgentService {
 
         let reply = GetJobStatusReply {
             message: format!("Hello {}!", "status"),
+        };
+
+        Ok(Response::new(reply))
+    }
+
+    async fn get_join_token(
+        &self,
+        _request: Request<GetJoinTokenRequest>,
+    ) -> Result<Response<GetJoinTokenReply>, Status> {
+        // TODO: Mint a signed JWT containing:
+        // - the node type (server or worker)
+        // - the node address & port
+        // - the node's public key (maybe?)
+        // - a cert to establish TLS
+        // - an expiration
+
+        let token = generate_join_token();
+        let reply = GetJoinTokenReply {
+            token: token,
         };
 
         Ok(Response::new(reply))
@@ -126,11 +178,11 @@ pub async fn run_follower(config: AgentConfig) -> Result<(), Box<dyn error::Erro
     let mut client = ManagerNodeClient::connect(leader_addr).await?;
 
     let leader_addr = config.manager.leader_address.clone();
-    let request = tonic::Request::new(JoinClusterRequest {
+    let request = tonic::Request::new(ManagerJoinRequest {
         address: leader_addr,
     });
 
-    let response = client.join_cluster(request).await?;
+    let response = client.manager_join(request).await?;
     debug!("RESPONSE={:?}", response);
 
     let (sender_to_store, receiver_from_server) = mpsc::channel();
@@ -156,4 +208,22 @@ pub async fn run_follower(config: AgentConfig) -> Result<(), Box<dyn error::Erro
     debug!("Cleaning Up");
 
     Ok(())
+}
+
+// add generate_join_token_function
+fn generate_join_token() -> String {
+    let claims = Claims {
+        sub: "b@b.com".to_owned(),
+        exp: 10000000000,
+    };
+
+    let key = b"secret";
+    let header = Header { kid: Some("signing_key".to_owned()), alg: Algorithm::HS512, ..Default::default() };
+
+    let token = match encode(&header, &claims, &EncodingKey::from_secret(key)) {
+        Ok(t) => t,
+        Err(_) => panic!(), // in practice you would return the error
+    };
+
+    token
 }

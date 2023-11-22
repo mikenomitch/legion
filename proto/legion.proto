@@ -2,18 +2,30 @@ syntax = "proto3";
 package legion;
 
 service ManagerNode {
-  rpc JoinCluster (JoinClusterRequest) returns (JoinClusterReply);
+  rpc ManagerJoin (ManagerJoinRequest) returns (ManagerJoinReply);
+  rpc WorkerJoin (WorkerJoinRequest) returns (WorkerJoinReply);
   rpc RunJob (RunJobRequest) returns (RunJobReply);
   rpc GetJobStatus (GetJobStatusRequest) returns (GetJobStatusReply);
+  rpc GetJoinToken (GetJoinTokenRequest) returns (GetJoinTokenReply);
 }
 
-message JoinClusterRequest {
+message ManagerJoinRequest {
   // Request message contains the address of the joining node
   string address = 1;
 }
 
-message JoinClusterReply {
+message ManagerJoinReply {
   // Reply contains the greeting message
+  string message = 1;
+}
+
+message WorkerJoinRequest {
+  // Request message contains the join-token
+  string token = 1;
+}
+
+message WorkerJoinReply {
+  // Reply contains a message for now, but eventually a bunch of config
   string message = 1;
 }
 
@@ -37,3 +49,10 @@ message GetJobStatusReply {
   string message = 1;
 }
 
+message GetJoinTokenRequest {
+  bool one_time = 1;
+}
+
+message GetJoinTokenReply {
+  string token = 1;
+}
