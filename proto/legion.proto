@@ -1,6 +1,8 @@
 syntax = "proto3";
 package legion;
 
+// === MANAGER ===
+
 service ManagerNode {
   rpc ManagerJoin (ManagerJoinRequest) returns (ManagerJoinReply);
   rpc WorkerJoin (WorkerJoinRequest) returns (WorkerJoinReply);
@@ -55,4 +57,18 @@ message GetJoinTokenRequest {
 
 message GetJoinTokenReply {
   string token = 1;
+}
+
+// === WORKER ===
+
+service WorkerNode {
+  rpc PostJob (PostJobRequest) returns (PostJobReply);
+}
+
+message PostJobRequest {
+  string message = 1;
+}
+
+message PostJobReply {
+  string message = 1;
 }
