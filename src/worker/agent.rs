@@ -1,12 +1,41 @@
 use crate::cmd::structs::JoinTokenClaims;
 use crate::constants::TMP_SECRET_KEY;
 use jsonwebtoken::errors::ErrorKind;
-use jsonwebtoken::{encode, decode, Header, Algorithm, Validation, EncodingKey, DecodingKey};
+use jsonwebtoken::{decode, Algorithm, Validation, DecodingKey};
 
 use crate::worker::fingerprint::fingerprint_node;
 
+use tonic::{transport::Server, Request, Response, Status};
+
+#[allow(non_snake_case)]
+pub mod legion {
+    tonic::include_proto!("legion");
+}
+use legion::worker_node_server::{WorkerNode, WorkerNodeServer};
+use legion::{
+    PostWorkReply,
+    PostWorkRequest,
+};
+
 use log::debug;
 use std::error;
+
+pub struct WorkerAgentService {}
+#[tonic::async_trait]
+impl WorkerNode for WorkerAgentService {
+    async fn post_work(
+        &self,
+        request: Request<PostWorkRequest>,
+    ) -> Result<Response<PostWorkReply>, Status> {
+        debug!("Got a request from {:?}", request.remote_addr());
+
+        let reply = PostWorkReply {
+            message: "I got work yay!".to_string(),
+        };
+
+        Ok(Response::new(reply))
+    }
+}
 
 pub async fn run_worker(token: &str) -> Result<(), Box<dyn error::Error>> {
     // let addr: String = format!("{}:{}", DEFAULT_ADDR, DEFAULT_PORT)
@@ -38,23 +67,23 @@ pub async fn run_worker(token: &str) -> Result<(), Box<dyn error::Error>> {
     let os = fingerprint_data.get("os").unwrap().as_str().unwrap();
     println!("OS fingerprinted as: {:?}", os);
 
-    // TODO:
-    // - Read the config file (if there)??
+    // TODO: ESTABLISH TLS CONNECTION
+    // TODO: SEND REAL REGISTRATION
+    // TODO: GET FROM TOKEN
 
-    // - Register with the manager
-        // - parse JWT from config or cmd
-        // - send request to manager
-        // - receive config bundle from manager
+    let addr = format!("{}:{}", "127.0.0.1", 4848)
+        .parse()
+        .unwrap();
 
-    // - Fingerprint the node (after or before?)
-        // - Run custom fingerprinters
+    println!("Worker node starting on {}", addr);
 
-    // - Boot client RPC server
-    // - Really register with manager
-    // - Start the heartbeat loop
+    // TODO: START HEARTBEAT LOOP
 
-    debug!("Cleaning Up");
-    debug!("Worker node starting on {}", token);
+    let worker_node = WorkerAgentService {};
+    Server::builder()
+        .add_service(WorkerNodeServer::new(worker_node))
+        .serve(addr)
+        .await?;
 
     Ok(())
 }

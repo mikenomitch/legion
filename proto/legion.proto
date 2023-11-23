@@ -62,13 +62,13 @@ message GetJoinTokenReply {
 // === WORKER ===
 
 service WorkerNode {
-  rpc PostJob (PostJobRequest) returns (PostJobReply);
+  rpc PostWork (PostWorkRequest) returns (PostWorkReply);
 }
 
-message PostJobRequest {
+message PostWorkRequest {
   string message = 1;
 }
 
-message PostJobReply {
+message PostWorkReply {
   string message = 1;
 }
