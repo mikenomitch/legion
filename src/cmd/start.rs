@@ -1,5 +1,5 @@
-use crate::cmd::structs::{AgentConfig, WorkerConfig};
-use crate::constants::{DEFAULT_CONFIG_PATH, DEFAULT_WORKER_CONFIG_PATH};
+use crate::cmd::structs::{AgentConfig};
+use crate::constants::{DEFAULT_CONFIG_PATH};
 use crate::manager::server::{run_follower, run_leader};
 use crate::worker::agent::run_worker;
 use jsonnet::JsonnetVm;
@@ -24,8 +24,7 @@ pub fn config() -> Command {
 
     let worker_cmd = Command::new("worker")
         .about("Start a worker node")
-        .arg(arg!(port: [PORT]))
-        .arg(arg!(-c --config [CONFIG] "test"));
+        .arg(arg!(token: [TOKEN]));
 
     Command::new("start")
         .about("Start an agent")
@@ -36,13 +35,9 @@ pub fn config() -> Command {
 }
 
 pub async fn handle(sub_matches: &clap::ArgMatches) -> Result<(), Box<dyn error::Error>> {
-    if let Some(("worker", _)) = sub_matches.subcommand() {
-        let config_path = sub_matches
-            .get_one::<String>("config")
-            .map(|s| s.as_str())
-            .unwrap_or(DEFAULT_WORKER_CONFIG_PATH);
-        let config = parse_worker_config(config_path)?;
-        run_worker(config).await
+    if let Some(("worker", arg_matches)) = sub_matches.subcommand() {
+        let token = arg_matches.get_one::<String>("token").ok_or("Must provide token")?;
+        run_worker(token).await
     } else {
         let config_path = sub_matches
             .get_one::<String>("config")
@@ -67,20 +62,6 @@ fn parse_config(config_path: &str) -> Result<AgentConfig, Box<dyn error::Error>>
     match res {
         Ok(s) => {
             let config: AgentConfig = serde_json::from_str(&s)?;
-            Ok(config)
-        }
-        Err(_) => Err("Failed to parse config file".into()),
-    }
-}
-
-fn parse_worker_config(config_path: &str) -> Result<WorkerConfig, Box<dyn error::Error>> {
-    // Pluginify jsonnet
-    let mut vm = JsonnetVm::new();
-    let res = vm.evaluate_file(config_path);
-
-    match res {
-        Ok(s) => {
-            let config: WorkerConfig = serde_json::from_str(&s)?;
             Ok(config)
         }
         Err(_) => Err("Failed to parse config file".into()),

@@ -1,26 +1,15 @@
-use crate::cmd::structs::AgentConfig;
-use crate::constants::{DEFAULT_ADDR, DEFAULT_PORT};
+use crate::cmd::structs::{AgentConfig, WorkerConfig, JoinTokenClaims};
+use crate::constants::{DEFAULT_ADDR, DEFAULT_PORT, TMP_SECRET_KEY, DEFAULT_WORKER_CONFIG_PATH};
 use crate::storage::node::{start_storage, Msg};
 use log::debug;
 use std::error;
 use std::sync::mpsc::{self, Sender, Receiver};
 // use std::thread;
 // use std::time::Duration;
+use jsonnet::JsonnetVm;
 
-use serde::{Serialize, Deserialize};
+use jsonwebtoken::errors::ErrorKind;
 use jsonwebtoken::{encode, decode, Header, Algorithm, Validation, EncodingKey, DecodingKey};
-
-/// Our claims struct, it needs to derive `Serialize` and/or `Deserialize`
-#[derive(Debug, Serialize, Deserialize)]
-struct Claims {
-    exp: usize,          // Required (validate_exp defaults to true in validation). Expiration time (as UTC timestamp)
-    sub: String,         // Optional. Subject (whom token refers to)
-}
-// aud: String,         // Optional. Audience
-// iat: usize,          // Optional. Issued at (as UTC timestamp)
-// iss: String,         // Optional. Issuer
-// nbf: usize,          // Optional. Not Before (as UTC timestamp)
-
 use std::sync::{Arc, Mutex};
 
 #[allow(non_snake_case)]
@@ -74,20 +63,6 @@ impl ManagerNode for ManagerAgentService {
         Ok(Response::new(reply))
     }
 
-    // TODO: Make this work for servers and workers
-    async fn worker_join(
-        &self,
-        request: Request<WorkerJoinRequest>,
-    ) -> Result<Response<WorkerJoinReply>, Status> {
-        debug!("Got a request from {:?}", request.remote_addr());
-
-        let reply = WorkerJoinReply {
-            message: format!("Replying with token passed to me: {}!", request.into_inner().token),
-        };
-
-        Ok(Response::new(reply))
-    }
-
     async fn run_job(
         &self,
         _request: Request<RunJobRequest>,
@@ -130,8 +105,36 @@ impl ManagerNode for ManagerAgentService {
         // - an expiration
 
         let token = generate_join_token();
+
         let reply = GetJoinTokenReply {
             token: token,
+        };
+
+        Ok(Response::new(reply))
+    }
+
+    // TODO: Make this work for servers and workers
+    async fn worker_join(
+        &self,
+        request: Request<WorkerJoinRequest>,
+    ) -> Result<Response<WorkerJoinReply>, Status> {
+        let token = request.into_inner().token;
+        let token_data = match decode::<JoinTokenClaims>(
+            &token,
+            &DecodingKey::from_secret(&TMP_SECRET_KEY[..]),
+            &Validation::new(Algorithm::HS512),
+        ) {
+            Ok(c) => c,
+            Err(err) => match *err.kind() {
+                ErrorKind::InvalidToken => panic!(), // Example on how to handle a specific error
+                _ => panic!(),
+            },
+        };
+        println!("{:?}", token_data.claims);
+        println!("{:?}", token_data.header);
+
+        let reply = WorkerJoinReply {
+            message: format!("Joined Yay?: {:?}!", token_data.claims),
         };
 
         Ok(Response::new(reply))
@@ -212,18 +215,35 @@ pub async fn run_follower(config: AgentConfig) -> Result<(), Box<dyn error::Erro
 
 // add generate_join_token_function
 fn generate_join_token() -> String {
-    let claims = Claims {
+    let config = parse_worker_config(DEFAULT_WORKER_CONFIG_PATH).unwrap();
+
+    let claims = JoinTokenClaims {
         sub: "b@b.com".to_owned(),
         exp: 10000000000,
+        address: "http://localhost:4747".to_owned(),
+        config: config,
     };
 
-    let key = b"secret";
     let header = Header { kid: Some("signing_key".to_owned()), alg: Algorithm::HS512, ..Default::default() };
 
-    let token = match encode(&header, &claims, &EncodingKey::from_secret(key)) {
+    let token = match encode(&header, &claims, &EncodingKey::from_secret(&TMP_SECRET_KEY[..])) {
         Ok(t) => t,
         Err(_) => panic!(), // in practice you would return the error
     };
 
     token
+}
+
+fn parse_worker_config(config_path: &str) -> Result<WorkerConfig, Box<dyn error::Error>> {
+    // Pluginify jsonnet
+    let mut vm = JsonnetVm::new();
+    let res = vm.evaluate_file(config_path);
+
+    match res {
+        Ok(s) => {
+            let config: WorkerConfig = serde_json::from_str(&s)?;
+            Ok(config)
+        }
+        Err(_) => Err("Failed to parse config file".into()),
+    }
 }
