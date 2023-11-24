@@ -7,11 +7,11 @@ pub mod legion {
     tonic::include_proto!("legion");
 }
 
-// use legion::manager_node_client::ManagerNodeClient;
+// use legion::manager_client::ManagerClient;
 // use crate::cmd::job::legion::WorkerJoinRequest;
 
-use legion::manager_node_client::ManagerNodeClient;
-// use legion::manager_node_server::{ManagerNode, ManagerNodeServer};
+use legion::insecure_manager_client::InsecureManagerClient;
+// use legion::manager_server::{Manager, ManagerServer};
 use legion::{
     // WorkerJoinReply,
     // WorkerJoinRequest,
@@ -31,7 +31,7 @@ pub async fn handle(_sub_matches: &clap::ArgMatches) -> Result<(), Box<dyn error
     // request token from the server
     // TODO: Eventually this should pick up the address from env var
     let address = "http://localhost:4747";
-    let mut client = ManagerNodeClient::connect(address).await?;
+    let mut client = InsecureManagerClient::connect(address).await?;
     let request = tonic::Request::new(GetJoinTokenRequest {
         one_time: false,
     });

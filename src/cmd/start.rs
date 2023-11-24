@@ -1,6 +1,6 @@
-use crate::cmd::structs::{AgentConfig};
-use crate::constants::{DEFAULT_CONFIG_PATH};
-use crate::manager::server::{run_follower, run_leader};
+use crate::cmd::structs::AgentConfig;
+use crate::constants::DEFAULT_CONFIG_PATH;
+use crate::manager::server::{ run_follower, run_leader };
 use crate::worker::agent::run_worker;
 use jsonnet::JsonnetVm;
 use std::error;

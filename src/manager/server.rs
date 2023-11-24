@@ -1,38 +1,37 @@
-use crate::cmd::structs::{AgentConfig, WorkerConfig, JoinTokenClaims};
-use crate::constants::{DEFAULT_ADDR, DEFAULT_PORT, TMP_SECRET_KEY, DEFAULT_WORKER_CONFIG_PATH};
+use crate::cmd::structs::{AgentConfig, JoinTokenClaims};
+use crate::constants::{DEFAULT_ADDR, DEFAULT_PORT, TMP_SECRET_KEY};
 use crate::storage::node::{start_storage, Msg};
+
+use futures::future::try_join;
 use log::debug;
 use std::error;
-use std::sync::mpsc::{self, Sender, Receiver};
+use std::sync::mpsc::{self, Receiver, Sender};
 // use std::thread;
 // use std::time::Duration;
-use jsonnet::JsonnetVm;
 
 use jsonwebtoken::errors::ErrorKind;
-use jsonwebtoken::{encode, decode, Header, Algorithm, Validation, EncodingKey, DecodingKey};
+use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 use std::sync::{Arc, Mutex};
+
+use futures::join; // Import the `futures` crate
 
 #[allow(non_snake_case)]
 pub mod legion {
     tonic::include_proto!("legion");
 }
 
-use legion::manager_node_client::ManagerNodeClient;
-use legion::manager_node_server::{ManagerNode, ManagerNodeServer};
+use crate::manager::join_server::{get_insecure_manager_service, InsecureManagerService};
+use legion::insecure_manager_server::InsecureManagerServer;
+use legion::manager_client::ManagerClient;
+use legion::manager_server::{Manager, ManagerServer};
+
 use legion::{
-    ManagerJoinReply,
-    ManagerJoinRequest,
-    WorkerJoinReply,
-    WorkerJoinRequest,
-    RunJobRequest,
-    RunJobReply,
-    GetJobStatusReply,
-    GetJobStatusRequest,
-    GetJoinTokenReply,
-    GetJoinTokenRequest,
+    GetJobStatusReply, GetJobStatusRequest, ManagerJoinReply, ManagerJoinRequest, RunJobReply,
+    RunJobRequest, WorkerJoinReply, WorkerJoinRequest,
 };
 
-use tonic::{transport::Server, Request, Response, Status};
+use tonic::transport::{Identity, Server, ServerTlsConfig};
+use tonic::{Request, Response, Status};
 
 #[allow(dead_code)]
 // #[derive(Default)]
@@ -42,7 +41,7 @@ pub struct ManagerAgentService {
 }
 
 #[tonic::async_trait]
-impl ManagerNode for ManagerAgentService {
+impl Manager for ManagerAgentService {
     // TODO: Deprecate this once the join token is used for everything
     async fn manager_join(
         &self,
@@ -67,7 +66,6 @@ impl ManagerNode for ManagerAgentService {
         &self,
         _request: Request<RunJobRequest>,
     ) -> Result<Response<RunJobReply>, Status> {
-
         // let to_store = self.sender_to_store.lock().unwrap();
 
         // to_store
@@ -85,29 +83,8 @@ impl ManagerNode for ManagerAgentService {
         &self,
         _request: Request<GetJobStatusRequest>,
     ) -> Result<Response<GetJobStatusReply>, Status> {
-
         let reply = GetJobStatusReply {
             message: format!("Hello {}!", "status"),
-        };
-
-        Ok(Response::new(reply))
-    }
-
-    async fn get_join_token(
-        &self,
-        _request: Request<GetJoinTokenRequest>,
-    ) -> Result<Response<GetJoinTokenReply>, Status> {
-        // TODO: Mint a signed JWT containing:
-        // - the node type (server or worker)
-        // - the node address & port
-        // - the node's public key (maybe?)
-        // - a cert to establish TLS
-        // - an expiration
-
-        let token = generate_join_token();
-
-        let reply = GetJoinTokenReply {
-            token: token,
         };
 
         Ok(Response::new(reply))
@@ -153,32 +130,58 @@ pub async fn run_leader(config: AgentConfig) -> Result<(), Box<dyn error::Error>
     let sender_to_server = Arc::new(Mutex::new(sender_to_server));
     let receiver_from_store = Arc::new(Mutex::new(receiver_from_store));
 
+    let cloned_config = config.clone();
+
     start_storage(receiver_from_server, sender_to_server, config);
+
+    // Spawn a separate grpc server for non-TLS calls
+
+    let join_server_addr = format!("{}:{}", cloned_config.server.address, cloned_config.server.insecure_port)
+        .parse()
+        .unwrap();
+
+    let insecure_manager_service = get_insecure_manager_service();
+    let join_server_fut = Server::builder()
+        .add_service(insecure_manager_service)
+        .serve(join_server_addr);
 
     let manager_node = ManagerAgentService {
         sender_to_store: sender_to_store,
-        receiver_from_store: receiver_from_store
+        receiver_from_store: receiver_from_store,
     };
 
-    debug!("Manager node starting on {}", addr);
-    Server::builder()
-        .add_service(ManagerNodeServer::new(manager_node))
-        .serve(addr)
-        .await?;
+    // let data_dir = std::path::PathBuf::from_iter([std::env!("CARGO_MANIFEST_DIR"), "data"]);
+    // let cert = std::fs::read_to_string(data_dir.join("tls/server.pem"))?;
+    // let key = std::fs::read_to_string(data_dir.join("tls/server.key"))?;
 
-    debug!("Cleaning Up");
+    // let identity = Identity::from_pem(cert, key);
+    // let tls = ServerTlsConfig::new().identity(identity);
+
+    let start_server_fut = Server::builder()
+        .add_service(ManagerServer::new(manager_node))
+        .serve(addr);
+    // .tls_config(tls)?
+
+    println!("Join server starting on {}", join_server_addr);
+    println!("Manager node starting on {}", addr);
+
+    let _res = join!(join_server_fut, start_server_fut);
 
     Ok(())
 }
 
+// =====================
+// =====================
+// ===== FOR LATER =====
+// =====================
+// =====================
+
 pub async fn run_follower(config: AgentConfig) -> Result<(), Box<dyn error::Error>> {
     let leader_addr = config.manager.leader_address.clone();
 
-    let addr = format!("{}:{}", DEFAULT_ADDR, 4848)
-    .parse()
-    .unwrap();
+    let addr = format!("{}:{}", DEFAULT_ADDR, 4848).parse().unwrap();
 
-    let mut client = ManagerNodeClient::connect(leader_addr).await?;
+    let mut client = ManagerClient::connect(leader_addr).await?;
 
     let leader_addr = config.manager.leader_address.clone();
     let request = tonic::Request::new(ManagerJoinRequest {
@@ -199,51 +202,16 @@ pub async fn run_follower(config: AgentConfig) -> Result<(), Box<dyn error::Erro
 
     let manager_node = ManagerAgentService {
         sender_to_store: sender_to_store,
-        receiver_from_store: receiver_from_store
+        receiver_from_store: receiver_from_store,
     };
 
     debug!("Manager node starting on {}", addr);
     Server::builder()
-        .add_service(ManagerNodeServer::new(manager_node))
+        .add_service(ManagerServer::new(manager_node))
         .serve(addr)
         .await?;
 
     debug!("Cleaning Up");
 
     Ok(())
-}
-
-// add generate_join_token_function
-fn generate_join_token() -> String {
-    let config = parse_worker_config(DEFAULT_WORKER_CONFIG_PATH).unwrap();
-
-    let claims = JoinTokenClaims {
-        sub: "b@b.com".to_owned(),
-        exp: 10000000000,
-        address: "http://localhost:4747".to_owned(),
-        config: config,
-    };
-
-    let header = Header { kid: Some("signing_key".to_owned()), alg: Algorithm::HS512, ..Default::default() };
-
-    let token = match encode(&header, &claims, &EncodingKey::from_secret(&TMP_SECRET_KEY[..])) {
-        Ok(t) => t,
-        Err(_) => panic!(), // in practice you would return the error
-    };
-
-    token
-}
-
-fn parse_worker_config(config_path: &str) -> Result<WorkerConfig, Box<dyn error::Error>> {
-    // Pluginify jsonnet
-    let mut vm = JsonnetVm::new();
-    let res = vm.evaluate_file(config_path);
-
-    match res {
-        Ok(s) => {
-            let config: WorkerConfig = serde_json::from_str(&s)?;
-            Ok(config)
-        }
-        Err(_) => Err("Failed to parse config file".into()),
-    }
 }

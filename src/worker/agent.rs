@@ -11,7 +11,7 @@ use tonic::{transport::Server, Request, Response, Status};
 pub mod legion {
     tonic::include_proto!("legion");
 }
-use legion::worker_node_server::{WorkerNode, WorkerNodeServer};
+use legion::worker_server::{Worker, WorkerServer};
 use legion::{
     PostWorkReply,
     PostWorkRequest,
@@ -22,7 +22,7 @@ use std::error;
 
 pub struct WorkerAgentService {}
 #[tonic::async_trait]
-impl WorkerNode for WorkerAgentService {
+impl Worker for WorkerAgentService {
     async fn post_work(
         &self,
         request: Request<PostWorkRequest>,
@@ -81,10 +81,9 @@ pub async fn run_worker(token: &str) -> Result<(), Box<dyn error::Error>> {
 
     let worker_node = WorkerAgentService {};
     Server::builder()
-        .add_service(WorkerNodeServer::new(worker_node))
+        .add_service(WorkerServer::new(worker_node))
         .serve(addr)
         .await?;
 
     Ok(())
 }
-

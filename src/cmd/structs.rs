@@ -11,14 +11,15 @@ pub struct ManagerConfig {
     pub peers: Vec<String>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ServerConfig {
     pub port: u64,
+    pub insecure_port: u64,
     pub address: String,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentConfig {
     pub server: ServerConfig,

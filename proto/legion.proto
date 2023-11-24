@@ -3,12 +3,11 @@ package legion;
 
 // === MANAGER ===
 
-service ManagerNode {
+service Manager {
   rpc ManagerJoin (ManagerJoinRequest) returns (ManagerJoinReply);
   rpc WorkerJoin (WorkerJoinRequest) returns (WorkerJoinReply);
   rpc RunJob (RunJobRequest) returns (RunJobReply);
   rpc GetJobStatus (GetJobStatusRequest) returns (GetJobStatusReply);
-  rpc GetJoinToken (GetJoinTokenRequest) returns (GetJoinTokenReply);
 }
 
 message ManagerJoinRequest {
@@ -51,6 +50,12 @@ message GetJobStatusReply {
   string message = 1;
 }
 
+// === INSECURE MANAGER ===
+
+service InsecureManager {
+  rpc GetJoinToken (GetJoinTokenRequest) returns (GetJoinTokenReply);
+}
+
 message GetJoinTokenRequest {
   bool one_time = 1;
 }
@@ -61,7 +66,7 @@ message GetJoinTokenReply {
 
 // === WORKER ===
 
-service WorkerNode {
+service Worker {
   rpc PostWork (PostWorkRequest) returns (PostWorkReply);
 }
 

@@ -7,7 +7,7 @@ use clap::{arg, Command};
 pub mod legion {
     tonic::include_proto!("legion");
 }
-use legion::manager_node_client::ManagerNodeClient;
+use legion::manager_client::ManagerClient;
 use legion::{RunJobRequest, GetJobStatusRequest};
 
 pub fn config() -> Command {
@@ -35,7 +35,7 @@ pub async fn handle(sub_matches: &clap::ArgMatches) -> Result<(), Box<dyn error:
 
 async fn run_job() -> Result<(), Box<dyn error::Error>> {
     let addr = format!("{}://{}:{}", DEFAULT_PROTOCOL, DEFAULT_ADDR, DEFAULT_PORT);
-    let mut client = ManagerNodeClient::connect(addr).await?;
+    let mut client = ManagerClient::connect(addr).await?;
 
     let request = tonic::Request::new(RunJobRequest {
         name: "Mike".into(),
@@ -50,7 +50,7 @@ async fn run_job() -> Result<(), Box<dyn error::Error>> {
 
 async fn get_status() -> Result<(), Box<dyn error::Error>> {
     let addr = format!("{}://{}:{}", DEFAULT_PROTOCOL, DEFAULT_ADDR, DEFAULT_PORT);
-    let mut client = ManagerNodeClient::connect(addr).await?;
+    let mut client = ManagerClient::connect(addr).await?;
 
     let request = tonic::Request::new(GetJobStatusRequest {
         name: "Mike".into(),
