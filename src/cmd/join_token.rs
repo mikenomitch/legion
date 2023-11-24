@@ -30,7 +30,7 @@ pub async fn handle(_sub_matches: &clap::ArgMatches) -> Result<(), Box<dyn error
 
     // request token from the server
     // TODO: Eventually this should pick up the address from env var
-    let address = "http://localhost:4747";
+    let address = "http://localhost:4748";
     let mut client = InsecureManagerClient::connect(address).await?;
     let request = tonic::Request::new(GetJoinTokenRequest {
         one_time: false,
