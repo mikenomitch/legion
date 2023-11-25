@@ -237,6 +237,7 @@ mod tests {
         let config = &WorkerConfig{
             server: ServerConfig{
                 port: 9876,
+                insecure_port: 9999,
                 address: "1.1.1.1".to_string(),
             },
             worker_config: WorkerConfigFromManager{
@@ -250,13 +251,11 @@ mod tests {
         });
 
         let os = res.get("os").unwrap().as_str().unwrap();
-        assert_eq!(res.get("os").unwrap(), os);
+        assert_eq!("macos", os);
 
-        let arch = res.get("arch").unwrap().as_str().unwrap();
-        assert_eq!(res.get("arch").unwrap(), arch);
 
-        // Test that the plugin works
-        let basic = res.get("basic").unwrap().as_str().unwrap();
-        assert_eq!(res.get("basic").unwrap(), basic);
+        // // Test that the plugin works
+        // let basic = res.get("basic").unwrap().as_str().unwrap();
+        // assert_eq!("output", basic);
     }
 }

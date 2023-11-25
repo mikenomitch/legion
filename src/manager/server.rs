@@ -2,9 +2,9 @@ use crate::cmd::structs::{AgentConfig, JoinTokenClaims};
 use crate::constants::{DEFAULT_ADDR, DEFAULT_PORT, TMP_SECRET_KEY};
 use crate::storage::node::{start_storage, Msg};
 
-use futures::future::try_join;
 use log::debug;
 use std::error;
+use std::str::FromStr;
 use std::sync::mpsc::{self, Receiver, Sender};
 // use std::thread;
 // use std::time::Duration;
@@ -20,8 +20,7 @@ pub mod legion {
     tonic::include_proto!("legion");
 }
 
-use crate::manager::join_server::{get_insecure_manager_service, InsecureManagerService};
-use legion::insecure_manager_server::InsecureManagerServer;
+use crate::manager::join_server::get_insecure_manager_service;
 use legion::manager_client::ManagerClient;
 use legion::manager_server::{Manager, ManagerServer};
 
@@ -150,17 +149,17 @@ pub async fn run_leader(config: AgentConfig) -> Result<(), Box<dyn error::Error>
         receiver_from_store: receiver_from_store,
     };
 
-    // let data_dir = std::path::PathBuf::from_iter([std::env!("CARGO_MANIFEST_DIR"), "data"]);
-    // let cert = std::fs::read_to_string(data_dir.join("tls/server.pem"))?;
-    // let key = std::fs::read_to_string(data_dir.join("tls/server.key"))?;
-
-    // let identity = Identity::from_pem(cert, key);
-    // let tls = ServerTlsConfig::new().identity(identity);
+    let data_dir = std::path::PathBuf::from_str("/Users/mike/code/legion/configs/tls").unwrap();
+    let cert = std::fs::read_to_string(data_dir.join("legion.pem"))?;
+    let key = std::fs::read_to_string(data_dir.join("legion.key"))?;
+    let identity = Identity::from_pem(cert, key);
+    let tls = ServerTlsConfig::new().identity(identity);
 
     let start_server_fut = Server::builder()
-        .add_service(ManagerServer::new(manager_node))
-        .serve(addr);
-    // .tls_config(tls)?
+    .tls_config(tls)?
+    .add_service(ManagerServer::new(manager_node))
+    .serve(addr);
+
 
     println!("Join server starting on {}", join_server_addr);
     println!("Manager node starting on {}", addr);
