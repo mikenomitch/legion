@@ -5,6 +5,7 @@ mod manager;
 mod storage;
 mod types;
 mod worker;
+mod util;
 use clap::Command;
 use std::ffi::OsString;
 use std::error;

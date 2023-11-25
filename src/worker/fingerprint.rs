@@ -1,7 +1,6 @@
 use crate::cmd::structs::WorkerConfig;
 use std::error;
 
-extern crate libloading;
 use libloading::{Library, Symbol};
 use std::env::consts::{ARCH, OS};
 use sysinfo::{CpuExt, DiskExt, System, SystemExt, NetworkExt};
