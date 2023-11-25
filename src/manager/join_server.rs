@@ -4,6 +4,7 @@ use tonic::{Request, Response, Status};
 
 use jsonnet::JsonnetVm;
 use std::error;
+use std::str::FromStr;
 
 #[allow(non_snake_case)]
 pub mod legion {
@@ -16,6 +17,10 @@ use legion::{
 };
 
 use jsonwebtoken::{encode, Header, Algorithm, EncodingKey};
+use tonic::transport::{Certificate, Channel, ClientTlsConfig};
+
+// use rustls::Certificate;
+// use rustls::PrivateKey;
 
 pub struct InsecureManagerService {}
 #[tonic::async_trait]
@@ -51,6 +56,25 @@ pub fn get_insecure_manager_service() -> InsecureManagerServer<InsecureManagerSe
 // add generate_join_token_function
 pub fn generate_join_token() -> String {
     let config = parse_worker_config(DEFAULT_WORKER_CONFIG_PATH).unwrap();
+
+    // let cert = std::fs::read_to_string(data_dir.join("legion.pem"))?;
+    // let key = std::fs::read_to_string(data_dir.join("legion.key"))?;
+    // let identity = Identity::from_pem(cert, key);
+    // let tls = ServerTlsConfig::new().identity(identity);
+
+    let data_dir = std::path::PathBuf::from_str("/Users/mike/code/legion/configs/tls").unwrap();
+    let pem = std::fs::read_to_string(data_dir.join("ca.pem")).unwrap();
+    let ca = Certificate::from_pem(pem);
+
+    // TODO:
+    // I think what I have to do is:
+    // - Generate a new leaf cert for the client
+    // - Embed this leaf cert into the JWT
+    // - When the client connects, it will use this leaf cert
+
+    let tls = ClientTlsConfig::new()
+        .ca_certificate(ca)
+        .domain_name("legion.com");
 
     let claims = JoinTokenClaims {
         sub: "legion".to_owned(),
