@@ -64,6 +64,9 @@ fn parse_config(config_path: &str) -> Result<AgentConfig, Box<dyn error::Error>>
             let config: AgentConfig = serde_json::from_str(&s)?;
             Ok(config)
         }
-        Err(_) => Err("Failed to parse config file".into()),
+        Err(e) => {
+            println!("{}", e.as_str());
+            Err("Failed to parse config file".into())
+        },
     }
 }

@@ -149,7 +149,7 @@ pub async fn run_leader(config: AgentConfig) -> Result<(), Box<dyn error::Error>
         receiver_from_store: receiver_from_store,
     };
 
-    let data_dir = std::path::PathBuf::from_str("/Users/mike/code/legion/configs/tls").unwrap();
+    let data_dir = std::path::PathBuf::from_str("/Users/mike/code/legion/configs/tls/legion").unwrap();
     let cert = std::fs::read_to_string(data_dir.join("legion.pem"))?;
     let key = std::fs::read_to_string(data_dir.join("legion.key"))?;
     let identity = Identity::from_pem(cert, key);

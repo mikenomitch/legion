@@ -1,4 +1,5 @@
 use crate::cmd::structs::{WorkerConfig, JoinTokenClaims};
+use crate::util::certs::{signed_cert_with_ca, read_root_cert};
 use crate::constants::{TMP_SECRET_KEY, DEFAULT_WORKER_CONFIG_PATH};
 use tonic::{Request, Response, Status};
 
@@ -57,29 +58,21 @@ pub fn get_insecure_manager_service() -> InsecureManagerServer<InsecureManagerSe
 pub fn generate_join_token() -> String {
     let config = parse_worker_config(DEFAULT_WORKER_CONFIG_PATH).unwrap();
 
-    // let cert = std::fs::read_to_string(data_dir.join("legion.pem"))?;
-    // let key = std::fs::read_to_string(data_dir.join("legion.key"))?;
-    // let identity = Identity::from_pem(cert, key);
-    // let tls = ServerTlsConfig::new().identity(identity);
-
-    let data_dir = std::path::PathBuf::from_str("/Users/mike/code/legion/configs/tls").unwrap();
-    let pem = std::fs::read_to_string(data_dir.join("ca.pem")).unwrap();
-    let ca = Certificate::from_pem(pem);
-
     // TODO:
     // I think what I have to do is:
-    // - Generate a new leaf cert for the client
-    // - Embed this leaf cert into the JWT
     // - When the client connects, it will use this leaf cert
 
-    let tls = ClientTlsConfig::new()
-        .ca_certificate(ca)
-        .domain_name("legion.com");
+    let ca_pem_path = "/Users/mike/code/legion/configs/tls/rootca.pem".to_string();
+    let ca_key_path = "/Users/mike/code/legion/configs/tls/rootca.key".to_string();
+    let cert = read_root_cert(ca_pem_path, ca_key_path).unwrap();
+    let (cert, key) = signed_cert_with_ca(cert, "legion".to_string());
 
     let claims = JoinTokenClaims {
         sub: "legion".to_owned(),
         exp: 10000000000,
-        address: "http://localhost:4747".to_owned(),
+        address: "https://localhost:4747".to_owned(),
+        cert: cert,
+        key: key,
         config: config,
     };
 

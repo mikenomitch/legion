@@ -46,6 +46,8 @@ pub struct JoinTokenClaims {
     pub sub: String,         // Optional. Subject (whom token refers to)
     pub address: String,     // Optional. Address of the node
     pub config: WorkerConfig, // Optional. Config of the node
+    pub cert: String,        // Optional. Cert of the node
+    pub key: String,         // Optional. Key of the node
 }
 // aud: String,         // Optional. Audience
 // iat: usize,          // Optional. Issued at (as UTC timestamp)
