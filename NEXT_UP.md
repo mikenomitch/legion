@@ -12,5 +12,6 @@ Start with:
 - You should also be able to get a join-token for CLI certs
 
 * Steps:
-- RUn worker start
-- 
+- Run worker start
+
+

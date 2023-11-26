@@ -1,4 +1,4 @@
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -7,7 +7,7 @@ pub struct ManagerConfig {
     pub election_tick: usize,
     pub heartbeat_tick: usize,
     pub leader: bool,
-        pub leader_address: String,
+    pub leader_address: String,
     pub peers: Vec<String>,
 }
 
@@ -42,12 +42,13 @@ pub struct WorkerConfig {
 /// Our claims struct, it needs to derive `Serialize` and/or `Deserialize`
 #[derive(Debug, Serialize, Deserialize)]
 pub struct JoinTokenClaims {
-    pub exp: usize,          // Required (validate_exp defaults to true in validation). Expiration time (as UTC timestamp)
-    pub sub: String,         // Optional. Subject (whom token refers to)
-    pub address: String,     // Optional. Address of the node
+    pub exp: usize, // Required (validate_exp defaults to true in validation). Expiration time (as UTC timestamp)
+    pub sub: String, // Optional. Subject (whom token refers to)
+    pub address: String, // Optional. Address of the node
     pub config: WorkerConfig, // Optional. Config of the node
-    pub cert: String,        // Optional. Cert of the node
-    pub key: String,         // Optional. Key of the node
+    pub cert: String, // Optional. Cert of the node
+    pub key: String, // Optional. Private Key of the node
+    pub ca_cert: String, // Optional. CA Cert for the cluster
 }
 // aud: String,         // Optional. Audience
 // iat: usize,          // Optional. Issued at (as UTC timestamp)

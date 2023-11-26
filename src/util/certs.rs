@@ -14,10 +14,9 @@
 /// ```
 // Do I need openssl?
 // extern crate openssl;
-
 use rcgen::{
-    Certificate, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair, KeyUsagePurpose,
-    SanType, PKCS_ECDSA_P256_SHA256, BasicConstraints,
+    BasicConstraints, Certificate, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair,
+    KeyUsagePurpose, SanType, PKCS_ECDSA_P256_SHA256,
 };
 
 use std::fs;
@@ -52,7 +51,10 @@ use std::io::{BufReader, Read};
 ///
 /// The `Certificate` object for the CA, or an error if the PEM files could not be read or parsed.
 
-pub fn read_root_cert(pem_path: String, key_path: String) -> Result<Certificate, Box<dyn std::error::Error>> {
+pub fn read_root_cert(
+    pem_path: String,
+    key_path: String,
+) -> Result<Certificate, Box<dyn std::error::Error>> {
     // Open the PEM file containing both the certificate and private key
 
     let pem_cert_file = File::open(pem_path)?;
@@ -87,7 +89,7 @@ pub fn create_ca_cert() -> Certificate {
     let key_pair = KeyPair::generate(&PKCS_ECDSA_P256_SHA256).unwrap();
 
     let mut dn = DistinguishedName::new();
-    dn.push(DnType::CommonName, "rootca");
+    dn.push(DnType::CommonName, "legion");
 
     let mut params = CertificateParams::default();
     params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
@@ -110,10 +112,11 @@ pub fn create_ca_cert() -> Certificate {
         &cert.serialize_private_key_pem().as_bytes(),
     )
     .unwrap();
+
     cert
 }
 
-pub fn signed_cert_with_ca(ca_cert: Certificate, dn_name: String) -> (String, String) {
+pub fn signed_cert_with_ca(ca_cert: Certificate, dn_name: String) -> (String, String, Certificate) {
     let mut dn = DistinguishedName::new();
     dn.push(DnType::CommonName, dn_name.clone());
 
@@ -125,7 +128,7 @@ pub fn signed_cert_with_ca(ca_cert: Certificate, dn_name: String) -> (String, St
 
     params.subject_alt_names = vec![
         SanType::DnsName(dn_name.clone()),
-        SanType::DnsName(String::from("localhost")),
+        SanType::DnsName(String::from("legion")),
         SanType::IpAddress(std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1))),
         SanType::IpAddress(std::net::IpAddr::V6(std::net::Ipv6Addr::new(
             0, 0, 0, 0, 0, 0, 0, 1,
@@ -135,7 +138,8 @@ pub fn signed_cert_with_ca(ca_cert: Certificate, dn_name: String) -> (String, St
 
     let cert_signed = cert.serialize_pem_with_signer(&ca_cert).unwrap();
     let key = cert.serialize_private_key_pem();
-    (cert_signed, key)
+
+    (cert_signed, key, cert)
 }
 
 /// Generates a new SSL certificate and private key signed by the specified CA.
@@ -145,8 +149,8 @@ pub fn signed_cert_with_ca(ca_cert: Certificate, dn_name: String) -> (String, St
 /// * `ca_cert` - The `Certificate` object for the CA to sign the new certificate with.
 /// * `dn_name` - The domain name to generate the certificate for.
 
-pub fn write_signed_cert_with_ca(ca_cert: Certificate, dn_name: String) {
-    let (cert_signed, key) = signed_cert_with_ca(ca_cert, dn_name.clone());
+pub fn write_signed_cert_with_ca(ca_cert: Certificate, dn_name: String) -> Certificate {
+    let (cert_signed, key, ca_cert_again) = signed_cert_with_ca(ca_cert, dn_name.clone());
 
     let path = format!("configs/tls/{dn_name}/");
     let cert_path = format!("configs/tls/{dn_name}/{dn_name}.pem");
@@ -155,6 +159,8 @@ pub fn write_signed_cert_with_ca(ca_cert: Certificate, dn_name: String) {
     std::fs::create_dir_all(path).unwrap();
     fs::write(cert_path, cert_signed).unwrap();
     fs::write(key_path, key).unwrap();
+
+    ca_cert_again
 }
 
 #[cfg(test)]
@@ -191,7 +197,7 @@ mod tests {
     #[test]
     fn signed_cert_with_ca_works() {
         let cert = create_ca_cert();
-        let (cert_signed, key) = signed_cert_with_ca(cert, "test".to_string());
+        let (cert_signed, key, _) = signed_cert_with_ca(cert, "test".to_string());
         assert!(cert_signed.len() > 0);
         assert!(key.len() > 0);
     }
@@ -199,6 +205,7 @@ mod tests {
     #[test]
     fn write_signed_cert_with_ca_works() {
         let cert = create_ca_cert();
-        write_signed_cert_with_ca(cert, "test".to_string());
+        write_signed_cert_with_ca(cert, "server".to_string());
+        // let cert_again = write_signed_cert_with_ca(cert, "client".to_string());
     }
 }

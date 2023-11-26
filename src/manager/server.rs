@@ -135,9 +135,12 @@ pub async fn run_leader(config: AgentConfig) -> Result<(), Box<dyn error::Error>
 
     // Spawn a separate grpc server for non-TLS calls
 
-    let join_server_addr = format!("{}:{}", cloned_config.server.address, cloned_config.server.insecure_port)
-        .parse()
-        .unwrap();
+    let join_server_addr = format!(
+        "{}:{}",
+        cloned_config.server.address, cloned_config.server.insecure_port
+    )
+    .parse()
+    .unwrap();
 
     let insecure_manager_service = get_insecure_manager_service();
     let join_server_fut = Server::builder()
@@ -149,17 +152,17 @@ pub async fn run_leader(config: AgentConfig) -> Result<(), Box<dyn error::Error>
         receiver_from_store: receiver_from_store,
     };
 
-    let data_dir = std::path::PathBuf::from_str("/Users/mike/code/legion/configs/tls/legion").unwrap();
-    let cert = std::fs::read_to_string(data_dir.join("legion.pem"))?;
-    let key = std::fs::read_to_string(data_dir.join("legion.key"))?;
+    let data_dir =
+        std::path::PathBuf::from_str("/Users/mike/code/legion/configs/tls/server").unwrap();
+    let cert = std::fs::read_to_string(data_dir.join("server.pem"))?;
+    let key = std::fs::read_to_string(data_dir.join("server.key"))?;
     let identity = Identity::from_pem(cert, key);
     let tls = ServerTlsConfig::new().identity(identity);
 
     let start_server_fut = Server::builder()
-    .tls_config(tls)?
-    .add_service(ManagerServer::new(manager_node))
-    .serve(addr);
-
+        .tls_config(tls)?
+        .add_service(ManagerServer::new(manager_node))
+        .serve(addr);
 
     println!("Join server starting on {}", join_server_addr);
     println!("Manager node starting on {}", addr);

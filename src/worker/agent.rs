@@ -65,8 +65,7 @@ pub async fn run_worker(token: &str) -> Result<(), Box<dyn error::Error>> {
     println!("{:?}", token_data.claims.address);
     println!("{:?}", token_data.claims.config);
 
-    println!("cert {:?}", token_data.claims.cert);
-    println!("key {:?}", token_data.claims.key);
+    println!("cert {:?}", token_data.claims.ca_cert);
 
     let fingerprint_data = fingerprint_node(&token_data.claims.config);
     let os = fingerprint_data.get("os").unwrap().as_str().unwrap();
@@ -79,11 +78,9 @@ pub async fn run_worker(token: &str) -> Result<(), Box<dyn error::Error>> {
     // TODO: Remove once testing is done
     // ---- START TEST -----
     // Temporarily estabilish a connection to the manager
-    let ca = Certificate::from_pem(token_data.claims.cert);
 
-    let tls = ClientTlsConfig::new()
-        .ca_certificate(ca)
-        .domain_name("legion");
+    let ca_cert = Certificate::from_pem(token_data.claims.ca_cert);
+    let tls = ClientTlsConfig::new().ca_certificate(ca_cert);
 
     let manager_addr = token_data.claims.address;
     let channel = Channel::from_shared(manager_addr)?
@@ -98,8 +95,6 @@ pub async fn run_worker(token: &str) -> Result<(), Box<dyn error::Error>> {
     let response = client.run_job(request).await?;
     debug!("RESPONSE={:?}", response);
     // ---- END TEST -----
-
-
 
 
     let worker_addr = format!("{}:{}", "127.0.0.1", 4848)

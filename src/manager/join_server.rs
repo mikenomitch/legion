@@ -65,14 +65,15 @@ pub fn generate_join_token() -> String {
     let ca_pem_path = "/Users/mike/code/legion/configs/tls/rootca.pem".to_string();
     let ca_key_path = "/Users/mike/code/legion/configs/tls/rootca.key".to_string();
     let cert = read_root_cert(ca_pem_path, ca_key_path).unwrap();
-    let (cert, key) = signed_cert_with_ca(cert, "legion".to_string());
+    let (new_cert, new_key, ca_cert_again) = signed_cert_with_ca(cert, "legion".to_string());
 
     let claims = JoinTokenClaims {
         sub: "legion".to_owned(),
         exp: 10000000000,
         address: "https://localhost:4747".to_owned(),
-        cert: cert,
-        key: key,
+        cert: new_cert,
+        key: new_key,
+        ca_cert: ca_cert_again.serialize_pem().unwrap(),
         config: config,
     };
 
