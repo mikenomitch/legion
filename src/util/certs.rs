@@ -89,6 +89,7 @@ pub fn create_ca_cert() -> Certificate {
     let key_pair = KeyPair::generate(&PKCS_ECDSA_P256_SHA256).unwrap();
 
     let mut dn = DistinguishedName::new();
+    dn.push(DnType::CommonName, "localhost");
     dn.push(DnType::CommonName, "legion");
 
     let mut params = CertificateParams::default();
@@ -129,6 +130,7 @@ pub fn signed_cert_with_ca(ca_cert: Certificate, dn_name: String) -> (String, St
     params.subject_alt_names = vec![
         SanType::DnsName(dn_name.clone()),
         SanType::DnsName(String::from("legion")),
+        SanType::DnsName(String::from("localhost")),
         SanType::IpAddress(std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1))),
         SanType::IpAddress(std::net::IpAddr::V6(std::net::Ipv6Addr::new(
             0, 0, 0, 0, 0, 0, 0, 1,

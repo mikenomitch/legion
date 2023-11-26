@@ -66,6 +66,7 @@ pub fn generate_join_token() -> String {
     let ca_key_path = "/Users/mike/code/legion/configs/tls/rootca.key".to_string();
     let cert = read_root_cert(ca_pem_path, ca_key_path).unwrap();
     let (new_cert, new_key, ca_cert_again) = signed_cert_with_ca(cert, "legion".to_string());
+    // let ca_as_string = std::fs::read_to_string(ca_pem_path.clone()).unwrap();
 
     let claims = JoinTokenClaims {
         sub: "legion".to_owned(),
