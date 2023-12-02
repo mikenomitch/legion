@@ -6,16 +6,13 @@ use crate::util::R;
 use log::debug;
 use std::str::FromStr;
 use std::sync::mpsc::{self, Receiver, Sender};
-// use std::thread;
-// use std::time::Duration;
 
 use jsonwebtoken::errors::ErrorKind;
 use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 use std::sync::{Arc, Mutex};
 
-use futures::join; // Import the `futures` crate
+use futures::join;
 
-#[allow(non_snake_case)]
 pub mod legion {
     tonic::include_proto!("legion");
 }
@@ -41,7 +38,7 @@ pub struct ManagerAgentService {
 
 #[tonic::async_trait]
 impl Manager for ManagerAgentService {
-    // TODO: Deprecate this once the join token is used for everything
+    // NOTE: Deprecate this once the join token is used for everything
     async fn manager_join(
         &self,
         request: Request<ManagerJoinRequest>,
@@ -84,7 +81,7 @@ impl Manager for ManagerAgentService {
         Ok(Response::new(reply))
     }
 
-    // TODO: Make this work for servers and workers
+    // NOTE: Make this work for servers and workers
     async fn worker_join(
         &self,
         request: Request<WorkerJoinRequest>,

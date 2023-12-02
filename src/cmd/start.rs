@@ -7,7 +7,6 @@ use jsonnet::JsonnetVm;
 
 use clap::{arg, Command};
 
-#[allow(non_snake_case)]
 pub mod legion {
     tonic::include_proto!("legion");
 }

@@ -2,20 +2,9 @@ use crate::util::R;
 
 // Note: Modified from: https://github.com/grimvoodoo/cert-gen
 
-/// This is a Rust script that generates SSL certificates for use in local development environments.
-///
-/// It takes two command-line arguments: the first is either the path to an existing CA file or the
-/// string "new" to create a new CA; the second is the domain name you wish to create a certificate for.
-///
-/// The script uses the `rcgen` crate to generate a new certificate and key pair, then signs the certificate
-/// with the specified CA. It saves the certificate and key files to disk in the `certs` directory.
-///
-/// Usage:
-/// ```
-/// $ cargo run -- args...
-/// ```
 // Do I need openssl?
 // extern crate openssl;
+
 use rcgen::{
     BasicConstraints, Certificate, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair,
     KeyUsagePurpose, SanType, PKCS_ECDSA_P256_SHA256,
@@ -25,10 +14,7 @@ use std::fs;
 use std::fs::File;
 use std::io::{BufReader, Read};
 
-pub fn read_root_cert(
-    pem_path: String,
-    key_path: String,
-) -> R<Certificate> {
+pub fn read_root_cert(pem_path: String, key_path: String) -> R<Certificate> {
     // Open the PEM file containing both the certificate and private key
 
     let pem_cert_file = File::open(pem_path)?;
@@ -53,6 +39,7 @@ pub fn read_root_cert(
     Ok(ca_cert)
 }
 
+#[allow(dead_code)]
 pub fn create_ca_cert() -> R<Certificate> {
     let key_pair = KeyPair::generate(&PKCS_ECDSA_P256_SHA256)?;
 
@@ -84,7 +71,10 @@ pub fn create_ca_cert() -> R<Certificate> {
     Ok(cert)
 }
 
-pub fn signed_cert_with_ca(ca_cert: Certificate, dn_name: String) -> R<(String, String, Certificate)> {
+pub fn signed_cert_with_ca(
+    ca_cert: Certificate,
+    dn_name: String,
+) -> R<(String, String, Certificate)> {
     let mut dn = DistinguishedName::new();
     dn.push(DnType::CommonName, dn_name.clone());
 
@@ -111,6 +101,7 @@ pub fn signed_cert_with_ca(ca_cert: Certificate, dn_name: String) -> R<(String, 
     Ok((cert_signed, key, cert))
 }
 
+#[allow(dead_code)]
 pub fn write_signed_cert_with_ca(ca_cert: Certificate, dn_name: String) -> R<Certificate> {
     let (cert_signed, key, ca_cert_again) = signed_cert_with_ca(ca_cert, dn_name.clone())?;
 
@@ -139,7 +130,7 @@ mod tests {
 
     #[test]
     fn read_root_cert_works() {
-        // TODO: Replace with better files
+        // NOTE: Replace with better files
         let ca_pem_path = "/Users/mike/code/legion/configs/tls/rootca.pem".to_string();
         let ca_key_path = "/Users/mike/code/legion/configs/tls/rootca.key".to_string();
 

@@ -2,7 +2,6 @@ use std::error;
 use clap::{arg, Command};
 use crate::constants::DEFAULT_INSECURE_ADDR;
 
-#[allow(non_snake_case)]
 pub mod legion {
     tonic::include_proto!("legion");
 }

@@ -1,25 +1,22 @@
 use crate::cmd::structs::JoinTokenClaims;
-use crate::constants::TMP_SECRET_KEY;
+use crate::constants::{DEFAULT_HOSTNAME, TMP_SECRET_KEY};
 use crate::util::R;
-use jsonwebtoken::errors::ErrorKind;
-use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
-
 use crate::worker::fingerprint::fingerprint_node;
+
+use jsonwebtoken::{decode, errors::ErrorKind, Algorithm, DecodingKey, Validation};
+use log::debug;
 
 use tonic::{
     transport::Certificate, transport::Channel, transport::ClientTlsConfig, transport::Server,
     Request, Response, Status,
 };
 
-#[allow(non_snake_case)]
 pub mod legion {
     tonic::include_proto!("legion");
 }
 use legion::manager_client::ManagerClient;
 use legion::worker_server::{Worker, WorkerServer};
 use legion::{PostWorkReply, PostWorkRequest, RunJobRequest};
-
-use log::debug;
 
 pub struct WorkerAgentService {}
 #[tonic::async_trait]
@@ -65,10 +62,11 @@ pub async fn run_worker(token: &str) -> R<()> {
 
     let fingerprint_data = fingerprint_node(&token_data.claims.config);
 
-    let os = fingerprint_data.get("os").
-        ok_or("OS fingerprinter failed to return an OS")?.
-        as_str().
-        ok_or("OS fingerprinter returned a non-string value")?;
+    let os = fingerprint_data
+        .get("os")
+        .ok_or("OS fingerprinter failed to return an OS")?
+        .as_str()
+        .ok_or("OS fingerprinter returned a non-string value")?;
 
     println!("OS fingerprinted as: {:?}", os);
 
@@ -97,7 +95,7 @@ pub async fn run_worker(token: &str) -> R<()> {
     debug!("RESPONSE={:?}", response);
     // ---- END TEST -----
 
-    let worker_addr = format!("{}:{}", "127.0.0.1", 4848).parse()?;
+    let worker_addr = format!("{}:{}", DEFAULT_HOSTNAME, 4848).parse()?;
     println!("Worker node starting on {}", worker_addr);
 
     // TODO: ADD YOUR OWN TLS TO THIS!

@@ -6,7 +6,6 @@ use tonic::{Request, Response, Status};
 
 use jsonnet::JsonnetVm;
 
-#[allow(non_snake_case)]
 pub mod legion {
     tonic::include_proto!("legion");
 }
@@ -49,7 +48,7 @@ pub fn get_insecure_manager_service() -> InsecureManagerServer<InsecureManagerSe
 pub fn generate_join_token() -> R<String> {
     let config = parse_worker_config(DEFAULT_WORKER_CONFIG_PATH)?;
 
-    // TODO:
+    // NOTE:
     // I think what I have to do is:
     // - When the client connects, it will use this leaf cert
 

@@ -1,9 +1,9 @@
 use crate::constants::{DEFAULT_HOSTNAME, DEFAULT_PORT, DEFAULT_PROTOCOL};
 use crate::util::R;
+
 use log::debug;
 use clap::{arg, Command};
 
-#[allow(non_snake_case)]
 pub mod legion {
     tonic::include_proto!("legion");
 }

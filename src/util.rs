@@ -1,4 +1,4 @@
 use std::error::Error;
 
-// Define the type alias here
+// Adds convenience for Result for brevity
 pub type R<T> = Result<T, Box<dyn Error>>;
