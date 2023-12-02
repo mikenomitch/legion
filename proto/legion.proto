@@ -6,6 +6,7 @@ package legion;
 service Manager {
   rpc ManagerJoin (ManagerJoinRequest) returns (ManagerJoinReply);
   rpc WorkerJoin (WorkerJoinRequest) returns (WorkerJoinReply);
+  rpc WorkerRegister (WorkerRegisterRequest) returns (WorkerRegisterReply);
   rpc RunJob (RunJobRequest) returns (RunJobReply);
   rpc GetJobStatus (GetJobStatusRequest) returns (GetJobStatusReply);
   rpc Heartbeat (HeartbeatRequest) returns (HeartbeatReply);
@@ -21,6 +22,14 @@ message ManagerJoinReply {
 
 message WorkerJoinRequest {
   string token = 1;
+}
+
+message WorkerRegisterRequest {
+  string name = 1;
+}
+
+message WorkerRegisterReply {
+  string message = 1;
 }
 
 message WorkerJoinReply {

@@ -17,7 +17,7 @@ pub mod legion {
 }
 use legion::manager_client::ManagerClient;
 use legion::worker_server::{Worker, WorkerServer};
-use legion::{PostWorkReply, PostWorkRequest, HeartbeatRequest};
+use legion::{PostWorkReply, PostWorkRequest, HeartbeatRequest, WorkerRegisterRequest};
 
 pub struct WorkerAgentService {}
 #[tonic::async_trait]
@@ -77,31 +77,52 @@ pub async fn run_worker(token: &str) -> R<()> {
         .add_service(WorkerServer::new(worker_node))
         .serve(addr);
 
-    let heartbeat_fut = start_heartbeats(token_data.claims.address, token_data.claims.ca_cert);
+    let mut client = create_manager_client(
+        token_data.claims.address,
+        token_data.claims.ca_cert,
+    ).await?;
 
+    register_self(client.clone()).await?;
+
+    let heartbeat_fut = start_heartbeats(client);
     let _res = join!(heartbeat_fut, worker_server_fut);
 
     Ok(())
 }
 
-
-async fn start_heartbeats(manager_addr: String, ca_cert: String) -> R<()> {
+async fn create_manager_client(manager_addr: String, ca_cert: String) -> R<ManagerClient<Channel>> {
     let ca_cert = Certificate::from_pem(ca_cert);
     let tls = ClientTlsConfig::new().ca_certificate(ca_cert);
-    let channel = Channel::from_shared(manager_addr)?
-        .tls_config(tls.clone())?
-        .connect()
-        .await?;
-    let mut client = ManagerClient::new(channel);
+    let channel = Channel::from_shared(manager_addr)?.tls_config(tls)?.connect().await?;
+    let client = ManagerClient::new(channel);
 
+    Ok(client)
+}
+
+
+async fn start_heartbeats(client: ManagerClient<Channel>) -> R<()> {
+    let mut c2 = client.clone();
     loop {
         let req = tonic::Request::new(HeartbeatRequest {
             name: "worker-a".into(),
         });
 
-        let response = client.heartbeat(req).await?;
+        let response = c2.heartbeat(req).await?;
         debug!("RESPONSE={:?}", response);
 
         tokio::time::sleep(tokio::time::Duration::from_secs(WORKER_HEARTBEAT_DURATION)).await;
     }
+}
+
+async fn register_self(client: ManagerClient<Channel>) -> R<()> {
+    let mut c2 = client.clone();
+
+    let req = tonic::Request::new(WorkerRegisterRequest {
+        name: "worker-a".into(),
+    });
+
+    let response = c2.worker_register(req).await?;
+    debug!("RESPONSE={:?}", response);
+
+    Ok(())
 }

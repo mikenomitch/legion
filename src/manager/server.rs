@@ -24,6 +24,7 @@ use legion::manager_server::{Manager, ManagerServer};
 use legion::{
     GetJobStatusReply, GetJobStatusRequest, HeartbeatReply, HeartbeatRequest, ManagerJoinReply,
     ManagerJoinRequest, RunJobReply, RunJobRequest, WorkerJoinReply, WorkerJoinRequest,
+    WorkerRegisterReply, WorkerRegisterRequest,
 };
 
 use tonic::transport::{Identity, Server, ServerTlsConfig};
@@ -113,6 +114,22 @@ impl Manager for ManagerAgentService {
     ) -> Result<Response<HeartbeatReply>, Status> {
         let reply = HeartbeatReply {
             message: format!("Thunky thunk"),
+        };
+
+        Ok(Response::new(reply))
+    }
+
+    async fn worker_register(
+        &self,
+        request: Request<WorkerRegisterRequest>,
+    ) -> Result<Response<WorkerRegisterReply>, Status> {
+
+        println!(
+            "You are in {}!", request.into_inner().name
+        );
+
+        let reply = WorkerRegisterReply {
+            message: format!("You are in!"),
         };
 
         Ok(Response::new(reply))
