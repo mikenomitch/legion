@@ -2,7 +2,6 @@ mod certs;
 mod cmd;
 mod constants;
 mod manager;
-mod plugins;
 mod storage;
 mod util;
 mod worker;

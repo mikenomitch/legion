@@ -9,3 +9,7 @@ edit legion.proto
 change stuff in server.rs to have new functions
 
 TODO: extensions to help?
+
+### Plugins
+
+Run `cargo build --release` to make these

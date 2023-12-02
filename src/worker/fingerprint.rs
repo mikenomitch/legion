@@ -240,7 +240,7 @@ mod tests {
                 address: "1.1.1.1".to_string(),
             },
             worker_config: WorkerConfigFromManager{
-                additional_fingerprinters: vec!["/Users/mike/Code/legion/src/plugins/fingerprinters/example/target/release/libexample.dylib".to_string()],
+                additional_fingerprinters: vec!["/Users/mike/Code/legion/plugins/fingerprinters/example/target/release/libexample.dylib".to_string()],
             }
         };
 
