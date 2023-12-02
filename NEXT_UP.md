@@ -7,18 +7,17 @@
 - Join with the token
 - The register command passes along a name and fingerprint data
 - A new list workers command shows the node in there
-- You can do this with two different workers at same time
+- You can do this with two different workers at same time (diff names)
 
 * Steps:
-- Extend Register RPC to have fingerprint data
-- Add fingerprint data to call
-- Add temporary sqlite store using rusqlite (or sled?)
+- Add temporary sqlite store using rusqlite
 - Boot the store when the manager starts
 - Write to it
 - Read from it
 - Make a general store interface
 - Make a store plugin system? (look for store-plugin in manager config, otherwise use sqlite?)
-- Do backups of the store?
+- Do snapshots of the store
+- Snapshots are loaded on reboot
 
 # Deferred Work
 

@@ -4,6 +4,7 @@ use crate::storage::node::{start_storage, Msg};
 use crate::util::R;
 
 use log::debug;
+use rusqlite::Connection;
 use std::str::FromStr;
 use std::sync::mpsc::{self, Receiver, Sender};
 
@@ -29,6 +30,13 @@ use legion::{
 
 use tonic::transport::{Identity, Server, ServerTlsConfig};
 use tonic::{Request, Response, Status};
+
+// TODO: Make it a real map
+#[derive(Debug)]
+struct Node {
+    id: String,
+    attrs: String,
+}
 
 #[allow(dead_code)]
 // #[derive(Default)]
@@ -124,9 +132,30 @@ impl Manager for ManagerAgentService {
         request: Request<WorkerRegisterRequest>,
     ) -> Result<Response<WorkerRegisterReply>, Status> {
 
-        println!(
-            "You are in {}!", request.into_inner().name
-        );
+        let request = request.into_inner();
+        let name = request.name;
+        let attrs = request.attributes;
+
+        let conn = Connection::open("foo.db").unwrap();
+
+        conn.execute(
+            "INSERT INTO node (id, attrs) VALUES (?1, ?2)",
+            (&name, &attrs),
+        ).unwrap();
+
+        let mut stmt = conn.prepare("SELECT id, attrs FROM node").unwrap();
+        let node_iter = stmt.query_map([], |row| {
+            Ok(Node {
+                id: row.get(0).unwrap(),
+                attrs: row.get(1).unwrap(),
+            })
+        }).unwrap();
+
+        for node in node_iter {
+            let n = node.unwrap();
+            println!("Found node {:?}", n.id);
+            println!("With attrs: {:?}", n.attrs);
+        }
 
         let reply = WorkerRegisterReply {
             message: format!("You are in!"),
@@ -215,7 +244,7 @@ pub async fn run_follower(config: AgentConfig) -> R<()> {
     let sender_to_server = Arc::new(Mutex::new(sender_to_server));
     let receiver_from_store = Arc::new(Mutex::new(receiver_from_store));
 
-    start_storage(receiver_from_server, sender_to_server, config);
+    let _ = start_storage(receiver_from_server, sender_to_server, config);
 
     let manager_node = ManagerAgentService {
         sender_to_store: sender_to_store,

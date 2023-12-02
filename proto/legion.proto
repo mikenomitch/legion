@@ -26,6 +26,7 @@ message WorkerJoinRequest {
 
 message WorkerRegisterRequest {
   string name = 1;
+  string attributes = 2;
 }
 
 message WorkerRegisterReply {

@@ -6,6 +6,7 @@ use crate::worker::fingerprint::fingerprint_node;
 use jsonwebtoken::{decode, errors::ErrorKind, Algorithm, DecodingKey, Validation};
 use log::debug;
 use futures::join;
+use serde_json::{Map, Value};
 
 use tonic::{
     transport::Certificate, transport::Channel, transport::ClientTlsConfig, transport::Server,
@@ -54,21 +55,10 @@ pub async fn run_worker(token: &str) -> R<()> {
         }
     };
 
-    // println!("{:?}", token_data.claims.address);
-    // println!("{:?}", token_data.claims.config);
-
     // TODO: ESTABLISH TLS CONNECTION PROPERLY
-    // println!("cert {:?}", token_data.claims.ca_cert);
 
     let fingerprint_data = fingerprint_node(&token_data.claims.config);
 
-    let os = fingerprint_data
-        .get("os")
-        .ok_or("OS fingerprinter failed to return an OS")?
-        .as_str()
-        .ok_or("OS fingerprinter returned a non-string value")?;
-
-    println!("OS fingerprinted as: {:?}", os);
     // TODO: SEND THE REAL RE-REGISTRATION WITH FINGERPRINT DATA
 
     let addr = format!("{}:{}", DEFAULT_HOSTNAME, 4848).parse()?;
@@ -77,12 +67,12 @@ pub async fn run_worker(token: &str) -> R<()> {
         .add_service(WorkerServer::new(worker_node))
         .serve(addr);
 
-    let mut client = create_manager_client(
+    let client = create_manager_client(
         token_data.claims.address,
         token_data.claims.ca_cert,
     ).await?;
 
-    register_self(client.clone()).await?;
+    register_self(client.clone(), fingerprint_data).await?;
 
     let heartbeat_fut = start_heartbeats(client);
     let _res = join!(heartbeat_fut, worker_server_fut);
@@ -114,11 +104,14 @@ async fn start_heartbeats(client: ManagerClient<Channel>) -> R<()> {
     }
 }
 
-async fn register_self(client: ManagerClient<Channel>) -> R<()> {
+async fn register_self(client: ManagerClient<Channel>, fingerprint_data: Map<String, Value>) -> R<()> {
     let mut c2 = client.clone();
+    let serialized_data = serde_json::to_string(&fingerprint_data)?;
+
 
     let req = tonic::Request::new(WorkerRegisterRequest {
         name: "worker-a".into(),
+        attributes: serialized_data,
     });
 
     let response = c2.worker_register(req).await?;

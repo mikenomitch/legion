@@ -7,20 +7,21 @@ edition = "2021"
 
 [dependencies]
 clap = { version = "4.1.8", features = ["cargo", "derive"] }
-tonic = { version = "0.10", features = ["tls"] }
-prost = "0.12"
-tokio = { version = "1.0", features = ["macros", "rt-multi-thread", "full"] }
+env_logger = "0.10.0"
+futures = "0.3"
 jsonnet-rs = "0.17.0"
+jsonwebtoken = "9.1.0"
+libloading = "0.8.1"
+log = "0.4.20"
+prost = "0.12"
+rcgen = { version = "0.11.3", features = ["pem", "x509-parser"] }
+rusqlite = { version = "0.30.0", features = ["bundled", "serde_json", "backup", "time"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-log = "0.4.20"
-env_logger = "0.10.0"
-libloading = "0.8.1"
 sysinfo = "0.29.10"
-jsonwebtoken = "9.1.0"
-futures = "0.3"
-rcgen = { version = "0.11.3", features = ["pem", "x509-parser"] }
 time = "0.3.30"
+tokio = { version = "1.0", features = ["macros", "rt-multi-thread", "full"] }
+tonic = { version = "0.10", features = ["tls"] }
 
 [build-dependencies]
 tonic-build = "0.8"
