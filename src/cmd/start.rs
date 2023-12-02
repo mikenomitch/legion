@@ -1,9 +1,9 @@
+use crate::util::R;
 use crate::cmd::structs::AgentConfig;
 use crate::constants::DEFAULT_CONFIG_PATH;
 use crate::manager::server::{ run_follower, run_leader };
 use crate::worker::agent::run_worker;
 use jsonnet::JsonnetVm;
-use std::error;
 
 use clap::{arg, Command};
 
@@ -34,7 +34,7 @@ pub fn config() -> Command {
         .subcommand(worker_cmd)
 }
 
-pub async fn handle(sub_matches: &clap::ArgMatches) -> Result<(), Box<dyn error::Error>> {
+pub async fn handle(sub_matches: &clap::ArgMatches) -> R<()> {
     if let Some(("worker", arg_matches)) = sub_matches.subcommand() {
         let token = arg_matches.get_one::<String>("token").ok_or("Must provide token")?;
         run_worker(token).await
@@ -54,7 +54,7 @@ pub async fn handle(sub_matches: &clap::ArgMatches) -> Result<(), Box<dyn error:
     }
 }
 
-fn parse_config(config_path: &str) -> Result<AgentConfig, Box<dyn error::Error>> {
+fn parse_config(config_path: &str) -> R<AgentConfig> {
     // Pluginify jsonnet
     let mut vm = JsonnetVm::new();
     let res = vm.evaluate_file(config_path);

@@ -45,7 +45,7 @@
 //     // doesn't end up getting moved.
 //     self.loaded_libraries.push(lib);
 
-//     let lib = self.loaded_libraries.last().unwrap();
+//     let lib = self.loaded_libraries.last()?;
 
 //     let constructor: Symbol<PluginCreate> = lib.get(b"_plugin_create")
 //         .chain_err(|| "The `_plugin_create` symbol wasn't found.")?;

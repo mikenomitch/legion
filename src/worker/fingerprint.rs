@@ -1,5 +1,5 @@
 use crate::cmd::structs::WorkerConfig;
-use std::error;
+use crate::util::R;
 
 use libloading::{Library, Symbol};
 use std::env::consts::{ARCH, OS};
@@ -47,7 +47,7 @@ pub fn fingerprint_node(config: &WorkerConfig) -> Map<String, Value> {
     ret
 }
 
-fn call_dynamic(path: &str) -> Result<Box<dyn Fingerprinter>, Box<dyn error::Error>> {
+fn call_dynamic(path: &str) -> R<Box<dyn Fingerprinter>> {
     unsafe {
         let lib = Library::new(path)?;
         let func: Symbol<unsafe extern "C" fn() -> Box<dyn Fingerprinter>> = lib.get(b"get")?;
@@ -232,7 +232,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fingerprint_node_works() {
+    fn fingerprint_node_works() -> R<()> {
         let config = &WorkerConfig{
             server: ServerConfig{
                 port: 9876,
@@ -249,12 +249,12 @@ mod tests {
             println!("v: {:?}", v.to_string());
         });
 
-        let os = res.get("os").unwrap().as_str().unwrap();
+        let os = res.get("os")?.as_str()?;
         assert_eq!("macos", os);
 
 
         // // Test that the plugin works
-        // let basic = res.get("basic").unwrap().as_str().unwrap();
+        // let basic = res.get("basic")?.as_str()?;
         // assert_eq!("output", basic);
     }
 }

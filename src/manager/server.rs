@@ -1,9 +1,9 @@
 use crate::cmd::structs::{AgentConfig, JoinTokenClaims};
 use crate::constants::{DEFAULT_ADDR, DEFAULT_PORT, TMP_SECRET_KEY};
 use crate::storage::node::{start_storage, Msg};
+use crate::util::R;
 
 use log::debug;
-use std::error;
 use std::str::FromStr;
 use std::sync::mpsc::{self, Receiver, Sender};
 // use std::thread;
@@ -48,11 +48,8 @@ impl Manager for ManagerAgentService {
     ) -> Result<Response<ManagerJoinReply>, Status> {
         debug!("Got a request from {:?}", request.remote_addr());
 
-        // let to_store = self.sender_to_store.lock().unwrap();
-
-        // to_store
-        //     .send(Msg::Content("LET ME IN".to_string()))
-        //     .unwrap();
+        // let to_store = self.sender_to_store.lock()?;
+        // to_store.send(Msg::Content("LET ME IN".to_string()))?;
 
         let reply = ManagerJoinReply {
             message: format!("Hello {}!", request.into_inner().address),
@@ -65,11 +62,9 @@ impl Manager for ManagerAgentService {
         &self,
         _request: Request<RunJobRequest>,
     ) -> Result<Response<RunJobReply>, Status> {
-        // let to_store = self.sender_to_store.lock().unwrap();
+        // let to_store = self.sender_to_store.lock()?;
+        // to_store.send(Msg::Content("ADD THE JOB".to_string()))?;
 
-        // to_store
-        //     .send(Msg::Content("ADD THE JOB".to_string()))
-        //     .unwrap();
 
         let reply = RunJobReply {
             message: format!("Hello {}!", "jorb"),
@@ -117,10 +112,8 @@ impl Manager for ManagerAgentService {
     }
 }
 
-pub async fn run_leader(config: AgentConfig) -> Result<(), Box<dyn error::Error>> {
-    let addr = format!("{}:{}", DEFAULT_ADDR, DEFAULT_PORT)
-        .parse()
-        .unwrap();
+pub async fn run_leader(config: AgentConfig) -> R<()> {
+    let addr = format!("{}:{}", DEFAULT_ADDR, DEFAULT_PORT).parse()?;
 
     let (sender_to_store, receiver_from_server) = mpsc::channel();
     let sender_to_store = Arc::new(Mutex::new(sender_to_store));
@@ -139,8 +132,7 @@ pub async fn run_leader(config: AgentConfig) -> Result<(), Box<dyn error::Error>
         "{}:{}",
         cloned_config.server.address, cloned_config.server.insecure_port
     )
-    .parse()
-    .unwrap();
+    .parse()?;
 
     let insecure_manager_service = get_insecure_manager_service();
     let join_server_fut = Server::builder()
@@ -153,7 +145,7 @@ pub async fn run_leader(config: AgentConfig) -> Result<(), Box<dyn error::Error>
     };
 
     let data_dir =
-        std::path::PathBuf::from_str("/Users/mike/code/legion/configs/tls/server").unwrap();
+        std::path::PathBuf::from_str("/Users/mike/code/legion/configs/tls/server")?;
     let cert = std::fs::read_to_string(data_dir.join("server.pem"))?;
     let key = std::fs::read_to_string(data_dir.join("server.key"))?;
     let identity = Identity::from_pem(cert, key);
@@ -178,10 +170,10 @@ pub async fn run_leader(config: AgentConfig) -> Result<(), Box<dyn error::Error>
 // =====================
 // =====================
 
-pub async fn run_follower(config: AgentConfig) -> Result<(), Box<dyn error::Error>> {
+pub async fn run_follower(config: AgentConfig) -> R<()> {
     let leader_addr = config.manager.leader_address.clone();
 
-    let addr = format!("{}:{}", DEFAULT_ADDR, 4848).parse().unwrap();
+    let addr = format!("{}:{}", DEFAULT_ADDR, 4848).parse()?;
 
     let mut client = ManagerClient::connect(leader_addr).await?;
 

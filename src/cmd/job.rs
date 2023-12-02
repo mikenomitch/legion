@@ -1,6 +1,6 @@
 use crate::constants::{DEFAULT_ADDR, DEFAULT_PORT, DEFAULT_PROTOCOL};
+use crate::util::R;
 use log::debug;
-use std::error;
 use clap::{arg, Command};
 
 #[allow(non_snake_case)]
@@ -25,7 +25,7 @@ pub fn config() -> Command {
         .subcommand(job_run_cmd)
         .subcommand(job_status_cmd)
 }
-pub async fn handle(sub_matches: &clap::ArgMatches) -> Result<(), Box<dyn error::Error>> {
+pub async fn handle(sub_matches: &clap::ArgMatches) -> R<()> {
     match sub_matches.subcommand() {
         Some(("run", _)) => run_job().await,
         Some(("status", _)) => get_status().await,
@@ -33,7 +33,7 @@ pub async fn handle(sub_matches: &clap::ArgMatches) -> Result<(), Box<dyn error:
     }
 }
 
-async fn run_job() -> Result<(), Box<dyn error::Error>> {
+async fn run_job() -> R<()> {
     let addr = format!("{}://{}:{}", DEFAULT_PROTOCOL, DEFAULT_ADDR, DEFAULT_PORT);
     let mut client = ManagerClient::connect(addr).await?;
 
@@ -48,7 +48,7 @@ async fn run_job() -> Result<(), Box<dyn error::Error>> {
     Ok(())
 }
 
-async fn get_status() -> Result<(), Box<dyn error::Error>> {
+async fn get_status() -> R<()> {
     let addr = format!("{}://{}:{}", DEFAULT_PROTOCOL, DEFAULT_ADDR, DEFAULT_PORT);
     let mut client = ManagerClient::connect(addr).await?;
 

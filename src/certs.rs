@@ -1,3 +1,5 @@
+use crate::util::R;
+
 // Note: Modified from: https://github.com/grimvoodoo/cert-gen
 
 /// This is a Rust script that generates SSL certificates for use in local development environments.
@@ -54,7 +56,7 @@ use std::io::{BufReader, Read};
 pub fn read_root_cert(
     pem_path: String,
     key_path: String,
-) -> Result<Certificate, Box<dyn std::error::Error>> {
+) -> R<Certificate> {
     // Open the PEM file containing both the certificate and private key
 
     let pem_cert_file = File::open(pem_path)?;
@@ -85,8 +87,8 @@ pub fn read_root_cert(
 ///
 /// The `Certificate` object for the new CA.
 
-pub fn create_ca_cert() -> Certificate {
-    let key_pair = KeyPair::generate(&PKCS_ECDSA_P256_SHA256).unwrap();
+pub fn create_ca_cert() -> R<Certificate> {
+    let key_pair = KeyPair::generate(&PKCS_ECDSA_P256_SHA256)?;
 
     let mut dn = DistinguishedName::new();
     dn.push(DnType::CommonName, "localhost");
@@ -102,22 +104,21 @@ pub fn create_ca_cert() -> Certificate {
 
     params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
 
-    let cert = Certificate::from_params(params).unwrap();
+    let cert = Certificate::from_params(params)?;
 
-    let cert_pem = cert.serialize_pem().unwrap();
+    let cert_pem = cert.serialize_pem()?;
 
-    std::fs::create_dir_all("configs/tls/").unwrap();
-    fs::write("configs/tls/rootca.pem", &cert_pem.as_bytes()).unwrap();
+    std::fs::create_dir_all("configs/tls/")?;
+    fs::write("configs/tls/rootca.pem", &cert_pem.as_bytes())?;
     fs::write(
         "configs/tls/rootca.key",
         &cert.serialize_private_key_pem().as_bytes(),
-    )
-    .unwrap();
+    )?;
 
-    cert
+    Ok(cert)
 }
 
-pub fn signed_cert_with_ca(ca_cert: Certificate, dn_name: String) -> (String, String, Certificate) {
+pub fn signed_cert_with_ca(ca_cert: Certificate, dn_name: String) -> R<(String, String, Certificate)> {
     let mut dn = DistinguishedName::new();
     dn.push(DnType::CommonName, dn_name.clone());
 
@@ -136,12 +137,12 @@ pub fn signed_cert_with_ca(ca_cert: Certificate, dn_name: String) -> (String, St
             0, 0, 0, 0, 0, 0, 0, 1,
         ))),
     ];
-    let cert = Certificate::from_params(params).unwrap();
+    let cert = Certificate::from_params(params)?;
 
-    let cert_signed = cert.serialize_pem_with_signer(&ca_cert).unwrap();
+    let cert_signed = cert.serialize_pem_with_signer(&ca_cert)?;
     let key = cert.serialize_private_key_pem();
 
-    (cert_signed, key, cert)
+    Ok((cert_signed, key, cert))
 }
 
 /// Generates a new SSL certificate and private key signed by the specified CA.
@@ -151,18 +152,18 @@ pub fn signed_cert_with_ca(ca_cert: Certificate, dn_name: String) -> (String, St
 /// * `ca_cert` - The `Certificate` object for the CA to sign the new certificate with.
 /// * `dn_name` - The domain name to generate the certificate for.
 
-pub fn write_signed_cert_with_ca(ca_cert: Certificate, dn_name: String) -> Certificate {
-    let (cert_signed, key, ca_cert_again) = signed_cert_with_ca(ca_cert, dn_name.clone());
+pub fn write_signed_cert_with_ca(ca_cert: Certificate, dn_name: String) -> R<Certificate> {
+    let (cert_signed, key, ca_cert_again) = signed_cert_with_ca(ca_cert, dn_name.clone())?;
 
     let path = format!("configs/tls/{dn_name}/");
     let cert_path = format!("configs/tls/{dn_name}/{dn_name}.pem");
     let key_path = format!("configs/tls/{dn_name}/{dn_name}.key");
 
-    std::fs::create_dir_all(path).unwrap();
-    fs::write(cert_path, cert_signed).unwrap();
-    fs::write(key_path, key).unwrap();
+    std::fs::create_dir_all(path)?;
+    fs::write(cert_path, cert_signed)?;
+    fs::write(key_path, key)?;
 
-    ca_cert_again
+    Ok(ca_cert_again)
 }
 
 #[cfg(test)]
@@ -170,9 +171,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn create_ca_cert_runs() {
-        let _cert = create_ca_cert();
-        assert!(true)
+    fn create_ca_cert_runs() -> R<()> {
+        let _cert = create_ca_cert()?;
+        assert!(true);
+
+        Ok(())
     }
 
     #[test]
@@ -197,17 +200,19 @@ mod tests {
     }
 
     #[test]
-    fn signed_cert_with_ca_works() {
-        let cert = create_ca_cert();
-        let (cert_signed, key, _) = signed_cert_with_ca(cert, "test".to_string());
+    fn signed_cert_with_ca_works() -> R<()> {
+        let cert = create_ca_cert()?;
+        let (cert_signed, key, _) = signed_cert_with_ca(cert, "test".to_string())?;
         assert!(cert_signed.len() > 0);
         assert!(key.len() > 0);
+
+        Ok(())
     }
 
     #[test]
-    fn write_signed_cert_with_ca_works() {
-        let cert = create_ca_cert();
-        write_signed_cert_with_ca(cert, "server".to_string());
-        // let cert_again = write_signed_cert_with_ca(cert, "client".to_string());
+    fn write_signed_cert_with_ca_works() -> R<()> {
+        let cert = create_ca_cert()?;
+        write_signed_cert_with_ca(cert, "server".to_string())?;
+        Ok(())
     }
 }

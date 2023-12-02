@@ -3,12 +3,13 @@ mod constants;
 use log::debug;
 mod manager;
 mod storage;
-mod types;
-mod worker;
 mod util;
+mod certs;
+mod worker;
+
 use clap::Command;
 use std::ffi::OsString;
-use std::error;
+use util::R;
 
 fn cli() -> Command {
     Command::new("legion")
@@ -22,7 +23,7 @@ fn cli() -> Command {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn error::Error>> {
+async fn main() -> R<()> {
     env_logger::init();
 
     let matches = cli().get_matches();
