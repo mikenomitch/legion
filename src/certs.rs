@@ -25,34 +25,6 @@ use std::fs;
 use std::fs::File;
 use std::io::{BufReader, Read};
 
-/// This is the main entry point for the program.
-///
-/// First it checks that the correct number of arguments have been passed in,
-/// then it checks if the first argument is "new" to create a new CA, or the path to an existing CA file.
-///
-/// The second argument is the domain name to generate the certificate for.
-///
-/// both are passed into the `signed_cert_with_ca` function to generate a new certificate and key pair
-/// signed by the specified CA.
-
-// TODO:
-// Replace time dep with chrono?
-// Remove main
-// Write a simple test that just runs the function
-// Write function you actually want
-// TDD your way to victory
-// Incorporate into the rest of the stuff
-
-/// Reads an existing CA certificate and private key from the specified PEM files.
-///
-/// # Arguments
-///
-/// * `ca_path` - The path to the CA file without any extension (e.g. "certs/rootca").
-///
-/// # Returns
-///
-/// The `Certificate` object for the CA, or an error if the PEM files could not be read or parsed.
-
 pub fn read_root_cert(
     pem_path: String,
     key_path: String,
@@ -80,12 +52,6 @@ pub fn read_root_cert(
 
     Ok(ca_cert)
 }
-
-/// Generates a new CA certificate and private key.
-///
-/// # Returns
-///
-/// The `Certificate` object for the new CA.
 
 pub fn create_ca_cert() -> R<Certificate> {
     let key_pair = KeyPair::generate(&PKCS_ECDSA_P256_SHA256)?;
@@ -145,13 +111,6 @@ pub fn signed_cert_with_ca(ca_cert: Certificate, dn_name: String) -> R<(String, 
     Ok((cert_signed, key, cert))
 }
 
-/// Generates a new SSL certificate and private key signed by the specified CA.
-///
-/// # Arguments
-///
-/// * `ca_cert` - The `Certificate` object for the CA to sign the new certificate with.
-/// * `dn_name` - The domain name to generate the certificate for.
-
 pub fn write_signed_cert_with_ca(ca_cert: Certificate, dn_name: String) -> R<Certificate> {
     let (cert_signed, key, ca_cert_again) = signed_cert_with_ca(ca_cert, dn_name.clone())?;
 
@@ -195,8 +154,6 @@ mod tests {
                 assert!(false);
             }
         }
-        // assert no error
-        // assert!(res.is_ok());
     }
 
     #[test]

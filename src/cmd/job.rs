@@ -1,4 +1,4 @@
-use crate::constants::{DEFAULT_ADDR, DEFAULT_PORT, DEFAULT_PROTOCOL};
+use crate::constants::{DEFAULT_HOSTNAME, DEFAULT_PORT, DEFAULT_PROTOCOL};
 use crate::util::R;
 use log::debug;
 use clap::{arg, Command};
@@ -34,7 +34,7 @@ pub async fn handle(sub_matches: &clap::ArgMatches) -> R<()> {
 }
 
 async fn run_job() -> R<()> {
-    let addr = format!("{}://{}:{}", DEFAULT_PROTOCOL, DEFAULT_ADDR, DEFAULT_PORT);
+    let addr = format!("{}://{}:{}", DEFAULT_PROTOCOL, DEFAULT_HOSTNAME, DEFAULT_PORT);
     let mut client = ManagerClient::connect(addr).await?;
 
     let request = tonic::Request::new(RunJobRequest {
@@ -49,7 +49,7 @@ async fn run_job() -> R<()> {
 }
 
 async fn get_status() -> R<()> {
-    let addr = format!("{}://{}:{}", DEFAULT_PROTOCOL, DEFAULT_ADDR, DEFAULT_PORT);
+    let addr = format!("{}://{}:{}", DEFAULT_PROTOCOL, DEFAULT_HOSTNAME, DEFAULT_PORT);
     let mut client = ManagerClient::connect(addr).await?;
 
     let request = tonic::Request::new(GetJobStatusRequest {

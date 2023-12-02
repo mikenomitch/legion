@@ -39,8 +39,6 @@ impl Worker for WorkerAgentService {
 }
 
 pub async fn run_worker(token: &str) -> R<()> {
-    // let addr: String = format!("{}:{}", DEFAULT_ADDR, DEFAULT_PORT).parse()?;
-
     println!("Starting worker node with token: {}", token);
 
     let token_data = match decode::<JoinTokenClaims>(

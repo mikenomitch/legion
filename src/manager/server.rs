@@ -1,5 +1,5 @@
 use crate::cmd::structs::{AgentConfig, JoinTokenClaims};
-use crate::constants::{DEFAULT_ADDR, DEFAULT_PORT, TMP_SECRET_KEY};
+use crate::constants::{DEFAULT_HOSTNAME, DEFAULT_PORT, TMP_SECRET_KEY};
 use crate::storage::node::{start_storage, Msg};
 use crate::util::R;
 
@@ -113,7 +113,7 @@ impl Manager for ManagerAgentService {
 }
 
 pub async fn run_leader(config: AgentConfig) -> R<()> {
-    let addr = format!("{}:{}", DEFAULT_ADDR, DEFAULT_PORT).parse()?;
+    let addr = format!("{}:{}", DEFAULT_HOSTNAME, DEFAULT_PORT).parse()?;
 
     let (sender_to_store, receiver_from_server) = mpsc::channel();
     let sender_to_store = Arc::new(Mutex::new(sender_to_store));
@@ -173,7 +173,7 @@ pub async fn run_leader(config: AgentConfig) -> R<()> {
 pub async fn run_follower(config: AgentConfig) -> R<()> {
     let leader_addr = config.manager.leader_address.clone();
 
-    let addr = format!("{}:{}", DEFAULT_ADDR, 4848).parse()?;
+    let addr = format!("{}:{}", DEFAULT_HOSTNAME, 4848).parse()?;
 
     let mut client = ManagerClient::connect(leader_addr).await?;
 

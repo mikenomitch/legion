@@ -1,7 +1,7 @@
 use crate::cmd::structs::{WorkerConfig, JoinTokenClaims};
 use crate::util::R;
 use crate::certs::{signed_cert_with_ca, read_root_cert};
-use crate::constants::{TMP_SECRET_KEY, DEFAULT_WORKER_CONFIG_PATH};
+use crate::constants::{TMP_SECRET_KEY, DEFAULT_WORKER_CONFIG_PATH, DEFAULT_ADDR};
 use tonic::{Request, Response, Status};
 
 use jsonnet::JsonnetVm;
@@ -29,14 +29,6 @@ impl InsecureManager for InsecureManagerService {
         &self,
         _request: Request<GetJoinTokenRequest>,
     ) -> Result<Response<GetJoinTokenReply>, Status> {
-        // TODO: Mint a signed JWT containing:
-
-        // - the node type (server or worker)
-        // - the node address & port
-        // - the node's public key (maybe?)
-        // - a cert to establish TLS
-        // - an expiration
-
         let token = generate_join_token().
             map_err(|e| Status::new(tonic::Code::Internal, e.to_string()))?;
 
@@ -71,7 +63,7 @@ pub fn generate_join_token() -> R<String> {
     let claims = JoinTokenClaims {
         sub: "legion".to_owned(),
         exp: 10000000000,
-        address: "https://localhost:4747".to_owned(),
+        address: DEFAULT_ADDR.to_owned(),
         cert: new_cert,
         key: new_key,
         ca_cert: ca_cert,

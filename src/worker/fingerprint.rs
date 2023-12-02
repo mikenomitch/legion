@@ -55,7 +55,7 @@ fn call_dynamic(path: &str) -> R<Box<dyn Fingerprinter>> {
     }
 }
 
-trait Fingerprinter {
+pub trait Fingerprinter {
     fn name(&self) -> &'static str;
 
     fn fingerprint(&self) -> Map<String, Value> {
@@ -245,16 +245,19 @@ mod tests {
         };
 
         let res = fingerprint_node(config);
-        res.values().for_each(|v| {
-            println!("v: {:?}", v.to_string());
-        });
 
-        let os = res.get("os")?.as_str()?;
+        // res.values().for_each(|v| {
+        //     println!("v: {:?}", v.to_string());
+        // });
+
+        let os = res.get("os").ok_or("no os")?.as_str().ok_or("no os")?;
         assert_eq!("macos", os);
 
 
-        // // Test that the plugin works
-        // let basic = res.get("basic")?.as_str()?;
-        // assert_eq!("output", basic);
+        // Test that the plugin works
+        let basic = res.get("basic").ok_or("no basic")?.as_str().ok_or("no basic")?;
+        assert_eq!("output", basic);
+
+        Ok(())
     }
 }

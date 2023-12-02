@@ -1,13 +1,14 @@
+mod certs;
 mod cmd;
 mod constants;
-use log::debug;
 mod manager;
+mod plugins;
 mod storage;
 mod util;
-mod certs;
 mod worker;
 
 use clap::Command;
+use log::debug;
 use std::ffi::OsString;
 use util::R;
 

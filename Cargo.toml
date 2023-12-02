@@ -20,8 +20,6 @@ sysinfo = "0.29.10"
 jsonwebtoken = "9.1.0"
 futures = "0.3"
 rcgen = { version = "0.11.3", features = ["pem", "x509-parser"] }
-chrono = "0.4.31"
-# TODO: Remove time dependency
 time = "0.3.30"
 
 [build-dependencies]

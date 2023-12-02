@@ -1,7 +1,5 @@
 #![crate_type = "cdylib"]
 
-// TODO: GET THE TRAIT FROM LEGION
-
 use serde_json::{Map, Number, Value};
 use std::collections::HashMap;
 

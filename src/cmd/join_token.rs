@@ -1,6 +1,6 @@
 use std::error;
 use clap::{arg, Command};
-// use log::debug;
+use crate::constants::DEFAULT_INSECURE_ADDR;
 
 #[allow(non_snake_case)]
 pub mod legion {
@@ -25,12 +25,11 @@ pub fn config() -> Command {
         .arg(arg!(-c --config [CONFIG] "test"))
 }
 pub async fn handle(_sub_matches: &clap::ArgMatches) -> Result<(), Box<dyn error::Error>> {
-    // TODO:
-    // Add: one-time token or persistent token argument
+    // TODO: add one-time token or persistent token argument
 
-    // request token from the server
-    // TODO: Eventually this should pick up the address from env var
-    let address = "http://localhost:4748";
+    let address = std::env::var("LEGION_ADDR").
+        unwrap_or(DEFAULT_INSECURE_ADDR.to_owned());
+
     let mut client = InsecureManagerClient::connect(address).await?;
     let request = tonic::Request::new(GetJoinTokenRequest {
         one_time: false,
