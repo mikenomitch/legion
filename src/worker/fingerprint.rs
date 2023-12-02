@@ -60,7 +60,7 @@ pub trait Fingerprinter {
 
     fn fingerprint(&self) -> Map<String, Value> {
         let mut map = Map::new();
-        map.insert("foo".to_string(), Value::String("bar".to_string()));
+        map.insert("foo".into(), Value::String("bar".into()));
         map
     }
 }
@@ -74,7 +74,7 @@ impl Fingerprinter for OSFingerprinter {
 
     fn fingerprint(&self) -> Map<String, Value> {
         let mut map = Map::new();
-        map.insert("os".to_string(), Value::String(OS.to_string()));
+        map.insert("os".into(), Value::String(OS.into()));
         map
     }
 }
@@ -88,7 +88,7 @@ impl Fingerprinter for ArchFingerprinter {
 
     fn fingerprint(&self) -> Map<String, Value> {
         let mut map = Map::new();
-        map.insert("arch".to_string(), Value::String(ARCH.to_string()));
+        map.insert("arch".into(), Value::String(ARCH.to_string()));
         map
     }
 }
@@ -114,42 +114,42 @@ impl Fingerprinter for KitchenSinkFingerprinter {
             let mut network_map: Map<String, Value> = Map::new();
 
             network_map.insert(
-                "name".to_string(),
+                "name".into(),
                 Value::String(interface_name.to_string()),
             );
 
             network_map.insert(
-                "mac_address".to_string(),
+                "mac_address".into(),
                 Value::String(data.mac_address().to_string()),
             );
 
-            networks_map.insert(interface_name.to_string(), Value::Object(network_map));
+            networks_map.insert(interface_name.into(), Value::Object(network_map));
         }
 
-        fingerprint.insert("networks".to_string(), Value::Object(networks_map));
+        fingerprint.insert("networks".into(), Value::Object(networks_map));
 
         // === CPUS ===
 
         let mut cpus_hash: Map<String, Value> = Map::new();
         sys.cpus().iter().for_each(|cpu| {
             let mut cpu_hash: Map<String, Value> = Map::new();
-            cpu_hash.insert("name".to_string(), Value::String(cpu.name().to_string()));
+            cpu_hash.insert("name".into(), Value::String(cpu.name().to_string()));
             cpu_hash.insert(
-                "usage".to_string(),
+                "usage".into(),
                 Value::String(cpu.cpu_usage().to_string()),
             );
             cpu_hash.insert(
-                "frequency".to_string(),
+                "frequency".into(),
                 Value::String(cpu.frequency().to_string()),
             );
             cpu_hash.insert(
-                "vendor_id".to_string(),
+                "vendor_id".into(),
                 Value::String(cpu.vendor_id().to_string()),
             );
-            cpus_hash.insert(cpu.name().to_string(), Value::Object(cpu_hash));
+            cpus_hash.insert(cpu.name().into(), Value::Object(cpu_hash));
         });
 
-        fingerprint.insert("cpus".to_string(), Value::Object(cpus_hash));
+        fingerprint.insert("cpus".into(), Value::Object(cpus_hash));
 
         // === Disks ===
 
@@ -157,59 +157,59 @@ impl Fingerprinter for KitchenSinkFingerprinter {
         sys.disks().iter().for_each(|disk| {
             let mut disk_hash: Map<String, Value> = Map::new();
             disk_hash.insert(
-                "disk_name".to_string(),
+                "disk_name".into(),
                 Value::String(disk.name().to_str().unwrap_or("").to_string()),
             );
             // disk_hash.insert(
-            //     "disk_file_system".to_string(),
+            //     "disk_file_system".into(),
             //     disk.file_system(),
             // );
             disk_hash.insert(
-                "disk_mount_point".to_string(),
+                "disk_mount_point".into(),
                 Value::String(disk.mount_point().to_str().unwrap_or("").to_string()),
             );
 
             fingerprint.insert(
-                "disk_total_space".to_string(),
+                "disk_total_space".into(),
                 Value::String(disk.total_space().to_string()),
             );
             fingerprint.insert(
-                "disk_available_space".to_string(),
+                "disk_available_space".into(),
                 Value::String(disk.available_space().to_string()),
             );
             fingerprint.insert(
-                "disk_is_removable".to_string(),
+                "disk_is_removable".into(),
                 Value::String(disk.is_removable().to_string()),
             );
 
             disks_hash.insert(
-                disk.name().to_str().unwrap_or("").to_string(),
+                disk.name().to_str().unwrap_or("").into(),
                 Value::Object(disk_hash)
             );
         });
 
-        fingerprint.insert("disks".to_string(), Value::Object(disks_hash));
+        fingerprint.insert("disks".into(), Value::Object(disks_hash));
 
         // === Memory ===
 
         fingerprint.insert(
-            "memory_total".to_string(),
+            "memory_total".into(),
             Value::String(sys.total_memory().to_string()),
         );
         fingerprint.insert(
-            "memory_free".to_string(),
+            "memory_free".into(),
             Value::String(sys.free_memory().to_string()),
         );
         fingerprint.insert(
-            "memory_used".to_string(),
+            "memory_used".into(),
             Value::String(sys.used_memory().to_string()),
         );
         fingerprint.insert(
-            "memory_swap_total".to_string(),
+            "memory_swap_total".into(),
             Value::String(sys.total_swap().to_string()),
         );
         fingerprint.insert(
-            "memory_swap_free".to_string(),
+            "memory_swap_free".into(),
             Value::String(sys.free_swap().to_string()),
         );
 
@@ -217,7 +217,7 @@ impl Fingerprinter for KitchenSinkFingerprinter {
 
         let signals = System::SUPPORTED_SIGNALS;
         fingerprint.insert(
-            "signals".to_string(),
+            "signals".into(),
             Value::Array(signals.iter().map(|s| Value::String(s.to_string())).collect()),
         );
 
@@ -237,10 +237,10 @@ mod tests {
             server: ServerConfig{
                 port: 9876,
                 insecure_port: 9999,
-                address: "1.1.1.1".to_string(),
+                address: "1.1.1.1".into(),
             },
             worker_config: WorkerConfigFromManager{
-                additional_fingerprinters: vec!["/Users/mike/Code/legion/plugins/fingerprinters/example/target/release/libexample.dylib".to_string()],
+                additional_fingerprinters: vec!["/Users/mike/Code/legion/plugins/fingerprinters/example/target/release/libexample.dylib".into()],
             }
         };
 

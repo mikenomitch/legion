@@ -37,7 +37,7 @@ pub async fn handle(_sub_matches: &clap::ArgMatches) -> Result<(), Box<dyn error
     let response = client.get_join_token(request).await?;
     println!("RESPONSE={:?}", response);
 
-    let t = response.get_ref().token.to_string();
+    let t = &response.get_ref().token;
 
     // print response & instructions
     println!("Generated token: {}", t);

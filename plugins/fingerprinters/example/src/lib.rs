@@ -8,7 +8,7 @@ trait Fingerprinter {
 
     fn fingerprint(&self) -> Map<String, Value> {
         let mut map = Map::new();
-        map.insert("foo".to_string(), Value::String("bar".to_string()));
+        map.insert("foo".into(), Value::String("bar".into()));
         map
     }
 }
@@ -20,7 +20,7 @@ impl Fingerprinter for BasicFingerprinter {
 
     fn fingerprint(&self) -> Map<String, Value> {
         let mut map = Map::new();
-        map.insert("basic".to_string(), Value::String("output".to_string()));
+        map.insert("basic".into(), Value::String("output".into()));
         map
     }
 }

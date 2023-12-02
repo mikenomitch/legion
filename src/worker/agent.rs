@@ -29,7 +29,7 @@ impl Worker for WorkerAgentService {
         debug!("Got a request from {:?}", request.remote_addr());
 
         let reply = PostWorkReply {
-            message: "I got work yay!".to_string(),
+            message: "I got work yay!".into(),
         };
 
         Ok(Response::new(reply))

@@ -131,8 +131,8 @@ mod tests {
     #[test]
     fn read_root_cert_works() {
         // NOTE: Replace with better files
-        let ca_pem_path = "/Users/mike/code/legion/configs/tls/rootca.pem".to_string();
-        let ca_key_path = "/Users/mike/code/legion/configs/tls/rootca.key".to_string();
+        let ca_pem_path: String = "/Users/mike/code/legion/configs/tls/rootca.pem".into();
+        let ca_key_path: String = "/Users/mike/code/legion/configs/tls/rootca.key".into();
 
         let res = read_root_cert(ca_pem_path, ca_key_path);
 
@@ -150,7 +150,7 @@ mod tests {
     #[test]
     fn signed_cert_with_ca_works() -> R<()> {
         let cert = create_ca_cert()?;
-        let (cert_signed, key, _) = signed_cert_with_ca(cert, "test".to_string())?;
+        let (cert_signed, key, _) = signed_cert_with_ca(cert, "test".into())?;
         assert!(cert_signed.len() > 0);
         assert!(key.len() > 0);
 
@@ -160,7 +160,7 @@ mod tests {
     #[test]
     fn write_signed_cert_with_ca_works() -> R<()> {
         let cert = create_ca_cert()?;
-        write_signed_cert_with_ca(cert, "server".to_string())?;
+        write_signed_cert_with_ca(cert, "server".into())?;
         Ok(())
     }
 }

@@ -52,10 +52,10 @@ pub fn generate_join_token() -> R<String> {
     // I think what I have to do is:
     // - When the client connects, it will use this leaf cert
 
-    let ca_pem_path = "/Users/mike/code/legion/configs/tls/rootca.pem".to_string();
-    let ca_key_path = "/Users/mike/code/legion/configs/tls/rootca.key".to_string();
+    let ca_pem_path: String = "/Users/mike/code/legion/configs/tls/rootca.pem".into();
+    let ca_key_path: String = "/Users/mike/code/legion/configs/tls/rootca.key".into();
     let cert = read_root_cert(ca_pem_path, ca_key_path)?;
-    let (new_cert, new_key, ca_cert_again) = signed_cert_with_ca(cert, "legion".to_string())?;
+    let (new_cert, new_key, ca_cert_again) = signed_cert_with_ca(cert, "legion".into())?;
     // let ca_as_string = std::fs::read_to_string(ca_pem_path.clone())?;
     let ca_cert = ca_cert_again.serialize_pem()?;
 

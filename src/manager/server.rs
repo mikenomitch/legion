@@ -46,7 +46,7 @@ impl Manager for ManagerAgentService {
         debug!("Got a request from {:?}", request.remote_addr());
 
         // let to_store = self.sender_to_store.lock()?;
-        // to_store.send(Msg::Content("LET ME IN".to_string()))?;
+        // to_store.send(Msg::Content("LET ME IN".into()))?;
 
         let reply = ManagerJoinReply {
             message: format!("Hello {}!", request.into_inner().address),
