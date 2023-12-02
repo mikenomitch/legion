@@ -8,45 +8,46 @@ service Manager {
   rpc WorkerJoin (WorkerJoinRequest) returns (WorkerJoinReply);
   rpc RunJob (RunJobRequest) returns (RunJobReply);
   rpc GetJobStatus (GetJobStatusRequest) returns (GetJobStatusReply);
+  rpc Heartbeat (HeartbeatRequest) returns (HeartbeatReply);
 }
 
 message ManagerJoinRequest {
-  // Request message contains the address of the joining node
   string address = 1;
 }
 
 message ManagerJoinReply {
-  // Reply contains the greeting message
   string message = 1;
 }
 
 message WorkerJoinRequest {
-  // Request message contains the join-token
   string token = 1;
 }
 
 message WorkerJoinReply {
-  // Reply contains a message for now, but eventually a bunch of config
   string message = 1;
 }
 
 message RunJobRequest {
-  // Request message contains the address of the joining node
   string name = 1;
 }
 
 message RunJobReply {
-  // Reply contains the greeting message
   string message = 1;
 }
 
 message GetJobStatusRequest {
-  // Request message contains the address of the joining node
   string name = 1;
 }
 
 message GetJobStatusReply {
-  // Reply contains the greeting message
+  string message = 1;
+}
+
+message HeartbeatRequest {
+  string name = 1;
+}
+
+message HeartbeatReply {
   string message = 1;
 }
 

@@ -1,10 +1,11 @@
 use crate::cmd::structs::JoinTokenClaims;
-use crate::constants::{DEFAULT_HOSTNAME, TMP_SECRET_KEY};
+use crate::constants::{DEFAULT_HOSTNAME, TMP_SECRET_KEY, WORKER_HEARTBEAT_DURATION};
 use crate::util::R;
 use crate::worker::fingerprint::fingerprint_node;
 
 use jsonwebtoken::{decode, errors::ErrorKind, Algorithm, DecodingKey, Validation};
 use log::debug;
+use futures::join;
 
 use tonic::{
     transport::Certificate, transport::Channel, transport::ClientTlsConfig, transport::Server,
@@ -16,7 +17,7 @@ pub mod legion {
 }
 use legion::manager_client::ManagerClient;
 use legion::worker_server::{Worker, WorkerServer};
-use legion::{PostWorkReply, PostWorkRequest, RunJobRequest};
+use legion::{PostWorkReply, PostWorkRequest, HeartbeatRequest};
 
 pub struct WorkerAgentService {}
 #[tonic::async_trait]
@@ -36,8 +37,6 @@ impl Worker for WorkerAgentService {
 }
 
 pub async fn run_worker(token: &str) -> R<()> {
-    println!("Starting worker node with token: {}", token);
-
     let token_data = match decode::<JoinTokenClaims>(
         &token,
         &DecodingKey::from_secret(&TMP_SECRET_KEY[..]),
@@ -55,10 +54,11 @@ pub async fn run_worker(token: &str) -> R<()> {
         }
     };
 
-    println!("{:?}", token_data.claims.address);
-    println!("{:?}", token_data.claims.config);
+    // println!("{:?}", token_data.claims.address);
+    // println!("{:?}", token_data.claims.config);
 
-    println!("cert {:?}", token_data.claims.ca_cert);
+    // TODO: ESTABLISH TLS CONNECTION PROPERLY
+    // println!("cert {:?}", token_data.claims.ca_cert);
 
     let fingerprint_data = fingerprint_node(&token_data.claims.config);
 
@@ -69,42 +69,39 @@ pub async fn run_worker(token: &str) -> R<()> {
         .ok_or("OS fingerprinter returned a non-string value")?;
 
     println!("OS fingerprinted as: {:?}", os);
+    // TODO: SEND THE REAL RE-REGISTRATION WITH FINGERPRINT DATA
 
-    // TODO: ESTABLISH TLS CONNECTION
-    // TODO: SEND REAL REGISTRATION
-    // TODO: GET FROM TOKEN
-
-    // TODO: Remove once testing is done
-    // ---- START TEST -----
-    // Temporarily estabilish a connection to the manager
-
-    let ca_cert = Certificate::from_pem(token_data.claims.ca_cert);
-    let tls = ClientTlsConfig::new().ca_certificate(ca_cert);
-
-    let manager_addr = token_data.claims.address;
-    let channel = Channel::from_shared(manager_addr)?
-        .tls_config(tls)?
-        .connect()
-        .await?;
-
-    let mut client = ManagerClient::new(channel);
-    let request = tonic::Request::new(RunJobRequest {
-        name: "Mike".into(),
-    });
-    let response = client.run_job(request).await?;
-    debug!("RESPONSE={:?}", response);
-    // ---- END TEST -----
-
-    let worker_addr = format!("{}:{}", DEFAULT_HOSTNAME, 4848).parse()?;
-    println!("Worker node starting on {}", worker_addr);
-
-    // TODO: ADD YOUR OWN TLS TO THIS!
-    // TODO: START HEARTBEAT LOOP
+    let addr = format!("{}:{}", DEFAULT_HOSTNAME, 4848).parse()?;
     let worker_node = WorkerAgentService {};
-    Server::builder()
+    let worker_server_fut = Server::builder()
         .add_service(WorkerServer::new(worker_node))
-        .serve(worker_addr)
-        .await?;
+        .serve(addr);
+
+    let heartbeat_fut = start_heartbeats(token_data.claims.address, token_data.claims.ca_cert);
+
+    let _res = join!(heartbeat_fut, worker_server_fut);
 
     Ok(())
+}
+
+
+async fn start_heartbeats(manager_addr: String, ca_cert: String) -> R<()> {
+    let ca_cert = Certificate::from_pem(ca_cert);
+    let tls = ClientTlsConfig::new().ca_certificate(ca_cert);
+    let channel = Channel::from_shared(manager_addr)?
+        .tls_config(tls.clone())?
+        .connect()
+        .await?;
+    let mut client = ManagerClient::new(channel);
+
+    loop {
+        let req = tonic::Request::new(HeartbeatRequest {
+            name: "worker-a".into(),
+        });
+
+        let response = client.heartbeat(req).await?;
+        debug!("RESPONSE={:?}", response);
+
+        tokio::time::sleep(tokio::time::Duration::from_secs(WORKER_HEARTBEAT_DURATION)).await;
+    }
 }

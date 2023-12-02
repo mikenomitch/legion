@@ -22,8 +22,8 @@ use legion::manager_client::ManagerClient;
 use legion::manager_server::{Manager, ManagerServer};
 
 use legion::{
-    GetJobStatusReply, GetJobStatusRequest, ManagerJoinReply, ManagerJoinRequest, RunJobReply,
-    RunJobRequest, WorkerJoinReply, WorkerJoinRequest,
+    GetJobStatusReply, GetJobStatusRequest, HeartbeatReply, HeartbeatRequest, ManagerJoinReply,
+    ManagerJoinRequest, RunJobReply, RunJobRequest, WorkerJoinReply, WorkerJoinRequest,
 };
 
 use tonic::transport::{Identity, Server, ServerTlsConfig};
@@ -61,7 +61,6 @@ impl Manager for ManagerAgentService {
     ) -> Result<Response<RunJobReply>, Status> {
         // let to_store = self.sender_to_store.lock()?;
         // to_store.send(Msg::Content("ADD THE JOB".to_string()))?;
-
 
         let reply = RunJobReply {
             message: format!("Hello {}!", "jorb"),
@@ -107,6 +106,17 @@ impl Manager for ManagerAgentService {
 
         Ok(Response::new(reply))
     }
+
+    async fn heartbeat(
+        &self,
+        _request: Request<HeartbeatRequest>,
+    ) -> Result<Response<HeartbeatReply>, Status> {
+        let reply = HeartbeatReply {
+            message: format!("Thunky thunk"),
+        };
+
+        Ok(Response::new(reply))
+    }
 }
 
 pub async fn run_leader(config: AgentConfig) -> R<()> {
@@ -141,15 +151,14 @@ pub async fn run_leader(config: AgentConfig) -> R<()> {
         receiver_from_store: receiver_from_store,
     };
 
-    let data_dir =
-        std::path::PathBuf::from_str("/Users/mike/code/legion/configs/tls/server")?;
+    let data_dir = std::path::PathBuf::from_str("/Users/mike/code/legion/configs/tls/server")?;
     let cert = std::fs::read_to_string(data_dir.join("server.pem"))?;
     let key = std::fs::read_to_string(data_dir.join("server.key"))?;
     let identity = Identity::from_pem(cert, key);
-    let tls = ServerTlsConfig::new().identity(identity);
+    let _tls = ServerTlsConfig::new().identity(identity);
 
     let start_server_fut = Server::builder()
-        .tls_config(tls)?
+        // .tls_config(tls)?
         .add_service(ManagerServer::new(manager_node))
         .serve(addr);
 
