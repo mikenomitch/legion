@@ -1,16 +1,13 @@
 use crate::cmd::structs::{AgentConfig, JoinTokenClaims};
 use crate::constants::{DEFAULT_HOSTNAME, DEFAULT_PORT, TMP_SECRET_KEY};
-use crate::storage::node::{start_storage, Msg};
+use crate::storage::store::Store;
 use crate::util::R;
 
 use log::debug;
-use rusqlite::Connection;
 use std::str::FromStr;
-use std::sync::mpsc::{self, Receiver, Sender};
 
 use jsonwebtoken::errors::ErrorKind;
 use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
-use std::sync::{Arc, Mutex};
 
 use futures::join;
 
@@ -31,18 +28,10 @@ use legion::{
 use tonic::transport::{Identity, Server, ServerTlsConfig};
 use tonic::{Request, Response, Status};
 
-// TODO: Make it a real map
-#[derive(Debug)]
-struct Node {
-    id: String,
-    attrs: String,
-}
-
 #[allow(dead_code)]
 // #[derive(Default)]
 pub struct ManagerAgentService {
-    sender_to_store: Arc<Mutex<Sender<Msg>>>,
-    receiver_from_store: Arc<Mutex<Receiver<String>>>,
+    store: Store,
 }
 
 #[tonic::async_trait]
@@ -53,9 +42,6 @@ impl Manager for ManagerAgentService {
         request: Request<ManagerJoinRequest>,
     ) -> Result<Response<ManagerJoinReply>, Status> {
         debug!("Got a request from {:?}", request.remote_addr());
-
-        // let to_store = self.sender_to_store.lock()?;
-        // to_store.send(Msg::Content("LET ME IN".into()))?;
 
         let reply = ManagerJoinReply {
             message: format!("Hello {}!", request.into_inner().address),
@@ -68,8 +54,6 @@ impl Manager for ManagerAgentService {
         &self,
         _request: Request<RunJobRequest>,
     ) -> Result<Response<RunJobReply>, Status> {
-        // let to_store = self.sender_to_store.lock()?;
-        // to_store.send(Msg::Content("ADD THE JOB".to_string()))?;
 
         let reply = RunJobReply {
             message: format!("Hello {}!", "jorb"),
@@ -136,25 +120,12 @@ impl Manager for ManagerAgentService {
         let name = request.name;
         let attrs = request.attributes;
 
-        let conn = Connection::open("foo.db").unwrap();
+        self.store.upsert_node(name.clone(), attrs.clone()).unwrap();
+        let nodes = self.store.get_nodes().unwrap();
 
-        conn.execute(
-            "INSERT INTO node (id, attrs) VALUES (?1, ?2)",
-            (&name, &attrs),
-        ).unwrap();
-
-        let mut stmt = conn.prepare("SELECT id, attrs FROM node").unwrap();
-        let node_iter = stmt.query_map([], |row| {
-            Ok(Node {
-                id: row.get(0).unwrap(),
-                attrs: row.get(1).unwrap(),
-            })
-        }).unwrap();
-
-        for node in node_iter {
-            let n = node.unwrap();
-            println!("Found node {:?}", n.id);
-            println!("With attrs: {:?}", n.attrs);
+        for node in nodes {
+            println!("Found node {:?}", node.id);
+            println!("With attrs: {:?}", node.attrs);
         }
 
         let reply = WorkerRegisterReply {
@@ -167,20 +138,10 @@ impl Manager for ManagerAgentService {
 
 pub async fn run_leader(config: AgentConfig) -> R<()> {
     let addr = format!("{}:{}", DEFAULT_HOSTNAME, DEFAULT_PORT).parse()?;
-
-    let (sender_to_store, receiver_from_server) = mpsc::channel();
-    let sender_to_store = Arc::new(Mutex::new(sender_to_store));
-
-    let (sender_to_server, receiver_from_store) = mpsc::channel();
-    let sender_to_server = Arc::new(Mutex::new(sender_to_server));
-    let receiver_from_store = Arc::new(Mutex::new(receiver_from_store));
-
     let cloned_config = config.clone();
-
-    start_storage(receiver_from_server, sender_to_server, config);
+    let store = Store::start_storage()?;
 
     // Spawn a separate grpc server for non-TLS calls
-
     let join_server_addr = format!(
         "{}:{}",
         cloned_config.server.address, cloned_config.server.insecure_port
@@ -193,8 +154,7 @@ pub async fn run_leader(config: AgentConfig) -> R<()> {
         .serve(join_server_addr);
 
     let manager_node = ManagerAgentService {
-        sender_to_store: sender_to_store,
-        receiver_from_store: receiver_from_store,
+        store: store,
     };
 
     let data_dir = std::path::PathBuf::from_str("/Users/mike/code/legion/configs/tls/server")?;
@@ -237,18 +197,10 @@ pub async fn run_follower(config: AgentConfig) -> R<()> {
     let response = client.manager_join(request).await?;
     debug!("RESPONSE={:?}", response);
 
-    let (sender_to_store, receiver_from_server) = mpsc::channel();
-    let sender_to_store = Arc::new(Mutex::new(sender_to_store));
-
-    let (sender_to_server, receiver_from_store) = mpsc::channel();
-    let sender_to_server = Arc::new(Mutex::new(sender_to_server));
-    let receiver_from_store = Arc::new(Mutex::new(receiver_from_store));
-
-    let _ = start_storage(receiver_from_server, sender_to_server, config);
+    let store = Store::start_storage()?;
 
     let manager_node = ManagerAgentService {
-        sender_to_store: sender_to_store,
-        receiver_from_store: receiver_from_store,
+        store: store,
     };
 
     debug!("Manager node starting on {}", addr);
