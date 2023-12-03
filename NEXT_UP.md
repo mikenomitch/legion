@@ -1,17 +1,29 @@
 # Next Up
-* Goal: Save node data to a store
+* Goal: Get dynamic node metadata call working
 
-* Test of Goal:
-- You can do this with two different workers at same time (diff names)
+* Success:
+- The following commands all work:
+    - cr node update worker -a foo baz
+    - cr node update worker -a foo.bar baz
+    - cr node update worker -a foo.bar baz -a wiz.woz wat
+    - cr bode update worker -f ./path/to/data.jsonette
 
-* Steps:
+# After that
+* Goal: Heartbeats actually monitor status
+
+* Success:
+- I can start a node
+- I can get its status with a "node info" command
+- If I kill the node, the status updates in N seconds
+- I can restart the node
+- The status updates again
 
 # Deferred Work
 
 Start with:
 * Goal: Make join process establish TLS
 
-* Test:
+* Success:
 - Run server with `cr start``
 - Try `cr job status`
 - Note that it fails
