@@ -2,7 +2,6 @@
 * Goal: Save node data to a store
 
 * Test of Goal:
-- A new list workers command shows the node in there
 - You can do this with two different workers at same time (diff names)
 
 * Steps:

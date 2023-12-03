@@ -11,6 +11,8 @@ service Manager {
   rpc GetJobStatus (GetJobStatusRequest) returns (GetJobStatusReply);
   rpc Heartbeat (HeartbeatRequest) returns (HeartbeatReply);
   rpc GetNodes (GetNodesRequest) returns (GetNodesReply);
+  rpc UpdateNodeDynamic (UpdateNodeDynamicRequest)
+    returns (UpdateNodeDynamicReply);
 }
 
 message ManagerJoinRequest {
@@ -68,10 +70,20 @@ message GetNodesRequest {
 message Node {
   string id = 1;
   string attrs = 2;
+  string dynamic = 3;
 }
 
 message GetNodesReply {
   repeated Node nodes = 1;
+}
+
+message UpdateNodeDynamicRequest {
+  string id = 1;
+  string dynamic_diff = 2;
+}
+
+message UpdateNodeDynamicReply {
+  optional Node node = 1;
 }
 
 // === INSECURE MANAGER ===

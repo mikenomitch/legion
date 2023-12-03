@@ -10,12 +10,6 @@ pub mod legion {
 
 use legion::Node;
 
-// #[derive(Debug)]
-// pub struct Node {
-//     pub id: String,
-//     pub attrs: String,
-// }
-
 // warning incorrectly
 #[allow(dead_code)]
 pub enum Msg {
@@ -54,7 +48,8 @@ impl Store {
         conn.execute(
             "CREATE TABLE IF NOT EXISTS node (
                 id    STRING PRIMARY KEY,
-                attrs  STRING NOT NULL
+                attrs  STRING NOT NULL,
+                dynamic STRING NOT NULL
             )",
             (), // empty list of parameters.
         )?;
@@ -66,25 +61,48 @@ impl Store {
     // NODES
     // ========================================
 
-    pub fn upsert_node(&self, id: String, attrs: String) -> R<()> {
+    pub fn upsert_node(&self, id: String, attrs: String, dynamic: String) -> R<()> {
         let conn = self.conn.lock().unwrap();
         let sql = r#"
-INSERT INTO node (id, attrs)
-VALUES (?1, ?2)
-ON CONFLICT(id) DO UPDATE SET attrs = ?2;
+INSERT INTO node (id, attrs, dynamic)
+VALUES (?1, ?2, ?3)
+ON CONFLICT(id) DO UPDATE SET attrs = ?2, dynamic = ?3;
 "#;
-        conn.execute(sql, (id, attrs))?;
+        conn.execute(sql, (id, attrs, dynamic))?;
 
         Ok(())
     }
 
+    pub fn get_node(&self, id: String) -> R<Option<Node>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT id, attrs, dynamic FROM node WHERE id = ?")?;
+        let node_iter = stmt.query_map([id], |row| {
+            Ok(Node {
+                id: row.get(0).unwrap(),
+                attrs: row.get(1).unwrap(),
+                dynamic: row.get(2).unwrap(),
+            })
+        })?;
+
+        let mut nodes = Vec::new();
+        for node in node_iter {
+            let n = node.unwrap();
+            nodes.push(n);
+        }
+
+        let node = nodes.pop();
+
+        Ok(node)
+    }
+
     pub fn get_nodes(&self) -> R<Vec<Node>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT id, attrs FROM node")?;
+        let mut stmt = conn.prepare("SELECT id, attrs, dynamic FROM node")?;
         let node_iter = stmt.query_map([], |row| {
             Ok(Node {
                 id: row.get(0).unwrap(),
                 attrs: row.get(1).unwrap(),
+                dynamic: row.get(2).unwrap(),
             })
         })?;
 
@@ -97,7 +115,11 @@ ON CONFLICT(id) DO UPDATE SET attrs = ?2;
         Ok(nodes)
     }
 
-    // ========================================
+    pub fn update_node_dyamic(&self, id: String, dynamic_diff: String) -> R<Option<Node>> {
+        self.get_node(id.clone())
+    }
+
+    // =======================================
     // JOBS
     // ========================================
 }

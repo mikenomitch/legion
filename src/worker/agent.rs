@@ -110,7 +110,7 @@ async fn register_self(client: ManagerClient<Channel>, fingerprint_data: Map<Str
 
 
     let req = tonic::Request::new(WorkerRegisterRequest {
-        name: "worker-a".into(),
+        name: "worker".into(),
         attributes: serialized_data,
     });
 

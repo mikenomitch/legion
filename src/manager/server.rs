@@ -20,9 +20,10 @@ use legion::manager_client::ManagerClient;
 use legion::manager_server::{Manager, ManagerServer};
 
 use legion::{
-    GetJobStatusReply, GetJobStatusRequest, HeartbeatReply, HeartbeatRequest, ManagerJoinReply,
-    ManagerJoinRequest, RunJobReply, RunJobRequest, WorkerJoinReply, WorkerJoinRequest,
-    WorkerRegisterReply, WorkerRegisterRequest, GetNodesReply, GetNodesRequest, Node
+    GetJobStatusReply, GetJobStatusRequest, GetNodesReply, GetNodesRequest, HeartbeatReply,
+    HeartbeatRequest, ManagerJoinReply, ManagerJoinRequest, Node, RunJobReply, RunJobRequest,
+    UpdateNodeDynamicReply, UpdateNodeDynamicRequest, WorkerJoinReply, WorkerJoinRequest,
+    WorkerRegisterReply, WorkerRegisterRequest,
 };
 
 use tonic::transport::{Identity, Server, ServerTlsConfig};
@@ -54,7 +55,6 @@ impl Manager for ManagerAgentService {
         &self,
         _request: Request<RunJobRequest>,
     ) -> Result<Response<RunJobReply>, Status> {
-
         let reply = RunJobReply {
             message: format!("Hello {}!", "jorb"),
         };
@@ -115,12 +115,14 @@ impl Manager for ManagerAgentService {
         &self,
         request: Request<WorkerRegisterRequest>,
     ) -> Result<Response<WorkerRegisterReply>, Status> {
-
         let request = request.into_inner();
         let name = request.name;
         let attrs = request.attributes;
+        let dynamic = "{}";
 
-        self.store.upsert_node(name.clone(), attrs.clone()).unwrap();
+        self.store
+            .upsert_node(name.clone(), attrs.clone(), dynamic.into())
+            .unwrap();
         let nodes = self.store.get_nodes().unwrap();
 
         for node in nodes {
@@ -141,17 +143,41 @@ impl Manager for ManagerAgentService {
     ) -> Result<Response<GetNodesReply>, Status> {
         let nodes = self.store.get_nodes().unwrap();
 
-        let mut reply = GetNodesReply {
-            nodes: Vec::new(),
-        };
+        let mut reply = GetNodesReply { nodes: Vec::new() };
 
         for node in nodes {
             let n = Node {
                 id: node.id,
                 attrs: node.attrs,
+                dynamic: "".into(),
             };
             reply.nodes.push(n);
         }
+
+        Ok(Response::new(reply))
+    }
+
+    async fn update_node_dynamic(
+        &self,
+        request: Request<UpdateNodeDynamicRequest>,
+    ) -> Result<Response<UpdateNodeDynamicReply>, Status> {
+        let r = request.into_inner();
+        let id = r.id;
+        let dynamic_diff = r.dynamic_diff;
+        let node = self.store.update_node_dyamic(id, dynamic_diff).unwrap();
+        let n = match node {
+            Some(no) => Some(Node {
+                    id: no.id,
+                    attrs: no.attrs,
+                    dynamic: no.dynamic,
+                }),
+            None => None
+        };
+
+
+        let reply = UpdateNodeDynamicReply {
+            node: n,
+        };
 
         Ok(Response::new(reply))
     }
@@ -174,9 +200,7 @@ pub async fn run_leader(config: AgentConfig) -> R<()> {
         .add_service(insecure_manager_service)
         .serve(join_server_addr);
 
-    let manager_node = ManagerAgentService {
-        store: store,
-    };
+    let manager_node = ManagerAgentService { store: store };
 
     let data_dir = std::path::PathBuf::from_str("/Users/mike/code/legion/configs/tls/server")?;
     let cert = std::fs::read_to_string(data_dir.join("server.pem"))?;
@@ -220,9 +244,7 @@ pub async fn run_follower(config: AgentConfig) -> R<()> {
 
     let store = Store::start_storage()?;
 
-    let manager_node = ManagerAgentService {
-        store: store,
-    };
+    let manager_node = ManagerAgentService { store: store };
 
     debug!("Manager node starting on {}", addr);
     Server::builder()
