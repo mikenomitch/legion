@@ -1,4 +1,4 @@
-pub const DEFAULT_PROTOCOL: &str = "https";
+// pub const DEFAULT_PROTOCOL: &str = "https";
 pub const DEFAULT_PORT: &str = "4747";
 // pub const DEFAULT_INSECURE_PORT: &str = "4748";
 pub const DEFAULT_HOSTNAME: &str = "127.0.0.1";

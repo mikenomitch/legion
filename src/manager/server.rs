@@ -22,7 +22,7 @@ use legion::manager_server::{Manager, ManagerServer};
 use legion::{
     GetJobStatusReply, GetJobStatusRequest, HeartbeatReply, HeartbeatRequest, ManagerJoinReply,
     ManagerJoinRequest, RunJobReply, RunJobRequest, WorkerJoinReply, WorkerJoinRequest,
-    WorkerRegisterReply, WorkerRegisterRequest,
+    WorkerRegisterReply, WorkerRegisterRequest, GetNodesReply, GetNodesRequest, Node
 };
 
 use tonic::transport::{Identity, Server, ServerTlsConfig};
@@ -131,6 +131,27 @@ impl Manager for ManagerAgentService {
         let reply = WorkerRegisterReply {
             message: format!("You are in!"),
         };
+
+        Ok(Response::new(reply))
+    }
+
+    async fn get_nodes(
+        &self,
+        _request: Request<GetNodesRequest>,
+    ) -> Result<Response<GetNodesReply>, Status> {
+        let nodes = self.store.get_nodes().unwrap();
+
+        let mut reply = GetNodesReply {
+            nodes: Vec::new(),
+        };
+
+        for node in nodes {
+            let n = Node {
+                id: node.id,
+                attrs: node.attrs,
+            };
+            reply.nodes.push(n);
+        }
 
         Ok(Response::new(reply))
     }

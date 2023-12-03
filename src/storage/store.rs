@@ -4,11 +4,17 @@ use log::debug;
 use rusqlite::Connection;
 use std::sync::{Arc, Mutex};
 
-#[derive(Debug)]
-pub struct Node {
-    pub id: String,
-    pub attrs: String,
+pub mod legion {
+    tonic::include_proto!("legion");
 }
+
+use legion::Node;
+
+// #[derive(Debug)]
+// pub struct Node {
+//     pub id: String,
+//     pub attrs: String,
+// }
 
 // warning incorrectly
 #[allow(dead_code)]

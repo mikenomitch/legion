@@ -1,22 +1,21 @@
-use crate::constants::{DEFAULT_HOSTNAME, DEFAULT_PORT, DEFAULT_PROTOCOL};
+use crate::constants::DEFAULT_ADDR;
 use crate::util::R;
 
-use log::debug;
 use clap::{arg, Command};
+use log::debug;
 
 pub mod legion {
     tonic::include_proto!("legion");
 }
 use legion::manager_client::ManagerClient;
-use legion::{RunJobRequest, GetJobStatusRequest};
+use legion::{GetJobStatusRequest, RunJobRequest};
 
 pub fn config() -> Command {
     let job_run_cmd = Command::new("run")
         .about("Run a job")
         .arg(arg!(path: [PATH]));
 
-    let job_status_cmd = Command::new("status")
-        .about("Get job status");
+    let job_status_cmd = Command::new("status").about("Get job status");
 
     Command::new("job")
         .about("Interact with jobs")
@@ -25,6 +24,7 @@ pub fn config() -> Command {
         .subcommand(job_run_cmd)
         .subcommand(job_status_cmd)
 }
+
 pub async fn handle(sub_matches: &clap::ArgMatches) -> R<()> {
     match sub_matches.subcommand() {
         Some(("run", _)) => run_job().await,
@@ -34,8 +34,7 @@ pub async fn handle(sub_matches: &clap::ArgMatches) -> R<()> {
 }
 
 async fn run_job() -> R<()> {
-    let addr = format!("{}://{}:{}", DEFAULT_PROTOCOL, DEFAULT_HOSTNAME, DEFAULT_PORT);
-    let mut client = ManagerClient::connect(addr).await?;
+    let mut client = ManagerClient::connect(DEFAULT_ADDR).await?;
 
     let request = tonic::Request::new(RunJobRequest {
         name: "Mike".into(),
@@ -49,8 +48,7 @@ async fn run_job() -> R<()> {
 }
 
 async fn get_status() -> R<()> {
-    let addr = format!("{}://{}:{}", DEFAULT_PROTOCOL, DEFAULT_HOSTNAME, DEFAULT_PORT);
-    let mut client = ManagerClient::connect(addr).await?;
+    let mut client = ManagerClient::connect(DEFAULT_ADDR).await?;
 
     let request = tonic::Request::new(GetJobStatusRequest {
         name: "Mike".into(),
