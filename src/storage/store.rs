@@ -1,3 +1,4 @@
+use crate::constants::DEFAULT_STORE_PATH;
 use crate::util::R;
 use log::debug;
 use rusqlite::Connection;
@@ -20,7 +21,7 @@ pub struct Store {
     conn: MemSafeConn,
 }
 
-// add function test to memsafeconn
+// NOTE: This will become a general interface for all storage backends
 impl Store {
     pub fn start_storage() -> R<Store> {
         debug!("Starting store");
@@ -33,8 +34,12 @@ impl Store {
     }
 
     fn create_memsafe_conn() -> R<MemSafeConn> {
-        debug!("Creating connection");
-        let conn = Connection::open_in_memory()?;
+        // let conn = Connection::open_in_memory()?;
+
+        // Using the disk version for now to simulate logs
+        // Would eventually split this into a cluster that shares
+        // logs via raft before committing to an in-memory sqlite db
+        let conn = Connection::open(DEFAULT_STORE_PATH)?;
         Ok(Arc::new(Mutex::new(conn)))
     }
 

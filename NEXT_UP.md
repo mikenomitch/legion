@@ -2,18 +2,10 @@
 * Goal: Save node data to a store
 
 * Test of Goal:
-- Run server with `cr start``
-- Get a join-token
-- Join with the token
-- The register command passes along a name and fingerprint data
 - A new list workers command shows the node in there
 - You can do this with two different workers at same time (diff names)
 
 * Steps:
-- Make a general store interface
-- Make a store plugin system? (look for store-plugin in manager config, otherwise use sqlite?)
-- Do snapshots of the store
-- Snapshots are loaded on reboot
 
 # Deferred Work
 
