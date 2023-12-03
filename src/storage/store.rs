@@ -1,4 +1,3 @@
-use crate::constants::DEFAULT_STORE_PATH;
 use crate::util::R;
 use log::debug;
 use rusqlite::Connection;
@@ -35,14 +34,12 @@ impl Store {
 
     fn create_memsafe_conn() -> R<MemSafeConn> {
         debug!("Creating connection");
-        let conn = Connection::open(DEFAULT_STORE_PATH)?;
+        let conn = Connection::open_in_memory()?;
         Ok(Arc::new(Mutex::new(conn)))
     }
 
     fn create_initial_tables(conn: MemSafeConn) -> R<()> {
         let conn = conn.lock().unwrap();
-
-        debug!("Loading tables");
         conn.execute(
             "CREATE TABLE IF NOT EXISTS node (
                 id    STRING PRIMARY KEY,
@@ -60,12 +57,12 @@ impl Store {
 
     pub fn upsert_node(&self, id: String, attrs: String) -> R<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "IF NOT EXISTS (SELECT * FROM node WHERE id = ?1) \
-            INSERT INTO node (id, attrs) VALUES (?1, ?2) \
-            ELSE UPDATE node SET attrs = ?2 WHERE id = ?1",
-            (id, attrs),
-        )?;
+        let sql = r#"
+INSERT INTO node (id, attrs)
+VALUES (?1, ?2)
+ON CONFLICT(id) DO UPDATE SET attrs = ?2;
+"#;
+        conn.execute(sql, (id, attrs))?;
 
         Ok(())
     }

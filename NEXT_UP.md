@@ -10,10 +10,6 @@
 - You can do this with two different workers at same time (diff names)
 
 * Steps:
-- Add temporary sqlite store using rusqlite
-- Boot the store when the manager starts
-- Write to it
-- Read from it
 - Make a general store interface
 - Make a store plugin system? (look for store-plugin in manager config, otherwise use sqlite?)
 - Do snapshots of the store
