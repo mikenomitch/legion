@@ -3,9 +3,9 @@ mod cmd;
 mod constants;
 mod manager;
 mod storage;
+mod structs;
 mod util;
 mod worker;
-
 use clap::Command;
 use log::debug;
 use std::ffi::OsString;
@@ -21,6 +21,7 @@ fn cli() -> Command {
         .subcommand(cmd::node::config())
         .subcommand(cmd::start::config())
         .subcommand(cmd::join_token::config())
+        .subcommand(cmd::join::config())
 }
 
 #[tokio::main]
@@ -33,6 +34,7 @@ async fn main() -> R<()> {
         Some(("job", sub_matches)) => cmd::job::handle(sub_matches).await?,
         Some(("node", sub_matches)) => cmd::node::handle(sub_matches).await?,
         Some(("join-token", sub_matches)) => cmd::join_token::handle(sub_matches).await?,
+        Some(("join", sub_matches)) => cmd::join::handle(sub_matches).await?,
         Some((ext, sub_matches)) => {
             let args = sub_matches
                 .get_many::<OsString>("")

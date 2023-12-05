@@ -1,14 +1,4 @@
 # Next Up
-* Goal: Get dynamic node metadata call working
-
-* Success:
-- The following commands all work:
-    - cr node update worker -a foo baz
-    - cr node update worker -a foo.bar baz
-    - cr node update worker -a foo.bar baz -a wiz.woz wat
-    - cr bode update worker -f ./path/to/data.jsonette
-
-# After that
 * Goal: Heartbeats actually monitor status
 
 * Success:
@@ -17,6 +7,15 @@
 - If I kill the node, the status updates in N seconds
 - I can restart the node
 - The status updates again
+
+# After that
+* Goal: Clean up
+
+* Success:
+- Nicely printing out node info (in a way that can be copied)
+- Figure out nicer way of doing Node to Node (or skipped altogether)
+- SQL queries generally cleaned up
+- Heartbeating happens nicely and roughly performantly?
 
 # Deferred Work
 

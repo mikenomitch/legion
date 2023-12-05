@@ -4,11 +4,8 @@ use crate::util::R;
 use clap::{arg, Command};
 use log::debug;
 
-pub mod legion {
-    tonic::include_proto!("legion");
-}
-use legion::manager_client::ManagerClient;
-use legion::{GetJobStatusRequest, RunJobRequest};
+use crate::structs::manager_client::ManagerClient;
+use crate::structs::{GetJobStatusRequest, RunJobRequest};
 
 pub fn config() -> Command {
     let job_run_cmd = Command::new("run")

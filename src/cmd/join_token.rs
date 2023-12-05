@@ -2,16 +2,12 @@ use std::error;
 use clap::{arg, Command};
 use crate::constants::DEFAULT_INSECURE_ADDR;
 
-pub mod legion {
-    tonic::include_proto!("legion");
-}
 
-// use legion::manager_client::ManagerClient;
 // use crate::cmd::job::legion::WorkerJoinRequest;
 
-use legion::insecure_manager_client::InsecureManagerClient;
-// use legion::manager_server::{Manager, ManagerServer};
-use legion::{
+use crate::structs::insecure_manager_client::InsecureManagerClient;
+// use crate::structs::manager_server::{Manager, ManagerServer};
+use crate::structs::{
     // WorkerJoinReply,
     // WorkerJoinRequest,
     GetJoinTokenRequest

@@ -13,12 +13,9 @@ use tonic::{
     Request, Response, Status,
 };
 
-pub mod legion {
-    tonic::include_proto!("legion");
-}
-use legion::manager_client::ManagerClient;
-use legion::worker_server::{Worker, WorkerServer};
-use legion::{PostWorkReply, PostWorkRequest, HeartbeatRequest, WorkerRegisterRequest};
+use crate::structs::manager_client::ManagerClient;
+use crate::structs::worker_server::{Worker, WorkerServer};
+use crate::structs::{PostWorkReply, PostWorkRequest, HeartbeatRequest, WorkerRegisterRequest};
 
 pub struct WorkerAgentService {}
 #[tonic::async_trait]
@@ -94,7 +91,7 @@ async fn start_heartbeats(client: ManagerClient<Channel>) -> R<()> {
     let mut c2 = client.clone();
     loop {
         let req = tonic::Request::new(HeartbeatRequest {
-            name: "worker-a".into(),
+            id: "worker".into(),
         });
 
         let response = c2.heartbeat(req).await?;

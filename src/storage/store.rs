@@ -1,14 +1,12 @@
 use crate::constants::DEFAULT_STORE_PATH;
-use crate::util::R;
+// use crate::structs::Node;
+use crate::util::{R, merge_json_strings};
 use log::debug;
 use rusqlite::Connection;
 use std::sync::{Arc, Mutex};
+use time::OffsetDateTime;
 
-pub mod legion {
-    tonic::include_proto!("legion");
-}
-
-use legion::Node;
+use crate::structs::Node as Node;
 
 // warning incorrectly
 #[allow(dead_code)]
@@ -48,8 +46,10 @@ impl Store {
         conn.execute(
             "CREATE TABLE IF NOT EXISTS node (
                 id    STRING PRIMARY KEY,
-                attrs  STRING NOT NULL,
-                dynamic STRING NOT NULL
+                status STRING NOT NULL,
+                attrs  JSONB NOT NULL,
+                dynamic JSONB NOT NULL,
+                last_heartbeat TIMESTAMP NOT NULL
             )",
             (), // empty list of parameters.
         )?;
@@ -61,48 +61,32 @@ impl Store {
     // NODES
     // ========================================
 
-    pub fn upsert_node(&self, id: String, attrs: String, dynamic: String) -> R<()> {
+    pub fn get_node(&self, id: String) -> R<Node> {
         let conn = self.conn.lock().unwrap();
-        let sql = r#"
-INSERT INTO node (id, attrs, dynamic)
-VALUES (?1, ?2, ?3)
-ON CONFLICT(id) DO UPDATE SET attrs = ?2, dynamic = ?3;
-"#;
-        conn.execute(sql, (id, attrs, dynamic))?;
-
-        Ok(())
-    }
-
-    pub fn get_node(&self, id: String) -> R<Option<Node>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT id, attrs, dynamic FROM node WHERE id = ?")?;
-        let node_iter = stmt.query_map([id], |row| {
+        let sql = "SELECT id, attrs, dynamic, status, last_heartbeat FROM node WHERE id = ?";
+        let node = conn.query_row(sql, [id], |row| {
             Ok(Node {
                 id: row.get(0).unwrap(),
                 attrs: row.get(1).unwrap(),
                 dynamic: row.get(2).unwrap(),
+                status: row.get(3).unwrap(),
+                last_heartbeat: row.get(4).unwrap(),
             })
         })?;
-
-        let mut nodes = Vec::new();
-        for node in node_iter {
-            let n = node.unwrap();
-            nodes.push(n);
-        }
-
-        let node = nodes.pop();
 
         Ok(node)
     }
 
     pub fn get_nodes(&self) -> R<Vec<Node>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT id, attrs, dynamic FROM node")?;
+        let mut stmt = conn.prepare("SELECT id, attrs, dynamic, status, last_heartbeat FROM node")?;
         let node_iter = stmt.query_map([], |row| {
             Ok(Node {
                 id: row.get(0).unwrap(),
                 attrs: row.get(1).unwrap(),
                 dynamic: row.get(2).unwrap(),
+                status: row.get(3).unwrap(),
+                last_heartbeat: row.get(4).unwrap(),
             })
         })?;
 
@@ -115,23 +99,64 @@ ON CONFLICT(id) DO UPDATE SET attrs = ?2, dynamic = ?3;
         Ok(nodes)
     }
 
-    pub fn update_node_dyamic(&self, id: String, dynamic_diff: String) -> R<Option<Node>> {
-        self.get_node(id.clone())
+    pub fn insert_node(&self, node: Node) -> R<Node> {
+        let conn = self.conn.lock().unwrap();
+        let sql = r#"
+INSERT INTO node (id, attrs, dynamic, status, last_heartbeat)
+VALUES (?1, ?2, ?3, ?4, ?5)
+ON CONFLICT(id) DO UPDATE SET attrs = ?2, dynamic = ?3, status = ?4, last_heartbeat = ?5
+RETURNING id, attrs, dynamic, status, last_heartbeat;
+"#;
+        let node = conn.query_row(sql, [node.id, node.attrs, node.dynamic, node.status, node.last_heartbeat], |row| {
+            Ok(Node {
+                id: row.get(0).unwrap(),
+                attrs: row.get(1).unwrap(),
+                dynamic: row.get(2).unwrap(),
+                status: row.get(3).unwrap(),
+                last_heartbeat: row.get(4).unwrap(),
+            })
+        })?;
+
+        Ok(node)
     }
 
-    // =======================================
-    // JOBS
-    // ========================================
+    pub fn update_node_dyamic(&self, id: String, dynamic_diff: String) -> R<Node> {
+        let node = self.get_node(id.clone())?;
+        let initial_dynamic = node.dynamic.clone();
+        let result = merge_json_strings(initial_dynamic, dynamic_diff);
+
+        let conn = self.conn.lock().unwrap();
+        let sql = r#"
+INSERT INTO node (id, attrs, dynamic)
+VALUES (?1, ?2, ?3)
+ON CONFLICT(id) DO UPDATE SET attrs = ?2, dynamic = ?3
+RETURNING id, attrs, dynamic, status, last_heartbeat;
+"#;
+        let node = conn.query_row(sql, [id, node.attrs, result], |row| {
+            Ok(Node {
+                id: row.get(0).unwrap(),
+                attrs: row.get(1).unwrap(),
+                dynamic: row.get(2).unwrap(),
+                status: row.get(3).unwrap(),
+                last_heartbeat: row.get(4).unwrap(),
+            })
+        })?;
+
+        Ok(node)
+    }
+
+    pub fn update_node_heartbeat(&self, id: String) -> R<()> {
+        let timestamp_now = OffsetDateTime::now_utc().to_string();
+
+        let conn = self.conn.lock().unwrap();
+        let sql = r#"
+        UPDATE node
+        SET last_heartbeat = ?1
+        WHERE id = ?2;
+"#;
+        println!("Updating heartbeat for node {} with TS: {}", id, timestamp_now);
+        conn.execute(sql, [timestamp_now, id])?;
+
+        Ok(())
+    }
 }
-
-
-// NODES
-
-// // Add a connection here?!?!
-// fn upsert_node(_node: Node) -> R<()> {
-//     Ok(())
-// }
-
-// fn get_nodes() -> R<()> {
-//     Ok(())
-// }

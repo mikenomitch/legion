@@ -8,22 +8,18 @@ use std::str::FromStr;
 
 use jsonwebtoken::errors::ErrorKind;
 use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
-
+use serde_json::json;
 use futures::join;
 
-pub mod legion {
-    tonic::include_proto!("legion");
-}
-
 use crate::manager::join_server::get_insecure_manager_service;
-use legion::manager_client::ManagerClient;
-use legion::manager_server::{Manager, ManagerServer};
+use crate::structs::manager_client::ManagerClient;
+use crate::structs::manager_server::{Manager, ManagerServer};
 
-use legion::{
+use crate::structs::{
     GetJobStatusReply, GetJobStatusRequest, GetNodesReply, GetNodesRequest, HeartbeatReply,
-    HeartbeatRequest, ManagerJoinReply, ManagerJoinRequest, Node, RunJobReply, RunJobRequest,
+    HeartbeatRequest, ManagerJoinReply, ManagerJoinRequest, RunJobReply, RunJobRequest,
     UpdateNodeDynamicReply, UpdateNodeDynamicRequest, WorkerJoinReply, WorkerJoinRequest,
-    WorkerRegisterReply, WorkerRegisterRequest,
+    WorkerRegisterReply, WorkerRegisterRequest, GetNodeReply, GetNodeRequest, Node
 };
 
 use tonic::transport::{Identity, Server, ServerTlsConfig};
@@ -102,12 +98,15 @@ impl Manager for ManagerAgentService {
 
     async fn heartbeat(
         &self,
-        _request: Request<HeartbeatRequest>,
+        request: Request<HeartbeatRequest>,
     ) -> Result<Response<HeartbeatReply>, Status> {
-        let reply = HeartbeatReply {
-            message: format!("Thunky thunk"),
-        };
+        let id = request.into_inner().id;
 
+        self.store.update_node_heartbeat(id).unwrap();
+
+        let reply = HeartbeatReply {
+            message: format!("ack"),
+        };
         Ok(Response::new(reply))
     }
 
@@ -118,11 +117,17 @@ impl Manager for ManagerAgentService {
         let request = request.into_inner();
         let name = request.name;
         let attrs = request.attributes;
-        let dynamic = "{}";
+        let dynamic = json!({}).to_string(); //
 
-        self.store
-            .upsert_node(name.clone(), attrs.clone(), dynamic.into())
-            .unwrap();
+        let node = Node {
+            id: name,
+            attrs: attrs.clone(),
+            dynamic: dynamic.clone(),
+            status: "new".to_string(),
+            last_heartbeat: "".to_string(),
+        };
+
+        self.store.insert_node(node.clone()).unwrap();
         let nodes = self.store.get_nodes().unwrap();
 
         for node in nodes {
@@ -142,20 +147,22 @@ impl Manager for ManagerAgentService {
         _request: Request<GetNodesRequest>,
     ) -> Result<Response<GetNodesReply>, Status> {
         let nodes = self.store.get_nodes().unwrap();
-
-        let mut reply = GetNodesReply { nodes: Vec::new() };
-
-        for node in nodes {
-            let n = Node {
-                id: node.id,
-                attrs: node.attrs,
-                dynamic: "".into(),
-            };
-            reply.nodes.push(n);
-        }
-
+        let reply = GetNodesReply { nodes: nodes };
         Ok(Response::new(reply))
     }
+
+    async fn get_node(
+        &self,
+        request: Request<GetNodeRequest>,
+    ) -> Result<Response<GetNodeReply>, Status> {
+        let id = request.into_inner().id;
+        let node = self.store.get_node(id)
+            .expect("Could not get node with given id");
+
+        let reply = GetNodeReply { node: Some(node) };
+        Ok(Response::new(reply))
+    }
+
 
     async fn update_node_dynamic(
         &self,
@@ -164,20 +171,8 @@ impl Manager for ManagerAgentService {
         let r = request.into_inner();
         let id = r.id;
         let dynamic_diff = r.dynamic_diff;
-        let node = self.store.update_node_dyamic(id, dynamic_diff).unwrap();
-        let n = match node {
-            Some(no) => Some(Node {
-                    id: no.id,
-                    attrs: no.attrs,
-                    dynamic: no.dynamic,
-                }),
-            None => None
-        };
-
-
-        let reply = UpdateNodeDynamicReply {
-            node: n,
-        };
+        let node = self.store.update_node_dyamic(id, dynamic_diff).expect("Can't find or update node");
+        let reply = UpdateNodeDynamicReply { node: Some(node) };
 
         Ok(Response::new(reply))
     }

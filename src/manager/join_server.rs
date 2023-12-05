@@ -6,11 +6,8 @@ use tonic::{Request, Response, Status};
 
 use jsonnet::JsonnetVm;
 
-pub mod legion {
-    tonic::include_proto!("legion");
-}
-use legion::insecure_manager_server::{InsecureManager, InsecureManagerServer};
-use legion::{
+use crate::structs::insecure_manager_server::{InsecureManager, InsecureManagerServer};
+use crate::structs::{
     GetJoinTokenReply,
     GetJoinTokenRequest,
 };

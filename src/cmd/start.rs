@@ -4,12 +4,7 @@ use crate::constants::DEFAULT_CONFIG_PATH;
 use crate::manager::server::{ run_follower, run_leader };
 use crate::worker::agent::run_worker;
 use jsonnet::JsonnetVm;
-
 use clap::{arg, Command};
-
-pub mod legion {
-    tonic::include_proto!("legion");
-}
 
 pub fn config() -> Command {
     let leader_cmd = Command::new("leader")
