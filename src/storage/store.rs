@@ -16,7 +16,7 @@ pub enum Msg {
 
 pub type MemSafeConn = Arc<Mutex<Connection>>;
 pub struct Store {
-    conn: MemSafeConn,
+    pub conn: MemSafeConn,
 }
 
 // NOTE: This will become a general interface for all storage backends
@@ -97,6 +97,34 @@ impl Store {
         }
 
         Ok(nodes)
+    }
+
+    pub fn get_node_ids_and_heartbeats(&self) -> R<Vec<(String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT id, last_heartbeat FROM node")?;
+        let node_iter = stmt.query_map([], |row| {
+            Ok((row.get(0).unwrap(), row.get(1).unwrap()))
+        })?;
+
+        let mut nodes_id_and_hb = Vec::new();
+        for node in node_iter {
+            let h = node.unwrap();
+            nodes_id_and_hb.push(h);
+        }
+
+        Ok(nodes_id_and_hb)
+    }
+
+    pub fn mark_nodes_as_lost(&self, ids: Vec<String>) -> R<()> {
+        let conn = self.conn.lock().unwrap();
+        let sql = r#"
+        UPDATE node
+        SET status = 'lost'
+        WHERE id IN (?1);
+"#;
+        conn.execute(sql, [ids])?;
+
+        Ok(())
     }
 
     pub fn insert_node(&self, node: Node) -> R<Node> {

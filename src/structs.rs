@@ -17,3 +17,14 @@ impl Printable for Node {
         println!("Attributes: {}", full_attrs);
     }
 }
+
+// impl for Node {
+//     last_heartbeat_too_slow(last_heartbeat: string) -> bool {
+//         let last_heartbeat = self.last_heartbeat;
+//         let last_heartbeat = OffsetDateTime::parse(last_heartbeat, "%+")?;
+//         let now = OffsetDateTime::now_utc();
+//         let diff = now - last_heartbeat;
+//         let diff = diff.whole_seconds();
+//         diff > 30
+//     }
+// }

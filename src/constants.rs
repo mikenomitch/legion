@@ -8,4 +8,5 @@ pub const DEFAULT_CONFIG_PATH: &str = "./configs/leader.jsonnet";
 pub const DEFAULT_WORKER_CONFIG_PATH: &str = "./configs/worker.jsonnet";
 pub const TMP_SECRET_KEY: [u8; 6] = *b"secret";
 pub const WORKER_HEARTBEAT_DURATION: u64 = 2;
+pub const NODE_CHECK_DURATION: u64 = 2;
 pub const DEFAULT_STORE_PATH: &str = ".legion/store.db";

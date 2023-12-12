@@ -1,5 +1,5 @@
 use crate::cmd::structs::{AgentConfig, JoinTokenClaims};
-use crate::constants::{DEFAULT_HOSTNAME, DEFAULT_PORT, TMP_SECRET_KEY};
+use crate::constants::{DEFAULT_HOSTNAME, DEFAULT_PORT, TMP_SECRET_KEY, NODE_CHECK_DURATION};
 use crate::storage::store::Store;
 use crate::util::R;
 
@@ -195,6 +195,10 @@ pub async fn run_leader(config: AgentConfig) -> R<()> {
         .add_service(insecure_manager_service)
         .serve(join_server_addr);
 
+    let s2 = Store{
+        conn: store.conn.clone()
+    };
+
     let manager_node = ManagerAgentService { store: store };
 
     let data_dir = std::path::PathBuf::from_str("/Users/mike/code/legion/configs/tls/server")?;
@@ -211,9 +215,28 @@ pub async fn run_leader(config: AgentConfig) -> R<()> {
     println!("Join server starting on {}", join_server_addr);
     println!("Manager node starting on {}", addr);
 
-    let _res = join!(join_server_fut, start_server_fut);
+    let node_checker_fut = start_node_status_checker(s2);
+
+    let _res = join!(join_server_fut, start_server_fut, node_checker_fut);
 
     Ok(())
+}
+
+async fn start_node_status_checker(store: Store) -> R<()> {
+    loop {
+        let node_ids_to_update = store.get_node_ids_and_heartbeats()?
+            .into_iter()
+            .filter(|(id, heartbeat)| Node::last_heartbeat_too_slow(heartbeat))
+            .map(|(id, heartbeat)| id)
+            .collect::<Vec<String>>();
+
+        store.mark_nodes_as_lost(node_ids_to_update)?;
+
+        // TODO:
+        // - Bring back old nodes to alive too
+
+        tokio::time::sleep(tokio::time::Duration::from_secs(NODE_CHECK_DURATION)).await;
+    }
 }
 
 // =====================
