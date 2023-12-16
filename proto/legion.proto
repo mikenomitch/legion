@@ -4,7 +4,6 @@ package legion;
 // === MANAGER ===
 
 service Manager {
-  rpc ManagerJoin (ManagerJoinRequest) returns (ManagerJoinReply);
   rpc WorkerJoin (WorkerJoinRequest) returns (WorkerJoinReply);
   rpc WorkerRegister (WorkerRegisterRequest) returns (WorkerRegisterReply);
   rpc RunJob (RunJobRequest) returns (RunJobReply);
@@ -14,14 +13,6 @@ service Manager {
   rpc GetNode (GetNodeRequest) returns (GetNodeReply);
   rpc UpdateNodeDynamic (UpdateNodeDynamicRequest)
     returns (UpdateNodeDynamicReply);
-}
-
-message ManagerJoinRequest {
-  string address = 1;
-}
-
-message ManagerJoinReply {
-  string message = 1;
 }
 
 message WorkerJoinRequest {

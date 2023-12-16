@@ -3,7 +3,6 @@ use crate::constants::{DEFAULT_HOSTNAME, DEFAULT_PORT, TMP_SECRET_KEY, NODE_CHEC
 use crate::storage::store::Store;
 use crate::util::R;
 
-use log::debug;
 use std::str::FromStr;
 
 use jsonwebtoken::errors::ErrorKind;
@@ -12,12 +11,11 @@ use serde_json::json;
 use futures::join;
 
 use crate::manager::join_server::get_insecure_manager_service;
-use crate::structs::manager_client::ManagerClient;
 use crate::structs::manager_server::{Manager, ManagerServer};
 
 use crate::structs::{
     GetJobStatusReply, GetJobStatusRequest, GetNodesReply, GetNodesRequest, HeartbeatReply,
-    HeartbeatRequest, ManagerJoinReply, ManagerJoinRequest, RunJobReply, RunJobRequest,
+    HeartbeatRequest,RunJobReply, RunJobRequest,
     UpdateNodeDynamicReply, UpdateNodeDynamicRequest, WorkerJoinReply, WorkerJoinRequest,
     WorkerRegisterReply, WorkerRegisterRequest, GetNodeReply, GetNodeRequest, Node
 };
@@ -33,20 +31,6 @@ pub struct ManagerAgentService {
 
 #[tonic::async_trait]
 impl Manager for ManagerAgentService {
-    // NOTE: Deprecate this once the join token is used for everything
-    async fn manager_join(
-        &self,
-        request: Request<ManagerJoinRequest>,
-    ) -> Result<Response<ManagerJoinReply>, Status> {
-        debug!("Got a request from {:?}", request.remote_addr());
-
-        let reply = ManagerJoinReply {
-            message: format!("Hello {}!", request.into_inner().address),
-        };
-
-        Ok(Response::new(reply))
-    }
-
     async fn run_job(
         &self,
         _request: Request<RunJobRequest>,
@@ -86,8 +70,6 @@ impl Manager for ManagerAgentService {
                 _ => panic!(),
             },
         };
-        println!("{:?}", token_data.claims);
-        println!("{:?}", token_data.header);
 
         let reply = WorkerJoinReply {
             message: format!("Joined Yay?: {:?}!", token_data.claims),
@@ -178,7 +160,7 @@ impl Manager for ManagerAgentService {
     }
 }
 
-pub async fn run_leader(config: AgentConfig) -> R<()> {
+pub async fn run_manager(config: AgentConfig) -> R<()> {
     let addr = format!("{}:{}", DEFAULT_HOSTNAME, DEFAULT_PORT).parse()?;
     let cloned_config = config.clone();
     let store = Store::start_storage()?;
@@ -228,13 +210,10 @@ async fn start_node_status_checker(store: Store) -> R<()> {
             .into_iter()
             .filter( |(_id, heartbeat)| {
                 match Node::last_heartbeat_too_slow(heartbeat) {
-                    Ok(too_slow) => {
-                        println!("Too slow: {}", too_slow);
-                        too_slow
-                    },
+                    Ok(too_slow) => too_slow,
                     Err(e) => {
-                        println!("Error checking heartbeat: {:?}", e);
-                        false
+                        println!("Error checking heartbeat - marking lost: {:?}", e);
+                        true
                     }
                 }
             })
@@ -244,40 +223,4 @@ async fn start_node_status_checker(store: Store) -> R<()> {
         store.mark_nodes_as_lost(node_ids_to_update)?;
         tokio::time::sleep(tokio::time::Duration::from_secs(NODE_CHECK_DURATION)).await;
     }
-}
-
-// =====================
-// =====================
-// ===== FOR LATER =====
-// =====================
-// =====================
-
-pub async fn run_follower(config: AgentConfig) -> R<()> {
-    let leader_addr = config.manager.leader_address.clone();
-
-    let addr = format!("{}:{}", DEFAULT_HOSTNAME, 4848).parse()?;
-
-    let mut client = ManagerClient::connect(leader_addr).await?;
-
-    let leader_addr = config.manager.leader_address.clone();
-    let request = tonic::Request::new(ManagerJoinRequest {
-        address: leader_addr,
-    });
-
-    let response = client.manager_join(request).await?;
-    debug!("RESPONSE={:?}", response);
-
-    let store = Store::start_storage()?;
-
-    let manager_node = ManagerAgentService { store: store };
-
-    debug!("Manager node starting on {}", addr);
-    Server::builder()
-        .add_service(ManagerServer::new(manager_node))
-        .serve(addr)
-        .await?;
-
-    debug!("Cleaning Up");
-
-    Ok(())
 }

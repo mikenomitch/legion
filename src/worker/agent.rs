@@ -9,8 +9,8 @@ use futures::join;
 use serde_json::{Map, Value};
 
 use tonic::{
-    transport::Certificate, transport::Channel, transport::ClientTlsConfig, transport::Server,
-    Request, Response, Status,
+    transport::Channel,transport::Server, Request, Response, Status,
+    // transport::Certificate, transport::ClientTlsConfig,
 };
 
 use crate::structs::manager_client::ManagerClient;
@@ -66,7 +66,8 @@ pub async fn run_worker(token: &str) -> R<()> {
 
     let client = create_manager_client(
         token_data.claims.address,
-        token_data.claims.ca_cert,
+        "".into(),
+        // token_data.claims.ca_cert,
     ).await?;
 
     register_self(client.clone(), fingerprint_data).await?;
@@ -77,10 +78,11 @@ pub async fn run_worker(token: &str) -> R<()> {
     Ok(())
 }
 
-async fn create_manager_client(manager_addr: String, ca_cert: String) -> R<ManagerClient<Channel>> {
-    let ca_cert = Certificate::from_pem(ca_cert);
-    let tls = ClientTlsConfig::new().ca_certificate(ca_cert);
-    let channel = Channel::from_shared(manager_addr)?.tls_config(tls)?.connect().await?;
+async fn create_manager_client(manager_addr: String, _ca_cert: String) -> R<ManagerClient<Channel>> {
+    // // let ca_cert = Certificate::from_pem(ca_cert);
+    // // let tls = ClientTlsConfig::new().ca_certificate(ca_cert);
+    // let channel = Channel::from_shared(manager_addr)?.tls_config(tls)?.connect().await?;
+    let channel = Channel::from_shared(manager_addr)?.connect().await?;
     let client = ManagerClient::new(channel);
 
     Ok(client)

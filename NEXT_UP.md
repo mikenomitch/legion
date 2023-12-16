@@ -1,6 +1,5 @@
 # Next Up
 * Goal: Clean up
-- Rip out any "follower" stuff
 
 # After that
 * Goal: Add more node stuff
@@ -12,14 +11,16 @@
 * Goal: Clean up
 
 * Success:
-- Nicely printing out node info (in a way that can be copied)
+- Nicely printing out node info (in a way that can be copied to other fns)
+- Has a jsony printing option for commands
 - Figure out nicer way of doing Node to Node (or skipped altogether)
 - SQL queries generally cleaned up
 - Heartbeating happens nicely and roughly performantly?
+-
 
 # Deferred Work
 
-Start with:
+### TLS joining
 * Goal: Make join process establish TLS
 
 * Success:

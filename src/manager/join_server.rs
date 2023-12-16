@@ -1,6 +1,6 @@
 use crate::cmd::structs::{WorkerConfig, JoinTokenClaims};
 use crate::util::R;
-use crate::certs::{signed_cert_with_ca, read_root_cert};
+// use crate::certs::{signed_cert_with_ca, read_root_cert};
 use crate::constants::{TMP_SECRET_KEY, DEFAULT_WORKER_CONFIG_PATH, DEFAULT_ADDR};
 use tonic::{Request, Response, Status};
 
@@ -48,21 +48,20 @@ pub fn generate_join_token() -> R<String> {
     // NOTE:
     // I think what I have to do is:
     // - When the client connects, it will use this leaf cert
-
-    let ca_pem_path: String = "/Users/mike/code/legion/configs/tls/rootca.pem".into();
-    let ca_key_path: String = "/Users/mike/code/legion/configs/tls/rootca.key".into();
-    let cert = read_root_cert(ca_pem_path, ca_key_path)?;
-    let (new_cert, new_key, ca_cert_again) = signed_cert_with_ca(cert, "legion".into())?;
-    // let ca_as_string = std::fs::read_to_string(ca_pem_path.clone())?;
-    let ca_cert = ca_cert_again.serialize_pem()?;
+    // let ca_pem_path: String = "/Users/mike/code/legion/configs/tls/rootca.pem".into();
+    // let ca_key_path: String = "/Users/mike/code/legion/configs/tls/rootca.key".into();
+    // let cert = read_root_cert(ca_pem_path, ca_key_path)?;
+    // let (new_cert, new_key, ca_cert_again) = signed_cert_with_ca(cert, "legion".into())?;
+    // // let ca_as_string = std::fs::read_to_string(ca_pem_path.clone())?;
+    // let ca_cert = ca_cert_again.serialize_pem()?;
 
     let claims = JoinTokenClaims {
         sub: "legion".to_owned(),
         exp: 10000000000,
         address: DEFAULT_ADDR.to_owned(),
-        cert: new_cert,
-        key: new_key,
-        ca_cert: ca_cert,
+        // cert: new_cert,
+        // key: new_key,
+        // ca_cert: ca_cert,
         config: config,
     };
 

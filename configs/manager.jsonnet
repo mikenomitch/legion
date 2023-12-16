@@ -1,13 +1,11 @@
 {
   server: {
-    port: 4949,
+    port: 4747,
+    insecurePort: 4748,
     address: "127.0.0.1",
   },
   manager: {
-    id: 3,
-    leader: false,
-    leaderAddress: "http://127.0.0.1:4747",
-    peers: ["127.0.0.1:4747", "127.0.0.1:4848"],
+    id: 1,
     electionTick: 30,
     heartbeatTick: 3,
     applied: 0,
