@@ -5,6 +5,7 @@ use log::debug;
 use rusqlite::Connection;
 use std::sync::{Arc, Mutex};
 use time::OffsetDateTime;
+use time::macros::format_description;
 
 use crate::structs::Node as Node;
 
@@ -122,7 +123,10 @@ impl Store {
         SET status = 'lost'
         WHERE id IN (?1);
 "#;
-        conn.execute(sql, [ids])?;
+
+        // TODO: This feels off...
+        let joined = ids.join(",");
+        conn.execute(sql, [joined])?;
 
         Ok(())
     }
@@ -174,7 +178,12 @@ RETURNING id, attrs, dynamic, status, last_heartbeat;
     }
 
     pub fn update_node_heartbeat(&self, id: String) -> R<()> {
-        let timestamp_now = OffsetDateTime::now_utc().to_string();
+        let fmt = format_description!(
+            "[year]-[month]-[day] [hour]:[minute]:[second] [offset_hour \
+                 sign:mandatory]:[offset_minute]:[offset_second]"
+        );
+
+        let timestamp_now = OffsetDateTime::now_utc().format(fmt)?;
 
         let conn = self.conn.lock().unwrap();
         let sql = r#"

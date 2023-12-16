@@ -1,4 +1,7 @@
-use crate::util::merge_json_strings;
+use time::macros::format_description;
+use crate::constants::DEFAULT_HEARTBEAT_TIMEOUT_SEC;
+use crate::util::{merge_json_strings, R};
+
 tonic::include_proto!("legion");
 
 pub trait Printable {
@@ -8,7 +11,10 @@ pub trait Printable {
 
 impl Printable for Node {
     fn print_short(&self) {
-        println!("ID: {}, Status: {}, Checkin: {}", self.id, self.status, self.last_heartbeat);
+        println!(
+            "ID: {}, Status: {}, Checkin: {}",
+            self.id, self.status, self.last_heartbeat
+        );
     }
 
     fn print_long(&self) {
@@ -18,13 +24,18 @@ impl Printable for Node {
     }
 }
 
-// impl for Node {
-//     last_heartbeat_too_slow(last_heartbeat: string) -> bool {
-//         let last_heartbeat = self.last_heartbeat;
-//         let last_heartbeat = OffsetDateTime::parse(last_heartbeat, "%+")?;
-//         let now = OffsetDateTime::now_utc();
-//         let diff = now - last_heartbeat;
-//         let diff = diff.whole_seconds();
-//         diff > 30
-//     }
-// }
+impl Node {
+    pub fn last_heartbeat_too_slow(last_heartbeat: &str) -> R<bool> {
+        let fmt = format_description!(
+            "[year]-[month]-[day] [hour]:[minute]:[second] [offset_hour \
+                 sign:mandatory]:[offset_minute]:[offset_second]"
+        );
+
+        let last_heartbeat = time::OffsetDateTime::parse(last_heartbeat, fmt)?;
+        let now = time::OffsetDateTime::now_utc();
+        let diff = now - last_heartbeat;
+        let too_slow = diff > time::Duration::seconds(DEFAULT_HEARTBEAT_TIMEOUT_SEC);
+
+        Ok(too_slow)
+    }
+}

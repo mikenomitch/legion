@@ -224,10 +224,23 @@ pub async fn run_leader(config: AgentConfig) -> R<()> {
 
 async fn start_node_status_checker(store: Store) -> R<()> {
     loop {
+        println!("Checking node statuses");
+
         let node_ids_to_update = store.get_node_ids_and_heartbeats()?
             .into_iter()
-            .filter(|(id, heartbeat)| Node::last_heartbeat_too_slow(heartbeat))
-            .map(|(id, heartbeat)| id)
+            .filter( |(_id, heartbeat)| {
+                match Node::last_heartbeat_too_slow(heartbeat) {
+                    Ok(too_slow) => {
+                        println!("Too slow: {}", too_slow);
+                        too_slow
+                    },
+                    Err(e) => {
+                        println!("Error checking heartbeat: {:?}", e);
+                        false
+                    }
+                }
+            })
+            .map(|(id, _heartbeat)| id)
             .collect::<Vec<String>>();
 
         store.mark_nodes_as_lost(node_ids_to_update)?;
@@ -235,6 +248,7 @@ async fn start_node_status_checker(store: Store) -> R<()> {
         // TODO:
         // - Bring back old nodes to alive too
 
+        println!("sleepy time");
         tokio::time::sleep(tokio::time::Duration::from_secs(NODE_CHECK_DURATION)).await;
     }
 }

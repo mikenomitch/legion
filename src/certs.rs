@@ -1,4 +1,6 @@
 use crate::util::R;
+use crate::structs::Node;
+use time::macros::format_description;
 
 // Note: Modified from: https://github.com/grimvoodoo/cert-gen
 
@@ -163,4 +165,30 @@ mod tests {
         write_signed_cert_with_ca(cert, "server".into())?;
         Ok(())
     }
+
+
+    #[test]
+    fn last_heartbeat_too_slow() -> R<()> {
+        let time_string = "2023-12-05 7:09:20.152741 +00:00:00";
+        let too_slow = Node::last_heartbeat_too_slow(time_string)?;
+        assert!(too_slow);
+
+        Ok(())
+    }
+
+    #[test]
+    fn time_parsing_check() -> R<()> {
+        let _time_string = "2023-12-05 7:09:20.152741 +00:00:00";
+        let should_work = "2020-01-02 03:04:05 +06:07:08";
+
+        let fmt = format_description!(
+            "[year]-[month]-[day] [hour]:[minute]:[second] [offset_hour \
+                 sign:mandatory]:[offset_minute]:[offset_second]"
+        );
+
+        let _ = time::OffsetDateTime::parse(should_work, &fmt)?;
+
+        Ok(())
+    }
+
 }
