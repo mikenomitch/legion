@@ -188,7 +188,7 @@ RETURNING id, attrs, dynamic, status, last_heartbeat;
         let conn = self.conn.lock().unwrap();
         let sql = r#"
         UPDATE node
-        SET last_heartbeat = ?1
+        SET last_heartbeat = ?1, status = 'active'
         WHERE id = ?2;
 "#;
         println!("Updating heartbeat for node {} with TS: {}", id, timestamp_now);

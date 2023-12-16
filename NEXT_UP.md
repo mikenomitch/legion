@@ -1,19 +1,4 @@
 # Next Up
-* Goal: Heartbeats actually update status
-
-* Success:
-- I can start a node
-- I can get its status with a "node info" command
-- If I kill the node, the status updates in N seconds
-- I can restart the node
-- The status updates again
-
-* To Do:
-- In server.rs start a loop getting nodes
-- Make the updates to status on lost
-- Update the ones that are found again
-
-# After that
 * Goal: Clean up
 - Rip out any "follower" stuff
 
