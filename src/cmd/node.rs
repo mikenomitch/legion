@@ -56,6 +56,7 @@ pub async fn handle(sub_matches: &clap::ArgMatches) -> R<()> {
             let id = arg_matches
                 .get_one::<String>("id")
                 .ok_or("Must provide id")?;
+
             get_node_info(id.to_string()).await
         }
         _ => unreachable!(),

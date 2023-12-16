@@ -1,6 +1,21 @@
 # Next Up
 * Goal: Clean up
 
+* Success:
+- Has a jsony printing option for commands
+- Nicely printing out node info (in a way that can be copied to other fns)
+- Figure out nicer way of doing Node to Node (or skipped altogether)
+- SQL queries generally cleaned up
+- Heartbeating happens nicely and roughly performantly?
+
+# After that
+Goal: Add expiry on join-tokens
+
+* Success:
+- I can pass an argument into the join-token generation for unlimited or a time
+- It defaults to 1 hour use
+- The JWT has this auto encoded in it and this is validated on join
+
 # After that
 * Goal: Add more node stuff
 - Other status checks along with heartbeats
@@ -8,15 +23,7 @@
 - Then make this all pluggable
 
 # After that
-* Goal: Clean up
-
-* Success:
-- Nicely printing out node info (in a way that can be copied to other fns)
-- Has a jsony printing option for commands
-- Figure out nicer way of doing Node to Node (or skipped altogether)
-- SQL queries generally cleaned up
-- Heartbeating happens nicely and roughly performantly?
--
+* Goal: Scheduling a Job on a node for real?!?!?
 
 # Deferred Work
 

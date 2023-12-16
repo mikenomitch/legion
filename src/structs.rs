@@ -6,7 +6,9 @@ tonic::include_proto!("legion");
 
 pub trait Printable {
     fn print_short(&self) -> ();
+    fn print_short_json(&self) -> ();
     fn print_long(&self) -> ();
+    fn print_long_json(&self) -> ();
 }
 
 impl Printable for Node {
@@ -17,10 +19,19 @@ impl Printable for Node {
         );
     }
 
+    fn print_short_json(&self) {
+        println!("hey");
+    }
+
     fn print_long(&self) {
         println!("Node ID: {}", self.id);
         let full_attrs = merge_json_strings(self.attrs.clone(), self.dynamic.clone());
         println!("Attributes: {}", full_attrs);
+    }
+
+    fn print_long_json(&self) {
+        let json = serde_json::to_string(&self).unwrap();
+        println!("{}", json);
     }
 }
 

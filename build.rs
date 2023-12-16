@@ -1,5 +1,14 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tonic_build::compile_protos("proto/legion.proto")?;
+    let proto_file = "proto/legion.proto";
+
+    // TODO: Confirm that this works
+    tonic_build::configure()
+        .build_server(true)
+        .type_attribute("Node", "#[derive(serde::Deserialize, serde::Serialize)]")
+        .compile(&[proto_file], &["."])
+        .unwrap_or_else(|e| panic!("protobuf compile error: {}", e));
+
+    // tonic_build::compile_protos("proto/legion.proto")?;
 
     // For every plugin of every type, build a release
     std::fs::read_dir("./plugins")?
