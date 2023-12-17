@@ -1,5 +1,6 @@
 use crate::constants::DEFAULT_STORE_PATH;
 // use crate::structs::Node;
+use rusqlite_migration::{Migrations, M};
 use crate::util::{R, merge_json_strings};
 use log::debug;
 use rusqlite::Connection;
@@ -43,17 +44,22 @@ impl Store {
     }
 
     fn create_initial_tables(conn: MemSafeConn) -> R<()> {
-        let conn = conn.lock().unwrap();
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS node (
+        let migrations = Migrations::new(vec![
+            M::up("CREATE TABLE IF NOT EXISTS node (
                 id    STRING PRIMARY KEY,
                 status STRING NOT NULL,
                 attrs  JSONB NOT NULL,
                 dynamic JSONB NOT NULL,
                 last_heartbeat TIMESTAMP NOT NULL
-            )",
-            (), // empty list of parameters.
-        )?;
+            )").down("DROP TABLE node;"),
+        ]);
+
+        let mut conn = conn.lock().unwrap();
+
+        // Note: from rusqlite_migrations:
+        conn.pragma_update(None, "journal_mode", &"WAL").unwrap();
+
+        migrations.to_latest(&mut conn).unwrap();
 
         Ok(())
     }

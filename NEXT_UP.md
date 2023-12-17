@@ -2,9 +2,6 @@
 * Goal: Clean up
 
 * Success:
-- Has a jsony printing option for commands
-- Nicely printing out node info (in a way that can be copied to other fns)
-- Figure out nicer way of doing Node to Node (or skipped altogether)
 - SQL queries generally cleaned up
 - Heartbeating happens nicely and roughly performantly?
 
