@@ -9,6 +9,8 @@ pub trait Printable {
     fn print_short_json(&self) -> ();
     fn print_long(&self) -> ();
     fn print_long_json(&self) -> ();
+    fn print_list_json(nodes: Vec<Node>) -> ();
+    fn print_list(nodes: Vec<Node>) -> ();
 }
 
 impl Printable for Node {
@@ -19,8 +21,20 @@ impl Printable for Node {
         );
     }
 
+    fn print_list_json(nodes: Vec<Node>) {
+        let json = serde_json::to_string(&nodes).unwrap();
+        println!("{}", json);
+    }
+
+    fn print_list(nodes: Vec<Node>) {
+        nodes.into_iter().for_each(|node| {
+            node.print_short()
+        });
+    }
+
     fn print_short_json(&self) {
-        println!("hey");
+        let json = serde_json::to_string(&self).unwrap();
+        println!("{}", json);
     }
 
     fn print_long(&self) {
