@@ -78,10 +78,17 @@ impl Manager for ManagerAgentService {
 
         let worker_config = self.store.get_worker_type(worker_type.clone()).unwrap();
 
+        let mut attrs = HashMap::new();
+        for (key, value) in worker_config.attributes.iter() {
+            let val_str = serde_json::to_string(value).unwrap();
+            attrs.insert(key.to_string(), val_str);
+        }
+
         let config = WorkerConfigMsg{
             name: worker_type,
             pool: worker_config.pool,
             additional_fingerprinters: worker_config.additional_fingerprinters,
+            attributes: worker_config.attributes,
         };
 
         let reply = WorkerPreRegisterReply {
@@ -250,11 +257,12 @@ async fn load_initial_data(store: &Store, config: &ManagerConfig) -> R<()> {
         let path_str = path.to_str().unwrap();
         let wcp = parse_worker_config(path_str).unwrap();
 
-        // let mut attrs = HashMap::new();
-        // for (key, value) in &wcp.attributes {
-        //     attrs.insert(key.clone(), Value::from_str(value.clone())?);
-        // }
 
+        let mut attrs = HashMap::new();
+        for (key, value) in wcp.attributes.iter() {
+            let val_str = serde_json::to_string(value)?;
+            attrs.insert(key.to_string(), val_str);
+        }
 
         let wc = WorkerConfigMsg {
             name: wcp.worker_type.clone(),

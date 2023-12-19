@@ -4,7 +4,7 @@ use rusqlite_migration::{Migrations, M};
 use crate::util::{R, merge_json_strings};
 use log::debug;
 use rusqlite::Connection;
-use std::sync::{Arc, Mutex};
+use std::{sync::{Arc, Mutex}, collections::HashMap};
 use time::OffsetDateTime;
 use time::macros::format_description;
 
@@ -221,6 +221,7 @@ RETURNING id, attrs, dynamic, status, last_heartbeat;
                 name: row.get(0).unwrap(),
                 pool: row.get(1).unwrap(),
                 additional_fingerprinters: [].to_vec(),
+                attributes: HashMap::new(),
             })
         })?;
 
@@ -245,6 +246,7 @@ RETURNING name, pool, additional_fingerprinters;
                 name: row.get(0).unwrap(),
                 pool: row.get(1).unwrap(),
                 additional_fingerprinters: [].to_vec(),
+                attributes: HashMap::new(),
             })
         })?;
 
