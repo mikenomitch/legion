@@ -3,9 +3,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ManagerConfig {
-    pub id: u64,
-    pub election_tick: usize,
-    pub heartbeat_tick: usize,
+    pub store_path: String,
+    pub worker_config_path: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -25,8 +24,11 @@ pub struct AgentConfig {
 
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
+#[serde(rename(serialize = "type", deserialize = "worker_type"))]
 pub struct WorkerConfigFromManager {
     pub additional_fingerprinters: Vec<String>,
+    pub worker_type: String,
+    pub pool: String,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -42,7 +44,8 @@ pub struct JoinTokenClaims {
     pub exp: usize, // Required (validate_exp defaults to true in validation). Expiration time (as UTC timestamp)
     pub sub: String, // Optional. Subject (whom token refers to)
     pub address: String, // Optional. Address of the node
-    pub config: WorkerConfig, // Optional. Config of the node
+    pub server_config: ServerConfig, // Optional. Config of the node
+    pub worker_type: String, // Optional. Type of the node (points to node template)
     // pub cert: String, // Optional. Cert of the node
     // pub key: String, // Optional. Private Key of the node
     // pub ca_cert: String, // Optional. CA Cert for the cluster

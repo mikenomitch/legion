@@ -18,7 +18,7 @@ use serde_json::{Map, Value};
 // https://michael-f-bryan.github.io/rust-ffi-guide/dynamic_loading.html
 // https://crates.io/crates/sysinfo
 
-pub fn fingerprint_node(config: &WorkerConfig) -> Map<String, Value> {
+pub fn fingerprint_node(additional_fingerprinters: Vec<String>) -> Map<String, Value> {
     let fps: Vec<Box<dyn Fingerprinter>> = vec![
         Box::new(ArchFingerprinter {}),
         Box::new(OSFingerprinter {}),
@@ -31,9 +31,7 @@ pub fn fingerprint_node(config: &WorkerConfig) -> Map<String, Value> {
         ret.extend(f.fingerprint());
     });
 
-    config
-        .worker_config
-        .additional_fingerprinters
+    additional_fingerprinters
         .iter()
         .for_each(|path| match call_dynamic(path) {
             Ok(fp) => {
@@ -240,6 +238,8 @@ mod tests {
                 address: "1.1.1.1".into(),
             },
             worker_config: WorkerConfigFromManager{
+                worker_type: "basic".into(),
+                pool: "infinity".into(),
                 additional_fingerprinters: vec!["/Users/mike/Code/legion/plugins/fingerprinters/example/target/release/libexample.dylib".into()],
             }
         };

@@ -62,7 +62,8 @@ pub fn generate_join_token() -> R<String> {
         // cert: new_cert,
         // key: new_key,
         // ca_cert: ca_cert,
-        config: config,
+        worker_type: config.worker_config.worker_type,
+        server_config: config.server,
     };
 
     let header = Header { kid: Some("signing_key".to_owned()), alg: Algorithm::HS512, ..Default::default() };

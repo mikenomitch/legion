@@ -1,17 +1,18 @@
 # Next Up
-* Goal: Clean up
-
-* Success:
-- SQL queries generally cleaned up
-- Heartbeating happens nicely and roughly performantly?
-
-# After that
-Goal: Add expiry on join-tokens
+* Goal: Add expiry on join-tokens
 
 * Success:
 - I can pass an argument into the join-token generation for unlimited or a time
 - It defaults to 1 hour use
 - The JWT has this auto encoded in it and this is validated on join
+
+# Next Up
+* Goal: Add node type on join-token
+
+* Success: I can make a new node type and save it
+- I can pass an argument into the join-token generation for node type
+- It defaults to something?
+- It adds a node_pool and initial dynamic attributes to the node info and that's it for now
 
 # After that
 * Goal: Add more node stuff

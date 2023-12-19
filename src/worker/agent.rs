@@ -15,7 +15,7 @@ use tonic::{
 
 use crate::structs::manager_client::ManagerClient;
 use crate::structs::worker_server::{Worker, WorkerServer};
-use crate::structs::{PostWorkReply, PostWorkRequest, HeartbeatRequest, WorkerRegisterRequest};
+use crate::structs::{PostWorkReply, PostWorkRequest, HeartbeatRequest, WorkerRegisterRequest, WorkerPreRegisterRequest, WorkerPreRegisterReply};
 
 pub struct WorkerAgentService {}
 #[tonic::async_trait]
@@ -52,12 +52,6 @@ pub async fn run_worker(token: &str) -> R<()> {
         }
     };
 
-    // TODO: ESTABLISH TLS CONNECTION PROPERLY
-
-    let fingerprint_data = fingerprint_node(&token_data.claims.config);
-
-    // TODO: SEND THE REAL RE-REGISTRATION WITH FINGERPRINT DATA
-
     let addr = format!("{}:{}", DEFAULT_HOSTNAME, 4848).parse()?;
     let worker_node = WorkerAgentService {};
     let worker_server_fut = Server::builder()
@@ -70,6 +64,11 @@ pub async fn run_worker(token: &str) -> R<()> {
         // token_data.claims.ca_cert,
     ).await?;
 
+    // TODO: ESTABLISH TLS CONNECTION PROPERLY
+    let pre_register_res = pre_register_self(client.clone(), token_data.claims.worker_type).await?;
+    let config = pre_register_res.into_inner().config.unwrap();
+
+    let fingerprint_data = fingerprint_node(config.additional_fingerprinters);
     register_self(client.clone(), fingerprint_data).await?;
 
     let heartbeat_fut = start_heartbeats(client);
@@ -90,13 +89,14 @@ async fn create_manager_client(manager_addr: String, _ca_cert: String) -> R<Mana
 
 
 async fn start_heartbeats(client: ManagerClient<Channel>) -> R<()> {
-    let mut c2 = client.clone();
+    let mut client_clone = client.clone();
+
     loop {
         let req = tonic::Request::new(HeartbeatRequest {
             id: "worker".into(),
         });
 
-        let response = c2.heartbeat(req).await?;
+        let response = client_clone.heartbeat(req).await?;
         debug!("RESPONSE={:?}", response);
 
         tokio::time::sleep(tokio::time::Duration::from_secs(WORKER_HEARTBEAT_DURATION)).await;
@@ -117,4 +117,17 @@ async fn register_self(client: ManagerClient<Channel>, fingerprint_data: Map<Str
     debug!("RESPONSE={:?}", response);
 
     Ok(())
+}
+
+async fn pre_register_self(client: ManagerClient<Channel>, worker_type: String) -> R<Response<WorkerPreRegisterReply>> {
+    let mut c2 = client.clone();
+
+    let req = tonic::Request::new(WorkerPreRegisterRequest {
+        name: "worker".into(),
+        worker_type: worker_type,
+    });
+
+    let response = c2.worker_pre_register(req).await?;
+
+    Ok(response)
 }

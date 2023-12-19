@@ -1,7 +1,9 @@
-use crate::cmd::structs::{AgentConfig, JoinTokenClaims};
-use crate::constants::{DEFAULT_HOSTNAME, DEFAULT_PORT, TMP_SECRET_KEY, NODE_CHECK_DURATION};
+use crate::cmd::structs::{AgentConfig, WorkerConfig, JoinTokenClaims};
+use crate::constants::{DEFAULT_HOSTNAME, DEFAULT_PORT, TMP_SECRET_KEY, NODE_CHECK_DURATION, DEFAULT_WORKER_CONFIG_PATH};
 use crate::storage::store::Store;
 use crate::util::R;
+
+use jsonnet::JsonnetVm;
 
 use std::str::FromStr;
 
@@ -16,8 +18,8 @@ use crate::structs::manager_server::{Manager, ManagerServer};
 use crate::structs::{
     GetJobStatusReply, GetJobStatusRequest, GetNodesReply, GetNodesRequest, HeartbeatReply,
     HeartbeatRequest,RunJobReply, RunJobRequest,
-    UpdateNodeDynamicReply, UpdateNodeDynamicRequest, WorkerJoinReply, WorkerJoinRequest,
-    WorkerRegisterReply, WorkerRegisterRequest, GetNodeReply, GetNodeRequest, Node
+    UpdateNodeDynamicReply, UpdateNodeDynamicRequest, WorkerPreRegisterRequest, WorkerPreRegisterReply,
+    WorkerRegisterReply, WorkerRegisterRequest, GetNodeReply, GetNodeRequest, Node, WorkerConfig as WorkerConfigMsg,
 };
 
 use tonic::transport::{Identity, Server, ServerTlsConfig};
@@ -53,31 +55,6 @@ impl Manager for ManagerAgentService {
         Ok(Response::new(reply))
     }
 
-    // NOTE: Make this work for servers and workers
-    async fn worker_join(
-        &self,
-        request: Request<WorkerJoinRequest>,
-    ) -> Result<Response<WorkerJoinReply>, Status> {
-        let token = request.into_inner().token;
-        let token_data = match decode::<JoinTokenClaims>(
-            &token,
-            &DecodingKey::from_secret(&TMP_SECRET_KEY[..]),
-            &Validation::new(Algorithm::HS512),
-        ) {
-            Ok(c) => c,
-            Err(err) => match *err.kind() {
-                ErrorKind::InvalidToken => panic!(), // Example on how to handle a specific error
-                _ => panic!(),
-            },
-        };
-
-        let reply = WorkerJoinReply {
-            message: format!("Joined Yay?: {:?}!", token_data.claims),
-        };
-
-        Ok(Response::new(reply))
-    }
-
     async fn heartbeat(
         &self,
         request: Request<HeartbeatRequest>,
@@ -91,6 +68,35 @@ impl Manager for ManagerAgentService {
         };
         Ok(Response::new(reply))
     }
+
+    async fn worker_pre_register(
+        &self,
+        request: Request<WorkerPreRegisterRequest>,
+    ) -> Result<Response<WorkerPreRegisterReply>, Status> {
+        let request = request.into_inner();
+        let worker_type = request.worker_type;
+
+        // TODO: Get from db instead of static config
+        let worker_config = self.store.get_worker_type(worker_type.clone()).unwrap();
+        println!("got me a worker_config: {:?}", worker_config);
+
+        let parsed_config = parse_worker_config(DEFAULT_WORKER_CONFIG_PATH).unwrap();
+
+        println!("parsed_config: {:?}", parsed_config);
+
+        let config = WorkerConfigMsg{
+            name: worker_type,
+            pool: "default".into(),
+            additional_fingerprinters: parsed_config.worker_config.additional_fingerprinters,
+        };
+
+        let reply = WorkerPreRegisterReply {
+            config: Some(config),
+        };
+
+        Ok(Response::new(reply))
+    }
+
 
     async fn worker_register(
         &self,
@@ -222,5 +228,19 @@ async fn start_node_status_checker(store: Store) -> R<()> {
 
         store.mark_nodes_as_lost(node_ids_to_update)?;
         tokio::time::sleep(tokio::time::Duration::from_secs(NODE_CHECK_DURATION)).await;
+    }
+}
+
+fn parse_worker_config(config_path: &str) -> R<WorkerConfig> {
+    // Pluginify jsonnet
+    let mut vm = JsonnetVm::new();
+    let res = vm.evaluate_file(config_path);
+
+    match res {
+        Ok(s) => {
+            let config: WorkerConfig = serde_json::from_str(&s)?;
+            Ok(config)
+        }
+        Err(_) => Err("Failed to parse config file".into()),
     }
 }

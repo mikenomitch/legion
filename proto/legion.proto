@@ -4,7 +4,9 @@ package legion;
 // === MANAGER ===
 
 service Manager {
-  rpc WorkerJoin (WorkerJoinRequest) returns (WorkerJoinReply);
+  // rpc WorkerJoin (WorkerJoinRequest) returns (WorkerJoinReply);
+  rpc WorkerPreRegister (WorkerPreRegisterRequest)
+    returns (WorkerPreRegisterReply);
   rpc WorkerRegister (WorkerRegisterRequest) returns (WorkerRegisterReply);
   rpc RunJob (RunJobRequest) returns (RunJobReply);
   rpc GetJobStatus (GetJobStatusRequest) returns (GetJobStatusReply);
@@ -15,8 +17,27 @@ service Manager {
     returns (UpdateNodeDynamicReply);
 }
 
-message WorkerJoinRequest {
-  string token = 1;
+// message WorkerJoinRequest {
+//   string token = 1;
+// }
+
+// message WorkerJoinReply {
+//   string message = 1;
+// }
+
+message WorkerPreRegisterRequest {
+  string name = 1;
+  string worker_type = 2;
+}
+
+message WorkerConfig {
+  string name = 1;
+  string pool = 2;
+  repeated string additional_fingerprinters = 3;
+}
+
+message WorkerPreRegisterReply {
+  WorkerConfig config = 1;
 }
 
 message WorkerRegisterRequest {
@@ -25,10 +46,6 @@ message WorkerRegisterRequest {
 }
 
 message WorkerRegisterReply {
-  string message = 1;
-}
-
-message WorkerJoinReply {
   string message = 1;
 }
 
