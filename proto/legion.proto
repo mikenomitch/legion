@@ -34,6 +34,7 @@ message WorkerConfig {
   string name = 1;
   string pool = 2;
   repeated string additional_fingerprinters = 3;
+  map<string, string> attributes = 4;
 }
 
 message WorkerPreRegisterReply {
@@ -112,7 +113,8 @@ service InsecureManager {
 }
 
 message GetJoinTokenRequest {
-  bool one_time = 1;
+  optional int64 ttl = 1;
+  optional string worker_type = 2;
 }
 
 message GetJoinTokenReply {

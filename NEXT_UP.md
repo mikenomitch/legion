@@ -11,7 +11,6 @@
 
 * Success: I can make a new node type and save it
 - I can pass an argument into the join-token generation for node type
-- It defaults to something?
 - It adds a node_pool and initial dynamic attributes to the node info and that's it for now
 
 # After that
@@ -26,7 +25,7 @@
 # Deferred Work
 
 ### TLS joining
-* Goal: Make join process establish TLS
+* Goal: Make join process establish TLS and/or WG
 
 * Success:
 - Run server with `cr start``

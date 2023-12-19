@@ -6,7 +6,7 @@ use crate::worker::fingerprint::fingerprint_node;
 use jsonwebtoken::{decode, errors::ErrorKind, Algorithm, DecodingKey, Validation};
 use log::debug;
 use futures::join;
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 
 use tonic::{
     transport::Channel,transport::Server, Request, Response, Status,
@@ -68,8 +68,16 @@ pub async fn run_worker(token: &str) -> R<()> {
     let pre_register_res = pre_register_self(client.clone(), token_data.claims.worker_type).await?;
     let config = pre_register_res.into_inner().config.unwrap();
 
+    let mut initial_attrs = Map::new();
+    config.attributes.keys().for_each(|k| {
+        let val = config.attributes.get(k).unwrap();
+        initial_attrs.insert(k.into(), Value::String(val.into()));
+    });
+
     let fingerprint_data = fingerprint_node(config.additional_fingerprinters);
-    register_self(client.clone(), fingerprint_data).await?;
+    initial_attrs.extend(fingerprint_data);
+
+    register_self(client.clone(), initial_attrs).await?;
 
     let heartbeat_fut = start_heartbeats(client);
     let _res = join!(heartbeat_fut, worker_server_fut);
@@ -106,7 +114,6 @@ async fn start_heartbeats(client: ManagerClient<Channel>) -> R<()> {
 async fn register_self(client: ManagerClient<Channel>, fingerprint_data: Map<String, Value>) -> R<()> {
     let mut c2 = client.clone();
     let serialized_data = serde_json::to_string(&fingerprint_data)?;
-
 
     let req = tonic::Request::new(WorkerRegisterRequest {
         name: "worker".into(),

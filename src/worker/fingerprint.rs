@@ -1,4 +1,3 @@
-use crate::cmd::structs::WorkerConfig;
 use crate::util::R;
 
 use libloading::{Library, Symbol};
@@ -225,26 +224,12 @@ impl Fingerprinter for KitchenSinkFingerprinter {
 
 #[cfg(test)]
 mod tests {
-    use crate::cmd::structs::{ServerConfig, WorkerConfigFromManager};
-
     use super::*;
 
     #[test]
     fn fingerprint_node_works() -> R<()> {
-        let config = &WorkerConfig{
-            server: ServerConfig{
-                port: 9876,
-                insecure_port: 9999,
-                address: "1.1.1.1".into(),
-            },
-            worker_config: WorkerConfigFromManager{
-                worker_type: "basic".into(),
-                pool: "infinity".into(),
-                additional_fingerprinters: vec!["/Users/mike/Code/legion/plugins/fingerprinters/example/target/release/libexample.dylib".into()],
-            }
-        };
-
-        let res = fingerprint_node(config);
+        let fps =vec!["/Users/mike/Code/legion/plugins/fingerprinters/example/target/release/libexample.dylib".into()];
+        let res = fingerprint_node(fps);
 
         // res.values().for_each(|v| {
         //     println!("v: {:?}", v.to_string());

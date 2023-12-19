@@ -53,7 +53,7 @@ impl Store {
                 last_heartbeat TIMESTAMP NOT NULL
             )").down("DROP TABLE node;"),
             M::up("CREATE TABLE IF NOT EXISTS worker_type (
-                name    STRING PRIMARY KEY,
+                name STRING PRIMARY KEY,
                 pool STRING NOT NULL,
                 additional_fingerprinters Text NOT NULL
             )").down("DROP TABLE worker_type;"),
@@ -210,7 +210,7 @@ RETURNING id, attrs, dynamic, status, last_heartbeat;
 
     pub fn get_worker_type(&self, name: String) -> R<WorkerConfig> {
         let conn = self.conn.lock().unwrap();
-        let sql = "SELECT name, worker_pool, additional_fingerprinters FROM worker_type WHERE name = ?";
+        let sql = "SELECT name, pool, additional_fingerprinters FROM worker_type WHERE name = ?";
 
         let config = conn.query_row(sql, [name], |row| {
             let af: String= row.get(2).unwrap();
@@ -227,13 +227,14 @@ RETURNING id, attrs, dynamic, status, last_heartbeat;
         Ok(config)
     }
 
+    // TODO: On manager start, add the workers from the host
     pub fn insert_worker_type(&self, config: WorkerConfig) -> R<WorkerConfig> {
         let conn = self.conn.lock().unwrap();
         let sql = r#"
-INSERT INTO worker_type (name, worker_pool, additional_fingerprinters)
+INSERT INTO worker_type (name, pool, additional_fingerprinters)
 VALUES (?1, ?2, ?3)
-ON CONFLICT(name) DO UPDATE SET worker_pool = ?2, additional_fingerprinters = ?3
-RETURNING name, worker_pool, additional_fingerprinters;
+ON CONFLICT(name) DO UPDATE SET pool = ?2, additional_fingerprinters = ?3
+RETURNING name, pool, additional_fingerprinters;
 "#;
         let config = conn.query_row(sql, [config.name, config.pool, config.additional_fingerprinters.join(",")], |row| {
             let af: String= row.get(2).unwrap();

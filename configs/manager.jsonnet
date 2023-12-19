@@ -4,8 +4,6 @@
     insecurePort: 4748,
     address: "127.0.0.1",
   },
-  manager: {
-    storePath: ".legion/"
-    workerConfigPath: "./configs/workers/",
-  },
+  storePath: ".legion/",
+  workerConfigPath: "./configs/workers/",
 }

@@ -1,19 +1,16 @@
-use crate::cmd::structs::{WorkerConfig, JoinTokenClaims};
+use crate::cmd::structs::{ManagerConfig, JoinTokenClaims};
 use crate::util::R;
-// use crate::certs::{signed_cert_with_ca, read_root_cert};
-use crate::constants::{TMP_SECRET_KEY, DEFAULT_WORKER_CONFIG_PATH, DEFAULT_ADDR};
-use tonic::{Request, Response, Status};
+use crate::constants::{TMP_SECRET_KEY, DEFAULT_CONFIG_PATH, DEFAULT_ADDR};
 
+use tonic::{Request, Response, Status};
 use jsonnet::JsonnetVm;
 
 use crate::structs::insecure_manager_server::{InsecureManager, InsecureManagerServer};
-use crate::structs::{
-    GetJoinTokenReply,
-    GetJoinTokenRequest,
-};
+use crate::structs::{GetJoinTokenReply, GetJoinTokenRequest};
 
 use jsonwebtoken::{encode, Header, Algorithm, EncodingKey};
 
+// use crate::certs::{signed_cert_with_ca, read_root_cert};
 // use tonic::transport::{Certificate, Channel, ClientTlsConfig};
 // use rustls::Certificate;
 // use rustls::PrivateKey;
@@ -23,9 +20,15 @@ pub struct InsecureManagerService {}
 impl InsecureManager for InsecureManagerService {
     async fn get_join_token(
         &self,
-        _request: Request<GetJoinTokenRequest>,
+        request: Request<GetJoinTokenRequest>,
     ) -> Result<Response<GetJoinTokenReply>, Status> {
-        let token = generate_join_token().
+
+        let worker_type = match request.into_inner().worker_type {
+            Some(wt) => wt,
+            None => "default".into(),
+        };
+
+        let token = generate_join_token(worker_type).
             map_err(|e| Status::new(tonic::Code::Internal, e.to_string()))?;
 
         let reply = GetJoinTokenReply {
@@ -42,8 +45,8 @@ pub fn get_insecure_manager_service() -> InsecureManagerServer<InsecureManagerSe
 }
 
 // add generate_join_token_function
-pub fn generate_join_token() -> R<String> {
-    let config = parse_worker_config(DEFAULT_WORKER_CONFIG_PATH)?;
+pub fn generate_join_token(worker_type: String) -> R<String> {
+    let config = parse_manager_config(DEFAULT_CONFIG_PATH)?;
 
     // NOTE:
     // I think what I have to do is:
@@ -62,7 +65,7 @@ pub fn generate_join_token() -> R<String> {
         // cert: new_cert,
         // key: new_key,
         // ca_cert: ca_cert,
-        worker_type: config.worker_config.worker_type,
+        worker_type: worker_type,
         server_config: config.server,
     };
 
@@ -73,14 +76,14 @@ pub fn generate_join_token() -> R<String> {
 }
 
 
-fn parse_worker_config(config_path: &str) -> R<WorkerConfig> {
+fn parse_manager_config(config_path: &str) -> R<ManagerConfig> {
     // Pluginify jsonnet
     let mut vm = JsonnetVm::new();
     let res = vm.evaluate_file(config_path);
 
     match res {
         Ok(s) => {
-            let config: WorkerConfig = serde_json::from_str(&s)?;
+            let config: ManagerConfig = serde_json::from_str(&s)?;
             Ok(config)
         }
         Err(_) => Err("Failed to parse config file".into()),

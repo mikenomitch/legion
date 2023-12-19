@@ -1,11 +1,5 @@
 use serde::{Deserialize, Serialize};
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct ManagerConfig {
-    pub store_path: String,
-    pub worker_config_path: String,
-}
+use serde_json::{Map, Value};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -17,26 +11,21 @@ pub struct ServerConfig {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
-pub struct AgentConfig {
+pub struct ManagerConfig {
     pub server: ServerConfig,
-    pub manager: ManagerConfig,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-#[serde(rename_all = "camelCase")]
-#[serde(rename(serialize = "type", deserialize = "worker_type"))]
-pub struct WorkerConfigFromManager {
-    pub additional_fingerprinters: Vec<String>,
-    pub worker_type: String,
-    pub pool: String,
+    pub store_path: String,
+    pub worker_config_path: String,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkerConfig {
-    pub server: ServerConfig,
-    pub worker_config: WorkerConfigFromManager,
+    pub additional_fingerprinters: Vec<String>,
+    pub worker_type: String,
+    pub pool: String,
+    pub attributes: Map<String, Value>,
 }
+
 
 /// Our claims struct, it needs to derive `Serialize` and/or `Deserialize`
 #[derive(Debug, Serialize, Deserialize)]

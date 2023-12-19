@@ -1,5 +1,5 @@
 use crate::util::R;
-use crate::cmd::structs::AgentConfig;
+use crate::cmd::structs::ManagerConfig;
 use crate::constants::DEFAULT_CONFIG_PATH;
 use crate::manager::server::run_manager;
 use crate::worker::agent::run_worker;
@@ -31,19 +31,20 @@ pub async fn handle(sub_matches: &clap::ArgMatches) -> R<()> {
             .get_one::<String>("config")
             .map(|s| s.as_str())
             .unwrap_or(DEFAULT_CONFIG_PATH);
+
         let config = parse_config(config_path)?;
         run_manager(config).await
     }
 }
 
-fn parse_config(config_path: &str) -> R<AgentConfig> {
+fn parse_config(config_path: &str) -> R<ManagerConfig> {
     // Pluginify jsonnet
     let mut vm = JsonnetVm::new();
     let res = vm.evaluate_file(config_path);
 
     match res {
         Ok(s) => {
-            let config: AgentConfig = serde_json::from_str(&s)?;
+            let config: ManagerConfig = serde_json::from_str(&s)?;
             Ok(config)
         }
         Err(e) => {

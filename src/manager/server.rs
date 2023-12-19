@@ -1,15 +1,15 @@
-use crate::cmd::structs::{AgentConfig, WorkerConfig, JoinTokenClaims};
-use crate::constants::{DEFAULT_HOSTNAME, DEFAULT_PORT, TMP_SECRET_KEY, NODE_CHECK_DURATION, DEFAULT_WORKER_CONFIG_PATH};
+use crate::cmd::structs::{ManagerConfig, WorkerConfig};
+use crate::constants::{DEFAULT_HOSTNAME, DEFAULT_PORT, NODE_CHECK_DURATION};
 use crate::storage::store::Store;
 use crate::util::R;
 
 use jsonnet::JsonnetVm;
 
+use std::collections::HashMap;
 use std::str::FromStr;
+use std::fs;
 
-use jsonwebtoken::errors::ErrorKind;
-use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
-use serde_json::json;
+use serde_json::{Value, json};
 use futures::join;
 
 use crate::manager::join_server::get_insecure_manager_service;
@@ -76,18 +76,12 @@ impl Manager for ManagerAgentService {
         let request = request.into_inner();
         let worker_type = request.worker_type;
 
-        // TODO: Get from db instead of static config
         let worker_config = self.store.get_worker_type(worker_type.clone()).unwrap();
-        println!("got me a worker_config: {:?}", worker_config);
-
-        let parsed_config = parse_worker_config(DEFAULT_WORKER_CONFIG_PATH).unwrap();
-
-        println!("parsed_config: {:?}", parsed_config);
 
         let config = WorkerConfigMsg{
             name: worker_type,
-            pool: "default".into(),
-            additional_fingerprinters: parsed_config.worker_config.additional_fingerprinters,
+            pool: worker_config.pool,
+            additional_fingerprinters: worker_config.additional_fingerprinters,
         };
 
         let reply = WorkerPreRegisterReply {
@@ -166,10 +160,13 @@ impl Manager for ManagerAgentService {
     }
 }
 
-pub async fn run_manager(config: AgentConfig) -> R<()> {
+pub async fn run_manager(config: ManagerConfig) -> R<()> {
     let addr = format!("{}:{}", DEFAULT_HOSTNAME, DEFAULT_PORT).parse()?;
     let cloned_config = config.clone();
     let store = Store::start_storage()?;
+
+    load_initial_data(&store, &config).await?;
+
 
     // Spawn a separate grpc server for non-TLS calls
     let join_server_addr = format!(
@@ -243,4 +240,31 @@ fn parse_worker_config(config_path: &str) -> R<WorkerConfig> {
         }
         Err(_) => Err("Failed to parse config file".into()),
     }
+}
+
+async fn load_initial_data(store: &Store, config: &ManagerConfig) -> R<()> {
+    let paths = fs::read_dir(config.worker_config_path.clone()).unwrap();
+
+    for path in paths {
+        let path = path.unwrap().path();
+        let path_str = path.to_str().unwrap();
+        let wcp = parse_worker_config(path_str).unwrap();
+
+        // let mut attrs = HashMap::new();
+        // for (key, value) in &wcp.attributes {
+        //     attrs.insert(key.clone(), Value::from_str(value.clone())?);
+        // }
+
+
+        let wc = WorkerConfigMsg {
+            name: wcp.worker_type.clone(),
+            pool: wcp.pool.clone(),
+            additional_fingerprinters: wcp.additional_fingerprinters,
+            attributes: attrs,
+        };
+
+        store.insert_worker_type(wc)?;
+    }
+
+    Ok(())
 }
