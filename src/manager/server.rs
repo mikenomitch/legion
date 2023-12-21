@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::str::FromStr;
 use std::fs;
 
-use serde_json::{Value, json};
+use serde_json::json;
 use futures::join;
 
 use crate::manager::join_server::get_insecure_manager_service;
@@ -106,6 +106,7 @@ impl Manager for ManagerAgentService {
         let request = request.into_inner();
         let name = request.name;
         let attrs = request.attributes;
+        let pool = request.pool;
         let dynamic = json!({}).to_string(); //
 
         let node = Node {
@@ -113,16 +114,12 @@ impl Manager for ManagerAgentService {
             attrs: attrs.clone(),
             dynamic: dynamic.clone(),
             status: "active".to_string(),
+            pool: pool,
             last_heartbeat: "".to_string(),
         };
 
         self.store.insert_node(node.clone()).unwrap();
         let nodes = self.store.get_nodes().unwrap();
-
-        for node in nodes {
-            println!("Found node {:?}", node.id);
-            println!("With attrs: {:?}", node.attrs);
-        }
 
         let reply = WorkerRegisterReply {
             message: format!("You are in!"),

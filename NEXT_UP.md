@@ -1,13 +1,4 @@
 # Next Up
-* Goal: Add node type on join-token
-
-* Success: I can make a new node type and save it
-- Fix the type errors when loading attrs
-- Get attrs saving properly on Node Join
-- I can join "default" and "alt" and properly see pool and attrs
-  threading thru all the way to the node info command & node list commands
-
-# Next Up
 * Goal: Add expiry on join-tokens
 
 * Success:
@@ -16,6 +7,8 @@
 - The JWT has this auto encoded in it and this is validated on join
 
 # After that
+- Clean up all the store sql with params! (so adding fields is simpler - you're about to add fields so do it now)
+
 - Other health status checks along with heartbeats?
     - Like heartbeating but at slower cadence (jsonb saved and pinged every N seconds)
     - Plugin system like fingerprinters
@@ -24,6 +17,8 @@
 
 - Clean up every unwrap()
 - Clean up gross conversions of attr hashes
+- Fix the attrs being saves with an additional escape for some reason
+- Join token for a non existent node type is fine
 
 - Output node attrs as a map in json not a string
 - Make many of the worker node attrs optional in the config

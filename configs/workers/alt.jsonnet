@@ -1,8 +1,8 @@
 {
     workerType: "alt",
     pool: "alt",
-    additionalFingerprinters: [],
+    additionalFingerprinters: ["example"],
     attributes: {
-        baz: "qux"
+        woot: "WUT"
     },
 }

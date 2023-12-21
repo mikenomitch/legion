@@ -9,9 +9,14 @@ pub fn config() -> Command {
     Command::new("join-token")
         .about("Creates a join token for a worker node")
         .arg(arg!(-t --type [TYPE] "type of worker to get join token for"))
+        .arg(arg!(--ttl [TTL] "ttl of join token in seconds"))
 }
 pub async fn handle(sub_matches: &clap::ArgMatches) -> Result<(), Box<dyn error::Error>> {
-    let ttl = 100;
+    let ttl = sub_matches
+        .get_one::<String>("ttl")
+        .map(|s| s.as_str())
+        .unwrap_or("1h");
+
     let worker_type = sub_matches
         .get_one::<String>("type")
         .map(|s| s.as_str())
@@ -23,7 +28,7 @@ pub async fn handle(sub_matches: &clap::ArgMatches) -> Result<(), Box<dyn error:
 
     let mut client = InsecureManagerClient::connect(address).await?;
     let request = tonic::Request::new(GetJoinTokenRequest {
-        ttl: Some(ttl),
+        ttl: Some(ttl.into()),
         worker_type: Some(worker_type.into()),
     });
 

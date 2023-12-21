@@ -16,8 +16,8 @@ pub trait Printable {
 impl Printable for Node {
     fn print_short(&self) {
         println!(
-            "ID: {}, Status: {}, Checkin: {}",
-            self.id, self.status, self.last_heartbeat
+            "ID: {}, Status: {}, Pool: {}, Checkin: {}",
+            self.id, self.status, self.pool, self.last_heartbeat
         );
     }
 

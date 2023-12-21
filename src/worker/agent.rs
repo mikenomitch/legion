@@ -6,7 +6,7 @@ use crate::worker::fingerprint::fingerprint_node;
 use jsonwebtoken::{decode, errors::ErrorKind, Algorithm, DecodingKey, Validation};
 use log::debug;
 use futures::join;
-use serde_json::{Map, Value, json};
+use serde_json::{Map, Value};
 
 use tonic::{
     transport::Channel,transport::Server, Request, Response, Status,
@@ -45,12 +45,15 @@ pub async fn run_worker(token: &str) -> R<()> {
             // print error message
             println!("Error: {}", err);
 
+            // TODO: Return a nicer error to the CLI - if the token is expired!
             match *err.kind() {
                 ErrorKind::InvalidToken => panic!(), // Example on how to handle a specific error
                 _ => panic!(),
             }
         }
     };
+
+    println!("Token data: {:?}", token_data);
 
     let addr = format!("{}:{}", DEFAULT_HOSTNAME, 4848).parse()?;
     let worker_node = WorkerAgentService {};
@@ -77,7 +80,7 @@ pub async fn run_worker(token: &str) -> R<()> {
     let fingerprint_data = fingerprint_node(config.additional_fingerprinters);
     initial_attrs.extend(fingerprint_data);
 
-    register_self(client.clone(), initial_attrs).await?;
+    register_self(client.clone(), config.pool, initial_attrs).await?;
 
     let heartbeat_fut = start_heartbeats(client);
     let _res = join!(heartbeat_fut, worker_server_fut);
@@ -111,13 +114,14 @@ async fn start_heartbeats(client: ManagerClient<Channel>) -> R<()> {
     }
 }
 
-async fn register_self(client: ManagerClient<Channel>, fingerprint_data: Map<String, Value>) -> R<()> {
+async fn register_self(client: ManagerClient<Channel>, pool: String, fingerprint_data: Map<String, Value>) -> R<()> {
     let mut c2 = client.clone();
     let serialized_data = serde_json::to_string(&fingerprint_data)?;
 
     let req = tonic::Request::new(WorkerRegisterRequest {
         name: "worker".into(),
         attributes: serialized_data,
+        pool: pool,
     });
 
     let response = c2.worker_register(req).await?;

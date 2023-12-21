@@ -32,7 +32,8 @@ pub fn fingerprint_node(additional_fingerprinters: Vec<String>) -> Map<String, V
 
     additional_fingerprinters
         .iter()
-        .for_each(|path| match call_dynamic(path) {
+        .map(|name| fp_plugin_name_to_path(name))
+        .for_each(|path| match call_dynamic(&path) {
             Ok(fp) => {
                 ret.extend(fp.fingerprint());
             }
@@ -42,6 +43,10 @@ pub fn fingerprint_node(additional_fingerprinters: Vec<String>) -> Map<String, V
         });
 
     ret
+}
+
+fn fp_plugin_name_to_path(name: &String) -> String {
+    format!("/Users/mike/Code/legion/plugins/fingerprinters/{}/target/release/libexample.dylib", name)
 }
 
 fn call_dynamic(path: &str) -> R<Box<dyn Fingerprinter>> {
@@ -228,7 +233,7 @@ mod tests {
 
     #[test]
     fn fingerprint_node_works() -> R<()> {
-        let fps =vec!["/Users/mike/Code/legion/plugins/fingerprinters/example/target/release/libexample.dylib".into()];
+        let fps =vec!["example".into()];
         let res = fingerprint_node(fps);
 
         // res.values().for_each(|v| {

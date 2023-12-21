@@ -1,3 +1,6 @@
+use std::ops::Add;
+use std::time::Duration;
+
 use crate::cmd::structs::{ManagerConfig, JoinTokenClaims};
 use crate::util::R;
 use crate::constants::{TMP_SECRET_KEY, DEFAULT_CONFIG_PATH, DEFAULT_ADDR};
@@ -15,6 +18,7 @@ use jsonwebtoken::{encode, Header, Algorithm, EncodingKey};
 // use rustls::Certificate;
 // use rustls::PrivateKey;
 
+
 pub struct InsecureManagerService {}
 #[tonic::async_trait]
 impl InsecureManager for InsecureManagerService {
@@ -22,13 +26,21 @@ impl InsecureManager for InsecureManagerService {
         &self,
         request: Request<GetJoinTokenRequest>,
     ) -> Result<Response<GetJoinTokenReply>, Status> {
+        let r = request.into_inner();
+        let ttl = r.clone().ttl;
+        let wt = r.clone().worker_type;
 
-        let worker_type = match request.into_inner().worker_type {
+        let worker_type = match wt {
             Some(wt) => wt,
             None => "default".into(),
         };
 
-        let token = generate_join_token(worker_type).
+        let ttl = match ttl {
+            Some(ttl) => ttl,
+            None => "1h".into(),
+        };
+
+        let token = generate_join_token(worker_type, ttl).
             map_err(|e| Status::new(tonic::Code::Internal, e.to_string()))?;
 
         let reply = GetJoinTokenReply {
@@ -45,8 +57,13 @@ pub fn get_insecure_manager_service() -> InsecureManagerServer<InsecureManagerSe
 }
 
 // add generate_join_token_function
-pub fn generate_join_token(worker_type: String) -> R<String> {
+pub fn generate_join_token(worker_type: String, ttl: String) -> R<String> {
     let config = parse_manager_config(DEFAULT_CONFIG_PATH)?;
+
+    let parsed_ttl: Duration = ttl.parse::<humantime::Duration>().unwrap().into();
+    let now = std::time::SystemTime::now();
+    let expiry = now + parsed_ttl;
+    let jwt_exp = expiry.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as usize;
 
     // NOTE:
     // I think what I have to do is:
@@ -60,7 +77,7 @@ pub fn generate_join_token(worker_type: String) -> R<String> {
 
     let claims = JoinTokenClaims {
         sub: "legion".to_owned(),
-        exp: 10000000000,
+        exp: jwt_exp,
         address: DEFAULT_ADDR.to_owned(),
         // cert: new_cert,
         // key: new_key,
