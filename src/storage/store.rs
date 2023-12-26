@@ -1,4 +1,4 @@
-use crate::constants::DEFAULT_STORE_PATH;
+use crate::{constants::DEFAULT_STORE_PATH, worker::fingerprint};
 // use crate::structs::Node;
 use rusqlite_migration::{Migrations, M};
 use crate::util::{R, merge_json_strings};
@@ -138,8 +138,6 @@ impl Store {
         SET status = 'lost'
         WHERE id IN (?1);
 "#;
-
-        // TODO: This feels off...
         let joined = ids.join(",");
         conn.execute(sql, [joined])?;
 
@@ -222,6 +220,9 @@ RETURNING id, attrs, dynamic, status, pool, last_heartbeat;
             let af: String= row.get(2)?;
             let attrs: String= row.get(3)?;
 
+            println!("Af: {}", af);
+            println!("Attrs: {}", attrs);
+
             Ok(WorkerConfig {
                 name: row.get(0)?,
                 pool: row.get(1)?,
@@ -233,9 +234,15 @@ RETURNING id, attrs, dynamic, status, pool, last_heartbeat;
         Ok(config)
     }
 
-    // TODO: On manager start, add the workers from the host
     pub fn insert_worker_type(&self, config: WorkerConfig) -> R<WorkerConfig> {
         let conn = self.conn.lock().unwrap();
+
+        let fingerprinters_to_save = config.additional_fingerprinters.join(",");
+        let attrs_to_save = serde_json::to_string(&config.attributes)?;
+
+        println!("Fingerprinters to save: {}", fingerprinters_to_save);
+        println!("attrs_to_save: {}", attrs_to_save);
+
         let sql = r#"
 INSERT INTO worker_type (name, pool, additional_fingerprinters, attributes)
 VALUES (?1, ?2, ?3, ?4)
@@ -243,7 +250,7 @@ ON CONFLICT(name) DO UPDATE SET pool = ?2, additional_fingerprinters = ?3, attri
 RETURNING name, pool, additional_fingerprinters, attributes;
 "#;
 
-            let config = conn.query_row(sql, [config.name, config.pool, config.additional_fingerprinters.join(","), serde_json::to_string(&config.attributes).unwrap()], |row| {
+            let config = conn.query_row(sql, [config.name, config.pool, fingerprinters_to_save, attrs_to_save], |row| {
             let af: String= row.get(2)?;
             let attrs: String= row.get(3)?;
 

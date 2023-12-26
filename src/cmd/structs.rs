@@ -30,14 +30,15 @@ pub struct WorkerConfig {
 /// Our claims struct, it needs to derive `Serialize` and/or `Deserialize`
 #[derive(Debug, Serialize, Deserialize)]
 pub struct JoinTokenClaims {
-    pub exp: usize, // Required (validate_exp defaults to true in validation). Expiration time (as UTC timestamp)
-    pub sub: String, // Optional. Subject (whom token refers to)
-    pub address: String, // Optional. Address of the node
-    pub server_config: ServerConfig, // Optional. Config of the node
-    pub worker_type: String, // Optional. Type of the node (points to node template)
-    // pub cert: String, // Optional. Cert of the node
-    // pub key: String, // Optional. Private Key of the node
-    // pub ca_cert: String, // Optional. CA Cert for the cluster
+    pub exp: usize,
+    pub sub: String,
+    pub address: String,
+    pub server_config: ServerConfig,
+    pub worker_type: String,
+    pub skip_expiry_validation: bool,
+    // pub cert: String
+    // pub key: String
+    // pub ca_cert: String
 }
 // aud: String,         // Optional. Audience
 // iat: usize,          // Optional. Issued at (as UTC timestamp)

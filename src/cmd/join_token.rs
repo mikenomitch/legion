@@ -22,13 +22,23 @@ pub async fn handle(sub_matches: &clap::ArgMatches) -> Result<(), Box<dyn error:
         .map(|s| s.as_str())
         .unwrap_or("default");
 
-    // TODO: add one-time token or persistent token argument
+    // TODO: add persistent token argument
     let address = std::env::var("LEGION_ADDR").
         unwrap_or(DEFAULT_INSECURE_ADDR.to_owned());
 
     let mut client = InsecureManagerClient::connect(address).await?;
+
+    let req_ttl: Option<String>;
+    // If 0 is specified, then set it to empty string
+    // to mean infinite
+    if ttl == "0" {
+        req_ttl = None;
+    } else {
+        req_ttl = Some(ttl.to_owned());
+    }
+
     let request = tonic::Request::new(GetJoinTokenRequest {
-        ttl: Some(ttl.into()),
+        ttl: req_ttl,
         worker_type: Some(worker_type.into()),
     });
 

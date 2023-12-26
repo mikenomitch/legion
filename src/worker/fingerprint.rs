@@ -233,7 +233,7 @@ mod tests {
 
     #[test]
     fn fingerprint_node_works() -> R<()> {
-        let fps =vec!["example".into()];
+        let fps = vec!["example".into()];
         let res = fingerprint_node(fps);
 
         // res.values().for_each(|v| {

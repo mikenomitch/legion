@@ -2,18 +2,20 @@
 * Goal: Add expiry on join-tokens
 
 * Success:
-- I can pass an argument into the join-token generation for unlimited or a time
-- It defaults to 1 hour use
-- The JWT has this auto encoded in it and this is validated on join
+- It errors nicely and leeway is documented
 
 # After that
 - Clean up all the store sql with params! (so adding fields is simpler - you're about to add fields so do it now)
+
+- Workers give themselves a name
+    - This can be templated from the config
 
 - Other health status checks along with heartbeats?
     - Like heartbeating but at slower cadence (jsonb saved and pinged every N seconds)
     - Plugin system like fingerprinters
 - First party resource stuff + ledger? (start w/ allocs?)
     - Plugin system for this
+- Any other plugins? (Storage maybe?)
 
 - Clean up every unwrap()
 - Clean up gross conversions of attr hashes
@@ -28,8 +30,13 @@
 - Nice errors in CLI commands for various failures
 - Better logging throughout
 - Write some integration tests
+- Write some unit tests
 - Think about your file setup (names/org/dupes)
 - Automated testing in CI (timebox this)
+- Worker configs CRUD commands
+    - I guess for this to really work, you would need to update any of this type
+      that already exist (and send them the info)
+    - Which means that nodes should save a reference to their type
 
 # Milestone
 * Hitting this point will be a fairly major milestone, as lots

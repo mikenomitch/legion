@@ -3,19 +3,26 @@ use crate::constants::{DEFAULT_HOSTNAME, TMP_SECRET_KEY, WORKER_HEARTBEAT_DURATI
 use crate::util::R;
 use crate::worker::fingerprint::fingerprint_node;
 
+use futures::join;
 use jsonwebtoken::{decode, errors::ErrorKind, Algorithm, DecodingKey, Validation};
 use log::debug;
-use futures::join;
 use serde_json::{Map, Value};
 
 use tonic::{
-    transport::Channel,transport::Server, Request, Response, Status,
+    transport::Channel,
+    transport::Server,
+    Request,
+    Response,
+    Status,
     // transport::Certificate, transport::ClientTlsConfig,
 };
 
 use crate::structs::manager_client::ManagerClient;
 use crate::structs::worker_server::{Worker, WorkerServer};
-use crate::structs::{PostWorkReply, PostWorkRequest, HeartbeatRequest, WorkerRegisterRequest, WorkerPreRegisterRequest, WorkerPreRegisterReply};
+use crate::structs::{
+    HeartbeatRequest, PostWorkReply, PostWorkRequest, WorkerPreRegisterReply,
+    WorkerPreRegisterRequest, WorkerRegisterRequest,
+};
 
 pub struct WorkerAgentService {}
 #[tonic::async_trait]
@@ -35,17 +42,20 @@ impl Worker for WorkerAgentService {
 }
 
 pub async fn run_worker(token: &str) -> R<()> {
+    let mut val = Validation::new(Algorithm::HS512);
+    val.validate_exp = false;
+
     let token_data = match decode::<JoinTokenClaims>(
         &token,
         &DecodingKey::from_secret(&TMP_SECRET_KEY[..]),
-        &Validation::new(Algorithm::HS512),
+        &val,
     ) {
         Ok(c) => c,
         Err(err) => {
             // print error message
             println!("Error: {}", err);
 
-            // TODO: Return a nicer error to the CLI - if the token is expired!
+            // TODO: Return a nicer error to the CLI instead of a panic
             match *err.kind() {
                 ErrorKind::InvalidToken => panic!(), // Example on how to handle a specific error
                 _ => panic!(),
@@ -53,7 +63,22 @@ pub async fn run_worker(token: &str) -> R<()> {
         }
     };
 
-    println!("Token data: {:?}", token_data);
+    // Reusing the validation code from above just to
+    // check for expiry. Not beautiful but it works.
+    if !token_data.claims.skip_expiry_validation {
+        println!("Validating expiry");
+        val.validate_exp = true;
+        match decode::<JoinTokenClaims>(&token, &DecodingKey::from_secret(&TMP_SECRET_KEY[..]), &val) {
+            Ok(_c) => (),
+            Err(err) => {
+                // TODO: Return a nicer error to the CLI instead of a panic
+                println!("Error: {}", err);
+                panic!()
+            }
+        }
+    } else {
+        println!("Skipping expiry validation");
+    }
 
     let addr = format!("{}:{}", DEFAULT_HOSTNAME, 4848).parse()?;
     let worker_node = WorkerAgentService {};
@@ -65,17 +90,24 @@ pub async fn run_worker(token: &str) -> R<()> {
         token_data.claims.address,
         "".into(),
         // token_data.claims.ca_cert,
-    ).await?;
+    )
+    .await?;
 
-    // TODO: ESTABLISH TLS CONNECTION PROPERLY
+    // TODO: Establish TLS connection properly
     let pre_register_res = pre_register_self(client.clone(), token_data.claims.worker_type).await?;
     let config = pre_register_res.into_inner().config.unwrap();
 
+    println!("Got config: {:?}", config);
+
     let mut initial_attrs = Map::new();
+
+    // TODO: This is maybe wrongly stringifying everything?
     config.attributes.keys().for_each(|k| {
         let val = config.attributes.get(k).unwrap();
         initial_attrs.insert(k.into(), Value::String(val.into()));
     });
+
+    println!("Initial attrs: {:?}", initial_attrs);
 
     let fingerprint_data = fingerprint_node(config.additional_fingerprinters);
     initial_attrs.extend(fingerprint_data);
@@ -88,7 +120,10 @@ pub async fn run_worker(token: &str) -> R<()> {
     Ok(())
 }
 
-async fn create_manager_client(manager_addr: String, _ca_cert: String) -> R<ManagerClient<Channel>> {
+async fn create_manager_client(
+    manager_addr: String,
+    _ca_cert: String,
+) -> R<ManagerClient<Channel>> {
     // // let ca_cert = Certificate::from_pem(ca_cert);
     // // let tls = ClientTlsConfig::new().ca_certificate(ca_cert);
     // let channel = Channel::from_shared(manager_addr)?.tls_config(tls)?.connect().await?;
@@ -97,7 +132,6 @@ async fn create_manager_client(manager_addr: String, _ca_cert: String) -> R<Mana
 
     Ok(client)
 }
-
 
 async fn start_heartbeats(client: ManagerClient<Channel>) -> R<()> {
     let mut client_clone = client.clone();
@@ -114,7 +148,11 @@ async fn start_heartbeats(client: ManagerClient<Channel>) -> R<()> {
     }
 }
 
-async fn register_self(client: ManagerClient<Channel>, pool: String, fingerprint_data: Map<String, Value>) -> R<()> {
+async fn register_self(
+    client: ManagerClient<Channel>,
+    pool: String,
+    fingerprint_data: Map<String, Value>,
+) -> R<()> {
     let mut c2 = client.clone();
     let serialized_data = serde_json::to_string(&fingerprint_data)?;
 
@@ -130,7 +168,10 @@ async fn register_self(client: ManagerClient<Channel>, pool: String, fingerprint
     Ok(())
 }
 
-async fn pre_register_self(client: ManagerClient<Channel>, worker_type: String) -> R<Response<WorkerPreRegisterReply>> {
+async fn pre_register_self(
+    client: ManagerClient<Channel>,
+    worker_type: String,
+) -> R<Response<WorkerPreRegisterReply>> {
     let mut c2 = client.clone();
 
     let req = tonic::Request::new(WorkerPreRegisterRequest {

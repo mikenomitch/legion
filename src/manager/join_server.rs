@@ -1,4 +1,3 @@
-use std::ops::Add;
 use std::time::Duration;
 
 use crate::cmd::structs::{ManagerConfig, JoinTokenClaims};
@@ -35,11 +34,6 @@ impl InsecureManager for InsecureManagerService {
             None => "default".into(),
         };
 
-        let ttl = match ttl {
-            Some(ttl) => ttl,
-            None => "1h".into(),
-        };
-
         let token = generate_join_token(worker_type, ttl).
             map_err(|e| Status::new(tonic::Code::Internal, e.to_string()))?;
 
@@ -57,13 +51,23 @@ pub fn get_insecure_manager_service() -> InsecureManagerServer<InsecureManagerSe
 }
 
 // add generate_join_token_function
-pub fn generate_join_token(worker_type: String, ttl: String) -> R<String> {
+pub fn generate_join_token(worker_type: String, ttl: Option<String>) -> R<String> {
     let config = parse_manager_config(DEFAULT_CONFIG_PATH)?;
 
-    let parsed_ttl: Duration = ttl.parse::<humantime::Duration>().unwrap().into();
-    let now = std::time::SystemTime::now();
-    let expiry = now + parsed_ttl;
-    let jwt_exp = expiry.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as usize;
+    let jwt_exp: usize;
+    match ttl {
+        Some(ttl) => {
+            // TODO: If this errors it probably means they did "1" not "1m" or "1s" etc
+            // handle this error nicely!
+            let parsed_ttl: Duration = ttl.parse::<humantime::Duration>().unwrap().into();
+            let now = std::time::SystemTime::now();
+            let expiry = now + parsed_ttl;
+            jwt_exp = expiry.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as usize;
+        }
+        None => {
+            jwt_exp = 0;
+        }
+    }
 
     // NOTE:
     // I think what I have to do is:
@@ -84,6 +88,7 @@ pub fn generate_join_token(worker_type: String, ttl: String) -> R<String> {
         // ca_cert: ca_cert,
         worker_type: worker_type,
         server_config: config.server,
+        skip_expiry_validation: jwt_exp == 0,
     };
 
     let header = Header { kid: Some("signing_key".to_owned()), alg: Algorithm::HS512, ..Default::default() };

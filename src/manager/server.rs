@@ -78,6 +78,9 @@ impl Manager for ManagerAgentService {
 
         let worker_config = self.store.get_worker_type(worker_type.clone()).unwrap();
 
+        println!("Got worker config: {:?}", worker_config);
+
+        // TODO: This is where the real error is i think
         let mut attrs = HashMap::new();
         for (key, value) in worker_config.attributes.iter() {
             let val_str = serde_json::to_string(value).unwrap();
@@ -119,7 +122,6 @@ impl Manager for ManagerAgentService {
         };
 
         self.store.insert_node(node.clone()).unwrap();
-        let nodes = self.store.get_nodes().unwrap();
 
         let reply = WorkerRegisterReply {
             message: format!("You are in!"),
