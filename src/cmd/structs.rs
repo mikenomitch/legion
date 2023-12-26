@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use std::collections::HashMap;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -23,9 +23,8 @@ pub struct WorkerConfig {
     pub additional_fingerprinters: Vec<String>,
     pub worker_type: String,
     pub pool: String,
-    pub attributes: Map<String, Value>,
+    pub attributes: HashMap<String, String>,
 }
-
 
 /// Our claims struct, it needs to derive `Serialize` and/or `Deserialize`
 #[derive(Debug, Serialize, Deserialize)]

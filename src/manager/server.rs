@@ -256,18 +256,11 @@ async fn load_initial_data(store: &Store, config: &ManagerConfig) -> R<()> {
         let path_str = path.to_str().unwrap();
         let wcp = parse_worker_config(path_str).unwrap();
 
-
-        let mut attrs = HashMap::new();
-        for (key, value) in wcp.attributes.iter() {
-            let val_str = serde_json::to_string(value)?;
-            attrs.insert(key.to_string(), val_str);
-        }
-
         let wc = WorkerConfigMsg {
             name: wcp.worker_type.clone(),
             pool: wcp.pool.clone(),
             additional_fingerprinters: wcp.additional_fingerprinters,
-            attributes: attrs,
+            attributes: wcp.attributes,
         };
 
         store.insert_worker_type(wc)?;

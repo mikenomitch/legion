@@ -173,12 +173,12 @@ RETURNING id, attrs, dynamic, status, pool, last_heartbeat;
 
         let conn = self.conn.lock().unwrap();
         let sql = r#"
-INSERT INTO node (id, attrs, dynamic)
-VALUES (?1, ?2, ?3)
-ON CONFLICT(id) DO UPDATE SET attrs = ?2, dynamic = ?3
-RETURNING id, attrs, dynamic, status, pool, last_heartbeat;
+        UPDATE node
+        SET dynamic = ?2
+        WHERE id IN (?1)
+        RETURNING id, attrs, dynamic, status, pool, last_heartbeat;
 "#;
-        let node = conn.query_row(sql, [id, node.attrs, result], |row| {
+        let node = conn.query_row(sql, [id, result], |row| {
             Ok(Node {
                 id: row.get(0)?,
                 attrs: row.get(1)?,
@@ -223,10 +223,17 @@ RETURNING id, attrs, dynamic, status, pool, last_heartbeat;
             println!("Af: {}", af);
             println!("Attrs: {}", attrs);
 
+            let fingerprinters: Vec<String>;
+            if af == "" {
+                fingerprinters = vec![];
+            } else {
+                fingerprinters = af.split(",").map(|s| s.to_string()).collect();
+            }
+
             Ok(WorkerConfig {
                 name: row.get(0)?,
                 pool: row.get(1)?,
-                additional_fingerprinters: af.split(",").map(|s| s.to_string()).collect(),
+                additional_fingerprinters: fingerprinters,
                 attributes: serde_json::from_str(&attrs).unwrap(),
             })
         })?;
@@ -240,6 +247,7 @@ RETURNING id, attrs, dynamic, status, pool, last_heartbeat;
         let fingerprinters_to_save = config.additional_fingerprinters.join(",");
         let attrs_to_save = serde_json::to_string(&config.attributes)?;
 
+        println!("&config.attributes: {:?}", &config.attributes);
         println!("Fingerprinters to save: {}", fingerprinters_to_save);
         println!("attrs_to_save: {}", attrs_to_save);
 
