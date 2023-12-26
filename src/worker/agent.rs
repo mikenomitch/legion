@@ -5,7 +5,7 @@ use crate::worker::fingerprint::fingerprint_node;
 
 use futures::join;
 use jsonwebtoken::{decode, errors::ErrorKind, Algorithm, DecodingKey, Validation};
-use log::debug;
+use log::{debug, error};
 use serde_json::{Map, Value};
 
 use tonic::{
@@ -66,18 +66,18 @@ pub async fn run_worker(token: &str) -> R<()> {
     // Reusing the validation code from above just to
     // check for expiry. Not beautiful but it works.
     if !token_data.claims.skip_expiry_validation {
-        println!("Validating expiry");
+        debug!("Validating expiry on join token");
         val.validate_exp = true;
         match decode::<JoinTokenClaims>(&token, &DecodingKey::from_secret(&TMP_SECRET_KEY[..]), &val) {
             Ok(_c) => (),
             Err(err) => {
                 // TODO: Return a nicer error to the CLI instead of a panic
-                println!("Error: {}", err);
+                error!("Error: {}", err);
                 panic!()
             }
         }
     } else {
-        println!("Skipping expiry validation");
+        debug!("Skipping expiry validation check on join token");
     }
 
     let addr = format!("{}:{}", DEFAULT_HOSTNAME, 4848).parse()?;
@@ -97,17 +97,11 @@ pub async fn run_worker(token: &str) -> R<()> {
     let pre_register_res = pre_register_self(client.clone(), token_data.claims.worker_type).await?;
     let config = pre_register_res.into_inner().config.unwrap();
 
-    println!("Got config: {:?}", config);
-
     let mut initial_attrs = Map::new();
-
-    // TODO: This is maybe wrongly stringifying everything?
     config.attributes.keys().for_each(|k| {
         let val = config.attributes.get(k).unwrap();
         initial_attrs.insert(k.into(), Value::String(val.into()));
     });
-
-    println!("Initial attrs: {:?}", initial_attrs);
 
     let fingerprint_data = fingerprint_node(config.additional_fingerprinters);
     initial_attrs.extend(fingerprint_data);

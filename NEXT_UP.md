@@ -1,10 +1,4 @@
 # Next Up
-* Goal: Add expiry on join-tokens
-
-* Success:
-- It errors nicely and leeway is documented
-
-# After that
 - Clean up all the store sql with params! (so adding fields is simpler - you're about to add fields so do it now)
 
 - Workers give themselves a name
@@ -19,7 +13,6 @@
 
 - Clean up every unwrap()
 - Clean up gross conversions of attr hashes
-- Fix the attrs being saves with an additional escape for some reason
 - Join token for a non existent node type is fine
 
 - Output node attrs as a map in json not a string
@@ -28,6 +21,7 @@
 - Same for manager config
 
 - Nice errors in CLI commands for various failures
+    - Join token errors for instance (see To Dos)
 - Better logging throughout
 - Write some integration tests
 - Write some unit tests

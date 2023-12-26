@@ -8,6 +8,7 @@ use jsonnet::JsonnetVm;
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::fs;
+use log::{warn, error};
 
 use serde_json::json;
 use futures::join;
@@ -76,11 +77,11 @@ impl Manager for ManagerAgentService {
         let request = request.into_inner();
         let worker_type = request.worker_type;
 
-        let worker_config = self.store.get_worker_type(worker_type.clone()).unwrap();
+        let worker_config = self.store.get_worker_type(worker_type.clone()).map_err( |e| {
+            error!("Error getting worker type {}: {:?}", worker_type.clone(), e);
+            Status::internal("Error getting worker type")
+        })?;
 
-        println!("Got worker config: {:?}", worker_config);
-
-        // TODO: This is where the real error is i think
         let mut attrs = HashMap::new();
         for (key, value) in worker_config.attributes.iter() {
             let val_str = serde_json::to_string(value).unwrap();
@@ -221,7 +222,7 @@ async fn start_node_status_checker(store: Store) -> R<()> {
                 match Node::last_heartbeat_too_slow(heartbeat) {
                     Ok(too_slow) => too_slow,
                     Err(e) => {
-                        println!("Error checking heartbeat - marking lost: {:?}", e);
+                        warn!("Error checking heartbeat - marking lost: {:?}", e);
                         true
                     }
                 }

@@ -1,7 +1,6 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let proto_file = "proto/legion.proto";
 
-    // TODO: Confirm that this works
     tonic_build::configure()
         .build_server(true)
         .type_attribute("Node", "#[derive(serde::Deserialize, serde::Serialize)]")

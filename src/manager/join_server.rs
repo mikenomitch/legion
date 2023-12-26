@@ -17,7 +17,6 @@ use jsonwebtoken::{encode, Header, Algorithm, EncodingKey};
 // use rustls::Certificate;
 // use rustls::PrivateKey;
 
-
 pub struct InsecureManagerService {}
 #[tonic::async_trait]
 impl InsecureManager for InsecureManagerService {

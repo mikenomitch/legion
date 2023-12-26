@@ -236,10 +236,6 @@ mod tests {
         let fps = vec!["example".into()];
         let res = fingerprint_node(fps);
 
-        // res.values().for_each(|v| {
-        //     println!("v: {:?}", v.to_string());
-        // });
-
         let os = res.get("os").ok_or("no os")?.as_str().ok_or("no os")?;
         assert_eq!("macos", os);
 

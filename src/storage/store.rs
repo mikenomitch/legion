@@ -1,4 +1,4 @@
-use crate::{constants::DEFAULT_STORE_PATH, worker::fingerprint};
+use crate::constants::DEFAULT_STORE_PATH;
 // use crate::structs::Node;
 use rusqlite_migration::{Migrations, M};
 use crate::util::{R, merge_json_strings};
@@ -220,9 +220,6 @@ RETURNING id, attrs, dynamic, status, pool, last_heartbeat;
             let af: String= row.get(2)?;
             let attrs: String= row.get(3)?;
 
-            println!("Af: {}", af);
-            println!("Attrs: {}", attrs);
-
             let fingerprinters: Vec<String>;
             if af == "" {
                 fingerprinters = vec![];
@@ -246,10 +243,6 @@ RETURNING id, attrs, dynamic, status, pool, last_heartbeat;
 
         let fingerprinters_to_save = config.additional_fingerprinters.join(",");
         let attrs_to_save = serde_json::to_string(&config.attributes)?;
-
-        println!("&config.attributes: {:?}", &config.attributes);
-        println!("Fingerprinters to save: {}", fingerprinters_to_save);
-        println!("attrs_to_save: {}", attrs_to_save);
 
         let sql = r#"
 INSERT INTO worker_type (name, pool, additional_fingerprinters, attributes)
