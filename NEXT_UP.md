@@ -2,9 +2,16 @@
 - Other health status checks along with heartbeats?
     - Like heartbeating but at slower cadence (jsonb saved and pinged every N seconds)
     - Plugin system like fingerprinters
+    - Can take args from dynamic??
+
 - First party resource stuff + ledger? (start w/ allocs?)
     - Plugin system for this
-- Any other plugins? (Storage maybe?)
+        - resources are just a special type of attr
+        - tracked by the manager (not by the node itself)
+        - Where do I set max_allocs?? (for an instance of a resouce)
+            - I can add some constraint to the whole cluster?
+                - I add a resource plugin to the cluster. It looks at attributes and then treats them as resource I can schedule on?
+            - At the node level, I just have an attr of some sort.
 
 - Clean up every unwrap()
 - Clean up gross conversions of attr hashes
@@ -23,6 +30,7 @@
 - Better logging throughout
 - Write some integration tests
 - Write some unit tests
+- Any other plugins? (Storage maybe?)
 - Think about your file setup (names/org/dupes)
 - Automated testing in CI (timebox this)
 - Worker configs CRUD commands

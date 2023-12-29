@@ -39,7 +39,14 @@ impl Printable for Node {
 
     fn print_long(&self) {
         println!("Node ID: {}", self.id);
-        let full_attrs = merge_json_strings(self.attrs.clone(), self.dynamic.clone());
+        let full_attrs =  merge_json_strings(
+            merge_json_strings(
+                self.config_attrs.clone(),
+                self.fingerprint_attrs.clone()
+            ),
+            self.dynamic_attrs.clone()
+        );
+
         println!("Attributes: {}", full_attrs);
     }
 

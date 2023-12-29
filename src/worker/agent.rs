@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::cmd::structs::JoinTokenClaims;
 use crate::constants::{DEFAULT_HOSTNAME, TMP_SECRET_KEY, WORKER_HEARTBEAT_DURATION};
 use crate::util::R;
@@ -110,19 +112,19 @@ pub async fn run_worker(token: &str) -> R<()> {
         None => random_string,
     };
 
-    let mut initial_attrs = Map::new();
-    config.attributes.keys().for_each(|k| {
-        if let Some(val) = config.attributes.get(k) {
-            initial_attrs.insert(k.into(), Value::String(val.into()));
-        } else {
-            error!("No value found for key: {}", k);
-        }
-    });
-
     let fingerprint_data = fingerprint_node(config.additional_fingerprinters);
-    initial_attrs.extend(fingerprint_data);
+    let health_checks = run_health_checks(config.additional_fingerprinters);
+    HashMap::new();
 
-    register_self(client.clone(), name.clone(), config.pool, initial_attrs).await?;
+    register_self(
+        client.clone(),
+        name.clone(),
+        config.pool,
+        config.attributes,
+        fingerprint_data,
+        health_checks
+    ).await?;
+
     let heartbeat_fut = start_heartbeats(name.clone(), client);
     let _res = join!(heartbeat_fut, worker_server_fut);
 
@@ -161,14 +163,20 @@ async fn register_self(
     client: ManagerClient<Channel>,
     name: String,
     pool: String,
-    fingerprint_data: Map<String, Value>,
+    config_attrs: HashMap<String, String>,
+    fingerprint_attrs: Map<String, Value>,
+    health_checks: HashMap<String, String>,
 ) -> R<()> {
     let mut c2 = client.clone();
-    let serialized_data = serde_json::to_string(&fingerprint_data)?;
+    let serialized_config_data = serde_json::to_string(&config_attrs)?;
+    let serialized_fp_data = serde_json::to_string(&fingerprint_attrs)?;
+    let serialized_health_check_data = serde_json::to_string(&health_checks)?;
 
     let req = tonic::Request::new(WorkerRegisterRequest {
         name: name.into(),
-        attributes: serialized_data,
+        config_attrs: serialized_config_data,
+        fingerprint_attrs: serialized_fp_data,
+        health_checks: serialized_health_check_data,
         pool: pool,
     });
 

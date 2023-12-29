@@ -49,10 +49,13 @@ impl Store {
         let migrations = Migrations::new(vec![
             M::up("CREATE TABLE IF NOT EXISTS node (
                 id    STRING PRIMARY KEY,
-                status STRING NOT NULL,
                 pool STRING NOT NULL,
-                attrs  JSONB NOT NULL,
-                dynamic JSONB NOT NULL,
+                status STRING NOT NULL,
+                availability STRING NOT NULL,
+                config_attrs  JSONB NOT NULL,
+                fingerprint_attrs  JSONB NOT NULL,
+                dynamic_attrs JSONB NOT NULL,
+                health_checks JSONB NOT NULL,
                 last_heartbeat TIMESTAMP NOT NULL
             )").down("DROP TABLE node;"),
             M::up("CREATE TABLE IF NOT EXISTS worker_type (
@@ -77,15 +80,24 @@ impl Store {
 
     pub fn get_node(&self, id: String) -> R<Node> {
         let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
-        let sql = "SELECT id, attrs, dynamic, status, pool, last_heartbeat FROM node WHERE id = ?";
+
+        let sql = r#"
+        SELECT id, pool, status, availability, config_attrs, fingerprint_attrs, dynamic_attrs, health_checks, last_heartbeat
+        FROM node
+        WHERE id = ?;
+"#;
+
         let node = conn.query_row(sql, [id], |row| {
             Ok(Node {
                 id: row.get(0)?,
-                attrs: row.get(1)?,
-                dynamic: row.get(2)?,
-                status: row.get(3)?,
-                pool: row.get(4)?,
-                last_heartbeat: row.get(5)?,
+                pool: row.get(1)?,
+                status: row.get(2)?,
+                availability: row.get(3)?,
+                config_attrs: row.get(4)?,
+                fingerprint_attrs: row.get(5)?,
+                dynamic_attrs: row.get(6)?,
+                health_checks: row.get(7)?,
+                last_heartbeat: row.get(8)?,
             })
         })?;
 
@@ -94,15 +106,23 @@ impl Store {
 
     pub fn get_nodes(&self) -> R<Vec<Node>> {
         let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
-        let mut stmt = conn.prepare("SELECT id, attrs, dynamic, status, pool, last_heartbeat FROM node")?;
+        let sql = r#"
+SELECT id, pool, status, availability, config_attrs, fingerprint_attrs, dynamic_attrs, health_checks, last_heartbeat
+FROM node;
+"#;
+
+        let mut stmt = conn.prepare(sql)?;
         let node_iter = stmt.query_map([], |row| {
             Ok(Node {
                 id: row.get(0)?,
-                attrs: row.get(1)?,
-                dynamic: row.get(2)?,
-                status: row.get(3)?,
-                pool: row.get(4)?,
-                last_heartbeat: row.get(5)?,
+                pool: row.get(1)?,
+                status: row.get(2)?,
+                availability: row.get(3)?,
+                config_attrs: row.get(4)?,
+                fingerprint_attrs: row.get(5)?,
+                dynamic_attrs: row.get(6)?,
+                health_checks: row.get(7)?,
+                last_heartbeat: row.get(8)?,
             })
         })?;
 
@@ -147,20 +167,23 @@ impl Store {
     pub fn insert_node(&self, node: Node) -> R<Node> {
         let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
         let sql = r#"
-INSERT INTO node (id, attrs, dynamic, status, pool, last_heartbeat)
-VALUES (:id, :attrs, :dynamic, :status, :pool, :last_heartbeat)
-ON CONFLICT(id) DO UPDATE SET attrs = :attrs, dynamic = :dynamic, status = :status, pool = :pool, last_heartbeat = :last_heartbeat
-RETURNING id, attrs, dynamic, status, pool, last_heartbeat;
+        INSERT INTO node (id, pool, status, availability, config_attrs, fingerprint_attrs, dynamic_attrs, health_checks, last_heartbeat)
+        VALUES (:id, :pool, :status, :availability, :config_attrs, :fingerprint_attrs, :dynamic_attrs, :health_checks, :last_heartbeat)
+        ON CONFLICT(id) DO UPDATE SET pool = :pool, status = :status, availability = :availability, config_attrs = :config_attrs, fingerprint_attrs = :fingerprint_attrs, dynamic_attrs = :dynamic_attrs, health_checks = :health_checks, last_heartbeat = :last_heartbeat
+        RETURNING id, pool, status, availability, config_attrs, fingerprint_attrs, dynamic_attrs, health_checks, last_heartbeat;
 "#;
 
         let node = conn.query_row(sql, to_params_named(&node).unwrap().to_slice().as_slice(), |row| {
             Ok(Node {
                 id: row.get(0)?,
-                attrs: row.get(1)?,
-                dynamic: row.get(2)?,
-                status: row.get(3)?,
-                pool: row.get(4)?,
-                last_heartbeat: row.get(5)?,
+                pool: row.get(1)?,
+                status: row.get(2)?,
+                availability: row.get(3)?,
+                config_attrs: row.get(4)?,
+                fingerprint_attrs: row.get(5)?,
+                dynamic_attrs: row.get(6)?,
+                health_checks: row.get(7)?,
+                last_heartbeat: row.get(8)?,
             })
         })?;
 
@@ -169,30 +192,33 @@ RETURNING id, attrs, dynamic, status, pool, last_heartbeat;
 
     pub fn update_node_dyamic(&self, id: String, dynamic_diff: String) -> R<Node> {
         let node = self.get_node(id.clone())?;
-        let initial_dynamic = node.dynamic.clone();
+        let initial_dynamic = node.dynamic_attrs.clone();
         let result = merge_json_strings(initial_dynamic, dynamic_diff);
 
         let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
         let sql = r#"
         UPDATE node
-        SET dynamic = :dynamic
+        SET dynamic_attrs = :dynamic_attrs
         WHERE id IN (:id)
-        RETURNING id, attrs, dynamic, status, pool, last_heartbeat;
+        RETURNING id, pool, status, availability, config_attrs, fingerprint_attrs, dynamic_attrs, health_checks, last_heartbeat;
 "#;
 
         let params = named_params! {
             ":id": id,
-            ":dynamic": result,
+            ":dynamic_attrs": result,
         };
 
         let node = conn.query_row(sql, params, |row| {
             Ok(Node {
                 id: row.get(0)?,
-                attrs: row.get(1)?,
-                dynamic: row.get(2)?,
-                status: row.get(3)?,
-                pool: row.get(4)?,
-                last_heartbeat: row.get(5)?,
+                pool: row.get(1)?,
+                status: row.get(2)?,
+                availability: row.get(3)?,
+                config_attrs: row.get(4)?,
+                fingerprint_attrs: row.get(5)?,
+                dynamic_attrs: row.get(6)?,
+                health_checks: row.get(7)?,
+                last_heartbeat: row.get(8)?,
             })
         })?;
 

@@ -34,8 +34,10 @@ message WorkerPreRegisterReply {
 
 message WorkerRegisterRequest {
   string name = 1;
-  string attributes = 2;
-  string pool = 3;
+  string pool = 2;
+  string config_attrs = 3;
+  string fingerprint_attrs = 4;
+  string health_checks = 5;
 }
 
 message WorkerRegisterReply {
@@ -68,11 +70,14 @@ message HeartbeatReply {
 
 message Node {
   string id = 1;
-  string attrs = 2;
-  string dynamic = 3;
-  string status = 4;
-  string last_heartbeat = 5;
-  string pool = 6;
+  string pool = 2;
+  string status = 3;
+  string availability = 4;
+  string config_attrs = 5;
+  string fingerprint_attrs = 6;
+  string dynamic_attrs = 7;
+  string health_checks = 8;
+  string last_heartbeat = 9;
 }
 
 message GetNodesRequest {

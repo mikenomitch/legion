@@ -45,6 +45,32 @@ pub fn fingerprint_node(additional_fingerprinters: Vec<String>) -> Map<String, V
     ret
 }
 
+pub fn run_health_checks(additional_fingerprinters: Vec<String>) -> Map<String, Value> {
+    let fps: Vec<Box<dyn Fingerprinter>> = vec![
+        Box::new(DiskChecker {}),
+    ];
+
+    let mut ret = Map::new();
+    fps.iter().for_each(|f| {
+        ret.extend(f.health_check());
+    });
+
+    additional_fingerprinters
+        .iter()
+        .map(|name| fp_plugin_name_to_path(name))
+        .for_each(|path| match call_dynamic(&path) {
+            Ok(fp) => {
+                ret.extend(fp.health_check());
+            }
+            Err(e) => {
+                println!("Error loading fingerprinter: {}", e);
+            }
+        });
+
+    ret
+}
+
+
 fn fp_plugin_name_to_path(name: &String) -> String {
     format!("/Users/mike/Code/legion/plugins/fingerprinters/{}/target/release/libexample.dylib", name)
 }
@@ -63,6 +89,12 @@ pub trait Fingerprinter {
     fn fingerprint(&self) -> Map<String, Value> {
         let mut map = Map::new();
         map.insert("foo".into(), Value::String("bar".into()));
+        map
+    }
+
+    fn health_check(&self) -> Map<String, Value> {
+        let mut map = Map::new();
+        map.insert("alive".into(), Value::String("pass".into()));
         map
     }
 }
@@ -91,6 +123,19 @@ impl Fingerprinter for ArchFingerprinter {
     fn fingerprint(&self) -> Map<String, Value> {
         let mut map = Map::new();
         map.insert("arch".into(), Value::String(ARCH.to_string()));
+        map
+    }
+}
+
+struct DiskChecker {}
+impl Fingerprinter for DiskChecker {
+    fn name(&self) -> &'static str {
+        "disk"
+    }
+
+    fn health_check(&self) -> Map<String, Value> {
+        let mut map = Map::new();
+        map.insert("disk".into(), Value::String("pass".into()));
         map
     }
 }

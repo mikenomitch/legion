@@ -121,18 +121,18 @@ impl Manager for ManagerAgentService {
         request: Request<WorkerRegisterRequest>,
     ) -> Result<Response<WorkerRegisterReply>, Status> {
         let request = request.into_inner();
-        let name = request.name;
-        let attrs = request.attributes;
-        let pool = request.pool;
-        let dynamic = json!({}).to_string(); //
+        let dynamic_attrs = json!({}).to_string();
 
         let node = Node {
-            id: name,
-            attrs: attrs.clone(),
-            dynamic: dynamic.clone(),
+            id: request.name,
+            fingerprint_attrs: request.fingerprint_attrs,
+            config_attrs: request.config_attrs,
+            dynamic_attrs: dynamic_attrs,
             status: "active".to_string(),
-            pool: pool,
+            availability: "availabile".to_string(),
+            pool: request.pool,
             last_heartbeat: "".to_string(),
+            health_checks: request.health_checks,
         };
 
         self.store.insert_node(node.clone()).map_err(|e| {
