@@ -1,12 +1,12 @@
 use crate::constants::DEFAULT_STORE_PATH;
-// use crate::structs::Node;
-use rusqlite_migration::{Migrations, M};
 use crate::util::{R, merge_json_strings};
 use log::debug;
-use rusqlite::Connection;
+use rusqlite_migration::{Migrations, M};
+use rusqlite::{Connection, named_params};
+use serde_rusqlite::to_params_named;
 use std::sync::{Arc, Mutex};
-use time::OffsetDateTime;
 use time::macros::format_description;
+use time::OffsetDateTime;
 
 use crate::structs::{WorkerConfig, Node};
 
@@ -20,6 +20,8 @@ pub type MemSafeConn = Arc<Mutex<Connection>>;
 pub struct Store {
     pub conn: MemSafeConn,
 }
+
+pub const CONN_LOCK_ERROR: &str = "Error locking database connection";
 
 // NOTE: This will become a general interface for all storage backends
 impl Store {
@@ -57,16 +59,14 @@ impl Store {
                 name STRING PRIMARY KEY,
                 pool STRING NOT NULL,
                 additional_fingerprinters Text NOT NULL,
-                attributes JSONB NOT NULL
+                attributes JSONB NOT NULL,
+                name_prefix STRING
             )").down("DROP TABLE worker_type;"),
         ]);
 
-        let mut conn = conn.lock().unwrap();
-
-        // Note: from rusqlite_migrations:
-        conn.pragma_update(None, "journal_mode", &"WAL").unwrap();
-
-        migrations.to_latest(&mut conn).unwrap();
+        let mut conn = conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
+        conn.pragma_update(None, "journal_mode", &"WAL")?;
+        migrations.to_latest(&mut conn)?;
 
         Ok(())
     }
@@ -76,7 +76,7 @@ impl Store {
     // ========================================
 
     pub fn get_node(&self, id: String) -> R<Node> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
         let sql = "SELECT id, attrs, dynamic, status, pool, last_heartbeat FROM node WHERE id = ?";
         let node = conn.query_row(sql, [id], |row| {
             Ok(Node {
@@ -93,7 +93,7 @@ impl Store {
     }
 
     pub fn get_nodes(&self) -> R<Vec<Node>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
         let mut stmt = conn.prepare("SELECT id, attrs, dynamic, status, pool, last_heartbeat FROM node")?;
         let node_iter = stmt.query_map([], |row| {
             Ok(Node {
@@ -116,7 +116,7 @@ impl Store {
     }
 
     pub fn get_node_ids_and_heartbeats(&self) -> R<Vec<(String, String)>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
         let mut stmt = conn.prepare("SELECT id, last_heartbeat FROM node")?;
         let node_iter = stmt.query_map([], |row| {
             Ok((row.get(0)?, row.get(1)?))
@@ -132,7 +132,7 @@ impl Store {
     }
 
     pub fn mark_nodes_as_lost(&self, ids: Vec<String>) -> R<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
         let sql = r#"
         UPDATE node
         SET status = 'lost'
@@ -145,14 +145,15 @@ impl Store {
     }
 
     pub fn insert_node(&self, node: Node) -> R<Node> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
         let sql = r#"
 INSERT INTO node (id, attrs, dynamic, status, pool, last_heartbeat)
-VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-ON CONFLICT(id) DO UPDATE SET attrs = ?2, dynamic = ?3, status = ?4, pool = ?5, last_heartbeat = ?6
+VALUES (:id, :attrs, :dynamic, :status, :pool, :last_heartbeat)
+ON CONFLICT(id) DO UPDATE SET attrs = :attrs, dynamic = :dynamic, status = :status, pool = :pool, last_heartbeat = :last_heartbeat
 RETURNING id, attrs, dynamic, status, pool, last_heartbeat;
 "#;
-        let node = conn.query_row(sql, [node.id, node.attrs, node.dynamic, node.status, node.pool, node.last_heartbeat], |row| {
+
+        let node = conn.query_row(sql, to_params_named(&node).unwrap().to_slice().as_slice(), |row| {
             Ok(Node {
                 id: row.get(0)?,
                 attrs: row.get(1)?,
@@ -171,14 +172,20 @@ RETURNING id, attrs, dynamic, status, pool, last_heartbeat;
         let initial_dynamic = node.dynamic.clone();
         let result = merge_json_strings(initial_dynamic, dynamic_diff);
 
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
         let sql = r#"
         UPDATE node
-        SET dynamic = ?2
-        WHERE id IN (?1)
+        SET dynamic = :dynamic
+        WHERE id IN (:id)
         RETURNING id, attrs, dynamic, status, pool, last_heartbeat;
 "#;
-        let node = conn.query_row(sql, [id, result], |row| {
+
+        let params = named_params! {
+            ":id": id,
+            ":dynamic": result,
+        };
+
+        let node = conn.query_row(sql, params, |row| {
             Ok(Node {
                 id: row.get(0)?,
                 attrs: row.get(1)?,
@@ -200,25 +207,33 @@ RETURNING id, attrs, dynamic, status, pool, last_heartbeat;
 
         let timestamp_now = OffsetDateTime::now_utc().format(fmt)?;
 
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
         let sql = r#"
         UPDATE node
-        SET last_heartbeat = ?1, status = 'active'
-        WHERE id = ?2;
+        SET last_heartbeat = :ts, status = 'active'
+        WHERE id = :id;
 "#;
         debug!("Updating heartbeat for node {} with TS: {}", id, timestamp_now);
-        conn.execute(sql, [timestamp_now, id])?;
+
+        let params = named_params! {
+            ":id": id,
+            ":ts": timestamp_now,
+        };
+
+        conn.execute(sql, params)?;
 
         Ok(())
     }
 
     pub fn get_worker_type(&self, name: String) -> R<WorkerConfig> {
-        let conn = self.conn.lock().unwrap();
-        let sql = "SELECT name, pool, additional_fingerprinters, attributes FROM worker_type WHERE name = ?";
+        let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
+        let sql = "SELECT name, pool, additional_fingerprinters, attributes, name_prefix FROM worker_type WHERE name = ?";
 
         let config = conn.query_row(sql, [name], |row| {
             let af: String= row.get(2)?;
+
             let attrs: String= row.get(3)?;
+            let parsed_attrs = serde_json::from_str(&attrs).unwrap();
 
             let fingerprinters: Vec<String>;
             if af == "" {
@@ -227,11 +242,14 @@ RETURNING id, attrs, dynamic, status, pool, last_heartbeat;
                 fingerprinters = af.split(",").map(|s| s.to_string()).collect();
             }
 
+            let name_prefix = row.get(4)?;
+
             Ok(WorkerConfig {
                 name: row.get(0)?,
                 pool: row.get(1)?,
                 additional_fingerprinters: fingerprinters,
-                attributes: serde_json::from_str(&attrs).unwrap(),
+                attributes: parsed_attrs,
+                name_prefix: name_prefix,
             })
         })?;
 
@@ -239,27 +257,38 @@ RETURNING id, attrs, dynamic, status, pool, last_heartbeat;
     }
 
     pub fn insert_worker_type(&self, config: WorkerConfig) -> R<WorkerConfig> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
 
         let fingerprinters_to_save = config.additional_fingerprinters.join(",");
         let attrs_to_save = serde_json::to_string(&config.attributes)?;
 
         let sql = r#"
-INSERT INTO worker_type (name, pool, additional_fingerprinters, attributes)
-VALUES (?1, ?2, ?3, ?4)
-ON CONFLICT(name) DO UPDATE SET pool = ?2, additional_fingerprinters = ?3, attributes = ?4
-RETURNING name, pool, additional_fingerprinters, attributes;
+INSERT INTO worker_type (name, pool, additional_fingerprinters, attributes, name_prefix)
+VALUES (:name, :pool, :af, :attrs, :name_prefix)
+ON CONFLICT(name) DO UPDATE SET pool = :pool, additional_fingerprinters = :af, attributes = :attrs, name_prefix = :name_prefix
+RETURNING name, pool, additional_fingerprinters, attributes, name_prefix;
 "#;
 
-            let config = conn.query_row(sql, [config.name, config.pool, fingerprinters_to_save, attrs_to_save], |row| {
+            let params = named_params! {
+                ":name": config.name,
+                ":pool": config.pool,
+                ":af": fingerprinters_to_save,
+                ":attrs": attrs_to_save,
+                ":name_prefix": config.name_prefix,
+            };
+
+            let config = conn.query_row(sql, params, |row| {
             let af: String= row.get(2)?;
             let attrs: String= row.get(3)?;
+            let parsed_attrs = serde_json::from_str(&attrs).unwrap();
+            let name_prefix = row.get(4)?;
 
             Ok(WorkerConfig {
                 name: row.get(0)?,
                 pool: row.get(1)?,
                 additional_fingerprinters: af.split(",").map(|s| s.to_string()).collect(),
-                attributes: serde_json::from_str(&attrs).unwrap(),
+                attributes: parsed_attrs,
+                name_prefix: name_prefix,
             })
         })?;
 

@@ -34,7 +34,7 @@ impl InsecureManager for InsecureManagerService {
         };
 
         let token = generate_join_token(worker_type, ttl).
-            map_err(|e| Status::new(tonic::Code::Internal, e.to_string()))?;
+            map_err( |e| Status::new(tonic::Code::NotFound, e.to_string()))?;
 
         let reply = GetJoinTokenReply {
             token: token,

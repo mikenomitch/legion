@@ -5,22 +5,22 @@ use crate::util::R;
 
 use jsonnet::JsonnetVm;
 
+use log::{error, warn};
 use std::collections::HashMap;
-use std::str::FromStr;
 use std::fs;
-use log::{warn, error};
+use std::str::FromStr;
 
-use serde_json::json;
 use futures::join;
+use serde_json::json;
 
 use crate::manager::join_server::get_insecure_manager_service;
 use crate::structs::manager_server::{Manager, ManagerServer};
 
 use crate::structs::{
-    GetJobStatusReply, GetJobStatusRequest, GetNodesReply, GetNodesRequest, HeartbeatReply,
-    HeartbeatRequest,RunJobReply, RunJobRequest,
-    UpdateNodeDynamicReply, UpdateNodeDynamicRequest, WorkerPreRegisterRequest, WorkerPreRegisterReply,
-    WorkerRegisterReply, WorkerRegisterRequest, GetNodeReply, GetNodeRequest, Node, WorkerConfig as WorkerConfigMsg,
+    GetJobStatusReply, GetJobStatusRequest, GetNodeReply, GetNodeRequest, GetNodesReply,
+    GetNodesRequest, HeartbeatReply, HeartbeatRequest, Node, RunJobReply, RunJobRequest,
+    UpdateNodeDynamicReply, UpdateNodeDynamicRequest, WorkerConfig as WorkerConfigMsg,
+    WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest,
 };
 
 use tonic::transport::{Identity, Server, ServerTlsConfig};
@@ -62,11 +62,15 @@ impl Manager for ManagerAgentService {
     ) -> Result<Response<HeartbeatReply>, Status> {
         let id = request.into_inner().id;
 
-        self.store.update_node_heartbeat(id).unwrap();
+        self.store.update_node_heartbeat(id.clone()).map_err(|e| {
+            error!("Error updading node heartbeat. Node ID: {}: {:?}", id, e);
+            Status::internal("Error updading node heartbeat")
+        })?;
 
         let reply = HeartbeatReply {
             message: format!("ack"),
         };
+
         Ok(Response::new(reply))
     }
 
@@ -77,22 +81,32 @@ impl Manager for ManagerAgentService {
         let request = request.into_inner();
         let worker_type = request.worker_type;
 
-        let worker_config = self.store.get_worker_type(worker_type.clone()).map_err( |e| {
-            error!("Error getting worker type {}: {:?}", worker_type.clone(), e);
-            Status::internal("Error getting worker type")
-        })?;
+        let worker_config = self
+            .store
+            .get_worker_type(worker_type.clone())
+            .map_err(|e| {
+                error!("Error getting worker type {}: {:?}", worker_type.clone(), e);
+                Status::internal("Error getting worker type")
+            })?;
 
         let mut attrs = HashMap::new();
         for (key, value) in worker_config.attributes.iter() {
-            let val_str = serde_json::to_string(value).unwrap();
-            attrs.insert(key.to_string(), val_str);
+            match serde_json::to_string(value).ok() {
+                Some(val_str) => {
+                    attrs.insert(key.to_string(), val_str);
+                }
+                None => {
+                    error!("Error serializing value for key: {}", key);
+                }
+            }
         }
 
-        let config = WorkerConfigMsg{
+        let config = WorkerConfigMsg {
             name: worker_type,
             pool: worker_config.pool,
             additional_fingerprinters: worker_config.additional_fingerprinters,
             attributes: worker_config.attributes,
+            name_prefix: worker_config.name_prefix,
         };
 
         let reply = WorkerPreRegisterReply {
@@ -101,7 +115,6 @@ impl Manager for ManagerAgentService {
 
         Ok(Response::new(reply))
     }
-
 
     async fn worker_register(
         &self,
@@ -122,7 +135,10 @@ impl Manager for ManagerAgentService {
             last_heartbeat: "".to_string(),
         };
 
-        self.store.insert_node(node.clone()).unwrap();
+        self.store.insert_node(node.clone()).map_err(|e| {
+            error!("Error registering worker: {:?}", e);
+            Status::internal("Error registering worker")
+        })?;
 
         let reply = WorkerRegisterReply {
             message: format!("You are in!"),
@@ -135,7 +151,11 @@ impl Manager for ManagerAgentService {
         &self,
         _request: Request<GetNodesRequest>,
     ) -> Result<Response<GetNodesReply>, Status> {
-        let nodes = self.store.get_nodes().unwrap();
+        let nodes = self.store.get_nodes().map_err(|e| {
+            error!("Error getting nodes: {:?}", e);
+            Status::internal("Error getting nodes")
+        })?;
+
         let reply = GetNodesReply { nodes: nodes };
         Ok(Response::new(reply))
     }
@@ -145,13 +165,14 @@ impl Manager for ManagerAgentService {
         request: Request<GetNodeRequest>,
     ) -> Result<Response<GetNodeReply>, Status> {
         let id = request.into_inner().id;
-        let node = self.store.get_node(id)
+        let node = self
+            .store
+            .get_node(id)
             .expect("Could not get node with given id");
 
         let reply = GetNodeReply { node: Some(node) };
         Ok(Response::new(reply))
     }
-
 
     async fn update_node_dynamic(
         &self,
@@ -160,7 +181,10 @@ impl Manager for ManagerAgentService {
         let r = request.into_inner();
         let id = r.id;
         let dynamic_diff = r.dynamic_diff;
-        let node = self.store.update_node_dyamic(id, dynamic_diff).expect("Can't find or update node");
+        let node = self
+            .store
+            .update_node_dyamic(id, dynamic_diff)
+            .expect("Can't find or update node");
         let reply = UpdateNodeDynamicReply { node: Some(node) };
 
         Ok(Response::new(reply))
@@ -174,7 +198,6 @@ pub async fn run_manager(config: ManagerConfig) -> R<()> {
 
     load_initial_data(&store, &config).await?;
 
-
     // Spawn a separate grpc server for non-TLS calls
     let join_server_addr = format!(
         "{}:{}",
@@ -187,8 +210,8 @@ pub async fn run_manager(config: ManagerConfig) -> R<()> {
         .add_service(insecure_manager_service)
         .serve(join_server_addr);
 
-    let s2 = Store{
-        conn: store.conn.clone()
+    let s2 = Store {
+        conn: store.conn.clone(),
     };
 
     let manager_node = ManagerAgentService { store: store };
@@ -216,17 +239,18 @@ pub async fn run_manager(config: ManagerConfig) -> R<()> {
 
 async fn start_node_status_checker(store: Store) -> R<()> {
     loop {
-        let node_ids_to_update = store.get_node_ids_and_heartbeats()?
+        let node_ids_to_update = store
+            .get_node_ids_and_heartbeats()?
             .into_iter()
-            .filter( |(_id, heartbeat)| {
-                match Node::last_heartbeat_too_slow(heartbeat) {
+            .filter(
+                |(_id, heartbeat)| match Node::last_heartbeat_too_slow(heartbeat) {
                     Ok(too_slow) => too_slow,
                     Err(e) => {
                         warn!("Error checking heartbeat - marking lost: {:?}", e);
                         true
                     }
-                }
-            })
+                },
+            )
             .map(|(id, _heartbeat)| id)
             .collect::<Vec<String>>();
 
@@ -245,23 +269,30 @@ fn parse_worker_config(config_path: &str) -> R<WorkerConfig> {
             let config: WorkerConfig = serde_json::from_str(&s)?;
             Ok(config)
         }
-        Err(_) => Err("Failed to parse config file".into()),
+        Err(e) => {
+            error!("Error parsing worker config: {:?}", e);
+            Err(e.to_string().into())
+        },
     }
 }
 
 async fn load_initial_data(store: &Store, config: &ManagerConfig) -> R<()> {
-    let paths = fs::read_dir(config.worker_config_path.clone()).unwrap();
+    let paths = fs::read_dir(config.worker_config_path.clone())?;
 
     for path in paths {
         let path = path.unwrap().path();
         let path_str = path.to_str().unwrap();
-        let wcp = parse_worker_config(path_str).unwrap();
+        let wcp = parse_worker_config(path_str)?;
+
+        let af = wcp.additional_fingerprinters.unwrap_or([].to_vec());
+        let attrs = wcp.attributes.unwrap_or(HashMap::new());
 
         let wc = WorkerConfigMsg {
             name: wcp.worker_type.clone(),
-            pool: wcp.pool.clone(),
-            additional_fingerprinters: wcp.additional_fingerprinters,
-            attributes: wcp.attributes,
+            pool: wcp.pool.unwrap_or("default".into()),
+            additional_fingerprinters: af,
+            attributes: attrs,
+            name_prefix: wcp.name_prefix,
         };
 
         store.insert_worker_type(wc)?;

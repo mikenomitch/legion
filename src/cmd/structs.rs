@@ -20,10 +20,11 @@ pub struct ManagerConfig {
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkerConfig {
-    pub additional_fingerprinters: Vec<String>,
     pub worker_type: String,
-    pub pool: String,
-    pub attributes: HashMap<String, String>,
+    pub additional_fingerprinters: Option<Vec<String>>,
+    pub pool: Option<String>,
+    pub attributes: Option<HashMap<String, String>>,
+    pub name_prefix: Option<String>,
 }
 
 /// Our claims struct, it needs to derive `Serialize` and/or `Deserialize`

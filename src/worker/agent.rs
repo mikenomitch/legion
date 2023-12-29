@@ -2,6 +2,8 @@ use crate::cmd::structs::JoinTokenClaims;
 use crate::constants::{DEFAULT_HOSTNAME, TMP_SECRET_KEY, WORKER_HEARTBEAT_DURATION};
 use crate::util::R;
 use crate::worker::fingerprint::fingerprint_node;
+use rand::{thread_rng, Rng};
+use rand::distributions::Alphanumeric;
 
 use futures::join;
 use jsonwebtoken::{decode, errors::ErrorKind, Algorithm, DecodingKey, Validation};
@@ -94,21 +96,34 @@ pub async fn run_worker(token: &str) -> R<()> {
     .await?;
 
     // TODO: Establish TLS connection properly
-    let pre_register_res = pre_register_self(client.clone(), token_data.claims.worker_type).await?;
-    let config = pre_register_res.into_inner().config.unwrap();
+    let pre_register_res = pre_register_self(client.clone(),token_data.claims.worker_type).await?;
+    let config = pre_register_res.into_inner().config.ok_or("No config found")?;
+
+    let random_string: String = thread_rng()
+        .sample_iter(&Alphanumeric)
+        .take(8)
+        .map(char::from)
+        .collect();
+
+    let name = match config.name_prefix {
+        Some(n) => n + "-" + &random_string,
+        None => random_string,
+    };
 
     let mut initial_attrs = Map::new();
     config.attributes.keys().for_each(|k| {
-        let val = config.attributes.get(k).unwrap();
-        initial_attrs.insert(k.into(), Value::String(val.into()));
+        if let Some(val) = config.attributes.get(k) {
+            initial_attrs.insert(k.into(), Value::String(val.into()));
+        } else {
+            error!("No value found for key: {}", k);
+        }
     });
 
     let fingerprint_data = fingerprint_node(config.additional_fingerprinters);
     initial_attrs.extend(fingerprint_data);
 
-    register_self(client.clone(), config.pool, initial_attrs).await?;
-
-    let heartbeat_fut = start_heartbeats(client);
+    register_self(client.clone(), name.clone(), config.pool, initial_attrs).await?;
+    let heartbeat_fut = start_heartbeats(name.clone(), client);
     let _res = join!(heartbeat_fut, worker_server_fut);
 
     Ok(())
@@ -127,12 +142,12 @@ async fn create_manager_client(
     Ok(client)
 }
 
-async fn start_heartbeats(client: ManagerClient<Channel>) -> R<()> {
+async fn start_heartbeats(name: String, client: ManagerClient<Channel>) -> R<()> {
     let mut client_clone = client.clone();
 
     loop {
         let req = tonic::Request::new(HeartbeatRequest {
-            id: "worker".into(),
+            id: name.to_owned(),
         });
 
         let response = client_clone.heartbeat(req).await?;
@@ -144,6 +159,7 @@ async fn start_heartbeats(client: ManagerClient<Channel>) -> R<()> {
 
 async fn register_self(
     client: ManagerClient<Channel>,
+    name: String,
     pool: String,
     fingerprint_data: Map<String, Value>,
 ) -> R<()> {
@@ -151,7 +167,7 @@ async fn register_self(
     let serialized_data = serde_json::to_string(&fingerprint_data)?;
 
     let req = tonic::Request::new(WorkerRegisterRequest {
-        name: "worker".into(),
+        name: name.into(),
         attributes: serialized_data,
         pool: pool,
     });
@@ -169,7 +185,6 @@ async fn pre_register_self(
     let mut c2 = client.clone();
 
     let req = tonic::Request::new(WorkerPreRegisterRequest {
-        name: "worker".into(),
         worker_type: worker_type,
     });
 

@@ -1,9 +1,4 @@
 # Next Up
-- Clean up all the store sql with params! (so adding fields is simpler - you're about to add fields so do it now)
-
-- Workers give themselves a name
-    - This can be templated from the config
-
 - Other health status checks along with heartbeats?
     - Like heartbeating but at slower cadence (jsonb saved and pinged every N seconds)
     - Plugin system like fingerprinters
@@ -19,6 +14,9 @@
 - Make many of the worker node attrs optional in the config
     - Nice errors for the ones that aren't
 - Same for manager config
+- Redo the structure of dynamic and attrs so you can change out the config
+    at manager level and it pushes changes to the children without overwriting
+    anything (maybe this isn't necessary)
 
 - Nice errors in CLI commands for various failures
     - Join token errors for instance (see To Dos)

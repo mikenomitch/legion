@@ -20,11 +20,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 None
             }
         })
-        .for_each(|path| {
-            std::fs::read_dir(path).
-                unwrap().
-                for_each( |entry| {
-                    let entry = entry.ok().unwrap();
+        .for_each(|path| match std::fs::read_dir(path) {
+            Ok(dir) => dir.for_each(|entry| match entry.ok() {
+                None => {
+                    println!("Error reading entry");
+                }
+                Some(entry) => {
                     let path = entry.path();
                     if path.is_dir() {
                         let mut cmd = std::process::Command::new("cargo");
@@ -32,7 +33,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         cmd.current_dir(path);
                         cmd.spawn().unwrap().wait().unwrap();
                     }
-                })
+                }
+            }),
+            Err(e) => {
+                println!("Error reading dir: {}", e);
+            }
         });
 
     Ok(())

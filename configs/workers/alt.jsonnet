@@ -5,4 +5,5 @@
     attributes: {
         woot: "WUT"
     },
+    namePrefix: "alternate",
 }
