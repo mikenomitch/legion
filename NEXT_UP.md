@@ -19,9 +19,7 @@
 - Clean up gross conversions of attr hashes
 
 - Think about your file setup (names/org/dupes)
-    - Split the GRPC "servers" into their own files
-      and the "agents" into their own files
-        - Perhaps split out agent code into own files beyond this
+    - Perhaps split out agent code into own files
     - Split out NodeChecks into own single file then keep
       node check logic together in one
     - Where structs get their definition

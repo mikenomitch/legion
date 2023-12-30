@@ -8,7 +8,6 @@ use rcgen::{
     BasicConstraints, Certificate, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair,
     KeyUsagePurpose, SanType, PKCS_ECDSA_P256_SHA256,
 };
-
 use std::fs;
 use std::fs::File;
 use std::io::{BufReader, Read};

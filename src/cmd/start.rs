@@ -1,10 +1,11 @@
-use crate::util::R;
 use crate::cmd::structs::ManagerConfig;
 use crate::constants::DEFAULT_CONFIG_PATH;
 use crate::manager::agent::run_manager;
-use crate::worker::server::run_worker;
-use jsonnet::JsonnetVm;
+use crate::util::R;
+use crate::worker::agent::run_worker;
+
 use clap::{arg, Command};
+use jsonnet::JsonnetVm;
 
 pub fn config() -> Command {
     let manager_cmd = Command::new("manager")
@@ -24,7 +25,9 @@ pub fn config() -> Command {
 
 pub async fn handle(sub_matches: &clap::ArgMatches) -> R<()> {
     if let Some(("worker", arg_matches)) = sub_matches.subcommand() {
-        let token = arg_matches.get_one::<String>("token").ok_or("Must provide token")?;
+        let token = arg_matches
+            .get_one::<String>("token")
+            .ok_or("Must provide token")?;
         run_worker(token).await
     } else {
         let config_path = sub_matches
@@ -50,6 +53,6 @@ fn parse_config(config_path: &str) -> R<ManagerConfig> {
         Err(e) => {
             println!("{}", e.as_str());
             Err("Failed to parse config file".into())
-        },
+        }
     }
 }

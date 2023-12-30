@@ -2,18 +2,18 @@ use crate::storage::store::Store;
 use crate::structs::manager_server::Manager;
 use crate::structs::{
     GetJobStatusReply, GetJobStatusRequest, GetNodeReply, GetNodeRequest, GetNodesReply,
-    GetNodesRequest, HeartbeatReply, HeartbeatRequest, Node, RunJobReply, RunJobRequest,
-    UpdateNodeDynamicReply, UpdateNodeDynamicRequest, WorkerConfig as WorkerConfigMsg,
-    WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest, HealthCheckRequest, HealthCheckReply,
+    GetNodesRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, Node,
+    RunJobReply, RunJobRequest, UpdateNodeDynamicReply, UpdateNodeDynamicRequest,
+    WorkerConfig as WorkerConfigMsg, WorkerPreRegisterReply, WorkerPreRegisterRequest,
+    WorkerRegisterReply, WorkerRegisterRequest,
 };
 
 use log::error;
-use std::collections::HashMap;
 use serde_json::json;
+use std::collections::HashMap;
 use tonic::{Request, Response, Status};
 
 #[allow(dead_code)]
-// #[derive(Default)]
 pub struct ManagerAgentService {
     pub store: Store,
 }
@@ -67,10 +67,15 @@ impl Manager for ManagerAgentService {
         let req = request.into_inner();
         let id = req.id;
 
-        self.store.update_node_health_checks(id.clone(), req.health_checks).map_err(|e| {
-            error!("Error updading node health checks. Node ID: {}: {:?}", id, e);
-            Status::internal("Error updading node health checks")
-        })?;
+        self.store
+            .update_node_health_checks(id.clone(), req.health_checks)
+            .map_err(|e| {
+                error!(
+                    "Error updading node health checks. Node ID: {}: {:?}",
+                    id, e
+                );
+                Status::internal("Error updading node health checks")
+            })?;
 
         let reply = HealthCheckReply {
             message: format!("ack"),
@@ -195,4 +200,3 @@ impl Manager for ManagerAgentService {
         Ok(Response::new(reply))
     }
 }
-

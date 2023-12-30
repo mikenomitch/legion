@@ -1,13 +1,10 @@
 use crate::constants::DEFAULT_ADDR;
+use crate::structs::manager_client::ManagerClient;
+use crate::structs::{GetNodeRequest, GetNodesRequest, Node, Printable, UpdateNodeDynamicRequest};
 use crate::util::R;
 
 use clap::{Arg, Command};
 use serde_json::Map;
-
-use crate::structs::manager_client::ManagerClient;
-use crate::structs::{Node, GetNodeRequest, GetNodesRequest, UpdateNodeDynamicRequest};
-
-use crate::structs::Printable;
 
 pub fn config() -> Command {
     let json_arg = Arg::new("json")
@@ -46,7 +43,7 @@ pub async fn handle(sub_matches: &clap::ArgMatches) -> R<()> {
         Some(("list", arg_matches)) => {
             let is_json = arg_matches.get_flag("json");
             get_nodes(is_json).await
-        },
+        }
         Some(("update", arg_matches)) => {
             let id = arg_matches
                 .get_one::<String>("id")
@@ -107,9 +104,13 @@ async fn update_node(node_id: String, key_path: String, value: String, is_json: 
     let response = client.update_node_dynamic(request).await?;
 
     match response.into_inner().node {
-        Some(node) =>  {
-            if is_json { node.print_long_json() } else { node.print_long() };
-        },
+        Some(node) => {
+            if is_json {
+                node.print_long_json()
+            } else {
+                node.print_long()
+            };
+        }
         None => println!("Node not found"),
     }
 
@@ -123,8 +124,12 @@ async fn get_node_info(node_id: String, is_json: bool) -> R<()> {
 
     match response.into_inner().node {
         Some(node) => {
-            if is_json { node.print_long_json() } else { node.print_long() };
-        },
+            if is_json {
+                node.print_long_json()
+            } else {
+                node.print_long()
+            };
+        }
         None => println!("Node not found"),
     }
 

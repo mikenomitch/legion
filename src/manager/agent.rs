@@ -1,11 +1,11 @@
 use crate::cmd::structs::{ManagerConfig, WorkerConfig};
 use crate::constants::{DEFAULT_HOSTNAME, DEFAULT_PORT, NODE_CHECK_DURATION};
 use crate::manager::join_server::get_insecure_manager_service;
-use crate::storage::store::Store;
-use crate::structs::{Node, WorkerConfig as WorkerConfigMsg,};
-use crate::structs::manager_server::ManagerServer;
-use crate::util::R;
 use crate::manager::server::ManagerAgentService;
+use crate::storage::store::Store;
+use crate::structs::manager_server::ManagerServer;
+use crate::structs::{Node, WorkerConfig as WorkerConfigMsg};
+use crate::util::R;
 
 use futures::join;
 use jsonnet::JsonnetVm;
@@ -96,7 +96,7 @@ fn parse_worker_config(config_path: &str) -> R<WorkerConfig> {
         Err(e) => {
             error!("Error parsing worker config: {:?}", e);
             Err(e.to_string().into())
-        },
+        }
     }
 }
 

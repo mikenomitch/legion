@@ -1,5 +1,7 @@
 use crate::constants::DEFAULT_STORE_PATH;
+use crate::structs::{Node, WorkerConfig};
 use crate::util::{merge_json_strings, R};
+
 use log::debug;
 use rusqlite::{named_params, Connection};
 use rusqlite_migration::{Migrations, M};
@@ -7,8 +9,6 @@ use serde_rusqlite::to_params_named;
 use std::sync::{Arc, Mutex};
 use time::macros::format_description;
 use time::OffsetDateTime;
-
-use crate::structs::{Node, WorkerConfig};
 
 // warning incorrectly
 #[allow(dead_code)]
@@ -177,23 +177,19 @@ FROM node;
         RETURNING id, pool, status, availability, config_attrs, fingerprint_attrs, dynamic_attrs, health_checks, last_heartbeat;
 "#;
 
-        let node = conn.query_row(
-            sql,
-            to_params_named(&node)?.to_slice().as_slice(),
-            |row| {
-                Ok(Node {
-                    id: row.get(0)?,
-                    pool: row.get(1)?,
-                    status: row.get(2)?,
-                    availability: row.get(3)?,
-                    config_attrs: row.get(4)?,
-                    fingerprint_attrs: row.get(5)?,
-                    dynamic_attrs: row.get(6)?,
-                    health_checks: row.get(7)?,
-                    last_heartbeat: row.get(8)?,
-                })
-            },
-        )?;
+        let node = conn.query_row(sql, to_params_named(&node)?.to_slice().as_slice(), |row| {
+            Ok(Node {
+                id: row.get(0)?,
+                pool: row.get(1)?,
+                status: row.get(2)?,
+                availability: row.get(3)?,
+                config_attrs: row.get(4)?,
+                fingerprint_attrs: row.get(5)?,
+                dynamic_attrs: row.get(6)?,
+                health_checks: row.get(7)?,
+                last_heartbeat: row.get(8)?,
+            })
+        })?;
 
         Ok(node)
     }
@@ -274,8 +270,6 @@ FROM node;
             ":id": id,
             ":health_checks": health_checks,
         };
-
-        println!("DOING IT!!! {}", health_checks);
 
         conn.execute(sql, params)?;
 

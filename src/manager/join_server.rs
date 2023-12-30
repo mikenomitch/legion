@@ -1,18 +1,14 @@
-use std::time::Duration;
-
-use crate::cmd::structs::{ManagerConfig, JoinTokenClaims};
-use crate::util::R;
-use crate::constants::{TMP_SECRET_KEY, DEFAULT_CONFIG_PATH, DEFAULT_ADDR};
-
-use tonic::{Request, Response, Status};
-use jsonnet::JsonnetVm;
-
+use crate::cmd::structs::{JoinTokenClaims, ManagerConfig};
+use crate::constants::{DEFAULT_ADDR, DEFAULT_CONFIG_PATH, TMP_SECRET_KEY};
 use crate::structs::insecure_manager_server::{InsecureManager, InsecureManagerServer};
 use crate::structs::{GetJoinTokenReply, GetJoinTokenRequest};
-
-use jsonwebtoken::{encode, Header, Algorithm, EncodingKey};
-
+use crate::util::R;
 // use crate::certs::{signed_cert_with_ca, read_root_cert};
+
+use jsonnet::JsonnetVm;
+use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+use std::time::Duration;
+use tonic::{Request, Response, Status};
 // use tonic::transport::{Certificate, Channel, ClientTlsConfig};
 // use rustls::Certificate;
 // use rustls::PrivateKey;
@@ -33,12 +29,10 @@ impl InsecureManager for InsecureManagerService {
             None => "default".into(),
         };
 
-        let token = generate_join_token(worker_type, ttl).
-            map_err( |e| Status::new(tonic::Code::NotFound, e.to_string()))?;
+        let token = generate_join_token(worker_type, ttl)
+            .map_err(|e| Status::new(tonic::Code::NotFound, e.to_string()))?;
 
-        let reply = GetJoinTokenReply {
-            token: token,
-        };
+        let reply = GetJoinTokenReply { token: token };
 
         Ok(Response::new(reply))
     }
@@ -90,12 +84,20 @@ pub fn generate_join_token(worker_type: String, ttl: Option<String>) -> R<String
         skip_expiry_validation: jwt_exp == 0,
     };
 
-    let header = Header { kid: Some("signing_key".to_owned()), alg: Algorithm::HS512, ..Default::default() };
+    let header = Header {
+        kid: Some("signing_key".to_owned()),
+        alg: Algorithm::HS512,
+        ..Default::default()
+    };
 
-    let encoded_token = encode(&header, &claims, &EncodingKey::from_secret(&TMP_SECRET_KEY[..])).map_err(|e| e.into());
+    let encoded_token = encode(
+        &header,
+        &claims,
+        &EncodingKey::from_secret(&TMP_SECRET_KEY[..]),
+    )
+    .map_err(|e| e.into());
     encoded_token
 }
-
 
 fn parse_manager_config(config_path: &str) -> R<ManagerConfig> {
     // Pluginify jsonnet

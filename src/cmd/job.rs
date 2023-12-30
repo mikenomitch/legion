@@ -1,11 +1,10 @@
 use crate::constants::DEFAULT_ADDR;
+use crate::structs::manager_client::ManagerClient;
+use crate::structs::{GetJobStatusRequest, RunJobRequest};
 use crate::util::R;
 
 use clap::{arg, Command};
 use log::debug;
-
-use crate::structs::manager_client::ManagerClient;
-use crate::structs::{GetJobStatusRequest, RunJobRequest};
 
 pub fn config() -> Command {
     let job_run_cmd = Command::new("run")

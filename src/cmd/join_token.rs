@@ -1,9 +1,9 @@
-use std::error;
-use clap::{arg, Command};
 use crate::constants::DEFAULT_INSECURE_ADDR;
 use crate::structs::insecure_manager_client::InsecureManagerClient;
 use crate::structs::GetJoinTokenRequest;
 
+use clap::{arg, Command};
+use std::error;
 
 pub fn config() -> Command {
     Command::new("join-token")
@@ -22,8 +22,7 @@ pub async fn handle(sub_matches: &clap::ArgMatches) -> Result<(), Box<dyn error:
         .map(|s| s.as_str())
         .unwrap_or("default");
 
-    let address = std::env::var("LEGION_ADDR").
-        unwrap_or(DEFAULT_INSECURE_ADDR.to_owned());
+    let address = std::env::var("LEGION_ADDR").unwrap_or(DEFAULT_INSECURE_ADDR.to_owned());
 
     let mut client = InsecureManagerClient::connect(address).await?;
 

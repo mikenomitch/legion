@@ -1,6 +1,7 @@
-use time::macros::format_description;
 use crate::constants::DEFAULT_HEARTBEAT_TIMEOUT_SEC;
 use crate::util::{merge_json_strings, R};
+
+use time::macros::format_description;
 
 tonic::include_proto!("legion");
 
@@ -27,9 +28,7 @@ impl Printable for Node {
     }
 
     fn print_list(nodes: Vec<Node>) {
-        nodes.into_iter().for_each(|node| {
-            node.print_short()
-        });
+        nodes.into_iter().for_each(|node| node.print_short());
     }
 
     fn print_short_json(&self) {
@@ -39,12 +38,9 @@ impl Printable for Node {
 
     fn print_long(&self) {
         println!("Node ID: {}", self.id);
-        let full_attrs =  merge_json_strings(
-            merge_json_strings(
-                self.config_attrs.clone(),
-                self.fingerprint_attrs.clone()
-            ),
-            self.dynamic_attrs.clone()
+        let full_attrs = merge_json_strings(
+            merge_json_strings(self.config_attrs.clone(), self.fingerprint_attrs.clone()),
+            self.dynamic_attrs.clone(),
         );
 
         println!("Attributes: {}", full_attrs);

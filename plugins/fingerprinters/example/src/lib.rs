@@ -29,7 +29,9 @@ pub trait NodeChecker {
 
 struct BasicNodeChecker {}
 impl NodeChecker for BasicNodeChecker {
-    fn name(&self) -> &'static str { "basic" }
+    fn name(&self) -> &'static str {
+        "basic"
+    }
 
     fn has_fingerprinter(&self) -> bool {
         true
@@ -54,5 +56,5 @@ impl NodeChecker for BasicNodeChecker {
 
 #[no_mangle]
 pub extern "C" fn get() -> Box<dyn NodeChecker> {
-    Box::new(BasicNodeChecker{})
+    Box::new(BasicNodeChecker {})
 }
