@@ -1,19 +1,9 @@
 # Next Up
-- First party resource stuff + ledger? (start w/ allocs?)
-    - Plugin system for this
-        - resources are just a special type of attr
-        - tracked by the manager (not by the node itself)
-        - Where do I set max_allocs?? (for an instance of a resouce)
-            - I can add some constraint to the whole cluster?
-                - I add a resource plugin to the cluster. It looks at attributes and then treats them as resource I can schedule on?
-            - At the node level, I just have an attr of some sort.
-
-- Clean up every unwrap()
-- Clean up gross conversions of attr hashes
-
-- Output node attrs as a map in json not a string
+- .legion folder gets auto-created if not there already
+- Manager config has almost everything optional
 - Nice errors if worker config missing necessary attrs
     - Same for manager config
+- Output node attrs as a map in json not a string
 
 - Nice errors in CLI commands for various failures
     - Join token errors for instance (see To Dos)
@@ -21,20 +11,47 @@
     - Node info error (missing node)
 
 - Better logging throughout
-    - Errors in right placer
-    - Debug statements to track
+    - Nicer error messages in the right places
+    - Debug statements to track things
     - Otel?!?!
 
+- Clean up every unwrap()
+- Clean up gross conversions of attr hashes
+
+- Think about your file setup (names/org/dupes)
+    - Split the GRPC "servers" into their own files
+      and the "agents" into their own files
+        - Perhaps split out agent code into own files beyond this
+    - Split out NodeChecks into own single file then keep
+      node check logic together in one
+    - Where structs get their definition
+    - Extract util functions
+    - Audit all files
 - Write some integration tests
 - Write some unit tests
 - Any other plugins? (Storage maybe?)
-- Think about your file setup (names/org/dupes)
 - Automated testing in CI (timebox this)
+- DRY up
+    - storage
+    - grpc servers
 
 - Worker configs CRUD commands
     - I guess for this to really work, you would need to update any of this type
       that already exist (and send them the info)
     - Which means that nodes should save a reference to their type
+
+- First party resource stuff + ledger? (start w/ allocs?)
+    - I submit a job and it places on a node
+    - I keep submitting jobs and they stop placing if resources run out
+    - I can remove a job and it frees up resources
+
+    - Plugin system for this
+        - resources are just a special type of attr
+        - tracked by the manager (not by the node itself)
+        - Where do I set max_allocs?? (for an instance of a resouce)
+            - I can add some constraint to the whole cluster?
+                - I add a resource plugin to the cluster. It looks at attributes and then treats them as resource I can schedule on?
+            - At the node level, I just have an attr of some sort.
 
 # Milestone
 * Hitting this point will be a fairly major milestone, as lots
@@ -59,7 +76,6 @@ of node management stuff is "done"
 * I can view logs (and they don't destroy my disk)
 * I can shell into the containers
 * I can monitor with a basic UI
-
 
 # Deferred Work
 

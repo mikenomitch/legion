@@ -1,8 +1,8 @@
 use crate::util::R;
 use crate::cmd::structs::ManagerConfig;
 use crate::constants::DEFAULT_CONFIG_PATH;
-use crate::manager::server::run_manager;
-use crate::worker::agent::run_worker;
+use crate::manager::agent::run_manager;
+use crate::worker::server::run_worker;
 use jsonnet::JsonnetVm;
 use clap::{arg, Command};
 
