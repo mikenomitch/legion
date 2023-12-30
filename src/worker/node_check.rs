@@ -71,7 +71,7 @@ pub fn run_health_checks(additional_node_checks: Vec<String>) -> Map<String, Val
 
 fn fp_plugin_name_to_path(name: &String) -> String {
     format!(
-        "/Users/mike/Code/legion/plugins/fingerprinters/{}/target/release/libexample.dylib",
+        "/Users/mike/Code/legion/plugins/node_checks/{}/target/release/libexample.dylib",
         name
     )
 }
