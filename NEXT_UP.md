@@ -10,22 +10,27 @@
 
 - Clean up every unwrap()
 - Clean up gross conversions of attr hashes
-- Join token for a non existent node type is fine
-- Node info for non-existent node errors with nice error
 
 - Output node attrs as a map in json not a string
-- Make many of the worker node attrs optional in the config
-    - Nice errors for the ones that aren't
-- Same for manager config
+- Nice errors if worker config missing necessary attrs
+    - Same for manager config
 
 - Nice errors in CLI commands for various failures
     - Join token errors for instance (see To Dos)
+    - Start with bad join token
+    - Node info error (missing node)
+
 - Better logging throughout
+    - Errors in right placer
+    - Debug statements to track
+    - Otel?!?!
+
 - Write some integration tests
 - Write some unit tests
 - Any other plugins? (Storage maybe?)
 - Think about your file setup (names/org/dupes)
 - Automated testing in CI (timebox this)
+
 - Worker configs CRUD commands
     - I guess for this to really work, you would need to update any of this type
       that already exist (and send them the info)

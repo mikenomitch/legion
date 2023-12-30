@@ -58,10 +58,10 @@ pub fn generate_join_token(worker_type: String, ttl: Option<String>) -> R<String
         Some(ttl) => {
             // TODO: If this errors it probably means they did "1" not "1m" or "1s" etc
             // handle this error nicely!
-            let parsed_ttl: Duration = ttl.parse::<humantime::Duration>().unwrap().into();
+            let parsed_ttl: Duration = ttl.parse::<humantime::Duration>()?.into();
             let now = std::time::SystemTime::now();
             let expiry = now + parsed_ttl;
-            jwt_exp = expiry.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as usize;
+            jwt_exp = expiry.duration_since(std::time::UNIX_EPOCH)?.as_secs() as usize;
         }
         None => {
             jwt_exp = 0;

@@ -179,7 +179,7 @@ FROM node;
 
         let node = conn.query_row(
             sql,
-            to_params_named(&node).unwrap().to_slice().as_slice(),
+            to_params_named(&node)?.to_slice().as_slice(),
             |row| {
                 Ok(Node {
                     id: row.get(0)?,
