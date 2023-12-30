@@ -20,7 +20,7 @@ use crate::structs::{
     GetJobStatusReply, GetJobStatusRequest, GetNodeReply, GetNodeRequest, GetNodesReply,
     GetNodesRequest, HeartbeatReply, HeartbeatRequest, Node, RunJobReply, RunJobRequest,
     UpdateNodeDynamicReply, UpdateNodeDynamicRequest, WorkerConfig as WorkerConfigMsg,
-    WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest,
+    WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest, HealthCheckRequest, HealthCheckReply,
 };
 
 use tonic::transport::{Identity, Server, ServerTlsConfig};
@@ -68,6 +68,25 @@ impl Manager for ManagerAgentService {
         })?;
 
         let reply = HeartbeatReply {
+            message: format!("ack"),
+        };
+
+        Ok(Response::new(reply))
+    }
+
+    async fn health_check(
+        &self,
+        request: Request<HealthCheckRequest>,
+    ) -> Result<Response<HealthCheckReply>, Status> {
+        let req = request.into_inner();
+        let id = req.id;
+
+        self.store.update_node_health_checks(id.clone(), req.health_checks).map_err(|e| {
+            error!("Error updading node health checks. Node ID: {}: {:?}", id, e);
+            Status::internal("Error updading node health checks")
+        })?;
+
+        let reply = HealthCheckReply {
             message: format!("ack"),
         };
 

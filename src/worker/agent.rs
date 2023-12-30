@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 
 use crate::cmd::structs::JoinTokenClaims;
-use crate::constants::{DEFAULT_HOSTNAME, TMP_SECRET_KEY, WORKER_HEARTBEAT_DURATION};
+use crate::constants::{DEFAULT_HOSTNAME, TMP_SECRET_KEY, WORKER_HEARTBEAT_DURATION, WORKER_HEALTH_CHECK_DURATION};
 use crate::util::R;
-use crate::worker::fingerprint::fingerprint_node;
+use crate::worker::fingerprint::{run_health_checks, fingerprint_node};
 use rand::{thread_rng, Rng};
 use rand::distributions::Alphanumeric;
 
@@ -25,7 +25,7 @@ use crate::structs::manager_client::ManagerClient;
 use crate::structs::worker_server::{Worker, WorkerServer};
 use crate::structs::{
     HeartbeatRequest, PostWorkReply, PostWorkRequest, WorkerPreRegisterReply,
-    WorkerPreRegisterRequest, WorkerRegisterRequest,
+    WorkerPreRegisterRequest, WorkerRegisterRequest, HealthCheckRequest,
 };
 
 pub struct WorkerAgentService {}
@@ -112,9 +112,8 @@ pub async fn run_worker(token: &str) -> R<()> {
         None => random_string,
     };
 
-    let fingerprint_data = fingerprint_node(config.additional_fingerprinters);
-    let health_checks = run_health_checks(config.additional_fingerprinters);
-    HashMap::new();
+    let fingerprint_data = fingerprint_node(config.additional_fingerprinters.clone());
+    let health_checks = run_health_checks(config.additional_fingerprinters.clone());
 
     register_self(
         client.clone(),
@@ -125,8 +124,9 @@ pub async fn run_worker(token: &str) -> R<()> {
         health_checks
     ).await?;
 
-    let heartbeat_fut = start_heartbeats(name.clone(), client);
-    let _res = join!(heartbeat_fut, worker_server_fut);
+    let heartbeat_fut = start_heartbeats(name.clone(), client.clone());
+    let checks_fut = start_health_checks(name.clone(), config.additional_fingerprinters.clone(), client);
+    let _res = join!(heartbeat_fut, checks_fut, worker_server_fut);
 
     Ok(())
 }
@@ -159,13 +159,32 @@ async fn start_heartbeats(name: String, client: ManagerClient<Channel>) -> R<()>
     }
 }
 
+async fn start_health_checks(name: String, additional_fingerprinters: Vec<String>, client: ManagerClient<Channel>) -> R<()> {
+    let mut client_clone = client.clone();
+
+    let checks_data = run_health_checks(additional_fingerprinters);
+    let serialized_health_check_data = serde_json::to_string(&checks_data)?;
+
+    loop {
+        let req = tonic::Request::new(HealthCheckRequest {
+            id: name.to_owned(),
+            health_checks: serialized_health_check_data.clone(),
+        });
+
+        let response = client_clone.health_check(req).await?;
+        debug!("RESPONSE={:?}", response);
+
+        tokio::time::sleep(tokio::time::Duration::from_secs(WORKER_HEALTH_CHECK_DURATION)).await;
+    }
+}
+
 async fn register_self(
     client: ManagerClient<Channel>,
     name: String,
     pool: String,
     config_attrs: HashMap<String, String>,
     fingerprint_attrs: Map<String, Value>,
-    health_checks: HashMap<String, String>,
+    health_checks: Map<String, Value>,
 ) -> R<()> {
     let mut c2 = client.clone();
     let serialized_config_data = serde_json::to_string(&config_attrs)?;

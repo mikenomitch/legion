@@ -1,8 +1,6 @@
 # Next Up
 - Other health status checks along with heartbeats?
-    - Like heartbeating but at slower cadence (jsonb saved and pinged every N seconds)
-    - Plugin system like fingerprinters
-    - Can take args from dynamic??
+    - "fingerprinter_plugin" renamed to "node_check_plugin"
 
 - First party resource stuff + ledger? (start w/ allocs?)
     - Plugin system for this
@@ -47,6 +45,21 @@ of node management stuff is "done"
 * Goal: Updating a job in response to node changes
 * Goal: Replacing a job in response to health check failure
 * Goal: Observing jobs on nodes via the CLI (where is it running, etc)
+
+# Mid Term Goal (real personal use)
+* I can run a manager/worker combo on Hetzner
+* I can run docker images
+* I can mount a host volume
+### After that
+* The app restarts if it crashes
+* I can monitor app health via CLI and UI
+* I can do deploys & updates
+* I can have basic networking between tasks and split between two nodes
+* Security stuff!!
+* I can view logs (and they don't destroy my disk)
+* I can shell into the containers
+* I can monitor with a basic UI
+
 
 # Deferred Work
 

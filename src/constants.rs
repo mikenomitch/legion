@@ -7,6 +7,7 @@ pub const DEFAULT_INSECURE_ADDR: &str = "http://127.0.0.1:4748";
 pub const DEFAULT_CONFIG_PATH: &str = "./configs/manager.jsonnet";
 pub const TMP_SECRET_KEY: [u8; 6] = *b"secret";
 pub const WORKER_HEARTBEAT_DURATION: u64 = 2;
+pub const WORKER_HEALTH_CHECK_DURATION: u64 = 30;
 pub const NODE_CHECK_DURATION: u64 = 2;
 pub const DEFAULT_STORE_PATH: &str = ".legion/store.sqlite";
 pub const DEFAULT_HEARTBEAT_TIMEOUT_SEC: i64 = 10;

@@ -1,9 +1,9 @@
 use crate::util::R;
 
 use libloading::{Library, Symbol};
-use std::env::consts::{ARCH, OS};
-use sysinfo::{CpuExt, DiskExt, System, SystemExt, NetworkExt};
 use serde_json::{Map, Value};
+use std::env::consts::{ARCH, OS};
+use sysinfo::{CpuExt, DiskExt, NetworkExt, System, SystemExt};
 
 // NOTE: Improve current fingerprinters:
 // Network - speed, IP addresses, etc
@@ -26,7 +26,7 @@ pub fn fingerprint_node(additional_fingerprinters: Vec<String>) -> Map<String, V
 
     let mut ret = Map::new();
 
-    fps.iter().for_each(|f| {
+    fps.iter().filter(|f| f.has_fingerprinter()).for_each(|f| {
         ret.extend(f.fingerprint());
     });
 
@@ -46,12 +46,11 @@ pub fn fingerprint_node(additional_fingerprinters: Vec<String>) -> Map<String, V
 }
 
 pub fn run_health_checks(additional_fingerprinters: Vec<String>) -> Map<String, Value> {
-    let fps: Vec<Box<dyn Fingerprinter>> = vec![
-        Box::new(DiskChecker {}),
-    ];
+    let fps: Vec<Box<dyn Fingerprinter>> = vec![Box::new(DiskChecker {})];
 
     let mut ret = Map::new();
-    fps.iter().for_each(|f| {
+
+    fps.iter().filter(|f| f.has_health_check()).for_each(|f| {
         ret.extend(f.health_check());
     });
 
@@ -70,9 +69,11 @@ pub fn run_health_checks(additional_fingerprinters: Vec<String>) -> Map<String, 
     ret
 }
 
-
 fn fp_plugin_name_to_path(name: &String) -> String {
-    format!("/Users/mike/Code/legion/plugins/fingerprinters/{}/target/release/libexample.dylib", name)
+    format!(
+        "/Users/mike/Code/legion/plugins/fingerprinters/{}/target/release/libexample.dylib",
+        name
+    )
 }
 
 fn call_dynamic(path: &str) -> R<Box<dyn Fingerprinter>> {
@@ -85,6 +86,14 @@ fn call_dynamic(path: &str) -> R<Box<dyn Fingerprinter>> {
 
 pub trait Fingerprinter {
     fn name(&self) -> &'static str;
+
+    fn has_fingerprinter(&self) -> bool {
+        false
+    }
+
+    fn has_health_check(&self) -> bool {
+        false
+    }
 
     fn fingerprint(&self) -> Map<String, Value> {
         let mut map = Map::new();
@@ -106,6 +115,10 @@ impl Fingerprinter for OSFingerprinter {
         "os"
     }
 
+    fn has_fingerprinter(&self) -> bool {
+        true
+    }
+
     fn fingerprint(&self) -> Map<String, Value> {
         let mut map = Map::new();
         map.insert("os".into(), Value::String(OS.into()));
@@ -118,6 +131,10 @@ struct ArchFingerprinter {}
 impl Fingerprinter for ArchFingerprinter {
     fn name(&self) -> &'static str {
         "arch"
+    }
+
+    fn has_fingerprinter(&self) -> bool {
+        true
     }
 
     fn fingerprint(&self) -> Map<String, Value> {
@@ -133,9 +150,31 @@ impl Fingerprinter for DiskChecker {
         "disk"
     }
 
+    fn has_health_check(&self) -> bool {
+        true
+    }
+
     fn health_check(&self) -> Map<String, Value> {
+        let mut sys = System::new_all();
+        sys.refresh_all();
+
+        let any_disk_under_50_free = sys.disks().iter().any(|disk| {
+            let percent_free = disk.available_space() as f64 / disk.total_space() as f64;
+            percent_free < 0.5
+        });
+
+        let any_disk_under_20_free = sys.disks().iter().any(|disk| {
+            let percent_free = disk.available_space() as f64 / disk.total_space() as f64;
+            percent_free < 0.2
+        });
+
+        // TODO: Ensure this works on MacOS
+        let fifty_val = if any_disk_under_50_free { "fail" } else { "pass" };
+        let twenty_val = if any_disk_under_20_free { "fail" } else { "pass" };
+
         let mut map = Map::new();
-        map.insert("disk".into(), Value::String("pass".into()));
+        map.insert("disk_under_fifty_free".into(), Value::String(fifty_val.into()));
+        map.insert("disk_under_twenty_free".into(), Value::String(twenty_val.into()));
         map
     }
 }
@@ -145,6 +184,10 @@ struct KitchenSinkFingerprinter {}
 impl Fingerprinter for KitchenSinkFingerprinter {
     fn name(&self) -> &'static str {
         "kitchen-sink"
+    }
+
+    fn has_fingerprinter(&self) -> bool {
+        true
     }
 
     fn fingerprint(&self) -> Map<String, Value> {
@@ -160,10 +203,7 @@ impl Fingerprinter for KitchenSinkFingerprinter {
         for (interface_name, data) in sys.networks() {
             let mut network_map: Map<String, Value> = Map::new();
 
-            network_map.insert(
-                "name".into(),
-                Value::String(interface_name.to_string()),
-            );
+            network_map.insert("name".into(), Value::String(interface_name.to_string()));
 
             network_map.insert(
                 "mac_address".into(),
@@ -181,10 +221,7 @@ impl Fingerprinter for KitchenSinkFingerprinter {
         sys.cpus().iter().for_each(|cpu| {
             let mut cpu_hash: Map<String, Value> = Map::new();
             cpu_hash.insert("name".into(), Value::String(cpu.name().to_string()));
-            cpu_hash.insert(
-                "usage".into(),
-                Value::String(cpu.cpu_usage().to_string()),
-            );
+            cpu_hash.insert("usage".into(), Value::String(cpu.cpu_usage().to_string()));
             cpu_hash.insert(
                 "frequency".into(),
                 Value::String(cpu.frequency().to_string()),
@@ -231,7 +268,7 @@ impl Fingerprinter for KitchenSinkFingerprinter {
 
             disks_hash.insert(
                 disk.name().to_str().unwrap_or("").into(),
-                Value::Object(disk_hash)
+                Value::Object(disk_hash),
             );
         });
 
@@ -265,7 +302,12 @@ impl Fingerprinter for KitchenSinkFingerprinter {
         let signals = System::SUPPORTED_SIGNALS;
         fingerprint.insert(
             "signals".into(),
-            Value::Array(signals.iter().map(|s| Value::String(s.to_string())).collect()),
+            Value::Array(
+                signals
+                    .iter()
+                    .map(|s| Value::String(s.to_string()))
+                    .collect(),
+            ),
         );
 
         fingerprint
@@ -284,9 +326,12 @@ mod tests {
         let os = res.get("os").ok_or("no os")?.as_str().ok_or("no os")?;
         assert_eq!("macos", os);
 
-
         // Test that the plugin works
-        let basic = res.get("basic").ok_or("no basic")?.as_str().ok_or("no basic")?;
+        let basic = res
+            .get("basic")
+            .ok_or("no basic")?
+            .as_str()
+            .ok_or("no basic")?;
         assert_eq!("output", basic);
 
         Ok(())

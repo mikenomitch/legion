@@ -1,14 +1,14 @@
 use crate::constants::DEFAULT_STORE_PATH;
-use crate::util::{R, merge_json_strings};
+use crate::util::{merge_json_strings, R};
 use log::debug;
+use rusqlite::{named_params, Connection};
 use rusqlite_migration::{Migrations, M};
-use rusqlite::{Connection, named_params};
 use serde_rusqlite::to_params_named;
 use std::sync::{Arc, Mutex};
 use time::macros::format_description;
 use time::OffsetDateTime;
 
-use crate::structs::{WorkerConfig, Node};
+use crate::structs::{Node, WorkerConfig};
 
 // warning incorrectly
 #[allow(dead_code)]
@@ -47,7 +47,8 @@ impl Store {
 
     fn create_initial_tables(conn: MemSafeConn) -> R<()> {
         let migrations = Migrations::new(vec![
-            M::up("CREATE TABLE IF NOT EXISTS node (
+            M::up(
+                "CREATE TABLE IF NOT EXISTS node (
                 id    STRING PRIMARY KEY,
                 pool STRING NOT NULL,
                 status STRING NOT NULL,
@@ -57,14 +58,19 @@ impl Store {
                 dynamic_attrs JSONB NOT NULL,
                 health_checks JSONB NOT NULL,
                 last_heartbeat TIMESTAMP NOT NULL
-            )").down("DROP TABLE node;"),
-            M::up("CREATE TABLE IF NOT EXISTS worker_type (
+            )",
+            )
+            .down("DROP TABLE node;"),
+            M::up(
+                "CREATE TABLE IF NOT EXISTS worker_type (
                 name STRING PRIMARY KEY,
                 pool STRING NOT NULL,
                 additional_fingerprinters Text NOT NULL,
                 attributes JSONB NOT NULL,
                 name_prefix STRING
-            )").down("DROP TABLE worker_type;"),
+            )",
+            )
+            .down("DROP TABLE worker_type;"),
         ]);
 
         let mut conn = conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
@@ -138,9 +144,7 @@ FROM node;
     pub fn get_node_ids_and_heartbeats(&self) -> R<Vec<(String, String)>> {
         let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
         let mut stmt = conn.prepare("SELECT id, last_heartbeat FROM node")?;
-        let node_iter = stmt.query_map([], |row| {
-            Ok((row.get(0)?, row.get(1)?))
-        })?;
+        let node_iter = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
 
         let mut nodes_id_and_hb = Vec::new();
         for node in node_iter {
@@ -173,19 +177,23 @@ FROM node;
         RETURNING id, pool, status, availability, config_attrs, fingerprint_attrs, dynamic_attrs, health_checks, last_heartbeat;
 "#;
 
-        let node = conn.query_row(sql, to_params_named(&node).unwrap().to_slice().as_slice(), |row| {
-            Ok(Node {
-                id: row.get(0)?,
-                pool: row.get(1)?,
-                status: row.get(2)?,
-                availability: row.get(3)?,
-                config_attrs: row.get(4)?,
-                fingerprint_attrs: row.get(5)?,
-                dynamic_attrs: row.get(6)?,
-                health_checks: row.get(7)?,
-                last_heartbeat: row.get(8)?,
-            })
-        })?;
+        let node = conn.query_row(
+            sql,
+            to_params_named(&node).unwrap().to_slice().as_slice(),
+            |row| {
+                Ok(Node {
+                    id: row.get(0)?,
+                    pool: row.get(1)?,
+                    status: row.get(2)?,
+                    availability: row.get(3)?,
+                    config_attrs: row.get(4)?,
+                    fingerprint_attrs: row.get(5)?,
+                    dynamic_attrs: row.get(6)?,
+                    health_checks: row.get(7)?,
+                    last_heartbeat: row.get(8)?,
+                })
+            },
+        )?;
 
         Ok(node)
     }
@@ -239,7 +247,10 @@ FROM node;
         SET last_heartbeat = :ts, status = 'active'
         WHERE id = :id;
 "#;
-        debug!("Updating heartbeat for node {} with TS: {}", id, timestamp_now);
+        debug!(
+            "Updating heartbeat for node {} with TS: {}",
+            id, timestamp_now
+        );
 
         let params = named_params! {
             ":id": id,
@@ -251,14 +262,34 @@ FROM node;
         Ok(())
     }
 
+    pub fn update_node_health_checks(&self, id: String, health_checks: String) -> R<()> {
+        let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
+        let sql = r#"
+        UPDATE node
+        SET health_checks = :health_checks
+        WHERE id = :id;
+"#;
+
+        let params = named_params! {
+            ":id": id,
+            ":health_checks": health_checks,
+        };
+
+        println!("DOING IT!!! {}", health_checks);
+
+        conn.execute(sql, params)?;
+
+        Ok(())
+    }
+
     pub fn get_worker_type(&self, name: String) -> R<WorkerConfig> {
         let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
         let sql = "SELECT name, pool, additional_fingerprinters, attributes, name_prefix FROM worker_type WHERE name = ?";
 
         let config = conn.query_row(sql, [name], |row| {
-            let af: String= row.get(2)?;
+            let af: String = row.get(2)?;
 
-            let attrs: String= row.get(3)?;
+            let attrs: String = row.get(3)?;
             let parsed_attrs = serde_json::from_str(&attrs).unwrap();
 
             let fingerprinters: Vec<String>;
@@ -295,17 +326,17 @@ ON CONFLICT(name) DO UPDATE SET pool = :pool, additional_fingerprinters = :af, a
 RETURNING name, pool, additional_fingerprinters, attributes, name_prefix;
 "#;
 
-            let params = named_params! {
-                ":name": config.name,
-                ":pool": config.pool,
-                ":af": fingerprinters_to_save,
-                ":attrs": attrs_to_save,
-                ":name_prefix": config.name_prefix,
-            };
+        let params = named_params! {
+            ":name": config.name,
+            ":pool": config.pool,
+            ":af": fingerprinters_to_save,
+            ":attrs": attrs_to_save,
+            ":name_prefix": config.name_prefix,
+        };
 
-            let config = conn.query_row(sql, params, |row| {
-            let af: String= row.get(2)?;
-            let attrs: String= row.get(3)?;
+        let config = conn.query_row(sql, params, |row| {
+            let af: String = row.get(2)?;
+            let attrs: String = row.get(3)?;
             let parsed_attrs = serde_json::from_str(&attrs).unwrap();
             let name_prefix = row.get(4)?;
 

@@ -10,6 +10,7 @@ service Manager {
   rpc RunJob (RunJobRequest) returns (RunJobReply);
   rpc GetJobStatus (GetJobStatusRequest) returns (GetJobStatusReply);
   rpc Heartbeat (HeartbeatRequest) returns (HeartbeatReply);
+  rpc HealthCheck (HealthCheckRequest) returns (HealthCheckReply);
   rpc GetNodes (GetNodesRequest) returns (GetNodesReply);
   rpc GetNode (GetNodeRequest) returns (GetNodeReply);
   rpc UpdateNodeDynamic (UpdateNodeDynamicRequest)
@@ -65,6 +66,15 @@ message HeartbeatRequest {
 }
 
 message HeartbeatReply {
+  string message = 1;
+}
+
+message HealthCheckRequest {
+  string id = 1;
+  string health_checks = 2;
+}
+
+message HealthCheckReply {
   string message = 1;
 }
 
