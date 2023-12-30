@@ -1,7 +1,7 @@
 {
     workerType: "alt",
     pool: "alt",
-    additionalFingerprinters: ["example"],
+    additionalNodeChecks: ["example"],
     attributes: {
         woot: "WUT"
     },

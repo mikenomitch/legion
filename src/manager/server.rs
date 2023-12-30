@@ -123,7 +123,7 @@ impl Manager for ManagerAgentService {
         let config = WorkerConfigMsg {
             name: worker_type,
             pool: worker_config.pool,
-            additional_fingerprinters: worker_config.additional_fingerprinters,
+            additional_node_checks: worker_config.additional_node_checks,
             attributes: worker_config.attributes,
             name_prefix: worker_config.name_prefix,
         };
@@ -303,13 +303,13 @@ async fn load_initial_data(store: &Store, config: &ManagerConfig) -> R<()> {
         let path_str = path.to_str().unwrap();
         let wcp = parse_worker_config(path_str)?;
 
-        let af = wcp.additional_fingerprinters.unwrap_or([].to_vec());
+        let af = wcp.additional_node_checks.unwrap_or([].to_vec());
         let attrs = wcp.attributes.unwrap_or(HashMap::new());
 
         let wc = WorkerConfigMsg {
             name: wcp.worker_type.clone(),
             pool: wcp.pool.unwrap_or("default".into()),
-            additional_fingerprinters: af,
+            additional_node_checks: af,
             attributes: attrs,
             name_prefix: wcp.name_prefix,
         };

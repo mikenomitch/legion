@@ -1,7 +1,4 @@
 # Next Up
-- Other health status checks along with heartbeats?
-    - "fingerprinter_plugin" renamed to "node_check_plugin"
-
 - First party resource stuff + ledger? (start w/ allocs?)
     - Plugin system for this
         - resources are just a special type of attr
@@ -14,14 +11,12 @@
 - Clean up every unwrap()
 - Clean up gross conversions of attr hashes
 - Join token for a non existent node type is fine
+- Node info for non-existent node errors with nice error
 
 - Output node attrs as a map in json not a string
 - Make many of the worker node attrs optional in the config
     - Nice errors for the ones that aren't
 - Same for manager config
-- Redo the structure of dynamic and attrs so you can change out the config
-    at manager level and it pushes changes to the children without overwriting
-    anything (maybe this isn't necessary)
 
 - Nice errors in CLI commands for various failures
     - Join token errors for instance (see To Dos)

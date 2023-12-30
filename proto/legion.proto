@@ -24,7 +24,7 @@ message WorkerPreRegisterRequest {
 message WorkerConfig {
   string name = 1;
   string pool = 2;
-  repeated string additional_fingerprinters = 3;
+  repeated string additional_node_checks = 3;
   map<string, string> attributes = 4;
   optional string name_prefix = 5;
 }

@@ -65,7 +65,7 @@ impl Store {
                 "CREATE TABLE IF NOT EXISTS worker_type (
                 name STRING PRIMARY KEY,
                 pool STRING NOT NULL,
-                additional_fingerprinters Text NOT NULL,
+                additional_node_checks Text NOT NULL,
                 attributes JSONB NOT NULL,
                 name_prefix STRING
             )",
@@ -284,7 +284,7 @@ FROM node;
 
     pub fn get_worker_type(&self, name: String) -> R<WorkerConfig> {
         let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
-        let sql = "SELECT name, pool, additional_fingerprinters, attributes, name_prefix FROM worker_type WHERE name = ?";
+        let sql = "SELECT name, pool, additional_node_checks, attributes, name_prefix FROM worker_type WHERE name = ?";
 
         let config = conn.query_row(sql, [name], |row| {
             let af: String = row.get(2)?;
@@ -292,11 +292,11 @@ FROM node;
             let attrs: String = row.get(3)?;
             let parsed_attrs = serde_json::from_str(&attrs).unwrap();
 
-            let fingerprinters: Vec<String>;
+            let node_checks: Vec<String>;
             if af == "" {
-                fingerprinters = vec![];
+                node_checks = vec![];
             } else {
-                fingerprinters = af.split(",").map(|s| s.to_string()).collect();
+                node_checks = af.split(",").map(|s| s.to_string()).collect();
             }
 
             let name_prefix = row.get(4)?;
@@ -304,7 +304,7 @@ FROM node;
             Ok(WorkerConfig {
                 name: row.get(0)?,
                 pool: row.get(1)?,
-                additional_fingerprinters: fingerprinters,
+                additional_node_checks: node_checks,
                 attributes: parsed_attrs,
                 name_prefix: name_prefix,
             })
@@ -316,20 +316,20 @@ FROM node;
     pub fn insert_worker_type(&self, config: WorkerConfig) -> R<WorkerConfig> {
         let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
 
-        let fingerprinters_to_save = config.additional_fingerprinters.join(",");
+        let node_checks_to_save = config.additional_node_checks.join(",");
         let attrs_to_save = serde_json::to_string(&config.attributes)?;
 
         let sql = r#"
-INSERT INTO worker_type (name, pool, additional_fingerprinters, attributes, name_prefix)
+INSERT INTO worker_type (name, pool, additional_node_checks, attributes, name_prefix)
 VALUES (:name, :pool, :af, :attrs, :name_prefix)
-ON CONFLICT(name) DO UPDATE SET pool = :pool, additional_fingerprinters = :af, attributes = :attrs, name_prefix = :name_prefix
-RETURNING name, pool, additional_fingerprinters, attributes, name_prefix;
+ON CONFLICT(name) DO UPDATE SET pool = :pool, additional_node_checks = :af, attributes = :attrs, name_prefix = :name_prefix
+RETURNING name, pool, additional_node_checks, attributes, name_prefix;
 "#;
 
         let params = named_params! {
             ":name": config.name,
             ":pool": config.pool,
-            ":af": fingerprinters_to_save,
+            ":af": node_checks_to_save,
             ":attrs": attrs_to_save,
             ":name_prefix": config.name_prefix,
         };
@@ -343,7 +343,7 @@ RETURNING name, pool, additional_fingerprinters, attributes, name_prefix;
             Ok(WorkerConfig {
                 name: row.get(0)?,
                 pool: row.get(1)?,
-                additional_fingerprinters: af.split(",").map(|s| s.to_string()).collect(),
+                additional_node_checks: af.split(",").map(|s| s.to_string()).collect(),
                 attributes: parsed_attrs,
                 name_prefix: name_prefix,
             })

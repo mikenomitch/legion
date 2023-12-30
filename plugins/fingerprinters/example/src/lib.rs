@@ -3,7 +3,7 @@
 use serde_json::{Map, Number, Value};
 use std::collections::HashMap;
 
-pub trait Fingerprinter {
+pub trait NodeChecker {
     fn name(&self) -> &'static str;
 
     fn has_fingerprinter(&self) -> bool {
@@ -27,8 +27,8 @@ pub trait Fingerprinter {
     }
 }
 
-struct BasicFingerprinter {}
-impl Fingerprinter for BasicFingerprinter {
+struct BasicNodeChecker {}
+impl NodeChecker for BasicNodeChecker {
     fn name(&self) -> &'static str { "basic" }
 
     fn has_fingerprinter(&self) -> bool {
@@ -53,6 +53,6 @@ impl Fingerprinter for BasicFingerprinter {
 }
 
 #[no_mangle]
-pub extern "C" fn get() -> Box<dyn Fingerprinter> {
-    Box::new(BasicFingerprinter{})
+pub extern "C" fn get() -> Box<dyn NodeChecker> {
+    Box::new(BasicNodeChecker{})
 }

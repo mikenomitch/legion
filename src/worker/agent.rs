@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use crate::cmd::structs::JoinTokenClaims;
 use crate::constants::{DEFAULT_HOSTNAME, TMP_SECRET_KEY, WORKER_HEARTBEAT_DURATION, WORKER_HEALTH_CHECK_DURATION};
 use crate::util::R;
-use crate::worker::fingerprint::{run_health_checks, fingerprint_node};
+use crate::worker::node_check::{run_health_checks, fingerprint_node};
 use rand::{thread_rng, Rng};
 use rand::distributions::Alphanumeric;
 
@@ -112,8 +112,8 @@ pub async fn run_worker(token: &str) -> R<()> {
         None => random_string,
     };
 
-    let fingerprint_data = fingerprint_node(config.additional_fingerprinters.clone());
-    let health_checks = run_health_checks(config.additional_fingerprinters.clone());
+    let fingerprint_data = fingerprint_node(config.additional_node_checks.clone());
+    let health_checks = run_health_checks(config.additional_node_checks.clone());
 
     register_self(
         client.clone(),
@@ -125,7 +125,7 @@ pub async fn run_worker(token: &str) -> R<()> {
     ).await?;
 
     let heartbeat_fut = start_heartbeats(name.clone(), client.clone());
-    let checks_fut = start_health_checks(name.clone(), config.additional_fingerprinters.clone(), client);
+    let checks_fut = start_health_checks(name.clone(), config.additional_node_checks.clone(), client);
     let _res = join!(heartbeat_fut, checks_fut, worker_server_fut);
 
     Ok(())
@@ -159,10 +159,10 @@ async fn start_heartbeats(name: String, client: ManagerClient<Channel>) -> R<()>
     }
 }
 
-async fn start_health_checks(name: String, additional_fingerprinters: Vec<String>, client: ManagerClient<Channel>) -> R<()> {
+async fn start_health_checks(name: String, additional_node_checks: Vec<String>, client: ManagerClient<Channel>) -> R<()> {
     let mut client_clone = client.clone();
 
-    let checks_data = run_health_checks(additional_fingerprinters);
+    let checks_data = run_health_checks(additional_node_checks);
     let serialized_health_check_data = serde_json::to_string(&checks_data)?;
 
     loop {

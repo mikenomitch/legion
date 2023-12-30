@@ -21,7 +21,7 @@ pub struct ManagerConfig {
 #[serde(rename_all = "camelCase")]
 pub struct WorkerConfig {
     pub worker_type: String,
-    pub additional_fingerprinters: Option<Vec<String>>,
+    pub additional_node_checks: Option<Vec<String>>,
     pub pool: Option<String>,
     pub attributes: Option<HashMap<String, String>>,
     pub name_prefix: Option<String>,

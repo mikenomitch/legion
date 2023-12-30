@@ -17,11 +17,11 @@ use sysinfo::{CpuExt, DiskExt, NetworkExt, System, SystemExt};
 // https://michael-f-bryan.github.io/rust-ffi-guide/dynamic_loading.html
 // https://crates.io/crates/sysinfo
 
-pub fn fingerprint_node(additional_fingerprinters: Vec<String>) -> Map<String, Value> {
-    let fps: Vec<Box<dyn Fingerprinter>> = vec![
-        Box::new(ArchFingerprinter {}),
-        Box::new(OSFingerprinter {}),
-        Box::new(KitchenSinkFingerprinter {}),
+pub fn fingerprint_node(additional_node_checks: Vec<String>) -> Map<String, Value> {
+    let fps: Vec<Box<dyn NodeChecker>> = vec![
+        Box::new(ArchNodeChecker {}),
+        Box::new(OSNodeChecker {}),
+        Box::new(KitchenSinkNodeChecker {}),
     ];
 
     let mut ret = Map::new();
@@ -30,7 +30,7 @@ pub fn fingerprint_node(additional_fingerprinters: Vec<String>) -> Map<String, V
         ret.extend(f.fingerprint());
     });
 
-    additional_fingerprinters
+    additional_node_checks
         .iter()
         .map(|name| fp_plugin_name_to_path(name))
         .for_each(|path| match call_dynamic(&path) {
@@ -45,8 +45,8 @@ pub fn fingerprint_node(additional_fingerprinters: Vec<String>) -> Map<String, V
     ret
 }
 
-pub fn run_health_checks(additional_fingerprinters: Vec<String>) -> Map<String, Value> {
-    let fps: Vec<Box<dyn Fingerprinter>> = vec![Box::new(DiskChecker {})];
+pub fn run_health_checks(additional_node_checks: Vec<String>) -> Map<String, Value> {
+    let fps: Vec<Box<dyn NodeChecker>> = vec![Box::new(DiskChecker {})];
 
     let mut ret = Map::new();
 
@@ -54,7 +54,7 @@ pub fn run_health_checks(additional_fingerprinters: Vec<String>) -> Map<String, 
         ret.extend(f.health_check());
     });
 
-    additional_fingerprinters
+    additional_node_checks
         .iter()
         .map(|name| fp_plugin_name_to_path(name))
         .for_each(|path| match call_dynamic(&path) {
@@ -76,15 +76,15 @@ fn fp_plugin_name_to_path(name: &String) -> String {
     )
 }
 
-fn call_dynamic(path: &str) -> R<Box<dyn Fingerprinter>> {
+fn call_dynamic(path: &str) -> R<Box<dyn NodeChecker>> {
     unsafe {
         let lib = Library::new(path)?;
-        let func: Symbol<unsafe extern "C" fn() -> Box<dyn Fingerprinter>> = lib.get(b"get")?;
+        let func: Symbol<unsafe extern "C" fn() -> Box<dyn NodeChecker>> = lib.get(b"get")?;
         Ok(func())
     }
 }
 
-pub trait Fingerprinter {
+pub trait NodeChecker {
     fn name(&self) -> &'static str;
 
     fn has_fingerprinter(&self) -> bool {
@@ -108,9 +108,9 @@ pub trait Fingerprinter {
     }
 }
 
-struct OSFingerprinter {}
+struct OSNodeChecker {}
 
-impl Fingerprinter for OSFingerprinter {
+impl NodeChecker for OSNodeChecker {
     fn name(&self) -> &'static str {
         "os"
     }
@@ -126,9 +126,9 @@ impl Fingerprinter for OSFingerprinter {
     }
 }
 
-struct ArchFingerprinter {}
+struct ArchNodeChecker {}
 
-impl Fingerprinter for ArchFingerprinter {
+impl NodeChecker for ArchNodeChecker {
     fn name(&self) -> &'static str {
         "arch"
     }
@@ -145,7 +145,7 @@ impl Fingerprinter for ArchFingerprinter {
 }
 
 struct DiskChecker {}
-impl Fingerprinter for DiskChecker {
+impl NodeChecker for DiskChecker {
     fn name(&self) -> &'static str {
         "disk"
     }
@@ -179,9 +179,9 @@ impl Fingerprinter for DiskChecker {
     }
 }
 
-struct KitchenSinkFingerprinter {}
+struct KitchenSinkNodeChecker {}
 
-impl Fingerprinter for KitchenSinkFingerprinter {
+impl NodeChecker for KitchenSinkNodeChecker {
     fn name(&self) -> &'static str {
         "kitchen-sink"
     }

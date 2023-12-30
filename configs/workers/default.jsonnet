@@ -1,7 +1,7 @@
 {
     workerType: "default",
     pool: "default",
-    additionalFingerprinters: [],
+    additionalNodeChecks: [],
     attributes: {
         foo: "bar"
     },
