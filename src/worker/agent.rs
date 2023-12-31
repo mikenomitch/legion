@@ -1,28 +1,25 @@
-use crate::cmd::structs::JoinTokenClaims;
 use crate::constants::{
-    DEFAULT_HOSTNAME, TMP_SECRET_KEY, WORKER_HEALTH_CHECK_DURATION, WORKER_HEARTBEAT_DURATION,
+    DEF_MANAGER_HOSTNAME, TMP_SECRET_KEY, WORKER_HEARTBEAT_DURATION_SEC,
+    WORKER_NODE_CHECK_DURATION_SEC,
 };
-use crate::structs::manager_client::ManagerClient;
-use crate::structs::worker_server::WorkerServer;
 use crate::structs::{
-    HealthCheckRequest, HeartbeatRequest, WorkerPreRegisterReply, WorkerPreRegisterRequest,
+    manager_client::ManagerClient, worker_server::WorkerServer, HealthCheckRequest,
+    HeartbeatRequest, JoinTokenClaims, WorkerPreRegisterReply, WorkerPreRegisterRequest,
     WorkerRegisterRequest,
 };
-use crate::util::{R, random_string};
-use crate::worker::node_check::{fingerprint_node, run_health_checks};
-use crate::worker::server::WorkerAgentService;
+use crate::util::{random_string, R};
+use crate::worker::{
+    node_check::{fingerprint_node, run_health_checks},
+    server::WorkerAgentService,
+};
 
 use futures::join;
 use jsonwebtoken::{decode, errors::ErrorKind, Algorithm, DecodingKey, Validation};
 use log::{debug, error};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
-use tonic::{
-    transport::Channel,
-    transport::Server,
-    Response,
-    // transport::Certificate, transport::ClientTlsConfig,
-};
+use tonic::{transport::Channel, transport::Server, Response};
+// use tonic::transport::Certificate, transport::ClientTlsConfig,
 
 pub async fn run_worker(token: &str) -> R<()> {
     let mut val = Validation::new(Algorithm::HS512);
@@ -67,7 +64,7 @@ pub async fn run_worker(token: &str) -> R<()> {
         debug!("Skipping expiry validation check on join token");
     }
 
-    let addr = format!("{}:{}", DEFAULT_HOSTNAME, 4848).parse()?;
+    let addr = format!("{}:{}", DEF_MANAGER_HOSTNAME, 4848).parse()?;
     let worker_node = WorkerAgentService {};
     let worker_server_fut = Server::builder()
         .add_service(WorkerServer::new(worker_node))
@@ -107,8 +104,7 @@ pub async fn run_worker(token: &str) -> R<()> {
     .await?;
 
     let heartbeat_fut = start_heartbeats(name.clone(), client.clone());
-    let checks_fut =
-        start_health_checks(name.clone(), config.additional_node_checks.clone(), client);
+    let checks_fut = start_node_checks(name.clone(), config.additional_node_checks.clone(), client);
     let _res = join!(heartbeat_fut, checks_fut, worker_server_fut);
 
     Ok(())
@@ -138,11 +134,14 @@ async fn start_heartbeats(name: String, client: ManagerClient<Channel>) -> R<()>
         let response = client_clone.heartbeat(req).await?;
         debug!("RESPONSE={:?}", response);
 
-        tokio::time::sleep(tokio::time::Duration::from_secs(WORKER_HEARTBEAT_DURATION)).await;
+        tokio::time::sleep(tokio::time::Duration::from_secs(
+            WORKER_HEARTBEAT_DURATION_SEC,
+        ))
+        .await;
     }
 }
 
-async fn start_health_checks(
+async fn start_node_checks(
     name: String,
     additional_node_checks: Vec<String>,
     client: ManagerClient<Channel>,
@@ -162,7 +161,7 @@ async fn start_health_checks(
         debug!("RESPONSE={:?}", response);
 
         tokio::time::sleep(tokio::time::Duration::from_secs(
-            WORKER_HEALTH_CHECK_DURATION,
+            WORKER_NODE_CHECK_DURATION_SEC,
         ))
         .await;
     }

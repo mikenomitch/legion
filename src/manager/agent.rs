@@ -1,10 +1,10 @@
-use crate::cmd::structs::{ManagerConfig, WorkerConfig};
-use crate::constants::{DEFAULT_HOSTNAME, DEFAULT_PORT, NODE_CHECK_DURATION};
 use crate::manager::join_server::get_insecure_manager_service;
 use crate::manager::server::ManagerAgentService;
 use crate::storage::store::Store;
-use crate::structs::manager_server::ManagerServer;
-use crate::structs::{Node, WorkerConfig as WorkerConfigMsg};
+use crate::structs::{
+    manager_server::ManagerServer, ManagerConfig, Node, WorkerConfig as WorkerConfigMsg,
+    WorkerConfigAlt,
+};
 use crate::util::R;
 
 use futures::join;
@@ -16,18 +16,12 @@ use std::str::FromStr;
 use tonic::transport::{Identity, Server, ServerTlsConfig};
 
 pub async fn run_manager(config: ManagerConfig) -> R<()> {
-    let addr = format!("{}:{}", DEFAULT_HOSTNAME, DEFAULT_PORT).parse()?;
-    let cloned_config = config.clone();
-    let store = Store::start_storage()?;
-
+    let full_config = config.with_defaults()?;
+    let store = Store::start_storage(full_config.clone())?;
     load_initial_data(&store, &config).await?;
 
     // Spawn a separate grpc server for non-TLS calls
-    let join_server_addr = format!(
-        "{}:{}",
-        cloned_config.server.address, cloned_config.server.insecure_port
-    )
-    .parse()?;
+    let join_server_addr = format!("{}:{}", full_config.server.host, full_config.server.insecure_port).parse()?;
 
     let insecure_manager_service = get_insecure_manager_service();
     let join_server_fut = Server::builder()
@@ -46,6 +40,7 @@ pub async fn run_manager(config: ManagerConfig) -> R<()> {
     let identity = Identity::from_pem(cert, key);
     let _tls = ServerTlsConfig::new().identity(identity);
 
+    let addr = format!("{}:{}", full_config.server.host, full_config.server.port).parse()?;
     let start_server_fut = Server::builder()
         // .tls_config(tls)?
         .add_service(ManagerServer::new(manager_node))
@@ -54,14 +49,13 @@ pub async fn run_manager(config: ManagerConfig) -> R<()> {
     println!("Join server starting on {}", join_server_addr);
     println!("Manager node starting on {}", addr);
 
-    let node_checker_fut = start_node_status_checker(s2);
-
+    let node_checker_fut = start_node_status_checker(s2, full_config.worker_check_seconds);
     let _res = join!(join_server_fut, start_server_fut, node_checker_fut);
 
     Ok(())
 }
 
-async fn start_node_status_checker(store: Store) -> R<()> {
+async fn start_node_status_checker(store: Store, check_seconds: u64) -> R<()> {
     loop {
         let node_ids_to_update = store
             .get_node_ids_and_heartbeats()?
@@ -79,18 +73,18 @@ async fn start_node_status_checker(store: Store) -> R<()> {
             .collect::<Vec<String>>();
 
         store.mark_nodes_as_lost(node_ids_to_update)?;
-        tokio::time::sleep(tokio::time::Duration::from_secs(NODE_CHECK_DURATION)).await;
+        tokio::time::sleep(tokio::time::Duration::from_secs(check_seconds)).await;
     }
 }
 
-fn parse_worker_config(config_path: &str) -> R<WorkerConfig> {
+fn parse_worker_config(config_path: &str) -> R<WorkerConfigAlt> {
     // Pluginify jsonnet
     let mut vm = JsonnetVm::new();
     let res = vm.evaluate_file(config_path);
 
     match res {
         Ok(s) => {
-            let config: WorkerConfig = serde_json::from_str(&s)?;
+            let config: WorkerConfigAlt = serde_json::from_str(&s)?;
             Ok(config)
         }
         Err(e) => {
@@ -101,9 +95,10 @@ fn parse_worker_config(config_path: &str) -> R<WorkerConfig> {
 }
 
 async fn load_initial_data(store: &Store, config: &ManagerConfig) -> R<()> {
-    let paths = fs::read_dir(config.worker_config_path.clone())?;
+    let worker_conf_path = config.with_defaults()?.worker_config_path.clone();
+    let sub_paths = fs::read_dir(worker_conf_path)?;
 
-    for path in paths {
+    for path in sub_paths {
         let path = path.unwrap().path();
         let path_str = path.to_str().unwrap();
         let wcp = parse_worker_config(path_str)?;

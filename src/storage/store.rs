@@ -1,5 +1,4 @@
-use crate::constants::DEFAULT_STORE_PATH;
-use crate::structs::{Node, WorkerConfig};
+use crate::structs::{Node, WorkerConfig, ManagerConfigFull};
 use crate::util::{merge_json_strings, R};
 
 use log::debug;
@@ -25,23 +24,23 @@ pub const CONN_LOCK_ERROR: &str = "Error locking database connection";
 
 // NOTE: This will become a general interface for all storage backends
 impl Store {
-    pub fn start_storage() -> R<Store> {
+    pub fn start_storage(config: ManagerConfigFull) -> R<Store> {
         debug!("Starting store");
-        let conn = Store::create_memsafe_conn()?;
-
+        let conn = Store::create_memsafe_conn(&config.store_path)?;
         Store::create_initial_tables(Arc::clone(&conn))?;
 
         let store = Store { conn };
         Ok(store)
     }
 
-    fn create_memsafe_conn() -> R<MemSafeConn> {
+    fn create_memsafe_conn(store_path: &str) -> R<MemSafeConn> {
         // let conn = Connection::open_in_memory()?;
 
         // Using the disk version for now to simulate logs
         // Would eventually split this into a cluster that shares
         // logs via raft before committing to an in-memory sqlite db
-        let conn = Connection::open(DEFAULT_STORE_PATH)?;
+
+        let conn = Connection::open(store_path)?;
         Ok(Arc::new(Mutex::new(conn)))
     }
 

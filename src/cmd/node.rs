@@ -1,4 +1,4 @@
-use crate::constants::DEFAULT_ADDR;
+use crate::constants::DEF_MANAGER_ADDRESS;
 use crate::structs::manager_client::ManagerClient;
 use crate::structs::{GetNodeRequest, GetNodesRequest, Node, Printable, UpdateNodeDynamicRequest};
 use crate::util::R;
@@ -76,7 +76,7 @@ pub async fn handle(sub_matches: &clap::ArgMatches) -> R<()> {
 }
 
 async fn get_nodes(is_json: bool) -> R<()> {
-    let mut client = ManagerClient::connect(DEFAULT_ADDR).await?;
+    let mut client = ManagerClient::connect(DEF_MANAGER_ADDRESS).await?;
     let request = tonic::Request::new(GetNodesRequest {});
     let response = client.get_nodes(request).await?;
     let nodes = response.into_inner().nodes;
@@ -91,7 +91,7 @@ async fn get_nodes(is_json: bool) -> R<()> {
 }
 
 async fn update_node(node_id: String, key_path: String, value: String, is_json: bool) -> R<()> {
-    let mut client = ManagerClient::connect(DEFAULT_ADDR).await?;
+    let mut client = ManagerClient::connect(DEF_MANAGER_ADDRESS).await?;
 
     let mut dynamic_diff = Map::new();
     dynamic_diff.insert(key_path, value.into());
@@ -118,7 +118,7 @@ async fn update_node(node_id: String, key_path: String, value: String, is_json: 
 }
 
 async fn get_node_info(node_id: String, is_json: bool) -> R<()> {
-    let mut client = ManagerClient::connect(DEFAULT_ADDR).await?;
+    let mut client = ManagerClient::connect(DEF_MANAGER_ADDRESS).await?;
     let request = tonic::Request::new(GetNodeRequest { id: node_id });
     let response = client.get_node(request).await?;
 

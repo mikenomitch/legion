@@ -1,4 +1,4 @@
-use crate::constants::DEFAULT_INSECURE_ADDR;
+use crate::constants::DEF_INSECURE_ADDR;
 use crate::structs::insecure_manager_client::InsecureManagerClient;
 use crate::structs::GetJoinTokenRequest;
 
@@ -11,6 +11,7 @@ pub fn config() -> Command {
         .arg(arg!(-t --type [TYPE] "type of worker to get join token for"))
         .arg(arg!(--ttl [TTL] "ttl of join token in seconds. 0 means infinite. Server adds 1 minute leeway"))
 }
+
 pub async fn handle(sub_matches: &clap::ArgMatches) -> Result<(), Box<dyn error::Error>> {
     let ttl = sub_matches
         .get_one::<String>("ttl")
@@ -22,7 +23,7 @@ pub async fn handle(sub_matches: &clap::ArgMatches) -> Result<(), Box<dyn error:
         .map(|s| s.as_str())
         .unwrap_or("default");
 
-    let address = std::env::var("LEGION_ADDR").unwrap_or(DEFAULT_INSECURE_ADDR.to_owned());
+    let address = std::env::var("LEGION_ADDR").unwrap_or(DEF_INSECURE_ADDR.to_owned());
 
     let mut client = InsecureManagerClient::connect(address).await?;
 

@@ -1,6 +1,6 @@
-use crate::cmd::structs::ManagerConfig;
-use crate::constants::DEFAULT_CONFIG_PATH;
+use crate::constants::DEF_CONFIG_PATH;
 use crate::manager::agent::run_manager;
+use crate::structs::ManagerConfig;
 use crate::util::R;
 use crate::worker::agent::run_worker;
 
@@ -33,7 +33,7 @@ pub async fn handle(sub_matches: &clap::ArgMatches) -> R<()> {
         let config_path = sub_matches
             .get_one::<String>("config")
             .map(|s| s.as_str())
-            .unwrap_or(DEFAULT_CONFIG_PATH);
+            .unwrap_or(DEF_CONFIG_PATH);
 
         let config = parse_config(config_path)?;
         run_manager(config).await

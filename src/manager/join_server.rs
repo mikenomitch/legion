@@ -1,7 +1,6 @@
-use crate::cmd::structs::{JoinTokenClaims, ManagerConfig};
-use crate::constants::{DEFAULT_ADDR, DEFAULT_CONFIG_PATH, TMP_SECRET_KEY};
+use crate::constants::{DEF_CONFIG_PATH, DEF_MANAGER_ADDRESS, TMP_SECRET_KEY};
+use crate::structs::{GetJoinTokenReply, GetJoinTokenRequest, JoinTokenClaims, ManagerConfig};
 use crate::structs::insecure_manager_server::{InsecureManager, InsecureManagerServer};
-use crate::structs::{GetJoinTokenReply, GetJoinTokenRequest};
 use crate::util::R;
 // use crate::certs::{signed_cert_with_ca, read_root_cert};
 
@@ -45,7 +44,7 @@ pub fn get_insecure_manager_service() -> InsecureManagerServer<InsecureManagerSe
 
 // add generate_join_token_function
 pub fn generate_join_token(worker_type: String, ttl: Option<String>) -> R<String> {
-    let config = parse_manager_config(DEFAULT_CONFIG_PATH)?;
+    let config = parse_manager_config(DEF_CONFIG_PATH)?.with_defaults()?;
 
     let jwt_exp: usize;
     match ttl {
@@ -75,12 +74,12 @@ pub fn generate_join_token(worker_type: String, ttl: Option<String>) -> R<String
     let claims = JoinTokenClaims {
         sub: "legion".to_owned(),
         exp: jwt_exp,
-        address: DEFAULT_ADDR.to_owned(),
+        address: DEF_MANAGER_ADDRESS.to_owned(),
         // cert: new_cert,
         // key: new_key,
         // ca_cert: ca_cert,
         worker_type: worker_type,
-        server_config: config.server,
+        server_config: config.server.into(),
         skip_expiry_validation: jwt_exp == 0,
     };
 

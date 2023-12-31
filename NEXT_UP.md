@@ -1,9 +1,16 @@
 # Next Up
 - .legion folder gets auto-created if not there already
-- Manager config has almost everything optional
+
 - Nice errors if worker config missing necessary attrs
     - Same for manager config
+
+- Fix the join-token and pre-register call destinations
+
 - Output node attrs as a map in json not a string
+
+- Environment variable or flag used for contacting manager
+    - How to nicely join-server port from this?
+        - You don't need it because its in the JWT!
 
 - Nice errors in CLI commands for various failures
     - Join token errors for instance (see To Dos)

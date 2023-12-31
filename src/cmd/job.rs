@@ -1,4 +1,4 @@
-use crate::constants::DEFAULT_ADDR;
+use crate::constants::DEF_MANAGER_ADDRESS;
 use crate::structs::manager_client::ManagerClient;
 use crate::structs::{GetJobStatusRequest, RunJobRequest};
 use crate::util::R;
@@ -30,7 +30,7 @@ pub async fn handle(sub_matches: &clap::ArgMatches) -> R<()> {
 }
 
 async fn run_job() -> R<()> {
-    let mut client = ManagerClient::connect(DEFAULT_ADDR).await?;
+    let mut client = ManagerClient::connect(DEF_MANAGER_ADDRESS).await?;
 
     let request = tonic::Request::new(RunJobRequest {
         name: "Mike".into(),
@@ -44,7 +44,7 @@ async fn run_job() -> R<()> {
 }
 
 async fn get_status() -> R<()> {
-    let mut client = ManagerClient::connect(DEFAULT_ADDR).await?;
+    let mut client = ManagerClient::connect(DEF_MANAGER_ADDRESS).await?;
 
     let request = tonic::Request::new(GetJobStatusRequest {
         name: "Mike".into(),

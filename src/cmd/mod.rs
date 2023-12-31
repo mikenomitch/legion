@@ -5,4 +5,3 @@ pub mod join;
 pub mod join_token;
 pub mod node;
 pub mod start;
-pub mod structs;
