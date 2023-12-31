@@ -4,6 +4,6 @@
     insecurePort: 4748,
     host: "127.0.0.1",
   },
-  storePath: ".legion/store.sqlite",
+  storePath: ".legion",
   workerConfigPath: "./configs/workers/",
 }

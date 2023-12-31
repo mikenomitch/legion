@@ -40,7 +40,10 @@ impl Store {
         // Would eventually split this into a cluster that shares
         // logs via raft before committing to an in-memory sqlite db
 
-        let conn = Connection::open(store_path)?;
+        std::fs::create_dir_all(store_path)?;
+        let tmp = std::path::Path::new(store_path).join("store.sqlite");
+        let final_path = tmp.to_str().ok_or("Error parsing store path")?;
+        let conn = Connection::open(final_path)?;
         Ok(Arc::new(Mutex::new(conn)))
     }
 

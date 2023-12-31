@@ -1,8 +1,5 @@
 # Next Up
-- .legion folder gets auto-created if not there already
-
 - Nice errors if worker config missing necessary attrs
-    - Same for manager config
 
 - Fix the join-token and pre-register call destinations
 
