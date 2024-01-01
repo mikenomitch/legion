@@ -1,6 +1,4 @@
 # Next Up
-- Nice errors if worker config missing necessary attrs
-
 - Fix the join-token and pre-register call destinations
 
 - Output node attrs as a map in json not a string

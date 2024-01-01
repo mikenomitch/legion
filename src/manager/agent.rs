@@ -84,12 +84,13 @@ fn parse_worker_config(config_path: &str) -> R<WorkerConfigAlt> {
 
     match res {
         Ok(s) => {
-            let config: WorkerConfigAlt = serde_json::from_str(&s)?;
+            let config: WorkerConfigAlt = serde_json::from_str(&s).map_err(|e| format!("Error parsing worker config at path {}: {}", config_path, e))?;
             Ok(config)
         }
         Err(e) => {
-            error!("Error parsing worker config: {:?}", e);
-            Err(e.to_string().into())
+            let msg = format!("Error parsing worker config at path {}: {}", config_path, e);
+            error!("{}", &msg);
+            Err(msg.into())
         }
     }
 }
