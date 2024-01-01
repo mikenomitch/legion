@@ -1,16 +1,13 @@
 # Next Up
-- Fix the join-token and pre-register call destinations
-
 - Output node attrs as a map in json not a string
-
-- Environment variable or flag used for contacting manager
-    - How to nicely join-server port from this?
-        - You don't need it because its in the JWT!
 
 - Nice errors in CLI commands for various failures
     - Join token errors for instance (see To Dos)
     - Start with bad join token
     - Node info error (missing node)
+    - Node update error
+        - Node missing
+        - Note: the command should show how to use this!
 
 - Better logging throughout
     - Nicer error messages in the right places
@@ -52,6 +49,19 @@
             - I can add some constraint to the whole cluster?
                 - I add a resource plugin to the cluster. It looks at attributes and then treats them as resource I can schedule on?
             - At the node level, I just have an attr of some sort.
+
+- Fix the join-token and pre-register call destinations
+    - Should the "insecure client" really just be a "public cert client"
+        - Gets from lets encrypt by default but you can provide your own CA too?
+    - Then the "client" is the "secure client" which does some self-signed CA magic
+      and only the workers have access to it?
+    - Or is TLS just not right right way to do this at all?
+    - !! You need to plan this and not just code it!!
+
+    - Environment variable or flag used for contacting manager
+        - How to nicely join-server port from this?
+            - You don't need it because its in the JWT!
+
 
 # Milestone
 * Hitting this point will be a fairly major milestone, as lots

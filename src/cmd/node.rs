@@ -4,7 +4,7 @@ use crate::structs::{GetNodeRequest, GetNodesRequest, Node, Printable, UpdateNod
 use crate::util::R;
 
 use clap::{Arg, Command};
-use serde_json::Map;
+use serde_json::{Map, Value};
 
 pub fn config() -> Command {
     let json_arg = Arg::new("json")
@@ -24,7 +24,11 @@ pub fn config() -> Command {
         .arg(json_arg.clone());
 
     let update_node_cmd = Command::new("update")
-        .about("Update node attributes")
+        .about("
+        Update node attributes
+
+        Example: legion node update <id> -a <key1>=<value1> <key2>=<value2>
+        ")
         .arg(Arg::new("id").value_name("id").required(true))
         .arg(Arg::new("attr").short('a').num_args(1..))
         .arg(json_arg.clone());
@@ -48,20 +52,35 @@ pub async fn handle(sub_matches: &clap::ArgMatches) -> R<()> {
             let id = arg_matches
                 .get_one::<String>("id")
                 .ok_or("Must provide id")?;
+
             let attrs = arg_matches
                 .get_many::<String>("attr")
                 .ok_or("Must provide attribute(s) to update")?;
-            let mut key_path = "";
-            let mut value = "";
 
+            let mut dynamic_diff = Map::new();
+
+            let mut error_msg = None;
             attrs.into_iter().for_each(|attr| {
                 let mut split = attr.split('=');
-                key_path = split.next().unwrap();
-                value = split.next().unwrap();
+
+                if let Some(key_path) = split.next() {
+                    if let Some(value) = split.next() {
+                        dynamic_diff.insert(key_path.into(), value.into());
+                    } else {
+                        error_msg = Some(format!("Invalid attribute: {} - must be of format KEY=VALUE", attr));
+                    }
+                } else {
+                    error_msg = Some(format!("Invalid attribute: {} - must be of format KEY=VALUE", attr));
+                }
             });
 
-            let is_json = arg_matches.get_flag("json");
-            update_node(id.into(), key_path.into(), value.into(), is_json).await
+            match error_msg {
+                Some(msg) => Err(msg.into()),
+                None => {
+                    let is_json = arg_matches.get_flag("json");
+                    update_node(id.into(), dynamic_diff, is_json).await
+                }
+            }
         }
         Some(("info", arg_matches)) => {
             let id = arg_matches
@@ -90,11 +109,8 @@ async fn get_nodes(is_json: bool) -> R<()> {
     Ok(())
 }
 
-async fn update_node(node_id: String, key_path: String, value: String, is_json: bool) -> R<()> {
+async fn update_node(node_id: String, dynamic_diff: Map<String,Value>,is_json: bool) -> R<()> {
     let mut client = ManagerClient::connect(DEF_MANAGER_ADDRESS).await?;
-
-    let mut dynamic_diff = Map::new();
-    dynamic_diff.insert(key_path, value.into());
 
     let request = tonic::Request::new(UpdateNodeDynamicRequest {
         id: node_id,

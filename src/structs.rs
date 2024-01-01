@@ -119,8 +119,9 @@ impl Printable for Node {
     }
 
     fn print_list_json(nodes: Vec<Node>) {
-        let json = serde_json::to_string(&nodes).unwrap();
-        println!("{}", json);
+        if let Ok(json) = serde_json::to_string(&nodes) {
+            println!("{}", json);
+        }
     }
 
     fn print_list(nodes: Vec<Node>) {
@@ -128,23 +129,24 @@ impl Printable for Node {
     }
 
     fn print_short_json(&self) {
-        let json = serde_json::to_string(&self).unwrap();
-        println!("{}", json);
+        if let Ok(json) = serde_json::to_string(&self) {
+            println!("{}", json);
+        }
     }
 
     fn print_long(&self) {
         println!("Node ID: {}", self.id);
-        let full_attrs = merge_json_strings(
-            merge_json_strings(self.config_attrs.clone(), self.fingerprint_attrs.clone()),
-            self.dynamic_attrs.clone(),
-        );
-
-        println!("Attributes: {}", full_attrs);
+        if let Ok(merged_config_and_fp)  = merge_json_strings(self.config_attrs.clone(), self.fingerprint_attrs.clone()) {
+            if let Ok(final_attrs) = merge_json_strings(merged_config_and_fp, self.dynamic_attrs.clone()) {
+                println!("Attributes: {}", final_attrs);
+            }
+        }
     }
 
     fn print_long_json(&self) {
-        let json = serde_json::to_string(&self).unwrap();
-        println!("{}", json);
+        if let Ok(json) = serde_json::to_string(&self) {
+            println!("{}", json);
+        }
     }
 }
 

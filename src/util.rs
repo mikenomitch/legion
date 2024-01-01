@@ -7,11 +7,11 @@ use std::error::Error;
 // Adds convenience for Result for brevity
 pub type R<T> = Result<T, Box<dyn Error>>;
 
-pub fn merge_json_strings(a: String, b: String) -> String {
-    let mut data_a: HashMap<String, Value> = serde_json::from_str(&a).unwrap();
-    let data_b: HashMap<String, Value> = serde_json::from_str(&b).unwrap();
+pub fn merge_json_strings(a: String, b: String) -> R<String> {
+    let mut data_a: HashMap<String, Value> = serde_json::from_str(&a)?;
+    let data_b: HashMap<String, Value> = serde_json::from_str(&b)?;
     data_a.extend(data_b);
-    to_string_pretty(&data_a).unwrap()
+    to_string_pretty(&data_a).map_err(|e| e.into())
 }
 
 pub fn random_string(length: usize) -> String {

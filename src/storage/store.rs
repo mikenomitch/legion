@@ -199,7 +199,7 @@ FROM node;
     pub fn update_node_dyamic(&self, id: String, dynamic_diff: String) -> R<Node> {
         let node = self.get_node(id.clone())?;
         let initial_dynamic = node.dynamic_attrs.clone();
-        let result = merge_json_strings(initial_dynamic, dynamic_diff);
+        let result = merge_json_strings(initial_dynamic, dynamic_diff)?;
 
         let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
         let sql = r#"
