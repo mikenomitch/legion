@@ -2,14 +2,14 @@ use crate::storage::store::Store;
 use crate::structs::manager_server::Manager;
 use crate::structs::{
     GetJobStatusReply, GetJobStatusRequest, GetNodeReply, GetNodeRequest, GetNodesReply,
-    GetNodesRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, Node,
+    GetNodesRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest,
     RunJobReply, RunJobRequest, UpdateNodeDynamicReply, UpdateNodeDynamicRequest,
     WorkerConfig as WorkerConfigMsg, WorkerPreRegisterReply, WorkerPreRegisterRequest,
     WorkerRegisterReply, WorkerRegisterRequest, NodeMsg,
 };
 
 use log::error;
-use serde_json::json;
+use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 use tonic::{Request, Response, Status};
 
@@ -192,10 +192,14 @@ impl Manager for ManagerAgentService {
     ) -> Result<Response<UpdateNodeDynamicReply>, Status> {
         let r = request.into_inner();
         let id = r.id;
-        let dynamic_diff = r.dynamic_diff;
+        let dd_as_map: Map<String, Value> = serde_json::from_str(&r.dynamic_diff).map_err(|e| {
+            error!("Error parsing dynamic diff: {:?}", e);
+            Status::internal("Error parsing dynamic diff")
+        })?;
+
         let node = self
             .store
-            .update_node_dyamic(id, dynamic_diff)
+            .update_node_dyamic(id, dd_as_map)
             .expect("Can't find or update node");
         let reply = UpdateNodeDynamicReply { node: Some(node.into()) };
 

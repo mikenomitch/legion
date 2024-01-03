@@ -4,7 +4,7 @@ use crate::util::R;
 use log::debug;
 use rusqlite::{named_params, Connection};
 use rusqlite_migration::{Migrations, M};
-use serde_json::{Map, json, to_string};
+use serde_json::{Map, Value, json, to_string};
 use serde_rusqlite::to_params_named;
 use std::sync::{Arc, Mutex};
 use time::macros::format_description;
@@ -199,17 +199,15 @@ FROM node;
         Ok(node)
     }
 
-    pub fn update_node_dyamic(&self, id: String, dynamic_diff: String) -> R<Node> {
+    pub fn update_node_dyamic(&self, id: String, dynamic_diff: Map<String, Value>) -> R<Node> {
         let node = self.get_node(id.clone())?;
         let default_map = Map::new();
-        let default_map_two = Map::new();
 
         let mut res = node.dynamic_attrs.as_object().unwrap_or(&default_map).clone();
-        let a = json!(&dynamic_diff);
-        let dd_obj = a.as_object().unwrap_or(&default_map_two);
-
-        res.extend(dd_obj.clone());
+        res.extend(dynamic_diff.clone());
         let res_as_string = to_string(&res).map_err(|e| e.to_string())?;
+
+        println!("res_as_string: {}", res_as_string);
 
         let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
         let sql = r#"

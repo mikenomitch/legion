@@ -1,5 +1,11 @@
 # Next Up
-- Output node attrs as a map in json not a string
+- Finish node type changes and clean up
+    - Dynamic node attr updates work
+    - All other node commands work (spot check)
+    - Clean up any gross code
+        - NodeMsg conversion before sql is kind of weird
+            - Can this be a custom serializer on Map?
+        - The default unwrap_or() values are spooky
 
 - Better logging throughout
     - Use tracing library + logging + appender + futures
