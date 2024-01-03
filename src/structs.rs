@@ -11,6 +11,7 @@ use crate::util::{merge_json_strings, R};
 
 use time::macros::format_description;
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 use std::collections::HashMap;
 
 tonic::include_proto!("legion");
@@ -105,15 +106,26 @@ pub trait Printable {
     fn print_short(&self) -> ();
     fn print_short_json(&self) -> ();
     fn print_long(&self) -> ();
-    fn print_long_json(&self) -> ();
+    fn print_long_json(&self) -> R<()>;
     fn print_list_json(nodes: Vec<Node>) -> ();
     fn print_list(nodes: Vec<Node>) -> ();
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct NodeFoo {
+    pub id: String,
+    pub status: String,
+    pub pool: String,
+    pub last_heartbeat: String,
+    pub config_attrs: Map<String, Value>,
+    pub fingerprint_attrs: Map<String, Value>,
+    pub dynamic_attrs: Map<String, Value>,
 }
 
 impl Printable for Node {
     fn print_short(&self) {
         println!(
-            "ID: {}, Status: {}, Pool: {}, Checkin: {}",
+            "ID: {} | Status: {} | Pool: {} | Checkin: {}",
             self.id, self.status, self.pool, self.last_heartbeat
         );
     }
@@ -143,10 +155,26 @@ impl Printable for Node {
         }
     }
 
-    fn print_long_json(&self) {
-        if let Ok(json) = serde_json::to_string(&self) {
+    fn print_long_json(&self) -> R<()>{
+        let config_map = serde_json::from_str::<Map<String, Value>>(&self.config_attrs)?;
+        let fp_map = serde_json::from_str::<Map<String, Value>>(&self.fingerprint_attrs)?;
+        let da_map = serde_json::from_str::<Map<String, Value>>(&self.dynamic_attrs)?;
+
+        let node_foo = NodeFoo {
+            id: self.id.clone(),
+            status: self.status.clone(),
+            pool: self.pool.clone(),
+            last_heartbeat: self.last_heartbeat.clone(),
+            config_attrs: config_map,
+            fingerprint_attrs: fp_map,
+            dynamic_attrs: da_map,
+        };
+
+        if let Ok(json) = serde_json::to_string(&node_foo) {
             println!("{}", json);
-        }
+        };
+
+        Ok(())
     }
 }
 

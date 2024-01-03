@@ -122,9 +122,9 @@ async fn update_node(node_id: String, dynamic_diff: Map<String,Value>,is_json: b
     match response.into_inner().node {
         Some(node) => {
             if is_json {
-                node.print_long_json()
+                node.print_long_json();
             } else {
-                node.print_long()
+                node.print_long();
             };
         }
         None => println!("Node not found"),
@@ -141,9 +141,9 @@ async fn get_node_info(node_id: String, is_json: bool) -> R<()> {
     match response.into_inner().node {
         Some(node) => {
             if is_json {
-                node.print_long_json()
+                node.print_long_json();
             } else {
-                node.print_long()
+                node.print_long();
             };
         }
         None => println!("Node not found"),

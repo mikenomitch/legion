@@ -175,10 +175,10 @@ impl Manager for ManagerAgentService {
         request: Request<GetNodeRequest>,
     ) -> Result<Response<GetNodeReply>, Status> {
         let id = request.into_inner().id;
-        let node = self
-            .store
-            .get_node(id)
-            .expect("Could not get node with given id");
+        let node = self.store.get_node(id.clone()).map_err(|e| {
+            error!("Error getting nodes: {:?}", e);
+            Status::internal(format!("Could not find node {}", id))
+        })?;
 
         let reply = GetNodeReply { node: Some(node) };
         Ok(Response::new(reply))

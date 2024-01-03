@@ -1,2 +1,2 @@
-// This tests if the defaults work
+// Purpose of this file is to test if the defaults work
 {}

@@ -1,6 +1,14 @@
 # Next Up
 - Output node attrs as a map in json not a string
 
+- Better logging throughout
+    - Use tracing library + logging + appender + futures
+    - Eventually add otel, but not yet
+    - Debug statements to track things
+    - Nicer error messages generally
+    - Go thru each command
+    - Think about how to dry it up
+
 - Nice errors in CLI commands for various failures
     - Join token errors for instance (see To Dos)
     - Start with bad join token
@@ -8,14 +16,12 @@
     - Node update error
         - Node missing
         - Note: the command should show how to use this!
-
-- Better logging throughout
-    - Nicer error messages in the right places
-    - Debug statements to track things
-    - Otel?!?!
-
-- Clean up every unwrap()
-- Clean up gross conversions of attr hashes
+    - Nice storage errors generally
+        - I think I'll have to have different error types
+          for the storage layer that the sql errors translate into
+          and then the layer calling the store has to deal with these
+          at a slightly different layer of abstraction
+        - See this page for in-store error handling (https://users.rust-lang.org/t/handle-rusqlite-error/39660/7)
 
 - Think about your file setup (names/org/dupes)
     - Perhaps split out agent code into own files
@@ -31,6 +37,7 @@
 - DRY up
     - storage
     - grpc servers
+    - Error handling
 
 - Worker configs CRUD commands
     - I guess for this to really work, you would need to update any of this type
