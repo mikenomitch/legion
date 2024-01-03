@@ -1,6 +1,6 @@
 use crate::constants::{DEF_CONFIG_PATH, DEF_MANAGER_ADDRESS, TMP_SECRET_KEY};
-use crate::structs::{GetJoinTokenReply, GetJoinTokenRequest, JoinTokenClaims, ManagerConfig};
 use crate::structs::insecure_manager_server::{InsecureManager, InsecureManagerServer};
+use crate::structs::{GetJoinTokenReply, GetJoinTokenRequest, JoinTokenClaims, ManagerConfig};
 use crate::util::R;
 // use crate::certs::{signed_cert_with_ca, read_root_cert};
 
@@ -31,7 +31,7 @@ impl InsecureManager for InsecureManagerService {
         let token = generate_join_token(worker_type, ttl)
             .map_err(|e| Status::new(tonic::Code::NotFound, e.to_string()))?;
 
-        let reply = GetJoinTokenReply { token: token };
+        let reply = GetJoinTokenReply { token };
 
         Ok(Response::new(reply))
     }
@@ -46,20 +46,17 @@ pub fn get_insecure_manager_service() -> InsecureManagerServer<InsecureManagerSe
 pub fn generate_join_token(worker_type: String, ttl: Option<String>) -> R<String> {
     let config = parse_manager_config(DEF_CONFIG_PATH)?.with_defaults()?;
 
-    let jwt_exp: usize;
-    match ttl {
+    let jwt_exp: usize = match ttl {
         Some(ttl) => {
             // TODO: If this errors it probably means they did "1" not "1m" or "1s" etc
             // handle this error nicely!
             let parsed_ttl: Duration = ttl.parse::<humantime::Duration>()?.into();
             let now = std::time::SystemTime::now();
             let expiry = now + parsed_ttl;
-            jwt_exp = expiry.duration_since(std::time::UNIX_EPOCH)?.as_secs() as usize;
+            expiry.duration_since(std::time::UNIX_EPOCH)?.as_secs() as usize
         }
-        None => {
-            jwt_exp = 0;
-        }
-    }
+        None => 0,
+    };
 
     // NOTE:
     // I think what I have to do is:
@@ -78,7 +75,7 @@ pub fn generate_join_token(worker_type: String, ttl: Option<String>) -> R<String
         // cert: new_cert,
         // key: new_key,
         // ca_cert: ca_cert,
-        worker_type: worker_type,
+        worker_type,
         server_config: config.server.into(),
         skip_expiry_validation: jwt_exp == 0,
     };
@@ -89,13 +86,12 @@ pub fn generate_join_token(worker_type: String, ttl: Option<String>) -> R<String
         ..Default::default()
     };
 
-    let encoded_token = encode(
+    encode(
         &header,
         &claims,
         &EncodingKey::from_secret(&TMP_SECRET_KEY[..]),
     )
-    .map_err(|e| e.into());
-    encoded_token
+    .map_err(|e| e.into())
 }
 
 fn parse_manager_config(config_path: &str) -> R<ManagerConfig> {

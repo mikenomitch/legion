@@ -26,7 +26,7 @@ pub async fn run_worker(token: &str) -> R<()> {
     val.validate_exp = false;
 
     let token_data = match decode::<JoinTokenClaims>(
-        &token,
+        token,
         &DecodingKey::from_secret(&TMP_SECRET_KEY[..]),
         &val,
     ) {
@@ -48,11 +48,8 @@ pub async fn run_worker(token: &str) -> R<()> {
     if !token_data.claims.skip_expiry_validation {
         debug!("Validating expiry on join token");
         val.validate_exp = true;
-        match decode::<JoinTokenClaims>(
-            &token,
-            &DecodingKey::from_secret(&TMP_SECRET_KEY[..]),
-            &val,
-        ) {
+        match decode::<JoinTokenClaims>(token, &DecodingKey::from_secret(&TMP_SECRET_KEY[..]), &val)
+        {
             Ok(_c) => (),
             Err(err) => {
                 // TODO: Return a nicer error to the CLI instead of a panic
@@ -181,11 +178,11 @@ async fn register_self(
     let serialized_health_check_data = serde_json::to_string(&health_checks)?;
 
     let req = tonic::Request::new(WorkerRegisterRequest {
-        name: name.into(),
+        name,
         config_attrs: serialized_config_data,
         fingerprint_attrs: serialized_fp_data,
         health_checks: serialized_health_check_data,
-        pool: pool,
+        pool,
     });
 
     let response = c2.worker_register(req).await?;
@@ -200,9 +197,7 @@ async fn pre_register_self(
 ) -> R<Response<WorkerPreRegisterReply>> {
     let mut c2 = client.clone();
 
-    let req = tonic::Request::new(WorkerPreRegisterRequest {
-        worker_type: worker_type,
-    });
+    let req = tonic::Request::new(WorkerPreRegisterRequest { worker_type });
 
     let response = c2.worker_pre_register(req).await?;
 

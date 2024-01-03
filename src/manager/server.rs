@@ -3,13 +3,13 @@ use crate::structs::manager_server::Manager;
 use crate::structs::{
     GetJobStatusReply, GetJobStatusRequest, GetNodeReply, GetNodeRequest, GetNodesReply,
     GetNodesRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest,
-    RunJobReply, RunJobRequest, UpdateNodeDynamicReply, UpdateNodeDynamicRequest,
+    NodeMsg, RunJobReply, RunJobRequest, UpdateNodeDynamicReply, UpdateNodeDynamicRequest,
     WorkerConfig as WorkerConfigMsg, WorkerPreRegisterReply, WorkerPreRegisterRequest,
-    WorkerRegisterReply, WorkerRegisterRequest, NodeMsg,
+    WorkerRegisterReply, WorkerRegisterRequest,
 };
 
 use log::error;
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use tonic::{Request, Response, Status};
 
@@ -54,7 +54,7 @@ impl Manager for ManagerAgentService {
         })?;
 
         let reply = HeartbeatReply {
-            message: format!("ack"),
+            message: "ack".into(),
         };
 
         Ok(Response::new(reply))
@@ -78,7 +78,7 @@ impl Manager for ManagerAgentService {
             })?;
 
         let reply = HealthCheckReply {
-            message: format!("ack"),
+            message: "ack".into(),
         };
 
         Ok(Response::new(reply))
@@ -137,7 +137,7 @@ impl Manager for ManagerAgentService {
             id: request.name,
             fingerprint_attrs: request.fingerprint_attrs,
             config_attrs: request.config_attrs,
-            dynamic_attrs: dynamic_attrs,
+            dynamic_attrs,
             status: "active".to_string(),
             availability: "availabile".to_string(),
             pool: request.pool,
@@ -145,13 +145,13 @@ impl Manager for ManagerAgentService {
             health_checks: request.health_checks,
         };
 
-        self.store.insert_node(node_msg.into()).map_err(|e| {
+        self.store.insert_node(node_msg).map_err(|e| {
             error!("Error registering worker: {:?}", e);
             Status::internal("Error registering worker")
         })?;
 
         let reply = WorkerRegisterReply {
-            message: format!("You are in!"),
+            message: "You are in!".into(),
         };
 
         Ok(Response::new(reply))
@@ -168,7 +168,9 @@ impl Manager for ManagerAgentService {
 
         let node_messages: Vec<NodeMsg> = nodes.into_iter().map(Into::into).collect();
 
-        let reply = GetNodesReply { nodes: node_messages };
+        let reply = GetNodesReply {
+            nodes: node_messages,
+        };
         Ok(Response::new(reply))
     }
 
@@ -182,7 +184,9 @@ impl Manager for ManagerAgentService {
             Status::internal(format!("Could not find node {}", id))
         })?;
 
-        let reply = GetNodeReply { node: Some(node.into()) };
+        let reply = GetNodeReply {
+            node: Some(node.into()),
+        };
         Ok(Response::new(reply))
     }
 
@@ -201,7 +205,9 @@ impl Manager for ManagerAgentService {
             .store
             .update_node_dyamic(id, dd_as_map)
             .expect("Can't find or update node");
-        let reply = UpdateNodeDynamicReply { node: Some(node.into()) };
+        let reply = UpdateNodeDynamicReply {
+            node: Some(node.into()),
+        };
 
         Ok(Response::new(reply))
     }

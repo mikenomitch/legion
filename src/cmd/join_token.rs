@@ -27,14 +27,11 @@ pub async fn handle(sub_matches: &clap::ArgMatches) -> Result<(), Box<dyn error:
 
     let mut client = InsecureManagerClient::connect(address).await?;
 
-    let req_ttl: Option<String>;
-    // If 0 is specified, then set it to empty string
-    // to mean infinite
-    if ttl == "0" || ttl == "none" || ttl == "skip" {
-        req_ttl = None;
+    let req_ttl: Option<String> = if ttl == "0" || ttl == "none" || ttl == "skip" {
+        None
     } else {
-        req_ttl = Some(ttl.to_owned());
-    }
+        Some(ttl.to_owned())
+    };
 
     let request = tonic::Request::new(GetJoinTokenRequest {
         ttl: req_ttl,

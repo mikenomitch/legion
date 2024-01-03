@@ -21,7 +21,11 @@ pub async fn run_manager(config: ManagerConfig) -> R<()> {
     load_initial_data(&store, &config).await?;
 
     // Spawn a separate grpc server for non-TLS calls
-    let join_server_addr = format!("{}:{}", full_config.server.host, full_config.server.insecure_port).parse()?;
+    let join_server_addr = format!(
+        "{}:{}",
+        full_config.server.host, full_config.server.insecure_port
+    )
+    .parse()?;
 
     let insecure_manager_service = get_insecure_manager_service();
     let join_server_fut = Server::builder()
@@ -32,7 +36,7 @@ pub async fn run_manager(config: ManagerConfig) -> R<()> {
         conn: store.conn.clone(),
     };
 
-    let manager_node = ManagerAgentService { store: store };
+    let manager_node = ManagerAgentService { store };
 
     let data_dir = std::path::PathBuf::from_str("/Users/mike/code/legion/configs/tls/server")?;
     let cert = std::fs::read_to_string(data_dir.join("server.pem"))?;
@@ -84,7 +88,9 @@ fn parse_worker_config(config_path: &str) -> R<WorkerConfigAlt> {
 
     match res {
         Ok(s) => {
-            let config: WorkerConfigAlt = serde_json::from_str(&s).map_err(|e| format!("Error parsing worker config at path {}: {}", config_path, e))?;
+            let config: WorkerConfigAlt = serde_json::from_str(&s).map_err(|e| {
+                format!("Error parsing worker config at path {}: {}", config_path, e)
+            })?;
             Ok(config)
         }
         Err(e) => {

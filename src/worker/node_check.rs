@@ -32,7 +32,7 @@ pub fn fingerprint_node(additional_node_checks: Vec<String>) -> Map<String, Valu
 
     additional_node_checks
         .iter()
-        .map(|name| fp_plugin_name_to_path(name))
+        .map(fp_plugin_name_to_path)
         .for_each(|path| match call_dynamic(&path) {
             Ok(fp) => {
                 ret.extend(fp.fingerprint());
@@ -56,7 +56,7 @@ pub fn run_health_checks(additional_node_checks: Vec<String>) -> Map<String, Val
 
     additional_node_checks
         .iter()
-        .map(|name| fp_plugin_name_to_path(name))
+        .map(fp_plugin_name_to_path)
         .for_each(|path| match call_dynamic(&path) {
             Ok(fp) => {
                 ret.extend(fp.health_check());
@@ -169,12 +169,26 @@ impl NodeChecker for DiskChecker {
         });
 
         // TODO: Ensure this works on MacOS
-        let fifty_val = if any_disk_under_50_free { "fail" } else { "pass" };
-        let twenty_val = if any_disk_under_20_free { "fail" } else { "pass" };
+        let fifty_val = if any_disk_under_50_free {
+            "fail"
+        } else {
+            "pass"
+        };
+        let twenty_val = if any_disk_under_20_free {
+            "fail"
+        } else {
+            "pass"
+        };
 
         let mut map = Map::new();
-        map.insert("disk_under_fifty_free".into(), Value::String(fifty_val.into()));
-        map.insert("disk_under_twenty_free".into(), Value::String(twenty_val.into()));
+        map.insert(
+            "disk_under_fifty_free".into(),
+            Value::String(fifty_val.into()),
+        );
+        map.insert(
+            "disk_under_twenty_free".into(),
+            Value::String(twenty_val.into()),
+        );
         map
     }
 }

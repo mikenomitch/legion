@@ -1,21 +1,15 @@
 use crate::constants::{
-    DEF_MANAGER_SERVER_PORT,
-    DEF_MANAGER_INSECURE_PORT,
-    DEF_MANAGER_HOSTNAME,
-    DEF_STORE_PATH,
-    DEF_WORKER_CONFIG_PATH,
-    DEF_LOST_NODE_AT_SEC,
-    DEF_WORKER_CHECK_SEC,
+    DEF_LOST_NODE_AT_SEC, DEF_MANAGER_HOSTNAME, DEF_MANAGER_INSECURE_PORT, DEF_MANAGER_SERVER_PORT,
+    DEF_STORE_PATH, DEF_WORKER_CHECK_SEC, DEF_WORKER_CONFIG_PATH,
 };
 use crate::util::R;
 
-use time::macros::format_description;
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, to_string, from_str};
+use serde_json::{from_str, to_string, Map, Value};
 use std::collections::HashMap;
+use time::macros::format_description;
 
 tonic::include_proto!("legion");
-
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -40,7 +34,6 @@ pub struct ServerConfigFull {
     pub port: u64,
     pub insecure_port: u64,
     pub host: String,
-
 }
 
 impl Into<ServerConfig> for ServerConfigFull {
@@ -125,7 +118,7 @@ impl Into<NodeMsg> for Node {
             id: self.id,
             status: self.status,
             pool: self.pool,
-            availability: self.availability.into(),
+            availability: self.availability,
             last_heartbeat: self.last_heartbeat,
             config_attrs: config_str,
             fingerprint_attrs: fp_str,
@@ -146,7 +139,7 @@ impl Into<Node> for NodeMsg {
             id: self.id,
             status: self.status,
             pool: self.pool,
-            availability: self.availability.into(),
+            availability: self.availability,
             last_heartbeat: self.last_heartbeat,
             config_attrs: config_map,
             fingerprint_attrs: fp_map,
@@ -193,9 +186,21 @@ impl Node {
 
         let mut attrs = Map::new();
         let default_map = Map::new();
-        let ca = self.config_attrs.as_object().unwrap_or(&default_map).clone();
-        let fa = self.fingerprint_attrs.as_object().unwrap_or(&default_map).clone();
-        let da = self.dynamic_attrs.as_object().unwrap_or(&default_map).clone();
+        let ca = self
+            .config_attrs
+            .as_object()
+            .unwrap_or(&default_map)
+            .clone();
+        let fa = self
+            .fingerprint_attrs
+            .as_object()
+            .unwrap_or(&default_map)
+            .clone();
+        let da = self
+            .dynamic_attrs
+            .as_object()
+            .unwrap_or(&default_map)
+            .clone();
 
         attrs.extend(ca);
         attrs.extend(fa);
@@ -240,14 +245,16 @@ impl ManagerConfig {
         let cloned = self.clone();
 
         let server_config = match cloned.server {
-            Some(config) => { config.with_defaults()? },
-            None => { ServerConfig::full_default() },
+            Some(config) => config.with_defaults()?,
+            None => ServerConfig::full_default(),
         };
 
         let mc = ManagerConfigFull {
             server: server_config,
             store_path: cloned.store_path.unwrap_or(DEF_STORE_PATH.into()),
-            worker_config_path: cloned.worker_config_path.unwrap_or(DEF_WORKER_CONFIG_PATH.into()),
+            worker_config_path: cloned
+                .worker_config_path
+                .unwrap_or(DEF_WORKER_CONFIG_PATH.into()),
             worker_check_seconds: cloned.worker_check_seconds.unwrap_or(DEF_WORKER_CHECK_SEC),
         };
 

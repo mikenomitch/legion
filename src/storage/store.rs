@@ -1,10 +1,10 @@
-use crate::structs::{Node, NodeMsg, WorkerConfig, ManagerConfigFull};
+use crate::structs::{ManagerConfigFull, Node, NodeMsg, WorkerConfig};
 use crate::util::R;
 
 use log::debug;
 use rusqlite::{named_params, Connection};
 use rusqlite_migration::{Migrations, M};
-use serde_json::{Map, Value, to_string};
+use serde_json::{to_string, Map, Value};
 use serde_rusqlite::to_params_named;
 use std::sync::{Arc, Mutex};
 use time::macros::format_description;
@@ -77,7 +77,7 @@ impl Store {
         ]);
 
         let mut conn = conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
-        conn.pragma_update(None, "journal_mode", &"WAL")?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
         migrations.to_latest(&mut conn)?;
 
         Ok(())
@@ -97,7 +97,7 @@ impl Store {
 "#;
 
         let node = conn.query_row(sql, [id], |row| {
-            let node = Node{
+            let node = Node {
                 id: row.get(0)?,
                 pool: row.get(1)?,
                 status: row.get(2)?,
@@ -114,7 +114,6 @@ impl Store {
 
         Ok(node)
     }
-
 
     pub fn get_nodes(&self) -> R<Vec<Node>> {
         let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
@@ -188,7 +187,7 @@ FROM node;
         // I get an error about serializing Map, and the simplest
         // way around it is to just use the node message when using
         // to_params_named, as its already a string
-        let node = conn.query_row(sql, to_params_named(&node)?.to_slice().as_slice(), |row| {
+        let node = conn.query_row(sql, to_params_named(node)?.to_slice().as_slice(), |row| {
             Ok(Node {
                 id: row.get(0)?,
                 pool: row.get(1)?,
@@ -209,7 +208,11 @@ FROM node;
         let node = self.get_node(id.clone())?;
         let default_map = Map::new();
 
-        let mut res = node.dynamic_attrs.as_object().unwrap_or(&default_map).clone();
+        let mut res = node
+            .dynamic_attrs
+            .as_object()
+            .unwrap_or(&default_map)
+            .clone();
         res.extend(dynamic_diff.clone());
         let res_as_string = to_string(&res).map_err(|e| e.to_string())?;
 
@@ -302,12 +305,11 @@ FROM node;
             let attrs: String = row.get(3)?;
             let parsed_attrs = serde_json::from_str(&attrs).unwrap();
 
-            let node_checks: Vec<String>;
-            if af == "" {
-                node_checks = vec![];
+            let node_checks: Vec<String> = if af.is_empty() {
+                vec![]
             } else {
-                node_checks = af.split(",").map(|s| s.to_string()).collect();
-            }
+                af.split(",").map(|s| s.to_string()).collect()
+            };
 
             let name_prefix = row.get(4)?;
 
@@ -316,7 +318,7 @@ FROM node;
                 pool: row.get(1)?,
                 additional_node_checks: node_checks,
                 attributes: parsed_attrs,
-                name_prefix: name_prefix,
+                name_prefix,
             })
         })?;
 
@@ -355,7 +357,7 @@ RETURNING name, pool, additional_node_checks, attributes, name_prefix;
                 pool: row.get(1)?,
                 additional_node_checks: af.split(",").map(|s| s.to_string()).collect(),
                 attributes: parsed_attrs,
-                name_prefix: name_prefix,
+                name_prefix,
             })
         })?;
 
