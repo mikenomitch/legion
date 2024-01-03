@@ -78,7 +78,7 @@ message HealthCheckReply {
   string message = 1;
 }
 
-message Node {
+message NodeMsg {
   string id = 1;
   string pool = 2;
   string status = 3;
@@ -94,7 +94,7 @@ message GetNodesRequest {
 }
 
 message GetNodesReply {
-  repeated Node nodes = 1;
+  repeated NodeMsg nodes = 1;
 }
 
 message GetNodeRequest {
@@ -102,7 +102,7 @@ message GetNodeRequest {
 }
 
 message GetNodeReply {
-  optional Node node = 1;
+  optional NodeMsg node = 1;
 }
 
 message UpdateNodeDynamicRequest {
@@ -111,7 +111,7 @@ message UpdateNodeDynamicRequest {
 }
 
 message UpdateNodeDynamicReply {
-  optional Node node = 1;
+  optional NodeMsg node = 1;
 }
 
 // === INSECURE MANAGER ===

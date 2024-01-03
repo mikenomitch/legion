@@ -1,9 +1,10 @@
-use crate::structs::{Node, WorkerConfig, ManagerConfigFull};
-use crate::util::{merge_json_strings, R};
+use crate::structs::{Node, NodeMsg, WorkerConfig, ManagerConfigFull};
+use crate::util::R;
 
 use log::debug;
 use rusqlite::{named_params, Connection};
 use rusqlite_migration::{Migrations, M};
+use serde_json::{Map, json, to_string};
 use serde_rusqlite::to_params_named;
 use std::sync::{Arc, Mutex};
 use time::macros::format_description;
@@ -96,7 +97,7 @@ impl Store {
 "#;
 
         let node = conn.query_row(sql, [id], |row| {
-            Ok(Node {
+            let node_msg = NodeMsg {
                 id: row.get(0)?,
                 pool: row.get(1)?,
                 status: row.get(2)?,
@@ -106,7 +107,9 @@ impl Store {
                 dynamic_attrs: row.get(6)?,
                 health_checks: row.get(7)?,
                 last_heartbeat: row.get(8)?,
-            })
+            };
+
+            Ok(node_msg.into())
         })?;
 
         Ok(node)
@@ -170,7 +173,7 @@ FROM node;
         Ok(())
     }
 
-    pub fn insert_node(&self, node: Node) -> R<Node> {
+    pub fn insert_node(&self, node: NodeMsg) -> R<Node> {
         let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
         let sql = r#"
         INSERT INTO node (id, pool, status, availability, config_attrs, fingerprint_attrs, dynamic_attrs, health_checks, last_heartbeat)
@@ -198,8 +201,15 @@ FROM node;
 
     pub fn update_node_dyamic(&self, id: String, dynamic_diff: String) -> R<Node> {
         let node = self.get_node(id.clone())?;
-        let initial_dynamic = node.dynamic_attrs.clone();
-        let result = merge_json_strings(initial_dynamic, dynamic_diff)?;
+        let default_map = Map::new();
+        let default_map_two = Map::new();
+
+        let mut res = node.dynamic_attrs.as_object().unwrap_or(&default_map).clone();
+        let a = json!(&dynamic_diff);
+        let dd_obj = a.as_object().unwrap_or(&default_map_two);
+
+        res.extend(dd_obj.clone());
+        let res_as_string = to_string(&res).map_err(|e| e.to_string())?;
 
         let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
         let sql = r#"
@@ -211,7 +221,7 @@ FROM node;
 
         let params = named_params! {
             ":id": id,
-            ":dynamic_attrs": result,
+            ":dynamic_attrs": res_as_string,
         };
 
         let node = conn.query_row(sql, params, |row| {

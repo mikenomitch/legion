@@ -7,11 +7,11 @@ use crate::constants::{
     DEF_LOST_NODE_AT_SEC,
     DEF_WORKER_CHECK_SEC,
 };
-use crate::util::{merge_json_strings, R};
+use crate::util::R;
 
 use time::macros::format_description;
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, to_string, from_str};
 use std::collections::HashMap;
 
 tonic::include_proto!("legion");
@@ -101,80 +101,58 @@ pub struct JoinTokenClaims {
 // iss: String,         // Optional. Issuer
 // nbf: usize,          // Optional. Not Before (as UTC timestamp)
 
-
-pub trait Printable {
-    fn print_short(&self) -> ();
-    fn print_short_json(&self) -> ();
-    fn print_long(&self) -> ();
-    fn print_long_json(&self) -> R<()>;
-    fn print_list_json(nodes: Vec<Node>) -> ();
-    fn print_list(nodes: Vec<Node>) -> ();
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct NodeFoo {
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Node {
     pub id: String,
     pub status: String,
     pub pool: String,
+    pub availability: String,
     pub last_heartbeat: String,
-    pub config_attrs: Map<String, Value>,
-    pub fingerprint_attrs: Map<String, Value>,
-    pub dynamic_attrs: Map<String, Value>,
+    pub config_attrs: Value,
+    pub fingerprint_attrs: Value,
+    pub dynamic_attrs: Value,
+    pub health_checks: Value,
 }
 
-impl Printable for Node {
-    fn print_short(&self) {
-        println!(
-            "ID: {} | Status: {} | Pool: {} | Checkin: {}",
-            self.id, self.status, self.pool, self.last_heartbeat
-        );
-    }
+impl Into<NodeMsg> for Node {
+    fn into(self) -> NodeMsg {
+        let config_str = to_string(&self.config_attrs).unwrap_or("{}".to_string());
+        let hc_str = to_string(&self.health_checks).unwrap_or("{}".to_string());
+        let fp_str = to_string(&self.fingerprint_attrs).unwrap_or("{}".to_string());
+        let da_str = to_string(&self.dynamic_attrs).unwrap_or("{}".to_string());
 
-    fn print_list_json(nodes: Vec<Node>) {
-        if let Ok(json) = serde_json::to_string(&nodes) {
-            println!("{}", json);
+        NodeMsg {
+            id: self.id,
+            status: self.status,
+            pool: self.pool,
+            availability: self.availability.into(),
+            last_heartbeat: self.last_heartbeat,
+            config_attrs: config_str,
+            fingerprint_attrs: fp_str,
+            dynamic_attrs: da_str,
+            health_checks: hc_str,
         }
     }
+}
 
-    fn print_list(nodes: Vec<Node>) {
-        nodes.into_iter().for_each(|node| node.print_short());
-    }
+impl Into<Node> for NodeMsg {
+    fn into(self) -> Node {
+        let config_map = from_str::<Value>(&self.config_attrs).unwrap_or(Value::Null);
+        let fp_map = from_str::<Value>(&self.fingerprint_attrs).unwrap_or(Value::Null);
+        let hc_map = from_str::<Value>(&self.health_checks).unwrap_or(Value::Null);
+        let da_map = from_str::<Value>(&self.dynamic_attrs).unwrap_or(Value::Null);
 
-    fn print_short_json(&self) {
-        if let Ok(json) = serde_json::to_string(&self) {
-            println!("{}", json);
-        }
-    }
-
-    fn print_long(&self) {
-        println!("Node ID: {}", self.id);
-        if let Ok(merged_config_and_fp)  = merge_json_strings(self.config_attrs.clone(), self.fingerprint_attrs.clone()) {
-            if let Ok(final_attrs) = merge_json_strings(merged_config_and_fp, self.dynamic_attrs.clone()) {
-                println!("Attributes: {}", final_attrs);
-            }
-        }
-    }
-
-    fn print_long_json(&self) -> R<()>{
-        let config_map = serde_json::from_str::<Map<String, Value>>(&self.config_attrs)?;
-        let fp_map = serde_json::from_str::<Map<String, Value>>(&self.fingerprint_attrs)?;
-        let da_map = serde_json::from_str::<Map<String, Value>>(&self.dynamic_attrs)?;
-
-        let node_foo = NodeFoo {
-            id: self.id.clone(),
-            status: self.status.clone(),
-            pool: self.pool.clone(),
-            last_heartbeat: self.last_heartbeat.clone(),
+        Node {
+            id: self.id,
+            status: self.status,
+            pool: self.pool,
+            availability: self.availability.into(),
+            last_heartbeat: self.last_heartbeat,
             config_attrs: config_map,
             fingerprint_attrs: fp_map,
             dynamic_attrs: da_map,
-        };
-
-        if let Ok(json) = serde_json::to_string(&node_foo) {
-            println!("{}", json);
-        };
-
-        Ok(())
+            health_checks: hc_map,
+        }
     }
 }
 
@@ -191,6 +169,56 @@ impl Node {
         let too_slow = diff > time::Duration::seconds(DEF_LOST_NODE_AT_SEC);
 
         Ok(too_slow)
+    }
+
+    pub fn print_short(&self) {
+        println!(
+            "ID: {} | Status: {} | Pool: {} | Checkin: {}",
+            self.id, self.status, self.pool, self.last_heartbeat
+        );
+    }
+
+    pub fn print_list_json(nodes: Vec<Node>) {
+        if let Ok(json) = to_string(&nodes) {
+            println!("{}", json);
+        }
+    }
+
+    pub fn print_list(nodes: Vec<Node>) {
+        nodes.into_iter().for_each(|node| node.print_short());
+    }
+
+    pub fn print_short_json(&self) {
+        if let Ok(json) = to_string(&self) {
+            println!("{}", json);
+        }
+    }
+
+    pub fn print_long(&self) -> R<()> {
+        println!("Node ID: {}", self.id);
+
+        let mut attrs = Map::new();
+        let default_map = Map::new();
+        let ca = self.config_attrs.as_object().unwrap_or(&default_map).clone();
+        let fa = self.fingerprint_attrs.as_object().unwrap_or(&default_map).clone();
+        let da = self.dynamic_attrs.as_object().unwrap_or(&default_map).clone();
+
+        attrs.extend(ca);
+        attrs.extend(fa);
+        attrs.extend(da);
+
+        let printable = to_string(&attrs)?;
+        println!("Attributes: {}", printable);
+
+        Ok(())
+    }
+
+    pub fn print_long_json(&self) -> R<()>{
+        if let Ok(json) = to_string(self) {
+            println!("{}", json);
+        };
+
+        Ok(())
     }
 }
 

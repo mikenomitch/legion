@@ -1,6 +1,6 @@
 use crate::constants::DEF_MANAGER_ADDRESS;
 use crate::structs::manager_client::ManagerClient;
-use crate::structs::{GetNodeRequest, GetNodesRequest, Node, Printable, UpdateNodeDynamicRequest};
+use crate::structs::{GetNodeRequest, GetNodesRequest, Node, UpdateNodeDynamicRequest};
 use crate::util::R;
 
 use clap::{Arg, Command};
@@ -98,7 +98,8 @@ async fn get_nodes(is_json: bool) -> R<()> {
     let mut client = ManagerClient::connect(DEF_MANAGER_ADDRESS).await?;
     let request = tonic::Request::new(GetNodesRequest {});
     let response = client.get_nodes(request).await?;
-    let nodes = response.into_inner().nodes;
+    let nodes_msg_list = response.into_inner().nodes;
+    let nodes: Vec<Node> = nodes_msg_list.into_iter().map(Into::into).collect();
 
     if is_json {
         Node::print_list_json(nodes);
@@ -120,7 +121,9 @@ async fn update_node(node_id: String, dynamic_diff: Map<String,Value>,is_json: b
     let response = client.update_node_dynamic(request).await?;
 
     match response.into_inner().node {
-        Some(node) => {
+        Some(node_msg) => {
+            let node: Node = node_msg.into();
+
             if is_json {
                 node.print_long_json();
             } else {
@@ -139,7 +142,9 @@ async fn get_node_info(node_id: String, is_json: bool) -> R<()> {
     let response = client.get_node(request).await?;
 
     match response.into_inner().node {
-        Some(node) => {
+        Some(node_msg) => {
+            let node: Node = node_msg.into();
+
             if is_json {
                 node.print_long_json();
             } else {

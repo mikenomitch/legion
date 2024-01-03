@@ -5,7 +5,7 @@ use crate::structs::{
     GetNodesRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, Node,
     RunJobReply, RunJobRequest, UpdateNodeDynamicReply, UpdateNodeDynamicRequest,
     WorkerConfig as WorkerConfigMsg, WorkerPreRegisterReply, WorkerPreRegisterRequest,
-    WorkerRegisterReply, WorkerRegisterRequest,
+    WorkerRegisterReply, WorkerRegisterRequest, NodeMsg,
 };
 
 use log::error;
@@ -133,7 +133,7 @@ impl Manager for ManagerAgentService {
         let request = request.into_inner();
         let dynamic_attrs = json!({}).to_string();
 
-        let node = Node {
+        let node_msg = NodeMsg {
             id: request.name,
             fingerprint_attrs: request.fingerprint_attrs,
             config_attrs: request.config_attrs,
@@ -145,7 +145,7 @@ impl Manager for ManagerAgentService {
             health_checks: request.health_checks,
         };
 
-        self.store.insert_node(node.clone()).map_err(|e| {
+        self.store.insert_node(node_msg.clone()).map_err(|e| {
             error!("Error registering worker: {:?}", e);
             Status::internal("Error registering worker")
         })?;
@@ -166,7 +166,9 @@ impl Manager for ManagerAgentService {
             Status::internal("Error getting nodes")
         })?;
 
-        let reply = GetNodesReply { nodes: nodes };
+        let node_messages: Vec<NodeMsg> = nodes.into_iter().map(Into::into).collect();
+
+        let reply = GetNodesReply { nodes: node_messages };
         Ok(Response::new(reply))
     }
 
@@ -180,7 +182,7 @@ impl Manager for ManagerAgentService {
             Status::internal(format!("Could not find node {}", id))
         })?;
 
-        let reply = GetNodeReply { node: Some(node) };
+        let reply = GetNodeReply { node: Some(node.into()) };
         Ok(Response::new(reply))
     }
 
@@ -195,7 +197,7 @@ impl Manager for ManagerAgentService {
             .store
             .update_node_dyamic(id, dynamic_diff)
             .expect("Can't find or update node");
-        let reply = UpdateNodeDynamicReply { node: Some(node) };
+        let reply = UpdateNodeDynamicReply { node: Some(node.into()) };
 
         Ok(Response::new(reply))
     }
