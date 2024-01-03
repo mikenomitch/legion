@@ -4,7 +4,7 @@ use crate::util::R;
 use log::debug;
 use rusqlite::{named_params, Connection};
 use rusqlite_migration::{Migrations, M};
-use serde_json::{Map, Value, json, to_string};
+use serde_json::{Map, Value, to_string};
 use serde_rusqlite::to_params_named;
 use std::sync::{Arc, Mutex};
 use time::macros::format_description;
@@ -97,7 +97,7 @@ impl Store {
 "#;
 
         let node = conn.query_row(sql, [id], |row| {
-            let node_msg = NodeMsg {
+            let node = Node{
                 id: row.get(0)?,
                 pool: row.get(1)?,
                 status: row.get(2)?,
@@ -109,11 +109,12 @@ impl Store {
                 last_heartbeat: row.get(8)?,
             };
 
-            Ok(node_msg.into())
+            Ok(node)
         })?;
 
         Ok(node)
     }
+
 
     pub fn get_nodes(&self) -> R<Vec<Node>> {
         let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
@@ -182,6 +183,11 @@ FROM node;
         RETURNING id, pool, status, availability, config_attrs, fingerprint_attrs, dynamic_attrs, health_checks, last_heartbeat;
 "#;
 
+        // TODO:
+        // Its not ideal that I am using NodeMsg here
+        // I get an error about serializing Map, and the simplest
+        // way around it is to just use the node message when using
+        // to_params_named, as its already a string
         let node = conn.query_row(sql, to_params_named(&node)?.to_slice().as_slice(), |row| {
             Ok(Node {
                 id: row.get(0)?,

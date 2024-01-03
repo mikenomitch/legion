@@ -145,7 +145,7 @@ impl Manager for ManagerAgentService {
             health_checks: request.health_checks,
         };
 
-        self.store.insert_node(node_msg.clone()).map_err(|e| {
+        self.store.insert_node(node_msg.into()).map_err(|e| {
             error!("Error registering worker: {:?}", e);
             Status::internal("Error registering worker")
         })?;

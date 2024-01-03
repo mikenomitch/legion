@@ -173,8 +173,8 @@ impl Node {
 
     pub fn print_short(&self) {
         println!(
-            "ID: {} | Status: {} | Pool: {} | Checkin: {}",
-            self.id, self.status, self.pool, self.last_heartbeat
+            "ID: {} | Pool: {} | Status: {} | Availability: {} | Last Heartbeat: {}",
+            self.id, self.pool, self.status, self.availability, self.last_heartbeat
         );
     }
 
@@ -188,13 +188,7 @@ impl Node {
         nodes.into_iter().for_each(|node| node.print_short());
     }
 
-    pub fn print_short_json(&self) {
-        if let Ok(json) = to_string(&self) {
-            println!("{}", json);
-        }
-    }
-
-    pub fn print_long(&self) -> R<()> {
+    pub fn print_long(&self) {
         println!("Node ID: {}", self.id);
 
         let mut attrs = Map::new();
@@ -207,18 +201,15 @@ impl Node {
         attrs.extend(fa);
         attrs.extend(da);
 
-        let printable = to_string(&attrs)?;
-        println!("Attributes: {}", printable);
-
-        Ok(())
+        if let Ok(printable) = to_string(&attrs) {
+            println!("Attributes: {}", printable);
+        }
     }
 
-    pub fn print_long_json(&self) -> R<()>{
+    pub fn print_long_json(&self) {
         if let Ok(json) = to_string(self) {
             println!("{}", json);
         };
-
-        Ok(())
     }
 }
 
