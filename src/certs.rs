@@ -1,4 +1,4 @@
-use crate::util::R;
+use crate::prelude::*;
 // Note: Modified from: https://github.com/grimvoodoo/cert-gen
 
 // Do I need openssl?

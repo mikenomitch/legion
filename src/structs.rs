@@ -1,12 +1,7 @@
-use crate::constants::{
-    DEF_LOST_NODE_AT_SEC, DEF_MANAGER_HOSTNAME, DEF_MANAGER_INSECURE_PORT, DEF_MANAGER_SERVER_PORT,
-    DEF_STORE_PATH, DEF_WORKER_CHECK_SEC, DEF_WORKER_CONFIG_PATH,
-};
-use crate::util::R;
+use crate::prelude::*;
 
 use serde::{Deserialize, Serialize};
-use serde_json::{from_str, to_string, Map, Value};
-use std::collections::HashMap;
+use serde_json::{from_str, to_string};
 use time::macros::format_description;
 
 tonic::include_proto!("legion");
@@ -173,7 +168,7 @@ impl Node {
 
     pub fn print_list_json(nodes: Vec<Node>) {
         if let Ok(json) = to_string(&nodes) {
-            println!("{}", json);
+            println!("{json}");
         }
     }
 

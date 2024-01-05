@@ -1,13 +1,11 @@
-use crate::constants::{
-    DEF_MANAGER_HOSTNAME, TMP_SECRET_KEY, WORKER_HEARTBEAT_DURATION_SEC,
-    WORKER_NODE_CHECK_DURATION_SEC,
-};
+use crate::prelude::*;
+
 use crate::structs::{
     manager_client::ManagerClient, worker_server::WorkerServer, HealthCheckRequest,
     HeartbeatRequest, JoinTokenClaims, WorkerPreRegisterReply, WorkerPreRegisterRequest,
     WorkerRegisterRequest,
 };
-use crate::util::{random_string, R};
+use crate::util::random_string;
 use crate::worker::{
     node_check::{fingerprint_node, run_health_checks},
     server::WorkerAgentService,
@@ -15,9 +13,6 @@ use crate::worker::{
 
 use futures::join;
 use jsonwebtoken::{decode, errors::ErrorKind, Algorithm, DecodingKey, Validation};
-use log::{debug, error};
-use serde_json::{Map, Value};
-use std::collections::HashMap;
 use tonic::{transport::Channel, transport::Server, Response};
 // use tonic::transport::Certificate, transport::ClientTlsConfig,
 

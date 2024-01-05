@@ -1,16 +1,15 @@
+use crate::prelude::*;
+
 use crate::storage::store::Store;
 use crate::structs::manager_server::Manager;
 use crate::structs::{
     GetJobStatusReply, GetJobStatusRequest, GetNodeReply, GetNodeRequest, GetNodesReply,
     GetNodesRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest,
     NodeMsg, RunJobReply, RunJobRequest, UpdateNodeDynamicReply, UpdateNodeDynamicRequest,
-    WorkerConfig as WorkerConfigMsg, WorkerPreRegisterReply, WorkerPreRegisterRequest,
-    WorkerRegisterReply, WorkerRegisterRequest,
+    WorkerConfig, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply,
+    WorkerRegisterRequest,
 };
 
-use log::error;
-use serde_json::{json, Map, Value};
-use std::collections::HashMap;
 use tonic::{Request, Response, Status};
 
 #[allow(dead_code)]
@@ -111,7 +110,7 @@ impl Manager for ManagerAgentService {
             }
         }
 
-        let config = WorkerConfigMsg {
+        let config = WorkerConfig {
             name: worker_type,
             pool: worker_config.pool,
             additional_node_checks: worker_config.additional_node_checks,

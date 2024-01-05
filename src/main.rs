@@ -2,14 +2,15 @@ mod certs;
 mod cmd;
 mod constants;
 mod manager;
+mod prelude;
 mod storage;
 mod structs;
 mod util;
 mod worker;
-use clap::Command;
-use log::debug;
+
+use crate::prelude::*;
+
 use std::ffi::OsString;
-use util::R;
 
 fn cli() -> Command {
     Command::new("legion")

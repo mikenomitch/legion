@@ -1,9 +1,7 @@
-use crate::constants::DEF_INSECURE_ADDR;
+use crate::prelude::*;
+
 use crate::structs::insecure_manager_client::InsecureManagerClient;
 use crate::structs::GetJoinTokenRequest;
-
-use clap::{arg, Command};
-use std::error;
 
 pub fn config() -> Command {
     Command::new("join-token")

@@ -1,6 +1,6 @@
-use crate::structs::{worker_server::Worker, PostWorkReply, PostWorkRequest};
+use crate::prelude::*;
 
-use log::debug;
+use crate::structs::{worker_server::Worker, PostWorkReply, PostWorkRequest};
 use tonic::{Request, Response, Status};
 
 pub struct WorkerAgentService {}

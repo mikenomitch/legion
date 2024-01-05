@@ -1,10 +1,9 @@
-use crate::constants::DEF_CONFIG_PATH;
+use crate::prelude::*;
+
 use crate::manager::agent::run_manager;
 use crate::structs::ManagerConfig;
-use crate::util::R;
 use crate::worker::agent::run_worker;
 
-use clap::{arg, Command};
 use jsonnet::JsonnetVm;
 
 pub fn config() -> Command {

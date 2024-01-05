@@ -1,10 +1,6 @@
-use crate::constants::DEF_MANAGER_ADDRESS;
+use crate::prelude::*;
 use crate::structs::manager_client::ManagerClient;
 use crate::structs::{GetNodeRequest, GetNodesRequest, Node, UpdateNodeDynamicRequest};
-use crate::util::R;
-
-use clap::{Arg, Command};
-use serde_json::{Map, Value};
 
 pub fn config() -> Command {
     let json_arg = Arg::new("json")
@@ -24,11 +20,13 @@ pub fn config() -> Command {
         .arg(json_arg.clone());
 
     let update_node_cmd = Command::new("update")
-        .about("
+        .about(
+            "
         Update node attributes
 
         Example: legion node update <id> -a <key1>=<value1> <key2>=<value2>
-        ")
+        ",
+        )
         .arg(Arg::new("id").value_name("id").required(true))
         .arg(Arg::new("attr").short('a').num_args(1..))
         .arg(json_arg.clone());
@@ -67,10 +65,16 @@ pub async fn handle(sub_matches: &clap::ArgMatches) -> R<()> {
                     if let Some(value) = split.next() {
                         dynamic_diff.insert(key_path.into(), value.into());
                     } else {
-                        error_msg = Some(format!("Invalid attribute: {} - must be of format KEY=VALUE", attr));
+                        error_msg = Some(format!(
+                            "Invalid attribute: {} - must be of format KEY=VALUE",
+                            attr
+                        ));
                     }
                 } else {
-                    error_msg = Some(format!("Invalid attribute: {} - must be of format KEY=VALUE", attr));
+                    error_msg = Some(format!(
+                        "Invalid attribute: {} - must be of format KEY=VALUE",
+                        attr
+                    ));
                 }
             });
 
@@ -110,7 +114,7 @@ async fn get_nodes(is_json: bool) -> R<()> {
     Ok(())
 }
 
-async fn update_node(node_id: String, dynamic_diff: Map<String,Value>,is_json: bool) -> R<()> {
+async fn update_node(node_id: String, dynamic_diff: Map<String, Value>, is_json: bool) -> R<()> {
     let mut client = ManagerClient::connect(DEF_MANAGER_ADDRESS).await?;
 
     let request = tonic::Request::new(UpdateNodeDynamicRequest {
