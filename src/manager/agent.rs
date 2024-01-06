@@ -15,8 +15,8 @@ use std::str::FromStr;
 use tonic::transport::{Identity, Server, ServerTlsConfig};
 
 pub async fn run_manager(config: ManagerConfig) -> R<()> {
-    let full_config = config.with_defaults()?;
-    let store = Store::start_storage(full_config.clone())?;
+    let full_config = config.with_defaults();
+    let store = Store::start_storage(&full_config)?;
     load_initial_data(&store, &config).await?;
 
     // Spawn a separate grpc server for non-TLS calls
@@ -49,8 +49,8 @@ pub async fn run_manager(config: ManagerConfig) -> R<()> {
         .add_service(ManagerServer::new(manager_node))
         .serve(addr);
 
-    println!("Join server starting on {}", join_server_addr);
-    println!("Manager node starting on {}", addr);
+    println!("Join server starting on {join_server_addr}");
+    println!("Manager node starting on {addr}");
 
     let node_checker_fut = start_node_status_checker(s2, full_config.worker_check_seconds);
     let _res = join!(join_server_fut, start_server_fut, node_checker_fut);
@@ -75,7 +75,7 @@ async fn start_node_status_checker(store: Store, check_seconds: u64) -> R<()> {
             .map(|(id, _heartbeat)| id)
             .collect::<Vec<String>>();
 
-        store.mark_nodes_as_lost(node_ids_to_update)?;
+        store.mark_nodes_as_lost(&node_ids_to_update)?;
         tokio::time::sleep(tokio::time::Duration::from_secs(check_seconds)).await;
     }
 }
@@ -87,13 +87,12 @@ fn parse_worker_config(config_path: &str) -> R<WorkerConfigAlt> {
 
     match res {
         Ok(s) => {
-            let config: WorkerConfigAlt = serde_json::from_str(&s).map_err(|e| {
-                format!("Error parsing worker config at path {}: {}", config_path, e)
-            })?;
+            let config: WorkerConfigAlt = serde_json::from_str(&s)
+                .map_err(|e| format!("Error parsing worker config at path {config_path}: {e}"))?;
             Ok(config)
         }
         Err(e) => {
-            let msg = format!("Error parsing worker config at path {}: {}", config_path, e);
+            let msg = format!("Error parsing worker config at path {config_path}: {e}");
             error!("{}", &msg);
             Err(msg.into())
         }
@@ -101,7 +100,7 @@ fn parse_worker_config(config_path: &str) -> R<WorkerConfigAlt> {
 }
 
 async fn load_initial_data(store: &Store, config: &ManagerConfig) -> R<()> {
-    let worker_conf_path = config.with_defaults()?.worker_config_path.clone();
+    let worker_conf_path = config.with_defaults().worker_config_path.clone();
     let sub_paths = fs::read_dir(worker_conf_path)?;
 
     for path in sub_paths {
@@ -120,7 +119,7 @@ async fn load_initial_data(store: &Store, config: &ManagerConfig) -> R<()> {
             name_prefix: wcp.name_prefix,
         };
 
-        store.insert_worker_type(wc)?;
+        store.insert_worker_type(&wc)?;
     }
 
     Ok(())

@@ -24,7 +24,7 @@ impl Manager for ManagerAgentService {
         _request: Request<RunJobRequest>,
     ) -> Result<Response<RunJobReply>, Status> {
         let reply = RunJobReply {
-            message: format!("Hello {}!", "jorb"),
+            message: "Hello job!".into(),
         };
 
         Ok(Response::new(reply))
@@ -35,7 +35,7 @@ impl Manager for ManagerAgentService {
         _request: Request<GetJobStatusRequest>,
     ) -> Result<Response<GetJobStatusReply>, Status> {
         let reply = GetJobStatusReply {
-            message: format!("Hello {}!", "status"),
+            message: "Hello status!".into(),
         };
 
         Ok(Response::new(reply))
@@ -67,7 +67,7 @@ impl Manager for ManagerAgentService {
         let id = req.id;
 
         self.store
-            .update_node_health_checks(id.clone(), req.health_checks)
+            .update_node_health_checks(&id, &req.health_checks)
             .map_err(|e| {
                 error!(
                     "Error updading node health checks. Node ID: {}: {:?}",
@@ -99,7 +99,7 @@ impl Manager for ManagerAgentService {
             })?;
 
         let mut attrs = HashMap::new();
-        for (key, value) in worker_config.attributes.iter() {
+        for (key, value) in &worker_config.attributes {
             match serde_json::to_string(value).ok() {
                 Some(val_str) => {
                     attrs.insert(key.to_string(), val_str);
@@ -140,7 +140,7 @@ impl Manager for ManagerAgentService {
             status: "active".to_string(),
             availability: "availabile".to_string(),
             pool: request.pool,
-            last_heartbeat: "".to_string(),
+            last_heartbeat: String::new(),
             health_checks: request.health_checks,
         };
 
@@ -178,9 +178,9 @@ impl Manager for ManagerAgentService {
         request: Request<GetNodeRequest>,
     ) -> Result<Response<GetNodeReply>, Status> {
         let id = request.into_inner().id;
-        let node = self.store.get_node(id.clone()).map_err(|e| {
+        let node = self.store.get_node(&id).map_err(|e| {
             error!("Error getting nodes: {:?}", e);
-            Status::internal(format!("Could not find node {}", id))
+            Status::internal(format!("Could not find node {id}"))
         })?;
 
         let reply = GetNodeReply {
@@ -202,7 +202,7 @@ impl Manager for ManagerAgentService {
 
         let node = self
             .store
-            .update_node_dyamic(id, dd_as_map)
+            .update_node_dyamic(&id, &dd_as_map)
             .expect("Can't find or update node");
         let reply = UpdateNodeDynamicReply {
             node: Some(node.into()),

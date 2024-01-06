@@ -5,7 +5,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_server(true)
         .type_attribute("NodeMsg", "#[derive(serde::Deserialize, serde::Serialize)]")
         .compile(&[proto_file], &["."])
-        .unwrap_or_else(|e| panic!("protobuf compile error: {}", e));
+        .unwrap_or_else(|e| panic!("protobuf compile error: {e}"));
 
     // tonic_build::compile_protos("proto/legion.proto")?;
 
@@ -36,7 +36,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }),
             Err(e) => {
-                println!("Error reading dir: {}", e);
+                println!("Error reading dir: {e}");
             }
         });
 

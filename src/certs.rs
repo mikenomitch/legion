@@ -61,21 +61,21 @@ pub fn create_ca_cert() -> R<Certificate> {
     let cert_pem = cert.serialize_pem()?;
 
     std::fs::create_dir_all("configs/tls/")?;
-    fs::write("configs/tls/rootca.pem", &cert_pem.as_bytes())?;
+    fs::write("configs/tls/rootca.pem", cert_pem.as_bytes())?;
     fs::write(
         "configs/tls/rootca.key",
-        &cert.serialize_private_key_pem().as_bytes(),
+        cert.serialize_private_key_pem().as_bytes(),
     )?;
 
     Ok(cert)
 }
 
 pub fn signed_cert_with_ca(
-    ca_cert: Certificate,
-    dn_name: String,
+    ca_cert: &Certificate,
+    dn_name: &str,
 ) -> R<(String, String, Certificate)> {
     let mut dn = DistinguishedName::new();
-    dn.push(DnType::CommonName, dn_name.clone());
+    dn.push(DnType::CommonName, dn_name.to_string());
 
     let mut params = CertificateParams::default();
 
@@ -84,7 +84,7 @@ pub fn signed_cert_with_ca(
     params.not_after = time::OffsetDateTime::now_utc() + time::Duration::days(365 * 20);
 
     params.subject_alt_names = vec![
-        SanType::DnsName(dn_name.clone()),
+        SanType::DnsName(dn_name.into()),
         SanType::DnsName(String::from("legion")),
         SanType::DnsName(String::from("localhost")),
         SanType::IpAddress(std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1))),
@@ -101,8 +101,8 @@ pub fn signed_cert_with_ca(
 }
 
 #[allow(dead_code)]
-pub fn write_signed_cert_with_ca(ca_cert: Certificate, dn_name: String) -> R<Certificate> {
-    let (cert_signed, key, ca_cert_again) = signed_cert_with_ca(ca_cert, dn_name.clone())?;
+pub fn write_signed_cert_with_ca(ca_cert: &Certificate, dn_name: &str) -> R<Certificate> {
+    let (cert_signed, key, ca_cert_again) = signed_cert_with_ca(&ca_cert, dn_name)?;
 
     let path = format!("configs/tls/{dn_name}/");
     let cert_path = format!("configs/tls/{dn_name}/{dn_name}.pem");
@@ -140,7 +140,7 @@ mod tests {
                 // assert_eq!(cert.is_ca(), IsCa::Ca(BasicConstraints::Unconstrained));
             }
             Err(e) => {
-                println!("Error: {}", e);
+                println!("Error: {e}");
                 assert!(false);
             }
         }
@@ -149,7 +149,7 @@ mod tests {
     #[test]
     fn signed_cert_with_ca_works() -> R<()> {
         let cert = create_ca_cert()?;
-        let (cert_signed, key, _) = signed_cert_with_ca(cert, "test".into())?;
+        let (cert_signed, key, _) = signed_cert_with_ca(&cert, "test".into())?;
         assert!(cert_signed.len() > 0);
         assert!(key.len() > 0);
 
@@ -159,7 +159,7 @@ mod tests {
     #[test]
     fn write_signed_cert_with_ca_works() -> R<()> {
         let cert = create_ca_cert()?;
-        write_signed_cert_with_ca(cert, "server".into())?;
+        write_signed_cert_with_ca(&cert, "server".into())?;
         Ok(())
     }
 }

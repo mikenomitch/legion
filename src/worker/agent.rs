@@ -28,7 +28,7 @@ pub async fn run_worker(token: &str) -> R<()> {
         Ok(c) => c,
         Err(err) => {
             // print error message
-            println!("Error: {}", err);
+            println!("Error: {err}");
 
             // TODO: Return a nicer error to the CLI instead of a panic
             match *err.kind() {
@@ -56,7 +56,7 @@ pub async fn run_worker(token: &str) -> R<()> {
         debug!("Skipping expiry validation check on join token");
     }
 
-    let addr = format!("{}:{}", DEF_MANAGER_HOSTNAME, 4848).parse()?;
+    let addr = format!("{DEF_MANAGER_HOSTNAME}:4848").parse()?;
     let worker_node = WorkerAgentService {};
     let worker_server_fut = Server::builder()
         .add_service(WorkerServer::new(worker_node))
@@ -64,7 +64,7 @@ pub async fn run_worker(token: &str) -> R<()> {
 
     let client = create_manager_client(
         token_data.claims.address,
-        "".into(),
+        String::new(),
         // token_data.claims.ca_cert,
     )
     .await?;
@@ -119,9 +119,7 @@ async fn start_heartbeats(name: String, client: ManagerClient<Channel>) -> R<()>
     let mut client_clone = client.clone();
 
     loop {
-        let req = tonic::Request::new(HeartbeatRequest {
-            id: name.to_owned(),
-        });
+        let req = tonic::Request::new(HeartbeatRequest { id: name.clone() });
 
         let response = client_clone.heartbeat(req).await?;
         debug!("RESPONSE={:?}", response);
@@ -145,7 +143,7 @@ async fn start_node_checks(
 
     loop {
         let req = tonic::Request::new(HealthCheckRequest {
-            id: name.to_owned(),
+            id: name.clone(),
             health_checks: serialized_health_check_data.clone(),
         });
 

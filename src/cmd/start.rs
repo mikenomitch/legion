@@ -31,8 +31,7 @@ pub async fn handle(sub_matches: &clap::ArgMatches) -> R<()> {
     } else {
         let config_path = sub_matches
             .get_one::<String>("config")
-            .map(|s| s.as_str())
-            .unwrap_or(DEF_CONFIG_PATH);
+            .map_or(DEF_CONFIG_PATH, String::as_str);
 
         let config = parse_config(config_path)?;
         run_manager(config).await

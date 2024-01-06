@@ -1,7 +1,5 @@
 # Next Up
 
-- Finish cargo clippy suggestions
-
 - Better logging throughout
 
   - Use tracing library + logging + appender + futures

@@ -24,10 +24,10 @@ pub const CONN_LOCK_ERROR: &str = "Error locking database connection";
 
 // NOTE: This will become a general interface for all storage backends
 impl Store {
-    pub fn start_storage(config: ManagerConfigFull) -> R<Store> {
+    pub fn start_storage(config: &ManagerConfigFull) -> R<Store> {
         debug!("Starting store");
         let conn = Store::create_memsafe_conn(&config.store_path)?;
-        Store::create_initial_tables(Arc::clone(&conn))?;
+        Store::create_initial_tables(&Arc::clone(&conn))?;
 
         let store = Store { conn };
         Ok(store)
@@ -47,7 +47,7 @@ impl Store {
         Ok(Arc::new(Mutex::new(conn)))
     }
 
-    fn create_initial_tables(conn: MemSafeConn) -> R<()> {
+    fn create_initial_tables(conn: &MemSafeConn) -> R<()> {
         let migrations = Migrations::new(vec![
             M::up(
                 "CREATE TABLE IF NOT EXISTS node (
@@ -86,7 +86,7 @@ impl Store {
     // NODES
     // ========================================
 
-    pub fn get_node(&self, id: String) -> R<Node> {
+    pub fn get_node(&self, id: &str) -> R<Node> {
         let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
 
         let sql = r#"
@@ -159,7 +159,7 @@ FROM node;
         Ok(nodes_id_and_hb)
     }
 
-    pub fn mark_nodes_as_lost(&self, ids: Vec<String>) -> R<()> {
+    pub fn mark_nodes_as_lost(&self, ids: &[String]) -> R<()> {
         let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
         let sql = r#"
         UPDATE node
@@ -203,8 +203,8 @@ FROM node;
         Ok(node)
     }
 
-    pub fn update_node_dyamic(&self, id: String, dynamic_diff: Map<String, Value>) -> R<Node> {
-        let node = self.get_node(id.clone())?;
+    pub fn update_node_dyamic(&self, id: &str, dynamic_diff: &Map<String, Value>) -> R<Node> {
+        let node = self.get_node(id)?;
         let default_map = Map::new();
 
         let mut res = node
@@ -212,10 +212,11 @@ FROM node;
             .as_object()
             .unwrap_or(&default_map)
             .clone();
+
         res.extend(dynamic_diff.clone());
         let res_as_string = to_string(&res).map_err(|e| e.to_string())?;
 
-        println!("res_as_string: {}", res_as_string);
+        println!("res_as_string: {res_as_string}");
 
         let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
         let sql = r#"
@@ -276,7 +277,7 @@ FROM node;
         Ok(())
     }
 
-    pub fn update_node_health_checks(&self, id: String, health_checks: String) -> R<()> {
+    pub fn update_node_health_checks(&self, id: &str, health_checks: &str) -> R<()> {
         let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
         let sql = r#"
         UPDATE node
@@ -324,7 +325,7 @@ FROM node;
         Ok(config)
     }
 
-    pub fn insert_worker_type(&self, config: WorkerConfig) -> R<WorkerConfig> {
+    pub fn insert_worker_type(&self, config: &WorkerConfig) -> R<WorkerConfig> {
         let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
 
         let node_checks_to_save = config.additional_node_checks.join(",");

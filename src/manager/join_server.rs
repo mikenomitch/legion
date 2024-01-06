@@ -6,6 +6,7 @@ use crate::structs::{GetJoinTokenReply, GetJoinTokenRequest, JoinTokenClaims, Ma
 
 use jsonnet::JsonnetVm;
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+use std::convert::Into;
 use std::time::Duration;
 use tonic::{Request, Response, Status};
 // use tonic::transport::{Certificate, Channel, ClientTlsConfig};
@@ -44,7 +45,7 @@ pub fn get_insecure_manager_service() -> InsecureManagerServer<InsecureManagerSe
 
 // add generate_join_token_function
 pub fn generate_join_token(worker_type: String, ttl: Option<String>) -> R<String> {
-    let config = parse_manager_config(DEF_CONFIG_PATH)?.with_defaults()?;
+    let config = parse_manager_config(DEF_CONFIG_PATH)?.with_defaults();
 
     let jwt_exp: usize = match ttl {
         Some(ttl) => {
@@ -91,7 +92,7 @@ pub fn generate_join_token(worker_type: String, ttl: Option<String>) -> R<String
         &claims,
         &EncodingKey::from_secret(&TMP_SECRET_KEY[..]),
     )
-    .map_err(|e| e.into())
+    .map_err(Into::into)
 }
 
 fn parse_manager_config(config_path: &str) -> R<ManagerConfig> {

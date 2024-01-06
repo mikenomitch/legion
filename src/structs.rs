@@ -31,12 +31,12 @@ pub struct ServerConfigFull {
     pub host: String,
 }
 
-impl Into<ServerConfig> for ServerConfigFull {
-    fn into(self) -> ServerConfig {
+impl From<ServerConfigFull> for ServerConfig {
+    fn from(val: ServerConfigFull) -> Self {
         ServerConfig {
-            port: Some(self.port),
-            insecure_port: Some(self.insecure_port),
-            host: Some(self.host),
+            port: Some(val.port),
+            insecure_port: Some(val.insecure_port),
+            host: Some(val.host),
         }
     }
 }
@@ -50,13 +50,13 @@ pub struct ManagerConfigFull {
     pub worker_check_seconds: u64,
 }
 
-impl Into<ManagerConfig> for ManagerConfigFull {
-    fn into(self) -> ManagerConfig {
+impl From<ManagerConfigFull> for ManagerConfig {
+    fn from(val: ManagerConfigFull) -> Self {
         ManagerConfig {
-            server: Some(self.server.into()),
-            store_path: Some(self.store_path),
-            worker_config_path: Some(self.worker_config_path),
-            worker_check_seconds: Some(self.worker_check_seconds),
+            server: Some(val.server.into()),
+            store_path: Some(val.store_path),
+            worker_config_path: Some(val.worker_config_path),
+            worker_check_seconds: Some(val.worker_check_seconds),
         }
     }
 }
@@ -102,19 +102,19 @@ pub struct Node {
     pub health_checks: Value,
 }
 
-impl Into<NodeMsg> for Node {
-    fn into(self) -> NodeMsg {
-        let config_str = to_string(&self.config_attrs).unwrap_or("{}".to_string());
-        let hc_str = to_string(&self.health_checks).unwrap_or("{}".to_string());
-        let fp_str = to_string(&self.fingerprint_attrs).unwrap_or("{}".to_string());
-        let da_str = to_string(&self.dynamic_attrs).unwrap_or("{}".to_string());
+impl From<Node> for NodeMsg {
+    fn from(node: Node) -> Self {
+        let config_str = to_string(&node.config_attrs).unwrap_or("{}".to_string());
+        let hc_str = to_string(&node.health_checks).unwrap_or("{}".to_string());
+        let fp_str = to_string(&node.fingerprint_attrs).unwrap_or("{}".to_string());
+        let da_str = to_string(&node.dynamic_attrs).unwrap_or("{}".to_string());
 
         NodeMsg {
-            id: self.id,
-            status: self.status,
-            pool: self.pool,
-            availability: self.availability,
-            last_heartbeat: self.last_heartbeat,
+            id: node.id,
+            status: node.status,
+            pool: node.pool,
+            availability: node.availability,
+            last_heartbeat: node.last_heartbeat,
             config_attrs: config_str,
             fingerprint_attrs: fp_str,
             dynamic_attrs: da_str,
@@ -123,19 +123,19 @@ impl Into<NodeMsg> for Node {
     }
 }
 
-impl Into<Node> for NodeMsg {
-    fn into(self) -> Node {
-        let config_map = from_str::<Value>(&self.config_attrs).unwrap_or(Value::Null);
-        let fp_map = from_str::<Value>(&self.fingerprint_attrs).unwrap_or(Value::Null);
-        let hc_map = from_str::<Value>(&self.health_checks).unwrap_or(Value::Null);
-        let da_map = from_str::<Value>(&self.dynamic_attrs).unwrap_or(Value::Null);
+impl From<NodeMsg> for Node {
+    fn from(node: NodeMsg) -> Self {
+        let config_map = from_str::<Value>(&node.config_attrs).unwrap_or(Value::Null);
+        let fp_map = from_str::<Value>(&node.fingerprint_attrs).unwrap_or(Value::Null);
+        let hc_map = from_str::<Value>(&node.health_checks).unwrap_or(Value::Null);
+        let da_map = from_str::<Value>(&node.dynamic_attrs).unwrap_or(Value::Null);
 
         Node {
-            id: self.id,
-            status: self.status,
-            pool: self.pool,
-            availability: self.availability,
-            last_heartbeat: self.last_heartbeat,
+            id: node.id,
+            status: node.status,
+            pool: node.pool,
+            availability: node.availability,
+            last_heartbeat: node.last_heartbeat,
             config_attrs: config_map,
             fingerprint_attrs: fp_map,
             dynamic_attrs: da_map,
@@ -166,13 +166,13 @@ impl Node {
         );
     }
 
-    pub fn print_list_json(nodes: Vec<Node>) {
-        if let Ok(json) = to_string(&nodes) {
+    pub fn print_list_json(nodes: &[Node]) {
+        if let Ok(json) = to_string(nodes) {
             println!("{json}");
         }
     }
 
-    pub fn print_list(nodes: Vec<Node>) {
+    pub fn print_list(nodes: &[Node]) {
         nodes.into_iter().for_each(|node| node.print_short());
     }
 
@@ -202,19 +202,19 @@ impl Node {
         attrs.extend(da);
 
         if let Ok(printable) = to_string(&attrs) {
-            println!("Attributes: {}", printable);
+            println!("Attributes: {printable}");
         }
     }
 
     pub fn print_long_json(&self) {
         if let Ok(json) = to_string(self) {
-            println!("{}", json);
+            println!("{json}");
         };
     }
 }
 
 impl ServerConfig {
-    pub fn with_defaults(&self) -> R<ServerConfigFull> {
+    pub fn with_defaults(&self) -> ServerConfigFull {
         let cloned = self.clone();
 
         let config = ServerConfigFull {
@@ -223,7 +223,7 @@ impl ServerConfig {
             host: cloned.host.unwrap_or(DEF_MANAGER_HOSTNAME.to_string()),
         };
 
-        Ok(config)
+        config
     }
 
     pub fn full_default() -> ServerConfigFull {
@@ -236,11 +236,11 @@ impl ServerConfig {
 }
 
 impl ManagerConfig {
-    pub fn with_defaults(&self) -> R<ManagerConfigFull> {
+    pub fn with_defaults(&self) -> ManagerConfigFull {
         let cloned = self.clone();
 
         let server_config = match cloned.server {
-            Some(config) => config.with_defaults()?,
+            Some(config) => config.with_defaults(),
             None => ServerConfig::full_default(),
         };
 
@@ -253,6 +253,6 @@ impl ManagerConfig {
             worker_check_seconds: cloned.worker_check_seconds.unwrap_or(DEF_WORKER_CHECK_SEC),
         };
 
-        Ok(mc)
+        mc
     }
 }

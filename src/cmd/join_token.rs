@@ -2,6 +2,7 @@ use crate::prelude::*;
 
 use crate::structs::insecure_manager_client::InsecureManagerClient;
 use crate::structs::GetJoinTokenRequest;
+use std::error;
 
 pub fn config() -> Command {
     Command::new("join-token")
@@ -13,13 +14,11 @@ pub fn config() -> Command {
 pub async fn handle(sub_matches: &clap::ArgMatches) -> Result<(), Box<dyn error::Error>> {
     let ttl = sub_matches
         .get_one::<String>("ttl")
-        .map(|s| s.as_str())
-        .unwrap_or("1h");
+        .map_or("1h", String::as_str);
 
     let worker_type = sub_matches
         .get_one::<String>("type")
-        .map(|s| s.as_str())
-        .unwrap_or("default");
+        .map_or("default", String::as_str);
 
     let address = std::env::var("LEGION_ADDR").unwrap_or(DEF_INSECURE_ADDR.to_owned());
 
@@ -40,7 +39,7 @@ pub async fn handle(sub_matches: &clap::ArgMatches) -> Result<(), Box<dyn error:
     let t = &response.get_ref().token;
 
     println!("To launch a client with this token, run: ");
-    println!("cr start worker {}", t);
+    println!("cr start worker {t}");
 
     Ok(())
 }

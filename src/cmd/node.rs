@@ -66,25 +66,22 @@ pub async fn handle(sub_matches: &clap::ArgMatches) -> R<()> {
                         dynamic_diff.insert(key_path.into(), value.into());
                     } else {
                         error_msg = Some(format!(
-                            "Invalid attribute: {} - must be of format KEY=VALUE",
-                            attr
+                            "Invalid attribute: {attr} - must be of format KEY=VALUE"
                         ));
                     }
                 } else {
                     error_msg = Some(format!(
-                        "Invalid attribute: {} - must be of format KEY=VALUE",
-                        attr
+                        "Invalid attribute: {attr} - must be of format KEY=VALUE"
                     ));
                 }
             });
 
-            match error_msg {
-                Some(msg) => Err(msg.into()),
-                None => {
-                    let is_json = arg_matches.get_flag("json");
-                    update_node(id.into(), dynamic_diff, is_json).await
-                }
+            if let Some(msg) = error_msg {
+                return Err(msg.into());
             }
+
+            let is_json = arg_matches.get_flag("json");
+            update_node(id.into(), dynamic_diff, is_json).await
         }
         Some(("info", arg_matches)) => {
             let id = arg_matches
@@ -106,9 +103,9 @@ async fn get_nodes(is_json: bool) -> R<()> {
     let nodes: Vec<Node> = nodes_msg_list.into_iter().map(Into::into).collect();
 
     if is_json {
-        Node::print_list_json(nodes);
+        Node::print_list_json(&nodes);
     } else {
-        Node::print_list(nodes);
+        Node::print_list(&nodes);
     }
 
     Ok(())
