@@ -16,6 +16,7 @@ use jsonwebtoken::{decode, errors::ErrorKind, Algorithm, DecodingKey, Validation
 use tonic::{transport::Channel, transport::Server, Response};
 // use tonic::transport::Certificate, transport::ClientTlsConfig,
 
+#[tracing::instrument]
 pub async fn run_worker(token: &str) -> R<()> {
     let mut val = Validation::new(Algorithm::HS512);
     val.validate_exp = false;
@@ -41,7 +42,7 @@ pub async fn run_worker(token: &str) -> R<()> {
     // Reusing the validation code from above just to
     // check for expiry. Not beautiful but it works.
     if !token_data.claims.skip_expiry_validation {
-        debug!("Validating expiry on join token");
+        info!("Validating expiry on join token");
         val.validate_exp = true;
         match decode::<JoinTokenClaims>(token, &DecodingKey::from_secret(&TMP_SECRET_KEY[..]), &val)
         {
@@ -53,7 +54,7 @@ pub async fn run_worker(token: &str) -> R<()> {
             }
         }
     } else {
-        debug!("Skipping expiry validation check on join token");
+        info!("Skipping expiry validation check on join token");
     }
 
     let addr = format!("{DEF_MANAGER_HOSTNAME}:4848").parse()?;
@@ -102,6 +103,7 @@ pub async fn run_worker(token: &str) -> R<()> {
     Ok(())
 }
 
+#[tracing::instrument]
 async fn create_manager_client(
     manager_addr: String,
     _ca_cert: String,
@@ -115,6 +117,7 @@ async fn create_manager_client(
     Ok(client)
 }
 
+#[tracing::instrument]
 async fn start_heartbeats(name: String, client: ManagerClient<Channel>) -> R<()> {
     let mut client_clone = client.clone();
 
@@ -122,7 +125,7 @@ async fn start_heartbeats(name: String, client: ManagerClient<Channel>) -> R<()>
         let req = tonic::Request::new(HeartbeatRequest { id: name.clone() });
 
         let response = client_clone.heartbeat(req).await?;
-        debug!("RESPONSE={:?}", response);
+        info!("RESPONSE={:?}", response);
 
         tokio::time::sleep(tokio::time::Duration::from_secs(
             WORKER_HEARTBEAT_DURATION_SEC,
@@ -131,6 +134,7 @@ async fn start_heartbeats(name: String, client: ManagerClient<Channel>) -> R<()>
     }
 }
 
+#[tracing::instrument]
 async fn start_node_checks(
     name: String,
     additional_node_checks: Vec<String>,
@@ -148,7 +152,7 @@ async fn start_node_checks(
         });
 
         let response = client_clone.health_check(req).await?;
-        debug!("RESPONSE={:?}", response);
+        info!("RESPONSE={:?}", response);
 
         tokio::time::sleep(tokio::time::Duration::from_secs(
             WORKER_NODE_CHECK_DURATION_SEC,
@@ -157,6 +161,7 @@ async fn start_node_checks(
     }
 }
 
+#[tracing::instrument]
 async fn register_self(
     client: ManagerClient<Channel>,
     name: String,
@@ -179,11 +184,12 @@ async fn register_self(
     });
 
     let response = c2.worker_register(req).await?;
-    debug!("RESPONSE={:?}", response);
+    info!("RESPONSE={:?}", response);
 
     Ok(())
 }
 
+#[tracing::instrument]
 async fn pre_register_self(
     client: ManagerClient<Channel>,
     worker_type: String,

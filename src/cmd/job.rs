@@ -35,7 +35,7 @@ async fn run_job() -> R<()> {
 
     let response = client.run_job(request).await?;
 
-    debug!("RESPONSE={:?}", response);
+    info!("RESPONSE={:?}", response);
 
     Ok(())
 }
@@ -49,7 +49,7 @@ async fn get_status() -> R<()> {
 
     let response = client.get_job_status(request).await?;
 
-    debug!("RESPONSE={:?}", response);
+    info!("RESPONSE={:?}", response);
 
     Ok(())
 }

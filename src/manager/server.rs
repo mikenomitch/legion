@@ -12,13 +12,14 @@ use crate::structs::{
 
 use tonic::{Request, Response, Status};
 
-#[allow(dead_code)]
+#[derive(Debug)]
 pub struct ManagerAgentService {
     pub store: Store,
 }
 
 #[tonic::async_trait]
 impl Manager for ManagerAgentService {
+    #[tracing::instrument]
     async fn run_job(
         &self,
         _request: Request<RunJobRequest>,
@@ -30,6 +31,7 @@ impl Manager for ManagerAgentService {
         Ok(Response::new(reply))
     }
 
+    #[tracing::instrument]
     async fn get_job_status(
         &self,
         _request: Request<GetJobStatusRequest>,
@@ -41,6 +43,7 @@ impl Manager for ManagerAgentService {
         Ok(Response::new(reply))
     }
 
+    #[tracing::instrument]
     async fn heartbeat(
         &self,
         request: Request<HeartbeatRequest>,
@@ -59,6 +62,7 @@ impl Manager for ManagerAgentService {
         Ok(Response::new(reply))
     }
 
+    #[tracing::instrument]
     async fn health_check(
         &self,
         request: Request<HealthCheckRequest>,
@@ -83,6 +87,7 @@ impl Manager for ManagerAgentService {
         Ok(Response::new(reply))
     }
 
+    #[tracing::instrument]
     async fn worker_pre_register(
         &self,
         request: Request<WorkerPreRegisterRequest>,
@@ -125,6 +130,7 @@ impl Manager for ManagerAgentService {
         Ok(Response::new(reply))
     }
 
+    #[tracing::instrument]
     async fn worker_register(
         &self,
         request: Request<WorkerRegisterRequest>,
@@ -156,6 +162,7 @@ impl Manager for ManagerAgentService {
         Ok(Response::new(reply))
     }
 
+    #[tracing::instrument]
     async fn get_nodes(
         &self,
         _request: Request<GetNodesRequest>,
@@ -173,6 +180,7 @@ impl Manager for ManagerAgentService {
         Ok(Response::new(reply))
     }
 
+    #[tracing::instrument]
     async fn get_node(
         &self,
         request: Request<GetNodeRequest>,
@@ -189,6 +197,7 @@ impl Manager for ManagerAgentService {
         Ok(Response::new(reply))
     }
 
+    #[tracing::instrument]
     async fn update_node_dynamic(
         &self,
         request: Request<UpdateNodeDynamicRequest>,

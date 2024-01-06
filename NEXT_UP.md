@@ -2,12 +2,12 @@
 
 - Better logging throughout
 
+  - Nicer error messages generally!
   - Use tracing library + logging + appender + futures
   - Eventually add otel, but not yet
   - Debug statements to track things
-  - Nicer error messages generally
   - Go thru each command
-  - Think about how to dry it up
+  - Think about how to dry it up (if needed?)
 
 - Nice errors in CLI commands for various failures
 

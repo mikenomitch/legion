@@ -27,7 +27,7 @@ fn cli() -> Command {
 
 #[tokio::main]
 async fn main() -> R<()> {
-    env_logger::init();
+    tracing_subscriber::fmt::init();
 
     let matches = cli().get_matches();
     match matches.subcommand() {
@@ -42,7 +42,7 @@ async fn main() -> R<()> {
                 .into_iter()
                 .flatten()
                 .collect::<Vec<_>>();
-            debug!("Calling to {ext:?} with {args:?}");
+            info!("Calling to {ext:?} with {args:?}");
         }
         _ => unreachable!(),
     };
