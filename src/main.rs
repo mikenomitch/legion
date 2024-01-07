@@ -5,10 +5,12 @@ mod manager;
 mod prelude;
 mod storage;
 mod structs;
+mod tracing_util;
 mod util;
 mod worker;
 
 use crate::prelude::*;
+use crate::tracing_util::init_tracing;
 
 use std::ffi::OsString;
 
@@ -27,7 +29,7 @@ fn cli() -> Command {
 
 #[tokio::main]
 async fn main() -> R<()> {
-    tracing_subscriber::fmt::init();
+    init_tracing()?;
 
     let matches = cli().get_matches();
     match matches.subcommand() {

@@ -7,7 +7,7 @@ use tonic::{Request, Response, Status};
 pub struct WorkerAgentService {}
 #[tonic::async_trait]
 impl Worker for WorkerAgentService {
-    #[tracing::instrument]
+    #[instrument(err, skip_all)]
     async fn post_work(
         &self,
         request: Request<PostWorkRequest>,

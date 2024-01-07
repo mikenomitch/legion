@@ -16,6 +16,7 @@ use sysinfo::{CpuExt, DiskExt, NetworkExt, System, SystemExt};
 // https://michael-f-bryan.github.io/rust-ffi-guide/dynamic_loading.html
 // https://crates.io/crates/sysinfo
 
+#[instrument(skip_all)]
 pub fn fingerprint_node(additional_node_checks: Vec<String>) -> Map<String, Value> {
     let fps: Vec<Box<dyn NodeChecker>> = vec![
         Box::new(ArchNodeChecker {}),
@@ -44,6 +45,7 @@ pub fn fingerprint_node(additional_node_checks: Vec<String>) -> Map<String, Valu
     ret
 }
 
+#[instrument(skip_all)]
 pub fn run_health_checks(additional_node_checks: Vec<String>) -> Map<String, Value> {
     let fps: Vec<Box<dyn NodeChecker>> = vec![Box::new(DiskChecker {})];
 
@@ -61,7 +63,7 @@ pub fn run_health_checks(additional_node_checks: Vec<String>) -> Map<String, Val
                 ret.extend(fp.health_check());
             }
             Err(e) => {
-                println!("Error loading fingerprinter: {e}");
+                error!("Error loading fingerprinter: {e}");
             }
         });
 
@@ -75,6 +77,7 @@ fn fp_plugin_name_to_path(name: &String) -> String {
     )
 }
 
+#[instrument(err, skip_all)]
 fn call_dynamic(path: &str) -> R<Box<dyn NodeChecker>> {
     unsafe {
         let lib = Library::new(path)?;

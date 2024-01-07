@@ -33,7 +33,9 @@ humantime = "2.1.0"
 serde_rusqlite = "0.34.0"
 rand = "0.8.5"
 tracing = "0.1.40"
-tracing-subscriber = "0.3.18"
+tracing-subscriber = { version = "0.3.18", features = ["json", "env-filter"] }
+tracing-futures = "0.2.5"
+tracing-appender = "0.2.3"
 
 [build-dependencies]
 tonic-build = "0.8"

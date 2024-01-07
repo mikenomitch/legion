@@ -26,6 +26,7 @@ pub async fn handle(sub_matches: &clap::ArgMatches) -> R<()> {
     }
 }
 
+#[instrument(err, skip_all)]
 async fn run_job() -> R<()> {
     let mut client = ManagerClient::connect(DEF_MANAGER_ADDRESS).await?;
 
@@ -40,6 +41,7 @@ async fn run_job() -> R<()> {
     Ok(())
 }
 
+#[instrument(err, skip_all)]
 async fn get_status() -> R<()> {
     let mut client = ManagerClient::connect(DEF_MANAGER_ADDRESS).await?;
 

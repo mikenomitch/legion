@@ -14,7 +14,7 @@ use std::fs;
 use std::str::FromStr;
 use tonic::transport::{Identity, Server, ServerTlsConfig};
 
-#[tracing::instrument]
+#[instrument(err, skip_all)]
 pub async fn run_manager(config: ManagerConfig) -> R<()> {
     let full_config = config.with_defaults();
     let store = Store::start_storage(&full_config)?;
@@ -59,7 +59,7 @@ pub async fn run_manager(config: ManagerConfig) -> R<()> {
     Ok(())
 }
 
-#[tracing::instrument]
+#[instrument(err, skip_all)]
 async fn start_node_status_checker(store: Store, check_seconds: u64) -> R<()> {
     loop {
         let node_ids_to_update = store
@@ -82,6 +82,7 @@ async fn start_node_status_checker(store: Store, check_seconds: u64) -> R<()> {
     }
 }
 
+#[instrument(err, skip_all)]
 fn parse_worker_config(config_path: &str) -> R<WorkerConfigAlt> {
     // Pluginify jsonnet
     let mut vm = JsonnetVm::new();
@@ -101,7 +102,7 @@ fn parse_worker_config(config_path: &str) -> R<WorkerConfigAlt> {
     }
 }
 
-#[tracing::instrument]
+#[instrument(err, skip_all)]
 async fn load_initial_data(store: &Store, config: &ManagerConfig) -> R<()> {
     let worker_conf_path = config.with_defaults().worker_config_path.clone();
     let sub_paths = fs::read_dir(worker_conf_path)?;

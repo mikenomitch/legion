@@ -3,8 +3,6 @@
 - Better logging throughout
 
   - Nicer error messages generally!
-  - Use tracing library + logging + appender + futures
-  - Eventually add otel, but not yet
   - Debug statements to track things
   - Go thru each command
   - Think about how to dry it up (if needed?)
@@ -37,6 +35,8 @@
 - Any other plugins? (Storage maybe?)
 - Automated testing in CI (timebox this)
 - Common Rust crates (errors? anyhow?)
+
+- Add otel tracing properly
 
 - DRY up
 

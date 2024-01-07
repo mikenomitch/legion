@@ -40,6 +40,7 @@ pub fn config() -> Command {
         .subcommand(node_info_cmd)
 }
 
+#[instrument(err, skip_all)]
 pub async fn handle(sub_matches: &clap::ArgMatches) -> R<()> {
     match sub_matches.subcommand() {
         Some(("list", arg_matches)) => {
@@ -95,6 +96,7 @@ pub async fn handle(sub_matches: &clap::ArgMatches) -> R<()> {
     }
 }
 
+#[instrument(err, skip_all)]
 async fn get_nodes(is_json: bool) -> R<()> {
     let mut client = ManagerClient::connect(DEF_MANAGER_ADDRESS).await?;
     let request = tonic::Request::new(GetNodesRequest {});
@@ -111,6 +113,7 @@ async fn get_nodes(is_json: bool) -> R<()> {
     Ok(())
 }
 
+#[instrument(err, skip_all)]
 async fn update_node(node_id: String, dynamic_diff: Map<String, Value>, is_json: bool) -> R<()> {
     let mut client = ManagerClient::connect(DEF_MANAGER_ADDRESS).await?;
 
@@ -137,6 +140,7 @@ async fn update_node(node_id: String, dynamic_diff: Map<String, Value>, is_json:
     Ok(())
 }
 
+#[instrument(err, skip_all)]
 async fn get_node_info(node_id: String, is_json: bool) -> R<()> {
     let mut client = ManagerClient::connect(DEF_MANAGER_ADDRESS).await?;
     let request = tonic::Request::new(GetNodeRequest { id: node_id });

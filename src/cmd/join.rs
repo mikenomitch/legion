@@ -7,6 +7,7 @@ pub fn config() -> Command {
         .arg(arg!(token: [TOKEN]))
 }
 
+#[instrument(err, skip_all)]
 pub async fn handle(arg_matches: &clap::ArgMatches) -> R<()> {
     let token = arg_matches
         .get_one::<String>("token")

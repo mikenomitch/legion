@@ -26,7 +26,7 @@ pub const CONN_LOCK_ERROR: &str = "Error locking database connection";
 
 // NOTE: This will become a general interface for all storage backends
 impl Store {
-    #[tracing::instrument]
+    #[instrument(err, skip_all)]
     pub fn start_storage(config: &ManagerConfigFull) -> R<Store> {
         info!("Starting store");
         let conn = Store::create_memsafe_conn(&config.store_path)?;
@@ -36,7 +36,7 @@ impl Store {
         Ok(store)
     }
 
-    #[tracing::instrument]
+    #[instrument(err, skip_all)]
     fn create_memsafe_conn(store_path: &str) -> R<MemSafeConn> {
         // let conn = Connection::open_in_memory()?;
 
@@ -51,7 +51,7 @@ impl Store {
         Ok(Arc::new(Mutex::new(conn)))
     }
 
-    #[tracing::instrument]
+    #[instrument(err, skip_all)]
     fn create_initial_tables(conn: &MemSafeConn) -> R<()> {
         let migrations = Migrations::new(vec![
             M::up(
@@ -91,7 +91,7 @@ impl Store {
     // NODES
     // ========================================
 
-    #[tracing::instrument]
+    #[instrument(err, skip_all)]
     pub fn get_node(&self, id: &str) -> R<Node> {
         info!("In get node yay");
         let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
@@ -122,7 +122,7 @@ impl Store {
         Ok(node)
     }
 
-    #[tracing::instrument]
+    #[instrument(err, skip_all)]
     pub fn get_nodes(&self) -> R<Vec<Node>> {
         let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
         let sql = r#"
@@ -154,7 +154,7 @@ FROM node;
         Ok(nodes)
     }
 
-    #[tracing::instrument]
+    #[instrument(err, skip_all)]
     pub fn get_node_ids_and_heartbeats(&self) -> R<Vec<(String, String)>> {
         let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
         let mut stmt = conn.prepare("SELECT id, last_heartbeat FROM node")?;
@@ -169,7 +169,7 @@ FROM node;
         Ok(nodes_id_and_hb)
     }
 
-    #[tracing::instrument]
+    #[instrument(err, skip_all)]
     pub fn mark_nodes_as_lost(&self, ids: &[String]) -> R<()> {
         let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
         let sql = r#"
@@ -183,7 +183,7 @@ FROM node;
         Ok(())
     }
 
-    #[tracing::instrument]
+    #[instrument(err, skip_all)]
     pub fn insert_node(&self, node: NodeMsg) -> R<Node> {
         let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
         let sql = r#"
@@ -215,7 +215,7 @@ FROM node;
         Ok(node)
     }
 
-    #[tracing::instrument]
+    #[instrument(err, skip_all)]
     pub fn update_node_dyamic(&self, id: &str, dynamic_diff: &Map<String, Value>) -> R<Node> {
         let node = self.get_node(id)?;
         let default_map = Map::new();
@@ -228,8 +228,6 @@ FROM node;
 
         res.extend(dynamic_diff.clone());
         let res_as_string = to_string(&res).map_err(|e| e.to_string())?;
-
-        println!("res_as_string: {res_as_string}");
 
         let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
         let sql = r#"
@@ -261,7 +259,7 @@ FROM node;
         Ok(node)
     }
 
-    #[tracing::instrument]
+    #[instrument(err, skip_all)]
     pub fn update_node_heartbeat(&self, id: String) -> R<()> {
         let fmt = format_description!(
             "[year]-[month]-[day] [hour]:[minute]:[second] [offset_hour \
@@ -291,7 +289,7 @@ FROM node;
         Ok(())
     }
 
-    #[tracing::instrument]
+    #[instrument(err, skip_all)]
     pub fn update_node_health_checks(&self, id: &str, health_checks: &str) -> R<()> {
         let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
         let sql = r#"
@@ -310,7 +308,7 @@ FROM node;
         Ok(())
     }
 
-    #[tracing::instrument]
+    #[instrument(err, skip_all)]
     pub fn get_worker_type(&self, name: String) -> R<WorkerConfig> {
         let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
         let sql = "SELECT name, pool, additional_node_checks, attributes, name_prefix FROM worker_type WHERE name = ?";
@@ -341,7 +339,7 @@ FROM node;
         Ok(config)
     }
 
-    #[tracing::instrument]
+    #[instrument(err, skip_all)]
     pub fn insert_worker_type(&self, config: &WorkerConfig) -> R<WorkerConfig> {
         let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
 

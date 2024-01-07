@@ -1,0 +1,1 @@
+{"timestamp":"2024-01-07T05:10:05.670218Z","level":"ERROR","fields":{"error":"Invalid attribute: foobar - must be of format KEY=VALUE"},"target":"legion::cmd::node"}

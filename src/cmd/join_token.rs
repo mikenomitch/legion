@@ -11,6 +11,7 @@ pub fn config() -> Command {
         .arg(arg!(--ttl [TTL] "ttl of join token in seconds. 0 means infinite. Server adds 1 minute leeway"))
 }
 
+#[instrument(err, skip_all)]
 pub async fn handle(sub_matches: &clap::ArgMatches) -> Result<(), Box<dyn error::Error>> {
     let ttl = sub_matches
         .get_one::<String>("ttl")

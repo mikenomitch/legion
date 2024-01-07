@@ -16,7 +16,7 @@ use jsonwebtoken::{decode, errors::ErrorKind, Algorithm, DecodingKey, Validation
 use tonic::{transport::Channel, transport::Server, Response};
 // use tonic::transport::Certificate, transport::ClientTlsConfig,
 
-#[tracing::instrument]
+#[instrument(err, skip_all)]
 pub async fn run_worker(token: &str) -> R<()> {
     let mut val = Validation::new(Algorithm::HS512);
     val.validate_exp = false;
@@ -103,7 +103,7 @@ pub async fn run_worker(token: &str) -> R<()> {
     Ok(())
 }
 
-#[tracing::instrument]
+#[instrument(err, skip_all)]
 async fn create_manager_client(
     manager_addr: String,
     _ca_cert: String,
@@ -117,7 +117,7 @@ async fn create_manager_client(
     Ok(client)
 }
 
-#[tracing::instrument]
+#[instrument(err, skip_all)]
 async fn start_heartbeats(name: String, client: ManagerClient<Channel>) -> R<()> {
     let mut client_clone = client.clone();
 
@@ -134,7 +134,7 @@ async fn start_heartbeats(name: String, client: ManagerClient<Channel>) -> R<()>
     }
 }
 
-#[tracing::instrument]
+#[instrument(err, skip_all)]
 async fn start_node_checks(
     name: String,
     additional_node_checks: Vec<String>,
@@ -161,7 +161,7 @@ async fn start_node_checks(
     }
 }
 
-#[tracing::instrument]
+#[instrument(err, skip_all)]
 async fn register_self(
     client: ManagerClient<Channel>,
     name: String,
@@ -189,7 +189,7 @@ async fn register_self(
     Ok(())
 }
 
-#[tracing::instrument]
+#[instrument(err, skip_all)]
 async fn pre_register_self(
     client: ManagerClient<Channel>,
     worker_type: String,
