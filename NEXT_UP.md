@@ -1,11 +1,20 @@
 # Next Up
 
-- Better logging throughout
+- First party resource stuff + ledger? (start w/ allocs?)
 
-  - Nicer error messages generally!
-  - Debug statements to track things
-  - Go thru each command
-  - Think about how to dry it up (if needed?)
+  - I submit a "job" and it places on a node
+  - I keep submitting jobs and they stop placing if resources run out
+  - I can remove a job and it frees up resources
+
+  - Plugin system for this
+    - resources are just a special type of attr
+    - tracked by the manager (not by the node itself)
+    - Where do I set max_allocs?? (for an instance of a resouce)
+      - I can add some constraint to the whole cluster?
+        - I add a resource plugin to the cluster. It looks at attributes and then treats them as resource I can schedule on?
+      - At the node level, I just have an attr of some sort.
+
+# Other shovel ready work
 
 - Nice errors in CLI commands for various failures
 
@@ -23,11 +32,9 @@
 
 - Think about your file setup (names/org/dupes)
 
-  - Perhaps split out agent code into own files
   - Split out NodeChecks into own single file then keep
     node check logic together in one
   - Where structs get their definition
-  - Extract util functions
   - Audit all files
 
 - Write some integration tests
@@ -40,8 +47,6 @@
 
 - DRY up
 
-  - storage
-  - grpc servers
   - Error handling
 
 - Worker configs CRUD commands
@@ -49,20 +54,6 @@
   - I guess for this to really work, you would need to update any of this type
     that already exist (and send them the info)
   - Which means that nodes should save a reference to their type
-
-- First party resource stuff + ledger? (start w/ allocs?)
-
-  - I submit a job and it places on a node
-  - I keep submitting jobs and they stop placing if resources run out
-  - I can remove a job and it frees up resources
-
-  - Plugin system for this
-    - resources are just a special type of attr
-    - tracked by the manager (not by the node itself)
-    - Where do I set max_allocs?? (for an instance of a resouce)
-      - I can add some constraint to the whole cluster?
-        - I add a resource plugin to the cluster. It looks at attributes and then treats them as resource I can schedule on?
-      - At the node level, I just have an attr of some sort.
 
 - Fix the join-token and pre-register call destinations
 

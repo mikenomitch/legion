@@ -50,9 +50,6 @@ fn parse_config(config_path: &str) -> R<ManagerConfig> {
             let config: ManagerConfig = serde_json::from_str(&s)?;
             Ok(config)
         }
-        Err(e) => {
-            println!("{}", e.as_str());
-            Err("Failed to parse config file".into())
-        }
+        Err(e) => Err(format!("Failed to parse config file: {}", e.to_string()).into()),
     }
 }

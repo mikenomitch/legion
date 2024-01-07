@@ -2,7 +2,7 @@ use crate::prelude::*;
 
 use crate::structs::{ManagerConfigFull, Node, NodeMsg, WorkerConfig};
 
-use rusqlite::{named_params, Connection};
+use rusqlite::{named_params, Connection, Row};
 use rusqlite_migration::{Migrations, M};
 use serde_json::to_string;
 use serde_rusqlite::to_params_named;
@@ -81,7 +81,9 @@ impl Store {
         ]);
 
         let mut conn = conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
+        info!("Pragma update");
         conn.pragma_update(None, "journal_mode", "WAL")?;
+        info!("Running migrations");
         migrations.to_latest(&mut conn)?;
 
         Ok(())
@@ -91,9 +93,24 @@ impl Store {
     // NODES
     // ========================================
 
+    fn node_from_row(&self, row: &Row<'_>) -> Result<Node, rusqlite::Error> {
+        let node = Node {
+            id: row.get(0)?,
+            pool: row.get(1)?,
+            status: row.get(2)?,
+            availability: row.get(3)?,
+            config_attrs: row.get(4)?,
+            fingerprint_attrs: row.get(5)?,
+            dynamic_attrs: row.get(6)?,
+            health_checks: row.get(7)?,
+            last_heartbeat: row.get(8)?,
+        };
+
+        Ok(node)
+    }
+
     #[instrument(err, skip_all)]
     pub fn get_node(&self, id: &str) -> R<Node> {
-        info!("In get node yay");
         let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
 
         let sql = r#"
@@ -101,24 +118,8 @@ impl Store {
         FROM node
         WHERE id = ?;
 "#;
+        let node = conn.query_row(sql, [id], |row| self.node_from_row(row))?;
 
-        let node = conn.query_row(sql, [id], |row| {
-            let node = Node {
-                id: row.get(0)?,
-                pool: row.get(1)?,
-                status: row.get(2)?,
-                availability: row.get(3)?,
-                config_attrs: row.get(4)?,
-                fingerprint_attrs: row.get(5)?,
-                dynamic_attrs: row.get(6)?,
-                health_checks: row.get(7)?,
-                last_heartbeat: row.get(8)?,
-            };
-
-            Ok(node)
-        })?;
-
-        info!("leaving get node");
         Ok(node)
     }
 
@@ -131,20 +132,7 @@ FROM node;
 "#;
 
         let mut stmt = conn.prepare(sql)?;
-        let node_iter = stmt.query_map([], |row| {
-            Ok(Node {
-                id: row.get(0)?,
-                pool: row.get(1)?,
-                status: row.get(2)?,
-                availability: row.get(3)?,
-                config_attrs: row.get(4)?,
-                fingerprint_attrs: row.get(5)?,
-                dynamic_attrs: row.get(6)?,
-                health_checks: row.get(7)?,
-                last_heartbeat: row.get(8)?,
-            })
-        })?;
-
+        let node_iter = stmt.query_map([], |row| self.node_from_row(row))?;
         let mut nodes = Vec::new();
         for node in node_iter {
             let n = node?;
@@ -199,17 +187,7 @@ FROM node;
         // way around it is to just use the node message when using
         // to_params_named, as its already a string
         let node = conn.query_row(sql, to_params_named(node)?.to_slice().as_slice(), |row| {
-            Ok(Node {
-                id: row.get(0)?,
-                pool: row.get(1)?,
-                status: row.get(2)?,
-                availability: row.get(3)?,
-                config_attrs: row.get(4)?,
-                fingerprint_attrs: row.get(5)?,
-                dynamic_attrs: row.get(6)?,
-                health_checks: row.get(7)?,
-                last_heartbeat: row.get(8)?,
-            })
+            self.node_from_row(row)
         })?;
 
         Ok(node)
@@ -242,19 +220,7 @@ FROM node;
             ":dynamic_attrs": res_as_string,
         };
 
-        let node = conn.query_row(sql, params, |row| {
-            Ok(Node {
-                id: row.get(0)?,
-                pool: row.get(1)?,
-                status: row.get(2)?,
-                availability: row.get(3)?,
-                config_attrs: row.get(4)?,
-                fingerprint_attrs: row.get(5)?,
-                dynamic_attrs: row.get(6)?,
-                health_checks: row.get(7)?,
-                last_heartbeat: row.get(8)?,
-            })
-        })?;
+        let node = conn.query_row(sql, params, |row| self.node_from_row(row))?;
 
         Ok(node)
     }
@@ -315,10 +281,8 @@ FROM node;
 
         let config = conn.query_row(sql, [name], |row| {
             let af: String = row.get(2)?;
-
             let attrs: String = row.get(3)?;
             let parsed_attrs = serde_json::from_str(&attrs).unwrap();
-
             let node_checks: Vec<String> = if af.is_empty() {
                 vec![]
             } else {

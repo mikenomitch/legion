@@ -16,6 +16,8 @@ use tonic::transport::{Identity, Server, ServerTlsConfig};
 
 #[instrument(err, skip_all)]
 pub async fn run_manager(config: ManagerConfig) -> R<()> {
+    info!("Starting manager node");
+
     let full_config = config.with_defaults();
     let store = Store::start_storage(&full_config)?;
     load_initial_data(&store, &config).await?;
@@ -61,15 +63,24 @@ pub async fn run_manager(config: ManagerConfig) -> R<()> {
 
 #[instrument(err, skip_all)]
 async fn start_node_status_checker(store: Store, check_seconds: u64) -> R<()> {
+    info!("Beginning node status checker loop");
     loop {
         let node_ids_to_update = store
             .get_node_ids_and_heartbeats()?
             .into_iter()
             .filter(
-                |(_id, heartbeat)| match Node::last_heartbeat_too_slow(heartbeat) {
-                    Ok(too_slow) => too_slow,
+                |(id, heartbeat)| match Node::last_heartbeat_too_slow(heartbeat) {
+                    Ok(too_slow) => {
+                        if too_slow {
+                            warn!("Node {} heartbeat too slow - marking as lost", id);
+                        }
+                        too_slow
+                    }
                     Err(e) => {
-                        warn!("Error checking heartbeat - marking lost: {:?}", e);
+                        warn!(
+                            "Error checking heartbeat - marking node {} lost: {:?}",
+                            id, e
+                        );
                         true
                     }
                 },

@@ -12,7 +12,7 @@ use crate::worker::{
 };
 
 use futures::join;
-use jsonwebtoken::{decode, errors::ErrorKind, Algorithm, DecodingKey, Validation};
+use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 use tonic::{transport::Channel, transport::Server, Response};
 // use tonic::transport::Certificate, transport::ClientTlsConfig,
 
@@ -21,38 +21,15 @@ pub async fn run_worker(token: &str) -> R<()> {
     let mut val = Validation::new(Algorithm::HS512);
     val.validate_exp = false;
 
-    let token_data = match decode::<JoinTokenClaims>(
-        token,
-        &DecodingKey::from_secret(&TMP_SECRET_KEY[..]),
-        &val,
-    ) {
-        Ok(c) => c,
-        Err(err) => {
-            // print error message
-            println!("Error: {err}");
-
-            // TODO: Return a nicer error to the CLI instead of a panic
-            match *err.kind() {
-                ErrorKind::InvalidToken => panic!(), // Example on how to handle a specific error
-                _ => panic!(),
-            }
-        }
-    };
+    let token_data =
+        decode::<JoinTokenClaims>(token, &DecodingKey::from_secret(&TMP_SECRET_KEY[..]), &val)?;
 
     // Reusing the validation code from above just to
     // check for expiry. Not beautiful but it works.
     if !token_data.claims.skip_expiry_validation {
         info!("Validating expiry on join token");
         val.validate_exp = true;
-        match decode::<JoinTokenClaims>(token, &DecodingKey::from_secret(&TMP_SECRET_KEY[..]), &val)
-        {
-            Ok(_c) => (),
-            Err(err) => {
-                // TODO: Return a nicer error to the CLI instead of a panic
-                error!("Error: {}", err);
-                panic!()
-            }
-        }
+        decode::<JoinTokenClaims>(token, &DecodingKey::from_secret(&TMP_SECRET_KEY[..]), &val)?;
     } else {
         info!("Skipping expiry validation check on join token");
     }

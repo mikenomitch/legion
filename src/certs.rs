@@ -140,7 +140,7 @@ mod tests {
                 // assert_eq!(cert.is_ca(), IsCa::Ca(BasicConstraints::Unconstrained));
             }
             Err(e) => {
-                println!("Error: {e}");
+                error!("Error: {e}");
                 assert!(false);
             }
         }

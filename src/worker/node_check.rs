@@ -38,7 +38,7 @@ pub fn fingerprint_node(additional_node_checks: Vec<String>) -> Map<String, Valu
                 ret.extend(fp.fingerprint());
             }
             Err(e) => {
-                println!("Error loading fingerprinter: {e}");
+                warn!("Error loading fingerprinter at path {path}, {e}");
             }
         });
 
