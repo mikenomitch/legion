@@ -1,14 +1,19 @@
 use crate::prelude::*;
 
 use crate::structs::manager_client::ManagerClient;
-use crate::structs::{GetJobStatusRequest, RunJobRequest};
+use crate::structs::{GetJobStatusRequest, ListJobsRequest, RunJobRequest};
+use jsonnet::JsonnetVm;
 
 pub fn config() -> Command {
     let job_run_cmd = Command::new("run")
         .about("Run a job")
         .arg(arg!(path: [PATH]));
 
-    let job_status_cmd = Command::new("status").about("Get job status");
+    let job_status_cmd = Command::new("status")
+        .about("Get job status")
+        .arg(arg!(name: [NAME]));
+
+    let job_list_cmd = Command::new("list").about("List all jobs");
 
     Command::new("job")
         .about("Interact with jobs")
@@ -16,27 +21,73 @@ pub fn config() -> Command {
         .arg_required_else_help(true)
         .subcommand(job_run_cmd)
         .subcommand(job_status_cmd)
+        .subcommand(job_list_cmd)
 }
 
 pub async fn handle(sub_matches: &clap::ArgMatches) -> R<()> {
     match sub_matches.subcommand() {
-        Some(("run", _)) => run_job().await,
+        Some(("run", matches)) => run_job(matches).await,
+        Some(("list", _)) => list_jobs().await,
         Some(("status", _)) => get_status().await,
         _ => unreachable!(),
     }
 }
 
 #[instrument(err, skip_all)]
-async fn run_job() -> R<()> {
+async fn run_job(arg_matches: &clap::ArgMatches) -> R<()> {
     let mut client = ManagerClient::connect(DEF_MANAGER_ADDRESS).await?;
 
+    let job_path = arg_matches
+        .get_one::<String>("path")
+        .map_or("./configs/jobs/demo.jsonnet", String::as_str);
+
+    let mut vm = JsonnetVm::new();
+
+    // let mut import_file_paths: Vec<&str> = vec![];
+
+    vm.import_callback(|_vm, base, rel| {
+        // println!("IMPORT: base={:?}, rel={:?}", base, rel);
+        let path = std::path::Path::new(base).join(rel);
+        let path_str = path.to_str().unwrap();
+        // println!("PATH={:?}", path_str);
+        let contents = std::fs::read_to_string(&path).unwrap();
+        // println!("RAW_CONTENT={:?}", contents);
+        Ok((base.into(), contents.to_string()))
+    });
+
+    let res = vm.evaluate_file(job_path);
+
+    match res {
+        Ok(s) => {
+            println!("JORB={:?}", s);
+        }
+        Err(e) => {
+            error!("{}", e);
+        }
+    }
+
+    // let config: JobConfig = serde_json::from_str(&res)?;
+
     let request = tonic::Request::new(RunJobRequest {
-        name: "Mike".into(),
+        parsed_jobspec: "Mike".into(),
+        submissions: vec![],
     });
 
     let response = client.run_job(request).await?;
 
-    info!("RESPONSE={:?}", response);
+    println!("RESPONSE={:?}", response);
+
+    Ok(())
+}
+
+#[instrument(err, skip_all)]
+async fn list_jobs() -> R<()> {
+    let mut client = ManagerClient::connect(DEF_MANAGER_ADDRESS).await?;
+
+    let request = tonic::Request::new(ListJobsRequest {});
+    let response = client.list_jobs(request).await?;
+
+    println!("RESPONSE={:?}", response);
 
     Ok(())
 }
@@ -51,7 +102,7 @@ async fn get_status() -> R<()> {
 
     let response = client.get_job_status(request).await?;
 
-    info!("RESPONSE={:?}", response);
+    println!("RESPONSE={:?}", response);
 
     Ok(())
 }

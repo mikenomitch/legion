@@ -51,7 +51,7 @@ impl Store {
         Ok(Arc::new(Mutex::new(conn)))
     }
 
-    #[instrument(err, skip_all)]
+    #[instrument(skip_all)]
     fn create_initial_tables(conn: &MemSafeConn) -> R<()> {
         let migrations = Migrations::new(vec![
             M::up(
@@ -78,6 +78,41 @@ impl Store {
             )",
             )
             .down("DROP TABLE worker_type;"),
+            M::up(
+                "CREATE TABLE IF NOT EXISTS job (
+                id STRING PRIMARY KEY,
+                name STRING NOT NULL,
+                type STRING NOT NULL,
+                meta JSONB NOT NULL,
+                version INTEGER NOT NULL,
+                created_at TIMESTAMP NOT NULL
+            )",
+            )
+            .down("DROP TABLE job;"),
+            M::up(
+                "CREATE TABLE IF NOT EXISTS submisson (
+                id STRING PRIMARY KEY,
+                text TEXT NOT NULL,
+                job_id STRING NOT NULL,
+                FOREIGN KEY(job_id) REFERENCES job(id)
+            )",
+            )
+            .down("DROP TABLE submisson;"),
+            M::up(
+                "CREATE TABLE IF NOT EXISTS task (
+                id STRING PRIMARY KEY,
+                name STRING NOT NULL,
+                status STRING NOT NULL,
+                driver STRING NOT NULL,
+                config JSONB NOT NULL,
+                resources JSONB NOT NULL,
+                constraints JSONB NOT NULL,
+                created_at TIMESTAMP NOT NULL,
+                job_id STRING NOT NULL,
+                FOREIGN KEY(job_id) REFERENCES job(id)
+            )",
+            )
+            .down("DROP TABLE task;"),
         ]);
 
         let mut conn = conn.lock().map_err(|_| CONN_LOCK_ERROR)?;

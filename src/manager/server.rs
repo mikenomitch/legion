@@ -5,9 +5,9 @@ use crate::structs::manager_server::Manager;
 use crate::structs::{
     GetJobStatusReply, GetJobStatusRequest, GetNodeReply, GetNodeRequest, GetNodesReply,
     GetNodesRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest,
-    NodeMsg, RunJobReply, RunJobRequest, UpdateNodeDynamicReply, UpdateNodeDynamicRequest,
-    WorkerConfig, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply,
-    WorkerRegisterRequest,
+    ListJobsReply, ListJobsRequest, NodeMsg, RunJobReply, RunJobRequest, UpdateNodeDynamicReply,
+    UpdateNodeDynamicRequest, WorkerConfig, WorkerPreRegisterReply, WorkerPreRegisterRequest,
+    WorkerRegisterReply, WorkerRegisterRequest,
 };
 
 use tonic::{Request, Response, Status};
@@ -39,6 +39,16 @@ impl Manager for ManagerAgentService {
         let reply = GetJobStatusReply {
             message: "Hello status!".into(),
         };
+
+        Ok(Response::new(reply))
+    }
+
+    #[instrument(skip_all)]
+    async fn list_jobs(
+        &self,
+        _request: Request<ListJobsRequest>,
+    ) -> Result<Response<ListJobsReply>, Status> {
+        let reply = ListJobsReply { jobs: vec![] };
 
         Ok(Response::new(reply))
     }

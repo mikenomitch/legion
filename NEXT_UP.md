@@ -1,5 +1,29 @@
 # Next Up
 
+- In run_job, parse the jobspec using jsonnet
+- Pass it to the server
+- Save the jobspec in SQL
+- Get a list of jobspecs
+- Get info on a single jobspec
+- Submit all the jsonnet submissions alongside the jobspec
+  - Maybe you can do the importst first and then just send
+    a single file?
+- Save these submissions in the DB
+- You can get submissions for a job with a new CLI endpoint
+- On job submit, tasks are created in the DB for the job
+  - You can view tasks as part of the job info CLI
+- On job submit, tasks a _syncronously_ placed onto nodes
+
+  - Add allocations table in the DB
+  - A ledger is kept of all the node resources and whats on the nodes
+  - A "topology"-like CLI command can be used to view the whole ledger
+    (perhaps just called "ledger"?)
+  - Initially you can go over the resources
+  - If you don't have enough resources on submit, the job
+    command fails and tells you why!
+  - Then figure out how to make it an async loop
+  - Then respond to node changes!
+
 - First party resource stuff + ledger? (start w/ allocs?)
 
   - I submit a "job" and it places on a node
@@ -16,7 +40,7 @@
 
 # Other shovel ready work
 
-- Nice errors in CLI commands for various failures
+- Nicer errors in CLI commands for various failures
 
   - Join token errors for instance (see To Dos)
   - Start with bad join token

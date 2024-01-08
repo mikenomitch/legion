@@ -22,7 +22,7 @@ pub fn config() -> Command {
         .subcommand(worker_cmd)
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 pub async fn handle(sub_matches: &clap::ArgMatches) -> R<()> {
     if let Some(("worker", arg_matches)) = sub_matches.subcommand() {
         let token = arg_matches
@@ -39,7 +39,7 @@ pub async fn handle(sub_matches: &clap::ArgMatches) -> R<()> {
     }
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 fn parse_config(config_path: &str) -> R<ManagerConfig> {
     // Pluginify jsonnet
     let mut vm = JsonnetVm::new();
