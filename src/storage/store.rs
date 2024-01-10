@@ -1,6 +1,6 @@
 use crate::prelude::*;
 
-use crate::structs::{ManagerConfigFull, Node, NodeMsg, WorkerConfig};
+use crate::structs::{JobConfig, ManagerConfigFull, Node, NodeMsg, TaskConfig, WorkerConfig};
 
 use rusqlite::{named_params, Connection, Row};
 use rusqlite_migration::{Migrations, M};
@@ -124,9 +124,9 @@ impl Store {
         Ok(())
     }
 
-    // ========================================
+    //
     // NODES
-    // ========================================
+    //
 
     fn node_from_row(&self, row: &Row<'_>) -> Result<Node, rusqlite::Error> {
         let node = Node {
@@ -308,6 +308,66 @@ FROM node;
 
         Ok(())
     }
+
+    //
+    // JOBS
+    //
+
+    #[instrument(err, skip_all)]
+    pub fn insert_job(&self, config: &JobConfig) -> R<JobConfig> {
+        let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
+
+        let sql = r#"
+INSERT INTO job (id, name, type, meta, version, created_at)
+VALUES (:id, :name, :type, :meta, :version, :created_at)
+RETURNING id, name, type, meta, version, created_at;
+"#;
+
+        let now = time::OffsetDateTime::now_utc();
+        let params = named_params! {
+            ":id": config.name,
+            ":name": config.name,
+            ":type": "default",
+            ":meta": "{}",
+            ":version": 0,
+            ":created_at": now,
+        };
+
+        let config = conn.query_row(sql, params, |row| {
+            let tasks = HashMap::new();
+            Ok(JobConfig {
+                name: row.get(0)?,
+                tasks: tasks,
+            })
+        })?;
+
+        Ok(config)
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn get_job(&self, name: &str) -> R<JobConfig> {
+        let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
+
+        let sql = r#"
+SELECT id, name, type, meta, version, created_at
+FROM job
+WHERE name = ?;
+"#;
+
+        let config = conn.query_row(sql, [name], |row| {
+            let tasks = HashMap::new();
+            Ok(JobConfig {
+                name: row.get(1)?,
+                tasks: tasks,
+            })
+        })?;
+
+        Ok(config)
+    }
+
+    //
+    // WORKER TYPES
+    //
 
     #[instrument(err, skip_all)]
     pub fn get_worker_type(&self, name: String) -> R<WorkerConfig> {

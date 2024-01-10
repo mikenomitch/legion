@@ -28,7 +28,7 @@ pub async fn handle(sub_matches: &clap::ArgMatches) -> R<()> {
     match sub_matches.subcommand() {
         Some(("run", matches)) => run_job(matches).await,
         Some(("list", _)) => list_jobs().await,
-        Some(("status", _)) => get_status().await,
+        Some(("status", matches)) => get_status(matches).await,
         _ => unreachable!(),
     }
 }
@@ -44,11 +44,10 @@ async fn run_job(arg_matches: &clap::ArgMatches) -> R<()> {
     let mut vm = JsonnetVm::new();
 
     // let mut import_file_paths: Vec<&str> = vec![];
-
     vm.import_callback(|_vm, base, rel| {
         // println!("IMPORT: base={:?}, rel={:?}", base, rel);
         let path = std::path::Path::new(base).join(rel);
-        let path_str = path.to_str().unwrap();
+        let _path_str = path.to_str().unwrap();
         // println!("PATH={:?}", path_str);
         let contents = std::fs::read_to_string(&path).unwrap();
         // println!("RAW_CONTENT={:?}", contents);
@@ -59,25 +58,20 @@ async fn run_job(arg_matches: &clap::ArgMatches) -> R<()> {
 
     match res {
         Ok(s) => {
-            println!("JORB={:?}", s);
+            let request = tonic::Request::new(RunJobRequest {
+                parsed_jobspec: s.to_string(),
+                submissions: vec![],
+            });
+
+            let response = client.run_job(request).await?;
+            println!("RESPONSE={:?}", response);
+            Ok(())
         }
         Err(e) => {
             error!("{}", e);
+            Err("Oh no".into())
         }
     }
-
-    // let config: JobConfig = serde_json::from_str(&res)?;
-
-    let request = tonic::Request::new(RunJobRequest {
-        parsed_jobspec: "Mike".into(),
-        submissions: vec![],
-    });
-
-    let response = client.run_job(request).await?;
-
-    println!("RESPONSE={:?}", response);
-
-    Ok(())
 }
 
 #[instrument(err, skip_all)]
@@ -93,13 +87,12 @@ async fn list_jobs() -> R<()> {
 }
 
 #[instrument(err, skip_all)]
-async fn get_status() -> R<()> {
+async fn get_status(arg_matches: &clap::ArgMatches) -> R<()> {
     let mut client = ManagerClient::connect(DEF_MANAGER_ADDRESS).await?;
-
+    let job_name = arg_matches.get_one::<String>("name").ok_or("need name")?;
     let request = tonic::Request::new(GetJobStatusRequest {
-        name: "Mike".into(),
+        name: job_name.to_owned(),
     });
-
     let response = client.get_job_status(request).await?;
 
     println!("RESPONSE={:?}", response);

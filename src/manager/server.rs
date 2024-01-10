@@ -5,9 +5,9 @@ use crate::structs::manager_server::Manager;
 use crate::structs::{
     GetJobStatusReply, GetJobStatusRequest, GetNodeReply, GetNodeRequest, GetNodesReply,
     GetNodesRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest,
-    ListJobsReply, ListJobsRequest, NodeMsg, RunJobReply, RunJobRequest, UpdateNodeDynamicReply,
-    UpdateNodeDynamicRequest, WorkerConfig, WorkerPreRegisterReply, WorkerPreRegisterRequest,
-    WorkerRegisterReply, WorkerRegisterRequest,
+    JobConfig, ListJobsReply, ListJobsRequest, NodeMsg, RunJobReply, RunJobRequest,
+    UpdateNodeDynamicReply, UpdateNodeDynamicRequest, WorkerConfig, WorkerPreRegisterReply,
+    WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest,
 };
 
 use tonic::{Request, Response, Status};
@@ -22,10 +22,19 @@ impl Manager for ManagerAgentService {
     #[instrument(skip_all)]
     async fn run_job(
         &self,
-        _request: Request<RunJobRequest>,
+        request: Request<RunJobRequest>,
     ) -> Result<Response<RunJobReply>, Status> {
+        let js = request.into_inner().parsed_jobspec;
+        let config: JobConfig =
+            serde_json::from_str(&js).map_err(|e| Status::internal("Error parsing jobspec"))?;
+
+        self.store.insert_job(&config).map_err(|e| {
+            error!("Error saving job: {:?}", e);
+            Status::internal("Error saving job")
+        })?;
+
         let reply = RunJobReply {
-            message: "Hello job!".into(),
+            message: "You are in!".into(),
         };
 
         Ok(Response::new(reply))
@@ -34,10 +43,17 @@ impl Manager for ManagerAgentService {
     #[instrument(skip_all)]
     async fn get_job_status(
         &self,
-        _request: Request<GetJobStatusRequest>,
+        request: Request<GetJobStatusRequest>,
     ) -> Result<Response<GetJobStatusReply>, Status> {
+        let name = request.into_inner().name;
+
+        let job = self.store.get_job(&name).map_err(|e| {
+            error!("Error getting job: {:?}", e);
+            Status::internal("Error getting job")
+        })?;
+
         let reply = GetJobStatusReply {
-            message: "Hello status!".into(),
+            message: format!("Got the job: {:?}", job.name),
         };
 
         Ok(Response::new(reply))

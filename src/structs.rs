@@ -71,6 +71,36 @@ pub struct WorkerConfigAlt {
     pub name_prefix: Option<String>,
 }
 
+// TODO: DRIVER CONFIG SHOULD BE CUSTOMIZABLE
+// AND EVENTUALLY ABLE TO HANDLE DEEP NESTING
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct DriverConfig {
+    pub message: String,
+}
+
+// TODO: DRIVER CONFIG SHOULD BE MORE CUSTOMIZABLE
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ResourcesConfig {
+    pub memory: u32,
+}
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskConfig {
+    pub count: u32,
+    pub driver: String,
+    pub config: DriverConfig,
+    pub resources: ResourcesConfig,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct JobConfig {
+    pub name: String,
+    pub tasks: HashMap<String, TaskConfig>,
+}
+
 /// Our claims struct, it needs to derive `Serialize` and/or `Deserialize`
 #[derive(Debug, Serialize, Deserialize)]
 pub struct JoinTokenClaims {
