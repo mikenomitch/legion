@@ -64,7 +64,12 @@ impl Manager for ManagerAgentService {
         &self,
         _request: Request<ListJobsRequest>,
     ) -> Result<Response<ListJobsReply>, Status> {
-        let reply = ListJobsReply { jobs: vec![] };
+        let jobs = self.store.get_jobs().map_err(|e| {
+            error!("Error getting jobs: {:?}", e);
+            Status::internal("Error getting jobs")
+        })?;
+
+        let reply = ListJobsReply { jobs };
 
         Ok(Response::new(reply))
     }

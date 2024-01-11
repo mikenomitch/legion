@@ -75,7 +75,6 @@ message ListJobsRequest {
 message JobMsg {
   string id = 1;
   string name = 2;
-  string status = 3;
 }
 
 message ListJobsReply {

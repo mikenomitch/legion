@@ -1,17 +1,12 @@
 # Next Up
 
-- In run_job, parse the jobspec using jsonnet
-- Pass it to the server
-- Save the jobspec in SQL
-- Get a list of jobspecs
-- Get info on a single jobspec
-- Submit all the jsonnet submissions alongside the jobspec
-  - Maybe you can do the importst first and then just send
-    a single file?
-- Save these submissions in the DB
-- You can get submissions for a job with a new CLI endpoint
+- Get a list of jobs via the CLI
 - On job submit, tasks are created in the DB for the job
   - You can view tasks as part of the job info CLI
+- Submit all the jsonnet submissions alongside the jobspec in the RPC
+- Save these submissions in the DB
+- You can get submissions for a job with a new CLI endpoint
+
 - On job submit, tasks a _syncronously_ placed onto nodes
 
   - Add allocations table in the DB

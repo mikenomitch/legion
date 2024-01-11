@@ -1,6 +1,6 @@
 use crate::prelude::*;
 
-use crate::structs::{JobConfig, ManagerConfigFull, Node, NodeMsg, TaskConfig, WorkerConfig};
+use crate::structs::{JobConfig, JobMsg, ManagerConfigFull, Node, NodeMsg, WorkerConfig};
 
 use rusqlite::{named_params, Connection, Row};
 use rusqlite_migration::{Migrations, M};
@@ -363,6 +363,45 @@ WHERE name = ?;
         })?;
 
         Ok(config)
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn get_jobs(&self) -> R<Vec<JobMsg>> {
+        let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
+
+        let sql = r#"
+SELECT id, name, type, meta, version, created_at
+FROM job;
+"#;
+
+        let config = conn.query_row(sql, [], |row| {
+            let tasks = HashMap::new();
+            Ok(JobMsg {
+                id: row.get(0)?,
+                name: row.get(1)?,
+            })
+        })?;
+
+        Ok(config)
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn get_jobs(&self) -> R<Vec<JobConfig>> {
+        let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
+        let sql = r#"
+        SELECT id, name, type, meta, version, created_at
+        FROM job;
+"#;
+
+        let mut stmt = conn.prepare(sql)?;
+        let job_iter = stmt.query_map([], |row| self.job_from_row(row))?;
+        let mut jobs = Vec::new();
+        for job in job_iter {
+            let j = job?;
+            jobs.push(j);
+        }
+
+        Ok(jobs)
     }
 
     //
