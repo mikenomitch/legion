@@ -2,3 +2,4 @@
 /plugins/*/*/target
 .legion/*
 ./logs/*
+.aider*
