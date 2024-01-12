@@ -365,26 +365,6 @@ WHERE name = ?;
         Ok(config)
     }
 
-
-    #[instrument(err, skip_all)]
-    pub fn get_jobs(&self) -> R<Vec<JobConfig>> {
-        let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
-        let sql = r#"
-        SELECT id, name, type, meta, version, created_at
-        FROM job;
-"#;
-
-        let mut stmt = conn.prepare(sql)?;
-        let job_iter = stmt.query_map([], |row| self.job_from_row(row))?;
-        let mut jobs = Vec::new();
-        for job in job_iter {
-            let j = job?;
-            jobs.push(j);
-        }
-
-        Ok(jobs)
-    }
-
     //
     // WORKER TYPES
     //
