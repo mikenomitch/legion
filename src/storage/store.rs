@@ -365,25 +365,6 @@ WHERE name = ?;
         Ok(config)
     }
 
-    #[instrument(err, skip_all)]
-    pub fn get_jobs(&self) -> R<Vec<JobMsg>> {
-        let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
-
-        let sql = r#"
-SELECT id, name, type, meta, version, created_at
-FROM job;
-"#;
-
-        let config = conn.query_row(sql, [], |row| {
-            let tasks = HashMap::new();
-            Ok(JobMsg {
-                id: row.get(0)?,
-                name: row.get(1)?,
-            })
-        })?;
-
-        Ok(config)
-    }
 
     #[instrument(err, skip_all)]
     pub fn get_jobs(&self) -> R<Vec<JobConfig>> {
