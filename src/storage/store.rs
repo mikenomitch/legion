@@ -81,20 +81,30 @@ impl Store {
             M::up(
                 "CREATE TABLE IF NOT EXISTS job (
                 id STRING PRIMARY KEY,
+                name STRING NOT NULL
+            )",
+            )
+            .down("DROP TABLE job;"),
+
+            M::up(
+                "CREATE TABLE IF NOT EXISTS job_config (
+                id STRING PRIMARY KEY,
                 name STRING NOT NULL,
                 type STRING NOT NULL,
                 meta JSONB NOT NULL,
                 version INTEGER NOT NULL,
-                created_at TIMESTAMP NOT NULL
+                created_at TIMESTAMP NOT NULL,
+                job_id STRING NOT NULL,
+                FOREIGN KEY(job_id) REFERENCES job(id)
             )",
             )
-            .down("DROP TABLE job;"),
+            .down("DROP TABLE job_config;"),
             M::up(
                 "CREATE TABLE IF NOT EXISTS submisson (
                 id STRING PRIMARY KEY,
                 text TEXT NOT NULL,
-                job_id STRING NOT NULL,
-                FOREIGN KEY(job_id) REFERENCES job(id)
+                job_config_id STRING NOT NULL,
+                FOREIGN KEY(job_config_id) REFERENCES job_config(id)
             )",
             )
             .down("DROP TABLE submisson;"),
