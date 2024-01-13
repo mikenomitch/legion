@@ -11,7 +11,7 @@
   - Task -> Only make if necessary (status holder?)
 - Get a list of jobs via the CLI
 
-- On job_config submit
+- On job submit
 
   - A job is created for a config if it doesn't exist already
   - A job_config is saved with a version one above the current version

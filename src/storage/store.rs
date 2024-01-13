@@ -31,7 +31,7 @@ impl Store {
     #[instrument(err, skip_all)]
     pub fn start_storage(config: &ManagerConfigFull) -> R<Store> {
         let conn = Store::create_memsafe_conn(&config.store_path)?;
-        let migrations = Store::create_initial_tables(&Arc::clone(&conn))?;
+        let _migrations = Store::create_initial_tables(&Arc::clone(&conn))?;
 
         let store = Store { conn };
 
@@ -470,6 +470,7 @@ WHERE name = ?;
         Ok(config)
     }
 
+    #[allow(dead_code)]
     pub fn handle_job_submit(&self, config: &JobConfig, subs: &Vec<Submission>) -> R<()> {
         let _conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
 
@@ -503,16 +504,46 @@ mod tests {
     }
 
     #[test]
+    fn adding_updating_and_getting_worker_types() -> R<()> {
+        let store = setup_store()?;
+
+        let mut attrs = HashMap::new();
+        attrs.insert("test".to_string(), "val".to_string());
+
+        let worker_config = WorkerConfig {
+            name: "test".to_string(),
+            pool: "default".to_string(),
+            additional_node_checks: vec![],
+            attributes: attrs,
+            name_prefix: None,
+        };
+
+        let returned_config = store.insert_worker_type(&worker_config)?;
+        assert_eq!(returned_config.name, worker_config.name);
+
+        let returned_config = store.get_worker_type("test".to_string())?;
+        assert_eq!(returned_config.name, worker_config.name);
+        assert_eq!(returned_config.pool, worker_config.pool);
+        let val = returned_config
+            .attributes
+            .get("test")
+            .ok_or("no test attr")?;
+
+        assert_eq!(val, "val");
+
+        teardown_store(&store)?;
+        Ok(())
+    }
+
+    #[test]
     fn handle_job_submit_adds_job_from_scratch() -> R<()> {
         let subs = vec![];
         let task_configs = vec![TaskConfig::default(), TaskConfig::default()];
-
         let job_name = "test".to_string();
         let job_config = JobConfig {
             name: job_name.clone(),
             tasks: task_configs,
         };
-
         let store = setup_store()?;
 
         // TODO: ensure_no_job_initially
@@ -535,19 +566,60 @@ mod tests {
         // TODO: check that initial job update was properly made
 
         teardown_store(&store)?;
-
         Ok(())
     }
 
     #[test]
     fn handle_job_submit_updates_job_properly() -> R<()> {
-        assert!(true);
+        let subs = vec![];
+        let task_configs = vec![TaskConfig::default(), TaskConfig::default()];
+        let job_name = "test".to_string();
+        let job_config = JobConfig {
+            name: job_name.clone(),
+            tasks: task_configs,
+        };
+
+        let store = setup_store()?;
+        let submit_response = store.handle_job_submit(&job_config, &subs);
+        assert!(submit_response.is_ok());
+
+        teardown_store(&store)?;
         Ok(())
     }
 
     #[test]
     fn handle_job_submit_with_unchanged_job_returns_error() -> R<()> {
         assert!(true);
+
+        let store = setup_store()?;
+        teardown_store(&store)?;
+        Ok(())
+    }
+
+    #[test]
+    fn handle_job_submit_with_unchanged_job_and_force_update_works() -> R<()> {
+        assert!(true);
+
+        let store = setup_store()?;
+        teardown_store(&store)?;
+        Ok(())
+    }
+
+    #[test]
+    fn handle_job_stop() -> R<()> {
+        assert!(true);
+
+        let store = setup_store()?;
+        teardown_store(&store)?;
+        Ok(())
+    }
+
+    #[test]
+    fn handle_job_purge() -> R<()> {
+        assert!(true);
+
+        let store = setup_store()?;
+        teardown_store(&store)?;
         Ok(())
     }
 }
