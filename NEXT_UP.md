@@ -1,8 +1,28 @@
 # Next Up
 
+- TIME TO TDD!
+
+- Split out job_config and job
+  - Job -> Status, name, type
+  - JobConfig -> Parsed information from the Submission
+  - Submission -> The raw files and a reference
+  - TaskConfig -> Parsed information from the Submission
+  - Allocation -> A task on a node, status, history, etc
+  - Task -> Only make if necessary (status holder?)
 - Get a list of jobs via the CLI
-- On job submit, tasks are created in the DB for the job
+
+- On job_config submit
+
+  - A job is created for a config if it doesn't exist already
+  - A job_config is saved with a version one above the current version
+  - Task configs are created for the job_config
+  - If the job_config passed in matches the latest, it is a noop
+    - Unless a flag is passed in to force bump + deploy it
+  - Associated submissions are saved to the DB
+  - A job_update is created pointing to the right configs
+
   - You can view tasks as part of the job info CLI
+
 - Submit all the jsonnet submissions alongside the jobspec in the RPC
 - Save these submissions in the DB
 - You can get submissions for a job with a new CLI endpoint

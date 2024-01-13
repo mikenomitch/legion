@@ -1,6 +1,8 @@
 use crate::prelude::*;
 
-use crate::structs::{JobConfig, JobMsg, ManagerConfigFull, Node, NodeMsg, WorkerConfig};
+use crate::structs::{
+    JobConfig, ManagerConfigFull, Node, NodeMsg, Submission, TaskConfig, WorkerConfig,
+};
 
 use rusqlite::{named_params, Connection, Row};
 use rusqlite_migration::{Migrations, M};
@@ -28,11 +30,11 @@ pub const CONN_LOCK_ERROR: &str = "Error locking database connection";
 impl Store {
     #[instrument(err, skip_all)]
     pub fn start_storage(config: &ManagerConfigFull) -> R<Store> {
-        info!("Starting store");
         let conn = Store::create_memsafe_conn(&config.store_path)?;
-        Store::create_initial_tables(&Arc::clone(&conn))?;
+        let migrations = Store::create_initial_tables(&Arc::clone(&conn))?;
 
         let store = Store { conn };
+
         Ok(store)
     }
 
@@ -51,9 +53,8 @@ impl Store {
         Ok(Arc::new(Mutex::new(conn)))
     }
 
-    #[instrument(skip_all)]
-    fn create_initial_tables(conn: &MemSafeConn) -> R<()> {
-        let migrations = Migrations::new(vec![
+    pub fn get_migrations() -> Migrations<'static> {
+        Migrations::new(vec![
             M::up(
                 "CREATE TABLE IF NOT EXISTS node (
                 id    STRING PRIMARY KEY,
@@ -81,11 +82,12 @@ impl Store {
             M::up(
                 "CREATE TABLE IF NOT EXISTS job (
                 id STRING PRIMARY KEY,
-                name STRING NOT NULL
+                name STRING NOT NULL,
+                status STRING NOT NULL,
+                created_at TIMESTAMP NOT NULL
             )",
             )
             .down("DROP TABLE job;"),
-
             M::up(
                 "CREATE TABLE IF NOT EXISTS job_config (
                 id STRING PRIMARY KEY,
@@ -100,38 +102,57 @@ impl Store {
             )
             .down("DROP TABLE job_config;"),
             M::up(
-                "CREATE TABLE IF NOT EXISTS submisson (
+                "CREATE TABLE IF NOT EXISTS submission (
                 id STRING PRIMARY KEY,
+                filename STRING NOT NULL,
                 text TEXT NOT NULL,
                 job_config_id STRING NOT NULL,
+                is_primary INTEGER NOT NULL,
                 FOREIGN KEY(job_config_id) REFERENCES job_config(id)
             )",
             )
-            .down("DROP TABLE submisson;"),
+            .down("DROP TABLE submission;"),
             M::up(
-                "CREATE TABLE IF NOT EXISTS task (
+                "CREATE TABLE IF NOT EXISTS task_config (
                 id STRING PRIMARY KEY,
                 name STRING NOT NULL,
-                status STRING NOT NULL,
                 driver STRING NOT NULL,
                 config JSONB NOT NULL,
                 resources JSONB NOT NULL,
                 constraints JSONB NOT NULL,
-                created_at TIMESTAMP NOT NULL,
                 job_id STRING NOT NULL,
-                FOREIGN KEY(job_id) REFERENCES job(id)
+                job_config_id STRING NOT NULL,
+                FOREIGN KEY(job_id) REFERENCES job(id),
+                FOREIGN KEY(job_config_id) REFERENCES job_config(id)
             )",
             )
-            .down("DROP TABLE task;"),
-        ]);
+            .down("DROP TABLE task_config;"),
+            M::up(
+                "CREATE TABLE IF NOT EXISTS job_update (
+                id STRING PRIMARY KEY,
+                status STRING NOT NULL,
+                job_id STRING NOT NULL,
+                to_job_config_id STRING NOT NULL,
+                from_job_config_id STRING NOT NULL,
+                FOREIGN KEY(job_id) REFERENCES job(id),
+                FOREIGN KEY(to_job_config_id) REFERENCES job_config(id)
+                FOREIGN KEY(from_job_config_id) REFERENCES job_config(id)
+            )",
+            )
+            .down("DROP TABLE job_update;"),
+        ])
+    }
 
+    #[instrument(skip_all)]
+    fn create_initial_tables(conn: &MemSafeConn) -> R<Migrations<'_>> {
+        let migrations = Store::get_migrations();
         let mut conn = conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
         info!("Pragma update");
         conn.pragma_update(None, "journal_mode", "WAL")?;
         info!("Running migrations");
         migrations.to_latest(&mut conn)?;
 
-        Ok(())
+        Ok(migrations)
     }
 
     //
@@ -320,62 +341,6 @@ FROM node;
     }
 
     //
-    // JOBS
-    //
-
-    #[instrument(err, skip_all)]
-    pub fn insert_job(&self, config: &JobConfig) -> R<JobConfig> {
-        let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
-
-        let sql = r#"
-INSERT INTO job (id, name, type, meta, version, created_at)
-VALUES (:id, :name, :type, :meta, :version, :created_at)
-RETURNING id, name, type, meta, version, created_at;
-"#;
-
-        let now = time::OffsetDateTime::now_utc();
-        let params = named_params! {
-            ":id": config.name,
-            ":name": config.name,
-            ":type": "default",
-            ":meta": "{}",
-            ":version": 0,
-            ":created_at": now,
-        };
-
-        let config = conn.query_row(sql, params, |row| {
-            let tasks = HashMap::new();
-            Ok(JobConfig {
-                name: row.get(0)?,
-                tasks: tasks,
-            })
-        })?;
-
-        Ok(config)
-    }
-
-    #[instrument(err, skip_all)]
-    pub fn get_job(&self, name: &str) -> R<JobConfig> {
-        let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
-
-        let sql = r#"
-SELECT id, name, type, meta, version, created_at
-FROM job
-WHERE name = ?;
-"#;
-
-        let config = conn.query_row(sql, [name], |row| {
-            let tasks = HashMap::new();
-            Ok(JobConfig {
-                name: row.get(1)?,
-                tasks: tasks,
-            })
-        })?;
-
-        Ok(config)
-    }
-
-    //
     // WORKER TYPES
     //
 
@@ -446,5 +411,143 @@ RETURNING name, pool, additional_node_checks, attributes, name_prefix;
         })?;
 
         Ok(config)
+    }
+
+    //
+    // JOBS
+    //
+
+    // TODO: This likely should do more?
+    #[instrument(err, skip_all)]
+    pub fn insert_job_config(&self, config: &JobConfig) -> R<JobConfig> {
+        let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
+
+        let sql = r#"
+INSERT INTO job (id, name, type, meta, version, created_at)
+VALUES (:id, :name, :type, :meta, :version, :created_at)
+RETURNING id, name, type, meta, version, created_at;
+"#;
+
+        let now = time::OffsetDateTime::now_utc();
+        let params = named_params! {
+            ":id": config.name,
+            ":name": config.name,
+            ":type": "default",
+            ":meta": "{}",
+            ":version": 0,
+            ":created_at": now,
+        };
+
+        let config = conn.query_row(sql, params, |row| {
+            let tasks = vec![];
+            Ok(JobConfig {
+                name: row.get(0)?,
+                tasks: tasks,
+            })
+        })?;
+
+        Ok(config)
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn get_job(&self, name: &str) -> R<JobConfig> {
+        let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
+
+        let sql = r#"
+SELECT id, name, type, meta, version, created_at
+FROM job
+WHERE name = ?;
+"#;
+
+        let config = conn.query_row(sql, [name], |row| {
+            let tasks = vec![];
+            Ok(JobConfig {
+                name: row.get(1)?,
+                tasks: tasks,
+            })
+        })?;
+
+        Ok(config)
+    }
+
+    pub fn handle_job_submit(&self, config: &JobConfig, subs: &Vec<Submission>) -> R<()> {
+        let _conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
+
+        println!("Got job config: {:?}", config);
+        println!("Got tasks: {:?}", config.tasks);
+        println!("Got subs: {:?}", subs);
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn setup_store() -> R<Store> {
+        let store_config = ManagerConfigFull {
+            store_path: "tests/store".to_string(),
+            ..Default::default()
+        };
+
+        Store::start_storage(&store_config)
+    }
+
+    fn teardown_store(store: &Store) -> R<()> {
+        let migrations = Store::get_migrations();
+        let mut conn = store.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
+        migrations.to_version(&mut conn, 0)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn handle_job_submit_adds_job_from_scratch() -> R<()> {
+        let subs = vec![];
+        let task_configs = vec![TaskConfig::default(), TaskConfig::default()];
+
+        let job_name = "test".to_string();
+        let job_config = JobConfig {
+            name: job_name.clone(),
+            tasks: task_configs,
+        };
+
+        let store = setup_store()?;
+
+        // TODO: ensure_no_job_initially
+        // let returned_config = store.get_job(&job_name)?;
+        // assert_eq!(returned_config.name, job_name);
+
+        let submit_response = store.handle_job_submit(&job_config, &subs);
+        assert!(submit_response.is_ok());
+
+        // TODO: check that job was saved
+        let returned_config = store.get_job(&job_name)?;
+        assert_eq!(returned_config.name, job_name);
+
+        // TODO: check that job config was saved
+
+        // TODO: check that tasks were saved
+
+        // TODO: check that submissions were saved
+
+        // TODO: check that initial job update was properly made
+
+        teardown_store(&store)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn handle_job_submit_updates_job_properly() -> R<()> {
+        assert!(true);
+        Ok(())
+    }
+
+    #[test]
+    fn handle_job_submit_with_unchanged_job_returns_error() -> R<()> {
+        assert!(true);
+        Ok(())
     }
 }

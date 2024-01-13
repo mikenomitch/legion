@@ -1,7 +1,7 @@
 use crate::prelude::*;
 
 use crate::structs::manager_client::ManagerClient;
-use crate::structs::{GetJobStatusRequest, JobMsg, ListJobsRequest, RunJobRequest};
+use crate::structs::{GetJobStatusRequest, Job, ListJobsRequest, RunJobRequest};
 use jsonnet::JsonnetVm;
 
 pub fn config() -> Command {
@@ -81,7 +81,7 @@ async fn list_jobs() -> R<()> {
     let request = tonic::Request::new(ListJobsRequest {});
     let response = client.list_jobs(request).await?;
     let jobs_list = response.into_inner().jobs;
-    let jobs: Vec<JobMsg> = jobs_list.into_iter().map(|j| j.into()).collect();
+    let jobs: Vec<Job> = jobs_list.into_iter().map(|j| j.into()).collect();
 
     println!("{:?}", jobs);
 

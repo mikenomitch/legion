@@ -69,16 +69,17 @@ message GetJobStatusReply {
 }
 
 message ListJobsRequest {
-
 }
 
-message JobMsg {
+message Job {
   string id = 1;
   string name = 2;
+  string status = 3;
+  int64 created_at = 4;
 }
 
 message ListJobsReply {
-  repeated JobMsg jobs = 1;
+  repeated Job jobs = 1;
 }
 
 message HeartbeatRequest {

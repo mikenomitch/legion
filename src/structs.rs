@@ -23,7 +23,7 @@ pub struct ManagerConfig {
     pub worker_check_seconds: Option<u64>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ServerConfigFull {
     pub port: u64,
@@ -41,7 +41,7 @@ impl From<ServerConfigFull> for ServerConfig {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ManagerConfigFull {
     pub server: ServerConfigFull,
@@ -73,32 +73,75 @@ pub struct WorkerConfigAlt {
 
 // TODO: DRIVER CONFIG SHOULD BE CUSTOMIZABLE
 // AND EVENTUALLY ABLE TO HANDLE DEEP NESTING
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct DriverConfig {
     pub message: String,
 }
 
 // TODO: DRIVER CONFIG SHOULD BE MORE CUSTOMIZABLE
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ResourcesConfig {
     pub memory: u32,
 }
-#[derive(Serialize, Deserialize, Debug, Clone)]
+// #[derive(Serialize, Deserialize, Debug, Clone)]
+// #[serde(rename_all = "camelCase")]
+// pub struct Job {
+//     pub name: String,
+// }
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskConfig {
+    pub name: String,
     pub count: u32,
     pub driver: String,
     pub config: DriverConfig,
     pub resources: ResourcesConfig,
 }
 
+impl DriverConfig {
+    pub fn new() -> Self {
+        DriverConfig {
+            message: "message".to_string(),
+        }
+    }
+}
+
+impl ResourcesConfig {
+    pub fn new() -> Self {
+        ResourcesConfig { memory: 0 }
+    }
+}
+
+impl TaskConfig {
+    pub fn new() -> Self {
+        TaskConfig {
+            name: "name".to_string(),
+            driver: "driver1".to_string(),
+            config: DriverConfig::new(),
+            resources: ResourcesConfig::new(),
+            count: 1,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct JobConfig {
     pub name: String,
-    pub tasks: HashMap<String, TaskConfig>,
+    pub tasks: Vec<TaskConfig>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct Submission {
+    pub id: String,
+    pub filename: String,
+    pub text: String,
+    pub job_config_id: String,
+    pub is_primary: bool,
 }
 
 /// Our claims struct, it needs to derive `Serialize` and/or `Deserialize`
