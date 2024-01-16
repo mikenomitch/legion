@@ -71,76 +71,56 @@ pub struct WorkerConfigAlt {
     pub name_prefix: Option<String>,
 }
 
-// TODO: DRIVER CONFIG SHOULD BE CUSTOMIZABLE
-// AND EVENTUALLY ABLE TO HANDLE DEEP NESTING
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct DriverConfig {
-    pub message: String,
-}
+// // TODO: DRIVER CONFIG SHOULD BE CUSTOMIZABLE
+// // AND EVENTUALLY ABLE TO HANDLE DEEP NESTING
+// #[derive(Serialize, Deserialize, Debug, Clone, Default)]
+// #[serde(rename_all = "camelCase")]
+// pub struct DriverConfig {
+//     pub message: String,
+// }
 
-// TODO: DRIVER CONFIG SHOULD BE MORE CUSTOMIZABLE
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct ResourcesConfig {
-    pub memory: u32,
-}
+// // TODO: DRIVER CONFIG SHOULD BE MORE CUSTOMIZABLE
+// #[derive(Serialize, Deserialize, Debug, Clone, Default)]
+// #[serde(rename_all = "camelCase")]
+// pub struct ResourcesConfig {
+//     pub memory: u32,
+// }
 // #[derive(Serialize, Deserialize, Debug, Clone)]
 // #[serde(rename_all = "camelCase")]
 // pub struct Job {
 //     pub name: String,
 // }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskConfig {
     pub name: String,
     pub count: u32,
     pub driver: String,
-    pub config: DriverConfig,
-    pub resources: ResourcesConfig,
+    pub config: Value,
+    pub resources: Value,
+    pub constraints: Value,
 }
 
-impl DriverConfig {
-    pub fn new() -> Self {
-        DriverConfig {
-            message: "message".to_string(),
-        }
-    }
-}
-
-impl ResourcesConfig {
-    pub fn new() -> Self {
-        ResourcesConfig { memory: 0 }
-    }
-}
-
-impl TaskConfig {
-    pub fn new() -> Self {
-        TaskConfig {
-            name: "name".to_string(),
-            driver: "driver1".to_string(),
-            config: DriverConfig::new(),
-            resources: ResourcesConfig::new(),
-            count: 1,
-        }
-    }
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct JobConfig {
     pub name: String,
     pub tasks: Vec<TaskConfig>,
+    pub version: Option<u32>,
+}
+
+impl JobConfig {
+    pub fn is_same_as(&self, other: &JobConfig) -> bool {
+        self.name == other.name && self.tasks == other.tasks
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Submission {
-    pub id: String,
     pub filename: String,
     pub text: String,
-    pub job_config_id: String,
     pub is_primary: bool,
 }
 

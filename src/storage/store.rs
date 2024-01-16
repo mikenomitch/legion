@@ -1,7 +1,7 @@
 use crate::prelude::*;
 
 use crate::structs::{
-    JobConfig, ManagerConfigFull, Node, NodeMsg, Submission, TaskConfig, WorkerConfig,
+    Job, JobConfig, ManagerConfigFull, Node, NodeMsg, Submission, TaskConfig, WorkerConfig,
 };
 
 use rusqlite::{named_params, Connection, Row};
@@ -115,6 +115,7 @@ impl Store {
             M::up(
                 "CREATE TABLE IF NOT EXISTS task_config (
                 id STRING PRIMARY KEY,
+                count INTEGER NOT NULL,
                 name STRING NOT NULL,
                 driver STRING NOT NULL,
                 config JSONB NOT NULL,
@@ -141,6 +142,15 @@ impl Store {
             )
             .down("DROP TABLE job_update;"),
         ])
+    }
+
+    pub fn clear_all_tables(&self) -> R<()> {
+        let migrations = Store::get_migrations();
+        let mut conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
+        migrations.to_version(&mut conn, 0)?;
+        migrations.to_latest(&mut conn)?;
+
+        Ok(())
     }
 
     #[instrument(skip_all)]
@@ -417,68 +427,238 @@ RETURNING name, pool, additional_node_checks, attributes, name_prefix;
     // JOBS
     //
 
-    // TODO: This likely should do more?
     #[instrument(err, skip_all)]
-    pub fn insert_job_config(&self, config: &JobConfig) -> R<JobConfig> {
+    pub fn get_job(&self, name: &str) -> R<Job> {
         let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
 
         let sql = r#"
-INSERT INTO job (id, name, type, meta, version, created_at)
-VALUES (:id, :name, :type, :meta, :version, :created_at)
-RETURNING id, name, type, meta, version, created_at;
-"#;
-
-        let now = time::OffsetDateTime::now_utc();
-        let params = named_params! {
-            ":id": config.name,
-            ":name": config.name,
-            ":type": "default",
-            ":meta": "{}",
-            ":version": 0,
-            ":created_at": now,
-        };
-
-        let config = conn.query_row(sql, params, |row| {
-            let tasks = vec![];
-            Ok(JobConfig {
-                name: row.get(0)?,
-                tasks: tasks,
-            })
-        })?;
-
-        Ok(config)
-    }
-
-    #[instrument(err, skip_all)]
-    pub fn get_job(&self, name: &str) -> R<JobConfig> {
-        let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
-
-        let sql = r#"
-SELECT id, name, type, meta, version, created_at
+SELECT id, name, status, created_at
 FROM job
 WHERE name = ?;
 "#;
 
         let config = conn.query_row(sql, [name], |row| {
-            let tasks = vec![];
-            Ok(JobConfig {
+            Ok(Job {
+                id: row.get(0)?,
                 name: row.get(1)?,
-                tasks: tasks,
+                status: row.get(2)?,
+                created_at: row.get(3)?,
             })
         })?;
 
         Ok(config)
     }
 
+    #[instrument(err, skip_all)]
+    pub fn get_job_config(&self, name: &str) -> R<JobConfig> {
+        let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
+
+        let jc_sql = r#"
+SELECT id, name, type, version, meta, created_at
+FROM job_config
+WHERE name = ?
+ORDER BY version DESC
+LIMIT 1;
+"#;
+
+        let (job_config, jc_id): (JobConfig, String) = conn.query_row(jc_sql, [name], |row| {
+            let tasks_to_replace = vec![];
+            let job_config_id = row.get(0)?;
+            let jc = JobConfig {
+                name: row.get(1)?,
+                tasks: tasks_to_replace,
+                version: Some(row.get(3)?),
+            };
+
+            Ok((jc, job_config_id))
+        })?;
+
+        let task_sql = r#"
+SELECT id, name, driver, count, config, resources, constraints, job_id, job_config_id
+FROM task_config
+WHERE job_config_id = ?;
+"#;
+        let mut stmt = conn.prepare(task_sql)?;
+
+        let task_iter = stmt.query_map([jc_id], |row| {
+            Ok(TaskConfig {
+                name: row.get(1)?,
+                driver: row.get(2)?,
+                count: row.get(3)?,
+                config: row.get(4)?,
+                resources: row.get(5)?,
+                constraints: row.get(6)?,
+            })
+        })?;
+
+        let mut tasks = Vec::new();
+        for task in task_iter {
+            let t = task?;
+            tasks.push(t);
+        }
+
+        let jc_2 = JobConfig {
+            tasks: tasks,
+            ..job_config
+        };
+
+        Ok(jc_2)
+    }
+
     #[allow(dead_code)]
     pub fn handle_job_submit(&self, config: &JobConfig, subs: &Vec<Submission>) -> R<()> {
-        let _conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
+        println!("given config: {:?}", config);
 
-        println!("Got job config: {:?}", config);
-        println!("Got tasks: {:?}", config.tasks);
-        println!("Got subs: {:?}", subs);
+        // Note: There is a race condition here with the version
+        // I think this should prob be all in a single lock, but
+        // I am not going to worry about this for now
 
-        Ok(())
+        let mut next_version = 1;
+
+        if let Ok(latest_job_config) = self.get_job_config(&config.name) {
+            println!("latest_job_config: {:?}", latest_job_config);
+            // if latest_job_config is deep equal to config, return an error
+            if latest_job_config.is_same_as(config) {
+                println!("IT IS THE SAME!");
+                return Err("Job config is unchanged".into());
+            } else {
+                next_version = latest_job_config.version.unwrap_or(0) + 1;
+                println!("I DONT THINK THESE CONFIGS ARE EQUAL YO")
+            }
+        } else {
+            println!("NO LATEST JOB CONFIG FOUND");
+        }
+
+        let mut conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+
+        let tx = conn.transaction()?;
+
+        // TODO: HERE IS WHERE YOU HAVE TO COME BACK TO!
+        let job_sql = r#"
+INSERT INTO job (id, name, status, created_at)
+VALUES (:id, :name, :status, :created_at)
+ON CONFLICT(id) DO NOTHING
+RETURNING id, name, status, created_at;
+"#;
+
+        let job_params = named_params! {
+            ":id": config.name,
+            ":name": config.name,
+            ":status": "active",
+            ":created_at": now,
+        };
+
+        println!("get or insert job");
+        let returned_job = tx.query_row(job_sql, job_params, |row| {
+            Ok(Job {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                status: row.get(2)?,
+                created_at: row.get(3)?,
+            })
+        })?;
+
+        println!("returned_job: {:?}", returned_job);
+
+        let jc_sql = r#"
+INSERT INTO job_config (id, name, type, meta, version, created_at, job_id)
+VALUES (:id, :name, :type, :meta, :version, :created_at, :job_id)
+RETURNING id, name, type, meta, version, created_at;
+"#;
+
+        let now = time::OffsetDateTime::now_utc();
+        let config_params = named_params! {
+            ":id": config.name,
+            ":name": config.name,
+            ":type": "default",
+            ":meta": "{}",
+            ":version": next_version,
+            ":created_at": now,
+            ":job_id": returned_job.id,
+        };
+
+        println!("get or insert job config");
+        let (_config, job_config_id): (JobConfig, String) =
+            tx.query_row(jc_sql, config_params, |row| {
+                let tasks = vec![];
+                Ok((
+                    JobConfig {
+                        name: row.get(1)?,
+                        version: Some(row.get(4)?),
+                        tasks: tasks,
+                    },
+                    row.get(0)?,
+                ))
+            })?;
+
+        let tasks_sql = r#"
+INSERT INTO task_config (name, driver, count, config, resources, constraints, job_id, job_config_id)
+VALUES (:name, :driver, :count, :config, :resources, :constraints, :job_id, :job_config_id);
+"#;
+
+        println!("insert tasks");
+        config.tasks.iter().for_each(|t| {
+            let task_params = named_params! {
+                ":name": t.name,
+                ":driver": t.driver,
+                ":count": t.count,
+                ":config": t.config,
+                ":resources": t.resources,
+                ":constraints": t.constraints,
+                ":job_id": returned_job.id,
+                ":job_config_id": job_config_id,
+            };
+
+            let _num_rows_changes = tx.execute(tasks_sql, task_params);
+        });
+
+        let subs_sql = r#"
+INSERT INTO submission (filename, text, is_primary, job_config_id)
+VALUES (:filename, :text, :is_primary, :job_config_id);
+"#;
+
+        println!("insert tasks");
+        subs.iter().for_each(|s| {
+            let sub_params = named_params! {
+                ":filename": s.filename,
+                ":text": s.text,
+                ":is_primary": s.is_primary,
+                ":job_config_id": job_config_id,
+            };
+
+            let _num_sub_rows_changes = tx.execute(subs_sql, sub_params);
+        });
+
+        tx.commit()
+            .map_err(|_| "Error committing transaction".into())
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn get_submissions_for_config(&self, job_config_id: &str) -> R<Vec<Submission>> {
+        let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
+
+        let sql = r#"
+SELECT s.id, s.filename, s.text, s.job_config_id, s.is_primary
+FROM submission s
+WHERE s.job_config_id = ?;
+"#;
+        let mut stmt = conn.prepare(sql)?;
+        let sub_iter = stmt.query_map([job_config_id], |row| {
+            Ok(Submission {
+                filename: row.get(1)?,
+                text: row.get(2)?,
+                is_primary: row.get(4)?,
+            })
+        })?;
+
+        let mut subs = Vec::new();
+        for sub in sub_iter {
+            let s = sub?;
+            subs.push(s);
+        }
+
+        Ok(subs)
     }
 }
 
@@ -492,16 +672,18 @@ mod tests {
             ..Default::default()
         };
 
-        Store::start_storage(&store_config)
+        let store = Store::start_storage(&store_config)?;
+        store.clear_all_tables()?;
+        Ok(store)
     }
 
-    fn teardown_store(store: &Store) -> R<()> {
-        let migrations = Store::get_migrations();
-        let mut conn = store.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
-        migrations.to_version(&mut conn, 0)?;
+    // fn teardown_store(store: &Store) -> R<()> {
+    //     let migrations = Store::get_migrations();
+    //     let mut conn = store.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
+    //     migrations.to_version(&mut conn, 0)?;
 
-        Ok(())
-    }
+    //     Ok(())
+    // }
 
     #[test]
     fn adding_updating_and_getting_worker_types() -> R<()> {
@@ -531,95 +713,271 @@ mod tests {
 
         assert_eq!(val, "val");
 
-        teardown_store(&store)?;
         Ok(())
     }
 
     #[test]
-    fn handle_job_submit_adds_job_from_scratch() -> R<()> {
-        let subs = vec![];
-        let task_configs = vec![TaskConfig::default(), TaskConfig::default()];
+    fn handle_job_submit_adds_new_job() -> R<()> {
+        let sub_one = Submission {
+            filename: "sub-1.jsonnet".into(),
+            text: "sub-1".into(),
+            is_primary: true,
+        };
+        let sub_two = Submission {
+            filename: "sub-2.libsonnet".into(),
+            text: "sub-2".into(),
+            is_primary: false,
+        };
+
+        let subs = vec![sub_one.clone(), sub_two.clone()];
+
+        let task_one = TaskConfig {
+            name: "task-1".to_string(),
+            driver: "driver-1".to_string(),
+            count: 1,
+            config: json!({ "message": "hello-1" }),
+            resources: json!({ "memory": 256 }),
+            constraints: json!({}),
+        };
+
+        let task_two = TaskConfig {
+            name: "task-2".to_string(),
+            driver: "driver-2".to_string(),
+            count: 2,
+            config: json!({ "message": "hi-2" }),
+            resources: json!({ "memory": 512 }),
+            constraints: json!({}),
+        };
+
+        let task_configs = vec![task_one.clone(), task_two.clone()];
         let job_name = "test".to_string();
         let job_config = JobConfig {
             name: job_name.clone(),
-            tasks: task_configs,
+            tasks: task_configs.clone(),
+            version: None,
         };
         let store = setup_store()?;
 
-        // TODO: ensure_no_job_initially
-        // let returned_config = store.get_job(&job_name)?;
-        // assert_eq!(returned_config.name, job_name);
+        let returned_config = store.get_job(&job_name);
+        assert!(returned_config.is_err());
+        assert_eq!(
+            returned_config.unwrap_err().to_string(),
+            "Query returned no rows"
+        );
 
+        // NOTE: What should this return (figure it out in context later)
         let submit_response = store.handle_job_submit(&job_config, &subs);
         assert!(submit_response.is_ok());
 
-        // TODO: check that job was saved
-        let returned_config = store.get_job(&job_name)?;
-        assert_eq!(returned_config.name, job_name);
+        let job = store.get_job(&job_name)?;
+        assert_eq!(job.name, job_name);
 
-        // TODO: check that job config was saved
+        let latest_job_config = store.get_job_config(&job_name)?;
+        assert_eq!(latest_job_config.name, job_name);
 
-        // TODO: check that tasks were saved
+        let t1_from_store = latest_job_config.tasks.get(0).ok_or("oof")?;
+        assert_eq!(task_one.name, t1_from_store.name);
+        assert_eq!(task_one.driver, t1_from_store.driver);
+        assert_eq!(
+            task_one.resources.get("memory").ok_or("no memory 1")?,
+            t1_from_store.resources.get("memory").ok_or("no memory 2")?
+        );
 
-        // TODO: check that submissions were saved
+        assert_eq!(
+            task_one.config.get("message").ok_or("no message 1")?,
+            t1_from_store.config.get("message").ok_or("no message 2")?
+        );
 
-        // TODO: check that initial job update was properly made
+        let t2_from_store = latest_job_config.tasks.get(1).ok_or("oof")?;
+        assert_eq!(task_two.name, t2_from_store.name);
 
-        teardown_store(&store)?;
+        let subs_from_store = store.get_submissions_for_config(&latest_job_config.name)?;
+        assert_eq!(subs_from_store.len(), 2);
+        let sub_one_from_store = subs_from_store.get(0).ok_or("no sub 1")?;
+        let sub_two_from_store = subs_from_store.get(1).ok_or("no sub 2")?;
+        assert_eq!(sub_one_from_store.filename, sub_one.filename);
+        assert_eq!(sub_two_from_store.filename, sub_two.filename);
+
         Ok(())
     }
 
     #[test]
     fn handle_job_submit_updates_job_properly() -> R<()> {
-        let subs = vec![];
-        let task_configs = vec![TaskConfig::default(), TaskConfig::default()];
-        let job_name = "test".to_string();
+        let orib_sub = Submission {
+            filename: "sub-1.jsonnet".into(),
+            text: "sub-1".into(),
+            is_primary: true,
+        };
+        let orig_submissions = vec![orib_sub.clone()];
+
+        let orig_task = TaskConfig {
+            name: "orig-task".to_string(),
+            driver: "driver-1".to_string(),
+            count: 1,
+            config: json!({ "message": "hello" }),
+            resources: json!({ "memory": 256 }),
+            constraints: json!({}),
+        };
+
+        let orig_task_configs = vec![orig_task.clone()];
         let job_config = JobConfig {
-            name: job_name.clone(),
-            tasks: task_configs,
+            name: "jobname".into(),
+            tasks: orig_task_configs.clone(),
+            version: None,
         };
 
         let store = setup_store()?;
-        let submit_response = store.handle_job_submit(&job_config, &subs);
+
+        // Original Job is submitted
+        let submit_response = store.handle_job_submit(&job_config, &orig_submissions);
         assert!(submit_response.is_ok());
 
-        teardown_store(&store)?;
+        // Get config for initial insert
+        let first_job_config = store.get_job_config("jobname".into())?;
+        assert_eq!(first_job_config.name, job_config.name);
+        assert_eq!(
+            1,
+            first_job_config
+                .version
+                .ok_or("missing version on config")?,
+        );
+
+        // Submit an updates job config
+        // updated: task driver config
+
+        let new_task = TaskConfig {
+            driver: "driver-new".to_string(),
+            ..orig_task
+        };
+        let new_task_configs = vec![new_task.clone()];
+        let job_config_with_modified_driver = JobConfig {
+            tasks: new_task_configs.clone(),
+            ..job_config
+        };
+
+        let submit_response =
+            store.handle_job_submit(&job_config_with_modified_driver.clone(), &orig_submissions);
+        if let Err(e) = submit_response {
+            println!("error: {}", e);
+        }
+        // assert!(submit_response.is_ok());
+
+        // Get config for initial insert
+        let second_job_config = store.get_job_config("jobname".into())?;
+        assert_eq!(
+            2,
+            second_job_config
+                .version
+                .ok_or("missing version on config")?,
+        );
+
+        // Submit an updates job config
+        // updated: additional task added
+
+        let extra_task = TaskConfig {
+            name: "extra-task".to_string(),
+            driver: "driver-extra".to_string(),
+            count: 1,
+            config: json!({ "message": "hello" }),
+            resources: json!({ "memory": 256 }),
+            constraints: json!({}),
+        };
+        let new_task_configs = vec![new_task.clone(), extra_task.clone()];
+
+        let job_config_with_extra_task = JobConfig {
+            tasks: new_task_configs.clone(),
+            ..job_config_with_modified_driver
+        };
+
+        let submit_response =
+            store.handle_job_submit(&job_config_with_extra_task, &orig_submissions);
+        assert!(submit_response.is_ok());
+
+        // Get config for initial insert
+        let third_job_config = store.get_job_config("jobname".into())?;
+        assert_eq!(
+            3,
+            third_job_config
+                .version
+                .ok_or("missing version on config")?,
+        );
+
+        // // Submit an updates job config
+        // // updated: metadata on job
+
+        // let job_config_with_new_metadata = JobConfig {
+        //     ... TODO ...
+        // };
+
+        // let submit_response = store.handle_job_submit(&job_config, &orig_submissions);
+        // assert!(submit_response.is_ok());
+
+        // // Get config for initial insert
+        // let fourth_job_config = store.get_job_config("jobname".into())?;
+        // assert_eq!(
+        //     4,
+        //     fourth_job_config
+        //         .version
+        //         .ok_or("missing version on config")?,
+        // );
+
         Ok(())
     }
 
     #[test]
     fn handle_job_submit_with_unchanged_job_returns_error() -> R<()> {
-        assert!(true);
+        let orig_submissions = vec![];
+        let orig_task = TaskConfig {
+            name: "dupe-task".to_string(),
+            driver: "driver".to_string(),
+            count: 1,
+            config: json!({ "message": "hello" }),
+            resources: json!({ "memory": 256 }),
+            constraints: json!({}),
+        };
+
+        let orig_task_configs = vec![orig_task.clone()];
+        let job_config = JobConfig {
+            name: "jobname".into(),
+            tasks: orig_task_configs.clone(),
+            version: None,
+        };
 
         let store = setup_store()?;
-        teardown_store(&store)?;
+
+        // Original Job is submitted
+        let submit_response = store.handle_job_submit(&job_config, &orig_submissions);
+        assert!(submit_response.is_ok());
+
+        // Errors on resubmit
+        let submit_response = store.handle_job_submit(&job_config, &orig_submissions);
+        assert!(submit_response.is_err());
+        assert_eq!(
+            submit_response.unwrap_err().to_string(),
+            "Job config is unchanged"
+        );
+
         Ok(())
     }
 
-    #[test]
-    fn handle_job_submit_with_unchanged_job_and_force_update_works() -> R<()> {
-        assert!(true);
+    // #[test]
+    // fn handle_job_submit_with_unchanged_job_and_force_update_works() -> R<()> {
+    //     assert!(true);
+    //     let _store = setup_store()?;
+    //     Ok(())
+    // }
 
-        let store = setup_store()?;
-        teardown_store(&store)?;
-        Ok(())
-    }
+    // #[test]
+    // fn handle_job_stop() -> R<()> {
+    //     assert!(true);
+    //     let _store = setup_store()?;
+    //     Ok(())
+    // }
 
-    #[test]
-    fn handle_job_stop() -> R<()> {
-        assert!(true);
-
-        let store = setup_store()?;
-        teardown_store(&store)?;
-        Ok(())
-    }
-
-    #[test]
-    fn handle_job_purge() -> R<()> {
-        assert!(true);
-
-        let store = setup_store()?;
-        teardown_store(&store)?;
-        Ok(())
-    }
+    // #[test]
+    // fn handle_job_purge() -> R<()> {
+    //     assert!(true);
+    //     let _store = setup_store()?;
+    //     Ok(())
+    // }
 }

@@ -28,9 +28,10 @@ impl Manager for ManagerAgentService {
         let config: JobConfig =
             serde_json::from_str(&js).map_err(|_| Status::internal("Error parsing jobspec"))?;
 
-        self.store.insert_job_config(&config).map_err(|e| {
-            error!("Error saving job: {:?}", e);
-            Status::internal("Error saving job")
+        let subs = vec![];
+        self.store.handle_job_submit(&config, &subs).map_err(|e| {
+            error!("Error running job: {:?}", e);
+            Status::internal("Error running job")
         })?;
 
         let reply = RunJobReply {
