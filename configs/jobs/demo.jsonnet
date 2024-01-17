@@ -1,18 +1,20 @@
 {
     name: "demo",
-    tasks: {
-        "first-task": {
-            count: 1,
-            driver: "noop",
+    tasks: [
+        {
+            name: "first-task",
+            driver: "docker",
             config: {
                 message: "Hello from first task",
             },
             resources: {
                 memory: 256,
             },
+            constraints: {},
+            count: 1,
         },
-        "second-task": {
-            count: 2,
+        {
+            name: "second-task",
             driver: "noop",
             config: {
                 message: "Hello from second task",
@@ -20,6 +22,8 @@
             resources: {
                 memory: 128,
             },
-        },
-    },
+            constraints: {},
+            count: 2,
+        }
+    ]
 }

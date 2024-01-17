@@ -169,6 +169,17 @@ impl Store {
     // NODES
     //
 
+    fn job_from_row(&self, row: &Row<'_>) -> Result<Job, rusqlite::Error> {
+        let job = Job {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            status: row.get(2)?,
+            created_at: row.get(3)?,
+        };
+
+        Ok(job)
+    }
+
     fn node_from_row(&self, row: &Row<'_>) -> Result<Node, rusqlite::Error> {
         let node = Node {
             id: row.get(0)?,
@@ -449,6 +460,24 @@ WHERE name = ?;
         Ok(config)
     }
 
+    pub fn get_jobs(&self) -> R<Vec<Job>> {
+        let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
+        let sql = r#"
+SELECT id, name, status, created_at
+FROM job;
+"#;
+
+        let mut stmt = conn.prepare(sql)?;
+        let job_iter = stmt.query_map([], |row| self.job_from_row(row))?;
+        let mut jobs = Vec::new();
+        for job in job_iter {
+            let j = job?;
+            jobs.push(j);
+        }
+
+        Ok(jobs)
+    }
+
     #[instrument(err, skip_all)]
     pub fn get_job_config(&self, name: &str) -> R<JobConfig> {
         let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
@@ -472,6 +501,8 @@ LIMIT 1;
 
             Ok((jc, job_config_id))
         })?;
+
+        println!("jc_id: {}", jc_id);
 
         let task_sql = r#"
 SELECT id, name, driver, count, config, resources, constraints, job_id, job_config_id
@@ -546,7 +577,6 @@ WHERE name = ?;
         let job = match get_job_res {
             Ok(j) => Ok(j),
             Err(rusqlite::Error::QueryReturnedNoRows) => {
-                // TODO: Make sure this a missing row error
                 let job_sql = r#"
 INSERT INTO job (id, name, status, created_at)
 VALUES (:id, :name, :status, :created_at)
@@ -556,7 +586,7 @@ RETURNING id, name, status, created_at;
                 let job_params = named_params! {
                     ":id": config.name,
                     ":name": config.name,
-                    ":status": "active",
+                    ":status": "done",
                     ":created_at": now,
                 };
 

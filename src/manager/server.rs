@@ -25,8 +25,10 @@ impl Manager for ManagerAgentService {
         request: Request<RunJobRequest>,
     ) -> Result<Response<RunJobReply>, Status> {
         let js = request.into_inner().parsed_jobspec;
-        let config: JobConfig =
-            serde_json::from_str(&js).map_err(|_| Status::internal("Error parsing jobspec"))?;
+        let config: JobConfig = serde_json::from_str(&js).map_err(|e| {
+            println!("Error parsing jobspec: {:?}", e);
+            Status::internal("Error parsing jobspec")
+        })?;
 
         let subs = vec![];
         self.store.handle_job_submit(&config, &subs).map_err(|e| {
@@ -65,12 +67,11 @@ impl Manager for ManagerAgentService {
         &self,
         _request: Request<ListJobsRequest>,
     ) -> Result<Response<ListJobsReply>, Status> {
-        // let jobs = self.store.get_jobs().map_err(|e| {
-        //     error!("Error getting jobs: {:?}", e);
-        //     Status::internal("Error getting jobs")
-        // })?;
+        let jobs = self.store.get_jobs().map_err(|e| {
+            error!("Error getting jobs: {:?}", e);
+            Status::internal("Error getting jobs")
+        })?;
 
-        let jobs = vec![];
         let reply = ListJobsReply { jobs };
 
         Ok(Response::new(reply))
