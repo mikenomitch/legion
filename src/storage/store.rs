@@ -57,7 +57,7 @@ impl Store {
         Migrations::new(vec![
             M::up(
                 "CREATE TABLE IF NOT EXISTS node (
-                id    STRING PRIMARY KEY,
+                id STRING PRIMARY KEY,
                 pool STRING NOT NULL,
                 status STRING NOT NULL,
                 availability STRING NOT NULL,
@@ -531,35 +531,54 @@ WHERE job_config_id = ?;
 
         let mut conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
         let now = OffsetDateTime::now_utc().unix_timestamp();
-
         let tx = conn.transaction()?;
 
-        // TODO: HERE IS WHERE YOU HAVE TO COME BACK TO!
-        let job_sql = r#"
-INSERT INTO job (id, name, status, created_at)
-VALUES (:id, :name, :status, :created_at)
-ON CONFLICT(id) DO NOTHING
-RETURNING id, name, status, created_at;
+        let get_job_sql = r#"
+SELECT id, name, status, created_at
+FROM job
+WHERE name = ?;
 "#;
 
-        let job_params = named_params! {
-            ":id": config.name,
-            ":name": config.name,
-            ":status": "active",
-            ":created_at": now,
-        };
-
-        println!("get or insert job");
-        let returned_job = tx.query_row(job_sql, job_params, |row| {
+        let get_job_res = tx.query_row(get_job_sql, [config.name.clone()], |row| {
             Ok(Job {
                 id: row.get(0)?,
                 name: row.get(1)?,
                 status: row.get(2)?,
                 created_at: row.get(3)?,
             })
-        })?;
+        });
 
-        println!("returned_job: {:?}", returned_job);
+        let job = match get_job_res {
+            Ok(j) => j,
+            Err(e) => {
+                println!("jobby error: {}", e);
+
+                let job_sql = r#"
+INSERT INTO job (id, name, status, created_at)
+VALUES (:id, :name, :status, :created_at)
+RETURNING id, name, status, created_at;
+"#;
+
+                let job_params = named_params! {
+                    ":id": config.name,
+                    ":name": config.name,
+                    ":status": "active",
+                    ":created_at": now,
+                };
+
+                println!("get or insert job");
+                tx.query_row(job_sql, job_params, |row| {
+                    Ok(Job {
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                        status: row.get(2)?,
+                        created_at: row.get(3)?,
+                    })
+                })?
+            }
+        };
+
+        println!("returned_job: {:?}", job);
 
         let jc_sql = r#"
 INSERT INTO job_config (id, name, type, meta, version, created_at, job_id)
@@ -569,16 +588,17 @@ RETURNING id, name, type, meta, version, created_at;
 
         let now = time::OffsetDateTime::now_utc();
         let config_params = named_params! {
-            ":id": config.name,
+            ":id": format!("{}-{}", config.name, next_version.to_string()),
             ":name": config.name,
             ":type": "default",
             ":meta": "{}",
             ":version": next_version,
             ":created_at": now,
-            ":job_id": returned_job.id,
+            ":job_id": job.id,
         };
 
         println!("get or insert job config");
+
         let (_config, job_config_id): (JobConfig, String) =
             tx.query_row(jc_sql, config_params, |row| {
                 let tasks = vec![];
@@ -591,6 +611,8 @@ RETURNING id, name, type, meta, version, created_at;
                     row.get(0)?,
                 ))
             })?;
+
+        println!("job_config_id is: {}", job_config_id);
 
         let tasks_sql = r#"
 INSERT INTO task_config (name, driver, count, config, resources, constraints, job_id, job_config_id)
@@ -606,7 +628,7 @@ VALUES (:name, :driver, :count, :config, :resources, :constraints, :job_id, :job
                 ":config": t.config,
                 ":resources": t.resources,
                 ":constraints": t.constraints,
-                ":job_id": returned_job.id,
+                ":job_id": job.id,
                 ":job_config_id": job_config_id,
             };
 
@@ -791,7 +813,7 @@ mod tests {
         let t2_from_store = latest_job_config.tasks.get(1).ok_or("oof")?;
         assert_eq!(task_two.name, t2_from_store.name);
 
-        let subs_from_store = store.get_submissions_for_config(&latest_job_config.name)?;
+        let subs_from_store = store.get_submissions_for_config(&latest_job_config.id())?;
         assert_eq!(subs_from_store.len(), 2);
         let sub_one_from_store = subs_from_store.get(0).ok_or("no sub 1")?;
         let sub_two_from_store = subs_from_store.get(1).ok_or("no sub 2")?;
@@ -857,10 +879,7 @@ mod tests {
 
         let submit_response =
             store.handle_job_submit(&job_config_with_modified_driver.clone(), &orig_submissions);
-        if let Err(e) = submit_response {
-            println!("error: {}", e);
-        }
-        // assert!(submit_response.is_ok());
+        assert!(submit_response.is_ok());
 
         // Get config for initial insert
         let second_job_config = store.get_job_config("jobname".into())?;

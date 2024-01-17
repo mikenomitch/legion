@@ -114,6 +114,13 @@ impl JobConfig {
     pub fn is_same_as(&self, other: &JobConfig) -> bool {
         self.name == other.name && self.tasks == other.tasks
     }
+
+    pub fn id(&self) -> String {
+        match self.version {
+            Some(version) => format!("{}-{}", self.name, version),
+            None => format!("{}-{}", self.name, 0),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
