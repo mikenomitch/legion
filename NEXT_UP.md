@@ -1,33 +1,15 @@
 # Next Up
 
-- TIME TO TDD!
-
 - Split out job_config and job
-  - Job -> Status, name, type
-  - JobConfig -> Parsed information from the Submission
-  - Submission -> The raw files and a reference
-  - TaskConfig -> Parsed information from the Submission
+
   - Allocation -> A task on a node, status, history, etc
-  - Task -> Only make if necessary (status holder?)
+
 - Get a list of jobs via the CLI
-
-- On job submit
-
-  - A job is created for a config if it doesn't exist already
-  - A job_config is saved with a version one above the current version
-  - Task configs are created for the job_config
-  - If the job_config passed in matches the latest, it is a noop
-    - Unless a flag is passed in to force bump + deploy it
-  - Associated submissions are saved to the DB
-  - A job_update is created pointing to the right configs
-
-  - You can view tasks as part of the job info CLI
-
+- You can view tasks as part of the job info CLI
 - Submit all the jsonnet submissions alongside the jobspec in the RPC
-- Save these submissions in the DB
 - You can get submissions for a job with a new CLI endpoint
 
-- On job submit, tasks a _syncronously_ placed onto nodes
+- On job submit, tasks are _syncronously_ placed onto nodes
 
   - Add allocations table in the DB
   - A ledger is kept of all the node resources and whats on the nodes
@@ -38,6 +20,9 @@
     command fails and tells you why!
   - Then figure out how to make it an async loop
   - Then respond to node changes!
+
+- Figure out what to do about ids for job and job_config and whatnot
+- Can pass a flag in to force bump job + deploy it (even if same submission)
 
 - First party resource stuff + ledger? (start w/ allocs?)
 

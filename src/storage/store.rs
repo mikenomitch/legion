@@ -507,26 +507,21 @@ WHERE job_config_id = ?;
 
     #[allow(dead_code)]
     pub fn handle_job_submit(&self, config: &JobConfig, subs: &Vec<Submission>) -> R<()> {
-        println!("given config: {:?}", config);
-
         // Note: There is a race condition here with the version
         // I think this should prob be all in a single lock, but
         // I am not going to worry about this for now
 
         let mut next_version = 1;
+        let mut last_versions_id = "".to_string();
 
         if let Ok(latest_job_config) = self.get_job_config(&config.name) {
-            println!("latest_job_config: {:?}", latest_job_config);
             // if latest_job_config is deep equal to config, return an error
             if latest_job_config.is_same_as(config) {
-                println!("IT IS THE SAME!");
                 return Err("Job config is unchanged".into());
             } else {
                 next_version = latest_job_config.version.unwrap_or(0) + 1;
-                println!("I DONT THINK THESE CONFIGS ARE EQUAL YO")
+                last_versions_id = latest_job_config.id();
             }
-        } else {
-            println!("NO LATEST JOB CONFIG FOUND");
         }
 
         let mut conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
@@ -549,10 +544,9 @@ WHERE name = ?;
         });
 
         let job = match get_job_res {
-            Ok(j) => j,
-            Err(e) => {
-                println!("jobby error: {}", e);
-
+            Ok(j) => Ok(j),
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                // TODO: Make sure this a missing row error
                 let job_sql = r#"
 INSERT INTO job (id, name, status, created_at)
 VALUES (:id, :name, :status, :created_at)
@@ -566,7 +560,6 @@ RETURNING id, name, status, created_at;
                     ":created_at": now,
                 };
 
-                println!("get or insert job");
                 tx.query_row(job_sql, job_params, |row| {
                     Ok(Job {
                         id: row.get(0)?,
@@ -574,11 +567,10 @@ RETURNING id, name, status, created_at;
                         status: row.get(2)?,
                         created_at: row.get(3)?,
                     })
-                })?
+                })
             }
-        };
-
-        println!("returned_job: {:?}", job);
+            Err(error) => Err(error),
+        }?;
 
         let jc_sql = r#"
 INSERT INTO job_config (id, name, type, meta, version, created_at, job_id)
@@ -597,8 +589,6 @@ RETURNING id, name, type, meta, version, created_at;
             ":job_id": job.id,
         };
 
-        println!("get or insert job config");
-
         let (_config, job_config_id): (JobConfig, String) =
             tx.query_row(jc_sql, config_params, |row| {
                 let tasks = vec![];
@@ -612,14 +602,11 @@ RETURNING id, name, type, meta, version, created_at;
                 ))
             })?;
 
-        println!("job_config_id is: {}", job_config_id);
-
         let tasks_sql = r#"
 INSERT INTO task_config (name, driver, count, config, resources, constraints, job_id, job_config_id)
 VALUES (:name, :driver, :count, :config, :resources, :constraints, :job_id, :job_config_id);
 "#;
 
-        println!("insert tasks");
         config.tasks.iter().for_each(|t| {
             let task_params = named_params! {
                 ":name": t.name,
@@ -640,7 +627,6 @@ INSERT INTO submission (filename, text, is_primary, job_config_id)
 VALUES (:filename, :text, :is_primary, :job_config_id);
 "#;
 
-        println!("insert tasks");
         subs.iter().for_each(|s| {
             let sub_params = named_params! {
                 ":filename": s.filename,
@@ -651,6 +637,21 @@ VALUES (:filename, :text, :is_primary, :job_config_id);
 
             let _num_sub_rows_changes = tx.execute(subs_sql, sub_params);
         });
+
+        let job_update_sql = r#"
+INSERT INTO job_update (id, status, job_id, to_job_config_id, from_job_config_id)
+VALUES (:id, :status, :job_id, :to_job_config_id, :from_job_config_id);
+"#;
+
+        let job_update_params = named_params! {
+            ":id": format!("{}-{}", job.id, next_version.to_string()),
+            ":status": "active",
+            ":job_id": job.id,
+            ":to_job_config_id": job_config_id,
+            ":from_job_config_id": last_versions_id,
+        };
+
+        let _num_update_row_changes = tx.execute(job_update_sql, job_update_params);
 
         tx.commit()
             .map_err(|_| "Error committing transaction".into())
