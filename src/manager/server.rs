@@ -56,9 +56,7 @@ impl Manager for ManagerAgentService {
             Status::internal("Error getting job")
         })?;
 
-        let reply = GetJobStatusReply {
-            message: format!("Got the job: {:?}", job.name),
-        };
+        let reply = GetJobStatusReply { job: Some(job) };
 
         Ok(Response::new(reply))
     }

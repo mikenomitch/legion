@@ -143,8 +143,7 @@ async fn get_status(arg_matches: &clap::ArgMatches) -> R<()> {
         name: job_name.to_owned(),
     });
     let response = client.get_job_status(request).await?;
-
-    println!("RESPONSE={:?}", response);
+    println!("{:?}", response.into_inner().job.unwrap());
 
     Ok(())
 }

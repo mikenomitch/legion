@@ -67,7 +67,7 @@ message GetJobStatusRequest {
 }
 
 message GetJobStatusReply {
-  string message = 1;
+  Job job = 1;
 }
 
 message StopJobRequest {
