@@ -97,7 +97,7 @@ impl Store {
                 version INTEGER NOT NULL,
                 created_at TIMESTAMP NOT NULL,
                 job_id STRING NOT NULL,
-                FOREIGN KEY(job_id) REFERENCES job(id)
+                FOREIGN KEY(job_id) REFERENCES job(id) ON DELETE CASCADE
             )",
             )
             .down("DROP TABLE job_config;"),
@@ -108,7 +108,7 @@ impl Store {
                 text TEXT NOT NULL,
                 job_config_id STRING NOT NULL,
                 is_primary INTEGER NOT NULL,
-                FOREIGN KEY(job_config_id) REFERENCES job_config(id)
+                FOREIGN KEY(job_config_id) REFERENCES job_config(id) ON DELETE CASCADE
             )",
             )
             .down("DROP TABLE submission;"),
@@ -123,8 +123,8 @@ impl Store {
                 constraints JSONB NOT NULL,
                 job_id STRING NOT NULL,
                 job_config_id STRING NOT NULL,
-                FOREIGN KEY(job_id) REFERENCES job(id),
-                FOREIGN KEY(job_config_id) REFERENCES job_config(id)
+                FOREIGN KEY(job_id) REFERENCES job(id) ON DELETE CASCADE,
+                FOREIGN KEY(job_config_id) REFERENCES job_config(id) ON DELETE CASCADE
             )",
             )
             .down("DROP TABLE task_config;"),
@@ -134,10 +134,10 @@ impl Store {
                 status STRING NOT NULL,
                 job_id STRING NOT NULL,
                 to_job_config_id STRING NOT NULL,
-                from_job_config_id STRING NOT NULL,
-                FOREIGN KEY(job_id) REFERENCES job(id),
-                FOREIGN KEY(to_job_config_id) REFERENCES job_config(id)
-                FOREIGN KEY(from_job_config_id) REFERENCES job_config(id)
+                from_job_config_id STRING,
+                FOREIGN KEY(job_id) REFERENCES job(id) ON DELETE CASCADE,
+                FOREIGN KEY(to_job_config_id) REFERENCES job_config(id) ON DELETE CASCADE,
+                FOREIGN KEY(from_job_config_id) REFERENCES job_config(id) ON DELETE CASCADE
             )",
             )
             .down("DROP TABLE job_update;"),
@@ -448,7 +448,7 @@ FROM job
 WHERE name = ?;
 "#;
 
-        let config = conn.query_row(sql, [name], |row| {
+        let job = conn.query_row(sql, [name], |row| {
             Ok(Job {
                 id: row.get(0)?,
                 name: row.get(1)?,
@@ -457,7 +457,7 @@ WHERE name = ?;
             })
         })?;
 
-        Ok(config)
+        Ok(job)
     }
 
     pub fn get_jobs(&self) -> R<Vec<Job>> {
@@ -476,6 +476,58 @@ FROM job;
         }
 
         Ok(jobs)
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn stop_job(&self, name: &str) -> R<()> {
+        let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
+        let sql = r#"
+        UPDATE job
+        SET status = 'stopped'
+        WHERE name = ?;
+"#;
+        conn.execute(sql, [name])?;
+
+        // TODO: Create a job_update record
+        // that kicks off the eval?
+        // ... or maybe just this adds the eval straight up?
+
+        Ok(())
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn destroy_job(&self, name: &str) -> R<()> {
+        let mut conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
+        let tx = conn.transaction()?;
+
+        let get_job_sql = r#"
+        SELECT id, name, status, created_at
+        FROM job
+        WHERE name = ?;
+        "#;
+
+        let job = tx.query_row(get_job_sql, [name], |row| {
+            Ok(Job {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                status: row.get(2)?,
+                created_at: row.get(3)?,
+            })
+        })?;
+
+        if job.status != "stopped" {
+            return Err("Job must be stopped before it can be destroyed".into());
+        }
+
+        let update_sql = r#"
+            DELETE FROM job
+            WHERE name = ? AND status = 'stopped';
+        "#;
+
+        tx.execute(update_sql, [name])?;
+
+        tx.commit()
+            .map_err(|_| "Error committing transaction".into())
     }
 
     #[instrument(err, skip_all)]

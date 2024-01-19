@@ -9,6 +9,8 @@ service Manager {
   rpc WorkerRegister (WorkerRegisterRequest) returns (WorkerRegisterReply);
   rpc RunJob (RunJobRequest) returns (RunJobReply);
   rpc GetJobStatus (GetJobStatusRequest) returns (GetJobStatusReply);
+  rpc StopJob (StopJobRequest) returns (StopJobReply);
+  rpc DestroyJob (DestroyJobRequest) returns (DestroyJobReply);
   rpc ListJobs (ListJobsRequest) returns (ListJobsReply);
   rpc Heartbeat (HeartbeatRequest) returns (HeartbeatReply);
   rpc HealthCheck (HealthCheckRequest) returns (HealthCheckReply);
@@ -65,6 +67,22 @@ message GetJobStatusRequest {
 }
 
 message GetJobStatusReply {
+  string message = 1;
+}
+
+message StopJobRequest {
+  string name = 1;
+}
+
+message StopJobReply {
+  string message = 1;
+}
+
+message DestroyJobRequest {
+  string name = 1;
+}
+
+message DestroyJobReply {
   string message = 1;
 }
 

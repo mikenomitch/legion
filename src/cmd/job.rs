@@ -1,13 +1,23 @@
 use crate::prelude::*;
 
 use crate::structs::manager_client::ManagerClient;
-use crate::structs::{GetJobStatusRequest, Job, ListJobsRequest, RunJobRequest};
+use crate::structs::{
+    DestroyJobRequest, GetJobStatusRequest, Job, ListJobsRequest, RunJobRequest, StopJobRequest,
+};
 use jsonnet::JsonnetVm;
 
 pub fn config() -> Command {
     let job_run_cmd = Command::new("run")
         .about("Run a job")
         .arg(arg!(path: [PATH]));
+
+    let job_stop_cmd = Command::new("stop")
+        .about("Stop a job")
+        .arg(arg!(name: [NAME]));
+
+    let job_destroy_cmd = Command::new("destroy")
+        .about("Destroy a job")
+        .arg(arg!(name: [NAME]));
 
     let job_status_cmd = Command::new("status")
         .about("Get job status")
@@ -22,15 +32,53 @@ pub fn config() -> Command {
         .subcommand(job_run_cmd)
         .subcommand(job_status_cmd)
         .subcommand(job_list_cmd)
+        .subcommand(job_stop_cmd)
+        .subcommand(job_destroy_cmd)
 }
 
 pub async fn handle(sub_matches: &clap::ArgMatches) -> R<()> {
     match sub_matches.subcommand() {
         Some(("run", matches)) => run_job(matches).await,
+        Some(("stop", matches)) => stop_job(matches).await,
+        Some(("destroy", matches)) => destroy_job(matches).await,
         Some(("list", _)) => list_jobs().await,
         Some(("status", matches)) => get_status(matches).await,
         _ => unreachable!(),
     }
+}
+
+#[instrument(err, skip_all)]
+async fn stop_job(arg_matches: &clap::ArgMatches) -> R<()> {
+    let mut client = ManagerClient::connect(DEF_MANAGER_ADDRESS).await?;
+    let job_name = arg_matches
+        .get_one::<String>("name")
+        .map_or("demo", String::as_str);
+
+    let request = tonic::Request::new(StopJobRequest {
+        name: job_name.to_owned(),
+    });
+
+    let response = client.stop_job(request).await?;
+    println!("RESPONSE={:?}", response);
+
+    Ok(())
+}
+
+#[instrument(err, skip_all)]
+async fn destroy_job(arg_matches: &clap::ArgMatches) -> R<()> {
+    let mut client = ManagerClient::connect(DEF_MANAGER_ADDRESS).await?;
+    let job_name = arg_matches
+        .get_one::<String>("name")
+        .map_or("demo", String::as_str);
+
+    let request = tonic::Request::new(DestroyJobRequest {
+        name: job_name.to_owned(),
+    });
+
+    let response = client.destroy_job(request).await?;
+    println!("RESPONSE={:?}", response);
+
+    Ok(())
 }
 
 #[instrument(err, skip_all)]
@@ -77,7 +125,6 @@ async fn run_job(arg_matches: &clap::ArgMatches) -> R<()> {
 #[instrument(err, skip_all)]
 async fn list_jobs() -> R<()> {
     let mut client = ManagerClient::connect(DEF_MANAGER_ADDRESS).await?;
-
     let request = tonic::Request::new(ListJobsRequest {});
     let response = client.list_jobs(request).await?;
     let jobs_list = response.into_inner().jobs;

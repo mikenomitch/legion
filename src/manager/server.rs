@@ -3,11 +3,12 @@ use crate::prelude::*;
 use crate::storage::store::Store;
 use crate::structs::manager_server::Manager;
 use crate::structs::{
-    GetJobStatusReply, GetJobStatusRequest, GetNodeReply, GetNodeRequest, GetNodesReply,
-    GetNodesRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest,
-    JobConfig, ListJobsReply, ListJobsRequest, NodeMsg, RunJobReply, RunJobRequest,
-    UpdateNodeDynamicReply, UpdateNodeDynamicRequest, WorkerConfig, WorkerPreRegisterReply,
-    WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest,
+    DestroyJobReply, DestroyJobRequest, GetJobStatusReply, GetJobStatusRequest, GetNodeReply,
+    GetNodeRequest, GetNodesReply, GetNodesRequest, HealthCheckReply, HealthCheckRequest,
+    HeartbeatReply, HeartbeatRequest, JobConfig, ListJobsReply, ListJobsRequest, NodeMsg,
+    RunJobReply, RunJobRequest, StopJobReply, StopJobRequest, UpdateNodeDynamicReply,
+    UpdateNodeDynamicRequest, WorkerConfig, WorkerPreRegisterReply, WorkerPreRegisterRequest,
+    WorkerRegisterReply, WorkerRegisterRequest,
 };
 
 use tonic::{Request, Response, Status};
@@ -73,6 +74,43 @@ impl Manager for ManagerAgentService {
         })?;
 
         let reply = ListJobsReply { jobs };
+
+        Ok(Response::new(reply))
+    }
+
+    #[instrument(skip_all)]
+    async fn stop_job(
+        &self,
+        request: Request<StopJobRequest>,
+    ) -> Result<Response<StopJobReply>, Status> {
+        let name = request.into_inner().name;
+
+        let _ = self.store.stop_job(&name).map_err(|e| {
+            error!("Error stopping job: {:?}", e);
+            Status::internal("Error stopping job")
+        })?;
+
+        let message = format!("Stopped {}", name);
+        let reply = StopJobReply { message };
+
+        Ok(Response::new(reply))
+    }
+
+    #[instrument(skip_all)]
+    async fn destroy_job(
+        &self,
+        request: Request<DestroyJobRequest>,
+    ) -> Result<Response<DestroyJobReply>, Status> {
+        let name = request.into_inner().name;
+
+        let _ = self.store.destroy_job(&name).map_err(|e| {
+            error!("Error deleting job: {:?}", e);
+            Status::internal("Error deleting job")
+        })?;
+
+        // TODO: Conditionalize
+        let message = format!("Destroyed {}", name);
+        let reply = DestroyJobReply { message };
 
         Ok(Response::new(reply))
     }
