@@ -38,7 +38,7 @@ impl Manager for ManagerAgentService {
         })?;
 
         let reply = RunJobReply {
-            message: "You are in!".into(),
+            message: "Job submit success".into(),
         };
 
         Ok(Response::new(reply))
@@ -228,7 +228,7 @@ impl Manager for ManagerAgentService {
         })?;
 
         let reply = WorkerRegisterReply {
-            message: "You are in!".into(),
+            message: "Worker registered".into(),
         };
 
         Ok(Response::new(reply))

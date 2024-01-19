@@ -11,7 +11,7 @@
                 memory: 256,
             },
             constraints: {},
-            count: 1,
+            count: 2,
         },
         {
             name: "second-task",

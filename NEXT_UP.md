@@ -1,9 +1,5 @@
 # Next Up
 
-- Split out job_config and job
-
-  - Allocation -> A task on a node, status, history, etc
-
 - Get a list of jobs via the CLI
 - You can view tasks as part of the job info CLI
 - Submit all the jsonnet submissions alongside the jobspec in the RPC

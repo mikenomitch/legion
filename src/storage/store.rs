@@ -114,7 +114,7 @@ impl Store {
             .down("DROP TABLE submission;"),
             M::up(
                 "CREATE TABLE IF NOT EXISTS task_config (
-                id STRING PRIMARY KEY,
+                id INTEGER PRIMARY KEY,
                 count INTEGER NOT NULL,
                 name STRING NOT NULL,
                 driver STRING NOT NULL,
@@ -553,8 +553,6 @@ LIMIT 1;
 
             Ok((jc, job_config_id))
         })?;
-
-        println!("jc_id: {}", jc_id);
 
         let task_sql = r#"
 SELECT id, name, driver, count, config, resources, constraints, job_id, job_config_id
