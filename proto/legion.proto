@@ -48,14 +48,15 @@ message WorkerRegisterReply {
   string message = 1;
 }
 
-message SubmissionMsg {
+message Submission {
   string path = 1;
-  string source = 2;
+  string content = 2;
+  bool is_primary = 3;
 }
 
 message RunJobRequest {
   string parsed_jobspec = 1;
-  repeated SubmissionMsg submissions = 2;
+  repeated Submission submissions = 2;
 }
 
 message RunJobReply {

@@ -123,13 +123,13 @@ impl JobConfig {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct Submission {
-    pub filename: String,
-    pub text: String,
-    pub is_primary: bool,
-}
+// #[derive(Serialize, Deserialize, Debug, Clone)]
+// #[serde(rename_all = "camelCase")]
+// pub struct Submission {
+//     pub filename: String,
+//     pub text: String,
+//     pub is_primary: bool,
+// }
 
 /// Our claims struct, it needs to derive `Serialize` and/or `Deserialize`
 #[derive(Debug, Serialize, Deserialize)]

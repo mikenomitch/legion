@@ -104,8 +104,8 @@ impl Store {
             M::up(
                 "CREATE TABLE IF NOT EXISTS submission (
                 id STRING PRIMARY KEY,
-                filename STRING NOT NULL,
-                text TEXT NOT NULL,
+                path STRING NOT NULL,
+                content TEXT NOT NULL,
                 job_config_id STRING NOT NULL,
                 is_primary INTEGER NOT NULL,
                 FOREIGN KEY(job_config_id) REFERENCES job_config(id) ON DELETE CASCADE
@@ -703,14 +703,14 @@ VALUES (:name, :driver, :count, :config, :resources, :constraints, :job_id, :job
         });
 
         let subs_sql = r#"
-INSERT INTO submission (filename, text, is_primary, job_config_id)
-VALUES (:filename, :text, :is_primary, :job_config_id);
+INSERT INTO submission (path, content, is_primary, job_config_id)
+VALUES (:path, :content, :is_primary, :job_config_id);
 "#;
 
         subs.iter().for_each(|s| {
             let sub_params = named_params! {
-                ":filename": s.filename,
-                ":text": s.text,
+                ":path": s.path,
+                ":content": s.content,
                 ":is_primary": s.is_primary,
                 ":job_config_id": job_config_id,
             };
@@ -742,15 +742,15 @@ VALUES (:id, :status, :job_id, :to_job_config_id, :from_job_config_id);
         let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
 
         let sql = r#"
-SELECT s.id, s.filename, s.text, s.job_config_id, s.is_primary
+SELECT s.id, s.path, s.content, s.job_config_id, s.is_primary
 FROM submission s
 WHERE s.job_config_id = ?;
 "#;
         let mut stmt = conn.prepare(sql)?;
         let sub_iter = stmt.query_map([job_config_id], |row| {
             Ok(Submission {
-                filename: row.get(1)?,
-                text: row.get(2)?,
+                path: row.get(1)?,
+                content: row.get(2)?,
                 is_primary: row.get(4)?,
             })
         })?;
@@ -822,13 +822,13 @@ mod tests {
     #[test]
     fn handle_job_submit_adds_new_job() -> R<()> {
         let sub_one = Submission {
-            filename: "sub-1.jsonnet".into(),
-            text: "sub-1".into(),
+            path: "sub-1.jsonnet".into(),
+            content: "sub-1".into(),
             is_primary: true,
         };
         let sub_two = Submission {
-            filename: "sub-2.libsonnet".into(),
-            text: "sub-2".into(),
+            path: "sub-2.libsonnet".into(),
+            content: "sub-2".into(),
             is_primary: false,
         };
 
@@ -868,7 +868,7 @@ mod tests {
             "Query returned no rows"
         );
 
-        // NOTE: What should this return (figure it out in context later)
+        // NOTE: What should this return (figure it out in concontent later)
         let submit_response = store.handle_job_submit(&job_config, &subs);
         assert!(submit_response.is_ok());
 
@@ -898,8 +898,8 @@ mod tests {
         assert_eq!(subs_from_store.len(), 2);
         let sub_one_from_store = subs_from_store.get(0).ok_or("no sub 1")?;
         let sub_two_from_store = subs_from_store.get(1).ok_or("no sub 2")?;
-        assert_eq!(sub_one_from_store.filename, sub_one.filename);
-        assert_eq!(sub_two_from_store.filename, sub_two.filename);
+        assert_eq!(sub_one_from_store.path, sub_one.path);
+        assert_eq!(sub_two_from_store.path, sub_two.path);
 
         Ok(())
     }
@@ -907,8 +907,8 @@ mod tests {
     #[test]
     fn handle_job_submit_updates_job_properly() -> R<()> {
         let orib_sub = Submission {
-            filename: "sub-1.jsonnet".into(),
-            text: "sub-1".into(),
+            path: "sub-1.jsonnet".into(),
+            content: "sub-1".into(),
             is_primary: true,
         };
         let orig_submissions = vec![orib_sub.clone()];

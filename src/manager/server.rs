@@ -6,7 +6,7 @@ use crate::structs::{
     DestroyJobReply, DestroyJobRequest, GetJobStatusReply, GetJobStatusRequest, GetNodeReply,
     GetNodeRequest, GetNodesReply, GetNodesRequest, HealthCheckReply, HealthCheckRequest,
     HeartbeatReply, HeartbeatRequest, JobConfig, ListJobsReply, ListJobsRequest, NodeMsg,
-    RunJobReply, RunJobRequest, StopJobReply, StopJobRequest, UpdateNodeDynamicReply,
+    RunJobReply, RunJobRequest, StopJobReply, StopJobRequest, Submission, UpdateNodeDynamicReply,
     UpdateNodeDynamicRequest, WorkerConfig, WorkerPreRegisterReply, WorkerPreRegisterRequest,
     WorkerRegisterReply, WorkerRegisterRequest,
 };

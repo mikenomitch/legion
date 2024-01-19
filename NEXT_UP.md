@@ -1,8 +1,16 @@
 # Next Up
 
-- Get a list of jobs via the CLI
-- You can view tasks as part of the job info CLI
-- Submit all the jsonnet submissions alongside the jobspec in the RPC
+- Submissions
+
+  - Submit all the jsonnet submissions alongside the jobspec in the RPC
+    - Figure out the lifetimes issue (...take your time on this...)
+  - Change the submissions table to have a join record rather than a FK
+  - Add the hash of the submission to the submissions table
+  - If you add a submission with the same hash, it just uses the existing one
+  - If you destroy a job, destroy its submissions if and only if they are not used by another job
+  - The hash is the ID?
+
+- You can view tasks as part of the job info CLI (change status to "info", I can get status via list)
 - You can get submissions for a job with a new CLI endpoint
 
 - On job submit, tasks are _syncronously_ placed onto nodes
@@ -10,7 +18,7 @@
   - Add allocations table in the DB
   - A ledger is kept of all the node resources and whats on the nodes
   - A "topology"-like CLI command can be used to view the whole ledger
-    (perhaps just called "ledger"?)
+    (perhaps just called "ledger" or "cluster")
   - Initially you can go over the resources
   - If you don't have enough resources on submit, the job
     command fails and tells you why!
