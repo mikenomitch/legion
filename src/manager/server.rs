@@ -25,13 +25,15 @@ impl Manager for ManagerAgentService {
         &self,
         request: Request<RunJobRequest>,
     ) -> Result<Response<RunJobReply>, Status> {
-        let js = request.into_inner().parsed_jobspec;
+        let inner = request.into_inner();
+        let js = inner.parsed_jobspec;
+        let subs = inner.submissions;
+
         let config: JobConfig = serde_json::from_str(&js).map_err(|e| {
             println!("Error parsing jobspec: {:?}", e);
             Status::internal("Error parsing jobspec")
         })?;
 
-        let subs = vec![];
         self.store.handle_job_submit(&config, &subs).map_err(|e| {
             error!("Error running job: {:?}", e);
             Status::internal("Error running job")

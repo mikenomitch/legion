@@ -103,15 +103,23 @@ impl Store {
             .down("DROP TABLE job_config;"),
             M::up(
                 "CREATE TABLE IF NOT EXISTS submission (
-                id STRING PRIMARY KEY,
-                path STRING NOT NULL,
-                content TEXT NOT NULL,
-                job_config_id STRING NOT NULL,
-                is_primary INTEGER NOT NULL,
-                FOREIGN KEY(job_config_id) REFERENCES job_config(id) ON DELETE CASCADE
+                hash STRING PRIMARY KEY,
+                content TEXT NOT NULL
             )",
             )
             .down("DROP TABLE submission;"),
+            M::up(
+                "CREATE TABLE IF NOT EXISTS job_config_submission (
+            id INTEGER PRIMARY KEY,
+            path STRING NOT NULL,
+            is_primary INTEGER NOT NULL,
+            job_config_id STRING NOT NULL,
+            submission_hash STRING NOT NULL,
+            FOREIGN KEY(job_config_id) REFERENCES job_config(id) ON DELETE CASCADE,
+            FOREIGN KEY(submission_hash) REFERENCES submission(hash) ON DELETE CASCADE
+        )",
+            )
+            .down("DROP TABLE job_config_submission;"),
             M::up(
                 "CREATE TABLE IF NOT EXISTS task_config (
                 id INTEGER PRIMARY KEY,
@@ -159,6 +167,7 @@ impl Store {
         let mut conn = conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
         info!("Pragma update");
         conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
         info!("Running migrations");
         migrations.to_latest(&mut conn)?;
 
@@ -703,19 +712,44 @@ VALUES (:name, :driver, :count, :config, :resources, :constraints, :job_id, :job
         });
 
         let subs_sql = r#"
-INSERT INTO submission (path, content, is_primary, job_config_id)
-VALUES (:path, :content, :is_primary, :job_config_id);
+INSERT INTO submission (content, hash)
+VALUES (:content, :hash)
+ON CONFLICT(hash) DO NOTHING;
 "#;
 
         subs.iter().for_each(|s| {
+            let sub_hash = s.hash();
+
             let sub_params = named_params! {
-                ":path": s.path,
                 ":content": s.content,
-                ":is_primary": s.is_primary,
-                ":job_config_id": job_config_id,
+                ":hash": sub_hash,
             };
 
-            let _num_sub_rows_changes = tx.execute(subs_sql, sub_params);
+            let num_sub_rows_changes = tx.execute(subs_sql, sub_params);
+            println!("num_sub_rows_changes: {:?}", num_sub_rows_changes);
+
+            // TODO: Make sure that if random things fail,
+            // we manually fail the transaction!
+
+            let job_config_sub_sql = r#"
+INSERT INTO job_config_submission (path, is_primary, job_config_id, submission_hash)
+VALUES (:path, :is_primary, :job_config_id, :submission_hash);
+"#;
+
+            let job_config_sub_params = named_params! {
+                ":path": s.path,
+                ":is_primary": s.is_primary,
+                ":job_config_id": job_config_id,
+                ":submission_hash": sub_hash,
+            };
+
+            let num_job_config_sub_rows_changes =
+                tx.execute(job_config_sub_sql, job_config_sub_params);
+
+            println!(
+                "num_job_config_sub_rows_changes: {:?}",
+                num_job_config_sub_rows_changes
+            );
         });
 
         let job_update_sql = r#"
@@ -1057,6 +1091,18 @@ mod tests {
             "Job config is unchanged"
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn destroying_a_job_destroys_all_associated_objects() -> R<()> {
+        // TODO: Do this but use come common code to DRY up above
+        Ok(())
+    }
+
+    #[test]
+    fn destroying_a_job_wont_destroy_other_used_submissions() -> R<()> {
+        // TODO: Do this but use come common code to DRY up above
         Ok(())
     }
 

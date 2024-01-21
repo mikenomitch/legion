@@ -8,7 +8,8 @@ edition = "2021"
 [dependencies]
 clap = { version = "4.4.10", features = ["cargo", "derive"] }
 futures = "0.3"
-jsonnet-rs = "0.17.0"
+# jsonnet-rs = "0.17.0"
+jsonnet-rs = { git = "https://github.com/mikenomitch/rust-jsonnet" }
 jsonwebtoken = "9.1.0"
 libloading = "0.8.1"
 prost = "0.12"
@@ -36,6 +37,7 @@ tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["json", "env-filter"] }
 tracing-futures = "0.2.5"
 tracing-appender = "0.2.3"
+sha2 = "0.10.8"
 
 [build-dependencies]
 tonic-build = "0.8"

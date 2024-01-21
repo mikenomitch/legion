@@ -6,7 +6,6 @@ use crate::structs::{
     Submission,
 };
 use jsonnet::JsonnetVm;
-use std::path::Path;
 
 pub fn config() -> Command {
     let job_run_cmd = Command::new("run")
@@ -92,34 +91,38 @@ async fn run_job(arg_matches: &clap::ArgMatches) -> R<()> {
         .map_or("./configs/jobs/demo.jsonnet", String::as_str);
 
     let mut vm = JsonnetVm::new();
-    let submissions = vec![];
+    let mut submissions = vec![];
 
-    let cl: Fn = |_vm: &_, base: &Path, rel: &_| {
-        // println!("IMPORT: base={:?}, rel={:?}", base, rel);
+    let content = std::fs::read_to_string(job_path)?;
+    let initial_sub = Submission {
+        path: job_path.to_string(),
+        content,
+        is_primary: true,
+    };
+    submissions.push(initial_sub);
+
+    vm.import_callback(|_vm, base, rel| {
+        println!("IMPORT: base={:?}, rel={:?}", base, rel);
         let path = std::path::Path::new(base).join(rel);
         let path_str = path.to_str().unwrap();
-        // println!("PATH={:?}", path_str);
+        println!("PATH={:?}", path_str);
         let contents = std::fs::read_to_string(&path).unwrap();
 
-        // TODO: set is_primary properly
         let sub = Submission {
             path: path_str.to_string(),
             content: contents.to_string(),
             is_primary: false,
         };
 
-        unsafe {
-            submissions.push(sub);
-        }
+        submissions.push(sub);
 
-        // println!("RAW_CONTENT={:?}", contents);
+        println!("RAW_CONTENT={:?}", contents);
         Ok((base.into(), contents.to_string()))
-    };
-
-    // let mut import_file_paths: Vec<&str> = vec![];
-    vm.import_callback(cl);
+    });
 
     let res = vm.evaluate_file(job_path);
+
+    println!("SUBMISSIONS={:?}", submissions);
 
     match res {
         Ok(s) => {

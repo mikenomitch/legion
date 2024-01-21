@@ -2,6 +2,7 @@ use crate::prelude::*;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{from_str, to_string};
+use sha2::{Digest, Sha256};
 use time::macros::format_description;
 
 tonic::include_proto!("legion");
@@ -38,6 +39,14 @@ impl From<ServerConfigFull> for ServerConfig {
             insecure_port: Some(val.insecure_port),
             host: Some(val.host),
         }
+    }
+}
+
+impl Submission {
+    pub fn hash(&self) -> String {
+        let content = &self.content;
+        let hash = Sha256::digest(content.as_bytes());
+        format!("{:x}", hash)
     }
 }
 

@@ -2,16 +2,14 @@
 
 - Submissions
 
-  - Submit all the jsonnet submissions alongside the jobspec in the RPC
-    - Figure out the lifetimes issue (...take your time on this...)
   - Change the submissions table to have a join record rather than a FK
   - Add the hash of the submission to the submissions table
   - If you add a submission with the same hash, it just uses the existing one
   - If you destroy a job, destroy its submissions if and only if they are not used by another job
-  - The hash is the ID?
+  - Fix the cascade delete not working on submissions!
 
 - You can view tasks as part of the job info CLI (change status to "info", I can get status via list)
-- You can get submissions for a job with a new CLI endpoint
+- You can get submissions for a job with a CLI command
 
 - On job submit, tasks are _syncronously_ placed onto nodes
 
@@ -76,8 +74,9 @@
 - DRY up
 
   - Error handling
+  - Store
 
-- Worker configs CRUD commands
+- Worker configs CRUD commands with push from manager
 
   - I guess for this to really work, you would need to update any of this type
     that already exist (and send them the info)
