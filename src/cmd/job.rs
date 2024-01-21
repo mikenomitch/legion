@@ -2,44 +2,44 @@ use crate::prelude::*;
 
 use crate::structs::manager_client::ManagerClient;
 use crate::structs::{
-    DestroyJobRequest, GetJobSpecRequest, GetJobStatusRequest, Job, ListJobsRequest, RunJobRequest,
+    DestroyJobRequest, GetJobInfoRequest, GetJobSpecRequest, Job, ListJobsRequest, RunJobRequest,
     StopJobRequest, Submission,
 };
 use jsonnet::JsonnetVm;
 
 pub fn config() -> Command {
-    let job_run_cmd = Command::new("run")
+    let run_cmd = Command::new("run")
         .about("Run a job")
         .arg(arg!(path: [PATH]));
 
-    let job_stop_cmd = Command::new("stop")
+    let stop_cmd = Command::new("stop")
         .about("Stop a job")
         .arg(arg!(name: [NAME]));
 
-    let job_destroy_cmd = Command::new("destroy")
+    let destroy_cmd = Command::new("destroy")
         .about("Destroy a job")
         .arg(arg!(name: [NAME]));
 
-    let job_status_cmd = Command::new("status")
-        .about("Get job status")
+    let info_cmd = Command::new("info")
+        .about("Get job info")
         .arg(arg!(name: [NAME]));
 
-    let job_spec_cmd = Command::new("spec")
+    let spec_cmd = Command::new("spec")
         .about("Get job spec used to define the job")
         .arg(arg!(name: [NAME]));
 
-    let job_list_cmd = Command::new("list").about("List all jobs");
+    let list_cmd = Command::new("list").about("List all jobs");
 
     Command::new("job")
         .about("Interact with jobs")
         .subcommand_required(true)
         .arg_required_else_help(true)
-        .subcommand(job_run_cmd)
-        .subcommand(job_status_cmd)
-        .subcommand(job_list_cmd)
-        .subcommand(job_stop_cmd)
-        .subcommand(job_spec_cmd)
-        .subcommand(job_destroy_cmd)
+        .subcommand(run_cmd)
+        .subcommand(info_cmd)
+        .subcommand(list_cmd)
+        .subcommand(stop_cmd)
+        .subcommand(spec_cmd)
+        .subcommand(destroy_cmd)
 }
 
 pub async fn handle(sub_matches: &clap::ArgMatches) -> R<()> {
@@ -49,7 +49,7 @@ pub async fn handle(sub_matches: &clap::ArgMatches) -> R<()> {
         Some(("spec", matches)) => get_job_spec(matches).await,
         Some(("destroy", matches)) => destroy_job(matches).await,
         Some(("list", _)) => list_jobs().await,
-        Some(("status", matches)) => get_status(matches).await,
+        Some(("info", matches)) => get_info(matches).await,
         _ => unreachable!(),
     }
 }
@@ -179,13 +179,13 @@ async fn list_jobs() -> R<()> {
 }
 
 #[instrument(err, skip_all)]
-async fn get_status(arg_matches: &clap::ArgMatches) -> R<()> {
+async fn get_info(arg_matches: &clap::ArgMatches) -> R<()> {
     let mut client = ManagerClient::connect(DEF_MANAGER_ADDRESS).await?;
     let job_name = arg_matches.get_one::<String>("name").ok_or("need name")?;
-    let request = tonic::Request::new(GetJobStatusRequest {
+    let request = tonic::Request::new(GetJobInfoRequest {
         name: job_name.to_owned(),
     });
-    let response = client.get_job_status(request).await?;
+    let response = client.get_job_info(request).await?;
     println!("{:?}", response.into_inner().job.unwrap());
 
     Ok(())

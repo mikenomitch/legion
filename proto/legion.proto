@@ -9,7 +9,7 @@ service Manager {
   rpc WorkerRegister (WorkerRegisterRequest) returns (WorkerRegisterReply);
   rpc RunJob (RunJobRequest) returns (RunJobReply);
   rpc GetJobSpec (GetJobSpecRequest) returns (GetJobSpecReply);
-  rpc GetJobStatus (GetJobStatusRequest) returns (GetJobStatusReply);
+  rpc GetJobInfo (GetJobInfoRequest) returns (GetJobInfoReply);
   rpc StopJob (StopJobRequest) returns (StopJobReply);
   rpc DestroyJob (DestroyJobRequest) returns (DestroyJobReply);
   rpc ListJobs (ListJobsRequest) returns (ListJobsReply);
@@ -64,11 +64,11 @@ message RunJobReply {
   string message = 1;
 }
 
-message GetJobStatusRequest {
+message GetJobInfoRequest {
   string name = 1;
 }
 
-message GetJobStatusReply {
+message GetJobInfoReply {
   Job job = 1;
 }
 

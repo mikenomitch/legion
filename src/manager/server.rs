@@ -3,8 +3,8 @@ use crate::prelude::*;
 use crate::storage::store::Store;
 use crate::structs::manager_server::Manager;
 use crate::structs::{
-    DestroyJobReply, DestroyJobRequest, GetJobSpecReply, GetJobSpecRequest, GetJobStatusReply,
-    GetJobStatusRequest, GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest,
+    DestroyJobReply, DestroyJobRequest, GetJobInfoReply, GetJobInfoRequest, GetJobSpecReply,
+    GetJobSpecRequest, GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest,
     HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, JobConfig,
     ListJobsReply, ListJobsRequest, NodeMsg, RunJobReply, RunJobRequest, StopJobReply,
     StopJobRequest, UpdateNodeDynamicReply, UpdateNodeDynamicRequest, WorkerConfig,
@@ -47,10 +47,10 @@ impl Manager for ManagerAgentService {
     }
 
     #[instrument(skip_all)]
-    async fn get_job_status(
+    async fn get_job_info(
         &self,
-        request: Request<GetJobStatusRequest>,
-    ) -> Result<Response<GetJobStatusReply>, Status> {
+        request: Request<GetJobInfoRequest>,
+    ) -> Result<Response<GetJobInfoReply>, Status> {
         let name = request.into_inner().name;
 
         let job = self.store.get_job(&name).map_err(|e| {
@@ -58,7 +58,7 @@ impl Manager for ManagerAgentService {
             Status::internal("Error getting job")
         })?;
 
-        let reply = GetJobStatusReply { job: Some(job) };
+        let reply = GetJobInfoReply { job: Some(job) };
 
         Ok(Response::new(reply))
     }
