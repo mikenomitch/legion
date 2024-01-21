@@ -3,12 +3,12 @@ use crate::prelude::*;
 use crate::storage::store::Store;
 use crate::structs::manager_server::Manager;
 use crate::structs::{
-    DestroyJobReply, DestroyJobRequest, GetJobStatusReply, GetJobStatusRequest, GetNodeReply,
-    GetNodeRequest, GetNodesReply, GetNodesRequest, HealthCheckReply, HealthCheckRequest,
-    HeartbeatReply, HeartbeatRequest, JobConfig, ListJobsReply, ListJobsRequest, NodeMsg,
-    RunJobReply, RunJobRequest, StopJobReply, StopJobRequest, Submission, UpdateNodeDynamicReply,
-    UpdateNodeDynamicRequest, WorkerConfig, WorkerPreRegisterReply, WorkerPreRegisterRequest,
-    WorkerRegisterReply, WorkerRegisterRequest,
+    DestroyJobReply, DestroyJobRequest, GetJobSpecReply, GetJobSpecRequest, GetJobStatusReply,
+    GetJobStatusRequest, GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest,
+    HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, JobConfig,
+    ListJobsReply, ListJobsRequest, NodeMsg, RunJobReply, RunJobRequest, StopJobReply,
+    StopJobRequest, UpdateNodeDynamicReply, UpdateNodeDynamicRequest, WorkerConfig,
+    WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest,
 };
 
 use tonic::{Request, Response, Status};
@@ -59,6 +59,30 @@ impl Manager for ManagerAgentService {
         })?;
 
         let reply = GetJobStatusReply { job: Some(job) };
+
+        Ok(Response::new(reply))
+    }
+
+    async fn get_job_spec(
+        &self,
+        request: Request<GetJobSpecRequest>,
+    ) -> Result<Response<GetJobSpecReply>, Status> {
+        let name = request.into_inner().name;
+
+        let config = self.store.get_job_config(&name).map_err(|e| {
+            error!("Error getting job config: {:?}", e);
+            Status::internal("Error getting job config")
+        })?;
+
+        let submissions = self
+            .store
+            .get_submissions_for_config(&config.id())
+            .map_err(|e| {
+                error!("Error getting submissions: {:?}", e);
+                Status::internal("Error getting submissions")
+            })?;
+
+        let reply = GetJobSpecReply { submissions };
 
         Ok(Response::new(reply))
     }

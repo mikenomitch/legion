@@ -2,8 +2,8 @@ use crate::prelude::*;
 
 use crate::structs::manager_client::ManagerClient;
 use crate::structs::{
-    DestroyJobRequest, GetJobStatusRequest, Job, ListJobsRequest, RunJobRequest, StopJobRequest,
-    Submission,
+    DestroyJobRequest, GetJobSpecRequest, GetJobStatusRequest, Job, ListJobsRequest, RunJobRequest,
+    StopJobRequest, Submission,
 };
 use jsonnet::JsonnetVm;
 
@@ -24,6 +24,10 @@ pub fn config() -> Command {
         .about("Get job status")
         .arg(arg!(name: [NAME]));
 
+    let job_spec_cmd = Command::new("spec")
+        .about("Get job spec used to define the job")
+        .arg(arg!(name: [NAME]));
+
     let job_list_cmd = Command::new("list").about("List all jobs");
 
     Command::new("job")
@@ -34,6 +38,7 @@ pub fn config() -> Command {
         .subcommand(job_status_cmd)
         .subcommand(job_list_cmd)
         .subcommand(job_stop_cmd)
+        .subcommand(job_spec_cmd)
         .subcommand(job_destroy_cmd)
 }
 
@@ -41,6 +46,7 @@ pub async fn handle(sub_matches: &clap::ArgMatches) -> R<()> {
     match sub_matches.subcommand() {
         Some(("run", matches)) => run_job(matches).await,
         Some(("stop", matches)) => stop_job(matches).await,
+        Some(("spec", matches)) => get_job_spec(matches).await,
         Some(("destroy", matches)) => destroy_job(matches).await,
         Some(("list", _)) => list_jobs().await,
         Some(("status", matches)) => get_status(matches).await,
@@ -61,6 +67,23 @@ async fn stop_job(arg_matches: &clap::ArgMatches) -> R<()> {
 
     let response = client.stop_job(request).await?;
     println!("RESPONSE={:?}", response);
+
+    Ok(())
+}
+
+#[instrument(err, skip_all)]
+async fn get_job_spec(arg_matches: &clap::ArgMatches) -> R<()> {
+    let mut client = ManagerClient::connect(DEF_MANAGER_ADDRESS).await?;
+    let job_name = arg_matches
+        .get_one::<String>("name")
+        .map_or("demo", String::as_str);
+
+    let request = tonic::Request::new(GetJobSpecRequest {
+        name: job_name.to_owned(),
+    });
+
+    let response = client.get_job_spec(request).await?;
+    println!("RESPONSE={:?}", response.into_inner().submissions);
 
     Ok(())
 }

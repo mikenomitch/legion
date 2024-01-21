@@ -8,6 +8,7 @@ service Manager {
     returns (WorkerPreRegisterReply);
   rpc WorkerRegister (WorkerRegisterRequest) returns (WorkerRegisterReply);
   rpc RunJob (RunJobRequest) returns (RunJobReply);
+  rpc GetJobSpec (GetJobSpecRequest) returns (GetJobSpecReply);
   rpc GetJobStatus (GetJobStatusRequest) returns (GetJobStatusReply);
   rpc StopJob (StopJobRequest) returns (StopJobReply);
   rpc DestroyJob (DestroyJobRequest) returns (DestroyJobReply);
@@ -69,6 +70,14 @@ message GetJobStatusRequest {
 
 message GetJobStatusReply {
   Job job = 1;
+}
+
+message GetJobSpecRequest {
+  string name = 1;
+}
+
+message GetJobSpecReply {
+  repeated Submission submissions = 2;
 }
 
 message StopJobRequest {
