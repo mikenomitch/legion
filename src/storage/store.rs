@@ -152,7 +152,7 @@ impl Store {
         ])
     }
 
-    pub fn clear_all_tables(&self) -> R<()> {
+    pub fn reset_all_tables(&self) -> R<()> {
         let migrations = Store::get_migrations();
         let mut conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
         migrations.to_version(&mut conn, 0)?;
@@ -776,16 +776,17 @@ VALUES (:id, :status, :job_id, :to_job_config_id, :from_job_config_id);
         let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
 
         let sql = r#"
-SELECT s.id, s.path, s.content, s.job_config_id, s.is_primary
-FROM submission s
-WHERE s.job_config_id = ?;
+        SELECT jcs.path, jcs.is_primary, s.content
+        FROM submission s
+        INNER JOIN job_config_submission jcs ON jcs.submission_hash = s.hash
+        WHERE jcs.job_config_id = ?;
 "#;
         let mut stmt = conn.prepare(sql)?;
         let sub_iter = stmt.query_map([job_config_id], |row| {
             Ok(Submission {
-                path: row.get(1)?,
+                path: row.get(0)?,
+                is_primary: row.get(1)?,
                 content: row.get(2)?,
-                is_primary: row.get(4)?,
             })
         })?;
 
@@ -810,7 +811,7 @@ mod tests {
         };
 
         let store = Store::start_storage(&store_config)?;
-        store.clear_all_tables()?;
+        store.reset_all_tables()?;
         Ok(store)
     }
 

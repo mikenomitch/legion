@@ -2,14 +2,11 @@
 
 - Submissions
 
-  - Change the submissions table to have a join record rather than a FK
-  - Add the hash of the submission to the submissions table
-  - If you add a submission with the same hash, it just uses the existing one
-  - If you destroy a job, destroy its submissions if and only if they are not used by another job
+  - You can get submissions for a job with a CLI command
   - Fix the cascade delete not working on submissions!
+  - If you destroy a job, destroy its submissions if and only if they are not used by another job
 
 - You can view tasks as part of the job info CLI (change status to "info", I can get status via list)
-- You can get submissions for a job with a CLI command
 
 - On job submit, tasks are _syncronously_ placed onto nodes
 
