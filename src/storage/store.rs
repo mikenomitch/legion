@@ -152,6 +152,7 @@ impl Store {
         ])
     }
 
+    #[allow(dead_code)]
     pub fn reset_all_tables(&self) -> R<()> {
         let migrations = Store::get_migrations();
         let mut conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;

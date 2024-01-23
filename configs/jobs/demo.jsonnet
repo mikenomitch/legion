@@ -1,5 +1,5 @@
 {
-    name: "demo",
+    name: "demo4",
     tasks: [
         {
             name: "first-task",

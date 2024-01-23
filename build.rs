@@ -4,6 +4,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tonic_build::configure()
         .build_server(true)
         .type_attribute("NodeMsg", "#[derive(serde::Deserialize, serde::Serialize)]")
+        .type_attribute(
+            "Job",
+            "#[derive(serde::Deserialize, serde::Serialize, tabled::Tabled)]",
+        )
         .compile(&[proto_file], &["."])
         .unwrap_or_else(|e| panic!("protobuf compile error: {e}"));
 

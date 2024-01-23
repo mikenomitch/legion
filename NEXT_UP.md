@@ -1,6 +1,6 @@
 # Next Up
 
-- You can view tasks as part of the job info CLI (change status to "info", I can get status via list)
+- You can view tasks as part of the job info CLI
 
 - Submissions
 
@@ -17,11 +17,11 @@
   - A ledger is kept of all the node resources and whats on the nodes
   - A "topology"-like CLI command can be used to view the whole ledger
     (perhaps just called "ledger" or "cluster")
-  - Initially you can go over the resources
+  - Initially you can go over the resources (it just tracks the totals)
   - If you don't have enough resources on submit, the job
     command fails and tells you why!
   - Then figure out how to make it an async loop
-  - Then respond to node changes!
+  - Then respond to node changes with reschedules
 
 - Figure out what to do about ids for job and job_config and whatnot
 - Can pass a flag in to force bump job + deploy it (even if same submission)

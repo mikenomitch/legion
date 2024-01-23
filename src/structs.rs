@@ -1,4 +1,5 @@
 use crate::prelude::*;
+use tabled::Tabled;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{from_str, to_string};
@@ -100,7 +101,25 @@ pub struct WorkerConfigAlt {
 //     pub name: String,
 // }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Tabled)]
+#[serde(rename_all = "camelCase")]
+pub struct JobPrint {
+    pub name: String,
+    pub status: String,
+    pub created_at: String,
+}
+
+impl From<Job> for JobPrint {
+    fn from(job: Job) -> Self {
+        JobPrint {
+            name: job.name,
+            status: job.status,
+            created_at: job.created_at.to_string(),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Tabled)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskConfig {
     pub name: String,
@@ -158,7 +177,7 @@ pub struct JoinTokenClaims {
 // iss: String,         // Optional. Issuer
 // nbf: usize,          // Optional. Not Before (as UTC timestamp)
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, Tabled)]
 pub struct Node {
     pub id: String,
     pub status: String,
@@ -228,23 +247,6 @@ impl Node {
         Ok(too_slow)
     }
 
-    pub fn print_short(&self) {
-        println!(
-            "ID: {} | Pool: {} | Status: {} | Availability: {} | Last Heartbeat: {}",
-            self.id, self.pool, self.status, self.availability, self.last_heartbeat
-        );
-    }
-
-    pub fn print_list_json(nodes: &[Node]) {
-        if let Ok(json) = to_string(nodes) {
-            println!("{json}");
-        }
-    }
-
-    pub fn print_list(nodes: &[Node]) {
-        nodes.into_iter().for_each(|node| node.print_short());
-    }
-
     pub fn print_long(&self) {
         println!("Node ID: {}", self.id);
 
@@ -279,6 +281,28 @@ impl Node {
         if let Ok(json) = to_string(self) {
             println!("{json}");
         };
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default, Tabled)]
+#[serde(rename_all = "camelCase")]
+pub struct NodePrint {
+    pub id: String,
+    pub status: String,
+    pub pool: String,
+    pub availability: String,
+    pub last_heartbeat: String,
+}
+
+impl From<Node> for NodePrint {
+    fn from(node: Node) -> Self {
+        NodePrint {
+            id: node.id,
+            status: node.status,
+            pool: node.pool,
+            availability: node.availability,
+            last_heartbeat: node.last_heartbeat,
+        }
     }
 }
 

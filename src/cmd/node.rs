@@ -1,6 +1,8 @@
+use crate::cmd::helpers::print_table;
 use crate::prelude::*;
 use crate::structs::manager_client::ManagerClient;
-use crate::structs::{GetNodeRequest, GetNodesRequest, Node, UpdateNodeDynamicRequest};
+use crate::structs::{GetNodeRequest, GetNodesRequest, Node, NodePrint, UpdateNodeDynamicRequest};
+use serde_json::to_string;
 
 pub fn config() -> Command {
     let json_arg = Arg::new("json")
@@ -105,9 +107,12 @@ async fn get_nodes(is_json: bool) -> R<()> {
     let nodes: Vec<Node> = nodes_msg_list.into_iter().map(Into::into).collect();
 
     if is_json {
-        Node::print_list_json(&nodes);
+        if let Ok(json) = to_string(&nodes) {
+            println!("{json}");
+        }
     } else {
-        Node::print_list(&nodes);
+        let printable_nodes: Vec<NodePrint> = nodes.into_iter().map(Into::into).collect();
+        print_table(printable_nodes);
     }
 
     Ok(())

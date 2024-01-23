@@ -1,9 +1,10 @@
 use crate::prelude::*;
 
+use crate::cmd::helpers::print_table;
 use crate::structs::manager_client::ManagerClient;
 use crate::structs::{
-    DestroyJobRequest, GetJobInfoRequest, GetJobSpecRequest, Job, ListJobsRequest, RunJobRequest,
-    StopJobRequest, Submission,
+    DestroyJobRequest, GetJobInfoRequest, GetJobSpecRequest, JobPrint, ListJobsRequest,
+    RunJobRequest, StopJobRequest, Submission,
 };
 use jsonnet::JsonnetVm;
 
@@ -125,10 +126,8 @@ async fn run_job(arg_matches: &clap::ArgMatches) -> R<()> {
     submissions.push(initial_sub);
 
     vm.import_callback(|_vm, base, rel| {
-        println!("IMPORT: base={:?}, rel={:?}", base, rel);
         let path = std::path::Path::new(base).join(rel);
         let path_str = path.to_str().unwrap();
-        println!("PATH={:?}", path_str);
         let contents = std::fs::read_to_string(&path).unwrap();
 
         let sub = Submission {
@@ -139,13 +138,10 @@ async fn run_job(arg_matches: &clap::ArgMatches) -> R<()> {
 
         submissions.push(sub);
 
-        println!("RAW_CONTENT={:?}", contents);
         Ok((base.into(), contents.to_string()))
     });
 
     let res = vm.evaluate_file(job_path);
-
-    println!("SUBMISSIONS={:?}", submissions);
 
     match res {
         Ok(s) => {
@@ -154,8 +150,7 @@ async fn run_job(arg_matches: &clap::ArgMatches) -> R<()> {
                 submissions,
             });
 
-            let response = client.run_job(request).await?;
-            println!("RESPONSE={:?}", response);
+            let _response = client.run_job(request).await?;
             Ok(())
         }
         Err(e) => {
@@ -171,9 +166,8 @@ async fn list_jobs() -> R<()> {
     let request = tonic::Request::new(ListJobsRequest {});
     let response = client.list_jobs(request).await?;
     let jobs_list = response.into_inner().jobs;
-    let jobs: Vec<Job> = jobs_list.into_iter().map(|j| j.into()).collect();
-
-    println!("{:?}", jobs);
+    let printable_jobs: Vec<JobPrint> = jobs_list.into_iter().map(Into::into).collect();
+    print_table(printable_jobs);
 
     Ok(())
 }
