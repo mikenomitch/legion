@@ -1,3 +1,5 @@
+use std::vec;
+
 use crate::prelude::*;
 
 use crate::cmd::helpers::print_table;
@@ -67,7 +69,7 @@ async fn stop_job(arg_matches: &clap::ArgMatches) -> R<()> {
     });
 
     let response = client.stop_job(request).await?;
-    println!("RESPONSE={:?}", response);
+    println!("{}", response.into_inner().message);
 
     Ok(())
 }
@@ -84,7 +86,13 @@ async fn get_job_spec(arg_matches: &clap::ArgMatches) -> R<()> {
     });
 
     let response = client.get_job_spec(request).await?;
-    println!("RESPONSE={:?}", response.into_inner().submissions);
+
+    response.into_inner().submissions.iter().for_each(|s| {
+        println!("=============================");
+        println!("{}:\n", s.path);
+        println!("{}", s.content);
+        println!("=============================");
+    });
 
     Ok(())
 }
@@ -101,7 +109,7 @@ async fn destroy_job(arg_matches: &clap::ArgMatches) -> R<()> {
     });
 
     let response = client.destroy_job(request).await?;
-    println!("RESPONSE={:?}", response);
+    println!("{}", response.into_inner().message);
 
     Ok(())
 }
@@ -150,12 +158,15 @@ async fn run_job(arg_matches: &clap::ArgMatches) -> R<()> {
                 submissions,
             });
 
-            let _response = client.run_job(request).await?;
+            let response = client.run_job(request).await?;
+
+            println!("{}", response.into_inner().message);
+
             Ok(())
         }
         Err(e) => {
-            error!("{}", e);
-            Err("Oh no".into())
+            error!("Error: {}", e.to_string());
+            Err(e.to_string().into())
         }
     }
 }
@@ -180,7 +191,10 @@ async fn get_info(arg_matches: &clap::ArgMatches) -> R<()> {
         name: job_name.to_owned(),
     });
     let response = client.get_job_info(request).await?;
-    println!("{:?}", response.into_inner().job.unwrap());
+
+    let printable_job: JobPrint = response.into_inner().job.ok_or("no job found")?.into();
+    // println!("{:?}", printable_job);
+    print_table(vec![printable_job]);
 
     Ok(())
 }
