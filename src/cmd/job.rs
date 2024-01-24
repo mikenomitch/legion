@@ -9,8 +9,16 @@ use crate::structs::{
     RunJobRequest, StopJobRequest, Submission,
 };
 use jsonnet::JsonnetVm;
+use serde_json::to_string;
 
 pub fn config() -> Command {
+    let json_arg = Arg::new("json")
+        .long("json")
+        .short('j')
+        .required(false)
+        .help("returns values in json format")
+        .num_args(0);
+
     let run_cmd = Command::new("run")
         .about("Run a job")
         .arg(arg!(path: [PATH]));
@@ -25,13 +33,17 @@ pub fn config() -> Command {
 
     let info_cmd = Command::new("info")
         .about("Get job info")
-        .arg(arg!(name: [NAME]));
+        .arg(arg!(name: [NAME]))
+        .arg(json_arg.clone());
 
     let spec_cmd = Command::new("spec")
         .about("Get job spec used to define the job")
-        .arg(arg!(name: [NAME]));
+        .arg(arg!(name: [NAME]))
+        .arg(json_arg.clone());
 
-    let list_cmd = Command::new("list").about("List all jobs");
+    let list_cmd = Command::new("list")
+        .about("List all jobs")
+        .arg(json_arg.clone());
 
     Command::new("job")
         .about("Interact with jobs")
@@ -51,7 +63,7 @@ pub async fn handle(sub_matches: &clap::ArgMatches) -> R<()> {
         Some(("stop", matches)) => stop_job(matches).await,
         Some(("spec", matches)) => get_job_spec(matches).await,
         Some(("destroy", matches)) => destroy_job(matches).await,
-        Some(("list", _)) => list_jobs().await,
+        Some(("list", matches)) => list_jobs(matches).await,
         Some(("info", matches)) => get_info(matches).await,
         _ => unreachable!(),
     }
@@ -76,6 +88,8 @@ async fn stop_job(arg_matches: &clap::ArgMatches) -> R<()> {
 
 #[instrument(err, skip_all)]
 async fn get_job_spec(arg_matches: &clap::ArgMatches) -> R<()> {
+    let is_json = arg_matches.get_flag("json");
+
     let mut client = ManagerClient::connect(DEF_MANAGER_ADDRESS).await?;
     let job_name = arg_matches
         .get_one::<String>("name")
@@ -87,12 +101,20 @@ async fn get_job_spec(arg_matches: &clap::ArgMatches) -> R<()> {
 
     let response = client.get_job_spec(request).await?;
 
-    response.into_inner().submissions.iter().for_each(|s| {
-        println!("=============================");
-        println!("{}:\n", s.path);
-        println!("{}", s.content);
-        println!("=============================");
-    });
+    let subs = response.into_inner().submissions;
+
+    if is_json {
+        if let Ok(json) = to_string(&subs) {
+            println!("{json}");
+        }
+    } else {
+        subs.iter().for_each(|s| {
+            println!("=============================");
+            println!("{}:\n", s.path);
+            println!("{}", s.content);
+            println!("=============================");
+        });
+    }
 
     Ok(())
 }
@@ -172,19 +194,30 @@ async fn run_job(arg_matches: &clap::ArgMatches) -> R<()> {
 }
 
 #[instrument(err, skip_all)]
-async fn list_jobs() -> R<()> {
+async fn list_jobs(arg_matches: &clap::ArgMatches) -> R<()> {
+    let is_json = arg_matches.get_flag("json");
+
     let mut client = ManagerClient::connect(DEF_MANAGER_ADDRESS).await?;
     let request = tonic::Request::new(ListJobsRequest {});
     let response = client.list_jobs(request).await?;
     let jobs_list = response.into_inner().jobs;
-    let printable_jobs: Vec<JobPrint> = jobs_list.into_iter().map(Into::into).collect();
-    print_table(printable_jobs);
+
+    if is_json {
+        if let Ok(json) = to_string(&jobs_list) {
+            println!("{json}");
+        }
+    } else {
+        let printable_jobs: Vec<JobPrint> = jobs_list.into_iter().map(Into::into).collect();
+        print_table(printable_jobs);
+    }
 
     Ok(())
 }
 
 #[instrument(err, skip_all)]
 async fn get_info(arg_matches: &clap::ArgMatches) -> R<()> {
+    let is_json = arg_matches.get_flag("json");
+
     let mut client = ManagerClient::connect(DEF_MANAGER_ADDRESS).await?;
     let job_name = arg_matches.get_one::<String>("name").ok_or("need name")?;
     let request = tonic::Request::new(GetJobInfoRequest {
@@ -192,9 +225,14 @@ async fn get_info(arg_matches: &clap::ArgMatches) -> R<()> {
     });
     let response = client.get_job_info(request).await?;
 
-    let printable_job: JobPrint = response.into_inner().job.ok_or("no job found")?.into();
-    // println!("{:?}", printable_job);
-    print_table(vec![printable_job]);
+    if is_json {
+        if let Ok(json) = to_string(&response.into_inner().job) {
+            println!("{json}");
+        }
+    } else {
+        let printable_job: JobPrint = response.into_inner().job.ok_or("no job found")?.into();
+        print_table(vec![printable_job]);
+    }
 
     Ok(())
 }

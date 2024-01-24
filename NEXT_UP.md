@@ -1,13 +1,5 @@
 # Next Up
 
-- You can view tasks as part of the job info CLI
-
-- Submissions
-
-  - Fix the cascade delete not working on submissions!
-  - If you destroy a job, destroy its submissions if and only if they are not used by another job
-
-- The printing associated with all of the job CLI commands is actually decent to look at
 - You can get json versions of all the job CLI commands
 - If you fail mid way thru any of the job submit parts, the transaction fails HARD!
 
@@ -22,6 +14,11 @@
     command fails and tells you why!
   - Then figure out how to make it an async loop
   - Then respond to node changes with reschedules
+
+- Submissions
+
+  - Fix the cascade delete not working on submissions!
+  - If you destroy a job, destroy its submissions if and only if they are not used by another job
 
 - Figure out what to do about ids for job and job_config and whatnot
 - Can pass a flag in to force bump job + deploy it (even if same submission)

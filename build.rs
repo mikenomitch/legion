@@ -8,6 +8,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "Job",
             "#[derive(serde::Deserialize, serde::Serialize, tabled::Tabled)]",
         )
+        .type_attribute(
+            "Submission",
+            "#[derive(serde::Deserialize, serde::Serialize, tabled::Tabled)]",
+        )
         .compile(&[proto_file], &["."])
         .unwrap_or_else(|e| panic!("protobuf compile error: {e}"));
 
