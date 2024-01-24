@@ -17,6 +17,7 @@ service Manager {
   rpc HealthCheck (HealthCheckRequest) returns (HealthCheckReply);
   rpc GetNodes (GetNodesRequest) returns (GetNodesReply);
   rpc GetNode (GetNodeRequest) returns (GetNodeReply);
+  rpc GetLedger (GetLedgerRequest) returns (GetLedgerReply);
   rpc UpdateNodeDynamic (UpdateNodeDynamicRequest)
     returns (UpdateNodeDynamicReply);
 }
@@ -152,6 +153,13 @@ message GetNodeRequest {
 
 message GetNodeReply {
   optional NodeMsg node = 1;
+}
+
+message GetLedgerRequest {
+}
+
+message GetLedgerReply {
+  string message = 1;
 }
 
 message UpdateNodeDynamicRequest {

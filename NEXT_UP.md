@@ -1,19 +1,25 @@
 # Next Up
 
-- You can get json versions of all the job CLI commands
-- If you fail mid way thru any of the job submit parts, the transaction fails HARD!
-
 - On job submit, tasks are _syncronously_ placed onto nodes
 
-  - Add allocations table in the DB
   - A ledger is kept of all the node resources and whats on the nodes
-  - A "topology"-like CLI command can be used to view the whole ledger
-    (perhaps just called "ledger" or "cluster")
+
+    - All allocs
+    - All nodes
+    - You can return this via the CLI
+      - "Node A, Resources: 10GB RAM, 10GB Disk, 10 CPU"
+        - Alloc A
+        - Alloc B
+      - Node B ...etc...
+
+  - Ledger CLI command prints it
   - Initially you can go over the resources (it just tracks the totals)
   - If you don't have enough resources on submit, the job
     command fails and tells you why!
   - Then figure out how to make it an async loop
   - Then respond to node changes with reschedules
+
+- If you fail mid way thru any of the job submit parts, the transaction fails HARD!
 
 - Submissions
 

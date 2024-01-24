@@ -25,6 +25,7 @@ fn cli() -> Command {
         .subcommand(cmd::start::config())
         .subcommand(cmd::join_token::config())
         .subcommand(cmd::join::config())
+        .subcommand(cmd::ledger::config())
 }
 
 #[tokio::main]
@@ -38,6 +39,7 @@ async fn main() -> R<()> {
         Some(("node", sub_matches)) => cmd::node::handle(sub_matches).await?,
         Some(("join-token", sub_matches)) => cmd::join_token::handle(sub_matches).await?,
         Some(("join", sub_matches)) => cmd::join::handle(sub_matches).await?,
+        Some(("ledger", sub_matches)) => cmd::ledger::handle(sub_matches).await?,
         Some((ext, sub_matches)) => {
             let args = sub_matches
                 .get_many::<OsString>("")

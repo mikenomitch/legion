@@ -149,6 +149,20 @@ impl Store {
             )",
             )
             .down("DROP TABLE job_update;"),
+            M::up(
+                "CREATE TABLE IF NOT EXISTS allocation (
+                id INTEGER PRIMARY KEY,
+                status STRING NOT NULL,
+                resources JSONB NOT NULL,
+                node_name STRING NOT NULL,
+                job_config_id STRING NOT NULL,
+                task_config_id INTEGER NOT NULL,
+                FOREIGN KEY(node_name) REFERENCES node(name) ON DELETE CASCADE,
+                FOREIGN KEY(job_config_id) REFERENCES job_config(id) ON DELETE CASCADE,
+                FOREIGN KEY(task_config_id) REFERENCES task_config(id) ON DELETE CASCADE
+            )",
+            )
+            .down("DROP TABLE allocation;"),
         ])
     }
 
@@ -799,6 +813,35 @@ VALUES (:id, :status, :job_id, :to_job_config_id, :from_job_config_id);
 
         Ok(subs)
     }
+
+    //
+    // ALLOCS
+    //
+
+    // #[instrument(err, skip_all)]
+    // pub fn place_alloc(&self, node_id, task_id) -> R<()> {
+    // }
+
+    // #[instrument(err, skip_all)]
+    // pub fn allocs_for_job(&self, job_id) -> R<()> {
+    // }
+
+    // #[instrument(err, skip_all)]
+    // pub fn allocs_for_job_config(&self, job_config_id) -> R<()> {
+    // }
+
+    // #[instrument(err, skip_all)]
+    // pub fn allocs_for_node(&self, node_name) -> R<()> {
+    // }
+
+    // #[instrument(err, skip_all)]
+    // pub fn get_allocs(&self) -> R<()> {
+    // }
+
+    // MAYBE...?
+    // #[instrument(err, skip_all)]
+    // pub fn get_allocs_by_node(&self) -> R<()> {
+    // }
 }
 
 #[cfg(test)]

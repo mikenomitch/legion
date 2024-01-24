@@ -4,11 +4,12 @@ use crate::storage::store::Store;
 use crate::structs::manager_server::Manager;
 use crate::structs::{
     DestroyJobReply, DestroyJobRequest, GetJobInfoReply, GetJobInfoRequest, GetJobSpecReply,
-    GetJobSpecRequest, GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest,
-    HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, JobConfig,
-    ListJobsReply, ListJobsRequest, NodeMsg, RunJobReply, RunJobRequest, StopJobReply,
-    StopJobRequest, UpdateNodeDynamicReply, UpdateNodeDynamicRequest, WorkerConfig,
-    WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest,
+    GetJobSpecRequest, GetLedgerReply, GetLedgerRequest, GetNodeReply, GetNodeRequest,
+    GetNodesReply, GetNodesRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply,
+    HeartbeatRequest, JobConfig, ListJobsReply, ListJobsRequest, NodeMsg, RunJobReply,
+    RunJobRequest, StopJobReply, StopJobRequest, UpdateNodeDynamicReply, UpdateNodeDynamicRequest,
+    WorkerConfig, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply,
+    WorkerRegisterRequest,
 };
 
 use tonic::{Request, Response, Status};
@@ -311,6 +312,18 @@ impl Manager for ManagerAgentService {
             .expect("Can't find or update node");
         let reply = UpdateNodeDynamicReply {
             node: Some(node.into()),
+        };
+
+        Ok(Response::new(reply))
+    }
+
+    #[instrument(skip_all)]
+    async fn get_ledger(
+        &self,
+        _request: Request<GetLedgerRequest>,
+    ) -> Result<Response<GetLedgerReply>, Status> {
+        let reply = GetLedgerReply {
+            message: "Heeey".into(),
         };
 
         Ok(Response::new(reply))
