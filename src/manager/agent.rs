@@ -34,7 +34,11 @@ pub async fn run_manager(config: ManagerConfig) -> R<()> {
         .add_service(insecure_manager_service)
         .serve(join_server_addr);
 
-    let s2 = Store {
+    let store_copy_a = Store {
+        conn: store.conn.clone(),
+    };
+
+    let store_copy_b = Store {
         conn: store.conn.clone(),
     };
 
@@ -55,7 +59,9 @@ pub async fn run_manager(config: ManagerConfig) -> R<()> {
     println!("Join server starting on {join_server_addr}");
     println!("Manager node starting on {addr}");
 
-    let node_checker_fut = start_node_status_checker(s2, full_config.worker_check_seconds);
+    let node_checker_fut =
+        start_node_status_checker(store_copy_a, full_config.worker_check_seconds);
+    let eval_loop_fut = start_eval_loop(store_copy_b);
     let _res = join!(join_server_fut, start_server_fut, node_checker_fut);
 
     Ok(())
@@ -90,6 +96,30 @@ async fn start_node_status_checker(store: Store, check_seconds: u64) -> R<()> {
 
         store.mark_nodes_as_lost(&node_ids_to_update)?;
         tokio::time::sleep(tokio::time::Duration::from_secs(check_seconds)).await;
+    }
+}
+
+#[instrument(err, skip_all)]
+async fn start_eval_loop(store: Store) -> R<()> {
+    info!("Beginning eval loop");
+
+    loop {
+        match store.get_next_eval() {
+            Ok(eval) => match eval.handle() {
+                Ok(message) => {
+                    info!("Eval {} handled successfully: {}", eval.id, message);
+                }
+                Err(e) => {
+                    error!("Error handling eval {}: {:?}", eval.id, e);
+                }
+            },
+            Err(e) => {
+                error!("Error getting next eval: {:?}", e);
+            }
+        }
+
+        // Note: do I want a sleep here?
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
     }
 }
 

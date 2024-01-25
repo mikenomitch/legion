@@ -1,5 +1,17 @@
 # Next Up
 
+- Eval Loop processes thing
+- A new job sticks an eval on the queue
+- It removes itself in its handle function
+- Its handle function "places" it onto a "random node" with an alloc
+- You can print out the ledger
+- Set up some sort of TDD system and crank thru scheduling logic
+
+  - Task placements/Job Start
+  - Task replacement/Job Update
+  - Node drops
+  - Allocs dying
+
 - On job submit, tasks are _syncronously_ placed onto nodes
 
   - A ledger is kept of all the node resources and whats on the nodes

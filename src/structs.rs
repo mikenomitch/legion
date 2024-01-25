@@ -51,6 +51,36 @@ impl Submission {
     }
 }
 
+impl Eval {
+    pub fn handle(&self) -> R<String> {
+        // This can have different logic for each eval type
+        // It should clean up after itself most likely
+        // But perhaps async clean ups make sense?
+
+        // TODO: Make this an enum!
+        match self.kind.as_str() {
+            "node_join" => {
+                println!("Woot - node_join");
+            }
+            "node_drop" => {
+                println!("Woot - node_drop");
+            }
+            "job_start" => {
+                println!("Woot - job_start");
+            }
+            "job_stop" => {
+                println!("Woot - job_stop");
+            }
+            "job_update" => {
+                println!("Woot - job_update");
+            }
+        }
+
+        println!("Woot - evalled");
+        Ok("Doneski".to_string())
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ManagerConfigFull {

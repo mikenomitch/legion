@@ -186,6 +186,15 @@ message GetJoinTokenReply {
   string token = 1;
 }
 
+message Eval {
+  string id = 1;
+  string status = 2;
+  string kind = 3;
+  string job_id = 4;
+  string job_config_id = 5;
+  string node_name = 6;
+}
+
 // === WORKER ===
 
 service Worker {

@@ -1,7 +1,7 @@
 use crate::prelude::*;
 
 use crate::structs::{
-    Job, JobConfig, ManagerConfigFull, Node, NodeMsg, Submission, TaskConfig, WorkerConfig,
+    Eval, Job, JobConfig, ManagerConfigFull, Node, NodeMsg, Submission, TaskConfig, WorkerConfig,
 };
 
 use rusqlite::{named_params, Connection, Row};
@@ -163,6 +163,20 @@ impl Store {
             )",
             )
             .down("DROP TABLE allocation;"),
+            M::up(
+                "CREATE TABLE IF NOT EXISTS eval (
+                id INTEGER PRIMARY KEY,
+                status STRING NOT NULL,
+                type STRING NOT NULL,
+                job_id STRING,
+                job_config_id STRING,
+                node_name STRING,
+                FOREIGN KEY(job_id) REFERENCES job(id) ON DELETE CASCADE,
+                FOREIGN KEY(job_config_id) REFERENCES job_config(id) ON DELETE CASCADE
+                FOREIGN KEY(node_name) REFERENCES node(name) ON DELETE CASCADE,
+            )",
+            )
+            .down("DROP TABLE eval;"),
         ])
     }
 
@@ -218,6 +232,18 @@ impl Store {
         };
 
         Ok(node)
+    }
+
+    fn eval_from_row(&self, row: &Row<'_>) -> Result<Eval, rusqlite::Error> {
+        let eval = Eval {
+            id: row.get(0)?,
+            status: row.get(1)?,
+            job_id: row.get(2)?,
+            job_config_id: row.get(3)?,
+            node_name: row.get(4)?,
+        };
+
+        Ok(eval)
     }
 
     #[instrument(err, skip_all)]
@@ -842,6 +868,25 @@ VALUES (:id, :status, :job_id, :to_job_config_id, :from_job_config_id);
     // #[instrument(err, skip_all)]
     // pub fn get_allocs_by_node(&self) -> R<()> {
     // }
+
+    //
+    // EVALS
+    //
+
+    #[instrument(err, skip_all)]
+    pub fn get_next_eval(&self) -> R<Eval> {
+        let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
+        let sql = r#"
+        SELECT id, status, type, job_id, job_config_id, node_name
+        FROM eval
+        WHERE status = 'pending'
+        ORDER BY id ASC
+        LIMIT 1;
+"#;
+
+        let eval = conn.query_row(sql, [], |row| self.eval_from_row(row))?;
+        Ok(eval)
+    }
 }
 
 #[cfg(test)]
