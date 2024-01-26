@@ -1,11 +1,16 @@
 use crate::prelude::*;
-
+use crate::storage::migrations::get_migrations;
+use crate::storage::queries::{
+    GET_JOB, GET_JOBS, GET_JOB_CONFIG, GET_NEXT_EVAL, GET_NODE, GET_NODES, GET_TASK_FOR_JOB_CONIFG,
+    GET_WORKER_TYPE, INSERT_JOB, INSERT_JOB_CONFIG, INSERT_JOB_CONFIG_SUBMISSION,
+    INSERT_JOB_UPDATE, INSERT_NODE, INSERT_SUBMISSION, INSERT_TASK, INSERT_WORKER_TYPE, NODE_ATTRS,
+};
 use crate::structs::{
     Eval, Job, JobConfig, ManagerConfigFull, Node, NodeMsg, Submission, TaskConfig, WorkerConfig,
 };
 
 use rusqlite::{named_params, Connection, Row};
-use rusqlite_migration::{Migrations, M};
+use rusqlite_migration::Migrations;
 use serde_json::to_string;
 use serde_rusqlite::to_params_named;
 use time::macros::format_description;
@@ -53,136 +58,9 @@ impl Store {
         Ok(Arc::new(Mutex::new(conn)))
     }
 
-    pub fn get_migrations() -> Migrations<'static> {
-        Migrations::new(vec![
-            M::up(
-                "CREATE TABLE IF NOT EXISTS node (
-                id STRING PRIMARY KEY,
-                pool STRING NOT NULL,
-                status STRING NOT NULL,
-                availability STRING NOT NULL,
-                config_attrs  JSONB NOT NULL,
-                fingerprint_attrs  JSONB NOT NULL,
-                dynamic_attrs JSONB NOT NULL,
-                health_checks JSONB NOT NULL,
-                last_heartbeat TIMESTAMP NOT NULL
-            )",
-            )
-            .down("DROP TABLE node;"),
-            M::up(
-                "CREATE TABLE IF NOT EXISTS worker_type (
-                name STRING PRIMARY KEY,
-                pool STRING NOT NULL,
-                additional_node_checks Text NOT NULL,
-                attributes JSONB NOT NULL,
-                name_prefix STRING
-            )",
-            )
-            .down("DROP TABLE worker_type;"),
-            M::up(
-                "CREATE TABLE IF NOT EXISTS job (
-                id STRING PRIMARY KEY,
-                name STRING NOT NULL,
-                status STRING NOT NULL,
-                created_at TIMESTAMP NOT NULL
-            )",
-            )
-            .down("DROP TABLE job;"),
-            M::up(
-                "CREATE TABLE IF NOT EXISTS job_config (
-                id STRING PRIMARY KEY,
-                name STRING NOT NULL,
-                type STRING NOT NULL,
-                meta JSONB NOT NULL,
-                version INTEGER NOT NULL,
-                created_at TIMESTAMP NOT NULL,
-                job_id STRING NOT NULL,
-                FOREIGN KEY(job_id) REFERENCES job(id) ON DELETE CASCADE
-            )",
-            )
-            .down("DROP TABLE job_config;"),
-            M::up(
-                "CREATE TABLE IF NOT EXISTS submission (
-                hash STRING PRIMARY KEY,
-                content TEXT NOT NULL
-            )",
-            )
-            .down("DROP TABLE submission;"),
-            M::up(
-                "CREATE TABLE IF NOT EXISTS job_config_submission (
-            id INTEGER PRIMARY KEY,
-            path STRING NOT NULL,
-            is_primary INTEGER NOT NULL,
-            job_config_id STRING NOT NULL,
-            submission_hash STRING NOT NULL,
-            FOREIGN KEY(job_config_id) REFERENCES job_config(id) ON DELETE CASCADE,
-            FOREIGN KEY(submission_hash) REFERENCES submission(hash) ON DELETE CASCADE
-        )",
-            )
-            .down("DROP TABLE job_config_submission;"),
-            M::up(
-                "CREATE TABLE IF NOT EXISTS task_config (
-                id INTEGER PRIMARY KEY,
-                count INTEGER NOT NULL,
-                name STRING NOT NULL,
-                driver STRING NOT NULL,
-                config JSONB NOT NULL,
-                resources JSONB NOT NULL,
-                constraints JSONB NOT NULL,
-                job_id STRING NOT NULL,
-                job_config_id STRING NOT NULL,
-                FOREIGN KEY(job_id) REFERENCES job(id) ON DELETE CASCADE,
-                FOREIGN KEY(job_config_id) REFERENCES job_config(id) ON DELETE CASCADE
-            )",
-            )
-            .down("DROP TABLE task_config;"),
-            M::up(
-                "CREATE TABLE IF NOT EXISTS job_update (
-                id STRING PRIMARY KEY,
-                status STRING NOT NULL,
-                job_id STRING NOT NULL,
-                to_job_config_id STRING NOT NULL,
-                from_job_config_id STRING,
-                FOREIGN KEY(job_id) REFERENCES job(id) ON DELETE CASCADE,
-                FOREIGN KEY(to_job_config_id) REFERENCES job_config(id) ON DELETE CASCADE,
-                FOREIGN KEY(from_job_config_id) REFERENCES job_config(id) ON DELETE CASCADE
-            )",
-            )
-            .down("DROP TABLE job_update;"),
-            M::up(
-                "CREATE TABLE IF NOT EXISTS allocation (
-                id INTEGER PRIMARY KEY,
-                status STRING NOT NULL,
-                resources JSONB NOT NULL,
-                node_name STRING NOT NULL,
-                job_config_id STRING NOT NULL,
-                task_config_id INTEGER NOT NULL,
-                FOREIGN KEY(node_name) REFERENCES node(name) ON DELETE CASCADE,
-                FOREIGN KEY(job_config_id) REFERENCES job_config(id) ON DELETE CASCADE,
-                FOREIGN KEY(task_config_id) REFERENCES task_config(id) ON DELETE CASCADE
-            )",
-            )
-            .down("DROP TABLE allocation;"),
-            M::up(
-                "CREATE TABLE IF NOT EXISTS eval (
-                id INTEGER PRIMARY KEY,
-                status STRING NOT NULL,
-                type STRING NOT NULL,
-                job_id STRING,
-                job_config_id STRING,
-                node_name STRING,
-                FOREIGN KEY(job_id) REFERENCES job(id) ON DELETE CASCADE,
-                FOREIGN KEY(job_config_id) REFERENCES job_config(id) ON DELETE CASCADE
-                FOREIGN KEY(node_name) REFERENCES node(name) ON DELETE CASCADE,
-            )",
-            )
-            .down("DROP TABLE eval;"),
-        ])
-    }
-
     #[allow(dead_code)]
     pub fn reset_all_tables(&self) -> R<()> {
-        let migrations = Store::get_migrations();
+        let migrations = get_migrations();
         let mut conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
         migrations.to_version(&mut conn, 0)?;
         migrations.to_latest(&mut conn)?;
@@ -192,7 +70,7 @@ impl Store {
 
     #[instrument(skip_all)]
     fn create_initial_tables(conn: &MemSafeConn) -> R<Migrations<'_>> {
-        let migrations = Store::get_migrations();
+        let migrations = get_migrations();
         let mut conn = conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
         info!("Pragma update");
         conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -204,7 +82,7 @@ impl Store {
     }
 
     //
-    // NODES
+    // from_row helpers
     //
 
     fn job_from_row(&self, row: &Row<'_>) -> Result<Job, rusqlite::Error> {
@@ -238,37 +116,58 @@ impl Store {
         let eval = Eval {
             id: row.get(0)?,
             status: row.get(1)?,
-            job_id: row.get(2)?,
-            job_config_id: row.get(3)?,
-            node_name: row.get(4)?,
+            kind: row.get(2)?,
+            job_id: row.get(3)?,
+            job_config_id: row.get(4)?,
+            node_name: row.get(5)?,
         };
 
         Ok(eval)
     }
 
+    fn worker_type_from_row(&self, row: &Row<'_>) -> Result<WorkerConfig, rusqlite::Error> {
+        let af: String = row.get(2)?;
+        let attrs: String = row.get(3)?;
+        let parsed_attrs = serde_json::from_str(&attrs).unwrap();
+        let name_prefix = row.get(4)?;
+
+        Ok(WorkerConfig {
+            name: row.get(0)?,
+            pool: row.get(1)?,
+            additional_node_checks: af.split(",").map(|s| s.to_string()).collect(),
+            attributes: parsed_attrs,
+            name_prefix,
+        })
+    }
+
+    fn task_config_from_row(&self, row: &Row<'_>) -> Result<TaskConfig, rusqlite::Error> {
+        let task_config = TaskConfig {
+            name: row.get(1)?,
+            driver: row.get(2)?,
+            count: row.get(3)?,
+            config: row.get(4)?,
+            resources: row.get(5)?,
+            constraints: row.get(6)?,
+        };
+
+        Ok(task_config)
+    }
+
+    //
+    // NODES
+    //
+
     #[instrument(err, skip_all)]
     pub fn get_node(&self, id: &str) -> R<Node> {
         let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
-
-        let sql = r#"
-        SELECT id, pool, status, availability, config_attrs, fingerprint_attrs, dynamic_attrs, health_checks, last_heartbeat
-        FROM node
-        WHERE id = ?;
-"#;
-        let node = conn.query_row(sql, [id], |row| self.node_from_row(row))?;
-
+        let node = conn.query_row(&GET_NODE, [id], |row| self.node_from_row(row))?;
         Ok(node)
     }
 
     #[instrument(err, skip_all)]
     pub fn get_nodes(&self) -> R<Vec<Node>> {
         let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
-        let sql = r#"
-SELECT id, pool, status, availability, config_attrs, fingerprint_attrs, dynamic_attrs, health_checks, last_heartbeat
-FROM node;
-"#;
-
-        let mut stmt = conn.prepare(sql)?;
+        let mut stmt = conn.prepare(GET_NODES.as_str())?;
         let node_iter = stmt.query_map([], |row| self.node_from_row(row))?;
         let mut nodes = Vec::new();
         for node in node_iter {
@@ -282,7 +181,8 @@ FROM node;
     #[instrument(err, skip_all)]
     pub fn get_node_ids_and_heartbeats(&self) -> R<Vec<(String, String)>> {
         let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
-        let mut stmt = conn.prepare("SELECT id, last_heartbeat FROM node")?;
+        let sql = "SELECT id, last_heartbeat FROM node";
+        let mut stmt = conn.prepare(sql)?;
         let node_iter = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
 
         let mut nodes_id_and_hb = Vec::new();
@@ -311,21 +211,17 @@ FROM node;
     #[instrument(err, skip_all)]
     pub fn insert_node(&self, node: NodeMsg) -> R<Node> {
         let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
-        let sql = r#"
-        INSERT INTO node (id, pool, status, availability, config_attrs, fingerprint_attrs, dynamic_attrs, health_checks, last_heartbeat)
-        VALUES (:id, :pool, :status, :availability, :config_attrs, :fingerprint_attrs, :dynamic_attrs, :health_checks, :last_heartbeat)
-        ON CONFLICT(id) DO UPDATE SET pool = :pool, status = :status, availability = :availability, config_attrs = :config_attrs, fingerprint_attrs = :fingerprint_attrs, dynamic_attrs = :dynamic_attrs, health_checks = :health_checks, last_heartbeat = :last_heartbeat
-        RETURNING id, pool, status, availability, config_attrs, fingerprint_attrs, dynamic_attrs, health_checks, last_heartbeat;
-"#;
-
         // TODO:
         // Its not ideal that I am using NodeMsg here
         // I get an error about serializing Map, and the simplest
         // way around it is to just use the node message when using
         // to_params_named, as its already a string
-        let node = conn.query_row(sql, to_params_named(node)?.to_slice().as_slice(), |row| {
-            self.node_from_row(row)
-        })?;
+
+        let node = conn.query_row(
+            &INSERT_NODE,
+            to_params_named(node)?.to_slice().as_slice(),
+            |row| self.node_from_row(row),
+        )?;
 
         Ok(node)
     }
@@ -345,19 +241,22 @@ FROM node;
         let res_as_string = to_string(&res).map_err(|e| e.to_string())?;
 
         let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
-        let sql = r#"
+
+        let update_sql = format!(
+            r#"
         UPDATE node
         SET dynamic_attrs = :dynamic_attrs
         WHERE id IN (:id)
-        RETURNING id, pool, status, availability, config_attrs, fingerprint_attrs, dynamic_attrs, health_checks, last_heartbeat;
-"#;
+        RETURNING {NODE_ATTRS};
+        "#
+        );
 
         let params = named_params! {
             ":id": id,
             ":dynamic_attrs": res_as_string,
         };
 
-        let node = conn.query_row(sql, params, |row| self.node_from_row(row))?;
+        let node = conn.query_row(&update_sql, params, |row| self.node_from_row(row))?;
 
         Ok(node)
     }
@@ -418,27 +317,8 @@ FROM node;
     #[instrument(err, skip_all)]
     pub fn get_worker_type(&self, name: String) -> R<WorkerConfig> {
         let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
-        let sql = "SELECT name, pool, additional_node_checks, attributes, name_prefix FROM worker_type WHERE name = ?";
-
-        let config = conn.query_row(sql, [name], |row| {
-            let af: String = row.get(2)?;
-            let attrs: String = row.get(3)?;
-            let parsed_attrs = serde_json::from_str(&attrs).unwrap();
-            let node_checks: Vec<String> = if af.is_empty() {
-                vec![]
-            } else {
-                af.split(",").map(|s| s.to_string()).collect()
-            };
-
-            let name_prefix = row.get(4)?;
-
-            Ok(WorkerConfig {
-                name: row.get(0)?,
-                pool: row.get(1)?,
-                additional_node_checks: node_checks,
-                attributes: parsed_attrs,
-                name_prefix,
-            })
+        let config = conn.query_row(&GET_WORKER_TYPE, [name], |row| {
+            self.worker_type_from_row(row)
         })?;
 
         Ok(config)
@@ -447,38 +327,19 @@ FROM node;
     #[instrument(err, skip_all)]
     pub fn insert_worker_type(&self, config: &WorkerConfig) -> R<WorkerConfig> {
         let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
-
         let node_checks_to_save = config.additional_node_checks.join(",");
         let attrs_to_save = serde_json::to_string(&config.attributes)?;
-
-        let sql = r#"
-INSERT INTO worker_type (name, pool, additional_node_checks, attributes, name_prefix)
-VALUES (:name, :pool, :af, :attrs, :name_prefix)
-ON CONFLICT(name) DO UPDATE SET pool = :pool, additional_node_checks = :af, attributes = :attrs, name_prefix = :name_prefix
-RETURNING name, pool, additional_node_checks, attributes, name_prefix;
-"#;
 
         let params = named_params! {
             ":name": config.name,
             ":pool": config.pool,
-            ":af": node_checks_to_save,
-            ":attrs": attrs_to_save,
+            ":additional_node_checks": node_checks_to_save,
+            ":attributes": attrs_to_save,
             ":name_prefix": config.name_prefix,
         };
 
-        let config = conn.query_row(sql, params, |row| {
-            let af: String = row.get(2)?;
-            let attrs: String = row.get(3)?;
-            let parsed_attrs = serde_json::from_str(&attrs).unwrap();
-            let name_prefix = row.get(4)?;
-
-            Ok(WorkerConfig {
-                name: row.get(0)?,
-                pool: row.get(1)?,
-                additional_node_checks: af.split(",").map(|s| s.to_string()).collect(),
-                attributes: parsed_attrs,
-                name_prefix,
-            })
+        let config = conn.query_row(&INSERT_WORKER_TYPE, params, |row| {
+            self.worker_type_from_row(row)
         })?;
 
         Ok(config)
@@ -491,33 +352,13 @@ RETURNING name, pool, additional_node_checks, attributes, name_prefix;
     #[instrument(err, skip_all)]
     pub fn get_job(&self, name: &str) -> R<Job> {
         let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
-
-        let sql = r#"
-SELECT id, name, status, created_at
-FROM job
-WHERE name = ?;
-"#;
-
-        let job = conn.query_row(sql, [name], |row| {
-            Ok(Job {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                status: row.get(2)?,
-                created_at: row.get(3)?,
-            })
-        })?;
-
+        let job = conn.query_row(&GET_JOB, [name], |row| self.job_from_row(row))?;
         Ok(job)
     }
 
     pub fn get_jobs(&self) -> R<Vec<Job>> {
         let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
-        let sql = r#"
-SELECT id, name, status, created_at
-FROM job;
-"#;
-
-        let mut stmt = conn.prepare(sql)?;
+        let mut stmt = conn.prepare(&GET_JOBS)?;
         let job_iter = stmt.query_map([], |row| self.job_from_row(row))?;
         let mut jobs = Vec::new();
         for job in job_iter {
@@ -550,31 +391,17 @@ FROM job;
         let mut conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
         let tx = conn.transaction()?;
 
-        let get_job_sql = r#"
-        SELECT id, name, status, created_at
-        FROM job
-        WHERE name = ?;
-        "#;
-
-        let job = tx.query_row(get_job_sql, [name], |row| {
-            Ok(Job {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                status: row.get(2)?,
-                created_at: row.get(3)?,
-            })
-        })?;
-
+        let job = tx.query_row(&GET_JOB, [name], |row| self.job_from_row(row))?;
         if job.status != "stopped" {
             return Err("Job must be stopped before it can be destroyed".into());
         }
 
-        let update_sql = r#"
+        let delete_sql = r#"
             DELETE FROM job
             WHERE name = ? AND status = 'stopped';
         "#;
 
-        tx.execute(update_sql, [name])?;
+        tx.execute(delete_sql, [name])?;
 
         tx.commit()
             .map_err(|_| "Error committing transaction".into())
@@ -583,44 +410,22 @@ FROM job;
     #[instrument(err, skip_all)]
     pub fn get_job_config(&self, name: &str) -> R<JobConfig> {
         let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
+        let (job_config, jc_id): (JobConfig, String) =
+            conn.query_row(&GET_JOB_CONFIG, [name], |row| {
+                let tasks_to_replace = vec![];
+                let job_config_id = row.get(0)?;
+                let jc = JobConfig {
+                    name: row.get(1)?,
+                    tasks: tasks_to_replace,
+                    version: Some(row.get(4)?),
+                };
 
-        let jc_sql = r#"
-SELECT id, name, type, version, meta, created_at
-FROM job_config
-WHERE name = ?
-ORDER BY version DESC
-LIMIT 1;
-"#;
+                Ok((jc, job_config_id))
+            })?;
 
-        let (job_config, jc_id): (JobConfig, String) = conn.query_row(jc_sql, [name], |row| {
-            let tasks_to_replace = vec![];
-            let job_config_id = row.get(0)?;
-            let jc = JobConfig {
-                name: row.get(1)?,
-                tasks: tasks_to_replace,
-                version: Some(row.get(3)?),
-            };
+        let mut stmt = conn.prepare(&GET_TASK_FOR_JOB_CONIFG)?;
 
-            Ok((jc, job_config_id))
-        })?;
-
-        let task_sql = r#"
-SELECT id, name, driver, count, config, resources, constraints, job_id, job_config_id
-FROM task_config
-WHERE job_config_id = ?;
-"#;
-        let mut stmt = conn.prepare(task_sql)?;
-
-        let task_iter = stmt.query_map([jc_id], |row| {
-            Ok(TaskConfig {
-                name: row.get(1)?,
-                driver: row.get(2)?,
-                count: row.get(3)?,
-                config: row.get(4)?,
-                resources: row.get(5)?,
-                constraints: row.get(6)?,
-            })
-        })?;
+        let task_iter = stmt.query_map([jc_id], |row| self.task_config_from_row(row))?;
 
         let mut tasks = Vec::new();
         for task in task_iter {
@@ -659,30 +464,13 @@ WHERE job_config_id = ?;
         let now = OffsetDateTime::now_utc().unix_timestamp();
         let tx = conn.transaction()?;
 
-        let get_job_sql = r#"
-SELECT id, name, status, created_at
-FROM job
-WHERE name = ?;
-"#;
-
-        let get_job_res = tx.query_row(get_job_sql, [config.name.clone()], |row| {
-            Ok(Job {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                status: row.get(2)?,
-                created_at: row.get(3)?,
-            })
+        let get_job_res = tx.query_row(&GET_JOB, [config.name.clone()], |row| {
+            self.job_from_row(row)
         });
 
         let job = match get_job_res {
             Ok(j) => Ok(j),
             Err(rusqlite::Error::QueryReturnedNoRows) => {
-                let job_sql = r#"
-INSERT INTO job (id, name, status, created_at)
-VALUES (:id, :name, :status, :created_at)
-RETURNING id, name, status, created_at;
-"#;
-
                 let job_params = named_params! {
                     ":id": config.name,
                     ":name": config.name,
@@ -690,23 +478,10 @@ RETURNING id, name, status, created_at;
                     ":created_at": now,
                 };
 
-                tx.query_row(job_sql, job_params, |row| {
-                    Ok(Job {
-                        id: row.get(0)?,
-                        name: row.get(1)?,
-                        status: row.get(2)?,
-                        created_at: row.get(3)?,
-                    })
-                })
+                tx.query_row(&INSERT_JOB, job_params, |row| self.job_from_row(row))
             }
             Err(error) => Err(error),
         }?;
-
-        let jc_sql = r#"
-INSERT INTO job_config (id, name, type, meta, version, created_at, job_id)
-VALUES (:id, :name, :type, :meta, :version, :created_at, :job_id)
-RETURNING id, name, type, meta, version, created_at;
-"#;
 
         let now = time::OffsetDateTime::now_utc();
         let config_params = named_params! {
@@ -720,7 +495,7 @@ RETURNING id, name, type, meta, version, created_at;
         };
 
         let (_config, job_config_id): (JobConfig, String) =
-            tx.query_row(jc_sql, config_params, |row| {
+            tx.query_row(&INSERT_JOB_CONFIG, config_params, |row| {
                 let tasks = vec![];
                 Ok((
                     JobConfig {
@@ -731,11 +506,6 @@ RETURNING id, name, type, meta, version, created_at;
                     row.get(0)?,
                 ))
             })?;
-
-        let tasks_sql = r#"
-INSERT INTO task_config (name, driver, count, config, resources, constraints, job_id, job_config_id)
-VALUES (:name, :driver, :count, :config, :resources, :constraints, :job_id, :job_config_id);
-"#;
 
         config.tasks.iter().for_each(|t| {
             let task_params = named_params! {
@@ -749,14 +519,8 @@ VALUES (:name, :driver, :count, :config, :resources, :constraints, :job_id, :job
                 ":job_config_id": job_config_id,
             };
 
-            let _num_rows_changes = tx.execute(tasks_sql, task_params);
+            let _num_rows_changes = tx.execute(&INSERT_TASK, task_params);
         });
-
-        let subs_sql = r#"
-INSERT INTO submission (content, hash)
-VALUES (:content, :hash)
-ON CONFLICT(hash) DO NOTHING;
-"#;
 
         subs.iter().for_each(|s| {
             let sub_hash = s.hash();
@@ -766,16 +530,11 @@ ON CONFLICT(hash) DO NOTHING;
                 ":hash": sub_hash,
             };
 
-            let num_sub_rows_changes = tx.execute(subs_sql, sub_params);
+            let num_sub_rows_changes = tx.execute(&INSERT_SUBMISSION, sub_params);
             println!("num_sub_rows_changes: {:?}", num_sub_rows_changes);
 
             // TODO: Make sure that if random things fail,
             // we manually fail the transaction!
-
-            let job_config_sub_sql = r#"
-INSERT INTO job_config_submission (path, is_primary, job_config_id, submission_hash)
-VALUES (:path, :is_primary, :job_config_id, :submission_hash);
-"#;
 
             let job_config_sub_params = named_params! {
                 ":path": s.path,
@@ -785,18 +544,13 @@ VALUES (:path, :is_primary, :job_config_id, :submission_hash);
             };
 
             let num_job_config_sub_rows_changes =
-                tx.execute(job_config_sub_sql, job_config_sub_params);
+                tx.execute(&INSERT_JOB_CONFIG_SUBMISSION, job_config_sub_params);
 
             println!(
                 "num_job_config_sub_rows_changes: {:?}",
                 num_job_config_sub_rows_changes
             );
         });
-
-        let job_update_sql = r#"
-INSERT INTO job_update (id, status, job_id, to_job_config_id, from_job_config_id)
-VALUES (:id, :status, :job_id, :to_job_config_id, :from_job_config_id);
-"#;
 
         let job_update_params = named_params! {
             ":id": format!("{}-{}", job.id, next_version.to_string()),
@@ -806,7 +560,7 @@ VALUES (:id, :status, :job_id, :to_job_config_id, :from_job_config_id);
             ":from_job_config_id": last_versions_id,
         };
 
-        let _num_update_row_changes = tx.execute(job_update_sql, job_update_params);
+        let _num_update_row_changes = tx.execute(&INSERT_JOB_UPDATE, job_update_params);
 
         tx.commit()
             .map_err(|_| "Error committing transaction".into())
@@ -873,21 +627,19 @@ VALUES (:id, :status, :job_id, :to_job_config_id, :from_job_config_id);
     // EVALS
     //
 
-    #[instrument(err, skip_all)]
+    // #[instrument(err, skip_all)]
     pub fn get_next_eval(&self) -> R<Eval> {
         let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
-        let sql = r#"
-        SELECT id, status, type, job_id, job_config_id, node_name
-        FROM eval
-        WHERE status = 'pending'
-        ORDER BY id ASC
-        LIMIT 1;
-"#;
-
-        let eval = conn.query_row(sql, [], |row| self.eval_from_row(row))?;
+        let eval = conn.query_row(&GET_NEXT_EVAL, [], |row| self.eval_from_row(row))?;
         Ok(eval)
     }
 }
+
+// =====
+// =====
+// TESTS
+// =====
+// =====
 
 #[cfg(test)]
 mod tests {

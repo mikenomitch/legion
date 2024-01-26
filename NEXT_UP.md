@@ -1,5 +1,7 @@
 # Next Up
 
+- Fix the store specs
+
 - Eval Loop processes thing
 - A new job sticks an eval on the queue
 - It removes itself in its handle function

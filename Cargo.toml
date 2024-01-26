@@ -39,6 +39,7 @@ tracing-futures = "0.2.5"
 tracing-appender = "0.2.3"
 sha2 = "0.10.8"
 tabled = "0.15.0"
+lazy_static = "1.4.0"
 
 [build-dependencies]
 tonic-build = "0.8"

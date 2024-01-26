@@ -58,23 +58,23 @@ impl Eval {
         // But perhaps async clean ups make sense?
 
         // TODO: Make this an enum!
-        match self.kind.as_str() {
-            "node_join" => {
-                println!("Woot - node_join");
-            }
-            "node_drop" => {
-                println!("Woot - node_drop");
-            }
-            "job_start" => {
-                println!("Woot - job_start");
-            }
-            "job_stop" => {
-                println!("Woot - job_stop");
-            }
-            "job_update" => {
-                println!("Woot - job_update");
-            }
-        }
+        // match self.kind.as_str() {
+        //     "node_join" => {
+        //         println!("Woot - node_join");
+        //     }
+        //     "node_drop" => {
+        //         println!("Woot - node_drop");
+        //     }
+        //     "job_start" => {
+        //         println!("Woot - job_start");
+        //     }
+        //     "job_stop" => {
+        //         println!("Woot - job_stop");
+        //     }
+        //     "job_update" => {
+        //         println!("Woot - job_update");
+        //     }
+        // }
 
         println!("Woot - evalled");
         Ok("Doneski".to_string())

@@ -62,7 +62,12 @@ pub async fn run_manager(config: ManagerConfig) -> R<()> {
     let node_checker_fut =
         start_node_status_checker(store_copy_a, full_config.worker_check_seconds);
     let eval_loop_fut = start_eval_loop(store_copy_b);
-    let _res = join!(join_server_fut, start_server_fut, node_checker_fut);
+    let _res = join!(
+        join_server_fut,
+        start_server_fut,
+        node_checker_fut,
+        eval_loop_fut
+    );
 
     Ok(())
 }

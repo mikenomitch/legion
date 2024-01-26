@@ -893,6 +893,7 @@ dependencies = [
  "json-patch",
  "jsonnet-rs",
  "jsonwebtoken",
+ "lazy_static",
  "libloading",
  "prost 0.12.3",
  "rand",
