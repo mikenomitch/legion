@@ -122,27 +122,3 @@
 
 - Hitting this point will be a fairly major milestone, as lots
   of node management stuff is "done"
-
-# After that
-
-- Goal: Scheduling a Job on a node for real
-- Goal: Updating a job in response to node changes
-- Goal: Replacing a job in response to health check failure
-- Goal: Observing jobs on nodes via the CLI (where is it running, etc)
-
-# Mid Term Goal (real personal use)
-
-- I can run a manager/worker combo on Hetzner
-- I can run docker images
-- I can mount a host volume
-
-### After that
-
-- The app restarts if it crashes
-- I can monitor app health via CLI and UI
-- I can do deploys & updates
-- I can have basic networking between tasks and split between two nodes
-- Security stuff!!
-- I can view logs (and they don't destroy my disk)
-- I can shell into the containers
-- I can monitor with a basic UI

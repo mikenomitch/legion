@@ -31,6 +31,13 @@
   - [ ] Affinities and anti-affinities work
   - [ ] Scheduling on same node as existing job works
   - [ ] Priorities and eviction works (eviction toggled at the pool level)
+  - [ ] Rescheduling works
+    - [ ] A node change will update a job's placement
+      - node health check
+      - dynamic metadata
+    - [ ] Job health check reschedules a job
+      - [ ] Initial failures restart the job
+      - [ ] Failure after N times forces a reschedule
   - [ ] A "spread" scheduler works (inverse of bin-pack)
   - [ ] A "speed" scheduler works that optimizes for fast placement
     - [ ] Uses Fly.io bidding architecture
