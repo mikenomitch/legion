@@ -3,7 +3,7 @@
     tasks: [
         {
             name: "first-task",
-            driver: "docker",
+            driver: "container",
             config: {
                 message: "Hello from first task",
             },

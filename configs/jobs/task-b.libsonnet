@@ -1,6 +1,6 @@
 {
     name: "task-b",
-    driver: "docker",
+    driver: "container",
     config: {
         message: "Hello from task B",
     },

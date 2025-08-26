@@ -30,7 +30,7 @@
   - Initially you can go over the resources (it just tracks the totals)
   - If you don't have enough resources on submit, the job
     command fails and tells you why!
-  - Then figure out how to make it an async loop
+  - Then figure out how to make it an optimistic async loop
   - Then respond to node changes with reschedules
 
 - If you fail mid way thru any of the job submit parts, the transaction fails HARD!
@@ -79,10 +79,16 @@
     node check logic together in one
   - Where structs get their definition
   - Audit all files
+  - Remame
+    - "driver" to "type" (but think about batch vs service vs other naming too)
+
 
 - Write some integration tests
 - Write some unit tests
-- Any other plugins? (Storage maybe?)
+- Any other plugins?
+  - Storage?
+  - Config?
+
 - Automated testing in CI (timebox this)
 - Common Rust crates (errors? anyhow?)
 
@@ -140,22 +146,3 @@
 - I can view logs (and they don't destroy my disk)
 - I can shell into the containers
 - I can monitor with a basic UI
-
-# Deferred Work
-
-### TLS joining
-
-- Goal: Make join process establish TLS and/or WG
-
-- Success:
-
-* Run server with `cr start``
-* Try `cr job status`
-* Note that it fails
-* Get a join-token
-* Join with this token. Note that the client connection works.
-* You should also be able to get a join-token for CLI certs
-
-- Steps:
-
-* Run worker start
