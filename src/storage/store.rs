@@ -530,8 +530,7 @@ impl Store {
                 ":hash": sub_hash,
             };
 
-            let num_sub_rows_changes = tx.execute(&INSERT_SUBMISSION, sub_params);
-            println!("num_sub_rows_changes: {:?}", num_sub_rows_changes);
+            let _num_sub_rows_changes = tx.execute(&INSERT_SUBMISSION, sub_params);
 
             // TODO: Make sure that if random things fail,
             // we manually fail the transaction!
@@ -543,13 +542,8 @@ impl Store {
                 ":submission_hash": sub_hash,
             };
 
-            let num_job_config_sub_rows_changes =
+            let _num_job_config_sub_rows_changes =
                 tx.execute(&INSERT_JOB_CONFIG_SUBMISSION, job_config_sub_params);
-
-            println!(
-                "num_job_config_sub_rows_changes: {:?}",
-                num_job_config_sub_rows_changes
-            );
         });
 
         let job_update_params = named_params! {

@@ -2,7 +2,7 @@ use crate::prelude::*;
 
 use libloading::{Library, Symbol};
 use std::env::consts::{ARCH, OS};
-use sysinfo::{CpuExt, DiskExt, NetworkExt, System, SystemExt};
+use sysinfo::{Disks, Networks, System, SUPPORTED_SIGNALS};
 
 // NOTE: Improve current fingerprinters:
 // Network - speed, IP addresses, etc
@@ -157,18 +157,22 @@ impl NodeChecker for DiskChecker {
     }
 
     fn health_check(&self) -> Map<String, Value> {
-        let mut sys = System::new_all();
-        sys.refresh_all();
+        let mut disks = Disks::new_with_refreshed_list();
+        disks.refresh();
 
-        let any_disk_under_50_free = sys.disks().iter().any(|disk| {
-            let percent_free = disk.available_space() as f64 / disk.total_space() as f64;
-            percent_free < 0.5
-        });
+        let usage_below = |threshold: f64| {
+            disks.list().iter().any(|disk| {
+                let total = disk.total_space();
+                if total == 0 {
+                    return false;
+                }
+                let percent_free = disk.available_space() as f64 / total as f64;
+                percent_free < threshold
+            })
+        };
 
-        let any_disk_under_20_free = sys.disks().iter().any(|disk| {
-            let percent_free = disk.available_space() as f64 / disk.total_space() as f64;
-            percent_free < 0.2
-        });
+        let any_disk_under_50_free = usage_below(0.5);
+        let any_disk_under_20_free = usage_below(0.2);
 
         // TODO: Ensure this works on MacOS
         let fifty_val = if any_disk_under_50_free {
@@ -216,7 +220,10 @@ impl NodeChecker for KitchenSinkNodeChecker {
 
         let mut networks_map: Map<String, Value> = Map::new();
         // Network interfaces name, data received and data transmitted:
-        for (interface_name, data) in sys.networks() {
+        let mut networks = Networks::new_with_refreshed_list();
+        networks.refresh();
+
+        for (interface_name, data) in &networks {
             let mut network_map: Map<String, Value> = Map::new();
 
             network_map.insert("name".into(), Value::String(interface_name.to_string()));
@@ -254,7 +261,10 @@ impl NodeChecker for KitchenSinkNodeChecker {
         // === Disks ===
 
         let mut disks_hash: Map<String, Value> = Map::new();
-        sys.disks().iter().for_each(|disk| {
+        let mut disks = Disks::new_with_refreshed_list();
+        disks.refresh();
+
+        disks.list().iter().for_each(|disk| {
             let mut disk_hash: Map<String, Value> = Map::new();
             disk_hash.insert(
                 "disk_name".into(),
@@ -315,7 +325,7 @@ impl NodeChecker for KitchenSinkNodeChecker {
 
         // === OTHER ===
 
-        let signals = System::SUPPORTED_SIGNALS;
+        let signals = SUPPORTED_SIGNALS;
         fingerprint.insert(
             "signals".into(),
             Value::Array(
