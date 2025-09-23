@@ -177,6 +177,10 @@ pub const TASK_CONFIG_ATTRS: &str = r#"
 id, name, driver, count, config, resources, constraints, job_id, job_config_id
 "#;
 
+pub const TASK_CONFIG_INSERT_ATTRS: &str = r#"
+name, driver, count, config, resources, constraints, job_id, job_config_id
+"#;
+
 // pub const TASK_CONFIG_PARAM_SET: &str = r#"
 // count = :count, name = :name, driver = :driver, config = :config, resources = :resources, constraints = :constraints, job_id = :job_id, job_config_id = :job_config_id
 // "#;
@@ -208,7 +212,7 @@ lazy_static! {
     );
     pub static ref INSERT_TASK: String = format!(
         r#"
-    INSERT INTO task_config ({TASK_CONFIG_ATTRS})
+    INSERT INTO task_config ({TASK_CONFIG_INSERT_ATTRS})
     VALUES ({TASK_CONFIG_ATTRS_VALS})
     "#
     );

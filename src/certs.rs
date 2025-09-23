@@ -5,15 +5,15 @@ use crate::prelude::*;
 // extern crate openssl;
 
 use rcgen::{
-    BasicConstraints, Certificate, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair,
-    KeyUsagePurpose, SanType, PKCS_ECDSA_P256_SHA256,
+    BasicConstraints, CertificateParams, CertifiedKey, DistinguishedName, DnType, Ia5String, IsCa,
+    KeyPair, KeyUsagePurpose, SanType,
 };
 use std::fs;
 use std::fs::File;
 use std::io::{BufReader, Read};
 
 #[allow(dead_code)]
-pub fn read_root_cert(pem_path: String, key_path: String) -> R<Certificate> {
+pub fn read_root_cert(pem_path: String, key_path: String) -> R<CertifiedKey> {
     // Open the PEM file containing both the certificate and private key
 
     let pem_cert_file = File::open(pem_path)?;
@@ -30,17 +30,20 @@ pub fn read_root_cert(pem_path: String, key_path: String) -> R<Certificate> {
 
     let key_pair = KeyPair::from_pem(key_pair_sting.as_str())?;
     // Parse the PEM file and create a new CertificateParams object
-    let ca_cert_params = CertificateParams::from_ca_cert_pem(cert_string.as_str(), key_pair)?;
+    let ca_cert_params = CertificateParams::from_ca_cert_pem(cert_string.as_str())?;
 
-    // Create a new certificate using the CertificateParams object
-    let ca_cert = Certificate::from_params(ca_cert_params)?;
+    // Reconstruct a certificate using the parsed parameters and key pair
+    let ca_cert = ca_cert_params.self_signed(&key_pair)?;
 
-    Ok(ca_cert)
+    Ok(CertifiedKey {
+        cert: ca_cert,
+        key_pair,
+    })
 }
 
 #[allow(dead_code)]
-pub fn create_ca_cert() -> R<Certificate> {
-    let key_pair = KeyPair::generate(&PKCS_ECDSA_P256_SHA256)?;
+pub fn create_ca_cert() -> R<CertifiedKey> {
+    let key_pair = KeyPair::generate()?;
 
     let mut dn = DistinguishedName::new();
     dn.push(DnType::CommonName, "localhost");
@@ -49,31 +52,29 @@ pub fn create_ca_cert() -> R<Certificate> {
     let mut params = CertificateParams::default();
     params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     params.distinguished_name = dn;
-    params.key_pair = Some(key_pair);
-
     params.not_before = time::OffsetDateTime::now_utc();
     params.not_after = time::OffsetDateTime::now_utc() + time::Duration::days(365 * 20);
 
     params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
 
-    let cert = Certificate::from_params(params)?;
+    let cert = params.self_signed(&key_pair)?;
 
-    let cert_pem = cert.serialize_pem()?;
+    let cert_pem = cert.pem();
 
     std::fs::create_dir_all("configs/tls/")?;
     fs::write("configs/tls/rootca.pem", cert_pem.as_bytes())?;
     fs::write(
         "configs/tls/rootca.key",
-        cert.serialize_private_key_pem().as_bytes(),
+        key_pair.serialize_pem().as_bytes(),
     )?;
 
-    Ok(cert)
+    Ok(CertifiedKey { cert, key_pair })
 }
 
 pub fn signed_cert_with_ca(
-    ca_cert: &Certificate,
+    ca_cert: &CertifiedKey,
     dn_name: &str,
-) -> R<(String, String, Certificate)> {
+) -> R<(String, String, CertifiedKey)> {
     let mut dn = DistinguishedName::new();
     dn.push(DnType::CommonName, dn_name.to_string());
 
@@ -84,24 +85,25 @@ pub fn signed_cert_with_ca(
     params.not_after = time::OffsetDateTime::now_utc() + time::Duration::days(365 * 20);
 
     params.subject_alt_names = vec![
-        SanType::DnsName(dn_name.into()),
-        SanType::DnsName(String::from("legion")),
-        SanType::DnsName(String::from("localhost")),
+        SanType::DnsName(Ia5String::try_from(dn_name)?),
+        SanType::DnsName(Ia5String::try_from("legion")?),
+        SanType::DnsName(Ia5String::try_from("localhost")?),
         SanType::IpAddress(std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1))),
         SanType::IpAddress(std::net::IpAddr::V6(std::net::Ipv6Addr::new(
             0, 0, 0, 0, 0, 0, 0, 1,
         ))),
     ];
-    let cert = Certificate::from_params(params)?;
+    let key_pair = KeyPair::generate()?;
+    let cert = params.signed_by(&key_pair, &ca_cert.cert, &ca_cert.key_pair)?;
 
-    let cert_signed = cert.serialize_pem_with_signer(&ca_cert)?;
-    let key = cert.serialize_private_key_pem();
+    let cert_signed = cert.pem();
+    let key = key_pair.serialize_pem();
 
-    Ok((cert_signed, key, cert))
+    Ok((cert_signed, key, CertifiedKey { cert, key_pair }))
 }
 
 #[allow(dead_code)]
-pub fn write_signed_cert_with_ca(ca_cert: &Certificate, dn_name: &str) -> R<Certificate> {
+pub fn write_signed_cert_with_ca(ca_cert: &CertifiedKey, dn_name: &str) -> R<CertifiedKey> {
     let (cert_signed, key, ca_cert_again) = signed_cert_with_ca(&ca_cert, dn_name)?;
 
     let path = format!("configs/tls/{dn_name}/");
@@ -149,7 +151,7 @@ mod tests {
     #[test]
     fn signed_cert_with_ca_works() -> R<()> {
         let cert = create_ca_cert()?;
-        let (cert_signed, key, _) = signed_cert_with_ca(&cert, "test".into())?;
+        let (cert_signed, key, _) = signed_cert_with_ca(&cert, "test")?;
         assert!(cert_signed.len() > 0);
         assert!(key.len() > 0);
 
@@ -159,7 +161,7 @@ mod tests {
     #[test]
     fn write_signed_cert_with_ca_works() -> R<()> {
         let cert = create_ca_cert()?;
-        write_signed_cert_with_ca(&cert, "server".into())?;
+        write_signed_cert_with_ca(&cert, "server")?;
         Ok(())
     }
 }
