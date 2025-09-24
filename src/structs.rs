@@ -6,6 +6,8 @@ use serde_json::{from_str, to_string};
 use sha2::{Digest, Sha256};
 use time::macros::format_description;
 
+use crate::storage::store::Store;
+
 tonic::include_proto!("legion");
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -52,7 +54,7 @@ impl Submission {
 }
 
 impl Eval {
-    pub fn handle(&self) -> R<String> {
+    pub fn handle(&self, _store: &Store) -> R<String> {
         // This can have different logic for each eval kind
         // It should clean up after itself most likely
         // But perhaps async clean ups make sense?
@@ -65,8 +67,8 @@ impl Eval {
         //     "node_drop" => {
         //         println!("Woot - node_drop");
         //     }
-        //     "job_start" => {
-        //         println!("Woot - job_start");
+        //     "job_submit" => {
+        //         println!("Woot - job_submit");
         //     }
         //     "job_stop" => {
         //         println!("Woot - job_stop");

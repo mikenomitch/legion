@@ -322,7 +322,7 @@ impl Manager for ManagerAgentService {
         &self,
         _request: Request<GetLedgerRequest>,
     ) -> Result<Response<GetLedgerReply>, Status> {
-        let reply = GetLedgerReply {
+        let reply: GetLedgerReply = GetLedgerReply {
             message: "Heeey".into(),
         };
 

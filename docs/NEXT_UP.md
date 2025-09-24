@@ -1,4 +1,30 @@
 # Next Up
+- Ledger prints nicely
+    - get_ledger updated and GetLedgerReply updated
+    - prints out a list of all the nodes with allocations on them
+    - CLI will properly and nicely print out the ledger
+
+- Eval Loop can process things
+    -  Start with a test of handling a chain of evals via Eval::handle being called repeatedly on them:
+        - Start with empty ledger
+        - Add a node via node_join
+        - Ledger shows an empty node
+        - Add another node via node_join
+        - Ledger shows two empty nodes
+        - Drop a node via node_drop
+        - Ledger shows an empty node
+        - Add a job via job_submit
+        - Allocations are added to the node
+        - Update the job via job_update
+        - Allocations are updated on the node (not added)
+        - Add a second job via job_submit
+        - Allocations are added to the node
+        - Remove a job via job_stop
+        - Allocations are removed from the node
+        - Remove the second job via job_stop
+        - All allocations are removed from the node and the ledger is empty
+
+        - Ensure that after each eval is handled by the store, it removes itself from the store
 
 - Eval Loop processes thing
 - A new job sticks an eval on the queue

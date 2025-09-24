@@ -110,7 +110,7 @@ async fn start_eval_loop(store: Store) -> R<()> {
 
     loop {
         match store.get_next_eval() {
-            Ok(eval) => match eval.handle() {
+            Ok(eval) => match eval.handle(&store) {
                 Ok(message) => {
                     info!("Eval {} handled successfully: {}", eval.id, message);
                 }
