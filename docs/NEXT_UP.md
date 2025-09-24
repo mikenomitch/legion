@@ -80,7 +80,7 @@
   - Where structs get their definition
   - Audit all files
   - Remame
-    - "driver" to "type" (but think about batch vs service vs other naming too)
+    - Audit task "kind" naming (think about batch vs service vs other naming too)
 
 
 - Write some integration tests

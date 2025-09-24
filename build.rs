@@ -17,7 +17,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // tonic_build::compile_protos("proto/legion.proto")?;
 
-    // For every plugin of every type, build a release
+    // For every plugin of every kind, build a release
     std::fs::read_dir("./plugins")?
         .filter_map(|entry| {
             let entry = entry.ok()?;

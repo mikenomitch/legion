@@ -46,25 +46,25 @@
 
 - [ ] Running workloads
   - [ ] A framework is set up to run workload plugins
-  - [ ] A "noop" type "works"
-  - [ ] An "executable" type works
+  - [ ] A "noop" kind "works"
+  - [ ] An "executable" kind works
     - [ ] The command and args given are run
     - [ ] It runs as a specific user
     - [ ] Unveil works properly
     - [ ] It is put in a cgroup that restricts cpu, memory, and disk appropriately
     - [ ] It uses landlock appropriately
     - [ ] It handles network namespaces well?
-  - [ ] A "container" type works
+  - [ ] A "container" kind works
     - Does it just user docker? Apple's container' runtime if on MacOS?
     - MUST work on a Mac easily (and on linux)
         1. Think about Kamal
         2. Think about local dev
-  - [ ] A "WASM" type works
-  - [ ] A "VM" type works
+  - [ ] A "WASM" kind works
+  - [ ] A "VM" kind works
     - Uses Libvirt? Uses cloud-hypervisor?
 
 - [ ] Deployments
   - [ ] A new version of a job starts a deployment
   - [ ] A framework is set up for deployments
-  - [ ] An "immediate" deployment type "works" and cycles out everything in place automatically
-  - [ ] A "rolling" deployment type is created and works
+  - [ ] An "immediate" deployment kind "works" and cycles out everything in place automatically
+  - [ ] A "rolling" deployment kind is created and works

@@ -5,7 +5,7 @@
 * Bin-Packing (Manager selects, manager is source of truth)
 * Spread (Manager selects, manager is source of truth)
 
-### Built-in Task Types
+### Built-in Task Kinds
 * container
 * executable (landlock, pledge, etc)
 * wasm

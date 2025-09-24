@@ -1,6 +1,6 @@
 {
     name: "task-a",
-    driver: "container",
+    kind: "container",
     config: {
         message: "Hello from task A",
     },

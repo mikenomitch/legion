@@ -53,7 +53,7 @@ impl Submission {
 
 impl Eval {
     pub fn handle(&self) -> R<String> {
-        // This can have different logic for each eval type
+        // This can have different logic for each eval kind
         // It should clean up after itself most likely
         // But perhaps async clean ups make sense?
 
@@ -111,15 +111,15 @@ pub struct WorkerConfigAlt {
     pub name_prefix: Option<String>,
 }
 
-// // TODO: DRIVER CONFIG SHOULD BE CUSTOMIZABLE
+// // TODO: TASK KIND CONFIG SHOULD BE CUSTOMIZABLE
 // // AND EVENTUALLY ABLE TO HANDLE DEEP NESTING
 // #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 // #[serde(rename_all = "camelCase")]
-// pub struct DriverConfig {
+// pub struct TypeConfig {
 //     pub message: String,
 // }
 
-// // TODO: DRIVER CONFIG SHOULD BE MORE CUSTOMIZABLE
+// // TODO: KIND CONFIG SHOULD BE MORE CUSTOMIZABLE
 // #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 // #[serde(rename_all = "camelCase")]
 // pub struct ResourcesConfig {
@@ -154,7 +154,7 @@ impl From<Job> for JobPrint {
 pub struct TaskConfig {
     pub name: String,
     pub count: u32,
-    pub driver: String,
+    pub kind: String,
     pub config: Value,
     pub resources: Value,
     pub constraints: Value,

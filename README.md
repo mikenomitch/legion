@@ -14,7 +14,7 @@ It aims to be differentiated from the above based on the following:
   - It is a small binary that can run on edge devices.
 - Flexiblity:
   - It has a plugin system for:
-    - Workload type (containers, WASM, binaries, VMs, etc)
+    - Workload kind (containers, WASM, binaries, VMs, etc)
     - Scheduler logic (optimize for utilization, resilience, speed)
     - Networking
     - Volumes
