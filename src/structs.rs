@@ -162,6 +162,17 @@ pub struct TaskConfig {
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
+pub struct Allocation {
+    pub id: i64,
+    pub status: String,
+    pub resources: Value,
+    pub node_id: String,
+    pub job_config_id: String,
+    pub task_config_id: i64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct JobConfig {
     pub name: String,
     pub tasks: Vec<TaskConfig>,

@@ -1,12 +1,15 @@
 use crate::prelude::*;
 use crate::storage::migrations::get_migrations;
 use crate::storage::queries::{
-    GET_JOB, GET_JOBS, GET_JOB_CONFIG, GET_NEXT_EVAL, GET_NODE, GET_NODES, GET_TASK_FOR_JOB_CONIFG,
-    GET_WORKER_TYPE, INSERT_JOB, INSERT_JOB_CONFIG, INSERT_JOB_CONFIG_SUBMISSION,
-    INSERT_JOB_UPDATE, INSERT_NODE, INSERT_SUBMISSION, INSERT_TASK, INSERT_WORKER_TYPE, NODE_ATTRS,
+    GET_ALLOCS, GET_ALLOCS_FOR_JOB, GET_ALLOCS_FOR_JOB_CONFIG, GET_ALLOCS_FOR_NODE, GET_JOB,
+    GET_JOBS, GET_JOB_CONFIG, GET_NEXT_EVAL, GET_NODE, GET_NODES, GET_TASK_FOR_JOB_CONIFG,
+    GET_WORKER_TYPE, INSERT_ALLOCATION, INSERT_JOB, INSERT_JOB_CONFIG,
+    INSERT_JOB_CONFIG_SUBMISSION, INSERT_JOB_UPDATE, INSERT_NODE, INSERT_SUBMISSION, INSERT_TASK,
+    INSERT_WORKER_TYPE, NODE_ATTRS,
 };
 use crate::structs::{
-    Eval, Job, JobConfig, ManagerConfigFull, Node, NodeMsg, Submission, TaskConfig, WorkerConfig,
+    Allocation, Eval, Job, JobConfig, ManagerConfigFull, Node, NodeMsg, Submission, TaskConfig,
+    WorkerConfig,
 };
 
 use rusqlite::{named_params, Connection, Row};
@@ -151,6 +154,19 @@ impl Store {
         };
 
         Ok(task_config)
+    }
+
+    fn allocation_from_row(&self, row: &Row<'_>) -> Result<Allocation, rusqlite::Error> {
+        let allocation = Allocation {
+            id: row.get(0)?,
+            status: row.get(1)?,
+            resources: row.get(2)?,
+            node_id: row.get(3)?,
+            job_config_id: row.get(4)?,
+            task_config_id: row.get(5)?,
+        };
+
+        Ok(allocation)
     }
 
     //
@@ -592,30 +608,104 @@ impl Store {
     // ALLOCS
     //
 
-    // #[instrument(err, skip_all)]
-    // pub fn place_alloc(&self, node_id, task_id) -> R<()> {
-    // }
+    #[instrument(err, skip_all)]
+    pub fn place_alloc(&self, node_id: &str, task_id: i64) -> R<Allocation> {
+        let mut conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
+        let tx = conn.transaction()?;
 
-    // #[instrument(err, skip_all)]
-    // pub fn allocs_for_job(&self, job_id) -> R<()> {
-    // }
+        let (job_config_id, resources): (String, Value) = tx.query_row(
+            "SELECT job_config_id, resources FROM task_config WHERE id = ?;",
+            [task_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
 
-    // #[instrument(err, skip_all)]
-    // pub fn allocs_for_job_config(&self, job_config_id) -> R<()> {
-    // }
+        let params = named_params! {
+            ":status": "placed",
+            ":resources": resources,
+            ":node_id": node_id,
+            ":job_config_id": job_config_id,
+            ":task_config_id": task_id,
+        };
 
-    // #[instrument(err, skip_all)]
-    // pub fn allocs_for_node(&self, node_name) -> R<()> {
-    // }
+        let allocation = tx.query_row(&INSERT_ALLOCATION, params, |row| {
+            self.allocation_from_row(row)
+        })?;
 
-    // #[instrument(err, skip_all)]
-    // pub fn get_allocs(&self) -> R<()> {
-    // }
+        tx.commit()?;
 
-    // MAYBE...?
-    // #[instrument(err, skip_all)]
-    // pub fn get_allocs_by_node(&self) -> R<()> {
-    // }
+        Ok(allocation)
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn allocs_for_job(&self, job_id: &str) -> R<Vec<Allocation>> {
+        let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
+        let mut stmt = conn.prepare(GET_ALLOCS_FOR_JOB.as_str())?;
+        let alloc_iter = stmt.query_map([job_id], |row| self.allocation_from_row(row))?;
+
+        let mut allocs = Vec::new();
+        for alloc in alloc_iter {
+            allocs.push(alloc?);
+        }
+
+        Ok(allocs)
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn allocs_for_job_config(&self, job_config_id: &str) -> R<Vec<Allocation>> {
+        let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
+        let mut stmt = conn.prepare(GET_ALLOCS_FOR_JOB_CONFIG.as_str())?;
+        let alloc_iter = stmt.query_map([job_config_id], |row| self.allocation_from_row(row))?;
+
+        let mut allocs = Vec::new();
+        for alloc in alloc_iter {
+            allocs.push(alloc?);
+        }
+
+        Ok(allocs)
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn allocs_for_node(&self, node_id: &str) -> R<Vec<Allocation>> {
+        let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
+        let mut stmt = conn.prepare(GET_ALLOCS_FOR_NODE.as_str())?;
+        let alloc_iter = stmt.query_map([node_id], |row| self.allocation_from_row(row))?;
+
+        let mut allocs = Vec::new();
+        for alloc in alloc_iter {
+            allocs.push(alloc?);
+        }
+
+        Ok(allocs)
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn get_allocs(&self) -> R<Vec<Allocation>> {
+        let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
+        let mut stmt = conn.prepare(GET_ALLOCS.as_str())?;
+        let alloc_iter = stmt.query_map([], |row| self.allocation_from_row(row))?;
+
+        let mut allocs = Vec::new();
+        for alloc in alloc_iter {
+            allocs.push(alloc?);
+        }
+
+        Ok(allocs)
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn get_allocs_by_node(&self) -> R<HashMap<String, Vec<Allocation>>> {
+        let allocs = self.get_allocs()?;
+        let mut by_node: HashMap<String, Vec<Allocation>> = HashMap::new();
+
+        for alloc in allocs {
+            by_node
+                .entry(alloc.node_id.clone())
+                .or_default()
+                .push(alloc);
+        }
+
+        Ok(by_node)
+    }
 
     //
     // EVALS
@@ -648,6 +738,31 @@ mod tests {
         let store = Store::start_storage(&store_config)?;
         store.reset_all_tables()?;
         Ok(store)
+    }
+
+    fn make_node(id: &str) -> Node {
+        Node {
+            id: id.to_string(),
+            status: "ready".into(),
+            pool: "default".into(),
+            availability: "available".into(),
+            last_heartbeat: "2023-01-01T00:00:00Z".into(),
+            config_attrs: json!({}),
+            fingerprint_attrs: json!({}),
+            dynamic_attrs: json!({}),
+            health_checks: json!({}),
+        }
+    }
+
+    fn task_id_for(store: &Store, task_name: &str, job_id: &str) -> R<i64> {
+        let conn = store.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
+        let id = conn.query_row(
+            "SELECT id FROM task_config WHERE name = ? AND job_id = ?;",
+            [task_name, job_id],
+            |row| row.get(0),
+        )?;
+
+        Ok(id)
     }
 
     // fn teardown_store(store: &Store) -> R<()> {
@@ -926,6 +1041,123 @@ mod tests {
             submit_response.unwrap_err().to_string(),
             "Job config is unchanged"
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn placing_allocations_and_querying_them() -> R<()> {
+        let store = setup_store()?;
+
+        let node_one_id = "node-one".to_string();
+        let node_two_id = "node-two".to_string();
+        store.insert_node(NodeMsg::from(make_node(&node_one_id)))?;
+        store.insert_node(NodeMsg::from(make_node(&node_two_id)))?;
+
+        let job_one_name = "job-one".to_string();
+        let task_one = TaskConfig {
+            name: "job-one-task-1".to_string(),
+            driver: "driver-a".to_string(),
+            count: 1,
+            config: json!({ "message": "hello" }),
+            resources: json!({ "memory": 256 }),
+            constraints: json!({}),
+        };
+        let task_two = TaskConfig {
+            name: "job-one-task-2".to_string(),
+            driver: "driver-b".to_string(),
+            count: 1,
+            config: json!({ "message": "world" }),
+            resources: json!({ "memory": 512 }),
+            constraints: json!({}),
+        };
+        let job_one_config = JobConfig {
+            name: job_one_name.clone(),
+            tasks: vec![task_one.clone(), task_two.clone()],
+            version: None,
+        };
+        let job_one_subs = vec![Submission {
+            path: "job-one-sub.jsonnet".into(),
+            content: "job-one".into(),
+            is_primary: true,
+        }];
+        store.handle_job_submit(&job_one_config, &job_one_subs)?;
+
+        let job_one_config_id = store.get_job_config(&job_one_name)?.id();
+        let task_one_id = task_id_for(&store, &task_one.name, &job_one_name)?;
+        let task_two_id = task_id_for(&store, &task_two.name, &job_one_name)?;
+
+        let job_two_name = "job-two".to_string();
+        let task_three = TaskConfig {
+            name: "job-two-task-1".to_string(),
+            driver: "driver-c".to_string(),
+            count: 1,
+            config: json!({ "message": "hola" }),
+            resources: json!({ "memory": 128 }),
+            constraints: json!({}),
+        };
+        let job_two_config = JobConfig {
+            name: job_two_name.clone(),
+            tasks: vec![task_three.clone()],
+            version: None,
+        };
+        let job_two_subs = vec![Submission {
+            path: "job-two-sub.jsonnet".into(),
+            content: "job-two".into(),
+            is_primary: true,
+        }];
+        store.handle_job_submit(&job_two_config, &job_two_subs)?;
+
+        let job_two_config_id = store.get_job_config(&job_two_name)?.id();
+        let task_three_id = task_id_for(&store, &task_three.name, &job_two_name)?;
+
+        let alloc_one = store.place_alloc(&node_one_id, task_one_id)?;
+        let alloc_two = store.place_alloc(&node_two_id, task_two_id)?;
+        let alloc_three = store.place_alloc(&node_one_id, task_three_id)?;
+
+        assert_eq!(alloc_one.status, "placed");
+        assert_eq!(alloc_one.node_id, node_one_id);
+        assert_eq!(alloc_one.task_config_id, task_one_id);
+        assert_eq!(alloc_one.job_config_id, job_one_config_id);
+        assert_eq!(alloc_one.resources, task_one.resources);
+
+        assert_eq!(alloc_two.resources, task_two.resources);
+        assert_eq!(alloc_three.job_config_id, job_two_config_id);
+        assert_eq!(alloc_three.resources, task_three.resources);
+
+        let job_one_allocs = store.allocs_for_job(&job_one_name)?;
+        assert_eq!(job_one_allocs.len(), 2);
+        let job_one_task_ids: Vec<i64> = job_one_allocs.iter().map(|a| a.task_config_id).collect();
+        assert!(job_one_task_ids.contains(&task_one_id));
+        assert!(job_one_task_ids.contains(&task_two_id));
+
+        let job_two_allocs = store.allocs_for_job(&job_two_name)?;
+        assert_eq!(job_two_allocs.len(), 1);
+        assert_eq!(job_two_allocs[0].task_config_id, task_three_id);
+
+        let job_one_config_allocs = store.allocs_for_job_config(&job_one_config_id)?;
+        assert_eq!(job_one_config_allocs.len(), 2);
+        let job_two_config_allocs = store.allocs_for_job_config(&job_two_config_id)?;
+        assert_eq!(job_two_config_allocs.len(), 1);
+        assert_eq!(job_two_config_allocs[0].task_config_id, task_three_id);
+
+        let node_one_allocs = store.allocs_for_node(&node_one_id)?;
+        assert_eq!(node_one_allocs.len(), 2);
+        let node_two_allocs = store.allocs_for_node(&node_two_id)?;
+        assert_eq!(node_two_allocs.len(), 1);
+
+        let all_allocs = store.get_allocs()?;
+        assert_eq!(all_allocs.len(), 3);
+
+        let allocs_by_node = store.get_allocs_by_node()?;
+        let node_one_group = allocs_by_node
+            .get(&node_one_id)
+            .ok_or("missing node one allocs")?;
+        assert_eq!(node_one_group.len(), 2);
+        let node_two_group = allocs_by_node
+            .get(&node_two_id)
+            .ok_or("missing node two allocs")?;
+        assert_eq!(node_two_group.len(), 1);
 
         Ok(())
     }

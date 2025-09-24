@@ -49,6 +49,64 @@ lazy_static! {
 }
 
 //
+// ALLOCATION
+//
+
+pub const ALLOCATION_ATTRS: &str = r#"
+id, status, resources, node_id, job_config_id, task_config_id
+"#;
+
+pub const ALLOCATION_SELECT_ATTRS: &str = r#"
+allocation.id, allocation.status, allocation.resources, allocation.node_id, allocation.job_config_id, allocation.task_config_id
+"#;
+
+pub const ALLOCATION_INSERT_ATTRS: &str = r#"
+status, resources, node_id, job_config_id, task_config_id
+"#;
+
+pub const ALLOCATION_ATTRS_VALS: &str = r#"
+:status, :resources, :node_id, :job_config_id, :task_config_id
+"#;
+
+lazy_static! {
+    pub static ref GET_ALLOCS: String = format!(
+        r#"
+    SELECT {ALLOCATION_ATTRS}
+    FROM allocation;
+    "#,
+    );
+    pub static ref GET_ALLOCS_FOR_NODE: String = format!(
+        r#"
+    SELECT {ALLOCATION_ATTRS}
+    FROM allocation
+    WHERE node_id = ?;
+    "#,
+    );
+    pub static ref GET_ALLOCS_FOR_JOB_CONFIG: String = format!(
+        r#"
+    SELECT {ALLOCATION_ATTRS}
+    FROM allocation
+    WHERE job_config_id = ?;
+    "#,
+    );
+    pub static ref GET_ALLOCS_FOR_JOB: String = format!(
+        r#"
+    SELECT {ALLOCATION_SELECT_ATTRS}
+    FROM allocation
+    INNER JOIN task_config ON task_config.id = allocation.task_config_id
+    WHERE task_config.job_id = ?;
+    "#,
+    );
+    pub static ref INSERT_ALLOCATION: String = format!(
+        r#"
+    INSERT INTO allocation ({ALLOCATION_INSERT_ATTRS})
+    VALUES ({ALLOCATION_ATTRS_VALS})
+    RETURNING {ALLOCATION_ATTRS};
+    "#,
+    );
+}
+
+//
 // WORKER_TYPE
 //
 
