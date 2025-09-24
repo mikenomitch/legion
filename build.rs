@@ -12,7 +12,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "Submission",
             "#[derive(serde::Deserialize, serde::Serialize, tabled::Tabled)]",
         )
-        .compile(&[proto_file], &["."])
+        .compile_protos(&[proto_file], &["."])
         .unwrap_or_else(|e| panic!("protobuf compile error: {e}"));
 
     // tonic_build::compile_protos("proto/legion.proto")?;

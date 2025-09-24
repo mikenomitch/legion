@@ -1,7 +1,5 @@
 # Next Up
 
-- Fix the store specs
-
 - Eval Loop processes thing
 - A new job sticks an eval on the queue
 - It removes itself in its handle function
@@ -9,12 +7,12 @@
 - You can print out the ledger
 - Set up some sort of TDD system and crank thru scheduling logic
 
-  - Task placements/Job Start
-  - Task replacement/Job Update
-  - Node drops
-  - Allocs dying
+- Task placements/Job Start
+- Task replacement/Job Update
+- Node drops
+- Allocs dying
 
-- On job submit, tasks are _syncronously_ placed onto nodes
+  - On job submit, tasks are _syncronously_ placed onto nodes
 
   - A ledger is kept of all the node resources and whats on the nodes
 
@@ -74,14 +72,8 @@
     - See this page for in-store error handling (https://users.rust-lang.org/t/handle-rusqlite-error/39660/7)
 
 - Think about your file setup (names/org/dupes)
-
-  - Split out NodeChecks into own single file then keep
-    node check logic together in one
   - Where structs get their definition
   - Audit all files
-  - Remame
-    - Audit task "kind" naming (think about batch vs service vs other naming too)
-
 
 - Write some integration tests
 - Write some unit tests
@@ -89,15 +81,7 @@
   - Storage?
   - Config?
 
-- Automated testing in CI (timebox this)
-- Common Rust crates (errors? anyhow?)
-
-- Add otel tracing properly
-
-- DRY up
-
-  - Error handling
-  - Store
+- Add otel tracing properly?
 
 - Worker configs CRUD commands with push from manager
 
