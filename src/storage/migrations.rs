@@ -72,7 +72,7 @@ pub fn get_migrations() -> Migrations<'static> {
             id INTEGER PRIMARY KEY,
             count INTEGER NOT NULL,
             name STRING NOT NULL,
-            driver STRING NOT NULL,
+            kind STRING NOT NULL,
             config JSONB NOT NULL,
             resources JSONB NOT NULL,
             constraints JSONB NOT NULL,

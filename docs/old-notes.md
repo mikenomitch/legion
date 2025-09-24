@@ -115,15 +115,15 @@ These are old notes from Bear transferred to this repo for tracking
   1. Pass in a job file
   2. Runs a binary
 - [ ] Running workloads II
-  1. Exec driver
-     1. Copy Seth’s exec v2/pledge driver
-  2. Podman driver?
-     1. Or just a docker driver?
+  1. Exec task kind
+     1. Copy Seth’s exec v2/pledge task kind implementation
+  2. Podman task kind?
+     1. Or just a docker-based task kind?
      2. Or something that can do both somehow?
      3. MUST work on a Mac easily (and on linux)
         1. Think about Kamal
         2. Think about local dev
-  3. Libvirt Driver
+  3. Libvirt task kind
      1. Use this instead? - [Run Cloud Virtual Machines Securely and Efficiently](https://www.cloudhypervisor.org/)?
 
 - [ ] Scheduling
@@ -173,13 +173,13 @@ These are old notes from Bear transferred to this repo for tracking
 * Reading jobfiles
   * Plugin (multiple languages)
   * Plugin (custom resources under new keys)
-  * Plugin (task drivers… are really just custom resources…???)
+  * Plugin (task kinds… are really just custom resources…???)
 * Running & monitoring jobs
   * Plugin?
-    * For different types
+    * For different kinds
 * Deployments
   * Plugin?
-    * For different types
+    * For different kinds
 * Policies
   * Plugin?
 
@@ -238,7 +238,7 @@ These are old notes from Bear transferred to this repo for tracking
   * [open-telemetry/opentelemetry-rust: OpenTelemetry API and SDK for Rust](https://github.com/open-telemetry/opentelemetry-rust)
 * Config lang?
   * jsonnet*
-* Task driver split into parts (isolations vs runner vs artifact)?
+* Task kind implementation split into parts (isolations vs runner vs artifact)?
 * networking using netavark (+ CNI)?
 * Networking over unix domain sockets legion overlay network
 * Apps that can use the DB but then get split out

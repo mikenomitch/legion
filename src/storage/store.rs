@@ -143,7 +143,7 @@ impl Store {
     fn task_config_from_row(&self, row: &Row<'_>) -> Result<TaskConfig, rusqlite::Error> {
         let task_config = TaskConfig {
             name: row.get(1)?,
-            driver: row.get(2)?,
+            kind: row.get(2)?,
             count: row.get(3)?,
             config: row.get(4)?,
             resources: row.get(5)?,
@@ -510,7 +510,7 @@ impl Store {
         config.tasks.iter().for_each(|t| {
             let task_params = named_params! {
                 ":name": t.name,
-                ":driver": t.driver,
+                ":kind": t.kind,
                 ":count": t.count,
                 ":config": t.config,
                 ":resources": t.resources,
@@ -706,7 +706,7 @@ mod tests {
 
         let task_one = TaskConfig {
             name: "task-1".to_string(),
-            driver: "driver-1".to_string(),
+            kind: "kind-1".to_string(),
             count: 1,
             config: json!({ "message": "hello-1" }),
             resources: json!({ "memory": 256 }),
@@ -715,7 +715,7 @@ mod tests {
 
         let task_two = TaskConfig {
             name: "task-2".to_string(),
-            driver: "driver-2".to_string(),
+            kind: "kind-2".to_string(),
             count: 2,
             config: json!({ "message": "hi-2" }),
             resources: json!({ "memory": 512 }),
@@ -750,7 +750,7 @@ mod tests {
 
         let t1_from_store = latest_job_config.tasks.get(0).ok_or("oof")?;
         assert_eq!(task_one.name, t1_from_store.name);
-        assert_eq!(task_one.driver, t1_from_store.driver);
+        assert_eq!(task_one.kind, t1_from_store.kind);
         assert_eq!(
             task_one.resources.get("memory").ok_or("no memory 1")?,
             t1_from_store.resources.get("memory").ok_or("no memory 2")?
@@ -785,7 +785,7 @@ mod tests {
 
         let orig_task = TaskConfig {
             name: "orig-task".to_string(),
-            driver: "driver-1".to_string(),
+            kind: "kind-1".to_string(),
             count: 1,
             config: json!({ "message": "hello" }),
             resources: json!({ "memory": 256 }),
@@ -816,20 +816,20 @@ mod tests {
         );
 
         // Submit an updates job config
-        // updated: task driver config
+        // updated: task kind config
 
         let new_task = TaskConfig {
-            driver: "driver-new".to_string(),
+            kind: "kind-new".to_string(),
             ..orig_task
         };
         let new_task_configs = vec![new_task.clone()];
-        let job_config_with_modified_driver = JobConfig {
+        let job_config_with_modified_kind = JobConfig {
             tasks: new_task_configs.clone(),
             ..job_config
         };
 
         let submit_response =
-            store.handle_job_submit(&job_config_with_modified_driver.clone(), &orig_submissions);
+            store.handle_job_submit(&job_config_with_modified_kind.clone(), &orig_submissions);
         assert!(submit_response.is_ok());
 
         // Get config for initial insert
@@ -846,7 +846,7 @@ mod tests {
 
         let extra_task = TaskConfig {
             name: "extra-task".to_string(),
-            driver: "driver-extra".to_string(),
+            kind: "kind-extra".to_string(),
             count: 1,
             config: json!({ "message": "hello" }),
             resources: json!({ "memory": 256 }),
@@ -856,7 +856,7 @@ mod tests {
 
         let job_config_with_extra_task = JobConfig {
             tasks: new_task_configs.clone(),
-            ..job_config_with_modified_driver
+            ..job_config_with_modified_kind
         };
 
         let submit_response =
@@ -899,7 +899,7 @@ mod tests {
         let orig_submissions = vec![];
         let orig_task = TaskConfig {
             name: "dupe-task".to_string(),
-            driver: "driver".to_string(),
+            kind: "kind".to_string(),
             count: 1,
             config: json!({ "message": "hello" }),
             resources: json!({ "memory": 256 }),

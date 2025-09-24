@@ -3,7 +3,7 @@
     tasks: {
         "first-task": {
             count: 1,
-            driver: "noop",
+            kind: "noop",
             config: {
                 message: "Hello from first task",
             },
@@ -14,7 +14,7 @@
         },
         "second-task": {
             count: 2,
-            driver: "noop",
+            kind: "noop",
             config: {
                 message: "Hello from second task",
             },
