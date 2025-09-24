@@ -16,6 +16,7 @@ use rusqlite::{named_params, Connection, Row};
 use rusqlite_migration::Migrations;
 use serde_json::to_string;
 use serde_rusqlite::to_params_named;
+use std::sync::MutexGuard;
 use time::macros::format_description;
 use time::OffsetDateTime;
 
@@ -64,7 +65,7 @@ impl Store {
     #[allow(dead_code)]
     pub fn reset_all_tables(&self) -> R<()> {
         let migrations = get_migrations();
-        let mut conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
+        let mut conn = self.connection()?;
         migrations.to_version(&mut conn, 0)?;
         migrations.to_latest(&mut conn)?;
 
@@ -74,7 +75,7 @@ impl Store {
     #[instrument(skip_all)]
     fn create_initial_tables(conn: &MemSafeConn) -> R<Migrations<'_>> {
         let migrations = get_migrations();
-        let mut conn = conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
+        let mut conn = Self::lock_conn(conn)?;
         info!("Pragma update");
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
@@ -82,6 +83,23 @@ impl Store {
         migrations.to_latest(&mut conn)?;
 
         Ok(migrations)
+    }
+
+    fn lock_conn(conn: &MemSafeConn) -> R<MutexGuard<'_, Connection>> {
+        conn.lock().map_err(|_| CONN_LOCK_ERROR.into())
+    }
+
+    fn connection(&self) -> R<MutexGuard<'_, Connection>> {
+        Self::lock_conn(&self.conn)
+    }
+
+    fn collect_rows<T, I>(iter: I) -> R<Vec<T>>
+    where
+        I: Iterator<Item = Result<T, rusqlite::Error>>,
+    {
+        let values: Result<Vec<_>, rusqlite::Error> = iter.collect();
+        let values = values.map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
+        Ok(values)
     }
 
     //
@@ -175,44 +193,34 @@ impl Store {
 
     #[instrument(err, skip_all)]
     pub fn get_node(&self, id: &str) -> R<Node> {
-        let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
+        let conn = self.connection()?;
         let node = conn.query_row(&GET_NODE, [id], |row| self.node_from_row(row))?;
         Ok(node)
     }
 
     #[instrument(err, skip_all)]
     pub fn get_nodes(&self) -> R<Vec<Node>> {
-        let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
+        let conn = self.connection()?;
         let mut stmt = conn.prepare(GET_NODES.as_str())?;
-        let node_iter = stmt.query_map([], |row| self.node_from_row(row))?;
-        let mut nodes = Vec::new();
-        for node in node_iter {
-            let n = node?;
-            nodes.push(n);
-        }
+        let nodes = Self::collect_rows(stmt.query_map([], |row| self.node_from_row(row))?)?;
 
         Ok(nodes)
     }
 
     #[instrument(err, skip_all)]
     pub fn get_node_ids_and_heartbeats(&self) -> R<Vec<(String, String)>> {
-        let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
+        let conn = self.connection()?;
         let sql = "SELECT id, last_heartbeat FROM node";
         let mut stmt = conn.prepare(sql)?;
-        let node_iter = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
-
-        let mut nodes_id_and_hb = Vec::new();
-        for node in node_iter {
-            let h = node?;
-            nodes_id_and_hb.push(h);
-        }
+        let nodes_id_and_hb =
+            Self::collect_rows(stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?)?;
 
         Ok(nodes_id_and_hb)
     }
 
     #[instrument(err, skip_all)]
     pub fn mark_nodes_as_lost(&self, ids: &[String]) -> R<()> {
-        let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
+        let conn = self.connection()?;
         let sql = r#"
         UPDATE node
         SET status = 'lost'
@@ -226,7 +234,7 @@ impl Store {
 
     #[instrument(err, skip_all)]
     pub fn insert_node(&self, node: NodeMsg) -> R<Node> {
-        let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
+        let conn = self.connection()?;
         // TODO:
         // Its not ideal that I am using NodeMsg here
         // I get an error about serializing Map, and the simplest
@@ -256,7 +264,7 @@ impl Store {
         res.extend(dynamic_diff.clone());
         let res_as_string = to_string(&res).map_err(|e| e.to_string())?;
 
-        let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
+        let conn = self.connection()?;
 
         let update_sql = format!(
             r#"
@@ -286,7 +294,7 @@ impl Store {
 
         let timestamp_now = OffsetDateTime::now_utc().format(fmt)?;
 
-        let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
+        let conn = self.connection()?;
         let sql = r#"
         UPDATE node
         SET last_heartbeat = :ts, status = 'active'
@@ -309,7 +317,7 @@ impl Store {
 
     #[instrument(err, skip_all)]
     pub fn update_node_health_checks(&self, id: &str, health_checks: &str) -> R<()> {
-        let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
+        let conn = self.connection()?;
         let sql = r#"
         UPDATE node
         SET health_checks = :health_checks
@@ -332,7 +340,7 @@ impl Store {
 
     #[instrument(err, skip_all)]
     pub fn get_worker_type(&self, name: String) -> R<WorkerConfig> {
-        let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
+        let conn = self.connection()?;
         let config = conn.query_row(&GET_WORKER_TYPE, [name], |row| {
             self.worker_type_from_row(row)
         })?;
@@ -342,7 +350,7 @@ impl Store {
 
     #[instrument(err, skip_all)]
     pub fn insert_worker_type(&self, config: &WorkerConfig) -> R<WorkerConfig> {
-        let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
+        let conn = self.connection()?;
         let node_checks_to_save = config.additional_node_checks.join(",");
         let attrs_to_save = serde_json::to_string(&config.attributes)?;
 
@@ -367,27 +375,22 @@ impl Store {
 
     #[instrument(err, skip_all)]
     pub fn get_job(&self, name: &str) -> R<Job> {
-        let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
+        let conn = self.connection()?;
         let job = conn.query_row(&GET_JOB, [name], |row| self.job_from_row(row))?;
         Ok(job)
     }
 
     pub fn get_jobs(&self) -> R<Vec<Job>> {
-        let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
+        let conn = self.connection()?;
         let mut stmt = conn.prepare(&GET_JOBS)?;
-        let job_iter = stmt.query_map([], |row| self.job_from_row(row))?;
-        let mut jobs = Vec::new();
-        for job in job_iter {
-            let j = job?;
-            jobs.push(j);
-        }
+        let jobs = Self::collect_rows(stmt.query_map([], |row| self.job_from_row(row))?)?;
 
         Ok(jobs)
     }
 
     #[instrument(err, skip_all)]
     pub fn stop_job(&self, name: &str) -> R<()> {
-        let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
+        let conn = self.connection()?;
         let sql = r#"
         UPDATE job
         SET status = 'stopped'
@@ -404,7 +407,7 @@ impl Store {
 
     #[instrument(err, skip_all)]
     pub fn destroy_job(&self, name: &str) -> R<()> {
-        let mut conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
+        let mut conn = self.connection()?;
         let tx = conn.transaction()?;
 
         let job = tx.query_row(&GET_JOB, [name], |row| self.job_from_row(row))?;
@@ -425,7 +428,7 @@ impl Store {
 
     #[instrument(err, skip_all)]
     pub fn get_job_config(&self, name: &str) -> R<JobConfig> {
-        let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
+        let conn = self.connection()?;
         let (job_config, jc_id): (JobConfig, String) =
             conn.query_row(&GET_JOB_CONFIG, [name], |row| {
                 let tasks_to_replace = vec![];
@@ -441,16 +444,11 @@ impl Store {
 
         let mut stmt = conn.prepare(&GET_TASK_FOR_JOB_CONIFG)?;
 
-        let task_iter = stmt.query_map([jc_id], |row| self.task_config_from_row(row))?;
-
-        let mut tasks = Vec::new();
-        for task in task_iter {
-            let t = task?;
-            tasks.push(t);
-        }
+        let tasks =
+            Self::collect_rows(stmt.query_map([jc_id], |row| self.task_config_from_row(row))?)?;
 
         let jc_2 = JobConfig {
-            tasks: tasks,
+            tasks,
             ..job_config
         };
 
@@ -476,7 +474,7 @@ impl Store {
             }
         }
 
-        let mut conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
+        let mut conn = self.connection()?;
         let now = OffsetDateTime::now_utc().unix_timestamp();
         let tx = conn.transaction()?;
 
@@ -578,7 +576,7 @@ impl Store {
 
     #[instrument(err, skip_all)]
     pub fn get_submissions_for_config(&self, job_config_id: &str) -> R<Vec<Submission>> {
-        let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
+        let conn = self.connection()?;
 
         let sql = r#"
         SELECT jcs.path, jcs.is_primary, s.content
@@ -587,19 +585,13 @@ impl Store {
         WHERE jcs.job_config_id = ?;
 "#;
         let mut stmt = conn.prepare(sql)?;
-        let sub_iter = stmt.query_map([job_config_id], |row| {
+        let subs = Self::collect_rows(stmt.query_map([job_config_id], |row| {
             Ok(Submission {
                 path: row.get(0)?,
                 is_primary: row.get(1)?,
                 content: row.get(2)?,
             })
-        })?;
-
-        let mut subs = Vec::new();
-        for sub in sub_iter {
-            let s = sub?;
-            subs.push(s);
-        }
+        })?)?;
 
         Ok(subs)
     }
@@ -713,7 +705,7 @@ impl Store {
 
     // #[instrument(err, skip_all)]
     pub fn get_next_eval(&self) -> R<Eval> {
-        let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
+        let conn = self.connection()?;
         let eval = conn.query_row(&GET_NEXT_EVAL, [], |row| self.eval_from_row(row))?;
         Ok(eval)
     }
