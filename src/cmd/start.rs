@@ -27,7 +27,7 @@ pub async fn handle(sub_matches: &clap::ArgMatches) -> R<()> {
     if let Some(("worker", arg_matches)) = sub_matches.subcommand() {
         let token = arg_matches
             .get_one::<String>("token")
-            .ok_or("Must provide token")?;
+            .context("Must provide token")?;
         run_worker(token).await
     } else {
         let config_path = sub_matches
@@ -43,13 +43,13 @@ pub async fn handle(sub_matches: &clap::ArgMatches) -> R<()> {
 fn parse_config(config_path: &str) -> R<ManagerConfig> {
     // Pluginify jsonnet
     let mut vm = JsonnetVm::new();
-    let res = vm.evaluate_file(config_path);
+    let rendered = vm
+        .evaluate_file(config_path)
+        .map_err(|e| anyhow!("failed to evaluate config {config_path}: {e}"))?
+        .to_string();
 
-    match res {
-        Ok(s) => {
-            let config: ManagerConfig = serde_json::from_str(&s)?;
-            Ok(config)
-        }
-        Err(e) => Err(format!("Failed to parse config file: {}", e.to_string()).into()),
-    }
+    let config: ManagerConfig = serde_json::from_str(&rendered)
+        .with_context(|| format!("failed to deserialize manager config from {config_path}"))?;
+
+    Ok(config)
 }

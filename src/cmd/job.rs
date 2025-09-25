@@ -71,7 +71,9 @@ pub async fn handle(sub_matches: &clap::ArgMatches) -> R<()> {
 
 #[instrument(err, skip_all)]
 async fn stop_job(arg_matches: &clap::ArgMatches) -> R<()> {
-    let mut client = ManagerClient::connect(DEF_MANAGER_ADDRESS).await?;
+    let mut client = ManagerClient::connect(DEF_MANAGER_ADDRESS)
+        .await
+        .context("failed to connect to manager")?;
     let job_name = arg_matches
         .get_one::<String>("name")
         .map_or("demo", String::as_str);
@@ -90,7 +92,9 @@ async fn stop_job(arg_matches: &clap::ArgMatches) -> R<()> {
 async fn get_job_spec(arg_matches: &clap::ArgMatches) -> R<()> {
     let is_json = arg_matches.get_flag("json");
 
-    let mut client = ManagerClient::connect(DEF_MANAGER_ADDRESS).await?;
+    let mut client = ManagerClient::connect(DEF_MANAGER_ADDRESS)
+        .await
+        .context("failed to connect to manager")?;
     let job_name = arg_matches
         .get_one::<String>("name")
         .map_or("demo", String::as_str);
@@ -121,7 +125,9 @@ async fn get_job_spec(arg_matches: &clap::ArgMatches) -> R<()> {
 
 #[instrument(err, skip_all)]
 async fn destroy_job(arg_matches: &clap::ArgMatches) -> R<()> {
-    let mut client = ManagerClient::connect(DEF_MANAGER_ADDRESS).await?;
+    let mut client = ManagerClient::connect(DEF_MANAGER_ADDRESS)
+        .await
+        .context("failed to connect to manager")?;
     let job_name = arg_matches
         .get_one::<String>("name")
         .map_or("demo", String::as_str);
@@ -138,7 +144,9 @@ async fn destroy_job(arg_matches: &clap::ArgMatches) -> R<()> {
 
 #[instrument(err, skip_all)]
 async fn run_job(arg_matches: &clap::ArgMatches) -> R<()> {
-    let mut client = ManagerClient::connect(DEF_MANAGER_ADDRESS).await?;
+    let mut client = ManagerClient::connect(DEF_MANAGER_ADDRESS)
+        .await
+        .context("failed to connect to manager")?;
 
     let job_path = arg_matches
         .get_one::<String>("path")
@@ -171,33 +179,30 @@ async fn run_job(arg_matches: &clap::ArgMatches) -> R<()> {
         Ok((base.into(), contents.to_string()))
     });
 
-    let res = vm.evaluate_file(job_path);
+    let rendered = vm
+        .evaluate_file(job_path)
+        .map_err(|e| anyhow!("failed to evaluate job spec {job_path}: {e}"))?
+        .to_string();
 
-    match res {
-        Ok(s) => {
-            let request = tonic::Request::new(RunJobRequest {
-                parsed_jobspec: s.to_string(),
-                submissions,
-            });
+    let request = tonic::Request::new(RunJobRequest {
+        parsed_jobspec: rendered,
+        submissions,
+    });
 
-            let response = client.run_job(request).await?;
+    let response = client.run_job(request).await.context("failed to run job")?;
 
-            println!("{}", response.into_inner().message);
+    println!("{}", response.into_inner().message);
 
-            Ok(())
-        }
-        Err(e) => {
-            error!("Error: {}", e.to_string());
-            Err(e.to_string().into())
-        }
-    }
+    Ok(())
 }
 
 #[instrument(err, skip_all)]
 async fn list_jobs(arg_matches: &clap::ArgMatches) -> R<()> {
     let is_json = arg_matches.get_flag("json");
 
-    let mut client = ManagerClient::connect(DEF_MANAGER_ADDRESS).await?;
+    let mut client = ManagerClient::connect(DEF_MANAGER_ADDRESS)
+        .await
+        .context("failed to connect to manager")?;
     let request = tonic::Request::new(ListJobsRequest {});
     let response = client.list_jobs(request).await?;
     let jobs_list = response.into_inner().jobs;
@@ -218,8 +223,10 @@ async fn list_jobs(arg_matches: &clap::ArgMatches) -> R<()> {
 async fn get_info(arg_matches: &clap::ArgMatches) -> R<()> {
     let is_json = arg_matches.get_flag("json");
 
-    let mut client = ManagerClient::connect(DEF_MANAGER_ADDRESS).await?;
-    let job_name = arg_matches.get_one::<String>("name").ok_or("need name")?;
+    let mut client = ManagerClient::connect(DEF_MANAGER_ADDRESS)
+        .await
+        .context("failed to connect to manager")?;
+    let job_name = arg_matches.get_one::<String>("name").context("need name")?;
     let request = tonic::Request::new(GetJobInfoRequest {
         name: job_name.to_owned(),
     });
@@ -230,7 +237,7 @@ async fn get_info(arg_matches: &clap::ArgMatches) -> R<()> {
             println!("{json}");
         }
     } else {
-        let printable_job: JobPrint = response.into_inner().job.ok_or("no job found")?.into();
+        let printable_job: JobPrint = response.into_inner().job.context("no job found")?.into();
         print_table(vec![printable_job]);
     }
 

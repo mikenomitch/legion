@@ -63,7 +63,7 @@ impl Eval {
             "job_submit" => self.handle_job_submit(store),
             "job_update" => self.handle_job_update(store),
             "job_stop" => self.handle_job_stop(store),
-            other => Err(format!("Unsupported eval kind: {other}").into()),
+            other => bail!("Unsupported eval kind: {other}"),
         }
     }
 
@@ -71,7 +71,7 @@ impl Eval {
         let node_id = self.node_name.clone().trim().to_owned();
 
         if node_id.is_empty() {
-            return Err("Eval node_join missing node name".into());
+            bail!("Eval node_join missing node name");
         }
 
         let last_heartbeat = Self::current_timestamp();
@@ -102,7 +102,7 @@ impl Eval {
         let node_id = self.node_name.clone().trim().to_owned();
 
         if node_id.is_empty() {
-            return Err("Eval node_drop missing node name".into());
+            bail!("Eval node_drop missing node name");
         }
 
         store.mark_node_lost(&node_id)?;
@@ -117,7 +117,7 @@ impl Eval {
 
     fn handle_job_update(&self, store: &Store) -> R<String> {
         if self.job_id.trim().is_empty() {
-            return Err("Eval job_update missing job id".into());
+            bail!("Eval job_update missing job id");
         }
 
         store.remove_allocs_for_job(&self.job_id)?;
@@ -128,7 +128,7 @@ impl Eval {
 
     fn handle_job_stop(&self, store: &Store) -> R<String> {
         if self.job_id.trim().is_empty() {
-            return Err("Eval job_stop missing job id".into());
+            bail!("Eval job_stop missing job id");
         }
 
         store.remove_allocs_for_job(&self.job_id)?;
@@ -138,7 +138,7 @@ impl Eval {
 
     fn schedule_job_allocations(&self, store: &Store) -> R<()> {
         if self.job_config_id.trim().is_empty() {
-            return Err("Eval missing job config id".into());
+            bail!("Eval missing job config id");
         }
 
         let nodes: Vec<Node> = store
@@ -148,7 +148,7 @@ impl Eval {
             .collect();
 
         if nodes.is_empty() {
-            return Err("No nodes available to place allocations".into());
+            bail!("No nodes available to place allocations");
         }
 
         let task_instances = store.get_task_instances_for_job_config(&self.job_config_id)?;
@@ -162,7 +162,7 @@ impl Eval {
             for _ in 0..count {
                 let node = nodes
                     .choose(&mut rng)
-                    .ok_or_else(|| "No nodes available to place allocations".to_string())?;
+                    .context("No nodes available to place allocations")?;
                 // TODO: Add pluggable scheduling logic here
                 store.place_alloc(&node.id, task_id)?;
             }
@@ -329,7 +329,7 @@ impl From<LedgerEntry> for LedgerNode {
 
 impl LedgerNode {
     pub fn into_entry(self) -> R<LedgerEntry> {
-        let node_msg = self.node.ok_or("Ledger node missing node information")?;
+        let node_msg = self.node.context("Ledger node missing node information")?;
         let node: Node = node_msg.into();
 
         let allocations = self
@@ -377,8 +377,8 @@ impl LedgerAllocation {
             task_config_id,
         } = self;
 
-        let resources: Value = serde_json::from_str(&resources)
-            .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
+        let resources: Value =
+            serde_json::from_str(&resources).context("failed to parse allocation resources")?;
 
         Ok(Allocation {
             id,
@@ -429,7 +429,7 @@ mod tests {
 
         let mut ledger = store.get_ledger()?;
         assert_eq!(ledger.len(), 1);
-        let node_one_entry = find_node(&ledger, "node-1").ok_or("missing node-1")?;
+        let node_one_entry = find_node(&ledger, "node-1").context("missing node-1")?;
         assert!(node_one_entry.allocations.is_empty());
 
         let node_two_eval = Eval {
@@ -461,7 +461,7 @@ mod tests {
 
         ledger = store.get_ledger()?;
         assert_eq!(ledger.len(), 1);
-        let node_one_entry = find_node(&ledger, "node-1").ok_or("missing node-1")?;
+        let node_one_entry = find_node(&ledger, "node-1").context("missing node-1")?;
         assert!(node_one_entry.allocations.is_empty());
 
         let job_one_name = "job-1".to_string();
@@ -497,7 +497,7 @@ mod tests {
         job_submit_eval.handle(&store)?;
 
         ledger = store.get_ledger()?;
-        let node_one_entry = find_node(&ledger, "node-1").ok_or("missing node-1")?;
+        let node_one_entry = find_node(&ledger, "node-1").context("missing node-1")?;
         assert_eq!(node_one_entry.allocations.len(), 1);
         assert_eq!(
             node_one_entry.allocations[0].job_config_id,
@@ -527,7 +527,7 @@ mod tests {
         job_update_eval.handle(&store)?;
 
         ledger = store.get_ledger()?;
-        let node_one_entry = find_node(&ledger, "node-1").ok_or("missing node-1")?;
+        let node_one_entry = find_node(&ledger, "node-1").context("missing node-1")?;
         assert_eq!(node_one_entry.allocations.len(), 1);
         assert_eq!(
             node_one_entry.allocations[0].job_config_id,
@@ -567,7 +567,7 @@ mod tests {
         job_two_submit_eval.handle(&store)?;
 
         ledger = store.get_ledger()?;
-        let node_one_entry = find_node(&ledger, "node-1").ok_or("missing node-1")?;
+        let node_one_entry = find_node(&ledger, "node-1").context("missing node-1")?;
         assert_eq!(node_one_entry.allocations.len(), 2);
 
         let stop_job_one_eval = Eval {
@@ -581,7 +581,7 @@ mod tests {
         stop_job_one_eval.handle(&store)?;
 
         ledger = store.get_ledger()?;
-        let node_one_entry = find_node(&ledger, "node-1").ok_or("missing node-1")?;
+        let node_one_entry = find_node(&ledger, "node-1").context("missing node-1")?;
         assert_eq!(node_one_entry.allocations.len(), 1);
         assert!(node_one_entry
             .allocations
@@ -599,7 +599,7 @@ mod tests {
         stop_job_two_eval.handle(&store)?;
 
         ledger = store.get_ledger()?;
-        let node_one_entry = find_node(&ledger, "node-1").ok_or("missing node-1")?;
+        let node_one_entry = find_node(&ledger, "node-1").context("missing node-1")?;
         assert!(node_one_entry.allocations.is_empty());
 
         Ok(())

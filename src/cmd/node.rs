@@ -52,11 +52,11 @@ pub async fn handle(sub_matches: &clap::ArgMatches) -> R<()> {
         Some(("update", arg_matches)) => {
             let id = arg_matches
                 .get_one::<String>("id")
-                .ok_or("Must provide id")?;
+                .context("Must provide id")?;
 
             let attrs = arg_matches
                 .get_many::<String>("attr")
-                .ok_or("Must provide attribute(s) to update")?;
+                .context("Must provide attribute(s) to update")?;
 
             let mut dynamic_diff = Map::new();
 
@@ -80,7 +80,7 @@ pub async fn handle(sub_matches: &clap::ArgMatches) -> R<()> {
             });
 
             if let Some(msg) = error_msg {
-                return Err(msg.into());
+                bail!(msg);
             }
 
             let is_json = arg_matches.get_flag("json");
@@ -89,7 +89,7 @@ pub async fn handle(sub_matches: &clap::ArgMatches) -> R<()> {
         Some(("info", arg_matches)) => {
             let id = arg_matches
                 .get_one::<String>("id")
-                .ok_or("Must provide id")?;
+                .context("Must provide id")?;
 
             let is_json = arg_matches.get_flag("json");
             get_node_info(id.to_string(), is_json).await
@@ -100,7 +100,9 @@ pub async fn handle(sub_matches: &clap::ArgMatches) -> R<()> {
 
 #[instrument(err, skip_all)]
 async fn get_nodes(is_json: bool) -> R<()> {
-    let mut client = ManagerClient::connect(DEF_MANAGER_ADDRESS).await?;
+    let mut client = ManagerClient::connect(DEF_MANAGER_ADDRESS)
+        .await
+        .context("failed to connect to manager")?;
     let request = tonic::Request::new(GetNodesRequest {});
     let response = client.get_nodes(request).await?;
     let nodes_msg_list = response.into_inner().nodes;
@@ -120,7 +122,9 @@ async fn get_nodes(is_json: bool) -> R<()> {
 
 #[instrument(err, skip_all)]
 async fn update_node(node_id: String, dynamic_diff: Map<String, Value>, is_json: bool) -> R<()> {
-    let mut client = ManagerClient::connect(DEF_MANAGER_ADDRESS).await?;
+    let mut client = ManagerClient::connect(DEF_MANAGER_ADDRESS)
+        .await
+        .context("failed to connect to manager")?;
 
     let request = tonic::Request::new(UpdateNodeDynamicRequest {
         id: node_id,
@@ -147,7 +151,9 @@ async fn update_node(node_id: String, dynamic_diff: Map<String, Value>, is_json:
 
 #[instrument(err, skip_all)]
 async fn get_node_info(node_id: String, is_json: bool) -> R<()> {
-    let mut client = ManagerClient::connect(DEF_MANAGER_ADDRESS).await?;
+    let mut client = ManagerClient::connect(DEF_MANAGER_ADDRESS)
+        .await
+        .context("failed to connect to manager")?;
     let request = tonic::Request::new(GetNodeRequest { id: node_id });
     let response = client.get_node(request).await?;
 
