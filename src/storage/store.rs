@@ -12,7 +12,7 @@ use crate::structs::{
     TaskConfig, WorkerConfig,
 };
 
-use rusqlite::{named_params, Connection, Row};
+use rusqlite::{named_params, Connection, Error as RusqliteError, Row};
 use rusqlite_migration::Migrations;
 use serde_json::to_string;
 use serde_rusqlite::to_params_named;
@@ -811,10 +811,15 @@ impl Store {
     //
 
     // #[instrument(err, skip_all)]
-    pub fn get_next_eval(&self) -> R<Eval> {
+    pub fn get_next_eval(&self) -> R<Option<Eval>> {
         let conn = self.connection()?;
-        let eval = conn.query_row(&GET_NEXT_EVAL, [], |row| self.eval_from_row(row))?;
-        Ok(eval)
+        let eval = conn.query_row(&GET_NEXT_EVAL, [], |row| self.eval_from_row(row));
+
+        match eval {
+            Ok(eval) => Ok(Some(eval)),
+            Err(RusqliteError::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 }
 

@@ -137,7 +137,7 @@ async fn start_eval_loop(store: Store) -> R<()> {
 
     loop {
         match store.get_next_eval() {
-            Ok(eval) => match eval.handle(&store) {
+            Ok(Some(eval)) => match eval.handle(&store) {
                 Ok(message) => {
                     info!("Eval {} handled successfully: {}", eval.id, message);
                 }
@@ -145,6 +145,9 @@ async fn start_eval_loop(store: Store) -> R<()> {
                     error!("Error handling eval {}: {:?}", eval.id, e);
                 }
             },
+            Ok(None) => {
+                info!("No next evals to handle");
+            }
             Err(e) => {
                 error!("Error getting next eval: {:?}", e);
             }
