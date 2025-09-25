@@ -229,6 +229,26 @@ impl Store {
     }
 
     #[instrument(err, skip_all)]
+    pub fn mark_node_lost(&self, id: &str) -> R<()> {
+        let conn = self.connection()?;
+        let sql = r#"
+        UPDATE node
+        SET status = :status, availability = :availability
+        WHERE id = :id;
+        "#;
+
+        let params = named_params! {
+            ":id": id,
+            ":status": "lost",
+            ":availability": "unavailable",
+        };
+
+        conn.execute(sql, params)?;
+
+        Ok(())
+    }
+
+    #[instrument(err, skip_all)]
     pub fn remove_node(&self, id: &str) -> R<()> {
         let conn = self.connection()?;
         conn.execute("DELETE FROM node WHERE id = ?;", [id])?;
@@ -252,7 +272,7 @@ impl Store {
         let conn = self.connection()?;
         let sql = r#"
         UPDATE node
-        SET status = 'lost'
+        SET status = 'lost', availability = 'unavailable'
         WHERE id IN (?1);
 "#;
         let joined = ids.join(",");
@@ -775,7 +795,7 @@ impl Store {
 
         let mut ledger = Vec::new();
 
-        for node in nodes {
+        for node in nodes.into_iter().filter(|node| node.status != "lost") {
             let node_allocations = allocations.get(&node.id).cloned().unwrap_or_default();
             ledger.push(LedgerEntry {
                 node,

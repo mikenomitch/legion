@@ -105,7 +105,7 @@ impl Eval {
             return Err("Eval node_drop missing node name".into());
         }
 
-        store.remove_node(&node_id)?;
+        store.mark_node_lost(&node_id)?;
 
         Ok(format!("Node {node_id} dropped"))
     }
@@ -141,7 +141,12 @@ impl Eval {
             return Err("Eval missing job config id".into());
         }
 
-        let nodes = store.get_nodes()?;
+        let nodes: Vec<Node> = store
+            .get_nodes()?
+            .into_iter()
+            .filter(|node| node.availability == "available")
+            .collect();
+
         if nodes.is_empty() {
             return Err("No nodes available to place allocations".into());
         }
@@ -449,6 +454,10 @@ mod tests {
             node_name: "node-2".into(),
         };
         drop_eval.handle(&store)?;
+
+        let dropped_node = store.get_node("node-2")?;
+        assert_eq!(dropped_node.status, "lost");
+        assert_eq!(dropped_node.availability, "unavailable");
 
         ledger = store.get_ledger()?;
         assert_eq!(ledger.len(), 1);
