@@ -11,7 +11,6 @@ use crate::structs::{
 use futures::join;
 use jsonnet::JsonnetVm;
 use std::fs;
-use std::str::FromStr;
 use tonic::transport::{Identity, Server, ServerTlsConfig};
 
 #[instrument(err, skip_all)]
@@ -44,15 +43,21 @@ pub async fn run_manager(config: ManagerConfig) -> R<()> {
 
     let manager_node = ManagerAgentService { store };
 
-    let data_dir = std::path::PathBuf::from_str("/Users/mike/code/legion/configs/tls/server")?;
-    let cert = std::fs::read_to_string(data_dir.join("server.pem"))?;
-    let key = std::fs::read_to_string(data_dir.join("server.key"))?;
-    let identity = Identity::from_pem(cert, key);
-    let _tls = ServerTlsConfig::new().identity(identity);
-
     let addr = format!("{}:{}", full_config.server.host, full_config.server.port).parse()?;
-    let start_server_fut = Server::builder()
-        // .tls_config(tls)?
+
+    let tls_identity = load_server_tls_identity()?;
+    let mut server_builder = match tls_identity {
+        Some(identity) => {
+            info!("Starting manager with TLS enabled");
+            Server::builder().tls_config(ServerTlsConfig::new().identity(identity))?
+        }
+        None => {
+            info!("Starting manager without TLS");
+            Server::builder()
+        }
+    };
+
+    let start_server_fut = server_builder
         .add_service(ManagerServer::new(manager_node))
         .serve(addr);
 
@@ -70,6 +75,28 @@ pub async fn run_manager(config: ManagerConfig) -> R<()> {
     );
 
     Ok(())
+}
+
+fn load_server_tls_identity() -> R<Option<Identity>> {
+    let tls_dir = std::env::var("LEGION_TLS_SERVER_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("configs/tls/server"));
+
+    let cert_path = tls_dir.join("server.pem");
+    let key_path = tls_dir.join("server.key");
+
+    if !(cert_path.exists() && key_path.exists()) {
+        info!(
+            ?tls_dir,
+            "TLS credentials not found; proceeding without TLS"
+        );
+        return Ok(None);
+    }
+
+    let cert = std::fs::read_to_string(cert_path)?;
+    let key = std::fs::read_to_string(key_path)?;
+
+    Ok(Some(Identity::from_pem(cert, key)))
 }
 
 #[instrument(err, skip_all)]
