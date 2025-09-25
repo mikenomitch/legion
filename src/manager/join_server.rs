@@ -98,13 +98,13 @@ pub fn generate_join_token(worker_type: String, ttl: Option<String>) -> R<String
 fn parse_manager_config(config_path: &str) -> R<ManagerConfig> {
     // Pluginify jsonnet
     let mut vm = JsonnetVm::new();
-    let res = vm.evaluate_file(config_path);
+    let rendered = vm
+        .evaluate_file(config_path)
+        .map_err(|e| anyhow!("failed to evaluate manager config {config_path}: {e}"))?
+        .to_string();
 
-    match res {
-        Ok(s) => {
-            let config: ManagerConfig = serde_json::from_str(&s)?;
-            Ok(config)
-        }
-        Err(_) => Err("Failed to parse config file".into()),
-    }
+    let config: ManagerConfig = serde_json::from_str(&rendered)
+        .with_context(|| format!("failed to deserialize manager config from {config_path}"))?;
+
+    Ok(config)
 }

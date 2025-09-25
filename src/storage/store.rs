@@ -57,7 +57,7 @@ impl Store {
 
         std::fs::create_dir_all(store_path)?;
         let tmp = std::path::Path::new(store_path).join("store.sqlite");
-        let final_path = tmp.to_str().ok_or("Error parsing store path")?;
+        let final_path = tmp.to_str().context("Error parsing store path")?;
         let conn = Connection::open(final_path)?;
         Ok(Arc::new(Mutex::new(conn)))
     }
@@ -86,7 +86,7 @@ impl Store {
     }
 
     fn lock_conn(conn: &MemSafeConn) -> R<MutexGuard<'_, Connection>> {
-        conn.lock().map_err(|_| CONN_LOCK_ERROR.into())
+        conn.lock().map_err(|_| anyhow!(CONN_LOCK_ERROR))
     }
 
     fn connection(&self) -> R<MutexGuard<'_, Connection>> {
@@ -98,7 +98,7 @@ impl Store {
         I: Iterator<Item = Result<T, rusqlite::Error>>,
     {
         let values: Result<Vec<_>, rusqlite::Error> = iter.collect();
-        let values = values.map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
+        let values = values.map_err(anyhow::Error::new)?;
         Ok(values)
     }
 
@@ -291,7 +291,7 @@ impl Store {
             .clone();
 
         res.extend(dynamic_diff.clone());
-        let res_as_string = to_string(&res).map_err(|e| e.to_string())?;
+        let res_as_string = to_string(&res).context("failed to serialize dynamic attrs")?;
 
         let conn = self.connection()?;
 
@@ -441,7 +441,7 @@ impl Store {
 
         let job = tx.query_row(&GET_JOB, [name], |row| self.job_from_row(row))?;
         if job.status != "stopped" {
-            return Err("Job must be stopped before it can be destroyed".into());
+            bail!("Job must be stopped before it can be destroyed");
         }
 
         let delete_sql = r#"
@@ -452,7 +452,7 @@ impl Store {
         tx.execute(delete_sql, [name])?;
 
         tx.commit()
-            .map_err(|_| "Error committing transaction".into())
+            .map_err(|_| anyhow!("Error committing transaction"))
     }
 
     #[instrument(err, skip_all)]
@@ -496,7 +496,7 @@ impl Store {
         if let Ok(latest_job_config) = self.get_job_config(&config.name) {
             // if latest_job_config is deep equal to config, return an error
             if latest_job_config.is_same_as(config) {
-                return Err("Job config is unchanged".into());
+                bail!("Job config is unchanged");
             } else {
                 next_version = latest_job_config.version.unwrap_or(0) + 1;
                 last_versions_id = latest_job_config.id();
@@ -600,7 +600,7 @@ impl Store {
         let _num_update_row_changes = tx.execute(&INSERT_JOB_UPDATE, job_update_params);
 
         tx.commit()
-            .map_err(|_| "Error committing transaction".into())
+            .map_err(|_| anyhow!("Error committing transaction"))
     }
 
     #[instrument(err, skip_all)]
@@ -654,7 +654,7 @@ impl Store {
 
     #[instrument(err, skip_all)]
     pub fn place_alloc(&self, node_id: &str, task_id: i64) -> R<Allocation> {
-        let mut conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
+        let mut conn = self.conn.lock().map_err(|_| anyhow!(CONN_LOCK_ERROR))?;
         let tx = conn.transaction()?;
 
         let (job_config_id, resources): (String, Value) = tx.query_row(
@@ -682,7 +682,7 @@ impl Store {
 
     #[instrument(err, skip_all)]
     pub fn allocs_for_job(&self, job_id: &str) -> R<Vec<Allocation>> {
-        let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
+        let conn = self.conn.lock().map_err(|_| anyhow!(CONN_LOCK_ERROR))?;
         let mut stmt = conn.prepare(GET_ALLOCS_FOR_JOB.as_str())?;
         let alloc_iter = stmt.query_map([job_id], |row| self.allocation_from_row(row))?;
 
@@ -696,7 +696,7 @@ impl Store {
 
     #[instrument(err, skip_all)]
     pub fn allocs_for_job_config(&self, job_config_id: &str) -> R<Vec<Allocation>> {
-        let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
+        let conn = self.conn.lock().map_err(|_| anyhow!(CONN_LOCK_ERROR))?;
         let mut stmt = conn.prepare(GET_ALLOCS_FOR_JOB_CONFIG.as_str())?;
         let alloc_iter = stmt.query_map([job_config_id], |row| self.allocation_from_row(row))?;
 
@@ -710,7 +710,7 @@ impl Store {
 
     #[instrument(err, skip_all)]
     pub fn allocs_for_node(&self, node_id: &str) -> R<Vec<Allocation>> {
-        let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
+        let conn = self.conn.lock().map_err(|_| anyhow!(CONN_LOCK_ERROR))?;
         let mut stmt = conn.prepare(GET_ALLOCS_FOR_NODE.as_str())?;
         let alloc_iter = stmt.query_map([node_id], |row| self.allocation_from_row(row))?;
 
@@ -724,7 +724,7 @@ impl Store {
 
     #[instrument(err, skip_all)]
     pub fn get_allocs(&self) -> R<Vec<Allocation>> {
-        let conn = self.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
+        let conn = self.conn.lock().map_err(|_| anyhow!(CONN_LOCK_ERROR))?;
         let mut stmt = conn.prepare(GET_ALLOCS.as_str())?;
         let alloc_iter = stmt.query_map([], |row| self.allocation_from_row(row))?;
 
@@ -834,7 +834,7 @@ mod tests {
     }
 
     fn task_id_for(store: &Store, task_name: &str, job_id: &str) -> R<i64> {
-        let conn = store.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
+        let conn = store.conn.lock().map_err(|_| anyhow!(CONN_LOCK_ERROR))?;
         let id = conn.query_row(
             "SELECT id FROM task_config WHERE name = ? AND job_id = ?;",
             [task_name, job_id],
@@ -846,7 +846,7 @@ mod tests {
 
     // fn teardown_store(store: &Store) -> R<()> {
     //     let migrations = Store::get_migrations();
-    //     let mut conn = store.conn.lock().map_err(|_| CONN_LOCK_ERROR)?;
+    //     let mut conn = store.conn.lock().map_err(|_| anyhow!(CONN_LOCK_ERROR))?;
     //     migrations.to_version(&mut conn, 0)?;
 
     //     Ok(())
@@ -876,7 +876,7 @@ mod tests {
         let val = returned_config
             .attributes
             .get("test")
-            .ok_or("no test attr")?;
+            .context("no test attr")?;
 
         assert_eq!(val, "val");
 
@@ -942,26 +942,32 @@ mod tests {
         let latest_job_config = store.get_job_config(&job_name)?;
         assert_eq!(latest_job_config.name, job_name);
 
-        let t1_from_store = latest_job_config.tasks.get(0).ok_or("oof")?;
+        let t1_from_store = latest_job_config.tasks.get(0).context("oof")?;
         assert_eq!(task_one.name, t1_from_store.name);
         assert_eq!(task_one.kind, t1_from_store.kind);
         assert_eq!(
-            task_one.resources.get("memory").ok_or("no memory 1")?,
-            t1_from_store.resources.get("memory").ok_or("no memory 2")?
+            task_one.resources.get("memory").context("no memory 1")?,
+            t1_from_store
+                .resources
+                .get("memory")
+                .context("no memory 2")?
         );
 
         assert_eq!(
-            task_one.config.get("message").ok_or("no message 1")?,
-            t1_from_store.config.get("message").ok_or("no message 2")?
+            task_one.config.get("message").context("no message 1")?,
+            t1_from_store
+                .config
+                .get("message")
+                .context("no message 2")?
         );
 
-        let t2_from_store = latest_job_config.tasks.get(1).ok_or("oof")?;
+        let t2_from_store = latest_job_config.tasks.get(1).context("oof")?;
         assert_eq!(task_two.name, t2_from_store.name);
 
         let subs_from_store = store.get_submissions_for_config(&latest_job_config.id())?;
         assert_eq!(subs_from_store.len(), 2);
-        let sub_one_from_store = subs_from_store.get(0).ok_or("no sub 1")?;
-        let sub_two_from_store = subs_from_store.get(1).ok_or("no sub 2")?;
+        let sub_one_from_store = subs_from_store.get(0).context("no sub 1")?;
+        let sub_two_from_store = subs_from_store.get(1).context("no sub 2")?;
         assert_eq!(sub_one_from_store.path, sub_one.path);
         assert_eq!(sub_two_from_store.path, sub_two.path);
 
@@ -1006,7 +1012,7 @@ mod tests {
             1,
             first_job_config
                 .version
-                .ok_or("missing version on config")?,
+                .context("missing version on config")?,
         );
 
         // Submit an updates job config
@@ -1032,7 +1038,7 @@ mod tests {
             2,
             second_job_config
                 .version
-                .ok_or("missing version on config")?,
+                .context("missing version on config")?,
         );
 
         // Submit an updates job config
@@ -1063,7 +1069,7 @@ mod tests {
             3,
             third_job_config
                 .version
-                .ok_or("missing version on config")?,
+                .context("missing version on config")?,
         );
 
         // // Submit an updates job config
@@ -1082,7 +1088,7 @@ mod tests {
         //     4,
         //     fourth_job_config
         //         .version
-        //         .ok_or("missing version on config")?,
+        //         .context("missing version on config")?,
         // );
 
         Ok(())
@@ -1231,11 +1237,11 @@ mod tests {
         let allocs_by_node = store.get_allocs_by_node()?;
         let node_one_group = allocs_by_node
             .get(&node_one_id)
-            .ok_or("missing node one allocs")?;
+            .context("missing node one allocs")?;
         assert_eq!(node_one_group.len(), 2);
         let node_two_group = allocs_by_node
             .get(&node_two_id)
-            .ok_or("missing node two allocs")?;
+            .context("missing node two allocs")?;
         assert_eq!(node_two_group.len(), 1);
 
         Ok(())

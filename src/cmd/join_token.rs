@@ -2,8 +2,6 @@ use crate::prelude::*;
 
 use crate::structs::insecure_manager_client::InsecureManagerClient;
 use crate::structs::GetJoinTokenRequest;
-use std::error;
-
 pub fn config() -> Command {
     Command::new("join-token")
         .about("Creates a join token for a worker node")
@@ -12,7 +10,7 @@ pub fn config() -> Command {
 }
 
 #[instrument(err, skip_all)]
-pub async fn handle(sub_matches: &clap::ArgMatches) -> Result<(), Box<dyn error::Error>> {
+pub async fn handle(sub_matches: &clap::ArgMatches) -> R<()> {
     let ttl = sub_matches
         .get_one::<String>("ttl")
         .map_or("1h", String::as_str);
@@ -23,7 +21,9 @@ pub async fn handle(sub_matches: &clap::ArgMatches) -> Result<(), Box<dyn error:
 
     let address = std::env::var("LEGION_ADDR").unwrap_or(DEF_INSECURE_ADDR.to_owned());
 
-    let mut client = InsecureManagerClient::connect(address).await?;
+    let mut client = InsecureManagerClient::connect(address.clone())
+        .await
+        .with_context(|| format!("failed to connect to manager at {address}"))?;
 
     let req_ttl: Option<String> = if ttl == "0" || ttl == "none" || ttl == "skip" {
         None
@@ -36,7 +36,10 @@ pub async fn handle(sub_matches: &clap::ArgMatches) -> Result<(), Box<dyn error:
         worker_type: Some(worker_type.into()),
     });
 
-    let response = client.get_join_token(request).await?;
+    let response = client
+        .get_join_token(request)
+        .await
+        .context("failed to request join token")?;
     let t = &response.get_ref().token;
 
     println!("To launch a client with this token, run: ");

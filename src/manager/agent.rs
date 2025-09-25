@@ -132,20 +132,19 @@ async fn start_eval_loop(store: Store) -> R<()> {
 fn parse_worker_config(config_path: &str) -> R<WorkerConfigAlt> {
     // Pluginify jsonnet
     let mut vm = JsonnetVm::new();
-    let res = vm.evaluate_file(config_path);
+    let rendered = vm
+        .evaluate_file(config_path)
+        .map_err(|e| {
+            let err = anyhow!("Error parsing worker config at path {config_path}: {e}");
+            error!("{err}");
+            err
+        })?
+        .to_string();
 
-    match res {
-        Ok(s) => {
-            let config: WorkerConfigAlt = serde_json::from_str(&s)
-                .map_err(|e| format!("Error parsing worker config at path {config_path}: {e}"))?;
-            Ok(config)
-        }
-        Err(e) => {
-            let msg = format!("Error parsing worker config at path {config_path}: {e}");
-            error!("{}", &msg);
-            Err(msg.into())
-        }
-    }
+    let config: WorkerConfigAlt = serde_json::from_str(&rendered)
+        .with_context(|| format!("Error parsing worker config at path {config_path}"))?;
+
+    Ok(config)
 }
 
 #[instrument(err, skip_all)]

@@ -11,6 +11,6 @@ pub fn config() -> Command {
 pub async fn handle(arg_matches: &clap::ArgMatches) -> R<()> {
     let token = arg_matches
         .get_one::<String>("token")
-        .ok_or("Must provide token")?;
+        .context("Must provide token")?;
     run_worker(token).await
 }

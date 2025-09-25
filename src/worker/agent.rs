@@ -52,7 +52,7 @@ pub async fn run_worker(token: &str) -> R<()> {
     let config = pre_register_res
         .into_inner()
         .config
-        .ok_or("No config found")?;
+        .context("No config found")?;
 
     let name_core = random_string(8);
     let name = match config.name_prefix {
