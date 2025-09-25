@@ -159,7 +159,21 @@ message GetLedgerRequest {
 }
 
 message GetLedgerReply {
-  string message = 1;
+  repeated LedgerNode nodes = 1;
+}
+
+message LedgerNode {
+  optional NodeMsg node = 1;
+  repeated LedgerAllocation allocations = 2;
+}
+
+message LedgerAllocation {
+  int64 id = 1;
+  string status = 2;
+  string resources = 3;
+  string node_id = 4;
+  string job_config_id = 5;
+  int64 task_config_id = 6;
 }
 
 message UpdateNodeDynamicRequest {
