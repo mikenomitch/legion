@@ -130,22 +130,22 @@ mod tests {
     }
 
     #[test]
-    fn read_root_cert_works() {
-        // NOTE: Replace with better files
-        let ca_pem_path: String = "/Users/mike/code/legion/configs/tls/rootca.pem".into();
-        let ca_key_path: String = "/Users/mike/code/legion/configs/tls/rootca.key".into();
+    fn read_root_cert_works() -> R<()> {
+        let _generated = create_ca_cert()?;
 
-        let res = read_root_cert(ca_pem_path, ca_key_path);
+        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let ca_pem_path = manifest_dir.join("configs/tls/rootca.pem");
+        let ca_key_path = manifest_dir.join("configs/tls/rootca.key");
 
-        match res {
-            Ok(_cert) => {
-                // assert_eq!(cert.is_ca(), IsCa::Ca(BasicConstraints::Unconstrained));
-            }
-            Err(e) => {
-                error!("Error: {e}");
-                assert!(false);
-            }
-        }
+        let cert = read_root_cert(
+            ca_pem_path.to_string_lossy().into_owned(),
+            ca_key_path.to_string_lossy().into_owned(),
+        )?;
+
+        assert!(cert.cert.pem().len() > 0);
+        assert!(cert.key_pair.serialize_pem().len() > 0);
+
+        Ok(())
     }
 
     #[test]
