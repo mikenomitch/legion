@@ -4,6 +4,19 @@
     - prints out a list of all the nodes with allocations on them
     - CLI will properly and nicely print out the ledger
 
+- Eval loop only goes thru nodes and jobs and calls the scheduler
+  The nodes and jobs have already been added to the list. The eval
+  loop just has to process changes and update the ledger accordingly
+  and also send the signals to the nodes to actually do stuff properly.
+
+  So the state in the DB of jobs should reflect reality at any given point.
+
+  A node_join eval -> Goes and sees if any jobs are waiting on that node
+  A node_drop eval -> Goes and reschedules jobs from that node
+  A job_submit eval -> Goes and schedules it onto a node if its not on one already
+  A job_update eval -> Goes and schedules it onto a node if its not on one already. Updates if needed
+  A job_drop eval -> Removes it from the nodes.
+
 - Eval Loop can process things
     -  Start with a test of handling a chain of evals via Eval::handle being called repeatedly on them:
         - Start with empty ledger
@@ -30,8 +43,10 @@
 - A new job sticks an eval on the queue
 - It removes itself in its handle function
 - Its handle function "places" it onto a "random node" with an alloc
-- You can print out the ledger
 - Set up some sort of TDD system and crank thru scheduling logic
+
+- The Eval loop will clean up future evaluations having to do with same job or
+  node since it now will have processed them
 
 - Task placements/Job Start
 - Task replacement/Job Update
