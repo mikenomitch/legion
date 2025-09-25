@@ -8,8 +8,8 @@ use crate::storage::queries::{
     INSERT_WORKER_TYPE, NODE_ATTRS,
 };
 use crate::structs::{
-    Allocation, Eval, Job, JobConfig, ManagerConfigFull, Node, NodeMsg, Submission, TaskConfig,
-    WorkerConfig,
+    Allocation, Eval, Job, JobConfig, LedgerEntry, ManagerConfigFull, Node, NodeMsg, Submission,
+    TaskConfig, WorkerConfig,
 };
 
 use rusqlite::{named_params, Connection, Row};
@@ -205,6 +205,35 @@ impl Store {
         let nodes = Self::collect_rows(stmt.query_map([], |row| self.node_from_row(row))?)?;
 
         Ok(nodes)
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn mark_node_ready(&self, id: &str, last_heartbeat: &str) -> R<()> {
+        let conn = self.connection()?;
+        let sql = r#"
+        UPDATE node
+        SET status = :status, availability = :availability, last_heartbeat = :last_heartbeat
+        WHERE id = :id;
+        "#;
+
+        let params = named_params! {
+            ":id": id,
+            ":status": "ready",
+            ":availability": "available",
+            ":last_heartbeat": last_heartbeat,
+        };
+
+        conn.execute(sql, params)?;
+
+        Ok(())
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn remove_node(&self, id: &str) -> R<()> {
+        let conn = self.connection()?;
+        conn.execute("DELETE FROM node WHERE id = ?;", [id])?;
+
+        Ok(())
     }
 
     #[instrument(err, skip_all)]
@@ -596,6 +625,29 @@ impl Store {
         Ok(subs)
     }
 
+    #[instrument(err, skip_all)]
+    pub fn get_task_instances_for_job_config(&self, job_config_id: &str) -> R<Vec<(i64, u32)>> {
+        let conn = self.connection()?;
+        let sql = r#"
+        SELECT id, count
+        FROM task_config
+        WHERE job_config_id = ?;
+        "#;
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map([job_config_id], |row| {
+            let id: i64 = row.get(0)?;
+            let count: u32 = row.get::<_, i64>(1)? as u32;
+            Ok((id, count))
+        })?;
+
+        let mut task_instances = Vec::new();
+        for row in rows {
+            task_instances.push(row?);
+        }
+
+        Ok(task_instances)
+    }
+
     //
     // ALLOCS
     //
@@ -697,6 +749,41 @@ impl Store {
         }
 
         Ok(by_node)
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn remove_allocs_for_job(&self, job_id: &str) -> R<()> {
+        let conn = self.connection()?;
+        let sql = r#"
+        DELETE FROM allocation
+        WHERE job_config_id IN (
+            SELECT id FROM job_config WHERE job_id = :job_id
+        );
+        "#;
+
+        let params = named_params! { ":job_id": job_id };
+
+        conn.execute(sql, params)?;
+
+        Ok(())
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn get_ledger(&self) -> R<Vec<LedgerEntry>> {
+        let nodes = self.get_nodes()?;
+        let allocations = self.get_allocs_by_node()?;
+
+        let mut ledger = Vec::new();
+
+        for node in nodes {
+            let node_allocations = allocations.get(&node.id).cloned().unwrap_or_default();
+            ledger.push(LedgerEntry {
+                node,
+                allocations: node_allocations,
+            });
+        }
+
+        Ok(ledger)
     }
 
     //
@@ -1049,7 +1136,7 @@ mod tests {
         let job_one_name = "job-one".to_string();
         let task_one = TaskConfig {
             name: "job-one-task-1".to_string(),
-            driver: "driver-a".to_string(),
+            kind: "driver-a".to_string(),
             count: 1,
             config: json!({ "message": "hello" }),
             resources: json!({ "memory": 256 }),
@@ -1057,7 +1144,7 @@ mod tests {
         };
         let task_two = TaskConfig {
             name: "job-one-task-2".to_string(),
-            driver: "driver-b".to_string(),
+            kind: "driver-b".to_string(),
             count: 1,
             config: json!({ "message": "world" }),
             resources: json!({ "memory": 512 }),
@@ -1082,7 +1169,7 @@ mod tests {
         let job_two_name = "job-two".to_string();
         let task_three = TaskConfig {
             name: "job-two-task-1".to_string(),
-            driver: "driver-c".to_string(),
+            kind: "driver-c".to_string(),
             count: 1,
             config: json!({ "message": "hola" }),
             resources: json!({ "memory": 128 }),

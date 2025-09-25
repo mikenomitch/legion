@@ -6,7 +6,7 @@ use crate::structs::{
     DestroyJobReply, DestroyJobRequest, GetJobInfoReply, GetJobInfoRequest, GetJobSpecReply,
     GetJobSpecRequest, GetLedgerReply, GetLedgerRequest, GetNodeReply, GetNodeRequest,
     GetNodesReply, GetNodesRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply,
-    HeartbeatRequest, JobConfig, ListJobsReply, ListJobsRequest, NodeMsg, RunJobReply,
+    HeartbeatRequest, JobConfig, LedgerNode, ListJobsReply, ListJobsRequest, NodeMsg, RunJobReply,
     RunJobRequest, StopJobReply, StopJobRequest, UpdateNodeDynamicReply, UpdateNodeDynamicRequest,
     WorkerConfig, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply,
     WorkerRegisterRequest,
@@ -322,9 +322,14 @@ impl Manager for ManagerAgentService {
         &self,
         _request: Request<GetLedgerRequest>,
     ) -> Result<Response<GetLedgerReply>, Status> {
-        let reply: GetLedgerReply = GetLedgerReply {
-            message: "Heeey".into(),
-        };
+        let ledger = self.store.get_ledger().map_err(|e| {
+            error!("Error getting ledger: {:?}", e);
+            Status::internal("Error getting ledger")
+        })?;
+
+        let nodes: Vec<LedgerNode> = ledger.into_iter().map(Into::into).collect();
+
+        let reply: GetLedgerReply = GetLedgerReply { nodes };
 
         Ok(Response::new(reply))
     }

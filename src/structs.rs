@@ -1,10 +1,12 @@
 use crate::prelude::*;
 use tabled::Tabled;
 
+use rand::{seq::SliceRandom, thread_rng};
 use serde::{Deserialize, Serialize};
 use serde_json::{from_str, to_string};
 use sha2::{Digest, Sha256};
 use time::macros::format_description;
+use time::OffsetDateTime;
 
 use crate::storage::store::Store;
 
@@ -54,32 +56,123 @@ impl Submission {
 }
 
 impl Eval {
-    pub fn handle(&self, _store: &Store) -> R<String> {
-        // This can have different logic for each eval kind
-        // It should clean up after itself most likely
-        // But perhaps async clean ups make sense?
+    pub fn handle(&self, store: &Store) -> R<String> {
+        match self.kind.as_str() {
+            "node_join" => self.handle_node_join(store),
+            "node_drop" => self.handle_node_drop(store),
+            "job_submit" => self.handle_job_submit(store),
+            "job_update" => self.handle_job_update(store),
+            "job_stop" => self.handle_job_stop(store),
+            other => Err(format!("Unsupported eval kind: {other}").into()),
+        }
+    }
 
-        // TODO: Make this an enum!
-        // match self.kind.as_str() {
-        //     "node_join" => {
-        //         println!("Woot - node_join");
-        //     }
-        //     "node_drop" => {
-        //         println!("Woot - node_drop");
-        //     }
-        //     "job_submit" => {
-        //         println!("Woot - job_submit");
-        //     }
-        //     "job_stop" => {
-        //         println!("Woot - job_stop");
-        //     }
-        //     "job_update" => {
-        //         println!("Woot - job_update");
-        //     }
-        // }
+    fn handle_node_join(&self, store: &Store) -> R<String> {
+        let node_id = self.node_name.clone().trim().to_owned();
 
-        println!("Woot - evalled");
-        Ok("Doneski".to_string())
+        if node_id.is_empty() {
+            return Err("Eval node_join missing node name".into());
+        }
+
+        let last_heartbeat = Self::current_timestamp();
+        let nodes = store.get_nodes()?;
+
+        if nodes.iter().any(|node| node.id == node_id) {
+            store.mark_node_ready(&node_id, &last_heartbeat)?;
+        } else {
+            let node = Node {
+                id: node_id.clone(),
+                status: "ready".into(),
+                pool: "default".into(),
+                availability: "available".into(),
+                last_heartbeat,
+                config_attrs: json!({}),
+                fingerprint_attrs: json!({}),
+                dynamic_attrs: json!({}),
+                health_checks: json!({}),
+            };
+
+            store.insert_node(node.into())?;
+        }
+
+        Ok(format!("Node {node_id} joined"))
+    }
+
+    fn handle_node_drop(&self, store: &Store) -> R<String> {
+        let node_id = self.node_name.clone().trim().to_owned();
+
+        if node_id.is_empty() {
+            return Err("Eval node_drop missing node name".into());
+        }
+
+        store.remove_node(&node_id)?;
+
+        Ok(format!("Node {node_id} dropped"))
+    }
+
+    fn handle_job_submit(&self, store: &Store) -> R<String> {
+        self.schedule_job_allocations(store)?;
+        Ok(format!("Job {} submitted", self.job_id))
+    }
+
+    fn handle_job_update(&self, store: &Store) -> R<String> {
+        if self.job_id.trim().is_empty() {
+            return Err("Eval job_update missing job id".into());
+        }
+
+        store.remove_allocs_for_job(&self.job_id)?;
+        self.schedule_job_allocations(store)?;
+
+        Ok(format!("Job {} updated", self.job_id))
+    }
+
+    fn handle_job_stop(&self, store: &Store) -> R<String> {
+        if self.job_id.trim().is_empty() {
+            return Err("Eval job_stop missing job id".into());
+        }
+
+        store.remove_allocs_for_job(&self.job_id)?;
+
+        Ok(format!("Job {} stopped", self.job_id))
+    }
+
+    fn schedule_job_allocations(&self, store: &Store) -> R<()> {
+        if self.job_config_id.trim().is_empty() {
+            return Err("Eval missing job config id".into());
+        }
+
+        let nodes = store.get_nodes()?;
+        if nodes.is_empty() {
+            return Err("No nodes available to place allocations".into());
+        }
+
+        let task_instances = store.get_task_instances_for_job_config(&self.job_config_id)?;
+        if task_instances.is_empty() {
+            return Ok(());
+        }
+
+        let mut rng = thread_rng();
+
+        for (task_id, count) in task_instances {
+            for _ in 0..count {
+                let node = nodes
+                    .choose(&mut rng)
+                    .ok_or_else(|| "No nodes available to place allocations".to_string())?;
+                // TODO: Add pluggable scheduling logic here
+                store.place_alloc(&node.id, task_id)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn current_timestamp() -> String {
+        OffsetDateTime::now_utc()
+            .format(format_description!(
+                "[year]-[month]-[day] [hour]:[minute]:[second] [offset_hour \
+                 sign:mandatory]:[offset_minute]:[offset_second]"
+            ))
+            .unwrap_or_else(|_| "1970-01-01 00:00:00 +00:00:00".into())
     }
 }
 
@@ -171,6 +264,337 @@ pub struct Allocation {
     pub node_id: String,
     pub job_config_id: String,
     pub task_config_id: i64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct LedgerEntry {
+    pub node: Node,
+    pub allocations: Vec<Allocation>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Tabled)]
+#[serde(rename_all = "camelCase")]
+pub struct LedgerNodePrint {
+    pub node_id: String,
+    pub status: String,
+    pub allocations: String,
+}
+
+impl From<&LedgerEntry> for LedgerNodePrint {
+    fn from(entry: &LedgerEntry) -> Self {
+        let allocations = if entry.allocations.is_empty() {
+            "None".to_string()
+        } else {
+            entry
+                .allocations
+                .iter()
+                .map(|alloc| {
+                    format!(
+                        "{} (task {}, job {})",
+                        alloc.id, alloc.task_config_id, alloc.job_config_id
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+
+        LedgerNodePrint {
+            node_id: entry.node.id.clone(),
+            status: entry.node.status.clone(),
+            allocations,
+        }
+    }
+}
+
+impl From<LedgerEntry> for LedgerNode {
+    fn from(entry: LedgerEntry) -> Self {
+        let allocations = entry
+            .allocations
+            .into_iter()
+            .map(LedgerAllocation::from)
+            .collect();
+
+        LedgerNode {
+            node: Some(entry.node.into()),
+            allocations,
+        }
+    }
+}
+
+impl LedgerNode {
+    pub fn into_entry(self) -> R<LedgerEntry> {
+        let node_msg = self.node.ok_or("Ledger node missing node information")?;
+        let node: Node = node_msg.into();
+
+        let allocations = self
+            .allocations
+            .into_iter()
+            .map(|allocation| allocation.into_allocation())
+            .collect::<R<Vec<_>>>()?;
+
+        Ok(LedgerEntry { node, allocations })
+    }
+}
+
+impl From<Allocation> for LedgerAllocation {
+    fn from(allocation: Allocation) -> Self {
+        let Allocation {
+            id,
+            status,
+            resources,
+            node_id,
+            job_config_id,
+            task_config_id,
+        } = allocation;
+
+        let resources = to_string(&resources).unwrap_or_else(|_| "{}".into());
+
+        LedgerAllocation {
+            id,
+            status,
+            resources,
+            node_id,
+            job_config_id,
+            task_config_id,
+        }
+    }
+}
+
+impl LedgerAllocation {
+    pub fn into_allocation(self) -> R<Allocation> {
+        let LedgerAllocation {
+            id,
+            status,
+            resources,
+            node_id,
+            job_config_id,
+            task_config_id,
+        } = self;
+
+        let resources: Value = serde_json::from_str(&resources)
+            .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
+
+        Ok(Allocation {
+            id,
+            status,
+            resources,
+            node_id,
+            job_config_id,
+            task_config_id,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::store::Store;
+
+    fn setup_store() -> R<Store> {
+        let store_config = ManagerConfigFull {
+            store_path: "tests/eval".to_string(),
+            ..Default::default()
+        };
+
+        let store = Store::start_storage(&store_config)?;
+        store.reset_all_tables()?;
+        Ok(store)
+    }
+
+    fn find_node<'a>(ledger: &'a [LedgerEntry], node_id: &str) -> Option<&'a LedgerEntry> {
+        ledger.iter().find(|entry| entry.node.id == node_id)
+    }
+
+    #[test]
+    fn eval_chain_updates_ledger_state() -> R<()> {
+        let store = setup_store()?;
+
+        assert!(store.get_ledger()?.is_empty());
+
+        let node_one_eval = Eval {
+            id: "1".into(),
+            status: "pending".into(),
+            kind: "node_join".into(),
+            job_id: String::new(),
+            job_config_id: String::new(),
+            node_name: "node-1".into(),
+        };
+        node_one_eval.handle(&store)?;
+
+        let mut ledger = store.get_ledger()?;
+        assert_eq!(ledger.len(), 1);
+        let node_one_entry = find_node(&ledger, "node-1").ok_or("missing node-1")?;
+        assert!(node_one_entry.allocations.is_empty());
+
+        let node_two_eval = Eval {
+            id: "2".into(),
+            status: "pending".into(),
+            kind: "node_join".into(),
+            job_id: String::new(),
+            job_config_id: String::new(),
+            node_name: "node-2".into(),
+        };
+        node_two_eval.handle(&store)?;
+
+        ledger = store.get_ledger()?;
+        assert_eq!(ledger.len(), 2);
+
+        let drop_eval = Eval {
+            id: "3".into(),
+            status: "pending".into(),
+            kind: "node_drop".into(),
+            job_id: String::new(),
+            job_config_id: String::new(),
+            node_name: "node-2".into(),
+        };
+        drop_eval.handle(&store)?;
+
+        ledger = store.get_ledger()?;
+        assert_eq!(ledger.len(), 1);
+        let node_one_entry = find_node(&ledger, "node-1").ok_or("missing node-1")?;
+        assert!(node_one_entry.allocations.is_empty());
+
+        let job_one_name = "job-1".to_string();
+        let job_one_task = TaskConfig {
+            name: "task-one".into(),
+            kind: "service".into(),
+            count: 1,
+            config: json!({ "message": "hello" }),
+            resources: json!({ "memory": 256 }),
+            constraints: json!({}),
+        };
+        let job_one_config = JobConfig {
+            name: job_one_name.clone(),
+            tasks: vec![job_one_task.clone()],
+            version: None,
+        };
+        let job_one_subs = vec![Submission {
+            path: "job-one".into(),
+            content: "job-one".into(),
+            is_primary: true,
+        }];
+        store.handle_job_submit(&job_one_config, &job_one_subs)?;
+        let job_one_config_id_v1 = store.get_job_config(&job_one_name)?.id();
+
+        let job_submit_eval = Eval {
+            id: "4".into(),
+            status: "pending".into(),
+            kind: "job_submit".into(),
+            job_id: job_one_name.clone(),
+            job_config_id: job_one_config_id_v1.clone(),
+            node_name: String::new(),
+        };
+        job_submit_eval.handle(&store)?;
+
+        ledger = store.get_ledger()?;
+        let node_one_entry = find_node(&ledger, "node-1").ok_or("missing node-1")?;
+        assert_eq!(node_one_entry.allocations.len(), 1);
+        assert_eq!(
+            node_one_entry.allocations[0].job_config_id,
+            job_one_config_id_v1
+        );
+
+        let updated_task = TaskConfig {
+            resources: json!({ "memory": 512 }),
+            ..job_one_task.clone()
+        };
+        let job_one_updated_config = JobConfig {
+            name: job_one_name.clone(),
+            tasks: vec![updated_task],
+            version: None,
+        };
+        store.handle_job_submit(&job_one_updated_config, &job_one_subs)?;
+        let job_one_config_id_v2 = store.get_job_config(&job_one_name)?.id();
+
+        let job_update_eval = Eval {
+            id: "5".into(),
+            status: "pending".into(),
+            kind: "job_update".into(),
+            job_id: job_one_name.clone(),
+            job_config_id: job_one_config_id_v2.clone(),
+            node_name: String::new(),
+        };
+        job_update_eval.handle(&store)?;
+
+        ledger = store.get_ledger()?;
+        let node_one_entry = find_node(&ledger, "node-1").ok_or("missing node-1")?;
+        assert_eq!(node_one_entry.allocations.len(), 1);
+        assert_eq!(
+            node_one_entry.allocations[0].job_config_id,
+            job_one_config_id_v2
+        );
+
+        let job_two_name = "job-2".to_string();
+        let job_two_task = TaskConfig {
+            name: "task-two".into(),
+            kind: "service".into(),
+            count: 1,
+            config: json!({ "message": "hola" }),
+            resources: json!({ "memory": 128 }),
+            constraints: json!({}),
+        };
+        let job_two_config = JobConfig {
+            name: job_two_name.clone(),
+            tasks: vec![job_two_task.clone()],
+            version: None,
+        };
+        let job_two_subs = vec![Submission {
+            path: "job-two".into(),
+            content: "job-two".into(),
+            is_primary: true,
+        }];
+        store.handle_job_submit(&job_two_config, &job_two_subs)?;
+        let job_two_config_id = store.get_job_config(&job_two_name)?.id();
+
+        let job_two_submit_eval = Eval {
+            id: "6".into(),
+            status: "pending".into(),
+            kind: "job_submit".into(),
+            job_id: job_two_name.clone(),
+            job_config_id: job_two_config_id.clone(),
+            node_name: String::new(),
+        };
+        job_two_submit_eval.handle(&store)?;
+
+        ledger = store.get_ledger()?;
+        let node_one_entry = find_node(&ledger, "node-1").ok_or("missing node-1")?;
+        assert_eq!(node_one_entry.allocations.len(), 2);
+
+        let stop_job_one_eval = Eval {
+            id: "7".into(),
+            status: "pending".into(),
+            kind: "job_stop".into(),
+            job_id: job_one_name.clone(),
+            job_config_id: job_one_config_id_v2.clone(),
+            node_name: String::new(),
+        };
+        stop_job_one_eval.handle(&store)?;
+
+        ledger = store.get_ledger()?;
+        let node_one_entry = find_node(&ledger, "node-1").ok_or("missing node-1")?;
+        assert_eq!(node_one_entry.allocations.len(), 1);
+        assert!(node_one_entry
+            .allocations
+            .iter()
+            .all(|alloc| alloc.job_config_id == job_two_config_id));
+
+        let stop_job_two_eval = Eval {
+            id: "8".into(),
+            status: "pending".into(),
+            kind: "job_stop".into(),
+            job_id: job_two_name,
+            job_config_id: job_two_config_id,
+            node_name: String::new(),
+        };
+        stop_job_two_eval.handle(&store)?;
+
+        ledger = store.get_ledger()?;
+        let node_one_entry = find_node(&ledger, "node-1").ok_or("missing node-1")?;
+        assert!(node_one_entry.allocations.is_empty());
+
+        Ok(())
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
