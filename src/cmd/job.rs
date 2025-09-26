@@ -76,7 +76,7 @@ pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
 }
 
 #[instrument(err, skip_all)]
-async fn stop_job(arg_matches: &clap::ArgMatches) -> R<()> {
+async fn stop_job(arg_matches: &ArgMatches) -> R<()> {
     let mut client = connect_manager_client().await?;
 async fn stop_job(arg_matches: &ArgMatches) -> R<()> {
     let mut client = ManagerClient::connect(DEF_MANAGER_ADDRESS)
@@ -130,7 +130,7 @@ async fn get_job_spec(arg_matches: &ArgMatches) -> R<()> {
 }
 
 #[instrument(err, skip_all)]
-async fn destroy_job(arg_matches: &clap::ArgMatches) -> R<()> {
+async fn destroy_job(arg_matches: &ArgMatches) -> R<()> {
     let mut client = connect_manager_client().await?;
     let job_name = arg_matches
         .get_one::<String>("name")
@@ -147,7 +147,7 @@ async fn destroy_job(arg_matches: &clap::ArgMatches) -> R<()> {
 }
 
 #[instrument(err, skip_all)]
-async fn run_job(arg_matches: &clap::ArgMatches) -> R<()> {
+async fn run_job(arg_matches: &ArgMatches) -> R<()> {
     let mut client = connect_manager_client().await?;
 
     let job_path = arg_matches
