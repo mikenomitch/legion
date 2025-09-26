@@ -1,8 +1,7 @@
 use std::vec;
 
 use crate::prelude::*;
-
-use crate::cmd::helpers::{json_flag, print_table};
+use crate::cmd::helpers::{connect_manager_client, print_table, json_flag};
 use crate::structs::manager_client::ManagerClient;
 use crate::structs::{
     DestroyJobRequest, GetJobInfoRequest, GetJobSpecRequest, JobPrint, ListJobsRequest,
@@ -78,6 +77,8 @@ pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
 
 #[instrument(err, skip_all)]
 async fn stop_job(arg_matches: &ArgMatches) -> R<()> {
+    let mut client = connect_manager_client().await?;
+async fn stop_job(arg_matches: &ArgMatches) -> R<()> {
     let mut client = ManagerClient::connect(DEF_MANAGER_ADDRESS)
         .await
         .context("failed to connect to manager")?;
@@ -99,9 +100,7 @@ async fn stop_job(arg_matches: &ArgMatches) -> R<()> {
 async fn get_job_spec(arg_matches: &ArgMatches) -> R<()> {
     let is_json = arg_matches.get_flag("json");
 
-    let mut client = ManagerClient::connect(DEF_MANAGER_ADDRESS)
-        .await
-        .context("failed to connect to manager")?;
+    let mut client = connect_manager_client().await?;
     let job_name = arg_matches
         .get_one::<String>("name")
         .map_or("demo", String::as_str);
@@ -132,9 +131,7 @@ async fn get_job_spec(arg_matches: &ArgMatches) -> R<()> {
 
 #[instrument(err, skip_all)]
 async fn destroy_job(arg_matches: &ArgMatches) -> R<()> {
-    let mut client = ManagerClient::connect(DEF_MANAGER_ADDRESS)
-        .await
-        .context("failed to connect to manager")?;
+    let mut client = connect_manager_client().await?;
     let job_name = arg_matches
         .get_one::<String>("name")
         .map_or("demo", String::as_str);
@@ -151,9 +148,7 @@ async fn destroy_job(arg_matches: &ArgMatches) -> R<()> {
 
 #[instrument(err, skip_all)]
 async fn run_job(arg_matches: &ArgMatches) -> R<()> {
-    let mut client = ManagerClient::connect(DEF_MANAGER_ADDRESS)
-        .await
-        .context("failed to connect to manager")?;
+    let mut client = connect_manager_client().await?;
 
     let job_path = arg_matches
         .get_one::<String>("path")
@@ -207,9 +202,7 @@ async fn run_job(arg_matches: &ArgMatches) -> R<()> {
 async fn list_jobs(arg_matches: &ArgMatches) -> R<()> {
     let is_json = arg_matches.get_flag("json");
 
-    let mut client = ManagerClient::connect(DEF_MANAGER_ADDRESS)
-        .await
-        .context("failed to connect to manager")?;
+    let mut client = connect_manager_client().await?;
     let request = tonic::Request::new(ListJobsRequest {});
     let response = client.list_jobs(request).await?;
     let jobs_list = response.into_inner().jobs;
@@ -230,9 +223,7 @@ async fn list_jobs(arg_matches: &ArgMatches) -> R<()> {
 async fn get_info(arg_matches: &ArgMatches) -> R<()> {
     let is_json = arg_matches.get_flag("json");
 
-    let mut client = ManagerClient::connect(DEF_MANAGER_ADDRESS)
-        .await
-        .context("failed to connect to manager")?;
+    let mut client = connect_manager_client().await?;
     let job_name = arg_matches.get_one::<String>("name").context("need name")?;
     let request = tonic::Request::new(GetJobInfoRequest {
         name: job_name.to_owned(),

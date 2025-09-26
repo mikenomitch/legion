@@ -1,5 +1,9 @@
+use crate::prelude::*;
+use crate::structs::manager_client::ManagerClient;
 use tabled::settings::Style;
 use tabled::{Table, Tabled};
+use tonic::transport::Certificate;
+use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 
 use crate::prelude::{Arg, ArgAction};
 
@@ -14,6 +18,48 @@ where
     //     .remove_vertical();
     let mut table = Table::new(&printable_list);
     println!("{}", table.with(Style::psql()).to_string());
+}
+
+#[instrument(err, skip_all)]
+pub async fn connect_manager_client() -> R<ManagerClient<Channel>> {
+    let address = std::env::var("LEGION_ADDR").unwrap_or_else(|_| DEF_MANAGER_ADDRESS.to_owned());
+
+    let endpoint = Endpoint::from_shared(address.clone())
+        .with_context(|| format!("invalid manager address: {address}"))?;
+
+    let scheme = endpoint.uri().scheme_str().map(str::to_owned);
+    let host = endpoint.uri().host().map(str::to_owned);
+
+    let endpoint = if matches!(scheme.as_deref(), Some("https" | "grpcs")) {
+        let domain = host.unwrap_or_else(|| "localhost".to_string());
+        let ca_bytes = match std::env::var("LEGION_TLS_CA_CERT") {
+            Ok(path) => std::fs::read(&path)
+                .with_context(|| format!("failed to read TLS CA certificate from {path}"))?,
+            Err(_) => {
+                let default_path = "configs/tls/rootca.pem";
+                std::fs::read(default_path).with_context(|| {
+                    format!("failed to read TLS CA certificate from {default_path}")
+                })?
+            }
+        };
+
+        let tls = ClientTlsConfig::new()
+            .ca_certificate(Certificate::from_pem(ca_bytes))
+            .domain_name(domain);
+
+        endpoint
+            .tls_config(tls)
+            .with_context(|| format!("failed to configure TLS for manager at {address}"))?
+    } else {
+        endpoint
+    };
+
+    let channel = endpoint
+        .connect()
+        .await
+        .with_context(|| format!("failed to connect to manager at {address}"))?;
+
+    Ok(ManagerClient::new(channel))
 }
 
 pub fn json_flag() -> Arg {
