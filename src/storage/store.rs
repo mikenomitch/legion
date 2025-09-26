@@ -505,7 +505,7 @@ impl Store {
     }
 
     #[allow(dead_code)]
-    pub fn handle_job_submit(&self, config: &JobConfig, subs: &Vec<Submission>) -> R<()> {
+    pub fn handle_job_submit(&self, config: &JobConfig, subs: &[Submission]) -> R<()> {
         // Note: There is a race condition here with the version
         // I think this should prob be all in a single lock, but
         // I am not going to worry about this for now
@@ -564,7 +564,7 @@ impl Store {
                     JobConfig {
                         name: row.get(1)?,
                         version: Some(row.get(4)?),
-                        tasks: tasks,
+                        tasks,
                     },
                     row.get(0)?,
                 ))

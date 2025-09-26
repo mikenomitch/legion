@@ -41,6 +41,7 @@ async fn main() -> R<()> {
         Some(("join", sub_matches)) => cmd::join::handle(sub_matches).await?,
         Some(("ledger", sub_matches)) => cmd::ledger::handle(sub_matches).await?,
         None => unreachable!(),
+        Some((_, _)) => unreachable!(),
     };
 
     Ok(())
