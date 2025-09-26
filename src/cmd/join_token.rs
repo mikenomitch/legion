@@ -5,12 +5,22 @@ use crate::structs::GetJoinTokenRequest;
 pub fn config() -> Command {
     Command::new("join-token")
         .about("Creates a join token for a worker node")
-        .arg(arg!(-t --type [TYPE] "type of worker to get join token for"))
-        .arg(arg!(--ttl [TTL] "ttl of join token in seconds. 0 means infinite. Server adds 1 minute leeway"))
+        .arg(
+            Arg::new("type")
+                .long("type")
+                .short('t')
+                .value_name("TYPE")
+                .help("Worker type to request a join token for"),
+        )
+        .arg(
+            Arg::new("ttl").long("ttl").value_name("TTL").help(
+                "TTL of the join token. Accepts chrono expressions like 1h. 0 means no expiry.",
+            ),
+        )
 }
 
 #[instrument(err, skip_all)]
-pub async fn handle(sub_matches: &clap::ArgMatches) -> R<()> {
+pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
     let ttl = sub_matches
         .get_one::<String>("ttl")
         .map_or("1h", String::as_str);
