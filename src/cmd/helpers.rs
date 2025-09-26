@@ -13,7 +13,7 @@ where
     //     .remove_horizontal()
     //     .remove_vertical();
     let mut table = Table::new(&printable_list);
-    println!("{}", table.with(Style::psql()).to_string());
+    println!("{}", table.with(Style::psql()));
 }
 
 pub fn json_flag() -> Arg {

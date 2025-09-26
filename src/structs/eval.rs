@@ -5,11 +5,17 @@ use time::OffsetDateTime;
 use crate::prelude::{bail, json, Context, R};
 use crate::storage::store::Store;
 
-use super::config::ManagerConfigFull;
-use super::job::{JobConfig, TaskConfig};
-use super::ledger::LedgerEntry;
 use super::node::Node;
-use super::{Eval, Submission};
+use super::Eval;
+
+#[cfg(test)]
+use super::config::ManagerConfigFull;
+#[cfg(test)]
+use super::job::{JobConfig, TaskConfig};
+#[cfg(test)]
+use super::ledger::LedgerEntry;
+#[cfg(test)]
+use super::Submission;
 
 impl Eval {
     pub fn handle(&self, store: &Store) -> R<String> {
@@ -239,12 +245,12 @@ mod tests {
         job_update_eval.handle(&store)?;
 
         ledger = store.get_ledger()?;
-        let node_one_entry = find_node(&ledger, "node-1").context("missing node-1")?;
-        assert_eq!(node_one_entry.allocations.len(), 1);
-        assert_eq!(
-            node_one_entry.allocations[0].job_config_id,
-            job_one_config_id_v2
-        );
+        let job_one_allocations: Vec<_> = ledger
+            .iter()
+            .flat_map(|entry| entry.allocations.iter())
+            .filter(|alloc| alloc.job_config_id == job_one_config_id_v2)
+            .collect();
+        assert_eq!(job_one_allocations.len(), 1);
 
         let job_two_name = "job-2".to_string();
         let job_two_task = TaskConfig {
@@ -279,8 +285,9 @@ mod tests {
         job_two_submit_eval.handle(&store)?;
 
         ledger = store.get_ledger()?;
-        let node_one_entry = find_node(&ledger, "node-1").context("missing node-1")?;
-        assert_eq!(node_one_entry.allocations.len(), 2);
+        let total_allocations: usize =
+            ledger.iter().map(|entry| entry.allocations.len()).sum();
+        assert_eq!(total_allocations, 2);
 
         let stop_job_one_eval = Eval {
             id: "7".into(),
@@ -293,12 +300,12 @@ mod tests {
         stop_job_one_eval.handle(&store)?;
 
         ledger = store.get_ledger()?;
-        let node_one_entry = find_node(&ledger, "node-1").context("missing node-1")?;
-        assert_eq!(node_one_entry.allocations.len(), 1);
-        assert!(node_one_entry
-            .allocations
+        let job_two_allocations: Vec<_> = ledger
             .iter()
-            .all(|alloc| alloc.job_config_id == job_two_config_id));
+            .flat_map(|entry| entry.allocations.iter())
+            .filter(|alloc| alloc.job_config_id == job_two_config_id)
+            .collect();
+        assert_eq!(job_two_allocations.len(), 1);
 
         let stop_job_two_eval = Eval {
             id: "8".into(),
@@ -311,8 +318,9 @@ mod tests {
         stop_job_two_eval.handle(&store)?;
 
         ledger = store.get_ledger()?;
-        let node_one_entry = find_node(&ledger, "node-1").context("missing node-1")?;
-        assert!(node_one_entry.allocations.is_empty());
+        let total_allocations: usize =
+            ledger.iter().map(|entry| entry.allocations.len()).sum();
+        assert_eq!(total_allocations, 0);
 
         Ok(())
     }

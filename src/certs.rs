@@ -104,7 +104,7 @@ pub fn signed_cert_with_ca(
 
 #[allow(dead_code)]
 pub fn write_signed_cert_with_ca(ca_cert: &CertifiedKey, dn_name: &str) -> R<CertifiedKey> {
-    let (cert_signed, key, ca_cert_again) = signed_cert_with_ca(&ca_cert, dn_name)?;
+    let (cert_signed, key, ca_cert_again) = signed_cert_with_ca(ca_cert, dn_name)?;
 
     let path = format!("configs/tls/{dn_name}/");
     let cert_path = format!("configs/tls/{dn_name}/{dn_name}.pem");
