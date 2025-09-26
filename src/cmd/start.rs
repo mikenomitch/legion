@@ -9,21 +9,24 @@ use jsonnet::JsonnetVm;
 pub fn config() -> Command {
     let manager_cmd = Command::new("manager")
         .about("Start a manager node")
-        .arg(arg!(-c --config [CONFIG] "test"));
+        .arg(config_path_arg());
 
-    let worker_cmd = Command::new("worker")
-        .about("Start a worker node")
-        .arg(arg!(token: [TOKEN]));
+    let worker_cmd = Command::new("worker").about("Start a worker node").arg(
+        Arg::new("token")
+            .value_name("TOKEN")
+            .help("Join token for the worker")
+            .required(true),
+    );
 
     Command::new("start")
         .about("Start an agent")
-        .arg(arg!(-c --config [CONFIG] "test"))
+        .arg(config_path_arg())
         .subcommand(manager_cmd)
         .subcommand(worker_cmd)
 }
 
 #[instrument(skip_all)]
-pub async fn handle(sub_matches: &clap::ArgMatches) -> R<()> {
+pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
     if let Some(("worker", arg_matches)) = sub_matches.subcommand() {
         let token = arg_matches
             .get_one::<String>("token")
@@ -52,4 +55,13 @@ fn parse_config(config_path: &str) -> R<ManagerConfig> {
         .with_context(|| format!("failed to deserialize manager config from {config_path}"))?;
 
     Ok(config)
+}
+
+fn config_path_arg() -> Arg {
+    Arg::new("config")
+        .short('c')
+        .long("config")
+        .value_name("CONFIG")
+        .help("Path to the manager configuration file")
+        .value_hint(ValueHint::FilePath)
 }

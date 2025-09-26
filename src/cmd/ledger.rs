@@ -1,16 +1,10 @@
-use crate::cmd::helpers::{connect_manager_client, print_table};
+use crate::cmd::helpers::{connect_manager_client, print_table, json_flag};
 use crate::prelude::*;
 use crate::structs::{GetLedgerRequest, LedgerEntry, LedgerNodePrint};
 pub fn config() -> Command {
     Command::new("ledger")
         .about("Shows the current state of the ledger")
-        .arg(
-            Arg::new("json")
-                .long("json")
-                .short('j')
-                .help("returns values in json format")
-                .num_args(0),
-        )
+        .arg(json_flag())
 }
 
 #[instrument(err, skip_all)]

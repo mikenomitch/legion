@@ -5,6 +5,8 @@ use tabled::{Table, Tabled};
 use tonic::transport::Certificate;
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 
+use crate::prelude::{Arg, ArgAction};
+
 pub fn print_table<T>(printable_list: Vec<T>)
 where
     T: Tabled,
@@ -58,4 +60,12 @@ pub async fn connect_manager_client() -> R<ManagerClient<Channel>> {
         .with_context(|| format!("failed to connect to manager at {address}"))?;
 
     Ok(ManagerClient::new(channel))
+}
+
+pub fn json_flag() -> Arg {
+    Arg::new("json")
+        .long("json")
+        .short('j')
+        .help("Return values in JSON format")
+        .action(ArgAction::SetTrue)
 }

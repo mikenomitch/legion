@@ -5,6 +5,7 @@ use libloading::{Library, Symbol};
 mod node_checkers;
 
 use node_checkers::{ArchNodeChecker, DiskChecker, KitchenSinkNodeChecker, OSNodeChecker};
+use std::path::PathBuf;
 
 // NOTE: Improve current fingerprinters:
 // Network - speed, IP addresses, etc
@@ -34,9 +35,9 @@ pub fn fingerprint_node(additional_node_checks: Vec<String>) -> Map<String, Valu
 
     additional_node_checks
         .iter()
-        .map(fp_plugin_name_to_path)
+        .map(|name| fp_plugin_name_to_path(name))
         .for_each(|path| match call_dynamic(&path) {
-            Ok(fp) => {
+            Ok((_lib, fp)) => {
                 ret.extend(fp.fingerprint());
             }
             Err(e) => {
@@ -59,9 +60,9 @@ pub fn run_health_checks(additional_node_checks: Vec<String>) -> Map<String, Val
 
     additional_node_checks
         .iter()
-        .map(fp_plugin_name_to_path)
+        .map(|name| fp_plugin_name_to_path(name))
         .for_each(|path| match call_dynamic(&path) {
-            Ok(fp) => {
+            Ok((_lib, fp)) => {
                 ret.extend(fp.health_check());
             }
             Err(e) => {
@@ -72,19 +73,32 @@ pub fn run_health_checks(additional_node_checks: Vec<String>) -> Map<String, Val
     ret
 }
 
-fn fp_plugin_name_to_path(name: &String) -> String {
-    format!(
-        "/Users/mike/Code/legion/plugins/node_checks/{}/target/release/libexample.dylib",
-        name
-    )
+fn fp_plugin_name_to_path(name: &str) -> String {
+    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    path.push("plugins");
+    path.push("node_checks");
+    path.push(name);
+    path.push("target");
+    path.push("release");
+    path.push(format!(
+        "{}{}{}",
+        std::env::consts::DLL_PREFIX,
+        name,
+        std::env::consts::DLL_SUFFIX
+    ));
+
+    path.to_string_lossy().into_owned()
 }
 
 #[instrument(err, skip_all)]
-fn call_dynamic(path: &str) -> R<Box<dyn NodeChecker>> {
+fn call_dynamic(path: &str) -> R<(Library, Box<dyn NodeChecker>)> {
     unsafe {
         let lib = Library::new(path)?;
-        let func: Symbol<unsafe extern "C" fn() -> Box<dyn NodeChecker>> = lib.get(b"get")?;
-        Ok(func())
+        let fp = {
+            let func: Symbol<unsafe extern "C" fn() -> Box<dyn NodeChecker>> = lib.get(b"get")?;
+            func()
+        };
+        Ok((lib, fp))
     }
 }
 
@@ -122,7 +136,7 @@ mod tests {
         let res = fingerprint_node(fps);
 
         let os = res.get("os").context("no os")?.as_str().context("no os")?;
-        assert_eq!("macos", os);
+        assert_eq!(std::env::consts::OS, os);
 
         // Test that the plugin works
         let basic = res
