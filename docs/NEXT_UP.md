@@ -4,6 +4,18 @@
     - prints out a list of all the nodes with allocations on them
     - CLI will properly and nicely print out the ledger
 
+- The Eval loop is being treated incorrectly. Think this thru.
+  It is not about adding nodes/jobs. It is about scheduling these
+  jobs once they are there. Or responding to the changes in nodes.
+
+  Does it go and construct some new data thats a minimular ledger,
+  and then this gets picked up by some loop that goes and sends
+  signals to the nodes to then go do stuff?
+
+  Or is it sending the signals to the nodes itself?
+  Or do the nodes check in and ask it for information on what to do
+  when they heartbeat (prob not!).
+
 - Eval loop only goes thru nodes and jobs and calls the scheduler
   The nodes and jobs have already been added to the list. The eval
   loop just has to process changes and update the ledger accordingly
