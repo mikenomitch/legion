@@ -12,15 +12,12 @@ mod worker;
 use crate::prelude::*;
 use crate::tracing_util::init_tracing;
 
-use std::ffi::OsString;
-
 fn cli() -> Command {
     Command::new("legion")
         .about("A simple, exensible, fast orchestrator")
         .bin_name("legion")
         .version(env!("CARGO_PKG_VERSION"))
         .propagate_version(true)
-        .allow_external_subcommands(true)
         .subcommand_required(true)
         .arg_required_else_help(true)
         .subcommand(cmd::job::config())
@@ -43,15 +40,6 @@ async fn main() -> R<()> {
         Some(("join-token", sub_matches)) => cmd::join_token::handle(sub_matches).await?,
         Some(("join", sub_matches)) => cmd::join::handle(sub_matches).await?,
         Some(("ledger", sub_matches)) => cmd::ledger::handle(sub_matches).await?,
-        Some((ext, sub_matches)) => {
-            let args = sub_matches
-                .get_many::<OsString>("")
-                .into_iter()
-                .flatten()
-                .map(OsString::as_os_str)
-                .collect::<Vec<_>>();
-            info!(?ext, ?args, "Invoking external command");
-        }
         None => unreachable!(),
     };
 
