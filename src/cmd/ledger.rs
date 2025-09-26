@@ -8,7 +8,7 @@ pub fn config() -> Command {
 }
 
 #[instrument(err, skip_all)]
-pub async fn handle(matches: &clap::ArgMatches) -> R<()> {
+pub async fn handle(matches: &ArgMatches) -> R<()> {
     let mut client = connect_manager_client().await?;
     let request = tonic::Request::new(GetLedgerRequest {});
     let response = client
