@@ -2,7 +2,7 @@ use std::vec;
 
 use crate::prelude::*;
 
-use crate::cmd::helpers::print_table;
+use crate::cmd::helpers::{json_flag, print_table};
 use crate::structs::manager_client::ManagerClient;
 use crate::structs::{
     DestroyJobRequest, GetJobInfoRequest, GetJobSpecRequest, JobPrint, ListJobsRequest,
@@ -12,38 +12,45 @@ use jsonnet::JsonnetVm;
 use serde_json::to_string;
 
 pub fn config() -> Command {
-    let json_arg = Arg::new("json")
-        .long("json")
-        .short('j')
-        .required(false)
-        .help("returns values in json format")
-        .num_args(0);
+    let run_cmd = Command::new("run").about("Run a job").arg(
+        Arg::new("path")
+            .value_name("PATH")
+            .help("Path to the job specification to run")
+            .value_hint(ValueHint::FilePath),
+    );
 
-    let run_cmd = Command::new("run")
-        .about("Run a job")
-        .arg(arg!(path: [PATH]));
+    let stop_cmd = Command::new("stop").about("Stop a job").arg(
+        Arg::new("name")
+            .value_name("NAME")
+            .help("Name of the job to stop"),
+    );
 
-    let stop_cmd = Command::new("stop")
-        .about("Stop a job")
-        .arg(arg!(name: [NAME]));
-
-    let destroy_cmd = Command::new("destroy")
-        .about("Destroy a job")
-        .arg(arg!(name: [NAME]));
+    let destroy_cmd = Command::new("destroy").about("Destroy a job").arg(
+        Arg::new("name")
+            .value_name("NAME")
+            .help("Name of the job to remove"),
+    );
 
     let info_cmd = Command::new("info")
         .about("Get job info")
-        .arg(arg!(name: [NAME]))
-        .arg(json_arg.clone());
+        .arg(
+            Arg::new("name")
+                .value_name("NAME")
+                .help("Name of the job to inspect")
+                .required(true),
+        )
+        .arg(json_flag());
 
     let spec_cmd = Command::new("spec")
         .about("Get job spec used to define the job")
-        .arg(arg!(name: [NAME]))
-        .arg(json_arg.clone());
+        .arg(
+            Arg::new("name")
+                .value_name("NAME")
+                .help("Name of the job to fetch the spec for"),
+        )
+        .arg(json_flag());
 
-    let list_cmd = Command::new("list")
-        .about("List all jobs")
-        .arg(json_arg.clone());
+    let list_cmd = Command::new("list").about("List all jobs").arg(json_flag());
 
     Command::new("job")
         .about("Interact with jobs")
@@ -57,7 +64,7 @@ pub fn config() -> Command {
         .subcommand(destroy_cmd)
 }
 
-pub async fn handle(sub_matches: &clap::ArgMatches) -> R<()> {
+pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
     match sub_matches.subcommand() {
         Some(("run", matches)) => run_job(matches).await,
         Some(("stop", matches)) => stop_job(matches).await,
@@ -70,7 +77,7 @@ pub async fn handle(sub_matches: &clap::ArgMatches) -> R<()> {
 }
 
 #[instrument(err, skip_all)]
-async fn stop_job(arg_matches: &clap::ArgMatches) -> R<()> {
+async fn stop_job(arg_matches: &ArgMatches) -> R<()> {
     let mut client = ManagerClient::connect(DEF_MANAGER_ADDRESS)
         .await
         .context("failed to connect to manager")?;
@@ -89,7 +96,7 @@ async fn stop_job(arg_matches: &clap::ArgMatches) -> R<()> {
 }
 
 #[instrument(err, skip_all)]
-async fn get_job_spec(arg_matches: &clap::ArgMatches) -> R<()> {
+async fn get_job_spec(arg_matches: &ArgMatches) -> R<()> {
     let is_json = arg_matches.get_flag("json");
 
     let mut client = ManagerClient::connect(DEF_MANAGER_ADDRESS)
@@ -124,7 +131,7 @@ async fn get_job_spec(arg_matches: &clap::ArgMatches) -> R<()> {
 }
 
 #[instrument(err, skip_all)]
-async fn destroy_job(arg_matches: &clap::ArgMatches) -> R<()> {
+async fn destroy_job(arg_matches: &ArgMatches) -> R<()> {
     let mut client = ManagerClient::connect(DEF_MANAGER_ADDRESS)
         .await
         .context("failed to connect to manager")?;
@@ -143,7 +150,7 @@ async fn destroy_job(arg_matches: &clap::ArgMatches) -> R<()> {
 }
 
 #[instrument(err, skip_all)]
-async fn run_job(arg_matches: &clap::ArgMatches) -> R<()> {
+async fn run_job(arg_matches: &ArgMatches) -> R<()> {
     let mut client = ManagerClient::connect(DEF_MANAGER_ADDRESS)
         .await
         .context("failed to connect to manager")?;
@@ -197,7 +204,7 @@ async fn run_job(arg_matches: &clap::ArgMatches) -> R<()> {
 }
 
 #[instrument(err, skip_all)]
-async fn list_jobs(arg_matches: &clap::ArgMatches) -> R<()> {
+async fn list_jobs(arg_matches: &ArgMatches) -> R<()> {
     let is_json = arg_matches.get_flag("json");
 
     let mut client = ManagerClient::connect(DEF_MANAGER_ADDRESS)
@@ -220,7 +227,7 @@ async fn list_jobs(arg_matches: &clap::ArgMatches) -> R<()> {
 }
 
 #[instrument(err, skip_all)]
-async fn get_info(arg_matches: &clap::ArgMatches) -> R<()> {
+async fn get_info(arg_matches: &ArgMatches) -> R<()> {
     let is_json = arg_matches.get_flag("json");
 
     let mut client = ManagerClient::connect(DEF_MANAGER_ADDRESS)

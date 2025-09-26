@@ -1,37 +1,46 @@
-use crate::cmd::helpers::print_table;
+use crate::cmd::helpers::{json_flag, print_table};
 use crate::prelude::*;
 use crate::structs::manager_client::ManagerClient;
 use crate::structs::{GetNodeRequest, GetNodesRequest, Node, NodePrint, UpdateNodeDynamicRequest};
 use serde_json::to_string;
 
 pub fn config() -> Command {
-    let json_arg = Arg::new("json")
-        .long("json")
-        .short('j')
-        .required(false)
-        .help("returns values in json format")
-        .num_args(0);
-
-    let get_nodes_cmd = Command::new("list")
-        .about("List nodes")
-        .arg(json_arg.clone());
+    let get_nodes_cmd = Command::new("list").about("List nodes").arg(json_flag());
 
     let node_info_cmd = Command::new("info")
         .about("Get node info")
-        .arg(Arg::new("id").value_name("id").required(true))
-        .arg(json_arg.clone());
+        .arg(
+            Arg::new("id")
+                .value_name("ID")
+                .help("Identifier of the node to inspect")
+                .required(true),
+        )
+        .arg(json_flag());
 
     let update_node_cmd = Command::new("update")
         .about(
-            "
-        Update node attributes
-
-        Example: legion node update <id> -a <key1>=<value1> <key2>=<value2>
+            "\
+        Update node attributes\n\
+        \n\
+        Example: legion node update <id> -a <key1>=<value1> <key2>=<value2>\
         ",
         )
-        .arg(Arg::new("id").value_name("id").required(true))
-        .arg(Arg::new("attr").short('a').num_args(1..))
-        .arg(json_arg.clone());
+        .arg(
+            Arg::new("id")
+                .value_name("ID")
+                .help("Identifier of the node to update")
+                .required(true),
+        )
+        .arg(
+            Arg::new("attr")
+                .short('a')
+                .long("attr")
+                .value_name("KEY=VALUE")
+                .help("Dynamic attributes to update on the node")
+                .num_args(1..)
+                .action(ArgAction::Append),
+        )
+        .arg(json_flag());
 
     Command::new("node")
         .about("Interact with nodes")
@@ -43,7 +52,7 @@ pub fn config() -> Command {
 }
 
 #[instrument(err, skip_all)]
-pub async fn handle(sub_matches: &clap::ArgMatches) -> R<()> {
+pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
     match sub_matches.subcommand() {
         Some(("list", arg_matches)) => {
             let is_json = arg_matches.get_flag("json");

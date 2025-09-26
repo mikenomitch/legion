@@ -1,4 +1,4 @@
-use crate::cmd::helpers::print_table;
+use crate::cmd::helpers::{json_flag, print_table};
 use crate::prelude::*;
 
 use crate::structs::manager_client::ManagerClient;
@@ -6,17 +6,11 @@ use crate::structs::{GetLedgerRequest, LedgerEntry, LedgerNodePrint};
 pub fn config() -> Command {
     Command::new("ledger")
         .about("Shows the current state of the ledger")
-        .arg(
-            Arg::new("json")
-                .long("json")
-                .short('j')
-                .help("returns values in json format")
-                .num_args(0),
-        )
+        .arg(json_flag())
 }
 
 #[instrument(err, skip_all)]
-pub async fn handle(matches: &clap::ArgMatches) -> R<()> {
+pub async fn handle(matches: &ArgMatches) -> R<()> {
     let address = std::env::var("LEGION_ADDR").unwrap_or(DEF_MANAGER_ADDRESS.to_owned());
     let mut client = ManagerClient::connect(address.clone())
         .await
