@@ -1,7 +1,5 @@
-use crate::cmd::helpers::print_table;
+use crate::cmd::helpers::{connect_manager_client, print_table};
 use crate::prelude::*;
-
-use crate::structs::manager_client::ManagerClient;
 use crate::structs::{GetLedgerRequest, LedgerEntry, LedgerNodePrint};
 pub fn config() -> Command {
     Command::new("ledger")
@@ -17,10 +15,7 @@ pub fn config() -> Command {
 
 #[instrument(err, skip_all)]
 pub async fn handle(matches: &clap::ArgMatches) -> R<()> {
-    let address = std::env::var("LEGION_ADDR").unwrap_or(DEF_MANAGER_ADDRESS.to_owned());
-    let mut client = ManagerClient::connect(address.clone())
-        .await
-        .with_context(|| format!("failed to connect to manager at {address}"))?;
+    let mut client = connect_manager_client().await?;
     let request = tonic::Request::new(GetLedgerRequest {});
     let response = client
         .get_ledger(request)

@@ -1,6 +1,5 @@
-use crate::cmd::helpers::print_table;
+use crate::cmd::helpers::{connect_manager_client, print_table};
 use crate::prelude::*;
-use crate::structs::manager_client::ManagerClient;
 use crate::structs::{GetNodeRequest, GetNodesRequest, Node, NodePrint, UpdateNodeDynamicRequest};
 use serde_json::to_string;
 
@@ -100,9 +99,7 @@ pub async fn handle(sub_matches: &clap::ArgMatches) -> R<()> {
 
 #[instrument(err, skip_all)]
 async fn get_nodes(is_json: bool) -> R<()> {
-    let mut client = ManagerClient::connect(DEF_MANAGER_ADDRESS)
-        .await
-        .context("failed to connect to manager")?;
+    let mut client = connect_manager_client().await?;
     let request = tonic::Request::new(GetNodesRequest {});
     let response = client.get_nodes(request).await?;
     let nodes_msg_list = response.into_inner().nodes;
@@ -122,9 +119,7 @@ async fn get_nodes(is_json: bool) -> R<()> {
 
 #[instrument(err, skip_all)]
 async fn update_node(node_id: String, dynamic_diff: Map<String, Value>, is_json: bool) -> R<()> {
-    let mut client = ManagerClient::connect(DEF_MANAGER_ADDRESS)
-        .await
-        .context("failed to connect to manager")?;
+    let mut client = connect_manager_client().await?;
 
     let request = tonic::Request::new(UpdateNodeDynamicRequest {
         id: node_id,
@@ -151,9 +146,7 @@ async fn update_node(node_id: String, dynamic_diff: Map<String, Value>, is_json:
 
 #[instrument(err, skip_all)]
 async fn get_node_info(node_id: String, is_json: bool) -> R<()> {
-    let mut client = ManagerClient::connect(DEF_MANAGER_ADDRESS)
-        .await
-        .context("failed to connect to manager")?;
+    let mut client = connect_manager_client().await?;
     let request = tonic::Request::new(GetNodeRequest { id: node_id });
     let response = client.get_node(request).await?;
 
