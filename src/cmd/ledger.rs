@@ -1,6 +1,6 @@
-use crate::cmd::helpers::{connect_manager_client, json_flag, print_table};
+use crate::cmd::helpers::{connect_manager_client, json_flag};
 use crate::prelude::*;
-use crate::structs::{GetLedgerRequest, LedgerEntry, LedgerNodePrint};
+use crate::structs::{GetLedgerRequest, LedgerEntry};
 pub fn config() -> Command {
     Command::new("ledger")
         .about("Shows the current state of the ledger")
@@ -30,8 +30,27 @@ pub async fn handle(matches: &ArgMatches) -> R<()> {
     } else if ledger.is_empty() {
         println!("No nodes registered in the ledger.");
     } else {
-        let printable: Vec<LedgerNodePrint> = ledger.iter().map(Into::into).collect();
-        print_table(printable);
+        println!("Ledger:");
+        for entry in ledger {
+            println!(
+                "- Node {} (status: {}, availability: {})",
+                entry.node.id, entry.node.status, entry.node.availability
+            );
+
+            if entry.allocations.is_empty() {
+                println!("  No allocations on this node.\n");
+                continue;
+            }
+
+            for alloc in entry.allocations {
+                let resources = serde_json::to_string_pretty(&alloc.resources)
+                    .unwrap_or_else(|_| "{}".to_string());
+                println!(
+                    "  • Allocation {} (task {}, job {}): status {}\n    Resources: {}\n",
+                    alloc.id, alloc.task_config_id, alloc.job_id, alloc.status, resources
+                );
+            }
+        }
     }
 
     Ok(())

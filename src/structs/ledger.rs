@@ -16,6 +16,7 @@ pub struct Allocation {
     pub node_id: String,
     pub job_config_id: String,
     pub task_config_id: i64,
+    pub job_id: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -98,6 +99,7 @@ impl From<Allocation> for LedgerAllocation {
             node_id,
             job_config_id,
             task_config_id,
+            job_id,
         } = allocation;
 
         let resources = to_string(&resources).unwrap_or_else(|_| "{}".into());
@@ -109,6 +111,7 @@ impl From<Allocation> for LedgerAllocation {
             node_id,
             job_config_id,
             task_config_id,
+            job_id,
         }
     }
 }
@@ -122,6 +125,7 @@ impl LedgerAllocation {
             node_id,
             job_config_id,
             task_config_id,
+            job_id,
         } = self;
 
         let resources: Value =
@@ -134,6 +138,7 @@ impl LedgerAllocation {
             node_id,
             job_config_id,
             task_config_id,
+            job_id,
         })
     }
 }

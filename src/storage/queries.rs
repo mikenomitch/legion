@@ -56,8 +56,17 @@ pub const ALLOCATION_ATTRS: &str = r#"
 id, status, resources, node_id, job_config_id, task_config_id
 "#;
 
+pub const ALLOCATION_WITH_JOB_ATTRS: &str = r#"
+allocation.id, allocation.status, allocation.resources, allocation.node_id, allocation.job_config_id, allocation.task_config_id, job_config.job_id
+"#;
+
 pub const ALLOCATION_SELECT_ATTRS: &str = r#"
-allocation.id, allocation.status, allocation.resources, allocation.node_id, allocation.job_config_id, allocation.task_config_id
+allocation.id, allocation.status, allocation.resources, allocation.node_id, allocation.job_config_id, allocation.task_config_id, task_config.job_id
+"#;
+
+pub const ALLOCATION_RETURNING_ATTRS: &str = r#"
+id, status, resources, node_id, job_config_id, task_config_id,
+    (SELECT job_id FROM job_config WHERE job_config.id = allocation.job_config_id) as job_id
 "#;
 
 pub const ALLOCATION_INSERT_ATTRS: &str = r#"
@@ -71,22 +80,25 @@ pub const ALLOCATION_ATTRS_VALS: &str = r#"
 lazy_static! {
     pub static ref GET_ALLOCS: String = format!(
         r#"
-    SELECT {ALLOCATION_ATTRS}
-    FROM allocation;
+    SELECT {ALLOCATION_WITH_JOB_ATTRS}
+    FROM allocation
+    INNER JOIN job_config ON job_config.id = allocation.job_config_id;
     "#,
     );
     pub static ref GET_ALLOCS_FOR_NODE: String = format!(
         r#"
-    SELECT {ALLOCATION_ATTRS}
+    SELECT {ALLOCATION_WITH_JOB_ATTRS}
     FROM allocation
-    WHERE node_id = ?;
+    INNER JOIN job_config ON job_config.id = allocation.job_config_id
+    WHERE allocation.node_id = ?;
     "#,
     );
     pub static ref GET_ALLOCS_FOR_JOB_CONFIG: String = format!(
         r#"
-    SELECT {ALLOCATION_ATTRS}
+    SELECT {ALLOCATION_WITH_JOB_ATTRS}
     FROM allocation
-    WHERE job_config_id = ?;
+    INNER JOIN job_config ON job_config.id = allocation.job_config_id
+    WHERE allocation.job_config_id = ?;
     "#,
     );
     pub static ref GET_ALLOCS_FOR_JOB: String = format!(
@@ -101,7 +113,7 @@ lazy_static! {
         r#"
     INSERT INTO allocation ({ALLOCATION_INSERT_ATTRS})
     VALUES ({ALLOCATION_ATTRS_VALS})
-    RETURNING {ALLOCATION_ATTRS};
+    RETURNING {ALLOCATION_RETURNING_ATTRS};
     "#,
     );
 }

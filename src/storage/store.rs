@@ -186,6 +186,7 @@ impl Store {
             node_id: row.get(3)?,
             job_config_id: row.get(4)?,
             task_config_id: row.get(5)?,
+            job_id: row.get(6)?,
         };
 
         Ok(allocation)
