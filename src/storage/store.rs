@@ -473,12 +473,43 @@ impl Store {
             bail!("Job must be stopped before it can be destroyed");
         }
 
+        let submission_hashes: Vec<String> = {
+            let mut sub_stmt = tx.prepare(
+                r#"
+                SELECT DISTINCT jcs.submission_hash
+                FROM job_config_submission jcs
+                INNER JOIN job_config jc ON jc.id = jcs.job_config_id
+                WHERE jc.job_id = ?;
+            "#,
+            )?;
+
+            let rows = sub_stmt.query_map([job.id.clone()], |row| row.get(0))?;
+            let hashes = Self::collect_rows(rows)?;
+            hashes
+        };
+
         let delete_sql = r#"
             DELETE FROM job
             WHERE name = ? AND status = 'stopped';
         "#;
 
         tx.execute(delete_sql, [name])?;
+
+        for submission_hash in submission_hashes {
+            let reference_count: i64 = tx.query_row(
+                r#"
+                SELECT COUNT(*)
+                FROM job_config_submission
+                WHERE submission_hash = ?;
+            "#,
+                [submission_hash.clone()],
+                |row| row.get(0),
+            )?;
+
+            if reference_count == 0 {
+                tx.execute("DELETE FROM submission WHERE hash = ?;", [submission_hash])?;
+            }
+        }
 
         tx.commit()
             .map_err(|_| anyhow!("Error committing transaction"))
@@ -1373,13 +1404,141 @@ mod tests {
 
     #[test]
     fn destroying_a_job_destroys_all_associated_objects() -> R<()> {
-        // TODO: Do this but use come common code to DRY up above
+        let store = setup_store()?;
+
+        let submissions = vec![
+            Submission {
+                path: "sub-1.jsonnet".into(),
+                content: "sub-1".into(),
+                is_primary: true,
+            },
+            Submission {
+                path: "sub-2.jsonnet".into(),
+                content: "sub-2".into(),
+                is_primary: false,
+            },
+        ];
+
+        let tasks = vec![TaskConfig {
+            name: "task-1".to_string(),
+            kind: "kind-1".to_string(),
+            count: 1,
+            config: json!({}),
+            resources: json!({}),
+            constraints: json!({}),
+        }];
+
+        let job_name = "solo-job".to_string();
+        let job_config = JobConfig {
+            name: job_name.clone(),
+            tasks,
+            version: None,
+        };
+
+        store.handle_job_submit(&job_config, &submissions)?;
+        store.stop_job(&job_name)?;
+
+        {
+            let conn = store.connection()?;
+            let submission_count: i64 =
+                conn.query_row("SELECT COUNT(*) FROM submission;", [], |row| row.get(0))?;
+            assert_eq!(submission_count, 2);
+        }
+
+        store.destroy_job(&job_name)?;
+
+        let conn = store.connection()?;
+        let job_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM job WHERE name = ?;",
+            [job_name],
+            |row| row.get(0),
+        )?;
+        let job_config_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM job_config WHERE job_id = ?;",
+            [job_config.name],
+            |row| row.get(0),
+        )?;
+        let job_config_submission_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM job_config_submission;", [], |row| {
+                row.get(0)
+            })?;
+        let submission_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM submission;", [], |row| row.get(0))?;
+
+        assert_eq!(job_count, 0);
+        assert_eq!(job_config_count, 0);
+        assert_eq!(job_config_submission_count, 0);
+        assert_eq!(submission_count, 0);
+
         Ok(())
     }
 
     #[test]
     fn destroying_a_job_wont_destroy_other_used_submissions() -> R<()> {
-        // TODO: Do this but use come common code to DRY up above
+        let store = setup_store()?;
+
+        let shared_submission = Submission {
+            path: "shared.jsonnet".into(),
+            content: "shared-content".into(),
+            is_primary: true,
+        };
+
+        let tasks = vec![TaskConfig {
+            name: "task-shared".to_string(),
+            kind: "kind".to_string(),
+            count: 1,
+            config: json!({}),
+            resources: json!({}),
+            constraints: json!({}),
+        }];
+
+        let job_one_config = JobConfig {
+            name: "job-one".into(),
+            tasks: tasks.clone(),
+            version: None,
+        };
+
+        let job_two_config = JobConfig {
+            name: "job-two".into(),
+            tasks,
+            version: None,
+        };
+
+        let job_one_subs = vec![shared_submission.clone()];
+        let job_two_subs = vec![shared_submission.clone()];
+
+        store.handle_job_submit(&job_one_config, &job_one_subs)?;
+        store.handle_job_submit(&job_two_config, &job_two_subs)?;
+
+        store.stop_job("job-one")?;
+        store.destroy_job("job-one")?;
+
+        let job_two = store.get_job("job-two")?;
+        assert_eq!(job_two.name, "job-two");
+
+        let conn = store.connection()?;
+        let submission_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM submission;", [], |row| row.get(0))?;
+        let job_one_records: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM job WHERE name = ?;",
+            ["job-one"],
+            |row| row.get(0),
+        )?;
+        let job_two_submission_refs: i64 = conn.query_row(
+            r#"
+            SELECT COUNT(*)
+            FROM job_config_submission jcs
+            INNER JOIN job_config jc ON jc.id = jcs.job_config_id
+            WHERE jc.job_id = ?;
+        "#,
+            ["job-two"],
+            |row| row.get(0),
+        )?;
+
+        assert_eq!(job_one_records, 0);
+        assert_eq!(submission_count, 1);
+        assert_eq!(job_two_submission_refs, 1);
+
         Ok(())
     }
 
