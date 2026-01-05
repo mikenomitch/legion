@@ -12,7 +12,7 @@ use crate::structs::{
     TaskConfig, WorkerConfig,
 };
 
-use rusqlite::{named_params, Connection, Error as RusqliteError, Row};
+use rusqlite::{named_params, params_from_iter, Connection, Error as RusqliteError, Row};
 use rusqlite_migration::Migrations;
 use serde_json::to_string;
 use serde_rusqlite::to_params_named;
@@ -155,7 +155,11 @@ impl Store {
         Ok(WorkerConfig {
             name: row.get(0)?,
             pool: row.get(1)?,
-            additional_node_checks: af.split(",").map(|s| s.to_string()).collect(),
+            additional_node_checks: af
+                .split(',')
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| s.to_string())
+                .collect(),
             attributes: parsed_attrs,
             name_prefix,
         })
@@ -269,14 +273,19 @@ impl Store {
 
     #[instrument(err, skip_all)]
     pub fn mark_nodes_as_lost(&self, ids: &[String]) -> R<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+
         let conn = self.connection()?;
-        let sql = r#"
-        UPDATE node
-        SET status = 'lost', availability = 'unavailable'
-        WHERE id IN (?1);
-"#;
-        let joined = ids.join(",");
-        conn.execute(sql, [joined])?;
+        let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+        let sql = format!(
+            "UPDATE node SET status = 'lost', availability = 'unavailable' WHERE id IN ({})",
+            placeholders
+        );
+
+        let mut stmt = conn.prepare(&sql)?;
+        stmt.execute(params_from_iter(ids))?;
 
         Ok(())
     }
@@ -858,6 +867,20 @@ mod tests {
         }
     }
 
+    fn make_node_msg(id: &str, status: &str) -> NodeMsg {
+        NodeMsg {
+            id: id.to_string(),
+            pool: "default".into(),
+            status: status.to_string(),
+            availability: "available".into(),
+            config_attrs: "{}".into(),
+            fingerprint_attrs: "{}".into(),
+            dynamic_attrs: "{}".into(),
+            health_checks: "{}".into(),
+            last_heartbeat: "2023-01-01 00:00:00 +00:00:00".into(),
+        }
+    }
+
     fn task_id_for(store: &Store, task_name: &str, job_id: &str) -> R<i64> {
         let conn = store.conn.lock().map_err(|_| anyhow!(CONN_LOCK_ERROR))?;
         let id = conn.query_row(
@@ -904,6 +927,61 @@ mod tests {
             .context("no test attr")?;
 
         assert_eq!(val, "val");
+
+        Ok(())
+    }
+
+    #[test]
+    fn worker_type_with_empty_checks_round_trips_as_empty_vec() -> R<()> {
+        let store = setup_store()?;
+
+        let worker_config = WorkerConfig {
+            name: "empty".to_string(),
+            pool: "default".to_string(),
+            additional_node_checks: vec![],
+            attributes: HashMap::new(),
+            name_prefix: None,
+        };
+
+        store.insert_worker_type(&worker_config)?;
+
+        let returned_config = store.get_worker_type(worker_config.name.clone())?;
+        assert!(returned_config.additional_node_checks.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn mark_nodes_as_lost_updates_status_and_availability() -> R<()> {
+        let store = setup_store()?;
+
+        store.insert_node(make_node_msg("node-one", "active"))?;
+        store.insert_node(make_node_msg("node-two", "active"))?;
+
+        store.mark_nodes_as_lost(&["node-one".to_string()])?;
+
+        let node_one = store.get_node("node-one")?;
+        assert_eq!(node_one.status, "lost");
+        assert_eq!(node_one.availability, "unavailable");
+
+        let node_two = store.get_node("node-two")?;
+        assert_eq!(node_two.status, "active");
+        assert_eq!(node_two.availability, "available");
+
+        Ok(())
+    }
+
+    #[test]
+    fn mark_nodes_as_lost_is_noop_for_empty_input() -> R<()> {
+        let store = setup_store()?;
+
+        store.insert_node(make_node_msg("node-one", "active"))?;
+
+        store.mark_nodes_as_lost(&[])?;
+
+        let node_one = store.get_node("node-one")?;
+        assert_eq!(node_one.status, "active");
+        assert_eq!(node_one.availability, "available");
 
         Ok(())
     }
