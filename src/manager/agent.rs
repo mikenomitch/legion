@@ -9,9 +9,12 @@ use crate::structs::{
 };
 
 use futures::join;
+use http::Method;
 use jsonnet::JsonnetVm;
 use std::fs;
 use tonic::transport::{Identity, Server, ServerTlsConfig};
+use tonic_web::GrpcWebLayer;
+use tower_http::cors::{Any, CorsLayer};
 
 #[instrument(err, skip_all)]
 pub async fn run_manager(config: ManagerConfig) -> R<()> {
@@ -57,8 +60,22 @@ pub async fn run_manager(config: ManagerConfig) -> R<()> {
         }
     };
 
+    let manager_service = ManagerServer::new(manager_node);
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_headers(Any)
+        .expose_headers([
+            http::header::HeaderName::from_static("grpc-status"),
+            http::header::HeaderName::from_static("grpc-message"),
+            http::header::HeaderName::from_static("grpc-encoding"),
+        ]);
+
     let start_server_fut = server_builder
-        .add_service(ManagerServer::new(manager_node))
+        .accept_http1(true)
+        .layer(cors)
+        .layer(GrpcWebLayer::new())
+        .add_service(manager_service)
         .serve(addr);
 
     println!("Join server starting on {join_server_addr}");
