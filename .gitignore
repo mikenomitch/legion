@@ -2,3 +2,5 @@
 /plugins/*/*/target
 .legion/*
 ./logs/*
+/ui/node_modules
+/ui/dist
