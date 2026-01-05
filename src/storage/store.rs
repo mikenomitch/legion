@@ -804,7 +804,7 @@ impl Store {
 
         let mut ledger = Vec::new();
 
-        for node in nodes.into_iter().filter(|node| node.status != "lost") {
+        for node in nodes {
             let node_allocations = allocations.get(&node.id).cloned().unwrap_or_default();
             ledger.push(LedgerEntry {
                 node,
@@ -982,6 +982,27 @@ mod tests {
         let node_one = store.get_node("node-one")?;
         assert_eq!(node_one.status, "active");
         assert_eq!(node_one.availability, "available");
+
+        Ok(())
+    }
+
+    #[test]
+    fn get_ledger_includes_lost_nodes() -> R<()> {
+        let store = setup_store()?;
+
+        store.insert_node(make_node_msg("node-one", "active"))?;
+        store.insert_node(make_node_msg("node-two", "active"))?;
+
+        store.mark_nodes_as_lost(&["node-two".to_string()])?;
+
+        let ledger = store.get_ledger()?;
+        assert_eq!(ledger.len(), 2);
+
+        let lost_entry = ledger
+            .iter()
+            .find(|entry| entry.node.id == "node-two")
+            .context("node-two missing from ledger")?;
+        assert_eq!(lost_entry.node.status, "lost");
 
         Ok(())
     }
