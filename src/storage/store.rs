@@ -987,6 +987,26 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_attrs_can_be_updated_after_join() -> R<()> {
+        let store = setup_store()?;
+
+        store.insert_node(make_node_msg("node-one", "active"))?;
+
+        let mut diff = Map::new();
+        diff.insert("foo".to_string(), json!("bar"));
+
+        let updated_node = store.update_node_dyamic("node-one", &diff)?;
+        let foo = updated_node
+            .dynamic_attrs
+            .get("foo")
+            .context("foo missing from dynamic attrs")?;
+
+        assert_eq!(foo, "bar");
+
+        Ok(())
+    }
+
+    #[test]
     fn get_ledger_includes_lost_nodes() -> R<()> {
         let store = setup_store()?;
 
