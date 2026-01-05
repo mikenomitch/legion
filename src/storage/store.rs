@@ -580,7 +580,7 @@ impl Store {
                 ))
             })?;
 
-        config.tasks.iter().for_each(|t| {
+        for t in &config.tasks {
             let task_params = named_params! {
                 ":name": t.name,
                 ":kind": t.kind,
@@ -592,10 +592,10 @@ impl Store {
                 ":job_config_id": job_config_id,
             };
 
-            let _num_rows_changes = tx.execute(&INSERT_TASK, task_params);
-        });
+            tx.execute(&INSERT_TASK, task_params)?;
+        }
 
-        subs.iter().for_each(|s| {
+        for s in subs {
             let sub_hash = s.hash();
 
             let sub_params = named_params! {
@@ -603,10 +603,7 @@ impl Store {
                 ":hash": sub_hash,
             };
 
-            let _num_sub_rows_changes = tx.execute(&INSERT_SUBMISSION, sub_params);
-
-            // TODO: Make sure that if random things fail,
-            // we manually fail the transaction!
+            tx.execute(&INSERT_SUBMISSION, sub_params)?;
 
             let job_config_sub_params = named_params! {
                 ":path": s.path,
@@ -615,9 +612,8 @@ impl Store {
                 ":submission_hash": sub_hash,
             };
 
-            let _num_job_config_sub_rows_changes =
-                tx.execute(&INSERT_JOB_CONFIG_SUBMISSION, job_config_sub_params);
-        });
+            tx.execute(&INSERT_JOB_CONFIG_SUBMISSION, job_config_sub_params)?;
+        }
 
         let job_update_params = named_params! {
             ":id": format!("{}-{}", job.id, next_version.to_string()),
@@ -627,7 +623,7 @@ impl Store {
             ":from_job_config_id": last_versions_id,
         };
 
-        let _num_update_row_changes = tx.execute(&INSERT_JOB_UPDATE, job_update_params);
+        tx.execute(&INSERT_JOB_UPDATE, job_update_params)?;
 
         tx.commit()
             .map_err(|_| anyhow!("Error committing transaction"))
@@ -1095,6 +1091,46 @@ mod tests {
         let sub_two_from_store = subs_from_store.get(1).context("no sub 2")?;
         assert_eq!(sub_one_from_store.path, sub_one.path);
         assert_eq!(sub_two_from_store.path, sub_two.path);
+
+        Ok(())
+    }
+
+    #[test]
+    fn handle_job_submit_rolls_back_on_failure() -> R<()> {
+        let task_one = TaskConfig {
+            name: "task-1".to_string(),
+            kind: "kind-1".to_string(),
+            count: 1,
+            config: json!({ "message": "hello-1" }),
+            resources: json!({ "memory": 256 }),
+            constraints: json!({}),
+        };
+
+        let job_name = "rollback-job".to_string();
+        let job_config = JobConfig {
+            name: job_name.clone(),
+            tasks: vec![task_one],
+            version: None,
+        };
+
+        let store = setup_store()?;
+        {
+            let conn = store.connection()?;
+            conn.execute("DROP TABLE job_config_submission;", [])?;
+        }
+
+        let result = store.handle_job_submit(
+            &job_config,
+            &[Submission {
+                path: "sub-1.jsonnet".into(),
+                content: "sub-1".into(),
+                is_primary: true,
+            }],
+        );
+
+        assert!(result.is_err());
+        assert!(store.get_job(&job_name).is_err());
+        assert!(store.get_job_config(&job_name).is_err());
 
         Ok(())
     }
