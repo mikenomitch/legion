@@ -1,4 +1,4 @@
-use crate::cmd::helpers::{connect_manager_client, print_table, json_flag};
+use crate::cmd::helpers::{connect_manager_client, json_flag, print_table};
 use crate::prelude::*;
 use crate::structs::{GetLedgerRequest, LedgerEntry, LedgerNodePrint};
 pub fn config() -> Command {

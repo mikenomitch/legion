@@ -2,7 +2,6 @@ use std::vec;
 
 use crate::cmd::helpers::{connect_manager_client, json_flag, print_table};
 use crate::prelude::*;
-use crate::structs::manager_client::ManagerClient;
 use crate::structs::{
     DestroyJobRequest, GetJobInfoRequest, GetJobSpecRequest, JobPrint, ListJobsRequest,
     RunJobRequest, StopJobRequest, Submission,

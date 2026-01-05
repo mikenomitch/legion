@@ -13,8 +13,10 @@ use crate::worker::{
 
 use futures::join;
 use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
-use tonic::{transport::Channel, transport::Server, Response};
-// use tonic::transport::Certificate, transport::ClientTlsConfig,
+use tonic::{
+    transport::Certificate, transport::Channel, transport::ClientTlsConfig, transport::Server,
+    Response,
+};
 
 #[instrument(err, skip_all)]
 pub async fn run_worker(token: &str) -> R<()> {
@@ -40,7 +42,10 @@ pub async fn run_worker(token: &str) -> R<()> {
         .add_service(WorkerServer::new(worker_node))
         .serve(addr);
 
-    let client = create_manager_client(
+    // print this address
+    info!("Manager node address: {}", token_data.claims.address);
+
+    let client: ManagerClient<Channel> = create_manager_client(
         token_data.claims.address,
         String::new(),
         // token_data.claims.ca_cert,
@@ -85,10 +90,12 @@ async fn create_manager_client(
     manager_addr: String,
     _ca_cert: String,
 ) -> R<ManagerClient<Channel>> {
-    // // let ca_cert = Certificate::from_pem(ca_cert);
-    // // let tls = ClientTlsConfig::new().ca_certificate(ca_cert);
-    // let channel = Channel::from_shared(manager_addr)?.tls_config(tls)?.connect().await?;
-    let channel = Channel::from_shared(manager_addr)?.connect().await?;
+    // let ca_cert = Certificate::from_pem(ca_cert);
+    // let tls: ClientTlsConfig = ClientTlsConfig::new().ca_certificate(ca_cert);
+    let channel = Channel::from_shared(manager_addr)?
+        // .tls_config(tls)? TODO: Temporarily doesn' do any TLS
+        .connect()
+        .await?;
     let client = ManagerClient::new(channel);
 
     Ok(client)

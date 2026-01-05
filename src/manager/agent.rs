@@ -93,10 +93,13 @@ fn load_server_tls_identity() -> R<Option<Identity>> {
         return Ok(None);
     }
 
-    let cert = std::fs::read_to_string(cert_path)?;
-    let key = std::fs::read_to_string(key_path)?;
+    // Temporarily don't do any TLS
+    return Ok(None);
 
-    Ok(Some(Identity::from_pem(cert, key)))
+    // let cert = std::fs::read_to_string(cert_path)?;
+    // let key = std::fs::read_to_string(key_path)?;
+
+    // Ok(Some(Identity::from_pem(cert, key)))
 }
 
 #[instrument(err, skip_all)]

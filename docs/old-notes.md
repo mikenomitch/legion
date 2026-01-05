@@ -193,98 +193,14 @@ These are old notes from Bear transferred to this repo for tracking
 * Artifacts
   * Pluginable!
   * * With cache!
+
 #### UI
-* Automatic grpc UI to start!
-* grpcui -proto proto/legion.proto -plaintext localhost:4747
 * Plugginable!
-  * Whole thing
+  * Whole thing can be swapped out
   * Routes too
 * Tools
-  * Axum + HTMX?
   * Dioxus?
-  * Tauri? - Prob not
-
-## Plugins
-* Schedulers
-* Commands & API Endpoints
-* Routes (for http API)
-* Fingerprinters
-* Networking fingerprinters (for different configs for Service Disco)
-* CNI (or custom networking plugin that can do CNI)
-* Allocation Setup Plugins
-* And Task Group Setup plugins
-* Configuration language (eventually all goes to JSON?)
-* Custom Resources
-
-* Things like Autoscaler should run as part of the core binary (and be pluginable), but then also be able to run outside as their own things. This would allow for simple Day 1 but performant Day N.
-  * Also maybe ingress proxies?
-
-* Legion should be able to be a librarh to other things. CLI shouldn’t be only interface ever.
-
-## Differentiators
-* Highly extensible
-* Sqlite???
-* No Raft?!?!
-  * Litestream?
-    * Both S3 + NFS?
-  * At least initially this sounds pretty slick
-  * You can have downtime on the leader and its NBD too…
-  * This would make development + running tremendously simpler (and cheaper!)
-  * Maybe mvsqlite
-    * [A distributed SQLite benchmark: How mvSQLite scales](https://su3.io/posts/mvsqlite-bench-20220930)
-  * Maybe rqlite? (Raft)
-* GRPC
-* OTEL
-  * [open-telemetry/opentelemetry-rust: OpenTelemetry API and SDK for Rust](https://github.com/open-telemetry/opentelemetry-rust)
-* Config lang?
-  * jsonnet*
-* Task kind implementation split into parts (isolations vs runner vs artifact)?
-* networking using netavark (+ CNI)?
-* Networking over unix domain sockets legion overlay network
-* Apps that can use the DB but then get split out
-  * Autoscaler
-  * GitOps App
-  * Overlay network controller?
-  * Logging?
-  * Buildpack runner
-  * Cert manager?
-* Ease
-  * First experience should be super easy for small apps
-    * Can push docker images directly into the worker node artifact cache to avoid setting up docker hub or whatnot?
-      * Or into servers and they sent to the worker nodes??
-    * Perhaps a proxy like Kamal has?
-  * Automatic “build & push” step for Docker?
-    * legion prep? Legion build?
-    * Plus a “context” file like npm or James’ Nomad file?
-* Root privs
-  * Processes for networking + volumes as root but not main?
-* Cert Manager built in for TLS stuff, Public CA routes?
-* Node Configuration Jobs
-  * Like a sysbatch but runs on join too, and adds dynamic node metadata
-* Pluggable Node Statuses for degradation
-  * Disk Pressure
-  * Network Pressure
-  * ETC ETC
-* Allocations are a default resource type
-* Node management “jobs”
-  * CNI?
-  * Volumes?
-  * Artifacts
-  * Ansible type stuff?
-* Use virtual fs for the alloc directory!
-  * From Tim in meeting
-  * “If Nomad v2 existed this is what we’d do”
-* Crazy idea -
-  * Add in-code task/job definitions like Prefect ([Welcome to Prefect](https://docs.prefect.io/latest/))
-  * Monetize with artifact store?
-* Eval hooks?
-  * If certain things happen on, you can define something to react from within legion?!
-  * Can break off into its own job (this is like autoscaler maybe where its a plugin?)
-* Port Forwarding
-* Pre-fetching artifacts in deploy process
-  * Artifact cache generally?
-  * This should be built in for the scaling cases
-  * Multiple layers of pre-fetching and tagging nodes as being pre-warmed
+  * TanStack with Solid?
 
 ## Names
 * Lots of little things
@@ -308,24 +224,16 @@ These are old notes from Bear transferred to this repo for tracking
 
 #### Random
 
-Steal from [Aurae Runtime](https://aurae.io/)
-* Typescript job specs?!?!
-* …better than yaml…
 * grpc API for integrations?
   * Maybe doesn’t matter?!?
 
-## Questions
-* Can a “framworks” thing like Mesos has exist?
-* Can you pre-allocate space to make scheduling decisions faster for incoming stuff?
+* Crazy idea -
+  * Add in-code task/job definitions like Prefect ([Welcome to Prefect](https://docs.prefect.io/latest/))
+  * Monetize with artifact store?
 
-* Should this be using a Fly.io-like scheduler system instead of the eval loop?
-  * Does this even replace the eval loop?
-  * Every client checks for what jobs need running
-    * Submits a bid
-    * After N seconds, scheduler gives it to the best option and tells it it got it
-    * Each one will pre-warm ASAP but block on actual starting
-    * This is dope for speed at scale
-    * How would it work in the case of trying to optimize? (just set a longer time to evaluate and you’re good?)
+## Questions
+* Can a “frameworks” thing like Mesos has exist?
+* Can you pre-allocate space to make scheduling decisions faster for incoming stuff?
 
 
 ### Various Links

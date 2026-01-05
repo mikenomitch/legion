@@ -285,8 +285,7 @@ mod tests {
         job_two_submit_eval.handle(&store)?;
 
         ledger = store.get_ledger()?;
-        let total_allocations: usize =
-            ledger.iter().map(|entry| entry.allocations.len()).sum();
+        let total_allocations: usize = ledger.iter().map(|entry| entry.allocations.len()).sum();
         assert_eq!(total_allocations, 2);
 
         let stop_job_one_eval = Eval {
@@ -318,8 +317,7 @@ mod tests {
         stop_job_two_eval.handle(&store)?;
 
         ledger = store.get_ledger()?;
-        let total_allocations: usize =
-            ledger.iter().map(|entry| entry.allocations.len()).sum();
+        let total_allocations: usize = ledger.iter().map(|entry| entry.allocations.len()).sum();
         assert_eq!(total_allocations, 0);
 
         Ok(())

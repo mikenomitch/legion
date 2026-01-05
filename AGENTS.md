@@ -1,38 +1,41 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-- Source: `src/` with key modules: `cmd/` (CLI), `manager/`, `worker/`, `storage/`, `certs.rs`, `tracing_util.rs`, `structs.rs` (generated types), `constants.rs`.
-- Protocol buffers: `proto/legion.proto` (compiled by `build.rs` via tonic-build).
-- Configs & examples: `configs/` (manager, workers, TLS, jobs).
-- Plugins: `plugins/<kind>/<name>/` (built as `dylib` during build).
-- Tests: unit tests co-located in modules; integration assets under `tests/`.
+- Source lives in `src/`: CLI in `cmd/`, orchestration in `manager/` and `worker/`, storage helpers in `storage/`, TLS helpers in `certs.rs`, tracing utilities in `tracing_util.rs`, generated proto types in `structs.rs`, constants in `constants.rs`.
+- Protobuf schema: `proto/legion.proto` compiled by `build.rs` via `tonic-build`.
+- Configs and examples: `configs/` (manager, worker, TLS dev certs, job demos).
+- Plugins: `plugins/<kind>/<name>/` built as `dylib` during Cargo build.
+- Tests sit beside modules; integration assets under `tests/`.
 
 ## Build, Test, and Development Commands
-- Build: `cargo build` (requires `protoc`). Builds crate `legion` and plugins.
-- Release: `cargo build --release`
-- Test: `cargo test --all --locked`
-- Run manager: `cargo run -- start manager -c configs/manager.jsonnet`
-- Run worker (join): `cargo run -- join <TOKEN>` or `cargo run -- start worker <TOKEN>`
-- Jobs: `cargo run -- job run configs/jobs/demo.jsonnet`; list: `cargo run -- job list -j`
-- Nodes: `cargo run -- node list` | info/update via subcommands
-- Join token: `LEGION_ADDR=http://127.0.0.1:4748 cargo run -- join-token --ttl 1h --type default`
+- Build crate and plugins: `cargo build` (requires `protoc`).
+- Release build: `cargo build --release`.
+- Run tests: `cargo test --all --locked`.
+- Run manager: `cargo run -- start manager -c configs/manager.jsonnet`.
+- Run worker: `cargo run -- join <TOKEN>` or `cargo run -- start worker <TOKEN>`.
+- Jobs: `cargo run -- job run configs/jobs/demo.jsonnet`; list with `cargo run -- job list -j`.
 
 ## Coding Style & Naming Conventions
-- Language: Rust 2021; 4-space indent; snake_case for modules/files; UpperCamelCase for types; SCREAMING_SNAKE_CASE for constants.
-- Formatting: `cargo fmt --all`; Linting: `cargo clippy --all -- -D warnings`.
-- Tracing: prefer `tracing` macros and `#[instrument]` for async boundaries.
-- Keep modules cohesive (e.g., worker checks in `src/worker/node_check/…`).
+- Rust 2021, 4-space indent, snake_case modules/files, UpperCamelCase types, SCREAMING_SNAKE_CASE constants.
+- Prefer `tracing` macros; add `#[instrument]` on async boundaries.
+- Format with `cargo fmt --all`; lint with `cargo clippy --all -- -D warnings`.
 
 ## Testing Guidelines
-- Framework: Rust `#[cfg(test)]` unit tests; run with `cargo test --all --locked`.
-- Place tests near code; name with `_test` modules/functions.
-- If a test needs data, use `tests/` assets (e.g., SQLite fixtures) and avoid mutating repo state.
+- Use Rust `#[cfg(test)]` unit tests near code; integration data in `tests/`.
+- Name tests descriptively with `_test` modules/functions.
+- Run full suite via `cargo test --all --locked`; avoid mutating shared fixtures.
 
 ## Commit & Pull Request Guidelines
-- Commits: imperative, concise (e.g., "Refactor store helpers", "Install protoc for CI tests").
-- PRs: include summary, rationale, and scope; link issues; add CLI examples and before/after notes when UX changes; ensure CI passes.
+- Commits: short, imperative summaries (e.g., "Refactor store helpers").
+- PRs: include summary, rationale, scope; link issues; note UX or CLI changes with before/after where relevant; ensure CI (fmt, clippy, tests) passes.
 
 ## Security & Configuration Tips
-- Protobuf compiler (`protoc`) is required locally (CI installs `protobuf-compiler`).
-- Defaults: manager `http://127.0.0.1:4747`, insecure `http://127.0.0.1:4748`; config path defaults to `configs/manager.jsonnet`.
-- TLS dev certs live under `configs/tls/`; do not use in production.
+- `protoc` must be available locally; CI installs `protobuf-compiler`.
+- Default manager address `http://127.0.0.1:4747`; insecure listener `http://127.0.0.1:4748`.
+- Dev TLS certs live in `configs/tls/`; do not use in production.
+
+## Docs, Plan, and To Dos
+- Docs, Plan, and To Dos live in `docs/`
+- `docs/NEXT_UP.md` contains the immediate todos for the current task that the human developer is working on
+- `docs/TASK-LIST.md` contains a higher-level To Do list
+- `docs/differentiators.md` contains a list of reasons that legion is different from K8s and Nomad
