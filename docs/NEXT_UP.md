@@ -1,5 +1,5 @@
 # Next Up
-- Ledger prints nicely
+- Ledger prints nicely - Codexed
     - get_ledger updated and GetLedgerReply updated
     - prints out a list of all the nodes with allocations on them
     - CLI will properly and nicely print out the ledger
@@ -84,10 +84,9 @@
   - Then figure out how to make it an optimistic async loop
   - Then respond to node changes with reschedules
 
-- If you fail mid way thru any of the job submit parts, the transaction fails HARD!
+- If you fail mid way thru any of the job submit parts, the transaction fails HARD! - Codexed
 
-- Submissions
-
+- Submissions - Codexed
   - Fix the cascade delete not working on submissions!
   - If you destroy a job, destroy its submissions if and only if they are not used by another job
 

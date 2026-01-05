@@ -3,14 +3,14 @@
   - [x] start starts a web server
     - [x] Tonic for gRPC
 
-- [x] Add a follower node
+- [x] Add a Worker node
   - [x] CLI arg to get address
   - [x] Makes contact via RPC
   - [x] Add message passing between the two via RPC
   - [x] It begins to heartbeat. Is marked unhealthy if it misses.
-    - [ ] Be able to watch this change via the CLI
+    - [x] Be able to watch this change via the CLI
   - [x] It has a basic fingerprinting system
-  - [ ] It has dynamic attributes that can be updated (I think this is done?)
+  - [ ] It has dynamic attributes that can be updated (I think this is done?) - Codexed
   - [ ] It properly shows up in the manager's ledger of worker nodes (is this done?)
   - [ ] It can be reconfigured from the server
   - [ ] It can be restarted from the server
@@ -23,8 +23,8 @@
   - [x] Job is stores in the backend
 
 - [ ] Scheduling
-  - [ ] Ledger command. I can see all the nodes and what is on them easily via a CLI command.
-  - [ ] A framework for running scheduler plugins exiss
+  - [ ] Ledger command. I can see all the nodes and what is on them easily via a CLI command. - Codexed
+  - [ ] A framework for running scheduler plugins exists
   - [ ] A "random" scheduler that selects nodes at random until one works, "works"
   - [ ] Constraints work
   - [ ] A "bin-pack" scheduler works
@@ -47,7 +47,7 @@
 - [ ] Running workloads
   - [ ] A framework is set up to run workload plugins
   - [ ] A "noop" kind "works"
-  - [ ] An "executable" kind works
+  - [ ] An "exec" kind works
     - [ ] The command and args given are run
     - [ ] It runs as a specific user
     - [ ] Unveil works properly
