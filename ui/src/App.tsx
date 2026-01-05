@@ -126,7 +126,7 @@ const Layout = (props: RouteSectionProps) => {
                 onClick={toggleTheme}
                 aria-label={theme() === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
               >
-                <span aria-hidden="true">💡</span>
+                <span aria-hidden="true" class="inline-block grayscale">💡</span>
               </button>
             </div>
           </header>
