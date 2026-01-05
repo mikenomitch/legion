@@ -1,6 +1,6 @@
-# Khepri UI
+# Legion UI
 
-A minimal Solid.js + Tailwind front-end for interacting with the Khepri manager over gRPC.
+A minimal Solid.js + Tailwind front-end for interacting with the Legion manager over gRPC.
 
 ## Getting started
 
