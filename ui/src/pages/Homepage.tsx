@@ -1,6 +1,6 @@
 import { For, Show, type Resource } from 'solid-js'
 import type { LedgerNode } from '../gen/legion_pb'
-import { asDisplay } from '../utils/format'
+import { asDisplay, formatRelativeTime } from '../utils/format'
 
 interface HomepageProps {
   ledger: Resource<readonly LedgerNode[] | undefined>
@@ -31,9 +31,9 @@ export default function Homepage(props: HomepageProps) {
                     <span class="rounded border border-neutral-200 bg-neutral-50 px-3 py-2 dark:border-neutral-800 dark:bg-neutral-900">
                       Availability: {item.node?.availability ?? '—'}
                     </span>
-                    <span class="rounded border border-neutral-200 bg-neutral-50 px-3 py-2 dark:border-neutral-800 dark:bg-neutral-900">
-                      Last heartbeat: {item.node?.lastHeartbeat ?? '—'}
-                    </span>
+                      <span class="rounded border border-neutral-200 bg-neutral-50 px-3 py-2 dark:border-neutral-800 dark:bg-neutral-900">
+                        Last heartbeat: {formatRelativeTime(item.node?.lastHeartbeat)}
+                      </span>
                   </div>
                   <div class="mt-4">
                     <p class="text-xs uppercase tracking-[0.12em] text-neutral-500 dark:text-neutral-400">Allocations</p>
@@ -41,9 +41,9 @@ export default function Homepage(props: HomepageProps) {
                       <Show
                         when={item.allocations.length}
                         fallback={
-                          <p class="rounded border border-dashed border-neutral-200 px-3 py-2 text-sm text-neutral-500 dark:border-neutral-700 dark:text-neutral-500">
-                            No allocations recorded.
-                          </p>
+                            <p class="rounded border border-dashed border-neutral-200 px-3 py-2 text-sm text-neutral-500 dark:border-neutral-700 dark:text-neutral-500">
+                              No current allocations
+                            </p>
                         }
                       >
                         <For each={item.allocations}>
