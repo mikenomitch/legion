@@ -15,7 +15,7 @@ pub fn get_migrations() -> Migrations<'static> {
             last_heartbeat TIMESTAMP NOT NULL
         )",
         )
-        .down("DROP TABLE node;"),
+        .down("DROP TABLE IF EXISTS node;"),
         M::up(
             "CREATE TABLE IF NOT EXISTS worker_type (
             name STRING PRIMARY KEY,
@@ -25,7 +25,7 @@ pub fn get_migrations() -> Migrations<'static> {
             name_prefix STRING
         )",
         )
-        .down("DROP TABLE worker_type;"),
+        .down("DROP TABLE IF EXISTS worker_type;"),
         M::up(
             "CREATE TABLE IF NOT EXISTS job (
             id STRING PRIMARY KEY,
@@ -34,7 +34,7 @@ pub fn get_migrations() -> Migrations<'static> {
             created_at TIMESTAMP NOT NULL
         )",
         )
-        .down("DROP TABLE job;"),
+        .down("DROP TABLE IF EXISTS job;"),
         M::up(
             "CREATE TABLE IF NOT EXISTS job_config (
             id STRING PRIMARY KEY,
@@ -47,14 +47,14 @@ pub fn get_migrations() -> Migrations<'static> {
             FOREIGN KEY(job_id) REFERENCES job(id) ON DELETE CASCADE
         )",
         )
-        .down("DROP TABLE job_config;"),
+        .down("DROP TABLE IF EXISTS job_config;"),
         M::up(
             "CREATE TABLE IF NOT EXISTS submission (
             hash STRING PRIMARY KEY,
             content TEXT NOT NULL
         )",
         )
-        .down("DROP TABLE submission;"),
+        .down("DROP TABLE IF EXISTS submission;"),
         M::up(
             "CREATE TABLE IF NOT EXISTS job_config_submission (
         id INTEGER PRIMARY KEY,
@@ -66,7 +66,7 @@ pub fn get_migrations() -> Migrations<'static> {
         FOREIGN KEY(submission_hash) REFERENCES submission(hash) ON DELETE CASCADE
     )",
         )
-        .down("DROP TABLE job_config_submission;"),
+        .down("DROP TABLE IF EXISTS job_config_submission;"),
         M::up(
             "CREATE TABLE IF NOT EXISTS task_config (
             id INTEGER PRIMARY KEY,
@@ -82,7 +82,7 @@ pub fn get_migrations() -> Migrations<'static> {
             FOREIGN KEY(job_config_id) REFERENCES job_config(id) ON DELETE CASCADE
         )",
         )
-        .down("DROP TABLE task_config;"),
+        .down("DROP TABLE IF EXISTS task_config;"),
         M::up(
             "CREATE TABLE IF NOT EXISTS job_update (
             id STRING PRIMARY KEY,
@@ -95,7 +95,7 @@ pub fn get_migrations() -> Migrations<'static> {
             FOREIGN KEY(from_job_config_id) REFERENCES job_config(id) ON DELETE CASCADE
         )",
         )
-        .down("DROP TABLE job_update;"),
+        .down("DROP TABLE IF EXISTS job_update;"),
         M::up(
             "CREATE TABLE IF NOT EXISTS allocation (
             id INTEGER PRIMARY KEY,
@@ -109,7 +109,7 @@ pub fn get_migrations() -> Migrations<'static> {
             FOREIGN KEY(task_config_id) REFERENCES task_config(id) ON DELETE CASCADE
         )",
         )
-        .down("DROP TABLE allocation;"),
+        .down("DROP TABLE IF EXISTS allocation;"),
         M::up(
             "CREATE TABLE IF NOT EXISTS eval (
             id INTEGER PRIMARY KEY,
@@ -123,6 +123,6 @@ pub fn get_migrations() -> Migrations<'static> {
             FOREIGN KEY(node_id) REFERENCES node(id) ON DELETE CASCADE
         )",
         )
-        .down("DROP TABLE eval;"),
+        .down("DROP TABLE IF EXISTS eval;"),
     ])
 }

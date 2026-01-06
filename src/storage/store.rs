@@ -555,7 +555,7 @@ impl Store {
         // I am not going to worry about this for now
 
         let mut next_version = 1;
-        let mut last_versions_id = "".to_string();
+        let mut last_versions_id: Option<String> = None;
 
         if let Ok(latest_job_config) = self.get_job_config(&config.name) {
             // if latest_job_config is deep equal to config, return an error
@@ -563,7 +563,7 @@ impl Store {
                 bail!("Job config is unchanged");
             } else {
                 next_version = latest_job_config.version.unwrap_or(0) + 1;
-                last_versions_id = latest_job_config.id();
+                last_versions_id = Some(latest_job_config.id());
             }
         }
 
