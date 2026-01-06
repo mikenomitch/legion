@@ -446,9 +446,7 @@ mod tests {
             .plan_and_apply(&job_config_id, PlanMode::Fresh)
             .expect_err("expected scheduling error");
 
-        assert!(err
-            .to_string()
-            .contains("Failed to place task analytics"));
+        assert!(err.to_string().contains("Failed to place task analytics"));
 
         Ok(())
     }

@@ -1,11 +1,10 @@
-use std::collections::HashSet;
-
-use anyhow::Context;
 use time::macros::format_description;
 use time::OffsetDateTime;
 use tracing::info;
 
 use crate::manager::scheduler::{PlanMode, PlanOutcome, Scheduler};
+#[cfg(test)]
+use crate::prelude::Context;
 use crate::prelude::{bail, json, R};
 use crate::storage::store::Store;
 
@@ -74,30 +73,9 @@ impl Eval {
         }
 
         store.mark_node_lost(node_id)?;
-        let lost_allocations = store.allocs_for_node(node_id)?;
+        store.reschedule_allocations_for_lost_node(node_id)?;
 
-        if lost_allocations.is_empty() {
-            return Ok(format!("Node {node_id} dropped"));
-        }
-
-        store.remove_allocs_for_node(node_id)?;
-
-        let mut rescheduled_jobs = HashSet::new();
-        for alloc in lost_allocations {
-            if rescheduled_jobs.insert(alloc.job_config_id.clone()) {
-                store.enqueue_eval(
-                    "job_reschedule",
-                    Some(&alloc.job_id),
-                    Some(&alloc.job_config_id),
-                    Some(node_id),
-                )?;
-            }
-        }
-
-        Ok(format!(
-            "Node {node_id} dropped and queued {} reschedule eval(s)",
-            rescheduled_jobs.len()
-        ))
+        Ok(format!("Node {node_id} dropped"))
     }
 
     fn handle_job_submit(&self, store: &Store) -> R<String> {
