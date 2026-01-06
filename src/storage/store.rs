@@ -12,7 +12,9 @@ use crate::structs::{
     TaskConfig, WorkerConfig,
 };
 
-use rusqlite::{named_params, params_from_iter, Connection, Error as RusqliteError, Row};
+use rusqlite::{
+    named_params, params_from_iter, Connection, Error as RusqliteError, OptionalExtension, Row,
+};
 use rusqlite_migration::Migrations;
 use serde_json::to_string;
 use serde_rusqlite::to_params_named;
@@ -135,12 +137,12 @@ impl Store {
 
     fn eval_from_row(&self, row: &Row<'_>) -> Result<Eval, rusqlite::Error> {
         let eval = Eval {
-            id: row.get(0)?,
+            id: row.get::<_, i64>(0)?.to_string(),
             status: row.get(1)?,
             kind: row.get(2)?,
-            job_id: row.get(3)?,
-            job_config_id: row.get(4)?,
-            node_name: row.get(5)?,
+            job_id: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+            job_config_id: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+            node_name: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
         };
 
         Ok(eval)
@@ -858,6 +860,65 @@ impl Store {
             Err(e) => Err(e.into()),
         }
     }
+
+    #[instrument(err, skip_all)]
+    pub fn claim_eval(&self) -> R<Option<Eval>> {
+        let mut conn = self.connection()?;
+        let tx = conn.transaction()?;
+
+        let eval_id: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM eval WHERE status = 'pending' ORDER BY id ASC LIMIT 1;",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+
+        let Some(eval_id) = eval_id else {
+            tx.commit()?;
+            return Ok(None);
+        };
+
+        let mut eval = tx.query_row(
+            "UPDATE eval SET status = 'in_flight' WHERE id = :id RETURNING id, status, type, job_id, job_config_id, node_id;",
+            named_params! {":id": eval_id},
+            |row| self.eval_from_row(row),
+        )?;
+
+        let eval_id = eval.id.clone();
+
+        if !eval.job_id.trim().is_empty() {
+            tx.execute(
+                "DELETE FROM eval WHERE status = 'pending' AND job_id = :job_id AND id != :id;",
+                named_params! {":job_id": eval.job_id.clone(), ":id": eval_id.clone()},
+            )?;
+        }
+
+        if !eval.node_name.trim().is_empty() {
+            tx.execute(
+                "DELETE FROM eval WHERE status = 'pending' AND node_id = :node_id AND id != :id;",
+                named_params! {":node_id": eval.node_name.clone(), ":id": eval_id.clone()},
+            )?;
+        }
+
+        tx.commit()?;
+        eval.status = "in_flight".to_string();
+
+        Ok(Some(eval))
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn complete_eval(&self, eval_id: &str, succeeded: bool) -> R<()> {
+        let mut conn = self.connection()?;
+
+        if succeeded {
+            conn.execute("DELETE FROM eval WHERE id = ?;", [eval_id])?;
+        } else {
+            conn.execute("UPDATE eval SET status = 'failed' WHERE id = ?;", [eval_id])?;
+        }
+
+        Ok(())
+    }
 }
 
 // =====
@@ -869,6 +930,7 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::params;
 
     fn setup_store() -> R<Store> {
         let store_config = ManagerConfigFull {
@@ -918,6 +980,24 @@ mod tests {
         )?;
 
         Ok(id)
+    }
+
+    fn insert_eval(
+        store: &Store,
+        id: i64,
+        status: &str,
+        kind: &str,
+        job_id: Option<&str>,
+        job_config_id: Option<&str>,
+        node_id: Option<&str>,
+    ) -> R<()> {
+        let conn = store.conn.lock().map_err(|_| anyhow!(CONN_LOCK_ERROR))?;
+        conn.execute(
+            "INSERT INTO eval (id, status, type, job_id, job_config_id, node_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6);",
+            params![id, status, kind, job_id, job_config_id, node_id],
+        )?;
+
+        Ok(())
     }
 
     // fn teardown_store(store: &Store) -> R<()> {
@@ -1595,6 +1675,95 @@ mod tests {
         assert_eq!(job_one_records, 0);
         assert_eq!(submission_count, 1);
         assert_eq!(job_two_submission_refs, 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn claim_eval_marks_in_flight_and_dedupes_pending() -> R<()> {
+        let store = setup_store()?;
+
+        store.insert_node(make_node_msg("node-1", "ready"))?;
+
+        insert_eval(
+            &store,
+            1,
+            "pending",
+            "node_join",
+            None,
+            None,
+            Some("node-1"),
+        )?;
+        insert_eval(
+            &store,
+            2,
+            "pending",
+            "node_join",
+            None,
+            None,
+            Some("node-1"),
+        )?;
+
+        let claimed = store.claim_eval()?.expect("eval should be claimed");
+        assert_eq!(claimed.id, "1");
+        assert_eq!(claimed.status, "in_flight");
+
+        let conn = store.conn.lock().map_err(|_| anyhow!(CONN_LOCK_ERROR))?;
+        let pending: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM eval WHERE status = 'pending';",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            pending, 0,
+            "duplicates for the same job/node should be removed"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn complete_eval_removes_or_marks_terminal() -> R<()> {
+        let store = setup_store()?;
+
+        store.insert_node(make_node_msg("node-1", "ready"))?;
+        store.insert_node(make_node_msg("node-2", "ready"))?;
+
+        insert_eval(
+            &store,
+            1,
+            "pending",
+            "node_join",
+            None,
+            None,
+            Some("node-1"),
+        )?;
+        insert_eval(
+            &store,
+            2,
+            "pending",
+            "node_drop",
+            None,
+            None,
+            Some("node-2"),
+        )?;
+
+        let first = store.claim_eval()?.expect("eval should be claimed");
+        store.complete_eval(&first.id, true)?;
+
+        let second = store.claim_eval()?.expect("second eval should be claimed");
+        store.complete_eval(&second.id, false)?;
+
+        let conn = store.conn.lock().map_err(|_| anyhow!(CONN_LOCK_ERROR))?;
+        let remaining: i64 = conn.query_row("SELECT COUNT(*) FROM eval;", [], |row| row.get(0))?;
+        assert_eq!(remaining, 1, "successful evals should be removed");
+
+        let failed_status: String = conn.query_row(
+            "SELECT status FROM eval WHERE id = ?;",
+            [second.id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(failed_status, "failed");
 
         Ok(())
     }
