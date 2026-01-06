@@ -1,8 +1,12 @@
-use rand::{seq::SliceRandom, thread_rng};
+use std::collections::HashSet;
+
+use anyhow::Context;
 use time::macros::format_description;
 use time::OffsetDateTime;
+use tracing::info;
 
-use crate::prelude::{bail, json, Context, R};
+use crate::manager::scheduler::{PlanMode, PlanOutcome, Scheduler};
+use crate::prelude::{bail, json, R};
 use crate::storage::store::Store;
 
 use super::node::Node;
@@ -25,6 +29,7 @@ impl Eval {
             "job_submit" => self.handle_job_submit(store),
             "job_update" => self.handle_job_update(store),
             "job_stop" => self.handle_job_stop(store),
+            "job_reschedule" => self.handle_job_reschedule(store),
             other => bail!("Unsupported eval kind: {other}"),
         }
     }
@@ -69,13 +74,43 @@ impl Eval {
         }
 
         store.mark_node_lost(node_id)?;
+        let lost_allocations = store.allocs_for_node(node_id)?;
 
-        Ok(format!("Node {node_id} dropped"))
+        if lost_allocations.is_empty() {
+            return Ok(format!("Node {node_id} dropped"));
+        }
+
+        store.remove_allocs_for_node(node_id)?;
+
+        let mut rescheduled_jobs = HashSet::new();
+        for alloc in lost_allocations {
+            if rescheduled_jobs.insert(alloc.job_config_id.clone()) {
+                store.enqueue_eval(
+                    "job_reschedule",
+                    Some(&alloc.job_id),
+                    Some(&alloc.job_config_id),
+                    Some(node_id),
+                )?;
+            }
+        }
+
+        Ok(format!(
+            "Node {node_id} dropped and queued {} reschedule eval(s)",
+            rescheduled_jobs.len()
+        ))
     }
 
     fn handle_job_submit(&self, store: &Store) -> R<String> {
-        self.schedule_job_allocations(store)?;
-        Ok(format!("Job {} submitted", self.job_id))
+        let outcome = self.schedule_job_allocations(store, PlanMode::Fresh)?;
+        if !outcome.deltas.is_empty() {
+            info!(?outcome.deltas, "Job submit allocation deltas");
+        }
+
+        Ok(format!(
+            "Job {} submitted with {} placements",
+            self.job_id,
+            outcome.allocations.len()
+        ))
     }
 
     fn handle_job_update(&self, store: &Store) -> R<String> {
@@ -84,9 +119,16 @@ impl Eval {
         }
 
         store.remove_allocs_for_job(&self.job_id)?;
-        self.schedule_job_allocations(store)?;
+        let outcome = self.schedule_job_allocations(store, PlanMode::Fresh)?;
+        if !outcome.deltas.is_empty() {
+            info!(?outcome.deltas, "Job update allocation deltas");
+        }
 
-        Ok(format!("Job {} updated", self.job_id))
+        Ok(format!(
+            "Job {} updated with {} placements",
+            self.job_id,
+            outcome.allocations.len()
+        ))
     }
 
     fn handle_job_stop(&self, store: &Store) -> R<String> {
@@ -99,39 +141,30 @@ impl Eval {
         Ok(format!("Job {} stopped", self.job_id))
     }
 
-    fn schedule_job_allocations(&self, store: &Store) -> R<()> {
+    fn handle_job_reschedule(&self, store: &Store) -> R<String> {
+        if self.job_id.trim().is_empty() || self.job_config_id.trim().is_empty() {
+            bail!("Eval job_reschedule missing identifiers");
+        }
+
+        let outcome = self.schedule_job_allocations(store, PlanMode::Reschedule)?;
+        if !outcome.deltas.is_empty() {
+            info!(?outcome.deltas, "Job reschedule allocation deltas");
+        }
+
+        Ok(format!(
+            "Job {} rescheduled with {} placements",
+            self.job_id,
+            outcome.allocations.len()
+        ))
+    }
+
+    fn schedule_job_allocations(&self, store: &Store, mode: PlanMode) -> R<PlanOutcome> {
         if self.job_config_id.trim().is_empty() {
             bail!("Eval missing job config id");
         }
 
-        let nodes: Vec<Node> = store
-            .get_nodes()?
-            .into_iter()
-            .filter(|node| node.availability == "available")
-            .collect();
-
-        if nodes.is_empty() {
-            bail!("No nodes available to place allocations");
-        }
-
-        let task_instances = store.get_task_instances_for_job_config(&self.job_config_id)?;
-        if task_instances.is_empty() {
-            return Ok(());
-        }
-
-        let mut rng = thread_rng();
-
-        for (task_id, count) in task_instances {
-            for _ in 0..count {
-                let node = nodes
-                    .choose(&mut rng)
-                    .context("No nodes available to place allocations")?;
-                // TODO: Add pluggable scheduling logic here
-                store.place_alloc(&node.id, task_id)?;
-            }
-        }
-
-        Ok(())
+        let scheduler = Scheduler::new(store);
+        scheduler.plan_and_apply(&self.job_config_id, mode)
     }
 
     fn current_timestamp() -> String {
