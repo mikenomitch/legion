@@ -1148,10 +1148,20 @@ impl Store {
 mod tests {
     use super::*;
     use rusqlite::params;
+    use tempfile::Builder;
 
     fn setup_store() -> R<Store> {
+        let store_dir = Builder::new()
+            .prefix("khepri-store-")
+            .tempdir()
+            .context("Error creating temp store directory")?
+            .keep();
+
         let store_config = ManagerConfigFull {
-            store_path: "tests/store".to_string(),
+            store_path: store_dir
+                .to_str()
+                .context("Error parsing store path")?
+                .to_string(),
             ..Default::default()
         };
 

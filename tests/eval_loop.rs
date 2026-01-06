@@ -4,11 +4,20 @@ use legion::structs::{
     config::ManagerConfigFull, job::JobConfig, job::TaskConfig, ledger::LedgerEntry, Eval,
     Submission,
 };
+use tempfile::Builder;
 
 fn setup_store() -> R<Store> {
-    let _ = std::fs::remove_dir_all("tests/eval_loop");
+    let store_dir = Builder::new()
+        .prefix("khepri-eval-loop-")
+        .tempdir()
+        .context("Error creating temp store directory")?
+        .keep();
+
     let store_config = ManagerConfigFull {
-        store_path: "tests/eval_loop".to_string(),
+        store_path: store_dir
+            .to_str()
+            .context("Error parsing store path")?
+            .to_string(),
         ..Default::default()
     };
 
