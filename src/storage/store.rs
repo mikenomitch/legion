@@ -674,11 +674,7 @@ impl Store {
             ":status": "active",
             ":job_id": job.id,
             ":to_job_config_id": job_config_id,
-            ":from_job_config_id": if last_versions_id.is_empty() {
-                None::<String>
-            } else {
-                Some(last_versions_id)
-            },
+            ":from_job_config_id": last_versions_id.clone(),
         };
 
         tx.execute(&INSERT_JOB_UPDATE, job_update_params)?;

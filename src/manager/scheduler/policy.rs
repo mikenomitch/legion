@@ -196,6 +196,40 @@ mod tests {
     }
 
     #[test]
+    fn bin_pack_prefers_lower_id_on_tie() {
+        let nodes = vec![node("node-a"), node("node-b")];
+        let allocations: HashMap<String, Vec<Allocation>> = HashMap::new();
+        let planned = HashMap::from([
+            (String::from("node-a"), 1_usize),
+            (String::from("node-b"), 1_usize),
+        ]);
+
+        let task = task("web");
+        let ctx = SchedulingContext::new(nodes.iter().collect(), &task, &allocations, &planned);
+        let policy = BinPackPolicy::default();
+
+        let choice = policy.select_node(ctx).expect("node expected");
+        assert_eq!(choice.id, "node-a");
+    }
+
+    #[test]
+    fn bin_pack_counts_planned_and_active_allocations() {
+        let nodes = vec![node("node-a"), node("node-b")];
+        let allocations: HashMap<String, Vec<Allocation>> = HashMap::from([
+            (String::from("node-a"), vec![alloc("node-a", 1), alloc("node-a", 2)]),
+            (String::from("node-b"), vec![alloc("node-b", 3)]),
+        ]);
+        let planned = HashMap::from([(String::from("node-b"), 2_usize)]);
+
+        let task = task("worker");
+        let ctx = SchedulingContext::new(nodes.iter().collect(), &task, &allocations, &planned);
+        let policy = BinPackPolicy::default();
+
+        let choice = policy.select_node(ctx).expect("node expected");
+        assert_eq!(choice.id, "node-b");
+    }
+
+    #[test]
     fn spread_prefers_least_loaded_node() {
         let nodes = vec![node("node-a"), node("node-b")];
         let allocations: HashMap<String, Vec<Allocation>> =
@@ -208,5 +242,36 @@ mod tests {
 
         let choice = policy.select_node(ctx).expect("node expected");
         assert_eq!(choice.id, "node-a");
+    }
+
+    #[test]
+    fn spread_prefers_lower_id_on_tie() {
+        let nodes = vec![node("node-a"), node("node-b")];
+        let allocations: HashMap<String, Vec<Allocation>> = HashMap::new();
+        let planned = HashMap::from([
+            (String::from("node-a"), 1_usize),
+            (String::from("node-b"), 1_usize),
+        ]);
+
+        let task = task("api");
+        let ctx = SchedulingContext::new(nodes.iter().collect(), &task, &allocations, &planned);
+        let policy = SpreadPolicy::default();
+
+        let choice = policy.select_node(ctx).expect("node expected");
+        assert_eq!(choice.id, "node-a");
+    }
+
+    #[test]
+    fn spread_returns_none_without_nodes() {
+        let nodes: Vec<Node> = vec![];
+        let allocations: HashMap<String, Vec<Allocation>> = HashMap::new();
+        let planned: HashMap<String, usize> = HashMap::new();
+
+        let task = task("api");
+        let ctx = SchedulingContext::new(nodes.iter().collect(), &task, &allocations, &planned);
+        let policy = SpreadPolicy::default();
+
+        let choice = policy.select_node(ctx);
+        assert!(choice.is_none());
     }
 }
