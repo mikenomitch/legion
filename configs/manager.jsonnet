@@ -6,4 +6,5 @@
   },
   storePath: ".legion",
   workerConfigPath: "./configs/workers/",
+  schedulingPolicy: "bin_pack",
 }

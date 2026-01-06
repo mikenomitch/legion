@@ -1,16 +1,6 @@
-mod certs;
-mod cmd;
-mod constants;
-mod manager;
-mod prelude;
-mod storage;
-mod structs;
-mod tracing_util;
-mod util;
-mod worker;
-
-use crate::prelude::*;
-use crate::tracing_util::init_tracing;
+use legion::cmd;
+use legion::prelude::*;
+use legion::tracing_util::init_tracing;
 
 fn cli() -> Command {
     Command::new("legion")

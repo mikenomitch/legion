@@ -1,0 +1,12 @@
+[package]
+name = "random"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+legion = { path = "../../..", version = "0.1.0" }
+rand = "0.8"
+serde_json = "1.0"
+
+[lib]
+crate-type = ["cdylib"]

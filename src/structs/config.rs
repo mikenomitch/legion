@@ -3,8 +3,8 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::prelude::{
-    DEF_MANAGER_HOSTNAME, DEF_MANAGER_INSECURE_PORT, DEF_MANAGER_SERVER_PORT, DEF_STORE_PATH,
-    DEF_WORKER_CHECK_SEC, DEF_WORKER_CONFIG_PATH,
+    DEF_MANAGER_HOSTNAME, DEF_MANAGER_INSECURE_PORT, DEF_MANAGER_SERVER_PORT,
+    DEF_SCHEDULING_POLICY, DEF_STORE_PATH, DEF_WORKER_CHECK_SEC, DEF_WORKER_CONFIG_PATH,
 };
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -22,6 +22,7 @@ pub struct ManagerConfig {
     pub store_path: Option<String>,
     pub worker_config_path: Option<String>,
     pub worker_check_seconds: Option<u64>,
+    pub scheduling_policy: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -63,13 +64,14 @@ impl ServerConfig {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ManagerConfigFull {
     pub server: ServerConfigFull,
     pub store_path: String,
     pub worker_config_path: String,
     pub worker_check_seconds: u64,
+    pub scheduling_policy: String,
 }
 
 impl From<ManagerConfigFull> for ManagerConfig {
@@ -79,6 +81,7 @@ impl From<ManagerConfigFull> for ManagerConfig {
             store_path: Some(val.store_path),
             worker_config_path: Some(val.worker_config_path),
             worker_check_seconds: Some(val.worker_check_seconds),
+            scheduling_policy: Some(val.scheduling_policy),
         }
     }
 }
@@ -102,6 +105,22 @@ impl ManagerConfig {
                 .clone()
                 .unwrap_or_else(|| DEF_WORKER_CONFIG_PATH.into()),
             worker_check_seconds: self.worker_check_seconds.unwrap_or(DEF_WORKER_CHECK_SEC),
+            scheduling_policy: self
+                .scheduling_policy
+                .clone()
+                .unwrap_or_else(|| DEF_SCHEDULING_POLICY.into()),
+        }
+    }
+}
+
+impl Default for ManagerConfigFull {
+    fn default() -> Self {
+        ManagerConfigFull {
+            server: ServerConfig::full_default(),
+            store_path: DEF_STORE_PATH.into(),
+            worker_config_path: DEF_WORKER_CONFIG_PATH.into(),
+            worker_check_seconds: DEF_WORKER_CHECK_SEC,
+            scheduling_policy: DEF_SCHEDULING_POLICY.into(),
         }
     }
 }
