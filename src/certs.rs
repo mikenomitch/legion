@@ -8,12 +8,20 @@ use rcgen::{
     BasicConstraints, CertificateParams, CertifiedKey, DistinguishedName, DnType, Ia5String, IsCa,
     KeyPair, KeyUsagePurpose, SanType,
 };
+use lazy_static::lazy_static;
 use std::fs;
 use std::fs::File;
 use std::io::{BufReader, Read};
+use std::sync::Mutex;
+
+lazy_static! {
+    static ref CERT_IO_LOCK: Mutex<()> = Mutex::new(());
+}
 
 #[allow(dead_code)]
 pub fn read_root_cert(pem_path: String, key_path: String) -> R<CertifiedKey> {
+    let _guard = CERT_IO_LOCK.lock().expect("cert IO lock poisoned");
+
     // Open the PEM file containing both the certificate and private key
 
     let pem_cert_file = File::open(pem_path)?;
@@ -43,6 +51,8 @@ pub fn read_root_cert(pem_path: String, key_path: String) -> R<CertifiedKey> {
 
 #[allow(dead_code)]
 pub fn create_ca_cert() -> R<CertifiedKey> {
+    let _guard = CERT_IO_LOCK.lock().expect("cert IO lock poisoned");
+
     let key_pair = KeyPair::generate()?;
 
     let mut dn = DistinguishedName::new();
@@ -62,11 +72,15 @@ pub fn create_ca_cert() -> R<CertifiedKey> {
     let cert_pem = cert.pem();
 
     std::fs::create_dir_all("configs/tls/")?;
-    fs::write("configs/tls/rootca.pem", cert_pem.as_bytes())?;
-    fs::write(
-        "configs/tls/rootca.key",
-        key_pair.serialize_pem().as_bytes(),
-    )?;
+
+    let cert_tmp = "configs/tls/rootca.pem.tmp";
+    let key_tmp = "configs/tls/rootca.key.tmp";
+
+    fs::write(cert_tmp, cert_pem.as_bytes())?;
+    fs::write(key_tmp, key_pair.serialize_pem().as_bytes())?;
+
+    fs::rename(cert_tmp, "configs/tls/rootca.pem")?;
+    fs::rename(key_tmp, "configs/tls/rootca.key")?;
 
     Ok(CertifiedKey { cert, key_pair })
 }

@@ -3,7 +3,7 @@ use crate::storage::migrations::get_migrations;
 use crate::storage::queries::{
     GET_ALLOCS, GET_ALLOCS_FOR_JOB, GET_ALLOCS_FOR_JOB_CONFIG, GET_ALLOCS_FOR_NODE, GET_JOB,
     GET_JOBS, GET_JOB_CONFIG, GET_NEXT_EVAL, GET_NODE, GET_NODES, GET_TASK_FOR_JOB_CONIFG,
-    GET_WORKER_TYPE, INSERT_ALLOCATION, INSERT_JOB, INSERT_JOB_CONFIG,
+    GET_WORKER_TYPE, INSERT_ALLOCATION, INSERT_EVAL, INSERT_JOB, INSERT_JOB_CONFIG,
     INSERT_JOB_CONFIG_SUBMISSION, INSERT_JOB_UPDATE, INSERT_NODE, INSERT_SUBMISSION, INSERT_TASK,
     INSERT_WORKER_TYPE, NODE_ATTRS,
 };
@@ -14,6 +14,7 @@ use crate::structs::{
 
 use rusqlite::{
     named_params, params_from_iter, Connection, Error as RusqliteError, OptionalExtension, Row,
+    Transaction,
 };
 use rusqlite_migration::Migrations;
 use serde_json::to_string;
@@ -554,7 +555,7 @@ impl Store {
         // I am not going to worry about this for now
 
         let mut next_version = 1;
-        let mut last_versions_id = "".to_string();
+        let mut last_versions_id: Option<String> = None;
 
         if let Ok(latest_job_config) = self.get_job_config(&config.name) {
             // if latest_job_config is deep equal to config, return an error
@@ -562,7 +563,7 @@ impl Store {
                 bail!("Job config is unchanged");
             } else {
                 next_version = latest_job_config.version.unwrap_or(0) + 1;
-                last_versions_id = latest_job_config.id();
+                last_versions_id = Some(latest_job_config.id());
             }
         }
 
@@ -707,6 +708,30 @@ impl Store {
         Ok(task_instances)
     }
 
+    #[instrument(err, skip_all)]
+    pub fn get_task_configs_for_job_config(
+        &self,
+        job_config_id: &str,
+    ) -> R<Vec<(i64, TaskConfig)>> {
+        let conn = self.connection()?;
+        let mut stmt = conn.prepare(&GET_TASK_FOR_JOB_CONIFG)?;
+        let rows = stmt.query_map([job_config_id], |row| {
+            let id = row.get(0)?;
+            let task = TaskConfig {
+                name: row.get(1)?,
+                kind: row.get(2)?,
+                count: row.get::<_, i64>(3)? as u32,
+                config: row.get(4)?,
+                resources: row.get(5)?,
+                constraints: row.get(6)?,
+            };
+
+            Ok((id, task))
+        })?;
+
+        Self::collect_rows(rows)
+    }
+
     //
     // ALLOCS
     //
@@ -715,7 +740,18 @@ impl Store {
     pub fn place_alloc(&self, node_id: &str, task_id: i64) -> R<Allocation> {
         let mut conn = self.conn.lock().map_err(|_| anyhow!(CONN_LOCK_ERROR))?;
         let tx = conn.transaction()?;
+        let allocation = self.insert_allocation(&tx, node_id, task_id)?;
+        tx.commit()?;
 
+        Ok(allocation)
+    }
+
+    fn insert_allocation(
+        &self,
+        tx: &Transaction<'_>,
+        node_id: &str,
+        task_id: i64,
+    ) -> R<Allocation> {
         let (job_config_id, resources): (String, Value) = tx.query_row(
             "SELECT job_config_id, resources FROM task_config WHERE id = ?;",
             [task_id],
@@ -734,9 +770,27 @@ impl Store {
             self.allocation_from_row(row)
         })?;
 
+        Ok(allocation)
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn apply_allocation_plan(&self, placements: &[(String, i64)]) -> R<Vec<Allocation>> {
+        if placements.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut conn = self.conn.lock().map_err(|_| anyhow!(CONN_LOCK_ERROR))?;
+        let tx = conn.transaction()?;
+        let mut allocations = Vec::new();
+
+        for placement in placements {
+            let allocation = self.insert_allocation(&tx, &placement.0, placement.1)?;
+            allocations.push(allocation);
+        }
+
         tx.commit()?;
 
-        Ok(allocation)
+        Ok(allocations)
     }
 
     #[instrument(err, skip_all)]
@@ -828,6 +882,14 @@ impl Store {
     }
 
     #[instrument(err, skip_all)]
+    pub fn remove_allocs_for_node(&self, node_id: &str) -> R<()> {
+        let conn = self.connection()?;
+        conn.execute("DELETE FROM allocation WHERE node_id = ?;", [node_id])?;
+
+        Ok(())
+    }
+
+    #[instrument(err, skip_all)]
     pub fn get_ledger(&self) -> R<Vec<LedgerEntry>> {
         let nodes = self.get_nodes()?;
         let allocations = self.get_allocs_by_node()?;
@@ -909,7 +971,7 @@ impl Store {
 
     #[instrument(err, skip_all)]
     pub fn complete_eval(&self, eval_id: &str, succeeded: bool) -> R<()> {
-        let mut conn = self.connection()?;
+        let conn: MutexGuard<'_, Connection> = self.connection()?;
 
         if succeeded {
             conn.execute("DELETE FROM eval WHERE id = ?;", [eval_id])?;
@@ -918,6 +980,46 @@ impl Store {
         }
 
         Ok(())
+    }
+
+    pub fn enqueue_eval(
+        &self,
+        kind: &str,
+        job_id: Option<&str>,
+        job_config_id: Option<&str>,
+        node_id: Option<&str>,
+    ) -> R<Eval> {
+        let mut conn = self.connection()?;
+        let tx = conn.transaction()?;
+
+        let next_id: i64 =
+            tx.query_row("SELECT COALESCE(MAX(id), 0) + 1 FROM eval;", [], |row| {
+                row.get(0)
+            })?;
+
+        let params = named_params! {
+            ":id": next_id,
+            ":status": "pending",
+            ":type": kind,
+            ":job_id": job_id.unwrap_or_default(),
+            ":job_config_id": job_config_id.unwrap_or_default(),
+            ":node_id": node_id.unwrap_or_default(),
+        };
+
+        tx.execute(&INSERT_EVAL, params)?;
+
+        let eval = Eval {
+            id: next_id.to_string(),
+            status: "pending".into(),
+            kind: kind.to_string(),
+            job_id: job_id.unwrap_or_default().to_string(),
+            job_config_id: job_config_id.unwrap_or_default().to_string(),
+            node_name: node_id.unwrap_or_default().to_string(),
+        };
+
+        tx.commit()?;
+
+        Ok(eval)
     }
 }
 

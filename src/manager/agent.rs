@@ -50,7 +50,7 @@ pub async fn run_manager(config: ManagerConfig) -> R<()> {
     let addr = format!("{}:{}", full_config.server.host, full_config.server.port).parse()?;
 
     let tls_identity = load_server_tls_identity()?;
-    let mut server_builder = match tls_identity {
+    let server_builder = match tls_identity {
         Some(identity) => {
             info!("Starting manager with TLS enabled");
             Server::builder().tls_config(ServerTlsConfig::new().identity(identity))?
