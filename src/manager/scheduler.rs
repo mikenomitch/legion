@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
-use libloading::Library;
 use serde_json::{Map, Value};
+
+use libloading::Library;
 
 use crate::prelude::*;
 use crate::storage::store::Store;
@@ -39,7 +40,7 @@ pub struct Scheduler<'a> {
     store: &'a Store,
     policy: Box<dyn SchedulingPolicy>,
     #[allow(dead_code)]
-    policy_lib: Library,
+    policy_lib: Option<Library>,
 }
 
 impl<'a> Scheduler<'a> {

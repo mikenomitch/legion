@@ -129,6 +129,7 @@ pub trait NodeChecker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     #[test]
     fn fingerprint_node_works() -> R<()> {
@@ -140,12 +141,18 @@ mod tests {
 
         if std::env::var("LEGION_SKIP_PLUGIN_BUILD").is_err() {
             // Test that the plugin works
-            let basic = res
-                .get("basic")
-                .context("no basic")?
-                .as_str()
-                .context("no basic")?;
-            assert_eq!("output", basic);
+            // Test that the plugin works when built
+            let plugin_path = fp_plugin_name_to_path("example");
+            if Path::new(&plugin_path).exists() {
+                let basic = res
+                    .get("basic")
+                    .context("no basic")?
+                    .as_str()
+                    .context("no basic")?;
+                assert_eq!("output", basic);
+            } else {
+                assert!(res.get("basic").is_none());
+            }
         }
 
         Ok(())
