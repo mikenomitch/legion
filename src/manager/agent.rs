@@ -12,6 +12,7 @@ use futures::join;
 use http::Method;
 use jsonnet::JsonnetVm;
 use std::fs;
+use std::time::Duration;
 use tonic::transport::{Identity, Server, ServerTlsConfig};
 use tonic_web::GrpcWebLayer;
 use tower_http::cors::{Any, CorsLayer};
@@ -155,26 +156,45 @@ async fn start_node_status_checker(store: Store, check_seconds: u64) -> R<()> {
 async fn start_eval_loop(store: Store) -> R<()> {
     info!("Beginning eval loop");
 
+    let mut backoff = Duration::from_secs(1);
+    let max_backoff = Duration::from_secs(30);
+
     loop {
-        match store.get_next_eval() {
-            Ok(Some(eval)) => match eval.handle(&store) {
-                Ok(message) => {
-                    info!("Eval {} handled successfully: {}", eval.id, message);
+        match store.claim_eval() {
+            Ok(Some(eval)) => {
+                backoff = Duration::from_secs(1);
+
+                match eval.handle(&store) {
+                    Ok(message) => {
+                        info!("Eval {} handled successfully: {}", eval.id, message);
+                        if let Err(e) = store.complete_eval(&eval.id, true) {
+                            error!("Error completing eval {}: {:?}", eval.id, e);
+                        }
+                    }
+                    Err(e) => {
+                        error!("Error handling eval {}: {:?}", eval.id, e);
+                        if let Err(complete_err) = store.complete_eval(&eval.id, false) {
+                            error!(
+                                "Error marking eval {} as failed after handling error: {:?}",
+                                eval.id, complete_err
+                            );
+                        }
+                    }
                 }
-                Err(e) => {
-                    error!("Error handling eval {}: {:?}", eval.id, e);
-                }
-            },
+
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
             Ok(None) => {
-                info!("No next evals to handle");
+                info!("No evals to handle; backing off");
+                tokio::time::sleep(backoff).await;
+                backoff = std::cmp::min(backoff * 2, max_backoff);
             }
             Err(e) => {
-                error!("Error getting next eval: {:?}", e);
+                error!("Error claiming next eval: {:?}", e);
+                tokio::time::sleep(backoff).await;
+                backoff = std::cmp::min(backoff * 2, max_backoff);
             }
         }
-
-        // Note: do I want a sleep here?
-        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
     }
 }
 
