@@ -1,0 +1,11 @@
+[package]
+name = "spread"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+legion = { path = "../../..", version = "0.1.0" }
+serde_json = "1.0"
+
+[lib]
+crate-type = ["cdylib"]

@@ -1,10 +1,14 @@
 use std::collections::HashMap;
 
+use libloading::Library;
 use serde_json::{Map, Value};
 
 use crate::prelude::*;
 use crate::storage::store::Store;
 use crate::structs::{Allocation, LedgerEntry, Node, TaskConfig};
+pub use policy::{load_policy, SchedulingContext, SchedulingPolicy};
+
+mod policy;
 
 #[derive(Debug, Clone)]
 pub struct PlannedAllocation {
@@ -31,14 +35,22 @@ pub struct PlanOutcome {
     pub deltas: Vec<LedgerDelta>,
 }
 
-#[derive(Debug)]
 pub struct Scheduler<'a> {
     store: &'a Store,
+    policy: Box<dyn SchedulingPolicy>,
+    #[allow(dead_code)]
+    policy_lib: Library,
 }
 
 impl<'a> Scheduler<'a> {
-    pub fn new(store: &'a Store) -> Self {
-        Scheduler { store }
+    pub fn new(store: &'a Store) -> R<Self> {
+        let (policy_lib, policy) = load_policy(&store.scheduling_policy)?;
+
+        Ok(Scheduler {
+            store,
+            policy,
+            policy_lib,
+        })
     }
 
     #[instrument(skip_all)]
@@ -121,7 +133,8 @@ impl<'a> Scheduler<'a> {
         tasks.sort_by(|a, b| a.0.cmp(&b.0));
 
         let mut placements = Vec::new();
-        let mut node_cursor = 0usize;
+        let mut planned: HashMap<String, usize> = HashMap::new();
+        let allocations = self.store.get_allocs_by_node()?;
 
         for (task_id, task_config, _desired_count) in tasks {
             let needed = required_counts.get(&task_id).copied().unwrap_or(0);
@@ -130,47 +143,40 @@ impl<'a> Scheduler<'a> {
             }
 
             for _ in 0..needed {
-                let node = self
-                    .next_node_for_task(&nodes, &task_config, &mut node_cursor)
-                    .with_context(|| format!("Failed to place task {}", task_config.name))?;
+                let eligible = nodes
+                    .iter()
+                    .filter(|node| Self::node_satisfies_constraints(node, &task_config.constraints))
+                    .collect::<Vec<_>>();
 
+                if eligible.is_empty() {
+                    bail!(
+                        "Failed to place task {}: no available nodes matching constraints",
+                        task_config.name
+                    );
+                }
+
+                let ctx = SchedulingContext::new(eligible, &task_config, &allocations, &planned);
+                let node_id = self
+                    .policy
+                    .select_node(ctx)
+                    .map(|node| node.id.clone())
+                    .with_context(|| {
+                        format!(
+                            "Scheduling policy {} failed to place task {}",
+                            self.policy.name(),
+                            task_config.name
+                        )
+                    })?;
+
+                *planned.entry(node_id.clone()).or_default() += 1;
                 placements.push(PlannedAllocation {
-                    node_id: node.id.clone(),
+                    node_id,
                     task_config_id: task_id,
                 });
             }
-
-            node_cursor = node_cursor.saturating_add(1) % nodes.len();
         }
 
         Ok(placements)
-    }
-
-    fn next_node_for_task<'b>(
-        &self,
-        nodes: &'b [Node],
-        task: &TaskConfig,
-        node_cursor: &mut usize,
-    ) -> R<&'b Node> {
-        let total_nodes = nodes.len();
-        if total_nodes == 0 {
-            bail!("No nodes available for placement");
-        }
-
-        for offset in 0..total_nodes {
-            let idx = (*node_cursor + offset) % total_nodes;
-            let candidate = &nodes[idx];
-
-            if Self::node_satisfies_constraints(candidate, &task.constraints) {
-                *node_cursor = idx;
-                return Ok(candidate);
-            }
-        }
-
-        bail!(
-            "No available nodes matching constraints for task {}",
-            task.name
-        )
     }
 
     fn node_satisfies_constraints(node: &Node, constraints: &Value) -> bool {
@@ -342,7 +348,7 @@ mod tests {
         store.handle_job_submit(&job, &[dummy_submission()])?;
         let job_config_id = store.get_job_config(&job.name)?.id();
 
-        let scheduler = Scheduler::new(&store);
+        let scheduler = Scheduler::new(&store)?;
         let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
 
         assert_eq!(outcome.allocations.len(), 3);
@@ -406,7 +412,7 @@ mod tests {
         let job_config_id = store.get_job_config(&job.name)?.id();
         let batch_id = task_id_for(&store, &job_config_id, "batch")?;
         store.place_alloc("node-a", batch_id)?;
-        let scheduler = Scheduler::new(&store);
+        let scheduler = Scheduler::new(&store)?;
         let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Reschedule)?;
 
         assert_eq!(outcome.allocations.len(), 2);
@@ -440,7 +446,7 @@ mod tests {
 
         store.handle_job_submit(&job, &[dummy_submission()])?;
         let job_config_id = store.get_job_config(&job.name)?.id();
-        let scheduler = Scheduler::new(&store);
+        let scheduler = Scheduler::new(&store)?;
 
         let err = scheduler
             .plan_and_apply(&job_config_id, PlanMode::Fresh)

@@ -141,7 +141,7 @@ impl Eval {
             bail!("Eval missing job config id");
         }
 
-        let scheduler = Scheduler::new(store);
+        let scheduler = Scheduler::new(store)?;
         scheduler.plan_and_apply(&self.job_config_id, mode)
     }
 

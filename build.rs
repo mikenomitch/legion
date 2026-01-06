@@ -1,6 +1,11 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let proto_file = "proto/legion.proto";
 
+    let skip_plugins = std::env::var("LEGION_SKIP_PLUGIN_BUILD").is_ok();
+    if !skip_plugins {
+        println!("cargo:rerun-if-changed=plugins");
+    }
+
     tonic_build::configure()
         .build_server(true)
         .type_attribute(".", "#[derive(serde::Deserialize, serde::Serialize)]")
@@ -11,11 +16,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // tonic_build::compile_protos("proto/legion.proto")?;
 
-    let skip_plugin_build = std::env::var_os("LEGION_SKIP_PLUGIN_BUILD").is_some();
-
-    if skip_plugin_build {
-        println!("cargo:warning=Skipping plugin builds");
-    } else {
+    if !skip_plugins {
         // For every plugin of every kind, build a release
         std::fs::read_dir("./plugins")?
             .filter_map(|entry| {
@@ -37,6 +38,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if path.is_dir() {
                             let mut cmd = std::process::Command::new("cargo");
                             cmd.arg("build").arg("--release");
+                            cmd.env("LEGION_SKIP_PLUGIN_BUILD", "1");
                             cmd.current_dir(path);
                             cmd.spawn().unwrap().wait().unwrap();
                         }

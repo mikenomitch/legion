@@ -36,6 +36,7 @@ pub type MemSafeConn = Arc<Mutex<Connection>>;
 #[derive(Debug)]
 pub struct Store {
     pub conn: MemSafeConn,
+    pub scheduling_policy: String,
 }
 
 pub const CONN_LOCK_ERROR: &str = "Error locking database connection";
@@ -47,7 +48,10 @@ impl Store {
         let conn = Store::create_memsafe_conn(&config.store_path)?;
         let _migrations = Store::create_initial_tables(&Arc::clone(&conn))?;
 
-        let store = Store { conn };
+        let store = Store {
+            conn,
+            scheduling_policy: config.scheduling_policy.clone(),
+        };
 
         Ok(store)
     }
