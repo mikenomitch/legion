@@ -4,11 +4,11 @@ use crate::prelude::*;
 // Do I need openssl?
 // extern crate openssl;
 
+use lazy_static::lazy_static;
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedKey, DistinguishedName, DnType, Ia5String, IsCa,
     KeyPair, KeyUsagePurpose, SanType,
 };
-use lazy_static::lazy_static;
 use std::fs;
 use std::fs::File;
 use std::io::{BufReader, Read};

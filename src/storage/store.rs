@@ -1,8 +1,8 @@
 use crate::prelude::*;
 use crate::storage::migrations::get_migrations;
 use crate::storage::queries::{
-    GET_ALLOCS, GET_ALLOCS_FOR_JOB, GET_ALLOCS_FOR_JOB_CONFIG, GET_ALLOCS_FOR_NODE, GET_JOB,
-    GET_JOBS, GET_JOB_CONFIG, GET_NEXT_EVAL, GET_NODE, GET_NODES, GET_TASK_FOR_JOB_CONIFG,
+    GET_ALLOCS, GET_ALLOCS_FOR_JOB, GET_ALLOCS_FOR_JOB_CONFIG, GET_ALLOCS_FOR_NODE, GET_EVALS,
+    GET_JOB, GET_JOBS, GET_JOB_CONFIG, GET_NEXT_EVAL, GET_NODE, GET_NODES, GET_TASK_FOR_JOB_CONIFG,
     GET_WORKER_TYPE, INSERT_ALLOCATION, INSERT_EVAL, INSERT_JOB, INSERT_JOB_CONFIG,
     INSERT_JOB_CONFIG_SUBMISSION, INSERT_JOB_UPDATE, INSERT_NODE, INSERT_SUBMISSION, INSERT_TASK,
     INSERT_WORKER_TYPE, NODE_ATTRS,
@@ -12,6 +12,7 @@ use crate::structs::{
     TaskConfig, WorkerConfig,
 };
 
+use rand::{seq::SliceRandom, thread_rng};
 use rusqlite::{
     named_params, params_from_iter, Connection, Error as RusqliteError, OptionalExtension, Row,
     Transaction,
@@ -19,6 +20,7 @@ use rusqlite::{
 use rusqlite_migration::Migrations;
 use serde_json::to_string;
 use serde_rusqlite::to_params_named;
+use std::collections::HashSet;
 use std::sync::MutexGuard;
 use time::macros::format_description;
 use time::OffsetDateTime;
@@ -254,6 +256,20 @@ impl Store {
         conn.execute(sql, params)?;
 
         Ok(())
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn remove_allocs_for_node(&self, node_id: &str) -> R<Vec<Allocation>> {
+        let allocs = self.allocs_for_node(node_id)?;
+
+        if allocs.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let conn = self.connection()?;
+        conn.execute("DELETE FROM allocation WHERE node_id = ?;", [node_id])?;
+
+        Ok(allocs)
     }
 
     #[instrument(err, skip_all)]
@@ -654,7 +670,11 @@ impl Store {
             ":status": "active",
             ":job_id": job.id,
             ":to_job_config_id": job_config_id,
-            ":from_job_config_id": last_versions_id,
+            ":from_job_config_id": if last_versions_id.is_empty() {
+                None::<String>
+            } else {
+                Some(last_versions_id)
+            },
         };
 
         tx.execute(&INSERT_JOB_UPDATE, job_update_params)?;
@@ -794,6 +814,18 @@ impl Store {
     }
 
     #[instrument(err, skip_all)]
+    pub fn count_allocations_for_task(&self, task_id: i64) -> R<u32> {
+        let conn = self.connection()?;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM allocation WHERE task_config_id = ?;",
+            [task_id],
+            |row| row.get(0),
+        )?;
+
+        Ok(count as u32)
+    }
+
+    #[instrument(err, skip_all)]
     pub fn allocs_for_job(&self, job_id: &str) -> R<Vec<Allocation>> {
         let conn = self.conn.lock().map_err(|_| anyhow!(CONN_LOCK_ERROR))?;
         let mut stmt = conn.prepare(GET_ALLOCS_FOR_JOB.as_str())?;
@@ -882,9 +914,54 @@ impl Store {
     }
 
     #[instrument(err, skip_all)]
-    pub fn remove_allocs_for_node(&self, node_id: &str) -> R<()> {
-        let conn = self.connection()?;
-        conn.execute("DELETE FROM allocation WHERE node_id = ?;", [node_id])?;
+    pub fn reconcile_job_config_allocations(&self, job_config_id: &str) -> R<()> {
+        let nodes: Vec<Node> = self
+            .get_nodes()?
+            .into_iter()
+            .filter(|node| node.availability == "available")
+            .collect();
+
+        if nodes.is_empty() {
+            bail!("No nodes available to place allocations");
+        }
+
+        let task_instances = self.get_task_instances_for_job_config(job_config_id)?;
+        if task_instances.is_empty() {
+            return Ok(());
+        }
+
+        let mut rng = thread_rng();
+
+        for (task_id, desired_count) in task_instances {
+            let current = self.count_allocations_for_task(task_id)?;
+
+            for _ in current..desired_count {
+                let node = nodes
+                    .choose(&mut rng)
+                    .context("No nodes available to place allocations")?;
+                self.place_alloc(&node.id, task_id)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn reschedule_allocations_for_lost_node(&self, node_id: &str) -> R<()> {
+        let removed_allocs = self.remove_allocs_for_node(node_id)?;
+
+        if removed_allocs.is_empty() {
+            return Ok(());
+        }
+
+        let affected_job_configs: HashSet<String> = removed_allocs
+            .into_iter()
+            .map(|alloc| alloc.job_config_id)
+            .collect();
+
+        for job_config_id in affected_job_configs {
+            self.reconcile_job_config_allocations(&job_config_id)?;
+        }
 
         Ok(())
     }
@@ -910,6 +987,44 @@ impl Store {
     //
     // EVALS
     //
+
+    #[instrument(err, skip_all)]
+    pub fn insert_eval(&self, eval: &Eval) -> R<()> {
+        let conn = self.connection()?;
+
+        conn.execute("PRAGMA foreign_keys = OFF;", [])?;
+
+        let params = named_params! {
+            ":id": eval.id,
+            ":status": eval.status,
+            ":type": eval.kind,
+            ":job_id": if eval.job_id.is_empty() { None::<String> } else { Some(eval.job_id.clone()) },
+            ":job_config_id": if eval.job_config_id.is_empty() { None::<String> } else { Some(eval.job_config_id.clone()) },
+            ":node_id": if eval.node_name.is_empty() { None::<String> } else { Some(eval.node_name.clone()) },
+        };
+
+        conn.execute(&INSERT_EVAL, params)?;
+        conn.execute("PRAGMA foreign_keys = ON;", [])?;
+
+        Ok(())
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn set_eval_status(&self, id: &str, status: &str) -> R<()> {
+        let conn = self.connection()?;
+        conn.execute("UPDATE eval SET status = ? WHERE id = ?;", [status, id])?;
+
+        Ok(())
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn get_evals(&self) -> R<Vec<Eval>> {
+        let conn = self.connection()?;
+        let mut stmt = conn.prepare(&GET_EVALS)?;
+        let rows = stmt.query_map([], |row| self.eval_from_row(row))?;
+
+        Self::collect_rows(rows)
+    }
 
     // #[instrument(err, skip_all)]
     pub fn get_next_eval(&self) -> R<Option<Eval>> {
@@ -1033,10 +1148,20 @@ impl Store {
 mod tests {
     use super::*;
     use rusqlite::params;
+    use tempfile::Builder;
 
     fn setup_store() -> R<Store> {
+        let store_dir = Builder::new()
+            .prefix("khepri-store-")
+            .tempdir()
+            .context("Error creating temp store directory")?
+            .keep();
+
         let store_config = ManagerConfigFull {
-            store_path: "tests/store".to_string(),
+            store_path: store_dir
+                .to_str()
+                .context("Error parsing store path")?
+                .to_string(),
             ..Default::default()
         };
 
