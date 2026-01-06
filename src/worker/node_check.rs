@@ -138,13 +138,15 @@ mod tests {
         let os = res.get("os").context("no os")?.as_str().context("no os")?;
         assert_eq!(std::env::consts::OS, os);
 
-        // Test that the plugin works
-        let basic = res
-            .get("basic")
-            .context("no basic")?
-            .as_str()
-            .context("no basic")?;
-        assert_eq!("output", basic);
+        if std::env::var("LEGION_SKIP_PLUGIN_BUILD").is_err() {
+            // Test that the plugin works
+            let basic = res
+                .get("basic")
+                .context("no basic")?
+                .as_str()
+                .context("no basic")?;
+            assert_eq!("output", basic);
+        }
 
         Ok(())
     }
