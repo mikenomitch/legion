@@ -1,7 +1,8 @@
-import { For, Show, createMemo, type Resource } from 'solid-js'
+import { For, Show, createEffect, createMemo, onCleanup, type Resource } from 'solid-js'
 import { createStore } from 'solid-js/store'
 import type { Job, Submission } from '../gen/legion_pb'
 import { managerClient } from '../grpcClient'
+import { POLL_INTERVAL_MS } from '../utils/polling'
 import { formatDate } from '../utils/format'
 
 interface JobsProps {
@@ -28,12 +29,38 @@ export default function Jobs(props: JobsProps) {
     }
   }
 
+  const refreshSpec = async (key: string) => {
+    const current = specs[key]
+    if (!current) return
+
+    setSpecs(key, (prev) => ({ ...prev, loading: true, error: undefined }))
+    try {
+      const response = await managerClient.getJobSpec({ name: key })
+      setSpecs(key, (prev) => ({ ...prev, loading: false, submissions: response.submissions }))
+    } catch (error) {
+      console.error('Failed to refresh job spec', error)
+      setSpecs(key, (prev) => ({ ...prev, loading: false, error: 'Unable to load job spec' }))
+    }
+  }
+
   const toggleSpecVisibility = (job: Job) => {
     const key = job.name || job.id
     if (!key) return
 
     setSpecs(key, (current) => (current ? { ...current, expanded: !current.expanded } : current))
   }
+
+  createEffect(() => {
+    const interval = window.setInterval(() => {
+      Object.entries(specs).forEach(([key, value]) => {
+        if (value?.expanded) {
+          void refreshSpec(key)
+        }
+      })
+    }, POLL_INTERVAL_MS)
+
+    onCleanup(() => window.clearInterval(interval))
+  })
 
   return (
     <Show when={!props.jobs.loading} fallback={<p class="text-neutral-500">Loading jobs…</p>}>
