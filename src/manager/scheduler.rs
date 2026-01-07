@@ -181,7 +181,7 @@ impl<'a> Scheduler<'a> {
         Ok(placements)
     }
 
-    fn apply_nodes_considered<'a>(&self, eligible: Vec<&'a Node>) -> R<Vec<&'a Node>> {
+    fn apply_nodes_considered<'b>(&self, eligible: Vec<&'b Node>) -> R<Vec<&'b Node>> {
         if eligible.len() <= 1 {
             return Ok(eligible);
         }

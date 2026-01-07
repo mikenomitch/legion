@@ -197,6 +197,9 @@ async fn start_eval_loop(store: Store, max_threads: usize) -> R<()> {
 fn spawn_eval_worker(join_set: &mut JoinSet<()>, store: &Store, worker_id: usize) {
     let store_for_eval = Store {
         conn: store.conn.clone(),
+        scheduling_policy: store.scheduling_policy.clone(),
+        default_eval_priority: store.default_eval_priority,
+        scheduler_settings: store.scheduler_settings.clone(),
     };
 
     join_set.spawn_blocking(move || eval_worker_loop(store_for_eval, worker_id));
