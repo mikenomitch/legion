@@ -13,10 +13,7 @@ use crate::worker::{
 
 use futures::join;
 use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
-use tonic::{
-    transport::Certificate, transport::Channel, transport::ClientTlsConfig, transport::Server,
-    Response,
-};
+use tonic::{transport::Channel, transport::Server, Response};
 
 #[instrument(err, skip_all)]
 pub async fn run_worker(token: &str) -> R<()> {

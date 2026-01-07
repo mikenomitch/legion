@@ -9,9 +9,11 @@ fn render_job_spec(path: &str) -> String {
         Ok((base.into(), contents))
     });
 
-    vm.evaluate_file(path)
+    let rendered = vm
+        .evaluate_file(path)
         .expect("jsonnet should evaluate")
-        .to_string()
+        .to_string();
+    rendered
 }
 
 #[test]

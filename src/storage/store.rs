@@ -83,7 +83,7 @@ impl Store {
             read_conns: Arc::new(read_conns),
             read_index: Arc::new(AtomicUsize::new(0)),
             scheduling_policy: config.scheduling_policy.clone(),
-            default_eval_priority: config.default_priority.clone(),
+            default_eval_priority: config.default_priority,
             scheduler_settings: config.scheduler_settings.clone(),
         };
 
@@ -161,9 +161,7 @@ impl Store {
     fn read_connection(&self) -> R<MutexGuard<'_, Connection>> {
         let pool = self.read_conns.as_slice();
         let index = self.read_index.fetch_add(1, Ordering::Relaxed);
-        let conn = pool
-            .get(index % pool.len())
-            .unwrap_or(&self.write_conn);
+        let conn = pool.get(index % pool.len()).unwrap_or(&self.write_conn);
         Self::lock_conn(conn)
     }
 
@@ -619,8 +617,7 @@ impl Store {
             )?;
 
             let rows = sub_stmt.query_map([job.id.clone()], |row| row.get(0))?;
-            let hashes = Self::collect_rows(rows)?;
-            hashes
+            Self::collect_rows(rows)?
         };
 
         let delete_sql = r#"
@@ -1374,6 +1371,7 @@ mod tests {
             store_path: "tests/store".into(),
             worker_config_path: "configs/workers".into(),
             worker_check_seconds: 5,
+            ..ManagerConfigFull::default()
         };
 
         store.upsert_manager_config("manager-a", &config)?;
