@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::{Map, Value};
 
@@ -6,7 +6,7 @@ use libloading::Library;
 
 use crate::prelude::*;
 use crate::storage::store::Store;
-use crate::structs::{Allocation, LedgerEntry, Node, TaskConfig};
+use crate::structs::{Allocation, Node, TaskConfig};
 pub use policy::{load_policy, SchedulingContext, SchedulingPolicy};
 
 mod policy;
@@ -98,14 +98,16 @@ impl<'a> Scheduler<'a> {
             });
         }
 
-        let ledger_before = self.store.get_ledger()?;
         let placement_pairs = placements
             .iter()
             .map(|placement| (placement.node_id.clone(), placement.task_config_id))
             .collect::<Vec<_>>();
+        let affected_nodes = placements
+            .iter()
+            .map(|placement| placement.node_id.clone())
+            .collect::<HashSet<_>>();
         let allocations = self.store.apply_allocation_plan(&placement_pairs)?;
-        let ledger_after = self.store.get_ledger()?;
-        let deltas = Self::ledger_delta(&ledger_before, &ledger_after);
+        let deltas = Self::allocations_delta(&affected_nodes, &allocations);
 
         Ok(PlanOutcome {
             allocations,
@@ -291,43 +293,40 @@ impl<'a> Scheduler<'a> {
             .all(|(key, value)| attrs.get(key).map(|attr| attr == value).unwrap_or(false))
     }
 
-    fn ledger_delta(before: &[LedgerEntry], after: &[LedgerEntry]) -> Vec<LedgerDelta> {
-        let mut before_map: HashMap<String, Vec<Allocation>> = before
-            .iter()
-            .map(|entry| (entry.node.id.clone(), entry.allocations.clone()))
-            .collect();
+    fn allocations_delta(
+        affected_nodes: &HashSet<String>,
+        allocations: &[Allocation],
+    ) -> Vec<LedgerDelta> {
+        let mut added_by_node: HashMap<String, Vec<Allocation>> = HashMap::new();
+        for allocation in allocations {
+            added_by_node
+                .entry(allocation.node_id.clone())
+                .or_default()
+                .push(allocation.clone());
+        }
+
+        let mut ordered_nodes = affected_nodes.iter().collect::<Vec<_>>();
+        ordered_nodes.sort();
 
         let mut deltas = Vec::new();
-
-        for entry in after {
-            let prev = before_map.remove(&entry.node.id).unwrap_or_default();
-            let added = entry
-                .allocations
-                .iter()
-                .filter(|alloc| !prev.iter().any(|p| p.id == alloc.id))
-                .cloned()
-                .collect::<Vec<_>>();
-            let removed = prev
-                .iter()
-                .filter(|alloc| !entry.allocations.iter().any(|p| p.id == alloc.id))
-                .cloned()
-                .collect::<Vec<_>>();
-
-            if !added.is_empty() || !removed.is_empty() {
-                deltas.push(LedgerDelta {
-                    node_id: entry.node.id.clone(),
-                    added,
-                    removed,
-                });
+        for node_id in ordered_nodes {
+            if let Some(added) = added_by_node.remove(*node_id) {
+                if !added.is_empty() {
+                    deltas.push(LedgerDelta {
+                        node_id: (*node_id).clone(),
+                        added,
+                        removed: Vec::new(),
+                    });
+                }
             }
         }
 
-        for (node_id, allocations) in before_map {
-            if !allocations.is_empty() {
+        for (node_id, added) in added_by_node {
+            if !added.is_empty() {
                 deltas.push(LedgerDelta {
                     node_id,
-                    added: Vec::new(),
-                    removed: allocations,
+                    added,
+                    removed: Vec::new(),
                 });
             }
         }
