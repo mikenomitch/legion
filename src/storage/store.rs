@@ -1447,13 +1447,23 @@ impl Store {
         let mut conn = self.write_connection()?;
         let tx = conn.transaction()?;
 
+        let job_id_value = job_id
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string);
+        let job_config_id_value = job_config_id
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string);
+        let node_id_value = node_id
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string);
+
         let params = named_params! {
             ":id": None::<i64>,
             ":status": "pending",
             ":type": kind,
-            ":job_id": job_id.unwrap_or_default(),
-            ":job_config_id": job_config_id.unwrap_or_default(),
-            ":node_id": node_id.unwrap_or_default(),
+            ":job_id": job_id_value,
+            ":job_config_id": job_config_id_value,
+            ":node_id": node_id_value,
             ":priority": priority.unwrap_or(self.default_eval_priority),
         };
 
@@ -1464,9 +1474,9 @@ impl Store {
             id: next_id.to_string(),
             status: "pending".into(),
             kind: kind.to_string(),
-            job_id: job_id.unwrap_or_default().to_string(),
-            job_config_id: job_config_id.unwrap_or_default().to_string(),
-            node_name: node_id.unwrap_or_default().to_string(),
+            job_id: job_id_value.unwrap_or_default(),
+            job_config_id: job_config_id_value.unwrap_or_default(),
+            node_name: node_id_value.unwrap_or_default(),
             priority: priority.unwrap_or(self.default_eval_priority),
         };
 
