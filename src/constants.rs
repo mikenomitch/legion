@@ -14,6 +14,7 @@ pub const DEF_INSECURE_ADDR: &str = "http://127.0.0.1:4748";
 // Loop time in manager rechecking nodes
 pub const DEF_WORKER_CHECK_SEC: u64 = 2;
 pub const DEF_SCHEDULING_POLICY: &str = "bin_pack";
+pub const DEF_EVAL_PRIORITY: i64 = 50;
 // Amount of time since last heartbeat before a node is considered lost
 pub const DEF_LOST_NODE_AT_SEC: i64 = 10;
 

@@ -188,6 +188,7 @@ mod tests {
             job_id: String::new(),
             job_config_id: String::new(),
             node_name: "node-1".into(),
+            priority: 50,
         };
         node_one_eval.handle(&store)?;
 
@@ -203,6 +204,7 @@ mod tests {
             job_id: String::new(),
             job_config_id: String::new(),
             node_name: "node-2".into(),
+            priority: 50,
         };
         node_two_eval.handle(&store)?;
 
@@ -240,6 +242,7 @@ mod tests {
             job_id: job_one_name.clone(),
             job_config_id: job_one_config_id.clone(),
             node_name: String::new(),
+            priority: 50,
         };
         job_one_eval.handle(&store)?;
 
@@ -252,6 +255,7 @@ mod tests {
             job_id: job_one_name.clone(),
             job_config_id: job_one_config_id_v2.clone(),
             node_name: String::new(),
+            priority: 50,
         };
         job_update_eval.handle(&store)?;
 
@@ -292,6 +296,7 @@ mod tests {
             job_id: job_two_name.clone(),
             job_config_id: job_two_config_id.clone(),
             node_name: String::new(),
+            priority: 50,
         };
         job_two_submit_eval.handle(&store)?;
 
@@ -306,6 +311,7 @@ mod tests {
             job_id: job_one_name.clone(),
             job_config_id: job_one_config_id_v2.clone(),
             node_name: String::new(),
+            priority: 50,
         };
         stop_job_one_eval.handle(&store)?;
 
@@ -324,6 +330,7 @@ mod tests {
             job_id: job_two_name,
             job_config_id: job_two_config_id,
             node_name: String::new(),
+            priority: 50,
         };
         stop_job_two_eval.handle(&store)?;
 

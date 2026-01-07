@@ -412,11 +412,11 @@ lazy_static! {
 //
 
 pub const EVAL_ATTRS: &str = r#"
-id, status, type, job_id, job_config_id, node_id
+id, status, type, job_id, job_config_id, node_id, priority
 "#;
 
 pub const EVAL_ATTRS_VALS: &str = r#"
-:id, :status, :type, :job_id, :job_config_id, :node_id
+:id, :status, :type, :job_id, :job_config_id, :node_id, :priority
 "#;
 
 // pub const EVAL_PARAM_SET: &str = r#"
@@ -429,7 +429,7 @@ lazy_static! {
     SELECT {EVAL_ATTRS}
     FROM eval
     WHERE status = 'pending'
-    ORDER BY id ASC
+    ORDER BY priority DESC, id ASC
     LIMIT 1;
     "#
     );
