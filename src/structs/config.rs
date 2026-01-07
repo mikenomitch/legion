@@ -137,17 +137,6 @@ impl Default for ManagerConfigFull {
             scheduling_policy: DEF_SCHEDULING_POLICY.into(),
             default_priority: DEF_EVAL_PRIORITY,
             scheduler_settings: None,
-        }
-    }
-}
-
-impl Default for ManagerConfigFull {
-    fn default() -> Self {
-        ManagerConfigFull {
-            server: ServerConfig::full_default(),
-            store_path: DEF_STORE_PATH.into(),
-            worker_config_path: DEF_WORKER_CONFIG_PATH.into(),
-            worker_check_seconds: DEF_WORKER_CHECK_SEC,
             eval_threads: default_eval_threads(),
         }
     }
