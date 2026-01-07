@@ -280,14 +280,23 @@ mod tests {
     }
 
     fn make_node_msg(id: &str, attrs: Value) -> NodeMsg {
+        make_node_msg_with_sources(id, attrs, json!({}), json!({}))
+    }
+
+    fn make_node_msg_with_sources(
+        id: &str,
+        config_attrs: Value,
+        fingerprint_attrs: Value,
+        dynamic_attrs: Value,
+    ) -> NodeMsg {
         NodeMsg {
             id: id.to_string(),
             pool: "default".into(),
             status: "active".into(),
             availability: "available".into(),
-            config_attrs: attrs.to_string(),
-            fingerprint_attrs: "{}".into(),
-            dynamic_attrs: "{}".into(),
+            config_attrs: config_attrs.to_string(),
+            fingerprint_attrs: fingerprint_attrs.to_string(),
+            dynamic_attrs: dynamic_attrs.to_string(),
             health_checks: "{}".into(),
             last_heartbeat: "2023-01-01 00:00:00 +00:00:00".into(),
         }
@@ -454,6 +463,81 @@ mod tests {
             .expect_err("expected scheduling error");
 
         assert!(err.to_string().contains("Failed to place task analytics"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn constraint_matching_across_node_attributes() -> R<()> {
+        let node = Node {
+            id: "node-mixed".into(),
+            status: "active".into(),
+            pool: "default".into(),
+            availability: "available".into(),
+            last_heartbeat: "2023-01-01 00:00:00 +00:00:00".into(),
+            config_attrs: json!({ "role": "db" }),
+            fingerprint_attrs: json!({ "arch": "arm64" }),
+            dynamic_attrs: json!({ "zone": "us-east" }),
+            health_checks: json!({}),
+        };
+
+        let constraints = json!({
+            "role": "db",
+            "arch": "arm64",
+            "zone": "us-east",
+        });
+
+        assert!(Scheduler::node_satisfies_constraints(&node, &constraints));
+
+        let mismatched = json!({ "role": "web", "arch": "arm64", "zone": "us-east" });
+        assert!(!Scheduler::node_satisfies_constraints(&node, &mismatched));
+
+        Ok(())
+    }
+
+    #[test]
+    fn scheduler_uses_nodes_matching_constraints_from_any_attribute_source() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", json!({ "role": "web" })))?;
+        store.insert_node(make_node_msg_with_sources(
+            "node-b",
+            json!({}),
+            json!({ "role": "db" }),
+            json!({}),
+        ))?;
+        store.insert_node(make_node_msg_with_sources(
+            "node-c",
+            json!({}),
+            json!({}),
+            json!({ "role": "db" }),
+        ))?;
+
+        let job = JobConfig {
+            name: "constraint-sources".into(),
+            tasks: vec![TaskConfig {
+                name: "db".into(),
+                count: 2,
+                kind: "noop".into(),
+                config: json!({}),
+                resources: json!({}),
+                constraints: json!({ "role": "db" }),
+            }],
+            version: None,
+        };
+
+        store.handle_job_submit(&job, &[dummy_submission()])?;
+        let job_config_id = store.get_job_config(&job.name)?.id();
+        let scheduler = Scheduler::new(&store)?;
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+
+        assert_eq!(outcome.allocations.len(), 2);
+        for alloc in &outcome.allocations {
+            let node = store.get_node(&alloc.node_id)?;
+            assert!(Scheduler::node_satisfies_constraints(
+                &node,
+                &json!({ "role": "db" })
+            ));
+        }
 
         Ok(())
     }
