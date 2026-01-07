@@ -23,8 +23,10 @@ pub async fn run_manager(config: ManagerConfig) -> R<()> {
     info!("Starting manager node");
 
     let full_config = config.with_defaults();
+    let manager_node_id = format!("{}:{}", full_config.server.host, full_config.server.port);
     let store = Store::start_storage(&full_config)?;
     load_initial_data(&store, &config).await?;
+    store.upsert_manager_config(&manager_node_id, &full_config)?;
 
     // Spawn a separate grpc server for non-TLS calls
     let join_server_addr = format!(

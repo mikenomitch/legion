@@ -1237,6 +1237,123 @@ export class GetLedgerReply extends Message<GetLedgerReply> {
 }
 
 /**
+ * @generated from message legion.ManagerNodeConfig
+ */
+export class ManagerNodeConfig extends Message<ManagerNodeConfig> {
+  /**
+   * @generated from field: string node_id = 1;
+   */
+  nodeId = "";
+
+  /**
+   * @generated from field: string config_json = 2;
+   */
+  configJson = "";
+
+  /**
+   * @generated from field: string updated_at = 3;
+   */
+  updatedAt = "";
+
+  constructor(data?: PartialMessage<ManagerNodeConfig>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ManagerNodeConfig";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "config_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "updated_at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ManagerNodeConfig {
+    return new ManagerNodeConfig().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ManagerNodeConfig {
+    return new ManagerNodeConfig().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ManagerNodeConfig {
+    return new ManagerNodeConfig().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ManagerNodeConfig | PlainMessage<ManagerNodeConfig> | undefined, b: ManagerNodeConfig | PlainMessage<ManagerNodeConfig> | undefined): boolean {
+    return proto3.util.equals(ManagerNodeConfig, a, b);
+  }
+}
+
+/**
+ * @generated from message legion.GetManagerConfigsRequest
+ */
+export class GetManagerConfigsRequest extends Message<GetManagerConfigsRequest> {
+  constructor(data?: PartialMessage<GetManagerConfigsRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetManagerConfigsRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetManagerConfigsRequest {
+    return new GetManagerConfigsRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetManagerConfigsRequest {
+    return new GetManagerConfigsRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetManagerConfigsRequest {
+    return new GetManagerConfigsRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetManagerConfigsRequest | PlainMessage<GetManagerConfigsRequest> | undefined, b: GetManagerConfigsRequest | PlainMessage<GetManagerConfigsRequest> | undefined): boolean {
+    return proto3.util.equals(GetManagerConfigsRequest, a, b);
+  }
+}
+
+/**
+ * @generated from message legion.GetManagerConfigsReply
+ */
+export class GetManagerConfigsReply extends Message<GetManagerConfigsReply> {
+  /**
+   * @generated from field: repeated legion.ManagerNodeConfig configs = 1;
+   */
+  configs: ManagerNodeConfig[] = [];
+
+  constructor(data?: PartialMessage<GetManagerConfigsReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetManagerConfigsReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "configs", kind: "message", T: ManagerNodeConfig, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetManagerConfigsReply {
+    return new GetManagerConfigsReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetManagerConfigsReply {
+    return new GetManagerConfigsReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetManagerConfigsReply {
+    return new GetManagerConfigsReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetManagerConfigsReply | PlainMessage<GetManagerConfigsReply> | undefined, b: GetManagerConfigsReply | PlainMessage<GetManagerConfigsReply> | undefined): boolean {
+    return proto3.util.equals(GetManagerConfigsReply, a, b);
+  }
+}
+
+/**
  * @generated from message legion.LedgerNode
  */
 export class LedgerNode extends Message<LedgerNode> {

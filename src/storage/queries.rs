@@ -446,3 +446,35 @@ lazy_static! {
     "#
     );
 }
+
+//
+// MANAGER CONFIG
+//
+
+pub const MANAGER_CONFIG_ATTRS: &str = r#"
+node_id, config, updated_at
+"#;
+
+pub const MANAGER_CONFIG_ATTRS_VALS: &str = r#"
+:node_id, :config, :updated_at
+"#;
+
+pub const MANAGER_CONFIG_PARAM_SET: &str = r#"
+config = :config, updated_at = :updated_at
+"#;
+
+lazy_static! {
+    pub static ref UPSERT_MANAGER_CONFIG: String = format!(
+        r#"
+    INSERT INTO manager_config ({MANAGER_CONFIG_ATTRS})
+    VALUES ({MANAGER_CONFIG_ATTRS_VALS})
+    ON CONFLICT(node_id) DO UPDATE SET {MANAGER_CONFIG_PARAM_SET};
+    "#,
+    );
+    pub static ref GET_MANAGER_CONFIGS: String = format!(
+        r#"
+    SELECT {MANAGER_CONFIG_ATTRS}
+    FROM manager_config;
+    "#,
+    );
+}

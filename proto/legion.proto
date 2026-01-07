@@ -18,6 +18,8 @@ service Manager {
   rpc GetNodes (GetNodesRequest) returns (GetNodesReply);
   rpc GetNode (GetNodeRequest) returns (GetNodeReply);
   rpc GetLedger (GetLedgerRequest) returns (GetLedgerReply);
+  rpc GetManagerConfigs (GetManagerConfigsRequest)
+    returns (GetManagerConfigsReply);
   rpc UpdateNodeDynamic (UpdateNodeDynamicRequest)
     returns (UpdateNodeDynamicReply);
 }
@@ -164,6 +166,18 @@ message GetLedgerRequest {
 
 message GetLedgerReply {
   repeated LedgerNode nodes = 1;
+}
+
+message ManagerNodeConfig {
+  string node_id = 1;
+  string config_json = 2;
+  string updated_at = 3;
+}
+
+message GetManagerConfigsRequest {}
+
+message GetManagerConfigsReply {
+  repeated ManagerNodeConfig configs = 1;
 }
 
 message LedgerNode {

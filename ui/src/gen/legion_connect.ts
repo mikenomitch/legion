@@ -3,7 +3,7 @@
 /* eslint-disable */
 // @ts-nocheck
 
-import { DestroyJobReply, DestroyJobRequest, GetJobInfoReply, GetJobInfoRequest, GetJobSpecReply, GetJobSpecRequest, GetJoinTokenReply, GetJoinTokenRequest, GetLedgerReply, GetLedgerRequest, GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, ListJobsReply, ListJobsRequest, PostWorkReply, PostWorkRequest, RunJobReply, RunJobRequest, StopJobReply, StopJobRequest, UpdateNodeDynamicReply, UpdateNodeDynamicRequest, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest } from "./legion_pb.js";
+import { DestroyJobReply, DestroyJobRequest, GetJobInfoReply, GetJobInfoRequest, GetJobSpecReply, GetJobSpecRequest, GetJoinTokenReply, GetJoinTokenRequest, GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest, GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, ListJobsReply, ListJobsRequest, PostWorkReply, PostWorkRequest, RunJobReply, RunJobRequest, StopJobReply, StopJobRequest, UpdateNodeDynamicReply, UpdateNodeDynamicRequest, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest } from "./legion_pb.js";
 import { MethodKind } from "@bufbuild/protobuf";
 
 /**
@@ -127,6 +127,15 @@ export const Manager = {
       name: "GetLedger",
       I: GetLedgerRequest,
       O: GetLedgerReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * @generated from rpc legion.Manager.GetManagerConfigs
+     */
+    getManagerConfigs: {
+      name: "GetManagerConfigs",
+      I: GetManagerConfigsRequest,
+      O: GetManagerConfigsReply,
       kind: MethodKind.Unary,
     },
     /**

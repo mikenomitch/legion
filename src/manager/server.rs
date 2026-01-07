@@ -4,12 +4,12 @@ use crate::storage::store::{JobSubmitOutcome, Store};
 use crate::structs::manager_server::Manager;
 use crate::structs::{
     DestroyJobReply, DestroyJobRequest, GetJobInfoReply, GetJobInfoRequest, GetJobSpecReply,
-    GetJobSpecRequest, GetLedgerReply, GetLedgerRequest, GetNodeReply, GetNodeRequest,
-    GetNodesReply, GetNodesRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply,
-    HeartbeatRequest, JobConfig, LedgerNode, ListJobsReply, ListJobsRequest, NodeMsg, RunJobReply,
-    RunJobRequest, StopJobReply, StopJobRequest, UpdateNodeDynamicReply, UpdateNodeDynamicRequest,
-    WorkerConfig, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply,
-    WorkerRegisterRequest,
+    GetJobSpecRequest, GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply,
+    GetManagerConfigsRequest, GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest,
+    HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, JobConfig, LedgerNode,
+    ListJobsReply, ListJobsRequest, NodeMsg, RunJobReply, RunJobRequest, StopJobReply,
+    StopJobRequest, UpdateNodeDynamicReply, UpdateNodeDynamicRequest, WorkerConfig,
+    WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest,
 };
 
 use tonic::{Request, Response, Status};
@@ -371,6 +371,21 @@ impl Manager for ManagerAgentService {
         let reply = UpdateNodeDynamicReply {
             node: Some(node.into()),
         };
+
+        Ok(Response::new(reply))
+    }
+
+    #[instrument(skip_all)]
+    async fn get_manager_configs(
+        &self,
+        _request: Request<GetManagerConfigsRequest>,
+    ) -> Result<Response<GetManagerConfigsReply>, Status> {
+        let configs = self.store.get_manager_configs().map_err(|e| {
+            error!("Error getting manager configs: {:?}", e);
+            Status::internal("Error getting manager configs")
+        })?;
+
+        let reply = GetManagerConfigsReply { configs };
 
         Ok(Response::new(reply))
     }
