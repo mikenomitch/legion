@@ -228,7 +228,7 @@ const Layout = (props: RouteSectionProps) => {
   );
 };
 
-function App() {
+const AppRoutes = () => {
   const location = useLocation();
 
   const [ledger, { refetch: refetchLedger }] = createResource(
@@ -271,15 +271,21 @@ function App() {
   });
 
   return (
+    <Route path="/" component={Layout}>
+      <Route path="/" component={() => <Homepage ledger={ledger} />} />
+      <Route path="/nodes" component={() => <Nodes nodes={nodes} />} />
+      <Route path="/jobs" component={() => <Jobs jobs={jobs} />} />
+      <Route path="/manager" component={Manager} />
+      <Route path="/testing" component={TestingUtils} />
+      <Route path="*" component={() => <Homepage ledger={ledger} />} />
+    </Route>
+  );
+};
+
+function App() {
+  return (
     <Router>
-      <Route path="/" component={Layout}>
-        <Route path="/" component={() => <Homepage ledger={ledger} />} />
-        <Route path="/nodes" component={() => <Nodes nodes={nodes} />} />
-        <Route path="/jobs" component={() => <Jobs jobs={jobs} />} />
-        <Route path="/manager" component={Manager} />
-        <Route path="/testing" component={TestingUtils} />
-        <Route path="*" component={() => <Homepage ledger={ledger} />} />
-      </Route>
+      <AppRoutes />
     </Router>
   );
 }
