@@ -2,14 +2,13 @@ use crate::prelude::*;
 use crate::storage::migrations::get_migrations;
 use crate::storage::queries::{
     GET_ALLOCS, GET_ALLOCS_FOR_JOB, GET_ALLOCS_FOR_JOB_CONFIG, GET_ALLOCS_FOR_NODE, GET_EVALS,
-    GET_JOB, GET_JOBS, GET_JOB_CONFIG, GET_NEXT_EVAL, GET_NODE, GET_NODES, GET_TASK_FOR_JOB_CONIFG,
-    GET_WORKER_TYPE, INSERT_ALLOCATION, INSERT_EVAL, INSERT_JOB, INSERT_JOB_CONFIG,
-    INSERT_JOB_CONFIG_SUBMISSION, INSERT_JOB_UPDATE, INSERT_NODE, INSERT_SUBMISSION, INSERT_TASK,
-    INSERT_WORKER_TYPE, NODE_ATTRS,
+    GET_JOB, GET_JOBS, GET_JOB_CONFIG, GET_MANAGER_CONFIGS, GET_NEXT_EVAL, GET_NODE, GET_NODES,
+    GET_TASK_FOR_JOB_CONIFG, GET_WORKER_TYPE, INSERT_ALLOCATION, INSERT_EVAL, INSERT_JOB,
+    INSERT_JOB_CONFIG,
 };
 use crate::structs::{
-    Allocation, Eval, Job, JobConfig, LedgerEntry, ManagerConfigFull, Node, NodeMsg, Submission,
-    TaskConfig, WorkerConfig,
+    Allocation, Eval, Job, JobConfig, LedgerEntry, ManagerConfigFull, ManagerNodeConfig, Node,
+    NodeMsg, Submission, TaskConfig, WorkerConfig,
 };
 
 use rand::{seq::SliceRandom, thread_rng};
@@ -18,7 +17,7 @@ use rusqlite::{
     Transaction,
 };
 use rusqlite_migration::Migrations;
-use serde_json::to_string;
+use serde_json::{to_string, to_string_pretty};
 use serde_rusqlite::to_params_named;
 use std::collections::HashSet;
 use std::sync::MutexGuard;
@@ -225,6 +224,51 @@ impl Store {
         };
 
         Ok(allocation)
+    }
+
+    fn manager_config_from_row(&self, row: &Row<'_>) -> Result<ManagerNodeConfig, rusqlite::Error> {
+        Ok(ManagerNodeConfig {
+            node_id: row.get(0)?,
+            config_json: row.get(1)?,
+            updated_at: row.get(2)?,
+        })
+    }
+
+    //
+    // MANAGER CONFIG
+    //
+
+    #[instrument(err, skip_all)]
+    pub fn upsert_manager_config(&self, node_id: &str, config: &ManagerConfigFull) -> R<()> {
+        let fmt = format_description!(
+            "[year]-[month]-[day] [hour]:[minute]:[second] [offset_hour \
+                 sign:mandatory]:[offset_minute]:[offset_second]"
+        );
+
+        let timestamp_now = OffsetDateTime::now_utc().format(fmt)?;
+        let config_json = to_string_pretty(config)?;
+
+        let conn = self.connection()?;
+
+        let params = named_params! {
+            ":node_id": node_id,
+            ":config": config_json,
+            ":updated_at": timestamp_now,
+        };
+
+        conn.execute(&UPSERT_MANAGER_CONFIG, params)?;
+
+        Ok(())
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn get_manager_configs(&self) -> R<Vec<ManagerNodeConfig>> {
+        let conn = self.connection()?;
+        let mut stmt = conn.prepare(GET_MANAGER_CONFIGS.as_str())?;
+        let configs =
+            Self::collect_rows(stmt.query_map([], |row| self.manager_config_from_row(row))?)?;
+
+        Ok(configs)
     }
 
     //
@@ -1279,6 +1323,44 @@ mod tests {
 
     //     Ok(())
     // }
+
+    #[test]
+    fn manager_config_round_trips_and_overwrites() -> R<()> {
+        let store = setup_store()?;
+
+        let config = ManagerConfigFull {
+            server: crate::structs::ServerConfigFull {
+                host: "127.0.0.1".into(),
+                port: 1234,
+                insecure_port: 4321,
+            },
+            store_path: "tests/store".into(),
+            worker_config_path: "configs/workers".into(),
+            worker_check_seconds: 5,
+        };
+
+        store.upsert_manager_config("manager-a", &config)?;
+
+        let configs = store.get_manager_configs()?;
+        assert_eq!(configs.len(), 1);
+
+        let parsed: serde_json::Value = serde_json::from_str(&configs[0].config_json)?;
+        assert_eq!(parsed["server"]["port"], 1234);
+
+        let mut updated = config.clone();
+        updated.worker_check_seconds = 99;
+        updated.server.port = 9876;
+
+        store.upsert_manager_config("manager-a", &updated)?;
+
+        let configs = store.get_manager_configs()?;
+        assert_eq!(configs.len(), 1);
+        let parsed_updated: serde_json::Value = serde_json::from_str(&configs[0].config_json)?;
+        assert_eq!(parsed_updated["server"]["port"], 9876);
+        assert_eq!(parsed_updated["workerCheckSeconds"], 99);
+
+        Ok(())
+    }
 
     #[test]
     fn adding_updating_and_getting_worker_types() -> R<()> {

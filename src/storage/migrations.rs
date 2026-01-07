@@ -125,5 +125,13 @@ pub fn get_migrations() -> Migrations<'static> {
         )",
         )
         .down("DROP TABLE IF EXISTS eval;"),
+        M::up(
+            "CREATE TABLE IF NOT EXISTS manager_config (
+            node_id STRING PRIMARY KEY,
+            config JSONB NOT NULL,
+            updated_at TIMESTAMP NOT NULL
+        )",
+        )
+        .down("DROP TABLE IF EXISTS manager_config;"),
     ])
 }
