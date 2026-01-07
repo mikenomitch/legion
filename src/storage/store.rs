@@ -1193,13 +1193,8 @@ impl Store {
         let mut conn = self.connection()?;
         let tx = conn.transaction()?;
 
-        let next_id: i64 =
-            tx.query_row("SELECT COALESCE(MAX(id), 0) + 1 FROM eval;", [], |row| {
-                row.get(0)
-            })?;
-
         let params = named_params! {
-            ":id": next_id,
+            ":id": None::<i64>,
             ":status": "pending",
             ":type": kind,
             ":job_id": job_id.unwrap_or_default(),
@@ -1209,6 +1204,7 @@ impl Store {
         };
 
         tx.execute(&INSERT_EVAL, params)?;
+        let next_id = tx.last_insert_rowid();
 
         let eval = Eval {
             id: next_id.to_string(),

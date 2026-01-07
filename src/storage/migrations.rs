@@ -112,7 +112,7 @@ pub fn get_migrations() -> Migrations<'static> {
         .down("DROP TABLE IF EXISTS allocation;"),
         M::up(
             "CREATE TABLE IF NOT EXISTS eval (
-            id INTEGER PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             status STRING NOT NULL,
             type STRING NOT NULL,
             job_id STRING,
@@ -125,6 +125,14 @@ pub fn get_migrations() -> Migrations<'static> {
         )",
         )
         .down("DROP TABLE IF EXISTS eval;"),
+        M::up(
+            "CREATE INDEX IF NOT EXISTS idx_eval_status_priority_id ON eval(status, priority DESC, id ASC);",
+        )
+        .down("DROP INDEX IF EXISTS idx_eval_status_priority_id;"),
+        M::up("CREATE INDEX IF NOT EXISTS idx_eval_status_job_id ON eval(status, job_id);")
+            .down("DROP INDEX IF EXISTS idx_eval_status_job_id;"),
+        M::up("CREATE INDEX IF NOT EXISTS idx_eval_status_node_id ON eval(status, node_id);")
+            .down("DROP INDEX IF EXISTS idx_eval_status_node_id;"),
         M::up(
             "CREATE TABLE IF NOT EXISTS manager_config (
             node_id STRING PRIMARY KEY,
