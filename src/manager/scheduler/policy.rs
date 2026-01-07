@@ -230,6 +230,20 @@ mod tests {
     }
 
     #[test]
+    fn bin_pack_returns_none_without_nodes() {
+        let nodes: Vec<Node> = vec![];
+        let allocations: HashMap<String, Vec<Allocation>> = HashMap::new();
+        let planned: HashMap<String, usize> = HashMap::new();
+
+        let task = task("web");
+        let ctx = SchedulingContext::new(nodes.iter().collect(), &task, &allocations, &planned);
+        let policy = BinPackPolicy::default();
+
+        let choice = policy.select_node(ctx);
+        assert!(choice.is_none());
+    }
+
+    #[test]
     fn spread_prefers_least_loaded_node() {
         let nodes = vec![node("node-a"), node("node-b")];
         let allocations: HashMap<String, Vec<Allocation>> =

@@ -674,7 +674,7 @@ impl Store {
             ":status": "active",
             ":job_id": job.id,
             ":to_job_config_id": job_config_id,
-            ":from_job_config_id": last_versions_id.clone(),
+            ":from_job_config_id": last_versions_id,
         };
 
         tx.execute(&INSERT_JOB_UPDATE, job_update_params)?;
