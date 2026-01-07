@@ -216,7 +216,10 @@ mod tests {
     fn bin_pack_counts_planned_and_active_allocations() {
         let nodes = vec![node("node-a"), node("node-b")];
         let allocations: HashMap<String, Vec<Allocation>> = HashMap::from([
-            (String::from("node-a"), vec![alloc("node-a", 1), alloc("node-a", 2)]),
+            (
+                String::from("node-a"),
+                vec![alloc("node-a", 1), alloc("node-a", 2)],
+            ),
             (String::from("node-b"), vec![alloc("node-b", 3)]),
         ]);
         let planned = HashMap::from([(String::from("node-b"), 2_usize)]);

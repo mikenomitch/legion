@@ -1,7 +1,9 @@
 {
+    name: "min",
     task: {
+        name: "hello",
         kind: "container",
-        options: {
+        config: {
             image: "mnomitch/hello_world_logger"
         },
     },

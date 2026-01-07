@@ -32,14 +32,14 @@ fn default_task_count() -> u32 {
     1
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Tabled)]
+#[derive(Serialize, Debug, Clone, Default, PartialEq, Tabled)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskConfig {
     pub name: String,
     #[serde(default = "default_task_count")]
     pub count: u32,
     pub kind: String,
-    #[serde(default = "empty_object")]
+    #[serde(default = "empty_object", alias = "options")]
     pub config: Value,
     #[serde(default = "empty_object")]
     pub resources: Value,
@@ -47,31 +47,40 @@ pub struct TaskConfig {
     pub constraints: Value,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-#[serde(rename_all = "camelCase")]
+#[derive(Serialize, Debug, Clone, PartialEq)]
 pub struct JobConfig {
     pub name: String,
-    #[serde(deserialize_with = "deserialize_tasks")]
     pub tasks: Vec<TaskConfig>,
     pub version: Option<u32>,
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JobConfigInput {
+    name: String,
+    #[serde(default)]
+    tasks: Option<TaskConfigList>,
+    #[serde(default)]
+    task: Option<TaskConfigInput>,
+    version: Option<u32>,
+}
+
+#[derive(Deserialize)]
 #[serde(untagged)]
 enum TaskConfigList {
-    List(Vec<TaskConfig>),
-    Map(BTreeMap<String, TaskConfigEntry>),
+    List(Vec<TaskConfigInput>),
+    Map(BTreeMap<String, TaskConfigInput>),
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct TaskConfigEntry {
+struct TaskConfigInput {
     #[serde(default)]
     name: Option<String>,
     #[serde(default = "default_task_count")]
     count: u32,
     kind: String,
-    #[serde(default = "empty_object")]
+    #[serde(default = "empty_object", alias = "options")]
     config: Value,
     #[serde(default = "empty_object")]
     resources: Value,
@@ -79,26 +88,56 @@ struct TaskConfigEntry {
     constraints: Value,
 }
 
-fn deserialize_tasks<'de, D>(deserializer: D) -> Result<Vec<TaskConfig>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let configs = TaskConfigList::deserialize(deserializer)?;
+impl TaskConfigInput {
+    fn into_task_config(self, name: String) -> TaskConfig {
+        TaskConfig {
+            name: self.name.unwrap_or(name),
+            count: self.count,
+            kind: self.kind,
+            config: self.config,
+            resources: self.resources,
+            constraints: self.constraints,
+        }
+    }
+}
 
-    Ok(match configs {
-        TaskConfigList::List(tasks) => tasks,
+fn task_list_to_vec(configs: TaskConfigList) -> Vec<TaskConfig> {
+    match configs {
+        TaskConfigList::List(tasks) => tasks
+            .into_iter()
+            .enumerate()
+            .map(|(index, task)| task.into_task_config(format!("task-{}", index + 1)))
+            .collect(),
         TaskConfigList::Map(map) => map
             .into_iter()
-            .map(|(name, task)| TaskConfig {
-                name: task.name.unwrap_or(name),
-                count: task.count,
-                kind: task.kind,
-                config: task.config,
-                resources: task.resources,
-                constraints: task.constraints,
-            })
+            .map(|(name, task)| task.into_task_config(name))
             .collect(),
-    })
+    }
+}
+
+impl<'de> Deserialize<'de> for JobConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let input = JobConfigInput::deserialize(deserializer)?;
+        let tasks = match (input.tasks, input.task) {
+            (Some(_), Some(_)) => {
+                return Err(D::Error::custom(
+                    "jobspec must define only one of task or tasks",
+                ))
+            }
+            (Some(tasks), None) => task_list_to_vec(tasks),
+            (None, Some(task)) => vec![task.into_task_config(String::from("task"))],
+            (None, None) => return Err(D::Error::custom("jobspec must define at least one task")),
+        };
+
+        Ok(JobConfig {
+            name: input.name,
+            tasks,
+            version: input.version,
+        })
+    }
 }
 
 impl JobConfig {
@@ -131,7 +170,6 @@ mod tests {
             "name": "demo",
             "tasks": [
                 {
-                    "name": "first",
                     "kind": "noop",
                     "count": 1,
                     "config": {},
@@ -146,7 +184,7 @@ mod tests {
 
         assert_eq!(config.name, "demo");
         assert_eq!(config.tasks.len(), 1);
-        assert_eq!(config.tasks[0].name, "first");
+        assert_eq!(config.tasks[0].name, "task-1");
     }
 
     #[test]
@@ -168,5 +206,41 @@ mod tests {
         assert_eq!(config.tasks.len(), 1);
         assert_eq!(config.tasks[0].name, "first");
         assert_eq!(config.tasks[0].count, 1);
+    }
+
+    #[test]
+    fn deserializes_single_task_jobspec() {
+        let spec = serde_json::json!({
+            "name": "demo",
+            "task": {
+                "kind": "noop",
+            },
+        });
+
+        let config: JobConfig = serde_json::from_value(spec).expect("task should deserialize");
+
+        assert_eq!(config.name, "demo");
+        assert_eq!(config.tasks.len(), 1);
+        assert_eq!(config.tasks[0].name, "task");
+    }
+
+    #[test]
+    fn deserializes_named_task_list_jobspec() {
+        let spec = serde_json::json!({
+            "name": "demo",
+            "tasks": [
+                {
+                    "name": "named",
+                    "kind": "noop",
+                }
+            ],
+        });
+
+        let config: JobConfig =
+            serde_json::from_value(spec).expect("named tasks list should deserialize");
+
+        assert_eq!(config.name, "demo");
+        assert_eq!(config.tasks.len(), 1);
+        assert_eq!(config.tasks[0].name, "named");
     }
 }
