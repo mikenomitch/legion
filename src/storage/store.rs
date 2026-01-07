@@ -37,6 +37,7 @@ pub type MemSafeConn = Arc<Mutex<Connection>>;
 pub struct Store {
     pub conn: MemSafeConn,
     pub scheduling_policy: String,
+    pub default_eval_priority: i64,
 }
 
 pub const CONN_LOCK_ERROR: &str = "Error locking database connection";
@@ -51,6 +52,7 @@ impl Store {
         let store = Store {
             conn,
             scheduling_policy: config.scheduling_policy.clone(),
+            default_eval_priority: config.default_priority,
         };
 
         Ok(store)
@@ -150,6 +152,7 @@ impl Store {
             job_id: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
             job_config_id: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
             node_name: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
+            priority: row.get(6)?,
         };
 
         Ok(eval)
@@ -569,7 +572,7 @@ impl Store {
     }
 
     #[allow(dead_code)]
-    pub fn handle_job_submit(&self, config: &JobConfig, subs: &[Submission]) -> R<()> {
+    pub fn handle_job_submit(&self, config: &JobConfig, subs: &[Submission]) -> R<String> {
         // Note: There is a race condition here with the version
         // I think this should prob be all in a single lock, but
         // I am not going to worry about this for now
@@ -674,17 +677,15 @@ impl Store {
             ":status": "active",
             ":job_id": job.id,
             ":to_job_config_id": job_config_id,
-            ":from_job_config_id": if last_versions_id.is_empty() {
-                None::<String>
-            } else {
-                Some(last_versions_id)
-            },
+            ":from_job_config_id": last_versions_id.clone(),
         };
 
         tx.execute(&INSERT_JOB_UPDATE, job_update_params)?;
 
         tx.commit()
-            .map_err(|_| anyhow!("Error committing transaction"))
+            .map_err(|_| anyhow!("Error committing transaction"))?;
+
+        Ok(job_config_id)
     }
 
     #[instrument(err, skip_all)]
@@ -1005,6 +1006,7 @@ impl Store {
             ":job_id": if eval.job_id.is_empty() { None::<String> } else { Some(eval.job_id.clone()) },
             ":job_config_id": if eval.job_config_id.is_empty() { None::<String> } else { Some(eval.job_config_id.clone()) },
             ":node_id": if eval.node_name.is_empty() { None::<String> } else { Some(eval.node_name.clone()) },
+            ":priority": eval.priority,
         };
 
         conn.execute(&INSERT_EVAL, params)?;
@@ -1049,7 +1051,7 @@ impl Store {
 
         let eval_id: Option<i64> = tx
             .query_row(
-                "SELECT id FROM eval WHERE status = 'pending' ORDER BY id ASC LIMIT 1;",
+                "SELECT id FROM eval WHERE status = 'pending' ORDER BY priority DESC, id ASC LIMIT 1;",
                 [],
                 |row| row.get(0),
             )
@@ -1061,7 +1063,7 @@ impl Store {
         };
 
         let mut eval = tx.query_row(
-            "UPDATE eval SET status = 'in_flight' WHERE id = :id RETURNING id, status, type, job_id, job_config_id, node_id;",
+            "UPDATE eval SET status = 'in_flight' WHERE id = :id RETURNING id, status, type, job_id, job_config_id, node_id, priority;",
             named_params! {":id": eval_id},
             |row| self.eval_from_row(row),
         )?;
@@ -1107,6 +1109,7 @@ impl Store {
         job_id: Option<&str>,
         job_config_id: Option<&str>,
         node_id: Option<&str>,
+        priority: Option<i64>,
     ) -> R<Eval> {
         let mut conn = self.connection()?;
         let tx = conn.transaction()?;
@@ -1123,6 +1126,7 @@ impl Store {
             ":job_id": job_id.unwrap_or_default(),
             ":job_config_id": job_config_id.unwrap_or_default(),
             ":node_id": node_id.unwrap_or_default(),
+            ":priority": priority.unwrap_or(self.default_eval_priority),
         };
 
         tx.execute(&INSERT_EVAL, params)?;
@@ -1134,6 +1138,7 @@ impl Store {
             job_id: job_id.unwrap_or_default().to_string(),
             job_config_id: job_config_id.unwrap_or_default().to_string(),
             node_name: node_id.unwrap_or_default().to_string(),
+            priority: priority.unwrap_or(self.default_eval_priority),
         };
 
         tx.commit()?;
@@ -1221,11 +1226,12 @@ mod tests {
         job_id: Option<&str>,
         job_config_id: Option<&str>,
         node_id: Option<&str>,
+        priority: i64,
     ) -> R<()> {
         let conn = store.conn.lock().map_err(|_| anyhow!(CONN_LOCK_ERROR))?;
         conn.execute(
-            "INSERT INTO eval (id, status, type, job_id, job_config_id, node_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6);",
-            params![id, status, kind, job_id, job_config_id, node_id],
+            "INSERT INTO eval (id, status, type, job_id, job_config_id, node_id, priority) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7);",
+            params![id, status, kind, job_id, job_config_id, node_id, priority],
         )?;
 
         Ok(())
@@ -1924,6 +1930,7 @@ mod tests {
             None,
             None,
             Some("node-1"),
+            50,
         )?;
         insert_eval(
             &store,
@@ -1933,6 +1940,7 @@ mod tests {
             None,
             None,
             Some("node-1"),
+            50,
         )?;
 
         let claimed = store.claim_eval()?.expect("eval should be claimed");
@@ -1968,6 +1976,7 @@ mod tests {
             None,
             None,
             Some("node-1"),
+            50,
         )?;
         insert_eval(
             &store,
@@ -1977,6 +1986,7 @@ mod tests {
             None,
             None,
             Some("node-2"),
+            50,
         )?;
 
         let first = store.claim_eval()?.expect("eval should be claimed");

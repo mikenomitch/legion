@@ -1,5 +1,7 @@
 use std::vec;
 
+use clap::value_parser;
+
 use crate::cmd::helpers::{connect_manager_client, json_flag, print_table};
 use crate::prelude::*;
 use crate::structs::{
@@ -10,24 +12,36 @@ use jsonnet::JsonnetVm;
 use serde_json::to_string;
 
 pub fn config() -> Command {
-    let run_cmd = Command::new("run").about("Run a job").arg(
-        Arg::new("path")
-            .value_name("PATH")
-            .help("Path to the job specification to run")
-            .value_hint(ValueHint::FilePath),
-    );
+    let run_cmd = Command::new("run")
+        .about("Run a job")
+        .arg(
+            Arg::new("path")
+                .value_name("PATH")
+                .help("Path to the job specification to run")
+                .value_hint(ValueHint::FilePath),
+        )
+        .arg(priority_arg())
+        .arg(asap_flag());
 
-    let stop_cmd = Command::new("stop").about("Stop a job").arg(
-        Arg::new("name")
-            .value_name("NAME")
-            .help("Name of the job to stop"),
-    );
+    let stop_cmd = Command::new("stop")
+        .about("Stop a job")
+        .arg(
+            Arg::new("name")
+                .value_name("NAME")
+                .help("Name of the job to stop"),
+        )
+        .arg(priority_arg())
+        .arg(asap_flag());
 
-    let destroy_cmd = Command::new("destroy").about("Destroy a job").arg(
-        Arg::new("name")
-            .value_name("NAME")
-            .help("Name of the job to remove"),
-    );
+    let destroy_cmd = Command::new("destroy")
+        .about("Destroy a job")
+        .arg(
+            Arg::new("name")
+                .value_name("NAME")
+                .help("Name of the job to remove"),
+        )
+        .arg(priority_arg())
+        .arg(asap_flag());
 
     let info_cmd = Command::new("info")
         .about("Get job info")
@@ -62,6 +76,31 @@ pub fn config() -> Command {
         .subcommand(destroy_cmd)
 }
 
+fn priority_arg() -> Arg {
+    Arg::new("priority")
+        .long("priority")
+        .value_name("PRIORITY")
+        .help("Priority to use for the request (higher runs sooner)")
+        .value_parser(value_parser!(i64))
+        .conflicts_with("asap")
+}
+
+fn asap_flag() -> Arg {
+    Arg::new("asap")
+        .long("asap")
+        .help("Force the request to run ASAP by setting priority to 100")
+        .action(ArgAction::SetTrue)
+        .conflicts_with("priority")
+}
+
+fn priority_from_matches(matches: &ArgMatches) -> Option<i64> {
+    if matches.get_flag("asap") {
+        Some(100)
+    } else {
+        matches.get_one::<i64>("priority").copied()
+    }
+}
+
 pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
     match sub_matches.subcommand() {
         Some(("run", matches)) => run_job(matches).await,
@@ -74,15 +113,29 @@ pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn priority_conflicts_with_asap() {
+        let cmd = config();
+        let result = cmd.try_get_matches_from(["job", "run", "--priority", "75", "--asap"]);
+        assert!(result.is_err());
+    }
+}
+
 #[instrument(err, skip_all)]
 async fn stop_job(arg_matches: &ArgMatches) -> R<()> {
     let mut client = connect_manager_client().await?;
     let job_name = arg_matches
         .get_one::<String>("name")
         .map_or("demo", String::as_str);
+    let priority = priority_from_matches(arg_matches);
 
     let request = tonic::Request::new(StopJobRequest {
         name: job_name.to_owned(),
+        priority,
     });
 
     let response = client.stop_job(request).await?;
@@ -130,9 +183,11 @@ async fn destroy_job(arg_matches: &ArgMatches) -> R<()> {
     let job_name = arg_matches
         .get_one::<String>("name")
         .map_or("demo", String::as_str);
+    let priority = priority_from_matches(arg_matches);
 
     let request = tonic::Request::new(DestroyJobRequest {
         name: job_name.to_owned(),
+        priority,
     });
 
     let response = client.destroy_job(request).await?;
@@ -148,6 +203,7 @@ async fn run_job(arg_matches: &ArgMatches) -> R<()> {
     let job_path = arg_matches
         .get_one::<String>("path")
         .map_or("./configs/jobs/demo.jsonnet", String::as_str);
+    let priority = priority_from_matches(arg_matches);
 
     let mut vm = JsonnetVm::new();
     let mut submissions = vec![];
@@ -184,6 +240,7 @@ async fn run_job(arg_matches: &ArgMatches) -> R<()> {
     let request = tonic::Request::new(RunJobRequest {
         parsed_jobspec: rendered,
         submissions,
+        priority,
     });
 
     let response = client.run_job(request).await.context("failed to run job")?;

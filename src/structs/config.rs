@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::prelude::{
-    DEF_MANAGER_HOSTNAME, DEF_MANAGER_INSECURE_PORT, DEF_MANAGER_SERVER_PORT,
+    DEF_EVAL_PRIORITY, DEF_MANAGER_HOSTNAME, DEF_MANAGER_INSECURE_PORT, DEF_MANAGER_SERVER_PORT,
     DEF_SCHEDULING_POLICY, DEF_STORE_PATH, DEF_WORKER_CHECK_SEC, DEF_WORKER_CONFIG_PATH,
 };
 
@@ -23,6 +23,7 @@ pub struct ManagerConfig {
     pub worker_config_path: Option<String>,
     pub worker_check_seconds: Option<u64>,
     pub scheduling_policy: Option<String>,
+    pub default_priority: Option<i64>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -72,6 +73,7 @@ pub struct ManagerConfigFull {
     pub worker_config_path: String,
     pub worker_check_seconds: u64,
     pub scheduling_policy: String,
+    pub default_priority: i64,
 }
 
 impl From<ManagerConfigFull> for ManagerConfig {
@@ -82,6 +84,7 @@ impl From<ManagerConfigFull> for ManagerConfig {
             worker_config_path: Some(val.worker_config_path),
             worker_check_seconds: Some(val.worker_check_seconds),
             scheduling_policy: Some(val.scheduling_policy),
+            default_priority: Some(val.default_priority),
         }
     }
 }
@@ -109,6 +112,7 @@ impl ManagerConfig {
                 .scheduling_policy
                 .clone()
                 .unwrap_or_else(|| DEF_SCHEDULING_POLICY.into()),
+            default_priority: self.default_priority.unwrap_or(DEF_EVAL_PRIORITY),
         }
     }
 }
@@ -121,6 +125,7 @@ impl Default for ManagerConfigFull {
             worker_config_path: DEF_WORKER_CONFIG_PATH.into(),
             worker_check_seconds: DEF_WORKER_CHECK_SEC,
             scheduling_policy: DEF_SCHEDULING_POLICY.into(),
+            default_priority: DEF_EVAL_PRIORITY,
         }
     }
 }

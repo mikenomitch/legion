@@ -118,6 +118,7 @@ pub fn get_migrations() -> Migrations<'static> {
             job_id STRING,
             job_config_id STRING,
             node_id STRING,
+            priority INTEGER NOT NULL,
             FOREIGN KEY(job_id) REFERENCES job(id) ON DELETE CASCADE,
             FOREIGN KEY(job_config_id) REFERENCES job_config(id) ON DELETE CASCADE,
             FOREIGN KEY(node_id) REFERENCES node(id) ON DELETE CASCADE
