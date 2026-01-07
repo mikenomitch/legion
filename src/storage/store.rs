@@ -4,7 +4,8 @@ use crate::storage::queries::{
     GET_ALLOCS, GET_ALLOCS_FOR_JOB, GET_ALLOCS_FOR_JOB_CONFIG, GET_ALLOCS_FOR_NODE, GET_EVALS,
     GET_JOB, GET_JOBS, GET_JOB_CONFIG, GET_MANAGER_CONFIGS, GET_NEXT_EVAL, GET_NODE, GET_NODES,
     GET_TASK_FOR_JOB_CONIFG, GET_WORKER_TYPE, INSERT_ALLOCATION, INSERT_EVAL, INSERT_JOB,
-    INSERT_JOB_CONFIG,
+    INSERT_JOB_CONFIG, INSERT_JOB_CONFIG_SUBMISSION, INSERT_JOB_UPDATE, INSERT_NODE,
+    INSERT_SUBMISSION, INSERT_TASK, INSERT_WORKER_TYPE, NODE_ATTRS, UPSERT_MANAGER_CONFIG,
 };
 use crate::structs::{
     Allocation, Eval, Job, JobConfig, LedgerEntry, ManagerConfigFull, ManagerNodeConfig, Node,
@@ -1233,13 +1234,8 @@ impl Store {
         let mut conn = self.write_connection()?;
         let tx = conn.transaction()?;
 
-        let next_id: i64 =
-            tx.query_row("SELECT COALESCE(MAX(id), 0) + 1 FROM eval;", [], |row| {
-                row.get(0)
-            })?;
-
         let params = named_params! {
-            ":id": next_id,
+            ":id": None::<i64>,
             ":status": "pending",
             ":type": kind,
             ":job_id": job_id.unwrap_or_default(),
@@ -1249,6 +1245,7 @@ impl Store {
         };
 
         tx.execute(&INSERT_EVAL, params)?;
+        let next_id = tx.last_insert_rowid();
 
         let eval = Eval {
             id: next_id.to_string(),
