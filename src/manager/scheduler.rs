@@ -310,7 +310,7 @@ impl<'a> Scheduler<'a> {
 
         let mut deltas = Vec::new();
         for node_id in ordered_nodes {
-            if let Some(added) = added_by_node.remove(*node_id) {
+            if let Some(added) = added_by_node.remove(node_id) {
                 if !added.is_empty() {
                     deltas.push(LedgerDelta {
                         node_id: (*node_id).clone(),

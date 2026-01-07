@@ -161,8 +161,10 @@ mod tests {
     use crate::storage::store::Store;
 
     fn setup_store() -> R<Store> {
+        let store_path = "tests/eval";
+        let _ = std::fs::remove_dir_all(store_path);
         let store_config = ManagerConfigFull {
-            store_path: "tests/eval".to_string(),
+            store_path: store_path.to_string(),
             ..Default::default()
         };
 

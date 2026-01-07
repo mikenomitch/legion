@@ -111,7 +111,7 @@ fn load_server_tls_identity() -> R<Option<Identity>> {
     }
 
     // Temporarily don't do any TLS
-    return Ok(None);
+    Ok(None)
 
     // let cert = std::fs::read_to_string(cert_path)?;
     // let key = std::fs::read_to_string(key_path)?;

@@ -103,8 +103,8 @@ impl SchedulingPolicy for SpreadPolicy {
 #[instrument(err, skip_all)]
 pub fn load_policy(name: &str) -> R<(Option<Library>, Box<dyn SchedulingPolicy>)> {
     match name {
-        "bin_pack" => Ok((None, Box::new(BinPackPolicy::default()))),
-        "spread" => Ok((None, Box::new(SpreadPolicy::default()))),
+        "bin_pack" => Ok((None, Box::new(BinPackPolicy))),
+        "spread" => Ok((None, Box::new(SpreadPolicy))),
         other => {
             let path = policy_plugin_name_to_path(other);
             unsafe {
