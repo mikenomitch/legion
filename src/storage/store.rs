@@ -20,10 +20,10 @@ use rusqlite::{
 use rusqlite_migration::Migrations;
 use serde_json::{to_string, to_string_pretty};
 use serde_rusqlite::to_params_named;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::MutexGuard;
+use std::sync::{MutexGuard, RwLock};
 use time::macros::format_description;
 use time::OffsetDateTime;
 
@@ -34,6 +34,14 @@ pub enum Msg {
 }
 
 pub type MemSafeConn = Arc<Mutex<Connection>>;
+const READ_MODEL_LOCK_ERROR: &str = "Error locking read model";
+
+#[derive(Debug, Clone, Default)]
+pub struct SchedulingReadModel {
+    pub nodes: HashMap<String, Node>,
+    pub allocations_by_node: HashMap<String, Vec<Allocation>>,
+    pub task_configs: HashMap<String, Vec<(i64, TaskConfig)>>,
+}
 
 #[derive(Debug, Clone)]
 pub struct Store {
@@ -43,6 +51,7 @@ pub struct Store {
     pub scheduling_policy: String,
     pub default_eval_priority: i64,
     pub scheduler_settings: Option<Value>,
+    read_model: Arc<RwLock<SchedulingReadModel>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,7 +94,10 @@ impl Store {
             scheduling_policy: config.scheduling_policy.clone(),
             default_eval_priority: config.default_priority,
             scheduler_settings: config.scheduler_settings.clone(),
+            read_model: Arc::new(RwLock::new(SchedulingReadModel::default())),
         };
+
+        store.refresh_read_model()?;
 
         Ok(store)
     }
@@ -133,6 +145,8 @@ impl Store {
         let mut conn = self.write_connection()?;
         migrations.to_version(&mut conn, 0)?;
         migrations.to_latest(&mut conn)?;
+        drop(conn);
+        self.refresh_read_model()?;
 
         Ok(())
     }
@@ -163,6 +177,172 @@ impl Store {
         let index = self.read_index.fetch_add(1, Ordering::Relaxed);
         let conn = pool.get(index % pool.len()).unwrap_or(&self.write_conn);
         Self::lock_conn(conn)
+    }
+
+    fn read_model_reader(&self) -> R<std::sync::RwLockReadGuard<'_, SchedulingReadModel>> {
+        self.read_model
+            .read()
+            .map_err(|_| anyhow!(READ_MODEL_LOCK_ERROR))
+    }
+
+    fn read_model_writer(&self) -> R<std::sync::RwLockWriteGuard<'_, SchedulingReadModel>> {
+        self.read_model
+            .write()
+            .map_err(|_| anyhow!(READ_MODEL_LOCK_ERROR))
+    }
+
+    fn load_read_model(&self) -> R<SchedulingReadModel> {
+        let conn = self.read_connection()?;
+        let mut nodes_stmt = conn.prepare(GET_NODES.as_str())?;
+        let nodes = Self::collect_rows(nodes_stmt.query_map([], |row| self.node_from_row(row))?)?;
+
+        let mut task_stmt = conn.prepare(
+            r#"
+            SELECT id, name, kind, count, config, resources, constraints, job_config_id
+            FROM task_config;
+            "#,
+        )?;
+        let task_rows = task_stmt.query_map([], |row| {
+            let id = row.get(0)?;
+            let task = TaskConfig {
+                name: row.get(1)?,
+                kind: row.get(2)?,
+                count: row.get::<_, i64>(3)? as u32,
+                config: row.get(4)?,
+                resources: row.get(5)?,
+                constraints: row.get(6)?,
+            };
+            let job_config_id: String = row.get(7)?;
+            Ok((job_config_id, id, task))
+        })?;
+
+        let mut task_configs: HashMap<String, Vec<(i64, TaskConfig)>> = HashMap::new();
+        for row in task_rows {
+            let (job_config_id, id, task) = row?;
+            task_configs
+                .entry(job_config_id)
+                .or_default()
+                .push((id, task));
+        }
+
+        let mut allocs_stmt = conn.prepare(GET_ALLOCS.as_str())?;
+        let allocs =
+            Self::collect_rows(allocs_stmt.query_map([], |row| self.allocation_from_row(row))?)?;
+        let mut allocations_by_node: HashMap<String, Vec<Allocation>> = HashMap::new();
+        for alloc in allocs {
+            allocations_by_node
+                .entry(alloc.node_id.clone())
+                .or_default()
+                .push(alloc);
+        }
+
+        Ok(SchedulingReadModel {
+            nodes: nodes
+                .into_iter()
+                .map(|node| (node.id.clone(), node))
+                .collect(),
+            allocations_by_node,
+            task_configs,
+        })
+    }
+
+    fn refresh_read_model(&self) -> R<()> {
+        let model = self.load_read_model()?;
+        let mut guard = self.read_model_writer()?;
+        *guard = model;
+        Ok(())
+    }
+
+    pub fn scheduling_read_model(&self) -> R<SchedulingReadModel> {
+        Ok(self.read_model_reader()?.clone())
+    }
+
+    fn cache_node(&self, node: Node) -> R<()> {
+        let mut guard = self.read_model_writer()?;
+        guard.nodes.insert(node.id.clone(), node);
+        Ok(())
+    }
+
+    fn cache_nodes_lost(&self, ids: &[String]) -> R<()> {
+        let mut guard = self.read_model_writer()?;
+        for id in ids {
+            if let Some(node) = guard.nodes.get_mut(id) {
+                node.status = "lost".to_string();
+                node.availability = "unavailable".to_string();
+            }
+        }
+        Ok(())
+    }
+
+    fn cache_remove_node(&self, id: &str) -> R<()> {
+        let mut guard = self.read_model_writer()?;
+        guard.nodes.remove(id);
+        guard.allocations_by_node.remove(id);
+        Ok(())
+    }
+
+    fn cache_add_allocations(&self, allocations: &[Allocation]) -> R<()> {
+        let mut guard = self.read_model_writer()?;
+        for allocation in allocations {
+            guard
+                .allocations_by_node
+                .entry(allocation.node_id.clone())
+                .or_default()
+                .push(allocation.clone());
+        }
+        Ok(())
+    }
+
+    fn cache_clear_allocations_for_node(&self, node_id: &str) -> R<()> {
+        let mut guard = self.read_model_writer()?;
+        guard
+            .allocations_by_node
+            .insert(node_id.to_string(), Vec::new());
+        Ok(())
+    }
+
+    fn cache_remove_allocations(&self, allocations: &[Allocation]) -> R<()> {
+        let mut guard = self.read_model_writer()?;
+        for allocation in allocations {
+            if let Some(node_allocs) = guard.allocations_by_node.get_mut(&allocation.node_id) {
+                node_allocs.retain(|alloc| alloc.id != allocation.id);
+            }
+        }
+        Ok(())
+    }
+
+    fn cache_set_task_configs_for_job_config(
+        &self,
+        job_config_id: &str,
+        tasks: Vec<(i64, TaskConfig)>,
+    ) -> R<()> {
+        let mut guard = self.read_model_writer()?;
+        guard.task_configs.insert(job_config_id.to_string(), tasks);
+        Ok(())
+    }
+
+    pub fn cached_task_configs_for_job_config(
+        &self,
+        job_config_id: &str,
+    ) -> R<Vec<(i64, TaskConfig)>> {
+        {
+            let guard = self.read_model_reader()?;
+            if let Some(tasks) = guard.task_configs.get(job_config_id) {
+                return Ok(tasks.clone());
+            }
+        }
+
+        let tasks = self.get_task_configs_for_job_config(job_config_id)?;
+        self.cache_set_task_configs_for_job_config(job_config_id, tasks.clone())?;
+        Ok(tasks)
+    }
+
+    pub fn cached_allocations_by_node(&self) -> R<HashMap<String, Vec<Allocation>>> {
+        Ok(self.read_model_reader()?.allocations_by_node.clone())
+    }
+
+    pub fn cached_nodes(&self) -> R<Vec<Node>> {
+        Ok(self.read_model_reader()?.nodes.values().cloned().collect())
     }
 
     fn collect_rows<T, I>(iter: I) -> R<Vec<T>>
@@ -348,6 +528,10 @@ impl Store {
 
         conn.execute(sql, params)?;
 
+        drop(conn);
+        let node = self.get_node(id)?;
+        self.cache_node(node)?;
+
         Ok(())
     }
 
@@ -368,6 +552,10 @@ impl Store {
 
         conn.execute(sql, params)?;
 
+        drop(conn);
+        let node = self.get_node(id)?;
+        self.cache_node(node)?;
+
         Ok(())
     }
 
@@ -382,6 +570,8 @@ impl Store {
         let conn = self.write_connection()?;
         conn.execute("DELETE FROM allocation WHERE node_id = ?;", [node_id])?;
 
+        self.cache_clear_allocations_for_node(node_id)?;
+
         Ok(allocs)
     }
 
@@ -389,6 +579,8 @@ impl Store {
     pub fn remove_node(&self, id: &str) -> R<()> {
         let conn = self.write_connection()?;
         conn.execute("DELETE FROM node WHERE id = ?;", [id])?;
+
+        self.cache_remove_node(id)?;
 
         Ok(())
     }
@@ -420,6 +612,8 @@ impl Store {
         let mut stmt = conn.prepare(&sql)?;
         stmt.execute(params_from_iter(ids))?;
 
+        self.cache_nodes_lost(ids)?;
+
         Ok(())
     }
 
@@ -437,6 +631,8 @@ impl Store {
             to_params_named(node)?.to_slice().as_slice(),
             |row| self.node_from_row(row),
         )?;
+
+        self.cache_node(node.clone())?;
 
         Ok(node)
     }
@@ -473,6 +669,8 @@ impl Store {
 
         let node = conn.query_row(&update_sql, params, |row| self.node_from_row(row))?;
 
+        self.cache_node(node.clone())?;
+
         Ok(node)
     }
 
@@ -503,6 +701,10 @@ impl Store {
 
         conn.execute(sql, params)?;
 
+        drop(conn);
+        let node = self.get_node(&id)?;
+        self.cache_node(node)?;
+
         Ok(())
     }
 
@@ -521,6 +723,10 @@ impl Store {
         };
 
         conn.execute(sql, params)?;
+
+        drop(conn);
+        let node = self.get_node(id)?;
+        self.cache_node(node)?;
 
         Ok(())
     }
@@ -798,6 +1004,9 @@ impl Store {
         tx.commit()
             .map_err(|_| anyhow!("Error committing transaction"))?;
 
+        let cached_tasks = self.get_task_configs_for_job_config(&job_config_id)?;
+        self.cache_set_task_configs_for_job_config(&job_config_id, cached_tasks)?;
+
         if was_update {
             Ok(JobSubmitOutcome::Updated { job_config_id })
         } else {
@@ -885,6 +1094,8 @@ impl Store {
         let allocation = self.insert_allocation(&tx, node_id, task_id)?;
         tx.commit()?;
 
+        self.cache_add_allocations(std::slice::from_ref(&allocation))?;
+
         Ok(allocation)
     }
 
@@ -931,6 +1142,8 @@ impl Store {
         }
 
         tx.commit()?;
+
+        self.cache_add_allocations(&allocations)?;
 
         Ok(allocations)
     }
@@ -1020,6 +1233,7 @@ impl Store {
 
     #[instrument(err, skip_all)]
     pub fn remove_allocs_for_job(&self, job_id: &str) -> R<()> {
+        let allocations = self.allocs_for_job(job_id)?;
         let conn = self.write_connection()?;
         let sql = r#"
         DELETE FROM allocation
@@ -1031,6 +1245,8 @@ impl Store {
         let params = named_params! { ":job_id": job_id };
 
         conn.execute(sql, params)?;
+
+        self.cache_remove_allocations(&allocations)?;
 
         Ok(())
     }
@@ -1393,6 +1609,156 @@ mod tests {
         let parsed_updated: serde_json::Value = serde_json::from_str(&configs[0].config_json)?;
         assert_eq!(parsed_updated["server"]["port"], 9876);
         assert_eq!(parsed_updated["workerCheckSeconds"], 99);
+
+        Ok(())
+    }
+
+    #[test]
+    fn read_model_tracks_nodes_and_updates() -> R<()> {
+        let store = setup_store()?;
+
+        store.insert_node(make_node_msg("node-one", "active"))?;
+        let model = store.scheduling_read_model()?;
+        let node = model.nodes.get("node-one").context("missing cached node")?;
+        assert_eq!(node.status, "active");
+
+        let mut diff = Map::new();
+        diff.insert("region".to_string(), json!("us-west"));
+        store.update_node_dyamic("node-one", &diff)?;
+        let model = store.scheduling_read_model()?;
+        let node = model.nodes.get("node-one").context("missing cached node")?;
+        assert_eq!(node.dynamic_attrs["region"], "us-west");
+
+        store.mark_node_lost("node-one")?;
+        let model = store.scheduling_read_model()?;
+        let node = model.nodes.get("node-one").context("missing cached node")?;
+        assert_eq!(node.status, "lost");
+        assert_eq!(node.availability, "unavailable");
+
+        Ok(())
+    }
+
+    #[test]
+    fn read_model_tracks_allocations_add_remove() -> R<()> {
+        let store = setup_store()?;
+
+        store.insert_node(make_node_msg("node-one", "ready"))?;
+
+        let job = JobConfig {
+            name: "cache-allocs".into(),
+            tasks: vec![TaskConfig {
+                name: "worker".into(),
+                count: 1,
+                kind: "noop".into(),
+                config: json!({}),
+                resources: json!({}),
+                constraints: json!({}),
+            }],
+            version: None,
+        };
+
+        store.handle_job_submit(
+            &job,
+            &[Submission {
+                path: "job.jsonnet".into(),
+                content: "{}".into(),
+                is_primary: true,
+            }],
+        )?;
+        let job_config_id = store.get_job_config(&job.name)?.id();
+        let task_id = task_id_for(&store, "worker", &job.name)?;
+        let alloc = store.place_alloc("node-one", task_id)?;
+
+        let model = store.scheduling_read_model()?;
+        let node_allocs = model
+            .allocations_by_node
+            .get("node-one")
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(node_allocs.len(), 1);
+        assert_eq!(node_allocs[0].id, alloc.id);
+        assert_eq!(node_allocs[0].job_config_id, job_config_id);
+
+        store.remove_allocs_for_node("node-one")?;
+        let model = store.scheduling_read_model()?;
+        let node_allocs = model
+            .allocations_by_node
+            .get("node-one")
+            .cloned()
+            .unwrap_or_default();
+        assert!(node_allocs.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn read_model_tracks_task_config_changes() -> R<()> {
+        let store = setup_store()?;
+
+        let job = JobConfig {
+            name: "cache-tasks".into(),
+            tasks: vec![TaskConfig {
+                name: "alpha".into(),
+                count: 1,
+                kind: "noop".into(),
+                config: json!({}),
+                resources: json!({}),
+                constraints: json!({}),
+            }],
+            version: None,
+        };
+
+        store.handle_job_submit(
+            &job,
+            &[Submission {
+                path: "job.jsonnet".into(),
+                content: "{}".into(),
+                is_primary: true,
+            }],
+        )?;
+
+        let job_config_id = store.get_job_config(&job.name)?.id();
+        let model = store.scheduling_read_model()?;
+        let tasks = model
+            .task_configs
+            .get(&job_config_id)
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].1.name, "alpha");
+
+        let updated_job = JobConfig {
+            name: job.name.clone(),
+            tasks: vec![TaskConfig {
+                name: "beta".into(),
+                count: 2,
+                kind: "noop".into(),
+                config: json!({}),
+                resources: json!({}),
+                constraints: json!({}),
+            }],
+            version: None,
+        };
+
+        store.handle_job_submit(
+            &updated_job,
+            &[Submission {
+                path: "job.jsonnet".into(),
+                content: "{}".into(),
+                is_primary: true,
+            }],
+        )?;
+
+        let new_job_config_id = store.get_job_config(&job.name)?.id();
+        let model = store.scheduling_read_model()?;
+        let tasks = model
+            .task_configs
+            .get(&new_job_config_id)
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].1.name, "beta");
+        assert_eq!(tasks[0].1.count, 2);
 
         Ok(())
     }

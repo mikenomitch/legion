@@ -63,10 +63,12 @@ impl<'a> Scheduler<'a> {
 
         let tasks = self
             .store
-            .get_task_configs_for_job_config(job_config_id)?
+            .cached_task_configs_for_job_config(job_config_id)?
             .into_iter()
             .map(|(id, config)| (id, config.clone(), config.count))
             .collect::<Vec<_>>();
+
+        let allocations_by_node = self.store.cached_allocations_by_node()?;
 
         let required_counts = match mode {
             PlanMode::Fresh => tasks
@@ -74,10 +76,13 @@ impl<'a> Scheduler<'a> {
                 .map(|(id, _config, count)| (*id, *count))
                 .collect::<HashMap<_, _>>(),
             PlanMode::Reschedule => {
-                let existing = self.store.allocs_for_job_config(job_config_id)?;
                 let mut current: HashMap<i64, u32> = HashMap::new();
-                for alloc in existing {
-                    *current.entry(alloc.task_config_id).or_default() += 1;
+                for allocations in allocations_by_node.values() {
+                    for alloc in allocations {
+                        if alloc.job_config_id == job_config_id {
+                            *current.entry(alloc.task_config_id).or_default() += 1;
+                        }
+                    }
                 }
 
                 tasks
@@ -90,7 +95,7 @@ impl<'a> Scheduler<'a> {
             }
         };
 
-        let placements = self.build_plan(nodes, tasks, required_counts)?;
+        let placements = self.build_plan(nodes, tasks, required_counts, &allocations_by_node)?;
         if placements.is_empty() {
             return Ok(PlanOutcome {
                 allocations: Vec::new(),
@@ -118,7 +123,7 @@ impl<'a> Scheduler<'a> {
     fn available_nodes(&self) -> R<Vec<Node>> {
         let mut nodes: Vec<Node> = self
             .store
-            .get_nodes()?
+            .cached_nodes()?
             .into_iter()
             .filter(|node| node.availability == "available")
             .collect();
@@ -132,12 +137,12 @@ impl<'a> Scheduler<'a> {
         nodes: Vec<Node>,
         mut tasks: Vec<(i64, TaskConfig, u32)>,
         required_counts: HashMap<i64, u32>,
+        allocations_by_node: &HashMap<String, Vec<Allocation>>,
     ) -> R<Vec<PlannedAllocation>> {
         tasks.sort_by(|a, b| a.0.cmp(&b.0));
 
         let mut placements = Vec::new();
         let mut planned: HashMap<String, usize> = HashMap::new();
-        let allocations = self.store.get_allocs_by_node()?;
 
         for (task_id, task_config, _desired_count) in tasks {
             let needed = required_counts.get(&task_id).copied().unwrap_or(0);
@@ -159,7 +164,8 @@ impl<'a> Scheduler<'a> {
                 }
 
                 let eligible = self.apply_nodes_considered(eligible)?;
-                let ctx = SchedulingContext::new(eligible, &task_config, &allocations, &planned);
+                let ctx =
+                    SchedulingContext::new(eligible, &task_config, allocations_by_node, &planned);
                 let node_id = self
                     .policy
                     .select_node(ctx)
