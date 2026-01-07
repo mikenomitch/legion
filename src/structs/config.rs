@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::prelude::{
     DEF_EVAL_PRIORITY, DEF_MANAGER_HOSTNAME, DEF_MANAGER_INSECURE_PORT, DEF_MANAGER_SERVER_PORT,
@@ -25,6 +26,7 @@ pub struct ManagerConfig {
     pub eval_threads: Option<usize>,
     pub scheduling_policy: Option<String>,
     pub default_priority: Option<i64>,
+    pub scheduler_settings: Option<Value>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -77,6 +79,7 @@ pub struct ManagerConfigFull {
     pub eval_threads: usize,
     pub scheduling_policy: String,
     pub default_priority: i64,
+    pub scheduler_settings: Option<Value>,
 }
 
 impl From<ManagerConfigFull> for ManagerConfig {
@@ -89,6 +92,7 @@ impl From<ManagerConfigFull> for ManagerConfig {
             eval_threads: Some(val.eval_threads),
             scheduling_policy: Some(val.scheduling_policy),
             default_priority: Some(val.default_priority),
+            scheduler_settings: val.scheduler_settings,
         }
     }
 }
@@ -118,6 +122,7 @@ impl ManagerConfig {
                 .clone()
                 .unwrap_or_else(|| DEF_SCHEDULING_POLICY.into()),
             default_priority: self.default_priority.unwrap_or(DEF_EVAL_PRIORITY),
+            scheduler_settings: self.scheduler_settings.clone(),
         }
     }
 }
@@ -131,6 +136,7 @@ impl Default for ManagerConfigFull {
             worker_check_seconds: DEF_WORKER_CHECK_SEC,
             scheduling_policy: DEF_SCHEDULING_POLICY.into(),
             default_priority: DEF_EVAL_PRIORITY,
+            scheduler_settings: None,
         }
     }
 }

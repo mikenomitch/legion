@@ -38,6 +38,7 @@ pub struct Store {
     pub conn: MemSafeConn,
     pub scheduling_policy: String,
     pub default_eval_priority: i64,
+    pub scheduler_settings: Option<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,7 +74,8 @@ impl Store {
         let store = Store {
             conn,
             scheduling_policy: config.scheduling_policy.clone(),
-            default_eval_priority: config.default_priority,
+            default_eval_priority: config.default_priority.clone(),
+            scheduler_settings: config.scheduler_settings.clone(),
         };
 
         Ok(store)
@@ -1683,7 +1685,10 @@ mod tests {
 
         // Resubmitting with unchanged config is idempotent
         let submit_response = store.handle_job_submit(&job_config, &orig_submissions)?;
-        assert!(matches!(submit_response, JobSubmitOutcome::Unchanged { .. }));
+        assert!(matches!(
+            submit_response,
+            JobSubmitOutcome::Unchanged { .. }
+        ));
 
         Ok(())
     }
