@@ -1,5 +1,5 @@
 import { A, Route, Router, useLocation, type RouteSectionProps } from '@solidjs/router'
-import { For, Show, createEffect, createMemo, createResource, createSignal } from 'solid-js'
+import { For, Show, createEffect, createMemo, createResource, createSignal, onCleanup } from 'solid-js'
 import { managerClient, managerEndpoint } from './grpcClient'
 import type { Job, LedgerNode, NodeMsg } from './gen/legion_pb'
 import Homepage from './pages/Homepage'
@@ -7,6 +7,7 @@ import Jobs from './pages/Jobs'
 import Manager from './pages/Manager'
 import Nodes from './pages/Nodes'
 import TestingUtils from './pages/TestingUtils'
+import { POLL_INTERVAL_MS } from './utils/polling'
 
 const navItems = [
   { key: 'overview', label: 'Overview', path: '/', title: 'Ledger', copy: 'Live allocations flowing through the cluster ledger.' },
@@ -139,19 +140,39 @@ const Layout = (props: RouteSectionProps) => {
 }
 
 function App() {
-  const [ledger] = createResource(async (): Promise<readonly LedgerNode[]> => {
+  const location = useLocation()
+
+  const [ledger, { refetch: refetchLedger }] = createResource(async (): Promise<readonly LedgerNode[]> => {
     const response = await managerClient.getLedger({})
     return response.nodes
   })
 
-  const [nodes] = createResource(async (): Promise<readonly NodeMsg[]> => {
+  const [nodes, { refetch: refetchNodes }] = createResource(async (): Promise<readonly NodeMsg[]> => {
     const response = await managerClient.getNodes({})
     return response.nodes
   })
 
-  const [jobs] = createResource(async (): Promise<readonly Job[]> => {
+  const [jobs, { refetch: refetchJobs }] = createResource(async (): Promise<readonly Job[]> => {
     const response = await managerClient.listJobs({})
     return response.jobs
+  })
+
+  createEffect(() => {
+    const current = location.pathname.replace(/\/+$/, '') || '/'
+    let refetch: (() => void) | null = null
+
+    if (current === '/') {
+      refetch = () => void refetchLedger()
+    } else if (current.startsWith('/nodes')) {
+      refetch = () => void refetchNodes()
+    } else if (current.startsWith('/jobs')) {
+      refetch = () => void refetchJobs()
+    }
+
+    if (!refetch) return
+
+    const interval = window.setInterval(refetch, POLL_INTERVAL_MS)
+    onCleanup(() => window.clearInterval(interval))
   })
 
   return (
