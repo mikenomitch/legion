@@ -22,6 +22,7 @@ pub struct ManagerConfig {
     pub store_path: Option<String>,
     pub worker_config_path: Option<String>,
     pub worker_check_seconds: Option<u64>,
+    pub eval_threads: Option<usize>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -63,13 +64,15 @@ impl ServerConfig {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ManagerConfigFull {
     pub server: ServerConfigFull,
     pub store_path: String,
     pub worker_config_path: String,
     pub worker_check_seconds: u64,
+    #[serde(default = "default_eval_threads")]
+    pub eval_threads: usize,
 }
 
 impl From<ManagerConfigFull> for ManagerConfig {
@@ -79,6 +82,7 @@ impl From<ManagerConfigFull> for ManagerConfig {
             store_path: Some(val.store_path),
             worker_config_path: Some(val.worker_config_path),
             worker_check_seconds: Some(val.worker_check_seconds),
+            eval_threads: Some(val.eval_threads),
         }
     }
 }
@@ -102,8 +106,27 @@ impl ManagerConfig {
                 .clone()
                 .unwrap_or_else(|| DEF_WORKER_CONFIG_PATH.into()),
             worker_check_seconds: self.worker_check_seconds.unwrap_or(DEF_WORKER_CHECK_SEC),
+            eval_threads: self.eval_threads.unwrap_or_else(default_eval_threads),
         }
     }
+}
+
+impl Default for ManagerConfigFull {
+    fn default() -> Self {
+        ManagerConfigFull {
+            server: ServerConfig::full_default(),
+            store_path: DEF_STORE_PATH.into(),
+            worker_config_path: DEF_WORKER_CONFIG_PATH.into(),
+            worker_check_seconds: DEF_WORKER_CHECK_SEC,
+            eval_threads: default_eval_threads(),
+        }
+    }
+}
+
+fn default_eval_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(1)
 }
 
 #[derive(Serialize, Deserialize, Debug)]

@@ -6,4 +6,5 @@
   },
   storePath: ".legion",
   workerConfigPath: "./configs/workers/",
+  evalThreads: 4,
 }
