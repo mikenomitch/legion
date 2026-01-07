@@ -104,6 +104,7 @@ fn eval_loop_reconciles_ledger_and_evals() -> R<()> {
             job_id: String::new(),
             job_config_id: String::new(),
             node_name: "node-1".into(),
+            priority: 50,
         },
         Eval {
             id: "2".into(),
@@ -112,6 +113,7 @@ fn eval_loop_reconciles_ledger_and_evals() -> R<()> {
             job_id: String::new(),
             job_config_id: String::new(),
             node_name: "node-2".into(),
+            priority: 50,
         },
         Eval {
             id: "3".into(),
@@ -120,6 +122,7 @@ fn eval_loop_reconciles_ledger_and_evals() -> R<()> {
             job_id: job_name.into(),
             job_config_id: job_config_v1_id.clone(),
             node_name: String::new(),
+            priority: 50,
         },
         Eval {
             id: "4".into(),
@@ -128,6 +131,7 @@ fn eval_loop_reconciles_ledger_and_evals() -> R<()> {
             job_id: job_name.into(),
             job_config_id: job_config_v2_id.clone(),
             node_name: String::new(),
+            priority: 50,
         },
         Eval {
             id: "5".into(),
@@ -136,6 +140,7 @@ fn eval_loop_reconciles_ledger_and_evals() -> R<()> {
             job_id: String::new(),
             job_config_id: String::new(),
             node_name: "node-1".into(),
+            priority: 50,
         },
         Eval {
             id: "6".into(),
@@ -144,6 +149,7 @@ fn eval_loop_reconciles_ledger_and_evals() -> R<()> {
             job_id: job_name.into(),
             job_config_id: job_config_v2_id.clone(),
             node_name: String::new(),
+            priority: 50,
         },
     ];
 
@@ -200,6 +206,45 @@ fn eval_loop_reconciles_ledger_and_evals() -> R<()> {
     assert_eq!(eval_status(&store, "6")?, "complete");
 
     assert!(process_next_eval(&store)?.is_none());
+
+    Ok(())
+}
+
+#[test]
+fn higher_priority_evals_are_processed_first() -> R<()> {
+    let store = setup_store()?;
+
+    let evals = vec![
+        Eval {
+            id: "1".into(),
+            status: "pending".into(),
+            kind: "node_join".into(),
+            job_id: String::new(),
+            job_config_id: String::new(),
+            node_name: "low-node".into(),
+            priority: 10,
+        },
+        Eval {
+            id: "2".into(),
+            status: "pending".into(),
+            kind: "node_join".into(),
+            job_id: String::new(),
+            job_config_id: String::new(),
+            node_name: "high-node".into(),
+            priority: 90,
+        },
+    ];
+
+    for eval in evals {
+        store.insert_eval(&eval)?;
+    }
+
+    let first_eval = store.get_next_eval()?.context("expected a pending eval")?;
+    assert_eq!(first_eval.id, "2");
+    store.set_eval_status(&first_eval.id, "complete")?;
+
+    let second_eval = store.get_next_eval()?.context("expected remaining eval")?;
+    assert_eq!(second_eval.id, "1");
 
     Ok(())
 }

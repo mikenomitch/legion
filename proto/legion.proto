@@ -59,6 +59,7 @@ message Submission {
 message RunJobRequest {
   string parsed_jobspec = 1;
   repeated Submission submissions = 2;
+  optional int64 priority = 3;
 }
 
 message RunJobReply {
@@ -83,6 +84,7 @@ message GetJobSpecReply {
 
 message StopJobRequest {
   string name = 1;
+  optional int64 priority = 2;
 }
 
 message StopJobReply {
@@ -91,6 +93,7 @@ message StopJobReply {
 
 message DestroyJobRequest {
   string name = 1;
+  optional int64 priority = 2;
 }
 
 message DestroyJobReply {
@@ -208,6 +211,7 @@ message Eval {
   string job_id = 4;
   string job_config_id = 5;
   string node_name = 6;
+  int64 priority = 7;
 }
 
 // === WORKER ===

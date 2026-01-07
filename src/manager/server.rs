@@ -29,16 +29,30 @@ impl Manager for ManagerAgentService {
         let inner = request.into_inner();
         let js = inner.parsed_jobspec;
         let subs = inner.submissions;
+        let priority = inner.priority.unwrap_or(self.store.default_eval_priority);
 
         let config: JobConfig = serde_json::from_str(&js).map_err(|e| {
             println!("Error parsing jobspec: {:?}", e);
             Status::internal("Error parsing jobspec")
         })?;
 
-        self.store.handle_job_submit(&config, &subs).map_err(|e| {
+        let job_config_id = self.store.handle_job_submit(&config, &subs).map_err(|e| {
             error!("Error running job: {:?}", e);
             Status::internal("Error running job")
         })?;
+
+        self.store
+            .enqueue_eval(
+                "job_submit",
+                Some(&config.name),
+                Some(&job_config_id),
+                None,
+                Some(priority),
+            )
+            .map_err(|e| {
+                error!("Error enqueueing eval: {:?}", e);
+                Status::internal("Error running job")
+            })?;
 
         let reply = RunJobReply {
             message: "Job submit success".into(),
@@ -108,12 +122,36 @@ impl Manager for ManagerAgentService {
         &self,
         request: Request<StopJobRequest>,
     ) -> Result<Response<StopJobReply>, Status> {
-        let name = request.into_inner().name;
+        let inner = request.into_inner();
+        let name = inner.name;
+        let priority = inner.priority.unwrap_or(self.store.default_eval_priority);
+
+        let job_config_id = self
+            .store
+            .get_job_config(&name)
+            .map_err(|e| {
+                error!("Error fetching job config for stop {}: {:?}", name, e);
+                Status::internal("Error stopping job")
+            })?
+            .id();
 
         let _ = self.store.stop_job(&name).map_err(|e| {
             error!("Error stopping job: {:?}", e);
             Status::internal("Error stopping job")
         })?;
+
+        self.store
+            .enqueue_eval(
+                "job_stop",
+                Some(&name),
+                Some(&job_config_id),
+                None,
+                Some(priority),
+            )
+            .map_err(|e| {
+                error!("Error enqueueing eval: {:?}", e);
+                Status::internal("Error stopping job")
+            })?;
 
         let message = format!("Stopped {}", name);
         let reply = StopJobReply { message };
