@@ -2,9 +2,14 @@ use std::collections::HashMap;
 
 use serde_json::{Map, Value};
 
+use libloading::Library;
+
 use crate::prelude::*;
 use crate::storage::store::Store;
 use crate::structs::{Allocation, LedgerEntry, Node, TaskConfig};
+pub use policy::{load_policy, SchedulingContext, SchedulingPolicy};
+
+mod policy;
 
 #[derive(Debug, Clone)]
 pub struct PlannedAllocation {
@@ -31,14 +36,22 @@ pub struct PlanOutcome {
     pub deltas: Vec<LedgerDelta>,
 }
 
-#[derive(Debug)]
 pub struct Scheduler<'a> {
     store: &'a Store,
+    policy: Box<dyn SchedulingPolicy>,
+    #[allow(dead_code)]
+    policy_lib: Option<Library>,
 }
 
 impl<'a> Scheduler<'a> {
-    pub fn new(store: &'a Store) -> Self {
-        Scheduler { store }
+    pub fn new(store: &'a Store) -> R<Self> {
+        let (policy_lib, policy) = load_policy(&store.scheduling_policy)?;
+
+        Ok(Scheduler {
+            store,
+            policy,
+            policy_lib,
+        })
     }
 
     #[instrument(skip_all)]
@@ -121,7 +134,8 @@ impl<'a> Scheduler<'a> {
         tasks.sort_by(|a, b| a.0.cmp(&b.0));
 
         let mut placements = Vec::new();
-        let mut node_cursor = 0usize;
+        let mut planned: HashMap<String, usize> = HashMap::new();
+        let allocations = self.store.get_allocs_by_node()?;
 
         for (task_id, task_config, _desired_count) in tasks {
             let needed = required_counts.get(&task_id).copied().unwrap_or(0);
@@ -130,47 +144,40 @@ impl<'a> Scheduler<'a> {
             }
 
             for _ in 0..needed {
-                let node = self
-                    .next_node_for_task(&nodes, &task_config, &mut node_cursor)
-                    .with_context(|| format!("Failed to place task {}", task_config.name))?;
+                let eligible = nodes
+                    .iter()
+                    .filter(|node| Self::node_satisfies_constraints(node, &task_config.constraints))
+                    .collect::<Vec<_>>();
 
+                if eligible.is_empty() {
+                    bail!(
+                        "Failed to place task {}: no available nodes matching constraints",
+                        task_config.name
+                    );
+                }
+
+                let ctx = SchedulingContext::new(eligible, &task_config, &allocations, &planned);
+                let node_id = self
+                    .policy
+                    .select_node(ctx)
+                    .map(|node| node.id.clone())
+                    .with_context(|| {
+                        format!(
+                            "Scheduling policy {} failed to place task {}",
+                            self.policy.name(),
+                            task_config.name
+                        )
+                    })?;
+
+                *planned.entry(node_id.clone()).or_default() += 1;
                 placements.push(PlannedAllocation {
-                    node_id: node.id.clone(),
+                    node_id,
                     task_config_id: task_id,
                 });
             }
-
-            node_cursor = node_cursor.saturating_add(1) % nodes.len();
         }
 
         Ok(placements)
-    }
-
-    fn next_node_for_task<'b>(
-        &self,
-        nodes: &'b [Node],
-        task: &TaskConfig,
-        node_cursor: &mut usize,
-    ) -> R<&'b Node> {
-        let total_nodes = nodes.len();
-        if total_nodes == 0 {
-            bail!("No nodes available for placement");
-        }
-
-        for offset in 0..total_nodes {
-            let idx = (*node_cursor + offset) % total_nodes;
-            let candidate = &nodes[idx];
-
-            if Self::node_satisfies_constraints(candidate, &task.constraints) {
-                *node_cursor = idx;
-                return Ok(candidate);
-            }
-        }
-
-        bail!(
-            "No available nodes matching constraints for task {}",
-            task.name
-        )
     }
 
     fn node_satisfies_constraints(node: &Node, constraints: &Value) -> bool {
@@ -273,14 +280,23 @@ mod tests {
     }
 
     fn make_node_msg(id: &str, attrs: Value) -> NodeMsg {
+        make_node_msg_with_sources(id, attrs, json!({}), json!({}))
+    }
+
+    fn make_node_msg_with_sources(
+        id: &str,
+        config_attrs: Value,
+        fingerprint_attrs: Value,
+        dynamic_attrs: Value,
+    ) -> NodeMsg {
         NodeMsg {
             id: id.to_string(),
             pool: "default".into(),
             status: "active".into(),
             availability: "available".into(),
-            config_attrs: attrs.to_string(),
-            fingerprint_attrs: "{}".into(),
-            dynamic_attrs: "{}".into(),
+            config_attrs: config_attrs.to_string(),
+            fingerprint_attrs: fingerprint_attrs.to_string(),
+            dynamic_attrs: dynamic_attrs.to_string(),
             health_checks: "{}".into(),
             last_heartbeat: "2023-01-01 00:00:00 +00:00:00".into(),
         }
@@ -342,7 +358,7 @@ mod tests {
         store.handle_job_submit(&job, &[dummy_submission()])?;
         let job_config_id = store.get_job_config(&job.name)?.id();
 
-        let scheduler = Scheduler::new(&store);
+        let scheduler = Scheduler::new(&store)?;
         let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
 
         assert_eq!(outcome.allocations.len(), 3);
@@ -406,7 +422,7 @@ mod tests {
         let job_config_id = store.get_job_config(&job.name)?.id();
         let batch_id = task_id_for(&store, &job_config_id, "batch")?;
         store.place_alloc("node-a", batch_id)?;
-        let scheduler = Scheduler::new(&store);
+        let scheduler = Scheduler::new(&store)?;
         let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Reschedule)?;
 
         assert_eq!(outcome.allocations.len(), 2);
@@ -440,15 +456,88 @@ mod tests {
 
         store.handle_job_submit(&job, &[dummy_submission()])?;
         let job_config_id = store.get_job_config(&job.name)?.id();
-        let scheduler = Scheduler::new(&store);
+        let scheduler = Scheduler::new(&store)?;
 
         let err = scheduler
             .plan_and_apply(&job_config_id, PlanMode::Fresh)
             .expect_err("expected scheduling error");
 
-        assert!(err
-            .to_string()
-            .contains("Failed to place task analytics"));
+        assert!(err.to_string().contains("Failed to place task analytics"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn constraint_matching_across_node_attributes() -> R<()> {
+        let node = Node {
+            id: "node-mixed".into(),
+            status: "active".into(),
+            pool: "default".into(),
+            availability: "available".into(),
+            last_heartbeat: "2023-01-01 00:00:00 +00:00:00".into(),
+            config_attrs: json!({ "role": "db" }),
+            fingerprint_attrs: json!({ "arch": "arm64" }),
+            dynamic_attrs: json!({ "zone": "us-east" }),
+            health_checks: json!({}),
+        };
+
+        let constraints = json!({
+            "role": "db",
+            "arch": "arm64",
+            "zone": "us-east",
+        });
+
+        assert!(Scheduler::node_satisfies_constraints(&node, &constraints));
+
+        let mismatched = json!({ "role": "web", "arch": "arm64", "zone": "us-east" });
+        assert!(!Scheduler::node_satisfies_constraints(&node, &mismatched));
+
+        Ok(())
+    }
+
+    #[test]
+    fn scheduler_uses_nodes_matching_constraints_from_any_attribute_source() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", json!({ "role": "web" })))?;
+        store.insert_node(make_node_msg_with_sources(
+            "node-b",
+            json!({}),
+            json!({ "role": "db" }),
+            json!({}),
+        ))?;
+        store.insert_node(make_node_msg_with_sources(
+            "node-c",
+            json!({}),
+            json!({}),
+            json!({ "role": "db" }),
+        ))?;
+
+        let job = JobConfig {
+            name: "constraint-sources".into(),
+            tasks: vec![TaskConfig {
+                name: "db".into(),
+                count: 2,
+                kind: "noop".into(),
+                config: json!({}),
+                resources: json!({}),
+                constraints: json!({ "role": "db" }),
+            }],
+            version: None,
+        };
+
+        store.handle_job_submit(&job, &[dummy_submission()])?;
+        let job_config_id = store.get_job_config(&job.name)?.id();
+        let scheduler = Scheduler::new(&store)?;
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+
+        assert_eq!(outcome.allocations.len(), 2);
+        for alloc in &outcome.allocations {
+            let node = store.get_node(&alloc.node_id)?;
+            assert!(Scheduler::node_satisfies_constraints(
+                &node,
+                &json!({ "role": "db" })
+            ));
+        }
 
         Ok(())
     }

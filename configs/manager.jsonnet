@@ -7,4 +7,6 @@
   storePath: ".legion",
   workerConfigPath: "./configs/workers/",
   evalThreads: 4,
+  schedulingPolicy: "bin_pack",
+  defaultPriority: 50,
 }
