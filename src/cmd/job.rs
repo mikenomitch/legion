@@ -21,7 +21,13 @@ pub fn config() -> Command {
                 .value_hint(ValueHint::FilePath),
         )
         .arg(priority_arg())
-        .arg(asap_flag());
+        .arg(asap_flag())
+        .arg(
+            Arg::new("force-reschedule")
+                .long("force-reschedule")
+                .help("Force a reschedule even if the job spec is unchanged")
+                .action(ArgAction::SetTrue),
+        );
 
     let stop_cmd = Command::new("stop")
         .about("Stop a job")
@@ -241,6 +247,7 @@ async fn run_job(arg_matches: &ArgMatches) -> R<()> {
         parsed_jobspec: rendered,
         submissions,
         priority,
+        force_reschedule: arg_matches.get_flag("force-reschedule"),
     });
 
     let response = client.run_job(request).await.context("failed to run job")?;

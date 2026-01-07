@@ -1,6 +1,6 @@
 use crate::prelude::*;
 
-use crate::storage::store::Store;
+use crate::storage::store::{JobSubmitOutcome, Store};
 use crate::structs::manager_server::Manager;
 use crate::structs::{
     DestroyJobReply, DestroyJobRequest, GetJobInfoReply, GetJobInfoRequest, GetJobSpecReply,
@@ -36,26 +36,46 @@ impl Manager for ManagerAgentService {
             Status::internal("Error parsing jobspec")
         })?;
 
-        let job_config_id = self.store.handle_job_submit(&config, &subs).map_err(|e| {
+        let force_reschedule = inner.force_reschedule;
+        let submit_outcome = self.store.handle_job_submit(&config, &subs).map_err(|e| {
             error!("Error running job: {:?}", e);
             Status::internal("Error running job")
         })?;
 
-        self.store
-            .enqueue_eval(
-                "job_submit",
-                Some(&config.name),
-                Some(&job_config_id),
-                None,
-                Some(priority),
-            )
-            .map_err(|e| {
-                error!("Error enqueueing eval: {:?}", e);
-                Status::internal("Error running job")
-            })?;
+        let job_config_id = submit_outcome.job_config_id().to_string();
+        let (eval_kind, message) = match submit_outcome {
+            JobSubmitOutcome::Unchanged { .. } => {
+                if force_reschedule {
+                    (
+                        Some("job_update"),
+                        "Job config unchanged; forced reschedule queued",
+                    )
+                } else {
+                    (None, "Job config unchanged; no update needed")
+                }
+            }
+            JobSubmitOutcome::Created { .. } | JobSubmitOutcome::Updated { .. } => {
+                (Some("job_submit"), "Job submit success")
+            }
+        };
+
+        if let Some(kind) = eval_kind {
+            self.store
+                .enqueue_eval(
+                    kind,
+                    Some(&config.name),
+                    Some(&job_config_id),
+                    None,
+                    Some(priority),
+                )
+                .map_err(|e| {
+                    error!("Error enqueueing eval: {:?}", e);
+                    Status::internal("Error running job")
+                })?;
+        }
 
         let reply = RunJobReply {
-            message: "Job submit success".into(),
+            message: message.into(),
         };
 
         Ok(Response::new(reply))

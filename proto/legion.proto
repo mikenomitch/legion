@@ -60,6 +60,7 @@ message RunJobRequest {
   string parsed_jobspec = 1;
   repeated Submission submissions = 2;
   optional int64 priority = 3;
+  bool force_reschedule = 4;
 }
 
 message RunJobReply {
