@@ -40,6 +40,27 @@ pub struct Store {
     pub default_eval_priority: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JobSubmitOutcome {
+    Created { job_config_id: String },
+    Updated { job_config_id: String },
+    Unchanged { job_config_id: String },
+}
+
+impl JobSubmitOutcome {
+    pub fn job_config_id(&self) -> &str {
+        match self {
+            JobSubmitOutcome::Created { job_config_id }
+            | JobSubmitOutcome::Updated { job_config_id }
+            | JobSubmitOutcome::Unchanged { job_config_id } => job_config_id,
+        }
+    }
+
+    pub fn is_unchanged(&self) -> bool {
+        matches!(self, JobSubmitOutcome::Unchanged { .. })
+    }
+}
+
 pub const CONN_LOCK_ERROR: &str = "Error locking database connection";
 
 // NOTE: This will become a general interface for all storage backends
@@ -572,21 +593,29 @@ impl Store {
     }
 
     #[allow(dead_code)]
-    pub fn handle_job_submit(&self, config: &JobConfig, subs: &[Submission]) -> R<String> {
+    pub fn handle_job_submit(
+        &self,
+        config: &JobConfig,
+        subs: &[Submission],
+    ) -> R<JobSubmitOutcome> {
         // Note: There is a race condition here with the version
         // I think this should prob be all in a single lock, but
         // I am not going to worry about this for now
 
         let mut next_version = 1;
         let mut last_versions_id: Option<String> = None;
+        let mut was_update = false;
 
         if let Ok(latest_job_config) = self.get_job_config(&config.name) {
-            // if latest_job_config is deep equal to config, return an error
+            // if latest_job_config is deep equal to config, return unchanged
             if latest_job_config.is_same_as(config) {
-                bail!("Job config is unchanged");
+                return Ok(JobSubmitOutcome::Unchanged {
+                    job_config_id: latest_job_config.id(),
+                });
             } else {
                 next_version = latest_job_config.version.unwrap_or(0) + 1;
                 last_versions_id = Some(latest_job_config.id());
+                was_update = true;
             }
         }
 
@@ -685,7 +714,11 @@ impl Store {
         tx.commit()
             .map_err(|_| anyhow!("Error committing transaction"))?;
 
-        Ok(job_config_id)
+        if was_update {
+            Ok(JobSubmitOutcome::Updated { job_config_id })
+        } else {
+            Ok(JobSubmitOutcome::Created { job_config_id })
+        }
     }
 
     #[instrument(err, skip_all)]
@@ -1422,8 +1455,8 @@ mod tests {
         );
 
         // NOTE: What should this return (figure it out in concontent later)
-        let submit_response = store.handle_job_submit(&job_config, &subs);
-        assert!(submit_response.is_ok());
+        let submit_response = store.handle_job_submit(&job_config, &subs)?;
+        assert!(matches!(submit_response, JobSubmitOutcome::Created { .. }));
 
         let job = store.get_job(&job_name)?;
         assert_eq!(job.name, job_name);
@@ -1531,8 +1564,8 @@ mod tests {
         let store = setup_store()?;
 
         // Original Job is submitted
-        let submit_response = store.handle_job_submit(&job_config, &orig_submissions);
-        assert!(submit_response.is_ok());
+        let submit_response = store.handle_job_submit(&job_config, &orig_submissions)?;
+        assert!(matches!(submit_response, JobSubmitOutcome::Created { .. }));
 
         // Get config for initial insert
         let first_job_config = store.get_job_config("jobname".into())?;
@@ -1558,8 +1591,8 @@ mod tests {
         };
 
         let submit_response =
-            store.handle_job_submit(&job_config_with_modified_kind.clone(), &orig_submissions);
-        assert!(submit_response.is_ok());
+            store.handle_job_submit(&job_config_with_modified_kind.clone(), &orig_submissions)?;
+        assert!(matches!(submit_response, JobSubmitOutcome::Updated { .. }));
 
         // Get config for initial insert
         let second_job_config = store.get_job_config("jobname".into())?;
@@ -1589,8 +1622,8 @@ mod tests {
         };
 
         let submit_response =
-            store.handle_job_submit(&job_config_with_extra_task, &orig_submissions);
-        assert!(submit_response.is_ok());
+            store.handle_job_submit(&job_config_with_extra_task, &orig_submissions)?;
+        assert!(matches!(submit_response, JobSubmitOutcome::Updated { .. }));
 
         // Get config for initial insert
         let third_job_config = store.get_job_config("jobname".into())?;
@@ -1624,7 +1657,7 @@ mod tests {
     }
 
     #[test]
-    fn handle_job_submit_with_unchanged_job_returns_error() -> R<()> {
+    fn handle_job_submit_with_unchanged_job_is_idempotent() -> R<()> {
         let orig_submissions = vec![];
         let orig_task = TaskConfig {
             name: "dupe-task".to_string(),
@@ -1645,16 +1678,12 @@ mod tests {
         let store = setup_store()?;
 
         // Original Job is submitted
-        let submit_response = store.handle_job_submit(&job_config, &orig_submissions);
-        assert!(submit_response.is_ok());
+        let submit_response = store.handle_job_submit(&job_config, &orig_submissions)?;
+        assert!(matches!(submit_response, JobSubmitOutcome::Created { .. }));
 
-        // Errors on resubmit
-        let submit_response = store.handle_job_submit(&job_config, &orig_submissions);
-        assert!(submit_response.is_err());
-        assert_eq!(
-            submit_response.unwrap_err().to_string(),
-            "Job config is unchanged"
-        );
+        // Resubmitting with unchanged config is idempotent
+        let submit_response = store.handle_job_submit(&job_config, &orig_submissions)?;
+        assert!(matches!(submit_response, JobSubmitOutcome::Unchanged { .. }));
 
         Ok(())
     }
