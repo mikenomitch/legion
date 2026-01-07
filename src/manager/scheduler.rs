@@ -156,6 +156,7 @@ impl<'a> Scheduler<'a> {
                     );
                 }
 
+                let eligible = self.apply_nodes_considered(eligible)?;
                 let ctx = SchedulingContext::new(eligible, &task_config, &allocations, &planned);
                 let node_id = self
                     .policy
@@ -178,6 +179,93 @@ impl<'a> Scheduler<'a> {
         }
 
         Ok(placements)
+    }
+
+    fn apply_nodes_considered<'a>(&self, eligible: Vec<&'a Node>) -> R<Vec<&'a Node>> {
+        if eligible.len() <= 1 {
+            return Ok(eligible);
+        }
+
+        if !matches!(self.policy.name(), "bin_pack" | "spread") {
+            return Ok(eligible);
+        }
+
+        let Some(settings) = self.store.scheduler_settings.as_ref() else {
+            return Ok(eligible);
+        };
+
+        let settings = match settings {
+            Value::Null => return Ok(eligible),
+            Value::Object(map) => map,
+            _ => {
+                bail!(
+                    "scheduler_settings for policy {} must be an object",
+                    self.policy.name()
+                )
+            }
+        };
+
+        let Some(nodes_considered) = settings.get("nodes_considered") else {
+            return Ok(eligible);
+        };
+
+        let limit = Self::parse_nodes_considered(nodes_considered, eligible.len())?;
+        Ok(eligible.into_iter().take(limit).collect())
+    }
+
+    fn parse_nodes_considered(value: &Value, eligible_len: usize) -> R<usize> {
+        if eligible_len == 0 {
+            return Ok(0);
+        }
+
+        match value {
+            Value::Number(count) => {
+                let count = count
+                    .as_u64()
+                    .context("nodes_considered must be a positive integer or percentage")?;
+
+                if count == 0 {
+                    bail!("nodes_considered must be at least 1");
+                }
+
+                if eligible_len == 1 {
+                    return Ok(1);
+                }
+
+                if count < 2 {
+                    bail!("nodes_considered must be at least 2");
+                }
+
+                Ok(std::cmp::min(count as usize, eligible_len))
+            }
+            Value::String(raw) => {
+                let trimmed = raw.trim();
+                let percent = trimmed
+                    .strip_suffix('%')
+                    .context("nodes_considered percentage must end with '%'")?;
+                let percent: f64 = percent
+                    .trim()
+                    .parse()
+                    .context("nodes_considered percentage must be a number")?;
+
+                if percent < 0.0 {
+                    bail!("nodes_considered percentage cannot be negative");
+                }
+
+                if eligible_len == 1 {
+                    return Ok(1);
+                }
+
+                let percent = percent / 100.0;
+                let mut count = ((eligible_len as f64) * percent).ceil() as usize;
+                if count < 2 {
+                    count = 2;
+                }
+
+                Ok(std::cmp::min(count, eligible_len))
+            }
+            _ => bail!("nodes_considered must be a number or percentage string"),
+        }
     }
 
     fn node_satisfies_constraints(node: &Node, constraints: &Value) -> bool {
@@ -250,26 +338,38 @@ impl<'a> Scheduler<'a> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
     use serde_json::{json, Value};
+    use tempfile::Builder;
 
     use super::*;
     use crate::structs::config::ManagerConfigFull;
     use crate::structs::{JobConfig, NodeMsg, Submission};
 
-    fn store_path() -> String {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock error")
-            .as_nanos();
+    fn store_path() -> R<String> {
+        let store_dir = Builder::new()
+            .prefix("khepri-scheduler-")
+            .tempdir()
+            .context("Error creating temp store directory")?
+            .keep();
 
-        format!("tests/store_scheduler_{}", nanos)
+        Ok(store_dir
+            .to_str()
+            .context("Error parsing store path")?
+            .to_string())
     }
 
     fn setup_store() -> R<Store> {
+        setup_store_with_scheduler("bin_pack", None)
+    }
+
+    fn setup_store_with_scheduler(
+        scheduling_policy: &str,
+        scheduler_settings: Option<Value>,
+    ) -> R<Store> {
         let store_config = ManagerConfigFull {
-            store_path: store_path(),
+            store_path: store_path()?,
+            scheduling_policy: scheduling_policy.into(),
+            scheduler_settings,
             ..Default::default()
         };
 
@@ -538,6 +638,87 @@ mod tests {
                 &json!({ "role": "db" })
             ));
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn spread_limits_nodes_considered_by_count() -> R<()> {
+        let store = setup_store_with_scheduler("spread", Some(json!({ "nodes_considered": 2 })))?;
+        store.insert_node(make_node_msg("node-a", json!({})))?;
+        store.insert_node(make_node_msg("node-b", json!({})))?;
+        store.insert_node(make_node_msg("node-c", json!({})))?;
+
+        let job = JobConfig {
+            name: "spread-considered".into(),
+            tasks: vec![TaskConfig {
+                name: "api".into(),
+                count: 1,
+                kind: "noop".into(),
+                config: json!({}),
+                resources: json!({}),
+                constraints: json!({}),
+            }],
+            version: None,
+        };
+
+        store.handle_job_submit(&job, &[dummy_submission()])?;
+        let job_config_id = store.get_job_config(&job.name)?.id();
+        let task_id = task_id_for(&store, &job_config_id, "api")?;
+
+        for _ in 0..3 {
+            store.place_alloc("node-a", task_id)?;
+        }
+        for _ in 0..2 {
+            store.place_alloc("node-b", task_id)?;
+        }
+
+        let scheduler = Scheduler::new(&store)?;
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+
+        assert_eq!(outcome.allocations.len(), 1);
+        assert_eq!(outcome.allocations[0].node_id, "node-b");
+
+        Ok(())
+    }
+
+    #[test]
+    fn bin_pack_limits_nodes_considered_by_percentage() -> R<()> {
+        let store =
+            setup_store_with_scheduler("bin_pack", Some(json!({ "nodes_considered": "50%" })))?;
+        store.insert_node(make_node_msg("node-a", json!({})))?;
+        store.insert_node(make_node_msg("node-b", json!({})))?;
+        store.insert_node(make_node_msg("node-c", json!({})))?;
+
+        let job = JobConfig {
+            name: "binpack-considered".into(),
+            tasks: vec![TaskConfig {
+                name: "worker".into(),
+                count: 1,
+                kind: "noop".into(),
+                config: json!({}),
+                resources: json!({}),
+                constraints: json!({}),
+            }],
+            version: None,
+        };
+
+        store.handle_job_submit(&job, &[dummy_submission()])?;
+        let job_config_id = store.get_job_config(&job.name)?.id();
+        let task_id = task_id_for(&store, &job_config_id, "worker")?;
+
+        for _ in 0..2 {
+            store.place_alloc("node-b", task_id)?;
+        }
+        for _ in 0..5 {
+            store.place_alloc("node-c", task_id)?;
+        }
+
+        let scheduler = Scheduler::new(&store)?;
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+
+        assert_eq!(outcome.allocations.len(), 1);
+        assert_eq!(outcome.allocations[0].node_id, "node-b");
 
         Ok(())
     }

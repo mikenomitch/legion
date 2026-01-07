@@ -42,12 +42,14 @@ pub async fn run_manager(config: ManagerConfig) -> R<()> {
         conn: store.conn.clone(),
         scheduling_policy: store.scheduling_policy.clone(),
         default_eval_priority: store.default_eval_priority,
+        scheduler_settings: store.scheduler_settings.clone(),
     };
 
     let store_copy_b = Store {
         conn: store.conn.clone(),
         scheduling_policy: store.scheduling_policy.clone(),
         default_eval_priority: store.default_eval_priority,
+        scheduler_settings: store.scheduler_settings.clone(),
     };
 
     let manager_node = ManagerAgentService { store };
