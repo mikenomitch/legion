@@ -33,6 +33,7 @@ fn make_job_config(name: &str, count: u32) -> JobConfig {
         config: json!({ "message": "hi" }),
         resources: json!({ "memory": 128 }),
         constraints: json!({}),
+        affinities: json!({}),
     };
 
     JobConfig {

@@ -2,17 +2,53 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use libloading::{Library, Symbol};
+use serde_json::{Map, Value};
 
 use crate::prelude::*;
 use crate::structs::{Allocation, Node, TaskConfig};
+
+#[derive(Debug, Clone, Copy)]
+pub struct SchedulerWeights {
+    pub affinity: f64,
+    pub anti_affinity: f64,
+    pub spread: f64,
+    pub bin_pack: f64,
+}
+
+impl SchedulerWeights {
+    pub fn for_policy(policy: &str) -> Self {
+        match policy {
+            "spread" => SchedulerWeights {
+                affinity: 1.0,
+                anti_affinity: 2.0,
+                spread: 1.0,
+                bin_pack: 0.0,
+            },
+            "bin_pack" => SchedulerWeights {
+                affinity: 1.0,
+                anti_affinity: 2.0,
+                spread: 0.0,
+                bin_pack: 1.0,
+            },
+            _ => SchedulerWeights {
+                affinity: 1.0,
+                anti_affinity: 2.0,
+                spread: 0.0,
+                bin_pack: 0.0,
+            },
+        }
+    }
+}
 
 #[allow(dead_code)]
 #[derive(Debug)]
 pub struct SchedulingContext<'a> {
     pub eligible_nodes: Vec<&'a Node>,
     pub task: &'a TaskConfig,
+    pub job_config_id: &'a str,
     pub allocations: &'a HashMap<String, Vec<Allocation>>,
     pub planned: &'a HashMap<String, usize>,
+    pub weights: SchedulerWeights,
 }
 
 #[allow(dead_code)]
@@ -20,14 +56,18 @@ impl<'a> SchedulingContext<'a> {
     pub fn new(
         eligible_nodes: Vec<&'a Node>,
         task: &'a TaskConfig,
+        job_config_id: &'a str,
         allocations: &'a HashMap<String, Vec<Allocation>>,
         planned: &'a HashMap<String, usize>,
+        weights: SchedulerWeights,
     ) -> Self {
         SchedulingContext {
             eligible_nodes,
             task,
+            job_config_id,
             allocations,
             planned,
+            weights,
         }
     }
 
@@ -51,15 +91,7 @@ pub struct BinPackPolicy;
 
 impl BinPackPolicy {
     fn pick_target<'a>(&self, ctx: &SchedulingContext<'a>) -> Option<&'a Node> {
-        ctx.eligible_nodes.iter().copied().max_by(|a, b| {
-            let a_load = ctx.total_assigned(&a.id);
-            let b_load = ctx.total_assigned(&b.id);
-
-            match a_load.cmp(&b_load) {
-                std::cmp::Ordering::Equal => b.id.cmp(&a.id),
-                other => other,
-            }
-        })
+        select_scored_node(ctx)
     }
 }
 
@@ -78,15 +110,7 @@ pub struct SpreadPolicy;
 
 impl SpreadPolicy {
     fn select_least_loaded<'a>(&self, ctx: &SchedulingContext<'a>) -> Option<&'a Node> {
-        ctx.eligible_nodes.iter().copied().min_by(|a, b| {
-            let a_load = ctx.total_assigned(&a.id);
-            let b_load = ctx.total_assigned(&b.id);
-
-            match a_load.cmp(&b_load) {
-                std::cmp::Ordering::Equal => a.id.cmp(&b.id),
-                other => other,
-            }
-        })
+        select_scored_node(ctx)
     }
 }
 
@@ -98,6 +122,120 @@ impl SchedulingPolicy for SpreadPolicy {
     fn select_node<'a>(&self, ctx: SchedulingContext<'a>) -> Option<&'a Node> {
         self.select_least_loaded(&ctx)
     }
+}
+
+fn select_scored_node<'a>(ctx: &SchedulingContext<'a>) -> Option<&'a Node> {
+    if ctx.eligible_nodes.is_empty() {
+        return None;
+    }
+
+    let mut min_load: Option<usize> = None;
+    let mut max_load: Option<usize> = None;
+    let mut loads: HashMap<&'a str, usize> = HashMap::new();
+
+    for node in &ctx.eligible_nodes {
+        let load = ctx.total_assigned(&node.id);
+        loads.insert(node.id.as_str(), load);
+        min_load = Some(min_load.map_or(load, |min| min.min(load)));
+        max_load = Some(max_load.map_or(load, |max| max.max(load)));
+    }
+
+    let min_load = min_load.unwrap_or_default() as f64;
+    let max_load = max_load.unwrap_or_default() as f64;
+    let range = (max_load - min_load).max(0.0);
+
+    ctx.eligible_nodes.iter().copied().max_by(|a, b| {
+        let a_score = score_node(ctx, *a, &loads, min_load, range);
+        let b_score = score_node(ctx, *b, &loads, min_load, range);
+
+        match a_score
+            .partial_cmp(&b_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+        {
+            std::cmp::Ordering::Equal => b.id.cmp(&a.id),
+            other => other,
+        }
+    })
+}
+
+fn score_node(
+    ctx: &SchedulingContext<'_>,
+    node: &Node,
+    loads: &HashMap<&str, usize>,
+    min_load: f64,
+    range: f64,
+) -> f64 {
+    let load = loads.get(node.id.as_str()).copied().unwrap_or_default() as f64;
+    let (spread_score, bin_pack_score) = if range > 0.0 {
+        (
+            (max_load_delta(range, load, min_load)),
+            (load - min_load) / range,
+        )
+    } else {
+        (0.0, 0.0)
+    };
+
+    let affinity_score = affinity_score(ctx.task, node);
+    let anti_affinity_score = anti_affinity_score(ctx, node);
+
+    ctx.weights.affinity * affinity_score
+        + ctx.weights.anti_affinity * anti_affinity_score
+        + ctx.weights.spread * spread_score
+        + ctx.weights.bin_pack * bin_pack_score
+}
+
+fn max_load_delta(range: f64, load: f64, min_load: f64) -> f64 {
+    let max_load = min_load + range;
+    (max_load - load) / range
+}
+
+fn affinity_score(task: &TaskConfig, node: &Node) -> f64 {
+    let affinity_map = match task.affinities.as_object() {
+        Some(map) if !map.is_empty() => map,
+        _ => return 0.0,
+    };
+
+    let attrs = node_attrs(node);
+    let matches = affinity_map
+        .iter()
+        .filter(|(key, value)| attrs.get(*key).map(|attr| attr == *value).unwrap_or(false))
+        .count();
+
+    matches as f64 / affinity_map.len() as f64
+}
+
+fn anti_affinity_score(ctx: &SchedulingContext<'_>, node: &Node) -> f64 {
+    if ctx.planned.get(&node.id).copied().unwrap_or(0) > 0 {
+        return 0.0;
+    }
+
+    let has_job_alloc = ctx.allocations.get(&node.id).map_or(false, |allocs| {
+        allocs
+            .iter()
+            .any(|alloc| alloc.job_config_id == ctx.job_config_id)
+    });
+
+    if has_job_alloc {
+        0.0
+    } else {
+        1.0
+    }
+}
+
+fn node_attrs(node: &Node) -> Map<String, Value> {
+    let mut attrs = Map::new();
+
+    if let Some(obj) = node.config_attrs.as_object() {
+        attrs.extend(obj.clone());
+    }
+    if let Some(obj) = node.fingerprint_attrs.as_object() {
+        attrs.extend(obj.clone());
+    }
+    if let Some(obj) = node.dynamic_attrs.as_object() {
+        attrs.extend(obj.clone());
+    }
+
+    attrs
 }
 
 #[instrument(err, skip_all)]
@@ -165,16 +303,17 @@ mod tests {
             config: json!({}),
             resources: json!({}),
             constraints: json!({}),
+            affinities: json!({}),
         }
     }
 
-    fn alloc(node_id: &str, id: i64) -> Allocation {
+    fn alloc(node_id: &str, id: i64, job_config_id: &str) -> Allocation {
         Allocation {
             id,
             status: "running".into(),
             resources: json!({}),
             node_id: node_id.into(),
-            job_config_id: "job".into(),
+            job_config_id: job_config_id.into(),
             task_config_id: 1,
             job_id: "job".into(),
         }
@@ -183,16 +322,25 @@ mod tests {
     #[test]
     fn bin_pack_prefers_more_loaded_node() {
         let nodes = vec![node("node-a"), node("node-b")];
-        let allocations: HashMap<String, Vec<Allocation>> =
-            HashMap::from([(String::from("node-a"), vec![alloc("node-a", 1)])]);
+        let allocations: HashMap<String, Vec<Allocation>> = HashMap::from([(
+            String::from("node-a"),
+            vec![alloc("node-a", 1, "other-job")],
+        )]);
         let planned = HashMap::from([(String::from("node-b"), 2_usize)]);
 
         let task = task("web");
-        let ctx = SchedulingContext::new(nodes.iter().collect(), &task, &allocations, &planned);
+        let ctx = SchedulingContext::new(
+            nodes.iter().collect(),
+            &task,
+            "job",
+            &allocations,
+            &planned,
+            SchedulerWeights::for_policy("bin_pack"),
+        );
         let policy = BinPackPolicy::default();
 
         let choice = policy.select_node(ctx).expect("node expected");
-        assert_eq!(choice.id, "node-b");
+        assert_eq!(choice.id, "node-a");
     }
 
     #[test]
@@ -205,7 +353,14 @@ mod tests {
         ]);
 
         let task = task("web");
-        let ctx = SchedulingContext::new(nodes.iter().collect(), &task, &allocations, &planned);
+        let ctx = SchedulingContext::new(
+            nodes.iter().collect(),
+            &task,
+            "job",
+            &allocations,
+            &planned,
+            SchedulerWeights::for_policy("bin_pack"),
+        );
         let policy = BinPackPolicy::default();
 
         let choice = policy.select_node(ctx).expect("node expected");
@@ -218,18 +373,31 @@ mod tests {
         let allocations: HashMap<String, Vec<Allocation>> = HashMap::from([
             (
                 String::from("node-a"),
-                vec![alloc("node-a", 1), alloc("node-a", 2)],
+                vec![
+                    alloc("node-a", 1, "other-job"),
+                    alloc("node-a", 2, "other-job"),
+                ],
             ),
-            (String::from("node-b"), vec![alloc("node-b", 3)]),
+            (
+                String::from("node-b"),
+                vec![alloc("node-b", 3, "other-job")],
+            ),
         ]);
         let planned = HashMap::from([(String::from("node-b"), 2_usize)]);
 
         let task = task("worker");
-        let ctx = SchedulingContext::new(nodes.iter().collect(), &task, &allocations, &planned);
+        let ctx = SchedulingContext::new(
+            nodes.iter().collect(),
+            &task,
+            "job",
+            &allocations,
+            &planned,
+            SchedulerWeights::for_policy("bin_pack"),
+        );
         let policy = BinPackPolicy::default();
 
         let choice = policy.select_node(ctx).expect("node expected");
-        assert_eq!(choice.id, "node-b");
+        assert_eq!(choice.id, "node-a");
     }
 
     #[test]
@@ -239,7 +407,14 @@ mod tests {
         let planned: HashMap<String, usize> = HashMap::new();
 
         let task = task("web");
-        let ctx = SchedulingContext::new(nodes.iter().collect(), &task, &allocations, &planned);
+        let ctx = SchedulingContext::new(
+            nodes.iter().collect(),
+            &task,
+            "job",
+            &allocations,
+            &planned,
+            SchedulerWeights::for_policy("bin_pack"),
+        );
         let policy = BinPackPolicy::default();
 
         let choice = policy.select_node(ctx);
@@ -249,12 +424,21 @@ mod tests {
     #[test]
     fn spread_prefers_least_loaded_node() {
         let nodes = vec![node("node-a"), node("node-b")];
-        let allocations: HashMap<String, Vec<Allocation>> =
-            HashMap::from([(String::from("node-a"), vec![alloc("node-a", 1)])]);
+        let allocations: HashMap<String, Vec<Allocation>> = HashMap::from([(
+            String::from("node-a"),
+            vec![alloc("node-a", 1, "other-job")],
+        )]);
         let planned = HashMap::from([(String::from("node-b"), 1_usize)]);
 
         let task = task("api");
-        let ctx = SchedulingContext::new(nodes.iter().collect(), &task, &allocations, &planned);
+        let ctx = SchedulingContext::new(
+            nodes.iter().collect(),
+            &task,
+            "job",
+            &allocations,
+            &planned,
+            SchedulerWeights::for_policy("spread"),
+        );
         let policy = SpreadPolicy::default();
 
         let choice = policy.select_node(ctx).expect("node expected");
@@ -271,7 +455,14 @@ mod tests {
         ]);
 
         let task = task("api");
-        let ctx = SchedulingContext::new(nodes.iter().collect(), &task, &allocations, &planned);
+        let ctx = SchedulingContext::new(
+            nodes.iter().collect(),
+            &task,
+            "job",
+            &allocations,
+            &planned,
+            SchedulerWeights::for_policy("spread"),
+        );
         let policy = SpreadPolicy::default();
 
         let choice = policy.select_node(ctx).expect("node expected");
@@ -285,7 +476,14 @@ mod tests {
         let planned: HashMap<String, usize> = HashMap::new();
 
         let task = task("api");
-        let ctx = SchedulingContext::new(nodes.iter().collect(), &task, &allocations, &planned);
+        let ctx = SchedulingContext::new(
+            nodes.iter().collect(),
+            &task,
+            "job",
+            &allocations,
+            &planned,
+            SchedulerWeights::for_policy("spread"),
+        );
         let policy = SpreadPolicy::default();
 
         let choice = policy.select_node(ctx);

@@ -1,6 +1,6 @@
 #![crate_type = "cdylib"]
 
-use legion::manager::scheduler::{SchedulingContext, SchedulingPolicy};
+use legion::manager::scheduler::{SchedulerWeights, SchedulingContext, SchedulingPolicy};
 use legion::structs::Node;
 use rand::rngs::StdRng;
 use rand::{seq::SliceRandom, SeedableRng};
@@ -70,6 +70,7 @@ mod tests {
             config: json!({}),
             resources: json!({}),
             constraints: json!({}),
+            affinities: json!({}),
         }
     }
 
@@ -79,13 +80,27 @@ mod tests {
         let allocations: HashMap<String, Vec<Allocation>> = HashMap::new();
         let planned = HashMap::new();
 
-        let ctx = SchedulingContext::new(nodes.iter().collect(), &task("job"), &allocations, &planned);
+        let ctx = SchedulingContext::new(
+            nodes.iter().collect(),
+            &task("job"),
+            "job",
+            &allocations,
+            &planned,
+            SchedulerWeights::for_policy("random"),
+        );
         let policy = RandomPolicy::seeded(42);
 
         let first = policy.select_node(ctx).expect("node");
         assert!(first.id == "node-a" || first.id == "node-b");
 
-        let ctx_again = SchedulingContext::new(nodes.iter().collect(), &task("job"), &allocations, &planned);
+        let ctx_again = SchedulingContext::new(
+            nodes.iter().collect(),
+            &task("job"),
+            "job",
+            &allocations,
+            &planned,
+            SchedulerWeights::for_policy("random"),
+        );
         let second = policy.select_node(ctx_again).expect("node");
         assert_ne!(first.id, second.id, "seeded rng should vary selections");
     }

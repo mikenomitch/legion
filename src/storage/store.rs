@@ -198,7 +198,7 @@ impl Store {
 
         let mut task_stmt = conn.prepare(
             r#"
-            SELECT id, name, kind, count, config, resources, constraints, job_config_id
+            SELECT id, name, kind, count, config, resources, constraints, affinities, job_config_id
             FROM task_config;
             "#,
         )?;
@@ -211,8 +211,9 @@ impl Store {
                 config: row.get(4)?,
                 resources: row.get(5)?,
                 constraints: row.get(6)?,
+                affinities: row.get(7)?,
             };
-            let job_config_id: String = row.get(7)?;
+            let job_config_id: String = row.get(8)?;
             Ok((job_config_id, id, task))
         })?;
 
@@ -426,6 +427,7 @@ impl Store {
             config: row.get(4)?,
             resources: row.get(5)?,
             constraints: row.get(6)?,
+            affinities: row.get(7)?,
         };
 
         Ok(task_config)
@@ -964,6 +966,7 @@ impl Store {
                 ":config": t.config,
                 ":resources": t.resources,
                 ":constraints": t.constraints,
+                ":affinities": t.affinities,
                 ":job_id": job.id,
                 ":job_config_id": job_config_id,
             };
@@ -1075,6 +1078,7 @@ impl Store {
                 config: row.get(4)?,
                 resources: row.get(5)?,
                 constraints: row.get(6)?,
+                affinities: row.get(7)?,
             };
 
             Ok((id, task))
@@ -1663,6 +1667,7 @@ mod tests {
                 config: json!({}),
                 resources: json!({}),
                 constraints: json!({}),
+                affinities: json!({}),
             }],
             version: None,
         };
@@ -1714,6 +1719,7 @@ mod tests {
                 config: json!({}),
                 resources: json!({}),
                 constraints: json!({}),
+                affinities: json!({}),
             }],
             version: None,
         };
@@ -1746,6 +1752,7 @@ mod tests {
                 config: json!({}),
                 resources: json!({}),
                 constraints: json!({}),
+                affinities: json!({}),
             }],
             version: None,
         };
@@ -1922,6 +1929,7 @@ mod tests {
             config: json!({ "message": "hello-1" }),
             resources: json!({ "memory": 256 }),
             constraints: json!({}),
+            affinities: json!({}),
         };
 
         let task_two = TaskConfig {
@@ -1931,6 +1939,7 @@ mod tests {
             config: json!({ "message": "hi-2" }),
             resources: json!({ "memory": 512 }),
             constraints: json!({}),
+            affinities: json!({}),
         };
 
         let task_configs = vec![task_one.clone(), task_two.clone()];
@@ -2000,6 +2009,7 @@ mod tests {
             config: json!({ "message": "hello-1" }),
             resources: json!({ "memory": 256 }),
             constraints: json!({}),
+            affinities: json!({}),
         };
 
         let job_name = "rollback-job".to_string();
@@ -2047,6 +2057,7 @@ mod tests {
             config: json!({ "message": "hello" }),
             resources: json!({ "memory": 256 }),
             constraints: json!({}),
+            affinities: json!({}),
         };
 
         let orig_task_configs = vec![orig_task.clone()];
@@ -2108,6 +2119,7 @@ mod tests {
             config: json!({ "message": "hello" }),
             resources: json!({ "memory": 256 }),
             constraints: json!({}),
+            affinities: json!({}),
         };
         let new_task_configs = vec![new_task.clone(), extra_task.clone()];
 
@@ -2161,6 +2173,7 @@ mod tests {
             config: json!({ "message": "hello" }),
             resources: json!({ "memory": 256 }),
             constraints: json!({}),
+            affinities: json!({}),
         };
 
         let orig_task_configs = vec![orig_task.clone()];
@@ -2203,6 +2216,7 @@ mod tests {
             config: json!({ "message": "hello" }),
             resources: json!({ "memory": 256 }),
             constraints: json!({}),
+            affinities: json!({}),
         };
         let task_two = TaskConfig {
             name: "job-one-task-2".to_string(),
@@ -2211,6 +2225,7 @@ mod tests {
             config: json!({ "message": "world" }),
             resources: json!({ "memory": 512 }),
             constraints: json!({}),
+            affinities: json!({}),
         };
         let job_one_config = JobConfig {
             name: job_one_name.clone(),
@@ -2236,6 +2251,7 @@ mod tests {
             config: json!({ "message": "hola" }),
             resources: json!({ "memory": 128 }),
             constraints: json!({}),
+            affinities: json!({}),
         };
         let job_two_config = JobConfig {
             name: job_two_name.clone(),
@@ -2327,6 +2343,7 @@ mod tests {
             config: json!({}),
             resources: json!({}),
             constraints: json!({}),
+            affinities: json!({}),
         }];
 
         let job_name = "solo-job".to_string();
@@ -2391,6 +2408,7 @@ mod tests {
             config: json!({}),
             resources: json!({}),
             constraints: json!({}),
+            affinities: json!({}),
         }];
 
         let job_one_config = JobConfig {
