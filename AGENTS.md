@@ -25,6 +25,7 @@
 - Use Rust `#[cfg(test)]` unit tests near code; integration data in `tests/`.
 - Name tests descriptively with `_test` modules/functions.
 - Run full suite via `cargo test --all --locked`; avoid mutating shared fixtures.
+- Always run Rust tests unless the change only touches the front end or documentation.
 
 ## Commit & Pull Request Guidelines
 - Commits: short, imperative summaries (e.g., "Refactor store helpers").
