@@ -273,6 +273,18 @@ async fn load_initial_data(store: &Store, config: &ManagerConfig) -> R<()> {
 
         let af = wcp.additional_node_checks.unwrap_or([].to_vec());
         let attrs = wcp.attributes.unwrap_or(HashMap::new());
+        let resources = wcp
+            .resources
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?
+            .unwrap_or_else(|| "{}".to_string());
+        let reserved_resources = wcp
+            .reserved_resources
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?
+            .unwrap_or_else(|| "{}".to_string());
 
         let wc = WorkerConfigMsg {
             name: wcp.worker_type.clone(),
@@ -280,6 +292,9 @@ async fn load_initial_data(store: &Store, config: &ManagerConfig) -> R<()> {
             additional_node_checks: af,
             attributes: attrs,
             name_prefix: wcp.name_prefix,
+            resources,
+            reserved_resources,
+            max_allocations: wcp.max_allocations,
         };
 
         store.insert_worker_type(&wc)?;

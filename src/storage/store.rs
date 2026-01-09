@@ -1,5 +1,6 @@
 use crate::constraints::{ConstraintSet, DistinctTracker};
 use crate::prelude::*;
+use crate::resources::ResourcePolicy;
 use crate::storage::migrations::get_migrations;
 use crate::storage::queries::{
     GET_ALLOCS, GET_ALLOCS_FOR_JOB, GET_ALLOCS_FOR_JOB_CONFIG, GET_ALLOCS_FOR_NODE, GET_EVALS,
@@ -60,6 +61,7 @@ pub struct Store {
     pub scheduling_policy: String,
     pub default_eval_priority: i64,
     pub scheduler_settings: Option<Value>,
+    pub resource_policy: ResourcePolicy,
     read_model: Arc<RwLock<SchedulingReadModel>>,
 }
 
@@ -95,6 +97,7 @@ impl Store {
         let write_conn = Store::create_write_conn(&db_path)?;
         let _migrations = Store::create_initial_tables(&Arc::clone(&write_conn))?;
         let read_conns = Store::create_read_pool(&db_path)?;
+        let resource_policy = ResourcePolicy::from_manager_config(config)?;
 
         let store = Store {
             write_conn,
@@ -103,6 +106,7 @@ impl Store {
             scheduling_policy: config.scheduling_policy.clone(),
             default_eval_priority: config.default_priority,
             scheduler_settings: config.scheduler_settings.clone(),
+            resource_policy,
             read_model: Arc::new(RwLock::new(SchedulingReadModel::default())),
         };
 
@@ -424,6 +428,9 @@ impl Store {
         let attrs: String = row.get(3)?;
         let parsed_attrs = serde_json::from_str(&attrs).unwrap();
         let name_prefix = row.get(4)?;
+        let resources = row.get(5)?;
+        let reserved_resources = row.get(6)?;
+        let max_allocations = row.get(7)?;
 
         Ok(WorkerConfig {
             name: row.get(0)?,
@@ -435,6 +442,9 @@ impl Store {
                 .collect(),
             attributes: parsed_attrs,
             name_prefix,
+            resources,
+            reserved_resources,
+            max_allocations,
         })
     }
 
@@ -768,6 +778,16 @@ impl Store {
         let conn = self.write_connection()?;
         let node_checks_to_save = config.additional_node_checks.join(",");
         let attrs_to_save = serde_json::to_string(&config.attributes)?;
+        let resources_to_save = if config.resources.is_empty() {
+            "{}".to_string()
+        } else {
+            config.resources.clone()
+        };
+        let reserved_resources_to_save = if config.reserved_resources.is_empty() {
+            "{}".to_string()
+        } else {
+            config.reserved_resources.clone()
+        };
 
         let params = named_params! {
             ":name": config.name,
@@ -775,6 +795,9 @@ impl Store {
             ":additional_node_checks": node_checks_to_save,
             ":attributes": attrs_to_save,
             ":name_prefix": config.name_prefix,
+            ":resources": resources_to_save,
+            ":reserved_resources": reserved_resources_to_save,
+            ":max_allocations": config.max_allocations,
         };
 
         let config = conn.query_row(&INSERT_WORKER_TYPE, params, |row| {
@@ -906,6 +929,7 @@ impl Store {
         config: &JobConfig,
         subs: &[Submission],
     ) -> R<JobSubmitOutcome> {
+        let config = self.normalize_job_config(config)?;
         // Note: There is a race condition here with the version
         // I think this should prob be all in a single lock, but
         // I am not going to worry about this for now
@@ -916,7 +940,7 @@ impl Store {
 
         if let Ok(latest_job_config) = self.get_job_config(&config.name) {
             // if latest_job_config is deep equal to config, return unchanged
-            if latest_job_config.is_same_as(config) {
+            if latest_job_config.is_same_as(&config) {
                 return Ok(JobSubmitOutcome::Unchanged {
                     job_config_id: latest_job_config.id(),
                 });
@@ -1031,6 +1055,27 @@ impl Store {
         } else {
             Ok(JobSubmitOutcome::Created { job_config_id })
         }
+    }
+
+    fn normalize_job_config(&self, config: &JobConfig) -> R<JobConfig> {
+        let tasks = config
+            .tasks
+            .iter()
+            .map(|task| {
+                let resources = self
+                    .resource_policy
+                    .normalize_task_resources(&task.resources, true)?;
+                Ok(TaskConfig {
+                    resources,
+                    ..task.clone()
+                })
+            })
+            .collect::<R<Vec<_>>>()?;
+
+        Ok(JobConfig {
+            tasks,
+            ..config.clone()
+        })
     }
 
     #[instrument(err, skip_all)]
@@ -1871,6 +1916,9 @@ mod tests {
             additional_node_checks: vec![],
             attributes: attrs,
             name_prefix: None,
+            resources: "{}".into(),
+            reserved_resources: "{}".into(),
+            max_allocations: None,
         };
 
         let returned_config = store.insert_worker_type(&worker_config)?;
@@ -1899,6 +1947,9 @@ mod tests {
             additional_node_checks: vec![],
             attributes: HashMap::new(),
             name_prefix: None,
+            resources: "{}".into(),
+            reserved_resources: "{}".into(),
+            max_allocations: None,
         };
 
         store.insert_worker_type(&worker_config)?;
@@ -2354,11 +2405,21 @@ mod tests {
         assert_eq!(alloc_one.node_id, node_one_id);
         assert_eq!(alloc_one.task_config_id, task_one_id);
         assert_eq!(alloc_one.job_config_id, job_one_config_id);
-        assert_eq!(alloc_one.resources, task_one.resources);
+        let expected_one = store
+            .resource_policy
+            .normalize_task_resources(&task_one.resources, false)?;
+        let expected_two = store
+            .resource_policy
+            .normalize_task_resources(&task_two.resources, false)?;
+        let expected_three = store
+            .resource_policy
+            .normalize_task_resources(&task_three.resources, false)?;
 
-        assert_eq!(alloc_two.resources, task_two.resources);
+        assert_eq!(alloc_one.resources, expected_one);
+
+        assert_eq!(alloc_two.resources, expected_two);
         assert_eq!(alloc_three.job_config_id, job_two_config_id);
-        assert_eq!(alloc_three.resources, task_three.resources);
+        assert_eq!(alloc_three.resources, expected_three);
 
         let job_one_allocs = store.allocs_for_job(&job_one_name)?;
         assert_eq!(job_one_allocs.len(), 2);

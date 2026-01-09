@@ -34,6 +34,9 @@ message WorkerConfig {
   repeated string additional_node_checks = 3;
   map<string, string> attributes = 4;
   optional string name_prefix = 5;
+  string resources = 6;
+  string reserved_resources = 7;
+  optional uint32 max_allocations = 8;
 }
 
 message WorkerPreRegisterReply {

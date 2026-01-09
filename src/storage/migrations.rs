@@ -26,6 +26,13 @@ pub fn get_migrations() -> Migrations<'static> {
         )",
         )
         .down("DROP TABLE IF EXISTS worker_type;"),
+        M::up("ALTER TABLE worker_type ADD COLUMN resources JSONB NOT NULL DEFAULT '{}';")
+            .down(""),
+        M::up(
+            "ALTER TABLE worker_type ADD COLUMN reserved_resources JSONB NOT NULL DEFAULT '{}';",
+        )
+        .down(""),
+        M::up("ALTER TABLE worker_type ADD COLUMN max_allocations INTEGER;").down(""),
         M::up(
             "CREATE TABLE IF NOT EXISTS job (
             id STRING PRIMARY KEY,

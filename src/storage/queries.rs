@@ -123,15 +123,15 @@ lazy_static! {
 //
 
 pub const WORKER_TYPE_ATTRS: &str = r#"
-name, pool, additional_node_checks, attributes, name_prefix
+name, pool, additional_node_checks, attributes, name_prefix, resources, reserved_resources, max_allocations
 "#;
 
 pub const WORKER_TYPE_PARAM_SET: &str = r#"
-pool = :pool, additional_node_checks = :additional_node_checks, attributes = :attributes, name_prefix = :name_prefix
+pool = :pool, additional_node_checks = :additional_node_checks, attributes = :attributes, name_prefix = :name_prefix, resources = :resources, reserved_resources = :reserved_resources, max_allocations = :max_allocations
 "#;
 
 pub const WORKER_TYPE_ATTRS_VALS: &str = r#"
-:name, :pool, :additional_node_checks, :attributes, :name_prefix
+:name, :pool, :additional_node_checks, :attributes, :name_prefix, :resources, :reserved_resources, :max_allocations
 "#;
 
 lazy_static! {

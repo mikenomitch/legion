@@ -6,6 +6,7 @@ use libloading::Library;
 
 use crate::constraints::{AffinitySet, ConstraintSet, DistinctTracker};
 use crate::prelude::*;
+use crate::resources::ResourcePolicy;
 use crate::storage::store::Store;
 use crate::structs::{Allocation, Node, TaskConfig};
 pub use policy::{load_policy, SchedulerWeights, SchedulingContext, SchedulingPolicy};
@@ -41,6 +42,28 @@ pub struct PlanOutcome {
 enum NodesConsidered {
     Count(u64),
     Percent(f64),
+}
+
+#[derive(Debug, Clone)]
+struct ResourceRequest {
+    values: HashMap<String, ResourceValue>,
+}
+
+#[derive(Debug, Clone)]
+struct ResourcePool {
+    values: HashMap<String, ResourceValue>,
+    unknown: HashSet<String>,
+}
+
+#[derive(Debug, Clone)]
+enum ResourceValue {
+    Amount(f64),
+    Items(HashSet<String>),
+}
+
+#[derive(Debug, Clone)]
+struct ResourceLedger {
+    pools: HashMap<String, ResourcePool>,
 }
 
 pub struct Scheduler<'a> {
@@ -161,12 +184,19 @@ impl<'a> Scheduler<'a> {
         let nodes_considered_setting = self.nodes_considered_setting()?;
         let node_lookup: HashMap<&str, &Node> =
             nodes.iter().map(|node| (node.id.as_str(), node)).collect();
+        let resource_policy = &self.store.resource_policy;
+        let mut resource_ledger =
+            ResourceLedger::new(&nodes, allocations_by_node, resource_policy)?;
 
         for (task_id, task_config, _desired_count) in tasks {
             let needed = required_counts.get(&task_id).copied().unwrap_or(0);
             if needed == 0 {
                 continue;
             }
+
+            let task_resources =
+                resource_policy.normalize_task_resources(&task_config.resources, true)?;
+            let task_request = ResourceRequest::from_value(&task_resources)?;
 
             let constraint_set =
                 ConstraintSet::new(&task_config.constraints).with_context(|| {
@@ -197,9 +227,14 @@ impl<'a> Scheduler<'a> {
                     base_eligible.clone()
                 };
 
+                let eligible = eligible
+                    .into_iter()
+                    .filter(|node| resource_ledger.can_fit(&node.id, &task_request))
+                    .collect::<Vec<_>>();
+
                 if eligible.is_empty() {
                     bail!(
-                        "Failed to place task {}: no available nodes matching constraints",
+                        "Failed to place task {}: no available nodes matching constraints or resources",
                         task_config.name
                     );
                 }
@@ -235,6 +270,7 @@ impl<'a> Scheduler<'a> {
                         tracker.insert_from_node(node);
                     }
                 }
+                resource_ledger.consume(&node_id, &task_request)?;
                 placements.push(PlannedAllocation {
                     node_id,
                     task_config_id: task_id,
@@ -465,6 +501,292 @@ impl<'a> Scheduler<'a> {
     }
 }
 
+impl ResourceRequest {
+    fn from_value(value: &Value) -> R<Self> {
+        let obj = value.as_object().context("resources must be an object")?;
+        let mut values = HashMap::new();
+
+        for (key, value) in obj {
+            let demand = match value {
+                Value::Number(num) => {
+                    let amount = num.as_f64().context("resource values must be numbers")?;
+                    if amount < 0.0 {
+                        bail!("resource {key} cannot be negative");
+                    }
+                    ResourceValue::Amount(amount)
+                }
+                Value::String(item) => {
+                    let mut items = HashSet::new();
+                    items.insert(item.clone());
+                    ResourceValue::Items(items)
+                }
+                Value::Array(items) => {
+                    let set = items.iter().map(value_token).collect::<HashSet<_>>();
+                    ResourceValue::Items(set)
+                }
+                _ => bail!("resource {key} must be a number or list"),
+            };
+
+            if matches!(demand, ResourceValue::Items(_)) && is_builtin_resource(key) {
+                bail!("resource {key} must be a number");
+            }
+
+            values.insert(key.clone(), demand);
+        }
+
+        Ok(ResourceRequest { values })
+    }
+}
+
+impl ResourceLedger {
+    fn new(
+        nodes: &[Node],
+        allocations_by_node: &HashMap<String, Vec<Allocation>>,
+        policy: &ResourcePolicy,
+    ) -> R<Self> {
+        let mut pools = HashMap::new();
+        for node in nodes {
+            let mut pool = ResourcePool::from_node(node)?;
+            if !pool.unknown.is_empty() {
+                warn!(
+                    node_id = %node.id,
+                    unknown_resources = ?pool.unknown,
+                    "Node missing resource fingerprints; assuming infinite capacity"
+                );
+            }
+            if let Some(allocs) = allocations_by_node.get(&node.id) {
+                for alloc in allocs {
+                    let normalized = policy.normalize_task_resources(&alloc.resources, false)?;
+                    let request = ResourceRequest::from_value(&normalized)?;
+                    pool.apply_usage(&request);
+                }
+            }
+            pools.insert(node.id.clone(), pool);
+        }
+
+        Ok(ResourceLedger { pools })
+    }
+
+    fn can_fit(&self, node_id: &str, request: &ResourceRequest) -> bool {
+        self.pools
+            .get(node_id)
+            .map(|pool| pool.can_fit(request))
+            .unwrap_or(false)
+    }
+
+    fn consume(&mut self, node_id: &str, request: &ResourceRequest) -> R<()> {
+        let pool = self
+            .pools
+            .get_mut(node_id)
+            .context("missing resource pool")?;
+        if !pool.can_fit(request) {
+            bail!("node {node_id} does not have required resources");
+        }
+        pool.consume(request);
+        Ok(())
+    }
+}
+
+impl ResourcePool {
+    fn from_node(node: &Node) -> R<Self> {
+        let mut values = HashMap::new();
+        let mut unknown = HashSet::new();
+
+        let (memory_mib, memory_unknown) = fingerprint_memory_mib(node)?;
+        if memory_unknown {
+            unknown.insert("memory".to_string());
+        }
+        values.insert("memory".to_string(), ResourceValue::Amount(memory_mib));
+
+        let (cpu_mhz, cores, cpu_unknown) = fingerprint_cpu(node)?;
+        if cpu_unknown {
+            unknown.insert("cpu".to_string());
+            unknown.insert("cores".to_string());
+        }
+        values.insert("cpu".to_string(), ResourceValue::Amount(cpu_mhz));
+        values.insert("cores".to_string(), ResourceValue::Amount(cores));
+
+        let config_attrs = node.config_attrs.as_object().cloned().unwrap_or_default();
+
+        let max_allocations = config_value(&config_attrs, &["maxAllocations", "max_allocations"])
+            .and_then(|value| value.as_f64());
+        let allocations = max_allocations.unwrap_or(f64::INFINITY);
+        values.insert(
+            "allocations".to_string(),
+            ResourceValue::Amount(allocations),
+        );
+
+        if let Some(custom) = config_value(&config_attrs, &["resources"]) {
+            let custom = custom
+                .as_object()
+                .context("node resources must be an object")?;
+            for (name, value) in custom {
+                if is_builtin_resource(name) {
+                    continue;
+                }
+                let resource = parse_resource_value(name, value)?;
+                values.insert(name.clone(), resource);
+            }
+        }
+
+        let mut pool = ResourcePool { values, unknown };
+
+        if let Some(reserved) =
+            config_value(&config_attrs, &["reservedResources", "reserved_resources"])
+        {
+            let reserved = reserved
+                .as_object()
+                .context("reserved_resources must be an object")?;
+            for (name, value) in reserved {
+                let reservation = parse_resource_value(name, value)?;
+                pool.reserve(name, &reservation);
+            }
+        }
+
+        Ok(pool)
+    }
+
+    fn can_fit(&self, request: &ResourceRequest) -> bool {
+        request.values.iter().all(|(name, demand)| match demand {
+            ResourceValue::Amount(amount) => match self.values.get(name) {
+                Some(ResourceValue::Amount(available)) => available >= amount,
+                _ => false,
+            },
+            ResourceValue::Items(items) => match self.values.get(name) {
+                Some(ResourceValue::Items(available)) => items.is_subset(available),
+                _ => false,
+            },
+        })
+    }
+
+    fn consume(&mut self, request: &ResourceRequest) {
+        self.apply_usage(request);
+    }
+
+    fn apply_usage(&mut self, request: &ResourceRequest) {
+        for (name, demand) in &request.values {
+            match demand {
+                ResourceValue::Amount(amount) => {
+                    let entry = self
+                        .values
+                        .entry(name.clone())
+                        .or_insert(ResourceValue::Amount(0.0));
+                    if let ResourceValue::Amount(available) = entry {
+                        *available -= amount;
+                    }
+                }
+                ResourceValue::Items(items) => {
+                    if let Some(ResourceValue::Items(available)) = self.values.get_mut(name) {
+                        for item in items {
+                            available.remove(item);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn reserve(&mut self, name: &str, reservation: &ResourceValue) {
+        match reservation {
+            ResourceValue::Amount(amount) => {
+                let entry = self
+                    .values
+                    .entry(name.to_string())
+                    .or_insert(ResourceValue::Amount(0.0));
+                if let ResourceValue::Amount(available) = entry {
+                    *available -= amount;
+                }
+            }
+            ResourceValue::Items(items) => {
+                if let Some(ResourceValue::Items(available)) = self.values.get_mut(name) {
+                    for item in items {
+                        available.remove(item);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn parse_resource_value(name: &str, value: &Value) -> R<ResourceValue> {
+    match value {
+        Value::Number(num) => {
+            let amount = num.as_f64().context("resource values must be numbers")?;
+            if amount < 0.0 {
+                bail!("resource {name} cannot be negative");
+            }
+            Ok(ResourceValue::Amount(amount))
+        }
+        Value::String(item) => {
+            let mut items = HashSet::new();
+            items.insert(item.clone());
+            Ok(ResourceValue::Items(items))
+        }
+        Value::Array(items) => Ok(ResourceValue::Items(
+            items.iter().map(value_token).collect::<HashSet<_>>(),
+        )),
+        _ => bail!("resource {name} must be a number or list"),
+    }
+}
+
+fn fingerprint_memory_mib(node: &Node) -> R<(f64, bool)> {
+    let total = node
+        .fingerprint_attrs
+        .get("memory_total")
+        .and_then(|value| value.as_str())
+        .and_then(|value| value.parse::<f64>().ok());
+
+    match total {
+        Some(total) => Ok((total / 1024.0, false)),
+        None => Ok((f64::INFINITY, true)),
+    }
+}
+
+fn fingerprint_cpu(node: &Node) -> R<(f64, f64, bool)> {
+    let mut total_mhz = 0.0;
+    let mut cores = 0.0;
+    let mut known = false;
+    if let Some(cpus) = node
+        .fingerprint_attrs
+        .get("cpus")
+        .and_then(|val| val.as_object())
+    {
+        for cpu in cpus.values() {
+            if let Some(freq) = cpu.get("frequency") {
+                if let Some(freq) = freq.as_str().and_then(|val| val.parse::<f64>().ok()) {
+                    total_mhz += freq;
+                    known = true;
+                } else if let Some(freq) = freq.as_f64() {
+                    total_mhz += freq;
+                    known = true;
+                }
+            }
+            cores += 1.0;
+        }
+        if !cpus.is_empty() {
+            known = true;
+        }
+    }
+
+    if known {
+        Ok((total_mhz, cores, false))
+    } else {
+        Ok((f64::INFINITY, f64::INFINITY, true))
+    }
+}
+
+fn config_value<'a>(attrs: &'a serde_json::Map<String, Value>, keys: &[&str]) -> Option<&'a Value> {
+    keys.iter().find_map(|key| attrs.get(*key))
+}
+
+fn is_builtin_resource(name: &str) -> bool {
+    matches!(name, "memory" | "cpu" | "cores" | "allocations")
+}
+
+fn value_token(value: &Value) -> String {
+    serde_json::to_string(value).unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::{json, Value};
@@ -510,7 +832,7 @@ mod tests {
     }
 
     fn make_node_msg(id: &str, attrs: Value) -> NodeMsg {
-        make_node_msg_with_sources(id, attrs, json!({}), json!({}))
+        make_node_msg_with_sources(id, attrs, default_fingerprint(), json!({}))
     }
 
     fn make_node_msg_with_sources(
@@ -519,6 +841,7 @@ mod tests {
         fingerprint_attrs: Value,
         dynamic_attrs: Value,
     ) -> NodeMsg {
+        let fingerprint_attrs = merge_fingerprint(fingerprint_attrs);
         NodeMsg {
             id: id.to_string(),
             pool: "default".into(),
@@ -530,6 +853,29 @@ mod tests {
             health_checks: "{}".into(),
             last_heartbeat: "2023-01-01 00:00:00 +00:00:00".into(),
         }
+    }
+
+    fn default_fingerprint() -> Value {
+        json!({
+            "memory_total": "8388608",
+            "cpus": {
+                "cpu-1": { "frequency": "2400" },
+                "cpu-2": { "frequency": "2400" },
+            }
+        })
+    }
+
+    fn merge_fingerprint(extra: Value) -> Value {
+        let mut base = default_fingerprint()
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+        if let Value::Object(additional) = extra {
+            for (key, value) in additional {
+                base.insert(key, value);
+            }
+        }
+        Value::Object(base)
     }
 
     fn insert_test_nodes(store: &Store) -> R<()> {
@@ -854,6 +1200,90 @@ mod tests {
             .apply_allocation_plan(&[(String::from("node-a"), task_id)])
             .expect_err("expected constraint failure");
         assert!(err.to_string().contains("does not satisfy constraints"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn resource_limits_prevent_overcommit() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg_with_sources(
+            "node-a",
+            json!({}),
+            json!({
+                "memory_total": "524288",
+                "cpus": { "cpu-1": { "frequency": "1000" } }
+            }),
+            json!({}),
+        ))?;
+
+        let job = JobConfig {
+            name: "mem-limited".into(),
+            tasks: vec![TaskConfig {
+                name: "worker".into(),
+                count: 3,
+                kind: "noop".into(),
+                config: json!({}),
+                resources: json!({ "memory": 256 }),
+                constraints: json!({}),
+                affinities: json!({}),
+            }],
+            version: None,
+        };
+
+        store.handle_job_submit(&job, &[dummy_submission()])?;
+        let job_config_id = store.get_job_config(&job.name)?.id();
+        let scheduler = Scheduler::new(&store)?;
+
+        let err = scheduler
+            .plan_and_apply(&job_config_id, PlanMode::Fresh)
+            .expect_err("expected resource scheduling failure");
+
+        assert!(err
+            .to_string()
+            .contains("no available nodes matching constraints or resources"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn max_allocations_limits_node_capacity() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg_with_sources(
+            "node-a",
+            json!({ "maxAllocations": 1 }),
+            json!({
+                "memory_total": "1048576",
+                "cpus": { "cpu-1": { "frequency": "1000" } }
+            }),
+            json!({}),
+        ))?;
+
+        let job = JobConfig {
+            name: "alloc-limit".into(),
+            tasks: vec![TaskConfig {
+                name: "worker".into(),
+                count: 2,
+                kind: "noop".into(),
+                config: json!({}),
+                resources: json!({ "memory": 128 }),
+                constraints: json!({}),
+                affinities: json!({}),
+            }],
+            version: None,
+        };
+
+        store.handle_job_submit(&job, &[dummy_submission()])?;
+        let job_config_id = store.get_job_config(&job.name)?.id();
+        let scheduler = Scheduler::new(&store)?;
+
+        let err = scheduler
+            .plan_and_apply(&job_config_id, PlanMode::Fresh)
+            .expect_err("expected max allocations failure");
+
+        assert!(err
+            .to_string()
+            .contains("no available nodes matching constraints or resources"));
 
         Ok(())
     }
