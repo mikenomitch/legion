@@ -223,6 +223,7 @@ mod tests {
             config: json!({ "message": "hi" }),
             resources: json!({ "memory": 128 }),
             constraints: json!({}),
+            affinities: json!({}),
         };
         let job_one_config = JobConfig {
             name: job_one_name.clone(),
@@ -277,6 +278,7 @@ mod tests {
             config: json!({ "message": "hola" }),
             resources: json!({ "memory": 128 }),
             constraints: json!({}),
+            affinities: json!({}),
         };
         let job_two_config = JobConfig {
             name: job_two_name.clone(),

@@ -7,7 +7,7 @@ use libloading::Library;
 use crate::prelude::*;
 use crate::storage::store::Store;
 use crate::structs::{Allocation, Node, TaskConfig};
-pub use policy::{load_policy, SchedulingContext, SchedulingPolicy};
+pub use policy::{load_policy, SchedulerWeights, SchedulingContext, SchedulingPolicy};
 
 mod policy;
 
@@ -95,7 +95,13 @@ impl<'a> Scheduler<'a> {
             }
         };
 
-        let placements = self.build_plan(nodes, tasks, required_counts, &allocations_by_node)?;
+        let placements = self.build_plan(
+            job_config_id,
+            nodes,
+            tasks,
+            required_counts,
+            &allocations_by_node,
+        )?;
         if placements.is_empty() {
             return Ok(PlanOutcome {
                 allocations: Vec::new(),
@@ -134,6 +140,7 @@ impl<'a> Scheduler<'a> {
 
     fn build_plan(
         &self,
+        job_config_id: &str,
         nodes: Vec<Node>,
         mut tasks: Vec<(i64, TaskConfig, u32)>,
         required_counts: HashMap<i64, u32>,
@@ -143,6 +150,7 @@ impl<'a> Scheduler<'a> {
 
         let mut placements = Vec::new();
         let mut planned: HashMap<String, usize> = HashMap::new();
+        let weights = self.scheduler_weights()?;
 
         for (task_id, task_config, _desired_count) in tasks {
             let needed = required_counts.get(&task_id).copied().unwrap_or(0);
@@ -164,8 +172,14 @@ impl<'a> Scheduler<'a> {
                 }
 
                 let eligible = self.apply_nodes_considered(eligible)?;
-                let ctx =
-                    SchedulingContext::new(eligible, &task_config, allocations_by_node, &planned);
+                let ctx = SchedulingContext::new(
+                    eligible,
+                    &task_config,
+                    job_config_id,
+                    allocations_by_node,
+                    &planned,
+                    weights,
+                );
                 let node_id = self
                     .policy
                     .select_node(ctx)
@@ -219,6 +233,53 @@ impl<'a> Scheduler<'a> {
 
         let limit = Self::parse_nodes_considered(nodes_considered, eligible.len())?;
         Ok(eligible.into_iter().take(limit).collect())
+    }
+
+    fn scheduler_weights(&self) -> R<SchedulerWeights> {
+        let mut weights = SchedulerWeights::for_policy(self.policy.name());
+        let Some(settings) = self.store.scheduler_settings.as_ref() else {
+            return Ok(weights);
+        };
+
+        let settings = match settings {
+            Value::Null => return Ok(weights),
+            Value::Object(map) => map,
+            _ => {
+                bail!(
+                    "scheduler_settings for policy {} must be an object",
+                    self.policy.name()
+                )
+            }
+        };
+
+        let Some(weight_values) = settings.get("weights") else {
+            return Ok(weights);
+        };
+
+        let weight_values = match weight_values {
+            Value::Object(map) => map,
+            _ => bail!("scheduler_settings weights must be an object"),
+        };
+
+        for (key, value) in weight_values {
+            let weight = value
+                .as_f64()
+                .with_context(|| format!("scheduler_settings weights {key} must be a number"))?;
+
+            if weight < 0.0 {
+                bail!("scheduler_settings weights {key} cannot be negative");
+            }
+
+            match key.as_str() {
+                "affinities" => weights.affinity = weight,
+                "anti_affinity" => weights.anti_affinity = weight,
+                "spread" => weights.spread = weight,
+                "bin_pack" => weights.bin_pack = weight,
+                _ => {}
+            }
+        }
+
+        Ok(weights)
     }
 
     fn parse_nodes_considered(value: &Value, eligible_len: usize) -> R<usize> {
@@ -447,6 +508,7 @@ mod tests {
                     config: json!({}),
                     resources: json!({}),
                     constraints: json!({}),
+                    affinities: json!({}),
                 },
                 TaskConfig {
                     name: "db".into(),
@@ -455,6 +517,7 @@ mod tests {
                     config: json!({}),
                     resources: json!({}),
                     constraints: json!({ "role": "db" }),
+                    affinities: json!({}),
                 },
             ],
             version: None,
@@ -476,7 +539,13 @@ mod tests {
             .iter()
             .filter(|alloc| alloc.task_config_id == web_id && alloc.node_id == "node-a")
             .count();
-        assert_eq!(web_on_node_a, 2);
+        let web_on_node_b = outcome
+            .allocations
+            .iter()
+            .filter(|alloc| alloc.task_config_id == web_id && alloc.node_id == "node-b")
+            .count();
+        assert_eq!(web_on_node_a, 1);
+        assert_eq!(web_on_node_b, 1);
 
         let db_on_node_b = outcome
             .allocations
@@ -491,7 +560,7 @@ mod tests {
             .iter()
             .find(|delta| delta.node_id == "node-a")
             .expect("node-a delta missing");
-        assert_eq!(node_a_delta.added.len(), 2);
+        assert_eq!(node_a_delta.added.len(), 1);
         assert!(node_a_delta.removed.is_empty());
 
         let node_b_delta = outcome
@@ -499,7 +568,7 @@ mod tests {
             .iter()
             .find(|delta| delta.node_id == "node-b")
             .expect("node-b delta missing");
-        assert_eq!(node_b_delta.added.len(), 1);
+        assert_eq!(node_b_delta.added.len(), 2);
         assert!(node_b_delta.removed.is_empty());
 
         Ok(())
@@ -519,6 +588,7 @@ mod tests {
                 config: json!({}),
                 resources: json!({}),
                 constraints: json!({}),
+                affinities: json!({}),
             }],
             version: None,
         };
@@ -531,12 +601,20 @@ mod tests {
         let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Reschedule)?;
 
         assert_eq!(outcome.allocations.len(), 2);
-        assert_eq!(outcome.deltas.len(), 1);
+        assert_eq!(outcome.deltas.len(), 2);
 
-        let delta = &outcome.deltas[0];
-        assert_eq!(delta.node_id, "node-a");
-        assert_eq!(delta.added.len(), 2);
-        assert!(delta.removed.is_empty());
+        let node_a_added = outcome
+            .allocations
+            .iter()
+            .filter(|alloc| alloc.node_id == "node-a")
+            .count();
+        let node_b_added = outcome
+            .allocations
+            .iter()
+            .filter(|alloc| alloc.node_id == "node-b")
+            .count();
+        assert_eq!(node_a_added, 1);
+        assert_eq!(node_b_added, 1);
 
         Ok(())
     }
@@ -555,6 +633,7 @@ mod tests {
                 config: json!({}),
                 resources: json!({}),
                 constraints: json!({ "role": "db" }),
+                affinities: json!({}),
             }],
             version: None,
         };
@@ -626,6 +705,7 @@ mod tests {
                 config: json!({}),
                 resources: json!({}),
                 constraints: json!({ "role": "db" }),
+                affinities: json!({}),
             }],
             version: None,
         };
@@ -663,6 +743,7 @@ mod tests {
                 config: json!({}),
                 resources: json!({}),
                 constraints: json!({}),
+                affinities: json!({}),
             }],
             version: None,
         };
@@ -704,6 +785,7 @@ mod tests {
                 config: json!({}),
                 resources: json!({}),
                 constraints: json!({}),
+                affinities: json!({}),
             }],
             version: None,
         };
@@ -723,7 +805,106 @@ mod tests {
         let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
 
         assert_eq!(outcome.allocations.len(), 1);
-        assert_eq!(outcome.allocations[0].node_id, "node-b");
+        assert_eq!(outcome.allocations[0].node_id, "node-a");
+
+        Ok(())
+    }
+
+    #[test]
+    fn spread_prefers_affinity_over_load_when_weighted() -> R<()> {
+        let store = setup_store_with_scheduler(
+            "spread",
+            Some(json!({
+                "weights": {
+                    "affinities": 2.0,
+                    "spread": 1.0,
+                    "anti_affinity": 0.0
+                }
+            })),
+        )?;
+
+        store.insert_node(make_node_msg("node-a", json!({ "zone": "us-east" })))?;
+        store.insert_node(make_node_msg("node-b", json!({ "zone": "us-west" })))?;
+
+        let load_job = JobConfig {
+            name: "load-job".into(),
+            tasks: vec![TaskConfig {
+                name: "load".into(),
+                count: 1,
+                kind: "noop".into(),
+                config: json!({}),
+                resources: json!({}),
+                constraints: json!({}),
+                affinities: json!({}),
+            }],
+            version: None,
+        };
+        store.handle_job_submit(&load_job, &[dummy_submission()])?;
+        let load_job_config_id = store.get_job_config(&load_job.name)?.id();
+        let load_task_id = task_id_for(&store, &load_job_config_id, "load")?;
+
+        for _ in 0..3 {
+            store.place_alloc("node-a", load_task_id)?;
+        }
+
+        let job = JobConfig {
+            name: "affinity-job".into(),
+            tasks: vec![TaskConfig {
+                name: "api".into(),
+                count: 1,
+                kind: "noop".into(),
+                config: json!({}),
+                resources: json!({}),
+                constraints: json!({}),
+                affinities: json!({ "zone": "us-east" }),
+            }],
+            version: None,
+        };
+        store.handle_job_submit(&job, &[dummy_submission()])?;
+        let job_config_id = store.get_job_config(&job.name)?.id();
+
+        let scheduler = Scheduler::new(&store)?;
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+
+        assert_eq!(outcome.allocations.len(), 1);
+        assert_eq!(outcome.allocations[0].node_id, "node-a");
+
+        Ok(())
+    }
+
+    #[test]
+    fn bin_pack_avoids_same_job_allocations() -> R<()> {
+        let store = setup_store_with_scheduler("bin_pack", None)?;
+        store.insert_node(make_node_msg("node-a", json!({})))?;
+        store.insert_node(make_node_msg("node-b", json!({})))?;
+
+        let job = JobConfig {
+            name: "anti-affinity-job".into(),
+            tasks: vec![TaskConfig {
+                name: "worker".into(),
+                count: 2,
+                kind: "noop".into(),
+                config: json!({}),
+                resources: json!({}),
+                constraints: json!({}),
+                affinities: json!({}),
+            }],
+            version: None,
+        };
+
+        store.handle_job_submit(&job, &[dummy_submission()])?;
+        let job_config_id = store.get_job_config(&job.name)?.id();
+
+        let scheduler = Scheduler::new(&store)?;
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+
+        assert_eq!(outcome.allocations.len(), 2);
+        let node_ids: HashSet<_> = outcome
+            .allocations
+            .iter()
+            .map(|alloc| alloc.node_id.as_str())
+            .collect();
+        assert_eq!(node_ids.len(), 2);
 
         Ok(())
     }

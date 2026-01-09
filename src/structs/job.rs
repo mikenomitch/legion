@@ -45,6 +45,8 @@ pub struct TaskConfig {
     pub resources: Value,
     #[serde(default = "empty_object")]
     pub constraints: Value,
+    #[serde(default = "empty_object")]
+    pub affinities: Value,
 }
 
 #[derive(Serialize, Debug, Clone, PartialEq)]
@@ -86,6 +88,8 @@ struct TaskConfigInput {
     resources: Value,
     #[serde(default = "empty_object")]
     constraints: Value,
+    #[serde(default = "empty_object")]
+    affinities: Value,
 }
 
 impl TaskConfigInput {
@@ -97,6 +101,7 @@ impl TaskConfigInput {
             config: self.config,
             resources: self.resources,
             constraints: self.constraints,
+            affinities: self.affinities,
         }
     }
 }

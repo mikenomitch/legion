@@ -244,11 +244,11 @@ lazy_static! {
 //
 
 pub const TASK_CONFIG_ATTRS: &str = r#"
-id, name, kind, count, config, resources, constraints, job_id, job_config_id
+id, name, kind, count, config, resources, constraints, affinities, job_id, job_config_id
 "#;
 
 pub const TASK_CONFIG_INSERT_ATTRS: &str = r#"
-name, kind, count, config, resources, constraints, job_id, job_config_id
+name, kind, count, config, resources, constraints, affinities, job_id, job_config_id
 "#;
 
 // pub const TASK_CONFIG_PARAM_SET: &str = r#"
@@ -256,7 +256,7 @@ name, kind, count, config, resources, constraints, job_id, job_config_id
 // "#;
 
 pub const TASK_CONFIG_ATTRS_VALS: &str = r#"
-:name, :kind, :count, :config, :resources, :constraints, :job_id, :job_config_id
+:name, :kind, :count, :config, :resources, :constraints, :affinities, :job_id, :job_config_id
 "#;
 
 lazy_static! {
