@@ -4,6 +4,7 @@
 - Source lives in `src/`: CLI in `cmd/`, orchestration in `manager/` and `worker/`, storage helpers in `storage/`, TLS helpers in `certs.rs`, tracing utilities in `tracing_util.rs`, generated proto types in `structs.rs`, constants in `constants.rs`.
 - Protobuf schema: `proto/legion.proto` compiled by `build.rs` via `tonic-build`.
 - Configs and examples: `configs/` (manager, worker, TLS dev certs, job demos).
+- When adding anything to job config, include it in `configs/jobs/maximal.jsonnet`.
 - Plugins: `plugins/<kind>/<name>/` built as `dylib` during Cargo build.
 - Tests sit beside modules; integration assets under `tests/`.
 
