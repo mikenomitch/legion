@@ -64,6 +64,13 @@ impl ConstraintSet {
         self.rules.iter().all(|rule| rule.matches(node, distinct))
     }
 
+    pub fn distinct_satisfied(&self, node: &Node, distinct: &DistinctTracker) -> bool {
+        self.rules
+            .iter()
+            .filter(|rule| rule.operator == Operator::Distinct)
+            .all(|rule| rule.matches(node, Some(distinct)))
+    }
+
     pub fn distinct_keys(&self) -> Vec<String> {
         self.rules
             .iter()
