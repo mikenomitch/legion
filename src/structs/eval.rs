@@ -1,4 +1,4 @@
-use time::macros::format_description;
+use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use tracing::info;
 
@@ -147,11 +147,8 @@ impl Eval {
 
     fn current_timestamp() -> String {
         OffsetDateTime::now_utc()
-            .format(format_description!(
-                "[year]-[month]-[day] [hour]:[minute]:[second] [offset_hour \
-                 sign:mandatory]:[offset_minute]:[offset_second]"
-            ))
-            .unwrap_or_else(|_| "1970-01-01 00:00:00 +00:00:00".into())
+            .format(&Rfc3339)
+            .unwrap_or_else(|_| "1970-01-01T00:00:00Z".into())
     }
 }
 
