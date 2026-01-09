@@ -1,9 +1,10 @@
 use std::collections::{HashMap, HashSet};
 
-use serde_json::{Map, Value};
+use serde_json::Value;
 
 use libloading::Library;
 
+use crate::constraints::{AffinitySet, ConstraintSet, DistinctTracker};
 use crate::prelude::*;
 use crate::storage::store::Store;
 use crate::structs::{Allocation, Node, TaskConfig};
@@ -151,6 +152,8 @@ impl<'a> Scheduler<'a> {
         let mut placements = Vec::new();
         let mut planned: HashMap<String, usize> = HashMap::new();
         let weights = self.scheduler_weights()?;
+        let node_lookup: HashMap<&str, &Node> =
+            nodes.iter().map(|node| (node.id.as_str(), node)).collect();
 
         for (task_id, task_config, _desired_count) in tasks {
             let needed = required_counts.get(&task_id).copied().unwrap_or(0);
@@ -158,11 +161,37 @@ impl<'a> Scheduler<'a> {
                 continue;
             }
 
-            for _ in 0..needed {
-                let eligible = nodes
+            let constraint_set =
+                ConstraintSet::new(&task_config.constraints).with_context(|| {
+                    format!("Failed to parse constraints for task {}", task_config.name)
+                })?;
+            let affinity_set = AffinitySet::new(&task_config.affinities).with_context(|| {
+                format!("Failed to parse affinities for task {}", task_config.name)
+            })?;
+            let mut distinct_tracker = Self::build_distinct_tracker(
+                &constraint_set,
+                task_id,
+                allocations_by_node,
+                &node_lookup,
+            );
+            let base_eligible = if distinct_tracker.is_none() {
+                nodes
                     .iter()
-                    .filter(|node| Self::node_satisfies_constraints(node, &task_config.constraints))
-                    .collect::<Vec<_>>();
+                    .filter(|node| constraint_set.is_satisfied(node, None))
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+
+            for _ in 0..needed {
+                let eligible = if distinct_tracker.is_some() {
+                    nodes
+                        .iter()
+                        .filter(|node| constraint_set.is_satisfied(node, distinct_tracker.as_ref()))
+                        .collect::<Vec<_>>()
+                } else {
+                    base_eligible.clone()
+                };
 
                 if eligible.is_empty() {
                     bail!(
@@ -175,6 +204,7 @@ impl<'a> Scheduler<'a> {
                 let ctx = SchedulingContext::new(
                     eligible,
                     &task_config,
+                    &affinity_set,
                     job_config_id,
                     allocations_by_node,
                     &planned,
@@ -193,6 +223,11 @@ impl<'a> Scheduler<'a> {
                     })?;
 
                 *planned.entry(node_id.clone()).or_default() += 1;
+                if let Some(tracker) = distinct_tracker.as_mut() {
+                    if let Some(node) = node_lookup.get(node_id.as_str()) {
+                        tracker.insert_from_node(node);
+                    }
+                }
                 placements.push(PlannedAllocation {
                     node_id,
                     task_config_id: task_id,
@@ -272,7 +307,6 @@ impl<'a> Scheduler<'a> {
 
             match key.as_str() {
                 "affinities" => weights.affinity = weight,
-                "anti_affinity" => weights.anti_affinity = weight,
                 "spread" => weights.spread = weight,
                 "bin_pack" => weights.bin_pack = weight,
                 _ => {}
@@ -280,6 +314,32 @@ impl<'a> Scheduler<'a> {
         }
 
         Ok(weights)
+    }
+
+    fn build_distinct_tracker<'b>(
+        constraints: &ConstraintSet,
+        task_id: i64,
+        allocations_by_node: &HashMap<String, Vec<Allocation>>,
+        node_lookup: &HashMap<&'b str, &'b Node>,
+    ) -> Option<DistinctTracker> {
+        let distinct_keys = constraints.distinct_keys();
+        if distinct_keys.is_empty() {
+            return None;
+        }
+
+        let mut tracker = DistinctTracker::new(&distinct_keys);
+        for (node_id, allocations) in allocations_by_node {
+            if allocations
+                .iter()
+                .any(|alloc| alloc.task_config_id == task_id)
+            {
+                if let Some(node) = node_lookup.get(node_id.as_str()) {
+                    tracker.insert_from_node(node);
+                }
+            }
+        }
+
+        Some(tracker)
     }
 
     fn parse_nodes_considered(value: &Value, eligible_len: usize) -> R<usize> {
@@ -337,29 +397,6 @@ impl<'a> Scheduler<'a> {
         }
     }
 
-    fn node_satisfies_constraints(node: &Node, constraints: &Value) -> bool {
-        let constraint_map = match constraints.as_object() {
-            Some(map) if !map.is_empty() => map,
-            _ => return true,
-        };
-
-        let mut attrs = Map::new();
-
-        if let Some(obj) = node.config_attrs.as_object() {
-            attrs.extend(obj.clone());
-        }
-        if let Some(obj) = node.fingerprint_attrs.as_object() {
-            attrs.extend(obj.clone());
-        }
-        if let Some(obj) = node.dynamic_attrs.as_object() {
-            attrs.extend(obj.clone());
-        }
-
-        constraint_map
-            .iter()
-            .all(|(key, value)| attrs.get(key).map(|attr| attr == value).unwrap_or(false))
-    }
-
     fn allocations_delta(
         affected_nodes: &HashSet<String>,
         allocations: &[Allocation],
@@ -405,6 +442,7 @@ impl<'a> Scheduler<'a> {
 #[cfg(test)]
 mod tests {
     use serde_json::{json, Value};
+    use std::collections::HashSet;
     use tempfile::Builder;
 
     use super::*;
@@ -544,8 +582,8 @@ mod tests {
             .iter()
             .filter(|alloc| alloc.task_config_id == web_id && alloc.node_id == "node-b")
             .count();
-        assert_eq!(web_on_node_a, 1);
-        assert_eq!(web_on_node_b, 1);
+        assert_eq!(web_on_node_a, 2);
+        assert_eq!(web_on_node_b, 0);
 
         let db_on_node_b = outcome
             .allocations
@@ -560,7 +598,7 @@ mod tests {
             .iter()
             .find(|delta| delta.node_id == "node-a")
             .expect("node-a delta missing");
-        assert_eq!(node_a_delta.added.len(), 1);
+        assert_eq!(node_a_delta.added.len(), 2);
         assert!(node_a_delta.removed.is_empty());
 
         let node_b_delta = outcome
@@ -568,7 +606,7 @@ mod tests {
             .iter()
             .find(|delta| delta.node_id == "node-b")
             .expect("node-b delta missing");
-        assert_eq!(node_b_delta.added.len(), 2);
+        assert_eq!(node_b_delta.added.len(), 1);
         assert!(node_b_delta.removed.is_empty());
 
         Ok(())
@@ -601,7 +639,7 @@ mod tests {
         let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Reschedule)?;
 
         assert_eq!(outcome.allocations.len(), 2);
-        assert_eq!(outcome.deltas.len(), 2);
+        assert_eq!(outcome.deltas.len(), 1);
 
         let node_a_added = outcome
             .allocations
@@ -613,8 +651,8 @@ mod tests {
             .iter()
             .filter(|alloc| alloc.node_id == "node-b")
             .count();
-        assert_eq!(node_a_added, 1);
-        assert_eq!(node_b_added, 1);
+        assert_eq!(node_a_added, 2);
+        assert_eq!(node_b_added, 0);
 
         Ok(())
     }
@@ -671,10 +709,12 @@ mod tests {
             "zone": "us-east",
         });
 
-        assert!(Scheduler::node_satisfies_constraints(&node, &constraints));
+        let constraint_set = ConstraintSet::new(&constraints)?;
+        assert!(constraint_set.is_satisfied(&node, None));
 
         let mismatched = json!({ "role": "web", "arch": "arm64", "zone": "us-east" });
-        assert!(!Scheduler::node_satisfies_constraints(&node, &mismatched));
+        let mismatched_set = ConstraintSet::new(&mismatched)?;
+        assert!(!mismatched_set.is_satisfied(&node, None));
 
         Ok(())
     }
@@ -718,11 +758,76 @@ mod tests {
         assert_eq!(outcome.allocations.len(), 2);
         for alloc in &outcome.allocations {
             let node = store.get_node(&alloc.node_id)?;
-            assert!(Scheduler::node_satisfies_constraints(
-                &node,
-                &json!({ "role": "db" })
-            ));
+            let constraint_set = ConstraintSet::new(&json!({ "role": "db" }))?;
+            assert!(constraint_set.is_satisfied(&node, None));
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn distinct_constraints_spread_allocations() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", json!({ "zone": "us-east" })))?;
+        store.insert_node(make_node_msg("node-b", json!({ "zone": "us-west" })))?;
+
+        let job = JobConfig {
+            name: "distinct-job".into(),
+            tasks: vec![TaskConfig {
+                name: "api".into(),
+                count: 2,
+                kind: "noop".into(),
+                config: json!({}),
+                resources: json!({}),
+                constraints: json!([{ "key": "zone", "operator": "distinct" }]),
+                affinities: json!({}),
+            }],
+            version: None,
+        };
+
+        store.handle_job_submit(&job, &[dummy_submission()])?;
+        let job_config_id = store.get_job_config(&job.name)?.id();
+        let scheduler = Scheduler::new(&store)?;
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+
+        assert_eq!(outcome.allocations.len(), 2);
+        let node_ids: HashSet<_> = outcome
+            .allocations
+            .iter()
+            .map(|alloc| alloc.node_id.as_str())
+            .collect();
+        assert_eq!(node_ids.len(), 2);
+
+        Ok(())
+    }
+
+    #[test]
+    fn apply_time_constraints_are_rechecked() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", json!({ "role": "web" })))?;
+
+        let job = JobConfig {
+            name: "apply-constraints".into(),
+            tasks: vec![TaskConfig {
+                name: "db".into(),
+                count: 1,
+                kind: "noop".into(),
+                config: json!({}),
+                resources: json!({}),
+                constraints: json!([{ "key": "role", "value": "db" }]),
+                affinities: json!({}),
+            }],
+            version: None,
+        };
+
+        store.handle_job_submit(&job, &[dummy_submission()])?;
+        let job_config_id = store.get_job_config(&job.name)?.id();
+        let task_id = task_id_for(&store, &job_config_id, "db")?;
+
+        let err = store
+            .apply_allocation_plan(&[(String::from("node-a"), task_id)])
+            .expect_err("expected constraint failure");
+        assert!(err.to_string().contains("does not satisfy constraints"));
 
         Ok(())
     }
@@ -805,7 +910,7 @@ mod tests {
         let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
 
         assert_eq!(outcome.allocations.len(), 1);
-        assert_eq!(outcome.allocations[0].node_id, "node-a");
+        assert_eq!(outcome.allocations[0].node_id, "node-b");
 
         Ok(())
     }
@@ -817,8 +922,7 @@ mod tests {
             Some(json!({
                 "weights": {
                     "affinities": 2.0,
-                    "spread": 1.0,
-                    "anti_affinity": 0.0
+                    "spread": 1.0
                 }
             })),
         )?;
@@ -868,43 +972,6 @@ mod tests {
 
         assert_eq!(outcome.allocations.len(), 1);
         assert_eq!(outcome.allocations[0].node_id, "node-a");
-
-        Ok(())
-    }
-
-    #[test]
-    fn bin_pack_avoids_same_job_allocations() -> R<()> {
-        let store = setup_store_with_scheduler("bin_pack", None)?;
-        store.insert_node(make_node_msg("node-a", json!({})))?;
-        store.insert_node(make_node_msg("node-b", json!({})))?;
-
-        let job = JobConfig {
-            name: "anti-affinity-job".into(),
-            tasks: vec![TaskConfig {
-                name: "worker".into(),
-                count: 2,
-                kind: "noop".into(),
-                config: json!({}),
-                resources: json!({}),
-                constraints: json!({}),
-                affinities: json!({}),
-            }],
-            version: None,
-        };
-
-        store.handle_job_submit(&job, &[dummy_submission()])?;
-        let job_config_id = store.get_job_config(&job.name)?.id();
-
-        let scheduler = Scheduler::new(&store)?;
-        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
-
-        assert_eq!(outcome.allocations.len(), 2);
-        let node_ids: HashSet<_> = outcome
-            .allocations
-            .iter()
-            .map(|alloc| alloc.node_id.as_str())
-            .collect();
-        assert_eq!(node_ids.len(), 2);
 
         Ok(())
     }
