@@ -260,24 +260,15 @@ impl Manager for ManagerAgentService {
                 Status::internal("Error getting worker type")
             })?;
 
-        let mut attrs = HashMap::new();
-        for (key, value) in &worker_config.attributes {
-            match serde_json::to_string(value).ok() {
-                Some(val_str) => {
-                    attrs.insert(key.to_string(), val_str);
-                }
-                None => {
-                    error!("Error serializing value for key: {}", key);
-                }
-            }
-        }
-
         let config = WorkerConfig {
             name: worker_type,
             pool: worker_config.pool,
             additional_node_checks: worker_config.additional_node_checks,
             attributes: worker_config.attributes,
             name_prefix: worker_config.name_prefix,
+            resources: worker_config.resources,
+            reserved_resources: worker_config.reserved_resources,
+            max_allocations: worker_config.max_allocations,
         };
 
         let reply = WorkerPreRegisterReply {

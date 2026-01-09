@@ -65,11 +65,24 @@ pub async fn run_worker(token: &str) -> R<()> {
     let fingerprint_data = fingerprint_node(config.additional_node_checks.clone());
     let health_checks = run_health_checks(config.additional_node_checks.clone());
 
+    let mut config_attrs = Map::new();
+    for (key, value) in config.attributes {
+        config_attrs.insert(key, Value::String(value));
+    }
+    let resources = serde_json::from_str(&config.resources).unwrap_or_else(|_| json!({}));
+    let reserved_resources =
+        serde_json::from_str(&config.reserved_resources).unwrap_or_else(|_| json!({}));
+    config_attrs.insert("resources".into(), resources);
+    config_attrs.insert("reservedResources".into(), reserved_resources);
+    if let Some(max_allocations) = config.max_allocations {
+        config_attrs.insert("maxAllocations".into(), json!(max_allocations));
+    }
+
     register_self(
         client.clone(),
         name.clone(),
         config.pool,
-        config.attributes,
+        config_attrs,
         fingerprint_data,
         health_checks,
     )
@@ -147,7 +160,7 @@ async fn register_self(
     client: ManagerClient<Channel>,
     name: String,
     pool: String,
-    config_attrs: HashMap<String, String>,
+    config_attrs: Map<String, Value>,
     fingerprint_attrs: Map<String, Value>,
     health_checks: Map<String, Value>,
 ) -> R<()> {

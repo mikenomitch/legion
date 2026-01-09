@@ -73,7 +73,10 @@ fn maximal_job_spec_parse() {
     assert_eq!(config.tasks.len(), 2);
     for task in &config.tasks {
         assert!(!task.name.is_empty(), "task name should be set");
-        assert!(value_is_non_empty(&task.config), "task config should be set");
+        assert!(
+            value_is_non_empty(&task.config),
+            "task config should be set"
+        );
         assert!(
             value_is_non_empty(&task.resources),
             "task resources should be set"

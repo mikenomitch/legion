@@ -27,6 +27,8 @@ pub struct ManagerConfig {
     pub scheduling_policy: Option<String>,
     pub default_priority: Option<i64>,
     pub scheduler_settings: Option<Value>,
+    pub task_resource_defaults: Option<Value>,
+    pub custom_resources: Option<Value>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -80,6 +82,8 @@ pub struct ManagerConfigFull {
     pub scheduling_policy: String,
     pub default_priority: i64,
     pub scheduler_settings: Option<Value>,
+    pub task_resource_defaults: Option<Value>,
+    pub custom_resources: Option<Value>,
 }
 
 impl From<ManagerConfigFull> for ManagerConfig {
@@ -93,6 +97,8 @@ impl From<ManagerConfigFull> for ManagerConfig {
             scheduling_policy: Some(val.scheduling_policy),
             default_priority: Some(val.default_priority),
             scheduler_settings: val.scheduler_settings,
+            task_resource_defaults: val.task_resource_defaults,
+            custom_resources: val.custom_resources,
         }
     }
 }
@@ -123,6 +129,8 @@ impl ManagerConfig {
                 .unwrap_or_else(|| DEF_SCHEDULING_POLICY.into()),
             default_priority: self.default_priority.unwrap_or(DEF_EVAL_PRIORITY),
             scheduler_settings: self.scheduler_settings.clone(),
+            task_resource_defaults: self.task_resource_defaults.clone(),
+            custom_resources: self.custom_resources.clone(),
         }
     }
 }
@@ -137,6 +145,8 @@ impl Default for ManagerConfigFull {
             scheduling_policy: DEF_SCHEDULING_POLICY.into(),
             default_priority: DEF_EVAL_PRIORITY,
             scheduler_settings: None,
+            task_resource_defaults: None,
+            custom_resources: None,
             eval_threads: default_eval_threads(),
         }
     }
@@ -156,4 +166,7 @@ pub struct WorkerConfigAlt {
     pub pool: Option<String>,
     pub attributes: Option<HashMap<String, String>>,
     pub name_prefix: Option<String>,
+    pub resources: Option<Value>,
+    pub reserved_resources: Option<Value>,
+    pub max_allocations: Option<u32>,
 }

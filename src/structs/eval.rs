@@ -54,7 +54,7 @@ impl Eval {
                 availability: "available".into(),
                 last_heartbeat,
                 config_attrs: json!({}),
-                fingerprint_attrs: json!({}),
+                fingerprint_attrs: Self::default_fingerprint_attrs(),
                 dynamic_attrs: json!({}),
                 health_checks: json!({}),
             };
@@ -149,6 +149,16 @@ impl Eval {
         OffsetDateTime::now_utc()
             .format(&Rfc3339)
             .unwrap_or_else(|_| "1970-01-01T00:00:00Z".into())
+    }
+
+    fn default_fingerprint_attrs() -> serde_json::Value {
+        json!({
+            "memory_total": "8388608",
+            "cpus": {
+                "cpu-1": { "frequency": "2400" },
+                "cpu-2": { "frequency": "2400" },
+            }
+        })
     }
 }
 
