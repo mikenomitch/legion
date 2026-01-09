@@ -1,6 +1,33 @@
 use crate::cmd::helpers::{connect_manager_client, json_flag};
 use crate::prelude::*;
 use crate::structs::{GetLedgerRequest, LedgerEntry};
+use serde::Serialize;
+use serde_json::Value;
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LedgerJsonNode {
+    id: String,
+    status: String,
+    availability: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LedgerJsonAllocation {
+    id: i64,
+    status: String,
+    resources: Value,
+    task_config_id: i64,
+    job_id: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LedgerJsonEntry {
+    node: LedgerJsonNode,
+    allocations: Vec<LedgerJsonAllocation>,
+}
 pub fn config() -> Command {
     Command::new("ledger")
         .about("Shows the current state of the ledger")
@@ -23,9 +50,31 @@ pub async fn handle(matches: &ArgMatches) -> R<()> {
         .collect::<R<Vec<_>>>()?;
 
     if matches.get_flag("json") {
+        let json_entries: Vec<LedgerJsonEntry> = ledger
+            .iter()
+            .map(|entry| LedgerJsonEntry {
+                node: LedgerJsonNode {
+                    id: entry.node.id.clone(),
+                    status: entry.node.status.clone(),
+                    availability: entry.node.availability.clone(),
+                },
+                allocations: entry
+                    .allocations
+                    .iter()
+                    .map(|alloc| LedgerJsonAllocation {
+                        id: alloc.id,
+                        status: alloc.status.clone(),
+                        resources: alloc.resources.clone(),
+                        task_config_id: alloc.task_config_id,
+                        job_id: alloc.job_id.clone(),
+                    })
+                    .collect(),
+            })
+            .collect();
         println!(
             "{}",
-            serde_json::to_string(&ledger).context("failed to serialize ledger to JSON")?
+            serde_json::to_string(&json_entries)
+                .context("failed to serialize ledger to JSON")?
         );
     } else if ledger.is_empty() {
         println!("No nodes registered in the ledger.");
