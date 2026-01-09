@@ -28,8 +28,8 @@ const navItems = [
     key: "overview",
     label: "Overview",
     path: "/",
-    title: "Ledger",
-    copy: "Live allocations flowing through the cluster ledger.",
+    title: "Overview",
+    copy: "Jobs running on the cluster.",
   },
   {
     key: "nodes",
@@ -61,24 +61,6 @@ const navItems = [
   },
 ] as const;
 
-type Section = (typeof navItems)[number]["key"];
-
-const sectionTitle: Record<Section, string> = {
-  home: "Ledger",
-  nodes: "Nodes",
-  jobs: "Jobs",
-  manager: "Manager",
-  testing: "Testing Utilities",
-};
-
-const sectionCopy: Record<Section, string> = {
-  home: "Live allocations flowing through the cluster ledger.",
-  nodes: "Every node the manager knows about.",
-  jobs: "Jobs reported by the manager in real time.",
-  manager: "Manager-specific controls and configuration.",
-  testing: "Sandboxes and utilities for experiments.",
-};
-
 const resolveInitialTheme = (): "light" | "dark" => {
   if (typeof window === "undefined") return "dark";
   const stored = localStorage.getItem("ui-theme");
@@ -97,9 +79,13 @@ const navButton = (active: boolean) =>
     ? "border-neutral-900 bg-neutral-900 text-white shadow-[4px_4px_0_#d4d4d8] dark:border-neutral-300 dark:bg-neutral-100 dark:text-neutral-900 dark:shadow-[4px_4px_0_#0b0d12]"
     : "border-neutral-200 bg-transparent text-neutral-700 shadow-[4px_4px_0_#d4d4d8] hover:border-neutral-400 hover:text-neutral-900 dark:border-neutral-800 dark:text-neutral-300 dark:shadow-[4px_4px_0_#0b0d12] dark:hover:border-neutral-500 dark:hover:text-white");
 
+const isEqualData = <T,>(a: T | undefined, b: T | undefined) =>
+  JSON.stringify(a) === JSON.stringify(b);
+
 const Layout = (props: RouteSectionProps) => {
   const location = useLocation();
   const [isNavOpen, setIsNavOpen] = createSignal(false);
+  const [isSidebarCollapsed, setIsSidebarCollapsed] = createSignal(false);
   const [theme, setTheme] = createSignal<"light" | "dark">(
     resolveInitialTheme(),
   );
@@ -133,15 +119,24 @@ const Layout = (props: RouteSectionProps) => {
     <div class={`min-h-screen ${baseContainer}`}>
       <div class="flex min-h-screen">
         <aside
-          class={`fixed inset-y-0 left-0 z-40 w-64 transform border-r border-neutral-200 bg-white/90 px-5 py-6 backdrop-blur-sm transition md:static md:translate-x-0 dark:border-neutral-800 dark:bg-neutral-950/80 ${
+          class={`fixed inset-y-0 left-0 z-40 flex w-64 transform flex-col overflow-hidden border-r border-neutral-200 bg-white/90 px-5 py-6 backdrop-blur-sm transition md:static ${
             isNavOpen() ? "translate-x-0" : "-translate-x-full"
-          } md:flex md:flex-col`}
+          } ${
+            isSidebarCollapsed() ? "md:hidden" : "md:flex md:translate-x-0"
+          } dark:border-neutral-800 dark:bg-neutral-950/80`}
           aria-label="Sidebar"
         >
           <div class="mb-8 flex items-center justify-between">
-            <div class="text-lg font-semibold uppercase tracking-[0.18em]">
+            <A
+              href="/"
+              class="text-lg font-semibold uppercase tracking-[0.18em]"
+              onClick={() => {
+                setIsNavOpen(false);
+                setIsSidebarCollapsed(false);
+              }}
+            >
               Legion
-            </div>
+            </A>
             <button
               type="button"
               class="rounded border border-neutral-200 p-2 text-neutral-700 shadow-sm transition hover:bg-neutral-100 md:hidden dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-900"
@@ -149,6 +144,17 @@ const Layout = (props: RouteSectionProps) => {
               aria-label="Close navigation"
             >
               ✕
+            </button>
+            <button
+              type="button"
+              class="hidden rounded border border-neutral-200 p-2 text-neutral-700 shadow-sm transition hover:bg-neutral-100 md:inline-flex dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-900"
+              onClick={() => {
+                setIsSidebarCollapsed(true);
+                setIsNavOpen(false);
+              }}
+              aria-label="Collapse sidebar"
+            >
+              ❯
             </button>
           </div>
           <nav class="flex flex-col gap-2">
@@ -188,8 +194,13 @@ const Layout = (props: RouteSectionProps) => {
             <div class="flex items-center gap-3">
               <button
                 type="button"
-                class="flex h-10 w-10 items-center justify-center rounded border border-neutral-300 bg-white text-lg shadow-[3px_3px_0_#d4d4d8] transition hover:-translate-y-0.5 md:hidden dark:border-neutral-700 dark:bg-neutral-900 dark:shadow-[3px_3px_0_#0b0d12]"
-                onClick={() => setIsNavOpen(true)}
+                class={`flex h-10 w-10 items-center justify-center rounded border border-neutral-300 bg-white text-lg shadow-[3px_3px_0_#d4d4d8] transition hover:-translate-y-0.5 dark:border-neutral-700 dark:bg-neutral-900 dark:shadow-[3px_3px_0_#0b0d12] ${
+                  isSidebarCollapsed() ? "md:flex" : "md:hidden"
+                }`}
+                onClick={() => {
+                  setIsNavOpen(true);
+                  setIsSidebarCollapsed(false);
+                }}
                 aria-label="Open navigation"
               >
                 ☰
@@ -214,8 +225,11 @@ const Layout = (props: RouteSectionProps) => {
                     : "Switch to dark mode"
                 }
               >
-                <span aria-hidden="true" class="inline-block grayscale">
-                  💡
+                <span
+                  aria-hidden="true"
+                  class="inline-block text-lg leading-none"
+                >
+                  {theme() === "dark" ? "☾" : "☀"}
                 </span>
               </button>
             </div>
@@ -228,40 +242,25 @@ const Layout = (props: RouteSectionProps) => {
   );
 };
 
-const AppRoutes = () => {
+type PollingControllerProps = {
+  refreshLedger: () => Promise<void>;
+  refreshNodes: () => Promise<void>;
+  refreshJobs: () => Promise<void>;
+};
+
+const PollingController = (props: PollingControllerProps) => {
   const location = useLocation();
-
-  const [ledger, { refetch: refetchLedger }] = createResource(
-    async (): Promise<readonly LedgerNode[]> => {
-      const response = await managerClient.getLedger({});
-      return response.nodes;
-    },
-  );
-
-  const [nodes, { refetch: refetchNodes }] = createResource(
-    async (): Promise<readonly NodeMsg[]> => {
-      const response = await managerClient.getNodes({});
-      return response.nodes;
-    },
-  );
-
-  const [jobs, { refetch: refetchJobs }] = createResource(
-    async (): Promise<readonly Job[]> => {
-      const response = await managerClient.listJobs({});
-      return response.jobs;
-    },
-  );
 
   createEffect(() => {
     const current = location.pathname.replace(/\/+$/, "") || "/";
     let refetch: (() => void) | null = null;
 
     if (current === "/") {
-      refetch = () => void refetchLedger();
+      refetch = () => void props.refreshLedger();
     } else if (current.startsWith("/nodes")) {
-      refetch = () => void refetchNodes();
+      refetch = () => void props.refreshNodes();
     } else if (current.startsWith("/jobs")) {
-      refetch = () => void refetchJobs();
+      refetch = () => void props.refreshJobs();
     }
 
     if (!refetch) return;
@@ -270,8 +269,70 @@ const AppRoutes = () => {
     onCleanup(() => window.clearInterval(interval));
   });
 
+  return null;
+};
+
+const AppRoutes = () => {
+  const fetchLedger = async (): Promise<readonly LedgerNode[]> => {
+    const response = await managerClient.getLedger({});
+    return response.nodes;
+  };
+
+  const fetchNodes = async (): Promise<readonly NodeMsg[]> => {
+    const response = await managerClient.getNodes({});
+    return response.nodes;
+  };
+
+  const fetchJobs = async (): Promise<readonly Job[]> => {
+    const response = await managerClient.listJobs({});
+    return response.jobs;
+  };
+
+  const [ledger, { mutate: setLedger }] = createResource(fetchLedger);
+  const [nodes, { mutate: setNodes }] = createResource(fetchNodes);
+  const [jobs, { mutate: setJobs }] = createResource(fetchJobs);
+
+  const refreshLedger = async () => {
+    try {
+      const next = await fetchLedger();
+      setLedger((prev) => (isEqualData(prev, next) ? prev : next));
+    } catch (error) {
+      console.error("Failed to refresh ledger", error);
+    }
+  };
+
+  const refreshNodes = async () => {
+    try {
+      const next = await fetchNodes();
+      setNodes((prev) => (isEqualData(prev, next) ? prev : next));
+    } catch (error) {
+      console.error("Failed to refresh nodes", error);
+    }
+  };
+
+  const refreshJobs = async () => {
+    try {
+      const next = await fetchJobs();
+      setJobs((prev) => (isEqualData(prev, next) ? prev : next));
+    } catch (error) {
+      console.error("Failed to refresh jobs", error);
+    }
+  };
+
   return (
-    <Route path="/" component={Layout}>
+    <Route
+      path="/"
+      component={(props) => (
+        <Layout {...props}>
+          <PollingController
+            refreshLedger={refreshLedger}
+            refreshNodes={refreshNodes}
+            refreshJobs={refreshJobs}
+          />
+          {props.children}
+        </Layout>
+      )}
+    >
       <Route path="/" component={() => <Homepage ledger={ledger} />} />
       <Route path="/nodes" component={() => <Nodes nodes={nodes} />} />
       <Route path="/jobs" component={() => <Jobs jobs={jobs} />} />

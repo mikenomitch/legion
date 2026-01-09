@@ -19,6 +19,31 @@ const parseAttributes = (value?: string): unknown => {
   }
 }
 
+const prettifyData = (value: unknown): string => {
+  if (value === undefined || value === null) return ''
+
+  if (typeof value === 'string') {
+    try {
+      return JSON.stringify(JSON.parse(value), null, 2)
+    } catch {
+      return value
+    }
+  }
+
+  if (isPlainObject(value) || Array.isArray(value)) {
+    try {
+      return JSON.stringify(value, null, 2)
+    } catch {
+      return String(value)
+    }
+  }
+
+  return String(value)
+}
+
+const extractField = (value: unknown, key: string): unknown =>
+  isPlainObject(value) && key in value ? (value as Record<string, unknown>)[key] : undefined
+
 const renderValue = (value: unknown): JSX.Element => {
   if (value === null || value === undefined) return <span class="text-neutral-500">—</span>
   if (Array.isArray(value)) {
@@ -53,11 +78,14 @@ interface KeyValueGridProps {
   title: string
   data: unknown
   emptyLabel: string
+  showTitle?: boolean
 }
 
 const KeyValueGrid = (props: KeyValueGridProps) => (
   <div class="space-y-2">
-    <h4 class="text-sm font-semibold text-neutral-900 dark:text-neutral-100">{props.title}</h4>
+    <Show when={props.showTitle ?? true}>
+      <h4 class="text-sm font-semibold text-neutral-900 dark:text-neutral-100">{props.title}</h4>
+    </Show>
     <div class="rounded border border-neutral-200 bg-neutral-50 p-3 dark:border-neutral-800 dark:bg-neutral-900/60">
       <Show
         when={(() => {
@@ -86,6 +114,41 @@ const KeyValueGrid = (props: KeyValueGridProps) => (
     </div>
   </div>
 )
+
+interface CollapsibleSectionProps {
+  title: string
+  children: JSX.Element
+  defaultOpen?: boolean
+}
+
+const CollapsibleSection = (props: CollapsibleSectionProps) => {
+  const [open, setOpen] = createSignal(props.defaultOpen ?? true)
+
+  return (
+    <div class="rounded border border-neutral-200 bg-white/90 px-3 py-2 shadow-sm dark:border-neutral-800 dark:bg-neutral-900/50">
+      <button
+        type="button"
+        class="flex w-full items-center justify-between text-left"
+        onClick={() => setOpen((prev) => !prev)}
+        aria-expanded={open()}
+      >
+        <span class="flex items-center gap-2 text-sm font-semibold text-neutral-900 dark:text-neutral-100">
+          <span
+            class={`inline-block text-lg leading-none transition-transform ${open() ? 'rotate-90' : 'rotate-0'}`}
+            aria-hidden="true"
+          >
+            ›
+          </span>
+          {props.title}
+        </span>
+        <span class="text-xs uppercase tracking-[0.1em] text-neutral-500 dark:text-neutral-400">{open() ? 'Hide' : 'Show'}</span>
+      </button>
+      <Show when={open()}>
+        <div class="mt-2">{props.children}</div>
+      </Show>
+    </div>
+  )
+}
 
 export default function Nodes(props: NodesProps) {
   const [statusFilter, setStatusFilter] = createSignal('All')
@@ -135,56 +198,98 @@ export default function Nodes(props: NodesProps) {
 
             <div class="grid gap-3 lg:grid-cols-2">
               <For each={filteredNodes()}>
-                {(node) => (
-                  <article class="rounded border border-neutral-200 bg-white/90 p-4 shadow-[5px_5px_0_#d4d4d8] transition dark:border-neutral-800 dark:bg-neutral-900/60 dark:shadow-[5px_5px_0_#0b0d12]">
-                    <div class="flex flex-wrap items-center justify-between gap-3">
-                      <div>
-                        <p class="text-xs uppercase tracking-[0.12em] text-neutral-500 dark:text-neutral-400">Node</p>
-                        <p class="text-lg font-semibold text-neutral-900 dark:text-neutral-100">{node.id || 'Unknown node'}</p>
-                        <p class="text-sm text-neutral-500 dark:text-neutral-400">Pool: {node.pool || '—'}</p>
-                      </div>
-                      <div class="flex flex-col items-end gap-2 text-right">
-                        <span class="rounded border border-neutral-300 px-2 py-1 text-[11px] uppercase tracking-wide text-neutral-800 dark:border-neutral-700 dark:text-neutral-200">
-                          {node.status || 'Unknown'}
-                        </span>
-                        <span class="text-xs text-neutral-600 dark:text-neutral-400">Last heartbeat {formatRelativeTime(node.lastHeartbeat)}</span>
-                      </div>
-                    </div>
+                {(node) => {
+                const configData = parseAttributes(node.configAttrs)
+                const dynamicData = parseAttributes(node.dynamicAttrs)
+                const fingerprintData = parseAttributes(node.fingerprintAttrs)
+                const networksData = extractField(dynamicData, 'networks') ?? extractField(fingerprintData, 'networks')
+                const signalsData = extractField(dynamicData, 'signals') ?? extractField(fingerprintData, 'signals')
+                  const healthData = parseAttributes(node.healthChecks)
+                  const formattedHealth = prettifyData(healthData ?? node.healthChecks)
 
-                    <div class="mt-3 grid gap-2 text-sm text-neutral-700 dark:text-neutral-300 sm:grid-cols-2 lg:grid-cols-3">
-                      <p class="rounded border border-neutral-200 bg-neutral-50 px-2 py-1 dark:border-neutral-800 dark:bg-neutral-950/60">
-                        Availability: {node.availability || '—'}
-                      </p>
-                      <p class="rounded border border-neutral-200 bg-neutral-50 px-2 py-1 dark:border-neutral-800 dark:bg-neutral-950/60">
-                        Health checks: {node.healthChecks || '—'}
-                      </p>
-                      <p class="rounded border border-neutral-200 bg-neutral-50 px-2 py-1 dark:border-neutral-800 dark:bg-neutral-950/60">
-                        Dynamic attributes: {node.dynamicAttrs ? 'Provided' : 'Not provided'}
-                      </p>
-                    </div>
-
-                    <div class="mt-4 space-y-3">
-                      <div class="grid gap-3 lg:grid-cols-2">
-                        <KeyValueGrid
-                          title="Static Config"
-                          data={parseAttributes(node.configAttrs)}
-                          emptyLabel="No static config provided"
-                        />
-                        <KeyValueGrid
-                          title="Dynamic Config"
-                          data={parseAttributes(node.dynamicAttrs)}
-                          emptyLabel="No dynamic config provided"
-                        />
+                  return (
+                    <article class="rounded border border-neutral-200 bg-white/90 p-4 shadow-[5px_5px_0_#d4d4d8] transition dark:border-neutral-800 dark:bg-neutral-900/60 dark:shadow-[5px_5px_0_#0b0d12]">
+                      <div class="flex flex-wrap items-center justify-between gap-3">
+                        <div>
+                          <p class="text-xs uppercase tracking-[0.12em] text-neutral-500 dark:text-neutral-400">Node</p>
+                          <p class="text-lg font-semibold text-neutral-900 dark:text-neutral-100">{node.id || 'Unknown node'}</p>
+                          <p class="text-sm text-neutral-500 dark:text-neutral-400">Pool: {node.pool || '—'}</p>
+                        </div>
+                        <div class="flex flex-col items-end gap-2 text-right">
+                          <span class="rounded border border-neutral-300 px-2 py-1 text-[11px] uppercase tracking-wide text-neutral-800 dark:border-neutral-700 dark:text-neutral-200">
+                            {node.status || 'Unknown'}
+                          </span>
+                          <span class="text-xs text-neutral-600 dark:text-neutral-400">Last heartbeat {formatRelativeTime(node.lastHeartbeat)}</span>
+                        </div>
                       </div>
 
-                      <KeyValueGrid
-                        title="Fingerprint"
-                        data={parseAttributes(node.fingerprintAttrs)}
-                        emptyLabel="No fingerprint data"
-                      />
-                    </div>
-                  </article>
-                )}
+                      <div class="mt-3 grid gap-2 text-sm text-neutral-700 dark:text-neutral-300 sm:grid-cols-2 lg:grid-cols-3">
+                        <p class="rounded border border-neutral-200 bg-neutral-50 px-2 py-1 dark:border-neutral-800 dark:bg-neutral-950/60">
+                          Availability: {node.availability || '—'}
+                        </p>
+                      </div>
+
+                      <div class="mt-4 space-y-3">
+                        <div class="grid gap-3 lg:grid-cols-2">
+                          <KeyValueGrid
+                            title="Static Config"
+                            data={configData}
+                            emptyLabel="No static config provided"
+                          />
+                          <KeyValueGrid
+                            title="Dynamic Config"
+                            data={dynamicData}
+                            emptyLabel="No dynamic config provided"
+                          />
+                        </div>
+
+                        <CollapsibleSection title="Fingerprint" defaultOpen={false}>
+                          <KeyValueGrid
+                            title="Fingerprint"
+                            showTitle={false}
+                            data={fingerprintData}
+                            emptyLabel="No fingerprint data"
+                          />
+                        </CollapsibleSection>
+
+                        <CollapsibleSection title="Networks" defaultOpen={false}>
+                          <KeyValueGrid
+                            title="Networks"
+                            showTitle={false}
+                            data={networksData}
+                            emptyLabel="No network data"
+                          />
+                        </CollapsibleSection>
+
+                        <CollapsibleSection title="Signals" defaultOpen={false}>
+                          <KeyValueGrid
+                            title="Signals"
+                            showTitle={false}
+                            data={signalsData}
+                            emptyLabel="No signal data"
+                          />
+                        </CollapsibleSection>
+
+                        <CollapsibleSection title="Health Checks" defaultOpen={false}>
+                          <div class="rounded border border-neutral-200 bg-neutral-50 p-3 shadow-sm dark:border-neutral-800 dark:bg-neutral-900/60">
+                            <div class="flex items-center justify-between">
+                              <h4 class="text-sm font-semibold text-neutral-900 dark:text-neutral-100">Health Checks</h4>
+                              <span class="text-[11px] uppercase tracking-[0.12em] text-neutral-500 dark:text-neutral-400">Status</span>
+                            </div>
+                            <Show
+                              when={formattedHealth.trim().length > 0}
+                              fallback={<p class="mt-2 text-sm text-neutral-500">No health check data</p>}
+                            >
+                              <pre class="mt-2 max-h-64 overflow-auto whitespace-pre-wrap break-words rounded bg-white/70 p-3 font-mono text-xs leading-relaxed text-neutral-800 shadow-inner dark:bg-neutral-950 dark:text-neutral-100">
+                                {formattedHealth}
+                              </pre>
+                            </Show>
+                          </div>
+                        </CollapsibleSection>
+                      </div>
+                    </article>
+                  )
+                }}
               </For>
             </div>
           </div>

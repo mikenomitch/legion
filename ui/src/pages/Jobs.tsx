@@ -12,8 +12,12 @@ interface JobsProps {
 export default function Jobs(props: JobsProps) {
   const [specs, setSpecs] =
     createStore<Record<string, { loading: boolean; error?: string; submissions?: Submission[]; expanded?: boolean }>>({})
+  const refreshingSpecs = new Set<string>()
 
   const jobList = createMemo(() => props.jobs() ?? [])
+
+  const submissionsEqual = (a?: Submission[], b?: Submission[]) =>
+    JSON.stringify(a ?? []) === JSON.stringify(b ?? [])
 
   const loadSpec = async (job: Job) => {
     const key = job.name || job.id
@@ -29,17 +33,27 @@ export default function Jobs(props: JobsProps) {
     }
   }
 
-  const refreshSpec = async (key: string) => {
+  const refreshSpec = async (key: string, { silent } = { silent: false }) => {
     const current = specs[key]
-    if (!current) return
+    if (!current || refreshingSpecs.has(key)) return
 
-    setSpecs(key, (prev) => ({ ...prev, loading: true, error: undefined }))
+    refreshingSpecs.add(key)
+
+    if (!silent) {
+      setSpecs(key, (prev) => ({ ...prev, loading: true, error: undefined }))
+    }
     try {
       const response = await managerClient.getJobSpec({ name: key })
-      setSpecs(key, (prev) => ({ ...prev, loading: false, submissions: response.submissions }))
+      setSpecs(key, (prev) =>
+        submissionsEqual(prev?.submissions, response.submissions)
+          ? prev
+          : { ...prev, loading: false, submissions: response.submissions },
+      )
     } catch (error) {
       console.error('Failed to refresh job spec', error)
       setSpecs(key, (prev) => ({ ...prev, loading: false, error: 'Unable to load job spec' }))
+    } finally {
+      refreshingSpecs.delete(key)
     }
   }
 
@@ -54,7 +68,7 @@ export default function Jobs(props: JobsProps) {
     const interval = window.setInterval(() => {
       Object.entries(specs).forEach(([key, value]) => {
         if (value?.expanded) {
-          void refreshSpec(key)
+          void refreshSpec(key, { silent: true })
         }
       })
     }, POLL_INTERVAL_MS)
