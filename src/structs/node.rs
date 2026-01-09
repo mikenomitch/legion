@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{from_str, to_string, Map, Value};
 use tabled::Tabled;
+use time::format_description::well_known::Rfc3339;
 use time::{macros::format_description, Duration, OffsetDateTime};
 
 use crate::prelude::{DEF_LOST_NODE_AT_SEC, R};
@@ -65,12 +66,13 @@ impl From<NodeMsg> for Node {
 
 impl Node {
     pub fn last_heartbeat_too_slow(last_heartbeat: &str) -> R<bool> {
-        let fmt = format_description!(
-            "[year]-[month]-[day] [hour]:[minute]:[second] [offset_hour \
-                 sign:mandatory]:[offset_minute]:[offset_second]"
-        );
-
-        let last_heartbeat = OffsetDateTime::parse(last_heartbeat, fmt)?;
+        let last_heartbeat = OffsetDateTime::parse(last_heartbeat, &Rfc3339).or_else(|_| {
+            let fmt = format_description!(
+                "[year]-[month]-[day] [hour]:[minute]:[second] [offset_hour \
+                     sign:mandatory]:[offset_minute]:[offset_second]"
+            );
+            OffsetDateTime::parse(last_heartbeat, fmt)
+        })?;
         let now = OffsetDateTime::now_utc();
         let diff = now - last_heartbeat;
         let too_slow = diff > Duration::seconds(DEF_LOST_NODE_AT_SEC);

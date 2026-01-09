@@ -26,6 +26,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{MutexGuard, RwLock};
+use time::format_description::well_known::Rfc3339;
 use time::macros::format_description;
 use time::OffsetDateTime;
 
@@ -698,12 +699,7 @@ impl Store {
 
     #[instrument(err, skip_all)]
     pub fn update_node_heartbeat(&self, id: String) -> R<()> {
-        let fmt = format_description!(
-            "[year]-[month]-[day] [hour]:[minute]:[second] [offset_hour \
-                 sign:mandatory]:[offset_minute]:[offset_second]"
-        );
-
-        let timestamp_now = OffsetDateTime::now_utc().format(fmt)?;
+        let timestamp_now = OffsetDateTime::now_utc().format(&Rfc3339)?;
 
         let conn = self.write_connection()?;
         let sql = r#"
