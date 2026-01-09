@@ -1,3 +1,4 @@
+use crate::constraints::{ConstraintSet, DistinctTracker};
 use crate::prelude::*;
 use crate::storage::migrations::get_migrations;
 use crate::storage::queries::{
@@ -20,6 +21,7 @@ use rusqlite::{
 use rusqlite_migration::Migrations;
 use serde_json::{to_string, to_string_pretty};
 use serde_rusqlite::to_params_named;
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -41,6 +43,12 @@ pub struct SchedulingReadModel {
     pub nodes: HashMap<String, Node>,
     pub allocations_by_node: HashMap<String, Vec<Allocation>>,
     pub task_configs: HashMap<String, Vec<(i64, TaskConfig)>>,
+}
+
+#[derive(Debug)]
+struct AllocationConstraintState {
+    constraints: ConstraintSet,
+    distinct: Option<DistinctTracker>,
 }
 
 #[derive(Debug, Clone)]
@@ -1142,6 +1150,42 @@ impl Store {
         Ok(allocation)
     }
 
+    fn load_allocation_constraints(
+        &self,
+        tx: &Transaction<'_>,
+        task_id: i64,
+    ) -> R<AllocationConstraintState> {
+        let constraints: Value = tx.query_row(
+            "SELECT constraints FROM task_config WHERE id = ?;",
+            [task_id],
+            |row| row.get(0),
+        )?;
+        let constraint_set = ConstraintSet::new(&constraints)
+            .with_context(|| format!("Failed to parse constraints for task {task_id}"))?;
+        let distinct_keys = constraint_set.distinct_keys();
+        let distinct = if distinct_keys.is_empty() {
+            None
+        } else {
+            let mut tracker = DistinctTracker::new(&distinct_keys);
+            let sql = "SELECT node.id, node.pool, node.status, node.availability, \
+                node.config_attrs, node.fingerprint_attrs, node.dynamic_attrs, \
+                node.health_checks, node.last_heartbeat \
+                FROM node INNER JOIN allocation ON allocation.node_id = node.id \
+                WHERE allocation.task_config_id = ?;";
+            let mut stmt = tx.prepare(&sql)?;
+            let rows = stmt.query_map([task_id], |row| self.node_from_row(row))?;
+            for row in rows {
+                tracker.insert_from_node(&row?);
+            }
+            Some(tracker)
+        };
+
+        Ok(AllocationConstraintState {
+            constraints: constraint_set,
+            distinct,
+        })
+    }
+
     #[instrument(err, skip_all)]
     pub fn apply_allocation_plan(&self, placements: &[(String, i64)]) -> R<Vec<Allocation>> {
         if placements.is_empty() {
@@ -1152,8 +1196,34 @@ impl Store {
         let tx = conn.transaction()?;
         let mut allocations = Vec::new();
 
+        let mut constraint_states: HashMap<i64, AllocationConstraintState> = HashMap::new();
+
         for placement in placements {
-            let allocation = self.insert_allocation(&tx, &placement.0, placement.1)?;
+            let (node_id, task_id) = (&placement.0, placement.1);
+            let state = match constraint_states.entry(task_id) {
+                Entry::Occupied(entry) => entry.into_mut(),
+                Entry::Vacant(entry) => {
+                    entry.insert(self.load_allocation_constraints(&tx, task_id)?)
+                }
+            };
+
+            let node = tx.query_row(&GET_NODE, [node_id], |row| self.node_from_row(row))?;
+            if !state
+                .constraints
+                .is_satisfied(&node, state.distinct.as_ref())
+            {
+                bail!(
+                    "Node {} does not satisfy constraints for task {}",
+                    node_id,
+                    task_id
+                );
+            }
+
+            if let Some(tracker) = state.distinct.as_mut() {
+                tracker.insert_from_node(&node);
+            }
+
+            let allocation = self.insert_allocation(&tx, node_id, task_id)?;
             allocations.push(allocation);
         }
 
