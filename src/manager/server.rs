@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::prelude::*;
 
 use crate::storage::store::{JobSubmitOutcome, Store};
@@ -368,6 +370,30 @@ impl Manager for ManagerAgentService {
             .store
             .update_node_dyamic(&id, &dd_as_map)
             .expect("Can't find or update node");
+        let allocs = self.store.allocs_for_node(&id).map_err(|e| {
+            error!("Error getting allocations for node {}: {:?}", id, e);
+            Status::internal("Error getting allocations for node")
+        })?;
+        let mut job_configs_to_eval = HashMap::new();
+        for alloc in allocs {
+            job_configs_to_eval
+                .entry(alloc.job_config_id)
+                .or_insert(alloc.job_id);
+        }
+        for (job_config_id, job_id) in job_configs_to_eval {
+            self.store
+                .enqueue_eval(
+                    "job_update",
+                    Some(&job_id),
+                    Some(&job_config_id),
+                    Some(&id),
+                    Some(self.store.default_eval_priority),
+                )
+                .map_err(|e| {
+                    error!("Error enqueueing eval for node {}: {:?}", id, e);
+                    Status::internal("Error enqueueing eval for node")
+                })?;
+        }
         let reply = UpdateNodeDynamicReply {
             node: Some(node.into()),
         };
