@@ -264,6 +264,16 @@ impl Store {
         Ok(())
     }
 
+    fn cache_node_dynamic_attrs(&self, node_id: &str, dynamic_attrs: Value) -> R<()> {
+        let mut guard = self.read_model_writer()?;
+        let cached = guard
+            .nodes
+            .get_mut(node_id)
+            .with_context(|| format!("Missing cached node {node_id}"))?;
+        cached.dynamic_attrs = dynamic_attrs;
+        Ok(())
+    }
+
     fn cache_nodes_lost(&self, ids: &[String]) -> R<()> {
         let mut guard = self.read_model_writer()?;
         for id in ids {
@@ -669,9 +679,11 @@ impl Store {
             ":dynamic_attrs": res_as_string,
         };
 
-        let node = conn.query_row(&update_sql, params, |row| self.node_from_row(row))?;
+        let mut node = conn.query_row(&update_sql, params, |row| self.node_from_row(row))?;
+        let dynamic_attrs = Value::Object(res);
+        node.dynamic_attrs = dynamic_attrs.clone();
 
-        self.cache_node(node.clone())?;
+        self.cache_node_dynamic_attrs(&node.id, dynamic_attrs)?;
 
         Ok(node)
     }
