@@ -37,6 +37,12 @@ pub struct PlanOutcome {
     pub deltas: Vec<LedgerDelta>,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum NodesConsidered {
+    Count(u64),
+    Percent(f64),
+}
+
 pub struct Scheduler<'a> {
     store: &'a Store,
     policy: Box<dyn SchedulingPolicy>,
@@ -152,6 +158,7 @@ impl<'a> Scheduler<'a> {
         let mut placements = Vec::new();
         let mut planned: HashMap<String, usize> = HashMap::new();
         let weights = self.scheduler_weights()?;
+        let nodes_considered_setting = self.nodes_considered_setting()?;
         let node_lookup: HashMap<&str, &Node> =
             nodes.iter().map(|node| (node.id.as_str(), node)).collect();
 
@@ -174,20 +181,17 @@ impl<'a> Scheduler<'a> {
                 allocations_by_node,
                 &node_lookup,
             );
-            let base_eligible = if distinct_tracker.is_none() {
-                nodes
-                    .iter()
-                    .filter(|node| constraint_set.is_satisfied(node, None))
-                    .collect::<Vec<_>>()
-            } else {
-                Vec::new()
-            };
+            let base_eligible = nodes
+                .iter()
+                .filter(|node| constraint_set.is_satisfied(node, None))
+                .collect::<Vec<_>>();
 
             for _ in 0..needed {
-                let eligible = if distinct_tracker.is_some() {
-                    nodes
+                let eligible = if let Some(tracker) = distinct_tracker.as_ref() {
+                    base_eligible
                         .iter()
-                        .filter(|node| constraint_set.is_satisfied(node, distinct_tracker.as_ref()))
+                        .copied()
+                        .filter(|node| constraint_set.distinct_satisfied(node, tracker))
                         .collect::<Vec<_>>()
                 } else {
                     base_eligible.clone()
@@ -200,7 +204,10 @@ impl<'a> Scheduler<'a> {
                     );
                 }
 
-                let eligible = self.apply_nodes_considered(eligible)?;
+                let eligible = self.apply_nodes_considered_with_setting(
+                    eligible,
+                    nodes_considered_setting.as_ref(),
+                )?;
                 let ctx = SchedulingContext::new(
                     eligible,
                     &task_config,
@@ -238,35 +245,20 @@ impl<'a> Scheduler<'a> {
         Ok(placements)
     }
 
-    fn apply_nodes_considered<'b>(&self, eligible: Vec<&'b Node>) -> R<Vec<&'b Node>> {
+    fn apply_nodes_considered_with_setting<'b>(
+        &self,
+        eligible: Vec<&'b Node>,
+        setting: Option<&NodesConsidered>,
+    ) -> R<Vec<&'b Node>> {
         if eligible.len() <= 1 {
             return Ok(eligible);
         }
 
-        if !matches!(self.policy.name(), "bin_pack" | "spread") {
-            return Ok(eligible);
-        }
-
-        let Some(settings) = self.store.scheduler_settings.as_ref() else {
+        let Some(setting) = setting else {
             return Ok(eligible);
         };
 
-        let settings = match settings {
-            Value::Null => return Ok(eligible),
-            Value::Object(map) => map,
-            _ => {
-                bail!(
-                    "scheduler_settings for policy {} must be an object",
-                    self.policy.name()
-                )
-            }
-        };
-
-        let Some(nodes_considered) = settings.get("nodes_considered") else {
-            return Ok(eligible);
-        };
-
-        let limit = Self::parse_nodes_considered(nodes_considered, eligible.len())?;
+        let limit = Self::nodes_considered_limit(setting, eligible.len())?;
         Ok(eligible.into_iter().take(limit).collect())
     }
 
@@ -342,12 +334,31 @@ impl<'a> Scheduler<'a> {
         Some(tracker)
     }
 
-    fn parse_nodes_considered(value: &Value, eligible_len: usize) -> R<usize> {
-        if eligible_len == 0 {
-            return Ok(0);
+    fn nodes_considered_setting(&self) -> R<Option<NodesConsidered>> {
+        if !matches!(self.policy.name(), "bin_pack" | "spread") {
+            return Ok(None);
         }
 
-        match value {
+        let Some(settings) = self.store.scheduler_settings.as_ref() else {
+            return Ok(None);
+        };
+
+        let settings = match settings {
+            Value::Null => return Ok(None),
+            Value::Object(map) => map,
+            _ => {
+                bail!(
+                    "scheduler_settings for policy {} must be an object",
+                    self.policy.name()
+                )
+            }
+        };
+
+        let Some(nodes_considered) = settings.get("nodes_considered") else {
+            return Ok(None);
+        };
+
+        match nodes_considered {
             Value::Number(count) => {
                 let count = count
                     .as_u64()
@@ -357,15 +368,7 @@ impl<'a> Scheduler<'a> {
                     bail!("nodes_considered must be at least 1");
                 }
 
-                if eligible_len == 1 {
-                    return Ok(1);
-                }
-
-                if count < 2 {
-                    bail!("nodes_considered must be at least 2");
-                }
-
-                Ok(std::cmp::min(count as usize, eligible_len))
+                Ok(Some(NodesConsidered::Count(count)))
             }
             Value::String(raw) => {
                 let trimmed = raw.trim();
@@ -381,11 +384,35 @@ impl<'a> Scheduler<'a> {
                     bail!("nodes_considered percentage cannot be negative");
                 }
 
+                Ok(Some(NodesConsidered::Percent(percent)))
+            }
+            _ => bail!("nodes_considered must be a number or percentage string"),
+        }
+    }
+
+    fn nodes_considered_limit(setting: &NodesConsidered, eligible_len: usize) -> R<usize> {
+        if eligible_len == 0 {
+            return Ok(0);
+        }
+
+        match setting {
+            NodesConsidered::Count(count) => {
                 if eligible_len == 1 {
                     return Ok(1);
                 }
 
-                let percent = percent / 100.0;
+                if *count < 2 {
+                    bail!("nodes_considered must be at least 2");
+                }
+
+                Ok(std::cmp::min(*count as usize, eligible_len))
+            }
+            NodesConsidered::Percent(percent) => {
+                if eligible_len == 1 {
+                    return Ok(1);
+                }
+
+                let percent = *percent / 100.0;
                 let mut count = ((eligible_len as f64) * percent).ceil() as usize;
                 if count < 2 {
                     count = 2;
@@ -393,7 +420,6 @@ impl<'a> Scheduler<'a> {
 
                 Ok(std::cmp::min(count, eligible_len))
             }
-            _ => bail!("nodes_considered must be a number or percentage string"),
         }
     }
 
