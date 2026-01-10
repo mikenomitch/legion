@@ -7,7 +7,7 @@ use crate::cmd::helpers::{connect_manager_client, json_flag, print_table};
 use crate::getter_rs::Client as GetterClient;
 use crate::prelude::*;
 use crate::structs::{
-    DestroyJobRequest, GetJobInfoRequest, GetJobSpecRequest, JobConfig, JobPlanPrint, JobPrint,
+    DestroyJobRequest, GetJobInfoRequest, GetJobSpecRequest, JobPlanPrint, JobPrint,
     ListJobsRequest, PlanJobRequest, RunJobRequest, StopJobRequest, Submission,
 };
 use jsonnet::JsonnetVm;
@@ -67,18 +67,11 @@ pub fn config() -> Command {
     let plan_cmd = Command::new("plan")
         .about("Preview which nodes allocations would land on")
         .arg(
-            Arg::new("name")
-                .value_name("NAME")
-                .help("Name of the job to plan")
-                .required_unless_present("path"),
-        )
-        .arg(
             Arg::new("path")
-                .long("path")
                 .value_name("PATH")
                 .help("Path or URL to the job specification to plan")
-                .value_hint(ValueHint::AnyPath)
-                .conflicts_with("name"),
+                .required(true)
+                .value_hint(ValueHint::AnyPath),
         )
         .arg(json_flag())
         .args(jsonnet_var_args());
@@ -140,14 +133,7 @@ struct JsonnetVars {
     tla_codes: Vec<(String, String)>,
 }
 
-impl JsonnetVars {
-    fn is_empty(&self) -> bool {
-        self.ext_vars.is_empty()
-            && self.ext_codes.is_empty()
-            && self.tla_vars.is_empty()
-            && self.tla_codes.is_empty()
-    }
-}
+impl JsonnetVars {}
 
 fn jsonnet_var_args() -> Vec<Arg> {
     vec![
@@ -426,37 +412,38 @@ async fn destroy_job(arg_matches: &ArgMatches) -> R<()> {
 async fn plan_job(arg_matches: &ArgMatches) -> R<()> {
     let is_json = arg_matches.get_flag("json");
     let mut client = connect_manager_client().await?;
-    let path = arg_matches.get_one::<String>("path").map(String::as_str);
+    let path = arg_matches
+        .get_one::<String>("path")
+        .map(String::as_str)
+        .context("missing jobspec path")?;
     let vars = jsonnet_vars_from_matches(arg_matches)?;
-    let job_name = if let Some(path) = path {
-        let resolved = resolve_jobspec_source(path)?;
-        let (rendered, _submissions) = render_jobspec(&resolved.path, &vars)?;
-        let config: JobConfig = serde_json::from_str(&rendered)
-            .with_context(|| format!("failed to deserialize job spec from {path} for planning"))?;
-        config.name
-    } else {
-        if !vars.is_empty() {
-            bail!("jsonnet variables require --path for job plan");
-        }
-        arg_matches
-            .get_one::<String>("name")
-            .map_or("demo", String::as_str)
-            .to_string()
-    };
+    let resolved = resolve_jobspec_source(path)?;
+    let (rendered, _submissions) = render_jobspec(&resolved.path, &vars)?;
 
-    let request = tonic::Request::new(PlanJobRequest { name: job_name });
+    let request = tonic::Request::new(PlanJobRequest {
+        parsed_jobspec: rendered,
+    });
 
     let response = client.plan_job(request).await?;
-    let allocations = response.into_inner().allocations;
-
     if is_json {
-        if let Ok(json) = to_string(&allocations) {
+        let reply = response.into_inner();
+        if let Ok(json) = to_string(&reply) {
             println!("{json}");
         }
+        return Ok(());
     } else {
+        let reply = response.into_inner();
+        let allocations = reply.allocations;
+        if !reply.message.is_empty() {
+            println!("{}", reply.message);
+        }
         let printable_allocations: Vec<JobPlanPrint> =
             allocations.into_iter().map(Into::into).collect();
-        print_table(printable_allocations);
+        if printable_allocations.is_empty() {
+            println!("No allocations planned");
+        } else {
+            print_table(printable_allocations);
+        }
     }
 
     Ok(())
