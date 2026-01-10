@@ -1358,7 +1358,7 @@ impl Store {
                 node.health_checks, node.last_heartbeat \
                 FROM node INNER JOIN allocation ON allocation.node_id = node.id \
                 WHERE allocation.task_config_id = ?;";
-            let mut stmt = tx.prepare(&sql)?;
+            let mut stmt = tx.prepare(sql)?;
             let rows = stmt.query_map([task_id], |row| self.node_from_row(row))?;
             for row in rows {
                 tracker.insert_from_node(&row?);

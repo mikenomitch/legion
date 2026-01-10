@@ -21,10 +21,10 @@ impl Source {
         if input.contains("://") {
             let url = Url::parse(input).context("parse source URL")?;
             if url.scheme() == "file" {
-                return Ok(Source::Path(PathBuf::from(
+                return Ok(Source::Path(
                     url.to_file_path()
                         .map_err(|_| anyhow!("invalid file URL"))?,
-                )));
+                ));
             }
             return Ok(Source::Url(url));
         }
@@ -40,7 +40,7 @@ impl Source {
                 .unwrap_or_else(|| "source".to_string()),
             Source::Url(url) => url
                 .path_segments()
-                .and_then(|segments| segments.last())
+                .and_then(|mut segments| segments.next_back())
                 .filter(|segment| !segment.is_empty())
                 .unwrap_or("download")
                 .to_string(),

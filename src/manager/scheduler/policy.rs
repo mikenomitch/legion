@@ -143,8 +143,8 @@ fn select_scored_node<'a>(ctx: &SchedulingContext<'a>) -> Option<&'a Node> {
     let range = (max_load - min_load).max(0.0);
 
     ctx.eligible_nodes.iter().copied().max_by(|a, b| {
-        let a_score = score_node(ctx, *a, &loads, min_load, range);
-        let b_score = score_node(ctx, *b, &loads, min_load, range);
+        let a_score = score_node(ctx, a, &loads, min_load, range);
+        let b_score = score_node(ctx, b, &loads, min_load, range);
 
         match a_score
             .partial_cmp(&b_score)
