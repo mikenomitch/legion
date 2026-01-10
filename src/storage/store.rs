@@ -4,10 +4,11 @@ use crate::resources::ResourcePolicy;
 use crate::storage::migrations::get_migrations;
 use crate::storage::queries::{
     GET_ALLOCS, GET_ALLOCS_FOR_JOB, GET_ALLOCS_FOR_JOB_CONFIG, GET_ALLOCS_FOR_NODE, GET_EVALS,
-    GET_JOB, GET_JOBS, GET_JOB_CONFIG, GET_MANAGER_CONFIGS, GET_NEXT_EVAL, GET_NODE, GET_NODES,
-    GET_TASK_FOR_JOB_CONIFG, GET_WORKER_TYPE, INSERT_ALLOCATION, INSERT_EVAL, INSERT_JOB,
-    INSERT_JOB_CONFIG, INSERT_JOB_CONFIG_SUBMISSION, INSERT_JOB_UPDATE, INSERT_NODE,
-    INSERT_SUBMISSION, INSERT_TASK, INSERT_WORKER_TYPE, NODE_ATTRS, UPSERT_MANAGER_CONFIG,
+    GET_JOB, GET_JOBS, GET_JOB_CONFIG, GET_JOB_CONFIG_BY_ID, GET_JOB_UPDATE_FOR_CONFIG,
+    GET_MANAGER_CONFIGS, GET_NEXT_EVAL, GET_NODE, GET_NODES, GET_TASK_FOR_JOB_CONIFG,
+    GET_WORKER_TYPE, INSERT_ALLOCATION, INSERT_EVAL, INSERT_JOB, INSERT_JOB_CONFIG,
+    INSERT_JOB_CONFIG_SUBMISSION, INSERT_JOB_UPDATE, INSERT_NODE, INSERT_SUBMISSION, INSERT_TASK,
+    INSERT_WORKER_TYPE, NODE_ATTRS, UPSERT_MANAGER_CONFIG,
 };
 use crate::structs::{
     Allocation, Eval, Job, JobConfig, LedgerEntry, ManagerConfigFull, ManagerNodeConfig, Node,
@@ -896,8 +897,8 @@ impl Store {
 
     pub fn get_job_config_optional(&self, name: &str) -> R<Option<JobConfig>> {
         let conn = self.read_connection()?;
-        let maybe_job_config: Option<(JobConfig, String)> =
-            conn.query_row(&GET_JOB_CONFIG, [name], |row| {
+        let maybe_job_config: Option<(JobConfig, String)> = conn
+            .query_row(&GET_JOB_CONFIG, [name], |row| {
                 let tasks_to_replace = vec![];
                 let job_config_id = row.get(0)?;
                 let jc = JobConfig {
@@ -915,9 +916,40 @@ impl Store {
         };
 
         let mut stmt = conn.prepare(&GET_TASK_FOR_JOB_CONIFG)?;
-        let tasks = Self::collect_rows(
-            stmt.query_map([jc_id], |row| self.task_config_from_row(row))?,
-        )?;
+        let tasks =
+            Self::collect_rows(stmt.query_map([jc_id], |row| self.task_config_from_row(row))?)?;
+
+        let jc_2 = JobConfig {
+            tasks,
+            ..job_config
+        };
+
+        Ok(Some(jc_2))
+    }
+
+    pub fn get_job_config_by_id_optional(&self, id: &str) -> R<Option<JobConfig>> {
+        let conn = self.read_connection()?;
+        let maybe_job_config: Option<(JobConfig, String)> = conn
+            .query_row(&GET_JOB_CONFIG_BY_ID, [id], |row| {
+                let tasks_to_replace = vec![];
+                let job_config_id = row.get(0)?;
+                let jc = JobConfig {
+                    name: row.get(1)?,
+                    tasks: tasks_to_replace,
+                    version: Some(row.get(4)?),
+                };
+
+                Ok((jc, job_config_id))
+            })
+            .optional()?;
+
+        let Some((job_config, jc_id)) = maybe_job_config else {
+            return Ok(None);
+        };
+
+        let mut stmt = conn.prepare(&GET_TASK_FOR_JOB_CONIFG)?;
+        let tasks =
+            Self::collect_rows(stmt.query_map([jc_id], |row| self.task_config_from_row(row))?)?;
 
         let jc_2 = JobConfig {
             tasks,
@@ -931,6 +963,12 @@ impl Store {
     pub fn get_job_config(&self, name: &str) -> R<JobConfig> {
         self.get_job_config_optional(name)?
             .ok_or_else(|| anyhow!("Job config not found for {}", name))
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn get_job_config_by_id(&self, id: &str) -> R<JobConfig> {
+        self.get_job_config_by_id_optional(id)?
+            .ok_or_else(|| anyhow!("Job config not found for {}", id))
     }
 
     #[allow(dead_code)]
@@ -1086,6 +1124,103 @@ impl Store {
             tasks,
             ..config.clone()
         })
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn previous_job_config_id(&self, job_config_id: &str) -> R<Option<String>> {
+        let conn = self.read_connection()?;
+        let previous = conn
+            .query_row(&GET_JOB_UPDATE_FOR_CONFIG, [job_config_id], |row| {
+                row.get::<_, Option<String>>(4)
+            })
+            .optional()?;
+        Ok(previous.flatten())
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn job_configs_schedule_equivalent(&self, from_id: &str, to_id: &str) -> R<bool> {
+        let from_tasks = self.get_task_configs_for_job_config(from_id)?;
+        let to_tasks = self.get_task_configs_for_job_config(to_id)?;
+
+        if from_tasks.len() != to_tasks.len() {
+            return Ok(false);
+        }
+
+        let to_map = to_tasks
+            .into_iter()
+            .map(|(_, task)| (task.name.clone(), task))
+            .collect::<HashMap<_, _>>();
+
+        for (_, task) in from_tasks {
+            let Some(to_task) = to_map.get(&task.name) else {
+                return Ok(false);
+            };
+            if !task_schedule_equivalent(&task, to_task) {
+                return Ok(false);
+            }
+        }
+
+        Ok(true)
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn migrate_allocations_to_job_config(
+        &self,
+        from_job_config_id: &str,
+        to_job_config_id: &str,
+    ) -> R<Vec<Allocation>> {
+        let from_tasks = self.get_task_configs_for_job_config(from_job_config_id)?;
+        let to_tasks = self.get_task_configs_for_job_config(to_job_config_id)?;
+        let to_map = to_tasks
+            .into_iter()
+            .map(|(id, task)| (task.name.clone(), id))
+            .collect::<HashMap<_, _>>();
+
+        let mut task_id_map = HashMap::new();
+        for (old_id, task) in from_tasks {
+            let new_id = to_map
+                .get(&task.name)
+                .copied()
+                .with_context(|| format!("missing updated task config for {}", task.name))?;
+            task_id_map.insert(old_id, new_id);
+        }
+
+        let allocations = self.allocs_for_job_config(from_job_config_id)?;
+        if allocations.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut conn = self.write_connection()?;
+        let tx = conn.transaction()?;
+        for allocation in &allocations {
+            let new_task_id = task_id_map
+                .get(&allocation.task_config_id)
+                .copied()
+                .context("missing task id mapping for allocation")?;
+            tx.execute(
+                "UPDATE allocation SET job_config_id = ?, task_config_id = ? WHERE id = ?;",
+                (to_job_config_id, new_task_id, allocation.id),
+            )?;
+        }
+        tx.commit()?;
+
+        let updated_allocations = allocations
+            .into_iter()
+            .map(|mut allocation| {
+                let new_task_id = task_id_map
+                    .get(&allocation.task_config_id)
+                    .copied()
+                    .unwrap_or(allocation.task_config_id);
+                allocation.job_config_id = to_job_config_id.to_string();
+                allocation.task_config_id = new_task_id;
+                allocation
+            })
+            .collect::<Vec<_>>();
+
+        self.cache_remove_allocations(&updated_allocations)?;
+        self.cache_add_allocations(&updated_allocations)?;
+
+        Ok(updated_allocations)
     }
 
     #[instrument(err, skip_all)]
@@ -1389,6 +1524,24 @@ impl Store {
     }
 
     #[instrument(err, skip_all)]
+    pub fn remove_allocs_for_job_config(&self, job_config_id: &str) -> R<Vec<Allocation>> {
+        let allocations = self.allocs_for_job_config(job_config_id)?;
+        if allocations.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let conn = self.write_connection()?;
+        conn.execute(
+            "DELETE FROM allocation WHERE job_config_id = ?;",
+            [job_config_id],
+        )?;
+
+        self.cache_remove_allocations(&allocations)?;
+
+        Ok(allocations)
+    }
+
+    #[instrument(err, skip_all)]
     pub fn reconcile_job_config_allocations(&self, job_config_id: &str) -> R<()> {
         let nodes: Vec<Node> = self
             .get_nodes()?
@@ -1621,6 +1774,13 @@ impl Store {
 
         Ok(eval)
     }
+}
+
+fn task_schedule_equivalent(left: &TaskConfig, right: &TaskConfig) -> bool {
+    left.count == right.count
+        && left.resources == right.resources
+        && left.constraints == right.constraints
+        && left.affinities == right.affinities
 }
 
 // =====

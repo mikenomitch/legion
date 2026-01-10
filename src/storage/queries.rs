@@ -224,6 +224,14 @@ lazy_static! {
     LIMIT 1;
     "#
     );
+    pub static ref GET_JOB_CONFIG_BY_ID: String = format!(
+        r#"
+    SELECT {JOB_CONFIG_ATTRS}
+    FROM job_config
+    WHERE id = ?
+    LIMIT 1;
+    "#
+    );
     pub static ref GET_JOB_CONFIGS: String = format!(
         r#"
     SELECT {JOB_CONFIG_ATTRS}
@@ -391,6 +399,15 @@ lazy_static! {
     SELECT {JOB_UPDATE_ATTRS}
     FROM job_update
     WHERE id = ?
+    "#
+    );
+    pub static ref GET_JOB_UPDATE_FOR_CONFIG: String = format!(
+        r#"
+    SELECT {JOB_UPDATE_ATTRS}
+    FROM job_update
+    WHERE to_job_config_id = ?
+    ORDER BY rowid DESC
+    LIMIT 1;
     "#
     );
     pub static ref GET_JOB_UPDATES: String = format!(
