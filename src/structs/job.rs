@@ -4,6 +4,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use tabled::Tabled;
 
+use super::TaskConfigMsg;
 use super::{Job, PlannedAllocation, Submission};
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Tabled)]
@@ -135,6 +136,37 @@ fn task_list_to_vec(configs: TaskConfigList) -> Vec<TaskConfig> {
             .into_iter()
             .map(|(name, task)| task.into_task_config(name))
             .collect(),
+    }
+}
+
+impl From<&TaskConfig> for TaskConfigMsg {
+    fn from(task: &TaskConfig) -> Self {
+        TaskConfigMsg {
+            name: task.name.clone(),
+            kind: task.kind.clone(),
+            config: task.config.to_string(),
+            resources: task.resources.to_string(),
+            constraints: task.constraints.to_string(),
+            affinities: task.affinities.to_string(),
+        }
+    }
+}
+
+impl TaskConfigMsg {
+    pub fn into_task_config(self) -> anyhow::Result<TaskConfig> {
+        let config = serde_json::from_str(&self.config)?;
+        let resources = serde_json::from_str(&self.resources)?;
+        let constraints = serde_json::from_str(&self.constraints)?;
+        let affinities = serde_json::from_str(&self.affinities)?;
+        Ok(TaskConfig {
+            name: self.name,
+            count: 1,
+            kind: self.kind,
+            config,
+            resources,
+            constraints,
+            affinities,
+        })
     }
 }
 

@@ -275,6 +275,13 @@ lazy_static! {
     WHERE name = ?
     "#
     );
+    pub static ref GET_TASK_BY_ID: String = format!(
+        r#"
+    SELECT {TASK_CONFIG_ATTRS}
+    FROM task_config
+    WHERE id = ?;
+    "#
+    );
     pub static ref GET_TASK_FOR_JOB_CONIFG: String = format!(
         r#"
     SELECT {TASK_CONFIG_ATTRS}

@@ -5,15 +5,16 @@ use crate::storage::migrations::get_migrations;
 use crate::storage::queries::{
     GET_ALLOCS, GET_ALLOCS_FOR_JOB, GET_ALLOCS_FOR_JOB_CONFIG, GET_ALLOCS_FOR_NODE, GET_EVALS,
     GET_JOB, GET_JOBS, GET_JOB_CONFIG, GET_JOB_CONFIG_BY_ID, GET_JOB_UPDATE_FOR_CONFIG,
-    GET_MANAGER_CONFIGS, GET_NEXT_EVAL, GET_NODE, GET_NODES, GET_TASK_FOR_JOB_CONIFG,
-    GET_WORKER_TYPE, INSERT_ALLOCATION, INSERT_EVAL, INSERT_JOB, INSERT_JOB_CONFIG,
-    INSERT_JOB_CONFIG_SUBMISSION, INSERT_JOB_UPDATE, INSERT_NODE, INSERT_SUBMISSION, INSERT_TASK,
-    INSERT_WORKER_TYPE, NODE_ATTRS, UPSERT_MANAGER_CONFIG,
+    GET_MANAGER_CONFIGS, GET_NEXT_EVAL, GET_NODE, GET_NODES, GET_TASK_BY_ID,
+    GET_TASK_FOR_JOB_CONIFG, GET_WORKER_TYPE, INSERT_ALLOCATION, INSERT_EVAL, INSERT_JOB,
+    INSERT_JOB_CONFIG, INSERT_JOB_CONFIG_SUBMISSION, INSERT_JOB_UPDATE, INSERT_NODE,
+    INSERT_SUBMISSION, INSERT_TASK, INSERT_WORKER_TYPE, NODE_ATTRS, UPSERT_MANAGER_CONFIG,
 };
 use crate::structs::{
     Allocation, Eval, Job, JobConfig, LedgerEntry, ManagerConfigFull, ManagerNodeConfig, Node,
     NodeMsg, Submission, TaskConfig, WorkerConfig,
 };
+use crate::task::TaskPluginRegistry;
 
 use rand::{seq::SliceRandom, thread_rng};
 use rusqlite::{
@@ -1106,10 +1107,12 @@ impl Store {
     }
 
     pub fn normalize_job_config(&self, config: &JobConfig) -> R<JobConfig> {
+        let mut task_plugins = TaskPluginRegistry::new();
         let tasks = config
             .tasks
             .iter()
             .map(|task| {
+                task_plugins.validate_task_config(task)?;
                 let resources = self
                     .resource_policy
                     .normalize_task_resources(&task.resources, true)?;
@@ -1291,6 +1294,18 @@ impl Store {
         })?;
 
         Self::collect_rows(rows)
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn get_task_config(&self, task_config_id: i64) -> R<TaskConfig> {
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare(&GET_TASK_BY_ID)?;
+        let mut rows = stmt.query([task_config_id])?;
+        let row = rows
+            .next()?
+            .context("task config not found for allocation")?;
+        self.task_config_from_row(row)
+            .context("failed to parse task config")
     }
 
     //
@@ -2223,7 +2238,7 @@ mod tests {
 
         let task_one = TaskConfig {
             name: "task-1".to_string(),
-            kind: "kind-1".to_string(),
+            kind: "noop".to_string(),
             count: 1,
             config: json!({ "message": "hello-1" }),
             resources: json!({ "memory": 256 }),
@@ -2233,7 +2248,7 @@ mod tests {
 
         let task_two = TaskConfig {
             name: "task-2".to_string(),
-            kind: "kind-2".to_string(),
+            kind: "noop".to_string(),
             count: 2,
             config: json!({ "message": "hi-2" }),
             resources: json!({ "memory": 512 }),
@@ -2303,7 +2318,7 @@ mod tests {
     fn handle_job_submit_rolls_back_on_failure() -> R<()> {
         let task_one = TaskConfig {
             name: "task-1".to_string(),
-            kind: "kind-1".to_string(),
+            kind: "noop".to_string(),
             count: 1,
             config: json!({ "message": "hello-1" }),
             resources: json!({ "memory": 256 }),
@@ -2351,7 +2366,7 @@ mod tests {
 
         let orig_task = TaskConfig {
             name: "orig-task".to_string(),
-            kind: "kind-1".to_string(),
+            kind: "noop".to_string(),
             count: 1,
             config: json!({ "message": "hello" }),
             resources: json!({ "memory": 256 }),
@@ -2386,7 +2401,8 @@ mod tests {
         // updated: task kind config
 
         let new_task = TaskConfig {
-            kind: "kind-new".to_string(),
+            kind: "noop".to_string(),
+            config: json!({ "message": "hello-updated" }),
             ..orig_task
         };
         let new_task_configs = vec![new_task.clone()];
@@ -2413,7 +2429,7 @@ mod tests {
 
         let extra_task = TaskConfig {
             name: "extra-task".to_string(),
-            kind: "kind-extra".to_string(),
+            kind: "noop".to_string(),
             count: 1,
             config: json!({ "message": "hello" }),
             resources: json!({ "memory": 256 }),
@@ -2467,7 +2483,7 @@ mod tests {
         let orig_submissions = vec![];
         let orig_task = TaskConfig {
             name: "dupe-task".to_string(),
-            kind: "kind".to_string(),
+            kind: "noop".to_string(),
             count: 1,
             config: json!({ "message": "hello" }),
             resources: json!({ "memory": 256 }),
@@ -2510,7 +2526,7 @@ mod tests {
         let job_one_name = "job-one".to_string();
         let task_one = TaskConfig {
             name: "job-one-task-1".to_string(),
-            kind: "driver-a".to_string(),
+            kind: "noop".to_string(),
             count: 1,
             config: json!({ "message": "hello" }),
             resources: json!({ "memory": 256 }),
@@ -2519,7 +2535,7 @@ mod tests {
         };
         let task_two = TaskConfig {
             name: "job-one-task-2".to_string(),
-            kind: "driver-b".to_string(),
+            kind: "noop".to_string(),
             count: 1,
             config: json!({ "message": "world" }),
             resources: json!({ "memory": 512 }),
@@ -2545,7 +2561,7 @@ mod tests {
         let job_two_name = "job-two".to_string();
         let task_three = TaskConfig {
             name: "job-two-task-1".to_string(),
-            kind: "driver-c".to_string(),
+            kind: "noop".to_string(),
             count: 1,
             config: json!({ "message": "hola" }),
             resources: json!({ "memory": 128 }),
@@ -2647,7 +2663,7 @@ mod tests {
 
         let tasks = vec![TaskConfig {
             name: "task-1".to_string(),
-            kind: "kind-1".to_string(),
+            kind: "noop".to_string(),
             count: 1,
             config: json!({}),
             resources: json!({}),
@@ -2712,7 +2728,7 @@ mod tests {
 
         let tasks = vec![TaskConfig {
             name: "task-shared".to_string(),
-            kind: "kind".to_string(),
+            kind: "noop".to_string(),
             count: 1,
             config: json!({}),
             resources: json!({}),

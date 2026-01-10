@@ -338,7 +338,10 @@ impl<'a> Scheduler<'a> {
             );
             let base_eligible = nodes
                 .iter()
-                .filter(|node| constraint_set.is_satisfied(node, None))
+                .filter(|node| {
+                    constraint_set.is_satisfied(node, None)
+                        && task_kind_ready(node, &task_config.kind)
+                })
                 .collect::<Vec<_>>();
 
             for _ in 0..needed {
@@ -917,6 +920,23 @@ fn is_builtin_resource(name: &str) -> bool {
     matches!(name, "memory" | "cpu" | "cores" | "allocations")
 }
 
+fn task_kind_ready(node: &Node, task_kind: &str) -> bool {
+    let Some(checks) = node.health_checks.as_object() else {
+        return true;
+    };
+    let readiness = checks
+        .get("taskReadiness")
+        .or_else(|| checks.get("task_readiness"))
+        .and_then(Value::as_object);
+    let Some(readiness) = readiness else {
+        return true;
+    };
+    let Some(status) = readiness.get(task_kind).and_then(Value::as_str) else {
+        return true;
+    };
+    status == "pass"
+}
+
 fn value_token(value: &Value) -> String {
     serde_json::to_string(value).unwrap_or_default()
 }
@@ -1114,6 +1134,42 @@ mod tests {
             .expect("node-b delta missing");
         assert_eq!(node_b_delta.added.len(), 1);
         assert!(node_b_delta.removed.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn respects_task_readiness_checks() -> R<()> {
+        let store = setup_store()?;
+        let mut node_a = make_node_msg("node-a", json!({}));
+        node_a.health_checks = json!({ "taskReadiness": { "exec": "fail" } }).to_string();
+        let mut node_b = make_node_msg("node-b", json!({}));
+        node_b.health_checks = json!({ "taskReadiness": { "exec": "pass" } }).to_string();
+        store.insert_node(node_a)?;
+        store.insert_node(node_b)?;
+
+        let job = JobConfig {
+            name: "readiness-job".into(),
+            tasks: vec![TaskConfig {
+                name: "command".into(),
+                count: 1,
+                kind: "exec".into(),
+                config: json!({ "command": "echo", "args": ["ready"] }),
+                resources: json!({}),
+                constraints: json!({}),
+                affinities: json!({}),
+            }],
+            version: None,
+        };
+
+        store.handle_job_submit(&job, &[dummy_submission()])?;
+        let job_config_id = store.get_job_config(&job.name)?.id();
+
+        let scheduler = Scheduler::new(&store)?;
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+
+        assert_eq!(outcome.allocations.len(), 1);
+        assert_eq!(outcome.allocations[0].node_id, "node-b");
 
         Ok(())
     }

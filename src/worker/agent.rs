@@ -9,6 +9,7 @@ use crate::util::random_string;
 use crate::worker::{
     node_check::{fingerprint_node, run_health_checks},
     server::WorkerAgentService,
+    task::TaskManager,
 };
 
 use futures::join;
@@ -33,8 +34,11 @@ pub async fn run_worker(token: &str) -> R<()> {
         info!("Skipping expiry validation check on join token");
     }
 
-    let addr = format!("{DEF_MANAGER_HOSTNAME}:4848").parse()?;
-    let worker_node = WorkerAgentService {};
+    let addr = format!("{DEF_MANAGER_HOSTNAME}:{DEF_WORKER_SERVER_PORT}").parse()?;
+    let task_manager = Arc::new(TaskManager::new()?);
+    let worker_node = WorkerAgentService {
+        task_manager: task_manager.clone(),
+    };
     let worker_server_fut = Server::builder()
         .add_service(WorkerServer::new(worker_node))
         .serve(addr);
@@ -77,6 +81,12 @@ pub async fn run_worker(token: &str) -> R<()> {
     if let Some(max_allocations) = config.max_allocations {
         config_attrs.insert("maxAllocations".into(), json!(max_allocations));
     }
+    config_attrs.insert(
+        "rpcAddress".into(),
+        Value::String(format!(
+            "http://{DEF_MANAGER_HOSTNAME}:{DEF_WORKER_SERVER_PORT}"
+        )),
+    );
 
     register_self(
         client.clone(),
@@ -89,7 +99,12 @@ pub async fn run_worker(token: &str) -> R<()> {
     .await?;
 
     let heartbeat_fut = start_heartbeats(name.clone(), client.clone());
-    let checks_fut = start_node_checks(name.clone(), config.additional_node_checks.clone(), client);
+    let checks_fut = start_node_checks(
+        name.clone(),
+        config.additional_node_checks.clone(),
+        client,
+        task_manager,
+    );
     let _res = join!(heartbeat_fut, checks_fut, worker_server_fut);
 
     Ok(())
@@ -133,10 +148,14 @@ async fn start_node_checks(
     name: String,
     additional_node_checks: Vec<String>,
     client: ManagerClient<Channel>,
+    task_manager: Arc<TaskManager>,
 ) -> R<()> {
     let mut client_clone = client.clone();
 
     let checks_data = run_health_checks(additional_node_checks);
+    let task_checks = task_manager.readiness_checks()?;
+    let mut checks_data = checks_data;
+    checks_data.extend(task_checks);
     let serialized_health_check_data = serde_json::to_string(&checks_data)?;
 
     loop {

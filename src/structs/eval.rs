@@ -3,13 +3,15 @@ use time::OffsetDateTime;
 use tracing::info;
 
 use crate::manager::scheduler::{PlanMode, PlanOutcome, Scheduler};
-#[cfg(test)]
-use crate::prelude::Context;
-use crate::prelude::{bail, json, R};
+use crate::prelude::{bail, json, Context, Value, DEF_MANAGER_HOSTNAME, DEF_WORKER_SERVER_PORT, R};
 use crate::storage::store::Store;
 
 use super::node::Node;
 use super::Eval;
+use crate::structs::{
+    worker_client::WorkerClient, Allocation, AllocationWork, LedgerAllocation, PostWorkRequest,
+    TaskConfigMsg,
+};
 
 #[cfg(test)]
 use super::config::ManagerConfigFull;
@@ -91,6 +93,7 @@ impl Eval {
         if !outcome.deltas.is_empty() {
             info!(?outcome.deltas, "Job submit allocation deltas");
         }
+        self.dispatch_allocations(store, &outcome.allocations)?;
 
         if let Some(prev_id) = previous_config_id {
             store.remove_allocs_for_job_config(&prev_id)?;
@@ -113,6 +116,7 @@ impl Eval {
         if !outcome.deltas.is_empty() {
             info!(?outcome.deltas, "Job update allocation deltas");
         }
+        self.dispatch_allocations(store, &outcome.allocations)?;
 
         Ok(format!(
             "Job {} updated with {} placements",
@@ -140,6 +144,7 @@ impl Eval {
         if !outcome.deltas.is_empty() {
             info!(?outcome.deltas, "Job reschedule allocation deltas");
         }
+        self.dispatch_allocations(store, &outcome.allocations)?;
 
         Ok(format!(
             "Job {} rescheduled with {} placements",
@@ -157,6 +162,51 @@ impl Eval {
         scheduler.plan_and_apply(&self.job_config_id, mode)
     }
 
+    fn dispatch_allocations(&self, store: &Store, allocations: &[Allocation]) -> R<()> {
+        if cfg!(test) || std::env::var("LEGION_SKIP_WORKER_RPC").is_ok() {
+            return Ok(());
+        }
+        if allocations.is_empty() {
+            return Ok(());
+        }
+
+        let mut work_items = Vec::new();
+        for allocation in allocations {
+            let node = store.get_node(&allocation.node_id)?;
+            let address = worker_rpc_address(&node);
+            let task = store.get_task_config(allocation.task_config_id)?;
+            work_items.push((address, allocation.clone(), task));
+        }
+
+        let runtime = tokio::runtime::Runtime::new()?;
+        runtime.block_on(async move {
+            for (address, allocation, task) in work_items {
+                let mut client = WorkerClient::connect(address.clone())
+                    .await
+                    .context(format!("failed to connect to worker at {address}"))?;
+                let request = PostWorkRequest {
+                    work: Some(AllocationWork {
+                        allocation: Some(LedgerAllocation::from(allocation.clone())),
+                        task: Some(TaskConfigMsg::from(&task)),
+                    }),
+                };
+                info!(
+                    allocation_id = allocation.id,
+                    task = %task.name,
+                    node = %allocation.node_id,
+                    "dispatching allocation to worker"
+                );
+                client
+                    .post_work(tonic::Request::new(request))
+                    .await
+                    .context("worker rejected allocation")?;
+            }
+            Ok::<(), anyhow::Error>(())
+        })?;
+
+        Ok(())
+    }
+
     fn current_timestamp() -> String {
         OffsetDateTime::now_utc()
             .format(&Rfc3339)
@@ -171,6 +221,22 @@ impl Eval {
                 "cpu-2": { "frequency": "2400" },
             }
         })
+    }
+}
+
+fn worker_rpc_address(node: &Node) -> String {
+    let default = format!("http://{DEF_MANAGER_HOSTNAME}:{DEF_WORKER_SERVER_PORT}");
+    let Some(attrs) = node.config_attrs.as_object() else {
+        return default;
+    };
+    let Some(Value::String(address)) = attrs.get("rpcAddress").or_else(|| attrs.get("rpc_address"))
+    else {
+        return default;
+    };
+    if address.starts_with("http://") || address.starts_with("https://") {
+        address.clone()
+    } else {
+        format!("http://{address}")
     }
 }
 
@@ -265,7 +331,7 @@ mod tests {
         let job_one_name = "job-1".to_string();
         let job_one_task = TaskConfig {
             name: "task-one".into(),
-            kind: "service".into(),
+            kind: "noop".into(),
             count: 1,
             config: json!({ "message": "hi" }),
             resources: json!({ "memory": 128 }),
@@ -320,7 +386,7 @@ mod tests {
         let job_two_name = "job-2".to_string();
         let job_two_task = TaskConfig {
             name: "task-two".into(),
-            kind: "service".into(),
+            kind: "noop".into(),
             count: 1,
             config: json!({ "message": "hola" }),
             resources: json!({ "memory": 128 }),
@@ -401,7 +467,7 @@ mod tests {
         let job_name = "update-job".to_string();
         let base_task = TaskConfig {
             name: "web".into(),
-            kind: "service".into(),
+            kind: "noop".into(),
             count: 1,
             config: json!({ "message": "v1" }),
             resources: json!({ "memory": 128 }),

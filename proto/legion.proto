@@ -256,8 +256,22 @@ service Worker {
   rpc PostWork (PostWorkRequest) returns (PostWorkReply);
 }
 
+message TaskConfigMsg {
+  string name = 1;
+  string kind = 2;
+  string config = 3;
+  string resources = 4;
+  string constraints = 5;
+  string affinities = 6;
+}
+
+message AllocationWork {
+  LedgerAllocation allocation = 1;
+  TaskConfigMsg task = 2;
+}
+
 message PostWorkRequest {
-  string message = 1;
+  AllocationWork work = 1;
 }
 
 message PostWorkReply {

@@ -8,6 +8,7 @@ pub mod prelude;
 pub mod resources;
 pub mod storage;
 pub mod structs;
+pub mod task;
 pub mod tracing_util;
 pub mod util;
 pub mod worker;

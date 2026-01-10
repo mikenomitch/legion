@@ -73,8 +73,7 @@ pub async fn handle(matches: &ArgMatches) -> R<()> {
             .collect();
         println!(
             "{}",
-            serde_json::to_string(&json_entries)
-                .context("failed to serialize ledger to JSON")?
+            serde_json::to_string(&json_entries).context("failed to serialize ledger to JSON")?
         );
     } else if ledger.is_empty() {
         println!("No nodes registered in the ledger.");

@@ -23,3 +23,4 @@ pub const DEF_LOST_NODE_AT_SEC: i64 = 10;
 pub const WORKER_HEARTBEAT_DURATION_SEC: u64 = 2;
 // How often the worker should update node to manager
 pub const WORKER_NODE_CHECK_DURATION_SEC: u64 = 30;
+pub const DEF_WORKER_SERVER_PORT: u64 = 4848;
