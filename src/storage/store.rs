@@ -894,10 +894,9 @@ impl Store {
             .map_err(|_| anyhow!("Error committing transaction"))
     }
 
-    #[instrument(err, skip_all)]
-    pub fn get_job_config(&self, name: &str) -> R<JobConfig> {
+    pub fn get_job_config_optional(&self, name: &str) -> R<Option<JobConfig>> {
         let conn = self.read_connection()?;
-        let (job_config, jc_id): (JobConfig, String) =
+        let maybe_job_config: Option<(JobConfig, String)> =
             conn.query_row(&GET_JOB_CONFIG, [name], |row| {
                 let tasks_to_replace = vec![];
                 let job_config_id = row.get(0)?;
@@ -908,19 +907,30 @@ impl Store {
                 };
 
                 Ok((jc, job_config_id))
-            })?;
+            })
+            .optional()?;
+
+        let Some((job_config, jc_id)) = maybe_job_config else {
+            return Ok(None);
+        };
 
         let mut stmt = conn.prepare(&GET_TASK_FOR_JOB_CONIFG)?;
-
-        let tasks =
-            Self::collect_rows(stmt.query_map([jc_id], |row| self.task_config_from_row(row))?)?;
+        let tasks = Self::collect_rows(
+            stmt.query_map([jc_id], |row| self.task_config_from_row(row))?,
+        )?;
 
         let jc_2 = JobConfig {
             tasks,
             ..job_config
         };
 
-        Ok(jc_2)
+        Ok(Some(jc_2))
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn get_job_config(&self, name: &str) -> R<JobConfig> {
+        self.get_job_config_optional(name)?
+            .ok_or_else(|| anyhow!("Job config not found for {}", name))
     }
 
     #[allow(dead_code)]
@@ -938,7 +948,7 @@ impl Store {
         let mut last_versions_id: Option<String> = None;
         let mut was_update = false;
 
-        if let Ok(latest_job_config) = self.get_job_config(&config.name) {
+        if let Some(latest_job_config) = self.get_job_config_optional(&config.name)? {
             // if latest_job_config is deep equal to config, return unchanged
             if latest_job_config.is_same_as(&config) {
                 return Ok(JobSubmitOutcome::Unchanged {

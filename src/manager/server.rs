@@ -106,10 +106,15 @@ impl Manager for ManagerAgentService {
     ) -> Result<Response<GetJobSpecReply>, Status> {
         let name = request.into_inner().name;
 
-        let config = self.store.get_job_config(&name).map_err(|e| {
+        let config = match self.store.get_job_config_optional(&name).map_err(|e| {
             error!("Error getting job config: {:?}", e);
             Status::internal("Error getting job config")
-        })?;
+        })? {
+            Some(config) => config,
+            None => {
+                return Err(Status::not_found("Job config not found"));
+            }
+        };
 
         let submissions = self
             .store
