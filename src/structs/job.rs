@@ -4,7 +4,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use tabled::Tabled;
 
-use super::{Job, Submission};
+use super::{Job, PlannedAllocation, Submission};
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Tabled)]
 #[serde(rename_all = "camelCase")]
@@ -20,6 +20,24 @@ impl From<Job> for JobPrint {
             name: job.name,
             status: job.status,
             created_at: job.created_at.to_string(),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Tabled)]
+#[serde(rename_all = "camelCase")]
+pub struct JobPlanPrint {
+    pub node_id: String,
+    pub task_config_id: i64,
+    pub task_name: String,
+}
+
+impl From<PlannedAllocation> for JobPlanPrint {
+    fn from(allocation: PlannedAllocation) -> Self {
+        JobPlanPrint {
+            node_id: allocation.node_id,
+            task_config_id: allocation.task_config_id,
+            task_name: allocation.task_name,
         }
     }
 }

@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use crate::prelude::*;
 
+use crate::manager::scheduler::{PlanMode, Scheduler};
 use crate::storage::store::{JobSubmitOutcome, Store};
 use crate::structs::manager_server::Manager;
 use crate::structs::{
@@ -9,9 +10,10 @@ use crate::structs::{
     GetJobSpecRequest, GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply,
     GetManagerConfigsRequest, GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest,
     HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, JobConfig, LedgerNode,
-    ListJobsReply, ListJobsRequest, NodeMsg, RunJobReply, RunJobRequest, StopJobReply,
-    StopJobRequest, UpdateNodeDynamicReply, UpdateNodeDynamicRequest, WorkerConfig,
-    WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest,
+    ListJobsReply, ListJobsRequest, NodeMsg, PlanJobReply, PlanJobRequest, PlannedAllocation,
+    RunJobReply, RunJobRequest, StopJobReply, StopJobRequest, UpdateNodeDynamicReply,
+    UpdateNodeDynamicRequest, WorkerConfig, WorkerPreRegisterReply, WorkerPreRegisterRequest,
+    WorkerRegisterReply, WorkerRegisterRequest,
 };
 
 use tonic::{Request, Response, Status};
@@ -96,6 +98,59 @@ impl Manager for ManagerAgentService {
         })?;
 
         let reply = GetJobInfoReply { job: Some(job) };
+
+        Ok(Response::new(reply))
+    }
+
+    #[instrument(skip_all)]
+    async fn plan_job(
+        &self,
+        request: Request<PlanJobRequest>,
+    ) -> Result<Response<PlanJobReply>, Status> {
+        let name = request.into_inner().name;
+
+        let job_config = self.store.get_job_config(&name).map_err(|e| {
+            error!("Error getting job config for plan {}: {:?}", name, e);
+            Status::internal("Error getting job config")
+        })?;
+
+        let scheduler = Scheduler::new(&self.store).map_err(|e| {
+            error!("Error building scheduler: {:?}", e);
+            Status::internal("Error preparing scheduler")
+        })?;
+
+        let plan = scheduler
+            .plan_only(&job_config.id(), PlanMode::Fresh)
+            .map_err(|e| {
+                error!("Error planning job {}: {:?}", name, e);
+                Status::internal("Error planning job")
+            })?;
+
+        let task_configs = self
+            .store
+            .get_task_configs_for_job_config(&job_config.id())
+            .map_err(|e| {
+                error!("Error getting task configs for plan {}: {:?}", name, e);
+                Status::internal("Error getting task configs")
+            })?;
+        let task_lookup: HashMap<i64, String> = task_configs
+            .into_iter()
+            .map(|(id, task)| (id, task.name))
+            .collect();
+
+        let allocations = plan
+            .into_iter()
+            .map(|placement| PlannedAllocation {
+                node_id: placement.node_id,
+                task_config_id: placement.task_config_id,
+                task_name: task_lookup
+                    .get(&placement.task_config_id)
+                    .cloned()
+                    .unwrap_or_default(),
+            })
+            .collect();
+
+        let reply = PlanJobReply { allocations };
 
         Ok(Response::new(reply))
     }

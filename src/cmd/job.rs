@@ -5,8 +5,8 @@ use clap::value_parser;
 use crate::cmd::helpers::{connect_manager_client, json_flag, print_table};
 use crate::prelude::*;
 use crate::structs::{
-    DestroyJobRequest, GetJobInfoRequest, GetJobSpecRequest, JobPrint, ListJobsRequest,
-    RunJobRequest, StopJobRequest, Submission,
+    DestroyJobRequest, GetJobInfoRequest, GetJobSpecRequest, JobPlanPrint, JobPrint,
+    ListJobsRequest, PlanJobRequest, RunJobRequest, StopJobRequest, Submission,
 };
 use jsonnet::JsonnetVm;
 use serde_json::to_string;
@@ -59,6 +59,16 @@ pub fn config() -> Command {
         )
         .arg(json_flag());
 
+    let plan_cmd = Command::new("plan")
+        .about("Preview which nodes allocations would land on")
+        .arg(
+            Arg::new("name")
+                .value_name("NAME")
+                .help("Name of the job to plan")
+                .required(true),
+        )
+        .arg(json_flag());
+
     let spec_cmd = Command::new("spec")
         .about("Get job spec used to define the job")
         .arg(
@@ -76,6 +86,7 @@ pub fn config() -> Command {
         .arg_required_else_help(true)
         .subcommand(run_cmd)
         .subcommand(info_cmd)
+        .subcommand(plan_cmd)
         .subcommand(list_cmd)
         .subcommand(stop_cmd)
         .subcommand(spec_cmd)
@@ -115,6 +126,7 @@ pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
         Some(("destroy", matches)) => destroy_job(matches).await,
         Some(("list", matches)) => list_jobs(matches).await,
         Some(("info", matches)) => get_info(matches).await,
+        Some(("plan", matches)) => plan_job(matches).await,
         _ => unreachable!(),
     }
 }
@@ -198,6 +210,34 @@ async fn destroy_job(arg_matches: &ArgMatches) -> R<()> {
 
     let response = client.destroy_job(request).await?;
     println!("{}", response.into_inner().message);
+
+    Ok(())
+}
+
+#[instrument(err, skip_all)]
+async fn plan_job(arg_matches: &ArgMatches) -> R<()> {
+    let is_json = arg_matches.get_flag("json");
+    let mut client = connect_manager_client().await?;
+    let job_name = arg_matches
+        .get_one::<String>("name")
+        .map_or("demo", String::as_str);
+
+    let request = tonic::Request::new(PlanJobRequest {
+        name: job_name.to_owned(),
+    });
+
+    let response = client.plan_job(request).await?;
+    let allocations = response.into_inner().allocations;
+
+    if is_json {
+        if let Ok(json) = to_string(&allocations) {
+            println!("{json}");
+        }
+    } else {
+        let printable_allocations: Vec<JobPlanPrint> =
+            allocations.into_iter().map(Into::into).collect();
+        print_table(printable_allocations);
+    }
 
     Ok(())
 }
