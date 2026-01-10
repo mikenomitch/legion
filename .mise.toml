@@ -17,8 +17,10 @@ run = "LEGION_ADDR=http://127.0.0.1:4748 cargo run -- join -a"
 [tasks.job]
 run = "cargo run -- job run {{arg path}}"
 
-[tasks.job.args]
-path = { required = true, completion = { type = "file", path = "configs/jobs" } }
+[[tasks.job.args]]
+name = "path"
+required = true
+completion = { type = "file", path = "configs/jobs" }
 
 [tasks.nuke]
 run = "rm -rf .legion"
