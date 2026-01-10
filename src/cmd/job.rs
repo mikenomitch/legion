@@ -232,6 +232,13 @@ fn resolve_jobspec_source(source: &str) -> R<ResolvedJobspec> {
     })
 }
 
+async fn resolve_jobspec_source_async(source: &str) -> R<ResolvedJobspec> {
+    let source = source.to_string();
+    tokio::task::spawn_blocking(move || resolve_jobspec_source(&source))
+        .await
+        .context("resolve jobspec source task panicked")?
+}
+
 fn ensure_jobspec_file(source: &str, fetched_path: &Path) -> R<PathBuf> {
     if fetched_path.is_file() {
         return Ok(fetched_path.to_path_buf());
@@ -417,7 +424,7 @@ async fn plan_job(arg_matches: &ArgMatches) -> R<()> {
         .map(String::as_str)
         .context("missing jobspec path")?;
     let vars = jsonnet_vars_from_matches(arg_matches)?;
-    let resolved = resolve_jobspec_source(path)?;
+    let resolved = resolve_jobspec_source_async(path).await?;
     let (rendered, _submissions) = render_jobspec(&resolved.path, &vars)?;
 
     let request = tonic::Request::new(PlanJobRequest {
@@ -458,7 +465,7 @@ async fn run_job(arg_matches: &ArgMatches) -> R<()> {
         .map_or("./configs/jobs/demo.jsonnet", String::as_str);
     let priority = priority_from_matches(arg_matches);
     let vars = jsonnet_vars_from_matches(arg_matches)?;
-    let resolved = resolve_jobspec_source(job_path)?;
+    let resolved = resolve_jobspec_source_async(job_path).await?;
     let (rendered, submissions) = render_jobspec(&resolved.path, &vars)?;
 
     let request = tonic::Request::new(RunJobRequest {

@@ -251,10 +251,10 @@ impl Rule {
     fn matches(&self, node: &Node, distinct: Option<&DistinctTracker>) -> bool {
         match self.operator {
             Operator::IsSet => {
-                return node_attr(node, &self.key).map_or(false, |value| !value.is_null())
+                return node_attr(node, &self.key).is_some_and(|value| !value.is_null())
             }
             Operator::IsNotSet => {
-                return node_attr(node, &self.key).map_or(true, |value| value.is_null())
+                return node_attr(node, &self.key).is_none_or(|value| value.is_null())
             }
             _ => {}
         }
