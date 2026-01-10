@@ -10,6 +10,7 @@ service Manager {
   rpc RunJob (RunJobRequest) returns (RunJobReply);
   rpc GetJobSpec (GetJobSpecRequest) returns (GetJobSpecReply);
   rpc GetJobInfo (GetJobInfoRequest) returns (GetJobInfoReply);
+  rpc PlanJob (PlanJobRequest) returns (PlanJobReply);
   rpc StopJob (StopJobRequest) returns (StopJobReply);
   rpc DestroyJob (DestroyJobRequest) returns (DestroyJobReply);
   rpc ListJobs (ListJobsRequest) returns (ListJobsReply);
@@ -86,6 +87,20 @@ message GetJobSpecRequest {
 
 message GetJobSpecReply {
   repeated Submission submissions = 2;
+}
+
+message PlanJobRequest {
+  string name = 1;
+}
+
+message PlanJobReply {
+  repeated PlannedAllocation allocations = 1;
+}
+
+message PlannedAllocation {
+  string node_id = 1;
+  int64 task_config_id = 2;
+  string task_name = 3;
 }
 
 message StopJobRequest {

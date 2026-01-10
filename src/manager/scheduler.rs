@@ -85,6 +85,61 @@ impl<'a> Scheduler<'a> {
     }
 
     #[instrument(skip_all)]
+    pub fn plan_only(&self, job_config_id: &str, mode: PlanMode) -> R<Vec<PlannedAllocation>> {
+        let nodes = self.available_nodes()?;
+        if nodes.is_empty() {
+            bail!("No nodes available to place allocations");
+        }
+
+        let tasks = self
+            .store
+            .cached_task_configs_for_job_config(job_config_id)?
+            .into_iter()
+            .map(|(id, config)| (id, config.clone(), config.count))
+            .collect::<Vec<_>>();
+
+        let mut allocations_by_node = self.store.cached_allocations_by_node()?;
+        if matches!(mode, PlanMode::Fresh) {
+            for allocations in allocations_by_node.values_mut() {
+                allocations.retain(|alloc| alloc.job_config_id != job_config_id);
+            }
+        }
+
+        let required_counts = match mode {
+            PlanMode::Fresh => tasks
+                .iter()
+                .map(|(id, _config, count)| (*id, *count))
+                .collect::<HashMap<_, _>>(),
+            PlanMode::Reschedule => {
+                let mut current: HashMap<i64, u32> = HashMap::new();
+                for allocations in allocations_by_node.values() {
+                    for alloc in allocations {
+                        if alloc.job_config_id == job_config_id {
+                            *current.entry(alloc.task_config_id).or_default() += 1;
+                        }
+                    }
+                }
+
+                tasks
+                    .iter()
+                    .map(|(id, _config, desired)| {
+                        let placed = current.get(id).copied().unwrap_or_default();
+                        (*id, desired.saturating_sub(placed))
+                    })
+                    .collect::<HashMap<_, _>>()
+            }
+        };
+
+        self.build_plan(
+            job_config_id,
+            nodes,
+            tasks,
+            required_counts,
+            &allocations_by_node,
+        )
+    }
+
+    #[instrument(skip_all)]
     pub fn plan_and_apply(&self, job_config_id: &str, mode: PlanMode) -> R<PlanOutcome> {
         let nodes = self.available_nodes()?;
         if nodes.is_empty() {
