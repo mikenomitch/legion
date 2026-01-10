@@ -2,7 +2,15 @@ use jsonnet::JsonnetVm;
 use legion::structs::JobConfig;
 use serde_json::Value;
 
-fn render_job_spec(path: &str) -> String {
+#[derive(Default)]
+struct JsonnetVars {
+    ext_vars: Vec<(String, String)>,
+    ext_codes: Vec<(String, String)>,
+    tla_vars: Vec<(String, String)>,
+    tla_codes: Vec<(String, String)>,
+}
+
+fn render_job_spec(path: &str, vars: &JsonnetVars) -> String {
     let mut vm = JsonnetVm::new();
     vm.import_callback(|_vm, base, rel| {
         let path = std::path::Path::new(base).join(rel);
@@ -10,11 +18,37 @@ fn render_job_spec(path: &str) -> String {
         Ok((base.into(), contents))
     });
 
+    for (key, value) in &vars.ext_vars {
+        vm.ext_var(key, value);
+    }
+    for (key, value) in &vars.ext_codes {
+        vm.ext_code(key, value);
+    }
+    for (key, value) in &vars.tla_vars {
+        vm.tla_var(key, value);
+    }
+    for (key, value) in &vars.tla_codes {
+        vm.tla_code(key, value);
+    }
+
     let rendered = vm
         .evaluate_file(path)
         .expect("jsonnet should evaluate")
         .to_string();
     rendered
+}
+
+fn default_jsonnet_vars() -> JsonnetVars {
+    JsonnetVars {
+        ext_vars: vec![
+            ("task_kind".to_string(), "exec".to_string()),
+            ("task_count".to_string(), "1".to_string()),
+            ("message".to_string(), "hello".to_string()),
+        ],
+        ext_codes: vec![],
+        tla_vars: vec![("job_name".to_string(), "vars-default".to_string())],
+        tla_codes: vec![("cpu".to_string(), "100".to_string())],
+    }
 }
 
 fn value_is_non_empty(value: &Value) -> bool {
@@ -40,7 +74,7 @@ fn config_jobs_parse() {
         }
 
         let path_str = path.to_string_lossy();
-        let rendered = render_job_spec(&path_str);
+        let rendered = render_job_spec(&path_str, &default_jsonnet_vars());
         let config: JobConfig = serde_json::from_str(&rendered)
             .unwrap_or_else(|e| panic!("failed to parse {}: {}", path_str, e));
 
@@ -64,7 +98,7 @@ fn maximal_job_spec_parse() {
         .join("jobs")
         .join("maximal.jsonnet");
     let path_str = path.to_string_lossy();
-    let rendered = render_job_spec(&path_str);
+    let rendered = render_job_spec(&path_str, &default_jsonnet_vars());
     let config: JobConfig = serde_json::from_str(&rendered)
         .unwrap_or_else(|e| panic!("failed to parse {}: {}", path_str, e));
 
@@ -90,4 +124,50 @@ fn maximal_job_spec_parse() {
             "task affinities should be set"
         );
     }
+}
+
+#[test]
+fn variable_job_spec_renders_with_different_values() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("configs")
+        .join("jobs")
+        .join("vars.jsonnet");
+    let path_str = path.to_string_lossy();
+
+    let vars_one = JsonnetVars {
+        ext_vars: vec![
+            ("task_kind".to_string(), "exec".to_string()),
+            ("task_count".to_string(), "1".to_string()),
+            ("message".to_string(), "hello-one".to_string()),
+        ],
+        tla_vars: vec![("job_name".to_string(), "vars-one".to_string())],
+        tla_codes: vec![("cpu".to_string(), "100".to_string())],
+        ..JsonnetVars::default()
+    };
+
+    let rendered_one = render_job_spec(&path_str, &vars_one);
+    let config_one: JobConfig = serde_json::from_str(&rendered_one)
+        .unwrap_or_else(|e| panic!("failed to parse {}: {}", path_str, e));
+
+    let vars_two = JsonnetVars {
+        ext_vars: vec![
+            ("task_kind".to_string(), "container".to_string()),
+            ("task_count".to_string(), "2".to_string()),
+            ("message".to_string(), "hello-two".to_string()),
+        ],
+        tla_vars: vec![("job_name".to_string(), "vars-two".to_string())],
+        tla_codes: vec![("cpu".to_string(), "250".to_string())],
+        ..JsonnetVars::default()
+    };
+
+    let rendered_two = render_job_spec(&path_str, &vars_two);
+    let config_two: JobConfig = serde_json::from_str(&rendered_two)
+        .unwrap_or_else(|e| panic!("failed to parse {}: {}", path_str, e));
+
+    assert_ne!(config_one.name, config_two.name);
+    assert_eq!(config_one.tasks.len(), 1);
+    assert_eq!(config_two.tasks.len(), 1);
+    assert_ne!(config_one.tasks[0].kind, config_two.tasks[0].kind);
+    assert_ne!(config_one.tasks[0].count, config_two.tasks[0].count);
+    assert_ne!(config_one.tasks[0].resources, config_two.tasks[0].resources);
 }
