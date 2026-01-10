@@ -5,7 +5,7 @@ use clap::value_parser;
 use crate::cmd::helpers::{connect_manager_client, json_flag, print_table};
 use crate::prelude::*;
 use crate::structs::{
-    DestroyJobRequest, GetJobInfoRequest, GetJobSpecRequest, JobPlanPrint, JobPrint,
+    DestroyJobRequest, GetJobInfoRequest, GetJobSpecRequest, JobConfig, JobPlanPrint, JobPrint,
     ListJobsRequest, PlanJobRequest, RunJobRequest, StopJobRequest, Submission,
 };
 use jsonnet::JsonnetVm;
@@ -27,7 +27,8 @@ pub fn config() -> Command {
                 .long("force-reschedule")
                 .help("Force a reschedule even if the job spec is unchanged")
                 .action(ArgAction::SetTrue),
-        );
+        )
+        .args(jsonnet_var_args());
 
     let stop_cmd = Command::new("stop")
         .about("Stop a job")
@@ -65,9 +66,18 @@ pub fn config() -> Command {
             Arg::new("name")
                 .value_name("NAME")
                 .help("Name of the job to plan")
-                .required(true),
+                .required_unless_present("path"),
         )
-        .arg(json_flag());
+        .arg(
+            Arg::new("path")
+                .long("path")
+                .value_name("PATH")
+                .help("Path to the job specification to plan")
+                .value_hint(ValueHint::FilePath)
+                .conflicts_with("name"),
+        )
+        .arg(json_flag())
+        .args(jsonnet_var_args());
 
     let spec_cmd = Command::new("spec")
         .about("Get job spec used to define the job")
@@ -116,6 +126,139 @@ fn priority_from_matches(matches: &ArgMatches) -> Option<i64> {
     } else {
         matches.get_one::<i64>("priority").copied()
     }
+}
+
+#[derive(Default)]
+struct JsonnetVars {
+    ext_vars: Vec<(String, String)>,
+    ext_codes: Vec<(String, String)>,
+    tla_vars: Vec<(String, String)>,
+    tla_codes: Vec<(String, String)>,
+}
+
+impl JsonnetVars {
+    fn is_empty(&self) -> bool {
+        self.ext_vars.is_empty()
+            && self.ext_codes.is_empty()
+            && self.tla_vars.is_empty()
+            && self.tla_codes.is_empty()
+    }
+}
+
+fn jsonnet_var_args() -> Vec<Arg> {
+    vec![
+        Arg::new("var")
+            .long("var")
+            .value_name("KEY=VALUE")
+            .help("Set a Jsonnet external string variable (std.extVar)")
+            .action(ArgAction::Append),
+        Arg::new("var-code")
+            .long("var-code")
+            .value_name("KEY=CODE")
+            .help("Set a Jsonnet external code variable (std.extVar)")
+            .action(ArgAction::Append),
+        Arg::new("arg")
+            .long("arg")
+            .value_name("KEY=VALUE")
+            .help("Set a Jsonnet top-level string argument")
+            .action(ArgAction::Append),
+        Arg::new("arg-code")
+            .long("arg-code")
+            .value_name("KEY=CODE")
+            .help("Set a Jsonnet top-level code argument")
+            .action(ArgAction::Append),
+    ]
+}
+
+fn parse_key_value(input: &str) -> R<(String, String)> {
+    let (key, value) = input.split_once('=').context("expected KEY=VALUE")?;
+    if key.is_empty() {
+        bail!("jsonnet variable key cannot be empty");
+    }
+    Ok((key.to_string(), value.to_string()))
+}
+
+fn jsonnet_vars_from_matches(matches: &ArgMatches) -> R<JsonnetVars> {
+    let mut vars = JsonnetVars::default();
+
+    if let Some(values) = matches.get_many::<String>("var") {
+        for value in values {
+            vars.ext_vars.push(parse_key_value(value)?);
+        }
+    }
+
+    if let Some(values) = matches.get_many::<String>("var-code") {
+        for value in values {
+            vars.ext_codes.push(parse_key_value(value)?);
+        }
+    }
+
+    if let Some(values) = matches.get_many::<String>("arg") {
+        for value in values {
+            vars.tla_vars.push(parse_key_value(value)?);
+        }
+    }
+
+    if let Some(values) = matches.get_many::<String>("arg-code") {
+        for value in values {
+            vars.tla_codes.push(parse_key_value(value)?);
+        }
+    }
+
+    Ok(vars)
+}
+
+fn apply_jsonnet_vars(vm: &mut JsonnetVm, vars: &JsonnetVars) {
+    for (key, value) in &vars.ext_vars {
+        vm.ext_var(key, value);
+    }
+    for (key, value) in &vars.ext_codes {
+        vm.ext_code(key, value);
+    }
+    for (key, value) in &vars.tla_vars {
+        vm.tla_var(key, value);
+    }
+    for (key, value) in &vars.tla_codes {
+        vm.tla_code(key, value);
+    }
+}
+
+fn render_jobspec(job_path: &str, vars: &JsonnetVars) -> R<(String, Vec<Submission>)> {
+    let mut vm = JsonnetVm::new();
+    let mut submissions = vec![];
+
+    let content = std::fs::read_to_string(job_path)?;
+    let initial_sub = Submission {
+        path: job_path.to_string(),
+        content,
+        is_primary: true,
+    };
+    submissions.push(initial_sub);
+
+    vm.import_callback(|_vm, base, rel| {
+        let path = std::path::Path::new(base).join(rel);
+        let path_str = path.to_str().unwrap();
+        let contents = std::fs::read_to_string(&path).unwrap();
+
+        let sub = Submission {
+            path: path_str.to_string(),
+            content: contents.to_string(),
+            is_primary: false,
+        };
+
+        submissions.push(sub);
+
+        Ok((base.into(), contents.to_string()))
+    });
+
+    apply_jsonnet_vars(&mut vm, vars);
+
+    let rendered = vm
+        .evaluate_file(job_path)
+        .map_err(|e| anyhow!("failed to evaluate job spec {job_path}: {e}"))?
+        .to_string();
+
+    Ok((rendered, submissions))
 }
 
 pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
@@ -218,13 +361,24 @@ async fn destroy_job(arg_matches: &ArgMatches) -> R<()> {
 async fn plan_job(arg_matches: &ArgMatches) -> R<()> {
     let is_json = arg_matches.get_flag("json");
     let mut client = connect_manager_client().await?;
-    let job_name = arg_matches
-        .get_one::<String>("name")
-        .map_or("demo", String::as_str);
+    let path = arg_matches.get_one::<String>("path").map(String::as_str);
+    let vars = jsonnet_vars_from_matches(arg_matches)?;
+    let job_name = if let Some(path) = path {
+        let (rendered, _submissions) = render_jobspec(path, &vars)?;
+        let config: JobConfig = serde_json::from_str(&rendered)
+            .with_context(|| format!("failed to deserialize job spec from {path} for planning"))?;
+        config.name
+    } else {
+        if !vars.is_empty() {
+            bail!("jsonnet variables require --path for job plan");
+        }
+        arg_matches
+            .get_one::<String>("name")
+            .map_or("demo", String::as_str)
+            .to_string()
+    };
 
-    let request = tonic::Request::new(PlanJobRequest {
-        name: job_name.to_owned(),
-    });
+    let request = tonic::Request::new(PlanJobRequest { name: job_name });
 
     let response = client.plan_job(request).await?;
     let allocations = response.into_inner().allocations;
@@ -250,38 +404,8 @@ async fn run_job(arg_matches: &ArgMatches) -> R<()> {
         .get_one::<String>("path")
         .map_or("./configs/jobs/demo.jsonnet", String::as_str);
     let priority = priority_from_matches(arg_matches);
-
-    let mut vm = JsonnetVm::new();
-    let mut submissions = vec![];
-
-    let content = std::fs::read_to_string(job_path)?;
-    let initial_sub = Submission {
-        path: job_path.to_string(),
-        content,
-        is_primary: true,
-    };
-    submissions.push(initial_sub);
-
-    vm.import_callback(|_vm, base, rel| {
-        let path = std::path::Path::new(base).join(rel);
-        let path_str = path.to_str().unwrap();
-        let contents = std::fs::read_to_string(&path).unwrap();
-
-        let sub = Submission {
-            path: path_str.to_string(),
-            content: contents.to_string(),
-            is_primary: false,
-        };
-
-        submissions.push(sub);
-
-        Ok((base.into(), contents.to_string()))
-    });
-
-    let rendered = vm
-        .evaluate_file(job_path)
-        .map_err(|e| anyhow!("failed to evaluate job spec {job_path}: {e}"))?
-        .to_string();
+    let vars = jsonnet_vars_from_matches(arg_matches)?;
+    let (rendered, submissions) = render_jobspec(job_path, &vars)?;
 
     let request = tonic::Request::new(RunJobRequest {
         parsed_jobspec: rendered,
