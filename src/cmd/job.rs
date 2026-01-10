@@ -1,8 +1,10 @@
+use std::path::{Path, PathBuf};
 use std::vec;
 
 use clap::value_parser;
 
 use crate::cmd::helpers::{connect_manager_client, json_flag, print_table};
+use crate::getter_rs::Client as GetterClient;
 use crate::prelude::*;
 use crate::structs::{
     DestroyJobRequest, GetJobInfoRequest, GetJobSpecRequest, JobConfig, JobPlanPrint, JobPrint,
@@ -10,6 +12,8 @@ use crate::structs::{
 };
 use jsonnet::JsonnetVm;
 use serde_json::to_string;
+use tempfile::TempDir;
+use url::Url;
 
 pub fn config() -> Command {
     let run_cmd = Command::new("run")
@@ -17,8 +21,8 @@ pub fn config() -> Command {
         .arg(
             Arg::new("path")
                 .value_name("PATH")
-                .help("Path to the job specification to run")
-                .value_hint(ValueHint::FilePath),
+                .help("Path or URL to the job specification to run")
+                .value_hint(ValueHint::AnyPath),
         )
         .arg(priority_arg())
         .arg(asap_flag())
@@ -72,8 +76,8 @@ pub fn config() -> Command {
             Arg::new("path")
                 .long("path")
                 .value_name("PATH")
-                .help("Path to the job specification to plan")
-                .value_hint(ValueHint::FilePath)
+                .help("Path or URL to the job specification to plan")
+                .value_hint(ValueHint::AnyPath)
                 .conflicts_with("name"),
         )
         .arg(json_flag())
@@ -223,13 +227,74 @@ fn apply_jsonnet_vars(vm: &mut JsonnetVm, vars: &JsonnetVars) {
     }
 }
 
-fn render_jobspec(job_path: &str, vars: &JsonnetVars) -> R<(String, Vec<Submission>)> {
+struct ResolvedJobspec {
+    _temp_dir: TempDir,
+    path: PathBuf,
+}
+
+fn resolve_jobspec_source(source: &str) -> R<ResolvedJobspec> {
+    let temp_dir = tempfile::tempdir().context("create temporary directory for jobspec")?;
+    let client = GetterClient::default();
+    let fetched_path = client
+        .get(source, temp_dir.path())
+        .with_context(|| format!("fetch jobspec from {source}"))?;
+    let resolved_path = ensure_jobspec_file(source, &fetched_path)?;
+
+    Ok(ResolvedJobspec {
+        _temp_dir: temp_dir,
+        path: resolved_path,
+    })
+}
+
+fn ensure_jobspec_file(source: &str, fetched_path: &Path) -> R<PathBuf> {
+    if fetched_path.is_file() {
+        return Ok(fetched_path.to_path_buf());
+    }
+
+    if fetched_path.is_dir() {
+        if let Some(subpath) = extract_jobspec_subpath(source)? {
+            let candidate = fetched_path.join(subpath);
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+            bail!(
+                "jobspec path {} does not exist in fetched directory",
+                candidate.display()
+            );
+        }
+    }
+
+    bail!(
+        "jobspec source {source} resolved to a directory; append #<relative path> to select a file"
+    )
+}
+
+fn extract_jobspec_subpath(source: &str) -> R<Option<PathBuf>> {
+    if !source.contains("://") {
+        return Ok(None);
+    }
+
+    let url = Url::parse(source).context("parse jobspec URL")?;
+    let Some(fragment) = url.fragment() else {
+        return Ok(None);
+    };
+
+    let fragment = fragment.trim_start_matches('/');
+    if fragment.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(PathBuf::from(fragment)))
+}
+
+fn render_jobspec(job_path: &Path, vars: &JsonnetVars) -> R<(String, Vec<Submission>)> {
     let mut vm = JsonnetVm::new();
     let mut submissions = vec![];
+    let job_path_str = job_path.to_string_lossy();
 
     let content = std::fs::read_to_string(job_path)?;
     let initial_sub = Submission {
-        path: job_path.to_string(),
+        path: job_path_str.to_string(),
         content,
         is_primary: true,
     };
@@ -255,7 +320,7 @@ fn render_jobspec(job_path: &str, vars: &JsonnetVars) -> R<(String, Vec<Submissi
 
     let rendered = vm
         .evaluate_file(job_path)
-        .map_err(|e| anyhow!("failed to evaluate job spec {job_path}: {e}"))?
+        .map_err(|e| anyhow!("failed to evaluate job spec {}: {e}", job_path.display()))?
         .to_string();
 
     Ok((rendered, submissions))
@@ -364,7 +429,8 @@ async fn plan_job(arg_matches: &ArgMatches) -> R<()> {
     let path = arg_matches.get_one::<String>("path").map(String::as_str);
     let vars = jsonnet_vars_from_matches(arg_matches)?;
     let job_name = if let Some(path) = path {
-        let (rendered, _submissions) = render_jobspec(path, &vars)?;
+        let resolved = resolve_jobspec_source(path)?;
+        let (rendered, _submissions) = render_jobspec(&resolved.path, &vars)?;
         let config: JobConfig = serde_json::from_str(&rendered)
             .with_context(|| format!("failed to deserialize job spec from {path} for planning"))?;
         config.name
@@ -405,7 +471,8 @@ async fn run_job(arg_matches: &ArgMatches) -> R<()> {
         .map_or("./configs/jobs/demo.jsonnet", String::as_str);
     let priority = priority_from_matches(arg_matches);
     let vars = jsonnet_vars_from_matches(arg_matches)?;
-    let (rendered, submissions) = render_jobspec(job_path, &vars)?;
+    let resolved = resolve_jobspec_source(job_path)?;
+    let (rendered, submissions) = render_jobspec(&resolved.path, &vars)?;
 
     let request = tonic::Request::new(RunJobRequest {
         parsed_jobspec: rendered,
