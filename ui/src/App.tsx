@@ -276,19 +276,22 @@ const PollingController = (props: PollingControllerProps) => {
 
   createEffect(() => {
     const current = location.pathname.replace(/\/+$/, "") || "/";
-    let refetch: (() => void) | null = null;
+    const refetches: Array<() => void> = [];
 
     if (current === "/") {
-      refetch = () => void props.refreshLedger();
+      refetches.push(() => void props.refreshLedger());
     } else if (current.startsWith("/nodes")) {
-      refetch = () => void props.refreshNodes();
+      refetches.push(() => void props.refreshNodes());
+      refetches.push(() => void props.refreshLedger());
     } else if (current.startsWith("/jobs")) {
-      refetch = () => void props.refreshJobs();
+      refetches.push(() => void props.refreshJobs());
     }
 
-    if (!refetch) return;
+    if (!refetches.length) return;
 
-    const interval = window.setInterval(refetch, POLL_INTERVAL_MS);
+    const interval = window.setInterval(() => {
+      refetches.forEach((refetch) => refetch());
+    }, POLL_INTERVAL_MS);
     onCleanup(() => window.clearInterval(interval));
   });
 
@@ -357,7 +360,7 @@ const AppRoutes = () => {
       )}
     >
       <Route path="/" component={() => <Homepage ledger={ledger} />} />
-      <Route path="/nodes" component={() => <Nodes nodes={nodes} />} />
+      <Route path="/nodes" component={() => <Nodes nodes={nodes} ledger={ledger} />} />
       <Route path="/jobs" component={() => <Jobs jobs={jobs} />} />
       <Route path="/manager" component={Manager} />
       <Route path="/testing" component={TestingUtils} />
