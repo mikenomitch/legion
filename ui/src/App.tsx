@@ -15,7 +15,8 @@ import {
   onCleanup,
 } from "solid-js";
 import { managerClient, managerEndpoint } from "./grpcClient";
-import type { Job, LedgerNode, NodeMsg } from "./gen/legion_pb";
+import { NodeMsg } from "./gen/legion_pb";
+import type { Job, LedgerNode } from "./gen/legion_pb";
 import Homepage from "./pages/Homepage";
 import Jobs from "./pages/Jobs";
 import Manager from "./pages/Manager";
@@ -81,6 +82,28 @@ const navButton = (active: boolean) =>
 
 const isEqualData = <T,>(a: T | undefined, b: T | undefined) =>
   JSON.stringify(a) === JSON.stringify(b);
+
+const normalizeNodes = (nodes: readonly NodeMsg[]): readonly NodeMsg[] => {
+  const priority = (node: NodeMsg) =>
+    node.status?.toLowerCase() === "active" ? 0 : 1;
+  return [...nodes].sort((a, b) => {
+    const diff = priority(a) - priority(b);
+    if (diff !== 0) return diff;
+    return (a.id || "").localeCompare(b.id || "");
+  });
+};
+
+const areNodesEqual = (
+  a: readonly NodeMsg[] | undefined,
+  b: readonly NodeMsg[] | undefined,
+) => {
+  if (a === b) return true;
+  if (!a || !b || a.length !== b.length) return false;
+  for (let index = 0; index < a.length; index += 1) {
+    if (!NodeMsg.equals(a[index], b[index])) return false;
+  }
+  return true;
+};
 
 const Layout = (props: RouteSectionProps) => {
   const location = useLocation();
@@ -280,7 +303,7 @@ const AppRoutes = () => {
 
   const fetchNodes = async (): Promise<readonly NodeMsg[]> => {
     const response = await managerClient.getNodes({});
-    return response.nodes;
+    return normalizeNodes(response.nodes);
   };
 
   const fetchJobs = async (): Promise<readonly Job[]> => {
@@ -304,7 +327,7 @@ const AppRoutes = () => {
   const refreshNodes = async () => {
     try {
       const next = await fetchNodes();
-      setNodes((prev) => (isEqualData(prev, next) ? prev : next));
+      setNodes((prev) => (areNodesEqual(prev, next) ? prev : next));
     } catch (error) {
       console.error("Failed to refresh nodes", error);
     }
