@@ -2,6 +2,7 @@ pub mod certs;
 pub mod cmd;
 pub mod constants;
 pub mod constraints;
+pub mod getter_rs;
 pub mod manager;
 pub mod prelude;
 pub mod resources;
