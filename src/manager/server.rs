@@ -107,36 +107,109 @@ impl Manager for ManagerAgentService {
         &self,
         request: Request<PlanJobRequest>,
     ) -> Result<Response<PlanJobReply>, Status> {
-        let name = request.into_inner().name;
+        let inner = request.into_inner();
+        let js = inner.parsed_jobspec;
 
-        let job_config = self.store.get_job_config(&name).map_err(|e| {
-            error!("Error getting job config for plan {}: {:?}", name, e);
-            Status::internal("Error getting job config")
+        let config: JobConfig = serde_json::from_str(&js).map_err(|e| {
+            println!("Error parsing jobspec: {:?}", e);
+            Status::internal("Error parsing jobspec")
         })?;
+        let config = self
+            .store
+            .normalize_job_config_for_plan(&config)
+            .map_err(|e| {
+                error!("Error normalizing job config: {:?}", e);
+                Status::internal("Error normalizing job config")
+            })?;
 
         let scheduler = Scheduler::new(&self.store).map_err(|e| {
             error!("Error building scheduler: {:?}", e);
             Status::internal("Error preparing scheduler")
         })?;
 
-        let plan = scheduler
-            .plan_only(&job_config.id(), PlanMode::Fresh)
-            .map_err(|e| {
-                error!("Error planning job {}: {:?}", name, e);
-                Status::internal("Error planning job")
-            })?;
-
-        let task_configs = self
+        let (plan, task_lookup, matches_existing_job, same_content, message) = match self
             .store
-            .get_task_configs_for_job_config(&job_config.id())
+            .get_job_config_optional(&config.name)
             .map_err(|e| {
-                error!("Error getting task configs for plan {}: {:?}", name, e);
-                Status::internal("Error getting task configs")
-            })?;
-        let task_lookup: HashMap<i64, String> = task_configs
-            .into_iter()
-            .map(|(id, task)| (id, task.name))
-            .collect();
+                error!("Error getting job config for plan {}: {:?}", config.name, e);
+                Status::internal("Error getting job config")
+            })? {
+            Some(existing) => {
+                let existing = self
+                    .store
+                    .normalize_job_config_for_plan(&existing)
+                    .map_err(|e| {
+                        error!("Error normalizing stored job config: {:?}", e);
+                        Status::internal("Error normalizing job config")
+                    })?;
+                if existing.is_same_as(&config) {
+                    let plan = scheduler
+                        .plan_only(&existing.id(), PlanMode::Fresh)
+                        .map_err(|e| {
+                            error!("Error planning job {}: {:?}", config.name, e);
+                            Status::internal("Error planning job")
+                        })?;
+                    let task_configs = self
+                        .store
+                        .get_task_configs_for_job_config(&existing.id())
+                        .map_err(|e| {
+                        error!(
+                            "Error getting task configs for plan {}: {:?}",
+                            config.name, e
+                        );
+                        Status::internal("Error getting task configs")
+                    })?;
+                    let task_lookup: HashMap<i64, String> = task_configs
+                        .into_iter()
+                        .map(|(id, task)| (id, task.name))
+                        .collect();
+                    (
+                        plan,
+                        task_lookup,
+                        true,
+                        true,
+                        "Job config matches existing job; planning force-reschedule".to_string(),
+                    )
+                } else {
+                    let plan = scheduler.plan_job_config(&config).map_err(|e| {
+                        error!("Error planning job {}: {:?}", config.name, e);
+                        Status::internal("Error planning job")
+                    })?;
+                    let task_lookup: HashMap<i64, String> = config
+                        .tasks
+                        .iter()
+                        .enumerate()
+                        .map(|(index, task)| ((index as i64) + 1, task.name.clone()))
+                        .collect();
+                    (
+                        plan,
+                        task_lookup,
+                        true,
+                        false,
+                        "Job config differs from existing job; planning new schedule".to_string(),
+                    )
+                }
+            }
+            None => {
+                let plan = scheduler.plan_job_config(&config).map_err(|e| {
+                    error!("Error planning job {}: {:?}", config.name, e);
+                    Status::internal("Error planning job")
+                })?;
+                let task_lookup: HashMap<i64, String> = config
+                    .tasks
+                    .iter()
+                    .enumerate()
+                    .map(|(index, task)| ((index as i64) + 1, task.name.clone()))
+                    .collect();
+                (
+                    plan,
+                    task_lookup,
+                    false,
+                    false,
+                    "Job not found; planning new schedule".to_string(),
+                )
+            }
+        };
 
         let allocations = plan
             .into_iter()
@@ -150,7 +223,12 @@ impl Manager for ManagerAgentService {
             })
             .collect();
 
-        let reply = PlanJobReply { allocations };
+        let reply = PlanJobReply {
+            allocations,
+            matches_existing_job,
+            same_content,
+            message,
+        };
 
         Ok(Response::new(reply))
     }

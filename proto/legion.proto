@@ -90,11 +90,15 @@ message GetJobSpecReply {
 }
 
 message PlanJobRequest {
-  string name = 1;
+  string parsed_jobspec = 1;
+  repeated Submission submissions = 2;
 }
 
 message PlanJobReply {
   repeated PlannedAllocation allocations = 1;
+  bool matches_existing_job = 2;
+  bool same_content = 3;
+  string message = 4;
 }
 
 message PlannedAllocation {

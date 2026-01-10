@@ -8,7 +8,7 @@ use crate::constraints::{AffinitySet, ConstraintSet, DistinctTracker};
 use crate::prelude::*;
 use crate::resources::ResourcePolicy;
 use crate::storage::store::Store;
-use crate::structs::{Allocation, Node, TaskConfig};
+use crate::structs::{Allocation, JobConfig, Node, TaskConfig};
 pub use policy::{load_policy, SchedulerWeights, SchedulingContext, SchedulingPolicy};
 
 mod policy;
@@ -132,6 +132,35 @@ impl<'a> Scheduler<'a> {
 
         self.build_plan(
             job_config_id,
+            nodes,
+            tasks,
+            required_counts,
+            &allocations_by_node,
+        )
+    }
+
+    #[instrument(skip_all)]
+    pub fn plan_job_config(&self, job_config: &JobConfig) -> R<Vec<PlannedAllocation>> {
+        let nodes = self.available_nodes()?;
+        if nodes.is_empty() {
+            bail!("No nodes available to place allocations");
+        }
+
+        let job_config_id = job_config.id();
+        let tasks = job_config
+            .tasks
+            .iter()
+            .enumerate()
+            .map(|(index, config)| ((index as i64) + 1, config.clone(), config.count))
+            .collect::<Vec<_>>();
+        let allocations_by_node = self.store.cached_allocations_by_node()?;
+        let required_counts = tasks
+            .iter()
+            .map(|(id, _config, count)| (*id, *count))
+            .collect::<HashMap<_, _>>();
+
+        self.build_plan(
+            &job_config_id,
             nodes,
             tasks,
             required_counts,

@@ -63,18 +63,11 @@ pub fn config() -> Command {
     let plan_cmd = Command::new("plan")
         .about("Preview which nodes allocations would land on")
         .arg(
-            Arg::new("name")
-                .value_name("NAME")
-                .help("Name of the job to plan")
-                .required_unless_present("path"),
-        )
-        .arg(
             Arg::new("path")
-                .long("path")
                 .value_name("PATH")
                 .help("Path to the job specification to plan")
                 .value_hint(ValueHint::FilePath)
-                .conflicts_with("name"),
+                .required(true),
         )
         .arg(json_flag())
         .args(jsonnet_var_args());
@@ -134,15 +127,6 @@ struct JsonnetVars {
     ext_codes: Vec<(String, String)>,
     tla_vars: Vec<(String, String)>,
     tla_codes: Vec<(String, String)>,
-}
-
-impl JsonnetVars {
-    fn is_empty(&self) -> bool {
-        self.ext_vars.is_empty()
-            && self.ext_codes.is_empty()
-            && self.tla_vars.is_empty()
-            && self.tla_codes.is_empty()
-    }
 }
 
 fn jsonnet_var_args() -> Vec<Arg> {
@@ -361,36 +345,36 @@ async fn destroy_job(arg_matches: &ArgMatches) -> R<()> {
 async fn plan_job(arg_matches: &ArgMatches) -> R<()> {
     let is_json = arg_matches.get_flag("json");
     let mut client = connect_manager_client().await?;
-    let path = arg_matches.get_one::<String>("path").map(String::as_str);
+    let path = arg_matches
+        .get_one::<String>("path")
+        .map(String::as_str)
+        .expect("path is required");
     let vars = jsonnet_vars_from_matches(arg_matches)?;
-    let job_name = if let Some(path) = path {
-        let (rendered, _submissions) = render_jobspec(path, &vars)?;
-        let config: JobConfig = serde_json::from_str(&rendered)
-            .with_context(|| format!("failed to deserialize job spec from {path} for planning"))?;
-        config.name
-    } else {
-        if !vars.is_empty() {
-            bail!("jsonnet variables require --path for job plan");
-        }
-        arg_matches
-            .get_one::<String>("name")
-            .map_or("demo", String::as_str)
-            .to_string()
-    };
+    let (rendered, submissions) = render_jobspec(path, &vars)?;
+    let _config: JobConfig = serde_json::from_str(&rendered)
+        .with_context(|| format!("failed to deserialize job spec from {path} for planning"))?;
 
-    let request = tonic::Request::new(PlanJobRequest { name: job_name });
+    let request = tonic::Request::new(PlanJobRequest {
+        parsed_jobspec: rendered,
+        submissions,
+    });
 
     let response = client.plan_job(request).await?;
-    let allocations = response.into_inner().allocations;
+    let response = response.into_inner();
 
     if is_json {
-        if let Ok(json) = to_string(&allocations) {
+        if let Ok(json) = to_string(&response) {
             println!("{json}");
         }
     } else {
+        if !response.message.is_empty() {
+            println!("{}", response.message);
+        }
         let printable_allocations: Vec<JobPlanPrint> =
-            allocations.into_iter().map(Into::into).collect();
-        print_table(printable_allocations);
+            response.allocations.into_iter().map(Into::into).collect();
+        if !printable_allocations.is_empty() {
+            print_table(printable_allocations);
+        }
     }
 
     Ok(())

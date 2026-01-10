@@ -896,8 +896,8 @@ impl Store {
 
     pub fn get_job_config_optional(&self, name: &str) -> R<Option<JobConfig>> {
         let conn = self.read_connection()?;
-        let maybe_job_config: Option<(JobConfig, String)> =
-            conn.query_row(&GET_JOB_CONFIG, [name], |row| {
+        let maybe_job_config: Option<(JobConfig, String)> = conn
+            .query_row(&GET_JOB_CONFIG, [name], |row| {
                 let tasks_to_replace = vec![];
                 let job_config_id = row.get(0)?;
                 let jc = JobConfig {
@@ -915,9 +915,8 @@ impl Store {
         };
 
         let mut stmt = conn.prepare(&GET_TASK_FOR_JOB_CONIFG)?;
-        let tasks = Self::collect_rows(
-            stmt.query_map([jc_id], |row| self.task_config_from_row(row))?,
-        )?;
+        let tasks =
+            Self::collect_rows(stmt.query_map([jc_id], |row| self.task_config_from_row(row))?)?;
 
         let jc_2 = JobConfig {
             tasks,
@@ -1086,6 +1085,11 @@ impl Store {
             tasks,
             ..config.clone()
         })
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn normalize_job_config_for_plan(&self, config: &JobConfig) -> R<JobConfig> {
+        self.normalize_job_config(config)
     }
 
     #[instrument(err, skip_all)]
