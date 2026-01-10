@@ -1,9 +1,10 @@
 import { For, Show, createMemo, createSignal, type JSX, type Resource } from 'solid-js'
-import type { NodeMsg } from '../gen/legion_pb'
+import type { LedgerNode, NodeMsg } from '../gen/legion_pb'
 import { formatRelativeTime } from '../utils/format'
 
 interface NodesProps {
   nodes: Resource<readonly NodeMsg[] | undefined>
+  ledger: Resource<readonly LedgerNode[] | undefined>
 }
 
 const isPlainObject = (value: unknown): value is Record<string, unknown> =>
@@ -44,6 +45,72 @@ const prettifyData = (value: unknown): string => {
 const extractField = (value: unknown, key: string): unknown =>
   isPlainObject(value) && key in value ? (value as Record<string, unknown>)[key] : undefined
 
+const toNumber = (value: unknown): number | undefined => {
+  if (typeof value === 'number' && Number.isFinite(value)) return value
+  if (typeof value === 'string' && value.trim() !== '') {
+    const parsed = Number(value)
+    if (Number.isFinite(parsed)) return parsed
+  }
+  return undefined
+}
+
+const collectResources = (value: unknown): Record<string, number> => {
+  if (!isPlainObject(value)) return {}
+
+  return Object.entries(value).reduce<Record<string, number>>((acc, [key, val]) => {
+    const numeric = toNumber(val)
+    if (numeric === undefined) return acc
+    acc[key] = numeric
+    return acc
+  }, {})
+}
+
+const mergeResourceTotals = (base: Record<string, number>, next: Record<string, number>): Record<string, number> => {
+  const combined = { ...base }
+  Object.entries(next).forEach(([key, value]) => {
+    combined[key] = (combined[key] ?? 0) + value
+  })
+  return combined
+}
+
+const subtractResources = (total: Record<string, number>, reserved: Record<string, number>): Record<string, number> => {
+  const keys = new Set([...Object.keys(total), ...Object.keys(reserved)])
+  const result: Record<string, number> = {}
+  keys.forEach((key) => {
+    const available = (total[key] ?? 0) - (reserved[key] ?? 0)
+    if (available > 0) {
+      result[key] = available
+    }
+  })
+  return result
+}
+
+const formatResourceValue = (value: number): string => {
+  if (!Number.isFinite(value)) return '—'
+  if (Math.abs(value) >= 1000 && Number.isInteger(value)) {
+    return new Intl.NumberFormat('en-US').format(value)
+  }
+  return value % 1 === 0 ? value.toString() : value.toFixed(2)
+}
+
+const resourcePriority = ['memory', 'cpu', 'allocations']
+
+const sortResourceKeys = (keys: string[]): string[] => {
+  const unique = Array.from(new Set(keys))
+  return unique.sort((a, b) => {
+    const priorityA = resourcePriority.indexOf(a)
+    const priorityB = resourcePriority.indexOf(b)
+
+    if (priorityA !== -1 || priorityB !== -1) {
+      if (priorityA === -1) return 1
+      if (priorityB === -1) return -1
+      return priorityA - priorityB
+    }
+
+    return a.localeCompare(b)
+  })
+}
+
 const renderValue = (value: unknown): JSX.Element => {
   if (value === null || value === undefined) return <span class="text-neutral-500">—</span>
   if (Array.isArray(value)) {
@@ -72,6 +139,30 @@ const renderValue = (value: unknown): JSX.Element => {
   }
 
   return <span class="break-words font-mono text-sm text-neutral-800 dark:text-neutral-200">{String(value)}</span>
+}
+
+const ResourceBar = (props: { label: string; used: number; total: number }) => {
+  const percentage = createMemo(() => {
+    if (props.total <= 0) return 0
+    return Math.min((props.used / props.total) * 100, 100)
+  })
+
+  return (
+    <div class="space-y-1">
+      <div class="flex items-center justify-between text-xs text-neutral-600 dark:text-neutral-400">
+        <span class="font-medium uppercase tracking-[0.12em]">{props.label}</span>
+        <span>
+          {formatResourceValue(props.used)} / {formatResourceValue(props.total)} ({percentage().toFixed(0)}%)
+        </span>
+      </div>
+      <div class="h-2 overflow-hidden rounded-full bg-neutral-200 dark:bg-neutral-800">
+        <div
+          class="h-full rounded-full bg-neutral-900 transition-all dark:bg-neutral-100"
+          style={{ width: `${percentage()}%` }}
+        />
+      </div>
+    </div>
+  )
 }
 
 interface KeyValueGridProps {
@@ -152,6 +243,14 @@ const CollapsibleSection = (props: CollapsibleSectionProps) => {
 
 export default function Nodes(props: NodesProps) {
   const [statusFilter, setStatusFilter] = createSignal('All')
+  const ledgerByNodeId = createMemo(() => {
+    const entries = new Map<string, LedgerNode>()
+    ;(props.ledger() ?? []).forEach((entry) => {
+      const nodeId = entry.node?.id
+      if (nodeId) entries.set(nodeId, entry)
+    })
+    return entries
+  })
 
   const statusOptions = createMemo(() => {
     const options = new Set<string>()
@@ -199,11 +298,24 @@ export default function Nodes(props: NodesProps) {
             <div class="grid gap-3 lg:grid-cols-2">
               <For each={filteredNodes()}>
                 {(node) => {
-                const configData = parseAttributes(node.configAttrs)
-                const dynamicData = parseAttributes(node.dynamicAttrs)
-                const fingerprintData = parseAttributes(node.fingerprintAttrs)
-                const networksData = extractField(dynamicData, 'networks') ?? extractField(fingerprintData, 'networks')
-                const signalsData = extractField(dynamicData, 'signals') ?? extractField(fingerprintData, 'signals')
+                  const configData = parseAttributes(node.configAttrs)
+                  const dynamicData = parseAttributes(node.dynamicAttrs)
+                  const fingerprintData = parseAttributes(node.fingerprintAttrs)
+                  const networksData = extractField(dynamicData, 'networks') ?? extractField(fingerprintData, 'networks')
+                  const signalsData = extractField(dynamicData, 'signals') ?? extractField(fingerprintData, 'signals')
+                  const ledgerNode = ledgerByNodeId().get(node.id ?? '')
+                  const allocations = ledgerNode?.allocations ?? []
+                  const configResources = collectResources(extractField(configData, 'resources'))
+                  const reservedResources = collectResources(extractField(configData, 'reservedResources'))
+                  const totalResources = subtractResources(configResources, reservedResources)
+                  const allocationResources = allocations.reduce<Record<string, number>>((acc, allocation) => {
+                    const parsed = parseAttributes(allocation.resources)
+                    return mergeResourceTotals(acc, collectResources(parsed))
+                  }, {})
+                  const resourceKeys = sortResourceKeys([
+                    ...Object.keys(totalResources),
+                    ...Object.keys(allocationResources),
+                  ])
                   const healthData = parseAttributes(node.healthChecks)
                   const formattedHealth = prettifyData(healthData ?? node.healthChecks)
 
@@ -230,6 +342,29 @@ export default function Nodes(props: NodesProps) {
                       </div>
 
                       <div class="mt-4 space-y-3">
+                        <div class="rounded border border-neutral-200 bg-neutral-50 p-3 shadow-sm dark:border-neutral-800 dark:bg-neutral-900/60">
+                          <div class="flex items-center justify-between">
+                            <h4 class="text-sm font-semibold text-neutral-900 dark:text-neutral-100">Resource Use</h4>
+                            <span class="text-[11px] uppercase tracking-[0.12em] text-neutral-500 dark:text-neutral-400">Used</span>
+                          </div>
+                          <Show
+                            when={resourceKeys.length > 0}
+                            fallback={<p class="mt-2 text-sm text-neutral-500">No resource data available.</p>}
+                          >
+                            <div class="mt-3 space-y-3">
+                              <For each={resourceKeys}>
+                                {(key) => (
+                                  <ResourceBar
+                                    label={key}
+                                    used={allocationResources[key] ?? 0}
+                                    total={totalResources[key] ?? 0}
+                                  />
+                                )}
+                              </For>
+                            </div>
+                          </Show>
+                        </div>
+
                         <div class="grid gap-3 lg:grid-cols-2">
                           <KeyValueGrid
                             title="Static Config"
