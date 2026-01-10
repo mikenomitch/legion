@@ -352,7 +352,7 @@ impl Manager for ManagerAgentService {
             config_attrs: request.config_attrs,
             dynamic_attrs,
             status: "active".to_string(),
-            availability: "availabile".to_string(),
+            availability: "available".to_string(),
             pool: request.pool,
             last_heartbeat: String::new(),
             health_checks: request.health_checks,
