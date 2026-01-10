@@ -62,9 +62,10 @@ pub fn config() -> Command {
     let plan_cmd = Command::new("plan")
         .about("Preview which nodes allocations would land on")
         .arg(
-            Arg::new("name")
-                .value_name("NAME")
-                .help("Name of the job to plan")
+            Arg::new("path")
+                .value_name("PATH")
+                .help("Path to the job specification to plan")
+                .value_hint(ValueHint::FilePath)
                 .required(true),
         )
         .arg(json_flag());
@@ -218,24 +219,24 @@ async fn destroy_job(arg_matches: &ArgMatches) -> R<()> {
 async fn plan_job(arg_matches: &ArgMatches) -> R<()> {
     let is_json = arg_matches.get_flag("json");
     let mut client = connect_manager_client().await?;
-    let job_name = arg_matches
-        .get_one::<String>("name")
-        .map_or("demo", String::as_str);
+    let job_path = arg_matches
+        .get_one::<String>("path")
+        .context("path is required")?;
+    let (rendered, _) = render_job_spec(job_path)?;
 
     let request = tonic::Request::new(PlanJobRequest {
-        name: job_name.to_owned(),
+        parsed_jobspec: rendered,
     });
 
-    let response = client.plan_job(request).await?;
-    let allocations = response.into_inner().allocations;
-
+    let response = client.plan_job(request).await?.into_inner();
     if is_json {
-        if let Ok(json) = to_string(&allocations) {
+        if let Ok(json) = to_string(&response) {
             println!("{json}");
         }
     } else {
+        println!("{}", response.message);
         let printable_allocations: Vec<JobPlanPrint> =
-            allocations.into_iter().map(Into::into).collect();
+            response.allocations.into_iter().map(Into::into).collect();
         print_table(printable_allocations);
     }
 
@@ -251,6 +252,23 @@ async fn run_job(arg_matches: &ArgMatches) -> R<()> {
         .map_or("./configs/jobs/demo.jsonnet", String::as_str);
     let priority = priority_from_matches(arg_matches);
 
+    let (rendered, submissions) = render_job_spec(job_path)?;
+
+    let request = tonic::Request::new(RunJobRequest {
+        parsed_jobspec: rendered,
+        submissions,
+        priority,
+        force_reschedule: arg_matches.get_flag("force-reschedule"),
+    });
+
+    let response = client.run_job(request).await.context("failed to run job")?;
+
+    println!("{}", response.into_inner().message);
+
+    Ok(())
+}
+
+fn render_job_spec(job_path: &str) -> R<(String, Vec<Submission>)> {
     let mut vm = JsonnetVm::new();
     let mut submissions = vec![];
 
@@ -283,18 +301,7 @@ async fn run_job(arg_matches: &ArgMatches) -> R<()> {
         .map_err(|e| anyhow!("failed to evaluate job spec {job_path}: {e}"))?
         .to_string();
 
-    let request = tonic::Request::new(RunJobRequest {
-        parsed_jobspec: rendered,
-        submissions,
-        priority,
-        force_reschedule: arg_matches.get_flag("force-reschedule"),
-    });
-
-    let response = client.run_job(request).await.context("failed to run job")?;
-
-    println!("{}", response.into_inner().message);
-
-    Ok(())
+    Ok((rendered, submissions))
 }
 
 #[instrument(err, skip_all)]

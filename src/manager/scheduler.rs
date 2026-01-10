@@ -86,11 +86,6 @@ impl<'a> Scheduler<'a> {
 
     #[instrument(skip_all)]
     pub fn plan_only(&self, job_config_id: &str, mode: PlanMode) -> R<Vec<PlannedAllocation>> {
-        let nodes = self.available_nodes()?;
-        if nodes.is_empty() {
-            bail!("No nodes available to place allocations");
-        }
-
         let tasks = self
             .store
             .cached_task_configs_for_job_config(job_config_id)?
@@ -98,7 +93,27 @@ impl<'a> Scheduler<'a> {
             .map(|(id, config)| (id, config.clone(), config.count))
             .collect::<Vec<_>>();
 
+        self.plan_for_tasks(job_config_id, tasks, mode, None)
+    }
+
+    pub fn plan_for_tasks(
+        &self,
+        job_config_id: &str,
+        tasks: Vec<(i64, TaskConfig, u32)>,
+        mode: PlanMode,
+        job_id_to_remove: Option<&str>,
+    ) -> R<Vec<PlannedAllocation>> {
+        let nodes = self.available_nodes()?;
+        if nodes.is_empty() {
+            bail!("No nodes available to place allocations");
+        }
+
         let mut allocations_by_node = self.store.cached_allocations_by_node()?;
+        if let Some(job_id) = job_id_to_remove {
+            for allocations in allocations_by_node.values_mut() {
+                allocations.retain(|alloc| alloc.job_id != job_id);
+            }
+        }
         if matches!(mode, PlanMode::Fresh) {
             for allocations in allocations_by_node.values_mut() {
                 allocations.retain(|alloc| alloc.job_config_id != job_config_id);

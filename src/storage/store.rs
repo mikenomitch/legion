@@ -1067,7 +1067,7 @@ impl Store {
         }
     }
 
-    fn normalize_job_config(&self, config: &JobConfig) -> R<JobConfig> {
+    pub(crate) fn normalize_job_config(&self, config: &JobConfig) -> R<JobConfig> {
         let tasks = config
             .tasks
             .iter()
