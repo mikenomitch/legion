@@ -1,9 +1,10 @@
 import { For, Show, createMemo, createSignal, type JSX, type Resource } from 'solid-js'
-import type { NodeMsg } from '../gen/legion_pb'
+import type { LedgerAllocation, LedgerNode, NodeMsg } from '../gen/legion_pb'
 import { formatRelativeTime } from '../utils/format'
 
 interface NodesProps {
   nodes: Resource<readonly NodeMsg[] | undefined>
+  ledger: Resource<readonly LedgerNode[] | undefined>
 }
 
 const isPlainObject = (value: unknown): value is Record<string, unknown> =>
@@ -43,6 +44,183 @@ const prettifyData = (value: unknown): string => {
 
 const extractField = (value: unknown, key: string): unknown =>
   isPlainObject(value) && key in value ? (value as Record<string, unknown>)[key] : undefined
+
+const BUILTIN_RESOURCES = new Set(['memory', 'cpu', 'cores', 'allocations'])
+
+type ResourceUsageEntry = {
+  name: string
+  label: string
+  total: number
+  used: number
+  kind: 'amount' | 'items'
+}
+
+const formatResourceLabel = (name: string): string => {
+  if (name === 'memory') return 'Memory'
+  if (name === 'cpu') return 'CPU'
+  if (name === 'cores') return 'Cores'
+  return name.replace(/[_-]+/g, ' ').replace(/\b\w/g, (char) => char.toUpperCase())
+}
+
+const toNumber = (value: unknown): number | null => {
+  if (typeof value === 'number' && Number.isFinite(value)) return value
+  if (typeof value === 'string') {
+    const parsed = Number.parseFloat(value)
+    return Number.isFinite(parsed) ? parsed : null
+  }
+  return null
+}
+
+const toItems = (value: unknown): string[] | null => {
+  if (typeof value === 'string') return [value]
+  if (Array.isArray(value)) {
+    return value.map((item) => (typeof item === 'string' ? item : JSON.stringify(item)))
+  }
+  return null
+}
+
+const formatAmount = (name: string, value: number): string => {
+  const formatted = new Intl.NumberFormat('en-US', { maximumFractionDigits: 1 }).format(value)
+  if (name === 'memory') {
+    const gib = value / 1024
+    return `${new Intl.NumberFormat('en-US', { maximumFractionDigits: 2 }).format(gib)} GiB`
+  }
+  if (name === 'cpu') return `${formatted} MHz`
+  if (name === 'cores') return `${formatted} cores`
+  return formatted
+}
+
+const formatUsage = (entry: ResourceUsageEntry): string => {
+  if (entry.kind === 'items') {
+    return `${entry.used} / ${entry.total} items`
+  }
+  return `${formatAmount(entry.name, entry.used)} / ${formatAmount(entry.name, entry.total)}`
+}
+
+const resourcePercent = (entry: ResourceUsageEntry): number => {
+  if (entry.total <= 0) return 0
+  return Math.min(100, Math.round((entry.used / entry.total) * 100))
+}
+
+const accumulateUsage = (
+  resources: unknown,
+  usage: {
+    amounts: Map<string, number>
+    items: Map<string, Set<string>>
+  },
+) => {
+  if (!isPlainObject(resources)) return
+
+  for (const [name, value] of Object.entries(resources)) {
+    const amount = toNumber(value)
+    if (amount !== null) {
+      usage.amounts.set(name, (usage.amounts.get(name) ?? 0) + amount)
+      continue
+    }
+
+    const items = toItems(value)
+    if (items) {
+      const set = usage.items.get(name) ?? new Set<string>()
+      items.forEach((item) => set.add(item))
+      usage.items.set(name, set)
+    }
+  }
+}
+
+const buildResourceUsage = (
+  configData: unknown,
+  fingerprintData: unknown,
+  allocations: readonly LedgerAllocation[],
+): ResourceUsageEntry[] => {
+  const totals = new Map<string, { kind: 'amount' | 'items'; total: number }>()
+
+  const memoryTotalRaw = extractField(fingerprintData, 'memory_total')
+  const memoryTotalKiB = toNumber(memoryTotalRaw)
+  if (memoryTotalKiB !== null && Number.isFinite(memoryTotalKiB)) {
+    totals.set('memory', { kind: 'amount', total: memoryTotalKiB / 1024 })
+  }
+
+  const cpuData = extractField(fingerprintData, 'cpus')
+  if (isPlainObject(cpuData)) {
+    let cpuTotal = 0
+    let coresTotal = 0
+    for (const value of Object.values(cpuData)) {
+      if (isPlainObject(value)) {
+        const frequency = toNumber(value.frequency)
+        if (frequency !== null) {
+          cpuTotal += frequency
+        }
+      }
+      coresTotal += 1
+    }
+
+    if (cpuTotal > 0) {
+      totals.set('cpu', { kind: 'amount', total: cpuTotal })
+    }
+    if (coresTotal > 0) {
+      totals.set('cores', { kind: 'amount', total: coresTotal })
+    }
+  }
+
+  const configResources = extractField(configData, 'resources')
+  if (isPlainObject(configResources)) {
+    for (const [name, value] of Object.entries(configResources)) {
+      if (BUILTIN_RESOURCES.has(name)) continue
+      const amount = toNumber(value)
+      if (amount !== null) {
+        totals.set(name, { kind: 'amount', total: amount })
+        continue
+      }
+      const items = toItems(value)
+      if (items) {
+        totals.set(name, { kind: 'items', total: items.length })
+      }
+    }
+  }
+
+  const usage = {
+    amounts: new Map<string, number>(),
+    items: new Map<string, Set<string>>(),
+  }
+
+  const reservedResources =
+    extractField(configData, 'reservedResources') ?? extractField(configData, 'reserved_resources')
+  accumulateUsage(reservedResources, usage)
+
+  allocations.forEach((allocation) => {
+    const allocResources = parseAttributes(allocation.resources)
+    accumulateUsage(allocResources, usage)
+  })
+
+  const entries: ResourceUsageEntry[] = []
+  for (const [name, details] of totals) {
+    if (!Number.isFinite(details.total) || details.total <= 0) continue
+    const used =
+      details.kind === 'items'
+        ? usage.items.get(name)?.size ?? 0
+        : usage.amounts.get(name) ?? 0
+    entries.push({
+      name,
+      label: formatResourceLabel(name),
+      total: details.total,
+      used,
+      kind: details.kind,
+    })
+  }
+
+  const priority = (name: string) => {
+    if (name === 'memory') return 0
+    if (name === 'cpu') return 1
+    if (name === 'cores') return 2
+    return 3
+  }
+
+  return entries.sort((a, b) => {
+    const diff = priority(a.name) - priority(b.name)
+    if (diff !== 0) return diff
+    return a.label.localeCompare(b.label)
+  })
+}
 
 const renderValue = (value: unknown): JSX.Element => {
   if (value === null || value === undefined) return <span class="text-neutral-500">—</span>
@@ -152,6 +330,15 @@ const CollapsibleSection = (props: CollapsibleSectionProps) => {
 
 export default function Nodes(props: NodesProps) {
   const [statusFilter, setStatusFilter] = createSignal('All')
+  const allocationsByNode = createMemo(() => {
+    const map = new Map<string, readonly LedgerAllocation[]>()
+    ;(props.ledger() ?? []).forEach((entry) => {
+      if (entry.node?.id) {
+        map.set(entry.node.id, entry.allocations)
+      }
+    })
+    return map
+  })
 
   const statusOptions = createMemo(() => {
     const options = new Set<string>()
@@ -199,13 +386,15 @@ export default function Nodes(props: NodesProps) {
             <div class="grid gap-3 lg:grid-cols-2">
               <For each={filteredNodes()}>
                 {(node) => {
-                const configData = parseAttributes(node.configAttrs)
-                const dynamicData = parseAttributes(node.dynamicAttrs)
-                const fingerprintData = parseAttributes(node.fingerprintAttrs)
-                const networksData = extractField(dynamicData, 'networks') ?? extractField(fingerprintData, 'networks')
-                const signalsData = extractField(dynamicData, 'signals') ?? extractField(fingerprintData, 'signals')
+                  const configData = parseAttributes(node.configAttrs)
+                  const dynamicData = parseAttributes(node.dynamicAttrs)
+                  const fingerprintData = parseAttributes(node.fingerprintAttrs)
+                  const networksData = extractField(dynamicData, 'networks') ?? extractField(fingerprintData, 'networks')
+                  const signalsData = extractField(dynamicData, 'signals') ?? extractField(fingerprintData, 'signals')
                   const healthData = parseAttributes(node.healthChecks)
                   const formattedHealth = prettifyData(healthData ?? node.healthChecks)
+                  const allocations = allocationsByNode().get(node.id) ?? []
+                  const resourceUsage = buildResourceUsage(configData, fingerprintData, allocations)
 
                   return (
                     <article class="rounded border border-neutral-200 bg-white/90 p-4 shadow-[5px_5px_0_#d4d4d8] transition dark:border-neutral-800 dark:bg-neutral-900/60 dark:shadow-[5px_5px_0_#0b0d12]">
@@ -230,6 +419,40 @@ export default function Nodes(props: NodesProps) {
                       </div>
 
                       <div class="mt-4 space-y-3">
+                        <div class="rounded border border-neutral-200 bg-neutral-50 p-3 shadow-sm dark:border-neutral-800 dark:bg-neutral-900/60">
+                          <div class="flex items-center justify-between">
+                            <h4 class="text-sm font-semibold text-neutral-900 dark:text-neutral-100">Resource Usage</h4>
+                            <span class="text-[11px] uppercase tracking-[0.12em] text-neutral-500 dark:text-neutral-400">Used</span>
+                          </div>
+                          <Show
+                            when={resourceUsage.length > 0}
+                            fallback={<p class="mt-2 text-sm text-neutral-500">No resource data available.</p>}
+                          >
+                            <div class="mt-3 space-y-3">
+                              <For each={resourceUsage}>
+                                {(entry) => (
+                                  <div class="space-y-2">
+                                    <div class="flex items-center justify-between text-sm">
+                                      <div>
+                                        <p class="font-medium text-neutral-800 dark:text-neutral-100">{entry.label}</p>
+                                        <p class="text-xs text-neutral-500 dark:text-neutral-400">{formatUsage(entry)}</p>
+                                      </div>
+                                      <span class="text-xs font-semibold text-neutral-700 dark:text-neutral-200">
+                                        {resourcePercent(entry)}%
+                                      </span>
+                                    </div>
+                                    <div class="h-2 w-full overflow-hidden rounded bg-neutral-200 dark:bg-neutral-800">
+                                      <div
+                                        class="h-full rounded bg-emerald-500 dark:bg-emerald-400"
+                                        style={{ width: `${resourcePercent(entry)}%` }}
+                                      />
+                                    </div>
+                                  </div>
+                                )}
+                              </For>
+                            </div>
+                          </Show>
+                        </div>
                         <div class="grid gap-3 lg:grid-cols-2">
                           <KeyValueGrid
                             title="Static Config"

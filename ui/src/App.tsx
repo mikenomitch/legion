@@ -281,7 +281,10 @@ const PollingController = (props: PollingControllerProps) => {
     if (current === "/") {
       refetch = () => void props.refreshLedger();
     } else if (current.startsWith("/nodes")) {
-      refetch = () => void props.refreshNodes();
+      refetch = () => {
+        void props.refreshNodes();
+        void props.refreshLedger();
+      };
     } else if (current.startsWith("/jobs")) {
       refetch = () => void props.refreshJobs();
     }
@@ -357,7 +360,7 @@ const AppRoutes = () => {
       )}
     >
       <Route path="/" component={() => <Homepage ledger={ledger} />} />
-      <Route path="/nodes" component={() => <Nodes nodes={nodes} />} />
+      <Route path="/nodes" component={() => <Nodes nodes={nodes} ledger={ledger} />} />
       <Route path="/jobs" component={() => <Jobs jobs={jobs} />} />
       <Route path="/manager" component={Manager} />
       <Route path="/testing" component={TestingUtils} />
