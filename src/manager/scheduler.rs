@@ -8,7 +8,7 @@ use crate::constraints::{AffinitySet, ConstraintSet, DistinctTracker};
 use crate::prelude::*;
 use crate::resources::ResourcePolicy;
 use crate::storage::store::Store;
-use crate::structs::{Allocation, Node, TaskConfig};
+use crate::structs::{Allocation, JobConfig, Node, TaskConfig};
 pub use policy::{load_policy, SchedulerWeights, SchedulingContext, SchedulingPolicy};
 
 mod policy;
@@ -71,6 +71,12 @@ pub struct Scheduler<'a> {
     policy: Box<dyn SchedulingPolicy>,
     #[allow(dead_code)]
     policy_lib: Option<Library>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PlanConfigOutcome {
+    pub allocations: Vec<PlannedAllocation>,
+    pub task_lookup: HashMap<i64, String>,
 }
 
 impl<'a> Scheduler<'a> {
@@ -137,6 +143,70 @@ impl<'a> Scheduler<'a> {
             required_counts,
             &allocations_by_node,
         )
+    }
+
+    #[instrument(skip_all)]
+    pub fn plan_for_config(
+        &self,
+        job_config: &JobConfig,
+        mode: PlanMode,
+        clear_job_id: Option<&str>,
+    ) -> R<PlanConfigOutcome> {
+        let nodes = self.available_nodes()?;
+        if nodes.is_empty() {
+            bail!("No nodes available to place allocations");
+        }
+
+        let tasks = Self::tasks_for_plan(job_config);
+        let task_lookup = tasks
+            .iter()
+            .map(|(id, task, _count)| (*id, task.name.clone()))
+            .collect::<HashMap<_, _>>();
+
+        let mut allocations_by_node = self.store.cached_allocations_by_node()?;
+        if let Some(job_id) = clear_job_id {
+            for allocations in allocations_by_node.values_mut() {
+                allocations.retain(|alloc| alloc.job_id != job_id);
+            }
+        }
+
+        let required_counts = match mode {
+            PlanMode::Fresh => tasks
+                .iter()
+                .map(|(id, _config, count)| (*id, *count))
+                .collect::<HashMap<_, _>>(),
+            PlanMode::Reschedule => {
+                let mut current: HashMap<i64, u32> = HashMap::new();
+                for allocations in allocations_by_node.values() {
+                    for alloc in allocations {
+                        if alloc.job_config_id == job_config.id() {
+                            *current.entry(alloc.task_config_id).or_default() += 1;
+                        }
+                    }
+                }
+
+                tasks
+                    .iter()
+                    .map(|(id, _config, desired)| {
+                        let placed = current.get(id).copied().unwrap_or_default();
+                        (*id, desired.saturating_sub(placed))
+                    })
+                    .collect::<HashMap<_, _>>()
+            }
+        };
+
+        let allocations = self.build_plan(
+            &job_config.id(),
+            nodes,
+            tasks,
+            required_counts,
+            &allocations_by_node,
+        )?;
+
+        Ok(PlanConfigOutcome {
+            allocations,
+            task_lookup,
+        })
     }
 
     #[instrument(skip_all)]
@@ -334,6 +404,15 @@ impl<'a> Scheduler<'a> {
         }
 
         Ok(placements)
+    }
+
+    fn tasks_for_plan(job_config: &JobConfig) -> Vec<(i64, TaskConfig, u32)> {
+        job_config
+            .tasks
+            .iter()
+            .enumerate()
+            .map(|(index, config)| ((index + 1) as i64, config.clone(), config.count))
+            .collect()
     }
 
     fn apply_nodes_considered_with_setting<'b>(
