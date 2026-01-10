@@ -7,6 +7,7 @@ use legion::structs::{
 use tempfile::Builder;
 
 fn setup_store() -> R<Store> {
+    std::env::set_var("LEGION_SKIP_TASK_DISPATCH", "1");
     let store_dir = Builder::new()
         .prefix("khepri-eval-loop-")
         .tempdir()
@@ -28,7 +29,7 @@ fn setup_store() -> R<Store> {
 fn make_job_config(name: &str, count: u32) -> JobConfig {
     let task = TaskConfig {
         name: format!("{name}-task"),
-        kind: "service".into(),
+        kind: "noop".into(),
         count,
         config: json!({ "message": "hi" }),
         resources: json!({ "memory": 128 }),

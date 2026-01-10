@@ -63,5 +63,27 @@
                 node_class: "spot",
             },
         },
+        {
+            name: "exec-example",
+            count: 1,
+            kind: "exec",
+            config: {
+                command: "echo",
+                args: ["hello from exec"],
+                env: {
+                    RUST_LOG: "info",
+                },
+            },
+            resources: {
+                cpus: 0.1,
+                memory: 64,
+            },
+            constraints: {
+                role: "exec",
+            },
+            affinities: {
+                region: "us-east",
+            },
+        },
     ],
 }

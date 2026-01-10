@@ -49,7 +49,10 @@ pub fn fingerprint_node(additional_node_checks: Vec<String>) -> Map<String, Valu
 }
 
 #[instrument(skip_all)]
-pub fn run_health_checks(additional_node_checks: Vec<String>) -> Map<String, Value> {
+pub fn run_health_checks(
+    additional_node_checks: Vec<String>,
+    task_checks: Option<Map<String, Value>>,
+) -> Map<String, Value> {
     let fps: Vec<Box<dyn NodeChecker>> = vec![Box::new(DiskChecker {})];
 
     let mut ret = Map::new();
@@ -69,6 +72,10 @@ pub fn run_health_checks(additional_node_checks: Vec<String>) -> Map<String, Val
                 error!("Error loading fingerprinter: {e}");
             }
         });
+
+    if let Some(task_checks) = task_checks {
+        ret.extend(task_checks);
+    }
 
     ret
 }

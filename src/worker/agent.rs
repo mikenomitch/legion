@@ -9,6 +9,7 @@ use crate::util::random_string;
 use crate::worker::{
     node_check::{fingerprint_node, run_health_checks},
     server::WorkerAgentService,
+    task_manager::TaskManager,
 };
 
 use futures::join;
@@ -34,7 +35,8 @@ pub async fn run_worker(token: &str) -> R<()> {
     }
 
     let addr = format!("{DEF_MANAGER_HOSTNAME}:4848").parse()?;
-    let worker_node = WorkerAgentService {};
+    let task_manager = Arc::new(TaskManager::new());
+    let worker_node = WorkerAgentService::new(task_manager.clone());
     let worker_server_fut = Server::builder()
         .add_service(WorkerServer::new(worker_node))
         .serve(addr);
@@ -63,7 +65,10 @@ pub async fn run_worker(token: &str) -> R<()> {
     };
 
     let fingerprint_data = fingerprint_node(config.additional_node_checks.clone());
-    let health_checks = run_health_checks(config.additional_node_checks.clone());
+    let health_checks = run_health_checks(
+        config.additional_node_checks.clone(),
+        Some(task_manager.readiness_checks()),
+    );
 
     let mut config_attrs = Map::new();
     for (key, value) in config.attributes {
@@ -77,6 +82,10 @@ pub async fn run_worker(token: &str) -> R<()> {
     if let Some(max_allocations) = config.max_allocations {
         config_attrs.insert("maxAllocations".into(), json!(max_allocations));
     }
+    config_attrs.insert(
+        "workerAddress".into(),
+        Value::String(format!("http://{DEF_MANAGER_HOSTNAME}:4848")),
+    );
 
     register_self(
         client.clone(),
@@ -89,7 +98,12 @@ pub async fn run_worker(token: &str) -> R<()> {
     .await?;
 
     let heartbeat_fut = start_heartbeats(name.clone(), client.clone());
-    let checks_fut = start_node_checks(name.clone(), config.additional_node_checks.clone(), client);
+    let checks_fut = start_node_checks(
+        name.clone(),
+        config.additional_node_checks.clone(),
+        client,
+        task_manager,
+    );
     let _res = join!(heartbeat_fut, checks_fut, worker_server_fut);
 
     Ok(())
@@ -133,13 +147,17 @@ async fn start_node_checks(
     name: String,
     additional_node_checks: Vec<String>,
     client: ManagerClient<Channel>,
+    task_manager: Arc<TaskManager>,
 ) -> R<()> {
     let mut client_clone = client.clone();
 
-    let checks_data = run_health_checks(additional_node_checks);
-    let serialized_health_check_data = serde_json::to_string(&checks_data)?;
-
     loop {
+        let checks_data = run_health_checks(
+            additional_node_checks.clone(),
+            Some(task_manager.readiness_checks()),
+        );
+        let serialized_health_check_data = serde_json::to_string(&checks_data)?;
+
         let req = tonic::Request::new(HealthCheckRequest {
             id: name.clone(),
             health_checks: serialized_health_check_data.clone(),

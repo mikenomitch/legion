@@ -1,20 +1,21 @@
+use std::collections::HashMap;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use tracing::info;
 
 use crate::manager::scheduler::{PlanMode, PlanOutcome, Scheduler};
-#[cfg(test)]
-use crate::prelude::Context;
-use crate::prelude::{bail, json, R};
+use crate::prelude::{bail, json, Context, R};
 use crate::storage::store::Store;
 
+use super::job::TaskConfig;
 use super::node::Node;
 use super::Eval;
+use crate::structs::{worker_client::WorkerClient, PostWorkRequest, TaskWork};
 
 #[cfg(test)]
 use super::config::ManagerConfigFull;
 #[cfg(test)]
-use super::job::{JobConfig, TaskConfig};
+use super::job::JobConfig;
 #[cfg(test)]
 use super::ledger::LedgerEntry;
 #[cfg(test)]
@@ -91,6 +92,7 @@ impl Eval {
         if !outcome.deltas.is_empty() {
             info!(?outcome.deltas, "Job submit allocation deltas");
         }
+        self.dispatch_allocations_to_workers(store, &outcome.allocations)?;
 
         if let Some(prev_id) = previous_config_id {
             store.remove_allocs_for_job_config(&prev_id)?;
@@ -113,6 +115,7 @@ impl Eval {
         if !outcome.deltas.is_empty() {
             info!(?outcome.deltas, "Job update allocation deltas");
         }
+        self.dispatch_allocations_to_workers(store, &outcome.allocations)?;
 
         Ok(format!(
             "Job {} updated with {} placements",
@@ -140,6 +143,7 @@ impl Eval {
         if !outcome.deltas.is_empty() {
             info!(?outcome.deltas, "Job reschedule allocation deltas");
         }
+        self.dispatch_allocations_to_workers(store, &outcome.allocations)?;
 
         Ok(format!(
             "Job {} rescheduled with {} placements",
@@ -155,6 +159,89 @@ impl Eval {
 
         let scheduler = Scheduler::new(store)?;
         scheduler.plan_and_apply(&self.job_config_id, mode)
+    }
+
+    fn dispatch_allocations_to_workers(
+        &self,
+        store: &Store,
+        allocations: &[crate::structs::Allocation],
+    ) -> R<()> {
+        if allocations.is_empty() {
+            return Ok(());
+        }
+
+        if std::env::var("LEGION_SKIP_TASK_DISPATCH").is_ok() {
+            info!("Skipping task dispatch due to LEGION_SKIP_TASK_DISPATCH");
+            return Ok(());
+        }
+
+        let mut task_lookup: HashMap<(String, i64), TaskConfig> = HashMap::new();
+        for allocation in allocations {
+            let key = (allocation.job_config_id.clone(), allocation.task_config_id);
+            if task_lookup.contains_key(&key) {
+                continue;
+            }
+            let tasks = store.get_task_configs_for_job_config(&allocation.job_config_id)?;
+            for (task_id, task) in tasks {
+                task_lookup.insert((allocation.job_config_id.clone(), task_id), task);
+            }
+        }
+
+        let mut node_addr: HashMap<String, String> = HashMap::new();
+        for allocation in allocations {
+            if node_addr.contains_key(&allocation.node_id) {
+                continue;
+            }
+            let node = store.get_node(&allocation.node_id)?;
+            let addr = node
+                .config_attrs
+                .get("workerAddress")
+                .or_else(|| node.dynamic_attrs.get("workerAddress"))
+                .and_then(|value| value.as_str())
+                .context("workerAddress missing from node attributes")?;
+            node_addr.insert(allocation.node_id.clone(), addr.to_string());
+        }
+
+        let runtime = tokio::runtime::Runtime::new()?;
+        runtime.block_on(async move {
+            for allocation in allocations {
+                let task = task_lookup
+                    .get(&(allocation.job_config_id.clone(), allocation.task_config_id))
+                    .context("missing task config for allocation")?;
+                let addr = node_addr
+                    .get(&allocation.node_id)
+                    .context("missing worker address for node")?;
+
+                let task_work = TaskWork {
+                    allocation_id: allocation.id,
+                    node_id: allocation.node_id.clone(),
+                    job_id: allocation.job_id.clone(),
+                    job_config_id: allocation.job_config_id.clone(),
+                    task_config_id: allocation.task_config_id,
+                    task_name: task.name.clone(),
+                    task_kind: task.kind.clone(),
+                    task_config: serde_json::to_string(&task.config)?,
+                    task_resources: serde_json::to_string(&task.resources)?,
+                };
+
+                info!(
+                    allocation_id = allocation.id,
+                    task_name = task.name,
+                    task_kind = task.kind,
+                    node_id = allocation.node_id,
+                    "Dispatching allocation to worker"
+                );
+
+                let mut client = WorkerClient::connect(addr.clone()).await?;
+                client
+                    .post_work(tonic::Request::new(PostWorkRequest {
+                        work: Some(task_work),
+                    }))
+                    .await?;
+            }
+
+            Ok(())
+        })
     }
 
     fn current_timestamp() -> String {
@@ -181,7 +268,12 @@ mod tests {
     use crate::structs::NodeMsg;
     use tempfile::Builder;
 
+    fn skip_task_dispatch() {
+        std::env::set_var("LEGION_SKIP_TASK_DISPATCH", "1");
+    }
+
     fn setup_store() -> R<Store> {
+        skip_task_dispatch();
         let store_dir = Builder::new()
             .prefix("legion-eval-")
             .tempdir()
@@ -265,7 +357,7 @@ mod tests {
         let job_one_name = "job-1".to_string();
         let job_one_task = TaskConfig {
             name: "task-one".into(),
-            kind: "service".into(),
+            kind: "noop".into(),
             count: 1,
             config: json!({ "message": "hi" }),
             resources: json!({ "memory": 128 }),
@@ -320,7 +412,7 @@ mod tests {
         let job_two_name = "job-2".to_string();
         let job_two_task = TaskConfig {
             name: "task-two".into(),
-            kind: "service".into(),
+            kind: "noop".into(),
             count: 1,
             config: json!({ "message": "hola" }),
             resources: json!({ "memory": 128 }),
@@ -401,7 +493,7 @@ mod tests {
         let job_name = "update-job".to_string();
         let base_task = TaskConfig {
             name: "web".into(),
-            kind: "service".into(),
+            kind: "noop".into(),
             count: 1,
             config: json!({ "message": "v1" }),
             resources: json!({ "memory": 128 }),

@@ -14,6 +14,7 @@ use crate::structs::{
     Allocation, Eval, Job, JobConfig, LedgerEntry, ManagerConfigFull, ManagerNodeConfig, Node,
     NodeMsg, Submission, TaskConfig, WorkerConfig,
 };
+use crate::task::load_task_plugin;
 
 use rand::{seq::SliceRandom, thread_rng};
 use rusqlite::{
@@ -1110,6 +1111,12 @@ impl Store {
             .tasks
             .iter()
             .map(|task| {
+                let plugin = load_task_plugin(&task.kind)
+                    .with_context(|| format!("Failed to load task plugin {}", task.kind))?;
+                plugin
+                    .plugin
+                    .validate_config(&task.config)
+                    .with_context(|| format!("Invalid config for task {}", task.name))?;
                 let resources = self
                     .resource_policy
                     .normalize_task_resources(&task.resources, true)?;
@@ -2223,7 +2230,7 @@ mod tests {
 
         let task_one = TaskConfig {
             name: "task-1".to_string(),
-            kind: "kind-1".to_string(),
+            kind: "noop".to_string(),
             count: 1,
             config: json!({ "message": "hello-1" }),
             resources: json!({ "memory": 256 }),
@@ -2233,7 +2240,7 @@ mod tests {
 
         let task_two = TaskConfig {
             name: "task-2".to_string(),
-            kind: "kind-2".to_string(),
+            kind: "noop".to_string(),
             count: 2,
             config: json!({ "message": "hi-2" }),
             resources: json!({ "memory": 512 }),
@@ -2303,7 +2310,7 @@ mod tests {
     fn handle_job_submit_rolls_back_on_failure() -> R<()> {
         let task_one = TaskConfig {
             name: "task-1".to_string(),
-            kind: "kind-1".to_string(),
+            kind: "noop".to_string(),
             count: 1,
             config: json!({ "message": "hello-1" }),
             resources: json!({ "memory": 256 }),
@@ -2351,7 +2358,7 @@ mod tests {
 
         let orig_task = TaskConfig {
             name: "orig-task".to_string(),
-            kind: "kind-1".to_string(),
+            kind: "noop".to_string(),
             count: 1,
             config: json!({ "message": "hello" }),
             resources: json!({ "memory": 256 }),
@@ -2386,7 +2393,7 @@ mod tests {
         // updated: task kind config
 
         let new_task = TaskConfig {
-            kind: "kind-new".to_string(),
+            config: json!({ "message": "hello", "version": 2 }),
             ..orig_task
         };
         let new_task_configs = vec![new_task.clone()];
@@ -2413,7 +2420,7 @@ mod tests {
 
         let extra_task = TaskConfig {
             name: "extra-task".to_string(),
-            kind: "kind-extra".to_string(),
+            kind: "noop".to_string(),
             count: 1,
             config: json!({ "message": "hello" }),
             resources: json!({ "memory": 256 }),
@@ -2467,7 +2474,7 @@ mod tests {
         let orig_submissions = vec![];
         let orig_task = TaskConfig {
             name: "dupe-task".to_string(),
-            kind: "kind".to_string(),
+            kind: "noop".to_string(),
             count: 1,
             config: json!({ "message": "hello" }),
             resources: json!({ "memory": 256 }),
@@ -2510,7 +2517,7 @@ mod tests {
         let job_one_name = "job-one".to_string();
         let task_one = TaskConfig {
             name: "job-one-task-1".to_string(),
-            kind: "driver-a".to_string(),
+            kind: "noop".to_string(),
             count: 1,
             config: json!({ "message": "hello" }),
             resources: json!({ "memory": 256 }),
@@ -2519,7 +2526,7 @@ mod tests {
         };
         let task_two = TaskConfig {
             name: "job-one-task-2".to_string(),
-            kind: "driver-b".to_string(),
+            kind: "noop".to_string(),
             count: 1,
             config: json!({ "message": "world" }),
             resources: json!({ "memory": 512 }),
@@ -2545,7 +2552,7 @@ mod tests {
         let job_two_name = "job-two".to_string();
         let task_three = TaskConfig {
             name: "job-two-task-1".to_string(),
-            kind: "driver-c".to_string(),
+            kind: "noop".to_string(),
             count: 1,
             config: json!({ "message": "hola" }),
             resources: json!({ "memory": 128 }),
@@ -2647,7 +2654,7 @@ mod tests {
 
         let tasks = vec![TaskConfig {
             name: "task-1".to_string(),
-            kind: "kind-1".to_string(),
+            kind: "noop".to_string(),
             count: 1,
             config: json!({}),
             resources: json!({}),
@@ -2712,7 +2719,7 @@ mod tests {
 
         let tasks = vec![TaskConfig {
             name: "task-shared".to_string(),
-            kind: "kind".to_string(),
+            kind: "noop".to_string(),
             count: 1,
             config: json!({}),
             resources: json!({}),

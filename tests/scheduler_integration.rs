@@ -57,6 +57,7 @@ impl TestCluster {
     }
 
     fn new_with_settings(policy: &str, scheduler_settings: Option<Value>) -> R<Self> {
+        std::env::set_var("LEGION_SKIP_TASK_DISPATCH", "1");
         let store_dir = Builder::new()
             .prefix("legion-scheduler-it-")
             .tempdir()
@@ -510,7 +511,7 @@ fn task_config(
 ) -> TaskConfig {
     TaskConfig {
         name: name.to_string(),
-        kind: "service".into(),
+        kind: "noop".into(),
         count,
         config: json!({ "message": "hi" }),
         resources,
@@ -653,7 +654,7 @@ fn job_resubmit_config(message: &str, count: u32, node_id: &str) -> JobConfig {
         name: "job-resubmit".into(),
         tasks: vec![TaskConfig {
             name: "resubmit-task".into(),
-            kind: "service".into(),
+            kind: "noop".into(),
             count,
             config: json!({ "message": message }),
             resources: json!({ "memory": 128, "cpu": 100 }),
