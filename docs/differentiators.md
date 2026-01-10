@@ -18,10 +18,13 @@
   * Eval hooks?
     * If certain things happen on, you can define something to react from within legion?
     * Can break off into its own job (this is like autoscaler maybe where its a plugin?)
+  * Logging
+  * Volumes
 
 * All in one (omakase) experience
   * Autoscaler
   * Ingress Proxy
+  * GitOps (deploy to git, update job automatically)
 
 * Ease
   * First experience should be super easy for small apps

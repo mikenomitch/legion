@@ -1,48 +1,36 @@
 # Task List and Milestones
-- [x] Start a manager node
-  - [x] start starts a web server
-    - [x] Tonic for gRPC
-
-- [x] Add a Worker node
+- [ ] Worker Nodes
+  - [x] Add a Worker node
   - [x] CLI arg to get address
   - [x] Makes contact via RPC
   - [x] Add message passing between the two via RPC
   - [x] It begins to heartbeat. Is marked unhealthy if it misses.
     - [x] Be able to watch this change via the CLI
   - [x] It has a basic fingerprinting system
-  - [ ] It has dynamic attributes that can be updated (I think this is done?) - Codexed
-  - [ ] It properly shows up in the manager's ledger of worker nodes (is this done?)
+  - [x] It has dynamic attributes that can be updated (I think this is done?) - Codexed
+  - [x] It properly shows up in the manager's ledger of worker nodes (is this done?)
   - [ ] It can be reconfigured from the server
   - [ ] It can be restarted from the server
   - [ ] TLS is autoconfigured and auto-rotated
 
-- [x] Job submission
-  - [x] CLI can submit a “job” object
-  - [x] GRPC call to submit a job
-  - [x] Job is parsed
-  - [x] Job is stores in the backend
-
 - [ ] Scheduling
-  - [ ] Ledger command. I can see all the nodes and what is on them easily via a CLI command. - Codexed
-  - [ ] A framework for running scheduler plugins exists
-  - [ ] A "random" scheduler that selects nodes at random until one works, "works"
-  - [ ] Constraints work
-  - [ ] A "bin-pack" scheduler works
-  - [ ] Affinities and anti-affinities work
+  - [x] Ledger command. I can see all the nodes and what is on them easily via a CLI command. - Codexed
+  - [x] A framework for running scheduler plugins exists
+  - [x] A "random" scheduler that selects nodes at random until one works, "works"
+  - [x] Constraints work
+  - [x] A "bin-pack" scheduler works
+  - [x] A "spread" scheduler works (inverse of bin-pack)
+  - [x] Affinities and anti-affinities work
+  - [ ] Worker groups + taint/toleration equiv
   - [ ] Scheduling on same node as existing job works
   - [ ] Priorities and eviction works (eviction toggled at the pool level)
   - [ ] Rescheduling works
-    - [ ] A node change will update a job's placement
-      - node health check
-      - dynamic metadata
+    - [ ] A node attr change will update a job's placement
+    - [ ] Health checks trigger reschedule (after restart)
+  - [ ] Dynamic metadata
     - [ ] Job health check reschedules a job
       - [ ] Initial failures restart the job
       - [ ] Failure after N times forces a reschedule
-  - [ ] A "spread" scheduler works (inverse of bin-pack)
-  - [ ] A "speed" scheduler works that optimizes for fast placement
-    - [ ] Uses Fly.io bidding architecture
-    - [ ] Workers start pre-fetching before being notified they have won
-    - [ ] Submitter can set a time or number of submissions before selecting winner
 
 - [ ] Running workloads
   - [ ] A framework is set up to run workload plugins
@@ -60,11 +48,81 @@
         1. Think about Kamal
         2. Think about local dev
   - [ ] A "WASM" kind works
-  - [ ] A "VM" kind works
-    - Uses Libvirt? Uses cloud-hypervisor?
+  
+- [ ] Artifact system
+  - [ ] Able to grab docker images
+  - [ ] Able to do some auth for this
+  - [ ] Able to grab files and put them on disk
+  - [ ] Have plugin system for this
 
-- [ ] Deployments
+- [ ] Rollouts
   - [ ] A new version of a job starts a deployment
   - [ ] A framework is set up for deployments
   - [ ] An "immediate" deployment kind "works" and cycles out everything in place automatically
   - [ ] A "rolling" deployment kind is created and works
+  - [ ] A "blue-green" deployment kind is created and works
+  - [ ] A "canary" deployment kind is created and works
+  - [ ] Nice UI for this
+  
+- [ ] KV & Secrets
+  - [ ] I can get one of these from a task
+  - [ ] When I update one of these, the task restarts (if configured to do so)
+  - [ ] I can use one of these in the defintion
+
+- [ ] Service Discovery
+  - [ ] I can declare a named service on a task
+  - [ ] I can declare health checks on that task
+  - [ ] Can query address and port from other services
+  - [ ] I can declare which other jobs have access to my service
+  
+- [ ] Persisting state
+  - [ ] Saving the SQLite works (litestream-like)?
+  - [ ] Raft Works
+ 
+- [ ] Stateful support
+  - [ ] ???
+  
+- [ ] Short-lived jobs
+  - [ ] Basic short-lived works
+  - [ ] DAGS (different machines)
+
+- [ ] Task groups and dependencies
+  - [ ] Can place two on the same machine
+  - [ ] DAG (same machines)
+  
+- [ ] Cron jobs
+- [ ] System Job
+- [ ] Sysbatch Job
+
+- [ ] Operational Stuff
+  - [ ] Joining a cluster
+  - [ ] Losing a manager
+  - [ ] Loading state back in from a file
+  - [ ] Cluster federation
+  - [ ] OTEL
+  - [ ] Logging
+  - [ ] Metrics
+  - [ ] Event Stream
+
+- [ ] Some Pack equivalent
+  - [ ] There is a default registry
+  - [ ] I can add a registry
+  - [ ] I can call to run with @<registry>/<job>
+  - [ ] I can inspect a job in the registry (just reads some metadata)
+  - [ ] There is a UI for inserting variables from job defintions with metadata in them
+
+- [ ] Joining a cluster and TLS is very easy
+
+## Long Term
+
+- [ ] A "speed" scheduler works that optimizes for fast placement
+    - [ ] Uses Fly.io bidding architecture
+    - [ ] Workers start pre-fetching before being notified they have won
+    - [ ] Submitter can set a time or number of submissions before selecting winner
+    
+- [ ] A "VM" kind works
+  - Uses Libvirt? Uses cloud-hypervisor? QEMU?
+
+- [ ] ACL System
+
+- [ ] Workload identity tokens

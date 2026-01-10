@@ -13,3 +13,9 @@ run = "cargo run job run {{arg(name='file')}}"
 
 [tasks.nuke]
 run = "rm -rf .legion"
+
+[tasks.proto-gen]
+run = "cargo build"
+
+[tasks.plugin-build]
+run = "cargo build --release"
