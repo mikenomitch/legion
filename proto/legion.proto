@@ -256,8 +256,19 @@ service Worker {
   rpc PostWork (PostWorkRequest) returns (PostWorkReply);
 }
 
+message TaskAllocation {
+  int64 allocation_id = 1;
+  string job_id = 2;
+  string job_config_id = 3;
+  string node_id = 4;
+  int64 task_config_id = 5;
+  string task_name = 6;
+  string task_kind = 7;
+  string task_config = 8;
+}
+
 message PostWorkRequest {
-  string message = 1;
+  TaskAllocation allocation = 1;
 }
 
 message PostWorkReply {

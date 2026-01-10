@@ -3,6 +3,7 @@ use time::OffsetDateTime;
 use tracing::info;
 
 use crate::manager::scheduler::{PlanMode, PlanOutcome, Scheduler};
+use crate::manager::dispatcher::dispatch_allocations;
 #[cfg(test)]
 use crate::prelude::Context;
 use crate::prelude::{bail, json, R};
@@ -154,7 +155,9 @@ impl Eval {
         }
 
         let scheduler = Scheduler::new(store)?;
-        scheduler.plan_and_apply(&self.job_config_id, mode)
+        let outcome = scheduler.plan_and_apply(&self.job_config_id, mode)?;
+        dispatch_allocations(store, &outcome.allocations)?;
+        Ok(outcome)
     }
 
     fn current_timestamp() -> String {

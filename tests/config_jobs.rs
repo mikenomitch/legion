@@ -104,7 +104,7 @@ fn maximal_job_spec_parse() {
 
     assert_eq!(config.name, "maximal-demo");
     assert_eq!(config.version, Some(1));
-    assert_eq!(config.tasks.len(), 2);
+    assert_eq!(config.tasks.len(), 3);
     for task in &config.tasks {
         assert!(!task.name.is_empty(), "task name should be set");
         assert!(

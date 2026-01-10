@@ -15,6 +15,7 @@ use crate::structs::{
     UpdateNodeDynamicRequest, WorkerConfig, WorkerPreRegisterReply, WorkerPreRegisterRequest,
     WorkerRegisterReply, WorkerRegisterRequest,
 };
+use crate::task_plugins::validate_job_config;
 
 use tonic::{Request, Response, Status};
 
@@ -41,6 +42,10 @@ impl Manager for ManagerAgentService {
         })?;
 
         let force_reschedule = inner.force_reschedule;
+        validate_job_config(&config).map_err(|e| {
+            error!("Error validating task configs: {:?}", e);
+            Status::invalid_argument("Error validating task configs")
+        })?;
         let submit_outcome = self.store.handle_job_submit(&config, &subs).map_err(|e| {
             error!("Error running job: {:?}", e);
             Status::internal("Error running job")
@@ -119,6 +124,10 @@ impl Manager for ManagerAgentService {
         let config = self.store.normalize_job_config(&config).map_err(|e| {
             error!("Error normalizing jobspec for plan: {:?}", e);
             Status::internal("Error normalizing jobspec")
+        })?;
+        validate_job_config(&config).map_err(|e| {
+            error!("Error validating task configs: {:?}", e);
+            Status::invalid_argument("Error validating task configs")
         })?;
 
         let scheduler = Scheduler::new(&self.store).map_err(|e| {
