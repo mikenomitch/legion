@@ -1,5 +1,5 @@
 [env]
-LEGION_ADDR = "http://127.0.0.1:4748"
+LEGION_ADDR = "http://127.0.0.1:4747"
 
 [tasks.boot]
 run = 'trap "kill 0" EXIT; cargo run -- start manager -c configs/manager.jsonnet & (cd ui && npx vite dev) & wait'
@@ -9,7 +9,7 @@ run = "LEGION_ADDR=http://127.0.0.1:4748 cargo run -- join -a"
 
 [tasks.job]
 usage = 'arg "<file>" default="./configs/jobs/mac.jsonnet"'
-run = "cargo run -- job run {{arg(name='file')}}"
+run = "cargo run job run {{arg(name='file')}}"
 
 [tasks.nuke]
 run = "rm -rf .legion"
