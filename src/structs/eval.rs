@@ -79,9 +79,21 @@ impl Eval {
     }
 
     fn handle_job_submit(&self, store: &Store) -> R<String> {
+        let previous_config_id = store.previous_job_config_id(&self.job_config_id)?;
+        if let Some(prev_id) = previous_config_id.as_ref() {
+            if store.job_configs_schedule_equivalent(prev_id, &self.job_config_id)? {
+                store.migrate_allocations_to_job_config(prev_id, &self.job_config_id)?;
+                return Ok(format!("Job {} submitted with 0 placements", self.job_id));
+            }
+        }
+
         let outcome = self.schedule_job_allocations(store, PlanMode::Fresh)?;
         if !outcome.deltas.is_empty() {
             info!(?outcome.deltas, "Job submit allocation deltas");
+        }
+
+        if let Some(prev_id) = previous_config_id {
+            store.remove_allocs_for_job_config(&prev_id)?;
         }
 
         Ok(format!(
@@ -166,12 +178,20 @@ impl Eval {
 mod tests {
     use super::*;
     use crate::storage::store::Store;
+    use crate::structs::NodeMsg;
+    use tempfile::Builder;
 
     fn setup_store() -> R<Store> {
-        let store_path = "tests/eval";
-        let _ = std::fs::remove_dir_all(store_path);
+        let store_dir = Builder::new()
+            .prefix("legion-eval-")
+            .tempdir()
+            .context("error creating temp store directory")?
+            .keep();
         let store_config = ManagerConfigFull {
-            store_path: store_path.to_string(),
+            store_path: store_dir
+                .to_str()
+                .context("error parsing store path")?
+                .to_string(),
             ..Default::default()
         };
 
@@ -182,6 +202,26 @@ mod tests {
 
     fn find_node<'a>(ledger: &'a [LedgerEntry], node_id: &str) -> Option<&'a LedgerEntry> {
         ledger.iter().find(|entry| entry.node.id == node_id)
+    }
+
+    fn make_node(id: &str, zone: &str) -> Node {
+        Node {
+            id: id.to_string(),
+            status: "ready".into(),
+            pool: "default".into(),
+            availability: "available".into(),
+            last_heartbeat: "2023-01-01T00:00:00Z".into(),
+            config_attrs: json!({ "node_id": id, "zone": zone }),
+            fingerprint_attrs: json!({
+                "memory_total": "8388608",
+                "cpus": {
+                    "cpu-1": { "frequency": "2400" },
+                    "cpu-2": { "frequency": "2400" },
+                }
+            }),
+            dynamic_attrs: json!({}),
+            health_checks: json!({}),
+        }
     }
 
     #[test]
@@ -348,6 +388,139 @@ mod tests {
         ledger = store.get_ledger()?;
         let total_allocations: usize = ledger.iter().map(|entry| entry.allocations.len()).sum();
         assert_eq!(total_allocations, 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn job_submit_update_reconciles_allocations() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(NodeMsg::from(make_node("node-a", "east")))?;
+        store.insert_node(NodeMsg::from(make_node("node-b", "west")))?;
+
+        let job_name = "update-job".to_string();
+        let base_task = TaskConfig {
+            name: "web".into(),
+            kind: "service".into(),
+            count: 1,
+            config: json!({ "message": "v1" }),
+            resources: json!({ "memory": 128 }),
+            constraints: json!({ "node_id": "node-a" }),
+            affinities: json!({}),
+        };
+
+        let job_config = JobConfig {
+            name: job_name.clone(),
+            tasks: vec![base_task.clone()],
+            version: None,
+        };
+        let job_subs = vec![Submission {
+            path: "job.jsonnet".into(),
+            content: "job".into(),
+            is_primary: true,
+        }];
+        store.handle_job_submit(&job_config, &job_subs)?;
+        let job_config_id = store.get_job_config(&job_name)?.id();
+
+        let initial_eval = Eval {
+            id: "1".into(),
+            status: "pending".into(),
+            kind: "job_submit".into(),
+            job_id: job_name.clone(),
+            job_config_id: job_config_id.clone(),
+            node_name: String::new(),
+            priority: 50,
+        };
+        initial_eval.handle(&store)?;
+
+        let initial_alloc = store
+            .allocs_for_job(&job_name)?
+            .into_iter()
+            .next()
+            .context("missing initial allocation")?;
+        assert_eq!(initial_alloc.node_id, "node-a");
+
+        let unchanged_task = TaskConfig {
+            config: json!({ "message": "v2" }),
+            ..base_task.clone()
+        };
+        let unchanged_config = JobConfig {
+            name: job_name.clone(),
+            tasks: vec![unchanged_task.clone()],
+            version: None,
+        };
+        store.handle_job_submit(&unchanged_config, &job_subs)?;
+        let unchanged_config_id = store.get_job_config(&job_name)?.id();
+        let unchanged_eval = Eval {
+            id: "2".into(),
+            status: "pending".into(),
+            kind: "job_submit".into(),
+            job_id: job_name.clone(),
+            job_config_id: unchanged_config_id.clone(),
+            node_name: String::new(),
+            priority: 50,
+        };
+        unchanged_eval.handle(&store)?;
+
+        let unchanged_allocations = store.allocs_for_job(&job_name)?;
+        assert_eq!(unchanged_allocations.len(), 1);
+        let unchanged_alloc = &unchanged_allocations[0];
+        assert_eq!(unchanged_alloc.id, initial_alloc.id);
+        assert_eq!(unchanged_alloc.node_id, "node-a");
+        assert_eq!(unchanged_alloc.job_config_id, unchanged_config_id);
+
+        let moved_task = TaskConfig {
+            constraints: json!({ "node_id": "node-b" }),
+            ..unchanged_task.clone()
+        };
+        let moved_config = JobConfig {
+            name: job_name.clone(),
+            tasks: vec![moved_task.clone()],
+            version: None,
+        };
+        store.handle_job_submit(&moved_config, &job_subs)?;
+        let moved_config_id = store.get_job_config(&job_name)?.id();
+        let moved_eval = Eval {
+            id: "3".into(),
+            status: "pending".into(),
+            kind: "job_submit".into(),
+            job_id: job_name.clone(),
+            job_config_id: moved_config_id.clone(),
+            node_name: String::new(),
+            priority: 50,
+        };
+        moved_eval.handle(&store)?;
+
+        let moved_allocations = store.allocs_for_job(&job_name)?;
+        assert_eq!(moved_allocations.len(), 1);
+        let moved_alloc = &moved_allocations[0];
+        assert_eq!(moved_alloc.node_id, "node-b");
+        assert_ne!(moved_alloc.id, initial_alloc.id);
+        assert_eq!(moved_alloc.job_config_id, moved_config_id);
+
+        let removed_task = TaskConfig {
+            count: 0,
+            ..moved_task
+        };
+        let removed_config = JobConfig {
+            name: job_name.clone(),
+            tasks: vec![removed_task],
+            version: None,
+        };
+        store.handle_job_submit(&removed_config, &job_subs)?;
+        let removed_config_id = store.get_job_config(&job_name)?.id();
+        let removed_eval = Eval {
+            id: "4".into(),
+            status: "pending".into(),
+            kind: "job_submit".into(),
+            job_id: job_name,
+            job_config_id: removed_config_id,
+            node_name: String::new(),
+            priority: 50,
+        };
+        removed_eval.handle(&store)?;
+
+        assert!(store.allocs_for_job("update-job")?.is_empty());
 
         Ok(())
     }

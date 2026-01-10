@@ -113,7 +113,8 @@ impl TestCluster {
         let job_config_id = self.store.get_job_config(&job_name)?.id();
         self.job_config_ids
             .insert(job_name.clone(), job_config_id.clone());
-        let eval_id = self.enqueue_eval("job_submit", Some(&job_name), Some(&job_config_id), None)?;
+        let eval_id =
+            self.enqueue_eval("job_submit", Some(&job_name), Some(&job_config_id), None)?;
         let _ = self.process_next_eval();
         Ok(eval_id)
     }
@@ -128,12 +129,7 @@ impl TestCluster {
 
     fn reschedule_job(&mut self, job_name: &str) -> R<()> {
         let job_config_id = self.job_config_id(job_name)?;
-        self.enqueue_eval(
-            "job_reschedule",
-            Some(job_name),
-            Some(&job_config_id),
-            None,
-        )?;
+        self.enqueue_eval("job_reschedule", Some(job_name), Some(&job_config_id), None)?;
         self.process_next_eval()?
             .context("expected job_reschedule eval")?;
         Ok(())
@@ -242,9 +238,7 @@ impl TestCluster {
     fn job_nodes(&self, job_id: &str) -> R<Vec<String>> {
         let ledger = self.ledger_json()?;
         let mut nodes = Vec::new();
-        let entries = ledger
-            .as_array()
-            .context("ledger json expected array")?;
+        let entries = ledger.as_array().context("ledger json expected array")?;
         for entry in entries {
             let node_id = entry
                 .get("node")
@@ -654,6 +648,22 @@ fn job_india() -> JobConfig {
     }
 }
 
+fn job_resubmit_config(message: &str, count: u32, node_id: &str) -> JobConfig {
+    JobConfig {
+        name: "job-resubmit".into(),
+        tasks: vec![TaskConfig {
+            name: "resubmit-task".into(),
+            kind: "service".into(),
+            count,
+            config: json!({ "message": message }),
+            resources: json!({ "memory": 128, "cpu": 100 }),
+            constraints: json!({ "node_id": node_id }),
+            affinities: json!({}),
+        }],
+        version: None,
+    }
+}
+
 fn job_score_load() -> JobConfig {
     JobConfig {
         name: "job-score-load".into(),
@@ -682,7 +692,7 @@ fn job_score_target() -> JobConfig {
     }
 }
 
-fn run_scheduler_scenario(policy: &str, node_count: usize) -> R<()> {
+fn run_scheduler_scenario(policy: &str, node_count: usize) -> R<TestCluster> {
     let mut cluster = TestCluster::new(policy)?;
     let mut nodes = base_node_specs();
     if node_count > nodes.len() {
@@ -751,7 +761,7 @@ fn run_scheduler_scenario(policy: &str, node_count: usize) -> R<()> {
     cluster.submit_job(job_india())?;
     cluster.assert_job_nodes("job-india", &["node-11"])?;
 
-    Ok(())
+    Ok(cluster)
 }
 
 fn run_scoring_scenario(policy: &str, scheduler_settings: Option<Value>) -> R<TestCluster> {
@@ -767,17 +777,35 @@ fn run_scoring_scenario(policy: &str, scheduler_settings: Option<Value>) -> R<Te
 
 #[test]
 fn scheduler_integration_spread_policy() -> R<()> {
-    run_scheduler_scenario("spread", 10)
+    let _cluster = run_scheduler_scenario("spread", 10)?;
+    Ok(())
 }
 
 #[test]
 fn scheduler_integration_bin_pack_policy() -> R<()> {
-    run_scheduler_scenario("bin_pack", 10)
+    let _cluster = run_scheduler_scenario("bin_pack", 10)?;
+    Ok(())
 }
 
 #[test]
 fn scheduler_integration_spread_policy_large_cluster() -> R<()> {
-    run_scheduler_scenario("spread", 50)
+    let mut cluster = run_scheduler_scenario("spread", 50)?;
+    let resubmit_job = "job-resubmit";
+
+    cluster.submit_job(job_resubmit_config("v1", 1, "node-6"))?;
+    cluster.assert_job_nodes(resubmit_job, &["node-6"])?;
+
+    let snapshot = cluster.snapshot_job_nodes(&[resubmit_job])?;
+    cluster.submit_job(job_resubmit_config("v2", 1, "node-6"))?;
+    cluster.assert_job_snapshot(&snapshot)?;
+
+    cluster.submit_job(job_resubmit_config("v3", 1, "node-8"))?;
+    cluster.assert_job_nodes(resubmit_job, &["node-8"])?;
+
+    cluster.submit_job(job_resubmit_config("v4", 0, "node-8"))?;
+    cluster.assert_job_absent(resubmit_job)?;
+
+    Ok(())
 }
 
 #[test]
