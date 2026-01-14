@@ -14,6 +14,7 @@ pub use exec::ExecTaskPlugin;
 pub struct TaskRuntime {
     pub state: Value,
     pub child: Option<Child>,
+    pub pid: Option<u32>,
 }
 
 pub trait TaskPlugin: Send + Sync {

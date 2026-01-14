@@ -18,6 +18,7 @@ service Manager {
   rpc HealthCheck (HealthCheckRequest) returns (HealthCheckReply);
   rpc GetNodes (GetNodesRequest) returns (GetNodesReply);
   rpc GetNode (GetNodeRequest) returns (GetNodeReply);
+  rpc RestartWorker (RestartWorkerRequest) returns (RestartWorkerReply);
   rpc GetLedger (GetLedgerRequest) returns (GetLedgerReply);
   rpc GetManagerConfigs (GetManagerConfigsRequest)
     returns (GetManagerConfigsReply);
@@ -190,6 +191,14 @@ message GetNodeReply {
   optional NodeMsg node = 1;
 }
 
+message RestartWorkerRequest {
+  string node_id = 1;
+}
+
+message RestartWorkerReply {
+  string message = 1;
+}
+
 message GetLedgerRequest {
 }
 
@@ -262,6 +271,7 @@ message Eval {
 
 service Worker {
   rpc PostWork (PostWorkRequest) returns (PostWorkReply);
+  rpc RestartWorker (RestartWorkerRequest) returns (RestartWorkerReply);
 }
 
 message TaskAllocation {

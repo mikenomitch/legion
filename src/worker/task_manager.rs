@@ -1,6 +1,7 @@
 use crate::prelude::*;
 use crate::structs::{Allocation, TaskAllocation, TaskConfig, TaskOnUnhealthyConfig};
 use crate::task_plugins::{TaskPluginRegistry, TaskRuntime};
+use crate::worker::state::{pid_is_running, PersistedAllocation, WorkerStateStore};
 use crate::worker::task_health::HealthMonitorHandle;
 use std::collections::HashMap;
 
@@ -17,10 +18,15 @@ pub struct WorkerTaskManager {
     task_configs: HashMap<i64, TaskConfig>,
     health_monitors: HashMap<i64, HealthMonitorHandle>,
     failed: Vec<FailedAllocationReport>,
+    state_store: WorkerStateStore,
 }
 
 impl WorkerTaskManager {
     pub fn new() -> Self {
+        Self::with_state_store(WorkerStateStore::new(WorkerStateStore::default_path()))
+    }
+
+    pub fn with_state_store(state_store: WorkerStateStore) -> Self {
         Self {
             registry: TaskPluginRegistry::new(),
             runtimes: HashMap::new(),
@@ -28,6 +34,7 @@ impl WorkerTaskManager {
             task_configs: HashMap::new(),
             health_monitors: HashMap::new(),
             failed: Vec::new(),
+            state_store,
         }
     }
 
@@ -82,6 +89,7 @@ impl WorkerTaskManager {
             allocation_id,
             reason: reason.into(),
         });
+        self.persist_state();
     }
 
     pub fn reconcile_allocations(
@@ -142,6 +150,7 @@ impl WorkerTaskManager {
 
         self.allocations.insert(allocation.id, allocation.clone());
         self.task_configs.insert(allocation.id, task.clone());
+        self.persist_state();
 
         Ok(())
     }
@@ -175,11 +184,88 @@ impl WorkerTaskManager {
 
         plugin.stop(allocation, task, runtime)?;
         plugin.start(allocation, task, runtime)?;
+        self.persist_state();
         Ok(())
     }
 
     pub fn register_health_monitor(&mut self, allocation_id: i64, handle: HealthMonitorHandle) {
         self.health_monitors.insert(allocation_id, handle);
+    }
+
+    pub fn restore_allocations(&mut self) -> R<Vec<(Allocation, TaskConfig)>> {
+        let persisted = self.state_store.load()?;
+        let mut active = Vec::new();
+        let mut restored = Vec::new();
+
+        for record in persisted {
+            let Some(pid) = record.pid else {
+                warn!(
+                    allocation_id = record.allocation.id,
+                    task_name = %record.task.name,
+                    "Skipping persisted allocation without pid"
+                );
+                continue;
+            };
+            if !pid_is_running(pid) {
+                warn!(
+                    allocation_id = record.allocation.id,
+                    task_name = %record.task.name,
+                    pid,
+                    "Skipping persisted allocation with dead pid"
+                );
+                continue;
+            }
+
+            let runtime = TaskRuntime {
+                pid: Some(pid),
+                ..TaskRuntime::default()
+            };
+            self.runtimes.insert(record.allocation.id, runtime);
+            self.allocations
+                .insert(record.allocation.id, record.allocation.clone());
+            self.task_configs
+                .insert(record.allocation.id, record.task.clone());
+            active.push(record.clone());
+            restored.push((record.allocation, record.task));
+        }
+
+        self.persist_state_with(&active);
+
+        Ok(restored)
+    }
+
+    fn persist_state(&self) {
+        let mut records = Vec::new();
+        for (allocation_id, allocation) in &self.allocations {
+            let Some(task) = self.task_configs.get(allocation_id) else {
+                continue;
+            };
+            let pid = self
+                .runtimes
+                .get(allocation_id)
+                .and_then(|runtime| runtime.pid);
+            if pid.is_none() {
+                warn!(
+                    allocation_id = allocation_id,
+                    task_name = %task.name,
+                    "Skipping persistence for allocation without pid"
+                );
+                continue;
+            }
+            records.push(PersistedAllocation {
+                allocation: allocation.clone(),
+                task: task.clone(),
+                pid,
+            });
+        }
+
+        self.persist_state_with(&records);
+    }
+
+    fn persist_state_with(&self, records: &[PersistedAllocation]) {
+        if let Err(err) = self.state_store.save(records) {
+            warn!(error = ?err, "Failed to persist worker allocation state");
+        }
     }
 }
 
@@ -220,7 +306,12 @@ fn task_from_allocation(allocation: &TaskAllocation) -> R<(Allocation, TaskConfi
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::structs::{TaskCheck, TaskCheckKind, TaskCheckType};
+    use crate::worker::task_health::spawn_health_monitor;
     use serde_json::json;
+    use std::thread;
+    use std::time::Duration;
+    use tempfile::TempDir;
 
     fn alloc() -> Allocation {
         Allocation {
@@ -236,7 +327,9 @@ mod tests {
 
     #[test]
     fn worker_task_manager_runs_exec_plugin() -> R<()> {
-        let mut manager = WorkerTaskManager::new();
+        let temp_dir = TempDir::new()?;
+        let state_store = WorkerStateStore::new(temp_dir.path().join("worker_state.json"));
+        let mut manager = WorkerTaskManager::with_state_store(state_store);
         manager.load_builtin_plugins();
         let task = TaskConfig {
             config: json!({"command": "true"}),
@@ -244,6 +337,73 @@ mod tests {
         };
 
         manager.run_allocation(&alloc(), &task)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn worker_restores_allocations_and_monitors() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let state_path = temp_dir.path().join("worker_state.json");
+
+        let state_store = WorkerStateStore::new(state_path.clone());
+        let mut manager = WorkerTaskManager::with_state_store(state_store);
+        manager.load_builtin_plugins();
+
+        let allocation = alloc();
+        let task = TaskConfig {
+            config: json!({"command": "sleep", "args": ["5"]}),
+            checks: vec![TaskCheck {
+                check_type: TaskCheckType::Health,
+                name: Some("heartbeat".into()),
+                kind: TaskCheckKind::Exec,
+                command: Some("true".into()),
+                args: None,
+                path: None,
+                port: None,
+                every: Duration::from_millis(50),
+                timeout: Duration::from_millis(50),
+                unhealthy_after_count: 3,
+                boot_grace_time: None,
+                unhealthy_after_count_timespan: None,
+            }],
+            ..TaskConfig::new("exec-task", "exec")
+        };
+
+        manager.run_allocation(&allocation, &task)?;
+
+        thread::sleep(Duration::from_millis(50));
+
+        let mut restarted_manager =
+            WorkerTaskManager::with_state_store(WorkerStateStore::new(state_path));
+        restarted_manager.load_builtin_plugins();
+
+        let restored = restarted_manager.restore_allocations()?;
+        assert_eq!(restored.len(), 1);
+
+        let manager = Arc::new(Mutex::new(restarted_manager));
+        let (restored_alloc, restored_task) = restored.into_iter().next().unwrap();
+        spawn_health_monitor(manager.clone(), restored_alloc, restored_task);
+
+        {
+            let guard = manager.lock().expect("task manager");
+            assert!(guard.health_monitors.contains_key(&allocation.id));
+        }
+
+        let pid = {
+            let guard = manager.lock().expect("task manager");
+            guard
+                .runtimes
+                .get(&allocation.id)
+                .and_then(|runtime| runtime.pid)
+                .context("pid missing")?
+        };
+
+        let mut system = sysinfo::System::new();
+        system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+        if let Some(process) = system.process(sysinfo::Pid::from_u32(pid)) {
+            process.kill();
+        }
+
         Ok(())
     }
 }

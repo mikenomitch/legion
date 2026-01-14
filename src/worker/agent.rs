@@ -9,6 +9,7 @@ use crate::util::random_string;
 use crate::worker::{
     node_check::{fingerprint_node, run_health_checks},
     server::WorkerAgentService,
+    state::WorkerStateStore,
     task_health::spawn_health_monitor,
     task_manager::WorkerTaskManager,
 };
@@ -36,11 +37,20 @@ pub async fn run_worker(token: &str) -> R<()> {
     }
 
     let addr = format!("{DEF_MANAGER_HOSTNAME}:{DEF_WORKER_SERVER_PORT}").parse()?;
-    let task_manager = Arc::new(Mutex::new(WorkerTaskManager::new()));
-    task_manager
-        .lock()
-        .expect("task manager")
-        .load_builtin_plugins();
+    let task_manager = Arc::new(Mutex::new(WorkerTaskManager::with_state_store(
+        WorkerStateStore::new(WorkerStateStore::default_path()),
+    )));
+    let restored_allocations = {
+        let mut manager = task_manager.lock().expect("task manager");
+        manager.load_builtin_plugins();
+        manager.restore_allocations().unwrap_or_else(|err| {
+            warn!(error = ?err, "Failed to restore persisted allocations");
+            Vec::new()
+        })
+    };
+    for (allocation, task) in restored_allocations {
+        spawn_health_monitor(task_manager.clone(), allocation, task);
+    }
     let worker_node = WorkerAgentService {
         task_manager: task_manager.clone(),
     };

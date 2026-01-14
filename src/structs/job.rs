@@ -254,7 +254,7 @@ impl Default for TaskOnUnhealthyConfig {
     }
 }
 
-#[derive(Serialize, Debug, Clone, Default, PartialEq, Tabled)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Tabled)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskConfig {
     pub name: String,

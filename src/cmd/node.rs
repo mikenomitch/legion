@@ -1,6 +1,9 @@
 use crate::cmd::helpers::{connect_manager_client, json_flag, print_table};
 use crate::prelude::*;
-use crate::structs::{GetNodeRequest, GetNodesRequest, Node, NodePrint, UpdateNodeDynamicRequest};
+use crate::structs::{
+    GetNodeRequest, GetNodesRequest, Node, NodePrint, RestartWorkerRequest,
+    UpdateNodeDynamicRequest,
+};
 use serde_json::to_string;
 
 pub fn config() -> Command {
@@ -41,6 +44,16 @@ pub fn config() -> Command {
         )
         .arg(json_flag());
 
+    let restart_node_cmd = Command::new("restart")
+        .about("Restart a worker node")
+        .arg(
+            Arg::new("id")
+                .value_name("ID")
+                .help("Identifier of the node to restart")
+                .required(true),
+        )
+        .arg(json_flag());
+
     Command::new("node")
         .about("Interact with nodes")
         .subcommand_required(true)
@@ -48,6 +61,7 @@ pub fn config() -> Command {
         .subcommand(get_nodes_cmd)
         .subcommand(update_node_cmd)
         .subcommand(node_info_cmd)
+        .subcommand(restart_node_cmd)
 }
 
 #[instrument(err, skip_all)]
@@ -101,6 +115,14 @@ pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
 
             let is_json = arg_matches.get_flag("json");
             get_node_info(id.to_string(), is_json).await
+        }
+        Some(("restart", arg_matches)) => {
+            let id = arg_matches
+                .get_one::<String>("id")
+                .context("Must provide id")?;
+
+            let is_json = arg_matches.get_flag("json");
+            restart_node(id.to_string(), is_json).await
         }
         _ => unreachable!(),
     }
@@ -173,4 +195,35 @@ async fn get_node_info(node_id: String, is_json: bool) -> R<()> {
     }
 
     Ok(())
+}
+
+#[instrument(err, skip_all)]
+async fn restart_node(node_id: String, is_json: bool) -> R<()> {
+    let mut client = connect_manager_client().await?;
+    let request = tonic::Request::new(RestartWorkerRequest { node_id });
+    let response = client.restart_worker(request).await?;
+    let reply = response.into_inner();
+
+    if is_json {
+        println!("{}", json!({ "message": reply.message }));
+    } else {
+        println!("{}", reply.message);
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn node_restart_command_parses() -> R<()> {
+        let matches = config().try_get_matches_from(["node", "restart", "node-1"])?;
+        let (subcommand, args) = matches.subcommand().context("Missing subcommand")?;
+        assert_eq!(subcommand, "restart");
+        let id = args.get_one::<String>("id").context("Missing id")?;
+        assert_eq!(id, "node-1");
+        Ok(())
+    }
 }
