@@ -4,7 +4,7 @@
 
 # Other shovel ready work
 
-- Nicer errors in CLI commands for various failures
+- Nicer errors in CLI commands for various failures - Codex
   - Nice storage errors generally
     - I think I'll have to have different error types
       for the storage layer that the sql errors translate into

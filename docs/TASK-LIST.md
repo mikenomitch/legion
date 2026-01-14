@@ -10,7 +10,7 @@
   - [x] It has dynamic attributes that can be updated (I think this is done?) - Codexed
   - [x] It properly shows up in the manager's ledger of worker nodes (is this done?)
   - [ ] It can be reconfigured from the server
-  - [ ] It can be restarted from the server
+  - [ ] It can be restarted from the server - Codex
   - [ ] TLS is autoconfigured and auto-rotated
 
 - [ ] Scheduling
@@ -21,21 +21,22 @@
   - [x] A "bin-pack" scheduler works
   - [x] A "spread" scheduler works (inverse of bin-pack)
   - [x] Affinities and anti-affinities work
+  - [ ] Some task group equivalent works
   - [ ] Worker groups + taint/toleration equiv
   - [ ] Scheduling on same node as existing job works
   - [ ] Priorities and eviction works (eviction toggled at the pool level)
-  - [ ] Rescheduling works
-    - [ ] A node attr change will update a job's placement
-    - [ ] Health checks trigger reschedule (after restart)
+  - [x] Rescheduling works
+    - [x] Health checks trigger reschedule (after restart)
   - [ ] Dynamic metadata
-    - [ ] Job health check reschedules a job
-      - [ ] Initial failures restart the job
-      - [ ] Failure after N times forces a reschedule
+    - [ ] A node attr change will update a job's placement
+  - [x] Job health check reschedules a job
+    - [x] Initial failures restart the job
+    - [x] Failure after N times forces a reschedule
 
 - [ ] Running workloads
-  - [ ] A framework is set up to run workload plugins
-  - [ ] A "noop" kind "works"
-  - [ ] An "exec" kind works
+  - [x] A framework is set up to run workload plugins
+  - [ ] A "noop" kind "works" - Test
+  - [ ] An "exec" kind works - Test
     - [ ] The command and args given are run
     - [ ] It runs as a specific user
     - [ ] Unveil works properly
@@ -48,6 +49,10 @@
         1. Think about Kamal
         2. Think about local dev
   - [ ] A "WASM" kind works
+ 
+- [ ] Make something for the AIs to use this
+  - Self-documenting CLI tool for agents
+  - Everything has an easily accessible type and spec
   
 - [ ] Artifact system
   - [ ] Able to grab docker images
