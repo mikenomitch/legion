@@ -1,6 +1,7 @@
 import { For, Show, type Resource } from 'solid-js'
 import type { LedgerNode } from '../gen/legion_pb'
 import { asDisplay, formatRelativeTime } from '../utils/format'
+import { healthToneClasses, summarizeHealthChecks } from '../utils/health'
 
 interface HomepageProps {
   ledger: Resource<readonly LedgerNode[] | undefined>
@@ -49,6 +50,16 @@ export default function Homepage(props: HomepageProps) {
                         <For each={item.allocations}>
                           {(allocation) => (
                             <div class="rounded border border-neutral-200 bg-neutral-50 p-3 dark:border-neutral-800 dark:bg-neutral-950/60">
+                              {(() => {
+                                const healthSummary = summarizeHealthChecks(item.node?.healthChecks)
+                                return (
+                                  <div class="mb-2 flex flex-wrap items-center gap-2 text-[11px] uppercase tracking-wide">
+                                    <span class={`rounded border px-2 py-1 ${healthToneClasses(healthSummary.tone)}`}>
+                                      {healthSummary.label}
+                                    </span>
+                                  </div>
+                                )
+                              })()}
                               <div class="flex flex-wrap items-center justify-between gap-2 text-sm text-neutral-900 dark:text-neutral-100">
                                 <span class="font-semibold">Allocation #{asDisplay(allocation.id)}</span>
                                 <span class="rounded border border-neutral-300 px-2 py-1 text-[11px] uppercase tracking-wide dark:border-neutral-700">

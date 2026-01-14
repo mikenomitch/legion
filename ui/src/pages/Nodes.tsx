@@ -1,6 +1,7 @@
 import { For, Show, createMemo, createSignal, type JSX, type Resource } from 'solid-js'
 import type { LedgerAllocation, LedgerNode, NodeMsg } from '../gen/legion_pb'
 import { formatRelativeTime } from '../utils/format'
+import { healthToneClasses, summarizeHealthChecks } from '../utils/health'
 
 interface NodesProps {
   nodes: Resource<readonly NodeMsg[] | undefined>
@@ -431,6 +432,7 @@ export default function Nodes(props: NodesProps) {
                   const signalsData = extractField(dynamicData, 'signals') ?? extractField(fingerprintData, 'signals')
                   const healthData = parseAttributes(node.healthChecks)
                   const formattedHealth = prettifyData(healthData ?? node.healthChecks)
+                  const healthSummary = summarizeHealthChecks(node.healthChecks)
                   const allocations = allocationsByNode().get(node.id) ?? []
                   const resourceUsage = buildResourceUsage(configData, fingerprintData, allocations)
 
@@ -457,6 +459,49 @@ export default function Nodes(props: NodesProps) {
                       </div>
 
                       <div class="mt-4 space-y-3">
+                        <div class="rounded border border-neutral-200 bg-neutral-50 p-3 shadow-sm dark:border-neutral-800 dark:bg-neutral-900/60">
+                          <div class="flex items-center justify-between">
+                            <h4 class="text-sm font-semibold text-neutral-900 dark:text-neutral-100">Allocations</h4>
+                            <span class="text-[11px] uppercase tracking-[0.12em] text-neutral-500 dark:text-neutral-400">
+                              {allocations.length} total
+                            </span>
+                          </div>
+                          <Show
+                            when={allocations.length > 0}
+                            fallback={<p class="mt-2 text-sm text-neutral-500">No allocations assigned.</p>}
+                          >
+                            <div class="mt-3 space-y-2">
+                              <For each={allocations}>
+                                {(allocation) => (
+                                  <div class="rounded border border-neutral-200 bg-white px-3 py-2 text-sm text-neutral-800 shadow-sm dark:border-neutral-800 dark:bg-neutral-950/60 dark:text-neutral-200">
+                                    <div class="flex flex-wrap items-center justify-between gap-2">
+                                      <span class="font-semibold">Allocation #{allocation.id}</span>
+                                      <div class="flex flex-wrap items-center gap-2 text-[11px] uppercase tracking-wide">
+                                        <span class={`rounded border px-2 py-1 ${healthToneClasses(healthSummary.tone)}`}>
+                                          {healthSummary.label}
+                                        </span>
+                                        <span class="rounded border border-neutral-300 px-2 py-1 dark:border-neutral-700">
+                                          {allocation.status || 'Unknown'}
+                                        </span>
+                                      </div>
+                                    </div>
+                                    <div class="mt-2 flex flex-wrap gap-2 text-xs text-neutral-600 dark:text-neutral-400">
+                                      <span class="rounded border border-neutral-200 bg-neutral-50 px-2 py-1 dark:border-neutral-800 dark:bg-neutral-900">
+                                        Job: {allocation.jobId || '—'}
+                                      </span>
+                                      <span class="rounded border border-neutral-200 bg-neutral-50 px-2 py-1 dark:border-neutral-800 dark:bg-neutral-900">
+                                        Job Config: {allocation.jobConfigId || '—'}
+                                      </span>
+                                      <span class="rounded border border-neutral-200 bg-neutral-50 px-2 py-1 dark:border-neutral-800 dark:bg-neutral-900">
+                                        Task Config: {allocation.taskConfigId || '—'}
+                                      </span>
+                                    </div>
+                                  </div>
+                                )}
+                              </For>
+                            </div>
+                          </Show>
+                        </div>
                         <div class="rounded border border-neutral-200 bg-neutral-50 p-3 shadow-sm dark:border-neutral-800 dark:bg-neutral-900/60">
                           <div class="flex items-center justify-between">
                             <h4 class="text-sm font-semibold text-neutral-900 dark:text-neutral-100">Resource Usage</h4>
@@ -555,7 +600,9 @@ export default function Nodes(props: NodesProps) {
                           <div class="rounded border border-neutral-200 bg-neutral-50 p-3 shadow-sm dark:border-neutral-800 dark:bg-neutral-900/60">
                             <div class="flex items-center justify-between">
                               <h4 class="text-sm font-semibold text-neutral-900 dark:text-neutral-100">Health Checks</h4>
-                              <span class="text-[11px] uppercase tracking-[0.12em] text-neutral-500 dark:text-neutral-400">Status</span>
+                              <span class={`rounded border px-2 py-1 text-[11px] uppercase tracking-wide ${healthToneClasses(healthSummary.tone)}`}>
+                                {healthSummary.label}
+                              </span>
                             </div>
                             <Show
                               when={formattedHealth.trim().length > 0}
