@@ -686,6 +686,10 @@ impl Store {
 
         self.cache_nodes_lost(ids)?;
 
+        for node_id in ids {
+            self.reschedule_allocations_for_lost_node(node_id)?;
+        }
+
         Ok(())
     }
 
@@ -2241,6 +2245,42 @@ mod tests {
         let node_one = store.get_node("node-one")?;
         assert_eq!(node_one.status, "active");
         assert_eq!(node_one.availability, "available");
+
+        Ok(())
+    }
+
+    #[test]
+    fn mark_nodes_as_lost_reschedules_allocations() -> R<()> {
+        let store = setup_store()?;
+
+        store.insert_node(make_node_msg("node-one", "active"))?;
+        store.insert_node(make_node_msg("node-two", "active"))?;
+
+        let job = JobConfig {
+            name: "lost-reschedule".into(),
+            tasks: vec![task("worker")],
+            version: None,
+        };
+
+        store.handle_job_submit(
+            &job,
+            &[Submission {
+                path: "job.jsonnet".into(),
+                content: "{}".into(),
+                is_primary: true,
+            }],
+        )?;
+
+        let task_id = task_id_for(&store, "worker", &job.name)?;
+        store.place_alloc("node-one", task_id)?;
+
+        store.mark_nodes_as_lost(&["node-one".to_string()])?;
+
+        let node_one_allocs = store.allocs_for_node("node-one")?;
+        let node_two_allocs = store.allocs_for_node("node-two")?;
+
+        assert!(node_one_allocs.is_empty());
+        assert_eq!(node_two_allocs.len(), 1);
 
         Ok(())
     }
