@@ -4,8 +4,8 @@ use libloading::{Library, Symbol};
 
 mod node_checkers;
 
+use crate::util::plugin_root_dir;
 use node_checkers::{ArchNodeChecker, DiskChecker, KitchenSinkNodeChecker, OSNodeChecker};
-use std::path::PathBuf;
 
 // NOTE: Improve current fingerprinters:
 // Network - speed, IP addresses, etc
@@ -49,7 +49,10 @@ pub fn fingerprint_node(additional_node_checks: Vec<String>) -> Map<String, Valu
 }
 
 #[instrument(skip_all)]
-pub fn run_health_checks(additional_node_checks: Vec<String>) -> Map<String, Value> {
+pub fn run_health_checks(
+    additional_node_checks: Vec<String>,
+    task_readiness: Option<Map<String, Value>>,
+) -> Map<String, Value> {
     let fps: Vec<Box<dyn NodeChecker>> = vec![Box::new(DiskChecker {})];
 
     let mut ret = Map::new();
@@ -70,12 +73,15 @@ pub fn run_health_checks(additional_node_checks: Vec<String>) -> Map<String, Val
             }
         });
 
+    if let Some(readiness) = task_readiness {
+        ret.insert("task_plugins".into(), Value::Object(readiness));
+    }
+
     ret
 }
 
 fn fp_plugin_name_to_path(name: &str) -> String {
-    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.push("plugins");
+    let mut path = plugin_root_dir();
     path.push("node_checks");
     path.push(name);
     path.push("target");

@@ -3,12 +3,12 @@ use crate::prelude::*;
 use crate::resources::ResourcePolicy;
 use crate::storage::migrations::get_migrations;
 use crate::storage::queries::{
-    GET_ALLOCS, GET_ALLOCS_FOR_JOB, GET_ALLOCS_FOR_JOB_CONFIG, GET_ALLOCS_FOR_NODE, GET_EVALS,
-    GET_JOB, GET_JOBS, GET_JOB_CONFIG, GET_JOB_CONFIG_BY_ID, GET_JOB_UPDATE_FOR_CONFIG,
-    GET_MANAGER_CONFIGS, GET_NEXT_EVAL, GET_NODE, GET_NODES, GET_TASK_FOR_JOB_CONIFG,
-    GET_WORKER_TYPE, INSERT_ALLOCATION, INSERT_EVAL, INSERT_JOB, INSERT_JOB_CONFIG,
-    INSERT_JOB_CONFIG_SUBMISSION, INSERT_JOB_UPDATE, INSERT_NODE, INSERT_SUBMISSION, INSERT_TASK,
-    INSERT_WORKER_TYPE, NODE_ATTRS, UPSERT_MANAGER_CONFIG,
+    GET_ALLOCATION_BY_ID, GET_ALLOCS, GET_ALLOCS_FOR_JOB, GET_ALLOCS_FOR_JOB_CONFIG,
+    GET_ALLOCS_FOR_NODE, GET_EVALS, GET_JOB, GET_JOBS, GET_JOB_CONFIG, GET_JOB_CONFIG_BY_ID,
+    GET_JOB_UPDATE_FOR_CONFIG, GET_MANAGER_CONFIGS, GET_NEXT_EVAL, GET_NODE, GET_NODES,
+    GET_TASK_FOR_JOB_CONIFG, GET_WORKER_TYPE, INSERT_ALLOCATION, INSERT_EVAL, INSERT_JOB,
+    INSERT_JOB_CONFIG, INSERT_JOB_CONFIG_SUBMISSION, INSERT_JOB_UPDATE, INSERT_NODE,
+    INSERT_SUBMISSION, INSERT_TASK, INSERT_WORKER_TYPE, NODE_ATTRS, UPSERT_MANAGER_CONFIG,
 };
 use crate::structs::{
     Allocation, Eval, Job, JobConfig, LedgerEntry, ManagerConfigFull, ManagerNodeConfig, Node,
@@ -1472,6 +1472,31 @@ impl Store {
         }
 
         Ok(allocs)
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn get_allocation_by_id(&self, allocation_id: i64) -> R<Option<Allocation>> {
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare(GET_ALLOCATION_BY_ID.as_str())?;
+        let allocation = stmt
+            .query_row([allocation_id], |row| self.allocation_from_row(row))
+            .optional()?;
+        Ok(allocation)
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn remove_allocation_by_id(&self, allocation_id: i64) -> R<Option<Allocation>> {
+        let allocation = self.get_allocation_by_id(allocation_id)?;
+        let Some(allocation) = allocation else {
+            return Ok(None);
+        };
+
+        let conn = self.write_connection()?;
+        conn.execute("DELETE FROM allocation WHERE id = ?;", [allocation_id])?;
+
+        self.cache_remove_allocations(std::slice::from_ref(&allocation))?;
+
+        Ok(Some(allocation))
     }
 
     #[instrument(err, skip_all)]

@@ -9,6 +9,7 @@ use crate::util::random_string;
 use crate::worker::{
     node_check::{fingerprint_node, run_health_checks},
     server::WorkerAgentService,
+    task_manager::WorkerTaskManager,
 };
 
 use futures::join;
@@ -33,8 +34,15 @@ pub async fn run_worker(token: &str) -> R<()> {
         info!("Skipping expiry validation check on join token");
     }
 
-    let addr = format!("{DEF_MANAGER_HOSTNAME}:4848").parse()?;
-    let worker_node = WorkerAgentService {};
+    let addr = format!("{DEF_MANAGER_HOSTNAME}:{DEF_WORKER_SERVER_PORT}").parse()?;
+    let task_manager = Arc::new(Mutex::new(WorkerTaskManager::new()));
+    task_manager
+        .lock()
+        .expect("task manager")
+        .load_builtin_plugins();
+    let worker_node = WorkerAgentService {
+        task_manager: task_manager.clone(),
+    };
     let worker_server_fut = Server::builder()
         .add_service(WorkerServer::new(worker_node))
         .serve(addr);
@@ -63,7 +71,11 @@ pub async fn run_worker(token: &str) -> R<()> {
     };
 
     let fingerprint_data = fingerprint_node(config.additional_node_checks.clone());
-    let health_checks = run_health_checks(config.additional_node_checks.clone());
+    let readiness = task_manager
+        .lock()
+        .expect("task manager")
+        .readiness_checks();
+    let health_checks = run_health_checks(config.additional_node_checks.clone(), Some(readiness));
 
     let mut config_attrs = Map::new();
     for (key, value) in config.attributes {
@@ -77,6 +89,13 @@ pub async fn run_worker(token: &str) -> R<()> {
     if let Some(max_allocations) = config.max_allocations {
         config_attrs.insert("maxAllocations".into(), json!(max_allocations));
     }
+    config_attrs.insert(
+        "workerAddress".into(),
+        Value::String(format!(
+            "http://{}:{}",
+            DEF_MANAGER_HOSTNAME, DEF_WORKER_SERVER_PORT
+        )),
+    );
 
     register_self(
         client.clone(),
@@ -88,8 +107,13 @@ pub async fn run_worker(token: &str) -> R<()> {
     )
     .await?;
 
-    let heartbeat_fut = start_heartbeats(name.clone(), client.clone());
-    let checks_fut = start_node_checks(name.clone(), config.additional_node_checks.clone(), client);
+    let heartbeat_fut = start_heartbeats(name.clone(), client.clone(), task_manager.clone());
+    let checks_fut = start_node_checks(
+        name.clone(),
+        config.additional_node_checks.clone(),
+        client,
+        task_manager.clone(),
+    );
     let _res = join!(heartbeat_fut, checks_fut, worker_server_fut);
 
     Ok(())
@@ -112,14 +136,42 @@ async fn create_manager_client(
 }
 
 #[instrument(err, skip_all)]
-async fn start_heartbeats(name: String, client: ManagerClient<Channel>) -> R<()> {
+async fn start_heartbeats(
+    name: String,
+    client: ManagerClient<Channel>,
+    task_manager: Arc<Mutex<WorkerTaskManager>>,
+) -> R<()> {
     let mut client_clone = client.clone();
 
     loop {
-        let req = tonic::Request::new(HeartbeatRequest { id: name.clone() });
+        let (allocations, failures) = {
+            let mut manager = task_manager.lock().expect("task manager");
+            let failures = manager
+                .drain_failures()
+                .into_iter()
+                .map(|failure| crate::structs::FailedAllocation {
+                    allocation_id: failure.allocation_id,
+                    reason: failure.reason,
+                })
+                .collect::<Vec<_>>();
+            (manager.allocations_snapshot(), failures)
+        };
+
+        let req = tonic::Request::new(HeartbeatRequest {
+            id: name.clone(),
+            allocation_ids: allocations,
+            failed_allocations: failures,
+        });
 
         let response = client_clone.heartbeat(req).await?;
         info!("RESPONSE={:?}", response);
+        let reply = response.into_inner();
+        if !reply.desired_allocations.is_empty() {
+            task_manager
+                .lock()
+                .expect("task manager")
+                .reconcile_allocations(&reply.desired_allocations);
+        }
 
         tokio::time::sleep(tokio::time::Duration::from_secs(
             WORKER_HEARTBEAT_DURATION_SEC,
@@ -133,13 +185,19 @@ async fn start_node_checks(
     name: String,
     additional_node_checks: Vec<String>,
     client: ManagerClient<Channel>,
+    task_manager: Arc<Mutex<WorkerTaskManager>>,
 ) -> R<()> {
     let mut client_clone = client.clone();
 
-    let checks_data = run_health_checks(additional_node_checks);
-    let serialized_health_check_data = serde_json::to_string(&checks_data)?;
-
     loop {
+        let checks_data = {
+            let readiness = task_manager
+                .lock()
+                .expect("task manager")
+                .readiness_checks();
+            run_health_checks(additional_node_checks.clone(), Some(readiness))
+        };
+        let serialized_health_check_data = serde_json::to_string(&checks_data)?;
         let req = tonic::Request::new(HealthCheckRequest {
             id: name.clone(),
             health_checks: serialized_health_check_data.clone(),

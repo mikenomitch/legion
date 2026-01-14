@@ -3,8 +3,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let skip_plugins = std::env::var("LEGION_SKIP_PLUGIN_BUILD").is_ok();
     let build_plugins = std::env::var("LEGION_BUILD_PLUGINS").is_ok();
+    let plugin_root = std::env::var("LEGION_PLUGIN_DIR").unwrap_or_else(|_| "plugins".into());
     if build_plugins && !skip_plugins {
-        println!("cargo:rerun-if-changed=plugins");
+        println!("cargo:rerun-if-changed={plugin_root}");
     }
 
     tonic_build::configure()
@@ -24,7 +25,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let plugin_target_root = manifest_dir.join("target").join("plugin-build");
 
         // For every plugin of every kind, build a release.
-        std::fs::read_dir("./plugins")?
+        std::fs::read_dir(&plugin_root)?
             .filter_map(|entry| {
                 let entry = entry.ok()?;
                 let path = entry.path();

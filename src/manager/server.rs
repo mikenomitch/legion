@@ -2,19 +2,21 @@ use std::collections::HashMap;
 
 use crate::prelude::*;
 
+use crate::manager::dispatcher::build_task_allocation;
 use crate::manager::scheduler::{PlanConfigOutcome, PlanMode, Scheduler};
 use crate::storage::store::{JobSubmitOutcome, Store};
 use crate::structs::manager_server::Manager;
 use crate::structs::{
-    DestroyJobReply, DestroyJobRequest, GetJobInfoReply, GetJobInfoRequest, GetJobSpecReply,
-    GetJobSpecRequest, GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply,
+    DestroyJobReply, DestroyJobRequest, FailedAllocation, GetJobInfoReply, GetJobInfoRequest,
+    GetJobSpecReply, GetJobSpecRequest, GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply,
     GetManagerConfigsRequest, GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest,
     HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, JobConfig, LedgerNode,
     ListJobsReply, ListJobsRequest, NodeMsg, PlanJobReply, PlanJobRequest, PlannedAllocation,
-    RunJobReply, RunJobRequest, StopJobReply, StopJobRequest, UpdateNodeDynamicReply,
+    RunJobReply, RunJobRequest, StopJobReply, StopJobRequest, TaskConfig, UpdateNodeDynamicReply,
     UpdateNodeDynamicRequest, WorkerConfig, WorkerPreRegisterReply, WorkerPreRegisterRequest,
     WorkerRegisterReply, WorkerRegisterRequest,
 };
+use crate::task_plugins::validate_job_config;
 
 use tonic::{Request, Response, Status};
 
@@ -41,6 +43,10 @@ impl Manager for ManagerAgentService {
         })?;
 
         let force_reschedule = inner.force_reschedule;
+        validate_job_config(&config).map_err(|e| {
+            error!("Error validating task configs: {:?}", e);
+            Status::invalid_argument("Error validating task configs")
+        })?;
         let submit_outcome = self.store.handle_job_submit(&config, &subs).map_err(|e| {
             error!("Error running job: {:?}", e);
             Status::internal("Error running job")
@@ -119,6 +125,10 @@ impl Manager for ManagerAgentService {
         let config = self.store.normalize_job_config(&config).map_err(|e| {
             error!("Error normalizing jobspec for plan: {:?}", e);
             Status::internal("Error normalizing jobspec")
+        })?;
+        validate_job_config(&config).map_err(|e| {
+            error!("Error validating task configs: {:?}", e);
+            Status::invalid_argument("Error validating task configs")
         })?;
 
         let scheduler = Scheduler::new(&self.store).map_err(|e| {
@@ -335,15 +345,27 @@ impl Manager for ManagerAgentService {
         &self,
         request: Request<HeartbeatRequest>,
     ) -> Result<Response<HeartbeatReply>, Status> {
-        let id = request.into_inner().id;
+        let req = request.into_inner();
+        let id = req.id;
 
         self.store.update_node_heartbeat(id.clone()).map_err(|e| {
             error!("Error updading node heartbeat. Node ID: {}: {:?}", id, e);
             Status::internal("Error updading node heartbeat")
         })?;
 
+        if let Err(err) = handle_failed_allocations(&self.store, &id, &req.failed_allocations) {
+            error!(node_id = %id, error = ?err, "Error handling failed allocations");
+        }
+
+        let desired_allocations = build_desired_allocations(&self.store, &id, &req.allocation_ids)
+            .map_err(|e| {
+                error!("Error building desired allocations: {:?}", e);
+                Status::internal("Error building desired allocations")
+            })?;
+
         let reply = HeartbeatReply {
             message: "ack".into(),
+            desired_allocations,
         };
 
         Ok(Response::new(reply))
@@ -373,6 +395,8 @@ impl Manager for ManagerAgentService {
 
         Ok(Response::new(reply))
     }
+
+    // ...
 
     #[instrument(skip_all)]
     async fn worker_pre_register(
@@ -552,5 +576,206 @@ impl Manager for ManagerAgentService {
         let reply: GetLedgerReply = GetLedgerReply { nodes };
 
         Ok(Response::new(reply))
+    }
+}
+
+fn handle_failed_allocations(store: &Store, node_id: &str, failed: &[FailedAllocation]) -> R<()> {
+    for failure in failed {
+        let allocation_id = failure.allocation_id;
+        let Some(allocation) = store.get_allocation_by_id(allocation_id)? else {
+            warn!(
+                allocation_id,
+                node_id, "Failed allocation not found; skipping reschedule"
+            );
+            continue;
+        };
+
+        store.remove_allocation_by_id(allocation_id)?;
+        store.enqueue_eval(
+            "job_reschedule",
+            Some(&allocation.job_id),
+            Some(&allocation.job_config_id),
+            Some(node_id),
+            None,
+        )?;
+
+        warn!(
+            allocation_id,
+            node_id,
+            reason = %failure.reason,
+            "Allocation reported failed; reschedule requested"
+        );
+    }
+
+    Ok(())
+}
+
+fn build_desired_allocations(
+    store: &Store,
+    node_id: &str,
+    reported_allocations: &[i64],
+) -> R<Vec<crate::structs::TaskAllocation>> {
+    let desired = store.allocs_for_node(node_id)?;
+    if desired.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let reported: std::collections::HashSet<i64> = reported_allocations.iter().copied().collect();
+    let mut task_cache: HashMap<String, HashMap<i64, TaskConfig>> = HashMap::new();
+    let mut allocations = Vec::new();
+
+    for allocation in desired {
+        if reported.contains(&allocation.id) {
+            continue;
+        }
+
+        let tasks = task_cache
+            .entry(allocation.job_config_id.clone())
+            .or_insert_with(HashMap::new);
+        if tasks.is_empty() {
+            let task_configs = store.get_task_configs_for_job_config(&allocation.job_config_id)?;
+            for (id, config) in task_configs {
+                tasks.insert(id, config);
+            }
+        }
+        let task = tasks
+            .get(&allocation.task_config_id)
+            .with_context(|| format!("Missing task config {}", allocation.task_config_id))?;
+        allocations.push(build_task_allocation(task, &allocation)?);
+    }
+
+    Ok(allocations)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::structs::config::ManagerConfigFull;
+    use crate::structs::{JobConfig, NodeMsg, Submission, TaskConfig};
+    use serde_json::json;
+    use tempfile::Builder;
+
+    fn setup_store() -> R<Store> {
+        let store_dir = Builder::new()
+            .prefix("legion-manager-server-")
+            .tempdir()
+            .context("error creating temp store directory")?
+            .keep();
+        let store_config = ManagerConfigFull {
+            store_path: store_dir
+                .to_str()
+                .context("error parsing store path")?
+                .to_string(),
+            ..Default::default()
+        };
+
+        let store = Store::start_storage(&store_config)?;
+        store.reset_all_tables()?;
+        Ok(store)
+    }
+
+    fn insert_node(store: &Store, id: &str) -> R<()> {
+        let node = NodeMsg {
+            id: id.to_string(),
+            pool: "default".into(),
+            status: "active".into(),
+            availability: "available".into(),
+            config_attrs: "{}".into(),
+            fingerprint_attrs: json!({
+                "memory_total": "8388608",
+                "cpus": {
+                    "cpu-1": { "frequency": "2400" },
+                    "cpu-2": { "frequency": "2400" },
+                }
+            })
+            .to_string(),
+            dynamic_attrs: "{}".into(),
+            health_checks: "{}".into(),
+            last_heartbeat: "2023-01-01 00:00:00 +00:00:00".into(),
+        };
+        store.insert_node(node)?;
+        Ok(())
+    }
+
+    fn submission() -> Submission {
+        Submission {
+            path: "job.jsonnet".into(),
+            content: "{}".into(),
+            is_primary: true,
+        }
+    }
+
+    #[test]
+    fn failed_allocations_enqueue_reschedule() -> R<()> {
+        let store = setup_store()?;
+        insert_node(&store, "node-a")?;
+
+        let job = JobConfig {
+            name: "job".into(),
+            tasks: vec![TaskConfig {
+                name: "task".into(),
+                count: 1,
+                kind: "noop".into(),
+                config: json!({}),
+                resources: json!({}),
+                constraints: json!({}),
+                affinities: json!({}),
+            }],
+            version: None,
+        };
+        store.handle_job_submit(&job, &[submission()])?;
+        let job_config_id = store.get_job_config(&job.name)?.id();
+        let task_id = store.get_task_configs_for_job_config(&job_config_id)?[0].0;
+        let allocation = store.place_alloc("node-a", task_id)?;
+
+        handle_failed_allocations(
+            &store,
+            "node-a",
+            &[FailedAllocation {
+                allocation_id: allocation.id,
+                reason: "boom".into(),
+            }],
+        )?;
+
+        assert!(store.get_allocation_by_id(allocation.id)?.is_none());
+        let evals = store.get_evals()?;
+        let eval = evals.first().context("missing eval")?;
+        assert_eq!(eval.kind, "job_reschedule");
+        assert_eq!(eval.job_config_id, job_config_id);
+        assert_eq!(eval.node_name, "node-a");
+
+        Ok(())
+    }
+
+    #[test]
+    fn desired_allocations_ignore_reported() -> R<()> {
+        let store = setup_store()?;
+        insert_node(&store, "node-a")?;
+
+        let job = JobConfig {
+            name: "job".into(),
+            tasks: vec![TaskConfig {
+                name: "task".into(),
+                count: 1,
+                kind: "noop".into(),
+                config: json!({}),
+                resources: json!({}),
+                constraints: json!({}),
+                affinities: json!({}),
+            }],
+            version: None,
+        };
+        store.handle_job_submit(&job, &[submission()])?;
+        let job_config_id = store.get_job_config(&job.name)?.id();
+        let task_id = store.get_task_configs_for_job_config(&job_config_id)?[0].0;
+        let allocation = store.place_alloc("node-a", task_id)?;
+
+        let desired = build_desired_allocations(&store, "node-a", &[])?;
+        assert_eq!(desired.len(), 1);
+
+        let desired = build_desired_allocations(&store, "node-a", &[allocation.id])?;
+        assert!(desired.is_empty());
+
+        Ok(())
     }
 }
