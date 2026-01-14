@@ -509,15 +509,12 @@ fn task_config(
     affinities: Value,
 ) -> TaskConfig {
     TaskConfig {
-        name: name.to_string(),
-        kind: "service".into(),
         count,
         config: json!({ "message": "hi" }),
         resources,
         constraints,
         affinities,
-        checks: Vec::new(),
-        on_unhealthy: legion::structs::TaskOnUnhealthyConfig::default(),
+        ..TaskConfig::new(name, "service")
     }
 }
 
@@ -654,15 +651,11 @@ fn job_resubmit_config(message: &str, count: u32, node_id: &str) -> JobConfig {
     JobConfig {
         name: "job-resubmit".into(),
         tasks: vec![TaskConfig {
-            name: "resubmit-task".into(),
-            kind: "service".into(),
             count,
             config: json!({ "message": message }),
             resources: json!({ "memory": 128, "cpu": 100 }),
             constraints: json!({ "node_id": node_id }),
-            affinities: json!({}),
-            checks: Vec::new(),
-            on_unhealthy: legion::structs::TaskOnUnhealthyConfig::default(),
+            ..TaskConfig::new("resubmit-task", "service")
         }],
         version: None,
     }

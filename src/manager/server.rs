@@ -905,18 +905,11 @@ mod tests {
         let job = JobConfig {
             name: "job".into(),
             tasks: vec![TaskConfig {
-                name: "task".into(),
-                count: 1,
-                kind: "noop".into(),
-                config: json!({}),
-                resources: json!({}),
-                constraints: json!({}),
-                affinities: json!({}),
-                checks: Vec::new(),
                 on_unhealthy: TaskOnUnhealthyConfig {
                     move_delay: Duration::from_secs(0),
                     ..TaskOnUnhealthyConfig::default()
                 },
+                ..TaskConfig::new("task", "noop")
             }],
             version: None,
         };
@@ -955,18 +948,11 @@ mod tests {
         let job = JobConfig {
             name: "job".into(),
             tasks: vec![TaskConfig {
-                name: "task".into(),
-                count: 1,
-                kind: "noop".into(),
-                config: json!({}),
-                resources: json!({}),
-                constraints: json!({}),
-                affinities: json!({}),
-                checks: Vec::new(),
                 on_unhealthy: TaskOnUnhealthyConfig {
                     move_delay: Duration::from_secs(0),
                     ..TaskOnUnhealthyConfig::default()
                 },
+                ..TaskConfig::new("task", "noop")
             }],
             version: None,
         };

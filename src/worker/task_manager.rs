@@ -1,5 +1,5 @@
 use crate::prelude::*;
-use crate::structs::{Allocation, TaskAllocation, TaskConfig};
+use crate::structs::{Allocation, TaskAllocation, TaskConfig, TaskOnUnhealthyConfig};
 use crate::task_plugins::{TaskPluginRegistry, TaskRuntime};
 use crate::worker::task_health::HealthMonitorHandle;
 use std::collections::HashMap;
@@ -192,22 +192,17 @@ fn task_from_allocation(allocation: &TaskAllocation) -> R<(Allocation, TaskConfi
         serde_json::from_str(&allocation.task_checks).context("Invalid task health checks JSON")?
     };
     let on_unhealthy = if allocation.task_on_unhealthy.trim().is_empty() {
-        crate::structs::TaskOnUnhealthyConfig::default()
+        TaskOnUnhealthyConfig::default()
     } else {
         serde_json::from_str(&allocation.task_on_unhealthy)
             .context("Invalid task on_unhealthy JSON")?
     };
 
     let task = TaskConfig {
-        name: allocation.task_name.clone(),
-        count: 1,
-        kind: allocation.task_kind.clone(),
         config: task_config,
-        resources: serde_json::json!({}),
-        constraints: serde_json::json!({}),
-        affinities: serde_json::json!({}),
         checks,
         on_unhealthy,
+        ..TaskConfig::new(&allocation.task_name, &allocation.task_kind)
     };
     let alloc = Allocation {
         id: allocation.allocation_id,
@@ -244,15 +239,8 @@ mod tests {
         let mut manager = WorkerTaskManager::new();
         manager.load_builtin_plugins();
         let task = TaskConfig {
-            name: "exec-task".into(),
-            count: 1,
-            kind: "exec".into(),
             config: json!({"command": "true"}),
-            resources: json!({}),
-            constraints: json!({}),
-            affinities: json!({}),
-            checks: Vec::new(),
-            on_unhealthy: crate::structs::TaskOnUnhealthyConfig::default(),
+            ..TaskConfig::new("exec-task", "exec")
         };
 
         manager.run_allocation(&alloc(), &task)?;
