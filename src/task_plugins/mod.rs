@@ -212,7 +212,7 @@ mod tests {
 
     fn exec_task() -> TaskConfig {
         TaskConfig {
-            config: json!({"command": "true"}),
+            config: json!({"command": ["true"]}),
             ..TaskConfig::new("exec-task", "exec")
         }
     }

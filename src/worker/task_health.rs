@@ -370,10 +370,11 @@ fn run_exec_check(runtime: &CheckRuntime) -> Result<(), String> {
         .command
         .as_ref()
         .ok_or_else(|| "exec check requires a command".to_string())?;
-    let mut cmd = Command::new(command);
-    if let Some(args) = runtime.check.args.as_ref() {
-        cmd.args(args);
-    }
+    let (program, args) = command
+        .split_first()
+        .ok_or_else(|| "exec check requires a command".to_string())?;
+    let mut cmd = Command::new(program);
+    cmd.args(args);
     let status = cmd
         .status()
         .map_err(|err| format!("exec check failed to run: {err}"))?;

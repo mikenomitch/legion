@@ -97,8 +97,7 @@
             count: 1,
             kind: "exec",
             config: {
-                command: "echo",
-                args: ["hello", "from", "exec"],
+                command: ["echo", "hello", "from", "exec"],
                 env: {
                     LEGION_TASK: "exec",
                 },

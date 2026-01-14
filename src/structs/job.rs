@@ -177,9 +177,7 @@ pub struct TaskCheck {
     #[serde(default)]
     pub port: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub command: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub args: Option<Vec<String>>,
+    pub command: Option<Vec<String>>,
     #[serde(
         default = "default_check_every",
         deserialize_with = "deserialize_duration",
@@ -411,7 +409,12 @@ impl TaskCheck {
                 format!("TCP Check {port}")
             }
             TaskCheckKind::Exec => {
-                let command = self.command.clone().unwrap_or_else(|| "Exec".into());
+                let command = self
+                    .command
+                    .as_ref()
+                    .and_then(|command| command.first())
+                    .cloned()
+                    .unwrap_or_else(|| "Exec".into());
                 format!("Exec Check {command}")
             }
         }
@@ -463,7 +466,13 @@ impl TaskConfig {
                             check.default_name()
                         );
                     }
-                    if check.command.as_deref().unwrap_or_default().is_empty() {
+                    let command = check
+                        .command
+                        .as_ref()
+                        .and_then(|command| command.first())
+                        .map(String::as_str)
+                        .unwrap_or_default();
+                    if command.is_empty() {
                         bail!(
                             "exec health check {} requires a command",
                             check.default_name()
