@@ -1,4 +1,4 @@
-use crate::cmd::helpers::{connect_manager_client, json_flag};
+use crate::cmd::helpers::{connect_manager_client, friendly_status, json_flag};
 use crate::prelude::*;
 use crate::structs::{GetLedgerRequest, LedgerEntry};
 use serde::Serialize;
@@ -41,7 +41,7 @@ pub async fn handle(matches: &ArgMatches) -> R<()> {
     let response = client
         .get_ledger(request)
         .await
-        .context("failed to request ledger state")?;
+        .map_err(|status| friendly_status("failed to request ledger state", status))?;
     let ledger_nodes = response.into_inner().nodes;
 
     let ledger: Vec<LedgerEntry> = ledger_nodes

@@ -3,7 +3,7 @@ use std::vec;
 
 use clap::value_parser;
 
-use crate::cmd::helpers::{connect_manager_client, json_flag, print_table};
+use crate::cmd::helpers::{connect_manager_client, friendly_status, json_flag, print_table};
 use crate::getter_rs::Client as GetterClient;
 use crate::prelude::*;
 use crate::structs::{
@@ -357,7 +357,10 @@ async fn stop_job(arg_matches: &ArgMatches) -> R<()> {
         priority,
     });
 
-    let response = client.stop_job(request).await?;
+    let response = client
+        .stop_job(request)
+        .await
+        .map_err(|status| friendly_status("failed to stop job", status))?;
     println!("{}", response.into_inner().message);
 
     Ok(())
@@ -376,7 +379,10 @@ async fn get_job_spec(arg_matches: &ArgMatches) -> R<()> {
         name: job_name.to_owned(),
     });
 
-    let response = client.get_job_spec(request).await?;
+    let response = client
+        .get_job_spec(request)
+        .await
+        .map_err(|status| friendly_status("failed to fetch job spec", status))?;
 
     let subs = response.into_inner().submissions;
 
@@ -409,7 +415,10 @@ async fn destroy_job(arg_matches: &ArgMatches) -> R<()> {
         priority,
     });
 
-    let response = client.destroy_job(request).await?;
+    let response = client
+        .destroy_job(request)
+        .await
+        .map_err(|status| friendly_status("failed to destroy job", status))?;
     println!("{}", response.into_inner().message);
 
     Ok(())
@@ -431,7 +440,10 @@ async fn plan_job(arg_matches: &ArgMatches) -> R<()> {
         parsed_jobspec: rendered,
     });
 
-    let response = client.plan_job(request).await?;
+    let response = client
+        .plan_job(request)
+        .await
+        .map_err(|status| friendly_status("failed to plan job", status))?;
     if is_json {
         let reply = response.into_inner();
         if let Ok(json) = to_string(&reply) {
@@ -475,7 +487,10 @@ async fn run_job(arg_matches: &ArgMatches) -> R<()> {
         force_reschedule: arg_matches.get_flag("force-reschedule"),
     });
 
-    let response = client.run_job(request).await.context("failed to run job")?;
+    let response = client
+        .run_job(request)
+        .await
+        .map_err(|status| friendly_status("failed to run job", status))?;
 
     println!("{}", response.into_inner().message);
 
@@ -488,7 +503,10 @@ async fn list_jobs(arg_matches: &ArgMatches) -> R<()> {
 
     let mut client = connect_manager_client().await?;
     let request = tonic::Request::new(ListJobsRequest {});
-    let response = client.list_jobs(request).await?;
+    let response = client
+        .list_jobs(request)
+        .await
+        .map_err(|status| friendly_status("failed to list jobs", status))?;
     let jobs_list = response.into_inner().jobs;
 
     if is_json {
@@ -512,7 +530,10 @@ async fn get_info(arg_matches: &ArgMatches) -> R<()> {
     let request = tonic::Request::new(GetJobInfoRequest {
         name: job_name.to_owned(),
     });
-    let response = client.get_job_info(request).await?;
+    let response = client
+        .get_job_info(request)
+        .await
+        .map_err(|status| friendly_status("failed to fetch job info", status))?;
 
     if is_json {
         if let Ok(json) = to_string(&response.into_inner().job) {

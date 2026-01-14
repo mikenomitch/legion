@@ -4,6 +4,7 @@ use tabled::settings::Style;
 use tabled::{Table, Tabled};
 use tonic::transport::Certificate;
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
+use tonic::{Code, Status};
 
 use crate::prelude::{Arg, ArgAction};
 
@@ -68,4 +69,31 @@ pub fn json_flag() -> Arg {
         .short('j')
         .help("Return values in JSON format")
         .action(ArgAction::SetTrue)
+}
+
+pub fn friendly_status(action: &str, status: Status) -> anyhow::Error {
+    let code = status.code();
+    let message = status.message().trim();
+    let mut description = if message.is_empty() {
+        action.to_string()
+    } else {
+        format!("{action}: {message}")
+    };
+
+    let hint = match code {
+        Code::Unavailable => Some("manager unavailable; check LEGION_ADDR or start the manager"),
+        Code::NotFound => Some("resource not found"),
+        Code::AlreadyExists => Some("resource already exists"),
+        Code::InvalidArgument => Some("request was invalid; check CLI arguments"),
+        Code::FailedPrecondition => Some("request precondition failed"),
+        Code::PermissionDenied | Code::Unauthenticated => Some("authentication failed"),
+        _ => None,
+    };
+
+    if let Some(hint) = hint {
+        description.push_str(&format!(" ({hint})"));
+    }
+    description.push_str(&format!(" [code={code}]"));
+
+    anyhow!(description)
 }

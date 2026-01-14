@@ -1,3 +1,4 @@
+use crate::cmd::helpers::friendly_status;
 use crate::prelude::*;
 
 use crate::structs::insecure_manager_client::InsecureManagerClient;
@@ -49,7 +50,7 @@ pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
     let response = client
         .get_join_token(request)
         .await
-        .context("failed to request join token")?;
+        .map_err(|status| friendly_status("failed to request join token", status))?;
     let t = &response.get_ref().token;
 
     println!("To launch a client with this token, run: ");

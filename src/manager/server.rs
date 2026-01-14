@@ -4,6 +4,7 @@ use crate::prelude::*;
 
 use crate::manager::dispatcher::build_task_allocation;
 use crate::manager::scheduler::{PlanConfigOutcome, PlanMode, Scheduler};
+use crate::storage::errors::StorageError;
 use crate::storage::store::{JobSubmitOutcome, Store};
 use crate::structs::manager_server::Manager;
 use crate::structs::{
@@ -19,6 +20,27 @@ use crate::structs::{
 use crate::task_plugins::validate_job_config;
 
 use tonic::{Request, Response, Status};
+
+fn map_store_error(action: &str, err: anyhow::Error) -> Status {
+    error!("{action}: {:?}", err);
+
+    let Some(storage_error) = StorageError::from_anyhow(&err) else {
+        return Status::internal(action);
+    };
+
+    let message = format!("{action}: {storage_error}");
+    match storage_error {
+        StorageError::NotFound { .. } => Status::not_found(message),
+        StorageError::Conflict { .. } => Status::already_exists(message),
+        StorageError::InvalidInput { .. } => Status::invalid_argument(message),
+        StorageError::ForeignKey { .. } => Status::failed_precondition(message),
+        StorageError::DatabaseBusy | StorageError::DatabaseLocked => Status::unavailable(message),
+        StorageError::DatabaseReadOnly => Status::failed_precondition(message),
+        StorageError::DatabaseCorrupt
+        | StorageError::DatabaseIo { .. }
+        | StorageError::Sqlite { .. } => Status::internal(message),
+    }
+}
 
 #[derive(Debug)]
 pub struct ManagerAgentService {
@@ -47,10 +69,10 @@ impl Manager for ManagerAgentService {
             error!("Error validating task configs: {:?}", e);
             Status::invalid_argument("Error validating task configs")
         })?;
-        let submit_outcome = self.store.handle_job_submit(&config, &subs).map_err(|e| {
-            error!("Error running job: {:?}", e);
-            Status::internal("Error running job")
-        })?;
+        let submit_outcome = self
+            .store
+            .handle_job_submit(&config, &subs)
+            .map_err(|e| map_store_error("Error running job", e))?;
 
         let job_config_id = submit_outcome.job_config_id().to_string();
         let (eval_kind, message) = match submit_outcome {
@@ -78,10 +100,7 @@ impl Manager for ManagerAgentService {
                     None,
                     Some(priority),
                 )
-                .map_err(|e| {
-                    error!("Error enqueueing eval: {:?}", e);
-                    Status::internal("Error running job")
-                })?;
+                .map_err(|e| map_store_error("Error running job", e))?;
         }
 
         let reply = RunJobReply {
@@ -98,10 +117,10 @@ impl Manager for ManagerAgentService {
     ) -> Result<Response<GetJobInfoReply>, Status> {
         let name = request.into_inner().name;
 
-        let job = self.store.get_job(&name).map_err(|e| {
-            error!("Error getting job: {:?}", e);
-            Status::internal("Error getting job")
-        })?;
+        let job = self
+            .store
+            .get_job(&name)
+            .map_err(|e| map_store_error("Error getting job", e))?;
 
         let reply = GetJobInfoReply { job: Some(job) };
 
@@ -122,10 +141,10 @@ impl Manager for ManagerAgentService {
             error!("Error parsing jobspec for plan: {:?}", e);
             Status::invalid_argument("Error parsing jobspec")
         })?;
-        let config = self.store.normalize_job_config(&config).map_err(|e| {
-            error!("Error normalizing jobspec for plan: {:?}", e);
-            Status::internal("Error normalizing jobspec")
-        })?;
+        let config = self
+            .store
+            .normalize_job_config(&config)
+            .map_err(|e| map_store_error("Error normalizing jobspec", e))?;
         validate_job_config(&config).map_err(|e| {
             error!("Error validating task configs: {:?}", e);
             Status::invalid_argument("Error validating task configs")
@@ -139,10 +158,7 @@ impl Manager for ManagerAgentService {
         let existing_config = self
             .store
             .get_job_config_optional(&config.name)
-            .map_err(|e| {
-                error!("Error getting job config for plan {}: {:?}", config.name, e);
-                Status::internal("Error getting job config")
-            })?;
+            .map_err(|e| map_store_error("Error getting job config", e))?;
 
         let (plan, task_lookup, message, matches_existing, same_content) = match existing_config {
             Some(existing) if existing.is_same_as(&config) => {
@@ -155,13 +171,7 @@ impl Manager for ManagerAgentService {
                 let task_configs = self
                     .store
                     .get_task_configs_for_job_config(&existing.id())
-                    .map_err(|e| {
-                        error!(
-                            "Error getting task configs for plan {}: {:?}",
-                            existing.name, e
-                        );
-                        Status::internal("Error getting task configs")
-                    })?;
+                    .map_err(|e| map_store_error("Error getting task configs", e))?;
                 let task_lookup = task_configs
                     .into_iter()
                     .map(|(id, task)| (id, task.name))
@@ -241,10 +251,11 @@ impl Manager for ManagerAgentService {
     ) -> Result<Response<GetJobSpecReply>, Status> {
         let name = request.into_inner().name;
 
-        let config = match self.store.get_job_config_optional(&name).map_err(|e| {
-            error!("Error getting job config: {:?}", e);
-            Status::internal("Error getting job config")
-        })? {
+        let config = match self
+            .store
+            .get_job_config_optional(&name)
+            .map_err(|e| map_store_error("Error getting job config", e))?
+        {
             Some(config) => config,
             None => {
                 return Err(Status::not_found("Job config not found"));
@@ -254,10 +265,7 @@ impl Manager for ManagerAgentService {
         let submissions = self
             .store
             .get_submissions_for_config(&config.id())
-            .map_err(|e| {
-                error!("Error getting submissions: {:?}", e);
-                Status::internal("Error getting submissions")
-            })?;
+            .map_err(|e| map_store_error("Error getting submissions", e))?;
 
         let reply = GetJobSpecReply { submissions };
 
@@ -269,10 +277,10 @@ impl Manager for ManagerAgentService {
         &self,
         _request: Request<ListJobsRequest>,
     ) -> Result<Response<ListJobsReply>, Status> {
-        let jobs = self.store.get_jobs().map_err(|e| {
-            error!("Error getting jobs: {:?}", e);
-            Status::internal("Error getting jobs")
-        })?;
+        let jobs = self
+            .store
+            .get_jobs()
+            .map_err(|e| map_store_error("Error getting jobs", e))?;
 
         let reply = ListJobsReply { jobs };
 
@@ -291,16 +299,13 @@ impl Manager for ManagerAgentService {
         let job_config_id = self
             .store
             .get_job_config(&name)
-            .map_err(|e| {
-                error!("Error fetching job config for stop {}: {:?}", name, e);
-                Status::internal("Error stopping job")
-            })?
+            .map_err(|e| map_store_error("Error stopping job", e))?
             .id();
 
-        let _ = self.store.stop_job(&name).map_err(|e| {
-            error!("Error stopping job: {:?}", e);
-            Status::internal("Error stopping job")
-        })?;
+        let _ = self
+            .store
+            .stop_job(&name)
+            .map_err(|e| map_store_error("Error stopping job", e))?;
 
         self.store
             .enqueue_eval(
@@ -310,10 +315,7 @@ impl Manager for ManagerAgentService {
                 None,
                 Some(priority),
             )
-            .map_err(|e| {
-                error!("Error enqueueing eval: {:?}", e);
-                Status::internal("Error stopping job")
-            })?;
+            .map_err(|e| map_store_error("Error stopping job", e))?;
 
         let message = format!("Stopped {}", name);
         let reply = StopJobReply { message };
@@ -328,10 +330,10 @@ impl Manager for ManagerAgentService {
     ) -> Result<Response<DestroyJobReply>, Status> {
         let name = request.into_inner().name;
 
-        let _ = self.store.destroy_job(&name).map_err(|e| {
-            error!("Error deleting job: {:?}", e);
-            Status::internal("Error deleting job")
-        })?;
+        let _ = self
+            .store
+            .destroy_job(&name)
+            .map_err(|e| map_store_error("Error deleting job", e))?;
 
         // TODO: Conditionalize
         let message = format!("Destroyed {}", name);
@@ -348,20 +350,16 @@ impl Manager for ManagerAgentService {
         let req = request.into_inner();
         let id = req.id;
 
-        self.store.update_node_heartbeat(id.clone()).map_err(|e| {
-            error!("Error updading node heartbeat. Node ID: {}: {:?}", id, e);
-            Status::internal("Error updading node heartbeat")
-        })?;
+        self.store
+            .update_node_heartbeat(id.clone())
+            .map_err(|e| map_store_error("Error updating node heartbeat", e))?;
 
         if let Err(err) = handle_failed_allocations(&self.store, &id, &req.failed_allocations) {
             error!(node_id = %id, error = ?err, "Error handling failed allocations");
         }
 
         let desired_allocations = build_desired_allocations(&self.store, &id, &req.allocation_ids)
-            .map_err(|e| {
-                error!("Error building desired allocations: {:?}", e);
-                Status::internal("Error building desired allocations")
-            })?;
+            .map_err(|e| map_store_error("Error building desired allocations", e))?;
 
         let reply = HeartbeatReply {
             message: "ack".into(),
@@ -381,13 +379,7 @@ impl Manager for ManagerAgentService {
 
         self.store
             .update_node_health_checks(&id, &req.health_checks)
-            .map_err(|e| {
-                error!(
-                    "Error updading node health checks. Node ID: {}: {:?}",
-                    id, e
-                );
-                Status::internal("Error updading node health checks")
-            })?;
+            .map_err(|e| map_store_error("Error updating node health checks", e))?;
 
         let reply = HealthCheckReply {
             message: "ack".into(),
@@ -409,10 +401,7 @@ impl Manager for ManagerAgentService {
         let worker_config = self
             .store
             .get_worker_type(worker_type.clone())
-            .map_err(|e| {
-                error!("Error getting worker type {}: {:?}", worker_type.clone(), e);
-                Status::internal("Error getting worker type")
-            })?;
+            .map_err(|e| map_store_error("Error getting worker type", e))?;
 
         let config = WorkerConfig {
             name: worker_type,
@@ -452,10 +441,9 @@ impl Manager for ManagerAgentService {
             health_checks: request.health_checks,
         };
 
-        self.store.insert_node(node_msg).map_err(|e| {
-            error!("Error registering worker: {:?}", e);
-            Status::internal("Error registering worker")
-        })?;
+        self.store
+            .insert_node(node_msg)
+            .map_err(|e| map_store_error("Error registering worker", e))?;
 
         let reply = WorkerRegisterReply {
             message: "Worker registered".into(),
@@ -469,10 +457,10 @@ impl Manager for ManagerAgentService {
         &self,
         _request: Request<GetNodesRequest>,
     ) -> Result<Response<GetNodesReply>, Status> {
-        let nodes = self.store.get_nodes().map_err(|e| {
-            error!("Error getting nodes: {:?}", e);
-            Status::internal("Error getting nodes")
-        })?;
+        let nodes = self
+            .store
+            .get_nodes()
+            .map_err(|e| map_store_error("Error getting nodes", e))?;
 
         let node_messages: Vec<NodeMsg> = nodes.into_iter().map(Into::into).collect();
 
@@ -488,10 +476,10 @@ impl Manager for ManagerAgentService {
         request: Request<GetNodeRequest>,
     ) -> Result<Response<GetNodeReply>, Status> {
         let id = request.into_inner().id;
-        let node = self.store.get_node(&id).map_err(|e| {
-            error!("Error getting nodes: {:?}", e);
-            Status::internal(format!("Could not find node {id}"))
-        })?;
+        let node = self
+            .store
+            .get_node(&id)
+            .map_err(|e| map_store_error("Error getting node", e))?;
 
         let reply = GetNodeReply {
             node: Some(node.into()),
@@ -514,11 +502,11 @@ impl Manager for ManagerAgentService {
         let node = self
             .store
             .update_node_dyamic(&id, &dd_as_map)
-            .expect("Can't find or update node");
-        let allocs = self.store.allocs_for_node(&id).map_err(|e| {
-            error!("Error getting allocations for node {}: {:?}", id, e);
-            Status::internal("Error getting allocations for node")
-        })?;
+            .map_err(|e| map_store_error("Error updating node", e))?;
+        let allocs = self
+            .store
+            .allocs_for_node(&id)
+            .map_err(|e| map_store_error("Error getting allocations for node", e))?;
         let mut job_configs_to_eval = HashMap::new();
         for alloc in allocs {
             job_configs_to_eval
@@ -534,10 +522,7 @@ impl Manager for ManagerAgentService {
                     Some(&id),
                     Some(self.store.default_eval_priority),
                 )
-                .map_err(|e| {
-                    error!("Error enqueueing eval for node {}: {:?}", id, e);
-                    Status::internal("Error enqueueing eval for node")
-                })?;
+                .map_err(|e| map_store_error("Error enqueueing eval for node", e))?;
         }
         let reply = UpdateNodeDynamicReply {
             node: Some(node.into()),
@@ -551,10 +536,10 @@ impl Manager for ManagerAgentService {
         &self,
         _request: Request<GetManagerConfigsRequest>,
     ) -> Result<Response<GetManagerConfigsReply>, Status> {
-        let configs = self.store.get_manager_configs().map_err(|e| {
-            error!("Error getting manager configs: {:?}", e);
-            Status::internal("Error getting manager configs")
-        })?;
+        let configs = self
+            .store
+            .get_manager_configs()
+            .map_err(|e| map_store_error("Error getting manager configs", e))?;
 
         let reply = GetManagerConfigsReply { configs };
 
@@ -566,10 +551,10 @@ impl Manager for ManagerAgentService {
         &self,
         _request: Request<GetLedgerRequest>,
     ) -> Result<Response<GetLedgerReply>, Status> {
-        let ledger = self.store.get_ledger().map_err(|e| {
-            error!("Error getting ledger: {:?}", e);
-            Status::internal("Error getting ledger")
-        })?;
+        let ledger = self
+            .store
+            .get_ledger()
+            .map_err(|e| map_store_error("Error getting ledger", e))?;
 
         let nodes: Vec<LedgerNode> = ledger.into_iter().map(Into::into).collect();
 

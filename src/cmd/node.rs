@@ -1,4 +1,4 @@
-use crate::cmd::helpers::{connect_manager_client, json_flag, print_table};
+use crate::cmd::helpers::{connect_manager_client, friendly_status, json_flag, print_table};
 use crate::prelude::*;
 use crate::structs::{GetNodeRequest, GetNodesRequest, Node, NodePrint, UpdateNodeDynamicRequest};
 use serde_json::to_string;
@@ -110,7 +110,10 @@ pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
 async fn get_nodes(is_json: bool) -> R<()> {
     let mut client = connect_manager_client().await?;
     let request = tonic::Request::new(GetNodesRequest {});
-    let response = client.get_nodes(request).await?;
+    let response = client
+        .get_nodes(request)
+        .await
+        .map_err(|status| friendly_status("failed to list nodes", status))?;
     let nodes_msg_list = response.into_inner().nodes;
     let nodes: Vec<Node> = nodes_msg_list.into_iter().map(Into::into).collect();
 
@@ -135,7 +138,10 @@ async fn update_node(node_id: String, dynamic_diff: Map<String, Value>, is_json:
         dynamic_diff: serde_json::to_string(&dynamic_diff)?,
     });
 
-    let response = client.update_node_dynamic(request).await?;
+    let response = client
+        .update_node_dynamic(request)
+        .await
+        .map_err(|status| friendly_status("failed to update node", status))?;
 
     match response.into_inner().node {
         Some(node_msg) => {
@@ -157,7 +163,10 @@ async fn update_node(node_id: String, dynamic_diff: Map<String, Value>, is_json:
 async fn get_node_info(node_id: String, is_json: bool) -> R<()> {
     let mut client = connect_manager_client().await?;
     let request = tonic::Request::new(GetNodeRequest { id: node_id });
-    let response = client.get_node(request).await?;
+    let response = client
+        .get_node(request)
+        .await
+        .map_err(|status| friendly_status("failed to fetch node info", status))?;
 
     match response.into_inner().node {
         Some(node_msg) => {

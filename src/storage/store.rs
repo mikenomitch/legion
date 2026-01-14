@@ -1,6 +1,7 @@
 use crate::constraints::{ConstraintSet, DistinctTracker};
 use crate::prelude::*;
 use crate::resources::ResourcePolicy;
+use crate::storage::errors::StorageError;
 use crate::storage::migrations::get_migrations;
 use crate::storage::queries::{
     GET_ALLOCATION_BY_ID, GET_ALLOCS, GET_ALLOCS_FOR_JOB, GET_ALLOCS_FOR_JOB_CONFIG,
@@ -529,7 +530,14 @@ impl Store {
     #[instrument(err, skip_all)]
     pub fn get_node(&self, id: &str) -> R<Node> {
         let conn = self.read_connection()?;
-        let node = conn.query_row(&GET_NODE, [id], |row| self.node_from_row(row))?;
+        let node = conn
+            .query_row(&GET_NODE, [id], |row| self.node_from_row(row))
+            .map_err(|error| match error {
+                RusqliteError::QueryReturnedNoRows => {
+                    anyhow::Error::new(StorageError::not_found("node", id))
+                }
+                other => anyhow::Error::from(other),
+            })?;
         Ok(node)
     }
 
@@ -767,9 +775,16 @@ impl Store {
     #[instrument(err, skip_all)]
     pub fn get_worker_type(&self, name: String) -> R<WorkerConfig> {
         let conn = self.read_connection()?;
-        let config = conn.query_row(&GET_WORKER_TYPE, [name], |row| {
-            self.worker_type_from_row(row)
-        })?;
+        let config = conn
+            .query_row(&GET_WORKER_TYPE, [name.clone()], |row| {
+                self.worker_type_from_row(row)
+            })
+            .map_err(|error| match error {
+                RusqliteError::QueryReturnedNoRows => {
+                    anyhow::Error::new(StorageError::not_found("worker type", name))
+                }
+                other => anyhow::Error::from(other),
+            })?;
 
         Ok(config)
     }
@@ -815,7 +830,14 @@ impl Store {
     #[instrument(err, skip_all)]
     pub fn get_job(&self, name: &str) -> R<Job> {
         let conn = self.read_connection()?;
-        let job = conn.query_row(&GET_JOB, [name], |row| self.job_from_row(row))?;
+        let job = conn
+            .query_row(&GET_JOB, [name], |row| self.job_from_row(row))
+            .map_err(|error| match error {
+                RusqliteError::QueryReturnedNoRows => {
+                    anyhow::Error::new(StorageError::not_found("job", name))
+                }
+                other => anyhow::Error::from(other),
+            })?;
         Ok(job)
     }
 
@@ -962,13 +984,13 @@ impl Store {
     #[instrument(err, skip_all)]
     pub fn get_job_config(&self, name: &str) -> R<JobConfig> {
         self.get_job_config_optional(name)?
-            .ok_or_else(|| anyhow!("Job config not found for {}", name))
+            .ok_or_else(|| StorageError::not_found("job config", name).into())
     }
 
     #[instrument(err, skip_all)]
     pub fn get_job_config_by_id(&self, id: &str) -> R<JobConfig> {
         self.get_job_config_by_id_optional(id)?
-            .ok_or_else(|| anyhow!("Job config not found for {}", id))
+            .ok_or_else(|| StorageError::not_found("job config", id).into())
     }
 
     #[allow(dead_code)]
@@ -2279,7 +2301,7 @@ mod tests {
         assert!(returned_config.is_err());
         assert_eq!(
             returned_config.unwrap_err().to_string(),
-            "Query returned no rows"
+            "job not found (id: test)"
         );
 
         // NOTE: What should this return (figure it out in concontent later)
