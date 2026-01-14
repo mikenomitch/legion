@@ -9,7 +9,8 @@
   - [x] It has a basic fingerprinting system
   - [x] It has dynamic attributes that can be updated (I think this is done?) - Codexed
   - [x] It properly shows up in the manager's ledger of worker nodes (is this done?)
-  - [ ] It can be reconfigured from the server
+  - [ ] It can be reconfigured from the server using CRUD commands
+    - [ ] For this to really work, do you need to update any of this type that already exist (and send them the info)? (Which means that nodes should save a reference to their type)?
   - [ ] It can be restarted from the server - Codex
   - [ ] TLS is autoconfigured and auto-rotated
 
@@ -32,6 +33,13 @@
   - [x] Job health check reschedules a job
     - [x] Initial failures restart the job
     - [x] Failure after N times forces a reschedule
+
+- [ ] Observability & Perf
+  - [ ] Add tracing to the scheduler
+  - [ ] Add a way to nicely view traces in the UI (make dev only one day)
+  - [ ] Write some benchmarks in a dedicated directory
+  - [ ] Fix the slowest bits of the scheduler using the perf tests
+  - [ ] Add to Agents.md that any changes to the scheduler should come with a before and after perf test benchmark
 
 - [ ] Running workloads
   - [x] A framework is set up to run workload plugins
@@ -96,8 +104,9 @@
   - [ ] DAG (same machines)
   
 - [ ] Cron jobs
-- [ ] System Job
 - [ ] Sysbatch Job
+- [ ] System Job (N per X?) (1 per metal) (2 per region) (etc)
+  - Is this more of a count issue than a job type itself??
 
 - [ ] Operational Stuff
   - [ ] Joining a cluster
@@ -115,8 +124,31 @@
   - [ ] I can call to run with @<registry>/<job>
   - [ ] I can inspect a job in the registry (just reads some metadata)
   - [ ] There is a UI for inserting variables from job defintions with metadata in them
+  - [ ] Plugins can be fetched by URL or the registry
 
 - [ ] Joining a cluster and TLS is very easy
+- [ ] Fix the join-token and pre-register call destinations
+  - [ ] Should the "insecure client" really just be a "public cert client"
+    - [ ] Gets from lets encrypt by default but you can provide your own CA too?
+  - [ ] Then the "client" is the "secure client" which does some self-signed CA magic
+    and only the workers have access to it?
+  - [ ] Or is TLS just not right right way to do this at all?
+  - [ ] !! You need to plan this and not just code it!!
+
+  - [ ] Environment variable or flag used for contacting manager
+    - [ ] How to nicely join-server port from this?
+      - [ ] You don't need it because its in the JWT!
+
+- [ ] Audit EVERY name decision in depth. Important.
+
+- [ ] AI Agent Stuff
+  - [ ] Plugin with MCP server
+  - [ ] Think thru Agents.md 
+  - [ ] Self-documenting CLI so agents can use it nicelu
+  - [ ] grpc endpoints very nicely documented (and auto-updating)
+  - [ ] An AI agents should be able to very easily write a plugin
+  - [ ] An AI agent should be able to very easily configure a Worker Node to talk to a manager node
+  - [ ] An AI agent should be able to search the registry and find any jobs that it makes sense to install and run for you
 
 ## Long Term
 
