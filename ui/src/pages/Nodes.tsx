@@ -297,39 +297,61 @@ interface CollapsibleSectionProps {
   title: string
   children: JSX.Element
   defaultOpen?: boolean
+  open?: boolean
+  onToggle?: (open: boolean) => void
 }
 
 const CollapsibleSection = (props: CollapsibleSectionProps) => {
-  const [open, setOpen] = createSignal(props.defaultOpen ?? true)
+  const [localOpen, setLocalOpen] = createSignal(props.defaultOpen ?? true)
+  const isControlled = () => props.open !== undefined
+  const isOpen = () => props.open ?? localOpen()
+
+  const toggle = () => {
+    const next = !isOpen()
+    if (props.onToggle) props.onToggle(next)
+    if (!isControlled()) setLocalOpen(next)
+  }
 
   return (
     <div class="rounded border border-neutral-200 bg-white/90 px-3 py-2 shadow-sm dark:border-neutral-800 dark:bg-neutral-900/50">
       <button
         type="button"
         class="flex w-full items-center justify-between text-left"
-        onClick={() => setOpen((prev) => !prev)}
-        aria-expanded={open()}
+        onClick={toggle}
+        aria-expanded={isOpen()}
       >
         <span class="flex items-center gap-2 text-sm font-semibold text-neutral-900 dark:text-neutral-100">
           <span
-            class={`inline-block text-lg leading-none transition-transform ${open() ? 'rotate-90' : 'rotate-0'}`}
+            class={`inline-block text-lg leading-none transition-transform ${isOpen() ? 'rotate-90' : 'rotate-0'}`}
             aria-hidden="true"
           >
             ›
           </span>
           {props.title}
         </span>
-        <span class="text-xs uppercase tracking-[0.1em] text-neutral-500 dark:text-neutral-400">{open() ? 'Hide' : 'Show'}</span>
+        <span class="text-xs uppercase tracking-[0.1em] text-neutral-500 dark:text-neutral-400">
+          {isOpen() ? 'Hide' : 'Show'}
+        </span>
       </button>
-      <Show when={open()}>
+      <Show when={isOpen()}>
         <div class="mt-2">{props.children}</div>
       </Show>
     </div>
   )
 }
 
+type NodeSectionKey = 'fingerprint' | 'networks' | 'signals' | 'health'
+
+const DEFAULT_SECTION_STATE: Record<NodeSectionKey, boolean> = {
+  fingerprint: false,
+  networks: false,
+  signals: false,
+  health: false,
+}
+
 export default function Nodes(props: NodesProps) {
   const [statusFilter, setStatusFilter] = createSignal('All')
+  const [sectionOpen, setSectionOpen] = createSignal(new Map<string, Record<NodeSectionKey, boolean>>())
   const allocationsByNode = createMemo(() => {
     const map = new Map<string, readonly LedgerAllocation[]>()
     ;(props.ledger() ?? []).forEach((entry) => {
@@ -361,6 +383,21 @@ export default function Nodes(props: NodesProps) {
     })
   })
 
+  const getSectionOpen = (nodeId: string, section: NodeSectionKey, defaultOpen: boolean): boolean => {
+    const stored = sectionOpen().get(nodeId)
+    if (stored) return stored[section]
+    return defaultOpen
+  }
+
+  const setSectionState = (nodeId: string, section: NodeSectionKey, open: boolean) => {
+    setSectionOpen((prev) => {
+      const next = new Map(prev)
+      const existing = next.get(nodeId) ?? DEFAULT_SECTION_STATE
+      next.set(nodeId, { ...existing, [section]: open })
+      return next
+    })
+  }
+
   return (
     <Show when={!props.nodes.loading} fallback={<p class="text-neutral-500">Loading nodes…</p>}>
       <Show when={!props.nodes.error} fallback={<p class="text-red-500">Failed to load nodes.</p>}>
@@ -386,6 +423,7 @@ export default function Nodes(props: NodesProps) {
             <div class="grid gap-3 lg:grid-cols-2">
               <For each={filteredNodes()}>
                 {(node) => {
+                  const nodeId = node.id || 'unknown'
                   const configData = parseAttributes(node.configAttrs)
                   const dynamicData = parseAttributes(node.dynamicAttrs)
                   const fingerprintData = parseAttributes(node.fingerprintAttrs)
@@ -466,7 +504,12 @@ export default function Nodes(props: NodesProps) {
                           />
                         </div>
 
-                        <CollapsibleSection title="Fingerprint" defaultOpen={false}>
+                        <CollapsibleSection
+                          title="Fingerprint"
+                          defaultOpen={false}
+                          open={getSectionOpen(nodeId, 'fingerprint', DEFAULT_SECTION_STATE.fingerprint)}
+                          onToggle={(open) => setSectionState(nodeId, 'fingerprint', open)}
+                        >
                           <KeyValueGrid
                             title="Fingerprint"
                             showTitle={false}
@@ -475,7 +518,12 @@ export default function Nodes(props: NodesProps) {
                           />
                         </CollapsibleSection>
 
-                        <CollapsibleSection title="Networks" defaultOpen={false}>
+                        <CollapsibleSection
+                          title="Networks"
+                          defaultOpen={false}
+                          open={getSectionOpen(nodeId, 'networks', DEFAULT_SECTION_STATE.networks)}
+                          onToggle={(open) => setSectionState(nodeId, 'networks', open)}
+                        >
                           <KeyValueGrid
                             title="Networks"
                             showTitle={false}
@@ -484,7 +532,12 @@ export default function Nodes(props: NodesProps) {
                           />
                         </CollapsibleSection>
 
-                        <CollapsibleSection title="Signals" defaultOpen={false}>
+                        <CollapsibleSection
+                          title="Signals"
+                          defaultOpen={false}
+                          open={getSectionOpen(nodeId, 'signals', DEFAULT_SECTION_STATE.signals)}
+                          onToggle={(open) => setSectionState(nodeId, 'signals', open)}
+                        >
                           <KeyValueGrid
                             title="Signals"
                             showTitle={false}
@@ -493,7 +546,12 @@ export default function Nodes(props: NodesProps) {
                           />
                         </CollapsibleSection>
 
-                        <CollapsibleSection title="Health Checks" defaultOpen={false}>
+                        <CollapsibleSection
+                          title="Health Checks"
+                          defaultOpen={false}
+                          open={getSectionOpen(nodeId, 'health', DEFAULT_SECTION_STATE.health)}
+                          onToggle={(open) => setSectionState(nodeId, 'health', open)}
+                        >
                           <div class="rounded border border-neutral-200 bg-neutral-50 p-3 shadow-sm dark:border-neutral-800 dark:bg-neutral-900/60">
                             <div class="flex items-center justify-between">
                               <h4 class="text-sm font-semibold text-neutral-900 dark:text-neutral-100">Health Checks</h4>
