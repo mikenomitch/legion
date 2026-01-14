@@ -83,7 +83,7 @@ pub fn dispatch_allocations(store: &Store, allocations: &[Allocation]) -> R<()> 
     Ok(())
 }
 
-fn worker_address_for_node(node: &crate::structs::Node) -> Option<String> {
+pub(crate) fn worker_address_for_node(node: &crate::structs::Node) -> Option<String> {
     let attrs = node.config_attrs.as_object()?;
     attrs
         .get("workerAddress")

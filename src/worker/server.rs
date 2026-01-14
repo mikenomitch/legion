@@ -1,11 +1,15 @@
 use crate::prelude::*;
-use crate::structs::{worker_server::Worker, PostWorkReply, PostWorkRequest};
+use crate::structs::{
+    worker_server::Worker, PostWorkReply, PostWorkRequest, RestartWorkerReply, RestartWorkerRequest,
+};
 use crate::worker::task_manager::WorkerTaskManager;
 use std::sync::{Arc, Mutex};
+use tokio::sync::watch;
 use tonic::{Request, Response, Status};
 
 pub struct WorkerAgentService {
     pub task_manager: Arc<Mutex<WorkerTaskManager>>,
+    pub restart_tx: watch::Sender<bool>,
 }
 #[tonic::async_trait]
 impl Worker for WorkerAgentService {
@@ -36,5 +40,16 @@ impl Worker for WorkerAgentService {
         };
 
         Ok(Response::new(reply))
+    }
+
+    #[instrument(err, skip_all)]
+    async fn restart_worker(
+        &self,
+        _request: Request<RestartWorkerRequest>,
+    ) -> Result<Response<RestartWorkerReply>, Status> {
+        let _ = self.restart_tx.send(true);
+        Ok(Response::new(RestartWorkerReply {
+            message: "Restart scheduled".into(),
+        }))
     }
 }

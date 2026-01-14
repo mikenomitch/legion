@@ -2,22 +2,24 @@ use std::collections::HashMap;
 
 use crate::prelude::*;
 
-use crate::manager::dispatcher::build_task_allocation;
+use crate::manager::dispatcher::{build_task_allocation, worker_address_for_node};
 use crate::manager::scheduler::{PlanConfigOutcome, PlanMode, Scheduler};
 use crate::storage::store::{JobSubmitOutcome, Store};
 use crate::structs::manager_server::Manager;
 use crate::structs::{
-    DestroyJobReply, DestroyJobRequest, FailedAllocation, GetJobInfoReply, GetJobInfoRequest,
-    GetJobSpecReply, GetJobSpecRequest, GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply,
-    GetManagerConfigsRequest, GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest,
-    HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, JobConfig, LedgerNode,
-    ListJobsReply, ListJobsRequest, NodeMsg, PlanJobReply, PlanJobRequest, PlannedAllocation,
-    RunJobReply, RunJobRequest, StopJobReply, StopJobRequest, TaskConfig, UpdateNodeDynamicReply,
-    UpdateNodeDynamicRequest, WorkerConfig, WorkerPreRegisterReply, WorkerPreRegisterRequest,
-    WorkerRegisterReply, WorkerRegisterRequest,
+    worker_client::WorkerClient, DestroyJobReply, DestroyJobRequest, FailedAllocation,
+    GetJobInfoReply, GetJobInfoRequest, GetJobSpecReply, GetJobSpecRequest, GetLedgerReply,
+    GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest, GetNodeReply,
+    GetNodeRequest, GetNodesReply, GetNodesRequest, HealthCheckReply, HealthCheckRequest,
+    HeartbeatReply, HeartbeatRequest, JobConfig, LedgerNode, ListJobsReply, ListJobsRequest,
+    NodeMsg, PlanJobReply, PlanJobRequest, PlannedAllocation, RestartWorkerReply,
+    RestartWorkerRequest, RunJobReply, RunJobRequest, StopJobReply, StopJobRequest, TaskConfig,
+    UpdateNodeDynamicReply, UpdateNodeDynamicRequest, WorkerConfig, WorkerPreRegisterReply,
+    WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest,
 };
 use crate::task_plugins::validate_job_config;
 
+use tonic::transport::Endpoint;
 use tonic::{Request, Response, Status};
 
 #[derive(Debug)]
@@ -577,6 +579,46 @@ impl Manager for ManagerAgentService {
 
         Ok(Response::new(reply))
     }
+
+    #[instrument(skip_all)]
+    async fn restart_worker(
+        &self,
+        request: Request<RestartWorkerRequest>,
+    ) -> Result<Response<RestartWorkerReply>, Status> {
+        let node_id = request.into_inner().node_id;
+        let node = self.store.get_node(&node_id).map_err(|e| {
+            error!("Error getting node {}: {:?}", node_id, e);
+            Status::internal("Error getting node")
+        })?;
+        let Some(worker_address) = worker_address_for_node(&node) else {
+            return Err(Status::failed_precondition(
+                "Worker address missing for node",
+            ));
+        };
+
+        let endpoint = Endpoint::from_shared(worker_address.clone()).map_err(|e| {
+            error!("Error building worker endpoint: {:?}", e);
+            Status::internal("Error restarting worker")
+        })?;
+        let channel = endpoint.connect().await.map_err(|e| {
+            error!("Error connecting to worker {}: {:?}", worker_address, e);
+            Status::internal("Error restarting worker")
+        })?;
+        let mut client = WorkerClient::new(channel);
+        let request = tonic::Request::new(RestartWorkerRequest {
+            node_id: node_id.clone(),
+        });
+        client.restart_worker(request).await.map_err(|e| {
+            error!("Error restarting worker {}: {:?}", node_id, e);
+            Status::internal("Error restarting worker")
+        })?;
+
+        let reply = RestartWorkerReply {
+            message: format!("Restart requested for worker {node_id}"),
+        };
+
+        Ok(Response::new(reply))
+    }
 }
 
 fn handle_failed_allocations(store: &Store, node_id: &str, failed: &[FailedAllocation]) -> R<()> {
@@ -651,9 +693,19 @@ fn build_desired_allocations(
 mod tests {
     use super::*;
     use crate::structs::config::ManagerConfigFull;
-    use crate::structs::{JobConfig, NodeMsg, Submission, TaskConfig};
-    use serde_json::json;
+    use crate::structs::{
+        worker_server::Worker, JobConfig, NodeMsg, PostWorkReply, PostWorkRequest,
+        RestartWorkerReply, RestartWorkerRequest, Submission, TaskConfig,
+    };
+    use serde_json::{json, Value};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
     use tempfile::Builder;
+    use tokio::net::TcpListener;
+    use tokio_stream::wrappers::TcpListenerStream;
+    use tonic::transport::Server;
 
     fn setup_store() -> R<Store> {
         let store_dir = Builder::new()
@@ -674,13 +726,13 @@ mod tests {
         Ok(store)
     }
 
-    fn insert_node(store: &Store, id: &str) -> R<()> {
+    fn insert_node(store: &Store, id: &str, config_attrs: Value) -> R<()> {
         let node = NodeMsg {
             id: id.to_string(),
             pool: "default".into(),
             status: "active".into(),
             availability: "available".into(),
-            config_attrs: "{}".into(),
+            config_attrs: config_attrs.to_string(),
             fingerprint_attrs: json!({
                 "memory_total": "8388608",
                 "cpus": {
@@ -708,7 +760,7 @@ mod tests {
     #[test]
     fn failed_allocations_enqueue_reschedule() -> R<()> {
         let store = setup_store()?;
-        insert_node(&store, "node-a")?;
+        insert_node(&store, "node-a", json!({}))?;
 
         let job = JobConfig {
             name: "job".into(),
@@ -750,7 +802,7 @@ mod tests {
     #[test]
     fn desired_allocations_ignore_reported() -> R<()> {
         let store = setup_store()?;
-        insert_node(&store, "node-a")?;
+        insert_node(&store, "node-a", json!({}))?;
 
         let job = JobConfig {
             name: "job".into(),
@@ -775,6 +827,70 @@ mod tests {
 
         let desired = build_desired_allocations(&store, "node-a", &[allocation.id])?;
         assert!(desired.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn restart_worker_forwards_request() -> R<()> {
+        #[derive(Default)]
+        struct TestWorkerService {
+            calls: Arc<AtomicUsize>,
+        }
+
+        #[tonic::async_trait]
+        impl Worker for TestWorkerService {
+            async fn post_work(
+                &self,
+                _request: Request<PostWorkRequest>,
+            ) -> Result<Response<PostWorkReply>, Status> {
+                Ok(Response::new(PostWorkReply {
+                    message: "ok".into(),
+                }))
+            }
+
+            async fn restart_worker(
+                &self,
+                _request: Request<RestartWorkerRequest>,
+            ) -> Result<Response<RestartWorkerReply>, Status> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(Response::new(RestartWorkerReply {
+                    message: "restarting".into(),
+                }))
+            }
+        }
+
+        let store = setup_store()?;
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let rt = tokio::runtime::Runtime::new()?;
+        let worker_address = rt.block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await?;
+            let addr = listener.local_addr()?;
+            let service = TestWorkerService {
+                calls: calls.clone(),
+            };
+            tokio::spawn(async move {
+                Server::builder()
+                    .add_service(crate::structs::worker_server::WorkerServer::new(service))
+                    .serve_with_incoming(TcpListenerStream::new(listener))
+                    .await
+                    .expect("worker server");
+            });
+            Ok::<_, anyhow::Error>(format!("http://{}", addr))
+        })?;
+
+        insert_node(&store, "node-a", json!({ "workerAddress": worker_address }))?;
+
+        let service = ManagerAgentService { store };
+        rt.block_on(async {
+            service
+                .restart_worker(Request::new(RestartWorkerRequest {
+                    node_id: "node-a".into(),
+                }))
+                .await
+        })?;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
 
         Ok(())
     }

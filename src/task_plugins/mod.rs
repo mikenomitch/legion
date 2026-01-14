@@ -14,6 +14,17 @@ pub use exec::ExecTaskPlugin;
 pub struct TaskRuntime {
     pub state: Value,
     pub child: Option<Child>,
+    pub pid: Option<u32>,
+}
+
+impl TaskRuntime {
+    pub fn with_pid(pid: u32) -> Self {
+        Self {
+            state: Value::Null,
+            child: None,
+            pid: Some(pid),
+        }
+    }
 }
 
 pub trait TaskPlugin: Send + Sync {

@@ -23,6 +23,7 @@ service Manager {
     returns (GetManagerConfigsReply);
   rpc UpdateNodeDynamic (UpdateNodeDynamicRequest)
     returns (UpdateNodeDynamicReply);
+  rpc RestartWorker (RestartWorkerRequest) returns (RestartWorkerReply);
 }
 
 message WorkerPreRegisterRequest {
@@ -233,6 +234,14 @@ message UpdateNodeDynamicReply {
   optional NodeMsg node = 1;
 }
 
+message RestartWorkerRequest {
+  string node_id = 1;
+}
+
+message RestartWorkerReply {
+  string message = 1;
+}
+
 // === INSECURE MANAGER ===
 
 service InsecureManager {
@@ -262,6 +271,7 @@ message Eval {
 
 service Worker {
   rpc PostWork (PostWorkRequest) returns (PostWorkReply);
+  rpc RestartWorker (RestartWorkerRequest) returns (RestartWorkerReply);
 }
 
 message TaskAllocation {

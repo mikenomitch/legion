@@ -14,6 +14,7 @@ use crate::worker::{
 
 use futures::join;
 use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
+use tokio::sync::watch;
 use tonic::{transport::Channel, transport::Server, Response};
 
 #[instrument(err, skip_all)]
@@ -36,16 +37,24 @@ pub async fn run_worker(token: &str) -> R<()> {
 
     let addr = format!("{DEF_MANAGER_HOSTNAME}:{DEF_WORKER_SERVER_PORT}").parse()?;
     let task_manager = Arc::new(Mutex::new(WorkerTaskManager::new()));
-    task_manager
-        .lock()
-        .expect("task manager")
-        .load_builtin_plugins();
+    {
+        let mut manager = task_manager.lock().expect("task manager");
+        manager.load_builtin_plugins();
+        if let Err(err) = manager.restore_allocations() {
+            error!(?err, "Failed to restore running allocations");
+        }
+    }
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let worker_node = WorkerAgentService {
         task_manager: task_manager.clone(),
+        restart_tx: shutdown_tx.clone(),
     };
+    let mut server_shutdown = shutdown_rx.clone();
     let worker_server_fut = Server::builder()
         .add_service(WorkerServer::new(worker_node))
-        .serve(addr);
+        .serve_with_shutdown(addr, async move {
+            let _ = server_shutdown.changed().await;
+        });
 
     // print this address
     info!("Manager node address: {}", token_data.claims.address);
@@ -107,12 +116,18 @@ pub async fn run_worker(token: &str) -> R<()> {
     )
     .await?;
 
-    let heartbeat_fut = start_heartbeats(name.clone(), client.clone(), task_manager.clone());
+    let heartbeat_fut = start_heartbeats(
+        name.clone(),
+        client.clone(),
+        task_manager.clone(),
+        shutdown_rx.clone(),
+    );
     let checks_fut = start_node_checks(
         name.clone(),
         config.additional_node_checks.clone(),
         client,
         task_manager.clone(),
+        shutdown_rx.clone(),
     );
     let _res = join!(heartbeat_fut, checks_fut, worker_server_fut);
 
@@ -140,10 +155,14 @@ async fn start_heartbeats(
     name: String,
     client: ManagerClient<Channel>,
     task_manager: Arc<Mutex<WorkerTaskManager>>,
+    mut shutdown_rx: watch::Receiver<bool>,
 ) -> R<()> {
     let mut client_clone = client.clone();
 
     loop {
+        if *shutdown_rx.borrow() {
+            return Ok(());
+        }
         let (allocations, failures) = {
             let mut manager = task_manager.lock().expect("task manager");
             let failures = manager
@@ -173,10 +192,12 @@ async fn start_heartbeats(
                 .reconcile_allocations(&reply.desired_allocations);
         }
 
-        tokio::time::sleep(tokio::time::Duration::from_secs(
-            WORKER_HEARTBEAT_DURATION_SEC,
-        ))
-        .await;
+        tokio::select! {
+            _ = shutdown_rx.changed() => return Ok(()),
+            _ = tokio::time::sleep(tokio::time::Duration::from_secs(
+                WORKER_HEARTBEAT_DURATION_SEC,
+            )) => {},
+        }
     }
 }
 
@@ -186,10 +207,14 @@ async fn start_node_checks(
     additional_node_checks: Vec<String>,
     client: ManagerClient<Channel>,
     task_manager: Arc<Mutex<WorkerTaskManager>>,
+    mut shutdown_rx: watch::Receiver<bool>,
 ) -> R<()> {
     let mut client_clone = client.clone();
 
     loop {
+        if *shutdown_rx.borrow() {
+            return Ok(());
+        }
         let checks_data = {
             let readiness = task_manager
                 .lock()
@@ -206,10 +231,12 @@ async fn start_node_checks(
         let response = client_clone.health_check(req).await?;
         info!("RESPONSE={:?}", response);
 
-        tokio::time::sleep(tokio::time::Duration::from_secs(
-            WORKER_NODE_CHECK_DURATION_SEC,
-        ))
-        .await;
+        tokio::select! {
+            _ = shutdown_rx.changed() => return Ok(()),
+            _ = tokio::time::sleep(tokio::time::Duration::from_secs(
+                WORKER_NODE_CHECK_DURATION_SEC,
+            )) => {},
+        }
     }
 }
 
