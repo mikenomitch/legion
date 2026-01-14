@@ -278,15 +278,9 @@ mod tests {
 
         let job_one_name = "job-1".to_string();
         let job_one_task = TaskConfig {
-            name: "task-one".into(),
-            kind: "service".into(),
-            count: 1,
             config: json!({ "message": "hi" }),
             resources: json!({ "memory": 128 }),
-            constraints: json!({}),
-            affinities: json!({}),
-            checks: Vec::new(),
-            on_unhealthy: crate::structs::TaskOnUnhealthyConfig::default(),
+            ..TaskConfig::new("task-one", "service")
         };
         let job_one_config = JobConfig {
             name: job_one_name.clone(),
@@ -335,15 +329,9 @@ mod tests {
 
         let job_two_name = "job-2".to_string();
         let job_two_task = TaskConfig {
-            name: "task-two".into(),
-            kind: "service".into(),
-            count: 1,
             config: json!({ "message": "hola" }),
             resources: json!({ "memory": 128 }),
-            constraints: json!({}),
-            affinities: json!({}),
-            checks: Vec::new(),
-            on_unhealthy: crate::structs::TaskOnUnhealthyConfig::default(),
+            ..TaskConfig::new("task-two", "service")
         };
         let job_two_config = JobConfig {
             name: job_two_name.clone(),
@@ -418,15 +406,10 @@ mod tests {
 
         let job_name = "update-job".to_string();
         let base_task = TaskConfig {
-            name: "web".into(),
-            kind: "service".into(),
-            count: 1,
             config: json!({ "message": "v1" }),
             resources: json!({ "memory": 128 }),
             constraints: json!({ "node_id": "node-a" }),
-            affinities: json!({}),
-            checks: Vec::new(),
-            on_unhealthy: crate::structs::TaskOnUnhealthyConfig::default(),
+            ..TaskConfig::new("web", "service")
         };
 
         let job_config = JobConfig {

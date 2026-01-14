@@ -419,6 +419,20 @@ impl TaskCheck {
 }
 
 impl TaskConfig {
+    pub fn new(name: impl Into<String>, kind: impl Into<String>) -> Self {
+        TaskConfig {
+            name: name.into(),
+            count: default_task_count(),
+            kind: kind.into(),
+            config: empty_object(),
+            resources: empty_object(),
+            constraints: empty_object(),
+            affinities: empty_object(),
+            checks: Vec::new(),
+            on_unhealthy: TaskOnUnhealthyConfig::default(),
+        }
+    }
+
     pub fn validate_checks(&self) -> R<()> {
         let has_boot_checks = self
             .checks

@@ -211,15 +211,8 @@ mod tests {
 
     fn exec_task() -> TaskConfig {
         TaskConfig {
-            name: "exec-task".into(),
-            count: 1,
-            kind: "exec".into(),
             config: json!({"command": "true"}),
-            resources: json!({}),
-            constraints: json!({}),
-            affinities: json!({}),
-            checks: Vec::new(),
-            on_unhealthy: crate::structs::TaskOnUnhealthyConfig::default(),
+            ..TaskConfig::new("exec-task", "exec")
         }
     }
 

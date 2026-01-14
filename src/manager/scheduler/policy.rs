@@ -246,17 +246,7 @@ mod tests {
     }
 
     fn task(name: &str) -> TaskConfig {
-        TaskConfig {
-            name: name.into(),
-            count: 1,
-            kind: "noop".into(),
-            config: json!({}),
-            resources: json!({}),
-            constraints: json!({}),
-            affinities: json!({}),
-            checks: Vec::new(),
-            on_unhealthy: crate::structs::TaskOnUnhealthyConfig::default(),
-        }
+        TaskConfig::new(name, "noop")
     }
 
     fn alloc(node_id: &str, id: i64, job_config_id: &str) -> Allocation {

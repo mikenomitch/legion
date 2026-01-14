@@ -1087,26 +1087,12 @@ mod tests {
             name: "sched-job".into(),
             tasks: vec![
                 TaskConfig {
-                    name: "web".into(),
                     count: 2,
-                    kind: "noop".into(),
-                    config: json!({}),
-                    resources: json!({}),
-                    constraints: json!({}),
-                    affinities: json!({}),
-                    checks: Vec::new(),
-                    on_unhealthy: crate::structs::TaskOnUnhealthyConfig::default(),
+                    ..TaskConfig::new("web", "noop")
                 },
                 TaskConfig {
-                    name: "db".into(),
-                    count: 1,
-                    kind: "noop".into(),
-                    config: json!({}),
-                    resources: json!({}),
                     constraints: json!({ "role": "db" }),
-                    affinities: json!({}),
-                    checks: Vec::new(),
-                    on_unhealthy: crate::structs::TaskOnUnhealthyConfig::default(),
+                    ..TaskConfig::new("db", "noop")
                 },
             ],
             version: None,
@@ -1171,15 +1157,8 @@ mod tests {
         let job = JobConfig {
             name: "resched-job".into(),
             tasks: vec![TaskConfig {
-                name: "batch".into(),
                 count: 3,
-                kind: "noop".into(),
-                config: json!({}),
-                resources: json!({}),
-                constraints: json!({}),
-                affinities: json!({}),
-                checks: Vec::new(),
-                on_unhealthy: crate::structs::TaskOnUnhealthyConfig::default(),
+                ..TaskConfig::new("batch", "noop")
             }],
             version: None,
         };
@@ -1216,17 +1195,7 @@ mod tests {
 
         let job = JobConfig {
             name: "resched-exclude".into(),
-            tasks: vec![TaskConfig {
-                name: "batch".into(),
-                count: 1,
-                kind: "noop".into(),
-                config: json!({}),
-                resources: json!({}),
-                constraints: json!({}),
-                affinities: json!({}),
-                checks: Vec::new(),
-                on_unhealthy: crate::structs::TaskOnUnhealthyConfig::default(),
-            }],
+            tasks: vec![TaskConfig::new("batch", "noop")],
             version: None,
         };
 
@@ -1254,15 +1223,8 @@ mod tests {
         let job = JobConfig {
             name: "unschedulable".into(),
             tasks: vec![TaskConfig {
-                name: "analytics".into(),
-                count: 1,
-                kind: "noop".into(),
-                config: json!({}),
-                resources: json!({}),
                 constraints: json!({ "role": "db" }),
-                affinities: json!({}),
-                checks: Vec::new(),
-                on_unhealthy: crate::structs::TaskOnUnhealthyConfig::default(),
+                ..TaskConfig::new("analytics", "noop")
             }],
             version: None,
         };
@@ -1330,15 +1292,9 @@ mod tests {
         let job = JobConfig {
             name: "constraint-sources".into(),
             tasks: vec![TaskConfig {
-                name: "db".into(),
                 count: 2,
-                kind: "noop".into(),
-                config: json!({}),
-                resources: json!({}),
                 constraints: json!({ "role": "db" }),
-                affinities: json!({}),
-                checks: Vec::new(),
-                on_unhealthy: crate::structs::TaskOnUnhealthyConfig::default(),
+                ..TaskConfig::new("db", "noop")
             }],
             version: None,
         };
@@ -1367,15 +1323,9 @@ mod tests {
         let job = JobConfig {
             name: "distinct-job".into(),
             tasks: vec![TaskConfig {
-                name: "api".into(),
                 count: 2,
-                kind: "noop".into(),
-                config: json!({}),
-                resources: json!({}),
                 constraints: json!([{ "key": "zone", "operator": "distinct" }]),
-                affinities: json!({}),
-                checks: Vec::new(),
-                on_unhealthy: crate::structs::TaskOnUnhealthyConfig::default(),
+                ..TaskConfig::new("api", "noop")
             }],
             version: None,
         };
@@ -1404,15 +1354,8 @@ mod tests {
         let job = JobConfig {
             name: "apply-constraints".into(),
             tasks: vec![TaskConfig {
-                name: "db".into(),
-                count: 1,
-                kind: "noop".into(),
-                config: json!({}),
-                resources: json!({}),
                 constraints: json!([{ "key": "role", "value": "db" }]),
-                affinities: json!({}),
-                checks: Vec::new(),
-                on_unhealthy: crate::structs::TaskOnUnhealthyConfig::default(),
+                ..TaskConfig::new("db", "noop")
             }],
             version: None,
         };
@@ -1445,15 +1388,9 @@ mod tests {
         let job = JobConfig {
             name: "mem-limited".into(),
             tasks: vec![TaskConfig {
-                name: "worker".into(),
                 count: 3,
-                kind: "noop".into(),
-                config: json!({}),
                 resources: json!({ "memory": 256 }),
-                constraints: json!({}),
-                affinities: json!({}),
-                checks: Vec::new(),
-                on_unhealthy: crate::structs::TaskOnUnhealthyConfig::default(),
+                ..TaskConfig::new("worker", "noop")
             }],
             version: None,
         };
@@ -1489,15 +1426,9 @@ mod tests {
         let job = JobConfig {
             name: "alloc-limit".into(),
             tasks: vec![TaskConfig {
-                name: "worker".into(),
                 count: 2,
-                kind: "noop".into(),
-                config: json!({}),
                 resources: json!({ "memory": 128 }),
-                constraints: json!({}),
-                affinities: json!({}),
-                checks: Vec::new(),
-                on_unhealthy: crate::structs::TaskOnUnhealthyConfig::default(),
+                ..TaskConfig::new("worker", "noop")
             }],
             version: None,
         };
@@ -1526,17 +1457,7 @@ mod tests {
 
         let job = JobConfig {
             name: "spread-considered".into(),
-            tasks: vec![TaskConfig {
-                name: "api".into(),
-                count: 1,
-                kind: "noop".into(),
-                config: json!({}),
-                resources: json!({}),
-                constraints: json!({}),
-                affinities: json!({}),
-                checks: Vec::new(),
-                on_unhealthy: crate::structs::TaskOnUnhealthyConfig::default(),
-            }],
+            tasks: vec![TaskConfig::new("api", "noop")],
             version: None,
         };
 
@@ -1570,17 +1491,7 @@ mod tests {
 
         let job = JobConfig {
             name: "binpack-considered".into(),
-            tasks: vec![TaskConfig {
-                name: "worker".into(),
-                count: 1,
-                kind: "noop".into(),
-                config: json!({}),
-                resources: json!({}),
-                constraints: json!({}),
-                affinities: json!({}),
-                checks: Vec::new(),
-                on_unhealthy: crate::structs::TaskOnUnhealthyConfig::default(),
-            }],
+            tasks: vec![TaskConfig::new("worker", "noop")],
             version: None,
         };
 
@@ -1621,17 +1532,7 @@ mod tests {
 
         let load_job = JobConfig {
             name: "load-job".into(),
-            tasks: vec![TaskConfig {
-                name: "load".into(),
-                count: 1,
-                kind: "noop".into(),
-                config: json!({}),
-                resources: json!({}),
-                constraints: json!({}),
-                affinities: json!({}),
-                checks: Vec::new(),
-                on_unhealthy: crate::structs::TaskOnUnhealthyConfig::default(),
-            }],
+            tasks: vec![TaskConfig::new("load", "noop")],
             version: None,
         };
         store.handle_job_submit(&load_job, &[dummy_submission()])?;
@@ -1645,15 +1546,8 @@ mod tests {
         let job = JobConfig {
             name: "affinity-job".into(),
             tasks: vec![TaskConfig {
-                name: "api".into(),
-                count: 1,
-                kind: "noop".into(),
-                config: json!({}),
-                resources: json!({}),
-                constraints: json!({}),
                 affinities: json!({ "zone": "us-east" }),
-                checks: Vec::new(),
-                on_unhealthy: crate::structs::TaskOnUnhealthyConfig::default(),
+                ..TaskConfig::new("api", "noop")
             }],
             version: None,
         };

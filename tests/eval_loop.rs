@@ -27,15 +27,10 @@ fn setup_store() -> R<Store> {
 
 fn make_job_config(name: &str, count: u32) -> JobConfig {
     let task = TaskConfig {
-        name: format!("{name}-task"),
-        kind: "service".into(),
         count,
         config: json!({ "message": "hi" }),
         resources: json!({ "memory": 128 }),
-        constraints: json!({}),
-        affinities: json!({}),
-        checks: Vec::new(),
-        on_unhealthy: legion::structs::TaskOnUnhealthyConfig::default(),
+        ..TaskConfig::new(format!("{name}-task"), "service")
     };
 
     JobConfig {
