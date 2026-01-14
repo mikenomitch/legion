@@ -7,35 +7,29 @@ use std::process::Command;
 pub struct ExecTaskPlugin;
 
 impl ExecTaskPlugin {
-    fn config_command<'a>(&self, config: &'a Value) -> R<&'a str> {
+    fn config_command(&self, config: &Value) -> R<Vec<String>> {
         let obj = config
             .as_object()
             .context("exec task config must be an object")?;
         let command = obj
             .get("command")
-            .and_then(|value| value.as_str())
-            .context("exec task config requires string command")?;
-        Ok(command)
-    }
-
-    fn config_args(&self, config: &Value) -> R<Vec<String>> {
-        let obj = config
-            .as_object()
-            .context("exec task config must be an object")?;
-        let Some(args) = obj.get("args") else {
-            return Ok(Vec::new());
-        };
-        let args = args
+            .context("exec task config requires command")?;
+        let command = command
             .as_array()
-            .context("exec task args must be a list of strings")?;
-        args.iter()
+            .context("exec task command must be a list of strings")?;
+        let command = command
+            .iter()
             .map(|value| {
                 value
                     .as_str()
                     .map(|val| val.to_string())
-                    .context("exec task args must be strings")
+                    .context("exec task command values must be strings")
             })
-            .collect::<R<Vec<_>>>()
+            .collect::<R<Vec<_>>>()?;
+        if command.is_empty() {
+            bail!("exec task command must include at least one entry");
+        }
+        Ok(command)
     }
 
     fn config_env(&self, config: &Value) -> R<HashMap<String, String>> {
@@ -83,9 +77,9 @@ impl TaskPlugin for ExecTaskPlugin {
             "type": "object",
             "required": ["command"],
             "properties": {
-                "command": { "type": "string", "minLength": 1 },
-                "args": {
+                "command": {
                     "type": "array",
+                    "minItems": 1,
                     "items": { "type": "string" }
                 },
                 "env": {
@@ -125,19 +119,21 @@ impl TaskPlugin for ExecTaskPlugin {
         runtime: &mut TaskRuntime,
     ) -> R<()> {
         let command = self.config_command(&task.config)?;
-        let args = self.config_args(&task.config)?;
         let env = self.config_env(&task.config)?;
         let cwd = self.config_cwd(&task.config)?;
+        let (program, args) = command
+            .split_first()
+            .context("exec task command must include at least one entry")?;
 
         info!(
             allocation_id = allocation.id,
             task_name = %task.name,
-            command,
+            command = program,
             "Starting exec task"
         );
 
-        let mut cmd = Command::new(command);
-        cmd.args(&args);
+        let mut cmd = Command::new(program);
+        cmd.args(args);
         if let Some(cwd) = cwd {
             cmd.current_dir(cwd);
         }

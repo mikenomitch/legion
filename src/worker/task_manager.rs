@@ -239,7 +239,7 @@ mod tests {
         let mut manager = WorkerTaskManager::new();
         manager.load_builtin_plugins();
         let task = TaskConfig {
-            config: json!({"command": "true"}),
+            config: json!({"command": ["true"]}),
             ..TaskConfig::new("exec-task", "exec")
         };
 
