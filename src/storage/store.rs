@@ -12,7 +12,7 @@ use crate::storage::queries::{
 };
 use crate::structs::{
     Allocation, Eval, Job, JobConfig, LedgerEntry, ManagerConfigFull, ManagerNodeConfig, Node,
-    NodeMsg, Submission, TaskConfig, WorkerConfig,
+    NodeMsg, Submission, TaskCheck, TaskConfig, TaskOnUnhealthyConfig, WorkerConfig,
 };
 
 use rand::{seq::SliceRandom, thread_rng};
@@ -212,7 +212,7 @@ impl Store {
 
         let mut task_stmt = conn.prepare(
             r#"
-            SELECT id, name, kind, count, config, resources, constraints, affinities, job_config_id
+            SELECT id, name, kind, count, config, resources, constraints, affinities, checks, on_unhealthy, job_config_id
             FROM task_config;
             "#,
         )?;
@@ -226,8 +226,10 @@ impl Store {
                 resources: row.get(5)?,
                 constraints: row.get(6)?,
                 affinities: row.get(7)?,
+                checks: self.parse_checks_column(8, row.get(8)?)?,
+                on_unhealthy: self.parse_on_unhealthy_column(9, row.get(9)?)?,
             };
-            let job_config_id: String = row.get(8)?;
+            let job_config_id: String = row.get(10)?;
             Ok((job_config_id, id, task))
         })?;
 
@@ -449,6 +451,34 @@ impl Store {
         })
     }
 
+    fn parse_checks_column(
+        &self,
+        idx: usize,
+        raw: String,
+    ) -> Result<Vec<TaskCheck>, rusqlite::Error> {
+        serde_json::from_str(&raw).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(
+                idx,
+                rusqlite::types::Type::Text,
+                Box::new(err),
+            )
+        })
+    }
+
+    fn parse_on_unhealthy_column(
+        &self,
+        idx: usize,
+        raw: String,
+    ) -> Result<TaskOnUnhealthyConfig, rusqlite::Error> {
+        serde_json::from_str(&raw).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(
+                idx,
+                rusqlite::types::Type::Text,
+                Box::new(err),
+            )
+        })
+    }
+
     fn task_config_from_row(&self, row: &Row<'_>) -> Result<TaskConfig, rusqlite::Error> {
         let task_config = TaskConfig {
             name: row.get(1)?,
@@ -458,6 +488,8 @@ impl Store {
             resources: row.get(5)?,
             constraints: row.get(6)?,
             affinities: row.get(7)?,
+            checks: self.parse_checks_column(8, row.get(8)?)?,
+            on_unhealthy: self.parse_on_unhealthy_column(9, row.get(9)?)?,
         };
 
         Ok(task_config)
@@ -845,6 +877,18 @@ impl Store {
     }
 
     #[instrument(err, skip_all)]
+    pub fn mark_job_failed(&self, job_id: &str) -> R<()> {
+        let conn = self.write_connection()?;
+        let sql = r#"
+        UPDATE job
+        SET status = 'failed'
+        WHERE id = ?;
+"#;
+        conn.execute(sql, [job_id])?;
+        Ok(())
+    }
+
+    #[instrument(err, skip_all)]
     pub fn destroy_job(&self, name: &str) -> R<()> {
         let mut conn = self.write_connection()?;
         let tx = conn.transaction()?;
@@ -1047,6 +1091,8 @@ impl Store {
             })?;
 
         for t in &config.tasks {
+            let checks = serde_json::to_string(&t.checks)?;
+            let on_unhealthy = serde_json::to_string(&t.on_unhealthy)?;
             let task_params = named_params! {
                 ":name": t.name,
                 ":kind": t.kind,
@@ -1055,6 +1101,8 @@ impl Store {
                 ":resources": t.resources,
                 ":constraints": t.constraints,
                 ":affinities": t.affinities,
+                ":checks": checks,
+                ":on_unhealthy": on_unhealthy,
                 ":job_id": job.id,
                 ":job_config_id": job_config_id,
             };
@@ -1285,6 +1333,8 @@ impl Store {
                 resources: row.get(5)?,
                 constraints: row.get(6)?,
                 affinities: row.get(7)?,
+                checks: self.parse_checks_column(8, row.get(8)?)?,
+                on_unhealthy: self.parse_on_unhealthy_column(9, row.get(9)?)?,
             };
 
             Ok((id, task))
@@ -1986,6 +2036,8 @@ mod tests {
                 resources: json!({}),
                 constraints: json!({}),
                 affinities: json!({}),
+                checks: Vec::new(),
+                on_unhealthy: crate::structs::TaskOnUnhealthyConfig::default(),
             }],
             version: None,
         };
@@ -2038,6 +2090,8 @@ mod tests {
                 resources: json!({}),
                 constraints: json!({}),
                 affinities: json!({}),
+                checks: Vec::new(),
+                on_unhealthy: crate::structs::TaskOnUnhealthyConfig::default(),
             }],
             version: None,
         };
@@ -2071,6 +2125,8 @@ mod tests {
                 resources: json!({}),
                 constraints: json!({}),
                 affinities: json!({}),
+                checks: Vec::new(),
+                on_unhealthy: crate::structs::TaskOnUnhealthyConfig::default(),
             }],
             version: None,
         };
@@ -2254,6 +2310,8 @@ mod tests {
             resources: json!({ "memory": 256 }),
             constraints: json!({}),
             affinities: json!({}),
+            checks: Vec::new(),
+            on_unhealthy: crate::structs::TaskOnUnhealthyConfig::default(),
         };
 
         let task_two = TaskConfig {
@@ -2264,6 +2322,8 @@ mod tests {
             resources: json!({ "memory": 512 }),
             constraints: json!({}),
             affinities: json!({}),
+            checks: Vec::new(),
+            on_unhealthy: crate::structs::TaskOnUnhealthyConfig::default(),
         };
 
         let task_configs = vec![task_one.clone(), task_two.clone()];
@@ -2334,6 +2394,8 @@ mod tests {
             resources: json!({ "memory": 256 }),
             constraints: json!({}),
             affinities: json!({}),
+            checks: Vec::new(),
+            on_unhealthy: crate::structs::TaskOnUnhealthyConfig::default(),
         };
 
         let job_name = "rollback-job".to_string();
@@ -2382,6 +2444,8 @@ mod tests {
             resources: json!({ "memory": 256 }),
             constraints: json!({}),
             affinities: json!({}),
+            checks: Vec::new(),
+            on_unhealthy: crate::structs::TaskOnUnhealthyConfig::default(),
         };
 
         let orig_task_configs = vec![orig_task.clone()];
@@ -2444,6 +2508,8 @@ mod tests {
             resources: json!({ "memory": 256 }),
             constraints: json!({}),
             affinities: json!({}),
+            checks: Vec::new(),
+            on_unhealthy: crate::structs::TaskOnUnhealthyConfig::default(),
         };
         let new_task_configs = vec![new_task.clone(), extra_task.clone()];
 
@@ -2498,6 +2564,8 @@ mod tests {
             resources: json!({ "memory": 256 }),
             constraints: json!({}),
             affinities: json!({}),
+            checks: Vec::new(),
+            on_unhealthy: crate::structs::TaskOnUnhealthyConfig::default(),
         };
 
         let orig_task_configs = vec![orig_task.clone()];
@@ -2541,6 +2609,8 @@ mod tests {
             resources: json!({ "memory": 256 }),
             constraints: json!({}),
             affinities: json!({}),
+            checks: Vec::new(),
+            on_unhealthy: crate::structs::TaskOnUnhealthyConfig::default(),
         };
         let task_two = TaskConfig {
             name: "job-one-task-2".to_string(),
@@ -2550,6 +2620,8 @@ mod tests {
             resources: json!({ "memory": 512 }),
             constraints: json!({}),
             affinities: json!({}),
+            checks: Vec::new(),
+            on_unhealthy: crate::structs::TaskOnUnhealthyConfig::default(),
         };
         let job_one_config = JobConfig {
             name: job_one_name.clone(),
@@ -2576,6 +2648,8 @@ mod tests {
             resources: json!({ "memory": 128 }),
             constraints: json!({}),
             affinities: json!({}),
+            checks: Vec::new(),
+            on_unhealthy: crate::structs::TaskOnUnhealthyConfig::default(),
         };
         let job_two_config = JobConfig {
             name: job_two_name.clone(),
@@ -2678,6 +2752,8 @@ mod tests {
             resources: json!({}),
             constraints: json!({}),
             affinities: json!({}),
+            checks: Vec::new(),
+            on_unhealthy: crate::structs::TaskOnUnhealthyConfig::default(),
         }];
 
         let job_name = "solo-job".to_string();
@@ -2743,6 +2819,8 @@ mod tests {
             resources: json!({}),
             constraints: json!({}),
             affinities: json!({}),
+            checks: Vec::new(),
+            on_unhealthy: crate::structs::TaskOnUnhealthyConfig::default(),
         }];
 
         let job_one_config = JobConfig {

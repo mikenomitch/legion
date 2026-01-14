@@ -44,7 +44,7 @@ pub async fn run_manager(config: ManagerConfig) -> R<()> {
 
     let store_copy_b = store.clone();
 
-    let manager_node = ManagerAgentService { store };
+    let manager_node = ManagerAgentService::new(store);
 
     let addr = format!("{}:{}", full_config.server.host, full_config.server.port).parse()?;
 

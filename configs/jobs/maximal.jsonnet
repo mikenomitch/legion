@@ -20,6 +20,35 @@
                 role: "web",
                 region: "us-east",
             },
+            checks: [
+                {
+                    type: "boot",
+                    name: "HTTP Boot /health",
+                    kind: "http",
+                    path: "/health",
+                    port: 8080,
+                    every: "5s",
+                    timeout: "2s",
+                    unhealthy_after_count: 1,
+                },
+                {
+                    type: "health",
+                    kind: "http",
+                    path: "/health",
+                    port: 8080,
+                    every: "10s",
+                    timeout: "2s",
+                    unhealthy_after_count: 1,
+                },
+            ],
+            on_unhealthy: {
+                restart_count: 3,
+                restart_period: "30m",
+                restart_delay: "30s",
+                move_count: 3,
+                move_period: "30m",
+                move_delay: "30s",
+            },
             affinities: [
                 {
                     key: "zone",

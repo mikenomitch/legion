@@ -1,6 +1,7 @@
 use crate::prelude::*;
 use crate::structs::{Allocation, TaskAllocation, TaskConfig};
 use crate::task_plugins::{TaskPluginRegistry, TaskRuntime};
+use crate::worker::task_health::HealthMonitorHandle;
 use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
@@ -12,6 +13,9 @@ pub struct FailedAllocationReport {
 pub struct WorkerTaskManager {
     registry: TaskPluginRegistry,
     runtimes: HashMap<i64, TaskRuntime>,
+    allocations: HashMap<i64, Allocation>,
+    task_configs: HashMap<i64, TaskConfig>,
+    health_monitors: HashMap<i64, HealthMonitorHandle>,
     failed: Vec<FailedAllocationReport>,
 }
 
@@ -20,6 +24,9 @@ impl WorkerTaskManager {
         Self {
             registry: TaskPluginRegistry::new(),
             runtimes: HashMap::new(),
+            allocations: HashMap::new(),
+            task_configs: HashMap::new(),
+            health_monitors: HashMap::new(),
             failed: Vec::new(),
         }
     }
@@ -48,25 +55,54 @@ impl WorkerTaskManager {
     }
 
     pub fn record_failure(&mut self, allocation_id: i64, reason: impl Into<String>) {
+        if let Some(monitor) = self.health_monitors.remove(&allocation_id) {
+            monitor.shutdown();
+        }
+        if let (Some(allocation), Some(task)) = (
+            self.allocations.get(&allocation_id),
+            self.task_configs.get(&allocation_id),
+        ) {
+            if let Some(plugin) = self.registry.plugin(&task.kind) {
+                if let Some(runtime) = self.runtimes.get_mut(&allocation_id) {
+                    if let Err(err) = plugin.destroy(allocation, task, runtime) {
+                        warn!(
+                            allocation_id,
+                            task_name = %task.name,
+                            error = ?err,
+                            "Failed to destroy allocation runtime"
+                        );
+                    }
+                }
+            }
+        }
         self.runtimes.remove(&allocation_id);
+        self.allocations.remove(&allocation_id);
+        self.task_configs.remove(&allocation_id);
         self.failed.push(FailedAllocationReport {
             allocation_id,
             reason: reason.into(),
         });
     }
 
-    pub fn reconcile_allocations(&mut self, allocations: &[TaskAllocation]) {
+    pub fn reconcile_allocations(
+        &mut self,
+        allocations: &[TaskAllocation],
+    ) -> Vec<(Allocation, TaskConfig)> {
+        let mut started = Vec::new();
         for allocation in allocations {
             if self.runtimes.contains_key(&allocation.allocation_id) {
                 continue;
             }
             match self.run_task_allocation(allocation) {
-                Ok(()) => {}
+                Ok((alloc, task)) => {
+                    started.push((alloc, task));
+                }
                 Err(err) => {
                     self.record_failure(allocation.allocation_id, err.to_string());
                 }
             }
         }
+        started
     }
 
     #[instrument(err, skip_all)]
@@ -104,18 +140,63 @@ impl WorkerTaskManager {
         );
         plugin.start(allocation, task, runtime)?;
 
+        self.allocations.insert(allocation.id, allocation.clone());
+        self.task_configs.insert(allocation.id, task.clone());
+
         Ok(())
     }
 
-    pub fn run_task_allocation(&mut self, allocation: &TaskAllocation) -> R<()> {
+    pub fn run_task_allocation(
+        &mut self,
+        allocation: &TaskAllocation,
+    ) -> R<(Allocation, TaskConfig)> {
         let (alloc, task) = task_from_allocation(allocation)?;
-        self.run_allocation(&alloc, &task)
+        self.run_allocation(&alloc, &task)?;
+        Ok((alloc, task))
+    }
+
+    pub fn restart_allocation(&mut self, allocation_id: i64) -> R<()> {
+        let allocation = self
+            .allocations
+            .get(&allocation_id)
+            .context("Allocation not found for restart")?;
+        let task = self
+            .task_configs
+            .get(&allocation_id)
+            .context("Task config missing for restart")?;
+        let runtime = self
+            .runtimes
+            .get_mut(&allocation_id)
+            .context("Task runtime missing for restart")?;
+        let plugin = self
+            .registry
+            .plugin(&task.kind)
+            .context("Task plugin missing for restart")?;
+
+        plugin.stop(allocation, task, runtime)?;
+        plugin.start(allocation, task, runtime)?;
+        Ok(())
+    }
+
+    pub fn register_health_monitor(&mut self, allocation_id: i64, handle: HealthMonitorHandle) {
+        self.health_monitors.insert(allocation_id, handle);
     }
 }
 
 fn task_from_allocation(allocation: &TaskAllocation) -> R<(Allocation, TaskConfig)> {
     let task_config: serde_json::Value =
         serde_json::from_str(&allocation.task_config).context("Invalid task configuration JSON")?;
+    let checks = if allocation.task_checks.trim().is_empty() {
+        Vec::new()
+    } else {
+        serde_json::from_str(&allocation.task_checks).context("Invalid task health checks JSON")?
+    };
+    let on_unhealthy = if allocation.task_on_unhealthy.trim().is_empty() {
+        crate::structs::TaskOnUnhealthyConfig::default()
+    } else {
+        serde_json::from_str(&allocation.task_on_unhealthy)
+            .context("Invalid task on_unhealthy JSON")?
+    };
 
     let task = TaskConfig {
         name: allocation.task_name.clone(),
@@ -125,6 +206,8 @@ fn task_from_allocation(allocation: &TaskAllocation) -> R<(Allocation, TaskConfi
         resources: serde_json::json!({}),
         constraints: serde_json::json!({}),
         affinities: serde_json::json!({}),
+        checks,
+        on_unhealthy,
     };
     let alloc = Allocation {
         id: allocation.allocation_id,
@@ -168,6 +251,8 @@ mod tests {
             resources: json!({}),
             constraints: json!({}),
             affinities: json!({}),
+            checks: Vec::new(),
+            on_unhealthy: crate::structs::TaskOnUnhealthyConfig::default(),
         };
 
         manager.run_allocation(&alloc(), &task)?;

@@ -93,6 +93,8 @@ fn worker_address_for_node(node: &crate::structs::Node) -> Option<String> {
 
 pub fn build_task_allocation(task: &TaskConfig, allocation: &Allocation) -> R<TaskAllocation> {
     let task_config = serde_json::to_string(&task.config)?;
+    let task_checks = serde_json::to_string(&task.checks)?;
+    let task_on_unhealthy = serde_json::to_string(&task.on_unhealthy)?;
     Ok(TaskAllocation {
         allocation_id: allocation.id,
         job_id: allocation.job_id.clone(),
@@ -102,6 +104,8 @@ pub fn build_task_allocation(task: &TaskConfig, allocation: &Allocation) -> R<Ta
         task_name: task.name.clone(),
         task_kind: task.kind.clone(),
         task_config,
+        task_checks,
+        task_on_unhealthy,
     })
 }
 

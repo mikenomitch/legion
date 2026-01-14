@@ -92,6 +92,9 @@ pub fn get_migrations() -> Migrations<'static> {
         .down("DROP TABLE IF EXISTS task_config;"),
         M::up("ALTER TABLE task_config ADD COLUMN affinities JSONB NOT NULL DEFAULT '{}';")
             .down(""),
+        M::up("ALTER TABLE task_config ADD COLUMN checks JSONB NOT NULL DEFAULT '[]';").down(""),
+        M::up("ALTER TABLE task_config ADD COLUMN on_unhealthy JSONB NOT NULL DEFAULT '{}';")
+            .down(""),
         M::up(
             "CREATE TABLE IF NOT EXISTS job_update (
             id STRING PRIMARY KEY,

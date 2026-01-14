@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::time::Duration;
 
 use crate::prelude::*;
 
@@ -12,17 +13,48 @@ use crate::structs::{
     GetManagerConfigsRequest, GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest,
     HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, JobConfig, LedgerNode,
     ListJobsReply, ListJobsRequest, NodeMsg, PlanJobReply, PlanJobRequest, PlannedAllocation,
-    RunJobReply, RunJobRequest, StopJobReply, StopJobRequest, TaskConfig, UpdateNodeDynamicReply,
-    UpdateNodeDynamicRequest, WorkerConfig, WorkerPreRegisterReply, WorkerPreRegisterRequest,
-    WorkerRegisterReply, WorkerRegisterRequest,
+    RunJobReply, RunJobRequest, StopJobReply, StopJobRequest, TaskConfig, TaskOnUnhealthyConfig,
+    UpdateNodeDynamicReply, UpdateNodeDynamicRequest, WorkerConfig, WorkerPreRegisterReply,
+    WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest,
 };
 use crate::task_plugins::validate_job_config;
 
+use time::{Duration as TimeDuration, OffsetDateTime};
 use tonic::{Request, Response, Status};
 
 #[derive(Debug)]
 pub struct ManagerAgentService {
     pub store: Store,
+    allocation_failures: Arc<Mutex<AllocationFailureTracker>>,
+}
+
+impl ManagerAgentService {
+    pub fn new(store: Store) -> Self {
+        Self {
+            store,
+            allocation_failures: Arc::new(Mutex::new(AllocationFailureTracker::default())),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+struct TaskKey {
+    job_config_id: String,
+    task_config_id: i64,
+}
+
+#[derive(Debug, Clone)]
+struct AllocationFailureContext {
+    job_id: String,
+    job_config_id: String,
+    task_config_id: i64,
+    on_unhealthy: TaskOnUnhealthyConfig,
+}
+
+#[derive(Debug, Default)]
+struct AllocationFailureTracker {
+    allocations: HashMap<i64, AllocationFailureContext>,
+    move_history: HashMap<TaskKey, Vec<OffsetDateTime>>,
 }
 
 #[tonic::async_trait]
@@ -353,7 +385,12 @@ impl Manager for ManagerAgentService {
             Status::internal("Error updading node heartbeat")
         })?;
 
-        if let Err(err) = handle_failed_allocations(&self.store, &id, &req.failed_allocations) {
+        if let Err(err) = handle_failed_allocations(
+            &self.store,
+            &self.allocation_failures,
+            &id,
+            &req.failed_allocations,
+        ) {
             error!(node_id = %id, error = ?err, "Error handling failed allocations");
         }
 
@@ -579,10 +616,20 @@ impl Manager for ManagerAgentService {
     }
 }
 
-fn handle_failed_allocations(store: &Store, node_id: &str, failed: &[FailedAllocation]) -> R<()> {
+fn handle_failed_allocations(
+    store: &Store,
+    failure_tracker: &Arc<Mutex<AllocationFailureTracker>>,
+    node_id: &str,
+    failed: &[FailedAllocation],
+) -> R<()> {
     for failure in failed {
         let allocation_id = failure.allocation_id;
-        let Some(allocation) = store.get_allocation_by_id(allocation_id)? else {
+        let allocation_context = {
+            let mut tracker = failure_tracker.lock().expect("allocation failure tracker");
+            tracker.context_for_allocation(store, allocation_id)?
+        };
+
+        let Some(context) = allocation_context else {
             warn!(
                 allocation_id,
                 node_id, "Failed allocation not found; skipping reschedule"
@@ -591,13 +638,36 @@ fn handle_failed_allocations(store: &Store, node_id: &str, failed: &[FailedAlloc
         };
 
         store.remove_allocation_by_id(allocation_id)?;
-        store.enqueue_eval(
-            "job_reschedule",
-            Some(&allocation.job_id),
-            Some(&allocation.job_config_id),
-            Some(node_id),
-            None,
-        )?;
+
+        let move_decision = {
+            let mut tracker = failure_tracker.lock().expect("allocation failure tracker");
+            tracker.record_move(&context)?
+        };
+
+        match move_decision {
+            MoveDecision::Reschedule { delay } => {
+                let job_id = context.job_id.clone();
+                let job_config_id = context.job_config_id.clone();
+                let node_id = node_id.to_string();
+                let store = store.clone();
+                schedule_reschedule(store, job_id, job_config_id, node_id, delay);
+            }
+            MoveDecision::JobFailed => {
+                store.mark_job_failed(&context.job_id)?;
+                warn!(
+                    allocation_id,
+                    job_id = %context.job_id,
+                    reason = %failure.reason,
+                    "Move limit exceeded; marking job failed"
+                );
+            }
+        }
+
+        failure_tracker
+            .lock()
+            .expect("allocation failure tracker")
+            .allocations
+            .remove(&allocation_id);
 
         warn!(
             allocation_id,
@@ -608,6 +678,128 @@ fn handle_failed_allocations(store: &Store, node_id: &str, failed: &[FailedAlloc
     }
 
     Ok(())
+}
+
+enum MoveDecision {
+    Reschedule { delay: Duration },
+    JobFailed,
+}
+
+fn schedule_reschedule(
+    store: Store,
+    job_id: String,
+    job_config_id: String,
+    node_id: String,
+    delay: Duration,
+) {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            handle.spawn(async move {
+                if delay.as_secs() > 0 {
+                    tokio::time::sleep(delay).await;
+                }
+                if let Err(err) = store.enqueue_eval(
+                    "job_reschedule",
+                    Some(&job_id),
+                    Some(&job_config_id),
+                    Some(&node_id),
+                    None,
+                ) {
+                    error!(
+                        job_id = %job_id,
+                        job_config_id = %job_config_id,
+                        error = ?err,
+                        "Failed to enqueue reschedule after unhealthy allocation"
+                    );
+                }
+            });
+        }
+        Err(_) => {
+            let delay_for_thread = delay;
+            let job_id = job_id.clone();
+            let job_config_id = job_config_id.clone();
+            let node_id = node_id.clone();
+            std::thread::spawn(move || {
+                if delay_for_thread.as_secs() > 0 {
+                    std::thread::sleep(delay_for_thread);
+                }
+                if let Err(err) = store.enqueue_eval(
+                    "job_reschedule",
+                    Some(&job_id),
+                    Some(&job_config_id),
+                    Some(&node_id),
+                    None,
+                ) {
+                    error!(
+                        job_id = %job_id,
+                        job_config_id = %job_config_id,
+                        error = ?err,
+                        "Failed to enqueue reschedule after unhealthy allocation"
+                    );
+                }
+            });
+        }
+    }
+}
+
+impl AllocationFailureTracker {
+    fn context_for_allocation(
+        &mut self,
+        store: &Store,
+        allocation_id: i64,
+    ) -> R<Option<AllocationFailureContext>> {
+        if let Some(context) = self.allocations.get(&allocation_id) {
+            return Ok(Some(context.clone()));
+        }
+
+        let Some(allocation) = store.get_allocation_by_id(allocation_id)? else {
+            return Ok(None);
+        };
+
+        let task_configs = store.cached_task_configs_for_job_config(&allocation.job_config_id)?;
+        let task = task_configs
+            .into_iter()
+            .find(|(task_id, _)| *task_id == allocation.task_config_id)
+            .map(|(_, task)| task)
+            .context("Missing task config for allocation")?;
+
+        let context = AllocationFailureContext {
+            job_id: allocation.job_id,
+            job_config_id: allocation.job_config_id,
+            task_config_id: allocation.task_config_id,
+            on_unhealthy: task.on_unhealthy,
+        };
+        self.allocations.insert(allocation_id, context.clone());
+        Ok(Some(context))
+    }
+
+    fn record_move(&mut self, context: &AllocationFailureContext) -> R<MoveDecision> {
+        let now = OffsetDateTime::now_utc();
+        let key = TaskKey {
+            job_config_id: context.job_config_id.clone(),
+            task_config_id: context.task_config_id,
+        };
+        let history = self.move_history.entry(key).or_default();
+        let window = time_duration(context.on_unhealthy.move_period);
+        history.retain(|time| now - *time <= window);
+
+        if let Some(limit) = context.on_unhealthy.move_count {
+            if history.len() as u32 >= limit {
+                return Ok(MoveDecision::JobFailed);
+            }
+        }
+
+        history.push(now);
+        Ok(MoveDecision::Reschedule {
+            delay: context.on_unhealthy.move_delay,
+        })
+    }
+}
+
+fn time_duration(duration: Duration) -> TimeDuration {
+    let secs = duration.as_secs() as i64;
+    let nanos = duration.subsec_nanos() as i64;
+    TimeDuration::seconds(secs) + TimeDuration::nanoseconds(nanos)
 }
 
 fn build_desired_allocations(
@@ -720,6 +912,11 @@ mod tests {
                 resources: json!({}),
                 constraints: json!({}),
                 affinities: json!({}),
+                checks: Vec::new(),
+                on_unhealthy: TaskOnUnhealthyConfig {
+                    move_delay: Duration::from_secs(0),
+                    ..TaskOnUnhealthyConfig::default()
+                },
             }],
             version: None,
         };
@@ -728,14 +925,17 @@ mod tests {
         let task_id = store.get_task_configs_for_job_config(&job_config_id)?[0].0;
         let allocation = store.place_alloc("node-a", task_id)?;
 
+        let tracker = Arc::new(Mutex::new(AllocationFailureTracker::default()));
         handle_failed_allocations(
             &store,
+            &tracker,
             "node-a",
             &[FailedAllocation {
                 allocation_id: allocation.id,
                 reason: "boom".into(),
             }],
         )?;
+        std::thread::sleep(Duration::from_millis(10));
 
         assert!(store.get_allocation_by_id(allocation.id)?.is_none());
         let evals = store.get_evals()?;
@@ -762,6 +962,11 @@ mod tests {
                 resources: json!({}),
                 constraints: json!({}),
                 affinities: json!({}),
+                checks: Vec::new(),
+                on_unhealthy: TaskOnUnhealthyConfig {
+                    move_delay: Duration::from_secs(0),
+                    ..TaskOnUnhealthyConfig::default()
+                },
             }],
             version: None,
         };
