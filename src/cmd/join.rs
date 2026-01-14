@@ -1,3 +1,4 @@
+use crate::cmd::helpers::friendly_status;
 use crate::prelude::*;
 use crate::structs::insecure_manager_client::InsecureManagerClient;
 use crate::structs::GetJoinTokenRequest;
@@ -82,7 +83,7 @@ async fn request_join_token(ttl: &str, worker_type: &str) -> R<String> {
     let response = client
         .get_join_token(request)
         .await
-        .context("failed to request join token")?;
+        .map_err(|status| friendly_status("failed to request join token", status))?;
 
     Ok(response.get_ref().token.clone())
 }
