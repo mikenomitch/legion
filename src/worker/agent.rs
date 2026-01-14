@@ -18,6 +18,7 @@ use futures::join;
 use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tonic::{transport::Channel, transport::Server, Response};
 
 #[instrument(err, skip_all)]
@@ -38,20 +39,34 @@ pub async fn run_worker(token: &str, name_override: Option<&str>) -> R<()> {
         info!("Skipping expiry validation check on join token");
     }
 
+    let manager_addr = token_data.claims.address;
+    let worker_type = token_data.claims.worker_type;
+    run_worker_with_manager(manager_addr, worker_type, name_override).await
+}
+
+#[instrument(err, skip_all)]
+pub async fn run_worker_local(
+    manager_addr: String,
+    worker_type: String,
+    name_override: Option<&str>,
+) -> R<()> {
+    run_worker_with_manager(manager_addr, worker_type, name_override).await
+}
+
+#[instrument(err, skip_all)]
+async fn run_worker_with_manager(
+    manager_addr: String,
+    worker_type: String,
+    name_override: Option<&str>,
+) -> R<()> {
     let addr = format!("{DEF_MANAGER_HOSTNAME}:{DEF_WORKER_SERVER_PORT}").parse()?;
 
-    // print this address
-    info!("Manager node address: {}", token_data.claims.address);
+    info!("Manager node address: {}", manager_addr);
 
-    let client: ManagerClient<Channel> = create_manager_client(
-        token_data.claims.address,
-        String::new(),
-        // token_data.claims.ca_cert,
-    )
-    .await?;
+    let client: ManagerClient<Channel> = connect_manager_with_retry(&manager_addr).await?;
 
     // TODO: Establish TLS connection properly
-    let pre_register_res = pre_register_self(client.clone(), token_data.claims.worker_type).await?;
+    let pre_register_res = pre_register_self(client.clone(), worker_type).await?;
     let config = pre_register_res
         .into_inner()
         .config
@@ -129,6 +144,27 @@ pub async fn run_worker(token: &str, name_override: Option<&str>) -> R<()> {
     Ok(())
 }
 
+#[instrument(err, skip_all)]
+async fn connect_manager_with_retry(manager_addr: &str) -> R<ManagerClient<Channel>> {
+    let mut backoff = Duration::from_millis(200);
+    let max_backoff = Duration::from_secs(5);
+
+    loop {
+        match create_manager_client(manager_addr.to_string(), String::new()).await {
+            Ok(client) => return Ok(client),
+            Err(err) => {
+                warn!(
+                    error = ?err,
+                    %manager_addr,
+                    "Failed to connect to manager; retrying"
+                );
+                tokio::time::sleep(backoff).await;
+                backoff = std::cmp::min(backoff * 2, max_backoff);
+            }
+        }
+    }
+}
+
 fn resolve_worker_name(name_override: Option<&str>, name_prefix: Option<String>) -> R<String> {
     let workers_dir = PathBuf::from(DEF_WORKER_STATE_DIR);
     if let Some(name) = name_override {
@@ -164,9 +200,7 @@ fn find_existing_worker_id(workers_dir: &Path) -> R<Option<String>> {
 
     match entries.len() {
         0 => Ok(None),
-        1 => Ok(entries
-            .pop()
-            .and_then(|name| name.into_string().ok())),
+        1 => Ok(entries.pop().and_then(|name| name.into_string().ok())),
         _ => Err(anyhow!(
             "Multiple worker IDs found in {}; specify --name to choose one",
             workers_dir.display()

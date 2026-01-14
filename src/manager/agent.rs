@@ -7,6 +7,7 @@ use crate::structs::{
     manager_server::ManagerServer, ManagerConfig, Node, WorkerConfig as WorkerConfigMsg,
     WorkerConfigAlt,
 };
+use crate::worker::agent::run_worker_local;
 
 use futures::join;
 use http::Method;
@@ -19,7 +20,7 @@ use tonic_web::GrpcWebLayer;
 use tower_http::cors::{Any, CorsLayer};
 
 #[instrument(err, skip_all)]
-pub async fn run_manager(config: ManagerConfig) -> R<()> {
+pub async fn run_manager(config: ManagerConfig, run_worker: bool) -> R<()> {
     info!("Starting manager node");
 
     let full_config = config.with_defaults();
@@ -84,14 +85,31 @@ pub async fn run_manager(config: ManagerConfig) -> R<()> {
     let node_checker_fut =
         start_node_status_checker(store_copy_a, full_config.worker_check_seconds);
     let eval_loop_fut = start_eval_loop(store_copy_b, full_config.eval_threads);
+    let manager_host = resolve_manager_host(&full_config.server.host);
+    let manager_addr = format!("http://{}:{}", manager_host, full_config.server.port);
+    let worker_fut = async move {
+        if run_worker {
+            info!(%manager_addr, "Starting in-process worker");
+            run_worker_local(manager_addr, "default".to_string(), None).await?;
+        }
+        Ok::<(), anyhow::Error>(())
+    };
     let _res = join!(
         join_server_fut,
         start_server_fut,
         node_checker_fut,
-        eval_loop_fut
+        eval_loop_fut,
+        worker_fut
     );
 
     Ok(())
+}
+
+fn resolve_manager_host(host: &str) -> String {
+    match host {
+        "0.0.0.0" | "::" => "127.0.0.1".to_string(),
+        _ => host.to_string(),
+    }
 }
 
 fn load_server_tls_identity() -> R<Option<Identity>> {

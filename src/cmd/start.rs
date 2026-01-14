@@ -9,20 +9,28 @@ use jsonnet::JsonnetVm;
 pub fn config() -> Command {
     let manager_cmd = Command::new("manager")
         .about("Start a manager node")
-        .arg(config_path_arg());
+        .arg(config_path_arg())
+        .arg(
+            Arg::new("run-worker")
+                .long("run-worker")
+                .action(ArgAction::SetTrue)
+                .help("Run a worker node alongside the manager"),
+        );
 
-    let worker_cmd = Command::new("worker").about("Start a worker node").arg(
-        Arg::new("token")
-            .value_name("TOKEN")
-            .help("Join token for the worker")
-            .required(true),
-    )
-    .arg(
-        Arg::new("name")
-            .long("name")
-            .value_name("NAME")
-            .help("Override the worker name/ID"),
-    );
+    let worker_cmd = Command::new("worker")
+        .about("Start a worker node")
+        .arg(
+            Arg::new("token")
+                .value_name("TOKEN")
+                .help("Join token for the worker")
+                .required(true),
+        )
+        .arg(
+            Arg::new("name")
+                .long("name")
+                .value_name("NAME")
+                .help("Override the worker name/ID"),
+        );
 
     Command::new("start")
         .about("Start an agent")
@@ -33,19 +41,29 @@ pub fn config() -> Command {
 
 #[instrument(skip_all)]
 pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
-    if let Some(("worker", arg_matches)) = sub_matches.subcommand() {
-        let token = arg_matches
-            .get_one::<String>("token")
-            .context("Must provide token")?;
-        let name = arg_matches.get_one::<String>("name").map(String::as_str);
-        run_worker(token, name).await
-    } else {
-        let config_path = sub_matches
-            .get_one::<String>("config")
-            .map_or(DEF_CONFIG_PATH, String::as_str);
-
-        let config = parse_config(config_path)?;
-        run_manager(config).await
+    match sub_matches.subcommand() {
+        Some(("worker", arg_matches)) => {
+            let token = arg_matches
+                .get_one::<String>("token")
+                .context("Must provide token")?;
+            let name = arg_matches.get_one::<String>("name").map(String::as_str);
+            run_worker(token, name).await
+        }
+        Some(("manager", arg_matches)) => {
+            let config_path = arg_matches
+                .get_one::<String>("config")
+                .map_or(DEF_CONFIG_PATH, String::as_str);
+            let run_worker = arg_matches.get_flag("run-worker");
+            let config = parse_config(config_path)?;
+            run_manager(config, run_worker).await
+        }
+        _ => {
+            let config_path = sub_matches
+                .get_one::<String>("config")
+                .map_or(DEF_CONFIG_PATH, String::as_str);
+            let config = parse_config(config_path)?;
+            run_manager(config, false).await
+        }
     }
 }
 
