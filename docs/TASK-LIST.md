@@ -11,11 +11,11 @@
   - [x] It properly shows up in the manager's ledger of worker nodes (is this done?)
   - [ ] It can be reconfigured from the server using CRUD commands
     - [ ] For this to really work, do you need to update any of this type that already exist (and send them the info)? (Which means that nodes should save a reference to their type)?
-  - [ ] It can be restarted from the server - Codex
+  - [x] It can be restarted from the server - Test it
   - [ ] TLS is autoconfigured and auto-rotated
 
 - [ ] Scheduling
-  - [x] Ledger command. I can see all the nodes and what is on them easily via a CLI command. - Codexed
+  - [x] Ledger command. I can see all the nodes and what is on them easily via a CLI command.
   - [x] A framework for running scheduler plugins exists
   - [x] A "random" scheduler that selects nodes at random until one works, "works"
   - [x] Constraints work
@@ -26,6 +26,7 @@
   - [ ] Worker groups + taint/toleration equiv
   - [ ] Scheduling on same node as existing job works
   - [ ] Priorities and eviction works (eviction toggled at the pool level)
+    - [ ] At least think about fair scheduling policies (do a lil LLMing to figure out if there's some 80/20 you can do here)
   - [x] Rescheduling works
     - [x] Health checks trigger reschedule (after restart)
   - [ ] Dynamic metadata
@@ -44,13 +45,13 @@
 - [ ] Running workloads
   - [x] A framework is set up to run workload plugins
   - [ ] A "noop" kind "works" - Test
-  - [ ] An "exec" kind works - Test
-    - [ ] The command and args given are run
+  - [x] An "exec" kind works - Test
+    - [x] The command and args given are run
     - [ ] It runs as a specific user
     - [ ] Unveil works properly
-    - [ ] It is put in a cgroup that restricts cpu, memory, and disk appropriately
+    - [ ] It is put in a cgroup that restricts cpu, memory, and disk appropriately (use youki lib?)
     - [ ] It uses landlock appropriately
-    - [ ] It handles network namespaces well?
+    - [ ] It handles network namespaces well? (use netavark lib?)
   - [ ] A "container" kind works
     - Does it just user docker? Apple's container' runtime if on MacOS?
     - MUST work on a Mac easily (and on linux)
