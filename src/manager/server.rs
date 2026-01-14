@@ -9,14 +9,15 @@ use crate::storage::errors::StorageError;
 use crate::storage::store::{JobSubmitOutcome, Store};
 use crate::structs::manager_server::Manager;
 use crate::structs::{
-    DestroyJobReply, DestroyJobRequest, FailedAllocation, GetJobInfoReply, GetJobInfoRequest,
-    GetJobSpecReply, GetJobSpecRequest, GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply,
-    GetManagerConfigsRequest, GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest,
-    HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, JobConfig, LedgerNode,
-    ListJobsReply, ListJobsRequest, NodeMsg, PlanJobReply, PlanJobRequest, PlannedAllocation,
-    RunJobReply, RunJobRequest, StopJobReply, StopJobRequest, TaskConfig, TaskOnUnhealthyConfig,
-    UpdateNodeDynamicReply, UpdateNodeDynamicRequest, WorkerConfig, WorkerPreRegisterReply,
-    WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest,
+    worker_client::WorkerClient, DestroyJobReply, DestroyJobRequest, FailedAllocation,
+    GetJobInfoReply, GetJobInfoRequest, GetJobSpecReply, GetJobSpecRequest, GetLedgerReply,
+    GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest, GetNodeReply,
+    GetNodeRequest, GetNodesReply, GetNodesRequest, HealthCheckReply, HealthCheckRequest,
+    HeartbeatReply, HeartbeatRequest, JobConfig, LedgerNode, ListJobsReply, ListJobsRequest, Node,
+    NodeMsg, PlanJobReply, PlanJobRequest, PlannedAllocation, RestartWorkerReply,
+    RestartWorkerRequest, RunJobReply, RunJobRequest, StopJobReply, StopJobRequest, TaskConfig,
+    TaskOnUnhealthyConfig, UpdateNodeDynamicReply, UpdateNodeDynamicRequest, WorkerConfig,
+    WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest,
 };
 use crate::task_plugins::validate_job_config;
 
@@ -525,6 +526,37 @@ impl Manager for ManagerAgentService {
     }
 
     #[instrument(skip_all)]
+    async fn restart_worker(
+        &self,
+        request: Request<RestartWorkerRequest>,
+    ) -> Result<Response<RestartWorkerReply>, Status> {
+        let node_id = request.into_inner().node_id;
+        let node = self.store.get_node(&node_id).map_err(|e| {
+            error!(error = ?e, node_id = %node_id, "Failed to get node for restart");
+            Status::not_found("Node not found")
+        })?;
+
+        let worker_address = worker_address_for_node(&node)
+            .ok_or_else(|| Status::failed_precondition("Worker address missing"))?;
+
+        let mut client = WorkerClient::connect(worker_address)
+            .await
+            .map_err(|e| Status::unavailable(format!("Failed to connect to worker: {e}")))?;
+        let response = client
+            .restart_worker(tonic::Request::new(RestartWorkerRequest {
+                node_id: node_id.clone(),
+            }))
+            .await
+            .map_err(|e| Status::unavailable(format!("Worker restart failed: {e}")))?;
+
+        let reply = RestartWorkerReply {
+            message: response.into_inner().message,
+        };
+
+        Ok(Response::new(reply))
+    }
+
+    #[instrument(skip_all)]
     async fn update_node_dynamic(
         &self,
         request: Request<UpdateNodeDynamicRequest>,
@@ -599,6 +631,14 @@ impl Manager for ManagerAgentService {
 
         Ok(Response::new(reply))
     }
+}
+
+fn worker_address_for_node(node: &Node) -> Option<String> {
+    let attrs = node.config_attrs.as_object()?;
+    attrs
+        .get("workerAddress")
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string())
 }
 
 fn handle_failed_allocations(
@@ -828,9 +868,15 @@ fn build_desired_allocations(
 mod tests {
     use super::*;
     use crate::structs::config::ManagerConfigFull;
-    use crate::structs::{JobConfig, NodeMsg, Submission, TaskConfig};
+    use crate::structs::worker_server::Worker;
+    use crate::structs::{
+        JobConfig, NodeMsg, PostWorkReply, PostWorkRequest, RestartWorkerReply,
+        RestartWorkerRequest, Submission, TaskConfig,
+    };
     use serde_json::json;
     use tempfile::Builder;
+    use tokio::sync::oneshot;
+    use tonic::transport::Server;
 
     fn setup_store() -> R<Store> {
         let store_dir = Builder::new()
@@ -880,6 +926,86 @@ mod tests {
             content: "{}".into(),
             is_primary: true,
         }
+    }
+
+    #[derive(Debug, Clone)]
+    struct TestWorker {
+        called: Arc<Mutex<Option<String>>>,
+    }
+
+    #[tonic::async_trait]
+    impl Worker for TestWorker {
+        async fn post_work(
+            &self,
+            _request: Request<PostWorkRequest>,
+        ) -> Result<Response<PostWorkReply>, Status> {
+            Err(Status::unimplemented("not used in test"))
+        }
+
+        async fn restart_worker(
+            &self,
+            request: Request<RestartWorkerRequest>,
+        ) -> Result<Response<RestartWorkerReply>, Status> {
+            let node_id = request.into_inner().node_id;
+            let mut guard = self.called.lock().expect("mutex");
+            *guard = Some(node_id);
+            Ok(Response::new(RestartWorkerReply {
+                message: "ok".into(),
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn manager_forwards_worker_restart() -> R<()> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        drop(listener);
+        let worker_address = format!("http://{}", addr);
+
+        let called = Arc::new(Mutex::new(None));
+        let worker = TestWorker {
+            called: called.clone(),
+        };
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            Server::builder()
+                .add_service(crate::structs::worker_server::WorkerServer::new(worker))
+                .serve_with_shutdown(addr, async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .ok();
+        });
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        let store = setup_store()?;
+        let node = Node {
+            id: "node-1".into(),
+            status: "ready".into(),
+            pool: "default".into(),
+            availability: "available".into(),
+            last_heartbeat: "2023-01-01T00:00:00Z".into(),
+            config_attrs: json!({ "workerAddress": worker_address }),
+            fingerprint_attrs: json!({}),
+            dynamic_attrs: json!({}),
+            health_checks: json!({}),
+        };
+        store.insert_node(NodeMsg::from(node))?;
+        let manager = ManagerAgentService::new(store);
+
+        let response = manager
+            .restart_worker(Request::new(RestartWorkerRequest {
+                node_id: "node-1".into(),
+            }))
+            .await?;
+
+        assert_eq!(response.into_inner().message, "ok");
+        let guard = called.lock().expect("mutex");
+        assert_eq!(guard.as_deref(), Some("node-1"));
+
+        let _ = shutdown_tx.send(());
+        Ok(())
     }
 
     #[test]

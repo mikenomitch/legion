@@ -151,6 +151,7 @@ impl TaskPlugin for ExecTaskPlugin {
                 task.name, allocation.id
             )
         })?;
+        runtime.pid = Some(child.id());
         runtime.child = Some(child);
         Ok(())
     }
@@ -164,6 +165,19 @@ impl TaskPlugin for ExecTaskPlugin {
             );
             let _ = child.kill();
             let _ = child.wait();
+            runtime.pid = None;
+        } else if let Some(pid) = runtime.pid.take() {
+            info!(
+                allocation_id = allocation.id,
+                task_name = %task.name,
+                pid,
+                "Stopping exec task by pid"
+            );
+            let mut system = sysinfo::System::new();
+            system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+            if let Some(process) = system.process(sysinfo::Pid::from_u32(pid)) {
+                process.kill();
+            }
         }
         Ok(())
     }
