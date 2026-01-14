@@ -1542,6 +1542,83 @@ impl Store {
     }
 
     #[instrument(err, skip_all)]
+    pub fn record_allocation_failure(
+        &self,
+        allocation: &crate::structs::TaskAllocation,
+        reason: &str,
+    ) -> R<()> {
+        let mut conn = self.write_connection()?;
+        let tx = conn.transaction()?;
+
+        tx.execute(
+            "UPDATE allocation SET status = 'failed' WHERE id = ?;",
+            [allocation.allocation_id],
+        )?;
+        let timestamp = time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_else(|_| "1970-01-01T00:00:00Z".into());
+        tx.execute(
+            r#"
+            INSERT INTO allocation_reschedule (
+                allocation_id, task_config_id, job_config_id, node_id, reason, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6);
+            "#,
+            rusqlite::params![
+                allocation.allocation_id,
+                allocation.task_config_id,
+                allocation.job_config_id,
+                allocation.node_id,
+                reason,
+                timestamp,
+            ],
+        )?;
+        tx.commit()?;
+
+        let failed_alloc = Allocation {
+            id: allocation.allocation_id,
+            status: "failed".into(),
+            resources: json!({}),
+            node_id: allocation.node_id.clone(),
+            job_config_id: allocation.job_config_id.clone(),
+            task_config_id: allocation.task_config_id,
+            job_id: allocation.job_id.clone(),
+        };
+        self.cache_remove_allocations(std::slice::from_ref(&failed_alloc))?;
+
+        Ok(())
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn reschedule_exclusions_for_task(
+        &self,
+        job_config_id: &str,
+        task_config_id: i64,
+    ) -> R<HashSet<String>> {
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare(
+            "SELECT node_id FROM allocation_reschedule WHERE job_config_id = ? AND task_config_id = ?;",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![job_config_id, task_config_id], |row| {
+            row.get::<_, String>(0)
+        })?;
+        let mut exclusions = HashSet::new();
+        for row in rows {
+            exclusions.insert(row?);
+        }
+        Ok(exclusions)
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn clear_reschedule_exclusions(&self, job_config_id: &str) -> R<()> {
+        let conn = self.write_connection()?;
+        conn.execute(
+            "DELETE FROM allocation_reschedule WHERE job_config_id = ?;",
+            [job_config_id],
+        )?;
+        Ok(())
+    }
+
+    #[instrument(err, skip_all)]
     pub fn reconcile_job_config_allocations(&self, job_config_id: &str) -> R<()> {
         let nodes: Vec<Node> = self
             .get_nodes()?

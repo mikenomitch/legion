@@ -12,6 +12,10 @@ impl TaskPlugin for NoopTaskPlugin {
         "noop"
     }
 
+    fn config_schema(&self) -> Value {
+        json!({ "type": "object" })
+    }
+
     fn readiness(&self) -> Map<String, Value> {
         let mut map = Map::new();
         map.insert("noop".into(), Value::String("pass".into()));

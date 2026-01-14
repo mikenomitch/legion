@@ -82,7 +82,8 @@ lazy_static! {
         r#"
     SELECT {ALLOCATION_WITH_JOB_ATTRS}
     FROM allocation
-    INNER JOIN job_config ON job_config.id = allocation.job_config_id;
+    INNER JOIN job_config ON job_config.id = allocation.job_config_id
+    WHERE allocation.status != 'failed';
     "#,
     );
     pub static ref GET_ALLOCS_FOR_NODE: String = format!(
@@ -90,7 +91,7 @@ lazy_static! {
     SELECT {ALLOCATION_WITH_JOB_ATTRS}
     FROM allocation
     INNER JOIN job_config ON job_config.id = allocation.job_config_id
-    WHERE allocation.node_id = ?;
+    WHERE allocation.node_id = ? AND allocation.status != 'failed';
     "#,
     );
     pub static ref GET_ALLOCS_FOR_JOB_CONFIG: String = format!(
@@ -98,7 +99,7 @@ lazy_static! {
     SELECT {ALLOCATION_WITH_JOB_ATTRS}
     FROM allocation
     INNER JOIN job_config ON job_config.id = allocation.job_config_id
-    WHERE allocation.job_config_id = ?;
+    WHERE allocation.job_config_id = ? AND allocation.status != 'failed';
     "#,
     );
     pub static ref GET_ALLOCS_FOR_JOB: String = format!(
@@ -106,7 +107,7 @@ lazy_static! {
     SELECT {ALLOCATION_SELECT_ATTRS}
     FROM allocation
     INNER JOIN task_config ON task_config.id = allocation.task_config_id
-    WHERE task_config.job_id = ?;
+    WHERE task_config.job_id = ? AND allocation.status != 'failed';
     "#,
     );
     pub static ref INSERT_ALLOCATION: String = format!(

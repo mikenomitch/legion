@@ -6,7 +6,7 @@ use crate::manager::scheduler::{PlanMode, PlanOutcome, Scheduler};
 use crate::manager::dispatcher::dispatch_allocations;
 #[cfg(test)]
 use crate::prelude::Context;
-use crate::prelude::{bail, json, R};
+use crate::prelude::{bail, json, warn, R};
 use crate::storage::store::Store;
 
 use super::node::Node;
@@ -156,7 +156,9 @@ impl Eval {
 
         let scheduler = Scheduler::new(store)?;
         let outcome = scheduler.plan_and_apply(&self.job_config_id, mode)?;
-        dispatch_allocations(store, &outcome.allocations)?;
+        if let Err(err) = dispatch_allocations(store, &outcome.allocations) {
+            warn!(error = %err, "Failed to dispatch allocations during eval");
+        }
         Ok(outcome)
     }
 

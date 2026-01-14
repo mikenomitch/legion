@@ -34,10 +34,20 @@ pub async fn run_worker(token: &str) -> R<()> {
         info!("Skipping expiry validation check on join token");
     }
 
+    let manager_addr = token_data.claims.address.clone();
+    let client: ManagerClient<Channel> = create_manager_client(
+        manager_addr,
+        String::new(),
+        // token_data.claims.ca_cert,
+    )
+    .await?;
+    let task_manager = Arc::new(Mutex::new(WorkerTaskManager::new(Some(client.clone()))));
+    {
+        let mut manager = task_manager.lock().expect("task manager");
+        manager.load_builtin_plugins();
+    }
+
     let addr = format!("{DEF_MANAGER_HOSTNAME}:{DEF_WORKER_SERVER_PORT}").parse()?;
-    let mut task_manager = WorkerTaskManager::new();
-    task_manager.load_builtin_plugins();
-    let task_manager = Arc::new(Mutex::new(task_manager));
     let worker_node = WorkerAgentService {
         task_manager: task_manager.clone(),
     };
@@ -47,13 +57,6 @@ pub async fn run_worker(token: &str) -> R<()> {
 
     // print this address
     info!("Manager node address: {}", token_data.claims.address);
-
-    let client: ManagerClient<Channel> = create_manager_client(
-        token_data.claims.address,
-        String::new(),
-        // token_data.claims.ca_cert,
-    )
-    .await?;
 
     // TODO: Establish TLS connection properly
     let pre_register_res = pre_register_self(client.clone(), token_data.claims.worker_type).await?;
@@ -102,7 +105,7 @@ pub async fn run_worker(token: &str) -> R<()> {
     )
     .await?;
 
-    let heartbeat_fut = start_heartbeats(name.clone(), client.clone());
+    let heartbeat_fut = start_heartbeats(name.clone(), client.clone(), task_manager.clone());
     let checks_fut = start_node_checks(
         name.clone(),
         config.additional_node_checks.clone(),
@@ -131,14 +134,35 @@ async fn create_manager_client(
 }
 
 #[instrument(err, skip_all)]
-async fn start_heartbeats(name: String, client: ManagerClient<Channel>) -> R<()> {
+async fn start_heartbeats(
+    name: String,
+    client: ManagerClient<Channel>,
+    task_manager: Arc<Mutex<WorkerTaskManager>>,
+) -> R<()> {
     let mut client_clone = client.clone();
 
     loop {
-        let req = tonic::Request::new(HeartbeatRequest { id: name.clone() });
+        let allocation_ids = task_manager
+            .lock()
+            .expect("task manager")
+            .allocation_ids();
+        let req = tonic::Request::new(HeartbeatRequest {
+            id: name.clone(),
+            allocation_ids,
+        });
 
         let response = client_clone.heartbeat(req).await?;
-        info!("RESPONSE={:?}", response);
+        let response = response.into_inner();
+        if !response.allocations.is_empty() {
+            info!(
+                allocations = response.allocations.len(),
+                "Worker received allocation reconciliation"
+            );
+            task_manager
+                .lock()
+                .expect("task manager")
+                .reconcile_allocations(response.allocations)?;
+        }
 
         tokio::time::sleep(tokio::time::Duration::from_secs(
             WORKER_HEARTBEAT_DURATION_SEC,

@@ -80,12 +80,24 @@ impl TaskPlugin for ExecTaskPlugin {
         "exec"
     }
 
-    fn validate_config(&self, config: &Value) -> R<()> {
-        self.config_command(config)?;
-        self.config_args(config)?;
-        self.config_env(config)?;
-        self.config_cwd(config)?;
-        Ok(())
+    fn config_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "required": ["command"],
+            "properties": {
+                "command": { "type": "string", "minLength": 1 },
+                "args": {
+                    "type": "array",
+                    "items": { "type": "string" }
+                },
+                "env": {
+                    "type": "object",
+                    "additionalProperties": { "type": "string" }
+                },
+                "cwd": { "type": "string" }
+            },
+            "additionalProperties": true
+        })
     }
 
     fn readiness(&self) -> Map<String, Value> {

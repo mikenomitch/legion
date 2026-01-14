@@ -150,5 +150,21 @@ pub fn get_migrations() -> Migrations<'static> {
         )",
         )
         .down("DROP TABLE IF EXISTS manager_config;"),
+        M::up(
+            "CREATE TABLE IF NOT EXISTS allocation_reschedule (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            allocation_id INTEGER NOT NULL,
+            task_config_id INTEGER NOT NULL,
+            job_config_id STRING NOT NULL,
+            node_id STRING NOT NULL,
+            reason STRING,
+            created_at TIMESTAMP NOT NULL
+        )",
+        )
+        .down("DROP TABLE IF EXISTS allocation_reschedule;"),
+        M::up(
+            "CREATE INDEX IF NOT EXISTS idx_allocation_reschedule_task ON allocation_reschedule(task_config_id, job_config_id);",
+        )
+        .down("DROP INDEX IF EXISTS idx_allocation_reschedule_task;"),
     ])
 }

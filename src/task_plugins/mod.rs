@@ -1,8 +1,8 @@
 use crate::prelude::*;
 use crate::structs::{Allocation, JobConfig, TaskConfig};
 use libloading::{Library, Symbol};
+use jsonschema::JSONSchema;
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::process::Child;
 
 mod exec;
@@ -18,7 +18,20 @@ pub struct TaskRuntime {
 pub trait TaskPlugin: Send + Sync {
     fn name(&self) -> &'static str;
 
-    fn validate_config(&self, _config: &Value) -> R<()> {
+    fn config_schema(&self) -> Value {
+        json!({})
+    }
+
+    fn validate_config(&self, config: &Value) -> R<()> {
+        let schema = Box::leak(Box::new(self.config_schema()));
+        let compiled = JSONSchema::options()
+            .with_draft(jsonschema::Draft::Draft7)
+            .compile(schema)
+            .context("invalid task config schema")?;
+        if let Err(errors) = compiled.validate(config) {
+            let messages = errors.map(|err| err.to_string()).collect::<Vec<_>>();
+            bail!("task config failed schema validation: {}", messages.join(", "));
+        }
         Ok(())
     }
 
@@ -79,13 +92,15 @@ impl TaskPluginRegistry {
         Self::default()
     }
 
-    pub fn load_plugin(&mut self, kind: &str) -> R<()> {
+    pub fn load_plugin(&mut self, kind: &str, run_setup: bool) -> R<()> {
         if self.plugins.contains_key(kind) {
             return Ok(());
         }
 
         let plugin = load_task_plugin(kind)?;
-        plugin.plugin.setup()?;
+        if run_setup {
+            plugin.plugin.setup()?;
+        }
         self.plugins.insert(kind.to_string(), plugin);
         Ok(())
     }
@@ -103,7 +118,7 @@ impl TaskPluginRegistry {
     }
 
     pub fn validate_task_config(&mut self, task: &TaskConfig) -> R<()> {
-        self.load_plugin(&task.kind)?;
+        self.load_plugin(&task.kind, false)?;
         let plugin = self
             .plugin(&task.kind)
             .context("task plugin loaded but missing")?;
@@ -142,8 +157,7 @@ fn load_task_plugin(name: &str) -> R<LoadedTaskPlugin> {
 }
 
 fn task_plugin_name_to_path(name: &str) -> String {
-    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.push("plugins");
+    let mut path = crate::util::plugin_root();
     path.push("tasks");
     path.push(name);
     path.push("target");
@@ -199,7 +213,7 @@ mod tests {
     #[test]
     fn exec_plugin_runs_command() -> R<()> {
         let mut registry = TaskPluginRegistry::new();
-        registry.load_plugin("exec")?;
+        registry.load_plugin("exec", true)?;
         let plugin = registry.plugin("exec").context("missing exec plugin")?;
         let mut runtime = TaskRuntime::default();
         let task = exec_task();
@@ -216,7 +230,7 @@ mod tests {
             let path = task_plugin_name_to_path("noop");
             if Path::new(&path).exists() {
                 let mut registry = TaskPluginRegistry::new();
-                registry.load_plugin("noop")?;
+                registry.load_plugin("noop", true)?;
                 let plugin = registry.plugin("noop").context("missing noop plugin")?;
                 let readiness = plugin.readiness();
                 if !readiness.is_empty() {

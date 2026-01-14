@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
 
 use crate::constraints::AffinitySet;
 use crate::prelude::*;
@@ -45,6 +44,7 @@ pub struct SchedulingContext<'a> {
     pub allocations: &'a HashMap<String, Vec<Allocation>>,
     pub planned: &'a HashMap<String, usize>,
     pub weights: SchedulerWeights,
+    pub reschedule_jitter: Option<HashMap<String, f64>>,
 }
 
 #[allow(dead_code)]
@@ -57,6 +57,7 @@ impl<'a> SchedulingContext<'a> {
         allocations: &'a HashMap<String, Vec<Allocation>>,
         planned: &'a HashMap<String, usize>,
         weights: SchedulerWeights,
+        reschedule_jitter: Option<HashMap<String, f64>>,
     ) -> Self {
         SchedulingContext {
             eligible_nodes,
@@ -66,6 +67,7 @@ impl<'a> SchedulingContext<'a> {
             allocations,
             planned,
             weights,
+            reschedule_jitter,
         }
     }
 
@@ -175,9 +177,17 @@ fn score_node(
 
     let affinity_score = affinity_score(ctx.task, ctx.affinity_set, node);
 
+    let jitter = ctx
+        .reschedule_jitter
+        .as_ref()
+        .and_then(|map| map.get(node.id.as_str()))
+        .copied()
+        .unwrap_or(0.0);
+
     ctx.weights.affinity * affinity_score
         + ctx.weights.spread * spread_score
         + ctx.weights.bin_pack * bin_pack_score
+        + jitter
 }
 
 fn max_load_delta(range: f64, load: f64, min_load: f64) -> f64 {
@@ -210,8 +220,7 @@ pub fn load_policy(name: &str) -> R<(Option<Library>, Box<dyn SchedulingPolicy>)
 }
 
 fn policy_plugin_name_to_path(name: &str) -> String {
-    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.push("plugins");
+    let mut path = crate::util::plugin_root();
     path.push("scheduling");
     path.push(name);
     path.push("target");
@@ -289,6 +298,7 @@ mod tests {
             &allocations,
             &planned,
             SchedulerWeights::for_policy("bin_pack"),
+            None,
         );
         let policy = BinPackPolicy::default();
 
@@ -315,6 +325,7 @@ mod tests {
             &allocations,
             &planned,
             SchedulerWeights::for_policy("bin_pack"),
+            None,
         );
         let policy = BinPackPolicy::default();
 
@@ -350,6 +361,7 @@ mod tests {
             &allocations,
             &planned,
             SchedulerWeights::for_policy("bin_pack"),
+            None,
         );
         let policy = BinPackPolicy::default();
 
@@ -373,6 +385,7 @@ mod tests {
             &allocations,
             &planned,
             SchedulerWeights::for_policy("bin_pack"),
+            None,
         );
         let policy = BinPackPolicy::default();
 
@@ -399,6 +412,7 @@ mod tests {
             &allocations,
             &planned,
             SchedulerWeights::for_policy("spread"),
+            None,
         );
         let policy = SpreadPolicy::default();
 
@@ -425,6 +439,7 @@ mod tests {
             &allocations,
             &planned,
             SchedulerWeights::for_policy("spread"),
+            None,
         );
         let policy = SpreadPolicy::default();
 
@@ -448,6 +463,7 @@ mod tests {
             &allocations,
             &planned,
             SchedulerWeights::for_policy("spread"),
+            None,
         );
         let policy = SpreadPolicy::default();
 

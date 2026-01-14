@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use crate::prelude::*;
 
+use crate::manager::dispatcher::allocations_for_node;
 use crate::manager::scheduler::{PlanConfigOutcome, PlanMode, Scheduler};
 use crate::storage::store::{JobSubmitOutcome, Store};
 use crate::structs::manager_server::Manager;
@@ -12,8 +13,8 @@ use crate::structs::{
     HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, JobConfig, LedgerNode,
     ListJobsReply, ListJobsRequest, NodeMsg, PlanJobReply, PlanJobRequest, PlannedAllocation,
     RunJobReply, RunJobRequest, StopJobReply, StopJobRequest, UpdateNodeDynamicReply,
-    UpdateNodeDynamicRequest, WorkerConfig, WorkerPreRegisterReply, WorkerPreRegisterRequest,
-    WorkerRegisterReply, WorkerRegisterRequest,
+    AllocationFailureReply, AllocationFailureRequest, UpdateNodeDynamicRequest, WorkerConfig,
+    WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest,
 };
 use crate::task_plugins::validate_job_config;
 
@@ -344,15 +345,32 @@ impl Manager for ManagerAgentService {
         &self,
         request: Request<HeartbeatRequest>,
     ) -> Result<Response<HeartbeatReply>, Status> {
-        let id = request.into_inner().id;
+        let req = request.into_inner();
+        let id = req.id;
 
         self.store.update_node_heartbeat(id.clone()).map_err(|e| {
             error!("Error updading node heartbeat. Node ID: {}: {:?}", id, e);
             Status::internal("Error updading node heartbeat")
         })?;
 
+        let desired = allocations_for_node(&self.store, &id).map_err(|e| {
+            error!("Error loading allocations for heartbeat {}: {:?}", id, e);
+            Status::internal("Error loading allocations")
+        })?;
+        let desired_ids = desired
+            .iter()
+            .map(|alloc| alloc.allocation_id)
+            .collect::<std::collections::HashSet<_>>();
+        let reported_ids = req.allocation_ids.into_iter().collect::<std::collections::HashSet<_>>();
+        let allocations = if desired_ids == reported_ids {
+            Vec::new()
+        } else {
+            desired
+        };
+
         let reply = HeartbeatReply {
             message: "ack".into(),
+            allocations,
         };
 
         Ok(Response::new(reply))
@@ -414,6 +432,40 @@ impl Manager for ManagerAgentService {
             config: Some(config),
         };
 
+        Ok(Response::new(reply))
+    }
+
+    #[instrument(skip_all)]
+    async fn report_allocation_failed(
+        &self,
+        request: Request<AllocationFailureRequest>,
+    ) -> Result<Response<AllocationFailureReply>, Status> {
+        let req = request.into_inner();
+        let allocation = req
+            .allocation
+            .ok_or_else(|| Status::invalid_argument("Missing allocation"))?;
+        self.store
+            .record_allocation_failure(&allocation, &req.reason)
+            .map_err(|e| {
+                error!("Error recording allocation failure: {:?}", e);
+                Status::internal("Error recording allocation failure")
+            })?;
+        self.store
+            .enqueue_eval(
+                "job_reschedule",
+                Some(&allocation.job_id),
+                Some(&allocation.job_config_id),
+                None,
+                None,
+            )
+            .map_err(|e| {
+                error!("Error enqueueing reschedule eval: {:?}", e);
+                Status::internal("Error enqueueing reschedule")
+            })?;
+
+        let reply = AllocationFailureReply {
+            message: "ack".into(),
+        };
         Ok(Response::new(reply))
     }
 

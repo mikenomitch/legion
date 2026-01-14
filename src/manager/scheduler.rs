@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use serde_json::Value;
 
 use libloading::Library;
@@ -26,7 +28,7 @@ pub struct LedgerDelta {
     pub removed: Vec<Allocation>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub enum PlanMode {
     Fresh,
     Reschedule,
@@ -71,6 +73,7 @@ pub struct Scheduler<'a> {
     policy: Box<dyn SchedulingPolicy>,
     #[allow(dead_code)]
     policy_lib: Option<Library>,
+    rng: Mutex<StdRng>,
 }
 
 #[derive(Debug, Clone)]
@@ -82,11 +85,13 @@ pub struct PlanConfigOutcome {
 impl<'a> Scheduler<'a> {
     pub fn new(store: &'a Store) -> R<Self> {
         let (policy_lib, policy) = load_policy(&store.scheduling_policy)?;
+        let rng = Mutex::new(Self::seeded_rng());
 
         Ok(Scheduler {
             store,
             policy,
             policy_lib,
+            rng,
         })
     }
 
@@ -141,6 +146,7 @@ impl<'a> Scheduler<'a> {
             nodes,
             tasks,
             required_counts,
+            mode,
             &allocations_by_node,
         )
     }
@@ -200,6 +206,7 @@ impl<'a> Scheduler<'a> {
             nodes,
             tasks,
             required_counts,
+            mode,
             &allocations_by_node,
         )?;
 
@@ -255,6 +262,7 @@ impl<'a> Scheduler<'a> {
             nodes,
             tasks,
             required_counts,
+            mode,
             &allocations_by_node,
         )?;
         if placements.is_empty() {
@@ -274,6 +282,9 @@ impl<'a> Scheduler<'a> {
             .collect::<HashSet<_>>();
         let allocations = self.store.apply_allocation_plan(&placement_pairs)?;
         let deltas = Self::allocations_delta(&affected_nodes, &allocations);
+        if matches!(mode, PlanMode::Reschedule) {
+            self.store.clear_reschedule_exclusions(job_config_id)?;
+        }
 
         Ok(PlanOutcome {
             allocations,
@@ -299,6 +310,7 @@ impl<'a> Scheduler<'a> {
         nodes: Vec<Node>,
         mut tasks: Vec<(i64, TaskConfig, u32)>,
         required_counts: HashMap<i64, u32>,
+        mode: PlanMode,
         allocations_by_node: &HashMap<String, Vec<Allocation>>,
     ) -> R<Vec<PlannedAllocation>> {
         tasks.sort_by(|a, b| a.0.cmp(&b.0));
@@ -336,6 +348,12 @@ impl<'a> Scheduler<'a> {
                 allocations_by_node,
                 &node_lookup,
             );
+            let reschedule_exclusions = if matches!(mode, PlanMode::Reschedule) {
+                self.store
+                    .reschedule_exclusions_for_task(job_config_id, task_id)?
+            } else {
+                HashSet::new()
+            };
             let base_eligible = nodes
                 .iter()
                 .filter(|node| constraint_set.is_satisfied(node, None))
@@ -354,6 +372,7 @@ impl<'a> Scheduler<'a> {
 
                 let eligible = eligible
                     .into_iter()
+                    .filter(|node| !reschedule_exclusions.contains(&node.id))
                     .filter(|node| resource_ledger.can_fit(&node.id, &task_request))
                     .collect::<Vec<_>>();
 
@@ -368,6 +387,11 @@ impl<'a> Scheduler<'a> {
                     eligible,
                     nodes_considered_setting.as_ref(),
                 )?;
+                let reschedule_jitter = if matches!(mode, PlanMode::Reschedule) {
+                    Some(self.reschedule_jitter(&eligible)?)
+                } else {
+                    None
+                };
                 let ctx = SchedulingContext::new(
                     eligible,
                     &task_config,
@@ -376,6 +400,7 @@ impl<'a> Scheduler<'a> {
                     allocations_by_node,
                     &planned,
                     weights,
+                    reschedule_jitter,
                 );
                 let node_id = self
                     .policy
@@ -404,6 +429,25 @@ impl<'a> Scheduler<'a> {
         }
 
         Ok(placements)
+    }
+
+    fn seeded_rng() -> StdRng {
+        if let Ok(seed) = std::env::var("LEGION_SCHEDULER_SEED") {
+            if let Ok(seed) = seed.parse::<u64>() {
+                return StdRng::seed_from_u64(seed);
+            }
+        }
+        StdRng::from_entropy()
+    }
+
+    fn reschedule_jitter(&self, eligible: &[&Node]) -> R<HashMap<String, f64>> {
+        let mut jitter = HashMap::new();
+        let mut rng = self.rng.lock().map_err(|_| anyhow!("scheduler rng lock poisoned"))?;
+        for node in eligible {
+            let value = rng.gen_range(0.0..=0.01);
+            jitter.insert(node.id.clone(), value);
+        }
+        Ok(jitter)
     }
 
     fn tasks_for_plan(job_config: &JobConfig) -> Vec<(i64, TaskConfig, u32)> {
@@ -929,7 +973,7 @@ mod tests {
 
     use super::*;
     use crate::structs::config::ManagerConfigFull;
-    use crate::structs::{JobConfig, NodeMsg, Submission};
+    use crate::structs::{JobConfig, NodeMsg, Submission, TaskAllocation};
 
     fn store_path() -> R<String> {
         let store_dir = Builder::new()
@@ -1035,6 +1079,15 @@ mod tests {
             .context("missing task")?;
 
         Ok(task.0)
+    }
+
+    fn task_config_for(store: &Store, job_config_id: &str, task_id: i64) -> R<TaskConfig> {
+        let task = store
+            .get_task_configs_for_job_config(job_config_id)?
+            .into_iter()
+            .find(|(id, _)| *id == task_id)
+            .context("missing task")?;
+        Ok(task.1)
     }
 
     #[test]
@@ -1160,6 +1213,96 @@ mod tests {
         assert_eq!(node_a_added, 2);
         assert_eq!(node_b_added, 0);
 
+        Ok(())
+    }
+
+    #[test]
+    fn reschedule_excludes_failed_node() -> R<()> {
+        let store = setup_store()?;
+        insert_test_nodes(&store)?;
+
+        let job = JobConfig {
+            name: "resched-exclude".into(),
+            tasks: vec![TaskConfig {
+                name: "api".into(),
+                count: 1,
+                kind: "noop".into(),
+                config: json!({}),
+                resources: json!({}),
+                constraints: json!({}),
+                affinities: json!({}),
+            }],
+            version: None,
+        };
+
+        store.handle_job_submit(&job, &[dummy_submission()])?;
+        let job_config_id = store.get_job_config(&job.name)?.id();
+        let task_id = task_id_for(&store, &job_config_id, "api")?;
+        let allocation = store.place_alloc("node-a", task_id)?;
+        let task = task_config_for(&store, &job_config_id, task_id)?;
+        let task_config = serde_json::to_string(&task.config)?;
+        let failure = TaskAllocation {
+            allocation_id: allocation.id,
+            job_id: allocation.job_id.clone(),
+            job_config_id: allocation.job_config_id.clone(),
+            node_id: allocation.node_id.clone(),
+            task_config_id: allocation.task_config_id,
+            task_name: task.name.clone(),
+            task_kind: task.kind.clone(),
+            task_config,
+        };
+        store.record_allocation_failure(&failure, "boom")?;
+
+        let scheduler = Scheduler::new(&store)?;
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Reschedule)?;
+        assert_eq!(outcome.allocations.len(), 1);
+        assert_ne!(outcome.allocations[0].node_id, "node-a");
+
+        let exclusions = store.reschedule_exclusions_for_task(&job_config_id, task_id)?;
+        assert!(exclusions.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn reschedule_jitter_is_deterministic_with_seed() -> R<()> {
+        std::env::set_var("LEGION_SCHEDULER_SEED", "42");
+        let store = setup_store()?;
+        insert_test_nodes(&store)?;
+
+        let job = JobConfig {
+            name: "resched-jitter".into(),
+            tasks: vec![TaskConfig {
+                name: "worker".into(),
+                count: 1,
+                kind: "noop".into(),
+                config: json!({}),
+                resources: json!({}),
+                constraints: json!({}),
+                affinities: json!({}),
+            }],
+            version: None,
+        };
+
+        store.handle_job_submit(&job, &[dummy_submission()])?;
+        let job_config_id = store.get_job_config(&job.name)?.id();
+        let scheduler_expected = Scheduler::new(&store)?;
+        let mut nodes = store.cached_nodes()?;
+        nodes.sort_by(|a, b| a.id.cmp(&b.id));
+        let eligible = nodes.iter().collect::<Vec<_>>();
+        let expected_jitter = scheduler_expected.reschedule_jitter(&eligible)?;
+        let expected_node = expected_jitter
+            .iter()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .map(|(node, _)| node.clone())
+            .context("missing jitter")?;
+
+        let scheduler = Scheduler::new(&store)?;
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Reschedule)?;
+        assert_eq!(outcome.allocations.len(), 1);
+        assert_eq!(outcome.allocations[0].node_id, expected_node);
+
+        std::env::remove_var("LEGION_SCHEDULER_SEED");
         Ok(())
     }
 

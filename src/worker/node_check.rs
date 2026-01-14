@@ -5,7 +5,6 @@ use libloading::{Library, Symbol};
 mod node_checkers;
 
 use node_checkers::{ArchNodeChecker, DiskChecker, KitchenSinkNodeChecker, OSNodeChecker};
-use std::path::PathBuf;
 
 // NOTE: Improve current fingerprinters:
 // Network - speed, IP addresses, etc
@@ -81,8 +80,7 @@ pub fn run_health_checks(
 }
 
 fn fp_plugin_name_to_path(name: &str) -> String {
-    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.push("plugins");
+    let mut path = crate::util::plugin_root();
     path.push("node_checks");
     path.push(name);
     path.push("target");

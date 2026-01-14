@@ -23,6 +23,8 @@ service Manager {
     returns (GetManagerConfigsReply);
   rpc UpdateNodeDynamic (UpdateNodeDynamicRequest)
     returns (UpdateNodeDynamicReply);
+  rpc ReportAllocationFailed (AllocationFailureRequest)
+    returns (AllocationFailureReply);
 }
 
 message WorkerPreRegisterRequest {
@@ -140,10 +142,12 @@ message ListJobsReply {
 
 message HeartbeatRequest {
   string id = 1;
+  repeated int64 allocation_ids = 2;
 }
 
 message HeartbeatReply {
   string message = 1;
+  repeated TaskAllocation allocations = 2;
 }
 
 message HealthCheckRequest {
@@ -265,6 +269,15 @@ message TaskAllocation {
   string task_name = 6;
   string task_kind = 7;
   string task_config = 8;
+}
+
+message AllocationFailureRequest {
+  TaskAllocation allocation = 1;
+  string reason = 2;
+}
+
+message AllocationFailureReply {
+  string message = 1;
 }
 
 message PostWorkRequest {
