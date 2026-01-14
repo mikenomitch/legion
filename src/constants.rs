@@ -24,4 +24,5 @@ pub const WORKER_HEARTBEAT_DURATION_SEC: u64 = 2;
 // How often the worker should update node to manager
 pub const WORKER_NODE_CHECK_DURATION_SEC: u64 = 30;
 pub const DEF_WORKER_SERVER_PORT: u64 = 4848;
-pub const DEF_WORKER_STATE_PATH: &str = ".legion/worker_state.json";
+pub const DEF_WORKER_STATE_DIR: &str = ".legion/workers";
+pub const DEF_WORKER_STATE_PATH: &str = ".legion/workers/default/worker_state.json";

@@ -37,6 +37,12 @@ pub fn config() -> Command {
                 .help("Join token TTL (e.g. 1h); 0 disables expiry")
                 .requires("auto"),
         )
+        .arg(
+            Arg::new("name")
+                .long("name")
+                .value_name("NAME")
+                .help("Override the worker name/ID"),
+        )
 }
 
 #[instrument(err, skip_all)]
@@ -58,7 +64,8 @@ pub async fn handle(arg_matches: &ArgMatches) -> R<()> {
             .to_owned()
     };
 
-    run_worker(&token).await
+    let name = arg_matches.get_one::<String>("name").map(String::as_str);
+    run_worker(&token, name).await
 }
 
 #[instrument(err, skip_all)]
