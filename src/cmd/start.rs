@@ -16,6 +16,12 @@ pub fn config() -> Command {
             .value_name("TOKEN")
             .help("Join token for the worker")
             .required(true),
+    )
+    .arg(
+        Arg::new("name")
+            .long("name")
+            .value_name("NAME")
+            .help("Override the worker name/ID"),
     );
 
     Command::new("start")
@@ -31,7 +37,8 @@ pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
         let token = arg_matches
             .get_one::<String>("token")
             .context("Must provide token")?;
-        run_worker(token).await
+        let name = arg_matches.get_one::<String>("name").map(String::as_str);
+        run_worker(token, name).await
     } else {
         let config_path = sub_matches
             .get_one::<String>("config")

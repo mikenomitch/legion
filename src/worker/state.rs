@@ -29,6 +29,16 @@ impl WorkerStateStore {
             .unwrap_or_else(|_| PathBuf::from(DEF_WORKER_STATE_PATH))
     }
 
+    pub fn path_for_worker(worker_id: &str) -> PathBuf {
+        std::env::var("LEGION_WORKER_STATE_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                PathBuf::from(DEF_WORKER_STATE_DIR)
+                    .join(worker_id)
+                    .join("worker_state.json")
+            })
+    }
+
     pub fn load(&self) -> R<Vec<PersistedAllocation>> {
         if !self.path.exists() {
             return Ok(Vec::new());

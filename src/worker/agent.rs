@@ -16,10 +16,12 @@ use crate::worker::{
 
 use futures::join;
 use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
+use std::fs;
+use std::path::{Path, PathBuf};
 use tonic::{transport::Channel, transport::Server, Response};
 
 #[instrument(err, skip_all)]
-pub async fn run_worker(token: &str) -> R<()> {
+pub async fn run_worker(token: &str, name_override: Option<&str>) -> R<()> {
     let mut val = Validation::new(Algorithm::HS512);
     val.validate_exp = false;
 
@@ -37,26 +39,6 @@ pub async fn run_worker(token: &str) -> R<()> {
     }
 
     let addr = format!("{DEF_MANAGER_HOSTNAME}:{DEF_WORKER_SERVER_PORT}").parse()?;
-    let task_manager = Arc::new(Mutex::new(WorkerTaskManager::with_state_store(
-        WorkerStateStore::new(WorkerStateStore::default_path()),
-    )));
-    let restored_allocations = {
-        let mut manager = task_manager.lock().expect("task manager");
-        manager.load_builtin_plugins();
-        manager.restore_allocations().unwrap_or_else(|err| {
-            warn!(error = ?err, "Failed to restore persisted allocations");
-            Vec::new()
-        })
-    };
-    for (allocation, task) in restored_allocations {
-        spawn_health_monitor(task_manager.clone(), allocation, task);
-    }
-    let worker_node = WorkerAgentService {
-        task_manager: task_manager.clone(),
-    };
-    let worker_server_fut = Server::builder()
-        .add_service(WorkerServer::new(worker_node))
-        .serve(addr);
 
     // print this address
     info!("Manager node address: {}", token_data.claims.address);
@@ -75,11 +57,28 @@ pub async fn run_worker(token: &str) -> R<()> {
         .config
         .context("No config found")?;
 
-    let name_core = random_string(8);
-    let name = match config.name_prefix {
-        Some(n) => n + "-" + &name_core,
-        None => name_core,
+    let name = resolve_worker_name(name_override, config.name_prefix.clone())?;
+    let state_path = WorkerStateStore::path_for_worker(&name);
+    let task_manager = Arc::new(Mutex::new(WorkerTaskManager::with_state_store(
+        WorkerStateStore::new(state_path),
+    )));
+    let restored_allocations = {
+        let mut manager = task_manager.lock().expect("task manager");
+        manager.load_builtin_plugins();
+        manager.restore_allocations().unwrap_or_else(|err| {
+            warn!(error = ?err, "Failed to restore persisted allocations");
+            Vec::new()
+        })
     };
+    for (allocation, task) in restored_allocations {
+        spawn_health_monitor(task_manager.clone(), allocation, task);
+    }
+    let worker_node = WorkerAgentService {
+        task_manager: task_manager.clone(),
+    };
+    let worker_server_fut = Server::builder()
+        .add_service(WorkerServer::new(worker_node))
+        .serve(addr);
 
     let fingerprint_data = fingerprint_node(config.additional_node_checks.clone());
     let readiness = task_manager
@@ -127,6 +126,59 @@ pub async fn run_worker(token: &str) -> R<()> {
     );
     let _res = join!(heartbeat_fut, checks_fut, worker_server_fut);
 
+    Ok(())
+}
+
+fn resolve_worker_name(name_override: Option<&str>, name_prefix: Option<String>) -> R<String> {
+    let workers_dir = PathBuf::from(DEF_WORKER_STATE_DIR);
+    if let Some(name) = name_override {
+        ensure_dir(&workers_dir.join(name))?;
+        return Ok(name.to_string());
+    }
+
+    let existing = find_existing_worker_id(&workers_dir)?;
+    if let Some(id) = existing {
+        return Ok(id);
+    }
+
+    let name_core = random_string(8);
+    let name = match name_prefix {
+        Some(prefix) => format!("{prefix}-{name_core}"),
+        None => name_core,
+    };
+    ensure_dir(&workers_dir.join(&name))?;
+    Ok(name)
+}
+
+fn find_existing_worker_id(workers_dir: &Path) -> R<Option<String>> {
+    if !workers_dir.exists() {
+        return Ok(None);
+    }
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(workers_dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            entries.push(entry.file_name());
+        }
+    }
+
+    match entries.len() {
+        0 => Ok(None),
+        1 => Ok(entries
+            .pop()
+            .and_then(|name| name.into_string().ok())),
+        _ => Err(anyhow!(
+            "Multiple worker IDs found in {}; specify --name to choose one",
+            workers_dir.display()
+        )),
+    }
+}
+
+fn ensure_dir(path: &Path) -> R<()> {
+    if path.as_os_str().is_empty() {
+        return Ok(());
+    }
+    fs::create_dir_all(path)?;
     Ok(())
 }
 
