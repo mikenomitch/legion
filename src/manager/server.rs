@@ -93,8 +93,8 @@ impl Manager for ManagerAgentService {
         let priority = inner.priority.unwrap_or(self.store.default_eval_priority);
 
         let config: JobConfig = serde_json::from_str(&js).map_err(|e| {
-            println!("Error parsing jobspec: {:?}", e);
-            Status::internal("Error parsing jobspec")
+            error!("Error parsing jobspec: {:?}", e);
+            Status::invalid_argument(format!("Error parsing jobspec: {e}"))
         })?;
 
         let force_reschedule = inner.force_reschedule;
