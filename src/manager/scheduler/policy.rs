@@ -254,6 +254,8 @@ mod tests {
             resources: json!({}),
             constraints: json!({}),
             affinities: json!({}),
+            checks: Vec::new(),
+            on_unhealthy: crate::structs::TaskOnUnhealthyConfig::default(),
         }
     }
 

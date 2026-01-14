@@ -9,6 +9,7 @@ use crate::util::random_string;
 use crate::worker::{
     node_check::{fingerprint_node, run_health_checks},
     server::WorkerAgentService,
+    task_health::spawn_health_monitor,
     task_manager::WorkerTaskManager,
 };
 
@@ -167,10 +168,13 @@ async fn start_heartbeats(
         info!("RESPONSE={:?}", response);
         let reply = response.into_inner();
         if !reply.desired_allocations.is_empty() {
-            task_manager
+            let new_allocations = task_manager
                 .lock()
                 .expect("task manager")
                 .reconcile_allocations(&reply.desired_allocations);
+            for (allocation, task) in new_allocations {
+                spawn_health_monitor(task_manager.clone(), allocation, task);
+            }
         }
 
         tokio::time::sleep(tokio::time::Duration::from_secs(

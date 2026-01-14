@@ -2,7 +2,10 @@ use serde::{de::Error, Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::time::Duration;
 use tabled::Tabled;
+
+use crate::prelude::{bail, R};
 
 use super::{Job, PlannedAllocation, Submission};
 
@@ -50,6 +53,207 @@ fn default_task_count() -> u32 {
     1
 }
 
+fn default_check_every() -> Duration {
+    Duration::from_secs(10)
+}
+
+fn default_check_timeout() -> Duration {
+    Duration::from_secs(20)
+}
+
+fn default_unhealthy_after_count() -> u32 {
+    1
+}
+
+#[allow(dead_code)]
+fn default_on_unhealthy() -> TaskOnUnhealthyConfig {
+    TaskOnUnhealthyConfig::default()
+}
+
+fn default_restart_count() -> u32 {
+    3
+}
+
+fn default_restart_period() -> Duration {
+    Duration::from_secs(30 * 60)
+}
+
+fn default_restart_delay() -> Duration {
+    Duration::from_secs(30)
+}
+
+fn default_move_period() -> Duration {
+    Duration::from_secs(30 * 60)
+}
+
+fn default_move_delay() -> Duration {
+    Duration::from_secs(30)
+}
+
+fn serialize_duration<S>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(&humantime::format_duration(*duration).to_string())
+}
+
+fn deserialize_duration<'de, D>(deserializer: D) -> Result<Duration, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    parse_duration_value(&value).map_err(serde::de::Error::custom)
+}
+
+fn deserialize_optional_duration<'de, D>(deserializer: D) -> Result<Option<Duration>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    if value.is_null() {
+        return Ok(None);
+    }
+    parse_duration_value(&value)
+        .map(Some)
+        .map_err(serde::de::Error::custom)
+}
+
+fn serialize_optional_duration<S>(
+    duration: &Option<Duration>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match duration {
+        Some(duration) => {
+            serializer.serialize_str(&humantime::format_duration(*duration).to_string())
+        }
+        None => serializer.serialize_none(),
+    }
+}
+
+fn parse_duration_value(value: &Value) -> Result<Duration, String> {
+    match value {
+        Value::Number(num) => {
+            let secs = num
+                .as_u64()
+                .ok_or_else(|| "Duration value must be a positive integer".to_string())?;
+            Ok(Duration::from_secs(secs))
+        }
+        Value::String(text) => {
+            humantime::parse_duration(text).map_err(|err| format!("Invalid duration {text}: {err}"))
+        }
+        _ => Err("Duration must be a string or number of seconds".to_string()),
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum TaskCheckType {
+    Health,
+    Readiness,
+    Boot,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum TaskCheckKind {
+    Http,
+    Tcp,
+    Exec,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskCheck {
+    #[serde(rename = "type")]
+    pub check_type: TaskCheckType,
+    #[serde(default)]
+    pub name: Option<String>,
+    pub kind: TaskCheckKind,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub args: Option<Vec<String>>,
+    #[serde(
+        default = "default_check_every",
+        deserialize_with = "deserialize_duration",
+        serialize_with = "serialize_duration"
+    )]
+    pub every: Duration,
+    #[serde(
+        default = "default_check_timeout",
+        deserialize_with = "deserialize_duration",
+        serialize_with = "serialize_duration"
+    )]
+    pub timeout: Duration,
+    #[serde(default = "default_unhealthy_after_count")]
+    pub unhealthy_after_count: u32,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_duration",
+        serialize_with = "serialize_optional_duration"
+    )]
+    pub boot_grace_time: Option<Duration>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_duration",
+        serialize_with = "serialize_optional_duration"
+    )]
+    pub unhealthy_after_count_timespan: Option<Duration>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskOnUnhealthyConfig {
+    #[serde(default = "default_restart_count")]
+    pub restart_count: u32,
+    #[serde(
+        default = "default_restart_period",
+        deserialize_with = "deserialize_duration",
+        serialize_with = "serialize_duration"
+    )]
+    pub restart_period: Duration,
+    #[serde(
+        default = "default_restart_delay",
+        deserialize_with = "deserialize_duration",
+        serialize_with = "serialize_duration"
+    )]
+    pub restart_delay: Duration,
+    #[serde(default)]
+    pub move_count: Option<u32>,
+    #[serde(
+        default = "default_move_period",
+        deserialize_with = "deserialize_duration",
+        serialize_with = "serialize_duration"
+    )]
+    pub move_period: Duration,
+    #[serde(
+        default = "default_move_delay",
+        deserialize_with = "deserialize_duration",
+        serialize_with = "serialize_duration"
+    )]
+    pub move_delay: Duration,
+}
+
+impl Default for TaskOnUnhealthyConfig {
+    fn default() -> Self {
+        Self {
+            restart_count: default_restart_count(),
+            restart_period: default_restart_period(),
+            restart_delay: default_restart_delay(),
+            move_count: None,
+            move_period: default_move_period(),
+            move_delay: default_move_delay(),
+        }
+    }
+}
+
 #[derive(Serialize, Debug, Clone, Default, PartialEq, Tabled)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskConfig {
@@ -65,6 +269,12 @@ pub struct TaskConfig {
     pub constraints: Value,
     #[serde(default = "empty_object")]
     pub affinities: Value,
+    #[serde(default)]
+    #[tabled(skip)]
+    pub checks: Vec<TaskCheck>,
+    #[serde(default = "default_on_unhealthy")]
+    #[tabled(skip)]
+    pub on_unhealthy: TaskOnUnhealthyConfig,
 }
 
 #[derive(Serialize, Debug, Clone, PartialEq)]
@@ -108,6 +318,10 @@ struct TaskConfigInput {
     constraints: Value,
     #[serde(default = "empty_object")]
     affinities: Value,
+    #[serde(default)]
+    checks: Vec<TaskCheck>,
+    #[serde(default)]
+    on_unhealthy: Option<TaskOnUnhealthyConfig>,
 }
 
 impl TaskConfigInput {
@@ -120,6 +334,8 @@ impl TaskConfigInput {
             resources: self.resources,
             constraints: self.constraints,
             affinities: self.affinities,
+            checks: self.checks,
+            on_unhealthy: self.on_unhealthy.unwrap_or_default(),
         }
     }
 }
@@ -173,6 +389,112 @@ impl JobConfig {
             Some(version) => format!("{}-{}", self.name, version),
             None => format!("{}-{}", self.name, 0),
         }
+    }
+}
+
+impl TaskCheck {
+    pub fn default_name(&self) -> String {
+        if let Some(name) = self.name.as_ref() {
+            return name.clone();
+        }
+
+        match self.kind {
+            TaskCheckKind::Http => {
+                let path = self.path.as_deref().unwrap_or("/");
+                format!("HTTP Check {path}")
+            }
+            TaskCheckKind::Tcp => {
+                let port = self
+                    .port
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unknown".into());
+                format!("TCP Check {port}")
+            }
+            TaskCheckKind::Exec => {
+                let command = self.command.clone().unwrap_or_else(|| "Exec".into());
+                format!("Exec Check {command}")
+            }
+        }
+    }
+}
+
+impl TaskConfig {
+    pub fn validate_checks(&self) -> R<()> {
+        let has_boot_checks = self
+            .checks
+            .iter()
+            .any(|check| matches!(check.check_type, TaskCheckType::Boot));
+        if has_boot_checks
+            && self
+                .checks
+                .iter()
+                .any(|check| check.boot_grace_time.is_some())
+        {
+            bail!("boot_grace_time cannot be set when boot checks are configured");
+        }
+
+        for check in &self.checks {
+            if check.unhealthy_after_count == 0 {
+                bail!(
+                    "health check {} unhealthy_after_count must be at least 1",
+                    check.default_name()
+                );
+            }
+
+            match check.kind {
+                TaskCheckKind::Exec => {
+                    if check.path.is_some() || check.port.is_some() {
+                        bail!(
+                            "exec health check {} cannot specify path or port",
+                            check.default_name()
+                        );
+                    }
+                    if check.command.as_deref().unwrap_or_default().is_empty() {
+                        bail!(
+                            "exec health check {} requires a command",
+                            check.default_name()
+                        );
+                    }
+                }
+                TaskCheckKind::Http | TaskCheckKind::Tcp => {
+                    if check.port.is_none() {
+                        bail!(
+                            "{} check {} requires a port",
+                            match check.kind {
+                                TaskCheckKind::Http => "http",
+                                TaskCheckKind::Tcp => "tcp",
+                                TaskCheckKind::Exec => "exec",
+                            },
+                            check.default_name()
+                        );
+                    }
+                    if check.path.is_none() {
+                        bail!(
+                            "{} check {} requires a path",
+                            match check.kind {
+                                TaskCheckKind::Http => "http",
+                                TaskCheckKind::Tcp => "tcp",
+                                TaskCheckKind::Exec => "exec",
+                            },
+                            check.default_name()
+                        );
+                    }
+                    if check.command.is_some() {
+                        bail!(
+                            "{} check {} cannot include command",
+                            match check.kind {
+                                TaskCheckKind::Http => "http",
+                                TaskCheckKind::Tcp => "tcp",
+                                TaskCheckKind::Exec => "exec",
+                            },
+                            check.default_name()
+                        );
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 

@@ -136,6 +136,7 @@ pub fn validate_job_config(config: &JobConfig) -> R<()> {
     let mut registry = TaskPluginRegistry::new();
     for task in &config.tasks {
         registry.validate_task_config(task)?;
+        task.validate_checks()?;
     }
     Ok(())
 }
@@ -217,6 +218,8 @@ mod tests {
             resources: json!({}),
             constraints: json!({}),
             affinities: json!({}),
+            checks: Vec::new(),
+            on_unhealthy: crate::structs::TaskOnUnhealthyConfig::default(),
         }
     }
 

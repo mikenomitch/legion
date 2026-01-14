@@ -1094,6 +1094,8 @@ mod tests {
                     resources: json!({}),
                     constraints: json!({}),
                     affinities: json!({}),
+                    checks: Vec::new(),
+                    on_unhealthy: crate::structs::TaskOnUnhealthyConfig::default(),
                 },
                 TaskConfig {
                     name: "db".into(),
@@ -1103,6 +1105,8 @@ mod tests {
                     resources: json!({}),
                     constraints: json!({ "role": "db" }),
                     affinities: json!({}),
+                    checks: Vec::new(),
+                    on_unhealthy: crate::structs::TaskOnUnhealthyConfig::default(),
                 },
             ],
             version: None,
@@ -1174,6 +1178,8 @@ mod tests {
                 resources: json!({}),
                 constraints: json!({}),
                 affinities: json!({}),
+                checks: Vec::new(),
+                on_unhealthy: crate::structs::TaskOnUnhealthyConfig::default(),
             }],
             version: None,
         };
@@ -1218,6 +1224,8 @@ mod tests {
                 resources: json!({}),
                 constraints: json!({}),
                 affinities: json!({}),
+                checks: Vec::new(),
+                on_unhealthy: crate::structs::TaskOnUnhealthyConfig::default(),
             }],
             version: None,
         };
@@ -1253,6 +1261,8 @@ mod tests {
                 resources: json!({}),
                 constraints: json!({ "role": "db" }),
                 affinities: json!({}),
+                checks: Vec::new(),
+                on_unhealthy: crate::structs::TaskOnUnhealthyConfig::default(),
             }],
             version: None,
         };
@@ -1327,6 +1337,8 @@ mod tests {
                 resources: json!({}),
                 constraints: json!({ "role": "db" }),
                 affinities: json!({}),
+                checks: Vec::new(),
+                on_unhealthy: crate::structs::TaskOnUnhealthyConfig::default(),
             }],
             version: None,
         };
@@ -1362,6 +1374,8 @@ mod tests {
                 resources: json!({}),
                 constraints: json!([{ "key": "zone", "operator": "distinct" }]),
                 affinities: json!({}),
+                checks: Vec::new(),
+                on_unhealthy: crate::structs::TaskOnUnhealthyConfig::default(),
             }],
             version: None,
         };
@@ -1397,6 +1411,8 @@ mod tests {
                 resources: json!({}),
                 constraints: json!([{ "key": "role", "value": "db" }]),
                 affinities: json!({}),
+                checks: Vec::new(),
+                on_unhealthy: crate::structs::TaskOnUnhealthyConfig::default(),
             }],
             version: None,
         };
@@ -1436,6 +1452,8 @@ mod tests {
                 resources: json!({ "memory": 256 }),
                 constraints: json!({}),
                 affinities: json!({}),
+                checks: Vec::new(),
+                on_unhealthy: crate::structs::TaskOnUnhealthyConfig::default(),
             }],
             version: None,
         };
@@ -1478,6 +1496,8 @@ mod tests {
                 resources: json!({ "memory": 128 }),
                 constraints: json!({}),
                 affinities: json!({}),
+                checks: Vec::new(),
+                on_unhealthy: crate::structs::TaskOnUnhealthyConfig::default(),
             }],
             version: None,
         };
@@ -1514,6 +1534,8 @@ mod tests {
                 resources: json!({}),
                 constraints: json!({}),
                 affinities: json!({}),
+                checks: Vec::new(),
+                on_unhealthy: crate::structs::TaskOnUnhealthyConfig::default(),
             }],
             version: None,
         };
@@ -1556,6 +1578,8 @@ mod tests {
                 resources: json!({}),
                 constraints: json!({}),
                 affinities: json!({}),
+                checks: Vec::new(),
+                on_unhealthy: crate::structs::TaskOnUnhealthyConfig::default(),
             }],
             version: None,
         };
@@ -1605,6 +1629,8 @@ mod tests {
                 resources: json!({}),
                 constraints: json!({}),
                 affinities: json!({}),
+                checks: Vec::new(),
+                on_unhealthy: crate::structs::TaskOnUnhealthyConfig::default(),
             }],
             version: None,
         };
@@ -1626,6 +1652,8 @@ mod tests {
                 resources: json!({}),
                 constraints: json!({}),
                 affinities: json!({ "zone": "us-east" }),
+                checks: Vec::new(),
+                on_unhealthy: crate::structs::TaskOnUnhealthyConfig::default(),
             }],
             version: None,
         };

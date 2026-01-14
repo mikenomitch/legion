@@ -516,6 +516,8 @@ fn task_config(
         resources,
         constraints,
         affinities,
+        checks: Vec::new(),
+        on_unhealthy: legion::structs::TaskOnUnhealthyConfig::default(),
     }
 }
 
@@ -659,6 +661,8 @@ fn job_resubmit_config(message: &str, count: u32, node_id: &str) -> JobConfig {
             resources: json!({ "memory": 128, "cpu": 100 }),
             constraints: json!({ "node_id": node_id }),
             affinities: json!({}),
+            checks: Vec::new(),
+            on_unhealthy: legion::structs::TaskOnUnhealthyConfig::default(),
         }],
         version: None,
     }

@@ -34,6 +34,8 @@ fn make_job_config(name: &str, count: u32) -> JobConfig {
         resources: json!({ "memory": 128 }),
         constraints: json!({}),
         affinities: json!({}),
+        checks: Vec::new(),
+        on_unhealthy: legion::structs::TaskOnUnhealthyConfig::default(),
     };
 
     JobConfig {

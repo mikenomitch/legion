@@ -273,6 +273,8 @@ message TaskAllocation {
   string task_name = 6;
   string task_kind = 7;
   string task_config = 8;
+  string task_checks = 9;
+  string task_on_unhealthy = 10;
 }
 
 message PostWorkRequest {

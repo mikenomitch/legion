@@ -285,6 +285,8 @@ mod tests {
             resources: json!({ "memory": 128 }),
             constraints: json!({}),
             affinities: json!({}),
+            checks: Vec::new(),
+            on_unhealthy: crate::structs::TaskOnUnhealthyConfig::default(),
         };
         let job_one_config = JobConfig {
             name: job_one_name.clone(),
@@ -340,6 +342,8 @@ mod tests {
             resources: json!({ "memory": 128 }),
             constraints: json!({}),
             affinities: json!({}),
+            checks: Vec::new(),
+            on_unhealthy: crate::structs::TaskOnUnhealthyConfig::default(),
         };
         let job_two_config = JobConfig {
             name: job_two_name.clone(),
@@ -421,6 +425,8 @@ mod tests {
             resources: json!({ "memory": 128 }),
             constraints: json!({ "node_id": "node-a" }),
             affinities: json!({}),
+            checks: Vec::new(),
+            on_unhealthy: crate::structs::TaskOnUnhealthyConfig::default(),
         };
 
         let job_config = JobConfig {
