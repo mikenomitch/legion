@@ -3,6 +3,8 @@ use std::collections::{HashMap, HashSet};
 use serde_json::Value;
 
 use libloading::Library;
+use rand::seq::SliceRandom;
+use rand::{rngs::StdRng, SeedableRng};
 
 use crate::constraints::{AffinitySet, ConstraintSet, DistinctTracker};
 use crate::prelude::*;
@@ -142,6 +144,7 @@ impl<'a> Scheduler<'a> {
             tasks,
             required_counts,
             &allocations_by_node,
+            mode,
         )
     }
 
@@ -201,6 +204,7 @@ impl<'a> Scheduler<'a> {
             tasks,
             required_counts,
             &allocations_by_node,
+            mode,
         )?;
 
         Ok(PlanConfigOutcome {
@@ -211,7 +215,19 @@ impl<'a> Scheduler<'a> {
 
     #[instrument(skip_all)]
     pub fn plan_and_apply(&self, job_config_id: &str, mode: PlanMode) -> R<PlanOutcome> {
-        let nodes = self.available_nodes()?;
+        self.plan_and_apply_with_exclusions(job_config_id, mode, None)
+    }
+
+    pub fn plan_and_apply_with_exclusions(
+        &self,
+        job_config_id: &str,
+        mode: PlanMode,
+        excluded_nodes: Option<&HashSet<String>>,
+    ) -> R<PlanOutcome> {
+        let mut nodes = self.available_nodes()?;
+        if let Some(excluded) = excluded_nodes {
+            nodes.retain(|node| !excluded.contains(&node.id));
+        }
         if nodes.is_empty() {
             bail!("No nodes available to place allocations");
         }
@@ -256,6 +272,7 @@ impl<'a> Scheduler<'a> {
             tasks,
             required_counts,
             &allocations_by_node,
+            mode.clone(),
         )?;
         if placements.is_empty() {
             return Ok(PlanOutcome {
@@ -300,6 +317,7 @@ impl<'a> Scheduler<'a> {
         mut tasks: Vec<(i64, TaskConfig, u32)>,
         required_counts: HashMap<i64, u32>,
         allocations_by_node: &HashMap<String, Vec<Allocation>>,
+        mode: PlanMode,
     ) -> R<Vec<PlannedAllocation>> {
         tasks.sort_by(|a, b| a.0.cmp(&b.0));
 
@@ -307,6 +325,11 @@ impl<'a> Scheduler<'a> {
         let mut planned: HashMap<String, usize> = HashMap::new();
         let weights = self.scheduler_weights()?;
         let nodes_considered_setting = self.nodes_considered_setting()?;
+        let mut reschedule_rng = if matches!(mode, PlanMode::Reschedule) {
+            Some(reschedule_rng())
+        } else {
+            None
+        };
         let node_lookup: HashMap<&str, &Node> =
             nodes.iter().map(|node| (node.id.as_str(), node)).collect();
         let resource_policy = &self.store.resource_policy;
@@ -364,30 +387,36 @@ impl<'a> Scheduler<'a> {
                     );
                 }
 
-                let eligible = self.apply_nodes_considered_with_setting(
-                    eligible,
-                    nodes_considered_setting.as_ref(),
-                )?;
-                let ctx = SchedulingContext::new(
-                    eligible,
-                    &task_config,
-                    &affinity_set,
-                    job_config_id,
-                    allocations_by_node,
-                    &planned,
-                    weights,
-                );
-                let node_id = self
-                    .policy
-                    .select_node(ctx)
-                    .map(|node| node.id.clone())
-                    .with_context(|| {
-                        format!(
-                            "Scheduling policy {} failed to place task {}",
-                            self.policy.name(),
-                            task_config.name
-                        )
-                    })?;
+                let node_id = if let Some(rng) = reschedule_rng.as_mut() {
+                    let choice = eligible
+                        .choose(rng)
+                        .context("No nodes available to place allocations")?;
+                    choice.id.clone()
+                } else {
+                    let eligible = self.apply_nodes_considered_with_setting(
+                        eligible,
+                        nodes_considered_setting.as_ref(),
+                    )?;
+                    let ctx = SchedulingContext::new(
+                        eligible,
+                        &task_config,
+                        &affinity_set,
+                        job_config_id,
+                        allocations_by_node,
+                        &planned,
+                        weights,
+                    );
+                    self.policy
+                        .select_node(ctx)
+                        .map(|node| node.id.clone())
+                        .with_context(|| {
+                            format!(
+                                "Scheduling policy {} failed to place task {}",
+                                self.policy.name(),
+                                task_config.name
+                            )
+                        })?
+                };
 
                 *planned.entry(node_id.clone()).or_default() += 1;
                 if let Some(tracker) = distinct_tracker.as_mut() {
@@ -842,6 +871,18 @@ impl ResourcePool {
     }
 }
 
+fn reschedule_rng() -> StdRng {
+    if let Ok(seed) = std::env::var("LEGION_RESCHEDULE_SEED") {
+        if let Ok(seed) = seed.parse::<u64>() {
+            return StdRng::seed_from_u64(seed);
+        }
+    }
+    if cfg!(test) {
+        return StdRng::seed_from_u64(7);
+    }
+    StdRng::from_entropy()
+}
+
 fn parse_resource_value(name: &str, value: &Value) -> R<ResourceValue> {
     match value {
         Value::Number(num) => {
@@ -1157,8 +1198,42 @@ mod tests {
             .iter()
             .filter(|alloc| alloc.node_id == "node-b")
             .count();
-        assert_eq!(node_a_added, 2);
-        assert_eq!(node_b_added, 0);
+        assert_eq!(node_a_added + node_b_added, 2);
+
+        Ok(())
+    }
+
+    #[test]
+    fn reschedule_excludes_failed_node() -> R<()> {
+        let store = setup_store()?;
+        insert_test_nodes(&store)?;
+
+        let job = JobConfig {
+            name: "resched-exclude".into(),
+            tasks: vec![TaskConfig {
+                name: "batch".into(),
+                count: 1,
+                kind: "noop".into(),
+                config: json!({}),
+                resources: json!({}),
+                constraints: json!({}),
+                affinities: json!({}),
+            }],
+            version: None,
+        };
+
+        store.handle_job_submit(&job, &[dummy_submission()])?;
+        let job_config_id = store.get_job_config(&job.name)?.id();
+        let scheduler = Scheduler::new(&store)?;
+        let excluded = HashSet::from(["node-a".to_string()]);
+        let outcome = scheduler.plan_and_apply_with_exclusions(
+            &job_config_id,
+            PlanMode::Reschedule,
+            Some(&excluded),
+        )?;
+
+        assert_eq!(outcome.allocations.len(), 1);
+        assert_eq!(outcome.allocations[0].node_id, "node-b");
 
         Ok(())
     }

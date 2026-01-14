@@ -85,6 +85,14 @@ lazy_static! {
     INNER JOIN job_config ON job_config.id = allocation.job_config_id;
     "#,
     );
+    pub static ref GET_ALLOCATION_BY_ID: String = format!(
+        r#"
+    SELECT {ALLOCATION_WITH_JOB_ATTRS}
+    FROM allocation
+    INNER JOIN job_config ON job_config.id = allocation.job_config_id
+    WHERE allocation.id = ?;
+    "#,
+    );
     pub static ref GET_ALLOCS_FOR_NODE: String = format!(
         r#"
     SELECT {ALLOCATION_WITH_JOB_ATTRS}

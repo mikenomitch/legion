@@ -1,7 +1,9 @@
+use std::collections::HashSet;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use tracing::info;
 
+use crate::manager::dispatcher::dispatch_allocations;
 use crate::manager::scheduler::{PlanMode, PlanOutcome, Scheduler};
 #[cfg(test)]
 use crate::prelude::Context;
@@ -154,7 +156,19 @@ impl Eval {
         }
 
         let scheduler = Scheduler::new(store)?;
-        scheduler.plan_and_apply(&self.job_config_id, mode)
+        let excluded = if matches!(mode, PlanMode::Reschedule) && !self.node_name.trim().is_empty()
+        {
+            Some(HashSet::from([self.node_name.clone()]))
+        } else {
+            None
+        };
+        let outcome = scheduler.plan_and_apply_with_exclusions(
+            &self.job_config_id,
+            mode,
+            excluded.as_ref(),
+        )?;
+        dispatch_allocations(store, &outcome.allocations)?;
+        Ok(outcome)
     }
 
     fn current_timestamp() -> String {

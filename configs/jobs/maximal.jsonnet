@@ -63,5 +63,28 @@
                 node_class: "spot",
             },
         },
+        {
+            name: "shell",
+            count: 1,
+            kind: "exec",
+            config: {
+                command: "echo",
+                args: ["hello", "from", "exec"],
+                env: {
+                    LEGION_TASK: "exec",
+                },
+                cwd: ".",
+            },
+            resources: {
+                cpus: 0.1,
+                memory: 128,
+            },
+            constraints: {
+                os: "linux",
+            },
+            affinities: {
+                region: "us-west",
+            },
+        },
     ],
 }

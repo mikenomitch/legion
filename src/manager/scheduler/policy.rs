@@ -1,5 +1,5 @@
+use crate::util::plugin_root_dir;
 use std::collections::HashMap;
-use std::path::PathBuf;
 
 use crate::constraints::AffinitySet;
 use crate::prelude::*;
@@ -210,8 +210,7 @@ pub fn load_policy(name: &str) -> R<(Option<Library>, Box<dyn SchedulingPolicy>)
 }
 
 fn policy_plugin_name_to_path(name: &str) -> String {
-    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.push("plugins");
+    let mut path = plugin_root_dir();
     path.push("scheduling");
     path.push(name);
     path.push("target");

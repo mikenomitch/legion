@@ -35,6 +35,7 @@ json-patch = "3.0.1"
 rusqlite_migration = "1.0.2"
 humantime = "2.1.0"
 serde_rusqlite = "0.36.0"
+jsonschema = "0.17.1"
 rand = "0.8.5"
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["json", "env-filter"] }
