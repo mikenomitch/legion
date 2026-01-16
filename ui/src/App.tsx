@@ -19,6 +19,7 @@ import { NodeMsg } from "./gen/legion_pb";
 import type { Job, LedgerNode } from "./gen/legion_pb";
 import Homepage from "./pages/Homepage";
 import Jobs from "./pages/Jobs";
+import KeyValue from "./pages/KeyValue";
 import Manager from "./pages/Manager";
 import Nodes from "./pages/Nodes";
 import TestingUtils from "./pages/TestingUtils";
@@ -45,6 +46,13 @@ const navItems = [
     path: "/jobs",
     title: "Jobs",
     copy: "Jobs reported by the manager in real time.",
+  },
+  {
+    key: "kv",
+    label: "Key/Value",
+    path: "/kv",
+    title: "Key/Value",
+    copy: "Browse and edit key/value entries.",
   },
   {
     key: "manager",
@@ -362,6 +370,7 @@ const AppRoutes = () => {
       <Route path="/" component={() => <Homepage ledger={ledger} />} />
       <Route path="/nodes" component={() => <Nodes nodes={nodes} ledger={ledger} />} />
       <Route path="/jobs" component={() => <Jobs jobs={jobs} />} />
+      <Route path="/kv" component={KeyValue} />
       <Route path="/manager" component={Manager} />
       <Route path="/testing" component={TestingUtils} />
       <Route path="*" component={() => <Homepage ledger={ledger} />} />

@@ -9,15 +9,19 @@ use crate::storage::errors::StorageError;
 use crate::storage::store::{JobSubmitOutcome, Store};
 use crate::structs::manager_server::Manager;
 use crate::structs::{
-    worker_client::WorkerClient, DestroyJobReply, DestroyJobRequest, FailedAllocation,
-    GetJobInfoReply, GetJobInfoRequest, GetJobSpecReply, GetJobSpecRequest, GetLedgerReply,
-    GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest, GetNodeReply,
-    GetNodeRequest, GetNodesReply, GetNodesRequest, HealthCheckReply, HealthCheckRequest,
-    HeartbeatReply, HeartbeatRequest, JobConfig, LedgerNode, ListJobsReply, ListJobsRequest, Node,
-    NodeMsg, PlanJobReply, PlanJobRequest, PlannedAllocation, RestartWorkerReply,
-    RestartWorkerRequest, RunJobReply, RunJobRequest, StopJobReply, StopJobRequest, TaskConfig,
-    TaskOnUnhealthyConfig, UpdateNodeDynamicReply, UpdateNodeDynamicRequest, WorkerConfig,
-    WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest,
+    worker_client::WorkerClient, AcquireKvLockReply, AcquireKvLockRequest, DeleteKvReply,
+    DeleteKvRequest, DestroyJobReply, DestroyJobRequest, FailedAllocation, GetJobInfoReply,
+    GetJobInfoRequest, GetJobSpecReply, GetJobSpecRequest, GetKvLockReply, GetKvLockRequest,
+    GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply,
+    GetManagerConfigsRequest, GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest,
+    HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, JobConfig, KvValueType,
+    LedgerNode, ListJobsReply, ListJobsRequest, ListKvReply, ListKvRequest, Node, NodeMsg,
+    PatchKvReply, PatchKvRequest, PlanJobReply, PlanJobRequest, PlannedAllocation, PutKvReply,
+    PutKvRequest, ReleaseKvLockReply, ReleaseKvLockRequest, RenewKvLockReply, RenewKvLockRequest,
+    RestartWorkerReply, RestartWorkerRequest, RunJobReply, RunJobRequest, StopJobReply,
+    StopJobRequest, TaskConfig, TaskOnUnhealthyConfig, UpdateNodeDynamicReply,
+    UpdateNodeDynamicRequest, WorkerConfig, WorkerPreRegisterReply, WorkerPreRegisterRequest,
+    WorkerRegisterReply, WorkerRegisterRequest,
 };
 use crate::task_plugins::validate_job_config;
 
@@ -630,6 +634,146 @@ impl Manager for ManagerAgentService {
         let reply: GetLedgerReply = GetLedgerReply { nodes };
 
         Ok(Response::new(reply))
+    }
+
+    #[instrument(skip_all)]
+    async fn put_kv(&self, request: Request<PutKvRequest>) -> Result<Response<PutKvReply>, Status> {
+        let req = request.into_inner();
+        let value_type = KvValueType::try_from(req.value_type).unwrap_or(KvValueType::Unspecified);
+        let entry = self
+            .store
+            .put_kv(
+                &req.key,
+                &req.value,
+                value_type,
+                req.expected_version,
+                req.lock_id.as_deref(),
+            )
+            .map_err(|e| map_store_error("Error putting kv entry", e))?;
+
+        Ok(Response::new(PutKvReply { entry: Some(entry) }))
+    }
+
+    #[instrument(skip_all)]
+    async fn get_kv(&self, request: Request<GetKvRequest>) -> Result<Response<GetKvReply>, Status> {
+        let req = request.into_inner();
+        let entry = self
+            .store
+            .get_kv(&req.key)
+            .map_err(|e| map_store_error("Error getting kv entry", e))?;
+
+        Ok(Response::new(GetKvReply { entry }))
+    }
+
+    #[instrument(skip_all)]
+    async fn list_kv(
+        &self,
+        request: Request<ListKvRequest>,
+    ) -> Result<Response<ListKvReply>, Status> {
+        let req = request.into_inner();
+        let entries = self
+            .store
+            .list_kv(&req.prefix)
+            .map_err(|e| map_store_error("Error listing kv entries", e))?;
+
+        Ok(Response::new(ListKvReply { entries }))
+    }
+
+    #[instrument(skip_all)]
+    async fn delete_kv(
+        &self,
+        request: Request<DeleteKvRequest>,
+    ) -> Result<Response<DeleteKvReply>, Status> {
+        let req = request.into_inner();
+        self.store
+            .delete_kv(&req.key, req.expected_version, req.lock_id.as_deref())
+            .map_err(|e| map_store_error("Error deleting kv entry", e))?;
+
+        Ok(Response::new(DeleteKvReply {
+            message: "kv entry deleted".to_string(),
+        }))
+    }
+
+    #[instrument(skip_all)]
+    async fn patch_kv(
+        &self,
+        request: Request<PatchKvRequest>,
+    ) -> Result<Response<PatchKvReply>, Status> {
+        let req = request.into_inner();
+        let entry = self
+            .store
+            .patch_kv(
+                &req.key,
+                &req.patch_json,
+                req.expected_version,
+                req.lock_id.as_deref(),
+            )
+            .map_err(|e| map_store_error("Error patching kv entry", e))?;
+
+        Ok(Response::new(PatchKvReply { entry: Some(entry) }))
+    }
+
+    #[instrument(skip_all)]
+    async fn acquire_kv_lock(
+        &self,
+        request: Request<AcquireKvLockRequest>,
+    ) -> Result<Response<AcquireKvLockReply>, Status> {
+        let req = request.into_inner();
+        let lock = self
+            .store
+            .acquire_kv_lock(
+                &req.key,
+                req.lock_id.as_deref(),
+                req.owner.as_deref(),
+                req.ttl_seconds,
+                req.force,
+            )
+            .map_err(|e| map_store_error("Error acquiring kv lock", e))?;
+
+        Ok(Response::new(AcquireKvLockReply { lock: Some(lock) }))
+    }
+
+    #[instrument(skip_all)]
+    async fn renew_kv_lock(
+        &self,
+        request: Request<RenewKvLockRequest>,
+    ) -> Result<Response<RenewKvLockReply>, Status> {
+        let req = request.into_inner();
+        let lock = self
+            .store
+            .renew_kv_lock(&req.key, &req.lock_id, req.ttl_seconds)
+            .map_err(|e| map_store_error("Error renewing kv lock", e))?;
+
+        Ok(Response::new(RenewKvLockReply { lock: Some(lock) }))
+    }
+
+    #[instrument(skip_all)]
+    async fn release_kv_lock(
+        &self,
+        request: Request<ReleaseKvLockRequest>,
+    ) -> Result<Response<ReleaseKvLockReply>, Status> {
+        let req = request.into_inner();
+        self.store
+            .release_kv_lock(&req.key, &req.lock_id)
+            .map_err(|e| map_store_error("Error releasing kv lock", e))?;
+
+        Ok(Response::new(ReleaseKvLockReply {
+            message: "kv lock released".to_string(),
+        }))
+    }
+
+    #[instrument(skip_all)]
+    async fn get_kv_lock(
+        &self,
+        request: Request<GetKvLockRequest>,
+    ) -> Result<Response<GetKvLockReply>, Status> {
+        let req = request.into_inner();
+        let lock = self
+            .store
+            .get_kv_lock(&req.key)
+            .map_err(|e| map_store_error("Error getting kv lock", e))?;
+
+        Ok(Response::new(GetKvLockReply { lock }))
     }
 }
 
