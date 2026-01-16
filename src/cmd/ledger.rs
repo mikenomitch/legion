@@ -1,6 +1,6 @@
 use crate::cmd::helpers::{connect_manager_client, friendly_status, json_flag};
 use crate::prelude::*;
-use crate::structs::{GetLedgerRequest, LedgerEntry};
+use crate::structs::{Allocation, GetLedgerRequest, LedgerEntry, Node};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -28,6 +28,42 @@ struct LedgerJsonEntry {
     node: LedgerJsonNode,
     allocations: Vec<LedgerJsonAllocation>,
 }
+
+impl From<&Node> for LedgerJsonNode {
+    fn from(node: &Node) -> Self {
+        Self {
+            id: node.id.clone(),
+            status: node.status.clone(),
+            availability: node.availability.clone(),
+        }
+    }
+}
+
+impl From<&Allocation> for LedgerJsonAllocation {
+    fn from(allocation: &Allocation) -> Self {
+        Self {
+            id: allocation.id,
+            status: allocation.status.clone(),
+            resources: allocation.resources.clone(),
+            task_config_id: allocation.task_config_id,
+            job_id: allocation.job_id.clone(),
+        }
+    }
+}
+
+impl From<&LedgerEntry> for LedgerJsonEntry {
+    fn from(entry: &LedgerEntry) -> Self {
+        Self {
+            node: LedgerJsonNode::from(&entry.node),
+            allocations: entry
+                .allocations
+                .iter()
+                .map(LedgerJsonAllocation::from)
+                .collect(),
+        }
+    }
+}
+
 pub fn config() -> Command {
     Command::new("ledger")
         .about("Shows the current state of the ledger")
@@ -50,27 +86,8 @@ pub async fn handle(matches: &ArgMatches) -> R<()> {
         .collect::<R<Vec<_>>>()?;
 
     if matches.get_flag("json") {
-        let json_entries: Vec<LedgerJsonEntry> = ledger
-            .iter()
-            .map(|entry| LedgerJsonEntry {
-                node: LedgerJsonNode {
-                    id: entry.node.id.clone(),
-                    status: entry.node.status.clone(),
-                    availability: entry.node.availability.clone(),
-                },
-                allocations: entry
-                    .allocations
-                    .iter()
-                    .map(|alloc| LedgerJsonAllocation {
-                        id: alloc.id,
-                        status: alloc.status.clone(),
-                        resources: alloc.resources.clone(),
-                        task_config_id: alloc.task_config_id,
-                        job_id: alloc.job_id.clone(),
-                    })
-                    .collect(),
-            })
-            .collect();
+        let json_entries: Vec<LedgerJsonEntry> =
+            ledger.iter().map(LedgerJsonEntry::from).collect();
         println!(
             "{}",
             serde_json::to_string(&json_entries).context("failed to serialize ledger to JSON")?
