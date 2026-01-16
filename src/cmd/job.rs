@@ -11,6 +11,7 @@ use crate::structs::{
     ListJobsRequest, PlanJobRequest, RunJobRequest, StopJobRequest, Submission,
 };
 use jsonnet::JsonnetVm;
+use serde::Serialize;
 use serde_json::to_string;
 use tempfile::TempDir;
 use url::Url;
@@ -168,32 +169,27 @@ fn parse_key_value(input: &str) -> R<(String, String)> {
     Ok((key.to_string(), value.to_string()))
 }
 
+fn collect_jsonnet_vars(
+    matches: &ArgMatches,
+    flag: &str,
+    target: &mut Vec<(String, String)>,
+) -> R<()> {
+    if let Some(values) = matches.get_many::<String>(flag) {
+        for value in values {
+            target.push(parse_key_value(value)?);
+        }
+    }
+
+    Ok(())
+}
+
 fn jsonnet_vars_from_matches(matches: &ArgMatches) -> R<JsonnetVars> {
     let mut vars = JsonnetVars::default();
 
-    if let Some(values) = matches.get_many::<String>("var") {
-        for value in values {
-            vars.ext_vars.push(parse_key_value(value)?);
-        }
-    }
-
-    if let Some(values) = matches.get_many::<String>("var-code") {
-        for value in values {
-            vars.ext_codes.push(parse_key_value(value)?);
-        }
-    }
-
-    if let Some(values) = matches.get_many::<String>("arg") {
-        for value in values {
-            vars.tla_vars.push(parse_key_value(value)?);
-        }
-    }
-
-    if let Some(values) = matches.get_many::<String>("arg-code") {
-        for value in values {
-            vars.tla_codes.push(parse_key_value(value)?);
-        }
-    }
+    collect_jsonnet_vars(matches, "var", &mut vars.ext_vars)?;
+    collect_jsonnet_vars(matches, "var-code", &mut vars.ext_codes)?;
+    collect_jsonnet_vars(matches, "arg", &mut vars.tla_vars)?;
+    collect_jsonnet_vars(matches, "arg-code", &mut vars.tla_codes)?;
 
     Ok(vars)
 }
@@ -210,6 +206,12 @@ fn apply_jsonnet_vars(vm: &mut JsonnetVm, vars: &JsonnetVars) {
     }
     for (key, value) in &vars.tla_codes {
         vm.tla_code(key, value);
+    }
+}
+
+fn print_json<T: Serialize>(value: &T) {
+    if let Ok(json) = to_string(value) {
+        println!("{json}");
     }
 }
 
@@ -387,9 +389,7 @@ async fn get_job_spec(arg_matches: &ArgMatches) -> R<()> {
     let subs = response.into_inner().submissions;
 
     if is_json {
-        if let Ok(json) = to_string(&subs) {
-            println!("{json}");
-        }
+        print_json(&subs);
     } else {
         subs.iter().for_each(|s| {
             println!("=============================");
@@ -446,9 +446,7 @@ async fn plan_job(arg_matches: &ArgMatches) -> R<()> {
         .map_err(|status| friendly_status("failed to plan job", status))?;
     if is_json {
         let reply = response.into_inner();
-        if let Ok(json) = to_string(&reply) {
-            println!("{json}");
-        }
+        print_json(&reply);
         return Ok(());
     } else {
         let reply = response.into_inner();
@@ -510,9 +508,7 @@ async fn list_jobs(arg_matches: &ArgMatches) -> R<()> {
     let jobs_list = response.into_inner().jobs;
 
     if is_json {
-        if let Ok(json) = to_string(&jobs_list) {
-            println!("{json}");
-        }
+        print_json(&jobs_list);
     } else {
         let printable_jobs: Vec<JobPrint> = jobs_list.into_iter().map(Into::into).collect();
         print_table(printable_jobs);
@@ -536,9 +532,7 @@ async fn get_info(arg_matches: &ArgMatches) -> R<()> {
         .map_err(|status| friendly_status("failed to fetch job info", status))?;
 
     if is_json {
-        if let Ok(json) = to_string(&response.into_inner().job) {
-            println!("{json}");
-        }
+        print_json(&response.into_inner().job);
     } else {
         let printable_job: JobPrint = response.into_inner().job.context("no job found")?.into();
         print_table(vec![printable_job]);
