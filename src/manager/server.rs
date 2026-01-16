@@ -6,7 +6,7 @@ use crate::prelude::*;
 use crate::manager::dispatcher::build_task_allocation;
 use crate::manager::scheduler::{PlanConfigOutcome, PlanMode, Scheduler};
 use crate::storage::errors::StorageError;
-use crate::storage::store::{JobSubmitOutcome, Store};
+use crate::storage::store::{JobKvReference, JobSubmitOutcome, Store};
 use crate::structs::manager_server::Manager;
 use crate::structs::{
     worker_client::WorkerClient, AcquireKvLockReply, AcquireKvLockRequest, DeleteKvReply,
@@ -14,12 +14,12 @@ use crate::structs::{
     GetJobInfoRequest, GetJobSpecReply, GetJobSpecRequest, GetKvLockReply, GetKvLockRequest,
     GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply,
     GetManagerConfigsRequest, GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest,
-    HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, JobConfig, KvValueType,
-    LedgerNode, ListJobsReply, ListJobsRequest, ListKvReply, ListKvRequest, Node, NodeMsg,
-    PatchKvReply, PatchKvRequest, PlanJobReply, PlanJobRequest, PlannedAllocation, PutKvReply,
-    PutKvRequest, ReleaseKvLockReply, ReleaseKvLockRequest, RenewKvLockReply, RenewKvLockRequest,
-    RestartWorkerReply, RestartWorkerRequest, RunJobReply, RunJobRequest, StopJobReply,
-    StopJobRequest, TaskConfig, TaskOnUnhealthyConfig, UpdateNodeDynamicReply,
+    HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, JobConfig, KvEntry,
+    KvValueType, LedgerNode, ListJobsReply, ListJobsRequest, ListKvReply, ListKvRequest, Node,
+    NodeMsg, PatchKvReply, PatchKvRequest, PlanJobReply, PlanJobRequest, PlannedAllocation,
+    PutKvReply, PutKvRequest, ReleaseKvLockReply, ReleaseKvLockRequest, RenewKvLockReply,
+    RenewKvLockRequest, RestartWorkerReply, RestartWorkerRequest, RunJobReply, RunJobRequest,
+    StopJobReply, StopJobRequest, TaskConfig, TaskOnUnhealthyConfig, UpdateNodeDynamicReply,
     UpdateNodeDynamicRequest, WorkerConfig, WorkerPreRegisterReply, WorkerPreRegisterRequest,
     WorkerRegisterReply, WorkerRegisterRequest,
 };
@@ -49,6 +49,186 @@ fn map_store_error(action: &str, err: anyhow::Error) -> Status {
     }
 }
 
+#[derive(Debug, Clone)]
+struct KvReference {
+    key: String,
+    json_pointer: String,
+}
+
+fn parse_kv_reference(value: &str) -> Option<&str> {
+    let value = value.strip_prefix('$')?;
+    if value.is_empty() || !value.contains('/') {
+        return None;
+    }
+    Some(value)
+}
+
+fn escape_json_pointer_segment(value: &str) -> String {
+    value.replace('~', "~0").replace('/', "~1")
+}
+
+fn decode_json_pointer_segment(value: &str) -> String {
+    value.replace("~1", "/").replace("~0", "~")
+}
+
+fn append_json_pointer(base: &str, segment: &str) -> String {
+    let escaped = escape_json_pointer_segment(segment);
+    if base.is_empty() {
+        format!("/{escaped}")
+    } else {
+        format!("{base}/{escaped}")
+    }
+}
+
+fn split_json_pointer(pointer: &str) -> Vec<String> {
+    if pointer.is_empty() {
+        return Vec::new();
+    }
+    pointer
+        .trim_start_matches('/')
+        .split('/')
+        .map(decode_json_pointer_segment)
+        .collect()
+}
+
+fn join_json_pointer(segments: &[String]) -> String {
+    if segments.is_empty() {
+        return String::new();
+    }
+    let encoded: Vec<String> = segments
+        .iter()
+        .map(|segment| escape_json_pointer_segment(segment))
+        .collect();
+    format!("/{}", encoded.join("/"))
+}
+
+fn normalize_kv_reference_pointer(value: &Value, pointer: &str) -> R<String> {
+    let mut segments = split_json_pointer(pointer);
+    if segments.is_empty() {
+        return Ok(pointer.to_string());
+    }
+
+    match segments[0].as_str() {
+        "task" => {
+            segments[0] = "tasks".to_string();
+            segments.insert(1, "0".to_string());
+            Ok(join_json_pointer(&segments))
+        }
+        "tasks" => {
+            let Some(tasks_value) = value.get("tasks") else {
+                return Ok(pointer.to_string());
+            };
+            if let Some(map) = tasks_value.as_object() {
+                let task_name = segments.get(1).context("kv reference missing task name")?;
+                let mut keys: Vec<&String> = map.keys().collect();
+                keys.sort();
+                let index = keys
+                    .iter()
+                    .position(|key| key.as_str() == task_name)
+                    .context("kv reference task name not found in tasks map")?;
+                segments[1] = index.to_string();
+                Ok(join_json_pointer(&segments))
+            } else {
+                Ok(pointer.to_string())
+            }
+        }
+        _ => Ok(pointer.to_string()),
+    }
+}
+
+fn kv_entry_value(entry: &KvEntry) -> R<Value> {
+    let value_type = KvValueType::try_from(entry.value_type).unwrap_or(KvValueType::Unspecified);
+    match value_type {
+        KvValueType::String => Ok(Value::String(entry.value.clone())),
+        KvValueType::Number | KvValueType::Json => {
+            let parsed: Value = serde_json::from_str(&entry.value)?;
+            Ok(parsed)
+        }
+        KvValueType::Unspecified => bail!("kv value type must be specified for {}", entry.key),
+    }
+}
+
+fn resolve_kv_references_in_value(
+    store: &Store,
+    value: &mut Value,
+    refs: &mut Vec<KvReference>,
+    pointer: &str,
+) -> R<()> {
+    match value {
+        Value::String(text) => {
+            let key = parse_kv_reference(text).map(str::to_string);
+            if let Some(key) = key {
+                let entry = store
+                    .get_kv(&key)?
+                    .ok_or_else(|| anyhow!("kv entry {key} not found"))?;
+                *value = kv_entry_value(&entry)?;
+                refs.push(KvReference {
+                    key,
+                    json_pointer: pointer.to_string(),
+                });
+            }
+        }
+        Value::Array(items) => {
+            for (index, item) in items.iter_mut().enumerate() {
+                let child = append_json_pointer(pointer, &index.to_string());
+                resolve_kv_references_in_value(store, item, refs, &child)?;
+            }
+        }
+        Value::Object(map) => {
+            for (key, item) in map.iter_mut() {
+                let child = append_json_pointer(pointer, key);
+                resolve_kv_references_in_value(store, item, refs, &child)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn resolve_jobspec_kv_references(store: &Store, jobspec: &str) -> R<(JobConfig, Vec<KvReference>)> {
+    let mut value: Value = serde_json::from_str(jobspec)?;
+    let mut refs = Vec::new();
+    resolve_kv_references_in_value(store, &mut value, &mut refs, "")?;
+    let refs = refs
+        .into_iter()
+        .map(|reference| {
+            let json_pointer = normalize_kv_reference_pointer(&value, &reference.json_pointer)?;
+            Ok(KvReference {
+                key: reference.key,
+                json_pointer,
+            })
+        })
+        .collect::<R<Vec<_>>>()?;
+    let config: JobConfig = serde_json::from_value(value)?;
+    Ok((config, refs))
+}
+
+fn apply_kv_references_to_config(
+    store: &Store,
+    config: &JobConfig,
+    refs: &[JobKvReference],
+) -> R<JobConfig> {
+    let mut value = serde_json::to_value(config)?;
+    for reference in refs {
+        let entry = store
+            .get_kv(&reference.kv_key)?
+            .ok_or_else(|| anyhow!("kv entry {} not found", reference.kv_key))?;
+        let replacement = kv_entry_value(&entry)?;
+        let pointer = reference.json_pointer.as_str();
+        let target = if pointer.is_empty() {
+            Some(&mut value)
+        } else {
+            value.pointer_mut(pointer)
+        };
+        let Some(target) = target else {
+            bail!("jobspec pointer {} missing during kv update", pointer);
+        };
+        *target = replacement;
+    }
+    let updated: JobConfig = serde_json::from_value(value)?;
+    Ok(updated)
+}
+
 #[derive(Debug)]
 pub struct ManagerAgentService {
     pub store: Store,
@@ -61,6 +241,77 @@ impl ManagerAgentService {
             store,
             allocation_failures: Arc::new(Mutex::new(AllocationFailureTracker::default())),
         }
+    }
+
+    fn handle_kv_change(&self, key: &str) -> Result<(), Status> {
+        let refs = self
+            .store
+            .job_kv_references_for_key(key)
+            .map_err(|e| map_store_error("Error loading kv references", e))?;
+        if refs.is_empty() {
+            return Ok(());
+        }
+
+        let mut jobs_to_update: HashMap<String, String> = HashMap::new();
+        for reference in refs {
+            jobs_to_update
+                .entry(reference.job_id)
+                .or_insert(reference.job_config_id);
+        }
+
+        for (job_id, job_config_id) in jobs_to_update {
+            let job_refs = self
+                .store
+                .job_kv_references_for_job(&job_id)
+                .map_err(|e| map_store_error("Error loading job kv references", e))?;
+            if job_refs.is_empty() {
+                continue;
+            }
+            let current_config = self
+                .store
+                .get_job_config_by_id(&job_config_id)
+                .map_err(|e| map_store_error("Error loading job config", e))?;
+            let updated_config =
+                apply_kv_references_to_config(&self.store, &current_config, &job_refs)
+                    .map_err(|e| map_store_error("Error applying kv references", e))?;
+            let submissions = self
+                .store
+                .get_submissions_for_config(&job_config_id)
+                .map_err(|e| map_store_error("Error loading job submissions", e))?;
+            let submit_outcome = self
+                .store
+                .handle_job_submit(&updated_config, &submissions)
+                .map_err(|e| map_store_error("Error updating job for kv change", e))?;
+            let new_job_config_id = submit_outcome.job_config_id().to_string();
+            let updated_refs: Vec<JobKvReference> = job_refs
+                .iter()
+                .map(|reference| JobKvReference {
+                    job_id: job_id.clone(),
+                    job_config_id: new_job_config_id.clone(),
+                    kv_key: reference.kv_key.clone(),
+                    json_pointer: reference.json_pointer.clone(),
+                })
+                .collect();
+            self.store
+                .replace_job_kv_references(&job_id, &updated_refs)
+                .map_err(|e| map_store_error("Error updating kv references", e))?;
+
+            if submit_outcome.is_unchanged() {
+                continue;
+            }
+
+            self.store
+                .enqueue_eval(
+                    "job_update",
+                    Some(&job_id),
+                    Some(&new_job_config_id),
+                    None,
+                    Some(self.store.default_eval_priority),
+                )
+                .map_err(|e| map_store_error("Error scheduling kv update", e))?;
+        }
+
+        Ok(())
     }
 }
 
@@ -96,7 +347,7 @@ impl Manager for ManagerAgentService {
         let subs = inner.submissions;
         let priority = inner.priority.unwrap_or(self.store.default_eval_priority);
 
-        let config: JobConfig = serde_json::from_str(&js).map_err(|e| {
+        let (config, kv_refs) = resolve_jobspec_kv_references(&self.store, &js).map_err(|e| {
             error!("Error parsing jobspec: {:?}", e);
             Status::invalid_argument(format!("Error parsing jobspec: {e}"))
         })?;
@@ -112,6 +363,18 @@ impl Manager for ManagerAgentService {
             .map_err(|e| map_store_error("Error running job", e))?;
 
         let job_config_id = submit_outcome.job_config_id().to_string();
+        let stored_refs: Vec<JobKvReference> = kv_refs
+            .into_iter()
+            .map(|reference| JobKvReference {
+                job_id: config.name.clone(),
+                job_config_id: job_config_id.clone(),
+                kv_key: reference.key,
+                json_pointer: reference.json_pointer,
+            })
+            .collect();
+        self.store
+            .replace_job_kv_references(&config.name, &stored_refs)
+            .map_err(|e| map_store_error("Error storing kv references", e))?;
         let (eval_kind, message) = match submit_outcome {
             JobSubmitOutcome::Unchanged { .. } => {
                 if force_reschedule {
@@ -174,10 +437,11 @@ impl Manager for ManagerAgentService {
             return Err(Status::invalid_argument("Plan request missing jobspec"));
         }
 
-        let config: JobConfig = serde_json::from_str(&jobspec).map_err(|e| {
-            error!("Error parsing jobspec for plan: {:?}", e);
-            Status::invalid_argument("Error parsing jobspec")
-        })?;
+        let (config, _kv_refs) =
+            resolve_jobspec_kv_references(&self.store, &jobspec).map_err(|e| {
+                error!("Error parsing jobspec for plan: {:?}", e);
+                Status::invalid_argument("Error parsing jobspec")
+            })?;
         let config = self
             .store
             .normalize_job_config(&config)
@@ -651,6 +915,8 @@ impl Manager for ManagerAgentService {
             )
             .map_err(|e| map_store_error("Error putting kv entry", e))?;
 
+        self.handle_kv_change(&req.key)?;
+
         Ok(Response::new(PutKvReply { entry: Some(entry) }))
     }
 
@@ -709,6 +975,8 @@ impl Manager for ManagerAgentService {
                 req.lock_id.as_deref(),
             )
             .map_err(|e| map_store_error("Error patching kv entry", e))?;
+
+        self.handle_kv_change(&req.key)?;
 
         Ok(Response::new(PatchKvReply { entry: Some(entry) }))
     }
@@ -1014,8 +1282,8 @@ mod tests {
     use crate::structs::config::ManagerConfigFull;
     use crate::structs::worker_server::Worker;
     use crate::structs::{
-        JobConfig, NodeMsg, PostWorkReply, PostWorkRequest, RestartWorkerReply,
-        RestartWorkerRequest, Submission, TaskConfig,
+        JobConfig, NodeMsg, PostWorkReply, PostWorkRequest, PutKvRequest, RestartWorkerReply,
+        RestartWorkerRequest, RunJobRequest, Submission, TaskConfig,
     };
     use serde_json::json;
     use tempfile::Builder;
@@ -1149,6 +1417,83 @@ mod tests {
         assert_eq!(guard.as_deref(), Some("node-1"));
 
         let _ = shutdown_tx.send(());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn kv_reference_updates_trigger_job_restart() -> R<()> {
+        let store = setup_store()?;
+        let manager = ManagerAgentService::new(store);
+
+        manager
+            .put_kv(Request::new(PutKvRequest {
+                key: "secrets/key".into(),
+                value: "first".into(),
+                value_type: KvValueType::String as i32,
+                expected_version: None,
+                lock_id: None,
+            }))
+            .await?;
+
+        let jobspec = json!({
+            "name": "kv-job",
+            "task": {
+                "kind": "exec",
+                "config": {
+                    "command": ["echo", "hi"],
+                    "env": {
+                        "KEY": "$secrets/key"
+                    }
+                }
+            }
+        })
+        .to_string();
+
+        manager
+            .run_job(Request::new(RunJobRequest {
+                parsed_jobspec: jobspec,
+                submissions: vec![submission()],
+                priority: None,
+                force_reschedule: false,
+            }))
+            .await?;
+
+        let config = manager.store.get_job_config("kv-job")?;
+        let env_value = config.tasks[0]
+            .config
+            .get("env")
+            .and_then(|env| env.get("KEY"))
+            .and_then(|value| value.as_str())
+            .context("missing env var")?;
+        assert_eq!(env_value, "first");
+
+        manager
+            .put_kv(Request::new(PutKvRequest {
+                key: "secrets/key".into(),
+                value: "second".into(),
+                value_type: KvValueType::String as i32,
+                expected_version: None,
+                lock_id: None,
+            }))
+            .await?;
+
+        let updated = manager.store.get_job_config("kv-job")?;
+        let updated_env_value = updated.tasks[0]
+            .config
+            .get("env")
+            .and_then(|env| env.get("KEY"))
+            .and_then(|value| value.as_str())
+            .context("missing updated env var")?;
+        assert_eq!(updated_env_value, "second");
+
+        let evals = manager.store.get_evals()?;
+        assert!(
+            evals
+                .iter()
+                .any(|eval| eval.kind == "job_update" && eval.job_id == "kv-job"),
+            "expected job_update eval after kv change"
+        );
+
         Ok(())
     }
 

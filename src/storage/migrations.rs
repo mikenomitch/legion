@@ -174,5 +174,25 @@ pub fn get_migrations() -> Migrations<'static> {
         )",
         )
         .down("DROP TABLE IF EXISTS kv_lock;"),
+        M::up(
+            "CREATE TABLE IF NOT EXISTS job_kv_reference (
+            id INTEGER PRIMARY KEY,
+            job_id STRING NOT NULL,
+            job_config_id STRING NOT NULL,
+            kv_key STRING NOT NULL,
+            json_pointer STRING NOT NULL,
+            FOREIGN KEY(job_id) REFERENCES job(id) ON DELETE CASCADE,
+            FOREIGN KEY(job_config_id) REFERENCES job_config(id) ON DELETE CASCADE
+        )",
+        )
+        .down("DROP TABLE IF EXISTS job_kv_reference;"),
+        M::up(
+            "CREATE INDEX IF NOT EXISTS idx_job_kv_reference_key ON job_kv_reference(kv_key);",
+        )
+        .down("DROP INDEX IF EXISTS idx_job_kv_reference_key;"),
+        M::up(
+            "CREATE INDEX IF NOT EXISTS idx_job_kv_reference_job ON job_kv_reference(job_id);",
+        )
+        .down("DROP INDEX IF EXISTS idx_job_kv_reference_job;"),
     ])
 }
