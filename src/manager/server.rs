@@ -1282,10 +1282,10 @@ mod tests {
     use crate::structs::config::ManagerConfigFull;
     use crate::structs::worker_server::Worker;
     use crate::structs::{
-        JobConfig, NodeMsg, PostWorkReply, PostWorkRequest, PutKvRequest, RestartWorkerReply,
-        RestartWorkerRequest, RunJobRequest, Submission, TaskConfig,
+        Eval, JobConfig, NodeMsg, PostWorkReply, PostWorkRequest, PutKvRequest, RestartWorkerReply,
+        RestartWorkerRequest, RunJobRequest, Submission, TaskConfig, UpdateNodeDynamicRequest,
     };
-    use serde_json::json;
+    use serde_json::{json, Map, Value};
     use tempfile::Builder;
     use tokio::sync::oneshot;
     use tonic::transport::Server;
@@ -1493,6 +1493,95 @@ mod tests {
                 .any(|eval| eval.kind == "job_update" && eval.job_id == "kv-job"),
             "expected job_update eval after kv change"
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn update_node_metadata_evicts_allocations_with_invalid_constraints() -> R<()> {
+        let store = setup_store()?;
+        let manager = ManagerAgentService::new(store.clone());
+
+        let node_a = Node {
+            id: "node-a".into(),
+            status: "ready".into(),
+            pool: "default".into(),
+            availability: "available".into(),
+            last_heartbeat: "2023-01-01T00:00:00Z".into(),
+            config_attrs: json!({ "node_id": "node-a" }),
+            fingerprint_attrs: json!({}),
+            dynamic_attrs: json!({ "tier": "edge" }),
+            health_checks: json!({}),
+        };
+        let node_b = Node {
+            id: "node-b".into(),
+            status: "ready".into(),
+            pool: "default".into(),
+            availability: "available".into(),
+            last_heartbeat: "2023-01-01T00:00:00Z".into(),
+            config_attrs: json!({ "node_id": "node-b" }),
+            fingerprint_attrs: json!({}),
+            dynamic_attrs: json!({ "tier": "edge" }),
+            health_checks: json!({}),
+        };
+        store.insert_node(NodeMsg::from(node_a))?;
+        store.insert_node(NodeMsg::from(node_b))?;
+
+        let job_name = "metadata-evict".to_string();
+        let task = TaskConfig {
+            constraints: json!({ "tier": "edge" }),
+            ..TaskConfig::new("task", "noop")
+        };
+        let job = JobConfig {
+            name: job_name.clone(),
+            tasks: vec![task],
+            version: None,
+        };
+        store.handle_job_submit(&job, &[submission()])?;
+        let job_config_id = store.get_job_config(&job_name)?.id();
+
+        let initial_eval = Eval {
+            id: "1".into(),
+            status: "pending".into(),
+            kind: "job_submit".into(),
+            job_id: job_name.clone(),
+            job_config_id: job_config_id.clone(),
+            node_name: String::new(),
+            priority: 50,
+        };
+        initial_eval.handle(&store)?;
+
+        let initial_alloc = store
+            .allocs_for_job(&job_name)?
+            .into_iter()
+            .next()
+            .context("missing initial allocation")?;
+        assert_eq!(initial_alloc.node_id, "node-a");
+
+        let mut diff: Map<String, Value> = Map::new();
+        diff.insert("tier".into(), json!("core"));
+        let runtime = tokio::runtime::Runtime::new()?;
+        let diff_json = serde_json::to_string(&diff)?;
+        let update_result = runtime.block_on(async {
+            manager
+                .update_node_dynamic(Request::new(UpdateNodeDynamicRequest {
+                    id: "node-a".into(),
+                    dynamic_diff: diff_json,
+                }))
+                .await
+        });
+        update_result.map_err(|err| anyhow!(err))?;
+
+        let evals = store.get_evals()?;
+        let update_eval = evals
+            .iter()
+            .find(|eval| eval.kind == "job_update" && eval.job_id == job_name)
+            .context("missing job_update eval")?;
+        update_eval.handle(&store)?;
+
+        let updated_allocs = store.allocs_for_job(&job_name)?;
+        assert_eq!(updated_allocs.len(), 1);
+        assert_eq!(updated_allocs[0].node_id, "node-b");
 
         Ok(())
     }
