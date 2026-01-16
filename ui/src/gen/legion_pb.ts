@@ -7,6 +7,38 @@ import type { BinaryReadOptions, FieldList, JsonReadOptions, JsonValue, PartialM
 import { Message, proto3, protoInt64 } from "@bufbuild/protobuf";
 
 /**
+ * @generated from enum legion.KvValueType
+ */
+export enum KvValueType {
+  /**
+   * @generated from enum value: KV_VALUE_TYPE_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * @generated from enum value: KV_VALUE_TYPE_STRING = 1;
+   */
+  STRING = 1,
+
+  /**
+   * @generated from enum value: KV_VALUE_TYPE_NUMBER = 2;
+   */
+  NUMBER = 2,
+
+  /**
+   * @generated from enum value: KV_VALUE_TYPE_JSON = 3;
+   */
+  JSON = 3,
+}
+// Retrieve enum metadata with: proto3.getEnumType(KvValueType)
+proto3.util.setEnumType(KvValueType, "legion.KvValueType", [
+  { no: 0, name: "KV_VALUE_TYPE_UNSPECIFIED" },
+  { no: 1, name: "KV_VALUE_TYPE_STRING" },
+  { no: 2, name: "KV_VALUE_TYPE_NUMBER" },
+  { no: 3, name: "KV_VALUE_TYPE_JSON" },
+]);
+
+/**
  * @generated from message legion.WorkerPreRegisterRequest
  */
 export class WorkerPreRegisterRequest extends Message<WorkerPreRegisterRequest> {
@@ -72,6 +104,21 @@ export class WorkerConfig extends Message<WorkerConfig> {
    */
   namePrefix?: string;
 
+  /**
+   * @generated from field: string resources = 6;
+   */
+  resources = "";
+
+  /**
+   * @generated from field: string reserved_resources = 7;
+   */
+  reservedResources = "";
+
+  /**
+   * @generated from field: optional uint32 max_allocations = 8;
+   */
+  maxAllocations?: number;
+
   constructor(data?: PartialMessage<WorkerConfig>) {
     super();
     proto3.util.initPartial(data, this);
@@ -85,6 +132,9 @@ export class WorkerConfig extends Message<WorkerConfig> {
     { no: 3, name: "additional_node_checks", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
     { no: 4, name: "attributes", kind: "map", K: 9 /* ScalarType.STRING */, V: {kind: "scalar", T: 9 /* ScalarType.STRING */} },
     { no: 5, name: "name_prefix", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 6, name: "resources", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 7, name: "reserved_resources", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 8, name: "max_allocations", kind: "scalar", T: 13 /* ScalarType.UINT32 */, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): WorkerConfig {
@@ -302,6 +352,16 @@ export class RunJobRequest extends Message<RunJobRequest> {
    */
   submissions: Submission[] = [];
 
+  /**
+   * @generated from field: optional int64 priority = 3;
+   */
+  priority?: bigint;
+
+  /**
+   * @generated from field: bool force_reschedule = 4;
+   */
+  forceReschedule = false;
+
   constructor(data?: PartialMessage<RunJobRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -312,6 +372,8 @@ export class RunJobRequest extends Message<RunJobRequest> {
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "parsed_jobspec", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 2, name: "submissions", kind: "message", T: Submission, repeated: true },
+    { no: 3, name: "priority", kind: "scalar", T: 3 /* ScalarType.INT64 */, opt: true },
+    { no: 4, name: "force_reschedule", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RunJobRequest {
@@ -517,6 +579,147 @@ export class GetJobSpecReply extends Message<GetJobSpecReply> {
 }
 
 /**
+ * @generated from message legion.PlanJobRequest
+ */
+export class PlanJobRequest extends Message<PlanJobRequest> {
+  /**
+   * @generated from field: string parsed_jobspec = 1;
+   */
+  parsedJobspec = "";
+
+  constructor(data?: PartialMessage<PlanJobRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.PlanJobRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "parsed_jobspec", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): PlanJobRequest {
+    return new PlanJobRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): PlanJobRequest {
+    return new PlanJobRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): PlanJobRequest {
+    return new PlanJobRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: PlanJobRequest | PlainMessage<PlanJobRequest> | undefined, b: PlanJobRequest | PlainMessage<PlanJobRequest> | undefined): boolean {
+    return proto3.util.equals(PlanJobRequest, a, b);
+  }
+}
+
+/**
+ * @generated from message legion.PlanJobReply
+ */
+export class PlanJobReply extends Message<PlanJobReply> {
+  /**
+   * @generated from field: repeated legion.PlannedAllocation allocations = 1;
+   */
+  allocations: PlannedAllocation[] = [];
+
+  /**
+   * @generated from field: string message = 2;
+   */
+  message = "";
+
+  /**
+   * @generated from field: bool matches_existing = 3;
+   */
+  matchesExisting = false;
+
+  /**
+   * @generated from field: bool same_content = 4;
+   */
+  sameContent = false;
+
+  constructor(data?: PartialMessage<PlanJobReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.PlanJobReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "allocations", kind: "message", T: PlannedAllocation, repeated: true },
+    { no: 2, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "matches_existing", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 4, name: "same_content", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): PlanJobReply {
+    return new PlanJobReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): PlanJobReply {
+    return new PlanJobReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): PlanJobReply {
+    return new PlanJobReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: PlanJobReply | PlainMessage<PlanJobReply> | undefined, b: PlanJobReply | PlainMessage<PlanJobReply> | undefined): boolean {
+    return proto3.util.equals(PlanJobReply, a, b);
+  }
+}
+
+/**
+ * @generated from message legion.PlannedAllocation
+ */
+export class PlannedAllocation extends Message<PlannedAllocation> {
+  /**
+   * @generated from field: string node_id = 1;
+   */
+  nodeId = "";
+
+  /**
+   * @generated from field: int64 task_config_id = 2;
+   */
+  taskConfigId = protoInt64.zero;
+
+  /**
+   * @generated from field: string task_name = 3;
+   */
+  taskName = "";
+
+  constructor(data?: PartialMessage<PlannedAllocation>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.PlannedAllocation";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "task_config_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 3, name: "task_name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): PlannedAllocation {
+    return new PlannedAllocation().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): PlannedAllocation {
+    return new PlannedAllocation().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): PlannedAllocation {
+    return new PlannedAllocation().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: PlannedAllocation | PlainMessage<PlannedAllocation> | undefined, b: PlannedAllocation | PlainMessage<PlannedAllocation> | undefined): boolean {
+    return proto3.util.equals(PlannedAllocation, a, b);
+  }
+}
+
+/**
  * @generated from message legion.StopJobRequest
  */
 export class StopJobRequest extends Message<StopJobRequest> {
@@ -524,6 +727,11 @@ export class StopJobRequest extends Message<StopJobRequest> {
    * @generated from field: string name = 1;
    */
   name = "";
+
+  /**
+   * @generated from field: optional int64 priority = 2;
+   */
+  priority?: bigint;
 
   constructor(data?: PartialMessage<StopJobRequest>) {
     super();
@@ -534,6 +742,7 @@ export class StopJobRequest extends Message<StopJobRequest> {
   static readonly typeName = "legion.StopJobRequest";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "priority", kind: "scalar", T: 3 /* ScalarType.INT64 */, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): StopJobRequest {
@@ -599,6 +808,11 @@ export class DestroyJobRequest extends Message<DestroyJobRequest> {
    */
   name = "";
 
+  /**
+   * @generated from field: optional int64 priority = 2;
+   */
+  priority?: bigint;
+
   constructor(data?: PartialMessage<DestroyJobRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -608,6 +822,7 @@ export class DestroyJobRequest extends Message<DestroyJobRequest> {
   static readonly typeName = "legion.DestroyJobRequest";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "priority", kind: "scalar", T: 3 /* ScalarType.INT64 */, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): DestroyJobRequest {
@@ -796,6 +1011,16 @@ export class HeartbeatRequest extends Message<HeartbeatRequest> {
    */
   id = "";
 
+  /**
+   * @generated from field: repeated int64 allocation_ids = 2;
+   */
+  allocationIds: bigint[] = [];
+
+  /**
+   * @generated from field: repeated legion.FailedAllocation failed_allocations = 3;
+   */
+  failedAllocations: FailedAllocation[] = [];
+
   constructor(data?: PartialMessage<HeartbeatRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -805,6 +1030,8 @@ export class HeartbeatRequest extends Message<HeartbeatRequest> {
   static readonly typeName = "legion.HeartbeatRequest";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "allocation_ids", kind: "scalar", T: 3 /* ScalarType.INT64 */, repeated: true },
+    { no: 3, name: "failed_allocations", kind: "message", T: FailedAllocation, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): HeartbeatRequest {
@@ -833,6 +1060,11 @@ export class HeartbeatReply extends Message<HeartbeatReply> {
    */
   message = "";
 
+  /**
+   * @generated from field: repeated legion.TaskAllocation desired_allocations = 2;
+   */
+  desiredAllocations: TaskAllocation[] = [];
+
   constructor(data?: PartialMessage<HeartbeatReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -842,6 +1074,7 @@ export class HeartbeatReply extends Message<HeartbeatReply> {
   static readonly typeName = "legion.HeartbeatReply";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "desired_allocations", kind: "message", T: TaskAllocation, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): HeartbeatReply {
@@ -858,6 +1091,49 @@ export class HeartbeatReply extends Message<HeartbeatReply> {
 
   static equals(a: HeartbeatReply | PlainMessage<HeartbeatReply> | undefined, b: HeartbeatReply | PlainMessage<HeartbeatReply> | undefined): boolean {
     return proto3.util.equals(HeartbeatReply, a, b);
+  }
+}
+
+/**
+ * @generated from message legion.FailedAllocation
+ */
+export class FailedAllocation extends Message<FailedAllocation> {
+  /**
+   * @generated from field: int64 allocation_id = 1;
+   */
+  allocationId = protoInt64.zero;
+
+  /**
+   * @generated from field: string reason = 2;
+   */
+  reason = "";
+
+  constructor(data?: PartialMessage<FailedAllocation>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.FailedAllocation";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "allocation_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 2, name: "reason", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): FailedAllocation {
+    return new FailedAllocation().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): FailedAllocation {
+    return new FailedAllocation().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): FailedAllocation {
+    return new FailedAllocation().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: FailedAllocation | PlainMessage<FailedAllocation> | undefined, b: FailedAllocation | PlainMessage<FailedAllocation> | undefined): boolean {
+    return proto3.util.equals(FailedAllocation, a, b);
   }
 }
 
@@ -1169,6 +1445,80 @@ export class GetNodeReply extends Message<GetNodeReply> {
 }
 
 /**
+ * @generated from message legion.RestartWorkerRequest
+ */
+export class RestartWorkerRequest extends Message<RestartWorkerRequest> {
+  /**
+   * @generated from field: string node_id = 1;
+   */
+  nodeId = "";
+
+  constructor(data?: PartialMessage<RestartWorkerRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.RestartWorkerRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RestartWorkerRequest {
+    return new RestartWorkerRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): RestartWorkerRequest {
+    return new RestartWorkerRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): RestartWorkerRequest {
+    return new RestartWorkerRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: RestartWorkerRequest | PlainMessage<RestartWorkerRequest> | undefined, b: RestartWorkerRequest | PlainMessage<RestartWorkerRequest> | undefined): boolean {
+    return proto3.util.equals(RestartWorkerRequest, a, b);
+  }
+}
+
+/**
+ * @generated from message legion.RestartWorkerReply
+ */
+export class RestartWorkerReply extends Message<RestartWorkerReply> {
+  /**
+   * @generated from field: string message = 1;
+   */
+  message = "";
+
+  constructor(data?: PartialMessage<RestartWorkerReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.RestartWorkerReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RestartWorkerReply {
+    return new RestartWorkerReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): RestartWorkerReply {
+    return new RestartWorkerReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): RestartWorkerReply {
+    return new RestartWorkerReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: RestartWorkerReply | PlainMessage<RestartWorkerReply> | undefined, b: RestartWorkerReply | PlainMessage<RestartWorkerReply> | undefined): boolean {
+    return proto3.util.equals(RestartWorkerReply, a, b);
+  }
+}
+
+/**
  * @generated from message legion.GetLedgerRequest
  */
 export class GetLedgerRequest extends Message<GetLedgerRequest> {
@@ -1354,6 +1704,896 @@ export class GetManagerConfigsReply extends Message<GetManagerConfigsReply> {
 }
 
 /**
+ * @generated from message legion.KvEntry
+ */
+export class KvEntry extends Message<KvEntry> {
+  /**
+   * @generated from field: string key = 1;
+   */
+  key = "";
+
+  /**
+   * @generated from field: string value = 2;
+   */
+  value = "";
+
+  /**
+   * @generated from field: legion.KvValueType value_type = 3;
+   */
+  valueType = KvValueType.UNSPECIFIED;
+
+  /**
+   * @generated from field: int64 version = 4;
+   */
+  version = protoInt64.zero;
+
+  /**
+   * @generated from field: string created_at = 5;
+   */
+  createdAt = "";
+
+  /**
+   * @generated from field: string updated_at = 6;
+   */
+  updatedAt = "";
+
+  constructor(data?: PartialMessage<KvEntry>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.KvEntry";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "key", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "value", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "value_type", kind: "enum", T: proto3.getEnumType(KvValueType) },
+    { no: 4, name: "version", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 5, name: "created_at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "updated_at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): KvEntry {
+    return new KvEntry().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): KvEntry {
+    return new KvEntry().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): KvEntry {
+    return new KvEntry().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: KvEntry | PlainMessage<KvEntry> | undefined, b: KvEntry | PlainMessage<KvEntry> | undefined): boolean {
+    return proto3.util.equals(KvEntry, a, b);
+  }
+}
+
+/**
+ * @generated from message legion.KvLock
+ */
+export class KvLock extends Message<KvLock> {
+  /**
+   * @generated from field: string key = 1;
+   */
+  key = "";
+
+  /**
+   * @generated from field: string lock_id = 2;
+   */
+  lockId = "";
+
+  /**
+   * @generated from field: optional string owner = 3;
+   */
+  owner?: string;
+
+  /**
+   * @generated from field: string acquired_at = 4;
+   */
+  acquiredAt = "";
+
+  /**
+   * @generated from field: string expires_at = 5;
+   */
+  expiresAt = "";
+
+  constructor(data?: PartialMessage<KvLock>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.KvLock";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "key", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "lock_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "owner", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 4, name: "acquired_at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "expires_at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): KvLock {
+    return new KvLock().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): KvLock {
+    return new KvLock().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): KvLock {
+    return new KvLock().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: KvLock | PlainMessage<KvLock> | undefined, b: KvLock | PlainMessage<KvLock> | undefined): boolean {
+    return proto3.util.equals(KvLock, a, b);
+  }
+}
+
+/**
+ * @generated from message legion.PutKvRequest
+ */
+export class PutKvRequest extends Message<PutKvRequest> {
+  /**
+   * @generated from field: string key = 1;
+   */
+  key = "";
+
+  /**
+   * @generated from field: string value = 2;
+   */
+  value = "";
+
+  /**
+   * @generated from field: legion.KvValueType value_type = 3;
+   */
+  valueType = KvValueType.UNSPECIFIED;
+
+  /**
+   * @generated from field: optional int64 expected_version = 4;
+   */
+  expectedVersion?: bigint;
+
+  /**
+   * @generated from field: optional string lock_id = 5;
+   */
+  lockId?: string;
+
+  constructor(data?: PartialMessage<PutKvRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.PutKvRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "key", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "value", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "value_type", kind: "enum", T: proto3.getEnumType(KvValueType) },
+    { no: 4, name: "expected_version", kind: "scalar", T: 3 /* ScalarType.INT64 */, opt: true },
+    { no: 5, name: "lock_id", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): PutKvRequest {
+    return new PutKvRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): PutKvRequest {
+    return new PutKvRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): PutKvRequest {
+    return new PutKvRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: PutKvRequest | PlainMessage<PutKvRequest> | undefined, b: PutKvRequest | PlainMessage<PutKvRequest> | undefined): boolean {
+    return proto3.util.equals(PutKvRequest, a, b);
+  }
+}
+
+/**
+ * @generated from message legion.PutKvReply
+ */
+export class PutKvReply extends Message<PutKvReply> {
+  /**
+   * @generated from field: legion.KvEntry entry = 1;
+   */
+  entry?: KvEntry;
+
+  constructor(data?: PartialMessage<PutKvReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.PutKvReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "entry", kind: "message", T: KvEntry },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): PutKvReply {
+    return new PutKvReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): PutKvReply {
+    return new PutKvReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): PutKvReply {
+    return new PutKvReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: PutKvReply | PlainMessage<PutKvReply> | undefined, b: PutKvReply | PlainMessage<PutKvReply> | undefined): boolean {
+    return proto3.util.equals(PutKvReply, a, b);
+  }
+}
+
+/**
+ * @generated from message legion.GetKvRequest
+ */
+export class GetKvRequest extends Message<GetKvRequest> {
+  /**
+   * @generated from field: string key = 1;
+   */
+  key = "";
+
+  constructor(data?: PartialMessage<GetKvRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetKvRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "key", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetKvRequest {
+    return new GetKvRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetKvRequest {
+    return new GetKvRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetKvRequest {
+    return new GetKvRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetKvRequest | PlainMessage<GetKvRequest> | undefined, b: GetKvRequest | PlainMessage<GetKvRequest> | undefined): boolean {
+    return proto3.util.equals(GetKvRequest, a, b);
+  }
+}
+
+/**
+ * @generated from message legion.GetKvReply
+ */
+export class GetKvReply extends Message<GetKvReply> {
+  /**
+   * @generated from field: optional legion.KvEntry entry = 1;
+   */
+  entry?: KvEntry;
+
+  constructor(data?: PartialMessage<GetKvReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetKvReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "entry", kind: "message", T: KvEntry, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetKvReply {
+    return new GetKvReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetKvReply {
+    return new GetKvReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetKvReply {
+    return new GetKvReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetKvReply | PlainMessage<GetKvReply> | undefined, b: GetKvReply | PlainMessage<GetKvReply> | undefined): boolean {
+    return proto3.util.equals(GetKvReply, a, b);
+  }
+}
+
+/**
+ * @generated from message legion.ListKvRequest
+ */
+export class ListKvRequest extends Message<ListKvRequest> {
+  /**
+   * @generated from field: string prefix = 1;
+   */
+  prefix = "";
+
+  constructor(data?: PartialMessage<ListKvRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListKvRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "prefix", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListKvRequest {
+    return new ListKvRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListKvRequest {
+    return new ListKvRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListKvRequest {
+    return new ListKvRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListKvRequest | PlainMessage<ListKvRequest> | undefined, b: ListKvRequest | PlainMessage<ListKvRequest> | undefined): boolean {
+    return proto3.util.equals(ListKvRequest, a, b);
+  }
+}
+
+/**
+ * @generated from message legion.ListKvReply
+ */
+export class ListKvReply extends Message<ListKvReply> {
+  /**
+   * @generated from field: repeated legion.KvEntry entries = 1;
+   */
+  entries: KvEntry[] = [];
+
+  constructor(data?: PartialMessage<ListKvReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListKvReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "entries", kind: "message", T: KvEntry, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListKvReply {
+    return new ListKvReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListKvReply {
+    return new ListKvReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListKvReply {
+    return new ListKvReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListKvReply | PlainMessage<ListKvReply> | undefined, b: ListKvReply | PlainMessage<ListKvReply> | undefined): boolean {
+    return proto3.util.equals(ListKvReply, a, b);
+  }
+}
+
+/**
+ * @generated from message legion.DeleteKvRequest
+ */
+export class DeleteKvRequest extends Message<DeleteKvRequest> {
+  /**
+   * @generated from field: string key = 1;
+   */
+  key = "";
+
+  /**
+   * @generated from field: optional int64 expected_version = 2;
+   */
+  expectedVersion?: bigint;
+
+  /**
+   * @generated from field: optional string lock_id = 3;
+   */
+  lockId?: string;
+
+  constructor(data?: PartialMessage<DeleteKvRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.DeleteKvRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "key", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "expected_version", kind: "scalar", T: 3 /* ScalarType.INT64 */, opt: true },
+    { no: 3, name: "lock_id", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): DeleteKvRequest {
+    return new DeleteKvRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): DeleteKvRequest {
+    return new DeleteKvRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): DeleteKvRequest {
+    return new DeleteKvRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: DeleteKvRequest | PlainMessage<DeleteKvRequest> | undefined, b: DeleteKvRequest | PlainMessage<DeleteKvRequest> | undefined): boolean {
+    return proto3.util.equals(DeleteKvRequest, a, b);
+  }
+}
+
+/**
+ * @generated from message legion.DeleteKvReply
+ */
+export class DeleteKvReply extends Message<DeleteKvReply> {
+  /**
+   * @generated from field: string message = 1;
+   */
+  message = "";
+
+  constructor(data?: PartialMessage<DeleteKvReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.DeleteKvReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): DeleteKvReply {
+    return new DeleteKvReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): DeleteKvReply {
+    return new DeleteKvReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): DeleteKvReply {
+    return new DeleteKvReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: DeleteKvReply | PlainMessage<DeleteKvReply> | undefined, b: DeleteKvReply | PlainMessage<DeleteKvReply> | undefined): boolean {
+    return proto3.util.equals(DeleteKvReply, a, b);
+  }
+}
+
+/**
+ * @generated from message legion.PatchKvRequest
+ */
+export class PatchKvRequest extends Message<PatchKvRequest> {
+  /**
+   * @generated from field: string key = 1;
+   */
+  key = "";
+
+  /**
+   * @generated from field: string patch_json = 2;
+   */
+  patchJson = "";
+
+  /**
+   * @generated from field: optional int64 expected_version = 3;
+   */
+  expectedVersion?: bigint;
+
+  /**
+   * @generated from field: optional string lock_id = 4;
+   */
+  lockId?: string;
+
+  constructor(data?: PartialMessage<PatchKvRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.PatchKvRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "key", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "patch_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "expected_version", kind: "scalar", T: 3 /* ScalarType.INT64 */, opt: true },
+    { no: 4, name: "lock_id", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): PatchKvRequest {
+    return new PatchKvRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): PatchKvRequest {
+    return new PatchKvRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): PatchKvRequest {
+    return new PatchKvRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: PatchKvRequest | PlainMessage<PatchKvRequest> | undefined, b: PatchKvRequest | PlainMessage<PatchKvRequest> | undefined): boolean {
+    return proto3.util.equals(PatchKvRequest, a, b);
+  }
+}
+
+/**
+ * @generated from message legion.PatchKvReply
+ */
+export class PatchKvReply extends Message<PatchKvReply> {
+  /**
+   * @generated from field: legion.KvEntry entry = 1;
+   */
+  entry?: KvEntry;
+
+  constructor(data?: PartialMessage<PatchKvReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.PatchKvReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "entry", kind: "message", T: KvEntry },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): PatchKvReply {
+    return new PatchKvReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): PatchKvReply {
+    return new PatchKvReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): PatchKvReply {
+    return new PatchKvReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: PatchKvReply | PlainMessage<PatchKvReply> | undefined, b: PatchKvReply | PlainMessage<PatchKvReply> | undefined): boolean {
+    return proto3.util.equals(PatchKvReply, a, b);
+  }
+}
+
+/**
+ * @generated from message legion.AcquireKvLockRequest
+ */
+export class AcquireKvLockRequest extends Message<AcquireKvLockRequest> {
+  /**
+   * @generated from field: string key = 1;
+   */
+  key = "";
+
+  /**
+   * @generated from field: optional string lock_id = 2;
+   */
+  lockId?: string;
+
+  /**
+   * @generated from field: optional string owner = 3;
+   */
+  owner?: string;
+
+  /**
+   * @generated from field: int64 ttl_seconds = 4;
+   */
+  ttlSeconds = protoInt64.zero;
+
+  /**
+   * @generated from field: bool force = 5;
+   */
+  force = false;
+
+  constructor(data?: PartialMessage<AcquireKvLockRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.AcquireKvLockRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "key", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "lock_id", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 3, name: "owner", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 4, name: "ttl_seconds", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 5, name: "force", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): AcquireKvLockRequest {
+    return new AcquireKvLockRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): AcquireKvLockRequest {
+    return new AcquireKvLockRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): AcquireKvLockRequest {
+    return new AcquireKvLockRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: AcquireKvLockRequest | PlainMessage<AcquireKvLockRequest> | undefined, b: AcquireKvLockRequest | PlainMessage<AcquireKvLockRequest> | undefined): boolean {
+    return proto3.util.equals(AcquireKvLockRequest, a, b);
+  }
+}
+
+/**
+ * @generated from message legion.AcquireKvLockReply
+ */
+export class AcquireKvLockReply extends Message<AcquireKvLockReply> {
+  /**
+   * @generated from field: legion.KvLock lock = 1;
+   */
+  lock?: KvLock;
+
+  constructor(data?: PartialMessage<AcquireKvLockReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.AcquireKvLockReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "lock", kind: "message", T: KvLock },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): AcquireKvLockReply {
+    return new AcquireKvLockReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): AcquireKvLockReply {
+    return new AcquireKvLockReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): AcquireKvLockReply {
+    return new AcquireKvLockReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: AcquireKvLockReply | PlainMessage<AcquireKvLockReply> | undefined, b: AcquireKvLockReply | PlainMessage<AcquireKvLockReply> | undefined): boolean {
+    return proto3.util.equals(AcquireKvLockReply, a, b);
+  }
+}
+
+/**
+ * @generated from message legion.RenewKvLockRequest
+ */
+export class RenewKvLockRequest extends Message<RenewKvLockRequest> {
+  /**
+   * @generated from field: string key = 1;
+   */
+  key = "";
+
+  /**
+   * @generated from field: string lock_id = 2;
+   */
+  lockId = "";
+
+  /**
+   * @generated from field: int64 ttl_seconds = 3;
+   */
+  ttlSeconds = protoInt64.zero;
+
+  constructor(data?: PartialMessage<RenewKvLockRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.RenewKvLockRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "key", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "lock_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "ttl_seconds", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RenewKvLockRequest {
+    return new RenewKvLockRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): RenewKvLockRequest {
+    return new RenewKvLockRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): RenewKvLockRequest {
+    return new RenewKvLockRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: RenewKvLockRequest | PlainMessage<RenewKvLockRequest> | undefined, b: RenewKvLockRequest | PlainMessage<RenewKvLockRequest> | undefined): boolean {
+    return proto3.util.equals(RenewKvLockRequest, a, b);
+  }
+}
+
+/**
+ * @generated from message legion.RenewKvLockReply
+ */
+export class RenewKvLockReply extends Message<RenewKvLockReply> {
+  /**
+   * @generated from field: legion.KvLock lock = 1;
+   */
+  lock?: KvLock;
+
+  constructor(data?: PartialMessage<RenewKvLockReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.RenewKvLockReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "lock", kind: "message", T: KvLock },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RenewKvLockReply {
+    return new RenewKvLockReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): RenewKvLockReply {
+    return new RenewKvLockReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): RenewKvLockReply {
+    return new RenewKvLockReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: RenewKvLockReply | PlainMessage<RenewKvLockReply> | undefined, b: RenewKvLockReply | PlainMessage<RenewKvLockReply> | undefined): boolean {
+    return proto3.util.equals(RenewKvLockReply, a, b);
+  }
+}
+
+/**
+ * @generated from message legion.ReleaseKvLockRequest
+ */
+export class ReleaseKvLockRequest extends Message<ReleaseKvLockRequest> {
+  /**
+   * @generated from field: string key = 1;
+   */
+  key = "";
+
+  /**
+   * @generated from field: string lock_id = 2;
+   */
+  lockId = "";
+
+  constructor(data?: PartialMessage<ReleaseKvLockRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ReleaseKvLockRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "key", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "lock_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ReleaseKvLockRequest {
+    return new ReleaseKvLockRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ReleaseKvLockRequest {
+    return new ReleaseKvLockRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ReleaseKvLockRequest {
+    return new ReleaseKvLockRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ReleaseKvLockRequest | PlainMessage<ReleaseKvLockRequest> | undefined, b: ReleaseKvLockRequest | PlainMessage<ReleaseKvLockRequest> | undefined): boolean {
+    return proto3.util.equals(ReleaseKvLockRequest, a, b);
+  }
+}
+
+/**
+ * @generated from message legion.ReleaseKvLockReply
+ */
+export class ReleaseKvLockReply extends Message<ReleaseKvLockReply> {
+  /**
+   * @generated from field: string message = 1;
+   */
+  message = "";
+
+  constructor(data?: PartialMessage<ReleaseKvLockReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ReleaseKvLockReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ReleaseKvLockReply {
+    return new ReleaseKvLockReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ReleaseKvLockReply {
+    return new ReleaseKvLockReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ReleaseKvLockReply {
+    return new ReleaseKvLockReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ReleaseKvLockReply | PlainMessage<ReleaseKvLockReply> | undefined, b: ReleaseKvLockReply | PlainMessage<ReleaseKvLockReply> | undefined): boolean {
+    return proto3.util.equals(ReleaseKvLockReply, a, b);
+  }
+}
+
+/**
+ * @generated from message legion.GetKvLockRequest
+ */
+export class GetKvLockRequest extends Message<GetKvLockRequest> {
+  /**
+   * @generated from field: string key = 1;
+   */
+  key = "";
+
+  constructor(data?: PartialMessage<GetKvLockRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetKvLockRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "key", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetKvLockRequest {
+    return new GetKvLockRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetKvLockRequest {
+    return new GetKvLockRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetKvLockRequest {
+    return new GetKvLockRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetKvLockRequest | PlainMessage<GetKvLockRequest> | undefined, b: GetKvLockRequest | PlainMessage<GetKvLockRequest> | undefined): boolean {
+    return proto3.util.equals(GetKvLockRequest, a, b);
+  }
+}
+
+/**
+ * @generated from message legion.GetKvLockReply
+ */
+export class GetKvLockReply extends Message<GetKvLockReply> {
+  /**
+   * @generated from field: optional legion.KvLock lock = 1;
+   */
+  lock?: KvLock;
+
+  constructor(data?: PartialMessage<GetKvLockReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetKvLockReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "lock", kind: "message", T: KvLock, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetKvLockReply {
+    return new GetKvLockReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetKvLockReply {
+    return new GetKvLockReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetKvLockReply {
+    return new GetKvLockReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetKvLockReply | PlainMessage<GetKvLockReply> | undefined, b: GetKvLockReply | PlainMessage<GetKvLockReply> | undefined): boolean {
+    return proto3.util.equals(GetKvLockReply, a, b);
+  }
+}
+
+/**
  * @generated from message legion.LedgerNode
  */
 export class LedgerNode extends Message<LedgerNode> {
@@ -1430,6 +2670,11 @@ export class LedgerAllocation extends Message<LedgerAllocation> {
    */
   taskConfigId = protoInt64.zero;
 
+  /**
+   * @generated from field: string job_id = 7;
+   */
+  jobId = "";
+
   constructor(data?: PartialMessage<LedgerAllocation>) {
     super();
     proto3.util.initPartial(data, this);
@@ -1444,6 +2689,7 @@ export class LedgerAllocation extends Message<LedgerAllocation> {
     { no: 4, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 5, name: "job_config_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 6, name: "task_config_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 7, name: "job_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): LedgerAllocation {
@@ -1657,6 +2903,11 @@ export class Eval extends Message<Eval> {
    */
   nodeName = "";
 
+  /**
+   * @generated from field: int64 priority = 7;
+   */
+  priority = protoInt64.zero;
+
   constructor(data?: PartialMessage<Eval>) {
     super();
     proto3.util.initPartial(data, this);
@@ -1671,6 +2922,7 @@ export class Eval extends Message<Eval> {
     { no: 4, name: "job_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 5, name: "job_config_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 6, name: "node_name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 7, name: "priority", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): Eval {
@@ -1691,13 +2943,104 @@ export class Eval extends Message<Eval> {
 }
 
 /**
+ * @generated from message legion.TaskAllocation
+ */
+export class TaskAllocation extends Message<TaskAllocation> {
+  /**
+   * @generated from field: int64 allocation_id = 1;
+   */
+  allocationId = protoInt64.zero;
+
+  /**
+   * @generated from field: string job_id = 2;
+   */
+  jobId = "";
+
+  /**
+   * @generated from field: string job_config_id = 3;
+   */
+  jobConfigId = "";
+
+  /**
+   * @generated from field: string node_id = 4;
+   */
+  nodeId = "";
+
+  /**
+   * @generated from field: int64 task_config_id = 5;
+   */
+  taskConfigId = protoInt64.zero;
+
+  /**
+   * @generated from field: string task_name = 6;
+   */
+  taskName = "";
+
+  /**
+   * @generated from field: string task_kind = 7;
+   */
+  taskKind = "";
+
+  /**
+   * @generated from field: string task_config = 8;
+   */
+  taskConfig = "";
+
+  /**
+   * @generated from field: string task_checks = 9;
+   */
+  taskChecks = "";
+
+  /**
+   * @generated from field: string task_on_unhealthy = 10;
+   */
+  taskOnUnhealthy = "";
+
+  constructor(data?: PartialMessage<TaskAllocation>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.TaskAllocation";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "allocation_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 2, name: "job_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "job_config_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "task_config_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 6, name: "task_name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 7, name: "task_kind", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 8, name: "task_config", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 9, name: "task_checks", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 10, name: "task_on_unhealthy", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): TaskAllocation {
+    return new TaskAllocation().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): TaskAllocation {
+    return new TaskAllocation().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): TaskAllocation {
+    return new TaskAllocation().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: TaskAllocation | PlainMessage<TaskAllocation> | undefined, b: TaskAllocation | PlainMessage<TaskAllocation> | undefined): boolean {
+    return proto3.util.equals(TaskAllocation, a, b);
+  }
+}
+
+/**
  * @generated from message legion.PostWorkRequest
  */
 export class PostWorkRequest extends Message<PostWorkRequest> {
   /**
-   * @generated from field: string message = 1;
+   * @generated from field: legion.TaskAllocation allocation = 1;
    */
-  message = "";
+  allocation?: TaskAllocation;
 
   constructor(data?: PartialMessage<PostWorkRequest>) {
     super();
@@ -1707,7 +3050,7 @@ export class PostWorkRequest extends Message<PostWorkRequest> {
   static readonly runtime: typeof proto3 = proto3;
   static readonly typeName = "legion.PostWorkRequest";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
-    { no: 1, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 1, name: "allocation", kind: "message", T: TaskAllocation },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): PostWorkRequest {

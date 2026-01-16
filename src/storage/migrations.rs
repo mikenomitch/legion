@@ -153,5 +153,26 @@ pub fn get_migrations() -> Migrations<'static> {
         )",
         )
         .down("DROP TABLE IF EXISTS manager_config;"),
+        M::up(
+            "CREATE TABLE IF NOT EXISTS kv_entry (
+            key STRING PRIMARY KEY,
+            value TEXT NOT NULL,
+            value_type INTEGER NOT NULL,
+            version INTEGER NOT NULL,
+            created_at TIMESTAMP NOT NULL,
+            updated_at TIMESTAMP NOT NULL
+        )",
+        )
+        .down("DROP TABLE IF EXISTS kv_entry;"),
+        M::up(
+            "CREATE TABLE IF NOT EXISTS kv_lock (
+            key STRING PRIMARY KEY,
+            lock_id STRING NOT NULL,
+            owner STRING,
+            acquired_at TIMESTAMP NOT NULL,
+            expires_at TIMESTAMP NOT NULL
+        )",
+        )
+        .down("DROP TABLE IF EXISTS kv_lock;"),
     ])
 }

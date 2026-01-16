@@ -12,17 +12,18 @@ use crate::storage::queries::{
     INSERT_SUBMISSION, INSERT_TASK, INSERT_WORKER_TYPE, NODE_ATTRS, UPSERT_MANAGER_CONFIG,
 };
 use crate::structs::{
-    Allocation, Eval, Job, JobConfig, LedgerEntry, ManagerConfigFull, ManagerNodeConfig, Node,
-    NodeMsg, Submission, TaskCheck, TaskConfig, TaskOnUnhealthyConfig, WorkerConfig,
+    Allocation, Eval, Job, JobConfig, KvEntry, KvLock, KvValueType, LedgerEntry, ManagerConfigFull,
+    ManagerNodeConfig, Node, NodeMsg, Submission, TaskCheck, TaskConfig, TaskOnUnhealthyConfig,
+    WorkerConfig,
 };
 
-use rand::{seq::SliceRandom, thread_rng};
+use rand::{seq::SliceRandom, thread_rng, Rng};
 use rusqlite::{
     named_params, params_from_iter, Connection, Error as RusqliteError, OpenFlags,
     OptionalExtension, Row, Transaction,
 };
 use rusqlite_migration::Migrations;
-use serde_json::{to_string, to_string_pretty};
+use serde_json::{from_str, to_string, to_string_pretty};
 use serde_rusqlite::to_params_named;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
@@ -382,6 +383,91 @@ impl Store {
         Ok(values)
     }
 
+    fn ensure_kv_key(key: &str) -> R<()> {
+        if key.trim().is_empty() {
+            return Err(anyhow::Error::new(StorageError::InvalidInput {
+                message: "kv key cannot be empty".to_string(),
+            }));
+        }
+
+        Ok(())
+    }
+
+    fn normalize_kv_value(value: &str, value_type: KvValueType) -> R<String> {
+        match value_type {
+            KvValueType::Unspecified => Err(anyhow::Error::new(StorageError::InvalidInput {
+                message: "kv value type must be specified".to_string(),
+            })),
+            KvValueType::String => Ok(value.to_string()),
+            KvValueType::Number => {
+                let parsed: Value = from_str(value).map_err(|err| {
+                    anyhow::Error::new(StorageError::InvalidInput {
+                        message: format!("invalid number value: {err}"),
+                    })
+                })?;
+                match parsed {
+                    Value::Number(_) => Ok(parsed.to_string()),
+                    _ => Err(anyhow::Error::new(StorageError::InvalidInput {
+                        message: "value is not a number".to_string(),
+                    })),
+                }
+            }
+            KvValueType::Json => {
+                let parsed: Value = from_str(value).map_err(|err| {
+                    anyhow::Error::new(StorageError::InvalidInput {
+                        message: format!("invalid json value: {err}"),
+                    })
+                })?;
+                Ok(parsed.to_string())
+            }
+        }
+    }
+
+    fn now_rfc3339() -> R<String> {
+        Ok(OffsetDateTime::now_utc().format(&Rfc3339)?)
+    }
+
+    fn parse_rfc3339(value: &str) -> R<OffsetDateTime> {
+        Ok(OffsetDateTime::parse(value, &Rfc3339)?)
+    }
+
+    fn random_lock_id() -> String {
+        let mut rng = thread_rng();
+        let bytes: [u8; 16] = rng.gen();
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    fn load_kv_lock_tx(&self, tx: &Transaction<'_>, key: &str) -> R<Option<KvLock>> {
+        let lock = tx
+            .query_row(
+                "SELECT key, lock_id, owner, acquired_at, expires_at FROM kv_lock WHERE key = ?;",
+                [key],
+                |row| self.kv_lock_from_row(row),
+            )
+            .optional()?;
+        Ok(lock)
+    }
+
+    fn enforce_kv_lock(&self, tx: &Transaction<'_>, key: &str, lock_id: Option<&str>) -> R<()> {
+        let Some(lock) = self.load_kv_lock_tx(tx, key)? else {
+            return Ok(());
+        };
+
+        let expires_at = Self::parse_rfc3339(&lock.expires_at)?;
+        if expires_at <= OffsetDateTime::now_utc() {
+            tx.execute("DELETE FROM kv_lock WHERE key = ?;", [key])?;
+            return Ok(());
+        }
+
+        if lock_id != Some(lock.lock_id.as_str()) {
+            return Err(anyhow::Error::new(StorageError::Conflict {
+                message: "kv lock is held by another client".to_string(),
+            }));
+        }
+
+        Ok(())
+    }
+
     //
     // from_row helpers
     //
@@ -425,6 +511,32 @@ impl Store {
         };
 
         Ok(eval)
+    }
+
+    fn kv_entry_from_row(&self, row: &Row<'_>) -> Result<KvEntry, rusqlite::Error> {
+        let value_type: i32 = row.get(2)?;
+        let entry = KvEntry {
+            key: row.get(0)?,
+            value: row.get(1)?,
+            value_type,
+            version: row.get(3)?,
+            created_at: row.get(4)?,
+            updated_at: row.get(5)?,
+        };
+
+        Ok(entry)
+    }
+
+    fn kv_lock_from_row(&self, row: &Row<'_>) -> Result<KvLock, rusqlite::Error> {
+        let lock = KvLock {
+            key: row.get(0)?,
+            lock_id: row.get(1)?,
+            owner: row.get(2)?,
+            acquired_at: row.get(3)?,
+            expires_at: row.get(4)?,
+        };
+
+        Ok(lock)
     }
 
     fn worker_type_from_row(&self, row: &Row<'_>) -> Result<WorkerConfig, rusqlite::Error> {
@@ -1874,6 +1986,400 @@ impl Store {
         tx.commit()?;
 
         Ok(eval)
+    }
+
+    //
+    // KV STORE
+    //
+
+    #[instrument(err, skip_all)]
+    pub fn put_kv(
+        &self,
+        key: &str,
+        value: &str,
+        value_type: KvValueType,
+        expected_version: Option<i64>,
+        lock_id: Option<&str>,
+    ) -> R<KvEntry> {
+        Self::ensure_kv_key(key)?;
+        let normalized_value = Self::normalize_kv_value(value, value_type)?;
+
+        let mut conn = self.write_connection()?;
+        let tx = conn.transaction()?;
+        self.enforce_kv_lock(&tx, key, lock_id)?;
+
+        let existing = tx
+            .query_row(
+                "SELECT key, value, value_type, version, created_at, updated_at FROM kv_entry WHERE key = ?;",
+                [key],
+                |row| self.kv_entry_from_row(row),
+            )
+            .optional()?;
+
+        let now = Self::now_rfc3339()?;
+        let value_type_value = value_type as i32;
+
+        let entry = if let Some(existing) = existing {
+            if let Some(expected) = expected_version {
+                if expected != existing.version {
+                    return Err(anyhow::Error::new(StorageError::Conflict {
+                        message: format!(
+                            "expected version {expected} does not match current version {}",
+                            existing.version
+                        ),
+                    }));
+                }
+            }
+
+            let next_version = existing.version + 1;
+            tx.execute(
+                "UPDATE kv_entry SET value = :value, value_type = :value_type, version = :version, updated_at = :updated_at WHERE key = :key;",
+                named_params! {
+                    ":value": normalized_value,
+                    ":value_type": value_type_value,
+                    ":version": next_version,
+                    ":updated_at": now,
+                    ":key": key,
+                },
+            )?;
+
+            KvEntry {
+                key: existing.key,
+                value: normalized_value,
+                value_type: value_type_value,
+                version: next_version,
+                created_at: existing.created_at,
+                updated_at: now,
+            }
+        } else {
+            if let Some(expected) = expected_version {
+                if expected != 0 {
+                    return Err(anyhow::Error::new(StorageError::Conflict {
+                        message: "kv entry does not exist".to_string(),
+                    }));
+                }
+            }
+
+            tx.execute(
+                "INSERT INTO kv_entry (key, value, value_type, version, created_at, updated_at) VALUES (:key, :value, :value_type, :version, :created_at, :updated_at);",
+                named_params! {
+                    ":key": key,
+                    ":value": normalized_value,
+                    ":value_type": value_type_value,
+                    ":version": 1_i64,
+                    ":created_at": now,
+                    ":updated_at": now,
+                },
+            )?;
+
+            KvEntry {
+                key: key.to_string(),
+                value: normalized_value,
+                value_type: value_type_value,
+                version: 1,
+                created_at: now.clone(),
+                updated_at: now,
+            }
+        };
+
+        tx.commit()?;
+
+        Ok(entry)
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn get_kv(&self, key: &str) -> R<Option<KvEntry>> {
+        Self::ensure_kv_key(key)?;
+        let conn = self.read_connection()?;
+        let entry = conn
+            .query_row(
+                "SELECT key, value, value_type, version, created_at, updated_at FROM kv_entry WHERE key = ?;",
+                [key],
+                |row| self.kv_entry_from_row(row),
+            )
+            .optional()?;
+
+        Ok(entry)
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn list_kv(&self, prefix: &str) -> R<Vec<KvEntry>> {
+        let conn = self.read_connection()?;
+        let pattern = format!("{prefix}%");
+        let mut stmt = conn.prepare(
+            "SELECT key, value, value_type, version, created_at, updated_at FROM kv_entry WHERE key LIKE ? ORDER BY key ASC;",
+        )?;
+        let rows = stmt.query_map([pattern], |row| self.kv_entry_from_row(row))?;
+        Self::collect_rows(rows)
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn delete_kv(
+        &self,
+        key: &str,
+        expected_version: Option<i64>,
+        lock_id: Option<&str>,
+    ) -> R<()> {
+        Self::ensure_kv_key(key)?;
+        let mut conn = self.write_connection()?;
+        let tx = conn.transaction()?;
+        self.enforce_kv_lock(&tx, key, lock_id)?;
+
+        let existing = tx
+            .query_row(
+                "SELECT key, value, value_type, version, created_at, updated_at FROM kv_entry WHERE key = ?;",
+                [key],
+                |row| self.kv_entry_from_row(row),
+            )
+            .optional()?;
+
+        let Some(existing) = existing else {
+            return Err(anyhow::Error::new(StorageError::not_found("kv entry", key)));
+        };
+
+        if let Some(expected) = expected_version {
+            if expected != existing.version {
+                return Err(anyhow::Error::new(StorageError::Conflict {
+                    message: format!(
+                        "expected version {expected} does not match current version {}",
+                        existing.version
+                    ),
+                }));
+            }
+        }
+
+        tx.execute("DELETE FROM kv_entry WHERE key = ?;", [key])?;
+        tx.commit()?;
+
+        Ok(())
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn patch_kv(
+        &self,
+        key: &str,
+        patch_json: &str,
+        expected_version: Option<i64>,
+        lock_id: Option<&str>,
+    ) -> R<KvEntry> {
+        Self::ensure_kv_key(key)?;
+        let mut conn = self.write_connection()?;
+        let tx = conn.transaction()?;
+        self.enforce_kv_lock(&tx, key, lock_id)?;
+
+        let mut entry = tx
+            .query_row(
+                "SELECT key, value, value_type, version, created_at, updated_at FROM kv_entry WHERE key = ?;",
+                [key],
+                |row| self.kv_entry_from_row(row),
+            )
+            .optional()?
+            .ok_or_else(|| anyhow::Error::new(StorageError::not_found("kv entry", key)))?;
+
+        if entry.value_type != KvValueType::Json as i32 {
+            return Err(anyhow::Error::new(StorageError::InvalidInput {
+                message: "kv entry is not JSON".to_string(),
+            }));
+        }
+
+        if let Some(expected) = expected_version {
+            if expected != entry.version {
+                return Err(anyhow::Error::new(StorageError::Conflict {
+                    message: format!(
+                        "expected version {expected} does not match current version {}",
+                        entry.version
+                    ),
+                }));
+            }
+        }
+
+        let mut current: Value = from_str(&entry.value).map_err(|err| {
+            anyhow::Error::new(StorageError::InvalidInput {
+                message: format!("invalid stored json value: {err}"),
+            })
+        })?;
+        let patch: json_patch::Patch = from_str(patch_json).map_err(|err| {
+            anyhow::Error::new(StorageError::InvalidInput {
+                message: format!("invalid json patch: {err}"),
+            })
+        })?;
+        json_patch::patch(&mut current, &patch.0).map_err(|err| {
+            anyhow::Error::new(StorageError::InvalidInput {
+                message: format!("unable to apply json patch: {err}"),
+            })
+        })?;
+
+        let updated_value = current.to_string();
+        let next_version = entry.version + 1;
+        let now = Self::now_rfc3339()?;
+
+        tx.execute(
+            "UPDATE kv_entry SET value = :value, version = :version, updated_at = :updated_at WHERE key = :key;",
+            named_params! {
+                ":value": updated_value,
+                ":version": next_version,
+                ":updated_at": now,
+                ":key": key,
+            },
+        )?;
+
+        entry.value = updated_value;
+        entry.version = next_version;
+        entry.updated_at = now;
+
+        tx.commit()?;
+
+        Ok(entry)
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn acquire_kv_lock(
+        &self,
+        key: &str,
+        lock_id: Option<&str>,
+        owner: Option<&str>,
+        ttl_seconds: i64,
+        force: bool,
+    ) -> R<KvLock> {
+        Self::ensure_kv_key(key)?;
+        if ttl_seconds <= 0 {
+            return Err(anyhow::Error::new(StorageError::InvalidInput {
+                message: "ttl_seconds must be greater than zero".to_string(),
+            }));
+        }
+
+        let mut conn = self.write_connection()?;
+        let tx = conn.transaction()?;
+        let now = OffsetDateTime::now_utc();
+        let expires_at = now + time::Duration::seconds(ttl_seconds);
+        let lock_id_value = lock_id
+            .map(str::to_string)
+            .unwrap_or_else(Self::random_lock_id);
+
+        if let Some(existing) = self.load_kv_lock_tx(&tx, key)? {
+            let expired = Self::parse_rfc3339(&existing.expires_at)? <= now;
+            let lock_matches = lock_id
+                .map(|id| id == existing.lock_id.as_str())
+                .unwrap_or(false);
+            if !expired && !lock_matches && !force {
+                return Err(anyhow::Error::new(StorageError::Conflict {
+                    message: "kv lock is already held".to_string(),
+                }));
+            }
+        }
+
+        let acquired_at = now.format(&Rfc3339)?;
+        let expires_at = expires_at.format(&Rfc3339)?;
+        let owner_value = owner.map(str::to_string);
+
+        tx.execute(
+            "INSERT INTO kv_lock (key, lock_id, owner, acquired_at, expires_at) VALUES (:key, :lock_id, :owner, :acquired_at, :expires_at)\n            ON CONFLICT(key) DO UPDATE SET lock_id = :lock_id, owner = :owner, acquired_at = :acquired_at, expires_at = :expires_at;",
+            named_params! {
+                ":key": key,
+                ":lock_id": lock_id_value,
+                ":owner": owner_value,
+                ":acquired_at": acquired_at,
+                ":expires_at": expires_at,
+            },
+        )?;
+
+        tx.commit()?;
+
+        Ok(KvLock {
+            key: key.to_string(),
+            lock_id: lock_id_value,
+            owner: owner_value,
+            acquired_at,
+            expires_at,
+        })
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn renew_kv_lock(&self, key: &str, lock_id: &str, ttl_seconds: i64) -> R<KvLock> {
+        Self::ensure_kv_key(key)?;
+        if ttl_seconds <= 0 {
+            return Err(anyhow::Error::new(StorageError::InvalidInput {
+                message: "ttl_seconds must be greater than zero".to_string(),
+            }));
+        }
+
+        let mut conn = self.write_connection()?;
+        let tx = conn.transaction()?;
+        let Some(mut lock) = self.load_kv_lock_tx(&tx, key)? else {
+            return Err(anyhow::Error::new(StorageError::not_found("kv lock", key)));
+        };
+
+        let now = OffsetDateTime::now_utc();
+        let expires_at = Self::parse_rfc3339(&lock.expires_at)?;
+        if expires_at <= now {
+            tx.execute("DELETE FROM kv_lock WHERE key = ?;", [key])?;
+            return Err(anyhow::Error::new(StorageError::Conflict {
+                message: "kv lock has expired".to_string(),
+            }));
+        }
+
+        if lock.lock_id != lock_id {
+            return Err(anyhow::Error::new(StorageError::Conflict {
+                message: "kv lock id does not match".to_string(),
+            }));
+        }
+
+        let new_expires_at = (now + time::Duration::seconds(ttl_seconds)).format(&Rfc3339)?;
+        tx.execute(
+            "UPDATE kv_lock SET expires_at = :expires_at WHERE key = :key;",
+            named_params! {
+                ":expires_at": new_expires_at,
+                ":key": key,
+            },
+        )?;
+
+        lock.expires_at = new_expires_at;
+        tx.commit()?;
+
+        Ok(lock)
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn release_kv_lock(&self, key: &str, lock_id: &str) -> R<()> {
+        Self::ensure_kv_key(key)?;
+        let mut conn = self.write_connection()?;
+        let tx = conn.transaction()?;
+        let Some(lock) = self.load_kv_lock_tx(&tx, key)? else {
+            return Err(anyhow::Error::new(StorageError::not_found("kv lock", key)));
+        };
+
+        if lock.lock_id != lock_id {
+            return Err(anyhow::Error::new(StorageError::Conflict {
+                message: "kv lock id does not match".to_string(),
+            }));
+        }
+
+        tx.execute("DELETE FROM kv_lock WHERE key = ?;", [key])?;
+        tx.commit()?;
+
+        Ok(())
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn get_kv_lock(&self, key: &str) -> R<Option<KvLock>> {
+        Self::ensure_kv_key(key)?;
+        let mut conn = self.write_connection()?;
+        let tx = conn.transaction()?;
+        let lock = self.load_kv_lock_tx(&tx, key)?;
+        let Some(lock) = lock else {
+            tx.commit()?;
+            return Ok(None);
+        };
+
+        let expires_at = Self::parse_rfc3339(&lock.expires_at)?;
+        if expires_at <= OffsetDateTime::now_utc() {
+            tx.execute("DELETE FROM kv_lock WHERE key = ?;", [key])?;
+            tx.commit()?;
+            return Ok(None);
+        }
+
+        tx.commit()?;
+        Ok(Some(lock))
     }
 }
 

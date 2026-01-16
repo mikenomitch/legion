@@ -24,6 +24,15 @@ service Manager {
     returns (GetManagerConfigsReply);
   rpc UpdateNodeDynamic (UpdateNodeDynamicRequest)
     returns (UpdateNodeDynamicReply);
+  rpc PutKv (PutKvRequest) returns (PutKvReply);
+  rpc GetKv (GetKvRequest) returns (GetKvReply);
+  rpc ListKv (ListKvRequest) returns (ListKvReply);
+  rpc DeleteKv (DeleteKvRequest) returns (DeleteKvReply);
+  rpc PatchKv (PatchKvRequest) returns (PatchKvReply);
+  rpc AcquireKvLock (AcquireKvLockRequest) returns (AcquireKvLockReply);
+  rpc RenewKvLock (RenewKvLockRequest) returns (RenewKvLockReply);
+  rpc ReleaseKvLock (ReleaseKvLockRequest) returns (ReleaseKvLockReply);
+  rpc GetKvLock (GetKvLockRequest) returns (GetKvLockReply);
 }
 
 message WorkerPreRegisterRequest {
@@ -216,6 +225,118 @@ message GetManagerConfigsRequest {}
 
 message GetManagerConfigsReply {
   repeated ManagerNodeConfig configs = 1;
+}
+
+enum KvValueType {
+  KV_VALUE_TYPE_UNSPECIFIED = 0;
+  KV_VALUE_TYPE_STRING = 1;
+  KV_VALUE_TYPE_NUMBER = 2;
+  KV_VALUE_TYPE_JSON = 3;
+}
+
+message KvEntry {
+  string key = 1;
+  string value = 2;
+  KvValueType value_type = 3;
+  int64 version = 4;
+  string created_at = 5;
+  string updated_at = 6;
+}
+
+message KvLock {
+  string key = 1;
+  string lock_id = 2;
+  optional string owner = 3;
+  string acquired_at = 4;
+  string expires_at = 5;
+}
+
+message PutKvRequest {
+  string key = 1;
+  string value = 2;
+  KvValueType value_type = 3;
+  optional int64 expected_version = 4;
+  optional string lock_id = 5;
+}
+
+message PutKvReply {
+  KvEntry entry = 1;
+}
+
+message GetKvRequest {
+  string key = 1;
+}
+
+message GetKvReply {
+  optional KvEntry entry = 1;
+}
+
+message ListKvRequest {
+  string prefix = 1;
+}
+
+message ListKvReply {
+  repeated KvEntry entries = 1;
+}
+
+message DeleteKvRequest {
+  string key = 1;
+  optional int64 expected_version = 2;
+  optional string lock_id = 3;
+}
+
+message DeleteKvReply {
+  string message = 1;
+}
+
+message PatchKvRequest {
+  string key = 1;
+  string patch_json = 2;
+  optional int64 expected_version = 3;
+  optional string lock_id = 4;
+}
+
+message PatchKvReply {
+  KvEntry entry = 1;
+}
+
+message AcquireKvLockRequest {
+  string key = 1;
+  optional string lock_id = 2;
+  optional string owner = 3;
+  int64 ttl_seconds = 4;
+  bool force = 5;
+}
+
+message AcquireKvLockReply {
+  KvLock lock = 1;
+}
+
+message RenewKvLockRequest {
+  string key = 1;
+  string lock_id = 2;
+  int64 ttl_seconds = 3;
+}
+
+message RenewKvLockReply {
+  KvLock lock = 1;
+}
+
+message ReleaseKvLockRequest {
+  string key = 1;
+  string lock_id = 2;
+}
+
+message ReleaseKvLockReply {
+  string message = 1;
+}
+
+message GetKvLockRequest {
+  string key = 1;
+}
+
+message GetKvLockReply {
+  optional KvLock lock = 1;
 }
 
 message LedgerNode {

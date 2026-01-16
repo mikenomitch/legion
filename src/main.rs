@@ -16,6 +16,7 @@ fn cli() -> Command {
         .subcommand(cmd::join_token::config())
         .subcommand(cmd::join::config())
         .subcommand(cmd::ledger::config())
+        .subcommand(cmd::kv::config())
 }
 
 #[tokio::main]
@@ -30,6 +31,7 @@ async fn main() -> R<()> {
         Some(("join-token", sub_matches)) => cmd::join_token::handle(sub_matches).await?,
         Some(("join", sub_matches)) => cmd::join::handle(sub_matches).await?,
         Some(("ledger", sub_matches)) => cmd::ledger::handle(sub_matches).await?,
+        Some(("kv", sub_matches)) => cmd::kv::handle(sub_matches).await?,
         None => unreachable!(),
         Some((_, _)) => unreachable!(),
     };

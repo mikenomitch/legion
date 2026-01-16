@@ -3,7 +3,7 @@
 /* eslint-disable */
 // @ts-nocheck
 
-import { DestroyJobReply, DestroyJobRequest, GetJobInfoReply, GetJobInfoRequest, GetJobSpecReply, GetJobSpecRequest, GetJoinTokenReply, GetJoinTokenRequest, GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest, GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, ListJobsReply, ListJobsRequest, PostWorkReply, PostWorkRequest, RunJobReply, RunJobRequest, StopJobReply, StopJobRequest, UpdateNodeDynamicReply, UpdateNodeDynamicRequest, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest } from "./legion_pb.js";
+import { AcquireKvLockReply, AcquireKvLockRequest, DeleteKvReply, DeleteKvRequest, DestroyJobReply, DestroyJobRequest, GetJobInfoReply, GetJobInfoRequest, GetJobSpecReply, GetJobSpecRequest, GetJoinTokenReply, GetJoinTokenRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest, GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, ListJobsReply, ListJobsRequest, ListKvReply, ListKvRequest, PatchKvReply, PatchKvRequest, PlanJobReply, PlanJobRequest, PostWorkReply, PostWorkRequest, PutKvReply, PutKvRequest, ReleaseKvLockReply, ReleaseKvLockRequest, RenewKvLockReply, RenewKvLockRequest, RestartWorkerReply, RestartWorkerRequest, RunJobReply, RunJobRequest, StopJobReply, StopJobRequest, UpdateNodeDynamicReply, UpdateNodeDynamicRequest, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest } from "./legion_pb.js";
 import { MethodKind } from "@bufbuild/protobuf";
 
 /**
@@ -55,6 +55,15 @@ export const Manager = {
       name: "GetJobInfo",
       I: GetJobInfoRequest,
       O: GetJobInfoReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * @generated from rpc legion.Manager.PlanJob
+     */
+    planJob: {
+      name: "PlanJob",
+      I: PlanJobRequest,
+      O: PlanJobReply,
       kind: MethodKind.Unary,
     },
     /**
@@ -121,6 +130,15 @@ export const Manager = {
       kind: MethodKind.Unary,
     },
     /**
+     * @generated from rpc legion.Manager.RestartWorker
+     */
+    restartWorker: {
+      name: "RestartWorker",
+      I: RestartWorkerRequest,
+      O: RestartWorkerReply,
+      kind: MethodKind.Unary,
+    },
+    /**
      * @generated from rpc legion.Manager.GetLedger
      */
     getLedger: {
@@ -145,6 +163,87 @@ export const Manager = {
       name: "UpdateNodeDynamic",
       I: UpdateNodeDynamicRequest,
       O: UpdateNodeDynamicReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * @generated from rpc legion.Manager.PutKv
+     */
+    putKv: {
+      name: "PutKv",
+      I: PutKvRequest,
+      O: PutKvReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * @generated from rpc legion.Manager.GetKv
+     */
+    getKv: {
+      name: "GetKv",
+      I: GetKvRequest,
+      O: GetKvReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * @generated from rpc legion.Manager.ListKv
+     */
+    listKv: {
+      name: "ListKv",
+      I: ListKvRequest,
+      O: ListKvReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * @generated from rpc legion.Manager.DeleteKv
+     */
+    deleteKv: {
+      name: "DeleteKv",
+      I: DeleteKvRequest,
+      O: DeleteKvReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * @generated from rpc legion.Manager.PatchKv
+     */
+    patchKv: {
+      name: "PatchKv",
+      I: PatchKvRequest,
+      O: PatchKvReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * @generated from rpc legion.Manager.AcquireKvLock
+     */
+    acquireKvLock: {
+      name: "AcquireKvLock",
+      I: AcquireKvLockRequest,
+      O: AcquireKvLockReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * @generated from rpc legion.Manager.RenewKvLock
+     */
+    renewKvLock: {
+      name: "RenewKvLock",
+      I: RenewKvLockRequest,
+      O: RenewKvLockReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * @generated from rpc legion.Manager.ReleaseKvLock
+     */
+    releaseKvLock: {
+      name: "ReleaseKvLock",
+      I: ReleaseKvLockRequest,
+      O: ReleaseKvLockReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * @generated from rpc legion.Manager.GetKvLock
+     */
+    getKvLock: {
+      name: "GetKvLock",
+      I: GetKvLockRequest,
+      O: GetKvLockReply,
       kind: MethodKind.Unary,
     },
   }
@@ -181,6 +280,15 @@ export const Worker = {
       name: "PostWork",
       I: PostWorkRequest,
       O: PostWorkReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * @generated from rpc legion.Worker.RestartWorker
+     */
+    restartWorker: {
+      name: "RestartWorker",
+      I: RestartWorkerRequest,
+      O: RestartWorkerReply,
       kind: MethodKind.Unary,
     },
   }
