@@ -26,7 +26,8 @@ pub async fn connect_manager_client() -> R<ManagerClient<Channel>> {
     let address = std::env::var("LEGION_ADDR").unwrap_or_else(|_| DEF_MANAGER_ADDRESS.to_owned());
 
     let endpoint = Endpoint::from_shared(address.clone())
-        .with_context(|| format!("invalid manager address: {address}"))?;
+        .with_context(|| format!("invalid manager address: {address}"))?
+        .connect_timeout(std::time::Duration::from_secs(5));
 
     let scheme = endpoint.uri().scheme_str().map(str::to_owned);
     let host = endpoint.uri().host().map(str::to_owned);
