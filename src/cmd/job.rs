@@ -7,8 +7,9 @@ use crate::cmd::helpers::{connect_manager_client, friendly_status, json_flag, pr
 use crate::getter_rs::Client as GetterClient;
 use crate::prelude::*;
 use crate::structs::{
-    DestroyJobRequest, GetJobInfoRequest, GetJobSpecRequest, JobPlanPrint, JobPrint,
-    ListJobsRequest, PlanJobRequest, RunJobRequest, StopJobRequest, Submission,
+    DestroyJobRequest, GetJobInfoRequest, GetJobSpecRequest, GetKvRequest, JobPlanPrint, JobPrint,
+    KvEntry, KvValueType, ListJobsRequest, PlanJobRequest, RunJobRequest, StopJobRequest,
+    Submission,
 };
 use jsonnet::JsonnetVm;
 use serde::Serialize;
@@ -132,6 +133,10 @@ struct JsonnetVars {
     ext_codes: Vec<(String, String)>,
     tla_vars: Vec<(String, String)>,
     tla_codes: Vec<(String, String)>,
+    kv_ext_vars: Vec<(String, String)>,
+    kv_ext_codes: Vec<(String, String)>,
+    kv_tla_vars: Vec<(String, String)>,
+    kv_tla_codes: Vec<(String, String)>,
 }
 
 impl JsonnetVars {}
@@ -143,20 +148,40 @@ fn jsonnet_var_args() -> Vec<Arg> {
             .value_name("KEY=VALUE")
             .help("Set a Jsonnet external string variable (std.extVar)")
             .action(ArgAction::Append),
+        Arg::new("kv-var")
+            .long("kv-var")
+            .value_name("KEY=KV_PATH")
+            .help("Set a Jsonnet external variable from a KV entry (std.extVar)")
+            .action(ArgAction::Append),
         Arg::new("var-code")
             .long("var-code")
             .value_name("KEY=CODE")
             .help("Set a Jsonnet external code variable (std.extVar)")
+            .action(ArgAction::Append),
+        Arg::new("kv-var-code")
+            .long("kv-var-code")
+            .value_name("KEY=KV_PATH")
+            .help("Set a Jsonnet external code variable from a KV entry (std.extVar)")
             .action(ArgAction::Append),
         Arg::new("arg")
             .long("arg")
             .value_name("KEY=VALUE")
             .help("Set a Jsonnet top-level string argument")
             .action(ArgAction::Append),
+        Arg::new("kv-arg")
+            .long("kv-arg")
+            .value_name("KEY=KV_PATH")
+            .help("Set a Jsonnet top-level argument from a KV entry")
+            .action(ArgAction::Append),
         Arg::new("arg-code")
             .long("arg-code")
             .value_name("KEY=CODE")
             .help("Set a Jsonnet top-level code argument")
+            .action(ArgAction::Append),
+        Arg::new("kv-arg-code")
+            .long("kv-arg-code")
+            .value_name("KEY=KV_PATH")
+            .help("Set a Jsonnet top-level code argument from a KV entry")
             .action(ArgAction::Append),
     ]
 }
@@ -187,9 +212,13 @@ fn jsonnet_vars_from_matches(matches: &ArgMatches) -> R<JsonnetVars> {
     let mut vars = JsonnetVars::default();
 
     collect_jsonnet_vars(matches, "var", &mut vars.ext_vars)?;
+    collect_jsonnet_vars(matches, "kv-var", &mut vars.kv_ext_vars)?;
     collect_jsonnet_vars(matches, "var-code", &mut vars.ext_codes)?;
+    collect_jsonnet_vars(matches, "kv-var-code", &mut vars.kv_ext_codes)?;
     collect_jsonnet_vars(matches, "arg", &mut vars.tla_vars)?;
+    collect_jsonnet_vars(matches, "kv-arg", &mut vars.kv_tla_vars)?;
     collect_jsonnet_vars(matches, "arg-code", &mut vars.tla_codes)?;
+    collect_jsonnet_vars(matches, "kv-arg-code", &mut vars.kv_tla_codes)?;
 
     Ok(vars)
 }
@@ -207,6 +236,98 @@ fn apply_jsonnet_vars(vm: &mut JsonnetVm, vars: &JsonnetVars) {
     for (key, value) in &vars.tla_codes {
         vm.tla_code(key, value);
     }
+}
+
+fn kv_entry_string_value(entry: &KvEntry) -> R<String> {
+    let value_type = KvValueType::try_from(entry.value_type).unwrap_or(KvValueType::Unspecified);
+    match value_type {
+        KvValueType::Unspecified => bail!("kv entry {} has unspecified value type", entry.key),
+        _ => Ok(entry.value.clone()),
+    }
+}
+
+fn kv_entry_code_value(entry: &KvEntry) -> R<String> {
+    let value_type = KvValueType::try_from(entry.value_type).unwrap_or(KvValueType::Unspecified);
+    match value_type {
+        KvValueType::Unspecified => bail!("kv entry {} has unspecified value type", entry.key),
+        KvValueType::String => Ok(serde_json::to_string(&entry.value)?),
+        KvValueType::Number | KvValueType::Json => Ok(entry.value.clone()),
+    }
+}
+
+fn resolve_kv_jsonnet_vars<F>(vars: JsonnetVars, mut lookup: F) -> R<JsonnetVars>
+where
+    F: FnMut(&str) -> R<KvEntry>,
+{
+    let mut vars = vars;
+    let kv_ext_vars = std::mem::take(&mut vars.kv_ext_vars);
+    for (key, kv_key) in kv_ext_vars {
+        let entry = lookup(&kv_key)?;
+        vars.ext_vars.push((key, kv_entry_string_value(&entry)?));
+    }
+
+    let kv_ext_codes = std::mem::take(&mut vars.kv_ext_codes);
+    for (key, kv_key) in kv_ext_codes {
+        let entry = lookup(&kv_key)?;
+        vars.ext_codes.push((key, kv_entry_code_value(&entry)?));
+    }
+
+    let kv_tla_vars = std::mem::take(&mut vars.kv_tla_vars);
+    for (key, kv_key) in kv_tla_vars {
+        let entry = lookup(&kv_key)?;
+        vars.tla_vars.push((key, kv_entry_string_value(&entry)?));
+    }
+
+    let kv_tla_codes = std::mem::take(&mut vars.kv_tla_codes);
+    for (key, kv_key) in kv_tla_codes {
+        let entry = lookup(&kv_key)?;
+        vars.tla_codes.push((key, kv_entry_code_value(&entry)?));
+    }
+
+    Ok(vars)
+}
+
+fn kv_keys_from_vars(vars: &JsonnetVars) -> Vec<String> {
+    let mut keys = std::collections::HashSet::new();
+    for (_, key) in vars
+        .kv_ext_vars
+        .iter()
+        .chain(vars.kv_ext_codes.iter())
+        .chain(vars.kv_tla_vars.iter())
+        .chain(vars.kv_tla_codes.iter())
+    {
+        keys.insert(key.clone());
+    }
+    keys.into_iter().collect()
+}
+
+async fn fetch_kv_entry(
+    client: &mut crate::structs::manager_client::ManagerClient<tonic::transport::Channel>,
+    key: &str,
+) -> R<KvEntry> {
+    let request = tonic::Request::new(GetKvRequest {
+        key: key.to_string(),
+    });
+    let response = client
+        .get_kv(request)
+        .await
+        .map_err(|status| friendly_status("failed to get kv entry", status))?;
+    response.into_inner().entry.context("kv entry not found")
+}
+
+async fn resolve_kv_jsonnet_vars_from_manager(
+    client: &mut crate::structs::manager_client::ManagerClient<tonic::transport::Channel>,
+    vars: JsonnetVars,
+) -> R<JsonnetVars> {
+    let mut cache = HashMap::new();
+    for key in kv_keys_from_vars(&vars) {
+        let entry = fetch_kv_entry(client, &key).await?;
+        cache.insert(key, entry);
+    }
+
+    resolve_kv_jsonnet_vars(vars, |key| {
+        cache.get(key).cloned().context("kv entry not loaded")
+    })
 }
 
 fn print_json<T: Serialize>(value: &T) {
@@ -337,12 +458,51 @@ pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::structs::JobConfig;
+    use tempfile::tempdir;
 
     #[test]
     fn priority_conflicts_with_asap() {
         let cmd = config();
         let result = cmd.try_get_matches_from(["job", "run", "--priority", "75", "--asap"]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn kv_vars_render_into_jobspec() -> R<()> {
+        let dir = tempdir()?;
+        let job_path = dir.path().join("job.jsonnet");
+        std::fs::write(
+            &job_path,
+            r#"
+            {
+              name: std.extVar("job_name"),
+              task: {
+                kind: "noop",
+              },
+            }
+            "#,
+        )?;
+
+        let mut vars = JsonnetVars::default();
+        vars.kv_ext_vars
+            .push(("job_name".into(), "jobs/name".into()));
+
+        let resolved = resolve_kv_jsonnet_vars(vars, |key| {
+            Ok(KvEntry {
+                key: key.to_string(),
+                value: "kv-job".into(),
+                value_type: KvValueType::String as i32,
+                version: 1,
+                created_at: "now".into(),
+                updated_at: "now".into(),
+            })
+        })?;
+
+        let (rendered, _subs) = render_jobspec(&job_path, &resolved)?;
+        let config: JobConfig = serde_json::from_str(&rendered)?;
+        assert_eq!(config.name, "kv-job");
+        Ok(())
     }
 }
 
@@ -433,6 +593,7 @@ async fn plan_job(arg_matches: &ArgMatches) -> R<()> {
         .map(String::as_str)
         .context("missing jobspec path")?;
     let vars = jsonnet_vars_from_matches(arg_matches)?;
+    let vars = resolve_kv_jsonnet_vars_from_manager(&mut client, vars).await?;
     let resolved = resolve_jobspec_source_async(path).await?;
     let (rendered, _submissions) = render_jobspec(&resolved.path, &vars)?;
 
@@ -475,6 +636,7 @@ async fn run_job(arg_matches: &ArgMatches) -> R<()> {
         .map_or("./configs/jobs/demo.jsonnet", String::as_str);
     let priority = priority_from_matches(arg_matches);
     let vars = jsonnet_vars_from_matches(arg_matches)?;
+    let vars = resolve_kv_jsonnet_vars_from_manager(&mut client, vars).await?;
     let resolved = resolve_jobspec_source_async(job_path).await?;
     let (rendered, submissions) = render_jobspec(&resolved.path, &vars)?;
 

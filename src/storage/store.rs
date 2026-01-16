@@ -19,7 +19,7 @@ use crate::structs::{
 
 use rand::{seq::SliceRandom, thread_rng, Rng};
 use rusqlite::{
-    named_params, params_from_iter, Connection, Error as RusqliteError, OpenFlags,
+    named_params, params, params_from_iter, Connection, Error as RusqliteError, OpenFlags,
     OptionalExtension, Row, Transaction,
 };
 use rusqlite_migration::Migrations;
@@ -73,6 +73,14 @@ pub enum JobSubmitOutcome {
     Created { job_config_id: String },
     Updated { job_config_id: String },
     Unchanged { job_config_id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobKvReference {
+    pub job_id: String,
+    pub job_config_id: String,
+    pub kv_key: String,
+    pub json_pointer: String,
 }
 
 impl JobSubmitOutcome {
@@ -537,6 +545,15 @@ impl Store {
         };
 
         Ok(lock)
+    }
+
+    fn job_kv_reference_from_row(&self, row: &Row<'_>) -> Result<JobKvReference, RusqliteError> {
+        Ok(JobKvReference {
+            job_id: row.get(0)?,
+            job_config_id: row.get(1)?,
+            kv_key: row.get(2)?,
+            json_pointer: row.get(3)?,
+        })
     }
 
     fn worker_type_from_row(&self, row: &Row<'_>) -> Result<WorkerConfig, rusqlite::Error> {
@@ -2380,6 +2397,46 @@ impl Store {
 
         tx.commit()?;
         Ok(Some(lock))
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn replace_job_kv_references(&self, job_id: &str, refs: &[JobKvReference]) -> R<()> {
+        let mut conn = self.write_connection()?;
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM job_kv_reference WHERE job_id = ?;", [job_id])?;
+        for reference in refs {
+            tx.execute(
+                "INSERT INTO job_kv_reference (job_id, job_config_id, kv_key, json_pointer) VALUES (?1, ?2, ?3, ?4);",
+                params![
+                    reference.job_id,
+                    reference.job_config_id,
+                    reference.kv_key,
+                    reference.json_pointer,
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn job_kv_references_for_key(&self, key: &str) -> R<Vec<JobKvReference>> {
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare(
+            "SELECT job_id, job_config_id, kv_key, json_pointer FROM job_kv_reference WHERE kv_key = ?;",
+        )?;
+        let rows = stmt.query_map([key], |row| self.job_kv_reference_from_row(row))?;
+        Self::collect_rows(rows)
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn job_kv_references_for_job(&self, job_id: &str) -> R<Vec<JobKvReference>> {
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare(
+            "SELECT job_id, job_config_id, kv_key, json_pointer FROM job_kv_reference WHERE job_id = ?;",
+        )?;
+        let rows = stmt.query_map([job_id], |row| self.job_kv_reference_from_row(row))?;
+        Self::collect_rows(rows)
     }
 }
 
