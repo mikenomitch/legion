@@ -86,8 +86,7 @@ pub async fn handle(matches: &ArgMatches) -> R<()> {
         .collect::<R<Vec<_>>>()?;
 
     if matches.get_flag("json") {
-        let json_entries: Vec<LedgerJsonEntry> =
-            ledger.iter().map(LedgerJsonEntry::from).collect();
+        let json_entries: Vec<LedgerJsonEntry> = ledger.iter().map(LedgerJsonEntry::from).collect();
         println!(
             "{}",
             serde_json::to_string(&json_entries).context("failed to serialize ledger to JSON")?
