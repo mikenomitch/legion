@@ -68,6 +68,14 @@ struct ResourceLedger {
     pools: HashMap<String, ResourcePool>,
 }
 
+struct TaskPlan<'a> {
+    constraint_set: ConstraintSet,
+    affinity_set: AffinitySet,
+    task_request: ResourceRequest,
+    base_eligible: Vec<&'a Node>,
+    distinct_tracker: Option<DistinctTracker>,
+}
+
 pub struct Scheduler<'a> {
     store: &'a Store,
     policy: Box<dyn SchedulingPolicy>,
@@ -343,28 +351,16 @@ impl<'a> Scheduler<'a> {
                 continue;
             }
 
-            let task_resources =
-                resource_policy.normalize_task_resources(&task_config.resources, true)?;
-            let task_request = ResourceRequest::from_value(&task_resources)?;
-
-            let constraint_set =
-                ConstraintSet::new(&task_config.constraints).with_context(|| {
-                    format!("Failed to parse constraints for task {}", task_config.name)
-                })?;
-            let affinity_set = AffinitySet::new(&task_config.affinities).with_context(|| {
-                format!("Failed to parse affinities for task {}", task_config.name)
-            })?;
-            let mut distinct_tracker = Self::build_distinct_tracker(
-                &constraint_set,
+            let mut plan = Self::build_task_plan(
                 task_id,
+                &task_config,
+                &nodes,
+                resource_policy,
                 allocations_by_node,
                 &node_lookup,
-            );
-            let base_eligible = nodes
-                .iter()
-                .filter(|node| constraint_set.is_satisfied(node, None))
-                .collect::<Vec<_>>();
+            )?;
 
+            let base_eligible = plan.base_eligible.clone();
             if let Some(per_key) = per_key {
                 let grouped = group_nodes_by_attr(&base_eligible, per_key);
                 if grouped.is_empty() {
@@ -386,146 +382,208 @@ impl<'a> Scheduler<'a> {
                     } else {
                         0
                     };
-                    let mut needed = task_config.count.num.saturating_sub(placed);
-                    while needed > 0 {
-                        let eligible = if let Some(tracker) = distinct_tracker.as_ref() {
-                            group
-                                .iter()
-                                .copied()
-                                .filter(|node| constraint_set.distinct_satisfied(node, tracker))
-                                .collect::<Vec<_>>()
-                        } else {
-                            group.clone()
-                        };
-
-                        let eligible = eligible
-                            .into_iter()
-                            .filter(|node| resource_ledger.can_fit(&node.id, &task_request))
-                            .collect::<Vec<_>>();
-
-                        if eligible.is_empty() {
-                            bail!(
-                                "Failed to place task {}: no available nodes matching constraints or resources",
-                                task_config.name
-                            );
-                        }
-
-                        let node_id = if let Some(rng) = reschedule_rng.as_mut() {
-                            let choice = eligible
-                                .choose(rng)
-                                .context("No nodes available to place allocations")?;
-                            choice.id.clone()
-                        } else {
-                            let eligible = self.apply_nodes_considered_with_setting(
-                                eligible,
-                                nodes_considered_setting.as_ref(),
-                            )?;
-                            let ctx = SchedulingContext::new(
-                                eligible,
-                                &task_config,
-                                &affinity_set,
-                                job_config_id,
-                                allocations_by_node,
-                                &planned,
-                                weights,
-                            );
-                            self.policy
-                                .select_node(ctx)
-                                .map(|node| node.id.clone())
-                                .with_context(|| {
-                                    format!(
-                                        "Scheduling policy {} failed to place task {}",
-                                        self.policy.name(),
-                                        task_config.name
-                                    )
-                                })?
-                        };
-
-                        *planned.entry(node_id.clone()).or_default() += 1;
-                        if let Some(tracker) = distinct_tracker.as_mut() {
-                            if let Some(node) = node_lookup.get(node_id.as_str()) {
-                                tracker.insert_from_node(node);
-                            }
-                        }
-                        resource_ledger.consume(&node_id, &task_request)?;
-                        placements.push(PlannedAllocation {
-                            node_id,
-                            task_config_id: task_id,
-                        });
-                        needed = needed.saturating_sub(1);
-                    }
+                    let needed = task_config.count.num.saturating_sub(placed);
+                    self.place_task_allocations(
+                        needed,
+                        task_id,
+                        &task_config,
+                        job_config_id,
+                        group,
+                        allocations_by_node,
+                        &mut planned,
+                        &mut reschedule_rng,
+                        nodes_considered_setting.as_ref(),
+                        &node_lookup,
+                        &mut resource_ledger,
+                        &mut plan,
+                        &mut placements,
+                        weights,
+                    )?;
                 }
             } else {
-                for _ in 0..needed {
-                    let eligible = if let Some(tracker) = distinct_tracker.as_ref() {
-                        base_eligible
-                            .iter()
-                            .copied()
-                            .filter(|node| constraint_set.distinct_satisfied(node, tracker))
-                            .collect::<Vec<_>>()
-                    } else {
-                        base_eligible.clone()
-                    };
-
-                    let eligible = eligible
-                        .into_iter()
-                        .filter(|node| resource_ledger.can_fit(&node.id, &task_request))
-                        .collect::<Vec<_>>();
-
-                    if eligible.is_empty() {
-                        bail!(
-                            "Failed to place task {}: no available nodes matching constraints or resources",
-                            task_config.name
-                        );
-                    }
-
-                    let node_id = if let Some(rng) = reschedule_rng.as_mut() {
-                        let choice = eligible
-                            .choose(rng)
-                            .context("No nodes available to place allocations")?;
-                        choice.id.clone()
-                    } else {
-                        let eligible = self.apply_nodes_considered_with_setting(
-                            eligible,
-                            nodes_considered_setting.as_ref(),
-                        )?;
-                        let ctx = SchedulingContext::new(
-                            eligible,
-                            &task_config,
-                            &affinity_set,
-                            job_config_id,
-                            allocations_by_node,
-                            &planned,
-                            weights,
-                        );
-                        self.policy
-                            .select_node(ctx)
-                            .map(|node| node.id.clone())
-                            .with_context(|| {
-                                format!(
-                                    "Scheduling policy {} failed to place task {}",
-                                    self.policy.name(),
-                                    task_config.name
-                                )
-                            })?
-                    };
-
-                    *planned.entry(node_id.clone()).or_default() += 1;
-                    if let Some(tracker) = distinct_tracker.as_mut() {
-                        if let Some(node) = node_lookup.get(node_id.as_str()) {
-                            tracker.insert_from_node(node);
-                        }
-                    }
-                    resource_ledger.consume(&node_id, &task_request)?;
-                    placements.push(PlannedAllocation {
-                        node_id,
-                        task_config_id: task_id,
-                    });
-                }
+                self.place_task_allocations(
+                    needed,
+                    task_id,
+                    &task_config,
+                    job_config_id,
+                    &base_eligible,
+                    allocations_by_node,
+                    &mut planned,
+                    &mut reschedule_rng,
+                    nodes_considered_setting.as_ref(),
+                    &node_lookup,
+                    &mut resource_ledger,
+                    &mut plan,
+                    &mut placements,
+                    weights,
+                )?;
             }
         }
 
         Ok(placements)
+    }
+
+    fn build_task_plan<'b>(
+        task_id: i64,
+        task_config: &'b TaskConfig,
+        nodes: &'b [Node],
+        resource_policy: &ResourcePolicy,
+        allocations_by_node: &HashMap<String, Vec<Allocation>>,
+        node_lookup: &HashMap<&'b str, &'b Node>,
+    ) -> R<TaskPlan<'b>> {
+        let task_resources =
+            resource_policy.normalize_task_resources(&task_config.resources, true)?;
+        let task_request = ResourceRequest::from_value(&task_resources)?;
+
+        let constraint_set = ConstraintSet::new(&task_config.constraints).with_context(|| {
+            format!("Failed to parse constraints for task {}", task_config.name)
+        })?;
+        let affinity_set = AffinitySet::new(&task_config.affinities)
+            .with_context(|| format!("Failed to parse affinities for task {}", task_config.name))?;
+        let distinct_tracker = Self::build_distinct_tracker(
+            &constraint_set,
+            task_id,
+            allocations_by_node,
+            node_lookup,
+        );
+        let base_eligible = nodes
+            .iter()
+            .filter(|node| constraint_set.is_satisfied(node, None))
+            .collect::<Vec<_>>();
+
+        Ok(TaskPlan {
+            constraint_set,
+            affinity_set,
+            task_request,
+            base_eligible,
+            distinct_tracker,
+        })
+    }
+
+    fn place_task_allocations<'b>(
+        &self,
+        count: u32,
+        task_id: i64,
+        task_config: &TaskConfig,
+        job_config_id: &str,
+        candidates: &[&'b Node],
+        allocations_by_node: &HashMap<String, Vec<Allocation>>,
+        planned: &mut HashMap<String, usize>,
+        reschedule_rng: &mut Option<StdRng>,
+        nodes_considered_setting: Option<&NodesConsidered>,
+        node_lookup: &HashMap<&'b str, &'b Node>,
+        resource_ledger: &mut ResourceLedger,
+        plan: &mut TaskPlan<'b>,
+        placements: &mut Vec<PlannedAllocation>,
+        weights: SchedulerWeights,
+    ) -> R<()> {
+        for _ in 0..count {
+            let eligible = Self::eligible_nodes(
+                candidates,
+                &plan.constraint_set,
+                plan.distinct_tracker.as_ref(),
+                resource_ledger,
+                &plan.task_request,
+            );
+
+            if eligible.is_empty() {
+                bail!(
+                    "Failed to place task {}: no available nodes matching constraints or resources",
+                    task_config.name
+                );
+            }
+
+            let node_id = self.select_node_id(
+                eligible,
+                reschedule_rng,
+                nodes_considered_setting,
+                task_config,
+                &plan.affinity_set,
+                job_config_id,
+                allocations_by_node,
+                planned,
+                weights,
+            )?;
+
+            *planned.entry(node_id.clone()).or_default() += 1;
+            if let Some(tracker) = plan.distinct_tracker.as_mut() {
+                if let Some(node) = node_lookup.get(node_id.as_str()) {
+                    tracker.insert_from_node(node);
+                }
+            }
+            resource_ledger.consume(&node_id, &plan.task_request)?;
+            placements.push(PlannedAllocation {
+                node_id,
+                task_config_id: task_id,
+            });
+        }
+
+        Ok(())
+    }
+
+    fn select_node_id<'b>(
+        &self,
+        eligible: Vec<&'b Node>,
+        reschedule_rng: &mut Option<StdRng>,
+        nodes_considered_setting: Option<&NodesConsidered>,
+        task_config: &TaskConfig,
+        affinity_set: &AffinitySet,
+        job_config_id: &str,
+        allocations_by_node: &HashMap<String, Vec<Allocation>>,
+        planned: &HashMap<String, usize>,
+        weights: SchedulerWeights,
+    ) -> R<String> {
+        if let Some(rng) = reschedule_rng.as_mut() {
+            let choice = eligible
+                .choose(rng)
+                .context("No nodes available to place allocations")?;
+            Ok(choice.id.clone())
+        } else {
+            let eligible =
+                self.apply_nodes_considered_with_setting(eligible, nodes_considered_setting)?;
+            let ctx = SchedulingContext::new(
+                eligible,
+                task_config,
+                affinity_set,
+                job_config_id,
+                allocations_by_node,
+                planned,
+                weights,
+            );
+            self.policy
+                .select_node(ctx)
+                .map(|node| node.id.clone())
+                .with_context(|| {
+                    format!(
+                        "Scheduling policy {} failed to place task {}",
+                        self.policy.name(),
+                        task_config.name
+                    )
+                })
+        }
+    }
+
+    fn eligible_nodes<'b>(
+        candidates: &[&'b Node],
+        constraint_set: &ConstraintSet,
+        distinct_tracker: Option<&DistinctTracker>,
+        resource_ledger: &ResourceLedger,
+        task_request: &ResourceRequest,
+    ) -> Vec<&'b Node> {
+        let eligible = if let Some(tracker) = distinct_tracker {
+            candidates
+                .iter()
+                .copied()
+                .filter(|node| constraint_set.distinct_satisfied(node, tracker))
+                .collect::<Vec<_>>()
+        } else {
+            candidates.to_vec()
+        };
+
+        eligible
+            .into_iter()
+            .filter(|node| resource_ledger.can_fit(&node.id, task_request))
+            .collect()
     }
 
     fn tasks_for_plan(job_config: &JobConfig) -> Vec<(i64, TaskConfig, u32)> {
