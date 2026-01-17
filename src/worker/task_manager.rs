@@ -1,5 +1,5 @@
 use crate::prelude::*;
-use crate::structs::{Allocation, TaskAllocation, TaskConfig, TaskOnUnhealthyConfig};
+use crate::structs::{Allocation, JobType, TaskAllocation, TaskConfig, TaskOnUnhealthyConfig};
 use crate::task_plugins::{TaskPluginRegistry, TaskRuntime};
 use crate::worker::state::{pid_is_running, PersistedAllocation, WorkerStateStore};
 use crate::worker::task_health::HealthMonitorHandle;
@@ -16,8 +16,10 @@ pub struct WorkerTaskManager {
     runtimes: HashMap<i64, TaskRuntime>,
     allocations: HashMap<i64, Allocation>,
     task_configs: HashMap<i64, TaskConfig>,
+    job_types: HashMap<i64, JobType>,
     health_monitors: HashMap<i64, HealthMonitorHandle>,
     failed: Vec<FailedAllocationReport>,
+    completed: Vec<i64>,
     state_store: WorkerStateStore,
 }
 
@@ -32,8 +34,10 @@ impl WorkerTaskManager {
             runtimes: HashMap::new(),
             allocations: HashMap::new(),
             task_configs: HashMap::new(),
+            job_types: HashMap::new(),
             health_monitors: HashMap::new(),
             failed: Vec::new(),
+            completed: Vec::new(),
             state_store,
         }
     }
@@ -61,6 +65,10 @@ impl WorkerTaskManager {
         std::mem::take(&mut self.failed)
     }
 
+    pub fn drain_completions(&mut self) -> Vec<i64> {
+        std::mem::take(&mut self.completed)
+    }
+
     pub fn record_failure(&mut self, allocation_id: i64, reason: impl Into<String>) {
         if let Some(monitor) = self.health_monitors.remove(&allocation_id) {
             monitor.shutdown();
@@ -85,10 +93,40 @@ impl WorkerTaskManager {
         self.runtimes.remove(&allocation_id);
         self.allocations.remove(&allocation_id);
         self.task_configs.remove(&allocation_id);
+        self.job_types.remove(&allocation_id);
         self.failed.push(FailedAllocationReport {
             allocation_id,
             reason: reason.into(),
         });
+        self.persist_state();
+    }
+
+    pub fn record_completion(&mut self, allocation_id: i64) {
+        if let Some(monitor) = self.health_monitors.remove(&allocation_id) {
+            monitor.shutdown();
+        }
+        if let (Some(allocation), Some(task)) = (
+            self.allocations.get(&allocation_id),
+            self.task_configs.get(&allocation_id),
+        ) {
+            if let Some(plugin) = self.registry.plugin(&task.kind) {
+                if let Some(runtime) = self.runtimes.get_mut(&allocation_id) {
+                    if let Err(err) = plugin.destroy(allocation, task, runtime) {
+                        warn!(
+                            allocation_id,
+                            task_name = %task.name,
+                            error = ?err,
+                            "Failed to destroy allocation runtime"
+                        );
+                    }
+                }
+            }
+        }
+        self.runtimes.remove(&allocation_id);
+        self.allocations.remove(&allocation_id);
+        self.task_configs.remove(&allocation_id);
+        self.job_types.remove(&allocation_id);
+        self.completed.push(allocation_id);
         self.persist_state();
     }
 
@@ -159,8 +197,9 @@ impl WorkerTaskManager {
         &mut self,
         allocation: &TaskAllocation,
     ) -> R<(Allocation, TaskConfig)> {
-        let (alloc, task) = task_from_allocation(allocation)?;
+        let (alloc, task, job_type) = task_from_allocation(allocation)?;
         self.run_allocation(&alloc, &task)?;
+        self.job_types.insert(alloc.id, job_type);
         Ok((alloc, task))
     }
 
@@ -225,6 +264,7 @@ impl WorkerTaskManager {
                 .insert(record.allocation.id, record.allocation.clone());
             self.task_configs
                 .insert(record.allocation.id, record.task.clone());
+            self.job_types.insert(record.allocation.id, record.job_type);
             active.push(record.clone());
             restored.push((record.allocation, record.task));
         }
@@ -240,6 +280,11 @@ impl WorkerTaskManager {
             let Some(task) = self.task_configs.get(allocation_id) else {
                 continue;
             };
+            let job_type = self
+                .job_types
+                .get(allocation_id)
+                .copied()
+                .unwrap_or_default();
             let pid = self
                 .runtimes
                 .get(allocation_id)
@@ -255,6 +300,7 @@ impl WorkerTaskManager {
             records.push(PersistedAllocation {
                 allocation: allocation.clone(),
                 task: task.clone(),
+                job_type,
                 pid,
             });
         }
@@ -267,9 +313,62 @@ impl WorkerTaskManager {
             warn!(error = ?err, "Failed to persist worker allocation state");
         }
     }
+
+    pub fn poll_run_completions(&mut self) {
+        let mut finished = Vec::new();
+        for allocation_id in self.runtimes.keys().copied().collect::<Vec<_>>() {
+            if !matches!(self.job_types.get(&allocation_id), Some(JobType::Run)) {
+                continue;
+            }
+
+            let exit_status = {
+                let runtime = match self.runtimes.get_mut(&allocation_id) {
+                    Some(runtime) => runtime,
+                    None => continue,
+                };
+                if let Some(child) = runtime.child.as_mut() {
+                    match child.try_wait() {
+                        Ok(Some(status)) => Some(Ok(status)),
+                        Ok(None) => None,
+                        Err(err) => Some(Err(format!("run task exit check failed: {err}"))),
+                    }
+                } else if let Some(pid) = runtime.pid {
+                    if pid_is_running(pid) {
+                        None
+                    } else {
+                        Some(Err(
+                            "run task exited but exit status is unavailable".to_string()
+                        ))
+                    }
+                } else {
+                    None
+                }
+            };
+
+            if let Some(result) = exit_status {
+                finished.push((allocation_id, result));
+            }
+        }
+
+        for (allocation_id, result) in finished {
+            match result {
+                Ok(status) => {
+                    if status.success() {
+                        self.record_completion(allocation_id);
+                    } else {
+                        self.record_failure(
+                            allocation_id,
+                            format!("run task exited with status {status}"),
+                        );
+                    }
+                }
+                Err(reason) => self.record_failure(allocation_id, reason),
+            }
+        }
+    }
 }
 
-fn task_from_allocation(allocation: &TaskAllocation) -> R<(Allocation, TaskConfig)> {
+fn task_from_allocation(allocation: &TaskAllocation) -> R<(Allocation, TaskConfig, JobType)> {
     let task_config: serde_json::Value =
         serde_json::from_str(&allocation.task_config).context("Invalid task configuration JSON")?;
     let checks = if allocation.task_checks.trim().is_empty() {
@@ -300,7 +399,13 @@ fn task_from_allocation(allocation: &TaskAllocation) -> R<(Allocation, TaskConfi
         job_id: allocation.job_id.clone(),
     };
 
-    Ok((alloc, task))
+    let job_type = if allocation.job_type.trim().is_empty() {
+        JobType::default()
+    } else {
+        JobType::parse(&allocation.job_type)?
+    };
+
+    Ok((alloc, task, job_type))
 }
 
 #[cfg(test)]

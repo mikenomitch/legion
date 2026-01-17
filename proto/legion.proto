@@ -152,6 +152,7 @@ message HeartbeatRequest {
   string id = 1;
   repeated int64 allocation_ids = 2;
   repeated FailedAllocation failed_allocations = 3;
+  repeated int64 completed_allocations = 4;
 }
 
 message HeartbeatReply {
@@ -406,6 +407,7 @@ message TaskAllocation {
   string task_config = 8;
   string task_checks = 9;
   string task_on_unhealthy = 10;
+  string job_type = 11;
 }
 
 message PostWorkRequest {

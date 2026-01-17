@@ -10,6 +10,37 @@ use crate::prelude::{bail, R};
 
 use super::{Job, PlannedAllocation, Submission};
 
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum JobType {
+    #[serde(alias = "default")]
+    Service,
+    Run,
+}
+
+impl Default for JobType {
+    fn default() -> Self {
+        JobType::Service
+    }
+}
+
+impl JobType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            JobType::Service => "service",
+            JobType::Run => "run",
+        }
+    }
+
+    pub fn parse(value: &str) -> R<Self> {
+        match value {
+            "service" | "default" => Ok(JobType::Service),
+            "run" => Ok(JobType::Run),
+            other => bail!("Unknown job type {other}"),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Tabled)]
 #[serde(rename_all = "camelCase")]
 pub struct JobPrint {
@@ -350,6 +381,8 @@ pub struct TaskConfig {
 pub struct JobConfig {
     pub name: String,
     pub tasks: Vec<TaskConfig>,
+    #[serde(rename = "type")]
+    pub job_type: JobType,
     pub version: Option<u32>,
 }
 
@@ -357,6 +390,8 @@ pub struct JobConfig {
 #[serde(rename_all = "camelCase")]
 struct JobConfigInput {
     name: String,
+    #[serde(rename = "type", default)]
+    job_type: JobType,
     #[serde(default)]
     tasks: Option<TaskConfigList>,
     #[serde(default)]
@@ -443,6 +478,7 @@ impl<'de> Deserialize<'de> for JobConfig {
         Ok(JobConfig {
             name: input.name,
             tasks,
+            job_type: input.job_type,
             version: input.version,
         })
     }
@@ -450,7 +486,7 @@ impl<'de> Deserialize<'de> for JobConfig {
 
 impl JobConfig {
     pub fn is_same_as(&self, other: &JobConfig) -> bool {
-        self.name == other.name && self.tasks == other.tasks
+        self.name == other.name && self.tasks == other.tasks && self.job_type == other.job_type
     }
 
     pub fn id(&self) -> String {

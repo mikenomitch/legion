@@ -3,8 +3,8 @@ use std::collections::{HashMap, HashSet};
 use legion::prelude::{json, Context, R};
 use legion::storage::store::Store;
 use legion::structs::{
-    config::ManagerConfigFull, job::JobConfig, job::TaskConfig, job::TaskCount, Eval, Node,
-    NodeMsg, Submission,
+    config::ManagerConfigFull, job::JobConfig, job::JobType, job::TaskConfig, job::TaskCount, Eval,
+    Node, NodeMsg, Submission,
 };
 use serde::Serialize;
 use serde_json::{Map, Value};
@@ -580,6 +580,7 @@ fn job_alpha() -> JobConfig {
             json!({ "zone": "east" }),
             json!([{ "key": "tier", "value": "gold", "multiplier": 2 }]),
         )],
+        job_type: JobType::Service,
         version: None,
     }
 }
@@ -594,6 +595,7 @@ fn job_bravo() -> JobConfig {
             json!({ "zone": "east", "rack": "rack-b" }),
             json!([{ "key": "tier", "value": "gold", "multiplier": 2 }]),
         )],
+        job_type: JobType::Service,
         version: None,
     }
 }
@@ -608,6 +610,7 @@ fn job_charlie() -> JobConfig {
             json!({ "zone": "central" }),
             json!([{ "key": "tier", "value": "gold", "multiplier": 2 }]),
         )],
+        job_type: JobType::Service,
         version: None,
     }
 }
@@ -622,6 +625,7 @@ fn job_delta() -> JobConfig {
             json!({ "zone": "west" }),
             json!([{ "key": "rack", "value": "rack-d", "multiplier": 3 }]),
         )],
+        job_type: JobType::Service,
         version: None,
     }
 }
@@ -636,6 +640,7 @@ fn job_echo() -> JobConfig {
             json!({ "zone": "west" }),
             json!([{ "key": "tier", "value": "silver", "multiplier": 2 }]),
         )],
+        job_type: JobType::Service,
         version: None,
     }
 }
@@ -650,6 +655,7 @@ fn job_foxtrot() -> JobConfig {
             json!({ "special": "enabled" }),
             json!({}),
         )],
+        job_type: JobType::Service,
         version: None,
     }
 }
@@ -667,6 +673,7 @@ fn job_golf() -> JobConfig {
             ]),
             json!({}),
         )],
+        job_type: JobType::Service,
         version: None,
     }
 }
@@ -681,6 +688,7 @@ fn job_hotel() -> JobConfig {
             json!({ "zone": "moon" }),
             json!({}),
         )],
+        job_type: JobType::Service,
         version: None,
     }
 }
@@ -695,6 +703,7 @@ fn job_india() -> JobConfig {
             json!({ "node_id": "node-11" }),
             json!({}),
         )],
+        job_type: JobType::Service,
         version: None,
     }
 }
@@ -709,6 +718,7 @@ fn job_resubmit_config(message: &str, count: u32, node_id: &str) -> JobConfig {
             constraints: json!({ "node_id": node_id }),
             ..TaskConfig::new("resubmit-task", "service")
         }],
+        job_type: JobType::Service,
         version: None,
     }
 }
@@ -723,6 +733,7 @@ fn job_score_load() -> JobConfig {
             json!({ "node_id": "score-node-1" }),
             json!({}),
         )],
+        job_type: JobType::Service,
         version: None,
     }
 }
@@ -737,6 +748,7 @@ fn job_score_target() -> JobConfig {
             json!({ "zone": "score" }),
             json!({}),
         )],
+        job_type: JobType::Service,
         version: None,
     }
 }
@@ -936,6 +948,7 @@ fn scheduler_count_per_attribute_reschedules_by_group() -> R<()> {
             count: TaskCount::per(3, "region"),
             ..TaskConfig::new("region-task", "service")
         }],
+        job_type: JobType::Service,
         version: None,
     };
 
@@ -999,6 +1012,7 @@ fn scheduler_count_per_id_scales_with_node_changes() -> R<()> {
             count: TaskCount::per(1, "id"),
             ..TaskConfig::new("id-task", "service")
         }],
+        job_type: JobType::Service,
         version: None,
     };
 

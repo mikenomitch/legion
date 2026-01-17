@@ -1,5 +1,6 @@
 {
     name: "maximal-demo",
+    type: "service",
     version: 1,
     tasks: [
         {

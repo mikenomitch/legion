@@ -10,6 +10,8 @@ use sysinfo::{Pid, System};
 pub struct PersistedAllocation {
     pub allocation: Allocation,
     pub task: TaskConfig,
+    #[serde(default)]
+    pub job_type: crate::structs::JobType,
     pub pid: Option<u32>,
 }
 

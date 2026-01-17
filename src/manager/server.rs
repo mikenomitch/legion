@@ -14,9 +14,9 @@ use crate::structs::{
     GetJobInfoRequest, GetJobSpecReply, GetJobSpecRequest, GetKvLockReply, GetKvLockRequest,
     GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply,
     GetManagerConfigsRequest, GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest,
-    HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, JobConfig, KvEntry,
-    KvValueType, LedgerNode, ListJobsReply, ListJobsRequest, ListKvReply, ListKvRequest, Node,
-    NodeMsg, PatchKvReply, PatchKvRequest, PlanJobReply, PlanJobRequest, PlannedAllocation,
+    HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, JobConfig, JobType,
+    KvEntry, KvValueType, LedgerNode, ListJobsReply, ListJobsRequest, ListKvReply, ListKvRequest,
+    Node, NodeMsg, PatchKvReply, PatchKvRequest, PlanJobReply, PlanJobRequest, PlannedAllocation,
     PutKvReply, PutKvRequest, ReleaseKvLockReply, ReleaseKvLockRequest, RenewKvLockReply,
     RenewKvLockRequest, RestartWorkerReply, RestartWorkerRequest, RunJobReply, RunJobRequest,
     StopJobReply, StopJobRequest, TaskConfig, TaskOnUnhealthyConfig, UpdateNodeDynamicReply,
@@ -655,6 +655,10 @@ impl Manager for ManagerAgentService {
             .update_node_heartbeat(id.clone())
             .map_err(|e| map_store_error("Error updating node heartbeat", e))?;
 
+        if let Err(err) = handle_completed_allocations(&self.store, &req.completed_allocations) {
+            error!(node_id = %id, error = ?err, "Error handling completed allocations");
+        }
+
         if let Err(err) = handle_failed_allocations(
             &self.store,
             &self.allocation_failures,
@@ -1053,6 +1057,38 @@ fn worker_address_for_node(node: &Node) -> Option<String> {
         .map(|value| value.to_string())
 }
 
+fn handle_completed_allocations(store: &Store, completed: &[i64]) -> R<()> {
+    for allocation_id in completed {
+        let allocation = store.get_allocation_by_id(*allocation_id)?;
+        let Some(allocation) = allocation else {
+            warn!(allocation_id, "Completed allocation not found; skipping");
+            continue;
+        };
+
+        let job_type = store
+            .job_type_for_config(&allocation.job_config_id)?
+            .unwrap_or_default();
+        if job_type != JobType::Run {
+            warn!(
+                allocation_id,
+                job_config_id = %allocation.job_config_id,
+                job_type = job_type.as_str(),
+                "Completed allocation reported for non-run job; skipping"
+            );
+            continue;
+        }
+
+        store.update_allocation_status(*allocation_id, "successful")?;
+
+        let allocs = store.allocs_for_job_config(&allocation.job_config_id)?;
+        if allocs.iter().all(|alloc| alloc.status == "successful") {
+            store.mark_job_successful(&allocation.job_id)?;
+        }
+    }
+
+    Ok(())
+}
+
 fn handle_failed_allocations(
     store: &Store,
     failure_tracker: &Arc<Mutex<AllocationFailureTracker>>,
@@ -1251,9 +1287,13 @@ fn build_desired_allocations(
 
     let reported: std::collections::HashSet<i64> = reported_allocations.iter().copied().collect();
     let mut task_cache: HashMap<String, HashMap<i64, TaskConfig>> = HashMap::new();
+    let mut job_type_cache: HashMap<String, JobType> = HashMap::new();
     let mut allocations = Vec::new();
 
     for allocation in desired {
+        if allocation.status == "successful" {
+            continue;
+        }
         if reported.contains(&allocation.id) {
             continue;
         }
@@ -1270,7 +1310,16 @@ fn build_desired_allocations(
         let task = tasks
             .get(&allocation.task_config_id)
             .with_context(|| format!("Missing task config {}", allocation.task_config_id))?;
-        allocations.push(build_task_allocation(task, &allocation)?);
+        let job_type = if let Some(job_type) = job_type_cache.get(&allocation.job_config_id) {
+            *job_type
+        } else {
+            let job_type = store
+                .job_type_for_config(&allocation.job_config_id)?
+                .unwrap_or_default();
+            job_type_cache.insert(allocation.job_config_id.clone(), job_type);
+            job_type
+        };
+        allocations.push(build_task_allocation(task, &allocation, job_type)?);
     }
 
     Ok(allocations)
@@ -1282,8 +1331,9 @@ mod tests {
     use crate::structs::config::ManagerConfigFull;
     use crate::structs::worker_server::Worker;
     use crate::structs::{
-        Eval, JobConfig, NodeMsg, PostWorkReply, PostWorkRequest, PutKvRequest, RestartWorkerReply,
-        RestartWorkerRequest, RunJobRequest, Submission, TaskConfig, UpdateNodeDynamicRequest,
+        Eval, JobConfig, JobType, NodeMsg, PostWorkReply, PostWorkRequest, PutKvRequest,
+        RestartWorkerReply, RestartWorkerRequest, RunJobRequest, Submission, TaskConfig,
+        UpdateNodeDynamicRequest,
     };
     use serde_json::{json, Map, Value};
     use tempfile::Builder;
@@ -1535,6 +1585,7 @@ mod tests {
         let job = JobConfig {
             name: job_name.clone(),
             tasks: vec![task],
+            job_type: JobType::Service,
             version: None,
         };
         store.handle_job_submit(&job, &[submission()])?;
@@ -1600,6 +1651,7 @@ mod tests {
                 },
                 ..TaskConfig::new("task", "noop")
             }],
+            job_type: JobType::Service,
             version: None,
         };
         store.handle_job_submit(&job, &[submission()])?;
@@ -1643,6 +1695,7 @@ mod tests {
                 },
                 ..TaskConfig::new("task", "noop")
             }],
+            job_type: JobType::Service,
             version: None,
         };
         store.handle_job_submit(&job, &[submission()])?;
@@ -1655,6 +1708,147 @@ mod tests {
 
         let desired = build_desired_allocations(&store, "node-a", &[allocation.id])?;
         assert!(desired.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn run_job_success_marks_allocations_and_job() -> R<()> {
+        let store = setup_store()?;
+        insert_node(&store, "node-a")?;
+
+        let job = JobConfig {
+            name: "run-job".into(),
+            tasks: vec![
+                TaskConfig::new("task-a", "noop"),
+                TaskConfig::new("task-b", "noop"),
+            ],
+            job_type: JobType::Run,
+            version: None,
+        };
+        store.handle_job_submit(&job, &[submission()])?;
+        let job_config_id = store.get_job_config(&job.name)?.id();
+        let task_ids = store.get_task_configs_for_job_config(&job_config_id)?;
+        let alloc_a = store.place_alloc("node-a", task_ids[0].0)?;
+        let alloc_b = store.place_alloc("node-a", task_ids[1].0)?;
+
+        let desired = build_desired_allocations(&store, "node-a", &[])?;
+        assert_eq!(desired.len(), 2);
+        assert!(desired.iter().all(|alloc| alloc.job_type == "run"));
+
+        handle_completed_allocations(&store, &[alloc_a.id, alloc_b.id])?;
+
+        let allocs = store.allocs_for_job_config(&job_config_id)?;
+        assert!(allocs.iter().all(|alloc| alloc.status == "successful"));
+        let job = store.get_job("run-job")?;
+        assert_eq!(job.status, "successful");
+
+        Ok(())
+    }
+
+    #[test]
+    fn run_job_failure_reschedules_only_failed_allocations() -> R<()> {
+        let store = setup_store()?;
+        insert_node(&store, "node-a")?;
+
+        let job = JobConfig {
+            name: "run-job-failure".into(),
+            tasks: vec![
+                TaskConfig::new("task-a", "noop"),
+                TaskConfig {
+                    on_unhealthy: TaskOnUnhealthyConfig {
+                        move_delay: Duration::from_secs(0),
+                        ..TaskOnUnhealthyConfig::default()
+                    },
+                    ..TaskConfig::new("task-b", "noop")
+                },
+            ],
+            job_type: JobType::Run,
+            version: None,
+        };
+        store.handle_job_submit(&job, &[submission()])?;
+        let job_config_id = store.get_job_config(&job.name)?.id();
+        let task_ids = store.get_task_configs_for_job_config(&job_config_id)?;
+        let alloc_a = store.place_alloc("node-a", task_ids[0].0)?;
+        let alloc_b = store.place_alloc("node-a", task_ids[1].0)?;
+
+        handle_completed_allocations(&store, &[alloc_a.id])?;
+
+        let tracker = Arc::new(Mutex::new(AllocationFailureTracker::default()));
+        handle_failed_allocations(
+            &store,
+            &tracker,
+            "node-a",
+            &[FailedAllocation {
+                allocation_id: alloc_b.id,
+                reason: "boom".into(),
+            }],
+        )?;
+        std::thread::sleep(Duration::from_millis(10));
+
+        let allocs = store.allocs_for_job_config(&job_config_id)?;
+        assert_eq!(allocs.len(), 1);
+        assert_eq!(allocs[0].id, alloc_a.id);
+        assert_eq!(allocs[0].status, "successful");
+
+        let evals = store.get_evals()?;
+        let eval = evals.first().context("missing eval")?;
+        assert_eq!(eval.kind, "job_reschedule");
+
+        let job = store.get_job("run-job-failure")?;
+        assert_ne!(job.status, "successful");
+
+        Ok(())
+    }
+
+    #[test]
+    fn run_job_move_limit_marks_job_failed() -> R<()> {
+        let store = setup_store()?;
+        insert_node(&store, "node-a")?;
+
+        let job = JobConfig {
+            name: "run-job-retry".into(),
+            tasks: vec![TaskConfig {
+                on_unhealthy: TaskOnUnhealthyConfig {
+                    move_count: Some(1),
+                    move_delay: Duration::from_secs(0),
+                    ..TaskOnUnhealthyConfig::default()
+                },
+                ..TaskConfig::new("task", "noop")
+            }],
+            job_type: JobType::Run,
+            version: None,
+        };
+        store.handle_job_submit(&job, &[submission()])?;
+        let job_config_id = store.get_job_config(&job.name)?.id();
+        let task_id = store.get_task_configs_for_job_config(&job_config_id)?[0].0;
+
+        let tracker = Arc::new(Mutex::new(AllocationFailureTracker::default()));
+
+        let first_alloc = store.place_alloc("node-a", task_id)?;
+        handle_failed_allocations(
+            &store,
+            &tracker,
+            "node-a",
+            &[FailedAllocation {
+                allocation_id: first_alloc.id,
+                reason: "boom".into(),
+            }],
+        )?;
+
+        let second_alloc = store.place_alloc("node-a", task_id)?;
+        handle_failed_allocations(
+            &store,
+            &tracker,
+            "node-a",
+            &[FailedAllocation {
+                allocation_id: second_alloc.id,
+                reason: "boom-again".into(),
+            }],
+        )?;
+
+        let job = store.get_job("run-job-retry")?;
+        assert_eq!(job.status, "failed");
 
         Ok(())
     }

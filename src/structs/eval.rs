@@ -16,7 +16,7 @@ use super::Eval;
 #[cfg(test)]
 use super::config::ManagerConfigFull;
 #[cfg(test)]
-use super::job::{JobConfig, TaskConfig, TaskCount};
+use super::job::{JobConfig, JobType, TaskConfig, TaskCount};
 #[cfg(test)]
 use super::ledger::LedgerEntry;
 #[cfg(test)]
@@ -287,6 +287,7 @@ mod tests {
         let job_one_config = JobConfig {
             name: job_one_name.clone(),
             tasks: vec![job_one_task.clone()],
+            job_type: JobType::Service,
             version: None,
         };
         let job_one_subs = vec![Submission {
@@ -338,6 +339,7 @@ mod tests {
         let job_two_config = JobConfig {
             name: job_two_name.clone(),
             tasks: vec![job_two_task.clone()],
+            job_type: JobType::Service,
             version: None,
         };
         let job_two_subs = vec![Submission {
@@ -417,6 +419,7 @@ mod tests {
         let job_config = JobConfig {
             name: job_name.clone(),
             tasks: vec![base_task.clone()],
+            job_type: JobType::Service,
             version: None,
         };
         let job_subs = vec![Submission {
@@ -452,6 +455,7 @@ mod tests {
         let unchanged_config = JobConfig {
             name: job_name.clone(),
             tasks: vec![unchanged_task.clone()],
+            job_type: JobType::Service,
             version: None,
         };
         store.handle_job_submit(&unchanged_config, &job_subs)?;
@@ -481,6 +485,7 @@ mod tests {
         let moved_config = JobConfig {
             name: job_name.clone(),
             tasks: vec![moved_task.clone()],
+            job_type: JobType::Service,
             version: None,
         };
         store.handle_job_submit(&moved_config, &job_subs)?;
@@ -510,6 +515,7 @@ mod tests {
         let removed_config = JobConfig {
             name: job_name.clone(),
             tasks: vec![removed_task],
+            job_type: JobType::Service,
             version: None,
         };
         store.handle_job_submit(&removed_config, &job_subs)?;

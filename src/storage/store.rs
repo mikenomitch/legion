@@ -12,9 +12,9 @@ use crate::storage::queries::{
     INSERT_SUBMISSION, INSERT_TASK, INSERT_WORKER_TYPE, NODE_ATTRS, UPSERT_MANAGER_CONFIG,
 };
 use crate::structs::{
-    Allocation, Eval, Job, JobConfig, KvEntry, KvLock, KvValueType, LedgerEntry, ManagerConfigFull,
-    ManagerNodeConfig, Node, NodeMsg, Submission, TaskCheck, TaskConfig, TaskCount,
-    TaskOnUnhealthyConfig, WorkerConfig,
+    Allocation, Eval, Job, JobConfig, JobType, KvEntry, KvLock, KvValueType, LedgerEntry,
+    ManagerConfigFull, ManagerNodeConfig, Node, NodeMsg, Submission, TaskCheck, TaskConfig,
+    TaskCount, TaskOnUnhealthyConfig, WorkerConfig,
 };
 
 use rand::{seq::SliceRandom, thread_rng, Rng};
@@ -1065,6 +1065,18 @@ impl Store {
     }
 
     #[instrument(err, skip_all)]
+    pub fn mark_job_successful(&self, job_id: &str) -> R<()> {
+        let conn = self.write_connection()?;
+        let sql = r#"
+        UPDATE job
+        SET status = 'successful'
+        WHERE id = ?;
+"#;
+        conn.execute(sql, [job_id])?;
+        Ok(())
+    }
+
+    #[instrument(err, skip_all)]
     pub fn destroy_job(&self, name: &str) -> R<()> {
         let mut conn = self.write_connection()?;
         let tx = conn.transaction()?;
@@ -1117,66 +1129,64 @@ impl Store {
 
     pub fn get_job_config_optional(&self, name: &str) -> R<Option<JobConfig>> {
         let conn = self.read_connection()?;
-        let maybe_job_config: Option<(JobConfig, String)> = conn
+        let maybe_job_config: Option<(String, String, String, u32)> = conn
             .query_row(&GET_JOB_CONFIG, [name], |row| {
-                let tasks_to_replace = vec![];
-                let job_config_id = row.get(0)?;
-                let jc = JobConfig {
-                    name: row.get(1)?,
-                    tasks: tasks_to_replace,
-                    version: Some(row.get(4)?),
-                };
-
-                Ok((jc, job_config_id))
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(4)?))
             })
             .optional()?;
 
-        let Some((job_config, jc_id)) = maybe_job_config else {
+        let Some((job_config_id, job_name, job_type_raw, job_version)) = maybe_job_config else {
             return Ok(None);
         };
 
-        let mut stmt = conn.prepare(&GET_TASK_FOR_JOB_CONIFG)?;
-        let tasks =
-            Self::collect_rows(stmt.query_map([jc_id], |row| self.task_config_from_row(row))?)?;
-
-        let jc_2 = JobConfig {
-            tasks,
-            ..job_config
+        let job_type = JobType::parse(&job_type_raw)?;
+        let job_config = JobConfig {
+            name: job_name,
+            tasks: vec![],
+            job_type,
+            version: Some(job_version),
         };
 
-        Ok(Some(jc_2))
+        let mut stmt = conn.prepare(&GET_TASK_FOR_JOB_CONIFG)?;
+        let tasks = Self::collect_rows(
+            stmt.query_map([job_config_id], |row| self.task_config_from_row(row))?,
+        )?;
+
+        Ok(Some(JobConfig {
+            tasks,
+            ..job_config
+        }))
     }
 
     pub fn get_job_config_by_id_optional(&self, id: &str) -> R<Option<JobConfig>> {
         let conn = self.read_connection()?;
-        let maybe_job_config: Option<(JobConfig, String)> = conn
+        let maybe_job_config: Option<(String, String, String, u32)> = conn
             .query_row(&GET_JOB_CONFIG_BY_ID, [id], |row| {
-                let tasks_to_replace = vec![];
-                let job_config_id = row.get(0)?;
-                let jc = JobConfig {
-                    name: row.get(1)?,
-                    tasks: tasks_to_replace,
-                    version: Some(row.get(4)?),
-                };
-
-                Ok((jc, job_config_id))
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(4)?))
             })
             .optional()?;
 
-        let Some((job_config, jc_id)) = maybe_job_config else {
+        let Some((job_config_id, job_name, job_type_raw, job_version)) = maybe_job_config else {
             return Ok(None);
         };
 
-        let mut stmt = conn.prepare(&GET_TASK_FOR_JOB_CONIFG)?;
-        let tasks =
-            Self::collect_rows(stmt.query_map([jc_id], |row| self.task_config_from_row(row))?)?;
-
-        let jc_2 = JobConfig {
-            tasks,
-            ..job_config
+        let job_type = JobType::parse(&job_type_raw)?;
+        let job_config = JobConfig {
+            name: job_name,
+            tasks: vec![],
+            job_type,
+            version: Some(job_version),
         };
 
-        Ok(Some(jc_2))
+        let mut stmt = conn.prepare(&GET_TASK_FOR_JOB_CONIFG)?;
+        let tasks = Self::collect_rows(
+            stmt.query_map([job_config_id], |row| self.task_config_from_row(row))?,
+        )?;
+
+        Ok(Some(JobConfig {
+            tasks,
+            ..job_config
+        }))
     }
 
     #[instrument(err, skip_all)]
@@ -1246,7 +1256,7 @@ impl Store {
         let config_params = named_params! {
             ":id": format!("{}-{}", config.name, next_version.to_string()),
             ":name": config.name,
-            ":type": "default",
+            ":type": config.job_type.as_str(),
             ":meta": "{}",
             ":version": next_version,
             ":created_at": now,
@@ -1261,6 +1271,7 @@ impl Store {
                         name: row.get(1)?,
                         version: Some(row.get(4)?),
                         tasks,
+                        job_type: config.job_type,
                     },
                     row.get(0)?,
                 ))
@@ -1349,6 +1360,43 @@ impl Store {
             tasks,
             ..config.clone()
         })
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn job_type_for_config(&self, job_config_id: &str) -> R<Option<JobType>> {
+        let conn = self.read_connection()?;
+        let job_type: Option<String> = conn
+            .query_row(
+                "SELECT type FROM job_config WHERE id = ?;",
+                [job_config_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        job_type.map(|value| JobType::parse(&value)).transpose()
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn update_allocation_status(
+        &self,
+        allocation_id: i64,
+        status: &str,
+    ) -> R<Option<Allocation>> {
+        let allocation = self.get_allocation_by_id(allocation_id)?;
+        let Some(mut allocation) = allocation else {
+            return Ok(None);
+        };
+
+        let conn = self.write_connection()?;
+        conn.execute(
+            "UPDATE allocation SET status = ? WHERE id = ?;",
+            (status, allocation_id),
+        )?;
+
+        allocation.status = status.to_string();
+        self.cache_remove_allocations(std::slice::from_ref(&allocation))?;
+        self.cache_add_allocations(std::slice::from_ref(&allocation))?;
+
+        Ok(Some(allocation))
     }
 
     #[instrument(err, skip_all)]
@@ -2748,6 +2796,7 @@ mod tests {
         let job = JobConfig {
             name: "cache-allocs".into(),
             tasks: vec![task("worker")],
+            job_type: JobType::Service,
             version: None,
         };
 
@@ -2792,6 +2841,7 @@ mod tests {
         let job = JobConfig {
             name: "cache-tasks".into(),
             tasks: vec![task("alpha")],
+            job_type: JobType::Service,
             version: None,
         };
 
@@ -2820,6 +2870,7 @@ mod tests {
                 count: TaskCount::new(2),
                 ..task("beta")
             }],
+            job_type: JobType::Service,
             version: None,
         };
 
@@ -2948,6 +2999,7 @@ mod tests {
         let job = JobConfig {
             name: "lost-reschedule".into(),
             tasks: vec![task("worker")],
+            job_type: JobType::Service,
             version: None,
         };
 
@@ -3048,6 +3100,7 @@ mod tests {
         let job_config = JobConfig {
             name: job_name.clone(),
             tasks: task_configs.clone(),
+            job_type: JobType::Service,
             version: None,
         };
         let store = setup_store()?;
@@ -3113,6 +3166,7 @@ mod tests {
         let job_config = JobConfig {
             name: job_name.clone(),
             tasks: vec![task_one],
+            job_type: JobType::Service,
             version: None,
         };
 
@@ -3157,6 +3211,7 @@ mod tests {
         let job_config = JobConfig {
             name: "jobname".into(),
             tasks: orig_task_configs.clone(),
+            job_type: JobType::Service,
             version: None,
         };
 
@@ -3265,6 +3320,7 @@ mod tests {
         let job_config = JobConfig {
             name: "jobname".into(),
             tasks: orig_task_configs.clone(),
+            job_type: JobType::Service,
             version: None,
         };
 
@@ -3307,6 +3363,7 @@ mod tests {
         let job_one_config = JobConfig {
             name: job_one_name.clone(),
             tasks: vec![task_one.clone(), task_two.clone()],
+            job_type: JobType::Service,
             version: None,
         };
         let job_one_subs = vec![Submission {
@@ -3329,6 +3386,7 @@ mod tests {
         let job_two_config = JobConfig {
             name: job_two_name.clone(),
             tasks: vec![task_three.clone()],
+            job_type: JobType::Service,
             version: None,
         };
         let job_two_subs = vec![Submission {
@@ -3425,6 +3483,7 @@ mod tests {
         let job_config = JobConfig {
             name: job_name.clone(),
             tasks,
+            job_type: JobType::Service,
             version: None,
         };
 
@@ -3481,12 +3540,14 @@ mod tests {
         let job_one_config = JobConfig {
             name: "job-one".into(),
             tasks: tasks.clone(),
+            job_type: JobType::Service,
             version: None,
         };
 
         let job_two_config = JobConfig {
             name: "job-two".into(),
             tasks,
+            job_type: JobType::Service,
             version: None,
         };
 

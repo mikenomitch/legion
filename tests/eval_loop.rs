@@ -1,7 +1,7 @@
 use legion::prelude::{json, Context, R};
 use legion::storage::store::Store;
 use legion::structs::{
-    config::ManagerConfigFull, job::JobConfig, job::TaskConfig, job::TaskCount,
+    config::ManagerConfigFull, job::JobConfig, job::JobType, job::TaskConfig, job::TaskCount,
     ledger::LedgerEntry, Eval, Submission,
 };
 use tempfile::Builder;
@@ -36,6 +36,7 @@ fn make_job_config(name: &str, count: u32) -> JobConfig {
     JobConfig {
         name: name.to_string(),
         tasks: vec![task],
+        job_type: JobType::Service,
         version: None,
     }
 }

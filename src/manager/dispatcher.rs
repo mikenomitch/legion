@@ -1,6 +1,8 @@
 use crate::prelude::*;
 use crate::storage::store::Store;
-use crate::structs::{worker_client::WorkerClient, Allocation, TaskAllocation, TaskConfig};
+use crate::structs::{
+    worker_client::WorkerClient, Allocation, JobType, TaskAllocation, TaskConfig,
+};
 use std::collections::HashMap;
 use tonic::transport::{Channel, Endpoint};
 
@@ -11,6 +13,7 @@ pub fn dispatch_allocations(store: &Store, allocations: &[Allocation]) -> R<()> 
     }
 
     let mut task_cache: HashMap<String, HashMap<i64, TaskConfig>> = HashMap::new();
+    let mut job_type_cache: HashMap<String, JobType> = HashMap::new();
     let mut node_cache: HashMap<String, crate::structs::Node> = HashMap::new();
 
     let runtime = tokio::runtime::Runtime::new()?;
@@ -30,6 +33,15 @@ pub fn dispatch_allocations(store: &Store, allocations: &[Allocation]) -> R<()> 
             let task = tasks
                 .get(&allocation.task_config_id)
                 .with_context(|| format!("Missing task config {}", allocation.task_config_id))?;
+            let job_type = if let Some(job_type) = job_type_cache.get(&allocation.job_config_id) {
+                *job_type
+            } else {
+                let job_type = store
+                    .job_type_for_config(&allocation.job_config_id)?
+                    .unwrap_or_default();
+                job_type_cache.insert(allocation.job_config_id.clone(), job_type);
+                job_type
+            };
 
             if !node_cache.contains_key(&allocation.node_id) {
                 let node = store.get_node(&allocation.node_id)?;
@@ -46,7 +58,7 @@ pub fn dispatch_allocations(store: &Store, allocations: &[Allocation]) -> R<()> 
                 continue;
             };
 
-            let task_allocation = build_task_allocation(task, allocation)?;
+            let task_allocation = build_task_allocation(task, allocation, job_type)?;
             let request = crate::structs::PostWorkRequest {
                 allocation: Some(task_allocation),
             };
@@ -91,7 +103,11 @@ fn worker_address_for_node(node: &crate::structs::Node) -> Option<String> {
         .map(|value| value.to_string())
 }
 
-pub fn build_task_allocation(task: &TaskConfig, allocation: &Allocation) -> R<TaskAllocation> {
+pub fn build_task_allocation(
+    task: &TaskConfig,
+    allocation: &Allocation,
+    job_type: JobType,
+) -> R<TaskAllocation> {
     let task_config = serde_json::to_string(&task.config)?;
     let task_checks = serde_json::to_string(&task.checks)?;
     let task_on_unhealthy = serde_json::to_string(&task.on_unhealthy)?;
@@ -106,6 +122,7 @@ pub fn build_task_allocation(task: &TaskConfig, allocation: &Allocation) -> R<Ta
         task_config,
         task_checks,
         task_on_unhealthy,
+        job_type: job_type.as_str().to_string(),
     })
 }
 

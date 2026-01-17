@@ -1173,7 +1173,7 @@ mod tests {
 
     use super::*;
     use crate::structs::config::ManagerConfigFull;
-    use crate::structs::{JobConfig, NodeMsg, Submission, TaskCount};
+    use crate::structs::{JobConfig, JobType, NodeMsg, Submission, TaskCount};
 
     fn store_path() -> R<String> {
         let store_dir = Builder::new()
@@ -1298,6 +1298,7 @@ mod tests {
                     ..TaskConfig::new("db", "noop")
                 },
             ],
+            job_type: JobType::Service,
             version: None,
         };
 
@@ -1363,6 +1364,7 @@ mod tests {
                 count: TaskCount::new(3),
                 ..TaskConfig::new("batch", "noop")
             }],
+            job_type: JobType::Service,
             version: None,
         };
 
@@ -1404,6 +1406,7 @@ mod tests {
                 count: TaskCount::per(2, "region"),
                 ..TaskConfig::new("api", "noop")
             }],
+            job_type: JobType::Service,
             version: None,
         };
 
@@ -1445,6 +1448,7 @@ mod tests {
                 count: TaskCount::per(2, "region"),
                 ..TaskConfig::new("api", "noop")
             }],
+            job_type: JobType::Service,
             version: None,
         };
 
@@ -1502,6 +1506,7 @@ mod tests {
                 constraints: json!({ "role": "db" }),
                 ..TaskConfig::new("db", "noop")
             }],
+            job_type: JobType::Service,
             version: None,
         };
 
@@ -1532,6 +1537,7 @@ mod tests {
         let job = JobConfig {
             name: "resched-exclude".into(),
             tasks: vec![TaskConfig::new("batch", "noop")],
+            job_type: JobType::Service,
             version: None,
         };
 
@@ -1562,6 +1568,7 @@ mod tests {
                 constraints: json!({ "role": "db" }),
                 ..TaskConfig::new("analytics", "noop")
             }],
+            job_type: JobType::Service,
             version: None,
         };
 
@@ -1632,6 +1639,7 @@ mod tests {
                 constraints: json!({ "role": "db" }),
                 ..TaskConfig::new("db", "noop")
             }],
+            job_type: JobType::Service,
             version: None,
         };
 
@@ -1663,6 +1671,7 @@ mod tests {
                 constraints: json!([{ "key": "zone", "operator": "distinct" }]),
                 ..TaskConfig::new("api", "noop")
             }],
+            job_type: JobType::Service,
             version: None,
         };
 
@@ -1693,6 +1702,7 @@ mod tests {
                 constraints: json!([{ "key": "role", "value": "db" }]),
                 ..TaskConfig::new("db", "noop")
             }],
+            job_type: JobType::Service,
             version: None,
         };
 
@@ -1728,6 +1738,7 @@ mod tests {
                 resources: json!({ "memory": 256 }),
                 ..TaskConfig::new("worker", "noop")
             }],
+            job_type: JobType::Service,
             version: None,
         };
 
@@ -1766,6 +1777,7 @@ mod tests {
                 resources: json!({ "memory": 128 }),
                 ..TaskConfig::new("worker", "noop")
             }],
+            job_type: JobType::Service,
             version: None,
         };
 
@@ -1794,6 +1806,7 @@ mod tests {
         let job = JobConfig {
             name: "spread-considered".into(),
             tasks: vec![TaskConfig::new("api", "noop")],
+            job_type: JobType::Service,
             version: None,
         };
 
@@ -1828,6 +1841,7 @@ mod tests {
         let job = JobConfig {
             name: "binpack-considered".into(),
             tasks: vec![TaskConfig::new("worker", "noop")],
+            job_type: JobType::Service,
             version: None,
         };
 
@@ -1869,6 +1883,7 @@ mod tests {
         let load_job = JobConfig {
             name: "load-job".into(),
             tasks: vec![TaskConfig::new("load", "noop")],
+            job_type: JobType::Service,
             version: None,
         };
         store.handle_job_submit(&load_job, &[dummy_submission()])?;
@@ -1885,6 +1900,7 @@ mod tests {
                 affinities: json!({ "zone": "us-east" }),
                 ..TaskConfig::new("api", "noop")
             }],
+            job_type: JobType::Service,
             version: None,
         };
         store.handle_job_submit(&job, &[dummy_submission()])?;

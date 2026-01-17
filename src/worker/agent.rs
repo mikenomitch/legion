@@ -241,8 +241,9 @@ async fn start_heartbeats(
     let mut client_clone = client.clone();
 
     loop {
-        let (allocations, failures) = {
+        let (allocations, failures, completions) = {
             let mut manager = task_manager.lock().expect("task manager");
+            manager.poll_run_completions();
             let failures = manager
                 .drain_failures()
                 .into_iter()
@@ -251,13 +252,15 @@ async fn start_heartbeats(
                     reason: failure.reason,
                 })
                 .collect::<Vec<_>>();
-            (manager.allocations_snapshot(), failures)
+            let completions = manager.drain_completions();
+            (manager.allocations_snapshot(), failures, completions)
         };
 
         let req = tonic::Request::new(HeartbeatRequest {
             id: name.clone(),
             allocation_ids: allocations,
             failed_allocations: failures,
+            completed_allocations: completions,
         });
 
         let response = client_clone.heartbeat(req).await?;
