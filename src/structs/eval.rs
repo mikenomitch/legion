@@ -1,10 +1,10 @@
 use std::collections::HashSet;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::manager::dispatcher::dispatch_allocations;
-use crate::manager::scheduler::{PlanMode, PlanOutcome, Scheduler};
+use crate::manager::scheduler::{PlanApplyResult, PlanMode, PlanOutcome, Scheduler};
 #[cfg(test)]
 use crate::prelude::Context;
 use crate::prelude::{bail, json, R};
@@ -164,13 +164,35 @@ impl Eval {
         } else {
             None
         };
-        let outcome = scheduler.plan_and_apply_with_exclusions(
-            &self.job_config_id,
-            mode,
-            excluded.as_ref(),
-        )?;
-        dispatch_allocations(store, &outcome.allocations)?;
-        Ok(outcome)
+        let max_attempts = 3;
+        for attempt in 1..=max_attempts {
+            let result = scheduler.plan_and_apply_with_exclusions(
+                &self.job_config_id,
+                mode.clone(),
+                excluded.as_ref(),
+            )?;
+            match result {
+                PlanApplyResult::Applied(outcome) => {
+                    dispatch_allocations(store, &outcome.allocations)?;
+                    return Ok(outcome);
+                }
+                PlanApplyResult::Rejected { reason } => {
+                    if attempt < max_attempts {
+                        warn!(
+                            attempt,
+                            max_attempts,
+                            %reason,
+                            "Plan rejected; retrying schedule"
+                        );
+                        continue;
+                    }
+
+                    bail!("Plan rejected after {max_attempts} attempts: {reason}");
+                }
+            }
+        }
+
+        bail!("Plan scheduling attempts exhausted")
     }
 
     fn current_timestamp() -> String {

@@ -23,10 +23,11 @@ use rusqlite::{
     OptionalExtension, Row, Transaction,
 };
 use rusqlite_migration::Migrations;
-use serde_json::{from_str, to_string, to_string_pretty, Value};
+use serde_json::{from_str, to_string, to_string_pretty, to_vec, Value};
 use serde_rusqlite::to_params_named;
+use sha2::{Digest, Sha256};
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{MutexGuard, RwLock};
@@ -54,6 +55,18 @@ pub struct SchedulingReadModel {
 struct AllocationConstraintState {
     constraints: ConstraintSet,
     distinct: Option<DistinctTracker>,
+}
+
+#[derive(Debug, Clone)]
+pub enum AllocationPlanStatus {
+    Applied { allocations: Vec<Allocation> },
+    Rejected { reason: String },
+}
+
+#[derive(Debug, Clone)]
+pub struct AllocationPlanSubmission {
+    pub plan_id: i64,
+    pub status: AllocationPlanStatus,
 }
 
 #[derive(Debug, Clone)]
@@ -1604,14 +1617,15 @@ impl Store {
         })
     }
 
-    #[instrument(err, skip_all)]
-    pub fn apply_allocation_plan(&self, placements: &[(String, i64)]) -> R<Vec<Allocation>> {
+    fn apply_allocation_plan_tx(
+        &self,
+        tx: &Transaction<'_>,
+        placements: &[(String, i64)],
+    ) -> R<Vec<Allocation>> {
         if placements.is_empty() {
             return Ok(Vec::new());
         }
 
-        let mut conn = self.write_connection()?;
-        let tx = conn.transaction()?;
         let mut allocations = Vec::new();
 
         let mut constraint_states: HashMap<i64, AllocationConstraintState> = HashMap::new();
@@ -1645,11 +1659,153 @@ impl Store {
             allocations.push(allocation);
         }
 
+        Ok(allocations)
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn apply_allocation_plan(&self, placements: &[(String, i64)]) -> R<Vec<Allocation>> {
+        if placements.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut conn = self.write_connection()?;
+        let tx = conn.transaction()?;
+        let allocations = self.apply_allocation_plan_tx(&tx, placements)?;
+
         tx.commit()?;
 
         self.cache_add_allocations(&allocations)?;
 
         Ok(allocations)
+    }
+
+    fn allocation_ledger_hash_for_entries(entries: &[(String, i64, i64)]) -> R<String> {
+        let payload = to_vec(entries)?;
+        let mut hasher = Sha256::new();
+        hasher.update(&payload);
+        Ok(format!("{:x}", hasher.finalize()))
+    }
+
+    fn allocation_ledger_hash_for_conn(&self, conn: &Connection) -> R<String> {
+        let mut stmt = conn.prepare(
+            "SELECT node_id, task_config_id, COUNT(*) as count \
+            FROM allocation \
+            GROUP BY node_id, task_config_id \
+            ORDER BY node_id, task_config_id;",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+
+        let mut entries = Vec::new();
+        for row in rows {
+            entries.push(row?);
+        }
+
+        Self::allocation_ledger_hash_for_entries(&entries)
+    }
+
+    pub fn allocation_ledger_hash_from_allocations(
+        allocations_by_node: &HashMap<String, Vec<Allocation>>,
+    ) -> R<String> {
+        let mut per_node: BTreeMap<String, BTreeMap<i64, i64>> = BTreeMap::new();
+        for (node_id, allocations) in allocations_by_node {
+            for allocation in allocations {
+                *per_node
+                    .entry(node_id.clone())
+                    .or_default()
+                    .entry(allocation.task_config_id)
+                    .or_default() += 1;
+            }
+        }
+
+        let mut entries = Vec::new();
+        for (node_id, tasks) in per_node {
+            for (task_id, count) in tasks {
+                entries.push((node_id.clone(), task_id, count));
+            }
+        }
+
+        Self::allocation_ledger_hash_for_entries(&entries)
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn submit_allocation_plan(
+        &self,
+        job_config_id: &str,
+        mode: &str,
+        placements: &[(String, i64)],
+        expected_ledger_hash: &str,
+    ) -> R<AllocationPlanSubmission> {
+        let now = Self::now_rfc3339()?;
+        let placements_json = serde_json::to_string(placements)?;
+
+        let mut conn = self.write_connection()?;
+        let tx = conn.transaction()?;
+
+        tx.execute(
+            "INSERT INTO allocation_plan (job_config_id, mode, status, expected_ledger_hash, placements, created_at) \
+            VALUES (:job_config_id, :mode, :status, :expected_ledger_hash, :placements, :created_at);",
+            named_params! {
+                ":job_config_id": job_config_id,
+                ":mode": mode,
+                ":status": "queued",
+                ":expected_ledger_hash": expected_ledger_hash,
+                ":placements": placements_json,
+                ":created_at": now,
+            },
+        )?;
+        let plan_id = tx.last_insert_rowid();
+
+        let current_hash = self.allocation_ledger_hash_for_conn(&tx)?;
+        if current_hash != expected_ledger_hash {
+            let reason = format!(
+                "allocation ledger changed (expected {expected_ledger_hash}, found {current_hash})"
+            );
+            tx.execute(
+                "UPDATE allocation_plan SET status = :status, rejection_reason = :reason WHERE id = :id;",
+                named_params! {
+                    ":status": "rejected",
+                    ":reason": reason,
+                    ":id": plan_id,
+                },
+            )?;
+            tx.commit()?;
+            return Ok(AllocationPlanSubmission {
+                plan_id,
+                status: AllocationPlanStatus::Rejected {
+                    reason: format!(
+                        "plan {plan_id} rejected: allocation ledger changed (expected {expected_ledger_hash}, found {current_hash})"
+                    ),
+                },
+            });
+        }
+
+        let allocations = self.apply_allocation_plan_tx(&tx, placements)?;
+        let applied_at = Self::now_rfc3339()?;
+        tx.execute(
+            "UPDATE allocation_plan SET status = :status, applied_at = :applied_at WHERE id = :id;",
+            named_params! {
+                ":status": "applied",
+                ":applied_at": applied_at,
+                ":id": plan_id,
+            },
+        )?;
+
+        tx.commit()?;
+
+        if !allocations.is_empty() {
+            self.cache_add_allocations(&allocations)?;
+        }
+
+        Ok(AllocationPlanSubmission {
+            plan_id,
+            status: AllocationPlanStatus::Applied { allocations },
+        })
     }
 
     #[instrument(err, skip_all)]

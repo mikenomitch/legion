@@ -9,7 +9,7 @@ use rand::{rngs::StdRng, SeedableRng};
 use crate::constraints::{AffinitySet, ConstraintSet, DistinctTracker};
 use crate::prelude::*;
 use crate::resources::ResourcePolicy;
-use crate::storage::store::Store;
+use crate::storage::store::{AllocationPlanStatus, Store};
 use crate::structs::{Allocation, JobConfig, Node, TaskConfig};
 pub use policy::{load_policy, SchedulerWeights, SchedulingContext, SchedulingPolicy};
 
@@ -34,10 +34,25 @@ pub enum PlanMode {
     Reschedule,
 }
 
+impl PlanMode {
+    fn as_str(&self) -> &'static str {
+        match self {
+            PlanMode::Fresh => "fresh",
+            PlanMode::Reschedule => "reschedule",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PlanOutcome {
     pub allocations: Vec<Allocation>,
     pub deltas: Vec<LedgerDelta>,
+}
+
+#[derive(Debug, Clone)]
+pub enum PlanApplyResult {
+    Applied(PlanOutcome),
+    Rejected { reason: String },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -222,7 +237,7 @@ impl<'a> Scheduler<'a> {
     }
 
     #[instrument(skip_all)]
-    pub fn plan_and_apply(&self, job_config_id: &str, mode: PlanMode) -> R<PlanOutcome> {
+    pub fn plan_and_apply(&self, job_config_id: &str, mode: PlanMode) -> R<PlanApplyResult> {
         self.plan_and_apply_with_exclusions(job_config_id, mode, None)
     }
 
@@ -231,7 +246,7 @@ impl<'a> Scheduler<'a> {
         job_config_id: &str,
         mode: PlanMode,
         excluded_nodes: Option<&HashSet<String>>,
-    ) -> R<PlanOutcome> {
+    ) -> R<PlanApplyResult> {
         let mut nodes = self.available_nodes()?;
         if let Some(excluded) = excluded_nodes {
             nodes.retain(|node| !excluded.contains(&node.id));
@@ -283,10 +298,10 @@ impl<'a> Scheduler<'a> {
             mode.clone(),
         )?;
         if placements.is_empty() {
-            return Ok(PlanOutcome {
+            return Ok(PlanApplyResult::Applied(PlanOutcome {
                 allocations: Vec::new(),
                 deltas: Vec::new(),
-            });
+            }));
         }
 
         let placement_pairs = placements
@@ -297,13 +312,25 @@ impl<'a> Scheduler<'a> {
             .iter()
             .map(|placement| placement.node_id.clone())
             .collect::<HashSet<_>>();
-        let allocations = self.store.apply_allocation_plan(&placement_pairs)?;
-        let deltas = Self::allocations_delta(&affected_nodes, &allocations);
+        let expected_ledger_hash =
+            Store::allocation_ledger_hash_from_allocations(&allocations_by_node)?;
+        let submission = self.store.submit_allocation_plan(
+            job_config_id,
+            mode.as_str(),
+            &placement_pairs,
+            &expected_ledger_hash,
+        )?;
 
-        Ok(PlanOutcome {
-            allocations,
-            deltas,
-        })
+        match submission.status {
+            AllocationPlanStatus::Applied { allocations } => {
+                let deltas = Self::allocations_delta(&affected_nodes, &allocations);
+                Ok(PlanApplyResult::Applied(PlanOutcome {
+                    allocations,
+                    deltas,
+                }))
+            }
+            AllocationPlanStatus::Rejected { reason } => Ok(PlanApplyResult::Rejected { reason }),
+        }
     }
 
     fn available_nodes(&self) -> R<Vec<Node>> {
@@ -1281,6 +1308,15 @@ mod tests {
         Ok(task.0)
     }
 
+    fn expect_applied(result: PlanApplyResult) -> R<PlanOutcome> {
+        match result {
+            PlanApplyResult::Applied(outcome) => Ok(outcome),
+            PlanApplyResult::Rejected { reason } => {
+                bail!("expected applied plan, got rejection: {reason}")
+            }
+        }
+    }
+
     #[test]
     fn plans_fresh_allocations_and_deltas() -> R<()> {
         let store = setup_store()?;
@@ -1305,7 +1341,7 @@ mod tests {
         let job_config_id = store.get_job_config(&job.name)?.id();
 
         let scheduler = Scheduler::new(&store)?;
-        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+        let outcome = expect_applied(scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?)?;
 
         assert_eq!(outcome.allocations.len(), 3);
 
@@ -1371,7 +1407,8 @@ mod tests {
         let batch_id = task_id_for(&store, &job_config_id, "batch")?;
         store.place_alloc("node-a", batch_id)?;
         let scheduler = Scheduler::new(&store)?;
-        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Reschedule)?;
+        let outcome =
+            expect_applied(scheduler.plan_and_apply(&job_config_id, PlanMode::Reschedule)?)?;
 
         assert_eq!(outcome.allocations.len(), 2);
         assert_eq!(outcome.deltas.len(), 1);
@@ -1410,7 +1447,7 @@ mod tests {
         store.handle_job_submit(&job, &[dummy_submission()])?;
         let job_config_id = store.get_job_config(&job.name)?.id();
         let scheduler = Scheduler::new(&store)?;
-        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+        let outcome = expect_applied(scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?)?;
 
         assert_eq!(outcome.allocations.len(), 4);
 
@@ -1463,7 +1500,8 @@ mod tests {
         store.remove_allocs_for_node("node-a")?;
 
         let scheduler = Scheduler::new(&store)?;
-        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Reschedule)?;
+        let outcome =
+            expect_applied(scheduler.plan_and_apply(&job_config_id, PlanMode::Reschedule)?)?;
 
         assert_eq!(outcome.allocations.len(), 2);
         for alloc in &outcome.allocations {
@@ -1508,7 +1546,7 @@ mod tests {
         store.handle_job_submit(&job, &[dummy_submission()])?;
         let job_config_id = store.get_job_config(&job.name)?.id();
         let scheduler = Scheduler::new(&store)?;
-        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+        let outcome = expect_applied(scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?)?;
 
         assert_eq!(outcome.allocations.len(), 2);
         for alloc in &outcome.allocations {
@@ -1539,11 +1577,11 @@ mod tests {
         let job_config_id = store.get_job_config(&job.name)?.id();
         let scheduler = Scheduler::new(&store)?;
         let excluded = HashSet::from(["node-a".to_string()]);
-        let outcome = scheduler.plan_and_apply_with_exclusions(
+        let outcome = expect_applied(scheduler.plan_and_apply_with_exclusions(
             &job_config_id,
             PlanMode::Reschedule,
             Some(&excluded),
-        )?;
+        )?)?;
 
         assert_eq!(outcome.allocations.len(), 1);
         assert_eq!(outcome.allocations[0].node_id, "node-b");
@@ -1638,7 +1676,7 @@ mod tests {
         store.handle_job_submit(&job, &[dummy_submission()])?;
         let job_config_id = store.get_job_config(&job.name)?.id();
         let scheduler = Scheduler::new(&store)?;
-        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+        let outcome = expect_applied(scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?)?;
 
         assert_eq!(outcome.allocations.len(), 2);
         for alloc in &outcome.allocations {
@@ -1669,7 +1707,7 @@ mod tests {
         store.handle_job_submit(&job, &[dummy_submission()])?;
         let job_config_id = store.get_job_config(&job.name)?.id();
         let scheduler = Scheduler::new(&store)?;
-        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+        let outcome = expect_applied(scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?)?;
 
         assert_eq!(outcome.allocations.len(), 2);
         let node_ids: HashSet<_> = outcome
@@ -1809,7 +1847,7 @@ mod tests {
         }
 
         let scheduler = Scheduler::new(&store)?;
-        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+        let outcome = expect_applied(scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?)?;
 
         assert_eq!(outcome.allocations.len(), 1);
         assert_eq!(outcome.allocations[0].node_id, "node-b");
@@ -1843,7 +1881,7 @@ mod tests {
         }
 
         let scheduler = Scheduler::new(&store)?;
-        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+        let outcome = expect_applied(scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?)?;
 
         assert_eq!(outcome.allocations.len(), 1);
         assert_eq!(outcome.allocations[0].node_id, "node-b");
@@ -1891,7 +1929,7 @@ mod tests {
         let job_config_id = store.get_job_config(&job.name)?.id();
 
         let scheduler = Scheduler::new(&store)?;
-        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+        let outcome = expect_applied(scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?)?;
 
         assert_eq!(outcome.allocations.len(), 1);
         assert_eq!(outcome.allocations[0].node_id, "node-a");

@@ -195,5 +195,24 @@ pub fn get_migrations() -> Migrations<'static> {
             "CREATE INDEX IF NOT EXISTS idx_job_kv_reference_job ON job_kv_reference(job_id);",
         )
         .down("DROP INDEX IF EXISTS idx_job_kv_reference_job;"),
+        M::up(
+            "CREATE TABLE IF NOT EXISTS allocation_plan (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_config_id STRING NOT NULL,
+            mode STRING NOT NULL,
+            status STRING NOT NULL,
+            expected_ledger_hash STRING NOT NULL,
+            placements JSONB NOT NULL,
+            rejection_reason STRING,
+            created_at TIMESTAMP NOT NULL,
+            applied_at TIMESTAMP,
+            FOREIGN KEY(job_config_id) REFERENCES job_config(id) ON DELETE CASCADE
+        )",
+        )
+        .down("DROP TABLE IF EXISTS allocation_plan;"),
+        M::up(
+            "CREATE INDEX IF NOT EXISTS idx_allocation_plan_status_created ON allocation_plan(status, created_at);",
+        )
+        .down("DROP INDEX IF EXISTS idx_allocation_plan_status_created;"),
     ])
 }
