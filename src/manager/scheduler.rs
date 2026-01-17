@@ -11,7 +11,7 @@ use crate::prelude::*;
 use crate::resources::ResourcePolicy;
 use crate::storage::store::Store;
 use crate::structs::{Allocation, JobConfig, Node, TaskConfig};
-pub use policy::{load_policy, SchedulerWeights, SchedulingContext, SchedulingPolicy};
+pub use policy::{load_policy, ResourceUsage, SchedulerWeights, SchedulingContext, SchedulingPolicy};
 
 mod policy;
 
@@ -54,6 +54,7 @@ struct ResourceRequest {
 #[derive(Debug, Clone)]
 struct ResourcePool {
     values: HashMap<String, ResourceValue>,
+    total_values: HashMap<String, ResourceValue>,
     unknown: HashSet<String>,
 }
 
@@ -502,6 +503,7 @@ impl<'a> Scheduler<'a> {
                 job_config_id,
                 allocations_by_node,
                 planned,
+                resource_ledger,
                 weights,
             )?;
 
@@ -531,6 +533,7 @@ impl<'a> Scheduler<'a> {
         job_config_id: &str,
         allocations_by_node: &HashMap<String, Vec<Allocation>>,
         planned: &HashMap<String, usize>,
+        resource_ledger: &ResourceLedger,
         weights: SchedulerWeights,
     ) -> R<String> {
         if let Some(rng) = reschedule_rng.as_mut() {
@@ -541,6 +544,7 @@ impl<'a> Scheduler<'a> {
         } else {
             let eligible =
                 self.apply_nodes_considered_with_setting(eligible, nodes_considered_setting)?;
+            let resource_usage = resource_ledger.utilization_for_nodes(&eligible);
             let ctx = SchedulingContext::new(
                 eligible,
                 task_config,
@@ -548,6 +552,7 @@ impl<'a> Scheduler<'a> {
                 job_config_id,
                 allocations_by_node,
                 planned,
+                resource_usage,
                 weights,
             );
             self.policy
@@ -951,6 +956,26 @@ impl ResourceLedger {
         pool.consume(request);
         Ok(())
     }
+
+    fn utilization_for_nodes<'a>(
+        &self,
+        nodes: &[&'a Node],
+    ) -> HashMap<String, ResourceUsage> {
+        nodes
+            .iter()
+            .map(|node| (node.id.clone(), self.utilization(&node.id)))
+            .collect()
+    }
+
+    fn utilization(&self, node_id: &str) -> ResourceUsage {
+        self.pools
+            .get(node_id)
+            .map(|pool| ResourceUsage {
+                cpu: pool.utilization("cpu"),
+                memory: pool.utilization("memory"),
+            })
+            .unwrap_or_default()
+    }
 }
 
 impl ResourcePool {
@@ -995,7 +1020,12 @@ impl ResourcePool {
             }
         }
 
-        let mut pool = ResourcePool { values, unknown };
+        let total_values = values.clone();
+        let mut pool = ResourcePool {
+            values,
+            total_values,
+            unknown,
+        };
 
         if let Some(reserved) =
             config_value(&config_attrs, &["reservedResources", "reserved_resources"])
@@ -1070,6 +1100,21 @@ impl ResourcePool {
                     }
                 }
             }
+        }
+    }
+
+    fn utilization(&self, name: &str) -> Option<f64> {
+        match (
+            self.total_values.get(name),
+            self.values.get(name),
+        ) {
+            (Some(ResourceValue::Amount(total)), Some(ResourceValue::Amount(remaining)))
+                if total.is_finite() && *total > 0.0 =>
+            {
+                let usage = (total - remaining) / total;
+                Some(usage.clamp(0.0, 1.0))
+            }
+            _ => None,
         }
     }
 }

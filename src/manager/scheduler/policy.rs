@@ -13,6 +13,32 @@ pub struct SchedulerWeights {
     pub bin_pack: f64,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ResourceUsage {
+    pub cpu: Option<f64>,
+    pub memory: Option<f64>,
+}
+
+impl ResourceUsage {
+    fn combined(self) -> Option<f64> {
+        let mut total = 0.0;
+        let mut count = 0.0;
+        if let Some(cpu) = self.cpu {
+            total += cpu;
+            count += 1.0;
+        }
+        if let Some(memory) = self.memory {
+            total += memory;
+            count += 1.0;
+        }
+        if count > 0.0 {
+            Some((total / count).clamp(0.0, 1.0))
+        } else {
+            None
+        }
+    }
+}
+
 impl SchedulerWeights {
     pub fn for_policy(policy: &str) -> Self {
         match policy {
@@ -44,6 +70,7 @@ pub struct SchedulingContext<'a> {
     pub job_config_id: &'a str,
     pub allocations: &'a HashMap<String, Vec<Allocation>>,
     pub planned: &'a HashMap<String, usize>,
+    pub resource_usage: HashMap<String, ResourceUsage>,
     pub weights: SchedulerWeights,
 }
 
@@ -56,6 +83,7 @@ impl<'a> SchedulingContext<'a> {
         job_config_id: &'a str,
         allocations: &'a HashMap<String, Vec<Allocation>>,
         planned: &'a HashMap<String, usize>,
+        resource_usage: HashMap<String, ResourceUsage>,
         weights: SchedulerWeights,
     ) -> Self {
         SchedulingContext {
@@ -65,6 +93,7 @@ impl<'a> SchedulingContext<'a> {
             job_config_id,
             allocations,
             planned,
+            resource_usage,
             weights,
         }
     }
@@ -164,7 +193,7 @@ fn score_node(
     range: f64,
 ) -> f64 {
     let load = loads.get(node.id.as_str()).copied().unwrap_or_default() as f64;
-    let (spread_score, bin_pack_score) = if range > 0.0 {
+    let (mut spread_score, mut bin_pack_score) = if range > 0.0 {
         (
             (max_load_delta(range, load, min_load)),
             (load - min_load) / range,
@@ -172,6 +201,22 @@ fn score_node(
     } else {
         (0.0, 0.0)
     };
+    if let Some(usage) = ctx
+        .resource_usage
+        .get(node.id.as_str())
+        .copied()
+        .and_then(ResourceUsage::combined)
+    {
+        let resource_spread = 1.0 - usage;
+        let resource_bin_pack = usage;
+        if range > 0.0 {
+            spread_score = (spread_score + resource_spread) / 2.0;
+            bin_pack_score = (bin_pack_score + resource_bin_pack) / 2.0;
+        } else {
+            spread_score = resource_spread;
+            bin_pack_score = resource_bin_pack;
+        }
+    }
 
     let affinity_score = affinity_score(ctx.task, ctx.affinity_set, node);
 
@@ -261,6 +306,13 @@ mod tests {
         }
     }
 
+    fn usage(cpu: f64, memory: f64) -> ResourceUsage {
+        ResourceUsage {
+            cpu: Some(cpu),
+            memory: Some(memory),
+        }
+    }
+
     #[test]
     fn bin_pack_prefers_more_loaded_node() {
         let nodes = vec![node("node-a"), node("node-b")];
@@ -279,6 +331,7 @@ mod tests {
             "job",
             &allocations,
             &planned,
+            HashMap::new(),
             SchedulerWeights::for_policy("bin_pack"),
         );
         let policy = BinPackPolicy::default();
@@ -305,6 +358,38 @@ mod tests {
             "job",
             &allocations,
             &planned,
+            HashMap::new(),
+            SchedulerWeights::for_policy("bin_pack"),
+        );
+        let policy = BinPackPolicy::default();
+
+        let choice = policy.select_node(ctx).expect("node expected");
+        assert_eq!(choice.id, "node-a");
+    }
+
+    #[test]
+    fn bin_pack_prefers_higher_resource_usage_on_tie() {
+        let nodes = vec![node("node-a"), node("node-b")];
+        let allocations: HashMap<String, Vec<Allocation>> = HashMap::new();
+        let planned = HashMap::from([
+            (String::from("node-a"), 1_usize),
+            (String::from("node-b"), 1_usize),
+        ]);
+        let resource_usage = HashMap::from([
+            (String::from("node-a"), usage(0.85, 0.8)),
+            (String::from("node-b"), usage(0.2, 0.3)),
+        ]);
+
+        let task = task("web");
+        let affinity_set = AffinitySet::new(&task.affinities).expect("affinities");
+        let ctx = SchedulingContext::new(
+            nodes.iter().collect(),
+            &task,
+            &affinity_set,
+            "job",
+            &allocations,
+            &planned,
+            resource_usage,
             SchedulerWeights::for_policy("bin_pack"),
         );
         let policy = BinPackPolicy::default();
@@ -340,6 +425,7 @@ mod tests {
             "job",
             &allocations,
             &planned,
+            HashMap::new(),
             SchedulerWeights::for_policy("bin_pack"),
         );
         let policy = BinPackPolicy::default();
@@ -363,6 +449,7 @@ mod tests {
             "job",
             &allocations,
             &planned,
+            HashMap::new(),
             SchedulerWeights::for_policy("bin_pack"),
         );
         let policy = BinPackPolicy::default();
@@ -389,12 +476,44 @@ mod tests {
             "job",
             &allocations,
             &planned,
+            HashMap::new(),
             SchedulerWeights::for_policy("spread"),
         );
         let policy = SpreadPolicy::default();
 
         let choice = policy.select_node(ctx).expect("node expected");
         assert_eq!(choice.id, "node-a");
+    }
+
+    #[test]
+    fn spread_prefers_lower_resource_usage_on_tie() {
+        let nodes = vec![node("node-a"), node("node-b")];
+        let allocations: HashMap<String, Vec<Allocation>> = HashMap::new();
+        let planned = HashMap::from([
+            (String::from("node-a"), 1_usize),
+            (String::from("node-b"), 1_usize),
+        ]);
+        let resource_usage = HashMap::from([
+            (String::from("node-a"), usage(0.9, 0.9)),
+            (String::from("node-b"), usage(0.1, 0.2)),
+        ]);
+
+        let task = task("api");
+        let affinity_set = AffinitySet::new(&task.affinities).expect("affinities");
+        let ctx = SchedulingContext::new(
+            nodes.iter().collect(),
+            &task,
+            &affinity_set,
+            "job",
+            &allocations,
+            &planned,
+            resource_usage,
+            SchedulerWeights::for_policy("spread"),
+        );
+        let policy = SpreadPolicy::default();
+
+        let choice = policy.select_node(ctx).expect("node expected");
+        assert_eq!(choice.id, "node-b");
     }
 
     #[test]
@@ -415,6 +534,7 @@ mod tests {
             "job",
             &allocations,
             &planned,
+            HashMap::new(),
             SchedulerWeights::for_policy("spread"),
         );
         let policy = SpreadPolicy::default();
@@ -438,6 +558,7 @@ mod tests {
             "job",
             &allocations,
             &planned,
+            HashMap::new(),
             SchedulerWeights::for_policy("spread"),
         );
         let policy = SpreadPolicy::default();
