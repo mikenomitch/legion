@@ -103,7 +103,7 @@ impl<'a> Scheduler<'a> {
             .store
             .cached_task_configs_for_job_config(job_config_id)?
             .into_iter()
-            .map(|(id, config)| (id, config.clone(), config.count))
+            .map(|(id, config)| (id, config.clone(), config.count.num))
             .collect::<Vec<_>>();
 
         let mut allocations_by_node = self.store.cached_allocations_by_node()?;
@@ -236,7 +236,7 @@ impl<'a> Scheduler<'a> {
             .store
             .cached_task_configs_for_job_config(job_config_id)?
             .into_iter()
-            .map(|(id, config)| (id, config.clone(), config.count))
+            .map(|(id, config)| (id, config.clone(), config.count.num))
             .collect::<Vec<_>>();
 
         let allocations_by_node = self.store.cached_allocations_by_node()?;
@@ -338,7 +338,8 @@ impl<'a> Scheduler<'a> {
 
         for (task_id, task_config, _desired_count) in tasks {
             let needed = required_counts.get(&task_id).copied().unwrap_or(0);
-            if needed == 0 {
+            let per_key = task_config.count.per.as_deref();
+            if needed == 0 && per_key.is_none() {
                 continue;
             }
 
@@ -364,71 +365,163 @@ impl<'a> Scheduler<'a> {
                 .filter(|node| constraint_set.is_satisfied(node, None))
                 .collect::<Vec<_>>();
 
-            for _ in 0..needed {
-                let eligible = if let Some(tracker) = distinct_tracker.as_ref() {
-                    base_eligible
-                        .iter()
-                        .copied()
-                        .filter(|node| constraint_set.distinct_satisfied(node, tracker))
-                        .collect::<Vec<_>>()
-                } else {
-                    base_eligible.clone()
-                };
-
-                let eligible = eligible
-                    .into_iter()
-                    .filter(|node| resource_ledger.can_fit(&node.id, &task_request))
-                    .collect::<Vec<_>>();
-
-                if eligible.is_empty() {
+            if let Some(per_key) = per_key {
+                let grouped = group_nodes_by_attr(&base_eligible, per_key);
+                if grouped.is_empty() {
                     bail!(
-                        "Failed to place task {}: no available nodes matching constraints or resources",
-                        task_config.name
+                        "Failed to place task {}: no eligible nodes with attribute {}",
+                        task_config.name,
+                        per_key
                     );
                 }
 
-                let node_id = if let Some(rng) = reschedule_rng.as_mut() {
-                    let choice = eligible
-                        .choose(rng)
-                        .context("No nodes available to place allocations")?;
-                    choice.id.clone()
-                } else {
-                    let eligible = self.apply_nodes_considered_with_setting(
-                        eligible,
-                        nodes_considered_setting.as_ref(),
-                    )?;
-                    let ctx = SchedulingContext::new(
-                        eligible,
-                        &task_config,
-                        &affinity_set,
-                        job_config_id,
-                        allocations_by_node,
-                        &planned,
-                        weights,
-                    );
-                    self.policy
-                        .select_node(ctx)
-                        .map(|node| node.id.clone())
-                        .with_context(|| {
-                            format!(
-                                "Scheduling policy {} failed to place task {}",
-                                self.policy.name(),
-                                task_config.name
-                            )
-                        })?
-                };
+                for group in grouped.values() {
+                    let placed = if matches!(mode, PlanMode::Reschedule) {
+                        count_allocations_in_group(
+                            allocations_by_node,
+                            job_config_id,
+                            task_id,
+                            group,
+                        )
+                    } else {
+                        0
+                    };
+                    let mut needed = task_config.count.num.saturating_sub(placed);
+                    while needed > 0 {
+                        let eligible = if let Some(tracker) = distinct_tracker.as_ref() {
+                            group
+                                .iter()
+                                .copied()
+                                .filter(|node| constraint_set.distinct_satisfied(node, tracker))
+                                .collect::<Vec<_>>()
+                        } else {
+                            group.clone()
+                        };
 
-                *planned.entry(node_id.clone()).or_default() += 1;
-                if let Some(tracker) = distinct_tracker.as_mut() {
-                    if let Some(node) = node_lookup.get(node_id.as_str()) {
-                        tracker.insert_from_node(node);
+                        let eligible = eligible
+                            .into_iter()
+                            .filter(|node| resource_ledger.can_fit(&node.id, &task_request))
+                            .collect::<Vec<_>>();
+
+                        if eligible.is_empty() {
+                            bail!(
+                                "Failed to place task {}: no available nodes matching constraints or resources",
+                                task_config.name
+                            );
+                        }
+
+                        let node_id = if let Some(rng) = reschedule_rng.as_mut() {
+                            let choice = eligible
+                                .choose(rng)
+                                .context("No nodes available to place allocations")?;
+                            choice.id.clone()
+                        } else {
+                            let eligible = self.apply_nodes_considered_with_setting(
+                                eligible,
+                                nodes_considered_setting.as_ref(),
+                            )?;
+                            let ctx = SchedulingContext::new(
+                                eligible,
+                                &task_config,
+                                &affinity_set,
+                                job_config_id,
+                                allocations_by_node,
+                                &planned,
+                                weights,
+                            );
+                            self.policy
+                                .select_node(ctx)
+                                .map(|node| node.id.clone())
+                                .with_context(|| {
+                                    format!(
+                                        "Scheduling policy {} failed to place task {}",
+                                        self.policy.name(),
+                                        task_config.name
+                                    )
+                                })?
+                        };
+
+                        *planned.entry(node_id.clone()).or_default() += 1;
+                        if let Some(tracker) = distinct_tracker.as_mut() {
+                            if let Some(node) = node_lookup.get(node_id.as_str()) {
+                                tracker.insert_from_node(node);
+                            }
+                        }
+                        resource_ledger.consume(&node_id, &task_request)?;
+                        placements.push(PlannedAllocation {
+                            node_id,
+                            task_config_id: task_id,
+                        });
+                        needed = needed.saturating_sub(1);
                     }
                 }
-                resource_ledger.consume(&node_id, &task_request)?;
-                placements.push(PlannedAllocation {
-                    node_id,
-                    task_config_id: task_id,
-                });
+            } else {
+                for _ in 0..needed {
+                    let eligible = if let Some(tracker) = distinct_tracker.as_ref() {
+                        base_eligible
+                            .iter()
+                            .copied()
+                            .filter(|node| constraint_set.distinct_satisfied(node, tracker))
+                            .collect::<Vec<_>>()
+                    } else {
+                        base_eligible.clone()
+                    };
+
+                    let eligible = eligible
+                        .into_iter()
+                        .filter(|node| resource_ledger.can_fit(&node.id, &task_request))
+                        .collect::<Vec<_>>();
+
+                    if eligible.is_empty() {
+                        bail!(
+                            "Failed to place task {}: no available nodes matching constraints or resources",
+                            task_config.name
+                        );
+                    }
+
+                    let node_id = if let Some(rng) = reschedule_rng.as_mut() {
+                        let choice = eligible
+                            .choose(rng)
+                            .context("No nodes available to place allocations")?;
+                        choice.id.clone()
+                    } else {
+                        let eligible = self.apply_nodes_considered_with_setting(
+                            eligible,
+                            nodes_considered_setting.as_ref(),
+                        )?;
+                        let ctx = SchedulingContext::new(
+                            eligible,
+                            &task_config,
+                            &affinity_set,
+                            job_config_id,
+                            allocations_by_node,
+                            &planned,
+                            weights,
+                        );
+                        self.policy
+                            .select_node(ctx)
+                            .map(|node| node.id.clone())
+                            .with_context(|| {
+                                format!(
+                                    "Scheduling policy {} failed to place task {}",
+                                    self.policy.name(),
+                                    task_config.name
+                                )
+                            })?
+                    };
+
+                    *planned.entry(node_id.clone()).or_default() += 1;
+                    if let Some(tracker) = distinct_tracker.as_mut() {
+                        if let Some(node) = node_lookup.get(node_id.as_str()) {
+                            tracker.insert_from_node(node);
+                        }
+                    }
+                    resource_ledger.consume(&node_id, &task_request)?;
+                    placements.push(PlannedAllocation {
+                        node_id,
+                        task_config_id: task_id,
+                    });
+                }
             }
         }
 
@@ -440,7 +533,7 @@ impl<'a> Scheduler<'a> {
             .tasks
             .iter()
             .enumerate()
-            .map(|(index, config)| ((index + 1) as i64, config.clone(), config.count))
+            .map(|(index, config)| ((index + 1) as i64, config.clone(), config.count.num))
             .collect()
     }
 
@@ -662,6 +755,54 @@ impl<'a> Scheduler<'a> {
 
         deltas
     }
+}
+
+fn group_nodes_by_attr<'a>(nodes: &'a [&'a Node], key: &str) -> HashMap<String, Vec<&'a Node>> {
+    let mut grouped: HashMap<String, Vec<&'a Node>> = HashMap::new();
+    for node in nodes {
+        let Some(value) = node_attribute(node, key) else {
+            continue;
+        };
+        let token = value_token(value);
+        grouped.entry(token).or_default().push(*node);
+    }
+    grouped
+}
+
+fn count_allocations_in_group(
+    allocations_by_node: &HashMap<String, Vec<Allocation>>,
+    job_config_id: &str,
+    task_id: i64,
+    nodes: &[&Node],
+) -> u32 {
+    let mut count = 0;
+    for node in nodes {
+        if let Some(allocs) = allocations_by_node.get(&node.id) {
+            count += allocs
+                .iter()
+                .filter(|alloc| {
+                    alloc.job_config_id == job_config_id && alloc.task_config_id == task_id
+                })
+                .count() as u32;
+        }
+    }
+    count
+}
+
+fn node_attribute<'a>(node: &'a Node, key: &str) -> Option<&'a Value> {
+    node.config_attrs
+        .as_object()
+        .and_then(|attrs| attrs.get(key))
+        .or_else(|| {
+            node.fingerprint_attrs
+                .as_object()
+                .and_then(|attrs| attrs.get(key))
+        })
+        .or_else(|| {
+            node.dynamic_attrs
+                .as_object()
+                .and_then(|attrs| attrs.get(key))
+        })
 }
 
 impl ResourceRequest {
@@ -970,7 +1111,7 @@ mod tests {
 
     use super::*;
     use crate::structs::config::ManagerConfigFull;
-    use crate::structs::{JobConfig, NodeMsg, Submission};
+    use crate::structs::{JobConfig, NodeMsg, Submission, TaskCount};
 
     fn store_path() -> R<String> {
         let store_dir = Builder::new()
@@ -1087,7 +1228,7 @@ mod tests {
             name: "sched-job".into(),
             tasks: vec![
                 TaskConfig {
-                    count: 2,
+                    count: TaskCount::new(2),
                     ..TaskConfig::new("web", "noop")
                 },
                 TaskConfig {
@@ -1157,7 +1298,7 @@ mod tests {
         let job = JobConfig {
             name: "resched-job".into(),
             tasks: vec![TaskConfig {
-                count: 3,
+                count: TaskCount::new(3),
                 ..TaskConfig::new("batch", "noop")
             }],
             version: None,
@@ -1184,6 +1325,94 @@ mod tests {
             .filter(|alloc| alloc.node_id == "node-b")
             .count();
         assert_eq!(node_a_added + node_b_added, 2);
+
+        Ok(())
+    }
+
+    #[test]
+    fn count_per_attribute_places_allocations_per_group() -> R<()> {
+        let store = setup_store_with_scheduler("spread", None)?;
+        store.insert_node(make_node_msg("node-a", json!({ "region": "east" })))?;
+        store.insert_node(make_node_msg("node-b", json!({ "region": "east" })))?;
+        store.insert_node(make_node_msg("node-c", json!({ "region": "west" })))?;
+
+        let job = JobConfig {
+            name: "per-attr-job".into(),
+            tasks: vec![TaskConfig {
+                count: TaskCount::per(2, "region"),
+                ..TaskConfig::new("api", "noop")
+            }],
+            version: None,
+        };
+
+        store.handle_job_submit(&job, &[dummy_submission()])?;
+        let job_config_id = store.get_job_config(&job.name)?.id();
+        let scheduler = Scheduler::new(&store)?;
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+
+        assert_eq!(outcome.allocations.len(), 4);
+
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for alloc in &outcome.allocations {
+            let node = store.get_node(&alloc.node_id)?;
+            let region = node
+                .config_attrs
+                .get("region")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_string();
+            *counts.entry(region).or_default() += 1;
+        }
+
+        assert_eq!(counts.get("east"), Some(&2));
+        assert_eq!(counts.get("west"), Some(&2));
+
+        Ok(())
+    }
+
+    #[test]
+    fn count_per_attribute_reschedules_within_group() -> R<()> {
+        let store = setup_store_with_scheduler("spread", None)?;
+        store.insert_node(make_node_msg("node-a", json!({ "region": "east" })))?;
+        store.insert_node(make_node_msg("node-b", json!({ "region": "east" })))?;
+        store.insert_node(make_node_msg("node-c", json!({ "region": "west" })))?;
+
+        let job = JobConfig {
+            name: "per-attr-resched".into(),
+            tasks: vec![TaskConfig {
+                count: TaskCount::per(2, "region"),
+                ..TaskConfig::new("api", "noop")
+            }],
+            version: None,
+        };
+
+        store.handle_job_submit(&job, &[dummy_submission()])?;
+        let job_config_id = store.get_job_config(&job.name)?.id();
+        let task_id = task_id_for(&store, &job_config_id, "api")?;
+
+        for _ in 0..2 {
+            store.place_alloc("node-a", task_id)?;
+        }
+        for _ in 0..2 {
+            store.place_alloc("node-c", task_id)?;
+        }
+
+        store.mark_node_lost("node-a")?;
+        store.remove_allocs_for_node("node-a")?;
+
+        let scheduler = Scheduler::new(&store)?;
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Reschedule)?;
+
+        assert_eq!(outcome.allocations.len(), 2);
+        for alloc in &outcome.allocations {
+            let node = store.get_node(&alloc.node_id)?;
+            let region = node
+                .config_attrs
+                .get("region")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            assert_eq!(region, "east");
+        }
 
         Ok(())
     }
@@ -1292,7 +1521,7 @@ mod tests {
         let job = JobConfig {
             name: "constraint-sources".into(),
             tasks: vec![TaskConfig {
-                count: 2,
+                count: TaskCount::new(2),
                 constraints: json!({ "role": "db" }),
                 ..TaskConfig::new("db", "noop")
             }],
@@ -1323,7 +1552,7 @@ mod tests {
         let job = JobConfig {
             name: "distinct-job".into(),
             tasks: vec![TaskConfig {
-                count: 2,
+                count: TaskCount::new(2),
                 constraints: json!([{ "key": "zone", "operator": "distinct" }]),
                 ..TaskConfig::new("api", "noop")
             }],
@@ -1388,7 +1617,7 @@ mod tests {
         let job = JobConfig {
             name: "mem-limited".into(),
             tasks: vec![TaskConfig {
-                count: 3,
+                count: TaskCount::new(3),
                 resources: json!({ "memory": 256 }),
                 ..TaskConfig::new("worker", "noop")
             }],
@@ -1426,7 +1655,7 @@ mod tests {
         let job = JobConfig {
             name: "alloc-limit".into(),
             tasks: vec![TaskConfig {
-                count: 2,
+                count: TaskCount::new(2),
                 resources: json!({ "memory": 128 }),
                 ..TaskConfig::new("worker", "noop")
             }],

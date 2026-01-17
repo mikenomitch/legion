@@ -95,6 +95,7 @@ pub fn get_migrations() -> Migrations<'static> {
         M::up("ALTER TABLE task_config ADD COLUMN checks JSONB NOT NULL DEFAULT '[]';").down(""),
         M::up("ALTER TABLE task_config ADD COLUMN on_unhealthy JSONB NOT NULL DEFAULT '{}';")
             .down(""),
+        M::up("ALTER TABLE task_config ADD COLUMN count_per STRING;").down(""),
         M::up(
             "CREATE TABLE IF NOT EXISTS job_update (
             id STRING PRIMARY KEY,
