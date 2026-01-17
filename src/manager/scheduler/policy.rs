@@ -11,6 +11,7 @@ pub struct SchedulerWeights {
     pub affinity: f64,
     pub spread: f64,
     pub bin_pack: f64,
+    pub anti_affinity: f64,
 }
 
 impl SchedulerWeights {
@@ -20,16 +21,19 @@ impl SchedulerWeights {
                 affinity: 1.0,
                 spread: 1.0,
                 bin_pack: 0.0,
+                anti_affinity: DEF_SCHEDULER_ANTI_AFFINITY_BIAS,
             },
             "bin_pack" => SchedulerWeights {
                 affinity: 1.0,
                 spread: 0.0,
                 bin_pack: 1.0,
+                anti_affinity: DEF_SCHEDULER_ANTI_AFFINITY_BIAS,
             },
             _ => SchedulerWeights {
                 affinity: 1.0,
                 spread: 0.0,
                 bin_pack: 0.0,
+                anti_affinity: DEF_SCHEDULER_ANTI_AFFINITY_BIAS,
             },
         }
     }
@@ -40,10 +44,12 @@ impl SchedulerWeights {
 pub struct SchedulingContext<'a> {
     pub eligible_nodes: Vec<&'a Node>,
     pub task: &'a TaskConfig,
+    pub task_config_id: i64,
     pub affinity_set: &'a AffinitySet,
     pub job_config_id: &'a str,
     pub allocations: &'a HashMap<String, Vec<Allocation>>,
     pub planned: &'a HashMap<String, usize>,
+    pub planned_task: &'a HashMap<String, usize>,
     pub weights: SchedulerWeights,
 }
 
@@ -52,19 +58,23 @@ impl<'a> SchedulingContext<'a> {
     pub fn new(
         eligible_nodes: Vec<&'a Node>,
         task: &'a TaskConfig,
+        task_config_id: i64,
         affinity_set: &'a AffinitySet,
         job_config_id: &'a str,
         allocations: &'a HashMap<String, Vec<Allocation>>,
         planned: &'a HashMap<String, usize>,
+        planned_task: &'a HashMap<String, usize>,
         weights: SchedulerWeights,
     ) -> Self {
         SchedulingContext {
             eligible_nodes,
             task,
+            task_config_id,
             affinity_set,
             job_config_id,
             allocations,
             planned,
+            planned_task,
             weights,
         }
     }
@@ -174,10 +184,12 @@ fn score_node(
     };
 
     let affinity_score = affinity_score(ctx.task, ctx.affinity_set, node);
+    let anti_affinity_score = anti_affinity_score(ctx, node);
 
     ctx.weights.affinity * affinity_score
         + ctx.weights.spread * spread_score
         + ctx.weights.bin_pack * bin_pack_score
+        + ctx.weights.anti_affinity * anti_affinity_score
 }
 
 fn max_load_delta(range: f64, load: f64, min_load: f64) -> f64 {
@@ -187,6 +199,30 @@ fn max_load_delta(range: f64, load: f64, min_load: f64) -> f64 {
 
 fn affinity_score(_task: &TaskConfig, affinity_set: &AffinitySet, node: &Node) -> f64 {
     affinity_set.score(node)
+}
+
+fn anti_affinity_score(ctx: &SchedulingContext<'_>, node: &Node) -> f64 {
+    let existing = ctx
+        .allocations
+        .get(node.id.as_str())
+        .map(|allocs| {
+            allocs
+                .iter()
+                .filter(|alloc| {
+                    alloc.job_config_id == ctx.job_config_id
+                        && alloc.task_config_id == ctx.task_config_id
+                })
+                .count()
+        })
+        .unwrap_or(0);
+    let planned = ctx.planned_task.get(node.id.as_str()).copied().unwrap_or(0);
+    let total = existing + planned;
+
+    if total == 0 {
+        0.0
+    } else {
+        -(total as f64)
+    }
 }
 
 #[instrument(err, skip_all)]
@@ -269,16 +305,19 @@ mod tests {
             vec![alloc("node-a", 1, "other-job")],
         )]);
         let planned = HashMap::from([(String::from("node-b"), 2_usize)]);
+        let planned_task: HashMap<String, usize> = HashMap::new();
 
         let task = task("web");
         let affinity_set = AffinitySet::new(&task.affinities).expect("affinities");
         let ctx = SchedulingContext::new(
             nodes.iter().collect(),
             &task,
+            1,
             &affinity_set,
             "job",
             &allocations,
             &planned,
+            &planned_task,
             SchedulerWeights::for_policy("bin_pack"),
         );
         let policy = BinPackPolicy::default();
@@ -295,16 +334,19 @@ mod tests {
             (String::from("node-a"), 1_usize),
             (String::from("node-b"), 1_usize),
         ]);
+        let planned_task: HashMap<String, usize> = HashMap::new();
 
         let task = task("web");
         let affinity_set = AffinitySet::new(&task.affinities).expect("affinities");
         let ctx = SchedulingContext::new(
             nodes.iter().collect(),
             &task,
+            1,
             &affinity_set,
             "job",
             &allocations,
             &planned,
+            &planned_task,
             SchedulerWeights::for_policy("bin_pack"),
         );
         let policy = BinPackPolicy::default();
@@ -330,16 +372,19 @@ mod tests {
             ),
         ]);
         let planned = HashMap::from([(String::from("node-b"), 2_usize)]);
+        let planned_task: HashMap<String, usize> = HashMap::new();
 
         let task = task("worker");
         let affinity_set = AffinitySet::new(&task.affinities).expect("affinities");
         let ctx = SchedulingContext::new(
             nodes.iter().collect(),
             &task,
+            1,
             &affinity_set,
             "job",
             &allocations,
             &planned,
+            &planned_task,
             SchedulerWeights::for_policy("bin_pack"),
         );
         let policy = BinPackPolicy::default();
@@ -353,16 +398,19 @@ mod tests {
         let nodes: Vec<Node> = vec![];
         let allocations: HashMap<String, Vec<Allocation>> = HashMap::new();
         let planned: HashMap<String, usize> = HashMap::new();
+        let planned_task: HashMap<String, usize> = HashMap::new();
 
         let task = task("web");
         let affinity_set = AffinitySet::new(&task.affinities).expect("affinities");
         let ctx = SchedulingContext::new(
             nodes.iter().collect(),
             &task,
+            1,
             &affinity_set,
             "job",
             &allocations,
             &planned,
+            &planned_task,
             SchedulerWeights::for_policy("bin_pack"),
         );
         let policy = BinPackPolicy::default();
@@ -379,16 +427,19 @@ mod tests {
             vec![alloc("node-a", 1, "other-job")],
         )]);
         let planned = HashMap::from([(String::from("node-b"), 1_usize)]);
+        let planned_task: HashMap<String, usize> = HashMap::new();
 
         let task = task("api");
         let affinity_set = AffinitySet::new(&task.affinities).expect("affinities");
         let ctx = SchedulingContext::new(
             nodes.iter().collect(),
             &task,
+            1,
             &affinity_set,
             "job",
             &allocations,
             &planned,
+            &planned_task,
             SchedulerWeights::for_policy("spread"),
         );
         let policy = SpreadPolicy::default();
@@ -405,16 +456,19 @@ mod tests {
             (String::from("node-a"), 1_usize),
             (String::from("node-b"), 1_usize),
         ]);
+        let planned_task: HashMap<String, usize> = HashMap::new();
 
         let task = task("api");
         let affinity_set = AffinitySet::new(&task.affinities).expect("affinities");
         let ctx = SchedulingContext::new(
             nodes.iter().collect(),
             &task,
+            1,
             &affinity_set,
             "job",
             &allocations,
             &planned,
+            &planned_task,
             SchedulerWeights::for_policy("spread"),
         );
         let policy = SpreadPolicy::default();
@@ -428,16 +482,19 @@ mod tests {
         let nodes: Vec<Node> = vec![];
         let allocations: HashMap<String, Vec<Allocation>> = HashMap::new();
         let planned: HashMap<String, usize> = HashMap::new();
+        let planned_task: HashMap<String, usize> = HashMap::new();
 
         let task = task("api");
         let affinity_set = AffinitySet::new(&task.affinities).expect("affinities");
         let ctx = SchedulingContext::new(
             nodes.iter().collect(),
             &task,
+            1,
             &affinity_set,
             "job",
             &allocations,
             &planned,
+            &planned_task,
             SchedulerWeights::for_policy("spread"),
         );
         let policy = SpreadPolicy::default();

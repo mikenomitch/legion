@@ -1,11 +1,12 @@
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::prelude::{
     DEF_EVAL_PRIORITY, DEF_MANAGER_HOSTNAME, DEF_MANAGER_INSECURE_PORT, DEF_MANAGER_SERVER_PORT,
-    DEF_SCHEDULING_POLICY, DEF_STORE_PATH, DEF_WORKER_CHECK_SEC, DEF_WORKER_CONFIG_PATH,
+    DEF_SCHEDULER_ANTI_AFFINITY_BIAS, DEF_SCHEDULING_POLICY, DEF_STORE_PATH,
+    DEF_WORKER_CHECK_SEC, DEF_WORKER_CONFIG_PATH,
 };
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -128,7 +129,10 @@ impl ManagerConfig {
                 .clone()
                 .unwrap_or_else(|| DEF_SCHEDULING_POLICY.into()),
             default_priority: self.default_priority.unwrap_or(DEF_EVAL_PRIORITY),
-            scheduler_settings: self.scheduler_settings.clone(),
+            scheduler_settings: self
+                .scheduler_settings
+                .clone()
+                .or_else(default_scheduler_settings),
             task_resource_defaults: self.task_resource_defaults.clone(),
             custom_resources: self.custom_resources.clone(),
         }
@@ -144,12 +148,18 @@ impl Default for ManagerConfigFull {
             worker_check_seconds: DEF_WORKER_CHECK_SEC,
             scheduling_policy: DEF_SCHEDULING_POLICY.into(),
             default_priority: DEF_EVAL_PRIORITY,
-            scheduler_settings: None,
+            scheduler_settings: default_scheduler_settings(),
             task_resource_defaults: None,
             custom_resources: None,
             eval_threads: default_eval_threads(),
         }
     }
+}
+
+fn default_scheduler_settings() -> Option<Value> {
+    Some(json!({
+        "anti_affinity": DEF_SCHEDULER_ANTI_AFFINITY_BIAS
+    }))
 }
 
 fn default_eval_threads() -> usize {

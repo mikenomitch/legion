@@ -477,6 +477,7 @@ impl<'a> Scheduler<'a> {
         placements: &mut Vec<PlannedAllocation>,
         weights: SchedulerWeights,
     ) -> R<()> {
+        let mut planned_task: HashMap<String, usize> = HashMap::new();
         for _ in 0..count {
             let eligible = Self::eligible_nodes(
                 candidates,
@@ -497,15 +498,18 @@ impl<'a> Scheduler<'a> {
                 eligible,
                 reschedule_rng,
                 nodes_considered_setting,
+                task_id,
                 task_config,
                 &plan.affinity_set,
                 job_config_id,
                 allocations_by_node,
                 planned,
+                &planned_task,
                 weights,
             )?;
 
             *planned.entry(node_id.clone()).or_default() += 1;
+            *planned_task.entry(node_id.clone()).or_default() += 1;
             if let Some(tracker) = plan.distinct_tracker.as_mut() {
                 if let Some(node) = node_lookup.get(node_id.as_str()) {
                     tracker.insert_from_node(node);
@@ -526,11 +530,13 @@ impl<'a> Scheduler<'a> {
         eligible: Vec<&'b Node>,
         reschedule_rng: &mut Option<StdRng>,
         nodes_considered_setting: Option<&NodesConsidered>,
+        task_id: i64,
         task_config: &TaskConfig,
         affinity_set: &AffinitySet,
         job_config_id: &str,
         allocations_by_node: &HashMap<String, Vec<Allocation>>,
         planned: &HashMap<String, usize>,
+        planned_task: &HashMap<String, usize>,
         weights: SchedulerWeights,
     ) -> R<String> {
         if let Some(rng) = reschedule_rng.as_mut() {
@@ -544,10 +550,12 @@ impl<'a> Scheduler<'a> {
             let ctx = SchedulingContext::new(
                 eligible,
                 task_config,
+                task_id,
                 affinity_set,
                 job_config_id,
                 allocations_by_node,
                 planned,
+                planned_task,
                 weights,
             );
             self.policy
@@ -630,6 +638,15 @@ impl<'a> Scheduler<'a> {
         };
 
         let Some(weight_values) = settings.get("weights") else {
+            if let Some(value) = settings.get("anti_affinity") {
+                let weight = value.as_f64().context(
+                    "scheduler_settings anti_affinity must be a non-negative number",
+                )?;
+                if weight < 0.0 {
+                    bail!("scheduler_settings anti_affinity cannot be negative");
+                }
+                weights.anti_affinity = weight;
+            }
             return Ok(weights);
         };
 
@@ -651,8 +668,19 @@ impl<'a> Scheduler<'a> {
                 "affinities" => weights.affinity = weight,
                 "spread" => weights.spread = weight,
                 "bin_pack" => weights.bin_pack = weight,
+                "anti_affinity" => weights.anti_affinity = weight,
                 _ => {}
             }
+        }
+
+        if let Some(value) = settings.get("anti_affinity") {
+            let weight = value
+                .as_f64()
+                .context("scheduler_settings anti_affinity must be a non-negative number")?;
+            if weight < 0.0 {
+                bail!("scheduler_settings anti_affinity cannot be negative");
+            }
+            weights.anti_affinity = weight;
         }
 
         Ok(weights)
@@ -1322,8 +1350,8 @@ mod tests {
             .iter()
             .filter(|alloc| alloc.task_config_id == web_id && alloc.node_id == "node-b")
             .count();
-        assert_eq!(web_on_node_a, 2);
-        assert_eq!(web_on_node_b, 0);
+        assert_eq!(web_on_node_a, 1);
+        assert_eq!(web_on_node_b, 1);
 
         let db_on_node_b = outcome
             .allocations
@@ -1338,7 +1366,7 @@ mod tests {
             .iter()
             .find(|delta| delta.node_id == "node-a")
             .expect("node-a delta missing");
-        assert_eq!(node_a_delta.added.len(), 2);
+        assert_eq!(node_a_delta.added.len(), 1);
         assert!(node_a_delta.removed.is_empty());
 
         let node_b_delta = outcome
@@ -1346,7 +1374,7 @@ mod tests {
             .iter()
             .find(|delta| delta.node_id == "node-b")
             .expect("node-b delta missing");
-        assert_eq!(node_b_delta.added.len(), 1);
+        assert_eq!(node_b_delta.added.len(), 2);
         assert!(node_b_delta.removed.is_empty());
 
         Ok(())
@@ -1846,7 +1874,7 @@ mod tests {
         let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
 
         assert_eq!(outcome.allocations.len(), 1);
-        assert_eq!(outcome.allocations[0].node_id, "node-b");
+        assert_eq!(outcome.allocations[0].node_id, "node-a");
 
         Ok(())
     }
@@ -1895,6 +1923,49 @@ mod tests {
 
         assert_eq!(outcome.allocations.len(), 1);
         assert_eq!(outcome.allocations[0].node_id, "node-a");
+
+        Ok(())
+    }
+
+    #[test]
+    fn anti_affinity_bias_spreads_same_task_allocations() -> R<()> {
+        let store = setup_store_with_scheduler(
+            "bin_pack",
+            Some(json!({
+                "anti_affinity": 2.0
+            })),
+        )?;
+        store.insert_node(make_node_msg("node-a", json!({})))?;
+        store.insert_node(make_node_msg("node-b", json!({})))?;
+
+        let job = JobConfig {
+            name: "anti-affinity-job".into(),
+            tasks: vec![TaskConfig {
+                count: TaskCount::new(2),
+                ..TaskConfig::new("api", "noop")
+            }],
+            version: None,
+        };
+
+        store.handle_job_submit(&job, &[dummy_submission()])?;
+        let job_config_id = store.get_job_config(&job.name)?.id();
+
+        let scheduler = Scheduler::new(&store)?;
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+
+        assert_eq!(outcome.allocations.len(), 2);
+        let node_a_count = outcome
+            .allocations
+            .iter()
+            .filter(|alloc| alloc.node_id == "node-a")
+            .count();
+        let node_b_count = outcome
+            .allocations
+            .iter()
+            .filter(|alloc| alloc.node_id == "node-b")
+            .count();
+        assert_eq!(node_a_count, 1);
+        assert_eq!(node_b_count, 1);
 
         Ok(())
     }
