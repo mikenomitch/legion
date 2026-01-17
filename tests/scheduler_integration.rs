@@ -310,6 +310,26 @@ impl TestCluster {
         Ok(())
     }
 
+    fn assert_job_nodes_in(&self, job_id: &str, allowed_nodes: &[&str], expected_count: usize) -> R<()> {
+        let actual = self.job_nodes(job_id)?;
+        assert_eq!(
+            actual.len(),
+            expected_count,
+            "job {job_id} allocation count mismatch in ledger json"
+        );
+        let allowed = allowed_nodes
+            .iter()
+            .map(|node| node.to_string())
+            .collect::<HashSet<_>>();
+        for node in actual {
+            assert!(
+                allowed.contains(&node),
+                "job {job_id} allocations mismatch in ledger json"
+            );
+        }
+        Ok(())
+    }
+
     fn assert_job_node_set(&self, job_id: &str, expected_nodes: &[&str]) -> R<()> {
         let actual = self.job_node_set(job_id)?;
         let expected = expected_nodes
@@ -763,7 +783,7 @@ fn run_scheduler_scenario(policy: &str, node_count: usize) -> R<TestCluster> {
     cluster.assert_job_nodes("job-delta", &["node-8"])?;
 
     cluster.submit_job(job_echo())?;
-    cluster.assert_job_nodes("job-echo", &["node-7"])?;
+    cluster.assert_job_nodes_in("job-echo", &["node-7", "node-8"], 1)?;
 
     cluster.drop_node("node-7", &["job-echo"])?;
     cluster.assert_job_nodes("job-echo", &["node-8"])?;
@@ -782,7 +802,7 @@ fn run_scheduler_scenario(policy: &str, node_count: usize) -> R<TestCluster> {
     cluster.assert_job_absent("job-charlie")?;
 
     cluster.submit_job(job_golf())?;
-    cluster.assert_job_node_set("job-golf", &["node-8", "node-9", "node-10"])?;
+    cluster.assert_job_nodes_in("job-golf", &["node-7", "node-8", "node-9", "node-10"], 3)?;
 
     let hotel_eval = cluster.submit_job_expect_failure(job_hotel())?;
     assert_eq!(cluster.eval_status(&hotel_eval)?, "failed");

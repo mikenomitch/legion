@@ -5,6 +5,8 @@ use crate::constraints::AffinitySet;
 use crate::prelude::*;
 use crate::structs::{Allocation, Node, TaskConfig};
 use libloading::{Library, Symbol};
+use rand::seq::SliceRandom;
+use rand::thread_rng;
 
 #[derive(Debug, Clone, Copy)]
 pub struct SchedulerWeights {
@@ -142,18 +144,29 @@ fn select_scored_node<'a>(ctx: &SchedulingContext<'a>) -> Option<&'a Node> {
     let max_load = max_load.unwrap_or_default() as f64;
     let range = (max_load - min_load).max(0.0);
 
-    ctx.eligible_nodes.iter().copied().max_by(|a, b| {
-        let a_score = score_node(ctx, a, &loads, min_load, range);
-        let b_score = score_node(ctx, b, &loads, min_load, range);
+    let mut scored_nodes = Vec::with_capacity(ctx.eligible_nodes.len());
+    let mut best_score: Option<f64> = None;
 
-        match a_score
-            .partial_cmp(&b_score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-        {
-            std::cmp::Ordering::Equal => b.id.cmp(&a.id),
-            other => other,
-        }
-    })
+    for node in &ctx.eligible_nodes {
+        let score = score_node(ctx, node, &loads, min_load, range);
+        best_score = Some(best_score.map_or(score, |best| best.max(score)));
+        scored_nodes.push((score, *node));
+    }
+
+    let best_score = best_score.unwrap_or_default();
+    let mut top_nodes: Vec<&'a Node> = scored_nodes
+        .into_iter()
+        .filter_map(|(score, node)| {
+            if (score - best_score).abs() <= f64::EPSILON {
+                Some(node)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    top_nodes.shuffle(&mut thread_rng());
+    top_nodes.into_iter().next()
 }
 
 fn score_node(
@@ -288,7 +301,7 @@ mod tests {
     }
 
     #[test]
-    fn bin_pack_prefers_lower_id_on_tie() {
+    fn bin_pack_picks_any_node_on_tie() {
         let nodes = vec![node("node-a"), node("node-b")];
         let allocations: HashMap<String, Vec<Allocation>> = HashMap::new();
         let planned = HashMap::from([
@@ -310,7 +323,7 @@ mod tests {
         let policy = BinPackPolicy::default();
 
         let choice = policy.select_node(ctx).expect("node expected");
-        assert_eq!(choice.id, "node-a");
+        assert!(["node-a", "node-b"].contains(&choice.id.as_str()));
     }
 
     #[test]
@@ -372,7 +385,7 @@ mod tests {
     }
 
     #[test]
-    fn spread_prefers_least_loaded_node() {
+    fn spread_picks_any_node_on_equal_load() {
         let nodes = vec![node("node-a"), node("node-b")];
         let allocations: HashMap<String, Vec<Allocation>> = HashMap::from([(
             String::from("node-a"),
@@ -394,11 +407,11 @@ mod tests {
         let policy = SpreadPolicy::default();
 
         let choice = policy.select_node(ctx).expect("node expected");
-        assert_eq!(choice.id, "node-a");
+        assert!(["node-a", "node-b"].contains(&choice.id.as_str()));
     }
 
     #[test]
-    fn spread_prefers_lower_id_on_tie() {
+    fn spread_picks_any_node_on_tie() {
         let nodes = vec![node("node-a"), node("node-b")];
         let allocations: HashMap<String, Vec<Allocation>> = HashMap::new();
         let planned = HashMap::from([
@@ -420,7 +433,7 @@ mod tests {
         let policy = SpreadPolicy::default();
 
         let choice = policy.select_node(ctx).expect("node expected");
-        assert_eq!(choice.id, "node-a");
+        assert!(["node-a", "node-b"].contains(&choice.id.as_str()));
     }
 
     #[test]

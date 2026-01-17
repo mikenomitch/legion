@@ -1556,7 +1556,13 @@ mod tests {
             .into_iter()
             .next()
             .context("missing initial allocation")?;
-        assert_eq!(initial_alloc.node_id, "node-a");
+        assert!(["node-a", "node-b"].contains(&initial_alloc.node_id.as_str()));
+        let target_node_id = initial_alloc.node_id.clone();
+        let expected_node_id = if target_node_id == "node-a" {
+            "node-b"
+        } else {
+            "node-a"
+        };
 
         let mut diff: Map<String, Value> = Map::new();
         diff.insert("tier".into(), json!("core"));
@@ -1565,7 +1571,7 @@ mod tests {
         let update_result = runtime.block_on(async {
             manager
                 .update_node_dynamic(Request::new(UpdateNodeDynamicRequest {
-                    id: "node-a".into(),
+                    id: target_node_id.clone(),
                     dynamic_diff: diff_json,
                 }))
                 .await
@@ -1581,7 +1587,7 @@ mod tests {
 
         let updated_allocs = store.allocs_for_job(&job_name)?;
         assert_eq!(updated_allocs.len(), 1);
-        assert_eq!(updated_allocs[0].node_id, "node-b");
+        assert_eq!(updated_allocs[0].node_id, expected_node_id);
 
         Ok(())
     }
