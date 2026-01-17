@@ -609,6 +609,13 @@ impl<'a> Scheduler<'a> {
         };
 
         let limit = Self::nodes_considered_limit(setting, eligible.len())?;
+        let mut eligible = eligible;
+        if limit < eligible.len() {
+            let mut rng = StdRng::from_rng(rand::thread_rng())
+                .context("Failed to seed nodes_considered RNG")?;
+            eligible.shuffle(&mut rng);
+        }
+
         Ok(eligible.into_iter().take(limit).collect())
     }
 
@@ -1778,67 +1785,113 @@ mod tests {
 
     #[test]
     fn spread_limits_nodes_considered_by_count() -> R<()> {
-        let store = setup_store_with_scheduler("spread", Some(json!({ "nodes_considered": 2 })))?;
-        store.insert_node(make_node_msg("node-a", json!({})))?;
-        store.insert_node(make_node_msg("node-b", json!({})))?;
-        store.insert_node(make_node_msg("node-c", json!({})))?;
+        let mut selected = HashSet::new();
+        for _ in 0..20 {
+            let store =
+                setup_store_with_scheduler("spread", Some(json!({ "nodes_considered": 2 })))?;
+            store.insert_node(make_node_msg("node-a", json!({})))?;
+            store.insert_node(make_node_msg("node-b", json!({})))?;
+            store.insert_node(make_node_msg("node-c", json!({})))?;
 
-        let job = JobConfig {
-            name: "spread-considered".into(),
-            tasks: vec![TaskConfig::new("api", "noop")],
-            version: None,
-        };
+            let job = JobConfig {
+                name: "spread-considered".into(),
+                tasks: vec![TaskConfig::new("api", "noop")],
+                version: None,
+            };
 
-        store.handle_job_submit(&job, &[dummy_submission()])?;
-        let job_config_id = store.get_job_config(&job.name)?.id();
-        let task_id = task_id_for(&store, &job_config_id, "api")?;
+            store.handle_job_submit(&job, &[dummy_submission()])?;
+            let job_config_id = store.get_job_config(&job.name)?.id();
+            let task_id = task_id_for(&store, &job_config_id, "api")?;
 
-        for _ in 0..3 {
-            store.place_alloc("node-a", task_id)?;
+            for _ in 0..3 {
+                store.place_alloc("node-a", task_id)?;
+            }
+            for _ in 0..2 {
+                store.place_alloc("node-b", task_id)?;
+            }
+
+            let scheduler = Scheduler::new(&store)?;
+            let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+
+            assert_eq!(outcome.allocations.len(), 1);
+            selected.insert(outcome.allocations[0].node_id.clone());
         }
-        for _ in 0..2 {
-            store.place_alloc("node-b", task_id)?;
-        }
 
-        let scheduler = Scheduler::new(&store)?;
-        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
-
-        assert_eq!(outcome.allocations.len(), 1);
-        assert_eq!(outcome.allocations[0].node_id, "node-b");
+        assert!(selected.contains("node-b"));
+        assert!(selected.contains("node-c"));
 
         Ok(())
     }
 
     #[test]
     fn bin_pack_limits_nodes_considered_by_percentage() -> R<()> {
-        let store =
-            setup_store_with_scheduler("bin_pack", Some(json!({ "nodes_considered": "50%" })))?;
+        let mut selected = HashSet::new();
+        for _ in 0..20 {
+            let store =
+                setup_store_with_scheduler("bin_pack", Some(json!({ "nodes_considered": "50%" })))?;
+            store.insert_node(make_node_msg("node-a", json!({})))?;
+            store.insert_node(make_node_msg("node-b", json!({})))?;
+            store.insert_node(make_node_msg("node-c", json!({})))?;
+
+            let job = JobConfig {
+                name: "binpack-considered".into(),
+                tasks: vec![TaskConfig::new("worker", "noop")],
+                version: None,
+            };
+
+            store.handle_job_submit(&job, &[dummy_submission()])?;
+            let job_config_id = store.get_job_config(&job.name)?.id();
+            let task_id = task_id_for(&store, &job_config_id, "worker")?;
+
+            for _ in 0..2 {
+                store.place_alloc("node-b", task_id)?;
+            }
+            for _ in 0..5 {
+                store.place_alloc("node-c", task_id)?;
+            }
+
+            let scheduler = Scheduler::new(&store)?;
+            let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+
+            assert_eq!(outcome.allocations.len(), 1);
+            selected.insert(outcome.allocations[0].node_id.clone());
+        }
+
+        assert!(selected.contains("node-b"));
+        assert!(selected.contains("node-c"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn nodes_considered_randomizes_subset_across_runs() -> R<()> {
+        let store = setup_store_with_scheduler("spread", Some(json!({ "nodes_considered": 2 })))?;
         store.insert_node(make_node_msg("node-a", json!({})))?;
         store.insert_node(make_node_msg("node-b", json!({})))?;
         store.insert_node(make_node_msg("node-c", json!({})))?;
-
-        let job = JobConfig {
-            name: "binpack-considered".into(),
-            tasks: vec![TaskConfig::new("worker", "noop")],
-            version: None,
-        };
-
-        store.handle_job_submit(&job, &[dummy_submission()])?;
-        let job_config_id = store.get_job_config(&job.name)?.id();
-        let task_id = task_id_for(&store, &job_config_id, "worker")?;
-
-        for _ in 0..2 {
-            store.place_alloc("node-b", task_id)?;
-        }
-        for _ in 0..5 {
-            store.place_alloc("node-c", task_id)?;
-        }
+        store.insert_node(make_node_msg("node-d", json!({})))?;
 
         let scheduler = Scheduler::new(&store)?;
-        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+        let nodes = scheduler.available_nodes()?;
+        let eligible = nodes.iter().collect::<Vec<_>>();
+        let setting = NodesConsidered::Count(2);
 
-        assert_eq!(outcome.allocations.len(), 1);
-        assert_eq!(outcome.allocations[0].node_id, "node-b");
+        let mut subsets = HashSet::new();
+        for _ in 0..20 {
+            let subset =
+                scheduler.apply_nodes_considered_with_setting(eligible.clone(), Some(&setting))?;
+            let mut ids = subset
+                .iter()
+                .map(|node| node.id.clone())
+                .collect::<Vec<_>>();
+            ids.sort();
+            subsets.insert(ids);
+        }
+
+        assert!(
+            subsets.len() > 1,
+            "expected nodes_considered to vary eligible subset"
+        );
 
         Ok(())
     }
