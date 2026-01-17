@@ -1480,6 +1480,51 @@ mod tests {
     }
 
     #[test]
+    fn count_per_attribute_respects_constraints() -> R<()> {
+        let store = setup_store_with_scheduler("spread", None)?;
+        store.insert_node(make_node_msg(
+            "node-a",
+            json!({ "region": "east", "role": "db" }),
+        ))?;
+        store.insert_node(make_node_msg(
+            "node-b",
+            json!({ "region": "east", "role": "web" }),
+        ))?;
+        store.insert_node(make_node_msg(
+            "node-c",
+            json!({ "region": "west", "role": "db" }),
+        ))?;
+
+        let job = JobConfig {
+            name: "per-attr-constraints".into(),
+            tasks: vec![TaskConfig {
+                count: TaskCount::per(1, "region"),
+                constraints: json!({ "role": "db" }),
+                ..TaskConfig::new("db", "noop")
+            }],
+            version: None,
+        };
+
+        store.handle_job_submit(&job, &[dummy_submission()])?;
+        let job_config_id = store.get_job_config(&job.name)?.id();
+        let scheduler = Scheduler::new(&store)?;
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+
+        assert_eq!(outcome.allocations.len(), 2);
+        for alloc in &outcome.allocations {
+            let node = store.get_node(&alloc.node_id)?;
+            let role = node
+                .config_attrs
+                .get("role")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            assert_eq!(role, "db");
+        }
+
+        Ok(())
+    }
+
+    #[test]
     fn reschedule_excludes_failed_node() -> R<()> {
         let store = setup_store()?;
         insert_test_nodes(&store)?;
