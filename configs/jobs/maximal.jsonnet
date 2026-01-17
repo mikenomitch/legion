@@ -66,7 +66,10 @@
         },
         {
             name: "batch",
-            count: 1,
+            count: {
+                num: 3,
+                per: "region",
+            },
             kind: "noop",
             config: {
                 script: "echo work",

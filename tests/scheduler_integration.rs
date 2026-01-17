@@ -3,7 +3,8 @@ use std::collections::{HashMap, HashSet};
 use legion::prelude::{json, Context, R};
 use legion::storage::store::Store;
 use legion::structs::{
-    config::ManagerConfigFull, job::JobConfig, job::TaskConfig, Eval, Node, NodeMsg, Submission,
+    config::ManagerConfigFull, job::JobConfig, job::TaskConfig, job::TaskCount, Eval, Node,
+    NodeMsg, Submission,
 };
 use serde::Serialize;
 use serde_json::{Map, Value};
@@ -144,6 +145,13 @@ impl TestCluster {
         Ok(())
     }
 
+    fn join_node(&mut self, node_id: &str) -> R<()> {
+        self.enqueue_eval("node_join", None, None, Some(node_id))?;
+        self.process_next_eval()?
+            .context("expected node_join eval")?;
+        Ok(())
+    }
+
     fn add_dynamic_attr(&self, node_id: &str, key: &str, value: Value) -> R<()> {
         let mut diff = Map::new();
         diff.insert(key.to_string(), value);
@@ -266,6 +274,27 @@ impl TestCluster {
         Ok(self.job_nodes(job_id)?.into_iter().collect())
     }
 
+    fn job_allocations_by_attr(&self, job_id: &str, attr: &str) -> R<HashMap<String, usize>> {
+        let ledger = self.store.get_ledger()?;
+        let mut counts = HashMap::new();
+        for entry in ledger {
+            let Some(value) = node_attribute(&entry.node, attr) else {
+                continue;
+            };
+            let alloc_count = entry
+                .allocations
+                .iter()
+                .filter(|alloc| alloc.job_id == job_id)
+                .count();
+            if alloc_count == 0 {
+                continue;
+            }
+            let key = value_key(value);
+            *counts.entry(key).or_default() += alloc_count;
+        }
+        Ok(counts)
+    }
+
     fn assert_job_nodes(&self, job_id: &str, expected_nodes: &[&str]) -> R<()> {
         let mut actual = self.job_nodes(job_id)?;
         actual.sort();
@@ -324,6 +353,29 @@ impl TestCluster {
         }
         Ok(())
     }
+}
+
+fn node_attribute<'a>(node: &'a Node, key: &str) -> Option<&'a Value> {
+    node.config_attrs
+        .as_object()
+        .and_then(|attrs| attrs.get(key))
+        .or_else(|| {
+            node.fingerprint_attrs
+                .as_object()
+                .and_then(|attrs| attrs.get(key))
+        })
+        .or_else(|| {
+            node.dynamic_attrs
+                .as_object()
+                .and_then(|attrs| attrs.get(key))
+        })
+}
+
+fn value_key(value: &Value) -> String {
+    value
+        .as_str()
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| serde_json::to_string(value).unwrap_or_default())
 }
 
 fn base_node_specs() -> Vec<NodeSpec> {
@@ -509,7 +561,7 @@ fn task_config(
     affinities: Value,
 ) -> TaskConfig {
     TaskConfig {
-        count,
+        count: TaskCount::new(count),
         config: json!({ "message": "hi" }),
         resources,
         constraints,
@@ -651,7 +703,7 @@ fn job_resubmit_config(message: &str, count: u32, node_id: &str) -> JobConfig {
     JobConfig {
         name: "job-resubmit".into(),
         tasks: vec![TaskConfig {
-            count,
+            count: TaskCount::new(count),
             config: json!({ "message": message }),
             resources: json!({ "memory": 128, "cpu": 100 }),
             constraints: json!({ "node_id": node_id }),
@@ -829,5 +881,142 @@ fn scheduler_scoring_weight_override() -> R<()> {
     });
     let cluster = run_scoring_scenario("spread", Some(settings))?;
     cluster.assert_job_nodes("job-score-target", &["score-node-1"])?;
+    Ok(())
+}
+
+#[test]
+fn scheduler_count_per_attribute_reschedules_by_group() -> R<()> {
+    let mut cluster = TestCluster::new("spread")?;
+    let nodes = vec![
+        NodeSpec {
+            id: "node-east-1".into(),
+            zone: "east".into(),
+            rack: "rack-a".into(),
+            tier: "gold".into(),
+            memory_mib: 4096.0,
+            cpu_mhz: 2400.0,
+            resources: json!({ "disk": 50 }),
+        },
+        NodeSpec {
+            id: "node-east-2".into(),
+            zone: "east".into(),
+            rack: "rack-b".into(),
+            tier: "gold".into(),
+            memory_mib: 4096.0,
+            cpu_mhz: 2400.0,
+            resources: json!({ "disk": 50 }),
+        },
+        NodeSpec {
+            id: "node-west-1".into(),
+            zone: "west".into(),
+            rack: "rack-c".into(),
+            tier: "silver".into(),
+            memory_mib: 4096.0,
+            cpu_mhz: 2400.0,
+            resources: json!({ "disk": 50 }),
+        },
+        NodeSpec {
+            id: "node-west-2".into(),
+            zone: "west".into(),
+            rack: "rack-d".into(),
+            tier: "silver".into(),
+            memory_mib: 4096.0,
+            cpu_mhz: 2400.0,
+            resources: json!({ "disk": 50 }),
+        },
+    ];
+    cluster.add_nodes(&nodes)?;
+    for node in &nodes {
+        cluster.add_dynamic_attr(&node.id, "region", json!(node.zone))?;
+    }
+
+    let job = JobConfig {
+        name: "job-per-region".into(),
+        tasks: vec![TaskConfig {
+            count: TaskCount::per(3, "region"),
+            ..TaskConfig::new("region-task", "service")
+        }],
+        version: None,
+    };
+
+    cluster.submit_job(job)?;
+    let initial_nodes = cluster.job_nodes("job-per-region")?;
+    assert_eq!(initial_nodes.len(), 6);
+
+    let counts = cluster.job_allocations_by_attr("job-per-region", "region")?;
+    assert_eq!(counts.get("east"), Some(&3));
+    assert_eq!(counts.get("west"), Some(&3));
+
+    cluster.drop_node("node-east-1", &["job-per-region"])?;
+    let rescheduled_nodes = cluster.job_nodes("job-per-region")?;
+    assert_eq!(rescheduled_nodes.len(), 6);
+    assert!(!rescheduled_nodes.contains(&"node-east-1".to_string()));
+
+    let rescheduled_counts = cluster.job_allocations_by_attr("job-per-region", "region")?;
+    assert_eq!(rescheduled_counts.get("east"), Some(&3));
+    assert_eq!(rescheduled_counts.get("west"), Some(&3));
+
+    Ok(())
+}
+
+#[test]
+fn scheduler_count_per_id_scales_with_node_changes() -> R<()> {
+    let mut cluster = TestCluster::new("spread")?;
+    let nodes = vec![
+        NodeSpec {
+            id: "node-1".into(),
+            zone: "east".into(),
+            rack: "rack-a".into(),
+            tier: "gold".into(),
+            memory_mib: 4096.0,
+            cpu_mhz: 2400.0,
+            resources: json!({ "disk": 50 }),
+        },
+        NodeSpec {
+            id: "node-2".into(),
+            zone: "east".into(),
+            rack: "rack-b".into(),
+            tier: "gold".into(),
+            memory_mib: 4096.0,
+            cpu_mhz: 2400.0,
+            resources: json!({ "disk": 50 }),
+        },
+        NodeSpec {
+            id: "node-3".into(),
+            zone: "west".into(),
+            rack: "rack-c".into(),
+            tier: "silver".into(),
+            memory_mib: 4096.0,
+            cpu_mhz: 2400.0,
+            resources: json!({ "disk": 50 }),
+        },
+    ];
+    cluster.add_nodes(&nodes)?;
+
+    let job = JobConfig {
+        name: "job-per-id".into(),
+        tasks: vec![TaskConfig {
+            count: TaskCount::per(1, "id"),
+            ..TaskConfig::new("id-task", "service")
+        }],
+        version: None,
+    };
+
+    cluster.submit_job(job)?;
+    cluster.assert_job_node_set("job-per-id", &["node-1", "node-2", "node-3"])?;
+
+    cluster.drop_node("node-2", &["job-per-id"])?;
+    let after_drop = cluster.job_nodes("job-per-id")?;
+    assert_eq!(after_drop.len(), 2);
+    assert!(!after_drop.contains(&"node-2".to_string()));
+
+    cluster.join_node("node-2")?;
+    cluster.assert_job_node_set("job-per-id", &["node-1", "node-2", "node-3"])?;
+
+    cluster.join_node("node-4")?;
+    let after_add = cluster.job_nodes("job-per-id")?;
+    assert_eq!(after_add.len(), 4);
+    assert!(after_add.contains(&"node-4".to_string()));
+
     Ok(())
 }

@@ -16,7 +16,7 @@ use super::Eval;
 #[cfg(test)]
 use super::config::ManagerConfigFull;
 #[cfg(test)]
-use super::job::{JobConfig, TaskConfig};
+use super::job::{JobConfig, TaskConfig, TaskCount};
 #[cfg(test)]
 use super::ledger::LedgerEntry;
 #[cfg(test)]
@@ -63,6 +63,8 @@ impl Eval {
 
             store.insert_node(node.into())?;
         }
+
+        store.reschedule_allocations_for_new_node()?;
 
         Ok(format!("Node {node_id} joined"))
     }
@@ -502,7 +504,7 @@ mod tests {
         assert_eq!(moved_alloc.job_config_id, moved_config_id);
 
         let removed_task = TaskConfig {
-            count: 0,
+            count: TaskCount::new(0),
             ..moved_task
         };
         let removed_config = JobConfig {
