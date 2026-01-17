@@ -721,6 +721,15 @@ impl Store {
         Ok(nodes)
     }
 
+    pub fn job_config_ids_with_count_per(&self) -> R<Vec<String>> {
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT job_config_id FROM task_config WHERE count_per IS NOT NULL AND count_per != '';",
+        )?;
+        let rows = stmt.query_map([], |row| row.get(0))?;
+        Self::collect_rows(rows)
+    }
+
     #[instrument(err, skip_all)]
     pub fn mark_node_ready(&self, id: &str, last_heartbeat: &str) -> R<()> {
         let conn = self.write_connection()?;
@@ -1880,6 +1889,15 @@ impl Store {
     }
 
     #[instrument(err, skip_all)]
+    pub fn reschedule_allocations_for_new_node(&self) -> R<()> {
+        let job_config_ids = self.job_config_ids_with_count_per()?;
+        for job_config_id in job_config_ids {
+            self.reconcile_job_config_allocations(&job_config_id)?;
+        }
+        Ok(())
+    }
+
+    #[instrument(err, skip_all)]
     pub fn get_ledger(&self) -> R<Vec<LedgerEntry>> {
         let nodes = self.get_nodes()?;
         let allocations = self.get_allocs_by_node()?;
@@ -2498,6 +2516,10 @@ impl Store {
 fn group_nodes_by_attr<'a>(nodes: &'a [&'a Node], key: &str) -> HashMap<String, Vec<&'a Node>> {
     let mut grouped: HashMap<String, Vec<&'a Node>> = HashMap::new();
     for node in nodes {
+        if key == "id" {
+            grouped.entry(node.id.clone()).or_default().push(*node);
+            continue;
+        }
         let Some(value) = node_attribute(node, key) else {
             continue;
         };

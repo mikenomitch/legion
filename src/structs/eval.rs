@@ -64,6 +64,8 @@ impl Eval {
             store.insert_node(node.into())?;
         }
 
+        store.reschedule_allocations_for_new_node()?;
+
         Ok(format!("Node {node_id} joined"))
     }
 

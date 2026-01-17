@@ -145,6 +145,13 @@ impl TestCluster {
         Ok(())
     }
 
+    fn join_node(&mut self, node_id: &str) -> R<()> {
+        self.enqueue_eval("node_join", None, None, Some(node_id))?;
+        self.process_next_eval()?
+            .context("expected node_join eval")?;
+        Ok(())
+    }
+
     fn add_dynamic_attr(&self, node_id: &str, key: &str, value: Value) -> R<()> {
         let mut diff = Map::new();
         diff.insert(key.to_string(), value);
@@ -948,6 +955,68 @@ fn scheduler_count_per_attribute_reschedules_by_group() -> R<()> {
     let rescheduled_counts = cluster.job_allocations_by_attr("job-per-region", "region")?;
     assert_eq!(rescheduled_counts.get("east"), Some(&3));
     assert_eq!(rescheduled_counts.get("west"), Some(&3));
+
+    Ok(())
+}
+
+#[test]
+fn scheduler_count_per_id_scales_with_node_changes() -> R<()> {
+    let mut cluster = TestCluster::new("spread")?;
+    let nodes = vec![
+        NodeSpec {
+            id: "node-1".into(),
+            zone: "east".into(),
+            rack: "rack-a".into(),
+            tier: "gold".into(),
+            memory_mib: 4096.0,
+            cpu_mhz: 2400.0,
+            resources: json!({ "disk": 50 }),
+        },
+        NodeSpec {
+            id: "node-2".into(),
+            zone: "east".into(),
+            rack: "rack-b".into(),
+            tier: "gold".into(),
+            memory_mib: 4096.0,
+            cpu_mhz: 2400.0,
+            resources: json!({ "disk": 50 }),
+        },
+        NodeSpec {
+            id: "node-3".into(),
+            zone: "west".into(),
+            rack: "rack-c".into(),
+            tier: "silver".into(),
+            memory_mib: 4096.0,
+            cpu_mhz: 2400.0,
+            resources: json!({ "disk": 50 }),
+        },
+    ];
+    cluster.add_nodes(&nodes)?;
+
+    let job = JobConfig {
+        name: "job-per-id".into(),
+        tasks: vec![TaskConfig {
+            count: TaskCount::per(1, "id"),
+            ..TaskConfig::new("id-task", "service")
+        }],
+        version: None,
+    };
+
+    cluster.submit_job(job)?;
+    cluster.assert_job_node_set("job-per-id", &["node-1", "node-2", "node-3"])?;
+
+    cluster.drop_node("node-2", &["job-per-id"])?;
+    let after_drop = cluster.job_nodes("job-per-id")?;
+    assert_eq!(after_drop.len(), 2);
+    assert!(!after_drop.contains(&"node-2".to_string()));
+
+    cluster.join_node("node-2")?;
+    cluster.assert_job_node_set("job-per-id", &["node-1", "node-2", "node-3"])?;
+
+    cluster.join_node("node-4")?;
+    let after_add = cluster.job_nodes("job-per-id")?;
+    assert_eq!(after_add.len(), 4);
+    assert!(after_add.contains(&"node-4".to_string()));
 
     Ok(())
 }

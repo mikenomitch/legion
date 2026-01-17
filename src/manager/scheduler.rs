@@ -760,6 +760,10 @@ impl<'a> Scheduler<'a> {
 fn group_nodes_by_attr<'a>(nodes: &'a [&'a Node], key: &str) -> HashMap<String, Vec<&'a Node>> {
     let mut grouped: HashMap<String, Vec<&'a Node>> = HashMap::new();
     for node in nodes {
+        if key == "id" {
+            grouped.entry(node.id.clone()).or_default().push(*node);
+            continue;
+        }
         let Some(value) = node_attribute(node, key) else {
             continue;
         };
