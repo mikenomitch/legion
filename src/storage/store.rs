@@ -13,8 +13,8 @@ use crate::storage::queries::{
 };
 use crate::structs::{
     Allocation, Eval, Job, JobConfig, KvEntry, KvLock, KvValueType, LedgerEntry, ManagerConfigFull,
-    ManagerNodeConfig, Node, NodeMsg, Submission, TaskCheck, TaskConfig, TaskOnUnhealthyConfig,
-    WorkerConfig,
+    ManagerNodeConfig, Node, NodeMsg, Submission, TaskCheck, TaskConfig, TaskCount,
+    TaskOnUnhealthyConfig, WorkerConfig,
 };
 
 use rand::{seq::SliceRandom, thread_rng, Rng};
@@ -23,7 +23,7 @@ use rusqlite::{
     OptionalExtension, Row, Transaction,
 };
 use rusqlite_migration::Migrations;
-use serde_json::{from_str, to_string, to_string_pretty};
+use serde_json::{from_str, to_string, to_string_pretty, Value};
 use serde_rusqlite::to_params_named;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
@@ -222,24 +222,29 @@ impl Store {
 
         let mut task_stmt = conn.prepare(
             r#"
-            SELECT id, name, kind, count, config, resources, constraints, affinities, checks, on_unhealthy, job_config_id
+            SELECT id, name, kind, count, count_per, config, resources, constraints, affinities, checks, on_unhealthy, job_config_id
             FROM task_config;
             "#,
         )?;
         let task_rows = task_stmt.query_map([], |row| {
             let id = row.get(0)?;
+            let count_num: u32 = row.get::<_, i64>(3)? as u32;
+            let count_per: Option<String> = row.get(4)?;
             let task = TaskConfig {
                 name: row.get(1)?,
                 kind: row.get(2)?,
-                count: row.get::<_, i64>(3)? as u32,
-                config: row.get(4)?,
-                resources: row.get(5)?,
-                constraints: row.get(6)?,
-                affinities: row.get(7)?,
-                checks: self.parse_checks_column(8, row.get(8)?)?,
-                on_unhealthy: self.parse_on_unhealthy_column(9, row.get(9)?)?,
+                count: TaskCount {
+                    num: count_num,
+                    per: count_per,
+                },
+                config: row.get(5)?,
+                resources: row.get(6)?,
+                constraints: row.get(7)?,
+                affinities: row.get(8)?,
+                checks: self.parse_checks_column(9, row.get(9)?)?,
+                on_unhealthy: self.parse_on_unhealthy_column(10, row.get(10)?)?,
             };
-            let job_config_id: String = row.get(10)?;
+            let job_config_id: String = row.get(11)?;
             Ok((job_config_id, id, task))
         })?;
 
@@ -610,16 +615,21 @@ impl Store {
     }
 
     fn task_config_from_row(&self, row: &Row<'_>) -> Result<TaskConfig, rusqlite::Error> {
+        let count_num: u32 = row.get::<_, i64>(3)? as u32;
+        let count_per: Option<String> = row.get(4)?;
         let task_config = TaskConfig {
             name: row.get(1)?,
             kind: row.get(2)?,
-            count: row.get(3)?,
-            config: row.get(4)?,
-            resources: row.get(5)?,
-            constraints: row.get(6)?,
-            affinities: row.get(7)?,
-            checks: self.parse_checks_column(8, row.get(8)?)?,
-            on_unhealthy: self.parse_on_unhealthy_column(9, row.get(9)?)?,
+            count: TaskCount {
+                num: count_num,
+                per: count_per,
+            },
+            config: row.get(5)?,
+            resources: row.get(6)?,
+            constraints: row.get(7)?,
+            affinities: row.get(8)?,
+            checks: self.parse_checks_column(9, row.get(9)?)?,
+            on_unhealthy: self.parse_on_unhealthy_column(10, row.get(10)?)?,
         };
 
         Ok(task_config)
@@ -709,6 +719,15 @@ impl Store {
         let nodes = Self::collect_rows(stmt.query_map([], |row| self.node_from_row(row))?)?;
 
         Ok(nodes)
+    }
+
+    pub fn job_config_ids_with_count_per(&self) -> R<Vec<String>> {
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT job_config_id FROM task_config WHERE count_per IS NOT NULL AND count_per != '';",
+        )?;
+        let rows = stmt.query_map([], |row| row.get(0))?;
+        Self::collect_rows(rows)
     }
 
     #[instrument(err, skip_all)]
@@ -803,15 +822,17 @@ impl Store {
             return Ok(());
         }
 
-        let conn = self.write_connection()?;
-        let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
-        let sql = format!(
-            "UPDATE node SET status = 'lost', availability = 'unavailable' WHERE id IN ({})",
-            placeholders
-        );
+        {
+            let conn = self.write_connection()?;
+            let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+            let sql = format!(
+                "UPDATE node SET status = 'lost', availability = 'unavailable' WHERE id IN ({})",
+                placeholders
+            );
 
-        let mut stmt = conn.prepare(&sql)?;
-        stmt.execute(params_from_iter(ids))?;
+            let mut stmt = conn.prepare(&sql)?;
+            stmt.execute(params_from_iter(ids))?;
+        }
 
         self.cache_nodes_lost(ids)?;
 
@@ -1251,7 +1272,8 @@ impl Store {
             let task_params = named_params! {
                 ":name": t.name,
                 ":kind": t.kind,
-                ":count": t.count,
+                ":count": t.count.num,
+                ":count_per": t.count.per,
                 ":config": t.config,
                 ":resources": t.resources,
                 ":constraints": t.constraints,
@@ -1480,16 +1502,21 @@ impl Store {
         let mut stmt = conn.prepare(&GET_TASK_FOR_JOB_CONIFG)?;
         let rows = stmt.query_map([job_config_id], |row| {
             let id = row.get(0)?;
+            let count_num: u32 = row.get::<_, i64>(3)? as u32;
+            let count_per: Option<String> = row.get(4)?;
             let task = TaskConfig {
                 name: row.get(1)?,
                 kind: row.get(2)?,
-                count: row.get::<_, i64>(3)? as u32,
-                config: row.get(4)?,
-                resources: row.get(5)?,
-                constraints: row.get(6)?,
-                affinities: row.get(7)?,
-                checks: self.parse_checks_column(8, row.get(8)?)?,
-                on_unhealthy: self.parse_on_unhealthy_column(9, row.get(9)?)?,
+                count: TaskCount {
+                    num: count_num,
+                    per: count_per,
+                },
+                config: row.get(5)?,
+                resources: row.get(6)?,
+                constraints: row.get(7)?,
+                affinities: row.get(8)?,
+                checks: self.parse_checks_column(9, row.get(9)?)?,
+                on_unhealthy: self.parse_on_unhealthy_column(10, row.get(10)?)?,
             };
 
             Ok((id, task))
@@ -1783,21 +1810,58 @@ impl Store {
             bail!("No nodes available to place allocations");
         }
 
-        let task_instances = self.get_task_instances_for_job_config(job_config_id)?;
-        if task_instances.is_empty() {
+        let tasks = self.get_task_configs_for_job_config(job_config_id)?;
+        if tasks.is_empty() {
             return Ok(());
         }
 
+        let allocations_by_node = self.get_allocs_by_node()?;
         let mut rng = thread_rng();
 
-        for (task_id, desired_count) in task_instances {
-            let current = self.count_allocations_for_task(task_id)?;
+        for (task_id, task_config) in tasks {
+            let constraint_set =
+                ConstraintSet::new(&task_config.constraints).with_context(|| {
+                    format!("Failed to parse constraints for task {}", task_config.name)
+                })?;
+            let eligible = nodes
+                .iter()
+                .filter(|node| constraint_set.is_satisfied(node, None))
+                .collect::<Vec<_>>();
 
-            for _ in current..desired_count {
-                let node = nodes
-                    .choose(&mut rng)
-                    .context("No nodes available to place allocations")?;
-                self.place_alloc(&node.id, task_id)?;
+            if eligible.is_empty() {
+                bail!(
+                    "Failed to place task {}: no available nodes matching constraints",
+                    task_config.name
+                );
+            }
+
+            if let Some(per_key) = task_config.count.per.as_deref() {
+                let grouped = group_nodes_by_attr(&eligible, per_key);
+                if grouped.is_empty() {
+                    bail!(
+                        "Failed to place task {}: no eligible nodes with attribute {}",
+                        task_config.name,
+                        per_key
+                    );
+                }
+
+                for group in grouped.values() {
+                    let placed = count_allocations_in_group(&allocations_by_node, task_id, group);
+                    for _ in placed..task_config.count.num {
+                        let node = group
+                            .choose(&mut rng)
+                            .context("No nodes available to place allocations")?;
+                        self.place_alloc(&node.id, task_id)?;
+                    }
+                }
+            } else {
+                let current = self.count_allocations_for_task(task_id)?;
+                for _ in current..task_config.count.num {
+                    let node = eligible
+                        .choose(&mut rng)
+                        .context("No nodes available to place allocations")?;
+                    self.place_alloc(&node.id, task_id)?;
+                }
             }
         }
 
@@ -1821,6 +1885,15 @@ impl Store {
             self.reconcile_job_config_allocations(&job_config_id)?;
         }
 
+        Ok(())
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn reschedule_allocations_for_new_node(&self) -> R<()> {
+        let job_config_ids = self.job_config_ids_with_count_per()?;
+        for job_config_id in job_config_ids {
+            self.reconcile_job_config_allocations(&job_config_id)?;
+        }
         Ok(())
     }
 
@@ -2440,6 +2513,59 @@ impl Store {
     }
 }
 
+fn group_nodes_by_attr<'a>(nodes: &'a [&'a Node], key: &str) -> HashMap<String, Vec<&'a Node>> {
+    let mut grouped: HashMap<String, Vec<&'a Node>> = HashMap::new();
+    for node in nodes {
+        if key == "id" {
+            grouped.entry(node.id.clone()).or_default().push(*node);
+            continue;
+        }
+        let Some(value) = node_attribute(node, key) else {
+            continue;
+        };
+        let token = value_token(value);
+        grouped.entry(token).or_default().push(*node);
+    }
+    grouped
+}
+
+fn count_allocations_in_group(
+    allocations_by_node: &HashMap<String, Vec<Allocation>>,
+    task_id: i64,
+    nodes: &[&Node],
+) -> u32 {
+    let mut count = 0;
+    for node in nodes {
+        if let Some(allocs) = allocations_by_node.get(&node.id) {
+            count += allocs
+                .iter()
+                .filter(|alloc| alloc.task_config_id == task_id)
+                .count() as u32;
+        }
+    }
+    count
+}
+
+fn node_attribute<'a>(node: &'a Node, key: &str) -> Option<&'a Value> {
+    node.config_attrs
+        .as_object()
+        .and_then(|attrs| attrs.get(key))
+        .or_else(|| {
+            node.fingerprint_attrs
+                .as_object()
+                .and_then(|attrs| attrs.get(key))
+        })
+        .or_else(|| {
+            node.dynamic_attrs
+                .as_object()
+                .and_then(|attrs| attrs.get(key))
+        })
+}
+
+fn value_token(value: &Value) -> String {
+    serde_json::to_string(value).unwrap_or_default()
+}
+
 fn task_schedule_equivalent(left: &TaskConfig, right: &TaskConfig) -> bool {
     left.count == right.count
         && left.resources == right.resources
@@ -2691,7 +2817,7 @@ mod tests {
         let updated_job = JobConfig {
             name: job.name.clone(),
             tasks: vec![TaskConfig {
-                count: 2,
+                count: TaskCount::new(2),
                 ..task("beta")
             }],
             version: None,
@@ -2715,7 +2841,7 @@ mod tests {
             .unwrap_or_default();
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].1.name, "beta");
-        assert_eq!(tasks[0].1.count, 2);
+        assert_eq!(tasks[0].1.count.num, 2);
 
         Ok(())
     }
@@ -2911,7 +3037,7 @@ mod tests {
         };
 
         let task_two = TaskConfig {
-            count: 2,
+            count: TaskCount::new(2),
             config: json!({ "message": "hi-2" }),
             resources: json!({ "memory": 512 }),
             ..TaskConfig::new("task-2", "kind-2")

@@ -1,8 +1,8 @@
 use legion::prelude::{json, Context, R};
 use legion::storage::store::Store;
 use legion::structs::{
-    config::ManagerConfigFull, job::JobConfig, job::TaskConfig, ledger::LedgerEntry, Eval,
-    Submission,
+    config::ManagerConfigFull, job::JobConfig, job::TaskConfig, job::TaskCount,
+    ledger::LedgerEntry, Eval, Submission,
 };
 use tempfile::Builder;
 
@@ -27,7 +27,7 @@ fn setup_store() -> R<Store> {
 
 fn make_job_config(name: &str, count: u32) -> JobConfig {
     let task = TaskConfig {
-        count,
+        count: TaskCount::new(count),
         config: json!({ "message": "hi" }),
         resources: json!({ "memory": 128 }),
         ..TaskConfig::new(format!("{name}-task"), "service")

@@ -1,3 +1,4 @@
+use serde::ser::SerializeStruct;
 use serde::{de::Error, Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -49,8 +50,78 @@ fn empty_object() -> Value {
     Value::Object(Default::default())
 }
 
-fn default_task_count() -> u32 {
-    1
+fn default_task_count() -> TaskCount {
+    TaskCount::default()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskCount {
+    pub num: u32,
+    pub per: Option<String>,
+}
+
+impl TaskCount {
+    pub fn new(num: u32) -> Self {
+        Self { num, per: None }
+    }
+
+    pub fn per(num: u32, per: impl Into<String>) -> Self {
+        Self {
+            num,
+            per: Some(per.into()),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum TaskCountInput {
+    Number(u32),
+    Per { num: u32, per: String },
+}
+
+impl Default for TaskCount {
+    fn default() -> Self {
+        Self { num: 1, per: None }
+    }
+}
+
+impl std::fmt::Display for TaskCount {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.per {
+            Some(per) => write!(f, "{} per {}", self.num, per),
+            None => write!(f, "{}", self.num),
+        }
+    }
+}
+
+impl Serialize for TaskCount {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match &self.per {
+            Some(per) => {
+                let mut state = serializer.serialize_struct("TaskCount", 2)?;
+                state.serialize_field("num", &self.num)?;
+                state.serialize_field("per", per)?;
+                state.end()
+            }
+            None => serializer.serialize_u32(self.num),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for TaskCount {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        match TaskCountInput::deserialize(deserializer)? {
+            TaskCountInput::Number(num) => Ok(TaskCount::new(num)),
+            TaskCountInput::Per { num, per } => Ok(TaskCount::per(num, per)),
+        }
+    }
 }
 
 fn default_check_every() -> Duration {
@@ -257,7 +328,7 @@ impl Default for TaskOnUnhealthyConfig {
 pub struct TaskConfig {
     pub name: String,
     #[serde(default = "default_task_count")]
-    pub count: u32,
+    pub count: TaskCount,
     pub kind: String,
     #[serde(default = "empty_object", alias = "options")]
     pub config: Value,
@@ -306,7 +377,7 @@ struct TaskConfigInput {
     #[serde(default)]
     name: Option<String>,
     #[serde(default = "default_task_count")]
-    count: u32,
+    count: TaskCount,
     kind: String,
     #[serde(default = "empty_object", alias = "options")]
     config: Value,
@@ -573,7 +644,7 @@ mod tests {
         assert_eq!(config.name, "demo");
         assert_eq!(config.tasks.len(), 1);
         assert_eq!(config.tasks[0].name, "first");
-        assert_eq!(config.tasks[0].count, 1);
+        assert_eq!(config.tasks[0].count.num, 1);
     }
 
     #[test]
@@ -610,5 +681,22 @@ mod tests {
         assert_eq!(config.name, "demo");
         assert_eq!(config.tasks.len(), 1);
         assert_eq!(config.tasks[0].name, "named");
+    }
+
+    #[test]
+    fn deserializes_task_count_per_attribute() {
+        let spec = serde_json::json!({
+            "name": "demo",
+            "task": {
+                "kind": "noop",
+                "count": { "num": 3, "per": "region" }
+            }
+        });
+
+        let config: JobConfig = serde_json::from_value(spec).expect("task should deserialize");
+
+        assert_eq!(config.tasks.len(), 1);
+        assert_eq!(config.tasks[0].count.num, 3);
+        assert_eq!(config.tasks[0].count.per.as_deref(), Some("region"));
     }
 }
