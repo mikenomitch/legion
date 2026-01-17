@@ -57,6 +57,10 @@ criterion = "0.5.1"
 [build-dependencies]
 tonic-build = "0.12.3"
 
+[[bench]]
+name = "scheduler_bench"
+harness = false
+
 # [[bin]] # Bin to run the HelloWorld gRPC server
 # name = "legion"
 # path = "src/main.rs"
