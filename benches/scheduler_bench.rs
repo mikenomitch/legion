@@ -24,6 +24,11 @@ fn setup_store(policy: &str) -> anyhow::Result<Store> {
     let store_config = ManagerConfigFull {
         store_path: store_path("khepri-scheduler-bench-")?,
         scheduling_policy: policy.into(),
+        task_resource_defaults: Some(json!({
+            "cpu": 0,
+            "memory": 0,
+            "allocations": 1
+        })),
         ..Default::default()
     };
 
