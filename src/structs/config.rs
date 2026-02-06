@@ -26,6 +26,7 @@ pub struct ManagerConfig {
     pub eval_threads: Option<usize>,
     pub scheduling_policy: Option<String>,
     pub default_priority: Option<i64>,
+    /// Scheduler policy knobs (for example `weights.anti_affinity` and `nodes_considered`).
     pub scheduler_settings: Option<Value>,
     pub task_resource_defaults: Option<Value>,
     pub custom_resources: Option<Value>,
@@ -81,6 +82,7 @@ pub struct ManagerConfigFull {
     pub eval_threads: usize,
     pub scheduling_policy: String,
     pub default_priority: i64,
+    /// Scheduler policy knobs (for example `weights.anti_affinity` and `nodes_considered`).
     pub scheduler_settings: Option<Value>,
     pub task_resource_defaults: Option<Value>,
     pub custom_resources: Option<Value>,

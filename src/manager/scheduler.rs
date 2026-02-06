@@ -116,7 +116,9 @@ impl<'a> Scheduler<'a> {
             bail!("No nodes available to place allocations");
         }
 
-        let all_tasks = self.store.cached_task_configs_for_job_config(job_config_id)?;
+        let all_tasks = self
+            .store
+            .cached_task_configs_for_job_config(job_config_id)?;
         let tasks = self.tasks_for_plan_from_store(job_config_id)?;
 
         let mut allocations_by_node = self.store.cached_allocations_by_node()?;
@@ -254,7 +256,9 @@ impl<'a> Scheduler<'a> {
             bail!("No nodes available to place allocations");
         }
 
-        let all_tasks = self.store.cached_task_configs_for_job_config(job_config_id)?;
+        let all_tasks = self
+            .store
+            .cached_task_configs_for_job_config(job_config_id)?;
         let tasks = self.tasks_for_plan_from_store(job_config_id)?;
 
         let allocations_by_node = self.store.cached_allocations_by_node()?;
@@ -343,6 +347,7 @@ impl<'a> Scheduler<'a> {
 
         let mut placements = Vec::new();
         let mut planned: HashMap<String, usize> = HashMap::new();
+        let mut planned_task_counts: HashMap<String, HashMap<i64, usize>> = HashMap::new();
         let weights = self.scheduler_weights()?;
         let nodes_considered_setting = self.nodes_considered_setting()?;
         let mut reschedule_rng = if matches!(mode, PlanMode::Reschedule) {
@@ -359,6 +364,7 @@ impl<'a> Scheduler<'a> {
         let mut group_sizes: HashMap<String, usize> = HashMap::new();
         let mut group_constraints: HashMap<String, Vec<ConstraintSet>> = HashMap::new();
         let mut task_group_map: HashMap<i64, (String, Option<String>)> = HashMap::new();
+        let mut group_to_task_ids: HashMap<String, HashSet<i64>> = HashMap::new();
 
         for (task_id, task_config) in &all_tasks {
             let per_key = task_config.count.per.clone();
@@ -378,15 +384,20 @@ impl<'a> Scheduler<'a> {
                 _ => {}
             }
             if group_sizes.get(&task_config.group).copied().unwrap_or(0) > 1 {
-                let constraint_set = ConstraintSet::new(&task_config.constraints).with_context(
-                    || format!("Failed to parse constraints for task {}", task_config.name),
-                )?;
+                let constraint_set =
+                    ConstraintSet::new(&task_config.constraints).with_context(|| {
+                        format!("Failed to parse constraints for task {}", task_config.name)
+                    })?;
                 group_constraints
                     .entry(task_config.group.clone())
                     .or_default()
                     .push(constraint_set);
             }
             task_group_map.insert(*task_id, (task_config.group.clone(), per_key));
+            group_to_task_ids
+                .entry(task_config.group.clone())
+                .or_default()
+                .insert(*task_id);
         }
 
         let mut group_assignments: HashMap<GroupKey, String> = HashMap::new();
@@ -434,7 +445,9 @@ impl<'a> Scheduler<'a> {
 
         let mut group_candidates: HashMap<GroupKey, Vec<&Node>> = HashMap::new();
         for (group_name, constraint_sets) in &group_constraints {
-            let per_key = group_per_key.get(group_name).and_then(|value| value.clone());
+            let per_key = group_per_key
+                .get(group_name)
+                .and_then(|value| value.clone());
             let mut grouped: HashMap<String, Vec<&Node>> = HashMap::new();
             for node in &nodes {
                 if !constraint_sets
@@ -508,11 +521,7 @@ impl<'a> Scheduler<'a> {
                         name: task_config.group.clone(),
                         token: group_name.to_string(),
                     };
-                    let group_key = if group_sizes
-                        .get(&task_config.group)
-                        .copied()
-                        .unwrap_or(0)
-                        > 1
+                    let group_key = if group_sizes.get(&task_config.group).copied().unwrap_or(0) > 1
                     {
                         Some(group_key)
                     } else {
@@ -539,6 +548,7 @@ impl<'a> Scheduler<'a> {
                         candidates_for_group,
                         allocations_by_node,
                         &mut planned,
+                        &mut planned_task_counts,
                         &mut reschedule_rng,
                         nodes_considered_setting.as_ref(),
                         &node_lookup,
@@ -548,6 +558,7 @@ impl<'a> Scheduler<'a> {
                         weights,
                         group_key.as_ref(),
                         &mut group_assignments,
+                        &group_to_task_ids,
                     )?;
                 }
             } else {
@@ -555,12 +566,7 @@ impl<'a> Scheduler<'a> {
                     name: task_config.group.clone(),
                     token: "default".to_string(),
                 };
-                let group_key = if group_sizes
-                    .get(&task_config.group)
-                    .copied()
-                    .unwrap_or(0)
-                    > 1
-                {
+                let group_key = if group_sizes.get(&task_config.group).copied().unwrap_or(0) > 1 {
                     Some(group_key)
                 } else {
                     None
@@ -586,6 +592,7 @@ impl<'a> Scheduler<'a> {
                     candidates_for_group,
                     allocations_by_node,
                     &mut planned,
+                    &mut planned_task_counts,
                     &mut reschedule_rng,
                     nodes_considered_setting.as_ref(),
                     &node_lookup,
@@ -595,6 +602,7 @@ impl<'a> Scheduler<'a> {
                     weights,
                     group_key.as_ref(),
                     &mut group_assignments,
+                    &group_to_task_ids,
                 )?;
             }
         }
@@ -648,6 +656,7 @@ impl<'a> Scheduler<'a> {
         candidates: &[&'b Node],
         allocations_by_node: &HashMap<String, Vec<Allocation>>,
         planned: &mut HashMap<String, usize>,
+        planned_task_counts: &mut HashMap<String, HashMap<i64, usize>>,
         reschedule_rng: &mut Option<StdRng>,
         nodes_considered_setting: Option<&NodesConsidered>,
         node_lookup: &HashMap<&'b str, &'b Node>,
@@ -657,7 +666,12 @@ impl<'a> Scheduler<'a> {
         weights: SchedulerWeights,
         group_key: Option<&GroupKey>,
         group_assignments: &mut HashMap<GroupKey, String>,
+        group_to_task_ids: &HashMap<String, HashSet<i64>>,
     ) -> R<()> {
+        let related_task_ids = group_to_task_ids
+            .get(&task_config.group)
+            .with_context(|| format!("Missing group mapping for {}", task_config.group))?;
+
         for _ in 0..count {
             let eligible = Self::eligible_nodes(
                 candidates,
@@ -698,7 +712,9 @@ impl<'a> Scheduler<'a> {
                         job_config_id,
                         allocations_by_node,
                         planned,
+                        planned_task_counts,
                         weights,
+                        related_task_ids,
                     )?;
                     group_assignments.insert(group_key.clone(), selected.clone());
                     selected
@@ -713,11 +729,18 @@ impl<'a> Scheduler<'a> {
                     job_config_id,
                     allocations_by_node,
                     planned,
+                    planned_task_counts,
                     weights,
+                    related_task_ids,
                 )?
             };
 
             *planned.entry(node_id.clone()).or_default() += 1;
+            *planned_task_counts
+                .entry(node_id.clone())
+                .or_default()
+                .entry(task_id)
+                .or_default() += 1;
             if let Some(tracker) = plan.distinct_tracker.as_mut() {
                 if let Some(node) = node_lookup.get(node_id.as_str()) {
                     tracker.insert_from_node(node);
@@ -743,7 +766,9 @@ impl<'a> Scheduler<'a> {
         job_config_id: &str,
         allocations_by_node: &HashMap<String, Vec<Allocation>>,
         planned: &HashMap<String, usize>,
+        planned_task_counts: &HashMap<String, HashMap<i64, usize>>,
         weights: SchedulerWeights,
+        related_task_ids: &HashSet<i64>,
     ) -> R<String> {
         if let Some(rng) = reschedule_rng.as_mut() {
             let choice = eligible
@@ -760,6 +785,8 @@ impl<'a> Scheduler<'a> {
                 job_config_id,
                 allocations_by_node,
                 planned,
+                planned_task_counts,
+                related_task_ids,
                 weights,
             );
             self.policy
@@ -1028,6 +1055,7 @@ impl<'a> Scheduler<'a> {
                 "affinities" => weights.affinity = weight,
                 "spread" => weights.spread = weight,
                 "bin_pack" => weights.bin_pack = weight,
+                "anti_affinity" => weights.anti_affinity = weight,
                 _ => {}
             }
         }
@@ -2435,6 +2463,64 @@ mod tests {
         }
         assert!(roles.contains("prep"));
         assert!(roles.contains("app"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn anti_affinity_weight_spreads_same_group_allocations() -> R<()> {
+        let store = setup_store_with_scheduler(
+            "bin_pack",
+            Some(json!({
+                "weights": {
+                    "affinities": 0.0,
+                    "spread": 0.0,
+                    "bin_pack": 1.0,
+                    "anti_affinity": 2.0
+                }
+            })),
+        )?;
+
+        store.insert_node(make_node_msg("node-a", json!({})))?;
+        store.insert_node(make_node_msg("node-b", json!({})))?;
+
+        let load_job = JobConfig {
+            name: "load-job-aa".into(),
+            tasks: vec![TaskConfig::new("load", "noop")],
+            version: None,
+        };
+        store.handle_job_submit(&load_job, &[dummy_submission()])?;
+        let load_job_config_id = store.get_job_config(&load_job.name)?.id();
+        let load_task_id = task_id_for(&store, &load_job_config_id, "load")?;
+
+        for _ in 0..3 {
+            store.place_alloc("node-a", load_task_id)?;
+        }
+
+        let job = JobConfig {
+            name: "anti-affinity-job".into(),
+            tasks: vec![TaskConfig {
+                count: TaskCount::new(2),
+                group: "web".into(),
+                ..TaskConfig::new("api", "noop")
+            }],
+            version: None,
+        };
+
+        store.handle_job_submit(&job, &[dummy_submission()])?;
+        let job_config_id = store.get_job_config(&job.name)?.id();
+
+        let scheduler = Scheduler::new(&store)?;
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+
+        assert_eq!(outcome.allocations.len(), 2);
+        let node_ids: HashSet<_> = outcome
+            .allocations
+            .iter()
+            .map(|alloc| alloc.node_id.as_str())
+            .collect();
+        assert!(node_ids.contains("node-a"));
+        assert!(node_ids.contains("node-b"));
 
         Ok(())
     }
