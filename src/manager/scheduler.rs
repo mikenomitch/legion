@@ -335,7 +335,6 @@ impl<'a> Scheduler<'a> {
         let mut planned: HashMap<String, usize> = HashMap::new();
         let weights = self.scheduler_weights()?;
         let nodes_considered_setting = self.nodes_considered_setting()?;
-        let use_policy_on_reschedule = self.use_policy_on_reschedule_setting()?;
         let mut reschedule_rng = if matches!(mode, PlanMode::Reschedule) {
             Some(reschedule_rng())
         } else {
@@ -395,7 +394,6 @@ impl<'a> Scheduler<'a> {
                         allocations_by_node,
                         &mut planned,
                         &mut reschedule_rng,
-                        use_policy_on_reschedule,
                         nodes_considered_setting.as_ref(),
                         &node_lookup,
                         &mut resource_ledger,
@@ -414,7 +412,6 @@ impl<'a> Scheduler<'a> {
                     allocations_by_node,
                     &mut planned,
                     &mut reschedule_rng,
-                    use_policy_on_reschedule,
                     nodes_considered_setting.as_ref(),
                     &node_lookup,
                     &mut resource_ledger,
@@ -475,7 +472,6 @@ impl<'a> Scheduler<'a> {
         allocations_by_node: &HashMap<String, Vec<Allocation>>,
         planned: &mut HashMap<String, usize>,
         reschedule_rng: &mut Option<StdRng>,
-        use_policy_on_reschedule: bool,
         nodes_considered_setting: Option<&NodesConsidered>,
         node_lookup: &HashMap<&'b str, &'b Node>,
         resource_ledger: &mut ResourceLedger,
@@ -502,7 +498,6 @@ impl<'a> Scheduler<'a> {
             let node_id = self.select_node_id(
                 eligible,
                 reschedule_rng,
-                use_policy_on_reschedule,
                 nodes_considered_setting,
                 task_config,
                 &plan.affinity_set,
@@ -532,7 +527,6 @@ impl<'a> Scheduler<'a> {
         &self,
         eligible: Vec<&'b Node>,
         reschedule_rng: &mut Option<StdRng>,
-        use_policy_on_reschedule: bool,
         nodes_considered_setting: Option<&NodesConsidered>,
         task_config: &TaskConfig,
         affinity_set: &AffinitySet,
@@ -541,17 +535,6 @@ impl<'a> Scheduler<'a> {
         planned: &HashMap<String, usize>,
         weights: SchedulerWeights,
     ) -> R<String> {
-        let use_policy_selection = reschedule_rng.is_none() || use_policy_on_reschedule;
-        if !use_policy_selection {
-            let rng = reschedule_rng
-                .as_mut()
-                .context("Missing reschedule RNG for random selection")?;
-            let choice = eligible
-                .choose(rng)
-                .context("No nodes available to place allocations")?;
-            return Ok(choice.id.clone());
-        }
-
         let eligible =
             self.apply_nodes_considered_with_setting(eligible, nodes_considered_setting)?;
         let ctx = SchedulingContext::new(
@@ -563,10 +546,10 @@ impl<'a> Scheduler<'a> {
             planned,
             weights,
         );
-        let selected = match reschedule_rng.as_mut() {
-            Some(rng) => self.select_policy_node_with_jitter(&ctx, rng),
-            None => self.policy.select_node(ctx),
-        };
+        let selected = reschedule_rng
+            .as_mut()
+            .map(|rng| self.select_policy_node_with_jitter(&ctx, rng))
+            .unwrap_or_else(|| self.policy.select_node(ctx));
         selected.map(|node| node.id.clone()).with_context(|| {
             format!(
                 "Scheduling policy {} failed to place task {}",
@@ -704,32 +687,6 @@ impl<'a> Scheduler<'a> {
         }
 
         Ok(weights)
-    }
-
-    fn use_policy_on_reschedule_setting(&self) -> R<bool> {
-        let Some(settings) = self.store.scheduler_settings.as_ref() else {
-            return Ok(true);
-        };
-
-        let settings = match settings {
-            Value::Null => return Ok(true),
-            Value::Object(map) => map,
-            _ => {
-                bail!(
-                    "scheduler_settings for policy {} must be an object",
-                    self.policy.name()
-                )
-            }
-        };
-
-        let Some(flag) = settings.get("use_policy_on_reschedule") else {
-            return Ok(true);
-        };
-
-        match flag {
-            Value::Bool(value) => Ok(*value),
-            _ => bail!("scheduler_settings use_policy_on_reschedule must be a boolean"),
-        }
     }
 
     fn build_distinct_tracker<'b>(
