@@ -4,13 +4,36 @@ use crate::util::plugin_root_dir;
 use jsonschema::JSONSchema;
 use libloading::{Library, Symbol};
 use std::collections::HashMap;
-use std::process::Child;
+use std::process::{Child, Command};
 
-mod exec;
 mod container;
+mod exec;
 
-pub use exec::ExecTaskPlugin;
 pub use container::ContainerTaskPlugin;
+pub use exec::ExecTaskPlugin;
+
+pub fn spawn_task_process(cmd: &mut Command) -> R<Child> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+
+        // Run task processes in their own session so they survive worker restarts
+        // and to keep worker signal handling independent from task signal handling.
+        unsafe {
+            cmd.pre_exec(|| {
+                unsafe extern "C" {
+                    fn setsid() -> i32;
+                }
+                if setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+
+    cmd.spawn().context("Failed to spawn task process")
+}
 
 #[derive(Default)]
 pub struct TaskRuntime {
@@ -417,6 +440,38 @@ mod tests {
 
         let err = validate_job_config(&config).unwrap_err();
         assert!(err.to_string().contains("cannot depend"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn spawned_task_process_runs_in_own_session() -> R<()> {
+        let mut cmd = std::process::Command::new("sleep");
+        cmd.arg("1");
+        let mut child = spawn_task_process(&mut cmd)?;
+
+        let stat = std::fs::read_to_string(format!("/proc/{}/stat", child.id()))?;
+        let after_comm = stat
+            .rsplit_once(") ")
+            .context("unexpected /proc stat format")?
+            .1;
+        let fields = after_comm.split_whitespace().collect::<Vec<_>>();
+        let pgrp: u32 = fields
+            .get(2)
+            .context("missing pgrp in /proc stat")?
+            .parse()
+            .context("invalid pgrp in /proc stat")?;
+        let session: u32 = fields
+            .get(3)
+            .context("missing session in /proc stat")?
+            .parse()
+            .context("invalid session in /proc stat")?;
+
+        assert_eq!(pgrp, child.id());
+        assert_eq!(session, child.id());
+
+        let _ = child.kill();
+        let _ = child.wait();
+        Ok(())
     }
 
     #[test]

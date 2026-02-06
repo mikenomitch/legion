@@ -1,6 +1,6 @@
 use crate::prelude::*;
 use crate::structs::{Allocation, TaskConfig};
-use crate::task_plugins::{TaskPlugin, TaskRuntime};
+use crate::task_plugins::{spawn_task_process, TaskPlugin, TaskRuntime};
 use std::process::Command;
 
 #[derive(Default)]
@@ -141,7 +141,7 @@ impl TaskPlugin for ExecTaskPlugin {
             cmd.envs(env);
         }
 
-        let child = cmd.spawn().with_context(|| {
+        let child = spawn_task_process(&mut cmd).with_context(|| {
             format!(
                 "Failed to spawn exec task {} for allocation {}",
                 task.name, allocation.id
