@@ -6,6 +6,8 @@
             name: "web",
             count: 2,
             kind: "noop",
+            group: "frontend",
+            lifecycle: "service",
             config: {
                 message: "Hello from the web task",
                 retries: 3,
@@ -71,6 +73,8 @@
                 per: "region",
             },
             kind: "noop",
+            group: "prep",
+            lifecycle: "batch",
             config: {
                 script: "echo work",
                 env: {
@@ -99,6 +103,14 @@
             name: "shell",
             count: 1,
             kind: "exec",
+            group: "frontend",
+            lifecycle: "sidecar",
+            dependsOn: [
+                {
+                    task: "batch",
+                    condition: "success",
+                },
+            ],
             config: {
                 command: ["echo", "hello", "from", "exec"],
                 env: {

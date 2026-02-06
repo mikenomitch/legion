@@ -10,7 +10,10 @@ use crate::constraints::{AffinitySet, ConstraintSet, DistinctTracker};
 use crate::prelude::*;
 use crate::resources::ResourcePolicy;
 use crate::storage::store::Store;
-use crate::structs::{Allocation, JobConfig, Node, TaskConfig};
+use crate::structs::{
+    Allocation, JobConfig, Node, TaskConfig, TaskDependencyCondition, TaskLifecycle,
+    TaskStatusState,
+};
 pub use policy::{load_policy, SchedulerWeights, SchedulingContext, SchedulingPolicy};
 
 mod policy;
@@ -76,6 +79,12 @@ struct TaskPlan<'a> {
     distinct_tracker: Option<DistinctTracker>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct GroupKey {
+    name: String,
+    token: String,
+}
+
 pub struct Scheduler<'a> {
     store: &'a Store,
     policy: Box<dyn SchedulingPolicy>,
@@ -107,12 +116,8 @@ impl<'a> Scheduler<'a> {
             bail!("No nodes available to place allocations");
         }
 
-        let tasks = self
-            .store
-            .cached_task_configs_for_job_config(job_config_id)?
-            .into_iter()
-            .map(|(id, config)| (id, config.clone(), config.count.num))
-            .collect::<Vec<_>>();
+        let all_tasks = self.store.cached_task_configs_for_job_config(job_config_id)?;
+        let tasks = self.tasks_for_plan_from_store(job_config_id)?;
 
         let mut allocations_by_node = self.store.cached_allocations_by_node()?;
         if matches!(mode, PlanMode::Fresh) {
@@ -150,6 +155,7 @@ impl<'a> Scheduler<'a> {
             job_config_id,
             nodes,
             tasks,
+            all_tasks,
             required_counts,
             &allocations_by_node,
             mode,
@@ -168,7 +174,14 @@ impl<'a> Scheduler<'a> {
             bail!("No nodes available to place allocations");
         }
 
-        let tasks = Self::tasks_for_plan(job_config);
+        let status_map = HashMap::new();
+        let tasks = Self::tasks_for_plan(job_config, &status_map)?;
+        let all_tasks = job_config
+            .tasks
+            .iter()
+            .enumerate()
+            .map(|(index, config)| ((index + 1) as i64, config.clone()))
+            .collect::<Vec<_>>();
         let task_lookup = tasks
             .iter()
             .map(|(id, task, _count)| (*id, task.name.clone()))
@@ -210,6 +223,7 @@ impl<'a> Scheduler<'a> {
             &job_config.id(),
             nodes,
             tasks,
+            all_tasks,
             required_counts,
             &allocations_by_node,
             mode,
@@ -240,12 +254,8 @@ impl<'a> Scheduler<'a> {
             bail!("No nodes available to place allocations");
         }
 
-        let tasks = self
-            .store
-            .cached_task_configs_for_job_config(job_config_id)?
-            .into_iter()
-            .map(|(id, config)| (id, config.clone(), config.count.num))
-            .collect::<Vec<_>>();
+        let all_tasks = self.store.cached_task_configs_for_job_config(job_config_id)?;
+        let tasks = self.tasks_for_plan_from_store(job_config_id)?;
 
         let allocations_by_node = self.store.cached_allocations_by_node()?;
 
@@ -278,6 +288,7 @@ impl<'a> Scheduler<'a> {
             job_config_id,
             nodes,
             tasks,
+            all_tasks,
             required_counts,
             &allocations_by_node,
             mode.clone(),
@@ -323,6 +334,7 @@ impl<'a> Scheduler<'a> {
         job_config_id: &str,
         nodes: Vec<Node>,
         mut tasks: Vec<(i64, TaskConfig, u32)>,
+        all_tasks: Vec<(i64, TaskConfig)>,
         required_counts: HashMap<i64, u32>,
         allocations_by_node: &HashMap<String, Vec<Allocation>>,
         mode: PlanMode,
@@ -343,6 +355,115 @@ impl<'a> Scheduler<'a> {
         let resource_policy = &self.store.resource_policy;
         let mut resource_ledger =
             ResourceLedger::new(&nodes, allocations_by_node, resource_policy)?;
+        let mut group_per_key: HashMap<String, Option<String>> = HashMap::new();
+        let mut group_sizes: HashMap<String, usize> = HashMap::new();
+        let mut group_constraints: HashMap<String, Vec<ConstraintSet>> = HashMap::new();
+        let mut task_group_map: HashMap<i64, (String, Option<String>)> = HashMap::new();
+
+        for (task_id, task_config) in &all_tasks {
+            let per_key = task_config.count.per.clone();
+            *group_sizes.entry(task_config.group.clone()).or_default() += 1;
+            match group_per_key.get(&task_config.group) {
+                Some(existing) if existing.as_deref() != per_key.as_deref() => {
+                    bail!(
+                        "Group {} mixes count.per values ({:?} vs {:?})",
+                        task_config.group,
+                        existing,
+                        per_key
+                    );
+                }
+                None => {
+                    group_per_key.insert(task_config.group.clone(), per_key.clone());
+                }
+                _ => {}
+            }
+            if group_sizes.get(&task_config.group).copied().unwrap_or(0) > 1 {
+                let constraint_set = ConstraintSet::new(&task_config.constraints).with_context(
+                    || format!("Failed to parse constraints for task {}", task_config.name),
+                )?;
+                group_constraints
+                    .entry(task_config.group.clone())
+                    .or_default()
+                    .push(constraint_set);
+            }
+            task_group_map.insert(*task_id, (task_config.group.clone(), per_key));
+        }
+
+        let mut group_assignments: HashMap<GroupKey, String> = HashMap::new();
+        for (node_id, allocations) in allocations_by_node {
+            for allocation in allocations {
+                if allocation.job_config_id != job_config_id {
+                    continue;
+                }
+                let Some((group_name, per_key)) = task_group_map.get(&allocation.task_config_id)
+                else {
+                    continue;
+                };
+                if group_sizes.get(group_name).copied().unwrap_or(0) <= 1 {
+                    continue;
+                }
+                let token = if let Some(per_key) = per_key.as_deref() {
+                    let node = node_lookup
+                        .get(node_id.as_str())
+                        .context("missing node for allocation")?;
+                    let value = node_attribute(node, per_key).with_context(|| {
+                        format!("Node {} missing attribute {}", node_id, per_key)
+                    })?;
+                    value_token(value)
+                } else {
+                    "default".to_string()
+                };
+                let key = GroupKey {
+                    name: group_name.clone(),
+                    token,
+                };
+                if let Some(existing) = group_assignments.get(&key) {
+                    if existing != node_id {
+                        bail!(
+                            "Group {} already assigned to node {} but allocation exists on {}",
+                            key.name,
+                            existing,
+                            node_id
+                        );
+                    }
+                } else {
+                    group_assignments.insert(key, node_id.clone());
+                }
+            }
+        }
+
+        let mut group_candidates: HashMap<GroupKey, Vec<&Node>> = HashMap::new();
+        for (group_name, constraint_sets) in &group_constraints {
+            let per_key = group_per_key.get(group_name).and_then(|value| value.clone());
+            let mut grouped: HashMap<String, Vec<&Node>> = HashMap::new();
+            for node in &nodes {
+                if !constraint_sets
+                    .iter()
+                    .all(|constraint| constraint.is_satisfied(node, None))
+                {
+                    continue;
+                }
+                let token = if let Some(per_key) = per_key.as_deref() {
+                    let Some(value) = node_attribute(node, per_key) else {
+                        continue;
+                    };
+                    value_token(value)
+                } else {
+                    "default".to_string()
+                };
+                grouped.entry(token).or_default().push(node);
+            }
+
+            for (token, group_nodes) in grouped {
+                group_candidates.insert(
+                    GroupKey {
+                        name: group_name.clone(),
+                        token,
+                    },
+                    group_nodes,
+                );
+            }
+        }
 
         for (task_id, task_config, _desired_count) in tasks {
             let needed = required_counts.get(&task_id).copied().unwrap_or(0);
@@ -371,24 +492,51 @@ impl<'a> Scheduler<'a> {
                     );
                 }
 
-                for group in grouped.values() {
+                for (group_name, group) in grouped {
                     let placed = if matches!(mode, PlanMode::Reschedule) {
                         count_allocations_in_group(
                             allocations_by_node,
                             job_config_id,
                             task_id,
-                            group,
+                            &group,
                         )
                     } else {
                         0
                     };
                     let needed = task_config.count.num.saturating_sub(placed);
+                    let group_key = GroupKey {
+                        name: task_config.group.clone(),
+                        token: group_name.to_string(),
+                    };
+                    let group_key = if group_sizes
+                        .get(&task_config.group)
+                        .copied()
+                        .unwrap_or(0)
+                        > 1
+                    {
+                        Some(group_key)
+                    } else {
+                        None
+                    };
+                    let candidates_for_group = if let Some(group_key) = group_key.as_ref() {
+                        group_candidates
+                            .get(group_key)
+                            .with_context(|| {
+                                format!(
+                                    "No eligible nodes for group {} ({})",
+                                    group_key.name, group_key.token
+                                )
+                            })?
+                            .as_slice()
+                    } else {
+                        group.as_slice()
+                    };
                     self.place_task_allocations(
                         needed,
                         task_id,
                         &task_config,
                         job_config_id,
-                        group,
+                        candidates_for_group,
                         allocations_by_node,
                         &mut planned,
                         &mut reschedule_rng,
@@ -398,15 +546,44 @@ impl<'a> Scheduler<'a> {
                         &mut plan,
                         &mut placements,
                         weights,
+                        group_key.as_ref(),
+                        &mut group_assignments,
                     )?;
                 }
             } else {
+                let group_key = GroupKey {
+                    name: task_config.group.clone(),
+                    token: "default".to_string(),
+                };
+                let group_key = if group_sizes
+                    .get(&task_config.group)
+                    .copied()
+                    .unwrap_or(0)
+                    > 1
+                {
+                    Some(group_key)
+                } else {
+                    None
+                };
+                let candidates_for_group = if let Some(group_key) = group_key.as_ref() {
+                    group_candidates
+                        .get(group_key)
+                        .with_context(|| {
+                            format!(
+                                "No eligible nodes for group {} ({})",
+                                group_key.name, group_key.token
+                            )
+                        })?
+                        .as_slice()
+                } else {
+                    base_eligible.as_slice()
+                };
                 self.place_task_allocations(
                     needed,
                     task_id,
                     &task_config,
                     job_config_id,
-                    &base_eligible,
+                    candidates_for_group,
                     allocations_by_node,
                     &mut planned,
                     &mut reschedule_rng,
@@ -416,6 +593,8 @@ impl<'a> Scheduler<'a> {
                     &mut plan,
                     &mut placements,
                     weights,
+                    group_key.as_ref(),
+                    &mut group_assignments,
                 )?;
             }
         }
@@ -476,6 +655,8 @@ impl<'a> Scheduler<'a> {
         plan: &mut TaskPlan<'b>,
         placements: &mut Vec<PlannedAllocation>,
         weights: SchedulerWeights,
+        group_key: Option<&GroupKey>,
+        group_assignments: &mut HashMap<GroupKey, String>,
     ) -> R<()> {
         for _ in 0..count {
             let eligible = Self::eligible_nodes(
@@ -493,17 +674,48 @@ impl<'a> Scheduler<'a> {
                 );
             }
 
-            let node_id = self.select_node_id(
-                eligible,
-                reschedule_rng,
-                nodes_considered_setting,
-                task_config,
-                &plan.affinity_set,
-                job_config_id,
-                allocations_by_node,
-                planned,
-                weights,
-            )?;
+            let node_id = if let Some(group_key) = group_key {
+                if let Some(existing) = group_assignments.get(group_key) {
+                    let is_eligible = eligible
+                        .iter()
+                        .any(|node| node.id.as_str() == existing.as_str());
+                    if !is_eligible {
+                        bail!(
+                            "Failed to place task {} in group {}: assigned node {} is not eligible",
+                            task_config.name,
+                            group_key.name,
+                            existing
+                        );
+                    }
+                    existing.clone()
+                } else {
+                    let selected = self.select_node_id(
+                        eligible,
+                        reschedule_rng,
+                        nodes_considered_setting,
+                        task_config,
+                        &plan.affinity_set,
+                        job_config_id,
+                        allocations_by_node,
+                        planned,
+                        weights,
+                    )?;
+                    group_assignments.insert(group_key.clone(), selected.clone());
+                    selected
+                }
+            } else {
+                self.select_node_id(
+                    eligible,
+                    reschedule_rng,
+                    nodes_considered_setting,
+                    task_config,
+                    &plan.affinity_set,
+                    job_config_id,
+                    allocations_by_node,
+                    planned,
+                    weights,
+                )?
+            };
 
             *planned.entry(node_id.clone()).or_default() += 1;
             if let Some(tracker) = plan.distinct_tracker.as_mut() {
@@ -586,13 +798,171 @@ impl<'a> Scheduler<'a> {
             .collect()
     }
 
-    fn tasks_for_plan(job_config: &JobConfig) -> Vec<(i64, TaskConfig, u32)> {
-        job_config
+    fn tasks_for_plan_from_store(&self, job_config_id: &str) -> R<Vec<(i64, TaskConfig, u32)>> {
+        let tasks = self
+            .store
+            .cached_task_configs_for_job_config(job_config_id)?
+            .into_iter()
+            .map(|(id, config)| (id, config.clone(), config.count.num))
+            .collect::<Vec<_>>();
+        let status_by_id = self.store.task_statuses_for_job_config(job_config_id)?;
+        let status_map = tasks
+            .iter()
+            .map(|(id, task, _)| {
+                (
+                    task.name.clone(),
+                    status_by_id
+                        .get(id)
+                        .copied()
+                        .unwrap_or(TaskStatusState::Pending),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+
+        Self::ready_tasks(tasks, &status_map)
+    }
+
+    fn tasks_for_plan(
+        job_config: &JobConfig,
+        status_map: &HashMap<String, TaskStatusState>,
+    ) -> R<Vec<(i64, TaskConfig, u32)>> {
+        let tasks = job_config
             .tasks
             .iter()
             .enumerate()
             .map(|(index, config)| ((index + 1) as i64, config.clone(), config.count.num))
-            .collect()
+            .collect::<Vec<_>>();
+
+        Self::ready_tasks(tasks, status_map)
+    }
+
+    fn ready_tasks(
+        tasks: Vec<(i64, TaskConfig, u32)>,
+        status_map: &HashMap<String, TaskStatusState>,
+    ) -> R<Vec<(i64, TaskConfig, u32)>> {
+        let mut name_to_id = HashMap::new();
+        let mut name_to_task = HashMap::new();
+        for (task_id, task_config, _count) in &tasks {
+            name_to_id.insert(task_config.name.clone(), *task_id);
+            name_to_task.insert(task_config.name.clone(), task_config.clone());
+        }
+
+        let mut indegree: HashMap<String, usize> = tasks
+            .iter()
+            .map(|(_, task, _)| (task.name.clone(), 0))
+            .collect();
+        let mut graph: HashMap<String, Vec<String>> = HashMap::new();
+
+        for (_task_id, task_config, _count) in &tasks {
+            for dependency in &task_config.depends_on {
+                let target = dependency.task.as_str();
+                if target == task_config.name {
+                    bail!("Task {} cannot depend on itself", task_config.name);
+                }
+                if !name_to_id.contains_key(target) {
+                    bail!(
+                        "Task {} depends on unknown task {}",
+                        task_config.name,
+                        target
+                    );
+                }
+                graph
+                    .entry(target.to_string())
+                    .or_default()
+                    .push(task_config.name.clone());
+                *indegree.entry(task_config.name.clone()).or_default() += 1;
+            }
+        }
+
+        let mut queue = indegree
+            .iter()
+            .filter(|(_, count)| **count == 0)
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>();
+        queue.sort();
+
+        let mut ordered = Vec::new();
+        while let Some(name) = queue.pop() {
+            ordered.push(name.clone());
+            if let Some(children) = graph.get(&name) {
+                for child in children {
+                    if let Some(count) = indegree.get_mut(child) {
+                        *count -= 1;
+                        if *count == 0 {
+                            queue.push(child.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        if ordered.len() != tasks.len() {
+            bail!("Task dependencies contain a cycle");
+        }
+
+        let mut planned: HashSet<String> = HashSet::new();
+        let mut ready = Vec::new();
+        let mut progress = true;
+
+        while progress {
+            progress = false;
+            for name in &ordered {
+                if planned.contains(name) {
+                    continue;
+                }
+                let task = name_to_task
+                    .get(name)
+                    .context("Task missing from task map")?;
+                let mut deps_satisfied = true;
+                for dependency in &task.depends_on {
+                    let dep_name = dependency.task.as_str();
+                    let dep_status = status_map
+                        .get(dep_name)
+                        .copied()
+                        .unwrap_or(TaskStatusState::Pending);
+                    let dep_lifecycle = name_to_task
+                        .get(dep_name)
+                        .map(|task| task.lifecycle.clone())
+                        .unwrap_or(TaskLifecycle::Service);
+                    let planned_dep = planned.contains(dep_name);
+                    let satisfied = match dependency.condition {
+                        TaskDependencyCondition::Start => dep_status.is_started() || planned_dep,
+                        TaskDependencyCondition::Complete => {
+                            if dep_status == TaskStatusState::Failed {
+                                false
+                            } else {
+                                dep_status.is_complete()
+                                    || (planned_dep && dep_lifecycle == TaskLifecycle::Batch)
+                            }
+                        }
+                        TaskDependencyCondition::Success => {
+                            if dep_status == TaskStatusState::Failed {
+                                false
+                            } else {
+                                dep_status.is_success()
+                                    || (planned_dep && dep_lifecycle == TaskLifecycle::Batch)
+                            }
+                        }
+                    };
+                    if !satisfied {
+                        deps_satisfied = false;
+                        break;
+                    }
+                }
+                if deps_satisfied {
+                    planned.insert(name.clone());
+                    progress = true;
+                }
+            }
+        }
+
+        for (task_id, task_config, count) in tasks {
+            if planned.contains(&task_config.name) {
+                ready.push((task_id, task_config, count));
+            }
+        }
+
+        Ok(ready)
     }
 
     fn apply_nodes_considered_with_setting<'b>(
@@ -1180,7 +1550,9 @@ mod tests {
 
     use super::*;
     use crate::structs::config::ManagerConfigFull;
-    use crate::structs::{JobConfig, NodeMsg, Submission, TaskCount};
+    use crate::structs::{
+        JobConfig, NodeMsg, Submission, TaskCount, TaskDependencyCondition, TaskLifecycle,
+    };
 
     fn store_path() -> R<String> {
         let store_dir = Builder::new()
@@ -1340,11 +1712,7 @@ mod tests {
 
         assert!(outcome.deltas.len() >= 1);
         let total_added: usize = outcome.deltas.iter().map(|delta| delta.added.len()).sum();
-        let total_removed: usize = outcome
-            .deltas
-            .iter()
-            .map(|delta| delta.removed.len())
-            .sum();
+        let total_removed: usize = outcome.deltas.iter().map(|delta| delta.removed.len()).sum();
         assert_eq!(total_added, 3);
         assert_eq!(total_removed, 0);
 
@@ -1892,6 +2260,181 @@ mod tests {
             subsets.len() > 1,
             "expected nodes_considered to vary eligible subset"
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn group_tasks_co_locate_on_same_node() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", json!({})))?;
+        store.insert_node(make_node_msg("node-b", json!({})))?;
+
+        let job = JobConfig {
+            name: "grouped".into(),
+            tasks: vec![
+                TaskConfig {
+                    group: "default".into(),
+                    ..TaskConfig::new("api", "noop")
+                },
+                TaskConfig {
+                    group: "default".into(),
+                    ..TaskConfig::new("cache", "noop")
+                },
+            ],
+            version: None,
+        };
+
+        store.handle_job_submit(&job, &[dummy_submission()])?;
+        let job_config_id = store.get_job_config(&job.name)?.id();
+        let scheduler = Scheduler::new(&store)?;
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+
+        let node_ids: HashSet<_> = outcome
+            .allocations
+            .iter()
+            .map(|alloc| alloc.node_id.as_str())
+            .collect();
+        assert_eq!(node_ids.len(), 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn groups_allow_distinct_constraints() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", json!({ "role": "web" })))?;
+        store.insert_node(make_node_msg("node-b", json!({ "role": "db" })))?;
+
+        let job = JobConfig {
+            name: "group-constraints".into(),
+            tasks: vec![
+                TaskConfig {
+                    group: "web".into(),
+                    constraints: json!({ "role": "web" }),
+                    ..TaskConfig::new("frontend", "noop")
+                },
+                TaskConfig {
+                    group: "db".into(),
+                    constraints: json!({ "role": "db" }),
+                    ..TaskConfig::new("database", "noop")
+                },
+            ],
+            version: None,
+        };
+
+        store.handle_job_submit(&job, &[dummy_submission()])?;
+        let job_config_id = store.get_job_config(&job.name)?.id();
+        let scheduler = Scheduler::new(&store)?;
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+
+        let mut allocations_by_task = HashMap::new();
+        for allocation in &outcome.allocations {
+            allocations_by_task.insert(allocation.task_config_id, allocation.node_id.clone());
+        }
+        let node_frontend = allocations_by_task
+            .get(&task_id_for(&store, &job_config_id, "frontend")?)
+            .cloned()
+            .unwrap();
+        let node_database = allocations_by_task
+            .get(&task_id_for(&store, &job_config_id, "database")?)
+            .cloned()
+            .unwrap();
+        assert_ne!(node_frontend, node_database);
+
+        Ok(())
+    }
+
+    #[test]
+    fn dag_batch_success_allows_service_within_group() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", json!({})))?;
+
+        let job = JobConfig {
+            name: "dag-group".into(),
+            tasks: vec![
+                TaskConfig {
+                    lifecycle: TaskLifecycle::Batch,
+                    group: "app".into(),
+                    ..TaskConfig::new("build", "exec")
+                },
+                TaskConfig {
+                    lifecycle: TaskLifecycle::Service,
+                    group: "app".into(),
+                    depends_on: vec![crate::structs::TaskDependency {
+                        task: "build".into(),
+                        condition: TaskDependencyCondition::Success,
+                    }],
+                    ..TaskConfig::new("api", "noop")
+                },
+            ],
+            version: None,
+        };
+
+        store.handle_job_submit(&job, &[dummy_submission()])?;
+        let job_config_id = store.get_job_config(&job.name)?.id();
+        let scheduler = Scheduler::new(&store)?;
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+
+        assert_eq!(outcome.allocations.len(), 2);
+        let node_ids: HashSet<_> = outcome
+            .allocations
+            .iter()
+            .map(|alloc| alloc.node_id.as_str())
+            .collect();
+        assert_eq!(node_ids.len(), 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn dag_batch_success_across_groups() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", json!({ "role": "prep" })))?;
+        store.insert_node(make_node_msg("node-b", json!({ "role": "app" })))?;
+
+        let job = JobConfig {
+            name: "dag-cross".into(),
+            tasks: vec![
+                TaskConfig {
+                    lifecycle: TaskLifecycle::Batch,
+                    group: "prep".into(),
+                    constraints: json!({ "role": "prep" }),
+                    ..TaskConfig::new("seed", "exec")
+                },
+                TaskConfig {
+                    lifecycle: TaskLifecycle::Service,
+                    group: "app".into(),
+                    constraints: json!({ "role": "app" }),
+                    depends_on: vec![crate::structs::TaskDependency {
+                        task: "seed".into(),
+                        condition: TaskDependencyCondition::Success,
+                    }],
+                    ..TaskConfig::new("web", "noop")
+                },
+            ],
+            version: None,
+        };
+
+        store.handle_job_submit(&job, &[dummy_submission()])?;
+        let job_config_id = store.get_job_config(&job.name)?.id();
+        let scheduler = Scheduler::new(&store)?;
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+
+        assert_eq!(outcome.allocations.len(), 2);
+        let mut roles = HashSet::new();
+        for allocation in &outcome.allocations {
+            let node = store.get_node(&allocation.node_id)?;
+            let role = node
+                .config_attrs
+                .get("role")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_string();
+            roles.insert(role);
+        }
+        assert!(roles.contains("prep"));
+        assert!(roles.contains("app"));
 
         Ok(())
     }

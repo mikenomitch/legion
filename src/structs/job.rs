@@ -54,6 +54,18 @@ fn default_task_count() -> TaskCount {
     TaskCount::default()
 }
 
+fn default_task_group() -> String {
+    "default".to_string()
+}
+
+fn default_task_lifecycle() -> TaskLifecycle {
+    TaskLifecycle::Service
+}
+
+fn default_dependency_condition() -> TaskDependencyCondition {
+    TaskDependencyCondition::Start
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskCount {
     pub num: u32,
@@ -235,6 +247,114 @@ pub enum TaskCheckKind {
     Exec,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum TaskDependencyCondition {
+    Start,
+    Complete,
+    Success,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskDependency {
+    pub task: String,
+    #[serde(default = "default_dependency_condition")]
+    pub condition: TaskDependencyCondition,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum TaskLifecycle {
+    Service,
+    Batch,
+    Sidecar,
+}
+
+impl Default for TaskLifecycle {
+    fn default() -> Self {
+        TaskLifecycle::Service
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskStatusState {
+    Pending,
+    Running,
+    Complete,
+    Success,
+    Failed,
+}
+
+impl TaskStatusState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TaskStatusState::Pending => "pending",
+            TaskStatusState::Running => "running",
+            TaskStatusState::Complete => "complete",
+            TaskStatusState::Success => "success",
+            TaskStatusState::Failed => "failed",
+        }
+    }
+
+    pub fn is_started(self) -> bool {
+        matches!(
+            self,
+            TaskStatusState::Running
+                | TaskStatusState::Complete
+                | TaskStatusState::Success
+                | TaskStatusState::Failed
+        )
+    }
+
+    pub fn is_complete(self) -> bool {
+        matches!(self, TaskStatusState::Complete | TaskStatusState::Success)
+    }
+
+    pub fn is_success(self) -> bool {
+        matches!(self, TaskStatusState::Success)
+    }
+}
+
+impl std::str::FromStr for TaskStatusState {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "pending" => Ok(TaskStatusState::Pending),
+            "running" => Ok(TaskStatusState::Running),
+            "complete" => Ok(TaskStatusState::Complete),
+            "success" => Ok(TaskStatusState::Success),
+            "failed" => Ok(TaskStatusState::Failed),
+            other => Err(format!("Unknown task status {other}")),
+        }
+    }
+}
+
+impl std::fmt::Display for TaskLifecycle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value = match self {
+            TaskLifecycle::Service => "service",
+            TaskLifecycle::Batch => "batch",
+            TaskLifecycle::Sidecar => "sidecar",
+        };
+        write!(f, "{value}")
+    }
+}
+
+impl std::str::FromStr for TaskLifecycle {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "service" => Ok(TaskLifecycle::Service),
+            "batch" => Ok(TaskLifecycle::Batch),
+            "sidecar" => Ok(TaskLifecycle::Sidecar),
+            other => Err(format!("Unknown lifecycle {other}")),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskCheck {
@@ -330,6 +450,14 @@ pub struct TaskConfig {
     #[serde(default = "default_task_count")]
     pub count: TaskCount,
     pub kind: String,
+    #[serde(default = "default_task_group")]
+    pub group: String,
+    #[serde(default)]
+    #[tabled(skip)]
+    pub depends_on: Vec<TaskDependency>,
+    #[serde(default = "default_task_lifecycle")]
+    #[tabled(skip)]
+    pub lifecycle: TaskLifecycle,
     #[serde(default = "empty_object", alias = "options")]
     pub config: Value,
     #[serde(default = "empty_object")]
@@ -379,6 +507,12 @@ struct TaskConfigInput {
     #[serde(default = "default_task_count")]
     count: TaskCount,
     kind: String,
+    #[serde(default = "default_task_group")]
+    group: String,
+    #[serde(default)]
+    depends_on: Vec<TaskDependencyInput>,
+    #[serde(default)]
+    lifecycle: TaskLifecycle,
     #[serde(default = "empty_object", alias = "options")]
     config: Value,
     #[serde(default = "empty_object")]
@@ -393,12 +527,39 @@ struct TaskConfigInput {
     on_unhealthy: Option<TaskOnUnhealthyConfig>,
 }
 
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum TaskDependencyInput {
+    Name(String),
+    Detailed {
+        task: String,
+        #[serde(default = "default_dependency_condition")]
+        condition: TaskDependencyCondition,
+    },
+}
+
 impl TaskConfigInput {
     fn into_task_config(self, name: String) -> TaskConfig {
+        let depends_on = self
+            .depends_on
+            .into_iter()
+            .map(|entry| match entry {
+                TaskDependencyInput::Name(task) => TaskDependency {
+                    task,
+                    condition: default_dependency_condition(),
+                },
+                TaskDependencyInput::Detailed { task, condition } => {
+                    TaskDependency { task, condition }
+                }
+            })
+            .collect();
         TaskConfig {
             name: self.name.unwrap_or(name),
             count: self.count,
             kind: self.kind,
+            group: self.group,
+            depends_on,
+            lifecycle: self.lifecycle,
             config: self.config,
             resources: self.resources,
             constraints: self.constraints,
@@ -498,6 +659,9 @@ impl TaskConfig {
             name: name.into(),
             count: default_task_count(),
             kind: kind.into(),
+            group: default_task_group(),
+            depends_on: Vec::new(),
+            lifecycle: default_task_lifecycle(),
             config: empty_object(),
             resources: empty_object(),
             constraints: empty_object(),
@@ -698,5 +862,57 @@ mod tests {
         assert_eq!(config.tasks.len(), 1);
         assert_eq!(config.tasks[0].count.num, 3);
         assert_eq!(config.tasks[0].count.per.as_deref(), Some("region"));
+    }
+
+    #[test]
+    fn deserializes_task_group_lifecycle_defaults() {
+        let spec = serde_json::json!({
+            "name": "demo",
+            "task": {
+                "kind": "noop",
+            }
+        });
+
+        let config: JobConfig = serde_json::from_value(spec).expect("task should deserialize");
+
+        assert_eq!(config.tasks[0].group, "default");
+        assert_eq!(config.tasks[0].lifecycle, TaskLifecycle::Service);
+        assert!(config.tasks[0].depends_on.is_empty());
+    }
+
+    #[test]
+    fn deserializes_task_dependencies() {
+        let spec = serde_json::json!({
+            "name": "demo",
+            "tasks": {
+                "build": {
+                    "kind": "noop"
+                },
+                "deploy": {
+                    "kind": "noop",
+                    "dependsOn": [
+                        "build",
+                        { "task": "build", "condition": "success" }
+                    ]
+                }
+            }
+        });
+
+        let config: JobConfig = serde_json::from_value(spec).expect("task should deserialize");
+        let deploy = config
+            .tasks
+            .iter()
+            .find(|task| task.name == "deploy")
+            .unwrap();
+        assert_eq!(deploy.depends_on.len(), 2);
+        assert_eq!(deploy.depends_on[0].task, "build");
+        assert_eq!(
+            deploy.depends_on[0].condition,
+            TaskDependencyCondition::Start
+        );
+        assert_eq!(
+            deploy.depends_on[1].condition,
+            TaskDependencyCondition::Success
+        );
     }
 }

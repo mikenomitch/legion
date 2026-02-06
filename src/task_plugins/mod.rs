@@ -1,5 +1,5 @@
 use crate::prelude::*;
-use crate::structs::{Allocation, JobConfig, TaskConfig};
+use crate::structs::{Allocation, JobConfig, TaskConfig, TaskDependencyCondition, TaskLifecycle};
 use crate::util::plugin_root_dir;
 use jsonschema::JSONSchema;
 use libloading::{Library, Symbol};
@@ -139,6 +139,117 @@ pub fn validate_job_config(config: &JobConfig) -> R<()> {
         registry.validate_task_config(task)?;
         task.validate_checks()?;
     }
+    validate_task_dependencies(config)?;
+    Ok(())
+}
+
+fn validate_task_dependencies(config: &JobConfig) -> R<()> {
+    let mut task_lookup: HashMap<String, &TaskConfig> = HashMap::new();
+    for task in &config.tasks {
+        if task_lookup.contains_key(&task.name) {
+            bail!("Duplicate task name {}", task.name);
+        }
+        task_lookup.insert(task.name.clone(), task);
+    }
+
+    let mut group_per_key: HashMap<String, Option<String>> = HashMap::new();
+    let mut group_has_primary: HashMap<String, bool> = HashMap::new();
+    for task in &config.tasks {
+        let per_key = task.count.per.clone();
+        match group_per_key.get(&task.group) {
+            Some(existing) if existing.as_deref() != per_key.as_deref() => {
+                bail!(
+                    "Group {} mixes count.per values ({:?} vs {:?})",
+                    task.group,
+                    existing,
+                    per_key
+                );
+            }
+            None => {
+                group_per_key.insert(task.group.clone(), per_key);
+            }
+            _ => {}
+        }
+        if task.lifecycle != TaskLifecycle::Sidecar {
+            group_has_primary.insert(task.group.clone(), true);
+        }
+    }
+
+    for task in &config.tasks {
+        if task.lifecycle == TaskLifecycle::Sidecar {
+            let has_primary = group_has_primary.get(&task.group).copied().unwrap_or(false);
+            if !has_primary {
+                bail!(
+                    "Sidecar task {} has no primary task in group {}",
+                    task.name,
+                    task.group
+                );
+            }
+        }
+        for dependency in &task.depends_on {
+            let target = task_lookup.get(&dependency.task).with_context(|| {
+                format!(
+                    "Task {} depends on unknown task {}",
+                    task.name, dependency.task
+                )
+            })?;
+            if task.lifecycle == TaskLifecycle::Sidecar && target.group != task.group {
+                bail!(
+                    "Sidecar task {} depends on task {} outside group {}",
+                    task.name,
+                    dependency.task,
+                    task.group
+                );
+            }
+            if task.lifecycle == TaskLifecycle::Service
+                && matches!(
+                    dependency.condition,
+                    TaskDependencyCondition::Complete | TaskDependencyCondition::Success
+                )
+                && target.lifecycle == TaskLifecycle::Service
+            {
+                bail!(
+                    "Service task {} cannot depend on {} completion or success",
+                    task.name,
+                    dependency.task
+                );
+            }
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum VisitState {
+        Visiting,
+        Visited,
+    }
+
+    fn visit(
+        name: &str,
+        task_lookup: &HashMap<String, &TaskConfig>,
+        visited: &mut HashMap<String, VisitState>,
+    ) -> R<()> {
+        if let Some(state) = visited.get(name) {
+            if matches!(state, VisitState::Visiting) {
+                bail!("Task dependencies contain a cycle at {}", name);
+            }
+            return Ok(());
+        }
+
+        visited.insert(name.to_string(), VisitState::Visiting);
+        if let Some(task) = task_lookup.get(name) {
+            for dependency in &task.depends_on {
+                visit(&dependency.task, task_lookup, visited)?;
+            }
+        }
+        visited.insert(name.to_string(), VisitState::Visited);
+        Ok(())
+    }
+
+    let mut visited = HashMap::new();
+    for name in task_lookup.keys() {
+        visit(name, &task_lookup, &mut visited)?;
+    }
+
     Ok(())
 }
 
@@ -254,5 +365,49 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    #[test]
+    fn service_task_cannot_depend_on_service_completion() {
+        let config = JobConfig {
+            name: "invalid".into(),
+            tasks: vec![
+                TaskConfig {
+                    lifecycle: TaskLifecycle::Service,
+                    config: json!({"command": ["true"]}),
+                    ..TaskConfig::new("api", "exec")
+                },
+                TaskConfig {
+                    lifecycle: TaskLifecycle::Service,
+                    depends_on: vec![crate::structs::TaskDependency {
+                        task: "api".into(),
+                        condition: TaskDependencyCondition::Complete,
+                    }],
+                    config: json!({"command": ["true"]}),
+                    ..TaskConfig::new("worker", "exec")
+                },
+            ],
+            version: None,
+        };
+
+        let err = validate_job_config(&config).unwrap_err();
+        assert!(err.to_string().contains("cannot depend"));
+    }
+
+    #[test]
+    fn sidecar_requires_primary_in_group() {
+        let config = JobConfig {
+            name: "invalid".into(),
+            tasks: vec![TaskConfig {
+                lifecycle: TaskLifecycle::Sidecar,
+                group: "helpers".into(),
+                config: json!({"command": ["true"]}),
+                ..TaskConfig::new("logger", "exec")
+            }],
+            version: None,
+        };
+
+        let err = validate_job_config(&config).unwrap_err();
+        assert!(err.to_string().contains("Sidecar task"));
     }
 }

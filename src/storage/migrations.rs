@@ -97,6 +97,33 @@ pub fn get_migrations() -> Migrations<'static> {
             .down(""),
         M::up("ALTER TABLE task_config ADD COLUMN count_per STRING;").down(""),
         M::up(
+            "ALTER TABLE task_config ADD COLUMN group_name STRING NOT NULL DEFAULT 'default';",
+        )
+        .down(""),
+        M::up(
+            "ALTER TABLE task_config ADD COLUMN lifecycle STRING NOT NULL DEFAULT 'service';",
+        )
+        .down(""),
+        M::up("ALTER TABLE task_config ADD COLUMN depends_on JSONB NOT NULL DEFAULT '[]';")
+            .down(""),
+        M::up(
+            "CREATE TABLE IF NOT EXISTS task_status (
+            task_config_id INTEGER PRIMARY KEY,
+            job_id STRING NOT NULL,
+            job_config_id STRING NOT NULL,
+            status STRING NOT NULL,
+            updated_at TIMESTAMP NOT NULL,
+            FOREIGN KEY(task_config_id) REFERENCES task_config(id) ON DELETE CASCADE,
+            FOREIGN KEY(job_id) REFERENCES job(id) ON DELETE CASCADE,
+            FOREIGN KEY(job_config_id) REFERENCES job_config(id) ON DELETE CASCADE
+        )",
+        )
+        .down("DROP TABLE IF EXISTS task_status;"),
+        M::up(
+            "CREATE INDEX IF NOT EXISTS idx_task_status_job_config_id ON task_status(job_config_id);",
+        )
+        .down("DROP INDEX IF EXISTS idx_task_status_job_config_id;"),
+        M::up(
             "CREATE TABLE IF NOT EXISTS job_update (
             id STRING PRIMARY KEY,
             status STRING NOT NULL,
