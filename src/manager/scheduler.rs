@@ -18,6 +18,8 @@ pub use policy::{load_policy, SchedulerWeights, SchedulingContext, SchedulingPol
 
 mod policy;
 
+const RESCHEDULE_SCORE_JITTER_THRESHOLD: f64 = 0.01;
+
 #[derive(Debug, Clone)]
 pub struct PlannedAllocation {
     pub node_id: String,
@@ -745,34 +747,28 @@ impl<'a> Scheduler<'a> {
         planned: &HashMap<String, usize>,
         weights: SchedulerWeights,
     ) -> R<String> {
-        if let Some(rng) = reschedule_rng.as_mut() {
-            let choice = eligible
-                .choose(rng)
-                .context("No nodes available to place allocations")?;
-            Ok(choice.id.clone())
-        } else {
-            let eligible =
-                self.apply_nodes_considered_with_setting(eligible, nodes_considered_setting)?;
-            let ctx = SchedulingContext::new(
-                eligible,
-                task_config,
-                affinity_set,
-                job_config_id,
-                allocations_by_node,
-                planned,
-                weights,
-            );
-            self.policy
-                .select_node(ctx)
-                .map(|node| node.id.clone())
-                .with_context(|| {
-                    format!(
-                        "Scheduling policy {} failed to place task {}",
-                        self.policy.name(),
-                        task_config.name
-                    )
-                })
-        }
+        let eligible =
+            self.apply_nodes_considered_with_setting(eligible, nodes_considered_setting)?;
+        let ctx = SchedulingContext::new(
+            eligible,
+            task_config,
+            affinity_set,
+            job_config_id,
+            allocations_by_node,
+            planned,
+            weights,
+        );
+        let selected = reschedule_rng
+            .as_mut()
+            .map(|rng| self.select_policy_node_with_jitter(&ctx, rng))
+            .unwrap_or_else(|| self.policy.select_node(ctx));
+        selected.map(|node| node.id.clone()).with_context(|| {
+            format!(
+                "Scheduling policy {} failed to place task {}",
+                self.policy.name(),
+                task_config.name
+            )
+        })
     }
 
     fn eligible_nodes<'b>(
@@ -987,6 +983,41 @@ impl<'a> Scheduler<'a> {
         }
 
         Ok(eligible.into_iter().take(limit).collect())
+    }
+
+    fn select_policy_node_with_jitter<'b>(
+        &self,
+        ctx: &SchedulingContext<'b>,
+        rng: &mut StdRng,
+    ) -> Option<&'b Node> {
+        if !matches!(self.policy.name(), "bin_pack" | "spread") {
+            let fallback_ctx = SchedulingContext::new(
+                ctx.eligible_nodes.clone(),
+                ctx.task,
+                ctx.affinity_set,
+                ctx.job_config_id,
+                ctx.allocations,
+                ctx.planned,
+                ctx.weights,
+            );
+            return self.policy.select_node(fallback_ctx);
+        }
+
+        let scored = score_nodes_for_context(ctx);
+        if scored.is_empty() {
+            return None;
+        }
+
+        let max_score = scored
+            .iter()
+            .fold(f64::NEG_INFINITY, |best, (_, score)| best.max(*score));
+        let mut top = scored
+            .into_iter()
+            .filter(|(_, score)| *score >= max_score - RESCHEDULE_SCORE_JITTER_THRESHOLD)
+            .map(|(node, _)| node)
+            .collect::<Vec<_>>();
+        top.shuffle(rng);
+        top.first().copied()
     }
 
     fn scheduler_weights(&self) -> R<SchedulerWeights> {
@@ -1206,6 +1237,45 @@ fn group_nodes_by_attr<'a>(nodes: &'a [&'a Node], key: &str) -> HashMap<String, 
         grouped.entry(token).or_default().push(*node);
     }
     grouped
+}
+
+fn score_nodes_for_context<'a>(ctx: &SchedulingContext<'a>) -> Vec<(&'a Node, f64)> {
+    if ctx.eligible_nodes.is_empty() {
+        return Vec::new();
+    }
+
+    let mut min_load: Option<usize> = None;
+    let mut max_load: Option<usize> = None;
+    let mut loads: HashMap<&'a str, usize> = HashMap::new();
+
+    for node in &ctx.eligible_nodes {
+        let load = ctx.total_assigned(&node.id);
+        loads.insert(node.id.as_str(), load);
+        min_load = Some(min_load.map_or(load, |min| min.min(load)));
+        max_load = Some(max_load.map_or(load, |max| max.max(load)));
+    }
+
+    let min_load = min_load.unwrap_or_default() as f64;
+    let max_load = max_load.unwrap_or_default() as f64;
+    let range = (max_load - min_load).max(0.0);
+
+    ctx.eligible_nodes
+        .iter()
+        .copied()
+        .map(|node| {
+            let load = loads.get(node.id.as_str()).copied().unwrap_or_default() as f64;
+            let (spread_score, bin_pack_score) = if range > 0.0 {
+                ((max_load - load) / range, (load - min_load) / range)
+            } else {
+                (0.0, 0.0)
+            };
+            let affinity_score = ctx.affinity_set.score(node);
+            let score = ctx.weights.affinity * affinity_score
+                + ctx.weights.spread * spread_score
+                + ctx.weights.bin_pack * bin_pack_score;
+            (node, score)
+        })
+        .collect()
 }
 
 fn count_allocations_in_group(
