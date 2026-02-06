@@ -9,7 +9,8 @@ use rand::{rngs::StdRng, SeedableRng};
 use crate::constraints::{AffinitySet, ConstraintSet, DistinctTracker};
 use crate::prelude::*;
 use crate::resources::ResourcePolicy;
-use crate::storage::store::Store;
+use crate::storage::errors::StorageError;
+use crate::storage::store::{PlanApplyOutcome, Store};
 use crate::structs::{
     Allocation, JobConfig, Node, TaskConfig, TaskDependencyCondition, TaskLifecycle,
     TaskStatusState,
@@ -35,6 +36,15 @@ pub struct LedgerDelta {
 pub enum PlanMode {
     Fresh,
     Reschedule,
+}
+
+impl PlanMode {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Fresh => "fresh",
+            Self::Reschedule => "reschedule",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -116,7 +126,9 @@ impl<'a> Scheduler<'a> {
             bail!("No nodes available to place allocations");
         }
 
-        let all_tasks = self.store.cached_task_configs_for_job_config(job_config_id)?;
+        let all_tasks = self
+            .store
+            .cached_task_configs_for_job_config(job_config_id)?;
         let tasks = self.tasks_for_plan_from_store(job_config_id)?;
 
         let mut allocations_by_node = self.store.cached_allocations_by_node()?;
@@ -254,7 +266,9 @@ impl<'a> Scheduler<'a> {
             bail!("No nodes available to place allocations");
         }
 
-        let all_tasks = self.store.cached_task_configs_for_job_config(job_config_id)?;
+        let all_tasks = self
+            .store
+            .cached_task_configs_for_job_config(job_config_id)?;
         let tasks = self.tasks_for_plan_from_store(job_config_id)?;
 
         let allocations_by_node = self.store.cached_allocations_by_node()?;
@@ -308,7 +322,27 @@ impl<'a> Scheduler<'a> {
             .iter()
             .map(|placement| placement.node_id.clone())
             .collect::<HashSet<_>>();
-        let allocations = self.store.apply_allocation_plan(&placement_pairs)?;
+        let expected_epoch = self.store.allocation_epoch()?;
+        let submission = self.store.insert_plan_submission(
+            job_config_id,
+            mode.as_str(),
+            &placement_pairs,
+            expected_epoch,
+        )?;
+        let allocations = match self.store.apply_plan_submission(&submission)? {
+            PlanApplyOutcome::Applied(allocations) => allocations,
+            PlanApplyOutcome::Rejected {
+                reason,
+                latest_epoch,
+            } => {
+                return Err(anyhow::Error::new(StorageError::Conflict {
+                    message: format!(
+                        "plan submission rejected: {reason} (expected epoch {}, latest epoch {})",
+                        submission.expected_epoch, latest_epoch
+                    ),
+                }));
+            }
+        };
         let deltas = Self::allocations_delta(&affected_nodes, &allocations);
 
         Ok(PlanOutcome {
@@ -378,9 +412,10 @@ impl<'a> Scheduler<'a> {
                 _ => {}
             }
             if group_sizes.get(&task_config.group).copied().unwrap_or(0) > 1 {
-                let constraint_set = ConstraintSet::new(&task_config.constraints).with_context(
-                    || format!("Failed to parse constraints for task {}", task_config.name),
-                )?;
+                let constraint_set =
+                    ConstraintSet::new(&task_config.constraints).with_context(|| {
+                        format!("Failed to parse constraints for task {}", task_config.name)
+                    })?;
                 group_constraints
                     .entry(task_config.group.clone())
                     .or_default()
@@ -434,7 +469,9 @@ impl<'a> Scheduler<'a> {
 
         let mut group_candidates: HashMap<GroupKey, Vec<&Node>> = HashMap::new();
         for (group_name, constraint_sets) in &group_constraints {
-            let per_key = group_per_key.get(group_name).and_then(|value| value.clone());
+            let per_key = group_per_key
+                .get(group_name)
+                .and_then(|value| value.clone());
             let mut grouped: HashMap<String, Vec<&Node>> = HashMap::new();
             for node in &nodes {
                 if !constraint_sets
@@ -508,11 +545,7 @@ impl<'a> Scheduler<'a> {
                         name: task_config.group.clone(),
                         token: group_name.to_string(),
                     };
-                    let group_key = if group_sizes
-                        .get(&task_config.group)
-                        .copied()
-                        .unwrap_or(0)
-                        > 1
+                    let group_key = if group_sizes.get(&task_config.group).copied().unwrap_or(0) > 1
                     {
                         Some(group_key)
                     } else {
@@ -555,12 +588,7 @@ impl<'a> Scheduler<'a> {
                     name: task_config.group.clone(),
                     token: "default".to_string(),
                 };
-                let group_key = if group_sizes
-                    .get(&task_config.group)
-                    .copied()
-                    .unwrap_or(0)
-                    > 1
-                {
+                let group_key = if group_sizes.get(&task_config.group).copied().unwrap_or(0) > 1 {
                     Some(group_key)
                 } else {
                     None
