@@ -2293,6 +2293,17 @@ impl Store {
     }
 
     #[instrument(err, skip_all)]
+    pub fn requeue_in_flight_evals(&self) -> R<u64> {
+        let conn = self.write_connection()?;
+        let updated = conn.execute(
+            "UPDATE eval SET status = 'pending' WHERE status = 'in_flight';",
+            [],
+        )?;
+
+        Ok(updated as u64)
+    }
+
+    #[instrument(err, skip_all)]
     pub fn complete_eval(&self, eval_id: &str, succeeded: bool) -> R<()> {
         let conn: MutexGuard<'_, Connection> = self.write_connection()?;
 
@@ -3894,6 +3905,45 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(failed_status, "failed");
+
+        Ok(())
+    }
+
+    #[test]
+    fn requeue_in_flight_evals_moves_stale_work_back_to_pending() -> R<()> {
+        let store = setup_store()?;
+
+        store.insert_node(make_node_msg("node-1", "ready"))?;
+
+        insert_eval(
+            &store,
+            1,
+            "in_flight",
+            "node_join",
+            None,
+            None,
+            Some("node-1"),
+            50,
+        )?;
+        insert_eval(
+            &store,
+            2,
+            "pending",
+            "node_join",
+            None,
+            None,
+            Some("node-1"),
+            40,
+        )?;
+
+        let requeued = store.requeue_in_flight_evals()?;
+        assert_eq!(requeued, 1);
+
+        let claimed = store.claim_eval()?.expect("eval should be claimed");
+        assert_eq!(
+            claimed.id, "1",
+            "higher-priority stale eval should run first"
+        );
 
         Ok(())
     }

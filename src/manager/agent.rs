@@ -174,6 +174,11 @@ async fn start_eval_loop(store: Store, max_threads: usize) -> R<()> {
     let max_threads = max_threads.max(1);
     info!(max_threads, "Beginning eval loop");
 
+    let requeued = store.requeue_in_flight_evals()?;
+    if requeued > 0 {
+        warn!(requeued, "Recovered stale in-flight evals at startup");
+    }
+
     let mut join_set = JoinSet::new();
     for worker_id in 0..max_threads {
         spawn_eval_worker(&mut join_set, &store, worker_id);
