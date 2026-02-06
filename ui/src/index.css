@@ -13,6 +13,10 @@ body {
   color: #0b0c0f;
 }
 
+#root {
+  min-height: 100vh;
+}
+
 .dark body {
   background: radial-gradient(circle at 20% 20%, rgba(255, 255, 255, 0.02), transparent 25%),
     radial-gradient(circle at 80% 0%, rgba(255, 255, 255, 0.02), transparent 30%),
@@ -22,4 +26,14 @@ body {
 
 a {
   color: inherit;
+}
+
+@layer components {
+  .surface-card {
+    @apply rounded-xl border border-neutral-200/80 bg-white/90 p-5 shadow-[0_8px_30px_rgba(15,23,42,0.08)] dark:border-neutral-800 dark:bg-neutral-900/65 dark:shadow-[0_12px_36px_rgba(2,6,23,0.45)];
+  }
+
+  .section-kicker {
+    @apply text-xs font-semibold uppercase tracking-[0.14em] text-neutral-500 dark:text-neutral-400;
+  }
 }

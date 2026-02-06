@@ -11,7 +11,7 @@ export default function Manager() {
   );
 
   return (
-    <div class="rounded border border-neutral-200 bg-white/90 p-6 text-neutral-700 shadow-[4px_4px_0_#d4d4d8] dark:border-neutral-800 dark:bg-neutral-900/60 dark:text-neutral-300 dark:shadow-[4px_4px_0_#0b0d12]">
+    <div class="surface-card text-neutral-700 dark:text-neutral-300">
       <div class="mb-4 flex flex-wrap items-center justify-between gap-3">
         <div>
           <p class="text-xs uppercase tracking-[0.12em] text-neutral-500 dark:text-neutral-400">
@@ -32,7 +32,7 @@ export default function Manager() {
           fallback={<p class="text-red-500">Failed to load manager configs.</p>}
         >
           {configs() && configs()!.length > 0 ? (
-            <div class="grid gap-4 md:grid-cols-2">
+            <div class="grid gap-5 md:grid-cols-2">
               <For each={configs()!}>
                 {(config) => (
                   <article class="rounded border border-neutral-200 bg-neutral-50 p-4 shadow-[4px_4px_0_#d4d4d8] transition dark:border-neutral-800 dark:bg-neutral-950/60 dark:shadow-[4px_4px_0_#0b0d12]">

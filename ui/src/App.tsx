@@ -80,13 +80,13 @@ const resolveInitialTheme = (): "light" | "dark" => {
 };
 
 const baseContainer =
-  "bg-neutral-50 text-neutral-900 dark:bg-gradient-to-br dark:from-neutral-950 dark:via-neutral-900 dark:to-neutral-950 dark:text-neutral-100";
+  "bg-neutral-100 text-neutral-900 dark:bg-gradient-to-br dark:from-neutral-950 dark:via-neutral-900 dark:to-black dark:text-neutral-100";
 
 const navButton = (active: boolean) =>
-  `flex w-full items-center justify-between rounded border px-3 py-2 text-left text-sm font-semibold transition hover:-translate-y-0.5 ` +
+  `group flex w-full items-center justify-between rounded-lg border px-3 py-2.5 text-left text-sm font-medium transition ` +
   (active
-    ? "border-neutral-900 bg-neutral-900 text-white shadow-[4px_4px_0_#d4d4d8] dark:border-neutral-300 dark:bg-neutral-100 dark:text-neutral-900 dark:shadow-[4px_4px_0_#0b0d12]"
-    : "border-neutral-200 bg-transparent text-neutral-700 shadow-[4px_4px_0_#d4d4d8] hover:border-neutral-400 hover:text-neutral-900 dark:border-neutral-800 dark:text-neutral-300 dark:shadow-[4px_4px_0_#0b0d12] dark:hover:border-neutral-500 dark:hover:text-white");
+    ? "border-neutral-900 bg-neutral-900 text-white shadow-sm dark:border-neutral-300 dark:bg-neutral-100 dark:text-neutral-900"
+    : "border-transparent text-neutral-600 hover:border-neutral-200 hover:bg-white hover:text-neutral-900 hover:shadow-sm dark:text-neutral-300 dark:hover:border-neutral-700 dark:hover:bg-neutral-900 dark:hover:text-white");
 
 const isEqualData = <T,>(a: T | undefined, b: T | undefined) =>
   JSON.stringify(a) === JSON.stringify(b);
@@ -150,17 +150,17 @@ const Layout = (props: RouteSectionProps) => {
     <div class={`min-h-screen ${baseContainer}`}>
       <div class="flex min-h-screen">
         <aside
-          class={`fixed inset-y-0 left-0 z-40 flex w-64 transform flex-col overflow-hidden border-r border-neutral-200 bg-white/90 px-5 py-6 backdrop-blur-sm transition md:static ${
+          class={`fixed inset-y-0 left-0 z-40 flex w-72 transform flex-col overflow-hidden border-r border-neutral-200/80 bg-white/95 px-5 py-6 backdrop-blur-sm transition md:static ${
             isNavOpen() ? "translate-x-0" : "-translate-x-full"
           } ${
             isSidebarCollapsed() ? "md:hidden" : "md:flex md:translate-x-0"
-          } dark:border-neutral-800 dark:bg-neutral-950/80`}
+          } dark:border-neutral-800 dark:bg-neutral-950/90`}
           aria-label="Sidebar"
         >
-          <div class="mb-8 flex items-center justify-between">
+          <div class="mb-8 flex items-center justify-between gap-2">
             <A
               href="/"
-              class="text-lg font-semibold uppercase tracking-[0.18em]"
+              class="text-lg font-semibold uppercase tracking-[0.22em] text-neutral-900 dark:text-neutral-100"
               onClick={() => {
                 setIsNavOpen(false);
                 setIsSidebarCollapsed(false);
@@ -170,7 +170,7 @@ const Layout = (props: RouteSectionProps) => {
             </A>
             <button
               type="button"
-              class="rounded border border-neutral-200 p-2 text-neutral-700 shadow-sm transition hover:bg-neutral-100 md:hidden dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-900"
+              class="rounded-lg border border-neutral-200 p-2 text-neutral-700 shadow-sm transition hover:bg-neutral-100 md:hidden dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-900"
               onClick={() => setIsNavOpen(false)}
               aria-label="Close navigation"
             >
@@ -178,7 +178,7 @@ const Layout = (props: RouteSectionProps) => {
             </button>
             <button
               type="button"
-              class="hidden rounded border border-neutral-200 p-2 text-neutral-700 shadow-sm transition hover:bg-neutral-100 md:inline-flex dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-900"
+              class="hidden rounded-lg border border-neutral-200 p-2 text-neutral-700 shadow-sm transition hover:bg-neutral-100 md:inline-flex dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-900"
               onClick={() => {
                 setIsSidebarCollapsed(true);
                 setIsNavOpen(false);
@@ -188,7 +188,7 @@ const Layout = (props: RouteSectionProps) => {
               ❯
             </button>
           </div>
-          <nav class="flex flex-col gap-2">
+          <nav class="flex flex-col gap-1.5">
             <For each={navItems}>
               {(item) => (
                 <A
@@ -201,7 +201,7 @@ const Layout = (props: RouteSectionProps) => {
               )}
             </For>
           </nav>
-          <div class="mt-auto pt-8 text-xs text-neutral-500 dark:text-neutral-400">
+          <div class="mt-auto rounded-lg border border-neutral-200/80 bg-neutral-50/80 p-3 text-xs text-neutral-500 dark:border-neutral-800 dark:bg-neutral-900/60 dark:text-neutral-400">
             <p class="uppercase tracking-[0.12em] text-neutral-600 dark:text-neutral-500">
               Manager
             </p>
@@ -214,18 +214,18 @@ const Layout = (props: RouteSectionProps) => {
         <Show when={isNavOpen()}>
           <button
             type="button"
-            class="fixed inset-0 z-30 bg-black/40 backdrop-blur-sm md:hidden"
+            class="fixed inset-0 z-30 bg-black/30 backdrop-blur-sm md:hidden"
             onClick={() => setIsNavOpen(false)}
             aria-label="Close navigation overlay"
           />
         </Show>
 
         <div class="flex flex-1 flex-col">
-          <header class="flex flex-wrap items-center justify-between gap-3 border-b border-neutral-200 px-4 pb-4 pt-6 md:px-8 dark:border-neutral-800">
+          <header class="sticky top-0 z-20 flex flex-wrap items-center justify-between gap-3 border-b border-neutral-200/80 bg-neutral-100/95 px-4 pb-4 pt-5 backdrop-blur md:px-8 dark:border-neutral-800 dark:bg-neutral-950/85">
             <div class="flex items-center gap-3">
               <button
                 type="button"
-                class={`flex h-10 w-10 items-center justify-center rounded border border-neutral-300 bg-white text-lg shadow-[3px_3px_0_#d4d4d8] transition hover:-translate-y-0.5 dark:border-neutral-700 dark:bg-neutral-900 dark:shadow-[3px_3px_0_#0b0d12] ${
+                class={`flex h-10 w-10 items-center justify-center rounded-lg border border-neutral-300 bg-white text-lg text-neutral-700 shadow-sm transition hover:bg-neutral-50 dark:border-neutral-700 dark:bg-neutral-900 dark:text-neutral-200 ${
                   isSidebarCollapsed() ? "md:flex" : "md:hidden"
                 }`}
                 onClick={() => {
@@ -240,7 +240,7 @@ const Layout = (props: RouteSectionProps) => {
                 <p class="text-xs uppercase tracking-[0.16em] text-neutral-500 dark:text-neutral-400">
                   {activeNav().title}
                 </p>
-                <h1 class="text-2xl font-semibold text-neutral-900 dark:text-neutral-50">
+                <h1 class="text-xl font-semibold text-neutral-900 dark:text-neutral-50 md:text-2xl">
                   {activeNav().copy}
                 </h1>
               </div>
@@ -248,7 +248,7 @@ const Layout = (props: RouteSectionProps) => {
             <div class="flex flex-wrap items-center gap-3">
               <button
                 type="button"
-                class="flex h-10 w-10 items-center justify-center rounded border border-neutral-300 bg-white text-lg font-medium text-neutral-800 shadow-[3px_3px_0_#d4d4d8] transition hover:-translate-y-0.5 dark:border-neutral-700 dark:bg-neutral-900 dark:text-neutral-100 dark:shadow-[3px_3px_0_#0b0d12]"
+                class="flex h-10 w-10 items-center justify-center rounded-lg border border-neutral-300 bg-white text-lg font-medium text-neutral-800 shadow-sm transition hover:bg-neutral-50 dark:border-neutral-700 dark:bg-neutral-900 dark:text-neutral-100"
                 onClick={toggleTheme}
                 aria-label={
                   theme() === "dark"
@@ -266,7 +266,7 @@ const Layout = (props: RouteSectionProps) => {
             </div>
           </header>
 
-          <main class="flex-1 px-4 py-6 md:px-8">{props.children ?? null}</main>
+          <main class="flex-1 px-4 py-6 md:px-8 md:py-8"><div class="mx-auto w-full max-w-7xl">{props.children ?? null}</div></main>
         </div>
       </div>
     </div>

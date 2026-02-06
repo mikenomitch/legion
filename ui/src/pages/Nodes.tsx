@@ -403,8 +403,8 @@ export default function Nodes(props: NodesProps) {
     <Show when={!props.nodes.loading} fallback={<p class="text-neutral-500">Loading nodes…</p>}>
       <Show when={!props.nodes.error} fallback={<p class="text-red-500">Failed to load nodes.</p>}>
         {filteredNodes().length > 0 ? (
-          <div class="space-y-4">
-            <div class="flex flex-wrap items-center justify-between gap-3 rounded border border-neutral-200 bg-white/80 p-4 text-sm shadow-[4px_4px_0_#d4d4d8] dark:border-neutral-800 dark:bg-neutral-900/60 dark:text-neutral-200 dark:shadow-[4px_4px_0_#0b0d12]">
+          <div class="space-y-5">
+            <div class="surface-card flex flex-wrap items-center justify-between gap-3 text-sm dark:text-neutral-200">
               <div>
                 <p class="text-xs uppercase tracking-[0.14em] text-neutral-500 dark:text-neutral-400">Node Status</p>
                 <p class="text-base font-semibold text-neutral-900 dark:text-neutral-100">{filteredNodes().length} visible</p>
@@ -412,7 +412,7 @@ export default function Nodes(props: NodesProps) {
               <label class="flex flex-wrap items-center gap-2 text-xs font-medium uppercase tracking-[0.12em] text-neutral-600 dark:text-neutral-300">
                 <span>Filter</span>
                 <select
-                  class="rounded border border-neutral-300 bg-white px-3 py-2 text-sm font-normal lowercase text-neutral-800 shadow-[3px_3px_0_#d4d4d8] transition hover:-translate-y-0.5 focus:outline-none dark:border-neutral-700 dark:bg-neutral-900 dark:text-neutral-100 dark:shadow-[3px_3px_0_#0b0d12]"
+                  class="rounded-lg border border-neutral-300 bg-white px-3 py-2 text-sm font-normal lowercase text-neutral-800 shadow-sm transition hover:bg-neutral-50 focus:outline-none dark:border-neutral-700 dark:bg-neutral-900 dark:text-neutral-100 dark:hover:bg-neutral-800"
                   value={statusFilter()}
                   onInput={(event) => setStatusFilter(event.currentTarget.value)}
                 >
@@ -421,7 +421,7 @@ export default function Nodes(props: NodesProps) {
               </label>
             </div>
 
-            <div class="grid gap-3 lg:grid-cols-2">
+            <div class="grid gap-4 lg:grid-cols-2">
               <For each={filteredNodes()}>
                 {(node) => {
                   const nodeId = node.id || 'unknown'
@@ -437,7 +437,7 @@ export default function Nodes(props: NodesProps) {
                   const resourceUsage = buildResourceUsage(configData, fingerprintData, allocations)
 
                   return (
-                    <article class="rounded border border-neutral-200 bg-white/90 p-4 shadow-[5px_5px_0_#d4d4d8] transition dark:border-neutral-800 dark:bg-neutral-900/60 dark:shadow-[5px_5px_0_#0b0d12]">
+                    <article class="surface-card">
                       <div class="flex flex-wrap items-center justify-between gap-3">
                         <div>
                           <p class="text-xs uppercase tracking-[0.12em] text-neutral-500 dark:text-neutral-400">Node</p>
@@ -475,7 +475,7 @@ export default function Nodes(props: NodesProps) {
                                 {(allocation) => (
                                   <div class="rounded border border-neutral-200 bg-white px-3 py-2 text-sm text-neutral-800 shadow-sm dark:border-neutral-800 dark:bg-neutral-950/60 dark:text-neutral-200">
                                     <div class="flex flex-wrap items-center justify-between gap-2">
-                                      <span class="font-semibold">Allocation #{allocation.id}</span>
+                                      <span class="font-semibold">Allocation #{String(allocation.id)}</span>
                                       <div class="flex flex-wrap items-center gap-2 text-[11px] uppercase tracking-wide">
                                         <span class={`rounded border px-2 py-1 ${healthToneClasses(healthSummary.tone)}`}>
                                           {healthSummary.label}
@@ -493,7 +493,7 @@ export default function Nodes(props: NodesProps) {
                                         Job Config: {allocation.jobConfigId || '—'}
                                       </span>
                                       <span class="rounded border border-neutral-200 bg-neutral-50 px-2 py-1 dark:border-neutral-800 dark:bg-neutral-900">
-                                        Task Config: {allocation.taskConfigId || '—'}
+                                        Task Config: {allocation.taskConfigId ? String(allocation.taskConfigId) : '—'}
                                       </span>
                                     </div>
                                   </div>
@@ -536,7 +536,7 @@ export default function Nodes(props: NodesProps) {
                             </div>
                           </Show>
                         </div>
-                        <div class="grid gap-3 lg:grid-cols-2">
+                        <div class="grid gap-4 lg:grid-cols-2">
                           <KeyValueGrid
                             title="Static Config"
                             data={configData}

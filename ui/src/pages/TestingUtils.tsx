@@ -1,7 +1,9 @@
 export default function TestingUtils() {
   return (
-    <div class="rounded border border-neutral-200 bg-white/90 p-6 text-neutral-700 shadow-[4px_4px_0_#d4d4d8] dark:border-neutral-800 dark:bg-neutral-900/60 dark:text-neutral-300 dark:shadow-[4px_4px_0_#0b0d12]">
-      Testing utilities coming soon.
+    <div class="surface-card space-y-2 text-neutral-700 dark:text-neutral-300">
+      <p class="section-kicker">Testing</p>
+      <h2 class="text-xl font-semibold text-neutral-900 dark:text-neutral-100">Testing utilities</h2>
+      <p class="text-sm text-neutral-600 dark:text-neutral-400">Tools and sandboxes for diagnostics will appear here soon.</p>
     </div>
   )
 }

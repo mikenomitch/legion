@@ -80,10 +80,10 @@ export default function Jobs(props: JobsProps) {
     <Show when={!props.jobs.loading} fallback={<p class="text-neutral-500">Loading jobs…</p>}>
       <Show when={!props.jobs.error} fallback={<p class="text-red-500">Failed to load jobs.</p>}>
         {jobList().length > 0 ? (
-          <div class="space-y-3">
+          <div class="space-y-4">
             <For each={jobList()}>
               {(job) => (
-                <article class="rounded border border-neutral-200 bg-white/90 p-4 shadow-[5px_5px_0_#d4d4d8] transition dark:border-neutral-800 dark:bg-neutral-900/60 dark:shadow-[5px_5px_0_#0b0d12]">
+                <article class="surface-card space-y-3">
                   <div class="flex flex-wrap items-center justify-between gap-3">
                     <div>
                       <p class="text-xs uppercase tracking-[0.12em] text-neutral-500 dark:text-neutral-400">Job</p>
@@ -98,7 +98,7 @@ export default function Jobs(props: JobsProps) {
                   <div class="mt-3 flex flex-wrap items-center gap-2">
                     <button
                       type="button"
-                      class="rounded border border-neutral-300 bg-white px-3 py-2 text-xs font-semibold uppercase tracking-[0.08em] text-neutral-800 shadow-[3px_3px_0_#d4d4d8] transition hover:-translate-y-0.5 dark:border-neutral-700 dark:bg-neutral-900 dark:text-neutral-100 dark:shadow-[3px_3px_0_#0b0d12]"
+                      class="rounded-lg border border-neutral-300 bg-white px-3 py-2 text-xs font-semibold uppercase tracking-[0.08em] text-neutral-800 shadow-sm transition hover:bg-neutral-50 dark:border-neutral-700 dark:bg-neutral-900 dark:text-neutral-100 dark:hover:bg-neutral-800"
                       onClick={() => loadSpec(job)}
                       disabled={specs[job.name || job.id]?.loading}
                     >
@@ -107,7 +107,7 @@ export default function Jobs(props: JobsProps) {
                   </div>
 
                   <Show when={specs[job.name || job.id]}>
-                    <div class="mt-3 space-y-2 rounded border border-neutral-200 bg-neutral-50 p-3 text-sm text-neutral-800 dark:border-neutral-800 dark:bg-neutral-950/60 dark:text-neutral-200">
+                    <div class="space-y-2 rounded-lg border border-neutral-200 bg-neutral-50 p-3 text-sm text-neutral-800 dark:border-neutral-800 dark:bg-neutral-950/60 dark:text-neutral-200">
                       <button
                         type="button"
                         class="flex w-full items-center justify-between rounded border border-neutral-200 bg-white px-3 py-2 text-left font-semibold uppercase tracking-[0.08em] text-neutral-800 shadow-sm transition hover:-translate-y-0.5 dark:border-neutral-700 dark:bg-neutral-900 dark:text-neutral-100"

@@ -197,8 +197,8 @@ export default function KeyValue() {
   )
 
   return (
-    <div class="space-y-6">
-      <header class="space-y-2">
+    <div class="space-y-7">
+      <header class="surface-card space-y-2">
         <p class="text-sm uppercase tracking-[0.2em] text-neutral-500 dark:text-neutral-400">
           Key/Value
         </p>
@@ -210,15 +210,15 @@ export default function KeyValue() {
         </p>
       </header>
 
-      <div class="grid gap-6 lg:grid-cols-[280px_1fr]">
-        <section class="rounded border border-neutral-200 bg-white/90 p-4 shadow-[4px_4px_0_#d4d4d8] dark:border-neutral-800 dark:bg-neutral-900/60 dark:shadow-[4px_4px_0_#0b0d12]">
+      <div class="grid gap-6 lg:grid-cols-[300px_1fr]">
+        <section class="surface-card">
           <div class="flex items-center justify-between">
             <h2 class="text-sm font-semibold uppercase tracking-[0.12em] text-neutral-600 dark:text-neutral-300">
               Keys
             </h2>
             <button
               type="button"
-              class="rounded border border-neutral-300 px-2 py-1 text-xs font-semibold uppercase tracking-[0.08em] text-neutral-700 shadow-sm transition hover:-translate-y-0.5 dark:border-neutral-700 dark:text-neutral-200"
+              class="rounded-lg border border-neutral-300 px-2 py-1 text-xs font-semibold uppercase tracking-[0.08em] text-neutral-700 shadow-sm transition hover:bg-neutral-100 dark:border-neutral-700 dark:text-neutral-200 dark:hover:bg-neutral-800"
               onClick={() => void refresh()}
             >
               Refresh
@@ -237,7 +237,7 @@ export default function KeyValue() {
           </Show>
         </section>
 
-        <section class="space-y-4 rounded border border-neutral-200 bg-white/90 p-4 shadow-[4px_4px_0_#d4d4d8] dark:border-neutral-800 dark:bg-neutral-900/60 dark:shadow-[4px_4px_0_#0b0d12]">
+        <section class="surface-card space-y-4">
           <div class="flex flex-wrap items-center justify-between gap-3">
             <div>
               <h2 class="text-sm font-semibold uppercase tracking-[0.12em] text-neutral-600 dark:text-neutral-300">
@@ -312,7 +312,7 @@ export default function KeyValue() {
             </button>
             <Show when={selectedEntry()}>
               <span class="text-xs text-neutral-500 dark:text-neutral-400">
-                Version {selectedEntry()?.version} • {valueTypeLabel(selectedEntry()?.valueType ?? 0)}
+                Version {String(selectedEntry()?.version ?? "—")} • {valueTypeLabel(selectedEntry()?.valueType ?? 0)}
               </span>
             </Show>
           </div>

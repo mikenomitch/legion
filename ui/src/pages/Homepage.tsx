@@ -12,11 +12,11 @@ export default function Homepage(props: HomepageProps) {
     <Show when={!props.ledger.loading} fallback={<p class="text-neutral-500">Loading ledger…</p>}>
       <Show when={!props.ledger.error} fallback={<p class="text-red-500">Failed to load ledger.</p>}>
         {props.ledger() && props.ledger()!.length > 0 ? (
-          <div class="space-y-4">
+          <div class="space-y-5">
             <For each={props.ledger()!}>
               {(item) => (
-                <article class="rounded border border-neutral-200 bg-white/90 p-4 shadow-[6px_6px_0_#d4d4d8] transition dark:border-neutral-800 dark:bg-neutral-900/60 dark:shadow-[6px_6px_0_#0b0d12]">
-                  <header class="flex items-center justify-between gap-4">
+                <article class="surface-card space-y-4">
+                  <header class="flex flex-wrap items-start justify-between gap-4">
                     <div>
                       <p class="text-xs uppercase tracking-[0.12em] text-neutral-500 dark:text-neutral-400">Node</p>
                       <div class="font-semibold text-neutral-900 dark:text-neutral-100">{item.node?.id ?? 'Unknown node'}</div>
@@ -25,7 +25,7 @@ export default function Homepage(props: HomepageProps) {
                       {item.node?.status ?? 'N/A'}
                     </span>
                   </header>
-                  <div class="mt-3 grid grid-cols-2 gap-2 text-sm text-neutral-700 dark:text-neutral-300 md:grid-cols-3">
+                  <div class="grid grid-cols-1 gap-2 text-sm text-neutral-700 dark:text-neutral-300 sm:grid-cols-2 md:grid-cols-3">
                     <span class="rounded border border-neutral-200 bg-neutral-50 px-3 py-2 dark:border-neutral-800 dark:bg-neutral-900">
                       Pool: {item.node?.pool ?? '—'}
                     </span>
@@ -36,7 +36,7 @@ export default function Homepage(props: HomepageProps) {
                         Last heartbeat: {formatRelativeTime(item.node?.lastHeartbeat)}
                       </span>
                   </div>
-                  <div class="mt-4">
+                  <div class="space-y-2">
                     <p class="text-xs uppercase tracking-[0.12em] text-neutral-500 dark:text-neutral-400">Allocations</p>
                     <div class="mt-2 space-y-2">
                       <Show
