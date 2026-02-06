@@ -310,7 +310,12 @@ impl TestCluster {
         Ok(())
     }
 
-    fn assert_job_nodes_in(&self, job_id: &str, allowed_nodes: &[&str], expected_count: usize) -> R<()> {
+    fn assert_job_nodes_in(
+        &self,
+        job_id: &str,
+        allowed_nodes: &[&str],
+        expected_count: usize,
+    ) -> R<()> {
         let actual = self.job_nodes(job_id)?;
         assert_eq!(
             actual.len(),

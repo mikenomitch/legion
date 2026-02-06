@@ -13,8 +13,8 @@ use crate::storage::queries::{
 };
 use crate::structs::{
     Allocation, Eval, Job, JobConfig, KvEntry, KvLock, KvValueType, LedgerEntry, ManagerConfigFull,
-    ManagerNodeConfig, Node, NodeMsg, Submission, TaskCheck, TaskConfig, TaskCount,
-    TaskOnUnhealthyConfig, WorkerConfig,
+    ManagerNodeConfig, Node, NodeMsg, Submission, TaskCheck, TaskConfig, TaskCount, TaskDependency,
+    TaskLifecycle, TaskOnUnhealthyConfig, TaskStatusState, WorkerConfig,
 };
 
 use rand::{seq::SliceRandom, thread_rng, Rng};
@@ -222,7 +222,7 @@ impl Store {
 
         let mut task_stmt = conn.prepare(
             r#"
-            SELECT id, name, kind, count, count_per, config, resources, constraints, affinities, checks, on_unhealthy, job_config_id
+            SELECT id, name, kind, count, count_per, group_name, lifecycle, depends_on, config, resources, constraints, affinities, checks, on_unhealthy, job_config_id
             FROM task_config;
             "#,
         )?;
@@ -230,6 +230,9 @@ impl Store {
             let id = row.get(0)?;
             let count_num: u32 = row.get::<_, i64>(3)? as u32;
             let count_per: Option<String> = row.get(4)?;
+            let group: String = row.get(5)?;
+            let lifecycle = self.parse_task_lifecycle_column(6, row.get(6)?)?;
+            let depends_on = self.parse_depends_on_column(7, row.get(7)?)?;
             let task = TaskConfig {
                 name: row.get(1)?,
                 kind: row.get(2)?,
@@ -237,14 +240,17 @@ impl Store {
                     num: count_num,
                     per: count_per,
                 },
-                config: row.get(5)?,
-                resources: row.get(6)?,
-                constraints: row.get(7)?,
-                affinities: row.get(8)?,
-                checks: self.parse_checks_column(9, row.get(9)?)?,
-                on_unhealthy: self.parse_on_unhealthy_column(10, row.get(10)?)?,
+                group,
+                lifecycle,
+                depends_on,
+                config: row.get(8)?,
+                resources: row.get(9)?,
+                constraints: row.get(10)?,
+                affinities: row.get(11)?,
+                checks: self.parse_checks_column(12, row.get(12)?)?,
+                on_unhealthy: self.parse_on_unhealthy_column(13, row.get(13)?)?,
             };
-            let job_config_id: String = row.get(11)?;
+            let job_config_id: String = row.get(14)?;
             Ok((job_config_id, id, task))
         })?;
 
@@ -440,6 +446,22 @@ impl Store {
         Ok(OffsetDateTime::now_utc().format(&Rfc3339)?)
     }
 
+    fn insert_task_statuses(
+        tx: &Transaction<'_>,
+        task_ids: &[i64],
+        job_id: &str,
+        job_config_id: &str,
+    ) -> R<()> {
+        let now = Self::now_rfc3339()?;
+        for task_id in task_ids {
+            tx.execute(
+                "INSERT INTO task_status (task_config_id, job_id, job_config_id, status, updated_at) VALUES (?, ?, ?, ?, ?);",
+                params![task_id, job_id, job_config_id, TaskStatusState::Pending.as_str(), now],
+            )?;
+        }
+        Ok(())
+    }
+
     fn parse_rfc3339(value: &str) -> R<OffsetDateTime> {
         Ok(OffsetDateTime::parse(value, &Rfc3339)?)
     }
@@ -614,9 +636,40 @@ impl Store {
         })
     }
 
+    fn parse_depends_on_column(
+        &self,
+        idx: usize,
+        raw: String,
+    ) -> Result<Vec<TaskDependency>, rusqlite::Error> {
+        serde_json::from_str(&raw).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(
+                idx,
+                rusqlite::types::Type::Text,
+                Box::new(err),
+            )
+        })
+    }
+
+    fn parse_task_lifecycle_column(
+        &self,
+        idx: usize,
+        raw: String,
+    ) -> Result<TaskLifecycle, rusqlite::Error> {
+        raw.parse::<TaskLifecycle>().map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(
+                idx,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, err)),
+            )
+        })
+    }
+
     fn task_config_from_row(&self, row: &Row<'_>) -> Result<TaskConfig, rusqlite::Error> {
         let count_num: u32 = row.get::<_, i64>(3)? as u32;
         let count_per: Option<String> = row.get(4)?;
+        let group: String = row.get(5)?;
+        let lifecycle = self.parse_task_lifecycle_column(6, row.get(6)?)?;
+        let depends_on = self.parse_depends_on_column(7, row.get(7)?)?;
         let task_config = TaskConfig {
             name: row.get(1)?,
             kind: row.get(2)?,
@@ -624,12 +677,15 @@ impl Store {
                 num: count_num,
                 per: count_per,
             },
-            config: row.get(5)?,
-            resources: row.get(6)?,
-            constraints: row.get(7)?,
-            affinities: row.get(8)?,
-            checks: self.parse_checks_column(9, row.get(9)?)?,
-            on_unhealthy: self.parse_on_unhealthy_column(10, row.get(10)?)?,
+            group,
+            lifecycle,
+            depends_on,
+            config: row.get(8)?,
+            resources: row.get(9)?,
+            constraints: row.get(10)?,
+            affinities: row.get(11)?,
+            checks: self.parse_checks_column(12, row.get(12)?)?,
+            on_unhealthy: self.parse_on_unhealthy_column(13, row.get(13)?)?,
         };
 
         Ok(task_config)
@@ -1266,14 +1322,19 @@ impl Store {
                 ))
             })?;
 
+        let mut task_ids = Vec::new();
         for t in &config.tasks {
             let checks = serde_json::to_string(&t.checks)?;
             let on_unhealthy = serde_json::to_string(&t.on_unhealthy)?;
+            let depends_on = serde_json::to_string(&t.depends_on)?;
             let task_params = named_params! {
                 ":name": t.name,
                 ":kind": t.kind,
                 ":count": t.count.num,
                 ":count_per": t.count.per,
+                ":group_name": t.group,
+                ":lifecycle": t.lifecycle.to_string(),
+                ":depends_on": depends_on,
                 ":config": t.config,
                 ":resources": t.resources,
                 ":constraints": t.constraints,
@@ -1284,7 +1345,8 @@ impl Store {
                 ":job_config_id": job_config_id,
             };
 
-            tx.execute(&INSERT_TASK, task_params)?;
+            let task_id: i64 = tx.query_row(&INSERT_TASK, task_params, |row| row.get(0))?;
+            task_ids.push(task_id);
         }
 
         for s in subs {
@@ -1316,6 +1378,8 @@ impl Store {
         };
 
         tx.execute(&INSERT_JOB_UPDATE, job_update_params)?;
+
+        Self::insert_task_statuses(&tx, &task_ids, &job.id, &job_config_id)?;
 
         tx.commit()
             .map_err(|_| anyhow!("Error committing transaction"))?;
@@ -1502,27 +1566,82 @@ impl Store {
         let mut stmt = conn.prepare(&GET_TASK_FOR_JOB_CONIFG)?;
         let rows = stmt.query_map([job_config_id], |row| {
             let id = row.get(0)?;
-            let count_num: u32 = row.get::<_, i64>(3)? as u32;
-            let count_per: Option<String> = row.get(4)?;
-            let task = TaskConfig {
-                name: row.get(1)?,
-                kind: row.get(2)?,
-                count: TaskCount {
-                    num: count_num,
-                    per: count_per,
-                },
-                config: row.get(5)?,
-                resources: row.get(6)?,
-                constraints: row.get(7)?,
-                affinities: row.get(8)?,
-                checks: self.parse_checks_column(9, row.get(9)?)?,
-                on_unhealthy: self.parse_on_unhealthy_column(10, row.get(10)?)?,
-            };
-
+            let task = self.task_config_from_row(row)?;
             Ok((id, task))
         })?;
 
         Self::collect_rows(rows)
+    }
+
+    pub fn task_statuses_for_job_config(
+        &self,
+        job_config_id: &str,
+    ) -> R<HashMap<i64, TaskStatusState>> {
+        let conn = self.read_connection()?;
+        let mut stmt = conn
+            .prepare("SELECT task_config_id, status FROM task_status WHERE job_config_id = ?;")?;
+        let rows = stmt.query_map([job_config_id], |row| {
+            let task_id: i64 = row.get(0)?;
+            let status: String = row.get(1)?;
+            let status = status.parse::<TaskStatusState>().map_err(|err| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    1,
+                    rusqlite::types::Type::Text,
+                    Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, err)),
+                )
+            })?;
+            Ok((task_id, status))
+        })?;
+
+        let mut statuses = HashMap::new();
+        for row in rows {
+            let (task_id, status) = row?;
+            statuses.insert(task_id, status);
+        }
+        Ok(statuses)
+    }
+
+    pub fn set_task_status(&self, task_config_id: i64, status: TaskStatusState) -> R<()> {
+        let conn = self.write_connection()?;
+        let now = Self::now_rfc3339()?;
+        conn.execute(
+            "UPDATE task_status SET status = ?, updated_at = ? WHERE task_config_id = ?;",
+            params![status.as_str(), now, task_config_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_task_statuses_for_allocations(&self, allocations: &[Allocation]) -> R<bool> {
+        if allocations.is_empty() {
+            return Ok(false);
+        }
+
+        let mut task_cache: HashMap<String, HashMap<i64, TaskConfig>> = HashMap::new();
+        let mut updated = false;
+
+        for allocation in allocations {
+            let tasks = task_cache
+                .entry(allocation.job_config_id.clone())
+                .or_insert_with(HashMap::new);
+            if tasks.is_empty() {
+                let configs = self.get_task_configs_for_job_config(&allocation.job_config_id)?;
+                for (id, config) in configs {
+                    tasks.insert(id, config);
+                }
+            }
+            let task = tasks
+                .get(&allocation.task_config_id)
+                .with_context(|| format!("Missing task config {}", allocation.task_config_id))?;
+
+            let status = match task.lifecycle {
+                TaskLifecycle::Batch => TaskStatusState::Success,
+                TaskLifecycle::Service | TaskLifecycle::Sidecar => TaskStatusState::Running,
+            };
+            self.set_task_status(allocation.task_config_id, status)?;
+            updated = true;
+        }
+
+        Ok(updated)
     }
 
     //
@@ -2582,6 +2701,7 @@ fn task_schedule_equivalent(left: &TaskConfig, right: &TaskConfig) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::manager::scheduler::{PlanMode, Scheduler};
     use rusqlite::params;
     use tempfile::Builder;
 
@@ -3617,6 +3737,54 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(failed_status, "failed");
+
+        Ok(())
+    }
+
+    #[test]
+    fn task_statuses_initialize_and_update() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "ready"))?;
+
+        let job = JobConfig {
+            name: "status-demo".into(),
+            tasks: vec![
+                TaskConfig {
+                    lifecycle: TaskLifecycle::Batch,
+                    ..TaskConfig::new("prep", "exec")
+                },
+                TaskConfig {
+                    lifecycle: TaskLifecycle::Service,
+                    ..TaskConfig::new("api", "noop")
+                },
+            ],
+            version: None,
+        };
+
+        store.handle_job_submit(
+            &job,
+            &[Submission {
+                path: "job.jsonnet".into(),
+                content: "job".into(),
+                is_primary: true,
+            }],
+        )?;
+        let job_config_id = store.get_job_config(&job.name)?.id();
+
+        let statuses = store.task_statuses_for_job_config(&job_config_id)?;
+        assert!(statuses
+            .values()
+            .all(|status| *status == TaskStatusState::Pending));
+
+        let scheduler = Scheduler::new(&store)?;
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+        store.update_task_statuses_for_allocations(&outcome.allocations)?;
+
+        let statuses = store.task_statuses_for_job_config(&job_config_id)?;
+        let prep_id = task_id_for(&store, "prep", &job.name)?;
+        let api_id = task_id_for(&store, "api", &job.name)?;
+        assert_eq!(statuses.get(&prep_id), Some(&TaskStatusState::Success));
+        assert_eq!(statuses.get(&api_id), Some(&TaskStatusState::Running));
 
         Ok(())
     }

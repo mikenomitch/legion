@@ -169,6 +169,7 @@ impl Eval {
             mode,
             excluded.as_ref(),
         )?;
+        store.update_task_statuses_for_allocations(&outcome.allocations)?;
         dispatch_allocations(store, &outcome.allocations)?;
         Ok(outcome)
     }

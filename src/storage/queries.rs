@@ -260,11 +260,11 @@ lazy_static! {
 //
 
 pub const TASK_CONFIG_ATTRS: &str = r#"
-id, name, kind, count, count_per, config, resources, constraints, affinities, checks, on_unhealthy, job_id, job_config_id
+id, name, kind, count, count_per, group_name, lifecycle, depends_on, config, resources, constraints, affinities, checks, on_unhealthy, job_id, job_config_id
 "#;
 
 pub const TASK_CONFIG_INSERT_ATTRS: &str = r#"
-name, kind, count, count_per, config, resources, constraints, affinities, checks, on_unhealthy, job_id, job_config_id
+name, kind, count, count_per, group_name, lifecycle, depends_on, config, resources, constraints, affinities, checks, on_unhealthy, job_id, job_config_id
 "#;
 
 // pub const TASK_CONFIG_PARAM_SET: &str = r#"
@@ -272,7 +272,7 @@ name, kind, count, count_per, config, resources, constraints, affinities, checks
 // "#;
 
 pub const TASK_CONFIG_ATTRS_VALS: &str = r#"
-:name, :kind, :count, :count_per, :config, :resources, :constraints, :affinities, :checks, :on_unhealthy, :job_id, :job_config_id
+:name, :kind, :count, :count_per, :group_name, :lifecycle, :depends_on, :config, :resources, :constraints, :affinities, :checks, :on_unhealthy, :job_id, :job_config_id
 "#;
 
 lazy_static! {
@@ -300,6 +300,7 @@ lazy_static! {
         r#"
     INSERT INTO task_config ({TASK_CONFIG_INSERT_ATTRS})
     VALUES ({TASK_CONFIG_ATTRS_VALS})
+    RETURNING id;
     "#
     );
 }
