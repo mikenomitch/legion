@@ -1,4 +1,4 @@
-use crate::constraints::{ConstraintSet, DistinctTracker};
+use crate::constraints::{ConstraintSet, DistinctTracker, PermitSet};
 use crate::prelude::*;
 use crate::resources::ResourcePolicy;
 use crate::storage::errors::StorageError;
@@ -53,6 +53,7 @@ pub struct SchedulingReadModel {
 #[derive(Debug)]
 struct AllocationConstraintState {
     constraints: ConstraintSet,
+    permit: PermitSet,
     distinct: Option<DistinctTracker>,
 }
 
@@ -234,7 +235,7 @@ impl Store {
 
         let mut task_stmt = conn.prepare(
             r#"
-            SELECT id, name, kind, count, count_per, group_name, lifecycle, depends_on, config, resources, constraints, affinities, checks, on_unhealthy, job_config_id
+            SELECT id, name, kind, count, count_per, group_name, lifecycle, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, job_config_id
             FROM task_config;
             "#,
         )?;
@@ -258,11 +259,12 @@ impl Store {
                 config: row.get(8)?,
                 resources: row.get(9)?,
                 constraints: row.get(10)?,
-                affinities: row.get(11)?,
-                checks: self.parse_checks_column(12, row.get(12)?)?,
-                on_unhealthy: self.parse_on_unhealthy_column(13, row.get(13)?)?,
+                permit: row.get(11)?,
+                affinities: row.get(12)?,
+                checks: self.parse_checks_column(13, row.get(13)?)?,
+                on_unhealthy: self.parse_on_unhealthy_column(14, row.get(14)?)?,
             };
-            let job_config_id: String = row.get(14)?;
+            let job_config_id: String = row.get(15)?;
             Ok((job_config_id, id, task))
         })?;
 
@@ -494,6 +496,7 @@ impl Store {
             if !state
                 .constraints
                 .is_satisfied(&node, state.distinct.as_ref())
+                || !state.permit.is_permitted(&node)
             {
                 let reason = format!(
                     "Node {} does not satisfy constraints for task {}",
@@ -823,9 +826,10 @@ impl Store {
             config: row.get(8)?,
             resources: row.get(9)?,
             constraints: row.get(10)?,
-            affinities: row.get(11)?,
-            checks: self.parse_checks_column(12, row.get(12)?)?,
-            on_unhealthy: self.parse_on_unhealthy_column(13, row.get(13)?)?,
+            permit: row.get(11)?,
+            affinities: row.get(12)?,
+            checks: self.parse_checks_column(13, row.get(13)?)?,
+            on_unhealthy: self.parse_on_unhealthy_column(14, row.get(14)?)?,
         };
 
         Ok(task_config)
@@ -1482,6 +1486,7 @@ impl Store {
                 ":config": t.config,
                 ":resources": t.resources,
                 ":constraints": t.constraints,
+                ":permit": t.permit,
                 ":affinities": t.affinities,
                 ":checks": checks,
                 ":on_unhealthy": on_unhealthy,
@@ -1836,13 +1841,15 @@ impl Store {
         tx: &Transaction<'_>,
         task_id: i64,
     ) -> R<AllocationConstraintState> {
-        let constraints: Value = tx.query_row(
-            "SELECT constraints FROM task_config WHERE id = ?;",
+        let (constraints, permit): (Value, Value) = tx.query_row(
+            "SELECT constraints, permit FROM task_config WHERE id = ?;",
             [task_id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         let constraint_set = ConstraintSet::new(&constraints)
             .with_context(|| format!("Failed to parse constraints for task {task_id}"))?;
+        let permit_set = PermitSet::new(&permit)
+            .with_context(|| format!("Failed to parse permit for task {task_id}"))?;
         let distinct_keys = constraint_set.distinct_keys();
         let distinct = if distinct_keys.is_empty() {
             None
@@ -1863,6 +1870,7 @@ impl Store {
 
         Ok(AllocationConstraintState {
             constraints: constraint_set,
+            permit: permit_set,
             distinct,
         })
     }
@@ -1892,6 +1900,7 @@ impl Store {
             if !state
                 .constraints
                 .is_satisfied(&node, state.distinct.as_ref())
+                || !state.permit.is_permitted(&node)
             {
                 bail!(
                     "Node {} does not satisfy constraints for task {}",
@@ -2099,14 +2108,18 @@ impl Store {
                 ConstraintSet::new(&task_config.constraints).with_context(|| {
                     format!("Failed to parse constraints for task {}", task_config.name)
                 })?;
+            let permit_set = PermitSet::new(&task_config.permit)
+                .with_context(|| format!("Failed to parse permit for task {}", task_config.name))?;
             let eligible = nodes
                 .iter()
-                .filter(|node| constraint_set.is_satisfied(node, None))
+                .filter(|node| {
+                    constraint_set.is_satisfied(node, None) && permit_set.is_permitted(node)
+                })
                 .collect::<Vec<_>>();
 
             if eligible.is_empty() {
                 bail!(
-                    "Failed to place task {}: no available nodes matching constraints",
+                    "Failed to place task {}: no available nodes matching constraints or permit",
                     task_config.name
                 );
             }
@@ -2846,6 +2859,7 @@ fn task_schedule_equivalent(left: &TaskConfig, right: &TaskConfig) -> bool {
     left.count == right.count
         && left.resources == right.resources
         && left.constraints == right.constraints
+        && left.permit == right.permit
         && left.affinities == right.affinities
 }
 

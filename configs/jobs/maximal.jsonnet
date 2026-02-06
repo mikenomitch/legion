@@ -22,6 +22,13 @@
                 role: "web",
                 region: "us-east",
             },
+            permit: [
+                {
+                    key: "pool",
+                    operator: "equal",
+                    value: "default",
+                },
+            ],
             checks: [
                 {
                     type: "boot",
