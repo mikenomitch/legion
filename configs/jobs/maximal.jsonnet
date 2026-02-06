@@ -114,5 +114,27 @@
                 region: "us-west",
             },
         },
+        {
+            name: "container",
+            count: 1,
+            kind: "container",
+            config: {
+                image: "alpine:latest",
+                command: ["echo", "hello", "from", "container"],
+                env: {
+                    LEGION_TASK: "container",
+                },
+            },
+            resources: {
+                cpus: 0.2,
+                memory: 128,
+            },
+            constraints: {
+                os: "macos",
+            },
+            affinities: {
+                region: "us-west",
+            },
+        },
     ],
 }

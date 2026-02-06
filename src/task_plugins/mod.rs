@@ -7,8 +7,10 @@ use std::collections::HashMap;
 use std::process::Child;
 
 mod exec;
+mod container;
 
 pub use exec::ExecTaskPlugin;
+pub use container::ContainerTaskPlugin;
 
 #[derive(Default)]
 pub struct TaskRuntime {
@@ -148,6 +150,10 @@ fn load_task_plugin(name: &str) -> R<LoadedTaskPlugin> {
             Box::new(ExecTaskPlugin::default()),
             None,
         )),
+        "container" => Ok(LoadedTaskPlugin::new(
+            Box::new(ContainerTaskPlugin::default()),
+            None,
+        )),
         other => {
             let path = task_plugin_name_to_path(other);
             unsafe {
@@ -217,11 +223,30 @@ mod tests {
         }
     }
 
+    fn container_task() -> TaskConfig {
+        TaskConfig {
+            config: json!({
+                "image": "alpine",
+                "command": ["echo", "hello"],
+                "env": { "MODE": "test" }
+            }),
+            ..TaskConfig::new("container-task", "container")
+        }
+    }
+
     #[test]
     fn task_registry_loads_exec_plugin() -> R<()> {
         let mut registry = TaskPluginRegistry::new();
         registry.validate_task_config(&exec_task())?;
         assert!(registry.plugin("exec").is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn task_registry_loads_container_plugin() -> R<()> {
+        let mut registry = TaskPluginRegistry::new();
+        registry.validate_task_config(&container_task())?;
+        assert!(registry.plugin("container").is_some());
         Ok(())
     }
 

@@ -42,6 +42,9 @@ impl WorkerTaskManager {
         if let Err(err) = self.registry.load_plugin("exec", true) {
             error!(?err, "Failed to load exec task plugin");
         }
+        if let Err(err) = self.registry.load_plugin("container", true) {
+            error!(?err, "Failed to load container task plugin");
+        }
         if let Err(err) = self.registry.load_plugin("noop", true) {
             debug!(?err, "Noop task plugin not available");
         }
@@ -351,13 +354,12 @@ mod tests {
 
         let allocation = alloc();
         let task = TaskConfig {
-            config: json!({"command": "sleep", "args": ["5"]}),
+            config: json!({"command": ["sleep", "5"]}),
             checks: vec![TaskCheck {
                 check_type: TaskCheckType::Health,
                 name: Some("heartbeat".into()),
                 kind: TaskCheckKind::Exec,
-                command: Some("true".into()),
-                args: None,
+                command: Some(vec!["true".into()]),
                 path: None,
                 port: None,
                 every: Duration::from_millis(50),
