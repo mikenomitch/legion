@@ -157,7 +157,7 @@ fn select_scored_node<'a>(ctx: &SchedulingContext<'a>) -> Option<&'a Node> {
     let mut top_nodes: Vec<&'a Node> = scored_nodes
         .into_iter()
         .filter_map(|(score, node)| {
-            if (score - best_score).abs() <= f64::EPSILON {
+            if (score - best_score).abs() <= 1e-9 {
                 Some(node)
             } else {
                 None
@@ -434,6 +434,45 @@ mod tests {
 
         let choice = policy.select_node(ctx).expect("node expected");
         assert!(["node-a", "node-b"].contains(&choice.id.as_str()));
+    }
+
+    #[test]
+    fn bin_pack_treats_near_equal_scores_as_tie() {
+        let nodes = vec![node("node-a"), node("node-b")];
+        let allocations: HashMap<String, Vec<Allocation>> = HashMap::from([(
+            String::from("node-a"),
+            vec![alloc("node-a", 1, "other-job")],
+        )]);
+        let planned = HashMap::new();
+
+        let task = task("web");
+        let affinity_set = AffinitySet::new(&task.affinities).expect("affinities");
+        let policy = BinPackPolicy::default();
+
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..64 {
+            let choice = policy
+                .select_node(SchedulingContext::new(
+                    nodes.iter().collect(),
+                    &task,
+                    &affinity_set,
+                    "job",
+                    &allocations,
+                    &planned,
+                    SchedulerWeights {
+                        affinity: 1.0,
+                        spread: 0.0,
+                        bin_pack: 5e-10,
+                    },
+                ))
+                .expect("node expected");
+            seen.insert(choice.id.clone());
+        }
+
+        assert!(
+            seen.contains("node-a") && seen.contains("node-b"),
+            "near-equal floating scores should not force deterministic clustering"
+        );
     }
 
     #[test]
