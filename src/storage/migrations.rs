@@ -222,5 +222,29 @@ pub fn get_migrations() -> Migrations<'static> {
             "CREATE INDEX IF NOT EXISTS idx_job_kv_reference_job ON job_kv_reference(job_id);",
         )
         .down("DROP INDEX IF EXISTS idx_job_kv_reference_job;"),
+        M::up(
+            "CREATE TABLE IF NOT EXISTS allocation_epoch (
+            singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+            epoch INTEGER NOT NULL
+        )",
+        )
+        .down("DROP TABLE IF EXISTS allocation_epoch;"),
+        M::up(
+            "INSERT OR IGNORE INTO allocation_epoch(singleton, epoch) VALUES (1, 0);",
+        )
+        .down(""),
+        M::up(
+            "CREATE TABLE IF NOT EXISTS plan_submission (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_config_id STRING NOT NULL,
+            mode STRING NOT NULL,
+            placements JSONB NOT NULL,
+            expected_epoch INTEGER NOT NULL,
+            status STRING NOT NULL,
+            rejection_reason STRING,
+            created_at TIMESTAMP NOT NULL
+        )",
+        )
+        .down("DROP TABLE IF EXISTS plan_submission;"),
     ])
 }
