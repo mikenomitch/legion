@@ -1,6 +1,6 @@
 use crate::prelude::*;
 use crate::structs::{Allocation, TaskConfig};
-use crate::task_plugins::{TaskPlugin, TaskRuntime};
+use crate::task_plugins::{spawn_task_process, TaskPlugin, TaskRuntime};
 use std::collections::HashMap;
 use std::process::Command;
 
@@ -207,7 +207,7 @@ impl TaskPlugin for ContainerTaskPlugin {
         let mut cmd = Command::new(&launch.program);
         cmd.args(&launch.args);
 
-        let child = cmd.spawn().with_context(|| {
+        let child = spawn_task_process(&mut cmd).with_context(|| {
             format!(
                 "Failed to spawn container task {} for allocation {}",
                 task.name, allocation.id
@@ -288,7 +288,10 @@ mod tests {
 
         let parsed = ContainerTaskConfig::from_value(&config)?;
         assert_eq!(parsed.image, "alpine:latest");
-        assert_eq!(parsed.command, vec!["echo".to_string(), "hello".to_string()]);
+        assert_eq!(
+            parsed.command,
+            vec!["echo".to_string(), "hello".to_string()]
+        );
         assert_eq!(parsed.env.get("MODE"), Some(&"test".to_string()));
         Ok(())
     }
