@@ -88,6 +88,7 @@ impl Eval {
         if let Some(prev_id) = previous_config_id.as_ref() {
             if store.job_configs_schedule_equivalent(prev_id, &self.job_config_id)? {
                 store.migrate_allocations_to_job_config(prev_id, &self.job_config_id)?;
+                self.schedule_batch_follow_up(store)?;
                 return Ok(format!("Job {} submitted with 0 placements", self.job_id));
             }
         }
@@ -100,6 +101,8 @@ impl Eval {
         if let Some(prev_id) = previous_config_id {
             store.remove_allocs_for_job_config(&prev_id)?;
         }
+
+        self.schedule_batch_follow_up(store)?;
 
         Ok(format!(
             "Job {} submitted with {} placements",
@@ -118,6 +121,8 @@ impl Eval {
         if !outcome.deltas.is_empty() {
             info!(?outcome.deltas, "Job update allocation deltas");
         }
+
+        self.schedule_batch_follow_up(store)?;
 
         Ok(format!(
             "Job {} updated with {} placements",
@@ -145,6 +150,8 @@ impl Eval {
         if !outcome.deltas.is_empty() {
             info!(?outcome.deltas, "Job reschedule allocation deltas");
         }
+
+        self.schedule_batch_follow_up(store)?;
 
         Ok(format!(
             "Job {} rescheduled with {} placements",
@@ -219,6 +226,43 @@ impl Eval {
     fn is_conflict_error(error: &anyhow::Error) -> bool {
         StorageError::from_anyhow(error)
             .is_some_and(|storage| matches!(storage, StorageError::Conflict { .. }))
+    }
+
+    fn schedule_batch_follow_up(&self, store: &Store) -> R<()> {
+        if self.job_id.trim().is_empty() || self.job_config_id.trim().is_empty() {
+            return Ok(());
+        }
+
+        let tasks = store.get_task_configs_for_job_config(&self.job_config_id)?;
+        let mut min_delay: Option<std::time::Duration> = None;
+        for (_, task) in tasks {
+            if task.lifecycle != super::job::TaskLifecycle::Batch {
+                continue;
+            }
+            let Some(schedule) = task.schedule.as_ref() else {
+                continue;
+            };
+            let delay = schedule.next_delay().map_err(|err| {
+                anyhow::anyhow!("invalid batch schedule for task {}: {err}", task.name)
+            })?;
+            min_delay = Some(match min_delay {
+                Some(current) => current.min(delay),
+                None => delay,
+            });
+        }
+
+        if let Some(delay) = min_delay {
+            store.enqueue_eval_after_delay(
+                "job_update",
+                Some(&self.job_id),
+                Some(&self.job_config_id),
+                None,
+                None,
+                delay,
+            )?;
+        }
+
+        Ok(())
     }
 
     fn current_timestamp() -> String {
