@@ -1045,3 +1045,98 @@ fn scheduler_count_per_id_scales_with_node_changes() -> R<()> {
 
     Ok(())
 }
+
+#[test]
+fn scheduler_multi_job_churn_constraints_and_count_per_reschedule() -> R<()> {
+    let mut cluster = TestCluster::new("spread")?;
+    let nodes = vec![
+        NodeSpec {
+            id: "east-a".into(),
+            zone: "east".into(),
+            rack: "rack-a".into(),
+            tier: "gold".into(),
+            memory_mib: 4096.0,
+            cpu_mhz: 2400.0,
+            resources: json!({ "disk": 80 }),
+        },
+        NodeSpec {
+            id: "east-b".into(),
+            zone: "east".into(),
+            rack: "rack-b".into(),
+            tier: "gold".into(),
+            memory_mib: 4096.0,
+            cpu_mhz: 2400.0,
+            resources: json!({ "disk": 80 }),
+        },
+        NodeSpec {
+            id: "west-a".into(),
+            zone: "west".into(),
+            rack: "rack-c".into(),
+            tier: "silver".into(),
+            memory_mib: 4096.0,
+            cpu_mhz: 2400.0,
+            resources: json!({ "disk": 80 }),
+        },
+        NodeSpec {
+            id: "west-b".into(),
+            zone: "west".into(),
+            rack: "rack-d".into(),
+            tier: "silver".into(),
+            memory_mib: 4096.0,
+            cpu_mhz: 2400.0,
+            resources: json!({ "disk": 80 }),
+        },
+    ];
+    cluster.add_nodes(&nodes)?;
+    for node in &nodes {
+        cluster.add_dynamic_attr(&node.id, "region", json!(node.zone))?;
+    }
+
+    let regional_job = JobConfig {
+        name: "job-regional".into(),
+        tasks: vec![TaskConfig {
+            count: TaskCount::per(2, "region"),
+            constraints: json!({}),
+            resources: json!({ "memory": 128, "cpu": 100 }),
+            ..TaskConfig::new("regional", "service")
+        }],
+        version: None,
+    };
+
+    let constrained_job = JobConfig {
+        name: "job-constrained".into(),
+        tasks: vec![TaskConfig {
+            count: TaskCount::new(2),
+            constraints: json!({ "zone": "east" }),
+            resources: json!({ "memory": 128, "cpu": 100 }),
+            ..TaskConfig::new("east-only", "service")
+        }],
+        version: None,
+    };
+
+    cluster.submit_job(regional_job)?;
+    cluster.submit_job(constrained_job)?;
+
+    let initial_regional = cluster.job_allocations_by_attr("job-regional", "region")?;
+    assert_eq!(initial_regional.get("east"), Some(&2));
+    assert_eq!(initial_regional.get("west"), Some(&2));
+    cluster.assert_job_nodes_in("job-constrained", &["east-a", "east-b"], 2)?;
+
+    cluster.drop_node("east-a", &["job-regional", "job-constrained"])?;
+    cluster.assert_job_nodes_in("job-constrained", &["east-b"], 2)?;
+
+    let after_drop_regional = cluster.job_allocations_by_attr("job-regional", "region")?;
+    assert_eq!(after_drop_regional.get("east"), Some(&2));
+    assert_eq!(after_drop_regional.get("west"), Some(&2));
+
+    cluster.join_node("east-a")?;
+    cluster.reschedule_job("job-regional")?;
+    cluster.reschedule_job("job-constrained")?;
+
+    let after_rejoin_regional = cluster.job_allocations_by_attr("job-regional", "region")?;
+    assert_eq!(after_rejoin_regional.get("east"), Some(&2));
+    assert_eq!(after_rejoin_regional.get("west"), Some(&2));
+    cluster.assert_job_nodes_in("job-constrained", &["east-a", "east-b"], 2)?;
+
+    Ok(())
+}
