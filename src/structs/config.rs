@@ -86,6 +86,27 @@ pub struct ManagerConfigFull {
     pub custom_resources: Option<Value>,
 }
 
+fn default_scheduler_anti_affinity_weight() -> f64 {
+    // Mirrors Nomad's built-in anti-affinity preference: a modest default signal
+    // that nudges same-task/group allocations apart unless stronger affinities apply.
+    1.0
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SchedulerSettings {
+    #[serde(default = "default_scheduler_anti_affinity_weight")]
+    pub anti_affinity_weight: f64,
+}
+
+impl Default for SchedulerSettings {
+    fn default() -> Self {
+        Self {
+            anti_affinity_weight: default_scheduler_anti_affinity_weight(),
+        }
+    }
+}
+
 impl From<ManagerConfigFull> for ManagerConfig {
     fn from(val: ManagerConfigFull) -> Self {
         ManagerConfig {

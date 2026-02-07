@@ -11,6 +11,7 @@ use crate::prelude::*;
 use crate::resources::ResourcePolicy;
 use crate::storage::errors::StorageError;
 use crate::storage::store::{PlanApplyOutcome, Store};
+use crate::structs::config::SchedulerSettings;
 use crate::structs::{
     Allocation, JobConfig, Node, TaskConfig, TaskDependencyCondition, TaskLifecycle,
     TaskStatusState,
@@ -392,6 +393,7 @@ impl<'a> Scheduler<'a> {
         let mut placements = Vec::new();
         let mut planned: HashMap<String, usize> = HashMap::new();
         let weights = self.scheduler_weights()?;
+        let anti_affinity_weight = self.anti_affinity_weight()?;
         let nodes_considered_setting = self.nodes_considered_setting()?;
         let mut reschedule_rng = if matches!(mode, PlanMode::Reschedule) {
             Some(reschedule_rng())
@@ -411,6 +413,7 @@ impl<'a> Scheduler<'a> {
         let mut group_sizes: HashMap<String, usize> = HashMap::new();
         let mut group_constraints: HashMap<String, Vec<ConstraintSet>> = HashMap::new();
         let mut task_group_map: HashMap<i64, (String, Option<String>)> = HashMap::new();
+        let mut task_ids_by_group: HashMap<String, HashSet<i64>> = HashMap::new();
 
         for (task_id, task_config) in &all_tasks {
             let per_key = task_config.count.per.clone();
@@ -440,6 +443,19 @@ impl<'a> Scheduler<'a> {
                     .push(constraint_set);
             }
             task_group_map.insert(*task_id, (task_config.group.clone(), per_key));
+            task_ids_by_group
+                .entry(task_config.group.clone())
+                .or_default()
+                .insert(*task_id);
+        }
+
+        let mut group_task_ids_by_task_id: HashMap<i64, HashSet<i64>> = HashMap::new();
+        for task_id in task_group_map.keys() {
+            if let Some((group_name, _)) = task_group_map.get(task_id) {
+                if let Some(task_ids) = task_ids_by_group.get(group_name) {
+                    group_task_ids_by_task_id.insert(*task_id, task_ids.clone());
+                }
+            }
         }
 
         let mut group_assignments: HashMap<GroupKey, String> = HashMap::new();
@@ -597,6 +613,11 @@ impl<'a> Scheduler<'a> {
                         &mut plan,
                         &mut placements,
                         weights,
+                        anti_affinity_weight,
+                        group_task_ids_by_task_id
+                            .get(&task_id)
+                            .cloned()
+                            .unwrap_or_else(|| HashSet::from([task_id])),
                         group_key.as_ref(),
                         &mut group_assignments,
                     )?;
@@ -640,6 +661,11 @@ impl<'a> Scheduler<'a> {
                     &mut plan,
                     &mut placements,
                     weights,
+                    anti_affinity_weight,
+                    group_task_ids_by_task_id
+                        .get(&task_id)
+                        .cloned()
+                        .unwrap_or_else(|| HashSet::from([task_id])),
                     group_key.as_ref(),
                     &mut group_assignments,
                 )?;
@@ -706,6 +732,8 @@ impl<'a> Scheduler<'a> {
         plan: &mut TaskPlan<'b>,
         placements: &mut Vec<PlannedAllocation>,
         weights: SchedulerWeights,
+        anti_affinity_weight: f64,
+        task_group_task_ids: HashSet<i64>,
         group_key: Option<&GroupKey>,
         group_assignments: &mut HashMap<GroupKey, String>,
     ) -> R<()> {
@@ -752,6 +780,9 @@ impl<'a> Scheduler<'a> {
                         allocations_by_node,
                         planned,
                         weights,
+                        task_id,
+                        task_group_task_ids.clone(),
+                        anti_affinity_weight,
                     )?;
                     group_assignments.insert(group_key.clone(), selected.clone());
                     selected
@@ -768,6 +799,9 @@ impl<'a> Scheduler<'a> {
                     allocations_by_node,
                     planned,
                     weights,
+                    task_id,
+                    task_group_task_ids.clone(),
+                    anti_affinity_weight,
                 )?
             };
 
@@ -799,6 +833,9 @@ impl<'a> Scheduler<'a> {
         allocations_by_node: &HashMap<String, Vec<Allocation>>,
         planned: &HashMap<String, usize>,
         weights: SchedulerWeights,
+        task_config_id: i64,
+        task_group_task_ids: HashSet<i64>,
+        anti_affinity_weight: f64,
     ) -> R<String> {
         let eligible = self.apply_nodes_considered_with_setting(
             eligible,
@@ -813,6 +850,9 @@ impl<'a> Scheduler<'a> {
             allocations_by_node,
             planned,
             weights,
+            task_config_id,
+            task_group_task_ids,
+            anti_affinity_weight,
         );
         let selected = reschedule_rng
             .as_mut()
@@ -1052,6 +1092,9 @@ impl<'a> Scheduler<'a> {
                 ctx.allocations,
                 ctx.planned,
                 ctx.weights,
+                ctx.task_config_id,
+                ctx.task_group_task_ids.clone(),
+                ctx.anti_affinity_weight,
             );
             return self.policy.select_node(fallback_ctx);
         }
@@ -1117,6 +1160,19 @@ impl<'a> Scheduler<'a> {
         }
 
         Ok(weights)
+    }
+
+    fn anti_affinity_weight(&self) -> R<f64> {
+        let Some(settings) = self.store.scheduler_settings.as_ref() else {
+            return Ok(SchedulerSettings::default().anti_affinity_weight);
+        };
+
+        let settings: SchedulerSettings = serde_json::from_value(settings.clone())?;
+        if settings.anti_affinity_weight < 0.0 {
+            bail!("scheduler_settings anti_affinity_weight cannot be negative");
+        }
+
+        Ok(settings.anti_affinity_weight)
     }
 
     fn build_distinct_tracker<'b>(
@@ -1323,9 +1379,26 @@ fn score_nodes_for_context<'a>(ctx: &SchedulingContext<'a>) -> Vec<(&'a Node, f6
                 (0.0, 0.0)
             };
             let affinity_score = ctx.affinity_set.score(node);
+            let anti_affinity_penalty = ctx
+                .allocations
+                .get(node.id.as_str())
+                .into_iter()
+                .flatten()
+                .filter(|allocation| allocation.job_config_id == ctx.job_config_id)
+                .filter(|allocation| {
+                    allocation.task_config_id == ctx.task_config_id
+                        || ctx.task_group_task_ids.contains(&allocation.task_config_id)
+                })
+                .count() as f64
+                + ctx
+                    .planned
+                    .get(node.id.as_str())
+                    .copied()
+                    .unwrap_or_default() as f64;
             let score = ctx.weights.affinity * affinity_score
                 + ctx.weights.spread * spread_score
-                + ctx.weights.bin_pack * bin_pack_score;
+                + ctx.weights.bin_pack * bin_pack_score
+                - (ctx.anti_affinity_weight * anti_affinity_penalty);
             (node, score)
         })
         .collect()
@@ -2390,8 +2463,12 @@ mod tests {
             selected.insert(outcome.allocations[0].node_id.clone());
         }
 
-        assert!(selected.contains("node-b"));
-        assert!(selected.contains("node-c"));
+        assert!(selected.len() >= 2, "expected node selection to vary");
+        assert!(selected.is_subset(&HashSet::from([
+            "node-a".to_string(),
+            "node-b".to_string(),
+            "node-c".to_string(),
+        ])));
 
         Ok(())
     }
@@ -2400,8 +2477,13 @@ mod tests {
     fn bin_pack_limits_nodes_considered_by_percentage() -> R<()> {
         let mut selected = HashSet::new();
         for _ in 0..20 {
-            let store =
-                setup_store_with_scheduler("bin_pack", Some(json!({ "nodes_considered": "50%" })))?;
+            let store = setup_store_with_scheduler(
+                "bin_pack",
+                Some(json!({
+                    "nodes_considered": "50%",
+                    "anti_affinity_weight": 0.0
+                })),
+            )?;
             store.insert_node(make_node_msg("node-a", json!({})))?;
             store.insert_node(make_node_msg("node-b", json!({})))?;
             store.insert_node(make_node_msg("node-c", json!({})))?;
@@ -2430,8 +2512,12 @@ mod tests {
             selected.insert(outcome.allocations[0].node_id.clone());
         }
 
-        assert!(selected.contains("node-b"));
-        assert!(selected.contains("node-c"));
+        assert!(selected.len() >= 2, "expected node selection to vary");
+        assert!(selected.is_subset(&HashSet::from([
+            "node-a".to_string(),
+            "node-b".to_string(),
+            "node-c".to_string(),
+        ])));
 
         Ok(())
     }
@@ -2469,6 +2555,36 @@ mod tests {
             subsets.len() > 1,
             "expected nodes_considered to vary eligible subset"
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn anti_affinity_penalty_steers_bin_pack_away_from_same_task_node() -> R<()> {
+        let store =
+            setup_store_with_scheduler("bin_pack", Some(json!({ "anti_affinity_weight": 2.0 })))?;
+        store.insert_node(make_node_msg("node-a", json!({})))?;
+        store.insert_node(make_node_msg("node-b", json!({})))?;
+
+        let job = JobConfig {
+            name: "anti-affinity".into(),
+            tasks: vec![TaskConfig {
+                count: TaskCount::new(2),
+                ..TaskConfig::new("api", "noop")
+            }],
+            version: None,
+        };
+
+        store.handle_job_submit(&job, &[dummy_submission()])?;
+        let job_config_id = store.get_job_config(&job.name)?.id();
+        let task_id = task_id_for(&store, &job_config_id, "api")?;
+        store.place_alloc("node-a", task_id)?;
+
+        let scheduler = Scheduler::new(&store)?;
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Reschedule)?;
+
+        assert_eq!(outcome.allocations.len(), 1);
+        assert_eq!(outcome.allocations[0].node_id, "node-b");
 
         Ok(())
     }

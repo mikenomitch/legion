@@ -1,5 +1,5 @@
 use crate::util::plugin_root_dir;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::constraints::AffinitySet;
 use crate::prelude::*;
@@ -47,6 +47,9 @@ pub struct SchedulingContext<'a> {
     pub allocations: &'a HashMap<String, Vec<Allocation>>,
     pub planned: &'a HashMap<String, usize>,
     pub weights: SchedulerWeights,
+    pub task_config_id: i64,
+    pub task_group_task_ids: HashSet<i64>,
+    pub anti_affinity_weight: f64,
 }
 
 #[allow(dead_code)]
@@ -59,6 +62,9 @@ impl<'a> SchedulingContext<'a> {
         allocations: &'a HashMap<String, Vec<Allocation>>,
         planned: &'a HashMap<String, usize>,
         weights: SchedulerWeights,
+        task_config_id: i64,
+        task_group_task_ids: HashSet<i64>,
+        anti_affinity_weight: f64,
     ) -> Self {
         SchedulingContext {
             eligible_nodes,
@@ -68,6 +74,9 @@ impl<'a> SchedulingContext<'a> {
             allocations,
             planned,
             weights,
+            task_config_id,
+            task_group_task_ids,
+            anti_affinity_weight,
         }
     }
 
@@ -187,10 +196,12 @@ fn score_node(
     };
 
     let affinity_score = affinity_score(ctx.task, ctx.affinity_set, node);
+    let anti_affinity_penalty = anti_affinity_penalty(ctx, node);
 
     ctx.weights.affinity * affinity_score
         + ctx.weights.spread * spread_score
         + ctx.weights.bin_pack * bin_pack_score
+        - (ctx.anti_affinity_weight * anti_affinity_penalty)
 }
 
 fn max_load_delta(range: f64, load: f64, min_load: f64) -> f64 {
@@ -200,6 +211,27 @@ fn max_load_delta(range: f64, load: f64, min_load: f64) -> f64 {
 
 fn affinity_score(_task: &TaskConfig, affinity_set: &AffinitySet, node: &Node) -> f64 {
     affinity_set.score(node)
+}
+
+fn anti_affinity_penalty(ctx: &SchedulingContext<'_>, node: &Node) -> f64 {
+    let node_allocations = ctx
+        .allocations
+        .get(node.id.as_str())
+        .into_iter()
+        .flatten()
+        .filter(|allocation| allocation.job_config_id == ctx.job_config_id)
+        .filter(|allocation| {
+            allocation.task_config_id == ctx.task_config_id
+                || ctx.task_group_task_ids.contains(&allocation.task_config_id)
+        })
+        .count();
+    let planned_allocations = ctx
+        .planned
+        .get(node.id.as_str())
+        .copied()
+        .unwrap_or_default();
+
+    (node_allocations + planned_allocations) as f64
 }
 
 #[instrument(err, skip_all)]
@@ -242,7 +274,7 @@ fn policy_plugin_name_to_path(name: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     fn node(id: &str) -> Node {
         Node {
@@ -293,6 +325,9 @@ mod tests {
             &allocations,
             &planned,
             SchedulerWeights::for_policy("bin_pack"),
+            1,
+            HashSet::from([1]),
+            0.0,
         );
         let policy = BinPackPolicy::default();
 
@@ -319,6 +354,9 @@ mod tests {
             &allocations,
             &planned,
             SchedulerWeights::for_policy("bin_pack"),
+            1,
+            HashSet::from([1]),
+            0.0,
         );
         let policy = BinPackPolicy::default();
 
@@ -354,6 +392,9 @@ mod tests {
             &allocations,
             &planned,
             SchedulerWeights::for_policy("bin_pack"),
+            1,
+            HashSet::from([1]),
+            0.0,
         );
         let policy = BinPackPolicy::default();
 
@@ -377,6 +418,9 @@ mod tests {
             &allocations,
             &planned,
             SchedulerWeights::for_policy("bin_pack"),
+            1,
+            HashSet::from([1]),
+            0.0,
         );
         let policy = BinPackPolicy::default();
 
@@ -403,6 +447,9 @@ mod tests {
             &allocations,
             &planned,
             SchedulerWeights::for_policy("spread"),
+            1,
+            HashSet::from([1]),
+            1.0,
         );
         let policy = SpreadPolicy::default();
 
@@ -429,6 +476,9 @@ mod tests {
             &allocations,
             &planned,
             SchedulerWeights::for_policy("spread"),
+            1,
+            HashSet::from([1]),
+            1.0,
         );
         let policy = SpreadPolicy::default();
 
@@ -464,6 +514,9 @@ mod tests {
                         spread: 0.0,
                         bin_pack: 5e-10,
                     },
+                    1,
+                    HashSet::from([1]),
+                    0.0,
                 ))
                 .expect("node expected");
             seen.insert(choice.id.clone());
@@ -491,6 +544,9 @@ mod tests {
             &allocations,
             &planned,
             SchedulerWeights::for_policy("spread"),
+            1,
+            HashSet::from([1]),
+            1.0,
         );
         let policy = SpreadPolicy::default();
 
