@@ -42,6 +42,9 @@ impl WorkerTaskManager {
         if let Err(err) = self.registry.load_plugin("exec", true) {
             error!(?err, "Failed to load exec task plugin");
         }
+        if let Err(err) = self.registry.load_plugin("container", true) {
+            error!(?err, "Failed to load container task plugin");
+        }
         if let Err(err) = self.registry.load_plugin("noop", true) {
             debug!(?err, "Noop task plugin not available");
         }

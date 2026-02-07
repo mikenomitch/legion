@@ -1,4 +1,4 @@
-use crate::constraints::{ConstraintSet, DistinctTracker};
+use crate::constraints::{ConstraintSet, DistinctTracker, PermitSet};
 use crate::prelude::*;
 use crate::resources::ResourcePolicy;
 use crate::storage::errors::StorageError;
@@ -53,7 +53,20 @@ pub struct SchedulingReadModel {
 #[derive(Debug)]
 struct AllocationConstraintState {
     constraints: ConstraintSet,
+    permit: PermitSet,
     distinct: Option<DistinctTracker>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PlanSubmission {
+    pub id: i64,
+    pub expected_epoch: i64,
+}
+
+#[derive(Debug, Clone)]
+pub enum PlanApplyOutcome {
+    Applied(Vec<Allocation>),
+    Rejected { reason: String, latest_epoch: i64 },
 }
 
 #[derive(Debug, Clone)]
@@ -222,7 +235,7 @@ impl Store {
 
         let mut task_stmt = conn.prepare(
             r#"
-            SELECT id, name, kind, count, count_per, group_name, lifecycle, depends_on, config, resources, constraints, affinities, checks, on_unhealthy, job_config_id
+            SELECT id, name, kind, count, count_per, group_name, lifecycle, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, job_config_id
             FROM task_config;
             "#,
         )?;
@@ -246,11 +259,12 @@ impl Store {
                 config: row.get(8)?,
                 resources: row.get(9)?,
                 constraints: row.get(10)?,
-                affinities: row.get(11)?,
-                checks: self.parse_checks_column(12, row.get(12)?)?,
-                on_unhealthy: self.parse_on_unhealthy_column(13, row.get(13)?)?,
+                permit: row.get(11)?,
+                affinities: row.get(12)?,
+                checks: self.parse_checks_column(13, row.get(13)?)?,
+                on_unhealthy: self.parse_on_unhealthy_column(14, row.get(14)?)?,
             };
-            let job_config_id: String = row.get(14)?;
+            let job_config_id: String = row.get(15)?;
             Ok((job_config_id, id, task))
         })?;
 
@@ -391,6 +405,135 @@ impl Store {
 
     pub fn cached_nodes(&self) -> R<Vec<Node>> {
         Ok(self.read_model_reader()?.nodes.values().cloned().collect())
+    }
+
+    pub fn allocation_epoch(&self) -> R<i64> {
+        let conn = self.read_connection()?;
+        let epoch = conn.query_row(
+            "SELECT epoch FROM allocation_epoch WHERE singleton = 1;",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(epoch)
+    }
+
+    fn bump_allocation_epoch_tx(&self, tx: &Transaction<'_>) -> R<i64> {
+        tx.execute(
+            "UPDATE allocation_epoch SET epoch = epoch + 1 WHERE singleton = 1;",
+            [],
+        )?;
+        let epoch = tx.query_row(
+            "SELECT epoch FROM allocation_epoch WHERE singleton = 1;",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(epoch)
+    }
+
+    pub fn insert_plan_submission(
+        &self,
+        job_config_id: &str,
+        mode: &str,
+        placements: &[(String, i64)],
+        expected_epoch: i64,
+    ) -> R<PlanSubmission> {
+        let created_at = OffsetDateTime::now_utc().format(&Rfc3339)?;
+        let placements_json = serde_json::to_string(placements)?;
+        let conn = self.write_connection()?;
+        let id = conn.query_row(
+            "INSERT INTO plan_submission(job_config_id, mode, placements, expected_epoch, status, created_at) VALUES (?1, ?2, ?3, ?4, 'queued', ?5) RETURNING id;",
+            params![job_config_id, mode, placements_json, expected_epoch, created_at],
+            |row| row.get(0),
+        )?;
+
+        Ok(PlanSubmission { id, expected_epoch })
+    }
+
+    pub fn apply_plan_submission(&self, submission: &PlanSubmission) -> R<PlanApplyOutcome> {
+        let mut conn = self.write_connection()?;
+        let tx = conn.transaction()?;
+
+        let latest_epoch: i64 = tx.query_row(
+            "SELECT epoch FROM allocation_epoch WHERE singleton = 1;",
+            [],
+            |row| row.get(0),
+        )?;
+
+        if latest_epoch != submission.expected_epoch {
+            let reason = format!(
+                "plan epoch {} is stale; latest epoch is {}",
+                submission.expected_epoch, latest_epoch
+            );
+            tx.execute(
+                "UPDATE plan_submission SET status = 'rejected', rejection_reason = ?1 WHERE id = ?2;",
+                params![reason, submission.id],
+            )?;
+            tx.commit()?;
+            return Ok(PlanApplyOutcome::Rejected {
+                reason,
+                latest_epoch,
+            });
+        }
+
+        let placements_json: String = tx.query_row(
+            "SELECT placements FROM plan_submission WHERE id = ?1;",
+            [submission.id],
+            |row| row.get(0),
+        )?;
+        let placements: Vec<(String, i64)> = serde_json::from_str(&placements_json)?;
+
+        let mut allocations = Vec::new();
+        let mut constraint_states: HashMap<i64, AllocationConstraintState> = HashMap::new();
+        for (node_id, task_id) in &placements {
+            let state = match constraint_states.entry(*task_id) {
+                Entry::Occupied(entry) => entry.into_mut(),
+                Entry::Vacant(entry) => {
+                    entry.insert(self.load_allocation_constraints(&tx, *task_id)?)
+                }
+            };
+
+            let node = tx.query_row(&GET_NODE, [node_id], |row| self.node_from_row(row))?;
+            if !state
+                .constraints
+                .is_satisfied(&node, state.distinct.as_ref())
+                || !state.permit.is_permitted(&node)
+            {
+                let reason = format!(
+                    "Node {} does not satisfy constraints for task {}",
+                    node_id, task_id
+                );
+                tx.execute(
+                    "UPDATE plan_submission SET status = 'rejected', rejection_reason = ?1 WHERE id = ?2;",
+                    params![reason, submission.id],
+                )?;
+                tx.commit()?;
+                return Ok(PlanApplyOutcome::Rejected {
+                    reason,
+                    latest_epoch: submission.expected_epoch,
+                });
+            }
+
+            if let Some(tracker) = state.distinct.as_mut() {
+                tracker.insert_from_node(&node);
+            }
+
+            let allocation = self.insert_allocation(&tx, node_id, *task_id)?;
+            allocations.push(allocation);
+        }
+
+        if !allocations.is_empty() {
+            self.bump_allocation_epoch_tx(&tx)?;
+        }
+
+        tx.execute(
+            "UPDATE plan_submission SET status = 'applied', rejection_reason = NULL WHERE id = ?1;",
+            [submission.id],
+        )?;
+        tx.commit()?;
+
+        self.cache_add_allocations(&allocations)?;
+
+        Ok(PlanApplyOutcome::Applied(allocations))
     }
 
     fn collect_rows<T, I>(iter: I) -> R<Vec<T>>
@@ -683,9 +826,10 @@ impl Store {
             config: row.get(8)?,
             resources: row.get(9)?,
             constraints: row.get(10)?,
-            affinities: row.get(11)?,
-            checks: self.parse_checks_column(12, row.get(12)?)?,
-            on_unhealthy: self.parse_on_unhealthy_column(13, row.get(13)?)?,
+            permit: row.get(11)?,
+            affinities: row.get(12)?,
+            checks: self.parse_checks_column(13, row.get(13)?)?,
+            on_unhealthy: self.parse_on_unhealthy_column(14, row.get(14)?)?,
         };
 
         Ok(task_config)
@@ -845,6 +989,10 @@ impl Store {
 
         let conn = self.write_connection()?;
         conn.execute("DELETE FROM allocation WHERE node_id = ?;", [node_id])?;
+        conn.execute(
+            "UPDATE allocation_epoch SET epoch = epoch + 1 WHERE singleton = 1;",
+            [],
+        )?;
 
         self.cache_clear_allocations_for_node(node_id)?;
 
@@ -1338,6 +1486,7 @@ impl Store {
                 ":config": t.config,
                 ":resources": t.resources,
                 ":constraints": t.constraints,
+                ":permit": t.permit,
                 ":affinities": t.affinities,
                 ":checks": checks,
                 ":on_unhealthy": on_unhealthy,
@@ -1692,13 +1841,15 @@ impl Store {
         tx: &Transaction<'_>,
         task_id: i64,
     ) -> R<AllocationConstraintState> {
-        let constraints: Value = tx.query_row(
-            "SELECT constraints FROM task_config WHERE id = ?;",
+        let (constraints, permit): (Value, Value) = tx.query_row(
+            "SELECT constraints, permit FROM task_config WHERE id = ?;",
             [task_id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         let constraint_set = ConstraintSet::new(&constraints)
             .with_context(|| format!("Failed to parse constraints for task {task_id}"))?;
+        let permit_set = PermitSet::new(&permit)
+            .with_context(|| format!("Failed to parse permit for task {task_id}"))?;
         let distinct_keys = constraint_set.distinct_keys();
         let distinct = if distinct_keys.is_empty() {
             None
@@ -1719,6 +1870,7 @@ impl Store {
 
         Ok(AllocationConstraintState {
             constraints: constraint_set,
+            permit: permit_set,
             distinct,
         })
     }
@@ -1748,6 +1900,7 @@ impl Store {
             if !state
                 .constraints
                 .is_satisfied(&node, state.distinct.as_ref())
+                || !state.permit.is_permitted(&node)
             {
                 bail!(
                     "Node {} does not satisfy constraints for task {}",
@@ -1764,6 +1917,7 @@ impl Store {
             allocations.push(allocation);
         }
 
+        self.bump_allocation_epoch_tx(&tx)?;
         tx.commit()?;
 
         self.cache_add_allocations(&allocations)?;
@@ -1844,6 +1998,10 @@ impl Store {
 
         let conn = self.write_connection()?;
         conn.execute("DELETE FROM allocation WHERE id = ?;", [allocation_id])?;
+        conn.execute(
+            "UPDATE allocation_epoch SET epoch = epoch + 1 WHERE singleton = 1;",
+            [],
+        )?;
 
         self.cache_remove_allocations(std::slice::from_ref(&allocation))?;
 
@@ -1893,6 +2051,10 @@ impl Store {
         let params = named_params! { ":job_id": job_id };
 
         conn.execute(sql, params)?;
+        conn.execute(
+            "UPDATE allocation_epoch SET epoch = epoch + 1 WHERE singleton = 1;",
+            [],
+        )?;
 
         self.cache_remove_allocations(&allocations)?;
 
@@ -1910,6 +2072,10 @@ impl Store {
         conn.execute(
             "DELETE FROM allocation WHERE job_config_id = ?;",
             [job_config_id],
+        )?;
+        conn.execute(
+            "UPDATE allocation_epoch SET epoch = epoch + 1 WHERE singleton = 1;",
+            [],
         )?;
 
         self.cache_remove_allocations(&allocations)?;
@@ -1942,14 +2108,18 @@ impl Store {
                 ConstraintSet::new(&task_config.constraints).with_context(|| {
                     format!("Failed to parse constraints for task {}", task_config.name)
                 })?;
+            let permit_set = PermitSet::new(&task_config.permit)
+                .with_context(|| format!("Failed to parse permit for task {}", task_config.name))?;
             let eligible = nodes
                 .iter()
-                .filter(|node| constraint_set.is_satisfied(node, None))
+                .filter(|node| {
+                    constraint_set.is_satisfied(node, None) && permit_set.is_permitted(node)
+                })
                 .collect::<Vec<_>>();
 
             if eligible.is_empty() {
                 bail!(
-                    "Failed to place task {}: no available nodes matching constraints",
+                    "Failed to place task {}: no available nodes matching constraints or permit",
                     task_config.name
                 );
             }
@@ -2133,6 +2303,17 @@ impl Store {
         eval.status = "in_flight".to_string();
 
         Ok(Some(eval))
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn requeue_in_flight_evals(&self) -> R<u64> {
+        let conn = self.write_connection()?;
+        let updated = conn.execute(
+            "UPDATE eval SET status = 'pending' WHERE status = 'in_flight';",
+            [],
+        )?;
+
+        Ok(updated as u64)
     }
 
     #[instrument(err, skip_all)]
@@ -2689,6 +2870,7 @@ fn task_schedule_equivalent(left: &TaskConfig, right: &TaskConfig) -> bool {
     left.count == right.count
         && left.resources == right.resources
         && left.constraints == right.constraints
+        && left.permit == right.permit
         && left.affinities == right.affinities
 }
 
@@ -3737,6 +3919,45 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(failed_status, "failed");
+
+        Ok(())
+    }
+
+    #[test]
+    fn requeue_in_flight_evals_moves_stale_work_back_to_pending() -> R<()> {
+        let store = setup_store()?;
+
+        store.insert_node(make_node_msg("node-1", "ready"))?;
+
+        insert_eval(
+            &store,
+            1,
+            "in_flight",
+            "node_join",
+            None,
+            None,
+            Some("node-1"),
+            50,
+        )?;
+        insert_eval(
+            &store,
+            2,
+            "pending",
+            "node_join",
+            None,
+            None,
+            Some("node-1"),
+            40,
+        )?;
+
+        let requeued = store.requeue_in_flight_evals()?;
+        assert_eq!(requeued, 1);
+
+        let claimed = store.claim_eval()?.expect("eval should be claimed");
+        assert_eq!(
+            claimed.id, "1",
+            "higher-priority stale eval should run first"
+        );
 
         Ok(())
     }

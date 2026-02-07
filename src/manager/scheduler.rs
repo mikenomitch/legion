@@ -6,10 +6,11 @@ use libloading::Library;
 use rand::seq::SliceRandom;
 use rand::{rngs::StdRng, SeedableRng};
 
-use crate::constraints::{AffinitySet, ConstraintSet, DistinctTracker};
+use crate::constraints::{AffinitySet, ConstraintSet, DistinctTracker, PermitSet};
 use crate::prelude::*;
 use crate::resources::ResourcePolicy;
-use crate::storage::store::Store;
+use crate::storage::errors::StorageError;
+use crate::storage::store::{PlanApplyOutcome, Store};
 use crate::structs::{
     Allocation, JobConfig, Node, TaskConfig, TaskDependencyCondition, TaskLifecycle,
     TaskStatusState,
@@ -37,6 +38,15 @@ pub struct LedgerDelta {
 pub enum PlanMode {
     Fresh,
     Reschedule,
+}
+
+impl PlanMode {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Fresh => "fresh",
+            Self::Reschedule => "reschedule",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -75,6 +85,7 @@ struct ResourceLedger {
 
 struct TaskPlan<'a> {
     constraint_set: ConstraintSet,
+    permit_set: PermitSet,
     affinity_set: AffinitySet,
     task_request: ResourceRequest,
     base_eligible: Vec<&'a Node>,
@@ -118,7 +129,9 @@ impl<'a> Scheduler<'a> {
             bail!("No nodes available to place allocations");
         }
 
-        let all_tasks = self.store.cached_task_configs_for_job_config(job_config_id)?;
+        let all_tasks = self
+            .store
+            .cached_task_configs_for_job_config(job_config_id)?;
         let tasks = self.tasks_for_plan_from_store(job_config_id)?;
 
         let mut allocations_by_node = self.store.cached_allocations_by_node()?;
@@ -256,7 +269,9 @@ impl<'a> Scheduler<'a> {
             bail!("No nodes available to place allocations");
         }
 
-        let all_tasks = self.store.cached_task_configs_for_job_config(job_config_id)?;
+        let all_tasks = self
+            .store
+            .cached_task_configs_for_job_config(job_config_id)?;
         let tasks = self.tasks_for_plan_from_store(job_config_id)?;
 
         let allocations_by_node = self.store.cached_allocations_by_node()?;
@@ -310,7 +325,27 @@ impl<'a> Scheduler<'a> {
             .iter()
             .map(|placement| placement.node_id.clone())
             .collect::<HashSet<_>>();
-        let allocations = self.store.apply_allocation_plan(&placement_pairs)?;
+        let expected_epoch = self.store.allocation_epoch()?;
+        let submission = self.store.insert_plan_submission(
+            job_config_id,
+            mode.as_str(),
+            &placement_pairs,
+            expected_epoch,
+        )?;
+        let allocations = match self.store.apply_plan_submission(&submission)? {
+            PlanApplyOutcome::Applied(allocations) => allocations,
+            PlanApplyOutcome::Rejected {
+                reason,
+                latest_epoch,
+            } => {
+                return Err(anyhow::Error::new(StorageError::Conflict {
+                    message: format!(
+                        "plan submission rejected: {reason} (expected epoch {}, latest epoch {})",
+                        submission.expected_epoch, latest_epoch
+                    ),
+                }));
+            }
+        };
         let deltas = Self::allocations_delta(&affected_nodes, &allocations);
 
         Ok(PlanOutcome {
@@ -380,9 +415,10 @@ impl<'a> Scheduler<'a> {
                 _ => {}
             }
             if group_sizes.get(&task_config.group).copied().unwrap_or(0) > 1 {
-                let constraint_set = ConstraintSet::new(&task_config.constraints).with_context(
-                    || format!("Failed to parse constraints for task {}", task_config.name),
-                )?;
+                let constraint_set =
+                    ConstraintSet::new(&task_config.constraints).with_context(|| {
+                        format!("Failed to parse constraints for task {}", task_config.name)
+                    })?;
                 group_constraints
                     .entry(task_config.group.clone())
                     .or_default()
@@ -436,7 +472,9 @@ impl<'a> Scheduler<'a> {
 
         let mut group_candidates: HashMap<GroupKey, Vec<&Node>> = HashMap::new();
         for (group_name, constraint_sets) in &group_constraints {
-            let per_key = group_per_key.get(group_name).and_then(|value| value.clone());
+            let per_key = group_per_key
+                .get(group_name)
+                .and_then(|value| value.clone());
             let mut grouped: HashMap<String, Vec<&Node>> = HashMap::new();
             for node in &nodes {
                 if !constraint_sets
@@ -510,11 +548,7 @@ impl<'a> Scheduler<'a> {
                         name: task_config.group.clone(),
                         token: group_name.to_string(),
                     };
-                    let group_key = if group_sizes
-                        .get(&task_config.group)
-                        .copied()
-                        .unwrap_or(0)
-                        > 1
+                    let group_key = if group_sizes.get(&task_config.group).copied().unwrap_or(0) > 1
                     {
                         Some(group_key)
                     } else {
@@ -557,12 +591,7 @@ impl<'a> Scheduler<'a> {
                     name: task_config.group.clone(),
                     token: "default".to_string(),
                 };
-                let group_key = if group_sizes
-                    .get(&task_config.group)
-                    .copied()
-                    .unwrap_or(0)
-                    > 1
-                {
+                let group_key = if group_sizes.get(&task_config.group).copied().unwrap_or(0) > 1 {
                     Some(group_key)
                 } else {
                     None
@@ -619,6 +648,8 @@ impl<'a> Scheduler<'a> {
         let constraint_set = ConstraintSet::new(&task_config.constraints).with_context(|| {
             format!("Failed to parse constraints for task {}", task_config.name)
         })?;
+        let permit_set = PermitSet::new(&task_config.permit)
+            .with_context(|| format!("Failed to parse permit for task {}", task_config.name))?;
         let affinity_set = AffinitySet::new(&task_config.affinities)
             .with_context(|| format!("Failed to parse affinities for task {}", task_config.name))?;
         let distinct_tracker = Self::build_distinct_tracker(
@@ -629,11 +660,12 @@ impl<'a> Scheduler<'a> {
         );
         let base_eligible = nodes
             .iter()
-            .filter(|node| constraint_set.is_satisfied(node, None))
+            .filter(|node| constraint_set.is_satisfied(node, None) && permit_set.is_permitted(node))
             .collect::<Vec<_>>();
 
         Ok(TaskPlan {
             constraint_set,
+            permit_set,
             affinity_set,
             task_request,
             base_eligible,
@@ -664,6 +696,7 @@ impl<'a> Scheduler<'a> {
             let eligible = Self::eligible_nodes(
                 candidates,
                 &plan.constraint_set,
+                &plan.permit_set,
                 plan.distinct_tracker.as_ref(),
                 resource_ledger,
                 &plan.task_request,
@@ -671,7 +704,7 @@ impl<'a> Scheduler<'a> {
 
             if eligible.is_empty() {
                 bail!(
-                    "Failed to place task {}: no available nodes matching constraints or resources",
+                    "Failed to place task {}: no available nodes matching constraints, permit, or resources",
                     task_config.name
                 );
             }
@@ -774,6 +807,7 @@ impl<'a> Scheduler<'a> {
     fn eligible_nodes<'b>(
         candidates: &[&'b Node],
         constraint_set: &ConstraintSet,
+        permit_set: &PermitSet,
         distinct_tracker: Option<&DistinctTracker>,
         resource_ledger: &ResourceLedger,
         task_request: &ResourceRequest,
@@ -782,7 +816,10 @@ impl<'a> Scheduler<'a> {
             candidates
                 .iter()
                 .copied()
-                .filter(|node| constraint_set.distinct_satisfied(node, tracker))
+                .filter(|node| {
+                    constraint_set.distinct_satisfied(node, tracker)
+                        && permit_set.is_permitted(node)
+                })
                 .collect::<Vec<_>>()
         } else {
             candidates.to_vec()
@@ -790,7 +827,9 @@ impl<'a> Scheduler<'a> {
 
         eligible
             .into_iter()
-            .filter(|node| resource_ledger.can_fit(&node.id, task_request))
+            .filter(|node| {
+                permit_set.is_permitted(node) && resource_ledger.can_fit(&node.id, task_request)
+            })
             .collect()
     }
 
@@ -2146,6 +2185,108 @@ mod tests {
     }
 
     #[test]
+    fn permit_allows_single_restriction() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg(
+            "node-a",
+            json!({ "restriction": { "foo": "bar" } }),
+        ))?;
+
+        let job = JobConfig {
+            name: "permit-single".into(),
+            tasks: vec![TaskConfig {
+                permit: json!([{ "key": "foo", "operator": "equal", "value": "bar" }]),
+                ..TaskConfig::new("api", "noop")
+            }],
+            version: None,
+        };
+
+        store.handle_job_submit(&job, &[dummy_submission()])?;
+        let job_config_id = store.get_job_config(&job.name)?.id();
+        let scheduler = Scheduler::new(&store)?;
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+
+        assert_eq!(outcome.allocations.len(), 1);
+        assert_eq!(outcome.allocations[0].node_id, "node-a");
+        Ok(())
+    }
+
+    #[test]
+    fn permit_handles_multiple_restrictions_pass_and_fail() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg(
+            "node-a",
+            json!({ "restriction": { "foo": "bar", "number": 4 } }),
+        ))?;
+
+        let passing_job = JobConfig {
+            name: "permit-multi-pass".into(),
+            tasks: vec![TaskConfig {
+                permit: json!([
+                    { "key": "foo", "operator": "equal", "value": "bar" },
+                    { "key": "number", "operator": "equal", "value": 4 }
+                ]),
+                ..TaskConfig::new("api", "noop")
+            }],
+            version: None,
+        };
+        store.handle_job_submit(&passing_job, &[dummy_submission()])?;
+        let pass_job_config_id = store.get_job_config(&passing_job.name)?.id();
+        let scheduler = Scheduler::new(&store)?;
+        let pass_outcome = scheduler.plan_and_apply(&pass_job_config_id, PlanMode::Fresh)?;
+        assert_eq!(pass_outcome.allocations.len(), 1);
+
+        let failing_job = JobConfig {
+            name: "permit-multi-fail".into(),
+            tasks: vec![TaskConfig {
+                permit: json!([
+                    { "key": "foo", "operator": "equal", "value": "bar" },
+                    { "key": "number", "operator": "equal", "value": 5 }
+                ]),
+                ..TaskConfig::new("api", "noop")
+            }],
+            version: None,
+        };
+        store.handle_job_submit(&failing_job, &[dummy_submission()])?;
+        let fail_job_config_id = store.get_job_config(&failing_job.name)?.id();
+        let fail_err = scheduler
+            .plan_and_apply(&fail_job_config_id, PlanMode::Fresh)
+            .expect_err("expected permit failure");
+        assert!(fail_err
+            .to_string()
+            .contains("no available nodes matching constraints, permit, or resources"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn permit_defaults_to_default_pool_when_no_restrictions() -> R<()> {
+        let store = setup_store()?;
+        let mut node_default = make_node_msg("node-a", json!({}));
+        node_default.pool = "default".into();
+        store.insert_node(node_default)?;
+        let mut node_other = make_node_msg("node-b", json!({}));
+        node_other.pool = "gpu".into();
+        store.insert_node(node_other)?;
+
+        let job = JobConfig {
+            name: "permit-default".into(),
+            tasks: vec![TaskConfig::new("api", "noop")],
+            version: None,
+        };
+
+        store.handle_job_submit(&job, &[dummy_submission()])?;
+        let job_config_id = store.get_job_config(&job.name)?.id();
+        let scheduler = Scheduler::new(&store)?;
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+
+        assert_eq!(outcome.allocations.len(), 1);
+        assert_eq!(outcome.allocations[0].node_id, "node-a");
+
+        Ok(())
+    }
+
+    #[test]
     fn resource_limits_prevent_overcommit() -> R<()> {
         let store = setup_store()?;
         store.insert_node(make_node_msg_with_sources(
@@ -2178,7 +2319,7 @@ mod tests {
 
         assert!(err
             .to_string()
-            .contains("no available nodes matching constraints or resources"));
+            .contains("no available nodes matching constraints, permit, or resources"));
 
         Ok(())
     }
@@ -2216,7 +2357,7 @@ mod tests {
 
         assert!(err
             .to_string()
-            .contains("no available nodes matching constraints or resources"));
+            .contains("no available nodes matching constraints, permit, or resources"));
 
         Ok(())
     }

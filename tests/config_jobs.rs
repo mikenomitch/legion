@@ -104,7 +104,7 @@ fn maximal_job_spec_parse() {
 
     assert_eq!(config.name, "maximal-demo");
     assert_eq!(config.version, Some(1));
-    assert_eq!(config.tasks.len(), 3);
+    assert_eq!(config.tasks.len(), 4);
     for task in &config.tasks {
         assert!(!task.name.is_empty(), "task name should be set");
         assert!(
@@ -118,6 +118,10 @@ fn maximal_job_spec_parse() {
         assert!(
             value_is_non_empty(&task.constraints),
             "task constraints should be set"
+        );
+        assert!(
+            task.permit.is_null() || task.permit.is_object() || task.permit.is_array(),
+            "task permit should parse as valid json type"
         );
         assert!(
             value_is_non_empty(&task.affinities),

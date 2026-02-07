@@ -1,6 +1,6 @@
 use crate::prelude::*;
 use crate::structs::{Allocation, TaskConfig};
-use crate::task_plugins::{TaskPlugin, TaskRuntime};
+use crate::task_plugins::{spawn_task_process, TaskPlugin, TaskRuntime};
 #[cfg(target_os = "linux")]
 use landlock::{AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr, ABI};
 #[cfg(unix)]
@@ -253,7 +253,7 @@ impl TaskPlugin for ExecTaskPlugin {
 
         configure_linux_process_options(&mut cmd, &linux_options, &allocation.id, &task.name)?;
 
-        let child = cmd.spawn().with_context(|| {
+        let child = spawn_task_process(&mut cmd).with_context(|| {
             format!(
                 "Failed to spawn exec task {} for allocation {}",
                 task.name, allocation.id

@@ -465,6 +465,8 @@ pub struct TaskConfig {
     #[serde(default = "empty_object")]
     pub constraints: Value,
     #[serde(default = "empty_object")]
+    pub permit: Value,
+    #[serde(default = "empty_object")]
     pub affinities: Value,
     #[serde(default)]
     #[tabled(skip)]
@@ -520,6 +522,8 @@ struct TaskConfigInput {
     #[serde(default = "empty_object")]
     constraints: Value,
     #[serde(default = "empty_object")]
+    permit: Value,
+    #[serde(default = "empty_object")]
     affinities: Value,
     #[serde(default)]
     checks: Vec<TaskCheck>,
@@ -563,6 +567,7 @@ impl TaskConfigInput {
             config: self.config,
             resources: self.resources,
             constraints: self.constraints,
+            permit: self.permit,
             affinities: self.affinities,
             checks: self.checks,
             on_unhealthy: self.on_unhealthy.unwrap_or_default(),
@@ -665,6 +670,7 @@ impl TaskConfig {
             config: empty_object(),
             resources: empty_object(),
             constraints: empty_object(),
+            permit: empty_object(),
             affinities: empty_object(),
             checks: Vec::new(),
             on_unhealthy: TaskOnUnhealthyConfig::default(),

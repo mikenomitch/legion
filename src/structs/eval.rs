@@ -1,13 +1,14 @@
 use std::collections::HashSet;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::manager::dispatcher::dispatch_allocations;
 use crate::manager::scheduler::{PlanMode, PlanOutcome, Scheduler};
 #[cfg(test)]
 use crate::prelude::Context;
 use crate::prelude::{bail, json, R};
+use crate::storage::errors::StorageError;
 use crate::storage::store::Store;
 
 use super::node::Node;
@@ -164,14 +165,48 @@ impl Eval {
         } else {
             None
         };
-        let outcome = scheduler.plan_and_apply_with_exclusions(
-            &self.job_config_id,
-            mode,
-            excluded.as_ref(),
-        )?;
-        store.update_task_statuses_for_allocations(&outcome.allocations)?;
-        dispatch_allocations(store, &outcome.allocations)?;
-        Ok(outcome)
+
+        const MAX_PLAN_RETRIES: usize = 3;
+        let mut attempt = 0;
+
+        loop {
+            attempt += 1;
+            let result = scheduler.plan_and_apply_with_exclusions(
+                &self.job_config_id,
+                mode.clone(),
+                excluded.as_ref(),
+            );
+
+            match result {
+                Ok(outcome) => {
+                    store.update_task_statuses_for_allocations(&outcome.allocations)?;
+                    dispatch_allocations(store, &outcome.allocations)?;
+                    return Ok(outcome);
+                }
+                Err(error) => {
+                    let maybe_conflict = StorageError::from_anyhow(&error)
+                        .is_some_and(|storage| matches!(storage, StorageError::Conflict { .. }));
+                    if maybe_conflict && attempt < MAX_PLAN_RETRIES {
+                        warn!(
+                            attempt,
+                            max_attempts = MAX_PLAN_RETRIES,
+                            error = %error,
+                            "Plan submission rejected due to stale state; retrying"
+                        );
+                        continue;
+                    }
+
+                    if maybe_conflict {
+                        return Err(error.context(format!(
+                            "plan submission failed after {} attempts",
+                            MAX_PLAN_RETRIES
+                        )));
+                    }
+
+                    return Err(error);
+                }
+            }
+        }
     }
 
     fn current_timestamp() -> String {

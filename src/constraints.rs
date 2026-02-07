@@ -84,6 +84,39 @@ impl ConstraintSet {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct PermitSet {
+    rules: Vec<Rule>,
+}
+
+impl PermitSet {
+    pub fn new(value: &Value) -> R<Self> {
+        let mut rules = parse_rules(value, false)?;
+        if !rules.iter().any(|rule| rule.key == "pool") {
+            rules.push(simple_rule("pool", Value::String("default".into())));
+        }
+        Ok(Self { rules })
+    }
+
+    pub fn is_permitted(&self, node: &Node) -> bool {
+        let restrictions = node_restrictions(node);
+
+        if !self
+            .rules
+            .iter()
+            .all(|rule| rule.matches_attrs(&restrictions, None))
+        {
+            return false;
+        }
+
+        restrictions.iter().all(|(key, value)| {
+            self.rules
+                .iter()
+                .any(|rule| rule.key == *key && rule.matches_value(value, None))
+        })
+    }
+}
+
 impl AffinitySet {
     pub fn new(value: &Value) -> R<Self> {
         let rules = parse_rules(value, true)?;
@@ -230,6 +263,7 @@ fn parse_operator(value: &Value) -> R<Operator> {
         .context("constraint/affinity operator must be a string")?;
 
     match raw {
+        "equal" => Ok(Operator::Eq),
         "=" => Ok(Operator::Eq),
         "!=" => Ok(Operator::NotEq),
         ">" => Ok(Operator::Gt),
@@ -263,6 +297,28 @@ impl Rule {
             return false;
         };
 
+        self.matches_value(attr, distinct)
+    }
+
+    fn matches_attrs(
+        &self,
+        attrs: &serde_json::Map<String, Value>,
+        distinct: Option<&DistinctTracker>,
+    ) -> bool {
+        match self.operator {
+            Operator::IsSet => return attrs.get(&self.key).is_some_and(|value| !value.is_null()),
+            Operator::IsNotSet => return attrs.get(&self.key).is_none_or(|value| value.is_null()),
+            _ => {}
+        }
+
+        let Some(attr) = attrs.get(&self.key) else {
+            return false;
+        };
+
+        self.matches_value(attr, distinct)
+    }
+
+    fn matches_value(&self, attr: &Value, distinct: Option<&DistinctTracker>) -> bool {
         match self.operator {
             Operator::Eq => attr == self.value.as_ref().unwrap(),
             Operator::NotEq => attr != self.value.as_ref().unwrap(),
@@ -355,6 +411,24 @@ fn node_attr<'a>(node: &'a Node, key: &str) -> Option<&'a Value> {
 
 fn value_token(value: &Value) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| String::new())
+}
+
+fn node_restrictions(node: &Node) -> serde_json::Map<String, Value> {
+    let mut restrictions = serde_json::Map::new();
+
+    restrictions.insert("pool".into(), Value::String(node.pool.clone()));
+
+    if let Some(Value::Object(map)) = node
+        .config_attrs
+        .as_object()
+        .and_then(|attrs| attrs.get("restriction"))
+    {
+        for (key, value) in map {
+            restrictions.insert(key.clone(), value.clone());
+        }
+    }
+
+    restrictions
 }
 
 #[cfg(test)]
