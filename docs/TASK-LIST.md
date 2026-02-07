@@ -47,10 +47,10 @@
   - [ ] A "noop" kind "works" - Test
   - [x] An "exec" kind works - Test
     - [x] The command and args given are run
-    - [ ] It runs as a specific user
+    - [x] It runs as a specific user
     - [ ] Unveil works properly
-    - [ ] It is put in a cgroup that restricts cpu, memory, and disk appropriately (use youki lib?)
-    - [ ] It uses landlock appropriately
+    - [x] It can join an existing cgroup (v2 only)
+    - [x] It uses landlock appropriately
     - [ ] It handles network namespaces well? (use netavark lib?)
   - [ ] A "container" kind works
     - Does it just user docker? Apple's container' runtime if on MacOS?
