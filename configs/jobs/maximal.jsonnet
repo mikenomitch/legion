@@ -124,6 +124,13 @@
                     LEGION_TASK: "exec",
                 },
                 cwd: ".",
+                user: "nobody",
+                oom_score_adj: 100,
+                cgroup: "legion/demo",
+                landlock: {
+                    read_only_paths: ["/usr", "/bin"],
+                    read_write_paths: ["/tmp"],
+                },
             },
             resources: {
                 cpus: 0.1,
