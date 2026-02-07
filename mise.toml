@@ -5,7 +5,7 @@ LEGION_ADDR = "http://127.0.0.1:4747"
 run = 'trap "kill 0" EXIT; cargo run -- start manager -c configs/manager.jsonnet & (cd ui && npx vite dev) & wait'
 
 [tasks.join]
-run = "LEGION_ADDR=http://127.0.0.1:4748 cargo run -- join -a"
+run = "scripts/dev/join.sh $@"
 
 [tasks.job]
 usage = 'arg "<file>" default="./configs/jobs/mac.jsonnet"'
