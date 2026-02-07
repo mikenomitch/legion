@@ -16,7 +16,9 @@ use crate::structs::{
     Allocation, JobConfig, Node, TaskConfig, TaskDependencyCondition, TaskLifecycle,
     TaskStatusState,
 };
-pub use policy::{load_policy, SchedulerWeights, SchedulingContext, SchedulingPolicy};
+pub use policy::{
+    load_policy, score_nodes_for_context, SchedulerWeights, SchedulingContext, SchedulingPolicy,
+};
 
 mod policy;
 
@@ -392,6 +394,7 @@ impl<'a> Scheduler<'a> {
 
         let mut placements = Vec::new();
         let mut planned: HashMap<String, usize> = HashMap::new();
+        let mut planned_by_task: HashMap<(String, i64), usize> = HashMap::new();
         let weights = self.scheduler_weights()?;
         let anti_affinity_weight = self.anti_affinity_weight()?;
         let nodes_considered_setting = self.nodes_considered_setting()?;
@@ -605,6 +608,7 @@ impl<'a> Scheduler<'a> {
                         candidates_for_group,
                         allocations_by_node,
                         &mut planned,
+                        &mut planned_by_task,
                         &mut reschedule_rng,
                         nodes_considered_setting.as_ref(),
                         &mut nodes_considered_rng,
@@ -653,6 +657,7 @@ impl<'a> Scheduler<'a> {
                     candidates_for_group,
                     allocations_by_node,
                     &mut planned,
+                    &mut planned_by_task,
                     &mut reschedule_rng,
                     nodes_considered_setting.as_ref(),
                     &mut nodes_considered_rng,
@@ -724,6 +729,7 @@ impl<'a> Scheduler<'a> {
         candidates: &[&'b Node],
         allocations_by_node: &HashMap<String, Vec<Allocation>>,
         planned: &mut HashMap<String, usize>,
+        planned_by_task: &mut HashMap<(String, i64), usize>,
         reschedule_rng: &mut Option<StdRng>,
         nodes_considered_setting: Option<&NodesConsidered>,
         nodes_considered_rng: &mut StdRng,
@@ -779,6 +785,7 @@ impl<'a> Scheduler<'a> {
                         job_config_id,
                         allocations_by_node,
                         planned,
+                        planned_by_task,
                         weights,
                         task_id,
                         task_group_task_ids.clone(),
@@ -798,6 +805,7 @@ impl<'a> Scheduler<'a> {
                     job_config_id,
                     allocations_by_node,
                     planned,
+                    planned_by_task,
                     weights,
                     task_id,
                     task_group_task_ids.clone(),
@@ -806,6 +814,9 @@ impl<'a> Scheduler<'a> {
             };
 
             *planned.entry(node_id.clone()).or_default() += 1;
+            *planned_by_task
+                .entry((node_id.clone(), task_id))
+                .or_default() += 1;
             if let Some(tracker) = plan.distinct_tracker.as_mut() {
                 if let Some(node) = node_lookup.get(node_id.as_str()) {
                     tracker.insert_from_node(node);
@@ -832,6 +843,7 @@ impl<'a> Scheduler<'a> {
         job_config_id: &str,
         allocations_by_node: &HashMap<String, Vec<Allocation>>,
         planned: &HashMap<String, usize>,
+        planned_by_task: &HashMap<(String, i64), usize>,
         weights: SchedulerWeights,
         task_config_id: i64,
         task_group_task_ids: HashSet<i64>,
@@ -849,6 +861,7 @@ impl<'a> Scheduler<'a> {
             job_config_id,
             allocations_by_node,
             planned,
+            planned_by_task,
             weights,
             task_config_id,
             task_group_task_ids,
@@ -1091,6 +1104,7 @@ impl<'a> Scheduler<'a> {
                 ctx.job_config_id,
                 ctx.allocations,
                 ctx.planned,
+                ctx.planned_by_task,
                 ctx.weights,
                 ctx.task_config_id,
                 ctx.task_group_task_ids.clone(),
@@ -1346,62 +1360,6 @@ fn group_nodes_by_attr<'a>(nodes: &'a [&'a Node], key: &str) -> HashMap<String, 
         grouped.entry(token).or_default().push(*node);
     }
     grouped
-}
-
-fn score_nodes_for_context<'a>(ctx: &SchedulingContext<'a>) -> Vec<(&'a Node, f64)> {
-    if ctx.eligible_nodes.is_empty() {
-        return Vec::new();
-    }
-
-    let mut min_load: Option<usize> = None;
-    let mut max_load: Option<usize> = None;
-    let mut loads: HashMap<&'a str, usize> = HashMap::new();
-
-    for node in &ctx.eligible_nodes {
-        let load = ctx.total_assigned(&node.id);
-        loads.insert(node.id.as_str(), load);
-        min_load = Some(min_load.map_or(load, |min| min.min(load)));
-        max_load = Some(max_load.map_or(load, |max| max.max(load)));
-    }
-
-    let min_load = min_load.unwrap_or_default() as f64;
-    let max_load = max_load.unwrap_or_default() as f64;
-    let range = (max_load - min_load).max(0.0);
-
-    ctx.eligible_nodes
-        .iter()
-        .copied()
-        .map(|node| {
-            let load = loads.get(node.id.as_str()).copied().unwrap_or_default() as f64;
-            let (spread_score, bin_pack_score) = if range > 0.0 {
-                ((max_load - load) / range, (load - min_load) / range)
-            } else {
-                (0.0, 0.0)
-            };
-            let affinity_score = ctx.affinity_set.score(node);
-            let anti_affinity_penalty = ctx
-                .allocations
-                .get(node.id.as_str())
-                .into_iter()
-                .flatten()
-                .filter(|allocation| allocation.job_config_id == ctx.job_config_id)
-                .filter(|allocation| {
-                    allocation.task_config_id == ctx.task_config_id
-                        || ctx.task_group_task_ids.contains(&allocation.task_config_id)
-                })
-                .count() as f64
-                + ctx
-                    .planned
-                    .get(node.id.as_str())
-                    .copied()
-                    .unwrap_or_default() as f64;
-            let score = ctx.weights.affinity * affinity_score
-                + ctx.weights.spread * spread_score
-                + ctx.weights.bin_pack * bin_pack_score
-                - (ctx.anti_affinity_weight * anti_affinity_penalty);
-            (node, score)
-        })
-        .collect()
 }
 
 fn node_attribute<'a>(node: &'a Node, key: &str) -> Option<&'a Value> {

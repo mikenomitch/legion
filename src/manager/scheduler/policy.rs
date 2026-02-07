@@ -46,6 +46,7 @@ pub struct SchedulingContext<'a> {
     pub job_config_id: &'a str,
     pub allocations: &'a HashMap<String, Vec<Allocation>>,
     pub planned: &'a HashMap<String, usize>,
+    pub planned_by_task: &'a HashMap<(String, i64), usize>,
     pub weights: SchedulerWeights,
     pub task_config_id: i64,
     pub task_group_task_ids: HashSet<i64>,
@@ -61,6 +62,7 @@ impl<'a> SchedulingContext<'a> {
         job_config_id: &'a str,
         allocations: &'a HashMap<String, Vec<Allocation>>,
         planned: &'a HashMap<String, usize>,
+        planned_by_task: &'a HashMap<(String, i64), usize>,
         weights: SchedulerWeights,
         task_config_id: i64,
         task_group_task_ids: HashSet<i64>,
@@ -73,6 +75,7 @@ impl<'a> SchedulingContext<'a> {
             job_config_id,
             allocations,
             planned,
+            planned_by_task,
             weights,
             task_config_id,
             task_group_task_ids,
@@ -153,16 +156,11 @@ fn select_scored_node<'a>(ctx: &SchedulingContext<'a>) -> Option<&'a Node> {
     let max_load = max_load.unwrap_or_default() as f64;
     let range = (max_load - min_load).max(0.0);
 
-    let mut scored_nodes = Vec::with_capacity(ctx.eligible_nodes.len());
-    let mut best_score: Option<f64> = None;
+    let scored_nodes = score_nodes_for_context_with_loads(ctx, &loads, min_load, range);
+    let best_score = scored_nodes
+        .iter()
+        .fold(f64::NEG_INFINITY, |best, (score, _)| best.max(*score));
 
-    for node in &ctx.eligible_nodes {
-        let score = score_node(ctx, node, &loads, min_load, range);
-        best_score = Some(best_score.map_or(score, |best| best.max(score)));
-        scored_nodes.push((score, *node));
-    }
-
-    let best_score = best_score.unwrap_or_default();
     let mut top_nodes: Vec<&'a Node> = scored_nodes
         .into_iter()
         .filter_map(|(score, node)| {
@@ -176,6 +174,44 @@ fn select_scored_node<'a>(ctx: &SchedulingContext<'a>) -> Option<&'a Node> {
 
     top_nodes.shuffle(&mut thread_rng());
     top_nodes.into_iter().next()
+}
+
+pub fn score_nodes_for_context<'a>(ctx: &SchedulingContext<'a>) -> Vec<(&'a Node, f64)> {
+    if ctx.eligible_nodes.is_empty() {
+        return Vec::new();
+    }
+
+    let mut min_load: Option<usize> = None;
+    let mut max_load: Option<usize> = None;
+    let mut loads: HashMap<&'a str, usize> = HashMap::new();
+
+    for node in &ctx.eligible_nodes {
+        let load = ctx.total_assigned(&node.id);
+        loads.insert(node.id.as_str(), load);
+        min_load = Some(min_load.map_or(load, |min| min.min(load)));
+        max_load = Some(max_load.map_or(load, |max| max.max(load)));
+    }
+
+    let min_load = min_load.unwrap_or_default() as f64;
+    let max_load = max_load.unwrap_or_default() as f64;
+    let range = (max_load - min_load).max(0.0);
+
+    score_nodes_for_context_with_loads(ctx, &loads, min_load, range)
+        .into_iter()
+        .map(|(score, node)| (node, score))
+        .collect()
+}
+
+fn score_nodes_for_context_with_loads<'a>(
+    ctx: &SchedulingContext<'a>,
+    loads: &HashMap<&'a str, usize>,
+    min_load: f64,
+    range: f64,
+) -> Vec<(f64, &'a Node)> {
+    ctx.eligible_nodes
+        .iter()
+        .map(|node| (score_node(ctx, node, loads, min_load, range), *node))
+        .collect()
 }
 
 fn score_node(
@@ -226,10 +262,15 @@ fn anti_affinity_penalty(ctx: &SchedulingContext<'_>, node: &Node) -> f64 {
         })
         .count();
     let planned_allocations = ctx
-        .planned
-        .get(node.id.as_str())
-        .copied()
-        .unwrap_or_default();
+        .task_group_task_ids
+        .iter()
+        .map(|task_id| {
+            ctx.planned_by_task
+                .get(&(node.id.clone(), *task_id))
+                .copied()
+                .unwrap_or_default()
+        })
+        .sum::<usize>();
 
     (node_allocations + planned_allocations) as f64
 }
@@ -314,6 +355,7 @@ mod tests {
             vec![alloc("node-a", 1, "other-job")],
         )]);
         let planned = HashMap::from([(String::from("node-b"), 2_usize)]);
+        let planned_by_task: HashMap<(String, i64), usize> = HashMap::new();
 
         let task = task("web");
         let affinity_set = AffinitySet::new(&task.affinities).expect("affinities");
@@ -324,6 +366,7 @@ mod tests {
             "job",
             &allocations,
             &planned,
+            &planned_by_task,
             SchedulerWeights::for_policy("bin_pack"),
             1,
             HashSet::from([1]),
@@ -343,6 +386,7 @@ mod tests {
             (String::from("node-a"), 1_usize),
             (String::from("node-b"), 1_usize),
         ]);
+        let planned_by_task: HashMap<(String, i64), usize> = HashMap::new();
 
         let task = task("web");
         let affinity_set = AffinitySet::new(&task.affinities).expect("affinities");
@@ -353,6 +397,7 @@ mod tests {
             "job",
             &allocations,
             &planned,
+            &planned_by_task,
             SchedulerWeights::for_policy("bin_pack"),
             1,
             HashSet::from([1]),
@@ -381,6 +426,7 @@ mod tests {
             ),
         ]);
         let planned = HashMap::from([(String::from("node-b"), 2_usize)]);
+        let planned_by_task: HashMap<(String, i64), usize> = HashMap::new();
 
         let task = task("worker");
         let affinity_set = AffinitySet::new(&task.affinities).expect("affinities");
@@ -391,6 +437,7 @@ mod tests {
             "job",
             &allocations,
             &planned,
+            &planned_by_task,
             SchedulerWeights::for_policy("bin_pack"),
             1,
             HashSet::from([1]),
@@ -407,6 +454,7 @@ mod tests {
         let nodes: Vec<Node> = vec![];
         let allocations: HashMap<String, Vec<Allocation>> = HashMap::new();
         let planned: HashMap<String, usize> = HashMap::new();
+        let planned_by_task: HashMap<(String, i64), usize> = HashMap::new();
 
         let task = task("web");
         let affinity_set = AffinitySet::new(&task.affinities).expect("affinities");
@@ -417,6 +465,7 @@ mod tests {
             "job",
             &allocations,
             &planned,
+            &planned_by_task,
             SchedulerWeights::for_policy("bin_pack"),
             1,
             HashSet::from([1]),
@@ -436,6 +485,7 @@ mod tests {
             vec![alloc("node-a", 1, "other-job")],
         )]);
         let planned = HashMap::from([(String::from("node-b"), 1_usize)]);
+        let planned_by_task: HashMap<(String, i64), usize> = HashMap::new();
 
         let task = task("api");
         let affinity_set = AffinitySet::new(&task.affinities).expect("affinities");
@@ -446,6 +496,7 @@ mod tests {
             "job",
             &allocations,
             &planned,
+            &planned_by_task,
             SchedulerWeights::for_policy("spread"),
             1,
             HashSet::from([1]),
@@ -465,6 +516,7 @@ mod tests {
             (String::from("node-a"), 1_usize),
             (String::from("node-b"), 1_usize),
         ]);
+        let planned_by_task: HashMap<(String, i64), usize> = HashMap::new();
 
         let task = task("api");
         let affinity_set = AffinitySet::new(&task.affinities).expect("affinities");
@@ -475,6 +527,7 @@ mod tests {
             "job",
             &allocations,
             &planned,
+            &planned_by_task,
             SchedulerWeights::for_policy("spread"),
             1,
             HashSet::from([1]),
@@ -494,6 +547,7 @@ mod tests {
             vec![alloc("node-a", 1, "other-job")],
         )]);
         let planned = HashMap::new();
+        let planned_by_task: HashMap<(String, i64), usize> = HashMap::new();
 
         let task = task("web");
         let affinity_set = AffinitySet::new(&task.affinities).expect("affinities");
@@ -509,6 +563,7 @@ mod tests {
                     "job",
                     &allocations,
                     &planned,
+                    &planned_by_task,
                     SchedulerWeights {
                         affinity: 1.0,
                         spread: 0.0,
@@ -533,6 +588,7 @@ mod tests {
         let nodes: Vec<Node> = vec![];
         let allocations: HashMap<String, Vec<Allocation>> = HashMap::new();
         let planned: HashMap<String, usize> = HashMap::new();
+        let planned_by_task: HashMap<(String, i64), usize> = HashMap::new();
 
         let task = task("api");
         let affinity_set = AffinitySet::new(&task.affinities).expect("affinities");
@@ -543,6 +599,7 @@ mod tests {
             "job",
             &allocations,
             &planned,
+            &planned_by_task,
             SchedulerWeights::for_policy("spread"),
             1,
             HashSet::from([1]),
