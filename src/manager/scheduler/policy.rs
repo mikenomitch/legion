@@ -7,6 +7,7 @@ use crate::structs::{Allocation, Node, TaskConfig};
 use libloading::{Library, Symbol};
 use rand::seq::SliceRandom;
 use rand::thread_rng;
+use serde_json::Value;
 
 #[derive(Debug, Clone, Copy)]
 pub struct SchedulerWeights {
@@ -45,6 +46,8 @@ pub struct SchedulingContext<'a> {
     pub affinity_set: &'a AffinitySet,
     pub job_config_id: &'a str,
     pub allocations: &'a HashMap<String, Vec<Allocation>>,
+    pub task_name_to_id: &'a HashMap<String, i64>,
+    pub planned_task_allocations: &'a HashMap<String, Vec<i64>>,
     pub planned: &'a HashMap<String, usize>,
     pub weights: SchedulerWeights,
 }
@@ -57,6 +60,8 @@ impl<'a> SchedulingContext<'a> {
         affinity_set: &'a AffinitySet,
         job_config_id: &'a str,
         allocations: &'a HashMap<String, Vec<Allocation>>,
+        task_name_to_id: &'a HashMap<String, i64>,
+        planned_task_allocations: &'a HashMap<String, Vec<i64>>,
         planned: &'a HashMap<String, usize>,
         weights: SchedulerWeights,
     ) -> Self {
@@ -66,6 +71,8 @@ impl<'a> SchedulingContext<'a> {
             affinity_set,
             job_config_id,
             allocations,
+            task_name_to_id,
+            planned_task_allocations,
             planned,
             weights,
         }
@@ -77,6 +84,21 @@ impl<'a> SchedulingContext<'a> {
             .map(|allocs| allocs.len())
             .unwrap_or(0)
             + self.planned.get(node_id).copied().unwrap_or(0)
+    }
+
+    fn has_task_on_node(&self, node_id: &str, task_id: i64) -> bool {
+        if self.allocations.get(node_id).is_some_and(|allocs| {
+            allocs.iter().any(|allocation| {
+                allocation.job_config_id == self.job_config_id
+                    && allocation.task_config_id == task_id
+            })
+        }) {
+            return true;
+        }
+
+        self.planned_task_allocations
+            .get(node_id)
+            .is_some_and(|task_ids| task_ids.contains(&task_id))
     }
 }
 
@@ -186,7 +208,7 @@ fn score_node(
         (0.0, 0.0)
     };
 
-    let affinity_score = affinity_score(ctx.task, ctx.affinity_set, node);
+    let affinity_score = affinity_score(ctx.task, ctx.affinity_set, node, ctx);
 
     ctx.weights.affinity * affinity_score
         + ctx.weights.spread * spread_score
@@ -198,8 +220,70 @@ fn max_load_delta(range: f64, load: f64, min_load: f64) -> f64 {
     (max_load - load) / range
 }
 
-fn affinity_score(_task: &TaskConfig, affinity_set: &AffinitySet, node: &Node) -> f64 {
-    affinity_set.score(node)
+fn affinity_score(
+    task: &TaskConfig,
+    affinity_set: &AffinitySet,
+    node: &Node,
+    ctx: &SchedulingContext<'_>,
+) -> f64 {
+    affinity_set.score(node) + task_colocation_affinity_score(task, node, ctx)
+}
+
+fn task_colocation_affinity_score(
+    task: &TaskConfig,
+    node: &Node,
+    ctx: &SchedulingContext<'_>,
+) -> f64 {
+    let preferences = task_colocation_preferences(&task.affinities);
+    if preferences.is_empty() {
+        return 0.0;
+    }
+
+    let mut matched = 0.0;
+    let mut total = 0.0;
+    for (task_name, multiplier) in preferences {
+        let weight = multiplier.abs();
+        total += weight;
+
+        let Some(task_id) = ctx.task_name_to_id.get(task_name) else {
+            continue;
+        };
+
+        if ctx.has_task_on_node(&node.id, *task_id) {
+            matched += multiplier;
+        }
+    }
+
+    if total == 0.0 {
+        0.0
+    } else {
+        matched / total
+    }
+}
+
+fn task_colocation_preferences(affinities: &Value) -> Vec<(&str, f64)> {
+    match affinities {
+        Value::Object(map) => map
+            .get("same_node_as")
+            .and_then(Value::as_str)
+            .map(|task| vec![(task, 1.0)])
+            .unwrap_or_default(),
+        Value::Array(items) => items
+            .iter()
+            .filter_map(|item| {
+                let obj = item.as_object()?;
+                let key = obj.get("key")?.as_str()?;
+                if key != "same_node_as" {
+                    return None;
+                }
+
+                let task = obj.get("value")?.as_str()?;
+                let multiplier = obj.get("multiplier").and_then(Value::as_f64).unwrap_or(1.0);
+                Some((task, multiplier))
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 #[instrument(err, skip_all)]
@@ -243,6 +327,7 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::collections::HashMap;
+    use std::sync::OnceLock;
 
     fn node(id: &str) -> Node {
         Node {
@@ -262,14 +347,33 @@ mod tests {
         TaskConfig::new(name, "noop")
     }
 
+    fn empty_task_name_to_id() -> &'static HashMap<String, i64> {
+        static EMPTY: OnceLock<HashMap<String, i64>> = OnceLock::new();
+        EMPTY.get_or_init(HashMap::new)
+    }
+
+    fn empty_planned_task_allocations() -> &'static HashMap<String, Vec<i64>> {
+        static EMPTY: OnceLock<HashMap<String, Vec<i64>>> = OnceLock::new();
+        EMPTY.get_or_init(HashMap::new)
+    }
+
     fn alloc(node_id: &str, id: i64, job_config_id: &str) -> Allocation {
+        alloc_for_task(node_id, id, job_config_id, 1)
+    }
+
+    fn alloc_for_task(
+        node_id: &str,
+        id: i64,
+        job_config_id: &str,
+        task_config_id: i64,
+    ) -> Allocation {
         Allocation {
             id,
             status: "running".into(),
             resources: json!({}),
             node_id: node_id.into(),
             job_config_id: job_config_id.into(),
-            task_config_id: 1,
+            task_config_id,
             job_id: "job".into(),
         }
     }
@@ -291,6 +395,8 @@ mod tests {
             &affinity_set,
             "job",
             &allocations,
+            empty_task_name_to_id(),
+            empty_planned_task_allocations(),
             &planned,
             SchedulerWeights::for_policy("bin_pack"),
         );
@@ -317,6 +423,8 @@ mod tests {
             &affinity_set,
             "job",
             &allocations,
+            empty_task_name_to_id(),
+            empty_planned_task_allocations(),
             &planned,
             SchedulerWeights::for_policy("bin_pack"),
         );
@@ -352,6 +460,8 @@ mod tests {
             &affinity_set,
             "job",
             &allocations,
+            empty_task_name_to_id(),
+            empty_planned_task_allocations(),
             &planned,
             SchedulerWeights::for_policy("bin_pack"),
         );
@@ -365,7 +475,7 @@ mod tests {
     fn bin_pack_returns_none_without_nodes() {
         let nodes: Vec<Node> = vec![];
         let allocations: HashMap<String, Vec<Allocation>> = HashMap::new();
-        let planned: HashMap<String, usize> = HashMap::new();
+        let planned = HashMap::from([(String::from("node-b"), 1_usize)]);
 
         let task = task("web");
         let affinity_set = AffinitySet::new(&task.affinities).expect("affinities");
@@ -375,6 +485,8 @@ mod tests {
             &affinity_set,
             "job",
             &allocations,
+            empty_task_name_to_id(),
+            empty_planned_task_allocations(),
             &planned,
             SchedulerWeights::for_policy("bin_pack"),
         );
@@ -401,6 +513,8 @@ mod tests {
             &affinity_set,
             "job",
             &allocations,
+            empty_task_name_to_id(),
+            empty_planned_task_allocations(),
             &planned,
             SchedulerWeights::for_policy("spread"),
         );
@@ -427,6 +541,8 @@ mod tests {
             &affinity_set,
             "job",
             &allocations,
+            empty_task_name_to_id(),
+            empty_planned_task_allocations(),
             &planned,
             SchedulerWeights::for_policy("spread"),
         );
@@ -458,6 +574,8 @@ mod tests {
                     &affinity_set,
                     "job",
                     &allocations,
+                    empty_task_name_to_id(),
+                    empty_planned_task_allocations(),
                     &planned,
                     SchedulerWeights {
                         affinity: 1.0,
@@ -476,6 +594,37 @@ mod tests {
     }
 
     #[test]
+    fn spread_prefers_node_with_same_node_as_affinity() {
+        let nodes = vec![node("node-a"), node("node-b")];
+        let allocations: HashMap<String, Vec<Allocation>> = HashMap::from([(
+            String::from("node-a"),
+            vec![alloc_for_task("node-a", 1, "job", 1)],
+        )]);
+        let planned = HashMap::from([(String::from("node-b"), 1_usize)]);
+        let task_name_to_id = HashMap::from([(String::from("api"), 1_i64)]);
+        let planned_task_allocations: HashMap<String, Vec<i64>> = HashMap::new();
+
+        let mut task = task("web");
+        task.affinities = json!({ "same_node_as": "api" });
+        let affinity_set = AffinitySet::new(&task.affinities).expect("affinities");
+        let ctx = SchedulingContext::new(
+            nodes.iter().collect(),
+            &task,
+            &affinity_set,
+            "job",
+            &allocations,
+            &task_name_to_id,
+            &planned_task_allocations,
+            &planned,
+            SchedulerWeights::for_policy("spread"),
+        );
+        let policy = SpreadPolicy::default();
+
+        let choice = policy.select_node(ctx).expect("node expected");
+        assert_eq!(choice.id, "node-a");
+    }
+
+    #[test]
     fn spread_returns_none_without_nodes() {
         let nodes: Vec<Node> = vec![];
         let allocations: HashMap<String, Vec<Allocation>> = HashMap::new();
@@ -489,6 +638,8 @@ mod tests {
             &affinity_set,
             "job",
             &allocations,
+            empty_task_name_to_id(),
+            empty_planned_task_allocations(),
             &planned,
             SchedulerWeights::for_policy("spread"),
         );
