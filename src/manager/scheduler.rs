@@ -396,6 +396,11 @@ impl<'a> Scheduler<'a> {
         let mut group_sizes: HashMap<String, usize> = HashMap::new();
         let mut group_constraints: HashMap<String, Vec<ConstraintSet>> = HashMap::new();
         let mut task_group_map: HashMap<i64, (String, Option<String>)> = HashMap::new();
+        let task_name_to_id: HashMap<String, i64> = all_tasks
+            .iter()
+            .map(|(task_id, task_config)| (task_config.name.clone(), *task_id))
+            .collect();
+        let mut planned_task_allocations: HashMap<String, Vec<i64>> = HashMap::new();
 
         for (task_id, task_config) in &all_tasks {
             let per_key = task_config.count.per.clone();
@@ -574,6 +579,8 @@ impl<'a> Scheduler<'a> {
                         job_config_id,
                         candidates_for_group,
                         allocations_by_node,
+                        &task_name_to_id,
+                        &mut planned_task_allocations,
                         &mut planned,
                         &mut reschedule_rng,
                         nodes_considered_setting.as_ref(),
@@ -616,6 +623,8 @@ impl<'a> Scheduler<'a> {
                     job_config_id,
                     candidates_for_group,
                     allocations_by_node,
+                    &task_name_to_id,
+                    &mut planned_task_allocations,
                     &mut planned,
                     &mut reschedule_rng,
                     nodes_considered_setting.as_ref(),
@@ -681,6 +690,8 @@ impl<'a> Scheduler<'a> {
         job_config_id: &str,
         candidates: &[&'b Node],
         allocations_by_node: &HashMap<String, Vec<Allocation>>,
+        task_name_to_id: &HashMap<String, i64>,
+        planned_task_allocations: &mut HashMap<String, Vec<i64>>,
         planned: &mut HashMap<String, usize>,
         reschedule_rng: &mut Option<StdRng>,
         nodes_considered_setting: Option<&NodesConsidered>,
@@ -732,6 +743,8 @@ impl<'a> Scheduler<'a> {
                         &plan.affinity_set,
                         job_config_id,
                         allocations_by_node,
+                        task_name_to_id,
+                        planned_task_allocations,
                         planned,
                         weights,
                     )?;
@@ -747,12 +760,18 @@ impl<'a> Scheduler<'a> {
                     &plan.affinity_set,
                     job_config_id,
                     allocations_by_node,
+                    task_name_to_id,
+                    planned_task_allocations,
                     planned,
                     weights,
                 )?
             };
 
             *planned.entry(node_id.clone()).or_default() += 1;
+            planned_task_allocations
+                .entry(node_id.clone())
+                .or_default()
+                .push(task_id);
             if let Some(tracker) = plan.distinct_tracker.as_mut() {
                 if let Some(node) = node_lookup.get(node_id.as_str()) {
                     tracker.insert_from_node(node);
@@ -777,6 +796,8 @@ impl<'a> Scheduler<'a> {
         affinity_set: &AffinitySet,
         job_config_id: &str,
         allocations_by_node: &HashMap<String, Vec<Allocation>>,
+        task_name_to_id: &HashMap<String, i64>,
+        planned_task_allocations: &HashMap<String, Vec<i64>>,
         planned: &HashMap<String, usize>,
         weights: SchedulerWeights,
     ) -> R<String> {
@@ -788,6 +809,8 @@ impl<'a> Scheduler<'a> {
             affinity_set,
             job_config_id,
             allocations_by_node,
+            task_name_to_id,
+            planned_task_allocations,
             planned,
             weights,
         );
@@ -1036,6 +1059,8 @@ impl<'a> Scheduler<'a> {
                 ctx.affinity_set,
                 ctx.job_config_id,
                 ctx.allocations,
+                ctx.task_name_to_id,
+                ctx.planned_task_allocations,
                 ctx.planned,
                 ctx.weights,
             );

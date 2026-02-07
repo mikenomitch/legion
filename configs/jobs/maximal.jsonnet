@@ -134,6 +134,7 @@
             },
             affinities: {
                 region: "us-west",
+                same_node_as: "web",
             },
         },
         {
