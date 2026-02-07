@@ -15,6 +15,7 @@ use crate::structs::{
     Allocation, JobConfig, Node, TaskConfig, TaskDependencyCondition, TaskLifecycle,
     TaskStatusState,
 };
+use policy::score_node_for_context;
 pub use policy::{load_policy, SchedulerWeights, SchedulingContext, SchedulingPolicy};
 
 mod policy;
@@ -411,6 +412,7 @@ impl<'a> Scheduler<'a> {
         let mut group_sizes: HashMap<String, usize> = HashMap::new();
         let mut group_constraints: HashMap<String, Vec<ConstraintSet>> = HashMap::new();
         let mut task_group_map: HashMap<i64, (String, Option<String>)> = HashMap::new();
+        let mut task_id_to_group: HashMap<i64, String> = HashMap::new();
         let task_name_to_id: HashMap<String, i64> = all_tasks
             .iter()
             .map(|(task_id, task_config)| (task_config.name.clone(), *task_id))
@@ -445,6 +447,7 @@ impl<'a> Scheduler<'a> {
                     .push(constraint_set);
             }
             task_group_map.insert(*task_id, (task_config.group.clone(), per_key));
+            task_id_to_group.insert(*task_id, task_config.group.clone());
         }
 
         let mut group_assignments: HashMap<GroupKey, String> = HashMap::new();
@@ -594,6 +597,7 @@ impl<'a> Scheduler<'a> {
                         candidates_for_group,
                         allocations_by_node,
                         &task_name_to_id,
+                        &task_id_to_group,
                         &mut planned_task_allocations,
                         &mut planned,
                         &mut reschedule_rng,
@@ -639,6 +643,7 @@ impl<'a> Scheduler<'a> {
                     candidates_for_group,
                     allocations_by_node,
                     &task_name_to_id,
+                    &task_id_to_group,
                     &mut planned_task_allocations,
                     &mut planned,
                     &mut reschedule_rng,
@@ -707,6 +712,7 @@ impl<'a> Scheduler<'a> {
         candidates: &[&'b Node],
         allocations_by_node: &HashMap<String, Vec<Allocation>>,
         task_name_to_id: &HashMap<String, i64>,
+        task_id_to_group: &HashMap<i64, String>,
         planned_task_allocations: &mut HashMap<String, Vec<i64>>,
         planned: &mut HashMap<String, usize>,
         reschedule_rng: &mut Option<StdRng>,
@@ -757,11 +763,13 @@ impl<'a> Scheduler<'a> {
                         reschedule_rng,
                         nodes_considered_setting,
                         nodes_considered_rng,
+                        task_id,
                         task_config,
                         &plan.affinity_set,
                         job_config_id,
                         allocations_by_node,
                         task_name_to_id,
+                        task_id_to_group,
                         planned_task_allocations,
                         planned,
                         weights,
@@ -775,11 +783,13 @@ impl<'a> Scheduler<'a> {
                     reschedule_rng,
                     nodes_considered_setting,
                     nodes_considered_rng,
+                    task_id,
                     task_config,
                     &plan.affinity_set,
                     job_config_id,
                     allocations_by_node,
                     task_name_to_id,
+                    task_id_to_group,
                     planned_task_allocations,
                     planned,
                     weights,
@@ -812,11 +822,13 @@ impl<'a> Scheduler<'a> {
         reschedule_rng: &mut Option<StdRng>,
         nodes_considered_setting: Option<&NodesConsidered>,
         nodes_considered_rng: &mut StdRng,
+        task_id: i64,
         task_config: &TaskConfig,
         affinity_set: &AffinitySet,
         job_config_id: &str,
         allocations_by_node: &HashMap<String, Vec<Allocation>>,
         task_name_to_id: &HashMap<String, i64>,
+        task_id_to_group: &HashMap<i64, String>,
         planned_task_allocations: &HashMap<String, Vec<i64>>,
         planned: &HashMap<String, usize>,
         weights: SchedulerWeights,
@@ -829,10 +841,12 @@ impl<'a> Scheduler<'a> {
         let ctx = SchedulingContext::new(
             eligible,
             task_config,
+            task_id,
             affinity_set,
             job_config_id,
             allocations_by_node,
             task_name_to_id,
+            task_id_to_group,
             planned_task_allocations,
             planned,
             weights,
@@ -1070,10 +1084,12 @@ impl<'a> Scheduler<'a> {
             let fallback_ctx = SchedulingContext::new(
                 ctx.eligible_nodes.clone(),
                 ctx.task,
+                ctx.task_id,
                 ctx.affinity_set,
                 ctx.job_config_id,
                 ctx.allocations,
                 ctx.task_name_to_id,
+                ctx.task_id_to_group,
                 ctx.planned_task_allocations,
                 ctx.planned,
                 ctx.weights,
@@ -1137,6 +1153,7 @@ impl<'a> Scheduler<'a> {
                 "affinities" => weights.affinity = weight,
                 "spread" => weights.spread = weight,
                 "bin_pack" => weights.bin_pack = weight,
+                "automatic_anti_affinity" => weights.automatic_anti_affinity = weight,
                 _ => {}
             }
         }
@@ -1341,16 +1358,7 @@ fn score_nodes_for_context<'a>(ctx: &SchedulingContext<'a>) -> Vec<(&'a Node, f6
         .iter()
         .copied()
         .map(|node| {
-            let load = loads.get(node.id.as_str()).copied().unwrap_or_default() as f64;
-            let (spread_score, bin_pack_score) = if range > 0.0 {
-                ((max_load - load) / range, (load - min_load) / range)
-            } else {
-                (0.0, 0.0)
-            };
-            let affinity_score = ctx.affinity_set.score(node);
-            let score = ctx.weights.affinity * affinity_score
-                + ctx.weights.spread * spread_score
-                + ctx.weights.bin_pack * bin_pack_score;
+            let score = score_node_for_context(ctx, node, &loads, min_load, range);
             (node, score)
         })
         .collect()
@@ -2912,6 +2920,47 @@ mod tests {
                 total_memory
             );
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn automatic_anti_affinity_penalizes_existing_group_allocations() -> R<()> {
+        let store = setup_store_with_scheduler(
+            "bin_pack",
+            Some(json!({
+                "weights": {
+                    "affinities": 0.0,
+                    "spread": 0.0,
+                    "bin_pack": 0.0,
+                    "automatic_anti_affinity": 1.0
+                }
+            })),
+        )?;
+
+        store.insert_node(make_node_msg("node-a", json!({})))?;
+        store.insert_node(make_node_msg("node-b", json!({})))?;
+
+        let job = JobConfig {
+            name: "anti-affinity-job".into(),
+            tasks: vec![TaskConfig {
+                count: TaskCount::new(2),
+                group: "service".into(),
+                ..TaskConfig::new("api", "noop")
+            }],
+            version: None,
+        };
+
+        store.handle_job_submit(&job, &[dummy_submission()])?;
+        let job_config_id = store.get_job_config(&job.name)?.id();
+        let task_id = task_id_for(&store, &job_config_id, "api")?;
+        store.place_alloc("node-a", task_id)?;
+
+        let scheduler = Scheduler::new(&store)?;
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Reschedule)?;
+
+        assert_eq!(outcome.allocations.len(), 1);
+        assert_eq!(outcome.allocations[0].node_id, "node-b");
 
         Ok(())
     }
