@@ -13,11 +13,21 @@ use futures::join;
 use http::Method;
 use jsonnet::JsonnetVm;
 use std::fs;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Notify;
 use tokio::task::JoinSet;
 use tonic::transport::{Identity, Server, ServerTlsConfig};
 use tonic_web::GrpcWebLayer;
 use tower_http::cors::{Any, CorsLayer};
+
+// Fallback poll interval used only when delay calculation fails.
+const IDLE_POLL_INTERVAL: Duration = Duration::from_secs(30);
+// Safety cap for empty queues so idle workers can still periodically re-check state.
+const IDLE_WAIT_CAP: Duration = Duration::from_secs(300);
+// Exponential backoff is reserved for true error paths (claim failures).
+const ERROR_BACKOFF_MIN: Duration = Duration::from_secs(1);
+const ERROR_BACKOFF_MAX: Duration = Duration::from_secs(30);
 
 #[instrument(err, skip_all)]
 pub async fn run_manager(config: ManagerConfig, run_worker: bool) -> R<()> {
@@ -185,60 +195,193 @@ async fn start_eval_loop(store: Store, max_threads: usize) -> R<()> {
     }
 
     let mut next_worker_id = max_threads;
+    // Supervises workers forever: any worker exit/crash is immediately replaced.
     loop {
-        match join_set.join_next().await {
-            Some(Ok(())) => {
-                warn!("Eval worker exited unexpectedly; restarting");
-            }
-            Some(Err(e)) => {
-                error!("Eval worker crashed; restarting: {:?}", e);
-            }
-            None => {
-                error!("Eval worker join set drained unexpectedly");
-                break;
-            }
+        if !restart_eval_worker_after_exit(&mut join_set, &store, &mut next_worker_id).await {
+            break;
         }
-
-        let worker_id = next_worker_id;
-        next_worker_id = next_worker_id.saturating_add(1);
-        spawn_eval_worker(&mut join_set, &store, worker_id);
     }
 
     Ok(())
 }
 
-fn spawn_eval_worker(join_set: &mut JoinSet<()>, store: &Store, worker_id: usize) {
-    let store_for_eval = store.clone();
+async fn restart_eval_worker_after_exit(
+    join_set: &mut JoinSet<()>,
+    store: &Store,
+    next_worker_id: &mut usize,
+) -> bool {
+    match join_set.join_next().await {
+        Some(Ok(())) => {
+            warn!("Eval worker exited unexpectedly; restarting");
+        }
+        Some(Err(e)) => {
+            error!("Eval worker crashed; restarting: {:?}", e);
+        }
+        None => {
+            error!("Eval worker join set drained unexpectedly");
+            return false;
+        }
+    }
 
-    join_set.spawn_blocking(move || eval_worker_loop(store_for_eval, worker_id));
+    let worker_id = *next_worker_id;
+    *next_worker_id = next_worker_id.saturating_add(1);
+    spawn_eval_worker(join_set, store, worker_id);
+    true
 }
 
-fn eval_worker_loop(store: Store, worker_id: usize) {
-    const IDLE_BACKOFF_MIN: Duration = Duration::from_secs(1);
-    const IDLE_BACKOFF_MAX: Duration = Duration::from_secs(30);
-    const POST_EVAL_PAUSE: Duration = Duration::from_millis(200);
+fn spawn_eval_worker(join_set: &mut JoinSet<()>, store: &Store, worker_id: usize) {
+    // Each worker shares the same notifier. enqueue/requeue paths wake sleepers.
+    let store_for_eval = store.clone();
+    let notifier = store.eval_notifier();
 
+    join_set.spawn(async move { eval_worker_loop(store_for_eval, notifier, worker_id).await });
+}
+
+async fn eval_worker_loop(store: Store, notifier: Arc<Notify>, worker_id: usize) {
     info!(worker_id, "Eval worker started");
 
-    let mut backoff = IDLE_BACKOFF_MIN;
+    let mut error_backoff = ERROR_BACKOFF_MIN;
     loop {
         match store.claim_eval() {
             Ok(Some(eval)) => {
-                backoff = IDLE_BACKOFF_MIN;
+                error_backoff = ERROR_BACKOFF_MIN;
                 handle_claimed_eval(&store, worker_id, &eval);
-                std::thread::sleep(POST_EVAL_PAUSE);
             }
             Ok(None) => {
-                info!(worker_id, "No evals to handle; backing off");
-                std::thread::sleep(backoff);
-                backoff = std::cmp::min(backoff * 2, IDLE_BACKOFF_MAX);
+                // Queue is empty (or only delayed work exists), so park until notified or due.
+                wait_for_next_eval(&store, &notifier, worker_id).await;
             }
             Err(e) => {
                 error!(worker_id, "Error claiming next eval: {:?}", e);
-                std::thread::sleep(backoff);
-                backoff = std::cmp::min(backoff * 2, IDLE_BACKOFF_MAX);
+                tokio::time::sleep(error_backoff).await;
+                error_backoff = std::cmp::min(error_backoff * 2, ERROR_BACKOFF_MAX);
             }
         }
+    }
+}
+
+async fn wait_for_next_eval(store: &Store, notifier: &Notify, worker_id: usize) {
+    // Compute the shortest meaningful sleep: until next delayed eval is ready,
+    // or a long idle cap when the queue has no pending rows.
+    let wait_for = match store.next_pending_eval_delay() {
+        Ok(Some(delay)) => delay,
+        Ok(None) => IDLE_WAIT_CAP,
+        Err(e) => {
+            warn!(
+                worker_id,
+                "Error checking pending evals before waiting: {:?}", e
+            );
+            IDLE_POLL_INTERVAL
+        }
+    };
+
+    if wait_for.is_zero() {
+        return;
+    }
+
+    info!(
+        worker_id,
+        ?wait_for,
+        "No ready evals; waiting for notify or timeout"
+    );
+    // Race wake events against timeout so workers react quickly to new work
+    // without busy polling when the queue is empty.
+    tokio::select! {
+        _ = notifier.notified() => {}
+        _ = tokio::time::sleep(wait_for) => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::structs::ManagerConfigFull;
+    use tempfile::Builder;
+
+    fn setup_store() -> R<Store> {
+        let store_dir = Builder::new()
+            .prefix("legion-agent-store-")
+            .tempdir()
+            .context("Error creating temp store directory")?
+            .keep();
+
+        let store_config = ManagerConfigFull {
+            store_path: store_dir
+                .to_str()
+                .context("Error parsing store path")?
+                .to_string(),
+            ..Default::default()
+        };
+
+        let store = Store::start_storage(&store_config)?;
+        store.reset_all_tables()?;
+        Ok(store)
+    }
+
+    #[tokio::test]
+    async fn wait_for_next_eval_wakes_immediately_after_enqueue() -> R<()> {
+        let store = setup_store()?;
+        let notifier = store.eval_notifier();
+
+        let wait_task = tokio::spawn({
+            let store = store.clone();
+            let notifier = notifier.clone();
+            async move { wait_for_next_eval(&store, &notifier, 0).await }
+        });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        store.enqueue_eval("node-left", None, None, None, Some(1))?;
+
+        tokio::time::timeout(Duration::from_millis(300), wait_task)
+            .await
+            .context("worker was not notified on enqueue")??;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn wait_for_next_eval_does_not_busy_loop_when_only_future_work_exists() -> R<()> {
+        let store = setup_store()?;
+        let notifier = store.eval_notifier();
+        store.enqueue_eval_after_delay(
+            "node-left",
+            None,
+            None,
+            None,
+            Some(1),
+            Duration::from_millis(80),
+        )?;
+
+        let start = tokio::time::Instant::now();
+        wait_for_next_eval(&store, &notifier, 0).await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed >= Duration::from_millis(50),
+            "wait elapsed too quickly ({elapsed:?}), likely busy-looping"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn restart_eval_worker_after_exit_spawns_replacement_worker() -> R<()> {
+        let store = setup_store()?;
+        let mut join_set = JoinSet::new();
+        let mut next_worker_id = 1;
+
+        join_set.spawn(async {});
+        let restarted =
+            restart_eval_worker_after_exit(&mut join_set, &store, &mut next_worker_id).await;
+
+        assert!(restarted);
+        assert_eq!(next_worker_id, 2);
+        assert_eq!(join_set.len(), 1);
+
+        join_set.abort_all();
+        while join_set.join_next().await.is_some() {}
+
+        Ok(())
     }
 }
 

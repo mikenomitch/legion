@@ -34,6 +34,7 @@ use std::time::Duration;
 use time::format_description::well_known::Rfc3339;
 use time::macros::format_description;
 use time::OffsetDateTime;
+use tokio::sync::Notify;
 
 // warning incorrectly
 #[allow(dead_code)]
@@ -80,6 +81,8 @@ pub struct Store {
     pub scheduler_settings: Option<Value>,
     pub resource_policy: ResourcePolicy,
     read_model: Arc<RwLock<SchedulingReadModel>>,
+    // Cross-task wake signal for eval workers waiting on an empty queue.
+    eval_notify: Arc<Notify>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,6 +136,7 @@ impl Store {
             scheduler_settings: config.scheduler_settings.clone(),
             resource_policy,
             read_model: Arc::new(RwLock::new(SchedulingReadModel::default())),
+            eval_notify: Arc::new(Notify::new()),
         };
 
         store.refresh_read_model()?;
@@ -2332,6 +2336,37 @@ impl Store {
         Ok(Some(eval))
     }
 
+    // Expose a clone so runtime worker tasks can await wake notifications.
+    pub fn eval_notifier(&self) -> Arc<Notify> {
+        Arc::clone(&self.eval_notify)
+    }
+
+    // Returns how long until the earliest pending eval becomes claimable.
+    // None means there is no pending eval row at all.
+    pub fn next_pending_eval_delay(&self) -> R<Option<Duration>> {
+        let conn = self.read_connection()?;
+
+        let next_ready_at: Option<String> = conn
+            .query_row(
+                "SELECT ready_at FROM eval WHERE status = 'pending' ORDER BY ready_at ASC LIMIT 1;",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+
+        let Some(next_ready_at) = next_ready_at else {
+            return Ok(None);
+        };
+
+        let next_ready_at = OffsetDateTime::parse(&next_ready_at, &Rfc3339)?;
+        let now = OffsetDateTime::now_utc();
+        if next_ready_at <= now {
+            return Ok(Some(Duration::ZERO));
+        }
+
+        Ok(Some((next_ready_at - now).try_into()?))
+    }
+
     #[instrument(err, skip_all)]
     pub fn requeue_in_flight_evals(&self) -> R<u64> {
         let conn = self.write_connection()?;
@@ -2339,6 +2374,11 @@ impl Store {
             "UPDATE eval SET status = 'pending' WHERE status = 'in_flight';",
             [],
         )?;
+
+        if updated > 0 {
+            // Startup recovery moved work from in_flight->pending; wake all waiters.
+            self.eval_notify.notify_waiters();
+        }
 
         Ok(updated as u64)
     }
@@ -2424,6 +2464,11 @@ impl Store {
         };
 
         tx.commit()?;
+
+        if delay.is_zero() {
+            // Zero-delay evals are immediately claimable, so wake one sleeping worker.
+            self.eval_notify.notify_one();
+        }
 
         Ok(eval)
     }
