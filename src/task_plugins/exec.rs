@@ -114,17 +114,14 @@ impl ExecTaskPlugin {
             Some(value) => Some(parse_landlock_config(value)?),
         };
 
-        let oom_score_adj = match obj.get("oom_score_adj") {
+        let oom_adj = obj.get("oom_adj");
+        let oom_score_adj = obj.get("oom_score_adj");
+        if oom_adj.is_some() && oom_score_adj.is_some() {
+            bail!("exec task config may specify only one of oom_adj or oom_score_adj");
+        }
+        let oom_score_adj = match oom_adj.or(oom_score_adj) {
             None => None,
-            Some(value) => {
-                let score = value
-                    .as_i64()
-                    .context("exec task oom_score_adj must be an integer")?;
-                if !(-1000..=1000).contains(&score) {
-                    bail!("exec task oom_score_adj must be between -1000 and 1000");
-                }
-                Some(score as i32)
-            }
+            Some(value) => Some(parse_oom_score_adj(value)?),
         };
 
         let cgroup = match obj.get("cgroup") {
@@ -171,6 +168,7 @@ impl TaskPlugin for ExecTaskPlugin {
                 },
                 "cwd": { "type": "string" },
                 "user": { "type": "string" },
+                "oom_adj": { "type": "integer", "minimum": -1000, "maximum": 1000 },
                 "oom_score_adj": { "type": "integer", "minimum": -1000, "maximum": 1000 },
                 "cgroup": { "type": "string" },
                 "landlock": {
@@ -185,7 +183,6 @@ impl TaskPlugin for ExecTaskPlugin {
                             "items": { "type": "string" }
                         }
                     },
-                    "required": ["read_only_paths", "read_write_paths"],
                     "additionalProperties": false
                 }
             },
@@ -303,6 +300,16 @@ impl TaskPlugin for ExecTaskPlugin {
         );
         self.stop(allocation, task, runtime)
     }
+}
+
+fn parse_oom_score_adj(value: &Value) -> R<i32> {
+    let score = value
+        .as_i64()
+        .context("exec task oom_adj must be an integer")?;
+    if !(-1000..=1000).contains(&score) {
+        bail!("exec task oom_adj must be between -1000 and 1000");
+    }
+    Ok(score as i32)
 }
 
 fn parse_landlock_config(value: &Value) -> R<LandlockOptions> {
@@ -474,7 +481,7 @@ mod tests {
         let plugin = ExecTaskPlugin;
         let config = json!({
             "command": ["echo", "hello"],
-            "oom_score_adj": 250,
+            "oom_adj": 250,
             "cgroup": "workloads/demo",
             "landlock": {
                 "read_only_paths": ["/usr"],
@@ -494,10 +501,25 @@ mod tests {
         let plugin = ExecTaskPlugin;
         let config = json!({
             "command": ["echo"],
-            "oom_score_adj": 1001,
+            "oom_adj": 1001,
         });
 
         let err = plugin.config_linux_options(&config).unwrap_err();
         assert!(err.to_string().contains("between -1000 and 1000"));
+    }
+
+    #[test]
+    fn linux_options_rejects_legacy_and_new_oom_fields_together() {
+        let plugin = ExecTaskPlugin;
+        let config = json!({
+            "command": ["echo"],
+            "oom_adj": 100,
+            "oom_score_adj": 200,
+        });
+
+        let err = plugin.config_linux_options(&config).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("only one of oom_adj or oom_score_adj"));
     }
 }

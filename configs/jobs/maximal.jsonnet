@@ -125,7 +125,7 @@
                 },
                 cwd: ".",
                 user: "nobody",
-                oom_score_adj: 100,
+                oom_adj: 100,
                 cgroup: "legion/demo",
                 landlock: {
                     read_only_paths: ["/usr", "/bin"],
