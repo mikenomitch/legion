@@ -30,6 +30,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{MutexGuard, RwLock};
+use std::time::Duration;
 use time::format_description::well_known::Rfc3339;
 use time::macros::format_description;
 use time::OffsetDateTime;
@@ -689,6 +690,7 @@ impl Store {
             node_name: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
             priority: row.get(6)?,
         };
+        let _ready_at: String = row.get(7)?;
 
         Ok(eval)
     }
@@ -787,15 +789,11 @@ impl Store {
         raw: Option<String>,
     ) -> Result<Option<TaskSchedule>, rusqlite::Error> {
         raw.map(|value| {
-            serde_json::from_str::<TaskSchedule>(&format!(
-                "\"{}\"",
-                value.replace('\\', "\\\\").replace('\"', "\\\"")
-            ))
-            .map_err(|err| {
+            value.parse::<TaskSchedule>().map_err(|err| {
                 rusqlite::Error::FromSqlConversionFailure(
                     idx,
                     rusqlite::types::Type::Text,
-                    Box::new(err),
+                    Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, err)),
                 )
             })
         })
@@ -2249,6 +2247,7 @@ impl Store {
             ":job_config_id": if eval.job_config_id.is_empty() { None::<String> } else { Some(eval.job_config_id.clone()) },
             ":node_id": if eval.node_name.is_empty() { None::<String> } else { Some(eval.node_name.clone()) },
             ":priority": eval.priority,
+            ":ready_at": Self::now_rfc3339()?,
         };
 
         conn.execute(&INSERT_EVAL, params)?;
@@ -2277,7 +2276,8 @@ impl Store {
     // #[instrument(err, skip_all)]
     pub fn get_next_eval(&self) -> R<Option<Eval>> {
         let conn = self.read_connection()?;
-        let eval = conn.query_row(&GET_NEXT_EVAL, [], |row| self.eval_from_row(row));
+        let now = Self::now_rfc3339()?;
+        let eval = conn.query_row(&GET_NEXT_EVAL, [now], |row| self.eval_from_row(row));
 
         match eval {
             Ok(eval) => Ok(Some(eval)),
@@ -2293,8 +2293,8 @@ impl Store {
 
         let eval_id: Option<i64> = tx
             .query_row(
-                "SELECT id FROM eval WHERE status = 'pending' ORDER BY priority DESC, id ASC LIMIT 1;",
-                [],
+                "SELECT id FROM eval WHERE status = 'pending' AND ready_at <= :now ORDER BY priority DESC, id ASC LIMIT 1;",
+                named_params! {":now": Self::now_rfc3339()?},
                 |row| row.get(0),
             )
             .optional()?;
@@ -2305,7 +2305,7 @@ impl Store {
         };
 
         let mut eval = tx.query_row(
-            "UPDATE eval SET status = 'in_flight' WHERE id = :id RETURNING id, status, type, job_id, job_config_id, node_id, priority;",
+            "UPDATE eval SET status = 'in_flight' WHERE id = :id RETURNING id, status, type, job_id, job_config_id, node_id, priority, ready_at;",
             named_params! {":id": eval_id},
             |row| self.eval_from_row(row),
         )?;
@@ -2364,6 +2364,25 @@ impl Store {
         node_id: Option<&str>,
         priority: Option<i64>,
     ) -> R<Eval> {
+        self.enqueue_eval_after_delay(
+            kind,
+            job_id,
+            job_config_id,
+            node_id,
+            priority,
+            Duration::ZERO,
+        )
+    }
+
+    pub fn enqueue_eval_after_delay(
+        &self,
+        kind: &str,
+        job_id: Option<&str>,
+        job_config_id: Option<&str>,
+        node_id: Option<&str>,
+        priority: Option<i64>,
+        delay: Duration,
+    ) -> R<Eval> {
         let mut conn = self.write_connection()?;
         let tx = conn.transaction()?;
 
@@ -2377,6 +2396,9 @@ impl Store {
             .filter(|value| !value.trim().is_empty())
             .map(str::to_string);
 
+        let ready_at =
+            (OffsetDateTime::now_utc() + time::Duration::try_from(delay)?).format(&Rfc3339)?;
+
         let params = named_params! {
             ":id": None::<i64>,
             ":status": "pending",
@@ -2385,6 +2407,7 @@ impl Store {
             ":job_config_id": job_config_id_value,
             ":node_id": node_id_value,
             ":priority": priority.unwrap_or(self.default_eval_priority),
+            ":ready_at": ready_at,
         };
 
         tx.execute(&INSERT_EVAL, params)?;
@@ -3899,6 +3922,38 @@ mod tests {
             pending, 0,
             "duplicates for the same job/node should be removed"
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn delayed_eval_is_not_claimed_until_ready() -> R<()> {
+        let store = setup_store()?;
+
+        store.insert_node(make_node_msg("node-1", "ready"))?;
+        let delayed = store.enqueue_eval_after_delay(
+            "node_join",
+            None,
+            None,
+            Some("node-1"),
+            Some(10),
+            Duration::from_secs(60),
+        )?;
+
+        assert!(store.claim_eval()?.is_none());
+
+        let delayed_id = delayed.id.clone();
+        let conn = store.write_connection()?;
+        conn.execute(
+            "UPDATE eval SET ready_at = '1970-01-01T00:00:00Z' WHERE id = ?;",
+            [delayed_id],
+        )?;
+        drop(conn);
+
+        let claimed = store
+            .claim_eval()?
+            .context("delayed eval should now be claimable")?;
+        assert_eq!(claimed.id, delayed.id);
 
         Ok(())
     }

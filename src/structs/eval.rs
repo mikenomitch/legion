@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 use crate::manager::dispatcher::dispatch_allocations;
 use crate::manager::scheduler::{PlanMode, PlanOutcome, Scheduler};
@@ -222,24 +222,32 @@ impl Eval {
         }
 
         let tasks = store.get_task_configs_for_job_config(&self.job_config_id)?;
-        let delay = tasks
-            .iter()
-            .filter_map(|(_, task)| {
-                if task.lifecycle != super::job::TaskLifecycle::Batch {
-                    return None;
-                }
-                task.schedule.as_ref()
-            })
-            .filter_map(|schedule| schedule.next_delay().ok())
-            .min();
+        let mut min_delay: Option<std::time::Duration> = None;
+        for (_, task) in tasks {
+            if task.lifecycle != super::job::TaskLifecycle::Batch {
+                continue;
+            }
+            let Some(schedule) = task.schedule.as_ref() else {
+                continue;
+            };
+            let delay = schedule.next_delay().map_err(|err| {
+                anyhow::anyhow!("invalid batch schedule for task {}: {err}", task.name)
+            })?;
+            min_delay = Some(match min_delay {
+                Some(current) => current.min(delay),
+                None => delay,
+            });
+        }
 
-        if let Some(delay) = delay {
-            schedule_job_update_after_delay(
-                store.clone(),
-                self.job_id.clone(),
-                self.job_config_id.clone(),
+        if let Some(delay) = min_delay {
+            store.enqueue_eval_after_delay(
+                "job_update",
+                Some(&self.job_id),
+                Some(&self.job_config_id),
+                None,
+                None,
                 delay,
-            );
+            )?;
         }
 
         Ok(())
@@ -260,34 +268,6 @@ impl Eval {
             }
         })
     }
-}
-
-fn schedule_job_update_after_delay(
-    store: Store,
-    job_id: String,
-    job_config_id: String,
-    delay: std::time::Duration,
-) {
-    std::thread::spawn(move || {
-        if delay.as_secs() > 0 {
-            std::thread::sleep(delay);
-        }
-
-        if let Err(err) = store.enqueue_eval(
-            "job_update",
-            Some(&job_id),
-            Some(&job_config_id),
-            None,
-            None,
-        ) {
-            error!(
-                job_id = %job_id,
-                job_config_id = %job_config_id,
-                error = ?err,
-                "Failed to enqueue scheduled batch follow-up"
-            );
-        }
-    });
 }
 
 #[cfg(test)]

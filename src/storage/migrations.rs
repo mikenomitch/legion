@@ -172,6 +172,12 @@ pub fn get_migrations() -> Migrations<'static> {
             "CREATE INDEX IF NOT EXISTS idx_eval_status_priority_id ON eval(status, priority DESC, id ASC);",
         )
         .down("DROP INDEX IF EXISTS idx_eval_status_priority_id;"),
+        M::up("ALTER TABLE eval ADD COLUMN ready_at TIMESTAMP NOT NULL DEFAULT '1970-01-01T00:00:00Z';")
+            .down(""),
+        M::up(
+            "CREATE INDEX IF NOT EXISTS idx_eval_status_ready_priority_id ON eval(status, ready_at, priority DESC, id ASC);",
+        )
+        .down("DROP INDEX IF EXISTS idx_eval_status_ready_priority_id;"),
         M::up("CREATE INDEX IF NOT EXISTS idx_eval_status_job_id ON eval(status, job_id);")
             .down("DROP INDEX IF EXISTS idx_eval_status_job_id;"),
         M::up("CREATE INDEX IF NOT EXISTS idx_eval_status_node_id ON eval(status, node_id);")
