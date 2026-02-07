@@ -159,34 +159,43 @@ impl Eval {
         }
 
         let scheduler = Scheduler::new(store)?;
-        let excluded = if matches!(mode, PlanMode::Reschedule) && !self.node_name.trim().is_empty()
-        {
-            Some(HashSet::from([self.node_name.clone()]))
-        } else {
-            None
-        };
+        let excluded = self.excluded_nodes_for_mode(&mode);
+        let outcome = self.plan_with_conflict_retries(&scheduler, mode, excluded.as_ref())?;
 
+        store.update_task_statuses_for_allocations(&outcome.allocations)?;
+        dispatch_allocations(store, &outcome.allocations)?;
+        Ok(outcome)
+    }
+
+    fn excluded_nodes_for_mode(&self, mode: &PlanMode) -> Option<HashSet<String>> {
+        if matches!(mode, PlanMode::Reschedule) && !self.node_name.trim().is_empty() {
+            return Some(HashSet::from([self.node_name.clone()]));
+        }
+
+        None
+    }
+
+    fn plan_with_conflict_retries(
+        &self,
+        scheduler: &Scheduler,
+        mode: PlanMode,
+        excluded: Option<&HashSet<String>>,
+    ) -> R<PlanOutcome> {
         const MAX_PLAN_RETRIES: usize = 3;
-        let mut attempt = 0;
 
-        loop {
-            attempt += 1;
-            let result = scheduler.plan_and_apply_with_exclusions(
+        for attempt in 1..=MAX_PLAN_RETRIES {
+            match scheduler.plan_and_apply_with_exclusions(
                 &self.job_config_id,
                 mode.clone(),
-                excluded.as_ref(),
-            );
-
-            match result {
-                Ok(outcome) => {
-                    store.update_task_statuses_for_allocations(&outcome.allocations)?;
-                    dispatch_allocations(store, &outcome.allocations)?;
-                    return Ok(outcome);
-                }
+                excluded,
+            ) {
+                Ok(outcome) => return Ok(outcome),
                 Err(error) => {
-                    let maybe_conflict = StorageError::from_anyhow(&error)
-                        .is_some_and(|storage| matches!(storage, StorageError::Conflict { .. }));
-                    if maybe_conflict && attempt < MAX_PLAN_RETRIES {
+                    if !Self::is_conflict_error(&error) {
+                        return Err(error);
+                    }
+
+                    if attempt < MAX_PLAN_RETRIES {
                         warn!(
                             attempt,
                             max_attempts = MAX_PLAN_RETRIES,
@@ -196,17 +205,20 @@ impl Eval {
                         continue;
                     }
 
-                    if maybe_conflict {
-                        return Err(error.context(format!(
-                            "plan submission failed after {} attempts",
-                            MAX_PLAN_RETRIES
-                        )));
-                    }
-
-                    return Err(error);
+                    return Err(error.context(format!(
+                        "plan submission failed after {} attempts",
+                        MAX_PLAN_RETRIES
+                    )));
                 }
             }
         }
+
+        unreachable!("retry loop returns or errors")
+    }
+
+    fn is_conflict_error(error: &anyhow::Error) -> bool {
+        StorageError::from_anyhow(error)
+            .is_some_and(|storage| matches!(storage, StorageError::Conflict { .. }))
     }
 
     fn current_timestamp() -> String {
@@ -432,6 +444,63 @@ mod tests {
         ledger = store.get_ledger()?;
         let total_allocations: usize = ledger.iter().map(|entry| entry.allocations.len()).sum();
         assert_eq!(total_allocations, 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn job_reschedule_excludes_failed_node() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(NodeMsg::from(make_node("node-a", "east")))?;
+        store.insert_node(NodeMsg::from(make_node("node-b", "east")))?;
+
+        let job_name = "reschedule-job".to_string();
+        let task = TaskConfig {
+            count: TaskCount::new(2),
+            resources: json!({ "memory": 128 }),
+            ..TaskConfig::new("api", "service")
+        };
+        let job_config = JobConfig {
+            name: job_name.clone(),
+            tasks: vec![task],
+            version: None,
+        };
+        let job_subs = vec![Submission {
+            path: "job.jsonnet".into(),
+            content: "job".into(),
+            is_primary: true,
+        }];
+        store.handle_job_submit(&job_config, &job_subs)?;
+        let job_config_id = store.get_job_config(&job_name)?.id();
+
+        let submit_eval = Eval {
+            id: "1".into(),
+            status: "pending".into(),
+            kind: "job_submit".into(),
+            job_id: job_name.clone(),
+            job_config_id: job_config_id.clone(),
+            node_name: String::new(),
+            priority: 50,
+        };
+        submit_eval.handle(&store)?;
+
+        store.mark_node_lost("node-a")?;
+        store.remove_allocs_for_node("node-a")?;
+
+        let reschedule_eval = Eval {
+            id: "2".into(),
+            status: "pending".into(),
+            kind: "job_reschedule".into(),
+            job_id: job_name.clone(),
+            job_config_id,
+            node_name: "node-a".into(),
+            priority: 50,
+        };
+        reschedule_eval.handle(&store)?;
+
+        let allocations = store.allocs_for_job(&job_name)?;
+        assert_eq!(allocations.len(), 2);
+        assert!(allocations.iter().all(|alloc| alloc.node_id == "node-b"));
 
         Ok(())
     }

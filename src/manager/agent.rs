@@ -4,7 +4,7 @@ use crate::manager::join_server::get_insecure_manager_service;
 use crate::manager::server::ManagerAgentService;
 use crate::storage::store::Store;
 use crate::structs::{
-    manager_server::ManagerServer, ManagerConfig, Node, WorkerConfig as WorkerConfigMsg,
+    manager_server::ManagerServer, Eval, ManagerConfig, Node, WorkerConfig as WorkerConfigMsg,
     WorkerConfigAlt,
 };
 use crate::worker::agent::run_worker_local;
@@ -214,52 +214,54 @@ fn spawn_eval_worker(join_set: &mut JoinSet<()>, store: &Store, worker_id: usize
 }
 
 fn eval_worker_loop(store: Store, worker_id: usize) {
+    const IDLE_BACKOFF_MIN: Duration = Duration::from_secs(1);
+    const IDLE_BACKOFF_MAX: Duration = Duration::from_secs(30);
+    const POST_EVAL_PAUSE: Duration = Duration::from_millis(200);
+
     info!(worker_id, "Eval worker started");
 
-    let mut backoff = Duration::from_secs(1);
-    let max_backoff = Duration::from_secs(30);
-
+    let mut backoff = IDLE_BACKOFF_MIN;
     loop {
         match store.claim_eval() {
             Ok(Some(eval)) => {
-                backoff = Duration::from_secs(1);
-
-                let result = eval.handle(&store);
-
-                match result {
-                    Ok(message) => {
-                        info!(
-                            worker_id,
-                            "Eval {} handled successfully: {}", eval.id, message
-                        );
-                        if let Err(e) = store.complete_eval(&eval.id, true) {
-                            error!(worker_id, "Error completing eval {}: {:?}", eval.id, e);
-                        }
-                    }
-                    Err(e) => {
-                        error!(worker_id, "Error handling eval {}: {:?}", eval.id, e);
-                        if let Err(complete_err) = store.complete_eval(&eval.id, false) {
-                            error!(
-                                worker_id,
-                                "Error marking eval {} as failed after handling error: {:?}",
-                                eval.id,
-                                complete_err
-                            );
-                        }
-                    }
-                }
-
-                std::thread::sleep(Duration::from_millis(200));
+                backoff = IDLE_BACKOFF_MIN;
+                handle_claimed_eval(&store, worker_id, &eval);
+                std::thread::sleep(POST_EVAL_PAUSE);
             }
             Ok(None) => {
                 info!(worker_id, "No evals to handle; backing off");
                 std::thread::sleep(backoff);
-                backoff = std::cmp::min(backoff * 2, max_backoff);
+                backoff = std::cmp::min(backoff * 2, IDLE_BACKOFF_MAX);
             }
             Err(e) => {
                 error!(worker_id, "Error claiming next eval: {:?}", e);
                 std::thread::sleep(backoff);
-                backoff = std::cmp::min(backoff * 2, max_backoff);
+                backoff = std::cmp::min(backoff * 2, IDLE_BACKOFF_MAX);
+            }
+        }
+    }
+}
+
+fn handle_claimed_eval(store: &Store, worker_id: usize, eval: &Eval) {
+    match eval.handle(store) {
+        Ok(message) => {
+            info!(
+                worker_id,
+                "Eval {} handled successfully: {}", eval.id, message
+            );
+            if let Err(e) = store.complete_eval(&eval.id, true) {
+                error!(worker_id, "Error completing eval {}: {:?}", eval.id, e);
+            }
+        }
+        Err(e) => {
+            error!(worker_id, "Error handling eval {}: {:?}", eval.id, e);
+            if let Err(complete_err) = store.complete_eval(&eval.id, false) {
+                error!(
+                    worker_id,
+                    "Error marking eval {} as failed after handling error: {:?}",
+                    eval.id,
+                    complete_err
+                );
             }
         }
     }

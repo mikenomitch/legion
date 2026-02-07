@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use serde_json::Value;
 
@@ -141,30 +141,12 @@ impl<'a> Scheduler<'a> {
             }
         }
 
-        let required_counts = match mode {
-            PlanMode::Fresh => tasks
-                .iter()
-                .map(|(id, _config, count)| (*id, *count))
-                .collect::<HashMap<_, _>>(),
-            PlanMode::Reschedule => {
-                let mut current: HashMap<i64, u32> = HashMap::new();
-                for allocations in allocations_by_node.values() {
-                    for alloc in allocations {
-                        if alloc.job_config_id == job_config_id {
-                            *current.entry(alloc.task_config_id).or_default() += 1;
-                        }
-                    }
-                }
-
-                tasks
-                    .iter()
-                    .map(|(id, _config, desired)| {
-                        let placed = current.get(id).copied().unwrap_or_default();
-                        (*id, desired.saturating_sub(placed))
-                    })
-                    .collect::<HashMap<_, _>>()
-            }
-        };
+        let required_counts = Self::required_counts_for_mode(
+            &tasks,
+            mode.clone(),
+            job_config_id,
+            &allocations_by_node,
+        );
 
         self.build_plan(
             job_config_id,
@@ -209,30 +191,12 @@ impl<'a> Scheduler<'a> {
             }
         }
 
-        let required_counts = match mode {
-            PlanMode::Fresh => tasks
-                .iter()
-                .map(|(id, _config, count)| (*id, *count))
-                .collect::<HashMap<_, _>>(),
-            PlanMode::Reschedule => {
-                let mut current: HashMap<i64, u32> = HashMap::new();
-                for allocations in allocations_by_node.values() {
-                    for alloc in allocations {
-                        if alloc.job_config_id == job_config.id() {
-                            *current.entry(alloc.task_config_id).or_default() += 1;
-                        }
-                    }
-                }
-
-                tasks
-                    .iter()
-                    .map(|(id, _config, desired)| {
-                        let placed = current.get(id).copied().unwrap_or_default();
-                        (*id, desired.saturating_sub(placed))
-                    })
-                    .collect::<HashMap<_, _>>()
-            }
-        };
+        let required_counts = Self::required_counts_for_mode(
+            &tasks,
+            mode.clone(),
+            &job_config.id(),
+            &allocations_by_node,
+        );
 
         let allocations = self.build_plan(
             &job_config.id(),
@@ -276,30 +240,12 @@ impl<'a> Scheduler<'a> {
 
         let allocations_by_node = self.store.cached_allocations_by_node()?;
 
-        let required_counts = match mode {
-            PlanMode::Fresh => tasks
-                .iter()
-                .map(|(id, _config, count)| (*id, *count))
-                .collect::<HashMap<_, _>>(),
-            PlanMode::Reschedule => {
-                let mut current: HashMap<i64, u32> = HashMap::new();
-                for allocations in allocations_by_node.values() {
-                    for alloc in allocations {
-                        if alloc.job_config_id == job_config_id {
-                            *current.entry(alloc.task_config_id).or_default() += 1;
-                        }
-                    }
-                }
-
-                tasks
-                    .iter()
-                    .map(|(id, _config, desired)| {
-                        let placed = current.get(id).copied().unwrap_or_default();
-                        (*id, desired.saturating_sub(placed))
-                    })
-                    .collect::<HashMap<_, _>>()
-            }
-        };
+        let required_counts = Self::required_counts_for_mode(
+            &tasks,
+            mode.clone(),
+            job_config_id,
+            &allocations_by_node,
+        );
 
         let placements = self.build_plan(
             job_config_id,
@@ -354,6 +300,71 @@ impl<'a> Scheduler<'a> {
         })
     }
 
+    fn required_counts_for_mode(
+        tasks: &[(i64, TaskConfig, u32)],
+        mode: PlanMode,
+        job_config_id: &str,
+        allocations_by_node: &HashMap<String, Vec<Allocation>>,
+    ) -> HashMap<i64, u32> {
+        if matches!(mode, PlanMode::Fresh) {
+            return tasks
+                .iter()
+                .map(|(id, _config, desired)| (*id, *desired))
+                .collect();
+        }
+
+        let mut placed_by_task: HashMap<i64, u32> = HashMap::new();
+        for allocations in allocations_by_node.values() {
+            for alloc in allocations {
+                if alloc.job_config_id == job_config_id {
+                    *placed_by_task.entry(alloc.task_config_id).or_default() += 1;
+                }
+            }
+        }
+
+        tasks
+            .iter()
+            .map(|(id, _config, desired)| {
+                let placed = placed_by_task.get(id).copied().unwrap_or_default();
+                (*id, desired.saturating_sub(placed))
+            })
+            .collect()
+    }
+
+    fn existing_alloc_counts_by_task_node(
+        job_config_id: &str,
+        allocations_by_node: &HashMap<String, Vec<Allocation>>,
+    ) -> HashMap<(i64, String), u32> {
+        let mut counts = HashMap::new();
+        for (node_id, allocations) in allocations_by_node {
+            for alloc in allocations {
+                if alloc.job_config_id == job_config_id {
+                    *counts
+                        .entry((alloc.task_config_id, node_id.clone()))
+                        .or_default() += 1;
+                }
+            }
+        }
+
+        counts
+    }
+
+    fn count_existing_allocations_in_group(
+        existing_alloc_counts_by_task_node: &HashMap<(i64, String), u32>,
+        task_id: i64,
+        nodes: &[&Node],
+    ) -> u32 {
+        nodes
+            .iter()
+            .map(|node| {
+                existing_alloc_counts_by_task_node
+                    .get(&(task_id, node.id.clone()))
+                    .copied()
+                    .unwrap_or_default()
+            })
+            .sum()
+    }
+
     fn available_nodes(&self) -> R<Vec<Node>> {
         let mut nodes: Vec<Node> = self
             .store
@@ -387,6 +398,10 @@ impl<'a> Scheduler<'a> {
         } else {
             None
         };
+        let mut nodes_considered_rng =
+            StdRng::from_rng(rand::thread_rng()).context("Failed to seed nodes_considered RNG")?;
+        let existing_alloc_counts_by_task_node =
+            Self::existing_alloc_counts_by_task_node(job_config_id, allocations_by_node);
         let node_lookup: HashMap<&str, &Node> =
             nodes.iter().map(|node| (node.id.as_str(), node)).collect();
         let resource_policy = &self.store.resource_policy;
@@ -534,9 +549,8 @@ impl<'a> Scheduler<'a> {
 
                 for (group_name, group) in grouped {
                     let placed = if matches!(mode, PlanMode::Reschedule) {
-                        count_allocations_in_group(
-                            allocations_by_node,
-                            job_config_id,
+                        Self::count_existing_allocations_in_group(
+                            &existing_alloc_counts_by_task_node,
                             task_id,
                             &group,
                         )
@@ -577,6 +591,7 @@ impl<'a> Scheduler<'a> {
                         &mut planned,
                         &mut reschedule_rng,
                         nodes_considered_setting.as_ref(),
+                        &mut nodes_considered_rng,
                         &node_lookup,
                         &mut resource_ledger,
                         &mut plan,
@@ -619,6 +634,7 @@ impl<'a> Scheduler<'a> {
                     &mut planned,
                     &mut reschedule_rng,
                     nodes_considered_setting.as_ref(),
+                    &mut nodes_considered_rng,
                     &node_lookup,
                     &mut resource_ledger,
                     &mut plan,
@@ -684,6 +700,7 @@ impl<'a> Scheduler<'a> {
         planned: &mut HashMap<String, usize>,
         reschedule_rng: &mut Option<StdRng>,
         nodes_considered_setting: Option<&NodesConsidered>,
+        nodes_considered_rng: &mut StdRng,
         node_lookup: &HashMap<&'b str, &'b Node>,
         resource_ledger: &mut ResourceLedger,
         plan: &mut TaskPlan<'b>,
@@ -728,6 +745,7 @@ impl<'a> Scheduler<'a> {
                         eligible,
                         reschedule_rng,
                         nodes_considered_setting,
+                        nodes_considered_rng,
                         task_config,
                         &plan.affinity_set,
                         job_config_id,
@@ -743,6 +761,7 @@ impl<'a> Scheduler<'a> {
                     eligible,
                     reschedule_rng,
                     nodes_considered_setting,
+                    nodes_considered_rng,
                     task_config,
                     &plan.affinity_set,
                     job_config_id,
@@ -773,6 +792,7 @@ impl<'a> Scheduler<'a> {
         eligible: Vec<&'b Node>,
         reschedule_rng: &mut Option<StdRng>,
         nodes_considered_setting: Option<&NodesConsidered>,
+        nodes_considered_rng: &mut StdRng,
         task_config: &TaskConfig,
         affinity_set: &AffinitySet,
         job_config_id: &str,
@@ -780,8 +800,11 @@ impl<'a> Scheduler<'a> {
         planned: &HashMap<String, usize>,
         weights: SchedulerWeights,
     ) -> R<String> {
-        let eligible =
-            self.apply_nodes_considered_with_setting(eligible, nodes_considered_setting)?;
+        let eligible = self.apply_nodes_considered_with_setting(
+            eligible,
+            nodes_considered_setting,
+            nodes_considered_rng,
+        )?;
         let ctx = SchedulingContext::new(
             eligible,
             task_config,
@@ -812,23 +835,15 @@ impl<'a> Scheduler<'a> {
         resource_ledger: &ResourceLedger,
         task_request: &ResourceRequest,
     ) -> Vec<&'b Node> {
-        let eligible = if let Some(tracker) = distinct_tracker {
-            candidates
-                .iter()
-                .copied()
-                .filter(|node| {
-                    constraint_set.distinct_satisfied(node, tracker)
-                        && permit_set.is_permitted(node)
-                })
-                .collect::<Vec<_>>()
-        } else {
-            candidates.to_vec()
-        };
-
-        eligible
-            .into_iter()
+        candidates
+            .iter()
+            .copied()
             .filter(|node| {
-                permit_set.is_permitted(node) && resource_ledger.can_fit(&node.id, task_request)
+                permit_set.is_permitted(node)
+                    && distinct_tracker
+                        .map(|tracker| constraint_set.distinct_satisfied(node, tracker))
+                        .unwrap_or(true)
+                    && resource_ledger.can_fit(&node.id, task_request)
             })
             .collect()
     }
@@ -875,56 +890,86 @@ impl<'a> Scheduler<'a> {
         tasks: Vec<(i64, TaskConfig, u32)>,
         status_map: &HashMap<String, TaskStatusState>,
     ) -> R<Vec<(i64, TaskConfig, u32)>> {
-        let mut name_to_id = HashMap::new();
-        let mut name_to_task = HashMap::new();
-        for (task_id, task_config, _count) in &tasks {
-            name_to_id.insert(task_config.name.clone(), *task_id);
-            name_to_task.insert(task_config.name.clone(), task_config.clone());
+        let mut tasks_by_name: HashMap<String, &TaskConfig> = HashMap::new();
+        for (_task_id, task, _count) in &tasks {
+            tasks_by_name.insert(task.name.clone(), task);
         }
 
+        let ordered_names = Self::task_names_topologically_sorted(&tasks, &tasks_by_name)?;
+
+        let mut planned = HashSet::new();
+        let mut progressed = true;
+        while progressed {
+            progressed = false;
+            for task_name in &ordered_names {
+                if planned.contains(task_name) {
+                    continue;
+                }
+
+                let task = tasks_by_name
+                    .get(task_name)
+                    .copied()
+                    .context("Task missing from task map")?;
+                let ready = task.depends_on.iter().all(|dependency| {
+                    Self::dependency_satisfied(dependency, status_map, &planned, &tasks_by_name)
+                });
+                if ready {
+                    planned.insert(task_name.clone());
+                    progressed = true;
+                }
+            }
+        }
+
+        Ok(tasks
+            .into_iter()
+            .filter(|(_, task, _)| planned.contains(&task.name))
+            .collect())
+    }
+
+    fn task_names_topologically_sorted(
+        tasks: &[(i64, TaskConfig, u32)],
+        tasks_by_name: &HashMap<String, &TaskConfig>,
+    ) -> R<Vec<String>> {
         let mut indegree: HashMap<String, usize> = tasks
             .iter()
             .map(|(_, task, _)| (task.name.clone(), 0))
             .collect();
         let mut graph: HashMap<String, Vec<String>> = HashMap::new();
 
-        for (_task_id, task_config, _count) in &tasks {
-            for dependency in &task_config.depends_on {
-                let target = dependency.task.as_str();
-                if target == task_config.name {
-                    bail!("Task {} cannot depend on itself", task_config.name);
+        for (_task_id, task, _count) in tasks {
+            for dependency in &task.depends_on {
+                let dep_name = dependency.task.as_str();
+                if dep_name == task.name {
+                    bail!("Task {} cannot depend on itself", task.name);
                 }
-                if !name_to_id.contains_key(target) {
-                    bail!(
-                        "Task {} depends on unknown task {}",
-                        task_config.name,
-                        target
-                    );
+                if !tasks_by_name.contains_key(dep_name) {
+                    bail!("Task {} depends on unknown task {}", task.name, dep_name);
                 }
+
                 graph
-                    .entry(target.to_string())
+                    .entry(dep_name.to_string())
                     .or_default()
-                    .push(task_config.name.clone());
-                *indegree.entry(task_config.name.clone()).or_default() += 1;
+                    .push(task.name.clone());
+                *indegree.entry(task.name.clone()).or_default() += 1;
             }
         }
 
-        let mut queue = indegree
+        let mut zero_degree = indegree
             .iter()
-            .filter(|(_, count)| **count == 0)
-            .map(|(name, _)| name.clone())
+            .filter_map(|(name, degree)| (*degree == 0).then_some(name.clone()))
             .collect::<Vec<_>>();
-        queue.sort();
+        zero_degree.sort();
+        let mut queue: VecDeque<String> = zero_degree.into_iter().collect();
 
-        let mut ordered = Vec::new();
-        while let Some(name) = queue.pop() {
+        let mut ordered = Vec::with_capacity(tasks.len());
+        while let Some(name) = queue.pop_front() {
             ordered.push(name.clone());
             if let Some(children) = graph.get(&name) {
                 for child in children {
                     if let Some(count) = indegree.get_mut(child) {
                         *count -= 1;
                         if *count == 0 {
-                            queue.push(child.clone());
+                            queue.push_back(child.clone());
                         }
                     }
                 }
@@ -935,75 +980,46 @@ impl<'a> Scheduler<'a> {
             bail!("Task dependencies contain a cycle");
         }
 
-        let mut planned: HashSet<String> = HashSet::new();
-        let mut ready = Vec::new();
-        let mut progress = true;
+        Ok(ordered)
+    }
 
-        while progress {
-            progress = false;
-            for name in &ordered {
-                if planned.contains(name) {
-                    continue;
-                }
-                let task = name_to_task
-                    .get(name)
-                    .context("Task missing from task map")?;
-                let mut deps_satisfied = true;
-                for dependency in &task.depends_on {
-                    let dep_name = dependency.task.as_str();
-                    let dep_status = status_map
-                        .get(dep_name)
-                        .copied()
-                        .unwrap_or(TaskStatusState::Pending);
-                    let dep_lifecycle = name_to_task
-                        .get(dep_name)
-                        .map(|task| task.lifecycle.clone())
-                        .unwrap_or(TaskLifecycle::Service);
-                    let planned_dep = planned.contains(dep_name);
-                    let satisfied = match dependency.condition {
-                        TaskDependencyCondition::Start => dep_status.is_started() || planned_dep,
-                        TaskDependencyCondition::Complete => {
-                            if dep_status == TaskStatusState::Failed {
-                                false
-                            } else {
-                                dep_status.is_complete()
-                                    || (planned_dep && dep_lifecycle == TaskLifecycle::Batch)
-                            }
-                        }
-                        TaskDependencyCondition::Success => {
-                            if dep_status == TaskStatusState::Failed {
-                                false
-                            } else {
-                                dep_status.is_success()
-                                    || (planned_dep && dep_lifecycle == TaskLifecycle::Batch)
-                            }
-                        }
-                    };
-                    if !satisfied {
-                        deps_satisfied = false;
-                        break;
-                    }
-                }
-                if deps_satisfied {
-                    planned.insert(name.clone());
-                    progress = true;
-                }
+    fn dependency_satisfied(
+        dependency: &crate::structs::TaskDependency,
+        status_map: &HashMap<String, TaskStatusState>,
+        planned: &HashSet<String>,
+        tasks_by_name: &HashMap<String, &TaskConfig>,
+    ) -> bool {
+        let dep_name = dependency.task.as_str();
+        let dep_status = status_map
+            .get(dep_name)
+            .copied()
+            .unwrap_or(TaskStatusState::Pending);
+        let dep_lifecycle = tasks_by_name
+            .get(dep_name)
+            .map(|task| task.lifecycle.clone())
+            .unwrap_or(TaskLifecycle::Service);
+        let planned_dep = planned.contains(dep_name);
+
+        match dependency.condition {
+            TaskDependencyCondition::Start => dep_status.is_started() || planned_dep,
+            TaskDependencyCondition::Complete => {
+                dep_status != TaskStatusState::Failed
+                    && (dep_status.is_complete()
+                        || (planned_dep && dep_lifecycle == TaskLifecycle::Batch))
+            }
+            TaskDependencyCondition::Success => {
+                dep_status != TaskStatusState::Failed
+                    && (dep_status.is_success()
+                        || (planned_dep && dep_lifecycle == TaskLifecycle::Batch))
             }
         }
-
-        for (task_id, task_config, count) in tasks {
-            if planned.contains(&task_config.name) {
-                ready.push((task_id, task_config, count));
-            }
-        }
-
-        Ok(ready)
     }
 
     fn apply_nodes_considered_with_setting<'b>(
         &self,
         eligible: Vec<&'b Node>,
         setting: Option<&NodesConsidered>,
+        rng: &mut StdRng,
     ) -> R<Vec<&'b Node>> {
         if eligible.len() <= 1 {
             return Ok(eligible);
@@ -1016,9 +1032,7 @@ impl<'a> Scheduler<'a> {
         let limit = Self::nodes_considered_limit(setting, eligible.len())?;
         let mut eligible = eligible;
         if limit < eligible.len() {
-            let mut rng = StdRng::from_rng(rand::thread_rng())
-                .context("Failed to seed nodes_considered RNG")?;
-            eligible.shuffle(&mut rng);
+            eligible.shuffle(rng);
         }
 
         Ok(eligible.into_iter().take(limit).collect())
@@ -1315,26 +1329,6 @@ fn score_nodes_for_context<'a>(ctx: &SchedulingContext<'a>) -> Vec<(&'a Node, f6
             (node, score)
         })
         .collect()
-}
-
-fn count_allocations_in_group(
-    allocations_by_node: &HashMap<String, Vec<Allocation>>,
-    job_config_id: &str,
-    task_id: i64,
-    nodes: &[&Node],
-) -> u32 {
-    let mut count = 0;
-    for node in nodes {
-        if let Some(allocs) = allocations_by_node.get(&node.id) {
-            count += allocs
-                .iter()
-                .filter(|alloc| {
-                    alloc.job_config_id == job_config_id && alloc.task_config_id == task_id
-                })
-                .count() as u32;
-        }
-    }
-    count
 }
 
 fn node_attribute<'a>(node: &'a Node, key: &str) -> Option<&'a Value> {
@@ -2456,9 +2450,13 @@ mod tests {
         let setting = NodesConsidered::Count(2);
 
         let mut subsets = HashSet::new();
+        let mut rng = StdRng::seed_from_u64(13);
         for _ in 0..20 {
-            let subset =
-                scheduler.apply_nodes_considered_with_setting(eligible.clone(), Some(&setting))?;
+            let subset = scheduler.apply_nodes_considered_with_setting(
+                eligible.clone(),
+                Some(&setting),
+                &mut rng,
+            )?;
             let mut ids = subset
                 .iter()
                 .map(|node| node.id.clone())
@@ -2646,6 +2644,249 @@ mod tests {
         }
         assert!(roles.contains("prep"));
         assert!(roles.contains("app"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn required_counts_for_mode_reschedule_only_plans_missing() {
+        let tasks = vec![
+            (1, TaskConfig::new("api", "noop"), 3),
+            (2, TaskConfig::new("worker", "noop"), 2),
+        ];
+        let allocations_by_node = HashMap::from([
+            (
+                "node-a".to_string(),
+                vec![
+                    Allocation {
+                        id: 1,
+                        job_id: "job-1".into(),
+                        job_config_id: "cfg-1".into(),
+                        task_config_id: 1,
+                        node_id: "node-a".into(),
+                        status: "running".into(),
+                        resources: json!({}),
+                    },
+                    Allocation {
+                        id: 2,
+                        job_id: "job-1".into(),
+                        job_config_id: "cfg-1".into(),
+                        task_config_id: 2,
+                        node_id: "node-a".into(),
+                        status: "running".into(),
+                        resources: json!({}),
+                    },
+                ],
+            ),
+            (
+                "node-b".to_string(),
+                vec![Allocation {
+                    id: 3,
+                    job_id: "other".into(),
+                    job_config_id: "cfg-2".into(),
+                    task_config_id: 1,
+                    node_id: "node-b".into(),
+                    status: "running".into(),
+                    resources: json!({}),
+                }],
+            ),
+        ]);
+
+        let required = Scheduler::required_counts_for_mode(
+            &tasks,
+            PlanMode::Reschedule,
+            "cfg-1",
+            &allocations_by_node,
+        );
+
+        assert_eq!(required.get(&1), Some(&2));
+        assert_eq!(required.get(&2), Some(&1));
+    }
+
+    #[test]
+    fn existing_alloc_counts_by_task_node_indexes_by_task_and_node() {
+        let allocations_by_node = HashMap::from([
+            (
+                "node-a".to_string(),
+                vec![
+                    Allocation {
+                        id: 1,
+                        job_id: "job-1".into(),
+                        job_config_id: "cfg-1".into(),
+                        task_config_id: 1,
+                        node_id: "node-a".into(),
+                        status: "running".into(),
+                        resources: json!({}),
+                    },
+                    Allocation {
+                        id: 2,
+                        job_id: "job-1".into(),
+                        job_config_id: "cfg-1".into(),
+                        task_config_id: 1,
+                        node_id: "node-a".into(),
+                        status: "running".into(),
+                        resources: json!({}),
+                    },
+                    Allocation {
+                        id: 3,
+                        job_id: "job-1".into(),
+                        job_config_id: "cfg-1".into(),
+                        task_config_id: 2,
+                        node_id: "node-a".into(),
+                        status: "running".into(),
+                        resources: json!({}),
+                    },
+                ],
+            ),
+            (
+                "node-b".to_string(),
+                vec![
+                    Allocation {
+                        id: 4,
+                        job_id: "job-1".into(),
+                        job_config_id: "cfg-1".into(),
+                        task_config_id: 1,
+                        node_id: "node-b".into(),
+                        status: "running".into(),
+                        resources: json!({}),
+                    },
+                    Allocation {
+                        id: 5,
+                        job_id: "other".into(),
+                        job_config_id: "cfg-other".into(),
+                        task_config_id: 1,
+                        node_id: "node-b".into(),
+                        status: "running".into(),
+                        resources: json!({}),
+                    },
+                ],
+            ),
+        ]);
+
+        let indexed = Scheduler::existing_alloc_counts_by_task_node("cfg-1", &allocations_by_node);
+
+        assert_eq!(indexed.get(&(1, "node-a".to_string())), Some(&2));
+        assert_eq!(indexed.get(&(1, "node-b".to_string())), Some(&1));
+        assert_eq!(indexed.get(&(2, "node-a".to_string())), Some(&1));
+        assert!(indexed.get(&(2, "node-b".to_string())).is_none());
+    }
+
+    #[test]
+    fn ready_tasks_allows_dependent_service_after_batch_chain() -> R<()> {
+        let build = TaskConfig {
+            lifecycle: TaskLifecycle::Batch,
+            ..TaskConfig::new("build", "exec")
+        };
+        let seed = TaskConfig {
+            lifecycle: TaskLifecycle::Batch,
+            depends_on: vec![crate::structs::TaskDependency {
+                task: "build".into(),
+                condition: TaskDependencyCondition::Success,
+            }],
+            ..TaskConfig::new("seed", "exec")
+        };
+        let api = TaskConfig {
+            depends_on: vec![crate::structs::TaskDependency {
+                task: "seed".into(),
+                condition: TaskDependencyCondition::Success,
+            }],
+            ..TaskConfig::new("api", "noop")
+        };
+
+        let ready = Scheduler::ready_tasks(
+            vec![(1, build, 1), (2, seed, 1), (3, api, 1)],
+            &HashMap::new(),
+        )?;
+
+        assert_eq!(ready.len(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn multiple_jobs_schedule_without_resource_oversubscription() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg_with_sources(
+            "node-a",
+            json!({}),
+            json!({
+                "memory_total": "2097152",
+                "cpus": { "cpu-1": { "frequency": "2000" } }
+            }),
+            json!({}),
+        ))?;
+        store.insert_node(make_node_msg_with_sources(
+            "node-b",
+            json!({}),
+            json!({
+                "memory_total": "2097152",
+                "cpus": { "cpu-1": { "frequency": "2000" } }
+            }),
+            json!({}),
+        ))?;
+
+        let job_one = JobConfig {
+            name: "job-one".into(),
+            tasks: vec![TaskConfig {
+                count: TaskCount::new(2),
+                resources: json!({ "memory": 768 }),
+                ..TaskConfig::new("api", "noop")
+            }],
+            version: None,
+        };
+        let job_two = JobConfig {
+            name: "job-two".into(),
+            tasks: vec![
+                TaskConfig {
+                    lifecycle: TaskLifecycle::Batch,
+                    group: "prep".into(),
+                    resources: json!({ "memory": 512 }),
+                    ..TaskConfig::new("prepare", "exec")
+                },
+                TaskConfig {
+                    group: "app".into(),
+                    depends_on: vec![crate::structs::TaskDependency {
+                        task: "prepare".into(),
+                        condition: TaskDependencyCondition::Success,
+                    }],
+                    resources: json!({ "memory": 768 }),
+                    ..TaskConfig::new("worker", "noop")
+                },
+            ],
+            version: None,
+        };
+
+        store.handle_job_submit(&job_one, &[dummy_submission()])?;
+        store.handle_job_submit(&job_two, &[dummy_submission()])?;
+
+        let scheduler = Scheduler::new(&store)?;
+        let outcome_one =
+            scheduler.plan_and_apply(&store.get_job_config("job-one")?.id(), PlanMode::Fresh)?;
+        let outcome_two =
+            scheduler.plan_and_apply(&store.get_job_config("job-two")?.id(), PlanMode::Fresh)?;
+
+        assert_eq!(outcome_one.allocations.len(), 2);
+        assert_eq!(outcome_two.allocations.len(), 2);
+
+        let ledger = store.get_ledger()?;
+        for entry in ledger {
+            let total_memory: f64 = entry
+                .allocations
+                .iter()
+                .map(|alloc| {
+                    alloc
+                        .resources
+                        .get("memory")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0)
+                })
+                .sum();
+            assert!(
+                total_memory <= 2048.0,
+                "node {} exceeded memory budget: {}",
+                entry.node.id,
+                total_memory
+            );
+        }
 
         Ok(())
     }
