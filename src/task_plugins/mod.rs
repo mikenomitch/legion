@@ -163,6 +163,12 @@ pub fn validate_job_config(config: &JobConfig) -> R<()> {
     for task in &config.tasks {
         registry.validate_task_config(task)?;
         task.validate_checks()?;
+        if task.schedule.is_some() && task.lifecycle != TaskLifecycle::Batch {
+            bail!(
+                "Task {} can only set schedule when lifecycle is batch",
+                task.name
+            );
+        }
     }
     validate_task_dependencies(config)?;
     Ok(())
@@ -472,6 +478,25 @@ mod tests {
         let _ = child.kill();
         let _ = child.wait();
         Ok(())
+    }
+
+    #[test]
+    fn non_batch_task_cannot_define_schedule() {
+        let config = JobConfig {
+            name: "invalid".into(),
+            tasks: vec![TaskConfig {
+                lifecycle: TaskLifecycle::Service,
+                schedule: Some(crate::structs::TaskSchedule::Every(
+                    std::time::Duration::from_secs(60),
+                )),
+                config: json!({"command": ["true"]}),
+                ..TaskConfig::new("api", "exec")
+            }],
+            version: None,
+        };
+
+        let err = validate_job_config(&config).unwrap_err();
+        assert!(err.to_string().contains("can only set schedule"));
     }
 
     #[test]

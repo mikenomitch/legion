@@ -14,7 +14,7 @@ use crate::storage::queries::{
 use crate::structs::{
     Allocation, Eval, Job, JobConfig, KvEntry, KvLock, KvValueType, LedgerEntry, ManagerConfigFull,
     ManagerNodeConfig, Node, NodeMsg, Submission, TaskCheck, TaskConfig, TaskCount, TaskDependency,
-    TaskLifecycle, TaskOnUnhealthyConfig, TaskStatusState, WorkerConfig,
+    TaskLifecycle, TaskOnUnhealthyConfig, TaskSchedule, TaskStatusState, WorkerConfig,
 };
 
 use rand::{seq::SliceRandom, thread_rng, Rng};
@@ -235,7 +235,7 @@ impl Store {
 
         let mut task_stmt = conn.prepare(
             r#"
-            SELECT id, name, kind, count, count_per, group_name, lifecycle, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, job_config_id
+            SELECT id, name, kind, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, job_config_id
             FROM task_config;
             "#,
         )?;
@@ -245,7 +245,8 @@ impl Store {
             let count_per: Option<String> = row.get(4)?;
             let group: String = row.get(5)?;
             let lifecycle = self.parse_task_lifecycle_column(6, row.get(6)?)?;
-            let depends_on = self.parse_depends_on_column(7, row.get(7)?)?;
+            let schedule = self.parse_schedule_column(7, row.get(7)?)?;
+            let depends_on = self.parse_depends_on_column(8, row.get(8)?)?;
             let task = TaskConfig {
                 name: row.get(1)?,
                 kind: row.get(2)?,
@@ -255,16 +256,17 @@ impl Store {
                 },
                 group,
                 lifecycle,
+                schedule,
                 depends_on,
-                config: row.get(8)?,
-                resources: row.get(9)?,
-                constraints: row.get(10)?,
-                permit: row.get(11)?,
-                affinities: row.get(12)?,
-                checks: self.parse_checks_column(13, row.get(13)?)?,
-                on_unhealthy: self.parse_on_unhealthy_column(14, row.get(14)?)?,
+                config: row.get(9)?,
+                resources: row.get(10)?,
+                constraints: row.get(11)?,
+                permit: row.get(12)?,
+                affinities: row.get(13)?,
+                checks: self.parse_checks_column(14, row.get(14)?)?,
+                on_unhealthy: self.parse_on_unhealthy_column(15, row.get(15)?)?,
             };
-            let job_config_id: String = row.get(15)?;
+            let job_config_id: String = row.get(16)?;
             Ok((job_config_id, id, task))
         })?;
 
@@ -779,6 +781,27 @@ impl Store {
         })
     }
 
+    fn parse_schedule_column(
+        &self,
+        idx: usize,
+        raw: Option<String>,
+    ) -> Result<Option<TaskSchedule>, rusqlite::Error> {
+        raw.map(|value| {
+            serde_json::from_str::<TaskSchedule>(&format!(
+                "\"{}\"",
+                value.replace('\\', "\\\\").replace('\"', "\\\"")
+            ))
+            .map_err(|err| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    idx,
+                    rusqlite::types::Type::Text,
+                    Box::new(err),
+                )
+            })
+        })
+        .transpose()
+    }
+
     fn parse_depends_on_column(
         &self,
         idx: usize,
@@ -812,7 +835,8 @@ impl Store {
         let count_per: Option<String> = row.get(4)?;
         let group: String = row.get(5)?;
         let lifecycle = self.parse_task_lifecycle_column(6, row.get(6)?)?;
-        let depends_on = self.parse_depends_on_column(7, row.get(7)?)?;
+        let schedule = self.parse_schedule_column(7, row.get(7)?)?;
+        let depends_on = self.parse_depends_on_column(8, row.get(8)?)?;
         let task_config = TaskConfig {
             name: row.get(1)?,
             kind: row.get(2)?,
@@ -822,14 +846,15 @@ impl Store {
             },
             group,
             lifecycle,
+            schedule,
             depends_on,
-            config: row.get(8)?,
-            resources: row.get(9)?,
-            constraints: row.get(10)?,
-            permit: row.get(11)?,
-            affinities: row.get(12)?,
-            checks: self.parse_checks_column(13, row.get(13)?)?,
-            on_unhealthy: self.parse_on_unhealthy_column(14, row.get(14)?)?,
+            config: row.get(9)?,
+            resources: row.get(10)?,
+            constraints: row.get(11)?,
+            permit: row.get(12)?,
+            affinities: row.get(13)?,
+            checks: self.parse_checks_column(14, row.get(14)?)?,
+            on_unhealthy: self.parse_on_unhealthy_column(15, row.get(15)?)?,
         };
 
         Ok(task_config)
@@ -1475,6 +1500,7 @@ impl Store {
             let checks = serde_json::to_string(&t.checks)?;
             let on_unhealthy = serde_json::to_string(&t.on_unhealthy)?;
             let depends_on = serde_json::to_string(&t.depends_on)?;
+            let schedule = t.schedule.as_ref().map(ToString::to_string);
             let task_params = named_params! {
                 ":name": t.name,
                 ":kind": t.kind,
@@ -1482,6 +1508,7 @@ impl Store {
                 ":count_per": t.count.per,
                 ":group_name": t.group,
                 ":lifecycle": t.lifecycle.to_string(),
+                ":schedule": schedule,
                 ":depends_on": depends_on,
                 ":config": t.config,
                 ":resources": t.resources,
@@ -2868,6 +2895,7 @@ fn value_token(value: &Value) -> String {
 
 fn task_schedule_equivalent(left: &TaskConfig, right: &TaskConfig) -> bool {
     left.count == right.count
+        && left.schedule == right.schedule
         && left.resources == right.resources
         && left.constraints == right.constraints
         && left.permit == right.permit

@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::manager::dispatcher::dispatch_allocations;
 use crate::manager::scheduler::{PlanMode, PlanOutcome, Scheduler};
@@ -88,6 +88,7 @@ impl Eval {
         if let Some(prev_id) = previous_config_id.as_ref() {
             if store.job_configs_schedule_equivalent(prev_id, &self.job_config_id)? {
                 store.migrate_allocations_to_job_config(prev_id, &self.job_config_id)?;
+                self.schedule_batch_follow_up(store)?;
                 return Ok(format!("Job {} submitted with 0 placements", self.job_id));
             }
         }
@@ -100,6 +101,8 @@ impl Eval {
         if let Some(prev_id) = previous_config_id {
             store.remove_allocs_for_job_config(&prev_id)?;
         }
+
+        self.schedule_batch_follow_up(store)?;
 
         Ok(format!(
             "Job {} submitted with {} placements",
@@ -118,6 +121,8 @@ impl Eval {
         if !outcome.deltas.is_empty() {
             info!(?outcome.deltas, "Job update allocation deltas");
         }
+
+        self.schedule_batch_follow_up(store)?;
 
         Ok(format!(
             "Job {} updated with {} placements",
@@ -145,6 +150,8 @@ impl Eval {
         if !outcome.deltas.is_empty() {
             info!(?outcome.deltas, "Job reschedule allocation deltas");
         }
+
+        self.schedule_batch_follow_up(store)?;
 
         Ok(format!(
             "Job {} rescheduled with {} placements",
@@ -209,6 +216,35 @@ impl Eval {
         }
     }
 
+    fn schedule_batch_follow_up(&self, store: &Store) -> R<()> {
+        if self.job_id.trim().is_empty() || self.job_config_id.trim().is_empty() {
+            return Ok(());
+        }
+
+        let tasks = store.get_task_configs_for_job_config(&self.job_config_id)?;
+        let delay = tasks
+            .iter()
+            .filter_map(|(_, task)| {
+                if task.lifecycle != super::job::TaskLifecycle::Batch {
+                    return None;
+                }
+                task.schedule.as_ref()
+            })
+            .filter_map(|schedule| schedule.next_delay().ok())
+            .min();
+
+        if let Some(delay) = delay {
+            schedule_job_update_after_delay(
+                store.clone(),
+                self.job_id.clone(),
+                self.job_config_id.clone(),
+                delay,
+            );
+        }
+
+        Ok(())
+    }
+
     fn current_timestamp() -> String {
         OffsetDateTime::now_utc()
             .format(&Rfc3339)
@@ -224,6 +260,34 @@ impl Eval {
             }
         })
     }
+}
+
+fn schedule_job_update_after_delay(
+    store: Store,
+    job_id: String,
+    job_config_id: String,
+    delay: std::time::Duration,
+) {
+    std::thread::spawn(move || {
+        if delay.as_secs() > 0 {
+            std::thread::sleep(delay);
+        }
+
+        if let Err(err) = store.enqueue_eval(
+            "job_update",
+            Some(&job_id),
+            Some(&job_config_id),
+            None,
+            None,
+        ) {
+            error!(
+                job_id = %job_id,
+                job_config_id = %job_config_id,
+                error = ?err,
+                "Failed to enqueue scheduled batch follow-up"
+            );
+        }
+    });
 }
 
 #[cfg(test)]

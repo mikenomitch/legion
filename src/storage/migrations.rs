@@ -106,6 +106,7 @@ pub fn get_migrations() -> Migrations<'static> {
             "ALTER TABLE task_config ADD COLUMN lifecycle STRING NOT NULL DEFAULT 'service';",
         )
         .down(""),
+        M::up("ALTER TABLE task_config ADD COLUMN schedule STRING;").down(""),
         M::up("ALTER TABLE task_config ADD COLUMN depends_on JSONB NOT NULL DEFAULT '[]';")
             .down(""),
         M::up(

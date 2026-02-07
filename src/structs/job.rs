@@ -1,8 +1,10 @@
+use chrono::Utc;
 use serde::ser::SerializeStruct;
 use serde::{de::Error, Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::str::FromStr;
 use std::time::Duration;
 use tabled::Tabled;
 
@@ -60,6 +62,119 @@ fn default_task_group() -> String {
 
 fn default_task_lifecycle() -> TaskLifecycle {
     TaskLifecycle::Service
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskSchedule {
+    Cron(String),
+    Every(Duration),
+}
+
+impl TaskSchedule {
+    pub fn next_delay(&self) -> Result<Duration, String> {
+        match self {
+            TaskSchedule::Every(duration) => Ok(*duration),
+            TaskSchedule::Cron(expression) => {
+                let schedule = cron::Schedule::from_str(expression)
+                    .map_err(|err| format!("Invalid cron expression {expression}: {err}"))?;
+                let now = Utc::now();
+                let next = schedule
+                    .upcoming(Utc)
+                    .next()
+                    .ok_or_else(|| format!("Cron expression {expression} has no future run"))?;
+                let delay = (next - now).to_std().unwrap_or(Duration::from_secs(0));
+                Ok(delay)
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for TaskSchedule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TaskSchedule::Cron(expr) => write!(f, "{expr}"),
+            TaskSchedule::Every(duration) => {
+                write!(f, "every {}", humantime::format_duration(*duration))
+            }
+        }
+    }
+}
+
+impl std::str::FromStr for TaskSchedule {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        parse_schedule_text(value)
+    }
+}
+
+impl Serialize for TaskSchedule {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            TaskSchedule::Cron(expr) => serializer.serialize_str(expr),
+            TaskSchedule::Every(duration) => serializer
+                .serialize_str(&format!("every {}", humantime::format_duration(*duration))),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for TaskSchedule {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        parse_schedule_value(&value).map_err(D::Error::custom)
+    }
+}
+
+fn parse_schedule_value(value: &Value) -> Result<TaskSchedule, String> {
+    match value {
+        Value::String(text) => parse_schedule_text(text),
+        Value::Object(map) => {
+            if let Some(cron_value) = map.get("cron") {
+                let cron_text = cron_value
+                    .as_str()
+                    .ok_or_else(|| "schedule.cron must be a string".to_string())?;
+                return parse_schedule_text(cron_text);
+            }
+            if let Some(every_value) = map.get("every") {
+                let duration = parse_duration_value(every_value)?;
+                if duration.is_zero() {
+                    return Err("schedule.every must be greater than 0".to_string());
+                }
+                return Ok(TaskSchedule::Every(duration));
+            }
+            Err("schedule object must include cron or every".to_string())
+        }
+        _ => Err("schedule must be a string or object".to_string()),
+    }
+}
+
+fn parse_schedule_text(text: &str) -> Result<TaskSchedule, String> {
+    let schedule_text = text.trim();
+    if let Some(every) = schedule_text.strip_prefix("every ") {
+        let duration = humantime::parse_duration(every)
+            .map_err(|err| format!("Invalid schedule duration {every}: {err}"))?;
+        if duration.is_zero() {
+            return Err("schedule duration must be greater than 0".to_string());
+        }
+        return Ok(TaskSchedule::Every(duration));
+    }
+
+    if let Ok(duration) = humantime::parse_duration(schedule_text) {
+        if duration.is_zero() {
+            return Err("schedule duration must be greater than 0".to_string());
+        }
+        return Ok(TaskSchedule::Every(duration));
+    }
+
+    cron::Schedule::from_str(schedule_text)
+        .map_err(|err| format!("Invalid schedule value {schedule_text}: {err}"))?;
+    Ok(TaskSchedule::Cron(schedule_text.to_string()))
 }
 
 fn default_dependency_condition() -> TaskDependencyCondition {
@@ -458,6 +573,9 @@ pub struct TaskConfig {
     #[serde(default = "default_task_lifecycle")]
     #[tabled(skip)]
     pub lifecycle: TaskLifecycle,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[tabled(skip)]
+    pub schedule: Option<TaskSchedule>,
     #[serde(default = "empty_object", alias = "options")]
     pub config: Value,
     #[serde(default = "empty_object")]
@@ -515,6 +633,8 @@ struct TaskConfigInput {
     depends_on: Vec<TaskDependencyInput>,
     #[serde(default)]
     lifecycle: TaskLifecycle,
+    #[serde(default)]
+    schedule: Option<TaskSchedule>,
     #[serde(default = "empty_object", alias = "options")]
     config: Value,
     #[serde(default = "empty_object")]
@@ -564,6 +684,7 @@ impl TaskConfigInput {
             group: self.group,
             depends_on,
             lifecycle: self.lifecycle,
+            schedule: self.schedule,
             config: self.config,
             resources: self.resources,
             constraints: self.constraints,
@@ -667,6 +788,7 @@ impl TaskConfig {
             group: default_task_group(),
             depends_on: Vec::new(),
             lifecycle: default_task_lifecycle(),
+            schedule: None,
             config: empty_object(),
             resources: empty_object(),
             constraints: empty_object(),
@@ -884,6 +1006,44 @@ mod tests {
         assert_eq!(config.tasks[0].group, "default");
         assert_eq!(config.tasks[0].lifecycle, TaskLifecycle::Service);
         assert!(config.tasks[0].depends_on.is_empty());
+    }
+
+    #[test]
+    fn deserializes_batch_schedule_every() {
+        let spec = serde_json::json!({
+            "name": "demo",
+            "task": {
+                "kind": "noop",
+                "lifecycle": "batch",
+                "schedule": "every 5m"
+            }
+        });
+
+        let config: JobConfig = serde_json::from_value(spec).expect("task should deserialize");
+
+        assert_eq!(
+            config.tasks[0].schedule,
+            Some(TaskSchedule::Every(Duration::from_secs(300)))
+        );
+    }
+
+    #[test]
+    fn deserializes_batch_schedule_cron() {
+        let spec = serde_json::json!({
+            "name": "demo",
+            "task": {
+                "kind": "noop",
+                "lifecycle": "batch",
+                "schedule": "0 * * * * *"
+            }
+        });
+
+        let config: JobConfig = serde_json::from_value(spec).expect("task should deserialize");
+
+        assert_eq!(
+            config.tasks[0].schedule,
+            Some(TaskSchedule::Cron("0 * * * * *".to_string()))
+        );
     }
 
     #[test]

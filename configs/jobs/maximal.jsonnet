@@ -82,6 +82,7 @@
             kind: "noop",
             group: "prep",
             lifecycle: "batch",
+            schedule: "every 15m",
             config: {
                 script: "echo work",
                 env: {
