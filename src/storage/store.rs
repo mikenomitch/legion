@@ -41,6 +41,7 @@ use time::format_description::well_known::Rfc3339;
 use time::macros::format_description;
 use time::{Duration as TimeDuration, OffsetDateTime};
 use tokio::sync::Notify;
+use tracing::info_span;
 
 // warning incorrectly
 #[allow(dead_code)]
@@ -359,6 +360,8 @@ impl Store {
     }
 
     fn write_connection(&self) -> R<MutexGuard<'_, Connection>> {
+        // `lock_conn` captures the mutex wait time (lock_wait_ms) so contention on the
+        // single-writer connection is visible in traces during throughput investigations.
         Self::lock_conn(&self.write_conn, "write")
     }
 
@@ -733,6 +736,8 @@ impl Store {
     }
 
     pub fn apply_plan_submission(&self, submission: &PlanSubmission) -> R<PlanApplyOutcome> {
+        // storage_tx span makes this transaction's duration filterable in traces.
+        let _tx_span = info_span!("storage_tx", operation = "apply_plan_submission").entered();
         let tx_started = Instant::now();
         debug!(
             submission_id = submission.id,
@@ -2587,42 +2592,72 @@ impl Store {
             return Ok(false);
         }
 
+        // Multiple planned allocations can target the same task; collapse to unique ids so
+        // lifecycle lookup and writes run once per task instead of once per allocation.
+        let mut task_ids = allocations
+            .iter()
+            .map(|allocation| allocation.task_config_id)
+            .collect::<Vec<_>>();
+        task_ids.sort_unstable();
+        task_ids.dedup();
+
+        // Build a parameterized IN-list for the current batch of task ids.
+        let placeholders = vec!["?"; task_ids.len()].join(", ");
+        let task_lifecycle_sql =
+            format!("SELECT id, lifecycle FROM task_config WHERE id IN ({placeholders});");
+        let lifecycle_lookup = {
+            let conn = self.read_connection()?;
+            let mut stmt = conn.prepare(&task_lifecycle_sql)?;
+            let rows = stmt.query_map(params_from_iter(task_ids.iter()), |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?;
+            let mut lookup = HashMap::new();
+            for row in rows {
+                let (task_id, lifecycle) = row?;
+                let lifecycle = lifecycle
+                    .parse::<TaskLifecycle>()
+                    .map_err(|err| anyhow!(err))?;
+                lookup.insert(task_id, lifecycle);
+            }
+            lookup
+        };
+
+        // Pre-compute final status per task, then execute all updates inside a single
+        // write transaction to reduce lock churn and commit overhead.
+        let mut statuses_to_apply = HashMap::new();
+        for task_id in task_ids {
+            let lifecycle = lifecycle_lookup
+                .get(&task_id)
+                .with_context(|| format!("Missing task config {task_id}"))?;
+            statuses_to_apply.insert(task_id, Self::task_status_for_lifecycle(lifecycle));
+        }
+
+        let _tx_span = info_span!(
+            "storage_tx",
+            operation = "update_task_statuses_for_allocations"
+        )
+        .entered();
         let tx_started = Instant::now();
         let mut conn = self.write_connection()?;
         let tx = conn.transaction()?;
-        let mut task_cache: HashMap<String, HashMap<i64, TaskConfig>> = HashMap::new();
-        let mut updates: HashMap<i64, TaskStatusState> = HashMap::new();
-
-        for allocation in allocations {
-            let tasks = task_cache
-                .entry(allocation.job_config_id.clone())
-                .or_insert_with(HashMap::new);
-            if tasks.is_empty() {
-                let configs = self.get_task_configs_for_job_config(&allocation.job_config_id)?;
-                for (id, config) in configs {
-                    tasks.insert(id, config);
-                }
-            }
-            let task = tasks
-                .get(&allocation.task_config_id)
-                .with_context(|| format!("Missing task config {}", allocation.task_config_id))?;
-
-            updates.insert(
-                allocation.task_config_id,
-                Self::task_status_for_lifecycle(&task.lifecycle),
-            );
+        let now = Self::now_rfc3339()?;
+        let mut stmt = tx.prepare(
+            "UPDATE task_status SET status = ?, updated_at = ? WHERE task_config_id = ? AND status != ?;",
+        )?;
+        let mut updated_rows = 0usize;
+        for (task_id, status) in statuses_to_apply {
+            // The status inequality guard avoids no-op row rewrites and cuts WAL traffic.
+            updated_rows +=
+                stmt.execute(params![status.as_str(), now, task_id, status.as_str()])?;
         }
-
-        self.apply_task_status_updates_tx(&tx, &updates)?;
+        drop(stmt);
         tx.commit()?;
         debug!(
-            allocation_count = allocations.len(),
-            updated_tasks = updates.len(),
-            duration_ms = tx_started.elapsed().as_millis(),
-            "Updated task statuses for allocations"
+            tx_duration_ms = tx_started.elapsed().as_millis() as u64,
+            updated_rows, "Completed task status update transaction"
         );
 
-        Ok(!updates.is_empty())
+        Ok(updated_rows > 0)
     }
 
     //
@@ -3297,6 +3332,7 @@ impl Store {
 
     #[instrument(err, skip_all)]
     pub fn claim_eval(&self) -> R<Option<Eval>> {
+        let _tx_span = info_span!("storage_tx", operation = "claim_eval").entered();
         let tx_started = Instant::now();
         let mut conn = self.write_connection()?;
         let tx = conn.transaction()?;
@@ -3405,6 +3441,7 @@ impl Store {
 
     #[instrument(err, skip_all)]
     pub fn complete_eval(&self, eval_id: &str, succeeded: bool) -> R<()> {
+        let _tx_span = info_span!("storage_tx", operation = "complete_eval").entered();
         let tx_started = Instant::now();
         let mut conn: MutexGuard<'_, Connection> = self.write_connection()?;
         let tx = conn.transaction()?;

@@ -1,10 +1,10 @@
 use rand::Rng;
 use std::collections::HashSet;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{cmp, thread};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
-use tracing::{info, warn};
+use tracing::{info, info_span, warn};
 
 use crate::manager::dispatcher::dispatch_allocations;
 use crate::manager::scheduler::{PlanMode, PlanOutcome, Scheduler};
@@ -205,12 +205,29 @@ impl Eval {
             bail!("Eval missing job config id");
         }
 
+        // Track scheduler end-to-end latency separately from storage spans so we can
+        // distinguish DB contention from planner/dispatch compute time.
+        let scheduling_span = info_span!(
+            "eval_schedule_job_allocations",
+            eval_kind = %self.kind,
+            mode = ?mode,
+            job_id = %self.job_id,
+            job_config_id = %self.job_config_id
+        );
+        let _scheduling_span_guard = scheduling_span.enter();
+        let scheduling_started = Instant::now();
+
         let scheduler = Scheduler::new(store)?;
         let excluded = self.excluded_nodes_for_mode(&mode);
         let outcome =
             self.plan_with_conflict_retries(store, &scheduler, mode, excluded.as_ref())?;
 
         dispatch_allocations(store, &outcome.allocations)?;
+        info!(
+            duration_ms = scheduling_started.elapsed().as_millis() as u64,
+            placement_count = outcome.allocations.len(),
+            "Completed eval allocation scheduling"
+        );
         Ok(outcome)
     }
 
