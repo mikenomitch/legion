@@ -3,6 +3,7 @@ use std::collections::HashMap;
 
 use crate::constraints::AffinitySet;
 use crate::prelude::*;
+use crate::structs::config::DEF_SCHEDULER_AUTO_ANTI_AFFINITY_WEIGHT;
 use crate::structs::{Allocation, Node, TaskConfig};
 use libloading::{Library, Symbol};
 use rand::seq::SliceRandom;
@@ -14,6 +15,7 @@ pub struct SchedulerWeights {
     pub affinity: f64,
     pub spread: f64,
     pub bin_pack: f64,
+    pub automatic_anti_affinity: f64,
 }
 
 impl SchedulerWeights {
@@ -23,16 +25,19 @@ impl SchedulerWeights {
                 affinity: 1.0,
                 spread: 1.0,
                 bin_pack: 0.0,
+                automatic_anti_affinity: DEF_SCHEDULER_AUTO_ANTI_AFFINITY_WEIGHT,
             },
             "bin_pack" => SchedulerWeights {
                 affinity: 1.0,
                 spread: 0.0,
                 bin_pack: 1.0,
+                automatic_anti_affinity: DEF_SCHEDULER_AUTO_ANTI_AFFINITY_WEIGHT,
             },
             _ => SchedulerWeights {
                 affinity: 1.0,
                 spread: 0.0,
                 bin_pack: 0.0,
+                automatic_anti_affinity: DEF_SCHEDULER_AUTO_ANTI_AFFINITY_WEIGHT,
             },
         }
     }
@@ -43,10 +48,12 @@ impl SchedulerWeights {
 pub struct SchedulingContext<'a> {
     pub eligible_nodes: Vec<&'a Node>,
     pub task: &'a TaskConfig,
+    pub task_id: i64,
     pub affinity_set: &'a AffinitySet,
     pub job_config_id: &'a str,
     pub allocations: &'a HashMap<String, Vec<Allocation>>,
     pub task_name_to_id: &'a HashMap<String, i64>,
+    pub task_id_to_group: &'a HashMap<i64, String>,
     pub planned_task_allocations: &'a HashMap<String, Vec<i64>>,
     pub planned: &'a HashMap<String, usize>,
     pub weights: SchedulerWeights,
@@ -57,10 +64,12 @@ impl<'a> SchedulingContext<'a> {
     pub fn new(
         eligible_nodes: Vec<&'a Node>,
         task: &'a TaskConfig,
+        task_id: i64,
         affinity_set: &'a AffinitySet,
         job_config_id: &'a str,
         allocations: &'a HashMap<String, Vec<Allocation>>,
         task_name_to_id: &'a HashMap<String, i64>,
+        task_id_to_group: &'a HashMap<i64, String>,
         planned_task_allocations: &'a HashMap<String, Vec<i64>>,
         planned: &'a HashMap<String, usize>,
         weights: SchedulerWeights,
@@ -68,10 +77,12 @@ impl<'a> SchedulingContext<'a> {
         SchedulingContext {
             eligible_nodes,
             task,
+            task_id,
             affinity_set,
             job_config_id,
             allocations,
             task_name_to_id,
+            task_id_to_group,
             planned_task_allocations,
             planned,
             weights,
@@ -99,6 +110,73 @@ impl<'a> SchedulingContext<'a> {
         self.planned_task_allocations
             .get(node_id)
             .is_some_and(|task_ids| task_ids.contains(&task_id))
+    }
+
+    fn allocations_on_node_for_task(&self, node_id: &str, task_id: i64) -> usize {
+        let existing = self
+            .allocations
+            .get(node_id)
+            .map(|allocs| {
+                allocs
+                    .iter()
+                    .filter(|allocation| {
+                        allocation.job_config_id == self.job_config_id
+                            && allocation.task_config_id == task_id
+                    })
+                    .count()
+            })
+            .unwrap_or_default();
+        let planned = self
+            .planned_task_allocations
+            .get(node_id)
+            .map(|task_ids| {
+                task_ids
+                    .iter()
+                    .filter(|planned_task_id| **planned_task_id == task_id)
+                    .count()
+            })
+            .unwrap_or_default();
+
+        existing + planned
+    }
+
+    fn group_allocations_on_node(&self, node_id: &str) -> usize {
+        let Some(group_name) = self.task_id_to_group.get(&self.task_id) else {
+            return 0;
+        };
+
+        let existing = self
+            .allocations
+            .get(node_id)
+            .map(|allocs| {
+                allocs
+                    .iter()
+                    .filter(|allocation| {
+                        allocation.job_config_id == self.job_config_id
+                            && self
+                                .task_id_to_group
+                                .get(&allocation.task_config_id)
+                                .is_some_and(|group| group == group_name)
+                    })
+                    .count()
+            })
+            .unwrap_or_default();
+        let planned = self
+            .planned_task_allocations
+            .get(node_id)
+            .map(|task_ids| {
+                task_ids
+                    .iter()
+                    .filter(|task_id| {
+                        self.task_id_to_group
+                            .get(task_id)
+                            .is_some_and(|group| group == group_name)
+                    })
+                    .count()
+            })
+            .unwrap_or_default();
+
+        existing + planned
     }
 }
 
@@ -170,7 +248,7 @@ fn select_scored_node<'a>(ctx: &SchedulingContext<'a>) -> Option<&'a Node> {
     let mut best_score: Option<f64> = None;
 
     for node in &ctx.eligible_nodes {
-        let score = score_node(ctx, node, &loads, min_load, range);
+        let score = score_node_for_context(ctx, node, &loads, min_load, range);
         best_score = Some(best_score.map_or(score, |best| best.max(score)));
         scored_nodes.push((score, *node));
     }
@@ -191,7 +269,7 @@ fn select_scored_node<'a>(ctx: &SchedulingContext<'a>) -> Option<&'a Node> {
     top_nodes.into_iter().next()
 }
 
-fn score_node(
+pub(crate) fn score_node_for_context(
     ctx: &SchedulingContext<'_>,
     node: &Node,
     loads: &HashMap<&str, usize>,
@@ -209,10 +287,18 @@ fn score_node(
     };
 
     let affinity_score = affinity_score(ctx.task, ctx.affinity_set, node, ctx);
+    let anti_affinity_penalty = automatic_anti_affinity_penalty(ctx, node);
 
     ctx.weights.affinity * affinity_score
         + ctx.weights.spread * spread_score
         + ctx.weights.bin_pack * bin_pack_score
+        - ctx.weights.automatic_anti_affinity * anti_affinity_penalty
+}
+
+fn automatic_anti_affinity_penalty(ctx: &SchedulingContext<'_>, node: &Node) -> f64 {
+    let same_task = ctx.allocations_on_node_for_task(&node.id, ctx.task_id);
+    let same_group = ctx.group_allocations_on_node(&node.id);
+    same_task.max(same_group) as f64
 }
 
 fn max_load_delta(range: f64, load: f64, min_load: f64) -> f64 {
@@ -352,6 +438,11 @@ mod tests {
         EMPTY.get_or_init(HashMap::new)
     }
 
+    fn empty_task_id_to_group() -> &'static HashMap<i64, String> {
+        static EMPTY: OnceLock<HashMap<i64, String>> = OnceLock::new();
+        EMPTY.get_or_init(HashMap::new)
+    }
+
     fn empty_planned_task_allocations() -> &'static HashMap<String, Vec<i64>> {
         static EMPTY: OnceLock<HashMap<String, Vec<i64>>> = OnceLock::new();
         EMPTY.get_or_init(HashMap::new)
@@ -392,10 +483,12 @@ mod tests {
         let ctx = SchedulingContext::new(
             nodes.iter().collect(),
             &task,
+            1,
             &affinity_set,
             "job",
             &allocations,
             empty_task_name_to_id(),
+            empty_task_id_to_group(),
             empty_planned_task_allocations(),
             &planned,
             SchedulerWeights::for_policy("bin_pack"),
@@ -420,10 +513,12 @@ mod tests {
         let ctx = SchedulingContext::new(
             nodes.iter().collect(),
             &task,
+            1,
             &affinity_set,
             "job",
             &allocations,
             empty_task_name_to_id(),
+            empty_task_id_to_group(),
             empty_planned_task_allocations(),
             &planned,
             SchedulerWeights::for_policy("bin_pack"),
@@ -457,10 +552,12 @@ mod tests {
         let ctx = SchedulingContext::new(
             nodes.iter().collect(),
             &task,
+            1,
             &affinity_set,
             "job",
             &allocations,
             empty_task_name_to_id(),
+            empty_task_id_to_group(),
             empty_planned_task_allocations(),
             &planned,
             SchedulerWeights::for_policy("bin_pack"),
@@ -482,10 +579,12 @@ mod tests {
         let ctx = SchedulingContext::new(
             nodes.iter().collect(),
             &task,
+            1,
             &affinity_set,
             "job",
             &allocations,
             empty_task_name_to_id(),
+            empty_task_id_to_group(),
             empty_planned_task_allocations(),
             &planned,
             SchedulerWeights::for_policy("bin_pack"),
@@ -510,10 +609,12 @@ mod tests {
         let ctx = SchedulingContext::new(
             nodes.iter().collect(),
             &task,
+            1,
             &affinity_set,
             "job",
             &allocations,
             empty_task_name_to_id(),
+            empty_task_id_to_group(),
             empty_planned_task_allocations(),
             &planned,
             SchedulerWeights::for_policy("spread"),
@@ -538,10 +639,12 @@ mod tests {
         let ctx = SchedulingContext::new(
             nodes.iter().collect(),
             &task,
+            1,
             &affinity_set,
             "job",
             &allocations,
             empty_task_name_to_id(),
+            empty_task_id_to_group(),
             empty_planned_task_allocations(),
             &planned,
             SchedulerWeights::for_policy("spread"),
@@ -571,16 +674,19 @@ mod tests {
                 .select_node(SchedulingContext::new(
                     nodes.iter().collect(),
                     &task,
+                    1,
                     &affinity_set,
                     "job",
                     &allocations,
                     empty_task_name_to_id(),
+                    empty_task_id_to_group(),
                     empty_planned_task_allocations(),
                     &planned,
                     SchedulerWeights {
                         affinity: 1.0,
                         spread: 0.0,
                         bin_pack: 5e-10,
+                        automatic_anti_affinity: 0.0,
                     },
                 ))
                 .expect("node expected");
@@ -610,10 +716,12 @@ mod tests {
         let ctx = SchedulingContext::new(
             nodes.iter().collect(),
             &task,
+            1,
             &affinity_set,
             "job",
             &allocations,
             &task_name_to_id,
+            empty_task_id_to_group(),
             &planned_task_allocations,
             &planned,
             SchedulerWeights::for_policy("spread"),
@@ -635,10 +743,12 @@ mod tests {
         let ctx = SchedulingContext::new(
             nodes.iter().collect(),
             &task,
+            1,
             &affinity_set,
             "job",
             &allocations,
             empty_task_name_to_id(),
+            empty_task_id_to_group(),
             empty_planned_task_allocations(),
             &planned,
             SchedulerWeights::for_policy("spread"),
