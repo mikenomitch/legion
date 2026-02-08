@@ -255,5 +255,75 @@ pub fn get_migrations() -> Migrations<'static> {
         )",
         )
         .down("DROP TABLE IF EXISTS plan_submission;"),
+        M::up(
+            "CREATE TABLE IF NOT EXISTS rollout (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id STRING NOT NULL,
+            from_job_config_id STRING,
+            to_job_config_id STRING NOT NULL,
+            status STRING NOT NULL,
+            incomplete INTEGER NOT NULL DEFAULT 0,
+            message STRING NOT NULL DEFAULT '',
+            strategy STRING,
+            progression STRING,
+            replacement STRING,
+            in_place INTEGER,
+            config_json JSONB NOT NULL DEFAULT '{}',
+            created_at TIMESTAMP NOT NULL,
+            updated_at TIMESTAMP NOT NULL,
+            completed_at TIMESTAMP,
+            FOREIGN KEY(job_id) REFERENCES job(id) ON DELETE CASCADE,
+            FOREIGN KEY(from_job_config_id) REFERENCES job_config(id) ON DELETE SET NULL,
+            FOREIGN KEY(to_job_config_id) REFERENCES job_config(id) ON DELETE CASCADE
+        )",
+        )
+        .down("DROP TABLE IF EXISTS rollout;"),
+        M::up("CREATE INDEX IF NOT EXISTS idx_rollout_job_id ON rollout(job_id);")
+            .down("DROP INDEX IF EXISTS idx_rollout_job_id;"),
+        M::up("CREATE INDEX IF NOT EXISTS idx_rollout_status ON rollout(status);")
+            .down("DROP INDEX IF EXISTS idx_rollout_status;"),
+        M::up(
+            "CREATE INDEX IF NOT EXISTS idx_rollout_job_status_created ON rollout(job_id, status, created_at DESC);",
+        )
+        .down("DROP INDEX IF EXISTS idx_rollout_job_status_created;"),
+        M::up(
+            "CREATE TABLE IF NOT EXISTS allocation_health (
+            allocation_id INTEGER PRIMARY KEY,
+            node_id STRING NOT NULL,
+            healthy INTEGER NOT NULL,
+            status STRING NOT NULL,
+            updated_at TIMESTAMP NOT NULL,
+            FOREIGN KEY(allocation_id) REFERENCES allocation(id) ON DELETE CASCADE,
+            FOREIGN KEY(node_id) REFERENCES node(id) ON DELETE CASCADE
+        )",
+        )
+        .down("DROP TABLE IF EXISTS allocation_health;"),
+        M::up(
+            "CREATE INDEX IF NOT EXISTS idx_allocation_health_node_id ON allocation_health(node_id);",
+        )
+        .down("DROP INDEX IF EXISTS idx_allocation_health_node_id;"),
+        M::up(
+            "CREATE TABLE IF NOT EXISTS rollout_event (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            rollout_id INTEGER NOT NULL,
+            job_id STRING NOT NULL,
+            group_name STRING,
+            level STRING NOT NULL,
+            message STRING NOT NULL,
+            metadata_json JSONB NOT NULL DEFAULT '{}',
+            created_at TIMESTAMP NOT NULL,
+            FOREIGN KEY(rollout_id) REFERENCES rollout(id) ON DELETE CASCADE,
+            FOREIGN KEY(job_id) REFERENCES job(id) ON DELETE CASCADE
+        )",
+        )
+        .down("DROP TABLE IF EXISTS rollout_event;"),
+        M::up(
+            "CREATE INDEX IF NOT EXISTS idx_rollout_event_rollout_created ON rollout_event(rollout_id, created_at ASC, id ASC);",
+        )
+        .down("DROP INDEX IF EXISTS idx_rollout_event_rollout_created;"),
+        M::up(
+            "CREATE INDEX IF NOT EXISTS idx_rollout_event_job_created ON rollout_event(job_id, created_at DESC, id DESC);",
+        )
+        .down("DROP INDEX IF EXISTS idx_rollout_event_job_created;"),
     ])
 }

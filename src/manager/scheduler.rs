@@ -220,11 +220,41 @@ impl<'a> Scheduler<'a> {
         self.plan_and_apply_with_exclusions(job_config_id, mode, None)
     }
 
+    #[instrument(skip_all)]
+    pub fn plan_and_apply_with_targets(
+        &self,
+        job_config_id: &str,
+        mode: PlanMode,
+        task_targets: &HashMap<i64, u32>,
+    ) -> R<PlanOutcome> {
+        self.plan_and_apply_with_targets_and_exclusions(job_config_id, mode, task_targets, None)
+    }
+
+    pub fn plan_and_apply_with_targets_and_exclusions(
+        &self,
+        job_config_id: &str,
+        mode: PlanMode,
+        task_targets: &HashMap<i64, u32>,
+        excluded_nodes: Option<&HashSet<String>>,
+    ) -> R<PlanOutcome> {
+        self.plan_and_apply_internal(job_config_id, mode, excluded_nodes, Some(task_targets))
+    }
+
     pub fn plan_and_apply_with_exclusions(
         &self,
         job_config_id: &str,
         mode: PlanMode,
         excluded_nodes: Option<&HashSet<String>>,
+    ) -> R<PlanOutcome> {
+        self.plan_and_apply_internal(job_config_id, mode, excluded_nodes, None)
+    }
+
+    fn plan_and_apply_internal(
+        &self,
+        job_config_id: &str,
+        mode: PlanMode,
+        excluded_nodes: Option<&HashSet<String>>,
+        task_targets: Option<&HashMap<i64, u32>>,
     ) -> R<PlanOutcome> {
         let mut nodes = self.available_nodes()?;
         if let Some(excluded) = excluded_nodes {
@@ -237,9 +267,20 @@ impl<'a> Scheduler<'a> {
         let all_tasks = self
             .store
             .cached_task_configs_for_job_config(job_config_id)?;
-        let tasks = self.tasks_for_plan_from_store(job_config_id)?;
+        let mut tasks = self.tasks_for_plan_from_store(job_config_id)?;
 
         let allocations_by_node = self.store.cached_allocations_by_node()?;
+        let existing_counts =
+            Self::existing_alloc_counts_by_task(job_config_id, &allocations_by_node);
+        if let Some(task_targets) = task_targets {
+            for (task_id, _config, desired) in &mut tasks {
+                if let Some(target) = task_targets.get(task_id) {
+                    *desired = (*target).min(*desired);
+                } else if matches!(mode, PlanMode::Reschedule) {
+                    *desired = existing_counts.get(task_id).copied().unwrap_or_default();
+                }
+            }
+        }
 
         let required_counts = Self::required_counts_for_mode(
             &tasks,
@@ -299,6 +340,21 @@ impl<'a> Scheduler<'a> {
             allocations,
             deltas,
         })
+    }
+
+    fn existing_alloc_counts_by_task(
+        job_config_id: &str,
+        allocations_by_node: &HashMap<String, Vec<Allocation>>,
+    ) -> HashMap<i64, u32> {
+        let mut counts = HashMap::new();
+        for allocations in allocations_by_node.values() {
+            for allocation in allocations {
+                if allocation.job_config_id == job_config_id {
+                    *counts.entry(allocation.task_config_id).or_default() += 1;
+                }
+            }
+        }
+        counts
     }
 
     fn required_counts_for_mode(
@@ -1802,6 +1858,8 @@ mod tests {
         insert_test_nodes(&store)?;
 
         let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
             name: "sched-job".into(),
             tasks: vec![
                 TaskConfig {
@@ -1861,6 +1919,8 @@ mod tests {
         insert_test_nodes(&store)?;
 
         let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
             name: "resched-job".into(),
             tasks: vec![TaskConfig {
                 count: TaskCount::new(3),
@@ -1902,6 +1962,8 @@ mod tests {
         store.insert_node(make_node_msg("node-c", json!({ "region": "west" })))?;
 
         let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
             name: "per-attr-job".into(),
             tasks: vec![TaskConfig {
                 count: TaskCount::per(2, "region"),
@@ -1943,6 +2005,8 @@ mod tests {
         store.insert_node(make_node_msg("node-c", json!({ "region": "west" })))?;
 
         let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
             name: "per-attr-resched".into(),
             tasks: vec![TaskConfig {
                 count: TaskCount::per(2, "region"),
@@ -1999,6 +2063,8 @@ mod tests {
         ))?;
 
         let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
             name: "per-attr-constraints".into(),
             tasks: vec![TaskConfig {
                 count: TaskCount::per(1, "region"),
@@ -2033,6 +2099,8 @@ mod tests {
         insert_test_nodes(&store)?;
 
         let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
             name: "resched-exclude".into(),
             tasks: vec![TaskConfig::new("batch", "noop")],
             version: None,
@@ -2060,6 +2128,8 @@ mod tests {
         store.insert_node(make_node_msg("node-a", json!({ "tier": "edge" })))?;
 
         let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
             name: "unschedulable".into(),
             tasks: vec![TaskConfig {
                 constraints: json!({ "role": "db" }),
@@ -2129,6 +2199,8 @@ mod tests {
         ))?;
 
         let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
             name: "constraint-sources".into(),
             tasks: vec![TaskConfig {
                 count: TaskCount::new(2),
@@ -2160,6 +2232,8 @@ mod tests {
         store.insert_node(make_node_msg("node-b", json!({ "zone": "us-west" })))?;
 
         let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
             name: "distinct-job".into(),
             tasks: vec![TaskConfig {
                 count: TaskCount::new(2),
@@ -2191,6 +2265,8 @@ mod tests {
         store.insert_node(make_node_msg("node-a", json!({ "role": "web" })))?;
 
         let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
             name: "apply-constraints".into(),
             tasks: vec![TaskConfig {
                 constraints: json!([{ "key": "role", "value": "db" }]),
@@ -2220,6 +2296,8 @@ mod tests {
         ))?;
 
         let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
             name: "permit-single".into(),
             tasks: vec![TaskConfig {
                 permit: json!([{ "key": "foo", "operator": "equal", "value": "bar" }]),
@@ -2247,6 +2325,8 @@ mod tests {
         ))?;
 
         let passing_job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
             name: "permit-multi-pass".into(),
             tasks: vec![TaskConfig {
                 permit: json!([
@@ -2264,6 +2344,8 @@ mod tests {
         assert_eq!(pass_outcome.allocations.len(), 1);
 
         let failing_job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
             name: "permit-multi-fail".into(),
             tasks: vec![TaskConfig {
                 permit: json!([
@@ -2297,6 +2379,8 @@ mod tests {
         store.insert_node(node_other)?;
 
         let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
             name: "permit-default".into(),
             tasks: vec![TaskConfig::new("api", "noop")],
             version: None,
@@ -2327,6 +2411,8 @@ mod tests {
         ))?;
 
         let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
             name: "mem-limited".into(),
             tasks: vec![TaskConfig {
                 count: TaskCount::new(3),
@@ -2365,6 +2451,8 @@ mod tests {
         ))?;
 
         let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
             name: "alloc-limit".into(),
             tasks: vec![TaskConfig {
                 count: TaskCount::new(2),
@@ -2400,6 +2488,8 @@ mod tests {
             store.insert_node(make_node_msg("node-c", json!({})))?;
 
             let job = JobConfig {
+                rollout: None,
+                rollout_by_group: Default::default(),
                 name: "spread-considered".into(),
                 tasks: vec![TaskConfig::new("api", "noop")],
                 version: None,
@@ -2440,6 +2530,8 @@ mod tests {
             store.insert_node(make_node_msg("node-c", json!({})))?;
 
             let job = JobConfig {
+                rollout: None,
+                rollout_by_group: Default::default(),
                 name: "binpack-considered".into(),
                 tasks: vec![TaskConfig::new("worker", "noop")],
                 version: None,
@@ -2513,6 +2605,8 @@ mod tests {
         store.insert_node(make_node_msg("node-b", json!({})))?;
 
         let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
             name: "grouped".into(),
             tasks: vec![
                 TaskConfig {
@@ -2549,6 +2643,8 @@ mod tests {
         store.insert_node(make_node_msg("node-b", json!({ "role": "db" })))?;
 
         let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
             name: "group-constraints".into(),
             tasks: vec![
                 TaskConfig {
@@ -2593,6 +2689,8 @@ mod tests {
         store.insert_node(make_node_msg("node-a", json!({})))?;
 
         let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
             name: "dag-group".into(),
             tasks: vec![
                 TaskConfig {
@@ -2636,6 +2734,8 @@ mod tests {
         store.insert_node(make_node_msg("node-b", json!({ "role": "app" })))?;
 
         let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
             name: "dag-cross".into(),
             tasks: vec![
                 TaskConfig {
@@ -2858,6 +2958,8 @@ mod tests {
         ))?;
 
         let job_one = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
             name: "job-one".into(),
             tasks: vec![TaskConfig {
                 count: TaskCount::new(2),
@@ -2867,6 +2969,8 @@ mod tests {
             version: None,
         };
         let job_two = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
             name: "job-two".into(),
             tasks: vec![
                 TaskConfig {
@@ -2942,6 +3046,8 @@ mod tests {
         store.insert_node(make_node_msg("node-b", json!({})))?;
 
         let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
             name: "anti-affinity-job".into(),
             tasks: vec![TaskConfig {
                 count: TaskCount::new(2),
@@ -2981,6 +3087,8 @@ mod tests {
         store.insert_node(make_node_msg("node-b", json!({ "zone": "us-west" })))?;
 
         let load_job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
             name: "load-job".into(),
             tasks: vec![TaskConfig::new("load", "noop")],
             version: None,
@@ -2994,6 +3102,8 @@ mod tests {
         }
 
         let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
             name: "affinity-job".into(),
             tasks: vec![TaskConfig {
                 affinities: json!({ "zone": "us-east" }),

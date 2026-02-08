@@ -312,7 +312,7 @@ export default function KeyValue() {
             </button>
             <Show when={selectedEntry()}>
               <span class="text-xs text-neutral-500 dark:text-neutral-400">
-                Version {selectedEntry()?.version} • {valueTypeLabel(selectedEntry()?.valueType ?? 0)}
+                Version {String(selectedEntry()?.version ?? '—')} • {valueTypeLabel(selectedEntry()?.valueType ?? 0)}
               </span>
             </Show>
           </div>

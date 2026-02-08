@@ -30,6 +30,7 @@ impl Eval {
             "node_drop" => self.handle_node_drop(store),
             "job_submit" => self.handle_job_submit(store),
             "job_update" => self.handle_job_update(store),
+            "rollout_tick" => self.handle_rollout_tick(store),
             "job_stop" => self.handle_job_stop(store),
             "job_reschedule" => self.handle_job_reschedule(store),
             other => bail!("Unsupported eval kind: {other}"),
@@ -129,6 +130,42 @@ impl Eval {
             self.job_id,
             outcome.allocations.len()
         ))
+    }
+
+    fn handle_rollout_tick(&self, store: &Store) -> R<String> {
+        let rollout_id = store
+            .latest_rollout_for_job_config(&self.job_config_id)?
+            .map(|rollout| rollout.id);
+        match crate::manager::rollout::handle_rollout_tick(self, store) {
+            Ok(message) => Ok(message),
+            Err(error) => {
+                if let Some(rollout_id) = rollout_id {
+                    let _ = store.update_rollout_status(
+                        rollout_id,
+                        "failed",
+                        false,
+                        Some(&error.to_string()),
+                    );
+                    if let Ok(Some(rollout)) = store.get_rollout(rollout_id) {
+                        let _ = store.append_rollout_event(
+                            rollout_id,
+                            &rollout.job_id,
+                            None,
+                            "error",
+                            &format!("Rollout tick failed: {}", error),
+                            Some(
+                                &json!({
+                                    "status": "failed",
+                                    "error": error.to_string(),
+                                })
+                                .to_string(),
+                            ),
+                        );
+                    }
+                }
+                Err(error)
+            }
+        }
     }
 
     fn handle_job_stop(&self, store: &Store) -> R<String> {
@@ -377,6 +414,8 @@ mod tests {
             ..TaskConfig::new("task-one", "service")
         };
         let job_one_config = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
             name: job_one_name.clone(),
             tasks: vec![job_one_task.clone()],
             version: None,
@@ -428,6 +467,8 @@ mod tests {
             ..TaskConfig::new("task-two", "service")
         };
         let job_two_config = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
             name: job_two_name.clone(),
             tasks: vec![job_two_task.clone()],
             version: None,
@@ -505,6 +546,8 @@ mod tests {
             ..TaskConfig::new("api", "service")
         };
         let job_config = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
             name: job_name.clone(),
             tasks: vec![task],
             version: None,
@@ -564,6 +607,8 @@ mod tests {
         };
 
         let job_config = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
             name: job_name.clone(),
             tasks: vec![base_task.clone()],
             version: None,
@@ -599,6 +644,8 @@ mod tests {
             ..base_task.clone()
         };
         let unchanged_config = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
             name: job_name.clone(),
             tasks: vec![unchanged_task.clone()],
             version: None,
@@ -628,6 +675,8 @@ mod tests {
             ..unchanged_task.clone()
         };
         let moved_config = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
             name: job_name.clone(),
             tasks: vec![moved_task.clone()],
             version: None,
@@ -657,6 +706,8 @@ mod tests {
             ..moved_task
         };
         let removed_config = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
             name: job_name.clone(),
             tasks: vec![removed_task],
             version: None,

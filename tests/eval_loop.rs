@@ -34,6 +34,8 @@ fn make_job_config(name: &str, count: u32) -> JobConfig {
     };
 
     JobConfig {
+        rollout: None,
+        rollout_by_group: Default::default(),
         name: name.to_string(),
         tasks: vec![task],
         version: None,

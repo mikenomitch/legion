@@ -36,6 +36,9 @@ pub async fn run_manager(config: ManagerConfig, run_worker: bool) -> R<()> {
     let full_config = config.with_defaults();
     let manager_node_id = format!("{}:{}", full_config.server.host, full_config.server.port);
     let store = Store::start_storage(&full_config)?;
+    if let Err(err) = store.prune_rollouts() {
+        warn!(error = ?err, "Failed pruning retained rollout history");
+    }
     load_initial_data(&store, &config).await?;
     store.upsert_manager_config(&manager_node_id, &full_config)?;
 
@@ -175,6 +178,9 @@ async fn start_node_status_checker(store: Store, check_seconds: u64) -> R<()> {
             .collect::<Vec<String>>();
 
         store.mark_nodes_as_lost(&node_ids_to_update)?;
+        if let Err(err) = store.reconcile_incomplete_rollouts() {
+            warn!(error = ?err, "Failed reconciling completed_incomplete rollouts");
+        }
         tokio::time::sleep(tokio::time::Duration::from_secs(check_seconds)).await;
     }
 }

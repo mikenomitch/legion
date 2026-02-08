@@ -2,6 +2,7 @@ use crate::prelude::*;
 use crate::storage::store::Store;
 use crate::structs::{worker_client::WorkerClient, Allocation, TaskAllocation, TaskConfig};
 use std::collections::HashMap;
+use tokio::runtime::RuntimeFlavor;
 use tonic::transport::{Channel, Endpoint};
 
 #[instrument(err, skip_all)]
@@ -13,8 +14,7 @@ pub fn dispatch_allocations(store: &Store, allocations: &[Allocation]) -> R<()> 
     let mut task_cache: HashMap<String, HashMap<i64, TaskConfig>> = HashMap::new();
     let mut node_cache: HashMap<String, crate::structs::Node> = HashMap::new();
 
-    let runtime = tokio::runtime::Runtime::new()?;
-    runtime.block_on(async {
+    run_dispatch_future(async {
         let mut clients: HashMap<String, WorkerClient<Channel>> = HashMap::new();
         for allocation in allocations {
             let tasks = task_cache
@@ -83,6 +83,24 @@ pub fn dispatch_allocations(store: &Store, allocations: &[Allocation]) -> R<()> 
     Ok(())
 }
 
+fn run_dispatch_future<F>(future: F) -> R<()>
+where
+    F: std::future::Future<Output = R<()>>,
+{
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            if handle.runtime_flavor() == RuntimeFlavor::CurrentThread {
+                bail!("dispatch_allocations cannot block inside a current-thread runtime");
+            }
+            tokio::task::block_in_place(|| handle.block_on(future))
+        }
+        Err(_) => {
+            let runtime = tokio::runtime::Runtime::new()?;
+            runtime.block_on(future)
+        }
+    }
+}
+
 fn worker_address_for_node(node: &crate::structs::Node) -> Option<String> {
     let attrs = node.config_attrs.as_object()?;
     attrs
@@ -132,5 +150,17 @@ mod tests {
             worker_address_for_node(&node),
             Some("http://127.0.0.1:4848".to_string())
         );
+    }
+
+    #[test]
+    fn run_dispatch_future_outside_runtime() -> R<()> {
+        run_dispatch_future(async { Ok(()) })?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn run_dispatch_future_inside_runtime() -> R<()> {
+        run_dispatch_future(async { Ok(()) })?;
+        Ok(())
     }
 }

@@ -7,7 +7,8 @@ pub const DEF_SCHEDULER_AUTO_ANTI_AFFINITY_WEIGHT: f64 = 0.2;
 
 use crate::prelude::{
     DEF_EVAL_PRIORITY, DEF_MANAGER_HOSTNAME, DEF_MANAGER_INSECURE_PORT, DEF_MANAGER_SERVER_PORT,
-    DEF_SCHEDULING_POLICY, DEF_STORE_PATH, DEF_WORKER_CHECK_SEC, DEF_WORKER_CONFIG_PATH,
+    DEF_ROLLOUT_RETENTION_DAYS, DEF_SCHEDULING_POLICY, DEF_STORE_PATH, DEF_WORKER_CHECK_SEC,
+    DEF_WORKER_CONFIG_PATH,
 };
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -28,6 +29,7 @@ pub struct ManagerConfig {
     pub eval_threads: Option<usize>,
     pub scheduling_policy: Option<String>,
     pub default_priority: Option<i64>,
+    pub rollout_retention_days: Option<u64>,
     pub scheduler_settings: Option<Value>,
     pub task_resource_defaults: Option<Value>,
     pub custom_resources: Option<Value>,
@@ -83,6 +85,7 @@ pub struct ManagerConfigFull {
     pub eval_threads: usize,
     pub scheduling_policy: String,
     pub default_priority: i64,
+    pub rollout_retention_days: u64,
     pub scheduler_settings: Option<Value>,
     pub task_resource_defaults: Option<Value>,
     pub custom_resources: Option<Value>,
@@ -98,6 +101,7 @@ impl From<ManagerConfigFull> for ManagerConfig {
             eval_threads: Some(val.eval_threads),
             scheduling_policy: Some(val.scheduling_policy),
             default_priority: Some(val.default_priority),
+            rollout_retention_days: Some(val.rollout_retention_days),
             scheduler_settings: val.scheduler_settings,
             task_resource_defaults: val.task_resource_defaults,
             custom_resources: val.custom_resources,
@@ -130,6 +134,9 @@ impl ManagerConfig {
                 .clone()
                 .unwrap_or_else(|| DEF_SCHEDULING_POLICY.into()),
             default_priority: self.default_priority.unwrap_or(DEF_EVAL_PRIORITY),
+            rollout_retention_days: self
+                .rollout_retention_days
+                .unwrap_or(DEF_ROLLOUT_RETENTION_DAYS),
             scheduler_settings: self.scheduler_settings.clone(),
             task_resource_defaults: self.task_resource_defaults.clone(),
             custom_resources: self.custom_resources.clone(),
@@ -146,6 +153,7 @@ impl Default for ManagerConfigFull {
             worker_check_seconds: DEF_WORKER_CHECK_SEC,
             scheduling_policy: DEF_SCHEDULING_POLICY.into(),
             default_priority: DEF_EVAL_PRIORITY,
+            rollout_retention_days: DEF_ROLLOUT_RETENTION_DAYS,
             scheduler_settings: None,
             task_resource_defaults: None,
             custom_resources: None,

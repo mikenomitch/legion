@@ -475,7 +475,7 @@ export default function Nodes(props: NodesProps) {
                                 {(allocation) => (
                                   <div class="rounded border border-neutral-200 bg-white px-3 py-2 text-sm text-neutral-800 shadow-sm dark:border-neutral-800 dark:bg-neutral-950/60 dark:text-neutral-200">
                                     <div class="flex flex-wrap items-center justify-between gap-2">
-                                      <span class="font-semibold">Allocation #{allocation.id}</span>
+                                      <span class="font-semibold">Allocation #{String(allocation.id)}</span>
                                       <div class="flex flex-wrap items-center gap-2 text-[11px] uppercase tracking-wide">
                                         <span class={`rounded border px-2 py-1 ${healthToneClasses(healthSummary.tone)}`}>
                                           {healthSummary.label}
@@ -493,7 +493,7 @@ export default function Nodes(props: NodesProps) {
                                         Job Config: {allocation.jobConfigId || '—'}
                                       </span>
                                       <span class="rounded border border-neutral-200 bg-neutral-50 px-2 py-1 dark:border-neutral-800 dark:bg-neutral-900">
-                                        Task Config: {allocation.taskConfigId || '—'}
+                                        Task Config: {allocation.taskConfigId ? String(allocation.taskConfigId) : '—'}
                                       </span>
                                     </div>
                                   </div>

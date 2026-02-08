@@ -505,6 +505,770 @@ export class GetJobInfoReply extends Message<GetJobInfoReply> {
 }
 
 /**
+ * @generated from message legion.ListRolloutsRequest
+ */
+export class ListRolloutsRequest extends Message<ListRolloutsRequest> {
+  /**
+   * @generated from field: optional string job_id = 1;
+   */
+  jobId?: string;
+
+  /**
+   * @generated from field: bool active_only = 2;
+   */
+  activeOnly = false;
+
+  constructor(data?: PartialMessage<ListRolloutsRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListRolloutsRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "job_id", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 2, name: "active_only", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListRolloutsRequest {
+    return new ListRolloutsRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListRolloutsRequest {
+    return new ListRolloutsRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListRolloutsRequest {
+    return new ListRolloutsRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListRolloutsRequest | PlainMessage<ListRolloutsRequest> | undefined, b: ListRolloutsRequest | PlainMessage<ListRolloutsRequest> | undefined): boolean {
+    return proto3.util.equals(ListRolloutsRequest, a, b);
+  }
+}
+
+/**
+ * @generated from message legion.Rollout
+ */
+export class Rollout extends Message<Rollout> {
+  /**
+   * @generated from field: int64 id = 1;
+   */
+  id = protoInt64.zero;
+
+  /**
+   * @generated from field: string job_id = 2;
+   */
+  jobId = "";
+
+  /**
+   * @generated from field: optional string from_job_config_id = 3;
+   */
+  fromJobConfigId?: string;
+
+  /**
+   * @generated from field: string to_job_config_id = 4;
+   */
+  toJobConfigId = "";
+
+  /**
+   * @generated from field: string status = 5;
+   */
+  status = "";
+
+  /**
+   * @generated from field: bool incomplete = 6;
+   */
+  incomplete = false;
+
+  /**
+   * @generated from field: string message = 7;
+   */
+  message = "";
+
+  /**
+   * @generated from field: optional string strategy = 8;
+   */
+  strategy?: string;
+
+  /**
+   * @generated from field: optional string progression = 9;
+   */
+  progression?: string;
+
+  /**
+   * @generated from field: optional string replacement = 10;
+   */
+  replacement?: string;
+
+  /**
+   * @generated from field: optional bool in_place = 11;
+   */
+  inPlace?: boolean;
+
+  /**
+   * @generated from field: string config_json = 12;
+   */
+  configJson = "";
+
+  /**
+   * @generated from field: string created_at = 13;
+   */
+  createdAt = "";
+
+  /**
+   * @generated from field: string updated_at = 14;
+   */
+  updatedAt = "";
+
+  /**
+   * @generated from field: optional string completed_at = 15;
+   */
+  completedAt?: string;
+
+  constructor(data?: PartialMessage<Rollout>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.Rollout";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 2, name: "job_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "from_job_config_id", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 4, name: "to_job_config_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "status", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "incomplete", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 7, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 8, name: "strategy", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 9, name: "progression", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 10, name: "replacement", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 11, name: "in_place", kind: "scalar", T: 8 /* ScalarType.BOOL */, opt: true },
+    { no: 12, name: "config_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 13, name: "created_at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 14, name: "updated_at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 15, name: "completed_at", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): Rollout {
+    return new Rollout().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): Rollout {
+    return new Rollout().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): Rollout {
+    return new Rollout().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: Rollout | PlainMessage<Rollout> | undefined, b: Rollout | PlainMessage<Rollout> | undefined): boolean {
+    return proto3.util.equals(Rollout, a, b);
+  }
+}
+
+/**
+ * @generated from message legion.ListRolloutsReply
+ */
+export class ListRolloutsReply extends Message<ListRolloutsReply> {
+  /**
+   * @generated from field: repeated legion.Rollout rollouts = 1;
+   */
+  rollouts: Rollout[] = [];
+
+  constructor(data?: PartialMessage<ListRolloutsReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListRolloutsReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "rollouts", kind: "message", T: Rollout, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListRolloutsReply {
+    return new ListRolloutsReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListRolloutsReply {
+    return new ListRolloutsReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListRolloutsReply {
+    return new ListRolloutsReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListRolloutsReply | PlainMessage<ListRolloutsReply> | undefined, b: ListRolloutsReply | PlainMessage<ListRolloutsReply> | undefined): boolean {
+    return proto3.util.equals(ListRolloutsReply, a, b);
+  }
+}
+
+/**
+ * @generated from message legion.GetRolloutRequest
+ */
+export class GetRolloutRequest extends Message<GetRolloutRequest> {
+  /**
+   * @generated from field: int64 id = 1;
+   */
+  id = protoInt64.zero;
+
+  constructor(data?: PartialMessage<GetRolloutRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetRolloutRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetRolloutRequest {
+    return new GetRolloutRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetRolloutRequest {
+    return new GetRolloutRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetRolloutRequest {
+    return new GetRolloutRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetRolloutRequest | PlainMessage<GetRolloutRequest> | undefined, b: GetRolloutRequest | PlainMessage<GetRolloutRequest> | undefined): boolean {
+    return proto3.util.equals(GetRolloutRequest, a, b);
+  }
+}
+
+/**
+ * @generated from message legion.GetRolloutReply
+ */
+export class GetRolloutReply extends Message<GetRolloutReply> {
+  /**
+   * @generated from field: optional legion.Rollout rollout = 1;
+   */
+  rollout?: Rollout;
+
+  constructor(data?: PartialMessage<GetRolloutReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetRolloutReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "rollout", kind: "message", T: Rollout, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetRolloutReply {
+    return new GetRolloutReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetRolloutReply {
+    return new GetRolloutReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetRolloutReply {
+    return new GetRolloutReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetRolloutReply | PlainMessage<GetRolloutReply> | undefined, b: GetRolloutReply | PlainMessage<GetRolloutReply> | undefined): boolean {
+    return proto3.util.equals(GetRolloutReply, a, b);
+  }
+}
+
+/**
+ * @generated from message legion.RolloutAllocationStatus
+ */
+export class RolloutAllocationStatus extends Message<RolloutAllocationStatus> {
+  /**
+   * @generated from field: int64 allocation_id = 1;
+   */
+  allocationId = protoInt64.zero;
+
+  /**
+   * @generated from field: string node_id = 2;
+   */
+  nodeId = "";
+
+  /**
+   * @generated from field: int64 task_config_id = 3;
+   */
+  taskConfigId = protoInt64.zero;
+
+  /**
+   * @generated from field: string task_name = 4;
+   */
+  taskName = "";
+
+  /**
+   * @generated from field: string task_group = 5;
+   */
+  taskGroup = "";
+
+  /**
+   * @generated from field: string lifecycle = 6;
+   */
+  lifecycle = "";
+
+  /**
+   * @generated from field: string status = 7;
+   */
+  status = "";
+
+  /**
+   * @generated from field: string role = 8;
+   */
+  role = "";
+
+  /**
+   * @generated from field: optional bool node_healthy = 9;
+   */
+  nodeHealthy?: boolean;
+
+  /**
+   * @generated from field: optional bool allocation_healthy = 10;
+   */
+  allocationHealthy?: boolean;
+
+  /**
+   * @generated from field: optional string allocation_health = 11;
+   */
+  allocationHealth?: string;
+
+  constructor(data?: PartialMessage<RolloutAllocationStatus>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.RolloutAllocationStatus";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "allocation_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 2, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "task_config_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 4, name: "task_name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "task_group", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "lifecycle", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 7, name: "status", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 8, name: "role", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 9, name: "node_healthy", kind: "scalar", T: 8 /* ScalarType.BOOL */, opt: true },
+    { no: 10, name: "allocation_healthy", kind: "scalar", T: 8 /* ScalarType.BOOL */, opt: true },
+    { no: 11, name: "allocation_health", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RolloutAllocationStatus {
+    return new RolloutAllocationStatus().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): RolloutAllocationStatus {
+    return new RolloutAllocationStatus().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): RolloutAllocationStatus {
+    return new RolloutAllocationStatus().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: RolloutAllocationStatus | PlainMessage<RolloutAllocationStatus> | undefined, b: RolloutAllocationStatus | PlainMessage<RolloutAllocationStatus> | undefined): boolean {
+    return proto3.util.equals(RolloutAllocationStatus, a, b);
+  }
+}
+
+/**
+ * @generated from message legion.RolloutGroupStatus
+ */
+export class RolloutGroupStatus extends Message<RolloutGroupStatus> {
+  /**
+   * @generated from field: string group = 1;
+   */
+  group = "";
+
+  /**
+   * @generated from field: uint32 step_index = 2;
+   */
+  stepIndex = 0;
+
+  /**
+   * @generated from field: uint32 total_steps = 3;
+   */
+  totalSteps = 0;
+
+  /**
+   * @generated from field: uint32 pending_manual_advances = 4;
+   */
+  pendingManualAdvances = 0;
+
+  /**
+   * @generated from field: repeated legion.RolloutAllocationStatus allocations = 5;
+   */
+  allocations: RolloutAllocationStatus[] = [];
+
+  constructor(data?: PartialMessage<RolloutGroupStatus>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.RolloutGroupStatus";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "group", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "step_index", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 3, name: "total_steps", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 4, name: "pending_manual_advances", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 5, name: "allocations", kind: "message", T: RolloutAllocationStatus, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RolloutGroupStatus {
+    return new RolloutGroupStatus().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): RolloutGroupStatus {
+    return new RolloutGroupStatus().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): RolloutGroupStatus {
+    return new RolloutGroupStatus().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: RolloutGroupStatus | PlainMessage<RolloutGroupStatus> | undefined, b: RolloutGroupStatus | PlainMessage<RolloutGroupStatus> | undefined): boolean {
+    return proto3.util.equals(RolloutGroupStatus, a, b);
+  }
+}
+
+/**
+ * @generated from message legion.GetRolloutStatusRequest
+ */
+export class GetRolloutStatusRequest extends Message<GetRolloutStatusRequest> {
+  /**
+   * @generated from field: int64 id = 1;
+   */
+  id = protoInt64.zero;
+
+  constructor(data?: PartialMessage<GetRolloutStatusRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetRolloutStatusRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetRolloutStatusRequest {
+    return new GetRolloutStatusRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetRolloutStatusRequest {
+    return new GetRolloutStatusRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetRolloutStatusRequest {
+    return new GetRolloutStatusRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetRolloutStatusRequest | PlainMessage<GetRolloutStatusRequest> | undefined, b: GetRolloutStatusRequest | PlainMessage<GetRolloutStatusRequest> | undefined): boolean {
+    return proto3.util.equals(GetRolloutStatusRequest, a, b);
+  }
+}
+
+/**
+ * @generated from message legion.GetRolloutStatusReply
+ */
+export class GetRolloutStatusReply extends Message<GetRolloutStatusReply> {
+  /**
+   * @generated from field: optional legion.Rollout rollout = 1;
+   */
+  rollout?: Rollout;
+
+  /**
+   * @generated from field: repeated legion.RolloutGroupStatus groups = 2;
+   */
+  groups: RolloutGroupStatus[] = [];
+
+  constructor(data?: PartialMessage<GetRolloutStatusReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetRolloutStatusReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "rollout", kind: "message", T: Rollout, opt: true },
+    { no: 2, name: "groups", kind: "message", T: RolloutGroupStatus, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetRolloutStatusReply {
+    return new GetRolloutStatusReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetRolloutStatusReply {
+    return new GetRolloutStatusReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetRolloutStatusReply {
+    return new GetRolloutStatusReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetRolloutStatusReply | PlainMessage<GetRolloutStatusReply> | undefined, b: GetRolloutStatusReply | PlainMessage<GetRolloutStatusReply> | undefined): boolean {
+    return proto3.util.equals(GetRolloutStatusReply, a, b);
+  }
+}
+
+/**
+ * @generated from message legion.RolloutEvent
+ */
+export class RolloutEvent extends Message<RolloutEvent> {
+  /**
+   * @generated from field: int64 id = 1;
+   */
+  id = protoInt64.zero;
+
+  /**
+   * @generated from field: int64 rollout_id = 2;
+   */
+  rolloutId = protoInt64.zero;
+
+  /**
+   * @generated from field: string job_id = 3;
+   */
+  jobId = "";
+
+  /**
+   * @generated from field: optional string group_name = 4;
+   */
+  groupName?: string;
+
+  /**
+   * @generated from field: string level = 5;
+   */
+  level = "";
+
+  /**
+   * @generated from field: string message = 6;
+   */
+  message = "";
+
+  /**
+   * @generated from field: string metadata_json = 7;
+   */
+  metadataJson = "";
+
+  /**
+   * @generated from field: string created_at = 8;
+   */
+  createdAt = "";
+
+  constructor(data?: PartialMessage<RolloutEvent>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.RolloutEvent";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 2, name: "rollout_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 3, name: "job_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "group_name", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 5, name: "level", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 7, name: "metadata_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 8, name: "created_at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RolloutEvent {
+    return new RolloutEvent().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): RolloutEvent {
+    return new RolloutEvent().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): RolloutEvent {
+    return new RolloutEvent().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: RolloutEvent | PlainMessage<RolloutEvent> | undefined, b: RolloutEvent | PlainMessage<RolloutEvent> | undefined): boolean {
+    return proto3.util.equals(RolloutEvent, a, b);
+  }
+}
+
+/**
+ * @generated from message legion.ListRolloutEventsRequest
+ */
+export class ListRolloutEventsRequest extends Message<ListRolloutEventsRequest> {
+  /**
+   * @generated from field: int64 rollout_id = 1;
+   */
+  rolloutId = protoInt64.zero;
+
+  /**
+   * @generated from field: optional uint32 limit = 2;
+   */
+  limit?: number;
+
+  constructor(data?: PartialMessage<ListRolloutEventsRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListRolloutEventsRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "rollout_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 2, name: "limit", kind: "scalar", T: 13 /* ScalarType.UINT32 */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListRolloutEventsRequest {
+    return new ListRolloutEventsRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListRolloutEventsRequest {
+    return new ListRolloutEventsRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListRolloutEventsRequest {
+    return new ListRolloutEventsRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListRolloutEventsRequest | PlainMessage<ListRolloutEventsRequest> | undefined, b: ListRolloutEventsRequest | PlainMessage<ListRolloutEventsRequest> | undefined): boolean {
+    return proto3.util.equals(ListRolloutEventsRequest, a, b);
+  }
+}
+
+/**
+ * @generated from message legion.ListRolloutEventsReply
+ */
+export class ListRolloutEventsReply extends Message<ListRolloutEventsReply> {
+  /**
+   * @generated from field: repeated legion.RolloutEvent events = 1;
+   */
+  events: RolloutEvent[] = [];
+
+  constructor(data?: PartialMessage<ListRolloutEventsReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListRolloutEventsReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "events", kind: "message", T: RolloutEvent, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListRolloutEventsReply {
+    return new ListRolloutEventsReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListRolloutEventsReply {
+    return new ListRolloutEventsReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListRolloutEventsReply {
+    return new ListRolloutEventsReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListRolloutEventsReply | PlainMessage<ListRolloutEventsReply> | undefined, b: ListRolloutEventsReply | PlainMessage<ListRolloutEventsReply> | undefined): boolean {
+    return proto3.util.equals(ListRolloutEventsReply, a, b);
+  }
+}
+
+/**
+ * @generated from message legion.AdvanceRolloutRequest
+ */
+export class AdvanceRolloutRequest extends Message<AdvanceRolloutRequest> {
+  /**
+   * @generated from field: int64 id = 1;
+   */
+  id = protoInt64.zero;
+
+  /**
+   * @generated from field: repeated string groups = 2;
+   */
+  groups: string[] = [];
+
+  /**
+   * @generated from field: optional int64 priority = 3;
+   */
+  priority?: bigint;
+
+  constructor(data?: PartialMessage<AdvanceRolloutRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.AdvanceRolloutRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 2, name: "groups", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 3, name: "priority", kind: "scalar", T: 3 /* ScalarType.INT64 */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): AdvanceRolloutRequest {
+    return new AdvanceRolloutRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): AdvanceRolloutRequest {
+    return new AdvanceRolloutRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): AdvanceRolloutRequest {
+    return new AdvanceRolloutRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: AdvanceRolloutRequest | PlainMessage<AdvanceRolloutRequest> | undefined, b: AdvanceRolloutRequest | PlainMessage<AdvanceRolloutRequest> | undefined): boolean {
+    return proto3.util.equals(AdvanceRolloutRequest, a, b);
+  }
+}
+
+/**
+ * @generated from message legion.AdvanceRolloutReply
+ */
+export class AdvanceRolloutReply extends Message<AdvanceRolloutReply> {
+  /**
+   * @generated from field: string message = 1;
+   */
+  message = "";
+
+  /**
+   * @generated from field: optional legion.Rollout rollout = 2;
+   */
+  rollout?: Rollout;
+
+  constructor(data?: PartialMessage<AdvanceRolloutReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.AdvanceRolloutReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "rollout", kind: "message", T: Rollout, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): AdvanceRolloutReply {
+    return new AdvanceRolloutReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): AdvanceRolloutReply {
+    return new AdvanceRolloutReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): AdvanceRolloutReply {
+    return new AdvanceRolloutReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: AdvanceRolloutReply | PlainMessage<AdvanceRolloutReply> | undefined, b: AdvanceRolloutReply | PlainMessage<AdvanceRolloutReply> | undefined): boolean {
+    return proto3.util.equals(AdvanceRolloutReply, a, b);
+  }
+}
+
+/**
  * @generated from message legion.GetJobSpecRequest
  */
 export class GetJobSpecRequest extends Message<GetJobSpecRequest> {
@@ -1021,6 +1785,11 @@ export class HeartbeatRequest extends Message<HeartbeatRequest> {
    */
   failedAllocations: FailedAllocation[] = [];
 
+  /**
+   * @generated from field: repeated legion.AllocationHealth allocation_health = 4;
+   */
+  allocationHealth: AllocationHealth[] = [];
+
   constructor(data?: PartialMessage<HeartbeatRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -1032,6 +1801,7 @@ export class HeartbeatRequest extends Message<HeartbeatRequest> {
     { no: 1, name: "id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 2, name: "allocation_ids", kind: "scalar", T: 3 /* ScalarType.INT64 */, repeated: true },
     { no: 3, name: "failed_allocations", kind: "message", T: FailedAllocation, repeated: true },
+    { no: 4, name: "allocation_health", kind: "message", T: AllocationHealth, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): HeartbeatRequest {
@@ -1134,6 +1904,55 @@ export class FailedAllocation extends Message<FailedAllocation> {
 
   static equals(a: FailedAllocation | PlainMessage<FailedAllocation> | undefined, b: FailedAllocation | PlainMessage<FailedAllocation> | undefined): boolean {
     return proto3.util.equals(FailedAllocation, a, b);
+  }
+}
+
+/**
+ * @generated from message legion.AllocationHealth
+ */
+export class AllocationHealth extends Message<AllocationHealth> {
+  /**
+   * @generated from field: int64 allocation_id = 1;
+   */
+  allocationId = protoInt64.zero;
+
+  /**
+   * @generated from field: bool healthy = 2;
+   */
+  healthy = false;
+
+  /**
+   * @generated from field: string status = 3;
+   */
+  status = "";
+
+  constructor(data?: PartialMessage<AllocationHealth>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.AllocationHealth";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "allocation_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 2, name: "healthy", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 3, name: "status", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): AllocationHealth {
+    return new AllocationHealth().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): AllocationHealth {
+    return new AllocationHealth().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): AllocationHealth {
+    return new AllocationHealth().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: AllocationHealth | PlainMessage<AllocationHealth> | undefined, b: AllocationHealth | PlainMessage<AllocationHealth> | undefined): boolean {
+    return proto3.util.equals(AllocationHealth, a, b);
   }
 }
 

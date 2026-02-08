@@ -47,6 +47,8 @@ pub fn spawn_health_monitor(
     task: TaskConfig,
 ) {
     if task.checks.is_empty() {
+        let mut guard = manager.lock().expect("task manager");
+        guard.set_allocation_health(allocation.id, true, "healthy (no checks configured)");
         return;
     }
 
@@ -59,6 +61,7 @@ pub fn spawn_health_monitor(
                 shutdown: shutdown_tx.clone(),
             },
         );
+        guard.set_allocation_health(allocation.id, false, "health checks starting");
     }
 
     tokio::spawn(async move {
@@ -163,6 +166,20 @@ async fn run_health_monitor(
                         );
                     }
                     continue;
+                }
+
+                {
+                    let mut guard = manager.lock().expect("task manager");
+                    let status = if result.ok {
+                        format!("{} passed", result.name)
+                    } else {
+                        let reason = result
+                            .error
+                            .clone()
+                            .unwrap_or_else(|| "unknown error".to_string());
+                        format!("{} failed: {}", result.name, reason)
+                    };
+                    guard.set_allocation_health(allocation.id, result.ok, status);
                 }
 
                 if matches!(result.check_type, TaskCheckType::Boot) && result.ok {

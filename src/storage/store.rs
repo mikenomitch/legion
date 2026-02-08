@@ -12,9 +12,10 @@ use crate::storage::queries::{
     INSERT_SUBMISSION, INSERT_TASK, INSERT_WORKER_TYPE, NODE_ATTRS, UPSERT_MANAGER_CONFIG,
 };
 use crate::structs::{
-    Allocation, Eval, Job, JobConfig, KvEntry, KvLock, KvValueType, LedgerEntry, ManagerConfigFull,
-    ManagerNodeConfig, Node, NodeMsg, Submission, TaskCheck, TaskConfig, TaskCount, TaskDependency,
-    TaskLifecycle, TaskOnUnhealthyConfig, TaskSchedule, TaskStatusState, WorkerConfig,
+    Allocation, AllocationHealth, Eval, Job, JobConfig, KvEntry, KvLock, KvValueType, LedgerEntry,
+    ManagerConfigFull, ManagerNodeConfig, Node, NodeMsg, Rollout, RolloutConfig, Submission,
+    TaskCheck, TaskConfig, TaskCount, TaskDependency, TaskLifecycle, TaskOnUnhealthyConfig,
+    TaskSchedule, TaskStatusState, WorkerConfig,
 };
 
 use rand::{seq::SliceRandom, thread_rng, Rng};
@@ -23,17 +24,18 @@ use rusqlite::{
     OptionalExtension, Row, Transaction,
 };
 use rusqlite_migration::Migrations;
+use serde::Serialize;
 use serde_json::{from_str, to_string, to_string_pretty, Value};
 use serde_rusqlite::to_params_named;
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{MutexGuard, RwLock};
 use std::time::Duration;
 use time::format_description::well_known::Rfc3339;
 use time::macros::format_description;
-use time::OffsetDateTime;
+use time::{Duration as TimeDuration, OffsetDateTime};
 use tokio::sync::Notify;
 
 // warning incorrectly
@@ -78,6 +80,7 @@ pub struct Store {
     pub read_index: Arc<AtomicUsize>,
     pub scheduling_policy: String,
     pub default_eval_priority: i64,
+    pub rollout_retention_days: u64,
     pub scheduler_settings: Option<Value>,
     pub resource_policy: ResourcePolicy,
     read_model: Arc<RwLock<SchedulingReadModel>>,
@@ -98,6 +101,28 @@ pub struct JobKvReference {
     pub job_config_id: String,
     pub kv_key: String,
     pub json_pointer: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AllocationHealthSnapshot {
+    pub allocation_id: i64,
+    pub node_id: String,
+    pub healthy: bool,
+    pub status: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RolloutEventRecord {
+    pub id: i64,
+    pub rollout_id: i64,
+    pub job_id: String,
+    pub group_name: Option<String>,
+    pub level: String,
+    pub message: String,
+    pub metadata_json: String,
+    pub created_at: String,
 }
 
 impl JobSubmitOutcome {
@@ -133,6 +158,7 @@ impl Store {
             read_index: Arc::new(AtomicUsize::new(0)),
             scheduling_policy: config.scheduling_policy.clone(),
             default_eval_priority: config.default_priority,
+            rollout_retention_days: config.rollout_retention_days,
             scheduler_settings: config.scheduler_settings.clone(),
             resource_policy,
             read_model: Arc::new(RwLock::new(SchedulingReadModel::default())),
@@ -633,6 +659,17 @@ impl Store {
         Ok(lock)
     }
 
+    fn job_config_ids_with_incomplete_rollouts(&self) -> R<Vec<String>> {
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT to_job_config_id
+             FROM rollout
+             WHERE status = 'completed_incomplete';",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        Self::collect_rows(rows)
+    }
+
     fn enforce_kv_lock(&self, tx: &Transaction<'_>, key: &str, lock_id: Option<&str>) -> R<()> {
         let Some(lock) = self.load_kv_lock_tx(tx, key)? else {
             return Ok(());
@@ -723,6 +760,53 @@ impl Store {
         };
 
         Ok(lock)
+    }
+
+    fn rollout_from_row(&self, row: &Row<'_>) -> Result<Rollout, rusqlite::Error> {
+        let in_place: Option<i64> = row.get(10)?;
+        Ok(Rollout {
+            id: row.get(0)?,
+            job_id: row.get(1)?,
+            from_job_config_id: row.get(2)?,
+            to_job_config_id: row.get(3)?,
+            status: row.get(4)?,
+            incomplete: row.get::<_, i64>(5)? != 0,
+            message: row.get(6)?,
+            strategy: row.get(7)?,
+            progression: row.get(8)?,
+            replacement: row.get(9)?,
+            in_place: in_place.map(|value| value != 0),
+            config_json: row.get(11)?,
+            created_at: row.get(12)?,
+            updated_at: row.get(13)?,
+            completed_at: row.get(14)?,
+        })
+    }
+
+    fn allocation_health_snapshot_from_row(
+        &self,
+        row: &Row<'_>,
+    ) -> Result<AllocationHealthSnapshot, rusqlite::Error> {
+        Ok(AllocationHealthSnapshot {
+            allocation_id: row.get(0)?,
+            node_id: row.get(1)?,
+            healthy: row.get::<_, i64>(2)? != 0,
+            status: row.get(3)?,
+            updated_at: row.get(4)?,
+        })
+    }
+
+    fn rollout_event_from_row(&self, row: &Row<'_>) -> Result<RolloutEventRecord, rusqlite::Error> {
+        Ok(RolloutEventRecord {
+            id: row.get(0)?,
+            rollout_id: row.get(1)?,
+            job_id: row.get(2)?,
+            group_name: row.get(3)?,
+            level: row.get(4)?,
+            message: row.get(5)?,
+            metadata_json: row.get(6)?,
+            created_at: row.get(7)?,
+        })
     }
 
     fn job_kv_reference_from_row(&self, row: &Row<'_>) -> Result<JobKvReference, RusqliteError> {
@@ -1346,15 +1430,56 @@ impl Store {
             .map_err(|_| anyhow!("Error committing transaction"))
     }
 
+    fn rollout_meta_from_value(
+        meta: Value,
+    ) -> Result<(Option<RolloutConfig>, BTreeMap<String, RolloutConfig>), RusqliteError> {
+        let Some(meta) = meta.as_object() else {
+            return Ok((None, BTreeMap::new()));
+        };
+
+        let rollout = match meta.get("rollout") {
+            Some(value) if !value.is_null() => Some(
+                serde_json::from_value::<RolloutConfig>(value.clone()).map_err(|err| {
+                    RusqliteError::FromSqlConversionFailure(
+                        3,
+                        rusqlite::types::Type::Text,
+                        Box::new(err),
+                    )
+                })?,
+            ),
+            _ => None,
+        };
+
+        let rollout_by_group = match meta.get("rolloutByGroup") {
+            Some(value) if !value.is_null() => serde_json::from_value::<
+                BTreeMap<String, RolloutConfig>,
+            >(value.clone())
+            .map_err(|err| {
+                RusqliteError::FromSqlConversionFailure(
+                    3,
+                    rusqlite::types::Type::Text,
+                    Box::new(err),
+                )
+            })?,
+            _ => BTreeMap::new(),
+        };
+
+        Ok((rollout, rollout_by_group))
+    }
+
     pub fn get_job_config_optional(&self, name: &str) -> R<Option<JobConfig>> {
         let conn = self.read_connection()?;
         let maybe_job_config: Option<(JobConfig, String)> = conn
             .query_row(&GET_JOB_CONFIG, [name], |row| {
                 let tasks_to_replace = vec![];
                 let job_config_id = row.get(0)?;
+                let meta: Value = row.get(3)?;
+                let (rollout, rollout_by_group) = Self::rollout_meta_from_value(meta)?;
                 let jc = JobConfig {
                     name: row.get(1)?,
                     tasks: tasks_to_replace,
+                    rollout,
+                    rollout_by_group,
                     version: Some(row.get(4)?),
                 };
 
@@ -1384,9 +1509,13 @@ impl Store {
             .query_row(&GET_JOB_CONFIG_BY_ID, [id], |row| {
                 let tasks_to_replace = vec![];
                 let job_config_id = row.get(0)?;
+                let meta: Value = row.get(3)?;
+                let (rollout, rollout_by_group) = Self::rollout_meta_from_value(meta)?;
                 let jc = JobConfig {
                     name: row.get(1)?,
                     tasks: tasks_to_replace,
+                    rollout,
+                    rollout_by_group,
                     version: Some(row.get(4)?),
                 };
 
@@ -1474,11 +1603,19 @@ impl Store {
         }?;
 
         let now = time::OffsetDateTime::now_utc();
+        let meta = if config.rollout.is_none() && config.rollout_by_group.is_empty() {
+            json!({})
+        } else {
+            json!({
+                "rollout": config.rollout,
+                "rolloutByGroup": config.rollout_by_group,
+            })
+        };
         let config_params = named_params! {
             ":id": format!("{}-{}", config.name, next_version.to_string()),
             ":name": config.name,
             ":type": "default",
-            ":meta": "{}",
+            ":meta": meta,
             ":version": next_version,
             ":created_at": now,
             ":job_id": job.id,
@@ -1490,6 +1627,8 @@ impl Store {
                 Ok((
                     JobConfig {
                         name: row.get(1)?,
+                        rollout: config.rollout.clone(),
+                        rollout_by_group: config.rollout_by_group.clone(),
                         version: Some(row.get(4)?),
                         tasks,
                     },
@@ -1602,6 +1741,256 @@ impl Store {
             })
             .optional()?;
         Ok(previous.flatten())
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn create_rollout(
+        &self,
+        job_id: &str,
+        from_job_config_id: Option<&str>,
+        to_job_config_id: &str,
+        status: &str,
+        strategy: Option<&str>,
+        progression: Option<&str>,
+        replacement: Option<&str>,
+        in_place: Option<bool>,
+        config_json: &str,
+    ) -> R<Rollout> {
+        let conn = self.write_connection()?;
+        let now = Self::now_rfc3339()?;
+        let in_place = in_place.map(i64::from);
+        let rollout = conn.query_row(
+            "INSERT INTO rollout (
+                job_id,
+                from_job_config_id,
+                to_job_config_id,
+                status,
+                strategy,
+                progression,
+                replacement,
+                in_place,
+                config_json,
+                created_at,
+                updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)
+            RETURNING id, job_id, from_job_config_id, to_job_config_id, status, incomplete,
+                      message, strategy, progression, replacement, in_place, config_json,
+                      created_at, updated_at, completed_at;",
+            params![
+                job_id,
+                from_job_config_id,
+                to_job_config_id,
+                status,
+                strategy,
+                progression,
+                replacement,
+                in_place,
+                config_json,
+                now
+            ],
+            |row| self.rollout_from_row(row),
+        )?;
+
+        Ok(rollout)
+    }
+
+    pub fn list_rollouts(&self, job_id: Option<&str>, active_only: bool) -> R<Vec<Rollout>> {
+        let conn = self.read_connection()?;
+        let base_sql = "SELECT id, job_id, from_job_config_id, to_job_config_id, status,
+                incomplete, message, strategy, progression, replacement, in_place,
+                config_json, created_at, updated_at, completed_at
+            FROM rollout";
+
+        let sql = match (job_id, active_only) {
+            (Some(_), true) => {
+                format!(
+                    "{base_sql} WHERE job_id = ?1 AND status NOT IN ('completed','failed','cancelled','completed_incomplete') ORDER BY id DESC;"
+                )
+            }
+            (Some(_), false) => format!("{base_sql} WHERE job_id = ?1 ORDER BY id DESC;"),
+            (None, true) => format!(
+                "{base_sql} WHERE status NOT IN ('completed','failed','cancelled','completed_incomplete') ORDER BY id DESC;"
+            ),
+            (None, false) => format!("{base_sql} ORDER BY id DESC;"),
+        };
+
+        let mut stmt = conn.prepare(&sql)?;
+        if let Some(job_id) = job_id {
+            let rows = stmt.query_map([job_id], |row| self.rollout_from_row(row))?;
+            Self::collect_rows(rows)
+        } else {
+            let rows = stmt.query_map([], |row| self.rollout_from_row(row))?;
+            Self::collect_rows(rows)
+        }
+    }
+
+    pub fn get_rollout(&self, rollout_id: i64) -> R<Option<Rollout>> {
+        let conn = self.read_connection()?;
+        let rollout = conn
+            .query_row(
+                "SELECT id, job_id, from_job_config_id, to_job_config_id, status,
+                        incomplete, message, strategy, progression, replacement, in_place,
+                        config_json, created_at, updated_at, completed_at
+                 FROM rollout
+                 WHERE id = ?;",
+                [rollout_id],
+                |row| self.rollout_from_row(row),
+            )
+            .optional()?;
+
+        Ok(rollout)
+    }
+
+    pub fn latest_rollout_for_job_config(&self, job_config_id: &str) -> R<Option<Rollout>> {
+        let conn = self.read_connection()?;
+        let rollout = conn
+            .query_row(
+                "SELECT id, job_id, from_job_config_id, to_job_config_id, status,
+                        incomplete, message, strategy, progression, replacement, in_place,
+                        config_json, created_at, updated_at, completed_at
+                 FROM rollout
+                 WHERE to_job_config_id = ?
+                 ORDER BY id DESC
+                 LIMIT 1;",
+                [job_config_id],
+                |row| self.rollout_from_row(row),
+            )
+            .optional()?;
+
+        Ok(rollout)
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn update_rollout_status(
+        &self,
+        rollout_id: i64,
+        status: &str,
+        incomplete: bool,
+        message: Option<&str>,
+    ) -> R<()> {
+        let conn = self.write_connection()?;
+        let now = Self::now_rfc3339()?;
+        let completed_at = match status {
+            "completed" | "failed" | "cancelled" | "completed_incomplete" => Some(now.clone()),
+            _ => None,
+        };
+        conn.execute(
+            "UPDATE rollout
+             SET status = ?1, incomplete = ?2, message = COALESCE(?3, message),
+                 updated_at = ?4, completed_at = ?5
+             WHERE id = ?6;",
+            params![
+                status,
+                i64::from(incomplete),
+                message,
+                now,
+                completed_at,
+                rollout_id
+            ],
+        )?;
+
+        Ok(())
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn update_rollout_config_json(&self, rollout_id: i64, config_json: &str) -> R<()> {
+        let conn = self.write_connection()?;
+        let now = Self::now_rfc3339()?;
+        conn.execute(
+            "UPDATE rollout
+             SET config_json = ?1, updated_at = ?2
+             WHERE id = ?3;",
+            params![config_json, now, rollout_id],
+        )?;
+
+        Ok(())
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn append_rollout_event(
+        &self,
+        rollout_id: i64,
+        job_id: &str,
+        group_name: Option<&str>,
+        level: &str,
+        message: &str,
+        metadata_json: Option<&str>,
+    ) -> R<RolloutEventRecord> {
+        let conn = self.write_connection()?;
+        let created_at = Self::now_rfc3339()?;
+        let metadata_json = metadata_json.unwrap_or("{}");
+        if metadata_json.trim().is_empty() {
+            return Err(anyhow::anyhow!(
+                "rollout event metadata_json cannot be empty"
+            ));
+        }
+        let _: Value = serde_json::from_str(metadata_json)
+            .with_context(|| format!("invalid rollout event metadata_json: {metadata_json}"))?;
+
+        let event = conn.query_row(
+            "INSERT INTO rollout_event (
+                rollout_id,
+                job_id,
+                group_name,
+                level,
+                message,
+                metadata_json,
+                created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            RETURNING id, rollout_id, job_id, group_name, level, message, metadata_json, created_at;",
+            params![
+                rollout_id,
+                job_id,
+                group_name,
+                level,
+                message,
+                metadata_json,
+                created_at
+            ],
+            |row| self.rollout_event_from_row(row),
+        )?;
+
+        Ok(event)
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn list_rollout_events(
+        &self,
+        rollout_id: i64,
+        limit: Option<u32>,
+    ) -> R<Vec<RolloutEventRecord>> {
+        let conn = self.read_connection()?;
+        let requested = limit.unwrap_or(500).clamp(1, 2_000);
+        let mut stmt = conn.prepare(
+            "SELECT id, rollout_id, job_id, group_name, level, message, metadata_json, created_at
+             FROM (
+                SELECT id, rollout_id, job_id, group_name, level, message, metadata_json, created_at
+                FROM rollout_event
+                WHERE rollout_id = ?1
+                ORDER BY id DESC
+                LIMIT ?2
+             )
+             ORDER BY id ASC;",
+        )?;
+        let rows = stmt.query_map(params![rollout_id, requested as i64], |row| {
+            self.rollout_event_from_row(row)
+        })?;
+        Self::collect_rows(rows)
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn prune_rollouts(&self) -> R<u64> {
+        let conn = self.write_connection()?;
+        let cutoff =
+            OffsetDateTime::now_utc() - TimeDuration::days(self.rollout_retention_days as i64);
+        let cutoff = cutoff
+            .format(&Rfc3339)
+            .context("failed to format rollout retention cutoff")?;
+        let changed = conn.execute(
+            "DELETE FROM rollout WHERE completed_at IS NOT NULL AND completed_at < ?;",
+            [cutoff],
+        )?;
+        Ok(changed as u64)
     }
 
     #[instrument(err, skip_all)]
@@ -2019,6 +2408,120 @@ impl Store {
     }
 
     #[instrument(err, skip_all)]
+    pub fn upsert_allocation_health_snapshots(
+        &self,
+        node_id: &str,
+        snapshots: &[AllocationHealth],
+    ) -> R<()> {
+        if snapshots.is_empty() {
+            return Ok(());
+        }
+
+        let mut conn = self.write_connection()?;
+        let tx = conn.transaction()?;
+        let now = Self::now_rfc3339()?;
+        for snapshot in snapshots {
+            tx.execute(
+                "INSERT INTO allocation_health (
+                    allocation_id,
+                    node_id,
+                    healthy,
+                    status,
+                    updated_at
+                )
+                SELECT ?1, ?2, ?3, ?4, ?5
+                WHERE EXISTS (SELECT 1 FROM allocation WHERE id = ?1 AND node_id = ?2)
+                ON CONFLICT(allocation_id) DO UPDATE
+                SET node_id = excluded.node_id,
+                    healthy = excluded.healthy,
+                    status = excluded.status,
+                    updated_at = excluded.updated_at;",
+                params![
+                    snapshot.allocation_id,
+                    node_id,
+                    i64::from(snapshot.healthy),
+                    snapshot.status.as_str(),
+                    now.as_str()
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn reconcile_incomplete_rollouts(&self) -> R<u64> {
+        let mut reconciled = 0_u64;
+        for job_config_id in self.job_config_ids_with_incomplete_rollouts()? {
+            match self.reconcile_job_config_allocations(&job_config_id) {
+                Ok(()) => {
+                    reconciled += 1;
+                }
+                Err(err) => {
+                    warn!(
+                        job_config_id = %job_config_id,
+                        error = ?err,
+                        "failed reconciling completed_incomplete rollout"
+                    );
+                }
+            }
+        }
+        Ok(reconciled)
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn allocation_health_for_allocations(
+        &self,
+        allocation_ids: &[i64],
+    ) -> R<HashMap<i64, AllocationHealthSnapshot>> {
+        if allocation_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let placeholders = std::iter::repeat("?")
+            .take(allocation_ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT allocation_id, node_id, healthy, status, updated_at
+             FROM allocation_health
+             WHERE allocation_id IN ({placeholders});"
+        );
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(allocation_ids.iter()), |row| {
+            self.allocation_health_snapshot_from_row(row)
+        })?;
+        let snapshots = Self::collect_rows(rows)?;
+        Ok(snapshots
+            .into_iter()
+            .map(|snapshot| (snapshot.allocation_id, snapshot))
+            .collect())
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn allocation_health_for_job_config(
+        &self,
+        job_config_id: &str,
+    ) -> R<HashMap<i64, AllocationHealthSnapshot>> {
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare(
+            "SELECT ah.allocation_id, ah.node_id, ah.healthy, ah.status, ah.updated_at
+             FROM allocation_health ah
+             INNER JOIN allocation a ON a.id = ah.allocation_id
+             WHERE a.job_config_id = ?1;",
+        )?;
+        let rows = stmt.query_map([job_config_id], |row| {
+            self.allocation_health_snapshot_from_row(row)
+        })?;
+        let snapshots = Self::collect_rows(rows)?;
+        Ok(snapshots
+            .into_iter()
+            .map(|snapshot| (snapshot.allocation_id, snapshot))
+            .collect())
+    }
+
+    #[instrument(err, skip_all)]
     pub fn remove_allocation_by_id(&self, allocation_id: i64) -> R<Option<Allocation>> {
         let allocation = self.get_allocation_by_id(allocation_id)?;
         let Some(allocation) = allocation else {
@@ -2208,7 +2711,12 @@ impl Store {
 
     #[instrument(err, skip_all)]
     pub fn reschedule_allocations_for_new_node(&self) -> R<()> {
-        let job_config_ids = self.job_config_ids_with_count_per()?;
+        let mut job_config_ids = self.job_config_ids_with_count_per()?;
+        for job_config_id in self.job_config_ids_with_incomplete_rollouts()? {
+            if !job_config_ids.contains(&job_config_id) {
+                job_config_ids.push(job_config_id);
+            }
+        }
         for job_config_id in job_config_ids {
             self.reconcile_job_config_allocations(&job_config_id)?;
         }
@@ -3144,6 +3652,8 @@ mod tests {
         store.insert_node(make_node_msg("node-one", "ready"))?;
 
         let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
             name: "cache-allocs".into(),
             tasks: vec![task("worker")],
             version: None,
@@ -3188,6 +3698,8 @@ mod tests {
         let store = setup_store()?;
 
         let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
             name: "cache-tasks".into(),
             tasks: vec![task("alpha")],
             version: None,
@@ -3213,6 +3725,8 @@ mod tests {
         assert_eq!(tasks[0].1.name, "alpha");
 
         let updated_job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
             name: job.name.clone(),
             tasks: vec![TaskConfig {
                 count: TaskCount::new(2),
@@ -3344,6 +3858,8 @@ mod tests {
         store.insert_node(make_node_msg("node-two", "active"))?;
 
         let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
             name: "lost-reschedule".into(),
             tasks: vec![task("worker")],
             version: None,
@@ -3444,6 +3960,8 @@ mod tests {
         let task_configs = vec![task_one.clone(), task_two.clone()];
         let job_name = "test".to_string();
         let job_config = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
             name: job_name.clone(),
             tasks: task_configs.clone(),
             version: None,
@@ -3509,6 +4027,8 @@ mod tests {
 
         let job_name = "rollback-job".to_string();
         let job_config = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
             name: job_name.clone(),
             tasks: vec![task_one],
             version: None,
@@ -3553,6 +4073,8 @@ mod tests {
 
         let orig_task_configs = vec![orig_task.clone()];
         let job_config = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
             name: "jobname".into(),
             tasks: orig_task_configs.clone(),
             version: None,
@@ -3583,6 +4105,8 @@ mod tests {
         };
         let new_task_configs = vec![new_task.clone()];
         let job_config_with_modified_kind = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
             tasks: new_task_configs.clone(),
             ..job_config
         };
@@ -3611,6 +4135,8 @@ mod tests {
         let new_task_configs = vec![new_task.clone(), extra_task.clone()];
 
         let job_config_with_extra_task = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
             tasks: new_task_configs.clone(),
             ..job_config_with_modified_kind
         };
@@ -3661,6 +4187,8 @@ mod tests {
 
         let orig_task_configs = vec![orig_task.clone()];
         let job_config = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
             name: "jobname".into(),
             tasks: orig_task_configs.clone(),
             version: None,
@@ -3703,6 +4231,8 @@ mod tests {
             ..TaskConfig::new("job-one-task-2", "driver-b")
         };
         let job_one_config = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
             name: job_one_name.clone(),
             tasks: vec![task_one.clone(), task_two.clone()],
             version: None,
@@ -3725,6 +4255,8 @@ mod tests {
             ..TaskConfig::new("job-two-task-1", "driver-c")
         };
         let job_two_config = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
             name: job_two_name.clone(),
             tasks: vec![task_three.clone()],
             version: None,
@@ -3821,6 +4353,8 @@ mod tests {
 
         let job_name = "solo-job".to_string();
         let job_config = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
             name: job_name.clone(),
             tasks,
             version: None,
@@ -3877,12 +4411,16 @@ mod tests {
         let tasks = vec![TaskConfig::new("task-shared", "kind")];
 
         let job_one_config = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
             name: "job-one".into(),
             tasks: tasks.clone(),
             version: None,
         };
 
         let job_two_config = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
             name: "job-two".into(),
             tasks,
             version: None,
@@ -4096,6 +4634,8 @@ mod tests {
         store.insert_node(make_node_msg("node-a", "ready"))?;
 
         let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
             name: "status-demo".into(),
             tasks: vec![
                 TaskConfig {
@@ -4134,6 +4674,301 @@ mod tests {
         let api_id = task_id_for(&store, "api", &job.name)?;
         assert_eq!(statuses.get(&prep_id), Some(&TaskStatusState::Success));
         assert_eq!(statuses.get(&api_id), Some(&TaskStatusState::Running));
+
+        Ok(())
+    }
+
+    #[test]
+    fn allocation_health_snapshots_upsert_and_cleanup() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "ready"))?;
+        store.insert_node(make_node_msg("node-b", "ready"))?;
+
+        let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "health-demo".into(),
+            tasks: vec![TaskConfig::new("web", "noop")],
+            version: None,
+        };
+        store.handle_job_submit(
+            &job,
+            &[Submission {
+                path: "job.jsonnet".into(),
+                content: "{}".into(),
+                is_primary: true,
+            }],
+        )?;
+        let task_id = task_id_for(&store, "web", &job.name)?;
+        let allocation = store.place_alloc("node-a", task_id)?;
+
+        store.upsert_allocation_health_snapshots(
+            "node-a",
+            &[AllocationHealth {
+                allocation_id: allocation.id,
+                healthy: false,
+                status: "starting".into(),
+            }],
+        )?;
+        store.upsert_allocation_health_snapshots(
+            "node-a",
+            &[AllocationHealth {
+                allocation_id: allocation.id,
+                healthy: true,
+                status: "healthy".into(),
+            }],
+        )?;
+
+        let health = store.allocation_health_for_allocations(&[allocation.id])?;
+        let entry = health
+            .get(&allocation.id)
+            .context("missing allocation health snapshot")?;
+        assert!(entry.healthy);
+        assert_eq!(entry.status, "healthy");
+
+        store.upsert_allocation_health_snapshots(
+            "node-b",
+            &[AllocationHealth {
+                allocation_id: allocation.id,
+                healthy: false,
+                status: "spoofed".into(),
+            }],
+        )?;
+        let health = store.allocation_health_for_allocations(&[allocation.id])?;
+        let entry = health
+            .get(&allocation.id)
+            .context("missing allocation health snapshot after non-owner write")?;
+        assert_eq!(entry.node_id, "node-a");
+        assert!(entry.healthy);
+        assert_eq!(entry.status, "healthy");
+
+        let removed = store.remove_allocation_by_id(allocation.id)?;
+        assert!(removed.is_some());
+        let health = store.allocation_health_for_allocations(&[allocation.id])?;
+        assert!(health.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn rollout_events_append_list_and_prune_with_rollout() -> R<()> {
+        let store = setup_store()?;
+
+        let v1 = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "rollout-events".into(),
+            tasks: vec![TaskConfig {
+                group: "web".into(),
+                ..TaskConfig::new("api", "noop")
+            }],
+            version: None,
+        };
+        store.handle_job_submit(&v1, &[])?;
+        let v1_id = store.get_job_config(&v1.name)?.id();
+
+        let v2 = JobConfig {
+            rollout: Some(RolloutConfig {
+                replacement: Some(crate::structs::RolloutReplacement::CreateFirst),
+                ..RolloutConfig::default()
+            }),
+            rollout_by_group: Default::default(),
+            name: "rollout-events".into(),
+            tasks: vec![TaskConfig {
+                group: "web".into(),
+                config: json!({ "version": 2 }),
+                ..TaskConfig::new("api", "noop")
+            }],
+            version: None,
+        };
+        store.handle_job_submit(&v2, &[])?;
+        let v2_id = store.get_job_config(&v2.name)?.id();
+
+        let rollout = store.create_rollout(
+            &v2.name,
+            Some(&v1_id),
+            &v2_id,
+            "running",
+            Some("default"),
+            Some("auto"),
+            Some("createFirst"),
+            Some(false),
+            "{}",
+        )?;
+
+        let first = store.append_rollout_event(
+            rollout.id,
+            &rollout.job_id,
+            None,
+            "info",
+            "Rollout created",
+            None,
+        )?;
+        let second = store.append_rollout_event(
+            rollout.id,
+            &rollout.job_id,
+            Some("web"),
+            "info",
+            "Group web advanced to step 1",
+            Some(r#"{"step":1}"#),
+        )?;
+
+        let events = store.list_rollout_events(rollout.id, None)?;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].id, first.id);
+        assert_eq!(events[1].id, second.id);
+        assert_eq!(events[1].group_name.as_deref(), Some("web"));
+
+        let limited = store.list_rollout_events(rollout.id, Some(1))?;
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].id, second.id);
+
+        let conn = store.write_connection()?;
+        conn.execute(
+            "UPDATE rollout SET completed_at = '1970-01-01T00:00:00Z', status = 'completed' WHERE id = ?1;",
+            [rollout.id],
+        )?;
+        drop(conn);
+
+        let pruned = store.prune_rollouts()?;
+        assert_eq!(pruned, 1);
+        assert!(store.get_rollout(rollout.id)?.is_none());
+        assert!(store.list_rollout_events(rollout.id, None)?.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn new_node_reconciles_completed_incomplete_rollouts() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "ready"))?;
+        store.insert_node(make_node_msg("node-b", "ready"))?;
+
+        let v1 = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "reconcile-incomplete".into(),
+            tasks: vec![TaskConfig::new("web", "noop")],
+            version: None,
+        };
+        store.handle_job_submit(
+            &v1,
+            &[Submission {
+                path: "job.jsonnet".into(),
+                content: "{}".into(),
+                is_primary: true,
+            }],
+        )?;
+        let v1_id = store.get_job_config(&v1.name)?.id();
+
+        let v2 = JobConfig {
+            rollout: Some(RolloutConfig::default()),
+            rollout_by_group: Default::default(),
+            name: "reconcile-incomplete".into(),
+            tasks: vec![TaskConfig {
+                config: json!({"version": 2}),
+                ..TaskConfig::new("web", "noop")
+            }],
+            version: None,
+        };
+        store.handle_job_submit(
+            &v2,
+            &[Submission {
+                path: "job.jsonnet".into(),
+                content: "{}".into(),
+                is_primary: true,
+            }],
+        )?;
+        let v2_id = store.get_job_config(&v2.name)?.id();
+        store.remove_allocs_for_job_config(&v2_id)?;
+
+        let rollout = store.create_rollout(
+            "reconcile-incomplete",
+            Some(&v1_id),
+            &v2_id,
+            "completed_incomplete",
+            Some("default"),
+            Some("auto"),
+            Some("createFirst"),
+            Some(false),
+            "{}",
+        )?;
+        store.append_rollout_event(
+            rollout.id,
+            &rollout.job_id,
+            None,
+            "warn",
+            "Rollout completed incompletely after capacity timeout",
+            None,
+        )?;
+
+        assert!(store.allocs_for_job_config(&v2_id)?.is_empty());
+        store.reschedule_allocations_for_new_node()?;
+        assert_eq!(store.allocs_for_job_config(&v2_id)?.len(), 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn incomplete_rollout_reconcile_attempts_placements() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "ready"))?;
+        store.insert_node(make_node_msg("node-b", "ready"))?;
+
+        let v1 = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "reconcile-incomplete-loop".into(),
+            tasks: vec![TaskConfig::new("web", "noop")],
+            version: None,
+        };
+        store.handle_job_submit(
+            &v1,
+            &[Submission {
+                path: "job.jsonnet".into(),
+                content: "{}".into(),
+                is_primary: true,
+            }],
+        )?;
+        let v1_id = store.get_job_config(&v1.name)?.id();
+
+        let v2 = JobConfig {
+            rollout: Some(RolloutConfig::default()),
+            rollout_by_group: Default::default(),
+            name: "reconcile-incomplete-loop".into(),
+            tasks: vec![TaskConfig {
+                config: json!({"version": 2}),
+                ..TaskConfig::new("web", "noop")
+            }],
+            version: None,
+        };
+        store.handle_job_submit(
+            &v2,
+            &[Submission {
+                path: "job.jsonnet".into(),
+                content: "{}".into(),
+                is_primary: true,
+            }],
+        )?;
+        let v2_id = store.get_job_config(&v2.name)?.id();
+        store.remove_allocs_for_job_config(&v2_id)?;
+
+        let _ = store.create_rollout(
+            "reconcile-incomplete-loop",
+            Some(&v1_id),
+            &v2_id,
+            "completed_incomplete",
+            Some("default"),
+            Some("auto"),
+            Some("createFirst"),
+            Some(false),
+            "{}",
+        )?;
+
+        assert!(store.allocs_for_job_config(&v2_id)?.is_empty());
+        let reconciled = store.reconcile_incomplete_rollouts()?;
+        assert_eq!(reconciled, 1);
+        assert_eq!(store.allocs_for_job_config(&v2_id)?.len(), 1);
 
         Ok(())
     }
