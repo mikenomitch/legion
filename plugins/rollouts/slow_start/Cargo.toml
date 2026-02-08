@@ -1,0 +1,10 @@
+[package]
+name = "slow_start"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+legion = { path = "../../..", version = "0.1.0" }
+
+[lib]
+crate-type = ["dylib"]

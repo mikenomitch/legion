@@ -1,3 +1,4 @@
+use crate::manager::rollout_strategy::validate_rollout_strategy_name;
 use crate::prelude::*;
 use crate::structs::{Allocation, JobConfig, TaskConfig, TaskDependencyCondition, TaskLifecycle};
 use crate::util::plugin_root_dir;
@@ -168,6 +169,18 @@ pub fn validate_job_config(config: &JobConfig) -> R<()> {
                 "Task {} can only set schedule when lifecycle is batch",
                 task.name
             );
+        }
+    }
+    config.validate_rollout()?;
+    if let Some(rollout) = config.rollout.as_ref() {
+        if let Some(strategy) = rollout.strategy.as_ref() {
+            validate_rollout_strategy_name(strategy).with_context(|| "invalid rollout.strategy")?;
+        }
+    }
+    for (group, rollout) in &config.rollout_by_group {
+        if let Some(strategy) = rollout.strategy.as_ref() {
+            validate_rollout_strategy_name(strategy)
+                .with_context(|| format!("invalid rolloutByGroup.{}.strategy", group))?;
         }
     }
     validate_task_dependencies(config)?;
@@ -424,6 +437,8 @@ mod tests {
     #[test]
     fn service_task_cannot_depend_on_service_completion() {
         let config = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
             name: "invalid".into(),
             tasks: vec![
                 TaskConfig {
@@ -483,6 +498,8 @@ mod tests {
     #[test]
     fn non_batch_task_cannot_define_schedule() {
         let config = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
             name: "invalid".into(),
             tasks: vec![TaskConfig {
                 lifecycle: TaskLifecycle::Service,
@@ -502,6 +519,8 @@ mod tests {
     #[test]
     fn sidecar_requires_primary_in_group() {
         let config = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
             name: "invalid".into(),
             tasks: vec![TaskConfig {
                 lifecycle: TaskLifecycle::Sidecar,
@@ -514,5 +533,45 @@ mod tests {
 
         let err = validate_job_config(&config).unwrap_err();
         assert!(err.to_string().contains("Sidecar task"));
+    }
+
+    #[test]
+    fn validates_default_rollout_strategy() -> R<()> {
+        let config = JobConfig {
+            rollout: Some(crate::structs::RolloutConfig {
+                strategy: Some("default".into()),
+                ..Default::default()
+            }),
+            rollout_by_group: Default::default(),
+            name: "valid-rollout-strategy".into(),
+            tasks: vec![TaskConfig {
+                config: json!({"command": ["true"]}),
+                ..TaskConfig::new("api", "exec")
+            }],
+            version: None,
+        };
+
+        validate_job_config(&config)?;
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_unknown_rollout_strategy() {
+        let config = JobConfig {
+            rollout: Some(crate::structs::RolloutConfig {
+                strategy: Some("does-not-exist".into()),
+                ..Default::default()
+            }),
+            rollout_by_group: Default::default(),
+            name: "invalid-rollout-strategy".into(),
+            tasks: vec![TaskConfig {
+                config: json!({"command": ["true"]}),
+                ..TaskConfig::new("api", "exec")
+            }],
+            version: None,
+        };
+
+        let err = validate_job_config(&config).expect_err("unknown strategy should fail");
+        assert!(err.to_string().contains("invalid rollout.strategy"));
     }
 }

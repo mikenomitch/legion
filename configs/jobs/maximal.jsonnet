@@ -1,6 +1,29 @@
 {
     name: "maximal-demo",
     version: 1,
+    rollout: {
+        strategy: "default",
+        progression: "auto",
+        replacement: "createFirst",
+        inPlace: false,
+        percentSteps: [10, 25, 50, 100],
+        stepStagger: "15s",
+        allocationStagger: "2s",
+        minHealthyTime: "10s",
+        healthyDeadline: "5m",
+        ignoreHealthChecks: false,
+        capacityBlockTimeout: "10m",
+        onCapacityTimeout: "rollback",
+        rollbackOnFailure: true,
+        onHealthDeadline: "rollback",
+        batchKillAfter: "30m",
+    },
+    rolloutByGroup: {
+        frontend: {
+            countEachStep: 1,
+            inPlace: true,
+        },
+    },
     tasks: [
         {
             name: "web",

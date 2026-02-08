@@ -597,6 +597,8 @@ fn task_config(
 
 fn job_alpha() -> JobConfig {
     JobConfig {
+        rollout: None,
+        rollout_by_group: Default::default(),
         name: "job-alpha".into(),
         tasks: vec![task_config(
             "alpha-task",
@@ -611,6 +613,8 @@ fn job_alpha() -> JobConfig {
 
 fn job_bravo() -> JobConfig {
     JobConfig {
+        rollout: None,
+        rollout_by_group: Default::default(),
         name: "job-bravo".into(),
         tasks: vec![task_config(
             "bravo-task",
@@ -625,6 +629,8 @@ fn job_bravo() -> JobConfig {
 
 fn job_charlie() -> JobConfig {
     JobConfig {
+        rollout: None,
+        rollout_by_group: Default::default(),
         name: "job-charlie".into(),
         tasks: vec![task_config(
             "charlie-task",
@@ -639,6 +645,8 @@ fn job_charlie() -> JobConfig {
 
 fn job_delta() -> JobConfig {
     JobConfig {
+        rollout: None,
+        rollout_by_group: Default::default(),
         name: "job-delta".into(),
         tasks: vec![task_config(
             "delta-task",
@@ -653,6 +661,8 @@ fn job_delta() -> JobConfig {
 
 fn job_echo() -> JobConfig {
     JobConfig {
+        rollout: None,
+        rollout_by_group: Default::default(),
         name: "job-echo".into(),
         tasks: vec![task_config(
             "echo-task",
@@ -667,6 +677,8 @@ fn job_echo() -> JobConfig {
 
 fn job_foxtrot() -> JobConfig {
     JobConfig {
+        rollout: None,
+        rollout_by_group: Default::default(),
         name: "job-foxtrot".into(),
         tasks: vec![task_config(
             "foxtrot-task",
@@ -681,6 +693,8 @@ fn job_foxtrot() -> JobConfig {
 
 fn job_golf() -> JobConfig {
     JobConfig {
+        rollout: None,
+        rollout_by_group: Default::default(),
         name: "job-golf".into(),
         tasks: vec![task_config(
             "golf-task",
@@ -698,6 +712,8 @@ fn job_golf() -> JobConfig {
 
 fn job_hotel() -> JobConfig {
     JobConfig {
+        rollout: None,
+        rollout_by_group: Default::default(),
         name: "job-hotel".into(),
         tasks: vec![task_config(
             "hotel-task",
@@ -712,6 +728,8 @@ fn job_hotel() -> JobConfig {
 
 fn job_india() -> JobConfig {
     JobConfig {
+        rollout: None,
+        rollout_by_group: Default::default(),
         name: "job-india".into(),
         tasks: vec![task_config(
             "india-task",
@@ -726,6 +744,8 @@ fn job_india() -> JobConfig {
 
 fn job_resubmit_config(message: &str, count: u32, node_id: &str) -> JobConfig {
     JobConfig {
+        rollout: None,
+        rollout_by_group: Default::default(),
         name: "job-resubmit".into(),
         tasks: vec![TaskConfig {
             count: TaskCount::new(count),
@@ -740,6 +760,8 @@ fn job_resubmit_config(message: &str, count: u32, node_id: &str) -> JobConfig {
 
 fn job_score_load() -> JobConfig {
     JobConfig {
+        rollout: None,
+        rollout_by_group: Default::default(),
         name: "job-score-load".into(),
         tasks: vec![task_config(
             "score-load-task",
@@ -754,6 +776,8 @@ fn job_score_load() -> JobConfig {
 
 fn job_score_target() -> JobConfig {
     JobConfig {
+        rollout: None,
+        rollout_by_group: Default::default(),
         name: "job-score-target".into(),
         tasks: vec![task_config(
             "score-target-task",
@@ -956,6 +980,8 @@ fn scheduler_count_per_attribute_reschedules_by_group() -> R<()> {
     }
 
     let job = JobConfig {
+        rollout: None,
+        rollout_by_group: Default::default(),
         name: "job-per-region".into(),
         tasks: vec![TaskConfig {
             count: TaskCount::per(3, "region"),
@@ -1019,6 +1045,8 @@ fn scheduler_count_per_id_scales_with_node_changes() -> R<()> {
     cluster.add_nodes(&nodes)?;
 
     let job = JobConfig {
+        rollout: None,
+        rollout_by_group: Default::default(),
         name: "job-per-id".into(),
         tasks: vec![TaskConfig {
             count: TaskCount::per(1, "id"),
@@ -1093,6 +1121,8 @@ fn scheduler_multi_job_churn_constraints_and_count_per_reschedule() -> R<()> {
     }
 
     let regional_job = JobConfig {
+        rollout: None,
+        rollout_by_group: Default::default(),
         name: "job-regional".into(),
         tasks: vec![TaskConfig {
             count: TaskCount::per(2, "region"),
@@ -1104,6 +1134,8 @@ fn scheduler_multi_job_churn_constraints_and_count_per_reschedule() -> R<()> {
     };
 
     let constrained_job = JobConfig {
+        rollout: None,
+        rollout_by_group: Default::default(),
         name: "job-constrained".into(),
         tasks: vec![TaskConfig {
             count: TaskCount::new(2),

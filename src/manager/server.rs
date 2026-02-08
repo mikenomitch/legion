@@ -1,25 +1,33 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::time::Duration;
 
 use crate::prelude::*;
 
 use crate::manager::dispatcher::build_task_allocation;
+use crate::manager::rollout::{
+    advance_rollout as advance_rollout_state, step_fractions_for_rollout,
+};
+use crate::manager::rollout_strategy;
 use crate::manager::scheduler::{PlanConfigOutcome, PlanMode, Scheduler};
 use crate::storage::errors::StorageError;
 use crate::storage::store::{JobKvReference, JobSubmitOutcome, Store};
 use crate::structs::manager_server::Manager;
 use crate::structs::{
-    worker_client::WorkerClient, AcquireKvLockReply, AcquireKvLockRequest, DeleteKvReply,
-    DeleteKvRequest, DestroyJobReply, DestroyJobRequest, FailedAllocation, GetJobInfoReply,
-    GetJobInfoRequest, GetJobSpecReply, GetJobSpecRequest, GetKvLockReply, GetKvLockRequest,
-    GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply,
-    GetManagerConfigsRequest, GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest,
-    HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, JobConfig, KvEntry,
-    KvValueType, LedgerNode, ListJobsReply, ListJobsRequest, ListKvReply, ListKvRequest, Node,
-    NodeMsg, PatchKvReply, PatchKvRequest, PlanJobReply, PlanJobRequest, PlannedAllocation,
-    PutKvReply, PutKvRequest, ReleaseKvLockReply, ReleaseKvLockRequest, RenewKvLockReply,
-    RenewKvLockRequest, RestartWorkerReply, RestartWorkerRequest, RunJobReply, RunJobRequest,
-    StopJobReply, StopJobRequest, TaskConfig, TaskOnUnhealthyConfig, UpdateNodeDynamicReply,
+    worker_client::WorkerClient, AcquireKvLockReply, AcquireKvLockRequest, AdvanceRolloutReply,
+    AdvanceRolloutRequest, AllocationHealth, DeleteKvReply, DeleteKvRequest, DestroyJobReply,
+    DestroyJobRequest, FailedAllocation, GetJobInfoReply, GetJobInfoRequest, GetJobSpecReply,
+    GetJobSpecRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply,
+    GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest, GetNodeReply,
+    GetNodeRequest, GetNodesReply, GetNodesRequest, GetRolloutReply, GetRolloutRequest,
+    GetRolloutStatusReply, GetRolloutStatusRequest, HealthCheckReply, HealthCheckRequest,
+    HeartbeatReply, HeartbeatRequest, JobConfig, KvEntry, KvValueType, LedgerNode, ListJobsReply,
+    ListJobsRequest, ListKvReply, ListKvRequest, ListRolloutEventsReply, ListRolloutEventsRequest,
+    ListRolloutsReply, ListRolloutsRequest, Node, NodeMsg, PatchKvReply, PatchKvRequest,
+    PlanJobReply, PlanJobRequest, PlannedAllocation, PutKvReply, PutKvRequest, ReleaseKvLockReply,
+    ReleaseKvLockRequest, RenewKvLockReply, RenewKvLockRequest, RestartWorkerReply,
+    RestartWorkerRequest, RolloutAllocationStatus, RolloutEvent, RolloutGroupStatus,
+    RolloutProgression, RolloutReplacement, RunJobReply, RunJobRequest, StopJobReply,
+    StopJobRequest, TaskConfig, TaskOnUnhealthyConfig, UpdateNodeDynamicReply,
     UpdateNodeDynamicRequest, WorkerConfig, WorkerPreRegisterReply, WorkerPreRegisterRequest,
     WorkerRegisterReply, WorkerRegisterRequest,
 };
@@ -229,6 +237,65 @@ fn apply_kv_references_to_config(
     Ok(updated)
 }
 
+#[derive(Debug, Clone)]
+struct RolloutLaunchConfig {
+    config_json: String,
+    strategy: Option<String>,
+    progression: Option<String>,
+    replacement: Option<String>,
+    in_place: Option<bool>,
+    is_manual: bool,
+}
+
+fn rollout_progression_name(value: &RolloutProgression) -> &'static str {
+    match value {
+        RolloutProgression::Auto => "auto",
+        RolloutProgression::Manual => "manual",
+    }
+}
+
+fn rollout_replacement_name(value: &RolloutReplacement) -> &'static str {
+    match value {
+        RolloutReplacement::DestroyFirst => "destroyFirst",
+        RolloutReplacement::CreateFirst => "createFirst",
+    }
+}
+
+fn build_rollout_launch_config(config: &JobConfig) -> Result<RolloutLaunchConfig, Status> {
+    let config_json = serde_json::to_string(&json!({
+        "rollout": &config.rollout,
+        "rolloutByGroup": &config.rollout_by_group,
+    }))
+    .map_err(|e| Status::internal(format!("Error serializing rollout config: {e}")))?;
+
+    let strategy = config
+        .rollout
+        .as_ref()
+        .and_then(|rollout| rollout.strategy.clone())
+        .or_else(|| Some("default".to_string()));
+    let progression = config
+        .rollout
+        .as_ref()
+        .and_then(|rollout| rollout.progression.as_ref())
+        .map(|value| rollout_progression_name(value).to_string());
+    let replacement = config
+        .rollout
+        .as_ref()
+        .and_then(|rollout| rollout.replacement.as_ref())
+        .map(|value| rollout_replacement_name(value).to_string());
+    let in_place = config.rollout.as_ref().and_then(|rollout| rollout.in_place);
+    let is_manual = progression.as_deref() == Some("manual");
+
+    Ok(RolloutLaunchConfig {
+        config_json,
+        strategy,
+        progression,
+        replacement,
+        in_place,
+        is_manual,
+    })
+}
+
 #[derive(Debug)]
 pub struct ManagerAgentService {
     pub store: Store,
@@ -241,6 +308,58 @@ impl ManagerAgentService {
             store,
             allocation_failures: Arc::new(Mutex::new(AllocationFailureTracker::default())),
         }
+    }
+
+    fn create_rollout_for_update(
+        &self,
+        job_id: &str,
+        previous_job_config_id: Option<&str>,
+        new_job_config_id: &str,
+        config: &JobConfig,
+        create_error: &str,
+    ) -> Result<bool, Status> {
+        let launch = build_rollout_launch_config(config)?;
+        let status = if launch.is_manual {
+            "waiting_manual_start"
+        } else {
+            "pending"
+        };
+        let rollout = self
+            .store
+            .create_rollout(
+                job_id,
+                previous_job_config_id,
+                new_job_config_id,
+                status,
+                launch.strategy.as_deref(),
+                launch.progression.as_deref(),
+                launch.replacement.as_deref(),
+                launch.in_place,
+                &launch.config_json,
+            )
+            .map_err(|e| map_store_error(create_error, e))?;
+        self.store
+            .append_rollout_event(
+                rollout.id,
+                &rollout.job_id,
+                None,
+                "info",
+                if launch.is_manual {
+                    "Rollout created; waiting for manual start"
+                } else {
+                    "Rollout started"
+                },
+                Some(
+                    &json!({
+                        "status": rollout.status,
+                        "progression": rollout.progression,
+                    })
+                    .to_string(),
+                ),
+            )
+            .map_err(|e| map_store_error("Error writing rollout event", e))?;
+
+        Ok(launch.is_manual)
     }
 
     fn handle_kv_change(&self, key: &str) -> Result<(), Status> {
@@ -300,15 +419,29 @@ impl ManagerAgentService {
                 continue;
             }
 
-            self.store
-                .enqueue_eval(
-                    "job_update",
-                    Some(&job_id),
-                    Some(&new_job_config_id),
-                    None,
-                    Some(self.store.default_eval_priority),
-                )
-                .map_err(|e| map_store_error("Error scheduling kv update", e))?;
+            let previous_job_config_id = self
+                .store
+                .previous_job_config_id(&new_job_config_id)
+                .map_err(|e| map_store_error("Error loading previous job config", e))?;
+            let is_manual = self.create_rollout_for_update(
+                &job_id,
+                previous_job_config_id.as_deref(),
+                &new_job_config_id,
+                &updated_config,
+                "Error creating rollout for kv update",
+            )?;
+
+            if !is_manual {
+                self.store
+                    .enqueue_eval(
+                        "rollout_tick",
+                        Some(&job_id),
+                        Some(&new_job_config_id),
+                        None,
+                        Some(self.store.default_eval_priority),
+                    )
+                    .map_err(|e| map_store_error("Error scheduling kv update rollout", e))?;
+            }
         }
 
         Ok(())
@@ -326,6 +459,7 @@ struct AllocationFailureContext {
     job_id: String,
     job_config_id: String,
     task_config_id: i64,
+    node_id: String,
     on_unhealthy: TaskOnUnhealthyConfig,
 }
 
@@ -386,8 +520,25 @@ impl Manager for ManagerAgentService {
                     (None, "Job config unchanged; no update needed")
                 }
             }
-            JobSubmitOutcome::Created { .. } | JobSubmitOutcome::Updated { .. } => {
-                (Some("job_submit"), "Job submit success")
+            JobSubmitOutcome::Created { .. } => (Some("job_submit"), "Job submit success"),
+            JobSubmitOutcome::Updated { .. } => {
+                let previous_job_config_id = self
+                    .store
+                    .previous_job_config_id(&job_config_id)
+                    .map_err(|e| map_store_error("Error loading previous job config", e))?;
+                let is_manual = self.create_rollout_for_update(
+                    &config.name,
+                    previous_job_config_id.as_deref(),
+                    &job_config_id,
+                    &config,
+                    "Error creating rollout",
+                )?;
+
+                if is_manual {
+                    (None, "Rollout created; waiting for manual start")
+                } else {
+                    (Some("rollout_tick"), "Rollout started")
+                }
             }
         };
 
@@ -425,6 +576,109 @@ impl Manager for ManagerAgentService {
         let reply = GetJobInfoReply { job: Some(job) };
 
         Ok(Response::new(reply))
+    }
+
+    #[instrument(skip_all)]
+    async fn list_rollouts(
+        &self,
+        request: Request<ListRolloutsRequest>,
+    ) -> Result<Response<ListRolloutsReply>, Status> {
+        let request = request.into_inner();
+        let job_id = request
+            .job_id
+            .as_deref()
+            .filter(|job| !job.trim().is_empty());
+        let rollouts = self
+            .store
+            .list_rollouts(job_id, request.active_only)
+            .map_err(|e| map_store_error("Error listing rollouts", e))?;
+
+        Ok(Response::new(ListRolloutsReply { rollouts }))
+    }
+
+    #[instrument(skip_all)]
+    async fn get_rollout(
+        &self,
+        request: Request<GetRolloutRequest>,
+    ) -> Result<Response<GetRolloutReply>, Status> {
+        let request = request.into_inner();
+        let rollout = self
+            .store
+            .get_rollout(request.id)
+            .map_err(|e| map_store_error("Error loading rollout", e))?;
+        Ok(Response::new(GetRolloutReply { rollout }))
+    }
+
+    #[instrument(skip_all)]
+    async fn get_rollout_status(
+        &self,
+        request: Request<GetRolloutStatusRequest>,
+    ) -> Result<Response<GetRolloutStatusReply>, Status> {
+        let request = request.into_inner();
+        let rollout = self
+            .store
+            .get_rollout(request.id)
+            .map_err(|e| map_store_error("Error loading rollout", e))?;
+        let Some(rollout) = rollout else {
+            return Ok(Response::new(GetRolloutStatusReply {
+                rollout: None,
+                groups: Vec::new(),
+            }));
+        };
+        let groups = build_rollout_group_status(&self.store, &rollout)
+            .map_err(|e| map_store_error("Error building rollout status", e))?;
+
+        Ok(Response::new(GetRolloutStatusReply {
+            rollout: Some(rollout),
+            groups,
+        }))
+    }
+
+    #[instrument(skip_all)]
+    async fn list_rollout_events(
+        &self,
+        request: Request<ListRolloutEventsRequest>,
+    ) -> Result<Response<ListRolloutEventsReply>, Status> {
+        let request = request.into_inner();
+        if request.rollout_id <= 0 {
+            return Err(Status::invalid_argument(
+                "rollout_id must be greater than 0",
+            ));
+        }
+        let events = self
+            .store
+            .list_rollout_events(request.rollout_id, request.limit)
+            .map_err(|e| map_store_error("Error listing rollout events", e))?
+            .into_iter()
+            .map(|event| RolloutEvent {
+                id: event.id,
+                rollout_id: event.rollout_id,
+                job_id: event.job_id,
+                group_name: event.group_name,
+                level: event.level,
+                message: event.message,
+                metadata_json: event.metadata_json,
+                created_at: event.created_at,
+            })
+            .collect::<Vec<_>>();
+
+        Ok(Response::new(ListRolloutEventsReply { events }))
+    }
+
+    #[instrument(skip_all)]
+    async fn advance_rollout(
+        &self,
+        request: Request<AdvanceRolloutRequest>,
+    ) -> Result<Response<AdvanceRolloutReply>, Status> {
+        let request = request.into_inner();
+        let priority = request.priority.unwrap_or(self.store.default_eval_priority);
+        let rollout = advance_rollout_state(&self.store, request.id, &request.groups, priority)
+            .map_err(|e| Status::invalid_argument(format!("Error advancing rollout: {e}")))?;
+
+        Ok(Response::new(AdvanceRolloutReply {
+            message: "Rollout advance queued".to_string(),
+            rollout: Some(rollout),
+        }))
     }
 
     #[instrument(skip_all)]
@@ -662,6 +916,15 @@ impl Manager for ManagerAgentService {
             &req.failed_allocations,
         ) {
             error!(node_id = %id, error = ?err, "Error handling failed allocations");
+        }
+        if let Err(err) =
+            update_allocation_health_snapshots(&self.store, &id, &req.allocation_health)
+        {
+            error!(
+                node_id = %id,
+                error = ?err,
+                "Error updating allocation health snapshots"
+            );
         }
 
         let desired_allocations = build_desired_allocations(&self.store, &id, &req.allocation_ids)
@@ -1073,6 +1336,15 @@ fn handle_failed_allocations(
             );
             continue;
         };
+        if context.node_id != node_id {
+            warn!(
+                allocation_id,
+                reported_node_id = %node_id,
+                owner_node_id = %context.node_id,
+                "Ignoring failed allocation report from non-owner node"
+            );
+            continue;
+        }
 
         store.remove_allocation_by_id(allocation_id)?;
 
@@ -1115,6 +1387,18 @@ fn handle_failed_allocations(
     }
 
     Ok(())
+}
+
+fn update_allocation_health_snapshots(
+    store: &Store,
+    node_id: &str,
+    snapshots: &[AllocationHealth],
+) -> R<()> {
+    if snapshots.is_empty() {
+        return Ok(());
+    }
+
+    store.upsert_allocation_health_snapshots(node_id, snapshots)
 }
 
 enum MoveDecision {
@@ -1204,6 +1488,7 @@ impl AllocationFailureTracker {
             job_id: allocation.job_id,
             job_config_id: allocation.job_config_id,
             task_config_id: allocation.task_config_id,
+            node_id: allocation.node_id,
             on_unhealthy: task.on_unhealthy,
         };
         self.allocations.insert(allocation_id, context.clone());
@@ -1239,25 +1524,204 @@ fn time_duration(duration: Duration) -> TimeDuration {
     TimeDuration::seconds(secs) + TimeDuration::nanoseconds(nanos)
 }
 
+fn build_rollout_group_status(
+    store: &Store,
+    rollout: &crate::structs::Rollout,
+) -> R<Vec<RolloutGroupStatus>> {
+    let to_config = store.get_job_config_by_id(&rollout.to_job_config_id)?;
+    let to_tasks = store.get_task_configs_for_job_config(&rollout.to_job_config_id)?;
+    let from_tasks = if let Some(from_job_config_id) = rollout.from_job_config_id.as_deref() {
+        store.get_task_configs_for_job_config(from_job_config_id)?
+    } else {
+        Vec::new()
+    };
+    let to_allocations = store.allocs_for_job_config(&rollout.to_job_config_id)?;
+    let from_allocations = if let Some(from_job_config_id) = rollout.from_job_config_id.as_deref() {
+        store.allocs_for_job_config(from_job_config_id)?
+    } else {
+        Vec::new()
+    };
+    let mut allocation_ids = to_allocations
+        .iter()
+        .map(|allocation| allocation.id)
+        .collect::<Vec<_>>();
+    allocation_ids.extend(from_allocations.iter().map(|allocation| allocation.id));
+    let allocation_health = store.allocation_health_for_allocations(&allocation_ids)?;
+
+    let runtime_groups = rollout
+        .config_json
+        .parse::<Value>()
+        .ok()
+        .and_then(|raw| raw.get("runtime").cloned())
+        .and_then(|runtime| runtime.get("groups").cloned())
+        .and_then(|groups| groups.as_object().cloned())
+        .unwrap_or_default();
+
+    let node_health = store
+        .get_nodes()?
+        .into_iter()
+        .map(|node| (node.id.clone(), derive_node_health(&node.health_checks)))
+        .collect::<HashMap<_, _>>();
+
+    let mut to_by_id = HashMap::new();
+    let mut from_by_id = HashMap::new();
+    let mut groups = BTreeSet::new();
+    let mut desired_count_by_group = HashMap::new();
+    for task in &to_config.tasks {
+        desired_count_by_group
+            .entry(task.group.clone())
+            .and_modify(|count: &mut u32| *count = (*count).max(task.count.num))
+            .or_insert(task.count.num);
+    }
+    for (task_id, task) in to_tasks {
+        groups.insert(task.group.clone());
+        to_by_id.insert(task_id, task);
+    }
+    for (task_id, task) in from_tasks {
+        groups.insert(task.group.clone());
+        from_by_id.insert(task_id, task);
+    }
+    groups.extend(runtime_groups.keys().cloned());
+
+    let mut allocations_by_group: HashMap<String, Vec<RolloutAllocationStatus>> = HashMap::new();
+    for allocation in &to_allocations {
+        let Some(task) = to_by_id.get(&allocation.task_config_id) else {
+            continue;
+        };
+        allocations_by_group
+            .entry(task.group.clone())
+            .or_default()
+            .push(RolloutAllocationStatus {
+                allocation_id: allocation.id,
+                node_id: allocation.node_id.clone(),
+                task_config_id: allocation.task_config_id,
+                task_name: task.name.clone(),
+                task_group: task.group.clone(),
+                lifecycle: task.lifecycle.to_string(),
+                status: allocation.status.clone(),
+                role: "replacement".to_string(),
+                node_healthy: node_health
+                    .get(&allocation.node_id)
+                    .and_then(|value| *value),
+                allocation_healthy: allocation_health.get(&allocation.id).map(|h| h.healthy),
+                allocation_health: allocation_health
+                    .get(&allocation.id)
+                    .map(|h| h.status.clone()),
+            });
+    }
+    for allocation in &from_allocations {
+        let Some(task) = from_by_id.get(&allocation.task_config_id) else {
+            continue;
+        };
+        allocations_by_group
+            .entry(task.group.clone())
+            .or_default()
+            .push(RolloutAllocationStatus {
+                allocation_id: allocation.id,
+                node_id: allocation.node_id.clone(),
+                task_config_id: allocation.task_config_id,
+                task_name: task.name.clone(),
+                task_group: task.group.clone(),
+                lifecycle: task.lifecycle.to_string(),
+                status: allocation.status.clone(),
+                role: "replacee".to_string(),
+                node_healthy: node_health
+                    .get(&allocation.node_id)
+                    .and_then(|value| *value),
+                allocation_healthy: allocation_health.get(&allocation.id).map(|h| h.healthy),
+                allocation_health: allocation_health
+                    .get(&allocation.id)
+                    .map(|h| h.status.clone()),
+            });
+    }
+
+    let mut group_statuses = Vec::new();
+    for group in groups {
+        let runtime = runtime_groups.get(&group);
+        let step_index = runtime
+            .and_then(|value| value.get("stepIndex"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as u32;
+        let pending_manual_advances = runtime
+            .and_then(|value| value.get("pendingManualAdvances"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as u32;
+        let base_count = desired_count_by_group.get(&group).copied().unwrap_or(1);
+        let configured_rollout = to_config
+            .rollout_config_for_group(&group)
+            .or_else(|| to_config.rollout.clone())
+            .unwrap_or_default();
+        let effective_rollout =
+            rollout_strategy::resolve_rollout_strategy(configured_rollout, &group, base_count)?;
+        let total_steps = step_fractions_for_rollout(&effective_rollout, base_count).len() as u32;
+
+        let mut allocations = allocations_by_group.remove(&group).unwrap_or_default();
+        allocations.sort_by_key(|entry| entry.allocation_id);
+
+        group_statuses.push(RolloutGroupStatus {
+            group,
+            step_index,
+            total_steps,
+            pending_manual_advances,
+            allocations,
+        });
+    }
+
+    Ok(group_statuses)
+}
+
+fn derive_node_health(value: &Value) -> Option<bool> {
+    match value {
+        Value::Bool(flag) => Some(*flag),
+        Value::String(text) => Some(text.eq_ignore_ascii_case("pass")),
+        Value::Array(values) => {
+            let mut seen = false;
+            let mut all_ok = true;
+            for item in values {
+                if let Some(ok) = derive_node_health(item) {
+                    seen = true;
+                    all_ok &= ok;
+                }
+            }
+            if seen {
+                Some(all_ok)
+            } else {
+                None
+            }
+        }
+        Value::Object(map) => {
+            let mut seen = false;
+            let mut all_ok = true;
+            for entry in map.values() {
+                if let Some(ok) = derive_node_health(entry) {
+                    seen = true;
+                    all_ok &= ok;
+                }
+            }
+            if seen {
+                Some(all_ok)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 fn build_desired_allocations(
     store: &Store,
     node_id: &str,
-    reported_allocations: &[i64],
+    _reported_allocations: &[i64],
 ) -> R<Vec<crate::structs::TaskAllocation>> {
     let desired = store.allocs_for_node(node_id)?;
     if desired.is_empty() {
         return Ok(Vec::new());
     }
 
-    let reported: std::collections::HashSet<i64> = reported_allocations.iter().copied().collect();
     let mut task_cache: HashMap<String, HashMap<i64, TaskConfig>> = HashMap::new();
     let mut allocations = Vec::new();
 
     for allocation in desired {
-        if reported.contains(&allocation.id) {
-            continue;
-        }
-
         let tasks = task_cache
             .entry(allocation.job_config_id.clone())
             .or_insert_with(HashMap::new);
@@ -1282,8 +1746,9 @@ mod tests {
     use crate::structs::config::ManagerConfigFull;
     use crate::structs::worker_server::Worker;
     use crate::structs::{
-        Eval, JobConfig, NodeMsg, PostWorkReply, PostWorkRequest, PutKvRequest, RestartWorkerReply,
-        RestartWorkerRequest, RunJobRequest, Submission, TaskConfig, UpdateNodeDynamicRequest,
+        AllocationHealth, Eval, JobConfig, ListRolloutEventsRequest, NodeMsg, PostWorkReply,
+        PostWorkRequest, PutKvRequest, RestartWorkerReply, RestartWorkerRequest, RunJobRequest,
+        Submission, TaskConfig, UpdateNodeDynamicRequest,
     };
     use serde_json::{json, Map, Value};
     use tempfile::Builder;
@@ -1338,6 +1803,47 @@ mod tests {
             content: "{}".into(),
             is_primary: true,
         }
+    }
+
+    #[test]
+    fn rollout_launch_config_defaults_to_default_strategy() -> R<()> {
+        let config = JobConfig {
+            name: "rollout-defaults".into(),
+            tasks: vec![TaskConfig::new("api", "noop")],
+            rollout: None,
+            rollout_by_group: Default::default(),
+            version: None,
+        };
+        let launch = build_rollout_launch_config(&config)?;
+        assert_eq!(launch.strategy.as_deref(), Some("default"));
+        assert!(launch.progression.is_none());
+        assert!(launch.replacement.is_none());
+        assert_eq!(launch.in_place, None);
+        assert!(!launch.is_manual);
+        assert!(launch.config_json.contains("\"rolloutByGroup\":{}"));
+        Ok(())
+    }
+
+    #[test]
+    fn rollout_launch_config_serializes_manual_create_first() -> R<()> {
+        let config = JobConfig {
+            name: "rollout-manual".into(),
+            tasks: vec![TaskConfig::new("api", "noop")],
+            rollout: Some(crate::structs::RolloutConfig {
+                progression: Some(RolloutProgression::Manual),
+                replacement: Some(RolloutReplacement::CreateFirst),
+                in_place: Some(true),
+                ..Default::default()
+            }),
+            rollout_by_group: Default::default(),
+            version: None,
+        };
+        let launch = build_rollout_launch_config(&config)?;
+        assert_eq!(launch.progression.as_deref(), Some("manual"));
+        assert_eq!(launch.replacement.as_deref(), Some("createFirst"));
+        assert_eq!(launch.in_place, Some(true));
+        assert!(launch.is_manual);
+        Ok(())
     }
 
     #[derive(Debug, Clone)]
@@ -1490,8 +1996,8 @@ mod tests {
         assert!(
             evals
                 .iter()
-                .any(|eval| eval.kind == "job_update" && eval.job_id == "kv-job"),
-            "expected job_update eval after kv change"
+                .any(|eval| eval.kind == "rollout_tick" && eval.job_id == "kv-job"),
+            "expected rollout_tick eval after kv change"
         );
 
         Ok(())
@@ -1533,6 +2039,8 @@ mod tests {
             ..TaskConfig::new("task", "noop")
         };
         let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
             name: job_name.clone(),
             tasks: vec![task],
             version: None,
@@ -1598,6 +2106,8 @@ mod tests {
         insert_node(&store, "node-a")?;
 
         let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
             name: "job".into(),
             tasks: vec![TaskConfig {
                 on_unhealthy: TaskOnUnhealthyConfig {
@@ -1636,11 +2146,433 @@ mod tests {
     }
 
     #[test]
-    fn desired_allocations_ignore_reported() -> R<()> {
+    fn failed_allocations_from_non_owner_node_are_ignored() -> R<()> {
+        let store = setup_store()?;
+        insert_node(&store, "node-a")?;
+        insert_node(&store, "node-b")?;
+
+        let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "job-non-owner".into(),
+            tasks: vec![TaskConfig::new("task", "noop")],
+            version: None,
+        };
+        store.handle_job_submit(&job, &[submission()])?;
+        let job_config_id = store.get_job_config(&job.name)?.id();
+        let task_id = store.get_task_configs_for_job_config(&job_config_id)?[0].0;
+        let allocation = store.place_alloc("node-a", task_id)?;
+
+        let tracker = Arc::new(Mutex::new(AllocationFailureTracker::default()));
+        handle_failed_allocations(
+            &store,
+            &tracker,
+            "node-b",
+            &[FailedAllocation {
+                allocation_id: allocation.id,
+                reason: "spoofed".into(),
+            }],
+        )?;
+        std::thread::sleep(Duration::from_millis(10));
+
+        assert!(store.get_allocation_by_id(allocation.id)?.is_some());
+        let evals = store.get_evals()?;
+        assert!(evals.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn allocation_health_snapshots_upsert() -> R<()> {
+        let store = setup_store()?;
+        insert_node(&store, "node-a")?;
+        insert_node(&store, "node-b")?;
+        let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "health-upsert".into(),
+            tasks: vec![TaskConfig::new("task", "noop")],
+            version: None,
+        };
+        store.handle_job_submit(&job, &[submission()])?;
+        let job_config_id = store.get_job_config(&job.name)?.id();
+        let task_id = store.get_task_configs_for_job_config(&job_config_id)?[0].0;
+        let allocation = store.place_alloc("node-a", task_id)?;
+
+        update_allocation_health_snapshots(
+            &store,
+            "node-a",
+            &[AllocationHealth {
+                allocation_id: allocation.id,
+                healthy: false,
+                status: "starting".into(),
+            }],
+        )?;
+        update_allocation_health_snapshots(
+            &store,
+            "node-a",
+            &[AllocationHealth {
+                allocation_id: allocation.id,
+                healthy: true,
+                status: "healthy".into(),
+            }],
+        )?;
+
+        let health = store.allocation_health_for_allocations(&[allocation.id])?;
+        let entry = health
+            .get(&allocation.id)
+            .context("missing allocation health")?;
+        assert!(entry.healthy);
+        assert_eq!(entry.status, "healthy");
+
+        update_allocation_health_snapshots(
+            &store,
+            "node-b",
+            &[AllocationHealth {
+                allocation_id: allocation.id,
+                healthy: false,
+                status: "wrong node".into(),
+            }],
+        )?;
+        let health = store.allocation_health_for_allocations(&[allocation.id])?;
+        let entry = health
+            .get(&allocation.id)
+            .context("missing allocation health after non-owner write attempt")?;
+        assert!(entry.healthy);
+        assert_eq!(entry.status, "healthy");
+        assert_eq!(entry.node_id, "node-a");
+
+        Ok(())
+    }
+
+    #[test]
+    fn rollout_group_status_includes_allocation_health() -> R<()> {
+        let store = setup_store()?;
+        insert_node(&store, "node-a")?;
+
+        let v1 = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "rollout-health".into(),
+            tasks: vec![TaskConfig {
+                group: "web".into(),
+                config: json!({ "version": 1 }),
+                ..TaskConfig::new("api", "noop")
+            }],
+            version: None,
+        };
+        store.handle_job_submit(&v1, &[submission()])?;
+        let v1_id = store.get_job_config(&v1.name)?.id();
+        let v1_task_id = store.get_task_configs_for_job_config(&v1_id)?[0].0;
+        let old_alloc = store.place_alloc("node-a", v1_task_id)?;
+
+        let v2 = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "rollout-health".into(),
+            tasks: vec![TaskConfig {
+                group: "web".into(),
+                config: json!({ "version": 2 }),
+                ..TaskConfig::new("api", "noop")
+            }],
+            version: None,
+        };
+        store.handle_job_submit(&v2, &[submission()])?;
+        let v2_id = store.get_job_config(&v2.name)?.id();
+        let v2_task_id = store.get_task_configs_for_job_config(&v2_id)?[0].0;
+        let new_alloc = store.place_alloc("node-a", v2_task_id)?;
+
+        let rollout = store.create_rollout(
+            "rollout-health",
+            Some(&v1_id),
+            &v2_id,
+            "running",
+            Some("default"),
+            Some("manual"),
+            Some("createFirst"),
+            Some(false),
+            r#"{"runtime":{"groups":{"web":{"stepIndex":1,"pendingManualAdvances":2}}}}"#,
+        )?;
+
+        update_allocation_health_snapshots(
+            &store,
+            "node-a",
+            &[AllocationHealth {
+                allocation_id: new_alloc.id,
+                healthy: true,
+                status: "http passed".into(),
+            }],
+        )?;
+        let groups = build_rollout_group_status(&store, &rollout)?;
+        let web = groups
+            .iter()
+            .find(|group| group.group == "web")
+            .context("missing web group")?;
+        assert_eq!(web.step_index, 1);
+        assert_eq!(web.pending_manual_advances, 2);
+        assert!(web
+            .allocations
+            .iter()
+            .any(|allocation| allocation.allocation_id == old_alloc.id));
+        let replacement = web
+            .allocations
+            .iter()
+            .find(|allocation| allocation.allocation_id == new_alloc.id)
+            .context("missing replacement allocation")?;
+        assert_eq!(replacement.role, "replacement");
+        assert_eq!(replacement.allocation_healthy, Some(true));
+        assert_eq!(
+            replacement.allocation_health.as_deref(),
+            Some("http passed")
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn rollout_group_status_partitions_allocations_by_group() -> R<()> {
+        let store = setup_store()?;
+        insert_node(&store, "node-a")?;
+
+        let v1 = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "rollout-groups".into(),
+            tasks: vec![
+                TaskConfig {
+                    group: "web".into(),
+                    config: json!({ "version": 1 }),
+                    ..TaskConfig::new("web-task", "noop")
+                },
+                TaskConfig {
+                    group: "api".into(),
+                    config: json!({ "version": 1 }),
+                    ..TaskConfig::new("api-task", "noop")
+                },
+            ],
+            version: None,
+        };
+        store.handle_job_submit(&v1, &[submission()])?;
+        let v1_id = store.get_job_config(&v1.name)?.id();
+        let v1_tasks = store.get_task_configs_for_job_config(&v1_id)?;
+        let v1_web = v1_tasks
+            .iter()
+            .find(|(_, task)| task.group == "web")
+            .map(|(id, _)| *id)
+            .context("missing v1 web task")?;
+        let v1_api = v1_tasks
+            .iter()
+            .find(|(_, task)| task.group == "api")
+            .map(|(id, _)| *id)
+            .context("missing v1 api task")?;
+        let old_web = store.place_alloc("node-a", v1_web)?;
+        let old_api = store.place_alloc("node-a", v1_api)?;
+
+        let v2 = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "rollout-groups".into(),
+            tasks: vec![
+                TaskConfig {
+                    group: "web".into(),
+                    config: json!({ "version": 2 }),
+                    ..TaskConfig::new("web-task", "noop")
+                },
+                TaskConfig {
+                    group: "api".into(),
+                    config: json!({ "version": 2 }),
+                    ..TaskConfig::new("api-task", "noop")
+                },
+            ],
+            version: None,
+        };
+        store.handle_job_submit(&v2, &[submission()])?;
+        let v2_id = store.get_job_config(&v2.name)?.id();
+        let v2_tasks = store.get_task_configs_for_job_config(&v2_id)?;
+        let v2_web = v2_tasks
+            .iter()
+            .find(|(_, task)| task.group == "web")
+            .map(|(id, _)| *id)
+            .context("missing v2 web task")?;
+        let v2_api = v2_tasks
+            .iter()
+            .find(|(_, task)| task.group == "api")
+            .map(|(id, _)| *id)
+            .context("missing v2 api task")?;
+        let new_web = store.place_alloc("node-a", v2_web)?;
+        let new_api = store.place_alloc("node-a", v2_api)?;
+
+        update_allocation_health_snapshots(
+            &store,
+            "node-a",
+            &[
+                AllocationHealth {
+                    allocation_id: new_web.id,
+                    healthy: true,
+                    status: "healthy".into(),
+                },
+                AllocationHealth {
+                    allocation_id: new_api.id,
+                    healthy: false,
+                    status: "starting".into(),
+                },
+            ],
+        )?;
+
+        let rollout = store.create_rollout(
+            "rollout-groups",
+            Some(&v1_id),
+            &v2_id,
+            "running",
+            Some("default"),
+            Some("manual"),
+            Some("createFirst"),
+            Some(false),
+            r#"{"runtime":{"groups":{"web":{"stepIndex":1},"api":{"stepIndex":0},"ghost":{"stepIndex":0}}}}"#,
+        )?;
+
+        let groups = build_rollout_group_status(&store, &rollout)?;
+        let web = groups
+            .iter()
+            .find(|group| group.group == "web")
+            .context("missing web group")?;
+        let api = groups
+            .iter()
+            .find(|group| group.group == "api")
+            .context("missing api group")?;
+        let ghost = groups
+            .iter()
+            .find(|group| group.group == "ghost")
+            .context("missing runtime-only group")?;
+
+        assert_eq!(web.allocations.len(), 2);
+        assert!(web
+            .allocations
+            .iter()
+            .all(|allocation| allocation.task_group == "web"));
+        assert!(web
+            .allocations
+            .iter()
+            .any(|allocation| allocation.allocation_id == old_web.id));
+        assert!(web
+            .allocations
+            .iter()
+            .any(|allocation| allocation.allocation_id == new_web.id));
+
+        assert_eq!(api.allocations.len(), 2);
+        assert!(api
+            .allocations
+            .iter()
+            .all(|allocation| allocation.task_group == "api"));
+        assert!(api
+            .allocations
+            .iter()
+            .any(|allocation| allocation.allocation_id == old_api.id));
+        assert!(api
+            .allocations
+            .iter()
+            .any(|allocation| allocation.allocation_id == new_api.id));
+        assert_eq!(ghost.allocations.len(), 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn derive_node_health_handles_nested_objects() {
+        let checks = json!({
+            "network": "pass",
+            "plugins": {
+                "exec": true,
+                "container": "pass"
+            }
+        });
+        assert_eq!(derive_node_health(&checks), Some(true));
+
+        let checks = json!({
+            "network": "pass",
+            "plugins": {
+                "exec": true,
+                "container": "fail"
+            }
+        });
+        assert_eq!(derive_node_health(&checks), Some(false));
+    }
+
+    #[tokio::test]
+    async fn list_rollout_events_returns_persisted_events() -> R<()> {
+        let store = setup_store()?;
+        let manager = ManagerAgentService::new(store.clone());
+        insert_node(&store, "node-a")?;
+
+        let v1 = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "rollout-events-api".into(),
+            tasks: vec![TaskConfig {
+                group: "web".into(),
+                ..TaskConfig::new("api", "noop")
+            }],
+            version: None,
+        };
+        store.handle_job_submit(&v1, &[submission()])?;
+        let v1_id = store.get_job_config(&v1.name)?.id();
+
+        let v2 = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "rollout-events-api".into(),
+            tasks: vec![TaskConfig {
+                group: "web".into(),
+                config: json!({ "version": 2 }),
+                ..TaskConfig::new("api", "noop")
+            }],
+            version: None,
+        };
+        store.handle_job_submit(&v2, &[submission()])?;
+        let v2_id = store.get_job_config(&v2.name)?.id();
+        let rollout = store.create_rollout(
+            "rollout-events-api",
+            Some(&v1_id),
+            &v2_id,
+            "running",
+            Some("default"),
+            Some("auto"),
+            Some("createFirst"),
+            Some(false),
+            "{}",
+        )?;
+        store.append_rollout_event(
+            rollout.id,
+            &rollout.job_id,
+            Some("web"),
+            "info",
+            "step advanced",
+            Some(r#"{"step":1}"#),
+        )?;
+
+        let response = manager
+            .list_rollout_events(Request::new(ListRolloutEventsRequest {
+                rollout_id: rollout.id,
+                limit: Some(10),
+            }))
+            .await?
+            .into_inner();
+
+        assert_eq!(response.events.len(), 1);
+        assert_eq!(response.events[0].rollout_id, rollout.id);
+        assert_eq!(response.events[0].group_name.as_deref(), Some("web"));
+        assert_eq!(response.events[0].message, "step advanced");
+        Ok(())
+    }
+
+    #[test]
+    fn desired_allocations_include_reported() -> R<()> {
         let store = setup_store()?;
         insert_node(&store, "node-a")?;
 
         let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
             name: "job".into(),
             tasks: vec![TaskConfig {
                 on_unhealthy: TaskOnUnhealthyConfig {
@@ -1660,7 +2592,7 @@ mod tests {
         assert_eq!(desired.len(), 1);
 
         let desired = build_desired_allocations(&store, "node-a", &[allocation.id])?;
-        assert!(desired.is_empty());
+        assert_eq!(desired.len(), 1);
 
         Ok(())
     }

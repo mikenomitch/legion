@@ -16,12 +16,13 @@ import {
 } from "solid-js";
 import { managerClient, managerEndpoint } from "./grpcClient";
 import { NodeMsg } from "./gen/legion_pb";
-import type { Job, LedgerNode } from "./gen/legion_pb";
+import type { Job, LedgerNode, Rollout } from "./gen/legion_pb";
 import Homepage from "./pages/Homepage";
 import Jobs from "./pages/Jobs";
 import KeyValue from "./pages/KeyValue";
 import Manager from "./pages/Manager";
 import Nodes from "./pages/Nodes";
+import Rollouts from "./pages/Rollouts";
 import TestingUtils from "./pages/TestingUtils";
 import { POLL_INTERVAL_MS } from "./utils/polling";
 
@@ -46,6 +47,13 @@ const navItems = [
     path: "/jobs",
     title: "Jobs",
     copy: "Jobs reported by the manager in real time.",
+  },
+  {
+    key: "rollouts",
+    label: "Rollouts",
+    path: "/rollouts",
+    title: "Rollouts",
+    copy: "Live and historical rollout activity.",
   },
   {
     key: "kv",
@@ -277,6 +285,7 @@ type PollingControllerProps = {
   refreshLedger: () => Promise<void>;
   refreshNodes: () => Promise<void>;
   refreshJobs: () => Promise<void>;
+  refreshRollouts: () => Promise<void>;
 };
 
 const PollingController = (props: PollingControllerProps) => {
@@ -287,7 +296,10 @@ const PollingController = (props: PollingControllerProps) => {
     let refetch: (() => void) | null = null;
 
     if (current === "/") {
-      refetch = () => void props.refreshLedger();
+      refetch = () => {
+        void props.refreshLedger();
+        void props.refreshRollouts();
+      };
     } else if (current.startsWith("/nodes")) {
       refetch = () => {
         void props.refreshNodes();
@@ -295,6 +307,8 @@ const PollingController = (props: PollingControllerProps) => {
       };
     } else if (current.startsWith("/jobs")) {
       refetch = () => void props.refreshJobs();
+    } else if (current.startsWith("/rollouts")) {
+      refetch = () => void props.refreshRollouts();
     }
 
     if (!refetch) return;
@@ -322,9 +336,15 @@ const AppRoutes = () => {
     return response.jobs;
   };
 
+  const fetchRollouts = async (): Promise<readonly Rollout[]> => {
+    const response = await managerClient.listRollouts({ activeOnly: true });
+    return response.rollouts;
+  };
+
   const [ledger, { mutate: setLedger }] = createResource(fetchLedger);
   const [nodes, { mutate: setNodes }] = createResource(fetchNodes);
   const [jobs, { mutate: setJobs }] = createResource(fetchJobs);
+  const [rollouts, { mutate: setRollouts }] = createResource(fetchRollouts);
 
   const refreshLedger = async () => {
     try {
@@ -353,6 +373,15 @@ const AppRoutes = () => {
     }
   };
 
+  const refreshRollouts = async () => {
+    try {
+      const next = await fetchRollouts();
+      setRollouts((prev) => (isEqualData(prev, next) ? prev : next));
+    } catch (error) {
+      console.error("Failed to refresh rollouts", error);
+    }
+  };
+
   return (
     <Route
       path="/"
@@ -362,18 +391,23 @@ const AppRoutes = () => {
             refreshLedger={refreshLedger}
             refreshNodes={refreshNodes}
             refreshJobs={refreshJobs}
+            refreshRollouts={refreshRollouts}
           />
           {props.children}
         </Layout>
       )}
     >
-      <Route path="/" component={() => <Homepage ledger={ledger} />} />
+      <Route
+        path="/"
+        component={() => <Homepage ledger={ledger} rollouts={rollouts} />}
+      />
       <Route path="/nodes" component={() => <Nodes nodes={nodes} ledger={ledger} />} />
       <Route path="/jobs" component={() => <Jobs jobs={jobs} />} />
+      <Route path="/rollouts" component={Rollouts} />
       <Route path="/kv" component={KeyValue} />
       <Route path="/manager" component={Manager} />
       <Route path="/testing" component={TestingUtils} />
-      <Route path="*" component={() => <Homepage ledger={ledger} />} />
+      <Route path="*" component={() => <Homepage ledger={ledger} rollouts={rollouts} />} />
     </Route>
   );
 };

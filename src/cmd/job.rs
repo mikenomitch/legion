@@ -7,13 +7,15 @@ use crate::cmd::helpers::{connect_manager_client, friendly_status, json_flag, pr
 use crate::getter_rs::Client as GetterClient;
 use crate::prelude::*;
 use crate::structs::{
-    DestroyJobRequest, GetJobInfoRequest, GetJobSpecRequest, GetKvRequest, JobPlanPrint, JobPrint,
-    KvEntry, KvValueType, ListJobsRequest, PlanJobRequest, RunJobRequest, StopJobRequest,
+    AdvanceRolloutRequest, DestroyJobRequest, GetJobInfoRequest, GetJobSpecRequest, GetKvRequest,
+    GetRolloutStatusRequest, JobPlanPrint, JobPrint, KvEntry, KvValueType, ListJobsRequest,
+    ListRolloutEventsRequest, ListRolloutsRequest, PlanJobRequest, RunJobRequest, StopJobRequest,
     Submission,
 };
 use jsonnet::JsonnetVm;
 use serde::Serialize;
 use serde_json::to_string;
+use tabled::Tabled;
 use tempfile::TempDir;
 use url::Url;
 
@@ -89,6 +91,83 @@ pub fn config() -> Command {
 
     let list_cmd = Command::new("list").about("List all jobs").arg(json_flag());
 
+    let rollout_list_cmd = Command::new("list")
+        .about("List rollouts")
+        .arg(
+            Arg::new("job")
+                .long("job")
+                .value_name("JOB")
+                .help("Filter rollouts by job id"),
+        )
+        .arg(
+            Arg::new("active")
+                .long("active")
+                .help("Show only active rollouts")
+                .action(ArgAction::SetTrue),
+        )
+        .arg(json_flag());
+
+    let rollout_advance_cmd = Command::new("advance")
+        .about("Manually advance a rollout")
+        .arg(
+            Arg::new("id")
+                .long("id")
+                .value_name("ID")
+                .help("Rollout id")
+                .required(true)
+                .value_parser(value_parser!(i64)),
+        )
+        .arg(
+            Arg::new("group")
+                .long("group")
+                .value_name("GROUP")
+                .help("Advance only specific task group(s); repeatable")
+                .action(ArgAction::Append),
+        )
+        .arg(priority_arg())
+        .arg(asap_flag())
+        .arg(json_flag());
+
+    let rollout_status_cmd = Command::new("status")
+        .about("Inspect rollout progress and allocations")
+        .arg(
+            Arg::new("id")
+                .long("id")
+                .value_name("ID")
+                .help("Rollout id")
+                .required(true)
+                .value_parser(value_parser!(i64)),
+        )
+        .arg(json_flag());
+
+    let rollout_events_cmd = Command::new("events")
+        .about("Show rollout event history")
+        .arg(
+            Arg::new("id")
+                .long("id")
+                .value_name("ID")
+                .help("Rollout id")
+                .required(true)
+                .value_parser(value_parser!(i64)),
+        )
+        .arg(
+            Arg::new("limit")
+                .long("limit")
+                .value_name("N")
+                .help("Maximum number of events to return (default 200)")
+                .value_parser(value_parser!(u32)),
+        )
+        .arg(json_flag());
+
+    let rollout_cmd = Command::new("rollout")
+        .about("Inspect rollouts")
+        .subcommand_required(true)
+        .arg_required_else_help(true)
+        .subcommand(rollout_list_cmd)
+        .subcommand(rollout_advance_cmd)
+        .subcommand(rollout_status_cmd)
+        .subcommand(rollout_events_cmd);
+
     Command::new("job")
         .about("Interact with jobs")
         .subcommand_required(true)
@@ -100,6 +179,7 @@ pub fn config() -> Command {
         .subcommand(stop_cmd)
         .subcommand(spec_cmd)
         .subcommand(destroy_cmd)
+        .subcommand(rollout_cmd)
 }
 
 fn priority_arg() -> Arg {
@@ -451,6 +531,29 @@ pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
         Some(("list", matches)) => list_jobs(matches).await,
         Some(("info", matches)) => get_info(matches).await,
         Some(("plan", matches)) => plan_job(matches).await,
+        Some(("rollout", matches)) => handle_rollout(matches).await,
+        _ => unreachable!(),
+    }
+}
+
+#[derive(Debug, Clone, Tabled, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RolloutPrint {
+    pub id: i64,
+    pub job_id: String,
+    pub status: String,
+    pub to_job_config_id: String,
+    pub from_job_config_id: String,
+    pub created_at: String,
+    pub incomplete: bool,
+}
+
+async fn handle_rollout(arg_matches: &ArgMatches) -> R<()> {
+    match arg_matches.subcommand() {
+        Some(("list", matches)) => list_rollouts(matches).await,
+        Some(("advance", matches)) => advance_rollout_cmd(matches).await,
+        Some(("status", matches)) => rollout_status_cmd(matches).await,
+        Some(("events", matches)) => rollout_events_cmd(matches).await,
         _ => unreachable!(),
     }
 }
@@ -676,6 +779,265 @@ async fn list_jobs(arg_matches: &ArgMatches) -> R<()> {
         print_table(printable_jobs);
     }
 
+    Ok(())
+}
+
+#[instrument(err, skip_all)]
+async fn list_rollouts(arg_matches: &ArgMatches) -> R<()> {
+    let is_json = arg_matches.get_flag("json");
+    let active_only = arg_matches.get_flag("active");
+    let job_id = arg_matches.get_one::<String>("job").cloned();
+
+    let mut client = connect_manager_client().await?;
+    let request = tonic::Request::new(ListRolloutsRequest {
+        job_id,
+        active_only,
+    });
+    let response = client
+        .list_rollouts(request)
+        .await
+        .map_err(|status| friendly_status("failed to list rollouts", status))?;
+    let rollouts = response.into_inner().rollouts;
+
+    if is_json {
+        print_json(&rollouts);
+    } else {
+        let printable = rollouts
+            .into_iter()
+            .map(|rollout| RolloutPrint {
+                id: rollout.id,
+                job_id: rollout.job_id,
+                status: rollout.status,
+                to_job_config_id: rollout.to_job_config_id,
+                from_job_config_id: rollout.from_job_config_id.unwrap_or_default(),
+                created_at: rollout.created_at,
+                incomplete: rollout.incomplete,
+            })
+            .collect::<Vec<_>>();
+        if printable.is_empty() {
+            println!("No rollouts found");
+        } else {
+            print_table(printable);
+        }
+    }
+
+    Ok(())
+}
+
+#[instrument(err, skip_all)]
+async fn advance_rollout_cmd(arg_matches: &ArgMatches) -> R<()> {
+    let rollout_id = *arg_matches
+        .get_one::<i64>("id")
+        .context("missing rollout id")?;
+    let groups = arg_matches
+        .get_many::<String>("group")
+        .map(|values| values.cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let priority = priority_from_matches(arg_matches);
+    let is_json = arg_matches.get_flag("json");
+
+    let mut client = connect_manager_client().await?;
+    let request = tonic::Request::new(AdvanceRolloutRequest {
+        id: rollout_id,
+        groups,
+        priority,
+    });
+    let response = client
+        .advance_rollout(request)
+        .await
+        .map_err(|status| friendly_status("failed to advance rollout", status))?
+        .into_inner();
+
+    if is_json {
+        print_json(&response.rollout);
+    } else if let Some(rollout) = response.rollout {
+        println!(
+            "{} (id={}, status={})",
+            response.message, rollout.id, rollout.status
+        );
+    } else {
+        println!("{}", response.message);
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, Tabled, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RolloutGroupStatusPrint {
+    group: String,
+    step: String,
+    pending_manual_advances: u32,
+    allocations: usize,
+}
+
+#[derive(Debug, Clone, Tabled, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RolloutAllocationStatusPrint {
+    allocation_id: i64,
+    task: String,
+    group: String,
+    lifecycle: String,
+    role: String,
+    status: String,
+    allocation_health: String,
+    node_id: String,
+    node_health: String,
+}
+
+#[derive(Debug, Clone, Tabled, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RolloutEventPrint {
+    id: i64,
+    created_at: String,
+    level: String,
+    group: String,
+    message: String,
+}
+
+#[instrument(err, skip_all)]
+async fn rollout_status_cmd(arg_matches: &ArgMatches) -> R<()> {
+    let rollout_id = *arg_matches
+        .get_one::<i64>("id")
+        .context("missing rollout id")?;
+    let is_json = arg_matches.get_flag("json");
+
+    let mut client = connect_manager_client().await?;
+    let request = tonic::Request::new(GetRolloutStatusRequest { id: rollout_id });
+    let response = client
+        .get_rollout_status(request)
+        .await
+        .map_err(|status| friendly_status("failed to load rollout status", status))?
+        .into_inner();
+
+    if is_json {
+        print_json(&response);
+        return Ok(());
+    }
+
+    let Some(rollout) = response.rollout else {
+        println!("Rollout {rollout_id} not found");
+        return Ok(());
+    };
+
+    println!(
+        "Rollout {} for job {} is {}{}",
+        rollout.id,
+        rollout.job_id,
+        rollout.status,
+        if rollout.incomplete {
+            " (incomplete)"
+        } else {
+            ""
+        }
+    );
+    if !rollout.message.is_empty() {
+        println!("Message: {}", rollout.message);
+    }
+
+    let group_rows = response
+        .groups
+        .iter()
+        .map(|group| RolloutGroupStatusPrint {
+            group: group.group.clone(),
+            step: format!(
+                "{}/{}",
+                group.step_index.min(group.total_steps),
+                group.total_steps.max(1)
+            ),
+            pending_manual_advances: group.pending_manual_advances,
+            allocations: group.allocations.len(),
+        })
+        .collect::<Vec<_>>();
+    if !group_rows.is_empty() {
+        print_table(group_rows);
+    }
+
+    let allocation_rows = response
+        .groups
+        .into_iter()
+        .flat_map(|group| {
+            group
+                .allocations
+                .into_iter()
+                .map(move |allocation| RolloutAllocationStatusPrint {
+                    allocation_id: allocation.allocation_id,
+                    task: allocation.task_name,
+                    group: group.group.clone(),
+                    lifecycle: allocation.lifecycle,
+                    role: allocation.role,
+                    status: allocation.status,
+                    allocation_health: allocation
+                        .allocation_health
+                        .or_else(|| {
+                            allocation.allocation_healthy.map(|healthy| {
+                                if healthy {
+                                    "healthy".to_string()
+                                } else {
+                                    "unhealthy".to_string()
+                                }
+                            })
+                        })
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    node_id: allocation.node_id,
+                    node_health: allocation
+                        .node_healthy
+                        .map(|healthy| {
+                            if healthy {
+                                "healthy".to_string()
+                            } else {
+                                "unhealthy".to_string()
+                            }
+                        })
+                        .unwrap_or_else(|| "unknown".to_string()),
+                })
+        })
+        .collect::<Vec<_>>();
+    if !allocation_rows.is_empty() {
+        print_table(allocation_rows);
+    }
+
+    Ok(())
+}
+
+#[instrument(err, skip_all)]
+async fn rollout_events_cmd(arg_matches: &ArgMatches) -> R<()> {
+    let rollout_id = *arg_matches
+        .get_one::<i64>("id")
+        .context("missing rollout id")?;
+    let limit = arg_matches.get_one::<u32>("limit").copied();
+    let is_json = arg_matches.get_flag("json");
+
+    let mut client = connect_manager_client().await?;
+    let request = tonic::Request::new(ListRolloutEventsRequest { rollout_id, limit });
+    let response = client
+        .list_rollout_events(request)
+        .await
+        .map_err(|status| friendly_status("failed to load rollout events", status))?
+        .into_inner();
+
+    if is_json {
+        print_json(&response.events);
+        return Ok(());
+    }
+
+    if response.events.is_empty() {
+        println!("No rollout events found for rollout {rollout_id}");
+        return Ok(());
+    }
+
+    let rows = response
+        .events
+        .into_iter()
+        .map(|event| RolloutEventPrint {
+            id: event.id,
+            created_at: event.created_at,
+            level: event.level,
+            group: event.group_name.unwrap_or_else(|| "all".to_string()),
+            message: event.message,
+        })
+        .collect::<Vec<_>>();
+    print_table(rows);
     Ok(())
 }
 

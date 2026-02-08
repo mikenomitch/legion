@@ -10,6 +10,11 @@ service Manager {
   rpc RunJob (RunJobRequest) returns (RunJobReply);
   rpc GetJobSpec (GetJobSpecRequest) returns (GetJobSpecReply);
   rpc GetJobInfo (GetJobInfoRequest) returns (GetJobInfoReply);
+  rpc ListRollouts (ListRolloutsRequest) returns (ListRolloutsReply);
+  rpc GetRollout (GetRolloutRequest) returns (GetRolloutReply);
+  rpc GetRolloutStatus (GetRolloutStatusRequest) returns (GetRolloutStatusReply);
+  rpc ListRolloutEvents (ListRolloutEventsRequest) returns (ListRolloutEventsReply);
+  rpc AdvanceRollout (AdvanceRolloutRequest) returns (AdvanceRolloutReply);
   rpc PlanJob (PlanJobRequest) returns (PlanJobReply);
   rpc StopJob (StopJobRequest) returns (StopJobReply);
   rpc DestroyJob (DestroyJobRequest) returns (DestroyJobReply);
@@ -91,6 +96,103 @@ message GetJobInfoReply {
   Job job = 1;
 }
 
+message ListRolloutsRequest {
+  optional string job_id = 1;
+  bool active_only = 2;
+}
+
+message Rollout {
+  int64 id = 1;
+  string job_id = 2;
+  optional string from_job_config_id = 3;
+  string to_job_config_id = 4;
+  string status = 5;
+  bool incomplete = 6;
+  string message = 7;
+  optional string strategy = 8;
+  optional string progression = 9;
+  optional string replacement = 10;
+  optional bool in_place = 11;
+  string config_json = 12;
+  string created_at = 13;
+  string updated_at = 14;
+  optional string completed_at = 15;
+}
+
+message ListRolloutsReply {
+  repeated Rollout rollouts = 1;
+}
+
+message GetRolloutRequest {
+  int64 id = 1;
+}
+
+message GetRolloutReply {
+  optional Rollout rollout = 1;
+}
+
+message RolloutAllocationStatus {
+  int64 allocation_id = 1;
+  string node_id = 2;
+  int64 task_config_id = 3;
+  string task_name = 4;
+  string task_group = 5;
+  string lifecycle = 6;
+  string status = 7;
+  string role = 8;
+  optional bool node_healthy = 9;
+  optional bool allocation_healthy = 10;
+  optional string allocation_health = 11;
+}
+
+message RolloutGroupStatus {
+  string group = 1;
+  uint32 step_index = 2;
+  uint32 total_steps = 3;
+  uint32 pending_manual_advances = 4;
+  repeated RolloutAllocationStatus allocations = 5;
+}
+
+message GetRolloutStatusRequest {
+  int64 id = 1;
+}
+
+message GetRolloutStatusReply {
+  optional Rollout rollout = 1;
+  repeated RolloutGroupStatus groups = 2;
+}
+
+message RolloutEvent {
+  int64 id = 1;
+  int64 rollout_id = 2;
+  string job_id = 3;
+  optional string group_name = 4;
+  string level = 5;
+  string message = 6;
+  string metadata_json = 7;
+  string created_at = 8;
+}
+
+message ListRolloutEventsRequest {
+  int64 rollout_id = 1;
+  optional uint32 limit = 2;
+}
+
+message ListRolloutEventsReply {
+  repeated RolloutEvent events = 1;
+}
+
+message AdvanceRolloutRequest {
+  int64 id = 1;
+  repeated string groups = 2;
+  optional int64 priority = 3;
+}
+
+message AdvanceRolloutReply {
+  string message = 1;
+  optional Rollout rollout = 2;
+}
+
 message GetJobSpecRequest {
   string name = 1;
 }
@@ -152,6 +254,7 @@ message HeartbeatRequest {
   string id = 1;
   repeated int64 allocation_ids = 2;
   repeated FailedAllocation failed_allocations = 3;
+  repeated AllocationHealth allocation_health = 4;
 }
 
 message HeartbeatReply {
@@ -162,6 +265,12 @@ message HeartbeatReply {
 message FailedAllocation {
   int64 allocation_id = 1;
   string reason = 2;
+}
+
+message AllocationHealth {
+  int64 allocation_id = 1;
+  bool healthy = 2;
+  string status = 3;
 }
 
 message HealthCheckRequest {

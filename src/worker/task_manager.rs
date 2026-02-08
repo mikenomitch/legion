@@ -1,5 +1,7 @@
 use crate::prelude::*;
-use crate::structs::{Allocation, TaskAllocation, TaskConfig, TaskOnUnhealthyConfig};
+use crate::structs::{
+    Allocation, AllocationHealth, TaskAllocation, TaskConfig, TaskOnUnhealthyConfig,
+};
 use crate::task_plugins::{TaskPluginRegistry, TaskRuntime};
 use crate::worker::state::{pid_is_running, PersistedAllocation, WorkerStateStore};
 use crate::worker::task_health::HealthMonitorHandle;
@@ -17,6 +19,7 @@ pub struct WorkerTaskManager {
     allocations: HashMap<i64, Allocation>,
     task_configs: HashMap<i64, TaskConfig>,
     health_monitors: HashMap<i64, HealthMonitorHandle>,
+    allocation_health: HashMap<i64, AllocationHealth>,
     failed: Vec<FailedAllocationReport>,
     state_store: WorkerStateStore,
 }
@@ -33,6 +36,7 @@ impl WorkerTaskManager {
             allocations: HashMap::new(),
             task_configs: HashMap::new(),
             health_monitors: HashMap::new(),
+            allocation_health: HashMap::new(),
             failed: Vec::new(),
             state_store,
         }
@@ -58,6 +62,12 @@ impl WorkerTaskManager {
         let mut allocations = self.runtimes.keys().copied().collect::<Vec<_>>();
         allocations.sort_unstable();
         allocations
+    }
+
+    pub fn allocation_health_snapshot(&self) -> Vec<AllocationHealth> {
+        let mut entries = self.allocation_health.values().cloned().collect::<Vec<_>>();
+        entries.sort_by_key(|entry| entry.allocation_id);
+        entries
     }
 
     pub fn drain_failures(&mut self) -> Vec<FailedAllocationReport> {
@@ -88,6 +98,7 @@ impl WorkerTaskManager {
         self.runtimes.remove(&allocation_id);
         self.allocations.remove(&allocation_id);
         self.task_configs.remove(&allocation_id);
+        self.allocation_health.remove(&allocation_id);
         self.failed.push(FailedAllocationReport {
             allocation_id,
             reason: reason.into(),
@@ -95,10 +106,44 @@ impl WorkerTaskManager {
         self.persist_state();
     }
 
+    pub fn set_allocation_health(
+        &mut self,
+        allocation_id: i64,
+        healthy: bool,
+        status: impl Into<String>,
+    ) {
+        self.allocation_health.insert(
+            allocation_id,
+            AllocationHealth {
+                allocation_id,
+                healthy,
+                status: status.into(),
+            },
+        );
+    }
+
     pub fn reconcile_allocations(
         &mut self,
         allocations: &[TaskAllocation],
     ) -> Vec<(Allocation, TaskConfig)> {
+        let desired_ids = allocations
+            .iter()
+            .map(|allocation| allocation.allocation_id)
+            .collect::<std::collections::HashSet<_>>();
+        let existing_ids = self.runtimes.keys().copied().collect::<Vec<_>>();
+        for allocation_id in existing_ids {
+            if desired_ids.contains(&allocation_id) {
+                continue;
+            }
+            if let Err(err) = self.stop_allocation(allocation_id) {
+                warn!(
+                    allocation_id,
+                    error = ?err,
+                    "Failed to stop undesired allocation"
+                );
+            }
+        }
+
         let mut started = Vec::new();
         for allocation in allocations {
             if self.runtimes.contains_key(&allocation.allocation_id) {
@@ -114,6 +159,45 @@ impl WorkerTaskManager {
             }
         }
         started
+    }
+
+    fn stop_allocation(&mut self, allocation_id: i64) -> R<()> {
+        if let Some(monitor) = self.health_monitors.remove(&allocation_id) {
+            monitor.shutdown();
+        }
+
+        let allocation = self.allocations.get(&allocation_id).cloned();
+        let task = self.task_configs.get(&allocation_id).cloned();
+        if let (Some(allocation), Some(task)) = (allocation.as_ref(), task.as_ref()) {
+            if let Some(plugin) = self.registry.plugin(&task.kind) {
+                if let Some(runtime) = self.runtimes.get_mut(&allocation_id) {
+                    if let Err(err) = plugin.stop(allocation, task, runtime) {
+                        warn!(
+                            allocation_id,
+                            task_name = %task.name,
+                            error = ?err,
+                            "Failed to stop allocation runtime"
+                        );
+                    }
+                    if let Err(err) = plugin.destroy(allocation, task, runtime) {
+                        warn!(
+                            allocation_id,
+                            task_name = %task.name,
+                            error = ?err,
+                            "Failed to destroy allocation runtime"
+                        );
+                    }
+                }
+            }
+        }
+
+        self.runtimes.remove(&allocation_id);
+        self.allocations.remove(&allocation_id);
+        self.task_configs.remove(&allocation_id);
+        self.allocation_health.remove(&allocation_id);
+        self.persist_state();
+
+        Ok(())
     }
 
     #[instrument(err, skip_all)]
@@ -153,6 +237,7 @@ impl WorkerTaskManager {
 
         self.allocations.insert(allocation.id, allocation.clone());
         self.task_configs.insert(allocation.id, task.clone());
+        self.set_allocation_health(allocation.id, false, "starting");
         self.persist_state();
 
         Ok(())
@@ -187,6 +272,7 @@ impl WorkerTaskManager {
 
         plugin.stop(allocation, task, runtime)?;
         plugin.start(allocation, task, runtime)?;
+        self.set_allocation_health(allocation_id, false, "restarting");
         self.persist_state();
         Ok(())
     }
@@ -228,6 +314,7 @@ impl WorkerTaskManager {
                 .insert(record.allocation.id, record.allocation.clone());
             self.task_configs
                 .insert(record.allocation.id, record.task.clone());
+            self.set_allocation_health(record.allocation.id, false, "restored");
             active.push(record.clone());
             restored.push((record.allocation, record.task));
         }
@@ -340,6 +427,75 @@ mod tests {
         };
 
         manager.run_allocation(&alloc(), &task)?;
+        Ok(())
+    }
+
+    #[test]
+    fn reconcile_removes_undesired_allocations() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let state_store = WorkerStateStore::new(temp_dir.path().join("worker_state.json"));
+        let mut manager = WorkerTaskManager::with_state_store(state_store);
+
+        let allocation = alloc();
+        manager
+            .runtimes
+            .insert(allocation.id, TaskRuntime::default());
+        manager
+            .allocations
+            .insert(allocation.id, allocation.clone());
+        manager
+            .task_configs
+            .insert(allocation.id, TaskConfig::new("noop-task", "noop"));
+        manager.set_allocation_health(allocation.id, true, "healthy");
+
+        assert!(manager.allocations.contains_key(&allocation.id));
+        assert!(manager.allocation_health.contains_key(&allocation.id));
+        let _ = manager.reconcile_allocations(&[]);
+        assert!(!manager.allocations.contains_key(&allocation.id));
+        assert!(!manager.runtimes.contains_key(&allocation.id));
+        assert!(!manager.allocation_health.contains_key(&allocation.id));
+
+        Ok(())
+    }
+
+    #[test]
+    fn allocation_health_snapshot_sorted() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let state_store = WorkerStateStore::new(temp_dir.path().join("worker_state.json"));
+        let mut manager = WorkerTaskManager::with_state_store(state_store);
+
+        manager.set_allocation_health(9, true, "healthy");
+        manager.set_allocation_health(3, false, "unhealthy");
+
+        let snapshot = manager.allocation_health_snapshot();
+        assert_eq!(snapshot.len(), 2);
+        assert_eq!(snapshot[0].allocation_id, 3);
+        assert_eq!(snapshot[0].healthy, false);
+        assert_eq!(snapshot[1].allocation_id, 9);
+        assert_eq!(snapshot[1].healthy, true);
+
+        Ok(())
+    }
+
+    #[test]
+    fn spawn_health_monitor_without_checks_marks_allocation_healthy() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let state_store = WorkerStateStore::new(temp_dir.path().join("worker_state.json"));
+        let manager = Arc::new(Mutex::new(WorkerTaskManager::with_state_store(state_store)));
+        let allocation = alloc();
+        let task = TaskConfig::new("noop-task", "noop");
+
+        spawn_health_monitor(manager.clone(), allocation.clone(), task);
+
+        let guard = manager.lock().expect("task manager");
+        let health = guard
+            .allocation_health
+            .get(&allocation.id)
+            .context("missing allocation health")?;
+        assert!(health.healthy);
+        assert_eq!(health.status, "healthy (no checks configured)");
+        assert!(!guard.health_monitors.contains_key(&allocation.id));
+
         Ok(())
     }
 

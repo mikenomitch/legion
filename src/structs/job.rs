@@ -3,7 +3,7 @@ use serde::ser::SerializeStruct;
 use serde::{de::Error, Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
 use std::time::Duration;
 use tabled::Tabled;
@@ -558,6 +558,258 @@ impl Default for TaskOnUnhealthyConfig {
     }
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum RolloutProgression {
+    Auto,
+    Manual,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum RolloutReplacement {
+    DestroyFirst,
+    CreateFirst,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum RolloutCapacityTimeoutAction {
+    Rollback,
+    Fail,
+    CompleteIncomplete,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum RolloutDeadlineAction {
+    Rollback,
+    Fail,
+    Pause,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RolloutConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strategy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progression: Option<RolloutProgression>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replacement: Option<RolloutReplacement>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_place: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub percent_each_step: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count_each_step: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub percent_steps: Option<Vec<u32>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count_steps: Option<Vec<u32>>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_duration",
+        serialize_with = "serialize_optional_duration"
+    )]
+    pub step_stagger: Option<Duration>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_duration",
+        serialize_with = "serialize_optional_duration"
+    )]
+    pub allocation_stagger: Option<Duration>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_duration",
+        serialize_with = "serialize_optional_duration"
+    )]
+    pub min_healthy_time: Option<Duration>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_duration",
+        serialize_with = "serialize_optional_duration"
+    )]
+    pub healthy_deadline: Option<Duration>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ignore_health_checks: Option<bool>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_duration",
+        serialize_with = "serialize_optional_duration"
+    )]
+    pub capacity_block_timeout: Option<Duration>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_capacity_timeout: Option<RolloutCapacityTimeoutAction>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollback_on_failure: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_health_deadline: Option<RolloutDeadlineAction>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_duration",
+        serialize_with = "serialize_optional_duration"
+    )]
+    pub batch_kill_after: Option<Duration>,
+}
+
+impl RolloutConfig {
+    fn step_mode_count(&self) -> usize {
+        usize::from(self.percent_each_step.is_some())
+            + usize::from(self.count_each_step.is_some())
+            + usize::from(self.percent_steps.is_some())
+            + usize::from(self.count_steps.is_some())
+    }
+
+    fn has_step_mode(&self) -> bool {
+        self.step_mode_count() > 0
+    }
+
+    fn clear_step_modes(&mut self) {
+        self.percent_each_step = None;
+        self.count_each_step = None;
+        self.percent_steps = None;
+        self.count_steps = None;
+    }
+
+    fn apply_override(&mut self, override_config: &RolloutConfig) {
+        if override_config.strategy.is_some() {
+            self.strategy = override_config.strategy.clone();
+        }
+        if override_config.progression.is_some() {
+            self.progression = override_config.progression.clone();
+        }
+        if override_config.replacement.is_some() {
+            self.replacement = override_config.replacement.clone();
+        }
+        if override_config.in_place.is_some() {
+            self.in_place = override_config.in_place;
+        }
+        if override_config.has_step_mode() {
+            self.clear_step_modes();
+        }
+        if override_config.percent_each_step.is_some() {
+            self.percent_each_step = override_config.percent_each_step;
+        }
+        if override_config.count_each_step.is_some() {
+            self.count_each_step = override_config.count_each_step;
+        }
+        if override_config.percent_steps.is_some() {
+            self.percent_steps = override_config.percent_steps.clone();
+        }
+        if override_config.count_steps.is_some() {
+            self.count_steps = override_config.count_steps.clone();
+        }
+        if override_config.step_stagger.is_some() {
+            self.step_stagger = override_config.step_stagger;
+        }
+        if override_config.allocation_stagger.is_some() {
+            self.allocation_stagger = override_config.allocation_stagger;
+        }
+        if override_config.min_healthy_time.is_some() {
+            self.min_healthy_time = override_config.min_healthy_time;
+        }
+        if override_config.healthy_deadline.is_some() {
+            self.healthy_deadline = override_config.healthy_deadline;
+        }
+        if override_config.ignore_health_checks.is_some() {
+            self.ignore_health_checks = override_config.ignore_health_checks;
+        }
+        if override_config.capacity_block_timeout.is_some() {
+            self.capacity_block_timeout = override_config.capacity_block_timeout;
+        }
+        if override_config.on_capacity_timeout.is_some() {
+            self.on_capacity_timeout = override_config.on_capacity_timeout.clone();
+        }
+        if override_config.rollback_on_failure.is_some() {
+            self.rollback_on_failure = override_config.rollback_on_failure;
+        }
+        if override_config.on_health_deadline.is_some() {
+            self.on_health_deadline = override_config.on_health_deadline.clone();
+        }
+        if override_config.batch_kill_after.is_some() {
+            self.batch_kill_after = override_config.batch_kill_after;
+        }
+    }
+
+    fn validate(&self, scope: &str) -> R<()> {
+        if self.step_mode_count() > 1 {
+            bail!(
+                "{} defines conflicting step modes; set only one of percentEachStep, countEachStep, percentSteps, countSteps",
+                scope
+            );
+        }
+
+        if let Some(percent_each_step) = self.percent_each_step {
+            if percent_each_step == 0 || percent_each_step > 100 {
+                bail!("{scope}.percentEachStep must be between 1 and 100");
+            }
+        }
+
+        if let Some(count_each_step) = self.count_each_step {
+            if count_each_step == 0 {
+                bail!("{scope}.countEachStep must be at least 1");
+            }
+        }
+
+        if let Some(percent_steps) = self.percent_steps.as_ref() {
+            if percent_steps.is_empty() {
+                bail!("{scope}.percentSteps must not be empty");
+            }
+
+            let mut previous = 0;
+            for step in percent_steps {
+                if *step == 0 || *step > 100 {
+                    bail!("{scope}.percentSteps values must be between 1 and 100");
+                }
+                if *step <= previous {
+                    bail!("{scope}.percentSteps must be strictly increasing");
+                }
+                previous = *step;
+            }
+
+            if percent_steps.last().copied() != Some(100) {
+                bail!("{scope}.percentSteps must end with 100");
+            }
+        }
+
+        if let Some(count_steps) = self.count_steps.as_ref() {
+            if count_steps.is_empty() {
+                bail!("{scope}.countSteps must not be empty");
+            }
+            if count_steps.iter().any(|step| *step == 0) {
+                bail!("{scope}.countSteps values must be at least 1");
+            }
+        }
+
+        if self
+            .strategy
+            .as_ref()
+            .is_some_and(|strategy| strategy.trim().is_empty())
+        {
+            bail!("{scope}.strategy cannot be empty");
+        }
+
+        if self
+            .capacity_block_timeout
+            .as_ref()
+            .is_some_and(Duration::is_zero)
+        {
+            bail!("{scope}.capacityBlockTimeout must be greater than 0 when set");
+        }
+
+        if self
+            .healthy_deadline
+            .as_ref()
+            .is_some_and(Duration::is_zero)
+        {
+            bail!("{scope}.healthyDeadline must be greater than 0 when set");
+        }
+
+        Ok(())
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Tabled)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskConfig {
@@ -598,6 +850,10 @@ pub struct TaskConfig {
 pub struct JobConfig {
     pub name: String,
     pub tasks: Vec<TaskConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollout: Option<RolloutConfig>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub rollout_by_group: BTreeMap<String, RolloutConfig>,
     pub version: Option<u32>,
 }
 
@@ -609,6 +865,10 @@ struct JobConfigInput {
     tasks: Option<TaskConfigList>,
     #[serde(default)]
     task: Option<TaskConfigInput>,
+    #[serde(default)]
+    rollout: Option<RolloutConfig>,
+    #[serde(default)]
+    rollout_by_group: BTreeMap<String, RolloutConfig>,
     version: Option<u32>,
 }
 
@@ -730,6 +990,8 @@ impl<'de> Deserialize<'de> for JobConfig {
         Ok(JobConfig {
             name: input.name,
             tasks,
+            rollout: input.rollout,
+            rollout_by_group: input.rollout_by_group,
             version: input.version,
         })
     }
@@ -737,7 +999,10 @@ impl<'de> Deserialize<'de> for JobConfig {
 
 impl JobConfig {
     pub fn is_same_as(&self, other: &JobConfig) -> bool {
-        self.name == other.name && self.tasks == other.tasks
+        self.name == other.name
+            && self.tasks == other.tasks
+            && self.rollout == other.rollout
+            && self.rollout_by_group == other.rollout_by_group
     }
 
     pub fn id(&self) -> String {
@@ -745,6 +1010,49 @@ impl JobConfig {
             Some(version) => format!("{}-{}", self.name, version),
             None => format!("{}-{}", self.name, 0),
         }
+    }
+
+    pub fn rollout_config_for_group(&self, group: &str) -> Option<RolloutConfig> {
+        match (&self.rollout, self.rollout_by_group.get(group)) {
+            (None, None) => None,
+            (Some(global), None) => Some(global.clone()),
+            (None, Some(group_override)) => Some(group_override.clone()),
+            (Some(global), Some(group_override)) => {
+                let mut merged = global.clone();
+                merged.apply_override(group_override);
+                Some(merged)
+            }
+        }
+    }
+
+    pub fn validate_rollout(&self) -> R<()> {
+        if self.rollout.is_none() && self.rollout_by_group.is_empty() {
+            return Ok(());
+        }
+
+        if let Some(global) = self.rollout.as_ref() {
+            global.validate("rollout")?;
+        }
+
+        let groups = self
+            .tasks
+            .iter()
+            .map(|task| task.group.clone())
+            .collect::<BTreeSet<_>>();
+
+        for (group, config) in &self.rollout_by_group {
+            if !groups.contains(group) {
+                bail!("rolloutByGroup references unknown group {group}");
+            }
+            config.validate(&format!("rolloutByGroup.{group}"))?;
+
+            let merged = self
+                .rollout_config_for_group(group)
+                .expect("group rollout should exist");
+            merged.validate(&format!("rolloutByGroup.{group}"))?;
+        }
+
+        Ok(())
     }
 }
 
@@ -1079,6 +1387,110 @@ mod tests {
         assert_eq!(
             deploy.depends_on[1].condition,
             TaskDependencyCondition::Success
+        );
+    }
+
+    #[test]
+    fn deserializes_rollout_with_group_overrides() -> R<()> {
+        let spec = serde_json::json!({
+            "name": "demo",
+            "tasks": {
+                "web": { "kind": "noop", "group": "frontend" },
+                "api": { "kind": "noop", "group": "backend" }
+            },
+            "rollout": {
+                "percentEachStep": 10,
+                "replacement": "createFirst",
+                "inPlace": false
+            },
+            "rolloutByGroup": {
+                "frontend": {
+                    "countEachStep": 2,
+                    "inPlace": true
+                }
+            }
+        });
+
+        let config: JobConfig = serde_json::from_value(spec)?;
+        let frontend = config
+            .rollout_config_for_group("frontend")
+            .expect("missing frontend rollout");
+        assert_eq!(frontend.count_each_step, Some(2));
+        assert!(frontend.percent_each_step.is_none());
+        assert_eq!(frontend.in_place, Some(true));
+
+        let backend = config
+            .rollout_config_for_group("backend")
+            .expect("missing backend rollout");
+        assert_eq!(backend.percent_each_step, Some(10));
+        assert!(backend.count_each_step.is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn rollout_validation_rejects_conflicting_step_modes() {
+        let spec = serde_json::json!({
+            "name": "demo",
+            "task": { "kind": "noop" },
+            "rollout": {
+                "countEachStep": 1,
+                "percentEachStep": 10
+            }
+        });
+
+        let config: JobConfig = serde_json::from_value(spec).expect("config should deserialize");
+        let err = config
+            .validate_rollout()
+            .expect_err("conflicting rollout step modes should fail");
+        assert!(
+            err.to_string().contains("conflicting step modes"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rollout_validation_rejects_invalid_percent_steps() {
+        let spec = serde_json::json!({
+            "name": "demo",
+            "task": { "kind": "noop" },
+            "rollout": {
+                "percentSteps": [10, 20, 90]
+            }
+        });
+
+        let config: JobConfig = serde_json::from_value(spec).expect("config should deserialize");
+        let err = config
+            .validate_rollout()
+            .expect_err("percent steps without 100 should fail");
+        assert!(
+            err.to_string().contains("must end with 100"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rollout_validation_rejects_unknown_group() {
+        let spec = serde_json::json!({
+            "name": "demo",
+            "task": {
+                "kind": "noop",
+                "group": "frontend"
+            },
+            "rolloutByGroup": {
+                "backend": {
+                    "countEachStep": 1
+                }
+            }
+        });
+
+        let config: JobConfig = serde_json::from_value(spec).expect("config should deserialize");
+        let err = config
+            .validate_rollout()
+            .expect_err("unknown rollout group should fail");
+        assert!(
+            err.to_string().contains("unknown group"),
+            "unexpected error: {err}"
         );
     }
 }

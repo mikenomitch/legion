@@ -3,7 +3,7 @@
 /* eslint-disable */
 // @ts-nocheck
 
-import { AcquireKvLockReply, AcquireKvLockRequest, DeleteKvReply, DeleteKvRequest, DestroyJobReply, DestroyJobRequest, GetJobInfoReply, GetJobInfoRequest, GetJobSpecReply, GetJobSpecRequest, GetJoinTokenReply, GetJoinTokenRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest, GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, ListJobsReply, ListJobsRequest, ListKvReply, ListKvRequest, PatchKvReply, PatchKvRequest, PlanJobReply, PlanJobRequest, PostWorkReply, PostWorkRequest, PutKvReply, PutKvRequest, ReleaseKvLockReply, ReleaseKvLockRequest, RenewKvLockReply, RenewKvLockRequest, RestartWorkerReply, RestartWorkerRequest, RunJobReply, RunJobRequest, StopJobReply, StopJobRequest, UpdateNodeDynamicReply, UpdateNodeDynamicRequest, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest } from "./legion_pb.js";
+import { AcquireKvLockReply, AcquireKvLockRequest, AdvanceRolloutReply, AdvanceRolloutRequest, DeleteKvReply, DeleteKvRequest, DestroyJobReply, DestroyJobRequest, GetJobInfoReply, GetJobInfoRequest, GetJobSpecReply, GetJobSpecRequest, GetJoinTokenReply, GetJoinTokenRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest, GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, ListJobsReply, ListJobsRequest, ListKvReply, ListKvRequest, ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply, ListRolloutsRequest, PatchKvReply, PatchKvRequest, PlanJobReply, PlanJobRequest, PostWorkReply, PostWorkRequest, PutKvReply, PutKvRequest, ReleaseKvLockReply, ReleaseKvLockRequest, RenewKvLockReply, RenewKvLockRequest, RestartWorkerReply, RestartWorkerRequest, RunJobReply, RunJobRequest, StopJobReply, StopJobRequest, UpdateNodeDynamicReply, UpdateNodeDynamicRequest, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest } from "./legion_pb.js";
 import { MethodKind } from "@bufbuild/protobuf";
 
 /**
@@ -55,6 +55,51 @@ export const Manager = {
       name: "GetJobInfo",
       I: GetJobInfoRequest,
       O: GetJobInfoReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * @generated from rpc legion.Manager.ListRollouts
+     */
+    listRollouts: {
+      name: "ListRollouts",
+      I: ListRolloutsRequest,
+      O: ListRolloutsReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * @generated from rpc legion.Manager.GetRollout
+     */
+    getRollout: {
+      name: "GetRollout",
+      I: GetRolloutRequest,
+      O: GetRolloutReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * @generated from rpc legion.Manager.GetRolloutStatus
+     */
+    getRolloutStatus: {
+      name: "GetRolloutStatus",
+      I: GetRolloutStatusRequest,
+      O: GetRolloutStatusReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * @generated from rpc legion.Manager.ListRolloutEvents
+     */
+    listRolloutEvents: {
+      name: "ListRolloutEvents",
+      I: ListRolloutEventsRequest,
+      O: ListRolloutEventsReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * @generated from rpc legion.Manager.AdvanceRollout
+     */
+    advanceRollout: {
+      name: "AdvanceRollout",
+      I: AdvanceRolloutRequest,
+      O: AdvanceRolloutReply,
       kind: MethodKind.Unary,
     },
     /**
