@@ -41,3 +41,18 @@
 - `docs/NEXT_UP.md` contains the immediate todos for the current task that the human developer is working on
 - `docs/TASK-LIST.md` contains a higher-level To Do list
 - `docs/differentiators.md` contains a list of reasons that legion is different from K8s and Nomad
+- Architecture and behavior docs:
+  - `docs/architecture-managers-workers.md`
+  - `docs/plugin-system.md`
+  - `docs/scheduler-and-eval-loop.md`
+  - `docs/jobs-tasks-and-scheduling.md`
+  - `docs/task-kind-plugins.md`
+  - `docs/task-kind-exec.md`
+  - `docs/task-kind-container.md`
+  - `docs/task-kind-noop.md`
+  - `docs/state-store.md`
+  - `docs/observability.md`
+  - `docs/ui-architecture.md`
+  - `docs/kv-store.md`
+  - `docs/testing-and-benchmarks.md`
+  - `docs/codebase-conventions.md`
