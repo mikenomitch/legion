@@ -1,13 +1,162 @@
 use crate::prelude::*;
 use crate::structs::{Allocation, TaskConfig};
-use crate::task_plugins::{spawn_task_process, TaskPlugin, TaskRuntime};
+use crate::task_plugins::{derived_schema, spawn_task_process, TaskPlugin, TaskRuntime};
 #[cfg(target_os = "linux")]
 use landlock::{AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr, ABI};
+use schemars::JsonSchema;
+use serde::Deserialize;
+#[cfg(unix)]
+use std::ffi::CString;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
+#[cfg(target_os = "linux")]
+use std::path::Path;
 use std::process::Command;
-#[cfg(unix)]
-use std::{ffi::CString, path::Path};
+
+fn default_exec_env() -> HashMap<String, String> {
+    HashMap::new()
+}
+
+fn default_landlock_paths() -> Vec<String> {
+    Vec::new()
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+struct ExecTaskConfig {
+    /// Command and arguments to execute. The first entry is the program binary.
+    command: Vec<String>,
+
+    /// Environment variables injected into the spawned process.
+    #[serde(default = "default_exec_env")]
+    #[schemars(default = "default_exec_env")]
+    env: HashMap<String, String>,
+
+    /// Optional working directory for the process.
+    #[serde(default)]
+    cwd: Option<String>,
+
+    /// Optional username or UID to run as (Unix only).
+    #[serde(default)]
+    user: Option<String>,
+
+    /// Legacy alias for Linux `oom_score_adj`.
+    #[serde(default)]
+    #[schemars(range(min = -1000, max = 1000))]
+    oom_adj: Option<i32>,
+
+    /// Linux OOM score adjustment in the range `[-1000, 1000]`.
+    #[serde(default)]
+    #[schemars(range(min = -1000, max = 1000))]
+    oom_score_adj: Option<i32>,
+
+    /// Optional Linux cgroup v2 subpath (for example `workloads/demo`).
+    #[serde(default)]
+    cgroup: Option<String>,
+
+    /// Optional Landlock path restrictions (Linux only).
+    #[serde(default)]
+    landlock: Option<ExecLandlockConfig>,
+
+    /// Additional plugin-specific fields reserved for forward compatibility.
+    #[serde(default, flatten)]
+    #[schemars(skip)]
+    _extra: HashMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ExecLandlockConfig {
+    /// Read-only paths accessible to the task process.
+    #[serde(default = "default_landlock_paths")]
+    #[schemars(default = "default_landlock_paths")]
+    read_only_paths: Vec<String>,
+
+    /// Read-write paths accessible to the task process.
+    #[serde(default = "default_landlock_paths")]
+    #[schemars(default = "default_landlock_paths")]
+    read_write_paths: Vec<String>,
+}
+
+impl ExecLandlockConfig {
+    fn to_runtime(&self) -> R<LandlockOptions> {
+        if self.read_only_paths.is_empty() && self.read_write_paths.is_empty() {
+            bail!("exec task landlock must specify at least one path");
+        }
+
+        Ok(LandlockOptions {
+            read_only_paths: self.read_only_paths.clone(),
+            read_write_paths: self.read_write_paths.clone(),
+        })
+    }
+}
+
+impl ExecTaskConfig {
+    fn from_value(config: &Value) -> R<Self> {
+        let parsed: Self =
+            serde_json::from_value(config.clone()).context("exec task config must be an object")?;
+        parsed.validate()?;
+        Ok(parsed)
+    }
+
+    fn validate(&self) -> R<()> {
+        if self.command.is_empty() {
+            bail!("exec task command must include at least one entry");
+        }
+
+        if self.oom_adj.is_some() && self.oom_score_adj.is_some() {
+            bail!("exec task config may specify only one of oom_adj or oom_score_adj");
+        }
+
+        if let Some(score) = self.oom_adj.or(self.oom_score_adj) {
+            if !(-1000..=1000).contains(&score) {
+                bail!("exec task oom_adj must be between -1000 and 1000");
+            }
+        }
+
+        if let Some(value) = self.cgroup.as_deref() {
+            let cgroup = value.trim_matches('/');
+            if cgroup.is_empty() {
+                bail!("exec task cgroup must not be empty");
+            }
+        }
+
+        if let Some(landlock) = self.landlock.as_ref() {
+            let _ = landlock.to_runtime()?;
+        }
+
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn user_spec(&self) -> R<Option<UserSpec>> {
+        let Some(user) = self.user.as_deref() else {
+            return Ok(None);
+        };
+        lookup_user(user).map(Some)
+    }
+
+    fn linux_options(&self) -> R<ExecLinuxOptions> {
+        let landlock = self
+            .landlock
+            .as_ref()
+            .map(ExecLandlockConfig::to_runtime)
+            .transpose()?;
+
+        let oom_score_adj = self.oom_adj.or(self.oom_score_adj);
+        let cgroup = self
+            .cgroup
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.trim_matches('/').to_string());
+
+        Ok(ExecLinuxOptions {
+            landlock,
+            oom_score_adj,
+            cgroup,
+        })
+    }
+}
 
 #[derive(Clone, Debug, Default)]
 struct ExecLinuxOptions {
@@ -33,117 +182,13 @@ struct UserSpec {
 pub struct ExecTaskPlugin;
 
 impl ExecTaskPlugin {
-    fn config_command(&self, config: &Value) -> R<Vec<String>> {
-        let obj = config
-            .as_object()
-            .context("exec task config must be an object")?;
-        let command = obj
-            .get("command")
-            .context("exec task config requires command")?;
-        let command = command
-            .as_array()
-            .context("exec task command must be a list of strings")?;
-        let command = command
-            .iter()
-            .map(|value| {
-                value
-                    .as_str()
-                    .map(|val| val.to_string())
-                    .context("exec task command values must be strings")
-            })
-            .collect::<R<Vec<_>>>()?;
-        if command.is_empty() {
-            bail!("exec task command must include at least one entry");
-        }
-        Ok(command)
+    fn parse_config(&self, config: &Value) -> R<ExecTaskConfig> {
+        ExecTaskConfig::from_value(config)
     }
 
-    fn config_env(&self, config: &Value) -> R<HashMap<String, String>> {
-        let obj = config
-            .as_object()
-            .context("exec task config must be an object")?;
-        let Some(env) = obj.get("env") else {
-            return Ok(HashMap::new());
-        };
-        let env = env.as_object().context("exec task env must be an object")?;
-        env.iter()
-            .map(|(key, value)| {
-                let value = value
-                    .as_str()
-                    .context("exec task env values must be strings")?;
-                Ok((key.clone(), value.to_string()))
-            })
-            .collect::<R<HashMap<_, _>>>()
-    }
-
-    fn config_cwd(&self, config: &Value) -> R<Option<String>> {
-        let obj = config
-            .as_object()
-            .context("exec task config must be an object")?;
-        let cwd = obj.get("cwd");
-        match cwd {
-            None => Ok(None),
-            Some(value) => Ok(Some(
-                value
-                    .as_str()
-                    .context("exec task cwd must be a string")?
-                    .to_string(),
-            )),
-        }
-    }
-
-    #[cfg(unix)]
-    fn config_user(&self, config: &Value) -> R<Option<UserSpec>> {
-        let obj = config
-            .as_object()
-            .context("exec task config must be an object")?;
-        let Some(value) = obj.get("user") else {
-            return Ok(None);
-        };
-        let user = value.as_str().context("exec task user must be a string")?;
-        lookup_user(user).map(Some)
-    }
-
+    #[cfg(test)]
     fn config_linux_options(&self, config: &Value) -> R<ExecLinuxOptions> {
-        let obj = config
-            .as_object()
-            .context("exec task config must be an object")?;
-
-        let landlock = match obj.get("landlock") {
-            None => None,
-            Some(value) => Some(parse_landlock_config(value)?),
-        };
-
-        let oom_adj = obj.get("oom_adj");
-        let oom_score_adj = obj.get("oom_score_adj");
-        if oom_adj.is_some() && oom_score_adj.is_some() {
-            bail!("exec task config may specify only one of oom_adj or oom_score_adj");
-        }
-        let oom_score_adj = match oom_adj.or(oom_score_adj) {
-            None => None,
-            Some(value) => Some(parse_oom_score_adj(value)?),
-        };
-
-        let cgroup = match obj.get("cgroup") {
-            None => None,
-            Some(value) => {
-                let cgroup = value
-                    .as_str()
-                    .context("exec task cgroup must be a string")?
-                    .trim_matches('/')
-                    .to_string();
-                if cgroup.is_empty() {
-                    bail!("exec task cgroup must not be empty");
-                }
-                Some(cgroup)
-            }
-        };
-
-        Ok(ExecLinuxOptions {
-            landlock,
-            oom_score_adj,
-            cgroup,
-        })
+        self.parse_config(config)?.linux_options()
     }
 }
 
@@ -153,41 +198,7 @@ impl TaskPlugin for ExecTaskPlugin {
     }
 
     fn schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "required": ["command"],
-            "properties": {
-                "command": {
-                    "type": "array",
-                    "minItems": 1,
-                    "items": { "type": "string" }
-                },
-                "env": {
-                    "type": "object",
-                    "additionalProperties": { "type": "string" }
-                },
-                "cwd": { "type": "string" },
-                "user": { "type": "string" },
-                "oom_adj": { "type": "integer", "minimum": -1000, "maximum": 1000 },
-                "oom_score_adj": { "type": "integer", "minimum": -1000, "maximum": 1000 },
-                "cgroup": { "type": "string" },
-                "landlock": {
-                    "type": "object",
-                    "properties": {
-                        "read_only_paths": {
-                            "type": "array",
-                            "items": { "type": "string" }
-                        },
-                        "read_write_paths": {
-                            "type": "array",
-                            "items": { "type": "string" }
-                        }
-                    },
-                    "additionalProperties": false
-                }
-            },
-            "additionalProperties": true
-        })
+        derived_schema::<ExecTaskConfig>()
     }
 
     fn readiness(&self) -> Map<String, Value> {
@@ -216,15 +227,13 @@ impl TaskPlugin for ExecTaskPlugin {
         task: &TaskConfig,
         runtime: &mut TaskRuntime,
     ) -> R<()> {
-        let command = self.config_command(&task.config)?;
-        let env = self.config_env(&task.config)?;
-        let cwd = self.config_cwd(&task.config)?;
-        #[cfg(unix)]
-        let user = self.config_user(&task.config)?;
-        let linux_options = self.config_linux_options(&task.config)?;
-        let (program, args) = command
+        let config = self.parse_config(&task.config)?;
+        let (program, args) = config
+            .command
             .split_first()
             .context("exec task command must include at least one entry")?;
+
+        let linux_options = config.linux_options()?;
 
         info!(
             allocation_id = allocation.id,
@@ -235,17 +244,17 @@ impl TaskPlugin for ExecTaskPlugin {
 
         let mut cmd = Command::new(program);
         cmd.args(args);
-        if let Some(cwd) = cwd {
+        if let Some(cwd) = config.cwd.as_deref() {
             cmd.current_dir(cwd);
         }
-        if !env.is_empty() {
-            cmd.envs(env);
-        }
-
         #[cfg(unix)]
-        if let Some(user) = user {
+        if let Some(user) = config.user_spec()? {
             cmd.uid(user.uid);
             cmd.gid(user.gid);
+        }
+
+        if !config.env.is_empty() {
+            cmd.envs(&config.env);
         }
 
         configure_linux_process_options(&mut cmd, &linux_options, &allocation.id, &task.name)?;
@@ -300,49 +309,6 @@ impl TaskPlugin for ExecTaskPlugin {
         );
         self.stop(allocation, task, runtime)
     }
-}
-
-fn parse_oom_score_adj(value: &Value) -> R<i32> {
-    let score = value
-        .as_i64()
-        .context("exec task oom_adj must be an integer")?;
-    if !(-1000..=1000).contains(&score) {
-        bail!("exec task oom_adj must be between -1000 and 1000");
-    }
-    Ok(score as i32)
-}
-
-fn parse_landlock_config(value: &Value) -> R<LandlockOptions> {
-    let obj = value
-        .as_object()
-        .context("exec task landlock must be an object")?;
-    let read_only_paths = parse_path_list(obj.get("read_only_paths"), "read_only_paths")?;
-    let read_write_paths = parse_path_list(obj.get("read_write_paths"), "read_write_paths")?;
-    if read_only_paths.is_empty() && read_write_paths.is_empty() {
-        bail!("exec task landlock must specify at least one path");
-    }
-    Ok(LandlockOptions {
-        read_only_paths,
-        read_write_paths,
-    })
-}
-
-fn parse_path_list(value: Option<&Value>, key: &str) -> R<Vec<String>> {
-    let Some(value) = value else {
-        return Ok(Vec::new());
-    };
-    let values = value
-        .as_array()
-        .with_context(|| format!("exec task landlock {key} must be a list of strings"))?;
-    values
-        .iter()
-        .map(|entry| {
-            entry
-                .as_str()
-                .map(ToOwned::to_owned)
-                .with_context(|| format!("exec task landlock {key} must contain only strings"))
-        })
-        .collect::<R<Vec<_>>>()
 }
 
 #[cfg(target_os = "linux")]

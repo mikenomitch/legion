@@ -9,9 +9,14 @@ use std::process::{Child, Command};
 
 mod container;
 mod exec;
+mod schema_docs;
 
 pub use container::ContainerTaskPlugin;
 pub use exec::ExecTaskPlugin;
+pub use schema_docs::{
+    builtin_task_plugin_schemas, render_builtin_task_plugin_schemas_markdown,
+    validate_builtin_task_plugin_schemas,
+};
 
 pub fn spawn_task_process(cmd: &mut Command) -> R<Child> {
     #[cfg(unix)]
@@ -34,6 +39,11 @@ pub fn spawn_task_process(cmd: &mut Command) -> R<Child> {
     }
 
     cmd.spawn().context("Failed to spawn task process")
+}
+
+pub(crate) fn derived_schema<T: schemars::JsonSchema>() -> Value {
+    serde_json::to_value(schemars::schema_for!(T))
+        .expect("derived task plugin schema should serialize")
 }
 
 #[derive(Default)]
@@ -299,14 +309,8 @@ fn validate_task_dependencies(config: &JobConfig) -> R<()> {
 
 fn load_task_plugin(name: &str) -> R<LoadedTaskPlugin> {
     match name {
-        "exec" => Ok(LoadedTaskPlugin::new(
-            Box::new(ExecTaskPlugin::default()),
-            None,
-        )),
-        "container" => Ok(LoadedTaskPlugin::new(
-            Box::new(ContainerTaskPlugin::default()),
-            None,
-        )),
+        "exec" => Ok(LoadedTaskPlugin::new(Box::new(ExecTaskPlugin), None)),
+        "container" => Ok(LoadedTaskPlugin::new(Box::new(ContainerTaskPlugin), None)),
         other => {
             let path = task_plugin_name_to_path(other);
             unsafe {
@@ -573,5 +577,11 @@ mod tests {
 
         let err = validate_job_config(&config).expect_err("unknown strategy should fail");
         assert!(err.to_string().contains("invalid rollout.strategy"));
+    }
+
+    #[test]
+    fn builtin_plugin_schemas_have_descriptions_and_defaults() -> R<()> {
+        validate_builtin_task_plugin_schemas()?;
+        Ok(())
     }
 }

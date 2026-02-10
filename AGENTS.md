@@ -41,6 +41,7 @@
 - `docs/NEXT_UP.md` contains the immediate todos for the current task that the human developer is working on
 - `docs/TASK-LIST.md` contains a higher-level To Do list
 - `docs/differentiators.md` contains a list of reasons that legion is different from K8s and Nomad
+- Every gRPC method and every request/response attribute must be documented with in-depth, public-facing proto comments in `proto/legion.proto` and treated as the source of truth for API behavior.
 - Architecture and behavior docs:
   - `docs/architecture-managers-workers.md`
   - `docs/plugin-system.md`

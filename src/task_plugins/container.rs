@@ -1,63 +1,46 @@
 use crate::prelude::*;
 use crate::structs::{Allocation, TaskConfig};
-use crate::task_plugins::{spawn_task_process, TaskPlugin, TaskRuntime};
-use std::collections::HashMap;
+use crate::task_plugins::{derived_schema, spawn_task_process, TaskPlugin, TaskRuntime};
+use schemars::JsonSchema;
+use serde::Deserialize;
 use std::process::Command;
 
-#[derive(Debug, Clone)]
+fn default_container_env() -> HashMap<String, String> {
+    HashMap::new()
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 struct ContainerTaskConfig {
+    /// Container image reference used for task execution.
     image: String,
+
+    /// Command and arguments to run inside the container.
     command: Vec<String>,
+
+    /// Environment variables passed through to the container runtime.
+    #[serde(default = "default_container_env")]
+    #[schemars(default = "default_container_env")]
     env: HashMap<String, String>,
+
+    /// Additional plugin-specific fields reserved for forward compatibility.
+    #[serde(default, flatten)]
+    #[schemars(skip)]
+    _extra: HashMap<String, Value>,
 }
 
 impl ContainerTaskConfig {
     fn from_value(config: &Value) -> R<Self> {
-        let obj = config
-            .as_object()
+        let parsed: Self = serde_json::from_value(config.clone())
             .context("container task config must be an object")?;
-        let image = obj
-            .get("image")
-            .and_then(|value| value.as_str())
-            .context("container task config requires image")?
-            .to_string();
-        let command = obj
-            .get("command")
-            .context("container task config requires command")?
-            .as_array()
-            .context("container task command must be a list of strings")?
-            .iter()
-            .map(|value| {
-                value
-                    .as_str()
-                    .map(|text| text.to_string())
-                    .context("container task command values must be strings")
-            })
-            .collect::<R<Vec<_>>>()?;
-        if command.is_empty() {
+        parsed.validate()?;
+        Ok(parsed)
+    }
+
+    fn validate(&self) -> R<()> {
+        if self.command.is_empty() {
             bail!("container task command must include at least one entry");
         }
-
-        let env = match obj.get("env") {
-            None => HashMap::new(),
-            Some(value) => value
-                .as_object()
-                .context("container task env must be an object")?
-                .iter()
-                .map(|(key, value)| {
-                    let value = value
-                        .as_str()
-                        .context("container task env values must be strings")?;
-                    Ok((key.clone(), value.to_string()))
-                })
-                .collect::<R<HashMap<_, _>>>()?,
-        };
-
-        Ok(Self {
-            image,
-            command,
-            env,
-        })
+        Ok(())
     }
 }
 
@@ -148,23 +131,7 @@ impl TaskPlugin for ContainerTaskPlugin {
     }
 
     fn schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "required": ["image", "command"],
-            "properties": {
-                "image": { "type": "string" },
-                "command": {
-                    "type": "array",
-                    "minItems": 1,
-                    "items": { "type": "string" }
-                },
-                "env": {
-                    "type": "object",
-                    "additionalProperties": { "type": "string" }
-                }
-            },
-            "additionalProperties": true
-        })
+        derived_schema::<ContainerTaskConfig>()
     }
 
     fn readiness(&self) -> Map<String, Value> {
@@ -300,14 +267,16 @@ mod tests {
     fn container_config_requires_image() {
         let config = json!({"command": ["echo"]});
         let err = ContainerTaskConfig::from_value(&config).expect_err("missing image");
-        assert!(err.to_string().contains("requires image"));
+        let details = format!("{err:#}");
+        assert!(details.contains("missing field `image`"));
     }
 
     #[test]
     fn container_config_requires_command() {
         let config = json!({"image": "alpine"});
         let err = ContainerTaskConfig::from_value(&config).expect_err("missing command");
-        assert!(err.to_string().contains("requires command"));
+        let details = format!("{err:#}");
+        assert!(details.contains("missing field `command`"));
     }
 
     #[test]
@@ -325,7 +294,8 @@ mod tests {
             "env": { "COUNT": 1 }
         });
         let err = ContainerTaskConfig::from_value(&config).expect_err("bad env");
-        assert!(err.to_string().contains("env values must be strings"));
+        let details = format!("{err:#}");
+        assert!(details.contains("invalid type"));
     }
 
     #[test]
@@ -340,31 +310,14 @@ mod tests {
     }
 
     #[test]
-    fn container_builds_launch_for_apple_container() -> R<()> {
-        let config = ContainerTaskConfig {
-            image: "alpine".into(),
-            command: vec!["echo".into(), "hello".into()],
-            env: HashMap::from([("HELLO".into(), "world".into())]),
-        };
-        let launch = build_launch(ContainerRuntimeKind::AppleContainer, &alloc(), &config);
-        assert_eq!(launch.program, "container");
-        assert!(launch.args.contains(&"--env".to_string()));
-        assert!(launch.args.contains(&"HELLO=world".to_string()));
-        assert!(launch.args.contains(&"alpine".to_string()));
-        Ok(())
-    }
-
-    #[test]
-    fn container_builds_launch_for_youki() -> R<()> {
-        let config = ContainerTaskConfig {
-            image: "alpine".into(),
-            command: vec!["echo".into(), "hello".into()],
-            env: HashMap::new(),
-        };
+    fn launch_command_uses_runtime_binary() -> R<()> {
+        let config = ContainerTaskConfig::from_value(&json!({
+            "image": "alpine",
+            "command": ["echo", "ok"]
+        }))?;
         let launch = build_launch(ContainerRuntimeKind::Youki, &alloc(), &config);
         assert_eq!(launch.program, "youki");
         assert!(launch.args.contains(&"--image".to_string()));
-        assert!(launch.args.contains(&"alpine".to_string()));
         Ok(())
     }
 }

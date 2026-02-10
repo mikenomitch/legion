@@ -74,6 +74,10 @@ Entry trait: `RolloutStrategyPlugin` in `src/manager/rollout_strategy.rs`.
 - Protobuf always compiles.
 - Plugins build only when `LEGION_BUILD_PLUGINS=1`.
 - Plugin builds are skipped if `LEGION_SKIP_PLUGIN_BUILD` is set.
+- When `build.rs` builds plugins, it uses an isolated `CARGO_TARGET_DIR`
+  under `target/plugin-build/...` for compile isolation.
+- Runtime dynamic loading still resolves from plugin crate-local paths such as
+  `plugins/<kind>/<name>/target/release/lib<name>.<ext>`.
 
 This allows normal core builds without paying plugin build cost.
 
@@ -91,4 +95,3 @@ Based on `docs/TASK-LIST.md`, `README.md`, and `docs/differentiators.md`, these 
 - Job submit hook plugins.
 
 Some similarly named functionality exists in non-plugin form today (for example, resource defaults/validation in `ResourcePolicy`).
-

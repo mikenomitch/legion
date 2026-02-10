@@ -10,6 +10,7 @@ fn cli() -> Command {
         .propagate_version(true)
         .subcommand_required(true)
         .arg_required_else_help(true)
+        .subcommand(cmd::docs::config())
         .subcommand(cmd::job::config())
         .subcommand(cmd::node::config())
         .subcommand(cmd::start::config())
@@ -25,6 +26,7 @@ async fn main() -> R<()> {
 
     let matches = cli().get_matches();
     match matches.subcommand() {
+        Some(("docs", sub_matches)) => cmd::docs::handle(sub_matches).await?,
         Some(("start", sub_matches)) => cmd::start::handle(sub_matches).await?,
         Some(("job", sub_matches)) => cmd::job::handle(sub_matches).await?,
         Some(("node", sub_matches)) => cmd::node::handle(sub_matches).await?,

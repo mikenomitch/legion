@@ -45,9 +45,11 @@ Worker task manager flow:
 2. On allocation start:
    - resolve plugin by `task.kind`
    - run `prepare` then `start`
-3. On reconciliation stop/failure:
+3. On reconciliation stop:
    - run `stop` then `destroy`
-4. Persist allocation/task/PID state to local worker file.
+4. On failure handling:
+   - worker records failure and calls plugin `destroy` for cleanup
+5. Persist allocation/task/PID state to local worker file.
 
 Health checks and restart policies are managed by worker health monitor logic outside the plugin, but plugins control the actual runtime start/stop behavior.
 
@@ -58,4 +60,3 @@ See per-kind docs:
 - `docs/task-kind-exec.md`
 - `docs/task-kind-container.md`
 - `docs/task-kind-noop.md`
-
