@@ -348,6 +348,48 @@ pub fn advance_rollout(
         .with_context(|| format!("Rollout {} not found after update", rollout.id))
 }
 
+#[instrument(skip_all, fields(rollout_id, revert, priority))]
+pub fn stop_rollout(store: &Store, rollout_id: i64, revert: bool, priority: i64) -> R<Rollout> {
+    let rollout = store
+        .get_rollout(rollout_id)?
+        .with_context(|| format!("Rollout {} not found", rollout_id))?;
+
+    if is_terminal_rollout_status(&rollout.status) {
+        return Ok(rollout);
+    }
+
+    if revert {
+        let scheduler = Scheduler::new(store)?;
+        let to_config = store.get_job_config_by_id(&rollout.to_job_config_id)?;
+        rollback_rollout(store, &scheduler, &rollout, &to_config)?;
+    }
+
+    let message = if revert {
+        "Rollout stopped and reverted"
+    } else {
+        "Rollout stopped"
+    };
+    store.update_rollout_status(rollout.id, "cancelled", false, Some(message))?;
+    let metadata = json!({
+        "status": "cancelled",
+        "revert": revert,
+        "priority": priority,
+    })
+    .to_string();
+    let _ = store.append_rollout_event(
+        rollout.id,
+        &rollout.job_id,
+        None,
+        "warn",
+        message,
+        Some(&metadata),
+    );
+
+    store
+        .get_rollout(rollout.id)?
+        .with_context(|| format!("Rollout {} not found after stop", rollout.id))
+}
+
 #[instrument(skip_all, fields(rollout_id = rollout.id, plans = plans.len()))]
 fn execute_tick(
     store: &Store,
