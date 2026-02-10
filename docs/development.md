@@ -24,13 +24,13 @@ Install and start Apple `container` first if needed: https://github.com/apple/co
 
 ```bash
 # One Linux worker
-mise run join -- --linux
+mise run join --linux
 
 # Three Linux workers
-mise run join -- --linux --count 3
+mise run join --linux --count 3
 ```
 
-By default Linux workers connect to `http://192.168.64.1:4748` (the default `container` host gateway for the default network). If your setup differs, pass `--manager-addr`. Run `mise run join -- --help` for additional options (platform, custom manager address, container name prefix, and forwarded join args).
+By default Linux workers connect to `http://192.168.64.1:4748` (the default `container` host gateway for the default network). If your setup differs, pass `--manager-addr`. Run `mise run join --help` for additional options (platform, custom manager address, container name prefix, startup log tail behavior, and forwarded join args).
 
 ### Testing GRPC endpoints
 
