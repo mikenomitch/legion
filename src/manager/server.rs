@@ -489,7 +489,7 @@ impl Manager for ManagerAgentService {
         let force_reschedule = inner.force_reschedule;
         validate_job_config(&config).map_err(|e| {
             error!("Error validating task configs: {:?}", e);
-            Status::invalid_argument("Error validating task configs")
+            Status::invalid_argument(format!("Error validating task configs: {e}"))
         })?;
         let submit_outcome = self
             .store
@@ -694,7 +694,7 @@ impl Manager for ManagerAgentService {
         let (config, _kv_refs) =
             resolve_jobspec_kv_references(&self.store, &jobspec).map_err(|e| {
                 error!("Error parsing jobspec for plan: {:?}", e);
-                Status::invalid_argument("Error parsing jobspec")
+                Status::invalid_argument(format!("Error parsing jobspec: {e}"))
             })?;
         let config = self
             .store
@@ -702,7 +702,7 @@ impl Manager for ManagerAgentService {
             .map_err(|e| map_store_error("Error normalizing jobspec", e))?;
         validate_job_config(&config).map_err(|e| {
             error!("Error validating task configs: {:?}", e);
-            Status::invalid_argument("Error validating task configs")
+            Status::invalid_argument(format!("Error validating task configs: {e}"))
         })?;
 
         let scheduler = Scheduler::new(&self.store).map_err(|e| {
@@ -721,7 +721,7 @@ impl Manager for ManagerAgentService {
                     .plan_only(&existing.id(), PlanMode::Fresh)
                     .map_err(|e| {
                         error!("Error planning job {}: {:?}", existing.name, e);
-                        Status::internal("Error planning job")
+                        Status::invalid_argument(format!("Error planning job: {e}"))
                     })?;
                 let task_configs = self
                     .store
@@ -748,7 +748,7 @@ impl Manager for ManagerAgentService {
                     .plan_for_config(&config, PlanMode::Fresh, Some(&config.name))
                     .map_err(|e| {
                         error!("Error planning updated job {}: {:?}", config.name, e);
-                        Status::internal("Error planning job")
+                        Status::invalid_argument(format!("Error planning job: {e}"))
                     })?;
                 (
                     allocations,
@@ -766,7 +766,7 @@ impl Manager for ManagerAgentService {
                     .plan_for_config(&config, PlanMode::Fresh, None)
                     .map_err(|e| {
                         error!("Error planning new job {}: {:?}", config.name, e);
-                        Status::internal("Error planning job")
+                        Status::invalid_argument(format!("Error planning job: {e}"))
                     })?;
                 (
                     allocations,
