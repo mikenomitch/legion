@@ -1,526 +1,1275 @@
 syntax = "proto3";
 package legion;
 
+// Legion gRPC API.
+//
+// Conventions used throughout this file:
+// - `*_json` and many string fields contain JSON payloads serialized as strings.
+// - Timestamps are generally RFC3339 strings unless a field explicitly says Unix timestamp.
+// - Optional fields are omitted when not provided by the client/server.
+
 // === MANAGER ===
 
+// Manager is the primary control-plane API.
+//
+// It is used by:
+// - Workers for registration, heartbeats, and health updates.
+// - CLI/UI clients for job, rollout, node, ledger, and KV operations.
 service Manager {
+  // Fetches effective worker-type configuration before a worker registers.
+  //
+  // This is the first manager call in the worker join flow.
   rpc WorkerPreRegister (WorkerPreRegisterRequest)
     returns (WorkerPreRegisterReply);
+
+  // Registers or upserts a worker node in manager state.
+  //
+  // A worker should call this after pre-registration and after local fingerprinting.
   rpc WorkerRegister (WorkerRegisterRequest) returns (WorkerRegisterReply);
+
+  // Submits or updates a job from a fully rendered jobspec.
+  //
+  // Depending on current state, this may create a new job config, create a rollout,
+  // and enqueue reconciliation work.
   rpc RunJob (RunJobRequest) returns (RunJobReply);
+
+  // Returns the submitted source files (submissions) associated with the latest job config.
   rpc GetJobSpec (GetJobSpecRequest) returns (GetJobSpecReply);
+
+  // Returns metadata for one job (status, creation time, etc).
   rpc GetJobInfo (GetJobInfoRequest) returns (GetJobInfoReply);
+
+  // Lists rollouts, optionally filtered by job and active status.
   rpc ListRollouts (ListRolloutsRequest) returns (ListRolloutsReply);
+
+  // Returns one rollout by numeric rollout ID.
   rpc GetRollout (GetRolloutRequest) returns (GetRolloutReply);
+
+  // Returns rollout plus per-group runtime status and allocation health snapshots.
   rpc GetRolloutStatus (GetRolloutStatusRequest) returns (GetRolloutStatusReply);
+
+  // Returns ordered rollout event history for a rollout.
   rpc ListRolloutEvents (ListRolloutEventsRequest) returns (ListRolloutEventsReply);
+
+  // Manually advances a rollout (all groups or selected groups).
   rpc AdvanceRollout (AdvanceRolloutRequest) returns (AdvanceRolloutReply);
+
+  // Computes a placement plan for a jobspec without mutating cluster state.
   rpc PlanJob (PlanJobRequest) returns (PlanJobReply);
+
+  // Marks a job as stopped and enqueues stop reconciliation.
   rpc StopJob (StopJobRequest) returns (StopJobReply);
+
+  // Permanently removes a stopped job and related records.
   rpc DestroyJob (DestroyJobRequest) returns (DestroyJobReply);
+
+  // Lists jobs known by the manager.
   rpc ListJobs (ListJobsRequest) returns (ListJobsReply);
+
+  // Worker heartbeat endpoint.
+  //
+  // Workers send runtime state, failures, and allocation health snapshots.
+  // The manager returns the desired allocations for that worker node.
   rpc Heartbeat (HeartbeatRequest) returns (HeartbeatReply);
+
+  // Worker node health-check endpoint.
+  //
+  // Workers report node-level and plugin readiness checks.
   rpc HealthCheck (HealthCheckRequest) returns (HealthCheckReply);
+
+  // Lists all nodes known by the manager.
   rpc GetNodes (GetNodesRequest) returns (GetNodesReply);
+
+  // Returns one node by ID.
   rpc GetNode (GetNodeRequest) returns (GetNodeReply);
+
+  // Proxies a restart request to a worker node.
   rpc RestartWorker (RestartWorkerRequest) returns (RestartWorkerReply);
+
+  // Returns node + allocation view of cluster state (the "ledger").
   rpc GetLedger (GetLedgerRequest) returns (GetLedgerReply);
+
+  // Returns config snapshots stored by manager instances.
   rpc GetManagerConfigs (GetManagerConfigsRequest)
     returns (GetManagerConfigsReply);
+
+  // Applies dynamic attribute updates to a node and triggers affected evaluations.
   rpc UpdateNodeDynamic (UpdateNodeDynamicRequest)
     returns (UpdateNodeDynamicReply);
+
+  // Creates or updates a KV entry.
   rpc PutKv (PutKvRequest) returns (PutKvReply);
+
+  // Gets one KV entry by key.
   rpc GetKv (GetKvRequest) returns (GetKvReply);
+
+  // Lists KV entries by prefix.
   rpc ListKv (ListKvRequest) returns (ListKvReply);
+
+  // Deletes one KV entry by key.
   rpc DeleteKv (DeleteKvRequest) returns (DeleteKvReply);
+
+  // Applies an RFC6902 JSON patch to a JSON-typed KV entry.
   rpc PatchKv (PatchKvRequest) returns (PatchKvReply);
+
+  // Acquires (or force-acquires) a lock for a KV key.
   rpc AcquireKvLock (AcquireKvLockRequest) returns (AcquireKvLockReply);
+
+  // Renews an existing KV lock lease.
   rpc RenewKvLock (RenewKvLockRequest) returns (RenewKvLockReply);
+
+  // Releases an existing KV lock.
   rpc ReleaseKvLock (ReleaseKvLockRequest) returns (ReleaseKvLockReply);
+
+  // Returns current non-expired lock state for a KV key.
   rpc GetKvLock (GetKvLockRequest) returns (GetKvLockReply);
 }
 
+// Request payload for WorkerPreRegister.
 message WorkerPreRegisterRequest {
+  // Worker type name (for example: "default").
+  //
+  // This selects the worker template stored on the manager.
+  // No manager-side default is applied by this RPC.
   string worker_type = 1;
 }
 
+// Effective worker configuration returned by pre-registration.
 message WorkerConfig {
+  // Worker type name that produced this config.
   string name = 1;
+
+  // Node pool this worker belongs to.
   string pool = 2;
+
+  // Additional dynamic node-check plugin names to execute on worker.
+  //
+  // Default: empty list when worker type does not specify checks.
   repeated string additional_node_checks = 3;
+
+  // Static worker attributes injected into node config attrs at registration.
+  //
+  // Default: empty object `{}` when worker type does not set attributes.
   map<string, string> attributes = 4;
+
+  // Optional prefix used when auto-generating worker IDs.
+  //
+  // Default: unset.
   optional string name_prefix = 5;
+
+  // JSON-encoded total node resource overrides/capabilities.
+  //
+  // Default: `{}` (from worker-type storage defaults).
   string resources = 6;
+
+  // JSON-encoded reserved resource amounts/items unavailable for scheduling.
+  //
+  // Default: `{}` (from worker-type storage defaults).
   string reserved_resources = 7;
+
+  // Optional maximum number of allocations this worker should host.
+  //
+  // Default: unset (no explicit max allocation cap).
   optional uint32 max_allocations = 8;
 }
 
+// Reply payload for WorkerPreRegister.
 message WorkerPreRegisterReply {
+  // Effective worker configuration to use for this worker instance.
+  //
+  // Manager sets this on successful responses.
   WorkerConfig config = 1;
 }
 
+// Request payload for WorkerRegister.
 message WorkerRegisterRequest {
+  // Worker/node ID to register.
   string name = 1;
+
+  // Pool assigned to this worker.
   string pool = 2;
+
+  // JSON object string of node configuration attributes.
   string config_attrs = 3;
+
+  // JSON object string of node fingerprint attributes collected on worker.
   string fingerprint_attrs = 4;
+
+  // JSON object/string with current worker health-check results.
   string health_checks = 5;
+
+  // Manager-populated defaults on registration (not client-provided):
+  // - `status = "active"`
+  // - `availability = "available"`
+  // - `dynamic_attrs = {}`
+  // - `last_heartbeat = ""` until first heartbeat
 }
 
+// Reply payload for WorkerRegister.
 message WorkerRegisterReply {
+  // Human-readable status message.
+  //
+  // Current manager reply value: `"Worker registered"`.
   string message = 1;
 }
 
+// One submission unit that contributed to a rendered jobspec.
 message Submission {
+  // Original submission path (file path, module path, or logical label).
   string path = 1;
+
+  // Full submission content as text.
   string content = 2;
+
+  // True when this submission is the primary entrypoint file.
   bool is_primary = 3;
 }
 
+// Request payload for RunJob.
 message RunJobRequest {
+  // Fully rendered job specification as JSON text.
+  //
+  // This is the canonical input consumed by manager scheduling/validation logic.
   string parsed_jobspec = 1;
+
+  // Source submissions used to produce `parsed_jobspec`.
   repeated Submission submissions = 2;
+
+  // Optional eval priority override.
+  //
+  // Higher values are processed sooner in the eval queue.
+  // Default when omitted: manager `default_priority`
+  // (`50` in built-in config defaults).
   optional int64 priority = 3;
+
+  // When true, enqueues a reschedule even when the job spec content is unchanged.
+  //
+  // Default: `false`.
   bool force_reschedule = 4;
 }
 
+// Reply payload for RunJob.
 message RunJobReply {
+  // Human-readable outcome message (created/updated/unchanged/rollout state).
+  //
+  // Current manager reply values include:
+  // - `"Job submit success"`
+  // - `"Rollout started"`
+  // - `"Rollout created; waiting for manual start"`
+  // - `"Job config unchanged; no update needed"`
+  // - `"Job config unchanged; forced reschedule queued"`
   string message = 1;
 }
 
+// Request payload for GetJobInfo.
 message GetJobInfoRequest {
+  // Job name (also used as job ID in current manager implementation).
   string name = 1;
 }
 
+// Reply payload for GetJobInfo.
 message GetJobInfoReply {
+  // Job metadata for the requested job.
+  //
+  // Manager returns NotFound instead of returning this field unset.
   Job job = 1;
 }
 
+// Request payload for ListRollouts.
 message ListRolloutsRequest {
+  // Optional job ID filter.
+  //
+  // When omitted (or blank), rollouts for all jobs are returned.
   optional string job_id = 1;
+
+  // When true, only active (non-terminal) rollouts are returned.
+  //
+  // Default: `false` (returns both active and terminal rollouts).
   bool active_only = 2;
 }
 
+// Rollout record.
 message Rollout {
+  // Unique rollout ID.
   int64 id = 1;
+
+  // Job ID this rollout belongs to.
   string job_id = 2;
+
+  // Previous job config ID being replaced (if any).
   optional string from_job_config_id = 3;
+
+  // Target job config ID for this rollout.
   string to_job_config_id = 4;
+
+  // Rollout status.
+  //
+  // Common values include: pending, running, waiting_manual_start,
+  // waiting_manual_advance, completed, failed, cancelled, completed_incomplete.
   string status = 5;
+
+  // True when rollout finished but did not fully reach desired target.
   bool incomplete = 6;
+
+  // Human-readable rollout status message.
   string message = 7;
+
+  // Strategy plugin name used to resolve rollout behavior.
   optional string strategy = 8;
+
+  // Progression mode (for example: auto/manual) as stored by manager.
   optional string progression = 9;
+
+  // Replacement mode (for example: createFirst/destroyFirst) as stored by manager.
   optional string replacement = 10;
+
+  // Whether rollout prefers in-place replacement behavior.
   optional bool in_place = 11;
+
+  // JSON-encoded rollout envelope/config/runtime state.
   string config_json = 12;
+
+  // RFC3339 creation timestamp.
   string created_at = 13;
+
+  // RFC3339 update timestamp.
   string updated_at = 14;
+
+  // RFC3339 completion timestamp for terminal rollouts.
   optional string completed_at = 15;
 }
 
+// Reply payload for ListRollouts.
 message ListRolloutsReply {
+  // Matching rollout records.
   repeated Rollout rollouts = 1;
 }
 
+// Request payload for GetRollout.
 message GetRolloutRequest {
+  // Rollout ID.
   int64 id = 1;
 }
 
+// Reply payload for GetRollout.
 message GetRolloutReply {
+  // Rollout when found; unset when not found.
   optional Rollout rollout = 1;
 }
 
+// Allocation-level status as seen in a rollout group status response.
 message RolloutAllocationStatus {
+  // Allocation ID.
   int64 allocation_id = 1;
+
+  // Node hosting this allocation.
   string node_id = 2;
+
+  // Task config ID backing this allocation.
   int64 task_config_id = 3;
+
+  // Task name for display and filtering.
   string task_name = 4;
+
+  // Task group name.
   string task_group = 5;
+
+  // Task lifecycle (for example: service, batch, sidecar).
   string lifecycle = 6;
+
+  // Allocation runtime status string.
   string status = 7;
+
+  // Rollout role for this allocation, typically replacement or replacee.
   string role = 8;
+
+  // Optional derived node health flag at query time.
   optional bool node_healthy = 9;
+
+  // Optional allocation health flag from latest worker snapshot.
   optional bool allocation_healthy = 10;
+
+  // Optional allocation health status text from latest worker snapshot.
   optional string allocation_health = 11;
 }
 
+// Group-level rollout status.
 message RolloutGroupStatus {
+  // Group name.
   string group = 1;
+
+  // Current step index (0-based in runtime state, API returns current numeric index).
   uint32 step_index = 2;
+
+  // Total number of computed rollout steps for this group.
   uint32 total_steps = 3;
+
+  // Number of queued manual-advance credits for this group.
   uint32 pending_manual_advances = 4;
+
+  // Allocations participating in this group's rollout.
   repeated RolloutAllocationStatus allocations = 5;
 }
 
+// Request payload for GetRolloutStatus.
 message GetRolloutStatusRequest {
+  // Rollout ID.
   int64 id = 1;
 }
 
+// Reply payload for GetRolloutStatus.
 message GetRolloutStatusReply {
+  // Rollout record when found.
   optional Rollout rollout = 1;
+
+  // Per-group runtime status.
   repeated RolloutGroupStatus groups = 2;
 }
 
+// Rollout event record.
 message RolloutEvent {
+  // Event ID.
   int64 id = 1;
+
+  // Rollout ID this event belongs to.
   int64 rollout_id = 2;
+
+  // Job ID this event belongs to.
   string job_id = 3;
+
+  // Optional task group this event is scoped to.
   optional string group_name = 4;
+
+  // Event severity level (for example: info, warn, error).
   string level = 5;
+
+  // Human-readable event message.
   string message = 6;
+
+  // JSON metadata payload as string.
   string metadata_json = 7;
+
+  // RFC3339 creation timestamp.
   string created_at = 8;
 }
 
+// Request payload for ListRolloutEvents.
 message ListRolloutEventsRequest {
+  // Rollout ID.
+  //
+  // Must be greater than 0.
   int64 rollout_id = 1;
+
+  // Optional maximum number of events to return.
+  //
+  // Default when omitted: `500`.
+  // Manager bounds: clamped to `[1, 2000]`.
   optional uint32 limit = 2;
 }
 
+// Reply payload for ListRolloutEvents.
 message ListRolloutEventsReply {
+  // Ordered rollout events (oldest to newest within the returned window).
   repeated RolloutEvent events = 1;
 }
 
+// Request payload for AdvanceRollout.
 message AdvanceRolloutRequest {
+  // Rollout ID.
   int64 id = 1;
+
+  // Group names to advance.
+  //
+  // Empty (default) means advance all groups in the rollout.
   repeated string groups = 2;
+
+  // Optional eval priority for generated rollout tick work.
+  //
+  // Default when omitted: manager `default_priority`
+  // (`50` in built-in config defaults).
   optional int64 priority = 3;
 }
 
+// Reply payload for AdvanceRollout.
 message AdvanceRolloutReply {
+  // Human-readable queue/advance message.
+  //
+  // Current manager reply value: `"Rollout advance queued"`.
   string message = 1;
+
+  // Updated rollout record after queuing manual advance.
   optional Rollout rollout = 2;
 }
 
+// Request payload for GetJobSpec.
 message GetJobSpecRequest {
+  // Job name.
   string name = 1;
 }
 
+// Reply payload for GetJobSpec.
 message GetJobSpecReply {
+  // Submissions associated with the latest job config.
+  //
+  // Field number intentionally remains `2` for compatibility.
   repeated Submission submissions = 2;
 }
 
+// Request payload for PlanJob.
 message PlanJobRequest {
+  // Fully rendered jobspec JSON to plan.
   string parsed_jobspec = 1;
 }
 
+// Reply payload for PlanJob.
 message PlanJobReply {
+  // Planned allocations for display.
   repeated PlannedAllocation allocations = 1;
+
+  // Human-readable planning summary.
   string message = 2;
+
+  // True when a job with the same name already exists.
   bool matches_existing = 3;
+
+  // True when existing config is content-identical to planned config.
   bool same_content = 4;
 }
 
+// Planned allocation display item.
 message PlannedAllocation {
+  // Target node ID.
   string node_id = 1;
+
+  // Task config ID in the planned context.
   int64 task_config_id = 2;
+
+  // Task name for readability.
   string task_name = 3;
 }
 
+// Request payload for StopJob.
 message StopJobRequest {
+  // Job name.
   string name = 1;
+
+  // Optional eval priority override.
+  //
+  // Default when omitted: manager `default_priority`
+  // (`50` in built-in config defaults).
   optional int64 priority = 2;
 }
 
+// Reply payload for StopJob.
 message StopJobReply {
+  // Human-readable status message.
+  //
+  // Current manager reply format: `"Stopped <job-name>"`.
   string message = 1;
 }
 
+// Request payload for DestroyJob.
 message DestroyJobRequest {
+  // Job name.
   string name = 1;
+
+  // Reserved for future eval-priority support.
+  //
+  // Current manager implementation ignores this field.
   optional int64 priority = 2;
 }
 
+// Reply payload for DestroyJob.
 message DestroyJobReply {
+  // Human-readable status message.
+  //
+  // Current manager reply format: `"Destroyed <job-name>"`.
   string message = 1;
 }
 
+// Request payload for ListJobs.
 message ListJobsRequest {
+  // Empty request; all jobs are returned.
 }
 
+// Job metadata record.
 message Job {
+  // Job ID.
   string id = 1;
+
+  // Job name.
   string name = 2;
+
+  // Job status string.
+  //
+  // Current values written by manager include: done, stopped, failed.
   string status = 3;
+
+  // Unix timestamp (seconds) when job was created.
   int64 created_at = 4;
 }
 
+// Reply payload for ListJobs.
 message ListJobsReply {
+  // Jobs known to manager.
   repeated Job jobs = 1;
 }
 
+// Request payload for Heartbeat.
 message HeartbeatRequest {
+  // Worker/node ID sending heartbeat.
   string id = 1;
+
+  // Allocation IDs currently known/running on worker.
+  //
+  // Default: empty list.
   repeated int64 allocation_ids = 2;
+
+  // Allocations that failed on worker since last heartbeat.
+  //
+  // Default: empty list.
   repeated FailedAllocation failed_allocations = 3;
+
+  // Latest per-allocation health snapshots from worker.
+  //
+  // Default: empty list.
   repeated AllocationHealth allocation_health = 4;
 }
 
+// Reply payload for Heartbeat.
 message HeartbeatReply {
+  // Human-readable acknowledgement.
+  //
+  // Current manager reply value: `"ack"`.
   string message = 1;
+
+  // Desired allocation set this worker should reconcile to.
+  //
+  // Default: empty list when manager has no desired allocations for this node.
   repeated TaskAllocation desired_allocations = 2;
 }
 
+// Failed allocation report item from worker to manager.
 message FailedAllocation {
+  // Failed allocation ID.
   int64 allocation_id = 1;
+
+  // Failure reason text.
   string reason = 2;
 }
 
+// Allocation health snapshot item from worker to manager.
 message AllocationHealth {
+  // Allocation ID.
   int64 allocation_id = 1;
+
+  // True when current health check state is healthy.
   bool healthy = 2;
+
+  // Human-readable health status details.
   string status = 3;
 }
 
+// Request payload for HealthCheck.
 message HealthCheckRequest {
+  // Worker/node ID submitting health checks.
   string id = 1;
+
+  // JSON-encoded node health-check payload.
   string health_checks = 2;
 }
 
+// Reply payload for HealthCheck.
 message HealthCheckReply {
+  // Human-readable acknowledgement.
+  //
+  // Current manager reply value: `"ack"`.
   string message = 1;
 }
 
+// Node record used in APIs.
 message NodeMsg {
+  // Node ID.
   string id = 1;
+
+  // Node pool.
   string pool = 2;
+
+  // Node status string.
+  //
+  // On worker registration manager sets default `"active"`.
   string status = 3;
+
+  // Scheduling availability string (for example: available/unavailable).
+  //
+  // On worker registration manager sets default `"available"`.
   string availability = 4;
+
+  // JSON-encoded configuration attributes.
   string config_attrs = 5;
+
+  // JSON-encoded fingerprint attributes.
   string fingerprint_attrs = 6;
+
+  // JSON-encoded dynamic attributes.
+  //
+  // On worker registration manager initializes this to `{}`.
   string dynamic_attrs = 7;
+
+  // JSON-encoded health check payload.
   string health_checks = 8;
+
+  // Last heartbeat timestamp string.
+  //
+  // On worker registration this starts empty and is set on first heartbeat.
   string last_heartbeat = 9;
 }
 
+// Request payload for GetNodes.
 message GetNodesRequest {
+  // Empty request; all nodes are returned.
 }
 
+// Reply payload for GetNodes.
 message GetNodesReply {
+  // Nodes known to manager.
   repeated NodeMsg nodes = 1;
 }
 
+// Request payload for GetNode.
 message GetNodeRequest {
+  // Node ID.
   string id = 1;
 }
 
+// Reply payload for GetNode.
 message GetNodeReply {
+  // Node record when found.
+  //
+  // Unset when the node ID does not exist.
   optional NodeMsg node = 1;
 }
 
+// Request payload for RestartWorker.
 message RestartWorkerRequest {
+  // Node/worker ID to restart.
   string node_id = 1;
 }
 
+// Reply payload for RestartWorker.
 message RestartWorkerReply {
+  // Human-readable status message.
+  //
+  // Manager forwards the worker's restart message.
+  // Built-in worker currently replies `"Worker restarting"`.
   string message = 1;
 }
 
+// Request payload for GetLedger.
 message GetLedgerRequest {
+  // Empty request; full ledger is returned.
 }
 
+// Reply payload for GetLedger.
 message GetLedgerReply {
+  // Ledger rows keyed by node.
   repeated LedgerNode nodes = 1;
 }
 
+// Snapshot of one manager node's stored manager config.
 message ManagerNodeConfig {
+  // Manager node ID.
   string node_id = 1;
+
+  // JSON-encoded manager configuration.
   string config_json = 2;
+
+  // Timestamp when this snapshot was updated.
   string updated_at = 3;
 }
 
-message GetManagerConfigsRequest {}
+// Request payload for GetManagerConfigs.
+message GetManagerConfigsRequest {
+  // Empty request; all manager config snapshots are returned.
+}
 
+// Reply payload for GetManagerConfigs.
 message GetManagerConfigsReply {
+  // Stored manager config snapshots.
   repeated ManagerNodeConfig configs = 1;
 }
 
+// Type discriminator for KV values.
 enum KvValueType {
+  // Invalid/unspecified type.
+  //
+  // Proto3 enum default is this value, but write APIs reject it.
   KV_VALUE_TYPE_UNSPECIFIED = 0;
+
+  // Plain string value.
   KV_VALUE_TYPE_STRING = 1;
+
+  // JSON numeric value.
   KV_VALUE_TYPE_NUMBER = 2;
+
+  // Arbitrary JSON value.
   KV_VALUE_TYPE_JSON = 3;
 }
 
+// KV entry record.
 message KvEntry {
+  // Key path.
   string key = 1;
+
+  // Raw stored value string.
+  //
+  // Interpretation depends on `value_type`.
   string value = 2;
+
+  // Type discriminator for `value`.
   KvValueType value_type = 3;
+
+  // Monotonic version used for optimistic concurrency.
   int64 version = 4;
+
+  // RFC3339 creation timestamp.
   string created_at = 5;
+
+  // RFC3339 update timestamp.
   string updated_at = 6;
 }
 
+// KV lock record.
 message KvLock {
+  // Key this lock protects.
   string key = 1;
+
+  // Lock token that must be provided for renew/release and optional writes.
   string lock_id = 2;
+
+  // Optional owner label for debugging/auditing.
   optional string owner = 3;
+
+  // RFC3339 time lock was acquired.
   string acquired_at = 4;
+
+  // RFC3339 lock expiration timestamp.
   string expires_at = 5;
 }
 
+// Request payload for PutKv.
 message PutKvRequest {
+  // Key path to create or update.
+  //
+  // Must be non-empty.
   string key = 1;
+
+  // Value to store.
+  //
+  // Interpretation and validation depend on `value_type`.
   string value = 2;
+
+  // Value type for normalization/validation.
+  //
+  // Required for writes. Default enum value is
+  // `KV_VALUE_TYPE_UNSPECIFIED`, which manager rejects.
   KvValueType value_type = 3;
+
+  // Optional expected version for optimistic concurrency checks.
+  //
+  // Behavior:
+  // - Update existing key: must match current version.
+  // - Create new key: may be omitted, or explicitly `0`.
   optional int64 expected_version = 4;
+
+  // Optional lock token; required when key is actively locked by another client.
+  //
+  // Default: unset.
   optional string lock_id = 5;
+
+  // Side effect:
+  // - If this key is referenced by one or more jobspec KV refs, manager recomputes
+  //   affected job configs and may create/update rollouts.
 }
 
+// Reply payload for PutKv.
 message PutKvReply {
+  // Stored KV entry after write.
+  //
+  // Includes incremented `version` and normalized `value`.
+  // Manager sets this on successful responses.
   KvEntry entry = 1;
 }
 
+// Request payload for GetKv.
 message GetKvRequest {
+  // Key path to fetch.
+  //
+  // Must be non-empty.
   string key = 1;
 }
 
+// Reply payload for GetKv.
 message GetKvReply {
+  // Entry when found; unset when key does not exist.
   optional KvEntry entry = 1;
 }
 
+// Request payload for ListKv.
 message ListKvRequest {
+  // Prefix filter; entries with keys beginning with this prefix are returned.
+  //
+  // Default empty string matches all keys.
   string prefix = 1;
 }
 
+// Reply payload for ListKv.
 message ListKvReply {
+  // Matching KV entries.
   repeated KvEntry entries = 1;
 }
 
+// Request payload for DeleteKv.
 message DeleteKvRequest {
+  // Key path to delete.
+  //
+  // Must be non-empty.
   string key = 1;
+
+  // Optional expected version for optimistic concurrency checks.
+  //
+  // Default: unset (no version check).
   optional int64 expected_version = 2;
+
+  // Optional lock token; required when key is actively locked by another client.
+  //
+  // Default: unset.
   optional string lock_id = 3;
 }
 
+// Reply payload for DeleteKv.
 message DeleteKvReply {
+  // Human-readable result message.
+  //
+  // Current manager reply value: `"kv entry deleted"`.
   string message = 1;
 }
 
+// Request payload for PatchKv.
 message PatchKvRequest {
+  // Key path to patch.
+  //
+  // Must reference an existing JSON-typed KV entry.
   string key = 1;
+
+  // RFC6902 JSON patch payload as text.
+  //
+  // Must parse as a valid JSON Patch document.
   string patch_json = 2;
+
+  // Optional expected version for optimistic concurrency checks.
+  //
+  // Default: unset (no version check).
   optional int64 expected_version = 3;
+
+  // Optional lock token; required when key is actively locked by another client.
+  //
+  // Default: unset.
   optional string lock_id = 4;
+
+  // Side effect:
+  // - If this key is referenced by one or more jobspec KV refs, manager recomputes
+  //   affected job configs and may create/update rollouts.
 }
 
+// Reply payload for PatchKv.
 message PatchKvReply {
+  // Updated KV entry after patch.
+  //
+  // Includes incremented `version`.
+  // Manager sets this on successful responses.
   KvEntry entry = 1;
 }
 
+// Request payload for AcquireKvLock.
 message AcquireKvLockRequest {
+  // Key path to lock.
+  //
+  // Must be non-empty.
   string key = 1;
+
+  // Optional caller-supplied lock token.
+  //
+  // If omitted, manager generates a random 32-hex-character token.
+  // If provided and it matches an existing active lock ID for this key,
+  // acquire is allowed even without `force=true`.
   optional string lock_id = 2;
+
+  // Optional owner label for diagnostics.
+  //
+  // Default: unset.
   optional string owner = 3;
+
+  // Lease duration in seconds.
+  //
+  // Must be > 0.
   int64 ttl_seconds = 4;
+
+  // When true, allows replacing an existing non-expired lock.
+  //
+  // Default: `false`.
   bool force = 5;
 }
 
+// Reply payload for AcquireKvLock.
 message AcquireKvLockReply {
+  // Active lock state.
+  //
+  // Manager sets this on successful responses.
   KvLock lock = 1;
 }
 
+// Request payload for RenewKvLock.
 message RenewKvLockRequest {
+  // Key path.
   string key = 1;
+
+  // Lock token currently held by caller.
+  //
+  // Must match the active lock's ID.
   string lock_id = 2;
+
+  // New lease duration in seconds.
+  //
+  // Must be > 0.
   int64 ttl_seconds = 3;
+
+  // Behavior note:
+  // - If lock is already expired, manager removes it and returns a conflict.
 }
 
+// Reply payload for RenewKvLock.
 message RenewKvLockReply {
+  // Updated lock state.
+  //
+  // Manager sets this on successful responses.
   KvLock lock = 1;
 }
 
+// Request payload for ReleaseKvLock.
 message ReleaseKvLockRequest {
+  // Key path.
   string key = 1;
+
+  // Lock token currently held by caller.
+  //
+  // Must match the active lock's ID.
   string lock_id = 2;
 }
 
+// Reply payload for ReleaseKvLock.
 message ReleaseKvLockReply {
+  // Human-readable result message.
+  //
+  // Current manager reply value: `"kv lock released"`.
   string message = 1;
 }
 
+// Request payload for GetKvLock.
 message GetKvLockRequest {
+  // Key path.
+  //
+  // Must be non-empty.
   string key = 1;
 }
 
+// Reply payload for GetKvLock.
 message GetKvLockReply {
+  // Active non-expired lock when present.
+  //
+  // If the stored lock is expired, manager removes it and returns unset.
   optional KvLock lock = 1;
 }
 
+// One ledger row grouping a node with its current allocations.
 message LedgerNode {
+  // Node record.
   optional NodeMsg node = 1;
+
+  // Allocations currently assigned to this node.
   repeated LedgerAllocation allocations = 2;
 }
 
+// Allocation record as returned in ledger responses.
 message LedgerAllocation {
+  // Allocation ID.
   int64 id = 1;
+
+  // Allocation status.
   string status = 2;
+
+  // JSON-encoded resource payload.
   string resources = 3;
+
+  // Node ID where this allocation is placed.
   string node_id = 4;
+
+  // Job config ID this allocation targets.
   string job_config_id = 5;
+
+  // Task config ID this allocation targets.
   int64 task_config_id = 6;
+
+  // Job ID this allocation belongs to.
   string job_id = 7;
 }
 
+// Request payload for UpdateNodeDynamic.
 message UpdateNodeDynamicRequest {
+  // Node ID to update.
   string id = 1;
+
+  // JSON object string merged into node dynamic attributes.
+  //
+  // Merge behavior is shallow object merge by key.
+  // Keys present in `dynamic_diff` overwrite existing keys.
   string dynamic_diff = 2;
+
+  // Side effect:
+  // - Manager enqueues `job_update` evals for job configs currently allocated
+  //   on this node, using manager default eval priority (default `50`).
 }
 
+// Reply payload for UpdateNodeDynamic.
 message UpdateNodeDynamicReply {
+  // Updated node record.
+  //
+  // Includes merged dynamic attributes as persisted by manager.
   optional NodeMsg node = 1;
 }
 
 // === INSECURE MANAGER ===
 
+// InsecureManager exposes bootstrap-only APIs on the insecure listener.
+//
+// This is typically used to issue join tokens before a worker has secure
+// cluster credentials.
 service InsecureManager {
+  // Generates a worker join token (JWT).
   rpc GetJoinToken (GetJoinTokenRequest) returns (GetJoinTokenReply);
 }
 
+// Request payload for GetJoinToken.
 message GetJoinTokenRequest {
+  // Optional token TTL string (for example: "1h", "30m").
+  //
+  // Unset means no expiry in current manager implementation
+  // (`exp` claim is set to `0` and `skip_expiry_validation=true`).
   optional string ttl = 1;
+
+  // Optional worker type to embed in token.
+  //
+  // Defaults to "default" when omitted.
   optional string worker_type = 2;
 }
 
+// Reply payload for GetJoinToken.
 message GetJoinTokenReply {
+  // Signed JWT join token.
   string token = 1;
 }
 
+// Internal eval queue item.
 message Eval {
+  // Eval ID.
   string id = 1;
+
+  // Eval status (for example: pending, in_flight, failed).
+  //
+  // Newly enqueued evals start as `pending`.
   string status = 2;
+
+  // Eval kind (for example: job_submit, node_drop, rollout_tick).
   string kind = 3;
+
+  // Associated job ID when applicable.
+  //
+  // Default empty string when not scoped to a job.
   string job_id = 4;
+
+  // Associated job config ID when applicable.
+  //
+  // Default empty string when not scoped to a job config.
   string job_config_id = 5;
+
+  // Associated node name/ID when applicable.
+  //
+  // Default empty string when not scoped to a node.
   string node_name = 6;
+
+  // Eval priority (higher processed first).
+  //
+  // Default when not explicitly provided: manager `default_priority`
+  // (`50` in built-in config defaults).
   int64 priority = 7;
 }
 
 // === WORKER ===
 
+// Worker is the per-node runtime API called by the manager.
 service Worker {
+  // Delivers one allocation payload to worker for execution/reconciliation.
   rpc PostWork (PostWorkRequest) returns (PostWorkReply);
+
+  // Requests the worker process to restart itself.
   rpc RestartWorker (RestartWorkerRequest) returns (RestartWorkerReply);
 }
 
+// Allocation payload sent to workers.
 message TaskAllocation {
+  // Allocation ID.
   int64 allocation_id = 1;
+
+  // Job ID.
   string job_id = 2;
+
+  // Job config ID.
   string job_config_id = 3;
+
+  // Target node ID.
   string node_id = 4;
+
+  // Task config ID.
   int64 task_config_id = 5;
+
+  // Task name.
   string task_name = 6;
+
+  // Task kind/plugin name.
   string task_kind = 7;
+
+  // JSON-encoded task config payload.
   string task_config = 8;
+
+  // JSON-encoded task health-check definitions.
   string task_checks = 9;
+
+  // JSON-encoded task unhealthy handling policy.
   string task_on_unhealthy = 10;
 }
 
+// Request payload for PostWork.
 message PostWorkRequest {
+  // Allocation payload to start/reconcile on worker.
+  //
+  // Required. Worker rejects request when this field is missing.
   TaskAllocation allocation = 1;
 }
 
+// Reply payload for PostWork.
 message PostWorkReply {
+  // Human-readable acknowledgement.
+  //
+  // Built-in worker reply value: `"Task accepted"`.
   string message = 1;
 }

@@ -2,6 +2,23 @@
 
 A distributed scheduler similar to Kubernetes or Nomad.
 
+## Documentation
+
+- [Managers and Workers](docs/architecture-managers-workers.md)
+- [Plugin System](docs/plugin-system.md)
+- [Scheduler and Eval Loop](docs/scheduler-and-eval-loop.md)
+- [Jobs, Tasks, and Scheduling](docs/jobs-tasks-and-scheduling.md)
+- [Task Kind Plugins](docs/task-kind-plugins.md)
+- [Task Kind: exec](docs/task-kind-exec.md)
+- [Task Kind: container](docs/task-kind-container.md)
+- [Task Kind: noop](docs/task-kind-noop.md)
+- [State Store](docs/state-store.md)
+- [Observability](docs/observability.md)
+- [UI Architecture](docs/ui-architecture.md)
+- [KV Store](docs/kv-store.md)
+- [Testing and Benchmarks](docs/testing-and-benchmarks.md)
+- [Codebase Conventions](docs/codebase-conventions.md)
+
 It aims to be differentiated from the above based on the following:
 - Ease:
   - It is the simplest scheduler to get running. Start a manager node in one command. Connect from a worker node in one command.
