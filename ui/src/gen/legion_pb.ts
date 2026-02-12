@@ -1659,6 +1659,47 @@ export class GetJobSpecRequest extends Message<GetJobSpecRequest> {
 }
 
 /**
+ * Request payload for GetJobSpecByConfig.
+ *
+ * @generated from message legion.GetJobSpecByConfigRequest
+ */
+export class GetJobSpecByConfigRequest extends Message<GetJobSpecByConfigRequest> {
+  /**
+   * Job config ID.
+   *
+   * @generated from field: string config_id = 1;
+   */
+  configId = "";
+
+  constructor(data?: PartialMessage<GetJobSpecByConfigRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetJobSpecByConfigRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "config_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetJobSpecByConfigRequest {
+    return new GetJobSpecByConfigRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetJobSpecByConfigRequest {
+    return new GetJobSpecByConfigRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetJobSpecByConfigRequest {
+    return new GetJobSpecByConfigRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetJobSpecByConfigRequest | PlainMessage<GetJobSpecByConfigRequest> | undefined, b: GetJobSpecByConfigRequest | PlainMessage<GetJobSpecByConfigRequest> | undefined): boolean {
+    return proto3.util.equals(GetJobSpecByConfigRequest, a, b);
+  }
+}
+
+/**
  * Reply payload for GetJobSpec.
  *
  * @generated from message legion.GetJobSpecReply
@@ -1698,6 +1739,145 @@ export class GetJobSpecReply extends Message<GetJobSpecReply> {
 
   static equals(a: GetJobSpecReply | PlainMessage<GetJobSpecReply> | undefined, b: GetJobSpecReply | PlainMessage<GetJobSpecReply> | undefined): boolean {
     return proto3.util.equals(GetJobSpecReply, a, b);
+  }
+}
+
+/**
+ * One job spec history entry.
+ *
+ * @generated from message legion.JobSpecHistoryItem
+ */
+export class JobSpecHistoryItem extends Message<JobSpecHistoryItem> {
+  /**
+   * Job config ID.
+   *
+   * @generated from field: string config_id = 1;
+   */
+  configId = "";
+
+  /**
+   * RFC3339 timestamp when config was created.
+   *
+   * @generated from field: string created_at = 2;
+   */
+  createdAt = "";
+
+  /**
+   * Monotonic config version.
+   *
+   * @generated from field: optional int64 version = 3;
+   */
+  version?: bigint;
+
+  constructor(data?: PartialMessage<JobSpecHistoryItem>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.JobSpecHistoryItem";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "config_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "created_at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "version", kind: "scalar", T: 3 /* ScalarType.INT64 */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): JobSpecHistoryItem {
+    return new JobSpecHistoryItem().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): JobSpecHistoryItem {
+    return new JobSpecHistoryItem().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): JobSpecHistoryItem {
+    return new JobSpecHistoryItem().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: JobSpecHistoryItem | PlainMessage<JobSpecHistoryItem> | undefined, b: JobSpecHistoryItem | PlainMessage<JobSpecHistoryItem> | undefined): boolean {
+    return proto3.util.equals(JobSpecHistoryItem, a, b);
+  }
+}
+
+/**
+ * Request payload for ListJobSpecHistory.
+ *
+ * @generated from message legion.ListJobSpecHistoryRequest
+ */
+export class ListJobSpecHistoryRequest extends Message<ListJobSpecHistoryRequest> {
+  /**
+   * Job name.
+   *
+   * @generated from field: string name = 1;
+   */
+  name = "";
+
+  constructor(data?: PartialMessage<ListJobSpecHistoryRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListJobSpecHistoryRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListJobSpecHistoryRequest {
+    return new ListJobSpecHistoryRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListJobSpecHistoryRequest {
+    return new ListJobSpecHistoryRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListJobSpecHistoryRequest {
+    return new ListJobSpecHistoryRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListJobSpecHistoryRequest | PlainMessage<ListJobSpecHistoryRequest> | undefined, b: ListJobSpecHistoryRequest | PlainMessage<ListJobSpecHistoryRequest> | undefined): boolean {
+    return proto3.util.equals(ListJobSpecHistoryRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for ListJobSpecHistory.
+ *
+ * @generated from message legion.ListJobSpecHistoryReply
+ */
+export class ListJobSpecHistoryReply extends Message<ListJobSpecHistoryReply> {
+  /**
+   * History in newest-first order.
+   *
+   * @generated from field: repeated legion.JobSpecHistoryItem items = 1;
+   */
+  items: JobSpecHistoryItem[] = [];
+
+  constructor(data?: PartialMessage<ListJobSpecHistoryReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListJobSpecHistoryReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "items", kind: "message", T: JobSpecHistoryItem, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListJobSpecHistoryReply {
+    return new ListJobSpecHistoryReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListJobSpecHistoryReply {
+    return new ListJobSpecHistoryReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListJobSpecHistoryReply {
+    return new ListJobSpecHistoryReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListJobSpecHistoryReply | PlainMessage<ListJobSpecHistoryReply> | undefined, b: ListJobSpecHistoryReply | PlainMessage<ListJobSpecHistoryReply> | undefined): boolean {
+    return proto3.util.equals(ListJobSpecHistoryReply, a, b);
   }
 }
 

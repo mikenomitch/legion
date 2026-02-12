@@ -15,13 +15,15 @@ use crate::structs::manager_server::Manager;
 use crate::structs::{
     worker_client::WorkerClient, AcquireKvLockReply, AcquireKvLockRequest, AdvanceRolloutReply,
     AdvanceRolloutRequest, AllocationHealth, DeleteKvReply, DeleteKvRequest, DestroyJobReply,
-    DestroyJobRequest, FailedAllocation, GetJobInfoReply, GetJobInfoRequest, GetJobSpecReply,
-    GetJobSpecRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply,
-    GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest, GetNodeReply,
-    GetNodeRequest, GetNodesReply, GetNodesRequest, GetRolloutReply, GetRolloutRequest,
-    GetRolloutStatusReply, GetRolloutStatusRequest, HealthCheckReply, HealthCheckRequest,
-    HeartbeatReply, HeartbeatRequest, JobConfig, KvEntry, KvValueType, LedgerNode, ListJobsReply,
-    ListJobsRequest, ListKvReply, ListKvRequest, ListRolloutEventsReply, ListRolloutEventsRequest,
+    DestroyJobRequest, FailedAllocation, GetJobInfoReply, GetJobInfoRequest,
+    GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest, GetKvLockReply,
+    GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest,
+    GetManagerConfigsReply, GetManagerConfigsRequest, GetNodeReply, GetNodeRequest, GetNodesReply,
+    GetNodesRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply,
+    GetRolloutStatusRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply,
+    HeartbeatRequest, JobConfig, JobSpecHistoryItem, KvEntry, KvValueType, LedgerNode,
+    ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobsReply, ListJobsRequest,
+    ListKvReply, ListKvRequest, ListRolloutEventsReply, ListRolloutEventsRequest,
     ListRolloutsReply, ListRolloutsRequest, Node, NodeMsg, PatchKvReply, PatchKvRequest,
     PlanJobReply, PlanJobRequest, PlannedAllocation, PutKvReply, PutKvRequest, ReleaseKvLockReply,
     ReleaseKvLockRequest, RenewKvLockReply, RenewKvLockRequest, RestartWorkerReply,
@@ -896,6 +898,44 @@ impl Manager for ManagerAgentService {
         let reply = GetJobSpecReply { submissions };
 
         Ok(Response::new(reply))
+    }
+
+    async fn get_job_spec_by_config(
+        &self,
+        request: Request<GetJobSpecByConfigRequest>,
+    ) -> Result<Response<GetJobSpecReply>, Status> {
+        let config_id = request.into_inner().config_id;
+
+        let submissions = self
+            .store
+            .get_submissions_for_config(&config_id)
+            .map_err(|e| map_store_error("Error getting submissions", e))?;
+
+        Ok(Response::new(GetJobSpecReply {
+            submissions,
+            ..Default::default()
+        }))
+    }
+
+    #[instrument(skip_all)]
+    async fn list_job_spec_history(
+        &self,
+        request: Request<ListJobSpecHistoryRequest>,
+    ) -> Result<Response<ListJobSpecHistoryReply>, Status> {
+        let name = request.into_inner().name;
+        let items = self
+            .store
+            .list_job_spec_history(&name)
+            .map_err(|e| map_store_error("Error listing job spec history", e))?
+            .into_iter()
+            .map(|(config_id, created_at, version)| JobSpecHistoryItem {
+                config_id,
+                created_at,
+                version,
+            })
+            .collect();
+
+        Ok(Response::new(ListJobSpecHistoryReply { items }))
     }
 
     #[instrument(skip_all)]

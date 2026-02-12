@@ -1,4 +1,4 @@
-import { createEffect, createResource, createSignal } from 'solid-js'
+import { createEffect, createMemo, createResource, createSignal } from 'solid-js'
 import SharedIndex from '../components/SharedIndex'
 import { managerClient } from '../grpcClient'
 import { formatRelativeTime } from '../utils/format'
@@ -23,17 +23,22 @@ export default function Jobs() {
     setPage(1)
   })
 
+  const [ledger] = createResource(async () => (await managerClient.getLedger({})).nodes)
+  const jobAllocationCounts = createMemo(() => {
+    const map = new Map<string, number>()
+    for (const node of ledger() ?? []) {
+      for (const allocation of node.allocations) {
+        map.set(allocation.jobId, (map.get(allocation.jobId) ?? 0) + 1)
+      }
+    }
+    return map
+  })
+
   const [data] = createResource(
     () => ({ search: search(), sort: sort(), page: page(), pageSize: pageSize() }),
     async (input) => {
       const [sortBy, sortOrder] = input.sort.split(':')
-      return managerClient.listJobs({
-        query: input.search,
-        sortBy,
-        sortOrder,
-        page: input.page,
-        pageSize: input.pageSize,
-      })
+      return managerClient.listJobs({ query: input.search, sortBy, sortOrder, page: input.page, pageSize: input.pageSize })
     },
   )
 
@@ -49,12 +54,12 @@ export default function Jobs() {
         { label: 'Created (oldest)', value: 'created_at:asc' },
         { label: 'Name (A-Z)', value: 'name:asc' },
       ]}
-      loading={data.loading}
+      loading={data.loading || ledger.loading}
       error={data.error ? 'Failed to load jobs.' : undefined}
       items={(data()?.jobs ?? []).map((job) => ({
         id: job.id,
         title: job.name || job.id,
-        subtitle: job.id,
+        subtitle: `Status: ${job.status || 'unknown'} · Allocations: ${jobAllocationCounts().get(job.id) ?? 0}`,
         health: job.status || 'unknown',
         healthClass: toneForStatus(job.status),
         updatedAt: formatRelativeTime(job.createdAt),

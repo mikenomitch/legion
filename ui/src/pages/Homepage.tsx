@@ -1,3 +1,4 @@
+import { A } from '@solidjs/router'
 import { For, Show, type Resource } from 'solid-js'
 import type { LedgerNode, Rollout } from '../gen/legion_pb'
 import { asDisplay, formatRelativeTime } from '../utils/format'
@@ -18,7 +19,7 @@ export default function Homepage(props: HomepageProps) {
               <header class="flex items-center justify-between gap-4">
                 <div>
                   <p class="text-xs uppercase tracking-[0.12em] text-neutral-500 dark:text-neutral-400">Rollouts</p>
-                  <div class="font-semibold text-neutral-900 dark:text-neutral-100">Active Rollouts</div>
+                  <A href="/rollouts" class="font-semibold text-neutral-900 underline-offset-2 hover:underline dark:text-neutral-100">Active Rollouts</A>
                 </div>
                 <span class="rounded border border-neutral-300 px-3 py-1 text-xs uppercase tracking-wide text-neutral-800 dark:border-neutral-700 dark:text-neutral-200">
                   {props.rollouts()?.length ?? 0}
@@ -71,7 +72,7 @@ export default function Homepage(props: HomepageProps) {
                   <header class="flex items-center justify-between gap-4">
                     <div>
                       <p class="text-xs uppercase tracking-[0.12em] text-neutral-500 dark:text-neutral-400">Node</p>
-                      <div class="font-semibold text-neutral-900 dark:text-neutral-100">{item.node?.id ?? 'Unknown node'}</div>
+                      <A href={`/nodes/${encodeURIComponent(item.node?.id ?? '')}`} class="font-semibold text-neutral-900 underline-offset-2 hover:underline dark:text-neutral-100">{item.node?.id ?? 'Unknown node'}</A>
                     </div>
                     <span class="rounded border border-neutral-300 px-3 py-1 text-xs uppercase tracking-wide text-neutral-800 dark:border-neutral-700 dark:text-neutral-200">
                       {item.node?.status ?? 'N/A'}
@@ -113,7 +114,7 @@ export default function Homepage(props: HomepageProps) {
                                 )
                               })()}
                               <div class="flex flex-wrap items-center justify-between gap-2 text-sm text-neutral-900 dark:text-neutral-100">
-                                <span class="font-semibold">Allocation #{asDisplay(allocation.id)}</span>
+                                <span class="font-semibold">Allocation #{asDisplay(allocation.id)} · <A href={`/jobs/${encodeURIComponent(allocation.jobId)}`} class="underline">{allocation.jobId}</A></span>
                                 <span class="rounded border border-neutral-300 px-2 py-1 text-[11px] uppercase tracking-wide dark:border-neutral-700">
                                   {allocation.status}
                                 </span>
