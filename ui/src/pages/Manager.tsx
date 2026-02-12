@@ -1,78 +1,66 @@
-import { For, Show, createResource } from "solid-js";
-import { managerClient } from "../grpcClient";
-import type { ManagerNodeConfig } from "../gen/legion_pb";
+import { createEffect, createResource, createSignal } from 'solid-js'
+import SharedIndex from '../components/SharedIndex'
+import { managerClient } from '../grpcClient'
+import { formatRelativeTime } from '../utils/format'
+import { healthToneClasses } from '../utils/health'
 
 export default function Manager() {
-  const [configs] = createResource(
-    async (): Promise<readonly ManagerNodeConfig[]> => {
-      const response = await managerClient.getManagerConfigs({});
-      return response.configs;
+  const [search, setSearch] = createSignal('')
+  const [sort, setSort] = createSignal('updated_at:desc')
+  const [page, setPage] = createSignal(1)
+  const [pageSize, setPageSize] = createSignal(20)
+
+  createEffect(() => {
+    search()
+    sort()
+    setPage(1)
+  })
+
+  const [data] = createResource(
+    () => ({ search: search(), sort: sort(), page: page(), pageSize: pageSize() }),
+    async (input) => {
+      const [sortBy, sortOrder] = input.sort.split(':')
+      return managerClient.getManagerConfigs({
+        query: input.search,
+        sortBy,
+        sortOrder,
+        page: input.page,
+        pageSize: input.pageSize,
+      })
     },
-  );
+  )
 
   return (
-    <div class="rounded border border-neutral-200 bg-white/90 p-6 text-neutral-700 shadow-[4px_4px_0_#d4d4d8] dark:border-neutral-800 dark:bg-neutral-900/60 dark:text-neutral-300 dark:shadow-[4px_4px_0_#0b0d12]">
-      <div class="mb-4 flex flex-wrap items-center justify-between gap-3">
-        <div>
-          <p class="text-xs uppercase tracking-[0.12em] text-neutral-500 dark:text-neutral-400">
-            Manager nodes
-          </p>
-          <h2 class="text-xl font-semibold text-neutral-900 dark:text-neutral-100">
-            Configuration snapshots
-          </h2>
-        </div>
-      </div>
-
-      <Show
-        when={!configs.loading}
-        fallback={<p class="text-neutral-500">Loading manager configs…</p>}
-      >
-        <Show
-          when={!configs.error}
-          fallback={<p class="text-red-500">Failed to load manager configs.</p>}
-        >
-          {configs() && configs()!.length > 0 ? (
-            <div class="grid gap-4 md:grid-cols-2">
-              <For each={configs()!}>
-                {(config) => (
-                  <article class="rounded border border-neutral-200 bg-neutral-50 p-4 shadow-[4px_4px_0_#d4d4d8] transition dark:border-neutral-800 dark:bg-neutral-950/60 dark:shadow-[4px_4px_0_#0b0d12]">
-                    <div class="mb-3 flex items-start justify-between gap-3">
-                      <div>
-                        <p class="text-[11px] uppercase tracking-[0.14em] text-neutral-500 dark:text-neutral-400">
-                          Node
-                        </p>
-                        <p class="text-lg font-semibold text-neutral-900 dark:text-neutral-100">
-                          {config.nodeId}
-                        </p>
-                        <p class="text-xs text-neutral-500 dark:text-neutral-400">
-                          Updated {config.updatedAt || "—"}
-                        </p>
-                      </div>
-                      <span class="rounded border border-neutral-200 px-2 py-1 text-[11px] uppercase tracking-wide text-neutral-700 dark:border-neutral-700 dark:text-neutral-200">
-                        Config
-                      </span>
-                    </div>
-                    <pre class="max-h-64 overflow-auto rounded bg-white p-3 text-xs leading-relaxed text-neutral-800 shadow-inner dark:bg-neutral-900 dark:text-neutral-100">
-                      {formatConfig(config.configJson)}
-                    </pre>
-                  </article>
-                )}
-              </For>
-            </div>
-          ) : (
-            <p class="text-neutral-500">No manager configs reported yet.</p>
-          )}
-        </Show>
-      </Show>
-    </div>
-  );
-}
-
-function formatConfig(configJson: string): string {
-  try {
-    return JSON.stringify(JSON.parse(configJson), null, 2);
-  } catch (error) {
-    console.error("Failed to parse manager config JSON", error);
-    return configJson;
-  }
+    <SharedIndex
+      entityLabel="Managers"
+      search={search()}
+      onSearch={setSearch}
+      sort={sort()}
+      onSort={setSort}
+      sortOptions={[
+        { label: 'Updated (newest)', value: 'updated_at:desc' },
+        { label: 'Updated (oldest)', value: 'updated_at:asc' },
+        { label: 'Manager ID', value: 'node_id:asc' },
+      ]}
+      loading={data.loading}
+      error={data.error ? 'Failed to load managers.' : undefined}
+      items={(data()?.configs ?? []).map((config) => ({
+        id: config.nodeId,
+        title: config.nodeId,
+        health: 'config',
+        healthClass: healthToneClasses('healthy'),
+        updatedAt: formatRelativeTime(config.updatedAt),
+        href: `/manager/${encodeURIComponent(config.nodeId)}`,
+      }))}
+      page={Number(data()?.page ?? page())}
+      pageSize={Number(data()?.pageSize ?? pageSize())}
+      totalCount={Number(data()?.totalCount ?? 0)}
+      onPageChange={setPage}
+      onPageSizeChange={(size) => {
+        setPageSize(size)
+        setPage(1)
+      }}
+      emptyLabel="No managers found."
+    />
+  )
 }

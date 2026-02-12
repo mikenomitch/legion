@@ -1551,6 +1551,25 @@ impl Store {
             .ok_or_else(|| StorageError::not_found("job config", id).into())
     }
 
+    pub fn list_job_spec_history(&self, name: &str) -> R<Vec<(String, String, Option<i64>)>> {
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT jc.id, jc.created_at, jc.version
+            FROM job_config jc
+            INNER JOIN job j ON j.id = jc.job_id
+            WHERE j.name = ?
+            ORDER BY jc.created_at DESC;
+            "#,
+        )?;
+
+        let rows = stmt.query_map([name], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get::<_, Option<i64>>(2)?))
+        })?;
+
+        Self::collect_rows(rows)
+    }
+
     #[allow(dead_code)]
     pub fn handle_job_submit(
         &self,
