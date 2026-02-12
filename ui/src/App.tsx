@@ -15,13 +15,19 @@ import {
   onCleanup,
 } from "solid-js";
 import { managerClient, managerEndpoint } from "./grpcClient";
-import { NodeMsg } from "./gen/legion_pb";
-import type { Job, LedgerNode, Rollout } from "./gen/legion_pb";
+import type { LedgerNode, Rollout } from "./gen/legion_pb";
 import Homepage from "./pages/Homepage";
+import DeploymentDetails from "./pages/DeploymentDetails";
+import Deployments from "./pages/Deployments";
+import JobDetails from "./pages/JobDetails";
 import Jobs from "./pages/Jobs";
+import ManagerNodeDetails from "./pages/ManagerNodeDetails";
+import ManagerNodes from "./pages/ManagerNodes";
+import NodeDetails from "./pages/NodeDetails";
 import KeyValue from "./pages/KeyValue";
 import Manager from "./pages/Manager";
 import Nodes from "./pages/Nodes";
+import RolloutDetails from "./pages/RolloutDetails";
 import Rollouts from "./pages/Rollouts";
 import TestingUtils from "./pages/TestingUtils";
 import { POLL_INTERVAL_MS } from "./utils/polling";
@@ -54,6 +60,20 @@ const navItems = [
     path: "/rollouts",
     title: "Rollouts",
     copy: "Live and historical rollout activity.",
+  },
+  {
+    key: "manager-nodes",
+    label: "Manager Nodes",
+    path: "/manager-nodes",
+    title: "Manager Nodes",
+    copy: "Manager node details and config snapshots.",
+  },
+  {
+    key: "deployments",
+    label: "Deployments",
+    path: "/deployments",
+    title: "Deployments",
+    copy: "Deployment targets across rollouts.",
   },
   {
     key: "kv",
@@ -98,28 +118,6 @@ const navButton = (active: boolean) =>
 
 const isEqualData = <T,>(a: T | undefined, b: T | undefined) =>
   JSON.stringify(a) === JSON.stringify(b);
-
-const normalizeNodes = (nodes: readonly NodeMsg[]): readonly NodeMsg[] => {
-  const priority = (node: NodeMsg) =>
-    node.status?.toLowerCase() === "active" ? 0 : 1;
-  return [...nodes].sort((a, b) => {
-    const diff = priority(a) - priority(b);
-    if (diff !== 0) return diff;
-    return (a.id || "").localeCompare(b.id || "");
-  });
-};
-
-const areNodesEqual = (
-  a: readonly NodeMsg[] | undefined,
-  b: readonly NodeMsg[] | undefined,
-) => {
-  if (a === b) return true;
-  if (!a || !b || a.length !== b.length) return false;
-  for (let index = 0; index < a.length; index += 1) {
-    if (!NodeMsg.equals(a[index], b[index])) return false;
-  }
-  return true;
-};
 
 const Layout = (props: RouteSectionProps) => {
   const location = useLocation();
@@ -283,8 +281,6 @@ const Layout = (props: RouteSectionProps) => {
 
 type PollingControllerProps = {
   refreshLedger: () => Promise<void>;
-  refreshNodes: () => Promise<void>;
-  refreshJobs: () => Promise<void>;
   refreshRollouts: () => Promise<void>;
 };
 
@@ -300,13 +296,6 @@ const PollingController = (props: PollingControllerProps) => {
         void props.refreshLedger();
         void props.refreshRollouts();
       };
-    } else if (current.startsWith("/nodes")) {
-      refetch = () => {
-        void props.refreshNodes();
-        void props.refreshLedger();
-      };
-    } else if (current.startsWith("/jobs")) {
-      refetch = () => void props.refreshJobs();
     } else if (current.startsWith("/rollouts")) {
       refetch = () => void props.refreshRollouts();
     }
@@ -326,24 +315,12 @@ const AppRoutes = () => {
     return response.nodes;
   };
 
-  const fetchNodes = async (): Promise<readonly NodeMsg[]> => {
-    const response = await managerClient.getNodes({});
-    return normalizeNodes(response.nodes);
-  };
-
-  const fetchJobs = async (): Promise<readonly Job[]> => {
-    const response = await managerClient.listJobs({});
-    return response.jobs;
-  };
-
   const fetchRollouts = async (): Promise<readonly Rollout[]> => {
     const response = await managerClient.listRollouts({ activeOnly: true });
     return response.rollouts;
   };
 
   const [ledger, { mutate: setLedger }] = createResource(fetchLedger);
-  const [nodes, { mutate: setNodes }] = createResource(fetchNodes);
-  const [jobs, { mutate: setJobs }] = createResource(fetchJobs);
   const [rollouts, { mutate: setRollouts }] = createResource(fetchRollouts);
 
   const refreshLedger = async () => {
@@ -352,24 +329,6 @@ const AppRoutes = () => {
       setLedger((prev) => (isEqualData(prev, next) ? prev : next));
     } catch (error) {
       console.error("Failed to refresh ledger", error);
-    }
-  };
-
-  const refreshNodes = async () => {
-    try {
-      const next = await fetchNodes();
-      setNodes((prev) => (areNodesEqual(prev, next) ? prev : next));
-    } catch (error) {
-      console.error("Failed to refresh nodes", error);
-    }
-  };
-
-  const refreshJobs = async () => {
-    try {
-      const next = await fetchJobs();
-      setJobs((prev) => (isEqualData(prev, next) ? prev : next));
-    } catch (error) {
-      console.error("Failed to refresh jobs", error);
     }
   };
 
@@ -389,8 +348,6 @@ const AppRoutes = () => {
         <Layout {...props}>
           <PollingController
             refreshLedger={refreshLedger}
-            refreshNodes={refreshNodes}
-            refreshJobs={refreshJobs}
             refreshRollouts={refreshRollouts}
           />
           {props.children}
@@ -401,9 +358,16 @@ const AppRoutes = () => {
         path="/"
         component={() => <Homepage ledger={ledger} rollouts={rollouts} />}
       />
-      <Route path="/nodes" component={() => <Nodes nodes={nodes} ledger={ledger} />} />
-      <Route path="/jobs" component={() => <Jobs jobs={jobs} />} />
+      <Route path="/nodes" component={Nodes} />
+      <Route path="/nodes/:id" component={NodeDetails} />
+      <Route path="/jobs" component={Jobs} />
+      <Route path="/jobs/:id" component={JobDetails} />
       <Route path="/rollouts" component={Rollouts} />
+      <Route path="/rollouts/:id" component={RolloutDetails} />
+      <Route path="/manager-nodes" component={ManagerNodes} />
+      <Route path="/manager-nodes/:id" component={ManagerNodeDetails} />
+      <Route path="/deployments" component={Deployments} />
+      <Route path="/deployments/:id" component={DeploymentDetails} />
       <Route path="/kv" component={KeyValue} />
       <Route path="/manager" component={Manager} />
       <Route path="/testing" component={TestingUtils} />
