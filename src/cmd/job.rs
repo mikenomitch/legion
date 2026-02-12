@@ -765,7 +765,9 @@ async fn list_jobs(arg_matches: &ArgMatches) -> R<()> {
     let is_json = arg_matches.get_flag("json");
 
     let mut client = connect_manager_client().await?;
-    let request = tonic::Request::new(ListJobsRequest {});
+    let request = tonic::Request::new(ListJobsRequest {
+        ..Default::default()
+    });
     let response = client
         .list_jobs(request)
         .await
@@ -792,6 +794,7 @@ async fn list_rollouts(arg_matches: &ArgMatches) -> R<()> {
     let request = tonic::Request::new(ListRolloutsRequest {
         job_id,
         active_only,
+        ..Default::default()
     });
     let response = client
         .list_rollouts(request)

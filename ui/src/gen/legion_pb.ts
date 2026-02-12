@@ -7,25 +7,37 @@ import type { BinaryReadOptions, FieldList, JsonReadOptions, JsonValue, PartialM
 import { Message, proto3, protoInt64 } from "@bufbuild/protobuf";
 
 /**
+ * Type discriminator for KV values.
+ *
  * @generated from enum legion.KvValueType
  */
 export enum KvValueType {
   /**
+   * Invalid/unspecified type.
+   *
+   * Proto3 enum default is this value, but write APIs reject it.
+   *
    * @generated from enum value: KV_VALUE_TYPE_UNSPECIFIED = 0;
    */
   UNSPECIFIED = 0,
 
   /**
+   * Plain string value.
+   *
    * @generated from enum value: KV_VALUE_TYPE_STRING = 1;
    */
   STRING = 1,
 
   /**
+   * JSON numeric value.
+   *
    * @generated from enum value: KV_VALUE_TYPE_NUMBER = 2;
    */
   NUMBER = 2,
 
   /**
+   * Arbitrary JSON value.
+   *
    * @generated from enum value: KV_VALUE_TYPE_JSON = 3;
    */
   JSON = 3,
@@ -39,10 +51,17 @@ proto3.util.setEnumType(KvValueType, "legion.KvValueType", [
 ]);
 
 /**
+ * Request payload for WorkerPreRegister.
+ *
  * @generated from message legion.WorkerPreRegisterRequest
  */
 export class WorkerPreRegisterRequest extends Message<WorkerPreRegisterRequest> {
   /**
+   * Worker type name (for example: "default").
+   *
+   * This selects the worker template stored on the manager.
+   * No manager-side default is applied by this RPC.
+   *
    * @generated from field: string worker_type = 1;
    */
   workerType = "";
@@ -76,45 +95,75 @@ export class WorkerPreRegisterRequest extends Message<WorkerPreRegisterRequest> 
 }
 
 /**
+ * Effective worker configuration returned by pre-registration.
+ *
  * @generated from message legion.WorkerConfig
  */
 export class WorkerConfig extends Message<WorkerConfig> {
   /**
+   * Worker type name that produced this config.
+   *
    * @generated from field: string name = 1;
    */
   name = "";
 
   /**
+   * Node pool this worker belongs to.
+   *
    * @generated from field: string pool = 2;
    */
   pool = "";
 
   /**
+   * Additional dynamic node-check plugin names to execute on worker.
+   *
+   * Default: empty list when worker type does not specify checks.
+   *
    * @generated from field: repeated string additional_node_checks = 3;
    */
   additionalNodeChecks: string[] = [];
 
   /**
+   * Static worker attributes injected into node config attrs at registration.
+   *
+   * Default: empty object `{}` when worker type does not set attributes.
+   *
    * @generated from field: map<string, string> attributes = 4;
    */
   attributes: { [key: string]: string } = {};
 
   /**
+   * Optional prefix used when auto-generating worker IDs.
+   *
+   * Default: unset.
+   *
    * @generated from field: optional string name_prefix = 5;
    */
   namePrefix?: string;
 
   /**
+   * JSON-encoded total node resource overrides/capabilities.
+   *
+   * Default: `{}` (from worker-type storage defaults).
+   *
    * @generated from field: string resources = 6;
    */
   resources = "";
 
   /**
+   * JSON-encoded reserved resource amounts/items unavailable for scheduling.
+   *
+   * Default: `{}` (from worker-type storage defaults).
+   *
    * @generated from field: string reserved_resources = 7;
    */
   reservedResources = "";
 
   /**
+   * Optional maximum number of allocations this worker should host.
+   *
+   * Default: unset (no explicit max allocation cap).
+   *
    * @generated from field: optional uint32 max_allocations = 8;
    */
   maxAllocations?: number;
@@ -155,10 +204,16 @@ export class WorkerConfig extends Message<WorkerConfig> {
 }
 
 /**
+ * Reply payload for WorkerPreRegister.
+ *
  * @generated from message legion.WorkerPreRegisterReply
  */
 export class WorkerPreRegisterReply extends Message<WorkerPreRegisterReply> {
   /**
+   * Effective worker configuration to use for this worker instance.
+   *
+   * Manager sets this on successful responses.
+   *
    * @generated from field: legion.WorkerConfig config = 1;
    */
   config?: WorkerConfig;
@@ -192,30 +247,42 @@ export class WorkerPreRegisterReply extends Message<WorkerPreRegisterReply> {
 }
 
 /**
+ * Request payload for WorkerRegister.
+ *
  * @generated from message legion.WorkerRegisterRequest
  */
 export class WorkerRegisterRequest extends Message<WorkerRegisterRequest> {
   /**
+   * Worker/node ID to register.
+   *
    * @generated from field: string name = 1;
    */
   name = "";
 
   /**
+   * Pool assigned to this worker.
+   *
    * @generated from field: string pool = 2;
    */
   pool = "";
 
   /**
+   * JSON object string of node configuration attributes.
+   *
    * @generated from field: string config_attrs = 3;
    */
   configAttrs = "";
 
   /**
+   * JSON object string of node fingerprint attributes collected on worker.
+   *
    * @generated from field: string fingerprint_attrs = 4;
    */
   fingerprintAttrs = "";
 
   /**
+   * JSON object/string with current worker health-check results.
+   *
    * @generated from field: string health_checks = 5;
    */
   healthChecks = "";
@@ -253,10 +320,16 @@ export class WorkerRegisterRequest extends Message<WorkerRegisterRequest> {
 }
 
 /**
+ * Reply payload for WorkerRegister.
+ *
  * @generated from message legion.WorkerRegisterReply
  */
 export class WorkerRegisterReply extends Message<WorkerRegisterReply> {
   /**
+   * Human-readable status message.
+   *
+   * Current manager reply value: `"Worker registered"`.
+   *
    * @generated from field: string message = 1;
    */
   message = "";
@@ -290,20 +363,28 @@ export class WorkerRegisterReply extends Message<WorkerRegisterReply> {
 }
 
 /**
+ * One submission unit that contributed to a rendered jobspec.
+ *
  * @generated from message legion.Submission
  */
 export class Submission extends Message<Submission> {
   /**
+   * Original submission path (file path, module path, or logical label).
+   *
    * @generated from field: string path = 1;
    */
   path = "";
 
   /**
+   * Full submission content as text.
+   *
    * @generated from field: string content = 2;
    */
   content = "";
 
   /**
+   * True when this submission is the primary entrypoint file.
+   *
    * @generated from field: bool is_primary = 3;
    */
   isPrimary = false;
@@ -339,25 +420,43 @@ export class Submission extends Message<Submission> {
 }
 
 /**
+ * Request payload for RunJob.
+ *
  * @generated from message legion.RunJobRequest
  */
 export class RunJobRequest extends Message<RunJobRequest> {
   /**
+   * Fully rendered job specification as JSON text.
+   *
+   * This is the canonical input consumed by manager scheduling/validation logic.
+   *
    * @generated from field: string parsed_jobspec = 1;
    */
   parsedJobspec = "";
 
   /**
+   * Source submissions used to produce `parsed_jobspec`.
+   *
    * @generated from field: repeated legion.Submission submissions = 2;
    */
   submissions: Submission[] = [];
 
   /**
+   * Optional eval priority override.
+   *
+   * Higher values are processed sooner in the eval queue.
+   * Default when omitted: manager `default_priority`
+   * (`50` in built-in config defaults).
+   *
    * @generated from field: optional int64 priority = 3;
    */
   priority?: bigint;
 
   /**
+   * When true, enqueues a reschedule even when the job spec content is unchanged.
+   *
+   * Default: `false`.
+   *
    * @generated from field: bool force_reschedule = 4;
    */
   forceReschedule = false;
@@ -394,10 +493,21 @@ export class RunJobRequest extends Message<RunJobRequest> {
 }
 
 /**
+ * Reply payload for RunJob.
+ *
  * @generated from message legion.RunJobReply
  */
 export class RunJobReply extends Message<RunJobReply> {
   /**
+   * Human-readable outcome message (created/updated/unchanged/rollout state).
+   *
+   * Current manager reply values include:
+   * - `"Job submit success"`
+   * - `"Rollout started"`
+   * - `"Rollout created; waiting for manual start"`
+   * - `"Job config unchanged; no update needed"`
+   * - `"Job config unchanged; forced reschedule queued"`
+   *
    * @generated from field: string message = 1;
    */
   message = "";
@@ -431,10 +541,14 @@ export class RunJobReply extends Message<RunJobReply> {
 }
 
 /**
+ * Request payload for GetJobInfo.
+ *
  * @generated from message legion.GetJobInfoRequest
  */
 export class GetJobInfoRequest extends Message<GetJobInfoRequest> {
   /**
+   * Job name (also used as job ID in current manager implementation).
+   *
    * @generated from field: string name = 1;
    */
   name = "";
@@ -468,10 +582,16 @@ export class GetJobInfoRequest extends Message<GetJobInfoRequest> {
 }
 
 /**
+ * Reply payload for GetJobInfo.
+ *
  * @generated from message legion.GetJobInfoReply
  */
 export class GetJobInfoReply extends Message<GetJobInfoReply> {
   /**
+   * Job metadata for the requested job.
+   *
+   * Manager returns NotFound instead of returning this field unset.
+   *
    * @generated from field: legion.Job job = 1;
    */
   job?: Job;
@@ -505,18 +625,71 @@ export class GetJobInfoReply extends Message<GetJobInfoReply> {
 }
 
 /**
+ * Request payload for ListRollouts.
+ *
  * @generated from message legion.ListRolloutsRequest
  */
 export class ListRolloutsRequest extends Message<ListRolloutsRequest> {
   /**
+   * Optional job ID filter.
+   *
+   * When omitted (or blank), rollouts for all jobs are returned.
+   *
    * @generated from field: optional string job_id = 1;
    */
   jobId?: string;
 
   /**
+   * When true, only active (non-terminal) rollouts are returned.
+   *
+   * Default: `false` (returns both active and terminal rollouts).
+   *
    * @generated from field: bool active_only = 2;
    */
   activeOnly = false;
+
+  /**
+   * Free-text search against rollout ID, job ID, status, and strategy fields.
+   *
+   * @generated from field: optional string query = 3;
+   */
+  query?: string;
+
+  /**
+   * Sort key. Supported values: `updated_at`, `created_at`, `status`, `job_id`.
+   *
+   * Default: `updated_at`.
+   *
+   * @generated from field: optional string sort_by = 4;
+   */
+  sortBy?: string;
+
+  /**
+   * Sort direction. Supported values: `asc`, `desc`.
+   *
+   * Default: `desc`.
+   *
+   * @generated from field: optional string sort_order = 5;
+   */
+  sortOrder?: string;
+
+  /**
+   * 1-indexed page number.
+   *
+   * Default: `1`.
+   *
+   * @generated from field: optional uint32 page = 6;
+   */
+  page?: number;
+
+  /**
+   * Maximum rollouts returned in a page.
+   *
+   * Default: `20`.
+   *
+   * @generated from field: optional uint32 page_size = 7;
+   */
+  pageSize?: number;
 
   constructor(data?: PartialMessage<ListRolloutsRequest>) {
     super();
@@ -528,6 +701,11 @@ export class ListRolloutsRequest extends Message<ListRolloutsRequest> {
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "job_id", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
     { no: 2, name: "active_only", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 3, name: "query", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 4, name: "sort_by", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 5, name: "sort_order", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 6, name: "page", kind: "scalar", T: 13 /* ScalarType.UINT32 */, opt: true },
+    { no: 7, name: "page_size", kind: "scalar", T: 13 /* ScalarType.UINT32 */, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListRolloutsRequest {
@@ -548,80 +726,115 @@ export class ListRolloutsRequest extends Message<ListRolloutsRequest> {
 }
 
 /**
+ * Rollout record.
+ *
  * @generated from message legion.Rollout
  */
 export class Rollout extends Message<Rollout> {
   /**
+   * Unique rollout ID.
+   *
    * @generated from field: int64 id = 1;
    */
   id = protoInt64.zero;
 
   /**
+   * Job ID this rollout belongs to.
+   *
    * @generated from field: string job_id = 2;
    */
   jobId = "";
 
   /**
+   * Previous job config ID being replaced (if any).
+   *
    * @generated from field: optional string from_job_config_id = 3;
    */
   fromJobConfigId?: string;
 
   /**
+   * Target job config ID for this rollout.
+   *
    * @generated from field: string to_job_config_id = 4;
    */
   toJobConfigId = "";
 
   /**
+   * Rollout status.
+   *
+   * Common values include: pending, running, waiting_manual_start,
+   * waiting_manual_advance, completed, failed, cancelled, completed_incomplete.
+   *
    * @generated from field: string status = 5;
    */
   status = "";
 
   /**
+   * True when rollout finished but did not fully reach desired target.
+   *
    * @generated from field: bool incomplete = 6;
    */
   incomplete = false;
 
   /**
+   * Human-readable rollout status message.
+   *
    * @generated from field: string message = 7;
    */
   message = "";
 
   /**
+   * Strategy plugin name used to resolve rollout behavior.
+   *
    * @generated from field: optional string strategy = 8;
    */
   strategy?: string;
 
   /**
+   * Progression mode (for example: auto/manual) as stored by manager.
+   *
    * @generated from field: optional string progression = 9;
    */
   progression?: string;
 
   /**
+   * Replacement mode (for example: createFirst/destroyFirst) as stored by manager.
+   *
    * @generated from field: optional string replacement = 10;
    */
   replacement?: string;
 
   /**
+   * Whether rollout prefers in-place replacement behavior.
+   *
    * @generated from field: optional bool in_place = 11;
    */
   inPlace?: boolean;
 
   /**
+   * JSON-encoded rollout envelope/config/runtime state.
+   *
    * @generated from field: string config_json = 12;
    */
   configJson = "";
 
   /**
+   * RFC3339 creation timestamp.
+   *
    * @generated from field: string created_at = 13;
    */
   createdAt = "";
 
   /**
+   * RFC3339 update timestamp.
+   *
    * @generated from field: string updated_at = 14;
    */
   updatedAt = "";
 
   /**
+   * RFC3339 completion timestamp for terminal rollouts.
+   *
    * @generated from field: optional string completed_at = 15;
    */
   completedAt?: string;
@@ -669,13 +882,38 @@ export class Rollout extends Message<Rollout> {
 }
 
 /**
+ * Reply payload for ListRollouts.
+ *
  * @generated from message legion.ListRolloutsReply
  */
 export class ListRolloutsReply extends Message<ListRolloutsReply> {
   /**
+   * Matching rollout records for the requested page.
+   *
    * @generated from field: repeated legion.Rollout rollouts = 1;
    */
   rollouts: Rollout[] = [];
+
+  /**
+   * Total number of records matching the filter before pagination.
+   *
+   * @generated from field: uint32 total_count = 2;
+   */
+  totalCount = 0;
+
+  /**
+   * 1-indexed page number returned.
+   *
+   * @generated from field: uint32 page = 3;
+   */
+  page = 0;
+
+  /**
+   * Page size used to produce this reply.
+   *
+   * @generated from field: uint32 page_size = 4;
+   */
+  pageSize = 0;
 
   constructor(data?: PartialMessage<ListRolloutsReply>) {
     super();
@@ -686,6 +924,9 @@ export class ListRolloutsReply extends Message<ListRolloutsReply> {
   static readonly typeName = "legion.ListRolloutsReply";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "rollouts", kind: "message", T: Rollout, repeated: true },
+    { no: 2, name: "total_count", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 3, name: "page", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 4, name: "page_size", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListRolloutsReply {
@@ -706,10 +947,14 @@ export class ListRolloutsReply extends Message<ListRolloutsReply> {
 }
 
 /**
+ * Request payload for GetRollout.
+ *
  * @generated from message legion.GetRolloutRequest
  */
 export class GetRolloutRequest extends Message<GetRolloutRequest> {
   /**
+   * Rollout ID.
+   *
    * @generated from field: int64 id = 1;
    */
   id = protoInt64.zero;
@@ -743,10 +988,14 @@ export class GetRolloutRequest extends Message<GetRolloutRequest> {
 }
 
 /**
+ * Reply payload for GetRollout.
+ *
  * @generated from message legion.GetRolloutReply
  */
 export class GetRolloutReply extends Message<GetRolloutReply> {
   /**
+   * Rollout when found; unset when not found.
+   *
    * @generated from field: optional legion.Rollout rollout = 1;
    */
   rollout?: Rollout;
@@ -780,60 +1029,84 @@ export class GetRolloutReply extends Message<GetRolloutReply> {
 }
 
 /**
+ * Allocation-level status as seen in a rollout group status response.
+ *
  * @generated from message legion.RolloutAllocationStatus
  */
 export class RolloutAllocationStatus extends Message<RolloutAllocationStatus> {
   /**
+   * Allocation ID.
+   *
    * @generated from field: int64 allocation_id = 1;
    */
   allocationId = protoInt64.zero;
 
   /**
+   * Node hosting this allocation.
+   *
    * @generated from field: string node_id = 2;
    */
   nodeId = "";
 
   /**
+   * Task config ID backing this allocation.
+   *
    * @generated from field: int64 task_config_id = 3;
    */
   taskConfigId = protoInt64.zero;
 
   /**
+   * Task name for display and filtering.
+   *
    * @generated from field: string task_name = 4;
    */
   taskName = "";
 
   /**
+   * Task group name.
+   *
    * @generated from field: string task_group = 5;
    */
   taskGroup = "";
 
   /**
+   * Task lifecycle (for example: service, batch, sidecar).
+   *
    * @generated from field: string lifecycle = 6;
    */
   lifecycle = "";
 
   /**
+   * Allocation runtime status string.
+   *
    * @generated from field: string status = 7;
    */
   status = "";
 
   /**
+   * Rollout role for this allocation, typically replacement or replacee.
+   *
    * @generated from field: string role = 8;
    */
   role = "";
 
   /**
+   * Optional derived node health flag at query time.
+   *
    * @generated from field: optional bool node_healthy = 9;
    */
   nodeHealthy?: boolean;
 
   /**
+   * Optional allocation health flag from latest worker snapshot.
+   *
    * @generated from field: optional bool allocation_healthy = 10;
    */
   allocationHealthy?: boolean;
 
   /**
+   * Optional allocation health status text from latest worker snapshot.
+   *
    * @generated from field: optional string allocation_health = 11;
    */
   allocationHealth?: string;
@@ -877,30 +1150,42 @@ export class RolloutAllocationStatus extends Message<RolloutAllocationStatus> {
 }
 
 /**
+ * Group-level rollout status.
+ *
  * @generated from message legion.RolloutGroupStatus
  */
 export class RolloutGroupStatus extends Message<RolloutGroupStatus> {
   /**
+   * Group name.
+   *
    * @generated from field: string group = 1;
    */
   group = "";
 
   /**
+   * Current step index (0-based in runtime state, API returns current numeric index).
+   *
    * @generated from field: uint32 step_index = 2;
    */
   stepIndex = 0;
 
   /**
+   * Total number of computed rollout steps for this group.
+   *
    * @generated from field: uint32 total_steps = 3;
    */
   totalSteps = 0;
 
   /**
+   * Number of queued manual-advance credits for this group.
+   *
    * @generated from field: uint32 pending_manual_advances = 4;
    */
   pendingManualAdvances = 0;
 
   /**
+   * Allocations participating in this group's rollout.
+   *
    * @generated from field: repeated legion.RolloutAllocationStatus allocations = 5;
    */
   allocations: RolloutAllocationStatus[] = [];
@@ -938,10 +1223,14 @@ export class RolloutGroupStatus extends Message<RolloutGroupStatus> {
 }
 
 /**
+ * Request payload for GetRolloutStatus.
+ *
  * @generated from message legion.GetRolloutStatusRequest
  */
 export class GetRolloutStatusRequest extends Message<GetRolloutStatusRequest> {
   /**
+   * Rollout ID.
+   *
    * @generated from field: int64 id = 1;
    */
   id = protoInt64.zero;
@@ -975,15 +1264,21 @@ export class GetRolloutStatusRequest extends Message<GetRolloutStatusRequest> {
 }
 
 /**
+ * Reply payload for GetRolloutStatus.
+ *
  * @generated from message legion.GetRolloutStatusReply
  */
 export class GetRolloutStatusReply extends Message<GetRolloutStatusReply> {
   /**
+   * Rollout record when found.
+   *
    * @generated from field: optional legion.Rollout rollout = 1;
    */
   rollout?: Rollout;
 
   /**
+   * Per-group runtime status.
+   *
    * @generated from field: repeated legion.RolloutGroupStatus groups = 2;
    */
   groups: RolloutGroupStatus[] = [];
@@ -1018,45 +1313,63 @@ export class GetRolloutStatusReply extends Message<GetRolloutStatusReply> {
 }
 
 /**
+ * Rollout event record.
+ *
  * @generated from message legion.RolloutEvent
  */
 export class RolloutEvent extends Message<RolloutEvent> {
   /**
+   * Event ID.
+   *
    * @generated from field: int64 id = 1;
    */
   id = protoInt64.zero;
 
   /**
+   * Rollout ID this event belongs to.
+   *
    * @generated from field: int64 rollout_id = 2;
    */
   rolloutId = protoInt64.zero;
 
   /**
+   * Job ID this event belongs to.
+   *
    * @generated from field: string job_id = 3;
    */
   jobId = "";
 
   /**
+   * Optional task group this event is scoped to.
+   *
    * @generated from field: optional string group_name = 4;
    */
   groupName?: string;
 
   /**
+   * Event severity level (for example: info, warn, error).
+   *
    * @generated from field: string level = 5;
    */
   level = "";
 
   /**
+   * Human-readable event message.
+   *
    * @generated from field: string message = 6;
    */
   message = "";
 
   /**
+   * JSON metadata payload as string.
+   *
    * @generated from field: string metadata_json = 7;
    */
   metadataJson = "";
 
   /**
+   * RFC3339 creation timestamp.
+   *
    * @generated from field: string created_at = 8;
    */
   createdAt = "";
@@ -1097,15 +1410,26 @@ export class RolloutEvent extends Message<RolloutEvent> {
 }
 
 /**
+ * Request payload for ListRolloutEvents.
+ *
  * @generated from message legion.ListRolloutEventsRequest
  */
 export class ListRolloutEventsRequest extends Message<ListRolloutEventsRequest> {
   /**
+   * Rollout ID.
+   *
+   * Must be greater than 0.
+   *
    * @generated from field: int64 rollout_id = 1;
    */
   rolloutId = protoInt64.zero;
 
   /**
+   * Optional maximum number of events to return.
+   *
+   * Default when omitted: `500`.
+   * Manager bounds: clamped to `[1, 2000]`.
+   *
    * @generated from field: optional uint32 limit = 2;
    */
   limit?: number;
@@ -1140,10 +1464,14 @@ export class ListRolloutEventsRequest extends Message<ListRolloutEventsRequest> 
 }
 
 /**
+ * Reply payload for ListRolloutEvents.
+ *
  * @generated from message legion.ListRolloutEventsReply
  */
 export class ListRolloutEventsReply extends Message<ListRolloutEventsReply> {
   /**
+   * Ordered rollout events (oldest to newest within the returned window).
+   *
    * @generated from field: repeated legion.RolloutEvent events = 1;
    */
   events: RolloutEvent[] = [];
@@ -1177,20 +1505,33 @@ export class ListRolloutEventsReply extends Message<ListRolloutEventsReply> {
 }
 
 /**
+ * Request payload for AdvanceRollout.
+ *
  * @generated from message legion.AdvanceRolloutRequest
  */
 export class AdvanceRolloutRequest extends Message<AdvanceRolloutRequest> {
   /**
+   * Rollout ID.
+   *
    * @generated from field: int64 id = 1;
    */
   id = protoInt64.zero;
 
   /**
+   * Group names to advance.
+   *
+   * Empty (default) means advance all groups in the rollout.
+   *
    * @generated from field: repeated string groups = 2;
    */
   groups: string[] = [];
 
   /**
+   * Optional eval priority for generated rollout tick work.
+   *
+   * Default when omitted: manager `default_priority`
+   * (`50` in built-in config defaults).
+   *
    * @generated from field: optional int64 priority = 3;
    */
   priority?: bigint;
@@ -1226,15 +1567,23 @@ export class AdvanceRolloutRequest extends Message<AdvanceRolloutRequest> {
 }
 
 /**
+ * Reply payload for AdvanceRollout.
+ *
  * @generated from message legion.AdvanceRolloutReply
  */
 export class AdvanceRolloutReply extends Message<AdvanceRolloutReply> {
   /**
+   * Human-readable queue/advance message.
+   *
+   * Current manager reply value: `"Rollout advance queued"`.
+   *
    * @generated from field: string message = 1;
    */
   message = "";
 
   /**
+   * Updated rollout record after queuing manual advance.
+   *
    * @generated from field: optional legion.Rollout rollout = 2;
    */
   rollout?: Rollout;
@@ -1269,10 +1618,14 @@ export class AdvanceRolloutReply extends Message<AdvanceRolloutReply> {
 }
 
 /**
+ * Request payload for GetJobSpec.
+ *
  * @generated from message legion.GetJobSpecRequest
  */
 export class GetJobSpecRequest extends Message<GetJobSpecRequest> {
   /**
+   * Job name.
+   *
    * @generated from field: string name = 1;
    */
   name = "";
@@ -1306,10 +1659,16 @@ export class GetJobSpecRequest extends Message<GetJobSpecRequest> {
 }
 
 /**
+ * Reply payload for GetJobSpec.
+ *
  * @generated from message legion.GetJobSpecReply
  */
 export class GetJobSpecReply extends Message<GetJobSpecReply> {
   /**
+   * Submissions associated with the latest job config.
+   *
+   * Field number intentionally remains `2` for compatibility.
+   *
    * @generated from field: repeated legion.Submission submissions = 2;
    */
   submissions: Submission[] = [];
@@ -1343,10 +1702,14 @@ export class GetJobSpecReply extends Message<GetJobSpecReply> {
 }
 
 /**
+ * Request payload for PlanJob.
+ *
  * @generated from message legion.PlanJobRequest
  */
 export class PlanJobRequest extends Message<PlanJobRequest> {
   /**
+   * Fully rendered jobspec JSON to plan.
+   *
    * @generated from field: string parsed_jobspec = 1;
    */
   parsedJobspec = "";
@@ -1380,25 +1743,35 @@ export class PlanJobRequest extends Message<PlanJobRequest> {
 }
 
 /**
+ * Reply payload for PlanJob.
+ *
  * @generated from message legion.PlanJobReply
  */
 export class PlanJobReply extends Message<PlanJobReply> {
   /**
+   * Planned allocations for display.
+   *
    * @generated from field: repeated legion.PlannedAllocation allocations = 1;
    */
   allocations: PlannedAllocation[] = [];
 
   /**
+   * Human-readable planning summary.
+   *
    * @generated from field: string message = 2;
    */
   message = "";
 
   /**
+   * True when a job with the same name already exists.
+   *
    * @generated from field: bool matches_existing = 3;
    */
   matchesExisting = false;
 
   /**
+   * True when existing config is content-identical to planned config.
+   *
    * @generated from field: bool same_content = 4;
    */
   sameContent = false;
@@ -1435,20 +1808,28 @@ export class PlanJobReply extends Message<PlanJobReply> {
 }
 
 /**
+ * Planned allocation display item.
+ *
  * @generated from message legion.PlannedAllocation
  */
 export class PlannedAllocation extends Message<PlannedAllocation> {
   /**
+   * Target node ID.
+   *
    * @generated from field: string node_id = 1;
    */
   nodeId = "";
 
   /**
+   * Task config ID in the planned context.
+   *
    * @generated from field: int64 task_config_id = 2;
    */
   taskConfigId = protoInt64.zero;
 
   /**
+   * Task name for readability.
+   *
    * @generated from field: string task_name = 3;
    */
   taskName = "";
@@ -1484,15 +1865,24 @@ export class PlannedAllocation extends Message<PlannedAllocation> {
 }
 
 /**
+ * Request payload for StopJob.
+ *
  * @generated from message legion.StopJobRequest
  */
 export class StopJobRequest extends Message<StopJobRequest> {
   /**
+   * Job name.
+   *
    * @generated from field: string name = 1;
    */
   name = "";
 
   /**
+   * Optional eval priority override.
+   *
+   * Default when omitted: manager `default_priority`
+   * (`50` in built-in config defaults).
+   *
    * @generated from field: optional int64 priority = 2;
    */
   priority?: bigint;
@@ -1527,10 +1917,16 @@ export class StopJobRequest extends Message<StopJobRequest> {
 }
 
 /**
+ * Reply payload for StopJob.
+ *
  * @generated from message legion.StopJobReply
  */
 export class StopJobReply extends Message<StopJobReply> {
   /**
+   * Human-readable status message.
+   *
+   * Current manager reply format: `"Stopped <job-name>"`.
+   *
    * @generated from field: string message = 1;
    */
   message = "";
@@ -1564,15 +1960,23 @@ export class StopJobReply extends Message<StopJobReply> {
 }
 
 /**
+ * Request payload for DestroyJob.
+ *
  * @generated from message legion.DestroyJobRequest
  */
 export class DestroyJobRequest extends Message<DestroyJobRequest> {
   /**
+   * Job name.
+   *
    * @generated from field: string name = 1;
    */
   name = "";
 
   /**
+   * Reserved for future eval-priority support.
+   *
+   * Current manager implementation ignores this field.
+   *
    * @generated from field: optional int64 priority = 2;
    */
   priority?: bigint;
@@ -1607,10 +2011,16 @@ export class DestroyJobRequest extends Message<DestroyJobRequest> {
 }
 
 /**
+ * Reply payload for DestroyJob.
+ *
  * @generated from message legion.DestroyJobReply
  */
 export class DestroyJobReply extends Message<DestroyJobReply> {
   /**
+   * Human-readable status message.
+   *
+   * Current manager reply format: `"Destroyed <job-name>"`.
+   *
    * @generated from field: string message = 1;
    */
   message = "";
@@ -1644,9 +2054,54 @@ export class DestroyJobReply extends Message<DestroyJobReply> {
 }
 
 /**
+ * Request payload for ListJobs.
+ *
  * @generated from message legion.ListJobsRequest
  */
 export class ListJobsRequest extends Message<ListJobsRequest> {
+  /**
+   * Free-text search against job name, ID, and status.
+   *
+   * @generated from field: optional string query = 1;
+   */
+  query?: string;
+
+  /**
+   * Sort key. Supported values: `name`, `status`, `created_at`.
+   *
+   * Default: `created_at`.
+   *
+   * @generated from field: optional string sort_by = 2;
+   */
+  sortBy?: string;
+
+  /**
+   * Sort direction. Supported values: `asc`, `desc`.
+   *
+   * Default: `desc`.
+   *
+   * @generated from field: optional string sort_order = 3;
+   */
+  sortOrder?: string;
+
+  /**
+   * 1-indexed page number.
+   *
+   * Default: `1`.
+   *
+   * @generated from field: optional uint32 page = 4;
+   */
+  page?: number;
+
+  /**
+   * Maximum jobs returned in a page.
+   *
+   * Default: `20`.
+   *
+   * @generated from field: optional uint32 page_size = 5;
+   */
+  pageSize?: number;
+
   constructor(data?: PartialMessage<ListJobsRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -1655,6 +2110,11 @@ export class ListJobsRequest extends Message<ListJobsRequest> {
   static readonly runtime: typeof proto3 = proto3;
   static readonly typeName = "legion.ListJobsRequest";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "query", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 2, name: "sort_by", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 3, name: "sort_order", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 4, name: "page", kind: "scalar", T: 13 /* ScalarType.UINT32 */, opt: true },
+    { no: 5, name: "page_size", kind: "scalar", T: 13 /* ScalarType.UINT32 */, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListJobsRequest {
@@ -1675,25 +2135,37 @@ export class ListJobsRequest extends Message<ListJobsRequest> {
 }
 
 /**
+ * Job metadata record.
+ *
  * @generated from message legion.Job
  */
 export class Job extends Message<Job> {
   /**
+   * Job ID.
+   *
    * @generated from field: string id = 1;
    */
   id = "";
 
   /**
+   * Job name.
+   *
    * @generated from field: string name = 2;
    */
   name = "";
 
   /**
+   * Job status string.
+   *
+   * Current values written by manager include: done, stopped, failed.
+   *
    * @generated from field: string status = 3;
    */
   status = "";
 
   /**
+   * Unix timestamp (seconds) when job was created.
+   *
    * @generated from field: int64 created_at = 4;
    */
   createdAt = protoInt64.zero;
@@ -1730,13 +2202,38 @@ export class Job extends Message<Job> {
 }
 
 /**
+ * Reply payload for ListJobs.
+ *
  * @generated from message legion.ListJobsReply
  */
 export class ListJobsReply extends Message<ListJobsReply> {
   /**
+   * Jobs known to manager for the requested page.
+   *
    * @generated from field: repeated legion.Job jobs = 1;
    */
   jobs: Job[] = [];
+
+  /**
+   * Total number of records matching the filter before pagination.
+   *
+   * @generated from field: uint32 total_count = 2;
+   */
+  totalCount = 0;
+
+  /**
+   * 1-indexed page number returned.
+   *
+   * @generated from field: uint32 page = 3;
+   */
+  page = 0;
+
+  /**
+   * Page size used to produce this reply.
+   *
+   * @generated from field: uint32 page_size = 4;
+   */
+  pageSize = 0;
 
   constructor(data?: PartialMessage<ListJobsReply>) {
     super();
@@ -1747,6 +2244,9 @@ export class ListJobsReply extends Message<ListJobsReply> {
   static readonly typeName = "legion.ListJobsReply";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "jobs", kind: "message", T: Job, repeated: true },
+    { no: 2, name: "total_count", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 3, name: "page", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 4, name: "page_size", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListJobsReply {
@@ -1767,25 +2267,41 @@ export class ListJobsReply extends Message<ListJobsReply> {
 }
 
 /**
+ * Request payload for Heartbeat.
+ *
  * @generated from message legion.HeartbeatRequest
  */
 export class HeartbeatRequest extends Message<HeartbeatRequest> {
   /**
+   * Worker/node ID sending heartbeat.
+   *
    * @generated from field: string id = 1;
    */
   id = "";
 
   /**
+   * Allocation IDs currently known/running on worker.
+   *
+   * Default: empty list.
+   *
    * @generated from field: repeated int64 allocation_ids = 2;
    */
   allocationIds: bigint[] = [];
 
   /**
+   * Allocations that failed on worker since last heartbeat.
+   *
+   * Default: empty list.
+   *
    * @generated from field: repeated legion.FailedAllocation failed_allocations = 3;
    */
   failedAllocations: FailedAllocation[] = [];
 
   /**
+   * Latest per-allocation health snapshots from worker.
+   *
+   * Default: empty list.
+   *
    * @generated from field: repeated legion.AllocationHealth allocation_health = 4;
    */
   allocationHealth: AllocationHealth[] = [];
@@ -1822,15 +2338,25 @@ export class HeartbeatRequest extends Message<HeartbeatRequest> {
 }
 
 /**
+ * Reply payload for Heartbeat.
+ *
  * @generated from message legion.HeartbeatReply
  */
 export class HeartbeatReply extends Message<HeartbeatReply> {
   /**
+   * Human-readable acknowledgement.
+   *
+   * Current manager reply value: `"ack"`.
+   *
    * @generated from field: string message = 1;
    */
   message = "";
 
   /**
+   * Desired allocation set this worker should reconcile to.
+   *
+   * Default: empty list when manager has no desired allocations for this node.
+   *
    * @generated from field: repeated legion.TaskAllocation desired_allocations = 2;
    */
   desiredAllocations: TaskAllocation[] = [];
@@ -1865,15 +2391,21 @@ export class HeartbeatReply extends Message<HeartbeatReply> {
 }
 
 /**
+ * Failed allocation report item from worker to manager.
+ *
  * @generated from message legion.FailedAllocation
  */
 export class FailedAllocation extends Message<FailedAllocation> {
   /**
+   * Failed allocation ID.
+   *
    * @generated from field: int64 allocation_id = 1;
    */
   allocationId = protoInt64.zero;
 
   /**
+   * Failure reason text.
+   *
    * @generated from field: string reason = 2;
    */
   reason = "";
@@ -1908,20 +2440,28 @@ export class FailedAllocation extends Message<FailedAllocation> {
 }
 
 /**
+ * Allocation health snapshot item from worker to manager.
+ *
  * @generated from message legion.AllocationHealth
  */
 export class AllocationHealth extends Message<AllocationHealth> {
   /**
+   * Allocation ID.
+   *
    * @generated from field: int64 allocation_id = 1;
    */
   allocationId = protoInt64.zero;
 
   /**
+   * True when current health check state is healthy.
+   *
    * @generated from field: bool healthy = 2;
    */
   healthy = false;
 
   /**
+   * Human-readable health status details.
+   *
    * @generated from field: string status = 3;
    */
   status = "";
@@ -1957,15 +2497,21 @@ export class AllocationHealth extends Message<AllocationHealth> {
 }
 
 /**
+ * Request payload for HealthCheck.
+ *
  * @generated from message legion.HealthCheckRequest
  */
 export class HealthCheckRequest extends Message<HealthCheckRequest> {
   /**
+   * Worker/node ID submitting health checks.
+   *
    * @generated from field: string id = 1;
    */
   id = "";
 
   /**
+   * JSON-encoded node health-check payload.
+   *
    * @generated from field: string health_checks = 2;
    */
   healthChecks = "";
@@ -2000,10 +2546,16 @@ export class HealthCheckRequest extends Message<HealthCheckRequest> {
 }
 
 /**
+ * Reply payload for HealthCheck.
+ *
  * @generated from message legion.HealthCheckReply
  */
 export class HealthCheckReply extends Message<HealthCheckReply> {
   /**
+   * Human-readable acknowledgement.
+   *
+   * Current manager reply value: `"ack"`.
+   *
    * @generated from field: string message = 1;
    */
   message = "";
@@ -2037,50 +2589,78 @@ export class HealthCheckReply extends Message<HealthCheckReply> {
 }
 
 /**
+ * Node record used in APIs.
+ *
  * @generated from message legion.NodeMsg
  */
 export class NodeMsg extends Message<NodeMsg> {
   /**
+   * Node ID.
+   *
    * @generated from field: string id = 1;
    */
   id = "";
 
   /**
+   * Node pool.
+   *
    * @generated from field: string pool = 2;
    */
   pool = "";
 
   /**
+   * Node status string.
+   *
+   * On worker registration manager sets default `"active"`.
+   *
    * @generated from field: string status = 3;
    */
   status = "";
 
   /**
+   * Scheduling availability string (for example: available/unavailable).
+   *
+   * On worker registration manager sets default `"available"`.
+   *
    * @generated from field: string availability = 4;
    */
   availability = "";
 
   /**
+   * JSON-encoded configuration attributes.
+   *
    * @generated from field: string config_attrs = 5;
    */
   configAttrs = "";
 
   /**
+   * JSON-encoded fingerprint attributes.
+   *
    * @generated from field: string fingerprint_attrs = 6;
    */
   fingerprintAttrs = "";
 
   /**
+   * JSON-encoded dynamic attributes.
+   *
+   * On worker registration manager initializes this to `{}`.
+   *
    * @generated from field: string dynamic_attrs = 7;
    */
   dynamicAttrs = "";
 
   /**
+   * JSON-encoded health check payload.
+   *
    * @generated from field: string health_checks = 8;
    */
   healthChecks = "";
 
   /**
+   * Last heartbeat timestamp string.
+   *
+   * On worker registration this starts empty and is set on first heartbeat.
+   *
    * @generated from field: string last_heartbeat = 9;
    */
   lastHeartbeat = "";
@@ -2122,9 +2702,54 @@ export class NodeMsg extends Message<NodeMsg> {
 }
 
 /**
+ * Request payload for GetNodes.
+ *
  * @generated from message legion.GetNodesRequest
  */
 export class GetNodesRequest extends Message<GetNodesRequest> {
+  /**
+   * Free-text search against node ID, status, pool, and availability.
+   *
+   * @generated from field: optional string query = 1;
+   */
+  query?: string;
+
+  /**
+   * Sort key. Supported values: `id`, `status`, `last_heartbeat`, `pool`.
+   *
+   * Default: `id`.
+   *
+   * @generated from field: optional string sort_by = 2;
+   */
+  sortBy?: string;
+
+  /**
+   * Sort direction. Supported values: `asc`, `desc`.
+   *
+   * Default: `asc`.
+   *
+   * @generated from field: optional string sort_order = 3;
+   */
+  sortOrder?: string;
+
+  /**
+   * 1-indexed page number.
+   *
+   * Default: `1`.
+   *
+   * @generated from field: optional uint32 page = 4;
+   */
+  page?: number;
+
+  /**
+   * Maximum nodes returned in a page.
+   *
+   * Default: `20`.
+   *
+   * @generated from field: optional uint32 page_size = 5;
+   */
+  pageSize?: number;
+
   constructor(data?: PartialMessage<GetNodesRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -2133,6 +2758,11 @@ export class GetNodesRequest extends Message<GetNodesRequest> {
   static readonly runtime: typeof proto3 = proto3;
   static readonly typeName = "legion.GetNodesRequest";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "query", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 2, name: "sort_by", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 3, name: "sort_order", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 4, name: "page", kind: "scalar", T: 13 /* ScalarType.UINT32 */, opt: true },
+    { no: 5, name: "page_size", kind: "scalar", T: 13 /* ScalarType.UINT32 */, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetNodesRequest {
@@ -2153,13 +2783,38 @@ export class GetNodesRequest extends Message<GetNodesRequest> {
 }
 
 /**
+ * Reply payload for GetNodes.
+ *
  * @generated from message legion.GetNodesReply
  */
 export class GetNodesReply extends Message<GetNodesReply> {
   /**
+   * Nodes known to manager for the requested page.
+   *
    * @generated from field: repeated legion.NodeMsg nodes = 1;
    */
   nodes: NodeMsg[] = [];
+
+  /**
+   * Total number of records matching the filter before pagination.
+   *
+   * @generated from field: uint32 total_count = 2;
+   */
+  totalCount = 0;
+
+  /**
+   * 1-indexed page number returned.
+   *
+   * @generated from field: uint32 page = 3;
+   */
+  page = 0;
+
+  /**
+   * Page size used to produce this reply.
+   *
+   * @generated from field: uint32 page_size = 4;
+   */
+  pageSize = 0;
 
   constructor(data?: PartialMessage<GetNodesReply>) {
     super();
@@ -2170,6 +2825,9 @@ export class GetNodesReply extends Message<GetNodesReply> {
   static readonly typeName = "legion.GetNodesReply";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "nodes", kind: "message", T: NodeMsg, repeated: true },
+    { no: 2, name: "total_count", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 3, name: "page", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 4, name: "page_size", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetNodesReply {
@@ -2190,10 +2848,14 @@ export class GetNodesReply extends Message<GetNodesReply> {
 }
 
 /**
+ * Request payload for GetNode.
+ *
  * @generated from message legion.GetNodeRequest
  */
 export class GetNodeRequest extends Message<GetNodeRequest> {
   /**
+   * Node ID.
+   *
    * @generated from field: string id = 1;
    */
   id = "";
@@ -2227,10 +2889,16 @@ export class GetNodeRequest extends Message<GetNodeRequest> {
 }
 
 /**
+ * Reply payload for GetNode.
+ *
  * @generated from message legion.GetNodeReply
  */
 export class GetNodeReply extends Message<GetNodeReply> {
   /**
+   * Node record when found.
+   *
+   * Unset when the node ID does not exist.
+   *
    * @generated from field: optional legion.NodeMsg node = 1;
    */
   node?: NodeMsg;
@@ -2264,10 +2932,14 @@ export class GetNodeReply extends Message<GetNodeReply> {
 }
 
 /**
+ * Request payload for RestartWorker.
+ *
  * @generated from message legion.RestartWorkerRequest
  */
 export class RestartWorkerRequest extends Message<RestartWorkerRequest> {
   /**
+   * Node/worker ID to restart.
+   *
    * @generated from field: string node_id = 1;
    */
   nodeId = "";
@@ -2301,10 +2973,17 @@ export class RestartWorkerRequest extends Message<RestartWorkerRequest> {
 }
 
 /**
+ * Reply payload for RestartWorker.
+ *
  * @generated from message legion.RestartWorkerReply
  */
 export class RestartWorkerReply extends Message<RestartWorkerReply> {
   /**
+   * Human-readable status message.
+   *
+   * Manager forwards the worker's restart message.
+   * Built-in worker currently replies `"Worker restarting"`.
+   *
    * @generated from field: string message = 1;
    */
   message = "";
@@ -2338,6 +3017,10 @@ export class RestartWorkerReply extends Message<RestartWorkerReply> {
 }
 
 /**
+ * Request payload for GetLedger.
+ *
+ * Empty request; full ledger is returned.
+ *
  * @generated from message legion.GetLedgerRequest
  */
 export class GetLedgerRequest extends Message<GetLedgerRequest> {
@@ -2369,10 +3052,14 @@ export class GetLedgerRequest extends Message<GetLedgerRequest> {
 }
 
 /**
+ * Reply payload for GetLedger.
+ *
  * @generated from message legion.GetLedgerReply
  */
 export class GetLedgerReply extends Message<GetLedgerReply> {
   /**
+   * Ledger rows keyed by node.
+   *
    * @generated from field: repeated legion.LedgerNode nodes = 1;
    */
   nodes: LedgerNode[] = [];
@@ -2406,20 +3093,28 @@ export class GetLedgerReply extends Message<GetLedgerReply> {
 }
 
 /**
+ * Snapshot of one manager node's stored manager config.
+ *
  * @generated from message legion.ManagerNodeConfig
  */
 export class ManagerNodeConfig extends Message<ManagerNodeConfig> {
   /**
+   * Manager node ID.
+   *
    * @generated from field: string node_id = 1;
    */
   nodeId = "";
 
   /**
+   * JSON-encoded manager configuration.
+   *
    * @generated from field: string config_json = 2;
    */
   configJson = "";
 
   /**
+   * Timestamp when this snapshot was updated.
+   *
    * @generated from field: string updated_at = 3;
    */
   updatedAt = "";
@@ -2455,9 +3150,54 @@ export class ManagerNodeConfig extends Message<ManagerNodeConfig> {
 }
 
 /**
+ * Request payload for GetManagerConfigs.
+ *
  * @generated from message legion.GetManagerConfigsRequest
  */
 export class GetManagerConfigsRequest extends Message<GetManagerConfigsRequest> {
+  /**
+   * Free-text search against manager node ID.
+   *
+   * @generated from field: optional string query = 1;
+   */
+  query?: string;
+
+  /**
+   * Sort key. Supported values: `node_id`, `updated_at`.
+   *
+   * Default: `updated_at`.
+   *
+   * @generated from field: optional string sort_by = 2;
+   */
+  sortBy?: string;
+
+  /**
+   * Sort direction. Supported values: `asc`, `desc`.
+   *
+   * Default: `desc`.
+   *
+   * @generated from field: optional string sort_order = 3;
+   */
+  sortOrder?: string;
+
+  /**
+   * 1-indexed page number.
+   *
+   * Default: `1`.
+   *
+   * @generated from field: optional uint32 page = 4;
+   */
+  page?: number;
+
+  /**
+   * Maximum manager configs returned in a page.
+   *
+   * Default: `20`.
+   *
+   * @generated from field: optional uint32 page_size = 5;
+   */
+  pageSize?: number;
+
   constructor(data?: PartialMessage<GetManagerConfigsRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -2466,6 +3206,11 @@ export class GetManagerConfigsRequest extends Message<GetManagerConfigsRequest> 
   static readonly runtime: typeof proto3 = proto3;
   static readonly typeName = "legion.GetManagerConfigsRequest";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "query", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 2, name: "sort_by", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 3, name: "sort_order", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 4, name: "page", kind: "scalar", T: 13 /* ScalarType.UINT32 */, opt: true },
+    { no: 5, name: "page_size", kind: "scalar", T: 13 /* ScalarType.UINT32 */, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetManagerConfigsRequest {
@@ -2486,13 +3231,38 @@ export class GetManagerConfigsRequest extends Message<GetManagerConfigsRequest> 
 }
 
 /**
+ * Reply payload for GetManagerConfigs.
+ *
  * @generated from message legion.GetManagerConfigsReply
  */
 export class GetManagerConfigsReply extends Message<GetManagerConfigsReply> {
   /**
+   * Stored manager config snapshots for the requested page.
+   *
    * @generated from field: repeated legion.ManagerNodeConfig configs = 1;
    */
   configs: ManagerNodeConfig[] = [];
+
+  /**
+   * Total number of records matching the filter before pagination.
+   *
+   * @generated from field: uint32 total_count = 2;
+   */
+  totalCount = 0;
+
+  /**
+   * 1-indexed page number returned.
+   *
+   * @generated from field: uint32 page = 3;
+   */
+  page = 0;
+
+  /**
+   * Page size used to produce this reply.
+   *
+   * @generated from field: uint32 page_size = 4;
+   */
+  pageSize = 0;
 
   constructor(data?: PartialMessage<GetManagerConfigsReply>) {
     super();
@@ -2503,6 +3273,9 @@ export class GetManagerConfigsReply extends Message<GetManagerConfigsReply> {
   static readonly typeName = "legion.GetManagerConfigsReply";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "configs", kind: "message", T: ManagerNodeConfig, repeated: true },
+    { no: 2, name: "total_count", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 3, name: "page", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 4, name: "page_size", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetManagerConfigsReply {
@@ -2523,35 +3296,51 @@ export class GetManagerConfigsReply extends Message<GetManagerConfigsReply> {
 }
 
 /**
+ * KV entry record.
+ *
  * @generated from message legion.KvEntry
  */
 export class KvEntry extends Message<KvEntry> {
   /**
+   * Key path.
+   *
    * @generated from field: string key = 1;
    */
   key = "";
 
   /**
+   * Raw stored value string.
+   *
+   * Interpretation depends on `value_type`.
+   *
    * @generated from field: string value = 2;
    */
   value = "";
 
   /**
+   * Type discriminator for `value`.
+   *
    * @generated from field: legion.KvValueType value_type = 3;
    */
   valueType = KvValueType.UNSPECIFIED;
 
   /**
+   * Monotonic version used for optimistic concurrency.
+   *
    * @generated from field: int64 version = 4;
    */
   version = protoInt64.zero;
 
   /**
+   * RFC3339 creation timestamp.
+   *
    * @generated from field: string created_at = 5;
    */
   createdAt = "";
 
   /**
+   * RFC3339 update timestamp.
+   *
    * @generated from field: string updated_at = 6;
    */
   updatedAt = "";
@@ -2590,30 +3379,42 @@ export class KvEntry extends Message<KvEntry> {
 }
 
 /**
+ * KV lock record.
+ *
  * @generated from message legion.KvLock
  */
 export class KvLock extends Message<KvLock> {
   /**
+   * Key this lock protects.
+   *
    * @generated from field: string key = 1;
    */
   key = "";
 
   /**
+   * Lock token that must be provided for renew/release and optional writes.
+   *
    * @generated from field: string lock_id = 2;
    */
   lockId = "";
 
   /**
+   * Optional owner label for debugging/auditing.
+   *
    * @generated from field: optional string owner = 3;
    */
   owner?: string;
 
   /**
+   * RFC3339 time lock was acquired.
+   *
    * @generated from field: string acquired_at = 4;
    */
   acquiredAt = "";
 
   /**
+   * RFC3339 lock expiration timestamp.
+   *
    * @generated from field: string expires_at = 5;
    */
   expiresAt = "";
@@ -2651,30 +3452,55 @@ export class KvLock extends Message<KvLock> {
 }
 
 /**
+ * Request payload for PutKv.
+ *
  * @generated from message legion.PutKvRequest
  */
 export class PutKvRequest extends Message<PutKvRequest> {
   /**
+   * Key path to create or update.
+   *
+   * Must be non-empty.
+   *
    * @generated from field: string key = 1;
    */
   key = "";
 
   /**
+   * Value to store.
+   *
+   * Interpretation and validation depend on `value_type`.
+   *
    * @generated from field: string value = 2;
    */
   value = "";
 
   /**
+   * Value type for normalization/validation.
+   *
+   * Required for writes. Default enum value is
+   * `KV_VALUE_TYPE_UNSPECIFIED`, which manager rejects.
+   *
    * @generated from field: legion.KvValueType value_type = 3;
    */
   valueType = KvValueType.UNSPECIFIED;
 
   /**
+   * Optional expected version for optimistic concurrency checks.
+   *
+   * Behavior:
+   * - Update existing key: must match current version.
+   * - Create new key: may be omitted, or explicitly `0`.
+   *
    * @generated from field: optional int64 expected_version = 4;
    */
   expectedVersion?: bigint;
 
   /**
+   * Optional lock token; required when key is actively locked by another client.
+   *
+   * Default: unset.
+   *
    * @generated from field: optional string lock_id = 5;
    */
   lockId?: string;
@@ -2712,10 +3538,17 @@ export class PutKvRequest extends Message<PutKvRequest> {
 }
 
 /**
+ * Reply payload for PutKv.
+ *
  * @generated from message legion.PutKvReply
  */
 export class PutKvReply extends Message<PutKvReply> {
   /**
+   * Stored KV entry after write.
+   *
+   * Includes incremented `version` and normalized `value`.
+   * Manager sets this on successful responses.
+   *
    * @generated from field: legion.KvEntry entry = 1;
    */
   entry?: KvEntry;
@@ -2749,10 +3582,16 @@ export class PutKvReply extends Message<PutKvReply> {
 }
 
 /**
+ * Request payload for GetKv.
+ *
  * @generated from message legion.GetKvRequest
  */
 export class GetKvRequest extends Message<GetKvRequest> {
   /**
+   * Key path to fetch.
+   *
+   * Must be non-empty.
+   *
    * @generated from field: string key = 1;
    */
   key = "";
@@ -2786,10 +3625,14 @@ export class GetKvRequest extends Message<GetKvRequest> {
 }
 
 /**
+ * Reply payload for GetKv.
+ *
  * @generated from message legion.GetKvReply
  */
 export class GetKvReply extends Message<GetKvReply> {
   /**
+   * Entry when found; unset when key does not exist.
+   *
    * @generated from field: optional legion.KvEntry entry = 1;
    */
   entry?: KvEntry;
@@ -2823,10 +3666,16 @@ export class GetKvReply extends Message<GetKvReply> {
 }
 
 /**
+ * Request payload for ListKv.
+ *
  * @generated from message legion.ListKvRequest
  */
 export class ListKvRequest extends Message<ListKvRequest> {
   /**
+   * Prefix filter; entries with keys beginning with this prefix are returned.
+   *
+   * Default empty string matches all keys.
+   *
    * @generated from field: string prefix = 1;
    */
   prefix = "";
@@ -2860,10 +3709,14 @@ export class ListKvRequest extends Message<ListKvRequest> {
 }
 
 /**
+ * Reply payload for ListKv.
+ *
  * @generated from message legion.ListKvReply
  */
 export class ListKvReply extends Message<ListKvReply> {
   /**
+   * Matching KV entries.
+   *
    * @generated from field: repeated legion.KvEntry entries = 1;
    */
   entries: KvEntry[] = [];
@@ -2897,20 +3750,34 @@ export class ListKvReply extends Message<ListKvReply> {
 }
 
 /**
+ * Request payload for DeleteKv.
+ *
  * @generated from message legion.DeleteKvRequest
  */
 export class DeleteKvRequest extends Message<DeleteKvRequest> {
   /**
+   * Key path to delete.
+   *
+   * Must be non-empty.
+   *
    * @generated from field: string key = 1;
    */
   key = "";
 
   /**
+   * Optional expected version for optimistic concurrency checks.
+   *
+   * Default: unset (no version check).
+   *
    * @generated from field: optional int64 expected_version = 2;
    */
   expectedVersion?: bigint;
 
   /**
+   * Optional lock token; required when key is actively locked by another client.
+   *
+   * Default: unset.
+   *
    * @generated from field: optional string lock_id = 3;
    */
   lockId?: string;
@@ -2946,10 +3813,16 @@ export class DeleteKvRequest extends Message<DeleteKvRequest> {
 }
 
 /**
+ * Reply payload for DeleteKv.
+ *
  * @generated from message legion.DeleteKvReply
  */
 export class DeleteKvReply extends Message<DeleteKvReply> {
   /**
+   * Human-readable result message.
+   *
+   * Current manager reply value: `"kv entry deleted"`.
+   *
    * @generated from field: string message = 1;
    */
   message = "";
@@ -2983,25 +3856,43 @@ export class DeleteKvReply extends Message<DeleteKvReply> {
 }
 
 /**
+ * Request payload for PatchKv.
+ *
  * @generated from message legion.PatchKvRequest
  */
 export class PatchKvRequest extends Message<PatchKvRequest> {
   /**
+   * Key path to patch.
+   *
+   * Must reference an existing JSON-typed KV entry.
+   *
    * @generated from field: string key = 1;
    */
   key = "";
 
   /**
+   * RFC6902 JSON patch payload as text.
+   *
+   * Must parse as a valid JSON Patch document.
+   *
    * @generated from field: string patch_json = 2;
    */
   patchJson = "";
 
   /**
+   * Optional expected version for optimistic concurrency checks.
+   *
+   * Default: unset (no version check).
+   *
    * @generated from field: optional int64 expected_version = 3;
    */
   expectedVersion?: bigint;
 
   /**
+   * Optional lock token; required when key is actively locked by another client.
+   *
+   * Default: unset.
+   *
    * @generated from field: optional string lock_id = 4;
    */
   lockId?: string;
@@ -3038,10 +3929,17 @@ export class PatchKvRequest extends Message<PatchKvRequest> {
 }
 
 /**
+ * Reply payload for PatchKv.
+ *
  * @generated from message legion.PatchKvReply
  */
 export class PatchKvReply extends Message<PatchKvReply> {
   /**
+   * Updated KV entry after patch.
+   *
+   * Includes incremented `version`.
+   * Manager sets this on successful responses.
+   *
    * @generated from field: legion.KvEntry entry = 1;
    */
   entry?: KvEntry;
@@ -3075,30 +3973,54 @@ export class PatchKvReply extends Message<PatchKvReply> {
 }
 
 /**
+ * Request payload for AcquireKvLock.
+ *
  * @generated from message legion.AcquireKvLockRequest
  */
 export class AcquireKvLockRequest extends Message<AcquireKvLockRequest> {
   /**
+   * Key path to lock.
+   *
+   * Must be non-empty.
+   *
    * @generated from field: string key = 1;
    */
   key = "";
 
   /**
+   * Optional caller-supplied lock token.
+   *
+   * If omitted, manager generates a random 32-hex-character token.
+   * If provided and it matches an existing active lock ID for this key,
+   * acquire is allowed even without `force=true`.
+   *
    * @generated from field: optional string lock_id = 2;
    */
   lockId?: string;
 
   /**
+   * Optional owner label for diagnostics.
+   *
+   * Default: unset.
+   *
    * @generated from field: optional string owner = 3;
    */
   owner?: string;
 
   /**
+   * Lease duration in seconds.
+   *
+   * Must be > 0.
+   *
    * @generated from field: int64 ttl_seconds = 4;
    */
   ttlSeconds = protoInt64.zero;
 
   /**
+   * When true, allows replacing an existing non-expired lock.
+   *
+   * Default: `false`.
+   *
    * @generated from field: bool force = 5;
    */
   force = false;
@@ -3136,10 +4058,16 @@ export class AcquireKvLockRequest extends Message<AcquireKvLockRequest> {
 }
 
 /**
+ * Reply payload for AcquireKvLock.
+ *
  * @generated from message legion.AcquireKvLockReply
  */
 export class AcquireKvLockReply extends Message<AcquireKvLockReply> {
   /**
+   * Active lock state.
+   *
+   * Manager sets this on successful responses.
+   *
    * @generated from field: legion.KvLock lock = 1;
    */
   lock?: KvLock;
@@ -3173,20 +4101,32 @@ export class AcquireKvLockReply extends Message<AcquireKvLockReply> {
 }
 
 /**
+ * Request payload for RenewKvLock.
+ *
  * @generated from message legion.RenewKvLockRequest
  */
 export class RenewKvLockRequest extends Message<RenewKvLockRequest> {
   /**
+   * Key path.
+   *
    * @generated from field: string key = 1;
    */
   key = "";
 
   /**
+   * Lock token currently held by caller.
+   *
+   * Must match the active lock's ID.
+   *
    * @generated from field: string lock_id = 2;
    */
   lockId = "";
 
   /**
+   * New lease duration in seconds.
+   *
+   * Must be > 0.
+   *
    * @generated from field: int64 ttl_seconds = 3;
    */
   ttlSeconds = protoInt64.zero;
@@ -3222,10 +4162,16 @@ export class RenewKvLockRequest extends Message<RenewKvLockRequest> {
 }
 
 /**
+ * Reply payload for RenewKvLock.
+ *
  * @generated from message legion.RenewKvLockReply
  */
 export class RenewKvLockReply extends Message<RenewKvLockReply> {
   /**
+   * Updated lock state.
+   *
+   * Manager sets this on successful responses.
+   *
    * @generated from field: legion.KvLock lock = 1;
    */
   lock?: KvLock;
@@ -3259,15 +4205,23 @@ export class RenewKvLockReply extends Message<RenewKvLockReply> {
 }
 
 /**
+ * Request payload for ReleaseKvLock.
+ *
  * @generated from message legion.ReleaseKvLockRequest
  */
 export class ReleaseKvLockRequest extends Message<ReleaseKvLockRequest> {
   /**
+   * Key path.
+   *
    * @generated from field: string key = 1;
    */
   key = "";
 
   /**
+   * Lock token currently held by caller.
+   *
+   * Must match the active lock's ID.
+   *
    * @generated from field: string lock_id = 2;
    */
   lockId = "";
@@ -3302,10 +4256,16 @@ export class ReleaseKvLockRequest extends Message<ReleaseKvLockRequest> {
 }
 
 /**
+ * Reply payload for ReleaseKvLock.
+ *
  * @generated from message legion.ReleaseKvLockReply
  */
 export class ReleaseKvLockReply extends Message<ReleaseKvLockReply> {
   /**
+   * Human-readable result message.
+   *
+   * Current manager reply value: `"kv lock released"`.
+   *
    * @generated from field: string message = 1;
    */
   message = "";
@@ -3339,10 +4299,16 @@ export class ReleaseKvLockReply extends Message<ReleaseKvLockReply> {
 }
 
 /**
+ * Request payload for GetKvLock.
+ *
  * @generated from message legion.GetKvLockRequest
  */
 export class GetKvLockRequest extends Message<GetKvLockRequest> {
   /**
+   * Key path.
+   *
+   * Must be non-empty.
+   *
    * @generated from field: string key = 1;
    */
   key = "";
@@ -3376,10 +4342,16 @@ export class GetKvLockRequest extends Message<GetKvLockRequest> {
 }
 
 /**
+ * Reply payload for GetKvLock.
+ *
  * @generated from message legion.GetKvLockReply
  */
 export class GetKvLockReply extends Message<GetKvLockReply> {
   /**
+   * Active non-expired lock when present.
+   *
+   * If the stored lock is expired, manager removes it and returns unset.
+   *
    * @generated from field: optional legion.KvLock lock = 1;
    */
   lock?: KvLock;
@@ -3413,15 +4385,21 @@ export class GetKvLockReply extends Message<GetKvLockReply> {
 }
 
 /**
+ * One ledger row grouping a node with its current allocations.
+ *
  * @generated from message legion.LedgerNode
  */
 export class LedgerNode extends Message<LedgerNode> {
   /**
+   * Node record.
+   *
    * @generated from field: optional legion.NodeMsg node = 1;
    */
   node?: NodeMsg;
 
   /**
+   * Allocations currently assigned to this node.
+   *
    * @generated from field: repeated legion.LedgerAllocation allocations = 2;
    */
   allocations: LedgerAllocation[] = [];
@@ -3456,40 +4434,56 @@ export class LedgerNode extends Message<LedgerNode> {
 }
 
 /**
+ * Allocation record as returned in ledger responses.
+ *
  * @generated from message legion.LedgerAllocation
  */
 export class LedgerAllocation extends Message<LedgerAllocation> {
   /**
+   * Allocation ID.
+   *
    * @generated from field: int64 id = 1;
    */
   id = protoInt64.zero;
 
   /**
+   * Allocation status.
+   *
    * @generated from field: string status = 2;
    */
   status = "";
 
   /**
+   * JSON-encoded resource payload.
+   *
    * @generated from field: string resources = 3;
    */
   resources = "";
 
   /**
+   * Node ID where this allocation is placed.
+   *
    * @generated from field: string node_id = 4;
    */
   nodeId = "";
 
   /**
+   * Job config ID this allocation targets.
+   *
    * @generated from field: string job_config_id = 5;
    */
   jobConfigId = "";
 
   /**
+   * Task config ID this allocation targets.
+   *
    * @generated from field: int64 task_config_id = 6;
    */
   taskConfigId = protoInt64.zero;
 
   /**
+   * Job ID this allocation belongs to.
+   *
    * @generated from field: string job_id = 7;
    */
   jobId = "";
@@ -3529,15 +4523,24 @@ export class LedgerAllocation extends Message<LedgerAllocation> {
 }
 
 /**
+ * Request payload for UpdateNodeDynamic.
+ *
  * @generated from message legion.UpdateNodeDynamicRequest
  */
 export class UpdateNodeDynamicRequest extends Message<UpdateNodeDynamicRequest> {
   /**
+   * Node ID to update.
+   *
    * @generated from field: string id = 1;
    */
   id = "";
 
   /**
+   * JSON object string merged into node dynamic attributes.
+   *
+   * Merge behavior is shallow object merge by key.
+   * Keys present in `dynamic_diff` overwrite existing keys.
+   *
    * @generated from field: string dynamic_diff = 2;
    */
   dynamicDiff = "";
@@ -3572,10 +4575,16 @@ export class UpdateNodeDynamicRequest extends Message<UpdateNodeDynamicRequest> 
 }
 
 /**
+ * Reply payload for UpdateNodeDynamic.
+ *
  * @generated from message legion.UpdateNodeDynamicReply
  */
 export class UpdateNodeDynamicReply extends Message<UpdateNodeDynamicReply> {
   /**
+   * Updated node record.
+   *
+   * Includes merged dynamic attributes as persisted by manager.
+   *
    * @generated from field: optional legion.NodeMsg node = 1;
    */
   node?: NodeMsg;
@@ -3609,15 +4618,26 @@ export class UpdateNodeDynamicReply extends Message<UpdateNodeDynamicReply> {
 }
 
 /**
+ * Request payload for GetJoinToken.
+ *
  * @generated from message legion.GetJoinTokenRequest
  */
 export class GetJoinTokenRequest extends Message<GetJoinTokenRequest> {
   /**
+   * Optional token TTL string (for example: "1h", "30m").
+   *
+   * Unset means no expiry in current manager implementation
+   * (`exp` claim is set to `0` and `skip_expiry_validation=true`).
+   *
    * @generated from field: optional string ttl = 1;
    */
   ttl?: string;
 
   /**
+   * Optional worker type to embed in token.
+   *
+   * Defaults to "default" when omitted.
+   *
    * @generated from field: optional string worker_type = 2;
    */
   workerType?: string;
@@ -3652,10 +4672,14 @@ export class GetJoinTokenRequest extends Message<GetJoinTokenRequest> {
 }
 
 /**
+ * Reply payload for GetJoinToken.
+ *
  * @generated from message legion.GetJoinTokenReply
  */
 export class GetJoinTokenReply extends Message<GetJoinTokenReply> {
   /**
+   * Signed JWT join token.
+   *
    * @generated from field: string token = 1;
    */
   token = "";
@@ -3689,40 +4713,67 @@ export class GetJoinTokenReply extends Message<GetJoinTokenReply> {
 }
 
 /**
+ * Internal eval queue item.
+ *
  * @generated from message legion.Eval
  */
 export class Eval extends Message<Eval> {
   /**
+   * Eval ID.
+   *
    * @generated from field: string id = 1;
    */
   id = "";
 
   /**
+   * Eval status (for example: pending, in_flight, failed).
+   *
+   * Newly enqueued evals start as `pending`.
+   *
    * @generated from field: string status = 2;
    */
   status = "";
 
   /**
+   * Eval kind (for example: job_submit, node_drop, rollout_tick).
+   *
    * @generated from field: string kind = 3;
    */
   kind = "";
 
   /**
+   * Associated job ID when applicable.
+   *
+   * Default empty string when not scoped to a job.
+   *
    * @generated from field: string job_id = 4;
    */
   jobId = "";
 
   /**
+   * Associated job config ID when applicable.
+   *
+   * Default empty string when not scoped to a job config.
+   *
    * @generated from field: string job_config_id = 5;
    */
   jobConfigId = "";
 
   /**
+   * Associated node name/ID when applicable.
+   *
+   * Default empty string when not scoped to a node.
+   *
    * @generated from field: string node_name = 6;
    */
   nodeName = "";
 
   /**
+   * Eval priority (higher processed first).
+   *
+   * Default when not explicitly provided: manager `default_priority`
+   * (`50` in built-in config defaults).
+   *
    * @generated from field: int64 priority = 7;
    */
   priority = protoInt64.zero;
@@ -3762,55 +4813,77 @@ export class Eval extends Message<Eval> {
 }
 
 /**
+ * Allocation payload sent to workers.
+ *
  * @generated from message legion.TaskAllocation
  */
 export class TaskAllocation extends Message<TaskAllocation> {
   /**
+   * Allocation ID.
+   *
    * @generated from field: int64 allocation_id = 1;
    */
   allocationId = protoInt64.zero;
 
   /**
+   * Job ID.
+   *
    * @generated from field: string job_id = 2;
    */
   jobId = "";
 
   /**
+   * Job config ID.
+   *
    * @generated from field: string job_config_id = 3;
    */
   jobConfigId = "";
 
   /**
+   * Target node ID.
+   *
    * @generated from field: string node_id = 4;
    */
   nodeId = "";
 
   /**
+   * Task config ID.
+   *
    * @generated from field: int64 task_config_id = 5;
    */
   taskConfigId = protoInt64.zero;
 
   /**
+   * Task name.
+   *
    * @generated from field: string task_name = 6;
    */
   taskName = "";
 
   /**
+   * Task kind/plugin name.
+   *
    * @generated from field: string task_kind = 7;
    */
   taskKind = "";
 
   /**
+   * JSON-encoded task config payload.
+   *
    * @generated from field: string task_config = 8;
    */
   taskConfig = "";
 
   /**
+   * JSON-encoded task health-check definitions.
+   *
    * @generated from field: string task_checks = 9;
    */
   taskChecks = "";
 
   /**
+   * JSON-encoded task unhealthy handling policy.
+   *
    * @generated from field: string task_on_unhealthy = 10;
    */
   taskOnUnhealthy = "";
@@ -3853,10 +4926,16 @@ export class TaskAllocation extends Message<TaskAllocation> {
 }
 
 /**
+ * Request payload for PostWork.
+ *
  * @generated from message legion.PostWorkRequest
  */
 export class PostWorkRequest extends Message<PostWorkRequest> {
   /**
+   * Allocation payload to start/reconcile on worker.
+   *
+   * Required. Worker rejects request when this field is missing.
+   *
    * @generated from field: legion.TaskAllocation allocation = 1;
    */
   allocation?: TaskAllocation;
@@ -3890,10 +4969,16 @@ export class PostWorkRequest extends Message<PostWorkRequest> {
 }
 
 /**
+ * Reply payload for PostWork.
+ *
  * @generated from message legion.PostWorkReply
  */
 export class PostWorkReply extends Message<PostWorkReply> {
   /**
+   * Human-readable acknowledgement.
+   *
+   * Built-in worker reply value: `"Task accepted"`.
+   *
    * @generated from field: string message = 1;
    */
   message = "";

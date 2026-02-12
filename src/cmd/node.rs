@@ -131,7 +131,9 @@ pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
 #[instrument(err, skip_all)]
 async fn get_nodes(is_json: bool) -> R<()> {
     let mut client = connect_manager_client().await?;
-    let request = tonic::Request::new(GetNodesRequest {});
+    let request = tonic::Request::new(GetNodesRequest {
+        ..Default::default()
+    });
     let response = client
         .get_nodes(request)
         .await

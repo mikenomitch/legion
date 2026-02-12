@@ -57,6 +57,35 @@ fn map_store_error(action: &str, err: anyhow::Error) -> Status {
     }
 }
 
+const DEFAULT_PAGE_SIZE: usize = 20;
+const MAX_PAGE_SIZE: usize = 100;
+
+fn normalize_query(value: Option<String>) -> Option<String> {
+    value.and_then(|query| {
+        let trimmed = query.trim().to_lowercase();
+        (!trimmed.is_empty()).then_some(trimmed)
+    })
+}
+
+fn parse_page(page: Option<u32>, page_size: Option<u32>) -> (usize, usize) {
+    let page = page.unwrap_or(1).max(1) as usize;
+    let size = page_size.unwrap_or(DEFAULT_PAGE_SIZE as u32).max(1) as usize;
+    (page, size.min(MAX_PAGE_SIZE))
+}
+
+fn paginate<T>(values: Vec<T>, page: usize, page_size: usize) -> (Vec<T>, u32) {
+    let total_count = values.len() as u32;
+    let start = page.saturating_sub(1).saturating_mul(page_size);
+    if start >= values.len() {
+        return (Vec::new(), total_count);
+    }
+    let end = (start + page_size).min(values.len());
+    (
+        values.into_iter().skip(start).take(end - start).collect(),
+        total_count,
+    )
+}
+
 #[derive(Debug, Clone)]
 struct KvReference {
     key: String,
@@ -588,12 +617,54 @@ impl Manager for ManagerAgentService {
             .job_id
             .as_deref()
             .filter(|job| !job.trim().is_empty());
-        let rollouts = self
+        let query = normalize_query(request.query);
+        let sort_by = request.sort_by.unwrap_or_else(|| "updated_at".to_string());
+        let sort_desc = request
+            .sort_order
+            .as_deref()
+            .unwrap_or("desc")
+            .eq_ignore_ascii_case("desc");
+        let (page, page_size) = parse_page(request.page, request.page_size);
+
+        let mut rollouts = self
             .store
             .list_rollouts(job_id, request.active_only)
             .map_err(|e| map_store_error("Error listing rollouts", e))?;
 
-        Ok(Response::new(ListRolloutsReply { rollouts }))
+        if let Some(query) = query {
+            rollouts.retain(|rollout| {
+                let id = rollout.id.to_string();
+                let status = rollout.status.to_lowercase();
+                let strategy = rollout.strategy.clone().unwrap_or_default().to_lowercase();
+                id.contains(&query)
+                    || rollout.job_id.to_lowercase().contains(&query)
+                    || status.contains(&query)
+                    || strategy.contains(&query)
+            });
+        }
+
+        rollouts.sort_by(|a, b| {
+            let ordering = match sort_by.as_str() {
+                "created_at" => a.created_at.cmp(&b.created_at),
+                "status" => a.status.cmp(&b.status),
+                "job_id" => a.job_id.cmp(&b.job_id),
+                _ => a.updated_at.cmp(&b.updated_at),
+            };
+            if sort_desc {
+                ordering.reverse()
+            } else {
+                ordering
+            }
+        });
+
+        let (rollouts, total_count) = paginate(rollouts, page, page_size);
+
+        Ok(Response::new(ListRolloutsReply {
+            rollouts,
+            total_count,
+            page: page as u32,
+            page_size: page_size as u32,
+        }))
     }
 
     #[instrument(skip_all)]
@@ -830,16 +901,52 @@ impl Manager for ManagerAgentService {
     #[instrument(skip_all)]
     async fn list_jobs(
         &self,
-        _request: Request<ListJobsRequest>,
+        request: Request<ListJobsRequest>,
     ) -> Result<Response<ListJobsReply>, Status> {
-        let jobs = self
+        let request = request.into_inner();
+        let query = normalize_query(request.query);
+        let sort_by = request.sort_by.unwrap_or_else(|| "created_at".to_string());
+        let sort_desc = request
+            .sort_order
+            .as_deref()
+            .unwrap_or("desc")
+            .eq_ignore_ascii_case("desc");
+        let (page, page_size) = parse_page(request.page, request.page_size);
+
+        let mut jobs = self
             .store
             .get_jobs()
             .map_err(|e| map_store_error("Error getting jobs", e))?;
 
-        let reply = ListJobsReply { jobs };
+        if let Some(query) = query {
+            jobs.retain(|job| {
+                job.id.to_lowercase().contains(&query)
+                    || job.name.to_lowercase().contains(&query)
+                    || job.status.to_lowercase().contains(&query)
+            });
+        }
 
-        Ok(Response::new(reply))
+        jobs.sort_by(|a, b| {
+            let ordering = match sort_by.as_str() {
+                "name" => a.name.cmp(&b.name),
+                "status" => a.status.cmp(&b.status),
+                _ => a.created_at.cmp(&b.created_at),
+            };
+            if sort_desc {
+                ordering.reverse()
+            } else {
+                ordering
+            }
+        });
+
+        let (jobs, total_count) = paginate(jobs, page, page_size);
+
+        Ok(Response::new(ListJobsReply {
+            jobs,
+            total_count,
+            page: page as u32,
+            page_size: page_size as u32,
+        }))
     }
 
     #[instrument(skip_all)]
@@ -1024,19 +1131,56 @@ impl Manager for ManagerAgentService {
     #[instrument(skip_all)]
     async fn get_nodes(
         &self,
-        _request: Request<GetNodesRequest>,
+        request: Request<GetNodesRequest>,
     ) -> Result<Response<GetNodesReply>, Status> {
+        let request = request.into_inner();
+        let query = normalize_query(request.query);
+        let sort_by = request.sort_by.unwrap_or_else(|| "id".to_string());
+        let sort_desc = request
+            .sort_order
+            .as_deref()
+            .unwrap_or("asc")
+            .eq_ignore_ascii_case("desc");
+        let (page, page_size) = parse_page(request.page, request.page_size);
+
         let nodes = self
             .store
             .get_nodes()
             .map_err(|e| map_store_error("Error getting nodes", e))?;
 
-        let node_messages: Vec<NodeMsg> = nodes.into_iter().map(Into::into).collect();
+        let mut node_messages: Vec<NodeMsg> = nodes.into_iter().map(Into::into).collect();
 
-        let reply = GetNodesReply {
-            nodes: node_messages,
-        };
-        Ok(Response::new(reply))
+        if let Some(query) = query {
+            node_messages.retain(|node| {
+                node.id.to_lowercase().contains(&query)
+                    || node.status.to_lowercase().contains(&query)
+                    || node.pool.to_lowercase().contains(&query)
+                    || node.availability.to_lowercase().contains(&query)
+            });
+        }
+
+        node_messages.sort_by(|a, b| {
+            let ordering = match sort_by.as_str() {
+                "status" => a.status.cmp(&b.status),
+                "last_heartbeat" => a.last_heartbeat.cmp(&b.last_heartbeat),
+                "pool" => a.pool.cmp(&b.pool),
+                _ => a.id.cmp(&b.id),
+            };
+            if sort_desc {
+                ordering.reverse()
+            } else {
+                ordering
+            }
+        });
+
+        let (nodes, total_count) = paginate(node_messages, page, page_size);
+
+        Ok(Response::new(GetNodesReply {
+            nodes,
+            total_count,
+            page: page as u32,
+            page_size: page_size as u32,
+        }))
     }
 
     #[instrument(skip_all)]
@@ -1134,16 +1278,47 @@ impl Manager for ManagerAgentService {
     #[instrument(skip_all)]
     async fn get_manager_configs(
         &self,
-        _request: Request<GetManagerConfigsRequest>,
+        request: Request<GetManagerConfigsRequest>,
     ) -> Result<Response<GetManagerConfigsReply>, Status> {
-        let configs = self
+        let request = request.into_inner();
+        let query = normalize_query(request.query);
+        let sort_by = request.sort_by.unwrap_or_else(|| "updated_at".to_string());
+        let sort_desc = request
+            .sort_order
+            .as_deref()
+            .unwrap_or("desc")
+            .eq_ignore_ascii_case("desc");
+        let (page, page_size) = parse_page(request.page, request.page_size);
+
+        let mut configs = self
             .store
             .get_manager_configs()
             .map_err(|e| map_store_error("Error getting manager configs", e))?;
 
-        let reply = GetManagerConfigsReply { configs };
+        if let Some(query) = query {
+            configs.retain(|config| config.node_id.to_lowercase().contains(&query));
+        }
 
-        Ok(Response::new(reply))
+        configs.sort_by(|a, b| {
+            let ordering = match sort_by.as_str() {
+                "node_id" => a.node_id.cmp(&b.node_id),
+                _ => a.updated_at.cmp(&b.updated_at),
+            };
+            if sort_desc {
+                ordering.reverse()
+            } else {
+                ordering
+            }
+        });
+
+        let (configs, total_count) = paginate(configs, page, page_size);
+
+        Ok(Response::new(GetManagerConfigsReply {
+            configs,
+            total_count,
+            page: page as u32,
+            page_size: page_size as u32,
+        }))
     }
 
     #[instrument(skip_all)]

@@ -7,12 +7,22 @@ import { AcquireKvLockReply, AcquireKvLockRequest, AdvanceRolloutReply, AdvanceR
 import { MethodKind } from "@bufbuild/protobuf";
 
 /**
+ * Manager is the primary control-plane API.
+ *
+ * It is used by:
+ * - Workers for registration, heartbeats, and health updates.
+ * - CLI/UI clients for job, rollout, node, ledger, and KV operations.
+ *
  * @generated from service legion.Manager
  */
 export const Manager = {
   typeName: "legion.Manager",
   methods: {
     /**
+     * Fetches effective worker-type configuration before a worker registers.
+     *
+     * This is the first manager call in the worker join flow.
+     *
      * @generated from rpc legion.Manager.WorkerPreRegister
      */
     workerPreRegister: {
@@ -22,6 +32,10 @@ export const Manager = {
       kind: MethodKind.Unary,
     },
     /**
+     * Registers or upserts a worker node in manager state.
+     *
+     * A worker should call this after pre-registration and after local fingerprinting.
+     *
      * @generated from rpc legion.Manager.WorkerRegister
      */
     workerRegister: {
@@ -31,6 +45,11 @@ export const Manager = {
       kind: MethodKind.Unary,
     },
     /**
+     * Submits or updates a job from a fully rendered jobspec.
+     *
+     * Depending on current state, this may create a new job config, create a rollout,
+     * and enqueue reconciliation work.
+     *
      * @generated from rpc legion.Manager.RunJob
      */
     runJob: {
@@ -40,6 +59,8 @@ export const Manager = {
       kind: MethodKind.Unary,
     },
     /**
+     * Returns the submitted source files (submissions) associated with the latest job config.
+     *
      * @generated from rpc legion.Manager.GetJobSpec
      */
     getJobSpec: {
@@ -49,6 +70,8 @@ export const Manager = {
       kind: MethodKind.Unary,
     },
     /**
+     * Returns metadata for one job (status, creation time, etc).
+     *
      * @generated from rpc legion.Manager.GetJobInfo
      */
     getJobInfo: {
@@ -58,6 +81,8 @@ export const Manager = {
       kind: MethodKind.Unary,
     },
     /**
+     * Lists rollouts, optionally filtered by job and active status.
+     *
      * @generated from rpc legion.Manager.ListRollouts
      */
     listRollouts: {
@@ -67,6 +92,8 @@ export const Manager = {
       kind: MethodKind.Unary,
     },
     /**
+     * Returns one rollout by numeric rollout ID.
+     *
      * @generated from rpc legion.Manager.GetRollout
      */
     getRollout: {
@@ -76,6 +103,8 @@ export const Manager = {
       kind: MethodKind.Unary,
     },
     /**
+     * Returns rollout plus per-group runtime status and allocation health snapshots.
+     *
      * @generated from rpc legion.Manager.GetRolloutStatus
      */
     getRolloutStatus: {
@@ -85,6 +114,8 @@ export const Manager = {
       kind: MethodKind.Unary,
     },
     /**
+     * Returns ordered rollout event history for a rollout.
+     *
      * @generated from rpc legion.Manager.ListRolloutEvents
      */
     listRolloutEvents: {
@@ -94,6 +125,8 @@ export const Manager = {
       kind: MethodKind.Unary,
     },
     /**
+     * Manually advances a rollout (all groups or selected groups).
+     *
      * @generated from rpc legion.Manager.AdvanceRollout
      */
     advanceRollout: {
@@ -103,6 +136,8 @@ export const Manager = {
       kind: MethodKind.Unary,
     },
     /**
+     * Computes a placement plan for a jobspec without mutating cluster state.
+     *
      * @generated from rpc legion.Manager.PlanJob
      */
     planJob: {
@@ -112,6 +147,8 @@ export const Manager = {
       kind: MethodKind.Unary,
     },
     /**
+     * Marks a job as stopped and enqueues stop reconciliation.
+     *
      * @generated from rpc legion.Manager.StopJob
      */
     stopJob: {
@@ -121,6 +158,8 @@ export const Manager = {
       kind: MethodKind.Unary,
     },
     /**
+     * Permanently removes a stopped job and related records.
+     *
      * @generated from rpc legion.Manager.DestroyJob
      */
     destroyJob: {
@@ -130,6 +169,8 @@ export const Manager = {
       kind: MethodKind.Unary,
     },
     /**
+     * Lists jobs known by the manager.
+     *
      * @generated from rpc legion.Manager.ListJobs
      */
     listJobs: {
@@ -139,6 +180,11 @@ export const Manager = {
       kind: MethodKind.Unary,
     },
     /**
+     * Worker heartbeat endpoint.
+     *
+     * Workers send runtime state, failures, and allocation health snapshots.
+     * The manager returns the desired allocations for that worker node.
+     *
      * @generated from rpc legion.Manager.Heartbeat
      */
     heartbeat: {
@@ -148,6 +194,10 @@ export const Manager = {
       kind: MethodKind.Unary,
     },
     /**
+     * Worker node health-check endpoint.
+     *
+     * Workers report node-level and plugin readiness checks.
+     *
      * @generated from rpc legion.Manager.HealthCheck
      */
     healthCheck: {
@@ -157,6 +207,8 @@ export const Manager = {
       kind: MethodKind.Unary,
     },
     /**
+     * Lists all nodes known by the manager.
+     *
      * @generated from rpc legion.Manager.GetNodes
      */
     getNodes: {
@@ -166,6 +218,8 @@ export const Manager = {
       kind: MethodKind.Unary,
     },
     /**
+     * Returns one node by ID.
+     *
      * @generated from rpc legion.Manager.GetNode
      */
     getNode: {
@@ -175,6 +229,8 @@ export const Manager = {
       kind: MethodKind.Unary,
     },
     /**
+     * Proxies a restart request to a worker node.
+     *
      * @generated from rpc legion.Manager.RestartWorker
      */
     restartWorker: {
@@ -184,6 +240,8 @@ export const Manager = {
       kind: MethodKind.Unary,
     },
     /**
+     * Returns node + allocation view of cluster state (the "ledger").
+     *
      * @generated from rpc legion.Manager.GetLedger
      */
     getLedger: {
@@ -193,6 +251,8 @@ export const Manager = {
       kind: MethodKind.Unary,
     },
     /**
+     * Returns config snapshots stored by manager instances.
+     *
      * @generated from rpc legion.Manager.GetManagerConfigs
      */
     getManagerConfigs: {
@@ -202,6 +262,8 @@ export const Manager = {
       kind: MethodKind.Unary,
     },
     /**
+     * Applies dynamic attribute updates to a node and triggers affected evaluations.
+     *
      * @generated from rpc legion.Manager.UpdateNodeDynamic
      */
     updateNodeDynamic: {
@@ -211,6 +273,8 @@ export const Manager = {
       kind: MethodKind.Unary,
     },
     /**
+     * Creates or updates a KV entry.
+     *
      * @generated from rpc legion.Manager.PutKv
      */
     putKv: {
@@ -220,6 +284,8 @@ export const Manager = {
       kind: MethodKind.Unary,
     },
     /**
+     * Gets one KV entry by key.
+     *
      * @generated from rpc legion.Manager.GetKv
      */
     getKv: {
@@ -229,6 +295,8 @@ export const Manager = {
       kind: MethodKind.Unary,
     },
     /**
+     * Lists KV entries by prefix.
+     *
      * @generated from rpc legion.Manager.ListKv
      */
     listKv: {
@@ -238,6 +306,8 @@ export const Manager = {
       kind: MethodKind.Unary,
     },
     /**
+     * Deletes one KV entry by key.
+     *
      * @generated from rpc legion.Manager.DeleteKv
      */
     deleteKv: {
@@ -247,6 +317,8 @@ export const Manager = {
       kind: MethodKind.Unary,
     },
     /**
+     * Applies an RFC6902 JSON patch to a JSON-typed KV entry.
+     *
      * @generated from rpc legion.Manager.PatchKv
      */
     patchKv: {
@@ -256,6 +328,8 @@ export const Manager = {
       kind: MethodKind.Unary,
     },
     /**
+     * Acquires (or force-acquires) a lock for a KV key.
+     *
      * @generated from rpc legion.Manager.AcquireKvLock
      */
     acquireKvLock: {
@@ -265,6 +339,8 @@ export const Manager = {
       kind: MethodKind.Unary,
     },
     /**
+     * Renews an existing KV lock lease.
+     *
      * @generated from rpc legion.Manager.RenewKvLock
      */
     renewKvLock: {
@@ -274,6 +350,8 @@ export const Manager = {
       kind: MethodKind.Unary,
     },
     /**
+     * Releases an existing KV lock.
+     *
      * @generated from rpc legion.Manager.ReleaseKvLock
      */
     releaseKvLock: {
@@ -283,6 +361,8 @@ export const Manager = {
       kind: MethodKind.Unary,
     },
     /**
+     * Returns current non-expired lock state for a KV key.
+     *
      * @generated from rpc legion.Manager.GetKvLock
      */
     getKvLock: {
@@ -295,12 +375,19 @@ export const Manager = {
 } as const;
 
 /**
+ * InsecureManager exposes bootstrap-only APIs on the insecure listener.
+ *
+ * This is typically used to issue join tokens before a worker has secure
+ * cluster credentials.
+ *
  * @generated from service legion.InsecureManager
  */
 export const InsecureManager = {
   typeName: "legion.InsecureManager",
   methods: {
     /**
+     * Generates a worker join token (JWT).
+     *
      * @generated from rpc legion.InsecureManager.GetJoinToken
      */
     getJoinToken: {
@@ -313,12 +400,16 @@ export const InsecureManager = {
 } as const;
 
 /**
+ * Worker is the per-node runtime API called by the manager.
+ *
  * @generated from service legion.Worker
  */
 export const Worker = {
   typeName: "legion.Worker",
   methods: {
     /**
+     * Delivers one allocation payload to worker for execution/reconciliation.
+     *
      * @generated from rpc legion.Worker.PostWork
      */
     postWork: {
@@ -328,6 +419,8 @@ export const Worker = {
       kind: MethodKind.Unary,
     },
     /**
+     * Requests the worker process to restart itself.
+     *
      * @generated from rpc legion.Worker.RestartWorker
      */
     restartWorker: {
