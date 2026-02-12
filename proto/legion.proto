@@ -289,6 +289,29 @@ message ListRolloutsRequest {
   //
   // Default: `false` (returns both active and terminal rollouts).
   bool active_only = 2;
+
+  // Free-text search against rollout ID, job ID, status, and strategy fields.
+  optional string query = 3;
+
+  // Sort key. Supported values: `updated_at`, `created_at`, `status`, `job_id`.
+  //
+  // Default: `updated_at`.
+  optional string sort_by = 4;
+
+  // Sort direction. Supported values: `asc`, `desc`.
+  //
+  // Default: `desc`.
+  optional string sort_order = 5;
+
+  // 1-indexed page number.
+  //
+  // Default: `1`.
+  optional uint32 page = 6;
+
+  // Maximum rollouts returned in a page.
+  //
+  // Default: `20`.
+  optional uint32 page_size = 7;
 }
 
 // Rollout record.
@@ -344,8 +367,17 @@ message Rollout {
 
 // Reply payload for ListRollouts.
 message ListRolloutsReply {
-  // Matching rollout records.
+  // Matching rollout records for the requested page.
   repeated Rollout rollouts = 1;
+
+  // Total number of records matching the filter before pagination.
+  uint32 total_count = 2;
+
+  // 1-indexed page number returned.
+  uint32 page = 3;
+
+  // Page size used to produce this reply.
+  uint32 page_size = 4;
 }
 
 // Request payload for GetRollout.
@@ -617,7 +649,28 @@ message DestroyJobReply {
 
 // Request payload for ListJobs.
 message ListJobsRequest {
-  // Empty request; all jobs are returned.
+  // Free-text search against job name, ID, and status.
+  optional string query = 1;
+
+  // Sort key. Supported values: `name`, `status`, `created_at`.
+  //
+  // Default: `created_at`.
+  optional string sort_by = 2;
+
+  // Sort direction. Supported values: `asc`, `desc`.
+  //
+  // Default: `desc`.
+  optional string sort_order = 3;
+
+  // 1-indexed page number.
+  //
+  // Default: `1`.
+  optional uint32 page = 4;
+
+  // Maximum jobs returned in a page.
+  //
+  // Default: `20`.
+  optional uint32 page_size = 5;
 }
 
 // Job metadata record.
@@ -639,8 +692,17 @@ message Job {
 
 // Reply payload for ListJobs.
 message ListJobsReply {
-  // Jobs known to manager.
+  // Jobs known to manager for the requested page.
   repeated Job jobs = 1;
+
+  // Total number of records matching the filter before pagination.
+  uint32 total_count = 2;
+
+  // 1-indexed page number returned.
+  uint32 page = 3;
+
+  // Page size used to produce this reply.
+  uint32 page_size = 4;
 }
 
 // Request payload for Heartbeat.
@@ -755,13 +817,43 @@ message NodeMsg {
 
 // Request payload for GetNodes.
 message GetNodesRequest {
-  // Empty request; all nodes are returned.
+  // Free-text search against node ID, status, pool, and availability.
+  optional string query = 1;
+
+  // Sort key. Supported values: `id`, `status`, `last_heartbeat`, `pool`.
+  //
+  // Default: `id`.
+  optional string sort_by = 2;
+
+  // Sort direction. Supported values: `asc`, `desc`.
+  //
+  // Default: `asc`.
+  optional string sort_order = 3;
+
+  // 1-indexed page number.
+  //
+  // Default: `1`.
+  optional uint32 page = 4;
+
+  // Maximum nodes returned in a page.
+  //
+  // Default: `20`.
+  optional uint32 page_size = 5;
 }
 
 // Reply payload for GetNodes.
 message GetNodesReply {
-  // Nodes known to manager.
+  // Nodes known to manager for the requested page.
   repeated NodeMsg nodes = 1;
+
+  // Total number of records matching the filter before pagination.
+  uint32 total_count = 2;
+
+  // 1-indexed page number returned.
+  uint32 page = 3;
+
+  // Page size used to produce this reply.
+  uint32 page_size = 4;
 }
 
 // Request payload for GetNode.
@@ -818,13 +910,43 @@ message ManagerNodeConfig {
 
 // Request payload for GetManagerConfigs.
 message GetManagerConfigsRequest {
-  // Empty request; all manager config snapshots are returned.
+  // Free-text search against manager node ID.
+  optional string query = 1;
+
+  // Sort key. Supported values: `node_id`, `updated_at`.
+  //
+  // Default: `updated_at`.
+  optional string sort_by = 2;
+
+  // Sort direction. Supported values: `asc`, `desc`.
+  //
+  // Default: `desc`.
+  optional string sort_order = 3;
+
+  // 1-indexed page number.
+  //
+  // Default: `1`.
+  optional uint32 page = 4;
+
+  // Maximum manager configs returned in a page.
+  //
+  // Default: `20`.
+  optional uint32 page_size = 5;
 }
 
 // Reply payload for GetManagerConfigs.
 message GetManagerConfigsReply {
-  // Stored manager config snapshots.
+  // Stored manager config snapshots for the requested page.
   repeated ManagerNodeConfig configs = 1;
+
+  // Total number of records matching the filter before pagination.
+  uint32 total_count = 2;
+
+  // 1-indexed page number returned.
+  uint32 page = 3;
+
+  // Page size used to produce this reply.
+  uint32 page_size = 4;
 }
 
 // Type discriminator for KV values.

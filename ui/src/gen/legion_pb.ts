@@ -648,6 +648,49 @@ export class ListRolloutsRequest extends Message<ListRolloutsRequest> {
    */
   activeOnly = false;
 
+  /**
+   * Free-text search against rollout ID, job ID, status, and strategy fields.
+   *
+   * @generated from field: optional string query = 3;
+   */
+  query?: string;
+
+  /**
+   * Sort key. Supported values: `updated_at`, `created_at`, `status`, `job_id`.
+   *
+   * Default: `updated_at`.
+   *
+   * @generated from field: optional string sort_by = 4;
+   */
+  sortBy?: string;
+
+  /**
+   * Sort direction. Supported values: `asc`, `desc`.
+   *
+   * Default: `desc`.
+   *
+   * @generated from field: optional string sort_order = 5;
+   */
+  sortOrder?: string;
+
+  /**
+   * 1-indexed page number.
+   *
+   * Default: `1`.
+   *
+   * @generated from field: optional uint32 page = 6;
+   */
+  page?: number;
+
+  /**
+   * Maximum rollouts returned in a page.
+   *
+   * Default: `20`.
+   *
+   * @generated from field: optional uint32 page_size = 7;
+   */
+  pageSize?: number;
+
   constructor(data?: PartialMessage<ListRolloutsRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -658,6 +701,11 @@ export class ListRolloutsRequest extends Message<ListRolloutsRequest> {
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "job_id", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
     { no: 2, name: "active_only", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 3, name: "query", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 4, name: "sort_by", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 5, name: "sort_order", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 6, name: "page", kind: "scalar", T: 13 /* ScalarType.UINT32 */, opt: true },
+    { no: 7, name: "page_size", kind: "scalar", T: 13 /* ScalarType.UINT32 */, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListRolloutsRequest {
@@ -840,11 +888,32 @@ export class Rollout extends Message<Rollout> {
  */
 export class ListRolloutsReply extends Message<ListRolloutsReply> {
   /**
-   * Matching rollout records.
+   * Matching rollout records for the requested page.
    *
    * @generated from field: repeated legion.Rollout rollouts = 1;
    */
   rollouts: Rollout[] = [];
+
+  /**
+   * Total number of records matching the filter before pagination.
+   *
+   * @generated from field: uint32 total_count = 2;
+   */
+  totalCount = 0;
+
+  /**
+   * 1-indexed page number returned.
+   *
+   * @generated from field: uint32 page = 3;
+   */
+  page = 0;
+
+  /**
+   * Page size used to produce this reply.
+   *
+   * @generated from field: uint32 page_size = 4;
+   */
+  pageSize = 0;
 
   constructor(data?: PartialMessage<ListRolloutsReply>) {
     super();
@@ -855,6 +924,9 @@ export class ListRolloutsReply extends Message<ListRolloutsReply> {
   static readonly typeName = "legion.ListRolloutsReply";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "rollouts", kind: "message", T: Rollout, repeated: true },
+    { no: 2, name: "total_count", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 3, name: "page", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 4, name: "page_size", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListRolloutsReply {
@@ -1546,116 +1618,6 @@ export class AdvanceRolloutReply extends Message<AdvanceRolloutReply> {
 }
 
 /**
- * Request payload for StopRollout.
- *
- * @generated from message legion.StopRolloutRequest
- */
-export class StopRolloutRequest extends Message<StopRolloutRequest> {
-  /**
-   * Rollout ID to stop.
-   *
-   * @generated from field: int64 id = 1;
-   */
-  id = protoInt64.zero;
-
-  /**
-   * When true, remove allocations for the rollout target config and re-schedule from
-   * the rollout source config (when present).
-   *
-   * @generated from field: bool revert = 2;
-   */
-  revert = false;
-
-  /**
-   * Optional eval priority for any rollback scheduling.
-   *
-   * Default when omitted: manager `default_priority`
-   * (`50` in built-in config defaults).
-   *
-   * @generated from field: optional int64 priority = 3;
-   */
-  priority?: bigint;
-
-  constructor(data?: PartialMessage<StopRolloutRequest>) {
-    super();
-    proto3.util.initPartial(data, this);
-  }
-
-  static readonly runtime: typeof proto3 = proto3;
-  static readonly typeName = "legion.StopRolloutRequest";
-  static readonly fields: FieldList = proto3.util.newFieldList(() => [
-    { no: 1, name: "id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
-    { no: 2, name: "revert", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
-    { no: 3, name: "priority", kind: "scalar", T: 3 /* ScalarType.INT64 */, opt: true },
-  ]);
-
-  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): StopRolloutRequest {
-    return new StopRolloutRequest().fromBinary(bytes, options);
-  }
-
-  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): StopRolloutRequest {
-    return new StopRolloutRequest().fromJson(jsonValue, options);
-  }
-
-  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): StopRolloutRequest {
-    return new StopRolloutRequest().fromJsonString(jsonString, options);
-  }
-
-  static equals(a: StopRolloutRequest | PlainMessage<StopRolloutRequest> | undefined, b: StopRolloutRequest | PlainMessage<StopRolloutRequest> | undefined): boolean {
-    return proto3.util.equals(StopRolloutRequest, a, b);
-  }
-}
-
-/**
- * Reply payload for StopRollout.
- *
- * @generated from message legion.StopRolloutReply
- */
-export class StopRolloutReply extends Message<StopRolloutReply> {
-  /**
-   * Human-readable stop/revert message.
-   *
-   * @generated from field: string message = 1;
-   */
-  message = "";
-
-  /**
-   * Updated rollout record after stop processing.
-   *
-   * @generated from field: optional legion.Rollout rollout = 2;
-   */
-  rollout?: Rollout;
-
-  constructor(data?: PartialMessage<StopRolloutReply>) {
-    super();
-    proto3.util.initPartial(data, this);
-  }
-
-  static readonly runtime: typeof proto3 = proto3;
-  static readonly typeName = "legion.StopRolloutReply";
-  static readonly fields: FieldList = proto3.util.newFieldList(() => [
-    { no: 1, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
-    { no: 2, name: "rollout", kind: "message", T: Rollout, opt: true },
-  ]);
-
-  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): StopRolloutReply {
-    return new StopRolloutReply().fromBinary(bytes, options);
-  }
-
-  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): StopRolloutReply {
-    return new StopRolloutReply().fromJson(jsonValue, options);
-  }
-
-  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): StopRolloutReply {
-    return new StopRolloutReply().fromJsonString(jsonString, options);
-  }
-
-  static equals(a: StopRolloutReply | PlainMessage<StopRolloutReply> | undefined, b: StopRolloutReply | PlainMessage<StopRolloutReply> | undefined): boolean {
-    return proto3.util.equals(StopRolloutReply, a, b);
-  }
-}
-
-/**
  * Request payload for GetJobSpec.
  *
  * @generated from message legion.GetJobSpecRequest
@@ -2094,11 +2056,52 @@ export class DestroyJobReply extends Message<DestroyJobReply> {
 /**
  * Request payload for ListJobs.
  *
- * Empty request; all jobs are returned.
- *
  * @generated from message legion.ListJobsRequest
  */
 export class ListJobsRequest extends Message<ListJobsRequest> {
+  /**
+   * Free-text search against job name, ID, and status.
+   *
+   * @generated from field: optional string query = 1;
+   */
+  query?: string;
+
+  /**
+   * Sort key. Supported values: `name`, `status`, `created_at`.
+   *
+   * Default: `created_at`.
+   *
+   * @generated from field: optional string sort_by = 2;
+   */
+  sortBy?: string;
+
+  /**
+   * Sort direction. Supported values: `asc`, `desc`.
+   *
+   * Default: `desc`.
+   *
+   * @generated from field: optional string sort_order = 3;
+   */
+  sortOrder?: string;
+
+  /**
+   * 1-indexed page number.
+   *
+   * Default: `1`.
+   *
+   * @generated from field: optional uint32 page = 4;
+   */
+  page?: number;
+
+  /**
+   * Maximum jobs returned in a page.
+   *
+   * Default: `20`.
+   *
+   * @generated from field: optional uint32 page_size = 5;
+   */
+  pageSize?: number;
+
   constructor(data?: PartialMessage<ListJobsRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -2107,6 +2110,11 @@ export class ListJobsRequest extends Message<ListJobsRequest> {
   static readonly runtime: typeof proto3 = proto3;
   static readonly typeName = "legion.ListJobsRequest";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "query", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 2, name: "sort_by", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 3, name: "sort_order", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 4, name: "page", kind: "scalar", T: 13 /* ScalarType.UINT32 */, opt: true },
+    { no: 5, name: "page_size", kind: "scalar", T: 13 /* ScalarType.UINT32 */, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListJobsRequest {
@@ -2200,11 +2208,32 @@ export class Job extends Message<Job> {
  */
 export class ListJobsReply extends Message<ListJobsReply> {
   /**
-   * Jobs known to manager.
+   * Jobs known to manager for the requested page.
    *
    * @generated from field: repeated legion.Job jobs = 1;
    */
   jobs: Job[] = [];
+
+  /**
+   * Total number of records matching the filter before pagination.
+   *
+   * @generated from field: uint32 total_count = 2;
+   */
+  totalCount = 0;
+
+  /**
+   * 1-indexed page number returned.
+   *
+   * @generated from field: uint32 page = 3;
+   */
+  page = 0;
+
+  /**
+   * Page size used to produce this reply.
+   *
+   * @generated from field: uint32 page_size = 4;
+   */
+  pageSize = 0;
 
   constructor(data?: PartialMessage<ListJobsReply>) {
     super();
@@ -2215,6 +2244,9 @@ export class ListJobsReply extends Message<ListJobsReply> {
   static readonly typeName = "legion.ListJobsReply";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "jobs", kind: "message", T: Job, repeated: true },
+    { no: 2, name: "total_count", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 3, name: "page", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 4, name: "page_size", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListJobsReply {
@@ -2672,11 +2704,52 @@ export class NodeMsg extends Message<NodeMsg> {
 /**
  * Request payload for GetNodes.
  *
- * Empty request; all nodes are returned.
- *
  * @generated from message legion.GetNodesRequest
  */
 export class GetNodesRequest extends Message<GetNodesRequest> {
+  /**
+   * Free-text search against node ID, status, pool, and availability.
+   *
+   * @generated from field: optional string query = 1;
+   */
+  query?: string;
+
+  /**
+   * Sort key. Supported values: `id`, `status`, `last_heartbeat`, `pool`.
+   *
+   * Default: `id`.
+   *
+   * @generated from field: optional string sort_by = 2;
+   */
+  sortBy?: string;
+
+  /**
+   * Sort direction. Supported values: `asc`, `desc`.
+   *
+   * Default: `asc`.
+   *
+   * @generated from field: optional string sort_order = 3;
+   */
+  sortOrder?: string;
+
+  /**
+   * 1-indexed page number.
+   *
+   * Default: `1`.
+   *
+   * @generated from field: optional uint32 page = 4;
+   */
+  page?: number;
+
+  /**
+   * Maximum nodes returned in a page.
+   *
+   * Default: `20`.
+   *
+   * @generated from field: optional uint32 page_size = 5;
+   */
+  pageSize?: number;
+
   constructor(data?: PartialMessage<GetNodesRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -2685,6 +2758,11 @@ export class GetNodesRequest extends Message<GetNodesRequest> {
   static readonly runtime: typeof proto3 = proto3;
   static readonly typeName = "legion.GetNodesRequest";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "query", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 2, name: "sort_by", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 3, name: "sort_order", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 4, name: "page", kind: "scalar", T: 13 /* ScalarType.UINT32 */, opt: true },
+    { no: 5, name: "page_size", kind: "scalar", T: 13 /* ScalarType.UINT32 */, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetNodesRequest {
@@ -2711,11 +2789,32 @@ export class GetNodesRequest extends Message<GetNodesRequest> {
  */
 export class GetNodesReply extends Message<GetNodesReply> {
   /**
-   * Nodes known to manager.
+   * Nodes known to manager for the requested page.
    *
    * @generated from field: repeated legion.NodeMsg nodes = 1;
    */
   nodes: NodeMsg[] = [];
+
+  /**
+   * Total number of records matching the filter before pagination.
+   *
+   * @generated from field: uint32 total_count = 2;
+   */
+  totalCount = 0;
+
+  /**
+   * 1-indexed page number returned.
+   *
+   * @generated from field: uint32 page = 3;
+   */
+  page = 0;
+
+  /**
+   * Page size used to produce this reply.
+   *
+   * @generated from field: uint32 page_size = 4;
+   */
+  pageSize = 0;
 
   constructor(data?: PartialMessage<GetNodesReply>) {
     super();
@@ -2726,6 +2825,9 @@ export class GetNodesReply extends Message<GetNodesReply> {
   static readonly typeName = "legion.GetNodesReply";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "nodes", kind: "message", T: NodeMsg, repeated: true },
+    { no: 2, name: "total_count", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 3, name: "page", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 4, name: "page_size", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetNodesReply {
@@ -3050,11 +3152,52 @@ export class ManagerNodeConfig extends Message<ManagerNodeConfig> {
 /**
  * Request payload for GetManagerConfigs.
  *
- * Empty request; all manager config snapshots are returned.
- *
  * @generated from message legion.GetManagerConfigsRequest
  */
 export class GetManagerConfigsRequest extends Message<GetManagerConfigsRequest> {
+  /**
+   * Free-text search against manager node ID.
+   *
+   * @generated from field: optional string query = 1;
+   */
+  query?: string;
+
+  /**
+   * Sort key. Supported values: `node_id`, `updated_at`.
+   *
+   * Default: `updated_at`.
+   *
+   * @generated from field: optional string sort_by = 2;
+   */
+  sortBy?: string;
+
+  /**
+   * Sort direction. Supported values: `asc`, `desc`.
+   *
+   * Default: `desc`.
+   *
+   * @generated from field: optional string sort_order = 3;
+   */
+  sortOrder?: string;
+
+  /**
+   * 1-indexed page number.
+   *
+   * Default: `1`.
+   *
+   * @generated from field: optional uint32 page = 4;
+   */
+  page?: number;
+
+  /**
+   * Maximum manager configs returned in a page.
+   *
+   * Default: `20`.
+   *
+   * @generated from field: optional uint32 page_size = 5;
+   */
+  pageSize?: number;
+
   constructor(data?: PartialMessage<GetManagerConfigsRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -3063,6 +3206,11 @@ export class GetManagerConfigsRequest extends Message<GetManagerConfigsRequest> 
   static readonly runtime: typeof proto3 = proto3;
   static readonly typeName = "legion.GetManagerConfigsRequest";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "query", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 2, name: "sort_by", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 3, name: "sort_order", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 4, name: "page", kind: "scalar", T: 13 /* ScalarType.UINT32 */, opt: true },
+    { no: 5, name: "page_size", kind: "scalar", T: 13 /* ScalarType.UINT32 */, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetManagerConfigsRequest {
@@ -3089,11 +3237,32 @@ export class GetManagerConfigsRequest extends Message<GetManagerConfigsRequest> 
  */
 export class GetManagerConfigsReply extends Message<GetManagerConfigsReply> {
   /**
-   * Stored manager config snapshots.
+   * Stored manager config snapshots for the requested page.
    *
    * @generated from field: repeated legion.ManagerNodeConfig configs = 1;
    */
   configs: ManagerNodeConfig[] = [];
+
+  /**
+   * Total number of records matching the filter before pagination.
+   *
+   * @generated from field: uint32 total_count = 2;
+   */
+  totalCount = 0;
+
+  /**
+   * 1-indexed page number returned.
+   *
+   * @generated from field: uint32 page = 3;
+   */
+  page = 0;
+
+  /**
+   * Page size used to produce this reply.
+   *
+   * @generated from field: uint32 page_size = 4;
+   */
+  pageSize = 0;
 
   constructor(data?: PartialMessage<GetManagerConfigsReply>) {
     super();
@@ -3104,6 +3273,9 @@ export class GetManagerConfigsReply extends Message<GetManagerConfigsReply> {
   static readonly typeName = "legion.GetManagerConfigsReply";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "configs", kind: "message", T: ManagerNodeConfig, repeated: true },
+    { no: 2, name: "total_count", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 3, name: "page", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 4, name: "page_size", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetManagerConfigsReply {
