@@ -9,6 +9,7 @@ import JobSpecDetail from './pages/details/JobSpecDetail'
 import ManagerNodeDetail from './pages/details/ManagerNodeDetail'
 import NodeDetail from './pages/details/NodeDetail'
 import RolloutDetail from './pages/details/RolloutDetail'
+import TaskDetail from './pages/details/TaskDetail'
 import Homepage from './pages/Homepage'
 import Jobs from './pages/Jobs'
 import KeyValue from './pages/KeyValue'
@@ -148,6 +149,7 @@ const AppRoutes = () => {
       <Route path="/manager/:id" component={ManagerNodeDetail} />
       <Route path="/jobs" component={Jobs} />
       <Route path="/jobs/:id" component={JobDetail} />
+      <Route path="/jobs/:id/tasks/:taskName" component={TaskDetail} />
       <Route path="/jobs/:id/specs/:configId" component={JobSpecDetail} />
       <Route path="/deployments" component={Deployments} />
       <Route path="/rollouts" component={Rollouts} />

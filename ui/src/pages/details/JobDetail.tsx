@@ -1,8 +1,9 @@
 import { A, useNavigate, useParams } from '@solidjs/router'
 import { For, Show, createMemo, createResource, createSignal } from 'solid-js'
-import { DetailSection, detailDangerButtonClass, detailTabButtonClass } from '../../components/DetailPrimitives'
+import { DetailBadge, DetailSection, detailDangerButtonClass, detailTabButtonClass } from '../../components/DetailPrimitives'
 import { managerClient } from '../../grpcClient'
 import { formatDate } from '../../utils/format'
+import { buildTaskRuntimeByName, extractJobSpecData, taskStatusTone, topoSortTaskNames } from '../../utils/jobspec'
 
 export default function JobDetail() {
   const params = useParams()
@@ -24,6 +25,10 @@ export default function JobDetail() {
       node.allocations.filter((allocation) => allocation.jobId === (jobInfo.job?.id ?? jobName())),
     )
 
+    const latestRollout = rollouts.rollouts[0]
+    const rolloutStatus = latestRollout ? await managerClient.getRolloutStatus({ id: latestRollout.id }) : undefined
+    const specData = extractJobSpecData(spec.submissions)
+
     return {
       job: jobInfo.job,
       allocations,
@@ -31,6 +36,8 @@ export default function JobDetail() {
       activeRollout: rollouts.rollouts.find((rollout) => !['completed', 'failed', 'cancelled', 'completed_incomplete'].includes(rollout.status.toLowerCase())),
       spec: spec.submissions,
       specHistory: specHistory.items,
+      taskSpec: specData,
+      taskRuntime: buildTaskRuntimeByName(rolloutStatus?.groups ?? []),
     }
   })
 
@@ -87,6 +94,110 @@ export default function JobDetail() {
                 </div>
               </DetailSection>
             </Show>
+
+            <DetailSection>
+              <h3 class="mb-2 font-semibold">Tasks by group</h3>
+              <Show
+                when={jobData()!.taskSpec?.tasks.length}
+                fallback={<p class="text-sm text-neutral-500">No task information available in current job spec.</p>}
+              >
+                <div class="space-y-4">
+                  <For each={[...new Set(jobData()!.taskSpec!.tasks.map((task) => task.group))]}>
+                    {(groupName) => (
+                      <div class="rounded border border-neutral-200 p-3 dark:border-neutral-700">
+                        <h4 class="text-sm font-semibold uppercase tracking-wide text-neutral-500">Group {groupName}</h4>
+                        <div class="mt-3 grid gap-2 md:grid-cols-2 xl:grid-cols-3">
+                          <For each={jobData()!.taskSpec!.tasks.filter((task) => task.group === groupName)}>
+                            {(task) => {
+                              const runtime = jobData()!.taskRuntime.get(task.name)
+                              const primaryStatus = runtime?.statuses[0] ?? 'not allocated'
+                              return (
+                                <A
+                                  href={`/jobs/${encodeURIComponent(jobName())}/tasks/${encodeURIComponent(task.name)}`}
+                                  class="rounded border border-neutral-200 bg-neutral-50 p-3 transition hover:border-neutral-400 hover:bg-white dark:border-neutral-700 dark:bg-neutral-900"
+                                >
+                                  <div class="flex items-start justify-between gap-2">
+                                    <div>
+                                      <p class="text-sm font-semibold">{task.name}</p>
+                                      <p class="text-xs text-neutral-500">{task.kind} · lifecycle {task.lifecycle}</p>
+                                    </div>
+                                    <DetailBadge tone={taskStatusTone(primaryStatus)}>{primaryStatus}</DetailBadge>
+                                  </div>
+                                  <Show when={task.lifecycle === 'sidecar'}>
+                                    <p class="mt-2 text-xs text-indigo-600 dark:text-indigo-300">
+                                      Sidecar task for group <span class="font-semibold">{task.group}</span>
+                                    </p>
+                                  </Show>
+                                  <Show when={task.dependsOn.length > 0}>
+                                    <p class="mt-2 text-xs text-neutral-500">
+                                      Depends on: {task.dependsOn.map((dependency) => dependency.task).join(', ')}
+                                    </p>
+                                  </Show>
+                                </A>
+                              )
+                            }}
+                          </For>
+                        </div>
+                      </div>
+                    )}
+                  </For>
+                </div>
+              </Show>
+            </DetailSection>
+
+            <DetailSection>
+              <h3 class="mb-2 font-semibold">Task DAG</h3>
+              <Show
+                when={jobData()!.taskSpec?.tasks.length}
+                fallback={<p class="text-sm text-neutral-500">DAG unavailable because the job spec could not be parsed.</p>}
+              >
+                <div class="overflow-x-auto">
+                  <div class="inline-flex min-w-full gap-3 pb-2">
+                    <For each={topoSortTaskNames(jobData()!.taskSpec!.tasks)}>
+                      {(layer, layerIndex) => (
+                        <div class="min-w-64 flex-1 rounded border border-neutral-200 bg-neutral-50 p-3 dark:border-neutral-700 dark:bg-neutral-900">
+                          <p class="mb-2 text-xs font-semibold uppercase tracking-wide text-neutral-500">Stage {layerIndex() + 1}</p>
+                          <div class="space-y-2">
+                            <For each={layer}>
+                              {(taskName) => {
+                                const task = jobData()!.taskSpec!.tasks.find((item) => item.name === taskName)
+                                if (!task) return null
+                                const runtime = jobData()!.taskRuntime.get(task.name)
+                                const status = runtime?.statuses[0] ?? 'not allocated'
+                                return (
+                                  <A href={`/jobs/${encodeURIComponent(jobName())}/tasks/${encodeURIComponent(task.name)}`} class="block rounded border border-neutral-200 bg-white p-2 text-sm hover:border-neutral-400 dark:border-neutral-700 dark:bg-neutral-950">
+                                    <div class="flex items-center justify-between gap-2">
+                                      <span class="font-semibold">{task.name}</span>
+                                      <DetailBadge tone={taskStatusTone(status)}>{status}</DetailBadge>
+                                    </div>
+                                    <p class="mt-1 text-xs text-neutral-500">{task.group} · {task.lifecycle}</p>
+                                    <Show when={task.lifecycle === 'sidecar'}>
+                                      <p class="mt-1 text-xs text-indigo-600 dark:text-indigo-300">Sidecar task</p>
+                                    </Show>
+                                  </A>
+                                )
+                              }}
+                            </For>
+                          </div>
+                        </div>
+                      )}
+                    </For>
+                  </div>
+                </div>
+                <div class="mt-3 rounded border border-dashed border-neutral-300 p-3 text-xs text-neutral-600 dark:border-neutral-700 dark:text-neutral-300">
+                  <p class="font-semibold">Dependency edges</p>
+                  <ul class="mt-2 space-y-1">
+                    <For each={jobData()!.taskSpec!.tasks.filter((task) => task.dependsOn.length > 0)}>
+                      {(task) => (
+                        <li>
+                          {task.dependsOn.map((dependency) => `${dependency.task} → ${task.name}${dependency.condition ? ` (${dependency.condition})` : ''}`).join(', ')}
+                        </li>
+                      )}
+                    </For>
+                  </ul>
+                </div>
+              </Show>
+            </DetailSection>
 
             <DetailSection>
               <h3 class="mb-2 font-semibold">Allocations</h3>
