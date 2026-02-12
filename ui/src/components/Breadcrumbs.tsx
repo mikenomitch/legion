@@ -7,8 +7,8 @@ export type Breadcrumb = {
 }
 
 const sectionLabels: Record<string, string> = {
-  nodes: 'Workers',
-  manager: 'Managers',
+  nodes: 'Worker Nodes',
+  manager: 'Manager Nodes',
   jobs: 'Jobs',
   deployments: 'Deployments',
   rollouts: 'Rollouts',
@@ -52,10 +52,10 @@ const labelForSegment = (segments: readonly string[], index: number): string => 
 
 export const buildCrumbs = (pathname: string): Breadcrumb[] => {
   const normalized = pathname.replace(/\/+$/, '') || '/'
-  if (normalized === '/') return []
+  const crumbs: Breadcrumb[] = [{ label: 'Legion', href: '/' }]
+  if (normalized === '/') return crumbs
 
   const segments = normalized.split('/').filter(Boolean)
-  const crumbs: Breadcrumb[] = []
 
   let href = ''
   segments.forEach((segment, index) => {

@@ -20,13 +20,15 @@ import TestingUtils from './pages/TestingUtils'
 
 const navItems = [
   { label: 'Overview', path: '/', title: 'Overview', copy: 'Jobs running on the cluster.' },
-  { label: 'Workers', path: '/nodes', title: 'Workers', copy: 'Inventory of workers.' },
-  { label: 'Managers', path: '/manager', title: 'Managers', copy: 'Manager config snapshots.' },
   { label: 'Jobs', path: '/jobs', title: 'Jobs', copy: 'Jobs and their health status.' },
   { label: 'Rollouts', path: '/rollouts', title: 'Rollouts', copy: 'Rollout execution details.' },
+  { label: 'Worker Nodes', path: '/nodes', title: 'Worker Nodes', copy: 'Inventory of worker nodes.' },
+  { label: 'Manager Nodes', path: '/manager', title: 'Manager Nodes', copy: 'Manager config snapshots.' },
   { label: 'Key/Value', path: '/kv', title: 'Key/Value', copy: 'Browse and edit key/value entries.' },
   { label: 'API', path: '/api', title: 'API', copy: 'Interactive gRPC explorer.' },
 ] as const
+
+const detailRoutes = new Set(['jobs', 'nodes', 'manager', 'rollouts', 'deployments'])
 
 const decodePathSegment = (value: string) => {
   try {
@@ -75,6 +77,12 @@ const Layout = (props: RouteSectionProps) => {
     }
   })
 
+  const isDetailRoute = () => {
+    const normalized = location.pathname.replace(/\/+$/, '') || '/'
+    const segments = normalized.split('/').filter(Boolean)
+    return segments.length > 1 && detailRoutes.has(segments[0] ?? '')
+  }
+
   return (
     <div class="min-h-screen bg-neutral-50 text-neutral-900 dark:bg-neutral-950 dark:text-neutral-100">
       <div class="flex min-h-screen">
@@ -112,7 +120,7 @@ const Layout = (props: RouteSectionProps) => {
           >
             {theme() === 'dark' ? '☀' : '☾'}
           </button>
-          <main class="flex-1 min-w-0 px-4 py-6 md:px-8">
+          <main class="flex-1 min-w-0 px-4 pt-8 pb-6 md:px-8 md:pt-10">
             <div class="mb-3 md:hidden">
               <button
                 type="button"
@@ -123,10 +131,12 @@ const Layout = (props: RouteSectionProps) => {
               </button>
             </div>
             <Breadcrumbs />
-            <section class="mb-5 rounded border border-neutral-200 bg-white/90 px-4 py-3 dark:border-neutral-800 dark:bg-neutral-900/60">
-              <h1 class="text-2xl font-semibold text-neutral-900 dark:text-neutral-100">{pageMeta().title}</h1>
-              <p class="mt-1 text-sm text-neutral-600 dark:text-neutral-300">{pageMeta().subtitle}</p>
-            </section>
+            <Show when={!isDetailRoute()}>
+              <section class="mb-5 rounded border border-neutral-200 bg-white/90 px-4 py-3 dark:border-neutral-800 dark:bg-neutral-900/60">
+                <h1 class="text-2xl font-semibold text-neutral-900 dark:text-neutral-100">{pageMeta().title}</h1>
+                <p class="mt-1 text-sm text-neutral-600 dark:text-neutral-300">{pageMeta().subtitle}</p>
+              </section>
+            </Show>
             {props.children}
           </main>
         </div>

@@ -375,7 +375,7 @@ function TypeTable(props: TypeTableProps) {
         when={props.fields.length > 0}
         fallback={<p class="mt-2 text-xs text-neutral-500">No fields.</p>}
       >
-        <div class="mt-3 overflow-x-auto">
+        <div class="mt-3 overflow-visible">
           <table class="min-w-full text-left text-xs">
             <thead>
               <tr class="text-neutral-500 dark:text-neutral-400">
