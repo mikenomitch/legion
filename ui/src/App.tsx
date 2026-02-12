@@ -23,6 +23,7 @@ import KeyValue from "./pages/KeyValue";
 import Manager from "./pages/Manager";
 import Nodes from "./pages/Nodes";
 import Rollouts from "./pages/Rollouts";
+import ApiExplorer from "./pages/ApiExplorer";
 import TestingUtils from "./pages/TestingUtils";
 import { POLL_INTERVAL_MS } from "./utils/polling";
 
@@ -68,6 +69,13 @@ const navItems = [
     path: "/manager",
     title: "Manager",
     copy: "Manager config and controls.",
+  },
+  {
+    key: "api",
+    label: "API",
+    path: "/api",
+    title: "API",
+    copy: "Interactive gRPC explorer with request and response types.",
   },
   {
     key: "testing",
@@ -406,6 +414,7 @@ const AppRoutes = () => {
       <Route path="/rollouts" component={Rollouts} />
       <Route path="/kv" component={KeyValue} />
       <Route path="/manager" component={Manager} />
+      <Route path="/api" component={ApiExplorer} />
       <Route path="/testing" component={TestingUtils} />
       <Route path="*" component={() => <Homepage ledger={ledger} rollouts={rollouts} />} />
     </Route>
