@@ -1,4 +1,4 @@
-import { createEffect, createResource, createSignal } from 'solid-js'
+import { createEffect, createMemo, createResource, createSignal } from 'solid-js'
 import SharedIndex from '../components/SharedIndex'
 import { managerClient } from '../grpcClient'
 import { formatRelativeTime } from '../utils/format'
@@ -14,6 +14,18 @@ export default function Nodes() {
     search()
     sort()
     setPage(1)
+  })
+
+  const [ledger] = createResource(async () => (await managerClient.getLedger({})).nodes)
+
+  const allocationCounts = createMemo(() => {
+    const counts = new Map<string, number>()
+    for (const entry of ledger() ?? []) {
+      const nodeId = entry.node?.id
+      if (!nodeId) continue
+      counts.set(nodeId, entry.allocations.length)
+    }
+    return counts
   })
 
   const [data] = createResource(
@@ -42,14 +54,14 @@ export default function Nodes() {
         { label: 'ID (Z-A)', value: 'id:desc' },
         { label: 'Last heartbeat (newest)', value: 'last_heartbeat:desc' },
       ]}
-      loading={data.loading}
+      loading={data.loading || ledger.loading}
       error={data.error ? 'Failed to load nodes.' : undefined}
       items={(data()?.nodes ?? []).map((node) => {
         const health = summarizeHealthChecks(node.healthChecks)
         return {
           id: node.id,
           title: node.id,
-          subtitle: `${node.pool || 'default'} · ${node.status || 'unknown'}`,
+          subtitle: `Pool: ${node.pool || 'default'} · Availability: ${node.availability || '—'} · Last heartbeat: ${formatRelativeTime(node.lastHeartbeat)} · Allocations: ${allocationCounts().get(node.id) ?? 0}`,
           health: health.label,
           healthClass: healthToneClasses(health.tone),
           updatedAt: formatRelativeTime(node.lastHeartbeat),

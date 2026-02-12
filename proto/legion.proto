@@ -36,6 +36,12 @@ service Manager {
   // Returns the submitted source files (submissions) associated with the latest job config.
   rpc GetJobSpec (GetJobSpecRequest) returns (GetJobSpecReply);
 
+  // Returns submissions for a specific job config ID.
+  rpc GetJobSpecByConfig (GetJobSpecByConfigRequest) returns (GetJobSpecReply);
+
+  // Lists known job spec versions for one job.
+  rpc ListJobSpecHistory (ListJobSpecHistoryRequest) returns (ListJobSpecHistoryReply);
+
   // Returns metadata for one job (status, creation time, etc).
   rpc GetJobInfo (GetJobInfoRequest) returns (GetJobInfoReply);
 
@@ -567,12 +573,42 @@ message GetJobSpecRequest {
   string name = 1;
 }
 
+// Request payload for GetJobSpecByConfig.
+message GetJobSpecByConfigRequest {
+  // Job config ID.
+  string config_id = 1;
+}
+
 // Reply payload for GetJobSpec.
 message GetJobSpecReply {
   // Submissions associated with the latest job config.
   //
   // Field number intentionally remains `2` for compatibility.
   repeated Submission submissions = 2;
+}
+
+// One job spec history entry.
+message JobSpecHistoryItem {
+  // Job config ID.
+  string config_id = 1;
+
+  // RFC3339 timestamp when config was created.
+  string created_at = 2;
+
+  // Monotonic config version.
+  optional int64 version = 3;
+}
+
+// Request payload for ListJobSpecHistory.
+message ListJobSpecHistoryRequest {
+  // Job name.
+  string name = 1;
+}
+
+// Reply payload for ListJobSpecHistory.
+message ListJobSpecHistoryReply {
+  // History in newest-first order.
+  repeated JobSpecHistoryItem items = 1;
 }
 
 // Request payload for PlanJob.
