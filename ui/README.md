@@ -34,3 +34,16 @@ npx protoc \
 - `npm run dev` – start the dev server
 - `npm run build` – type-check and produce a production build
 - `npm run preview` – preview the production build locally
+
+## API explorer implementation notes
+
+The `/api` route uses these libraries so Legion does **not** need to hand-roll a custom gRPC console:
+
+- **ConnectRPC (`@connectrpc/connect`, `@connectrpc/connect-web`)**: Maintained by Buf, already used by the UI, and gives strongly-typed, browser-native gRPC calls against generated service descriptors.
+- **Buf Protobuf runtime (`@bufbuild/protobuf`)**: Exposes generated message/service descriptors so the API page can render request/response type metadata for every RPC method.
+- **JSONEditor (`jsoneditor`)**: Mature and widely used JSON editor widget that provides a rich interactive request body editor instead of building editor UX from scratch.
+
+Alternatives considered:
+
+- **grpcui**: Excellent server-hosted explorer, but it is a separate Go service rather than an embeddable in-app browser component.
+- **Postman/Insomnia/BloomRPC**: Great external tools, but they don't satisfy the requirement to provide an integrated API section directly inside Legion UI.
