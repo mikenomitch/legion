@@ -58,6 +58,7 @@ export default function Rollouts() {
   const [logFilter, setLogFilter] = createSignal('')
   const [advanceTarget, setAdvanceTarget] = createSignal('all')
   const [advanceBusy, setAdvanceBusy] = createSignal(false)
+  const [stopBusy, setStopBusy] = createSignal(false)
   const [advanceMessage, setAdvanceMessage] = createSignal('')
 
   const fetchRollouts = async (): Promise<readonly Rollout[]> => {
@@ -168,9 +169,15 @@ export default function Rollouts() {
     return ['all', ...Array.from(values).sort()]
   })
 
+  const isTerminalStatus = (status?: string) => {
+    if (!status) return false
+    const normalized = status.toLowerCase()
+    return normalized === 'completed' || normalized === 'failed' || normalized === 'cancelled' || normalized === 'completed_incomplete'
+  }
+
   const advanceRollout = async () => {
     const id = selectedId()
-    if (!id || advanceBusy()) return
+    if (!id || advanceBusy() || stopBusy()) return
     setAdvanceBusy(true)
     setAdvanceMessage('')
     try {
@@ -183,6 +190,25 @@ export default function Rollouts() {
       setAdvanceMessage('Failed to queue rollout advance')
     } finally {
       setAdvanceBusy(false)
+    }
+  }
+
+
+  const stopAndRevertRollout = async () => {
+    const id = selectedId()
+    const rollout = details()?.rollout
+    if (!id || !rollout || isTerminalStatus(rollout.status) || stopBusy() || advanceBusy()) return
+    setStopBusy(true)
+    setAdvanceMessage('')
+    try {
+      const response = await managerClient.stopRollout({ id, revert: true })
+      setAdvanceMessage(response.message || 'Rollout stopped and reverted')
+      await Promise.all([refetchRollouts(), refetchDetails(), refetchEvents()])
+    } catch (error) {
+      console.error('Failed to stop rollout', error)
+      setAdvanceMessage('Failed to stop and revert rollout')
+    } finally {
+      setStopBusy(false)
     }
   }
 
@@ -309,10 +335,18 @@ export default function Rollouts() {
                         <button
                           type="button"
                           onClick={advanceRollout}
-                          disabled={advanceBusy()}
+                          disabled={advanceBusy() || stopBusy()}
                           class="rounded border border-neutral-300 bg-white px-3 py-2 text-sm font-semibold uppercase tracking-[0.08em] text-neutral-800 shadow-[3px_3px_0_#d4d4d8] transition hover:-translate-y-0.5 disabled:opacity-60 dark:border-neutral-700 dark:bg-neutral-900 dark:text-neutral-100 dark:shadow-[3px_3px_0_#0b0d12]"
                         >
                           {advanceBusy() ? 'Advancing…' : 'Advance'}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={stopAndRevertRollout}
+                          disabled={stopBusy() || advanceBusy() || isTerminalStatus(detail().rollout?.status)}
+                          class="rounded border border-red-300 bg-red-50 px-3 py-2 text-sm font-semibold uppercase tracking-[0.08em] text-red-700 shadow-[3px_3px_0_#fca5a5] transition hover:-translate-y-0.5 disabled:opacity-60 dark:border-red-900 dark:bg-red-950 dark:text-red-200 dark:shadow-[3px_3px_0_#7f1d1d]"
+                        >
+                          {stopBusy() ? 'Stopping…' : 'Stop & Revert'}
                         </button>
                       </div>
                     </div>

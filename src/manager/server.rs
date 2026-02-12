@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::Duration;
 
 use crate::prelude::*;
@@ -6,6 +6,7 @@ use crate::prelude::*;
 use crate::manager::dispatcher::build_task_allocation;
 use crate::manager::rollout::{
     advance_rollout as advance_rollout_state, step_fractions_for_rollout,
+    stop_rollout as stop_rollout_state,
 };
 use crate::manager::rollout_strategy;
 use crate::manager::scheduler::{PlanConfigOutcome, PlanMode, Scheduler};
@@ -27,9 +28,9 @@ use crate::structs::{
     ReleaseKvLockRequest, RenewKvLockReply, RenewKvLockRequest, RestartWorkerReply,
     RestartWorkerRequest, RolloutAllocationStatus, RolloutEvent, RolloutGroupStatus,
     RolloutProgression, RolloutReplacement, RunJobReply, RunJobRequest, StopJobReply,
-    StopJobRequest, TaskConfig, TaskOnUnhealthyConfig, UpdateNodeDynamicReply,
-    UpdateNodeDynamicRequest, WorkerConfig, WorkerPreRegisterReply, WorkerPreRegisterRequest,
-    WorkerRegisterReply, WorkerRegisterRequest,
+    StopJobRequest, StopRolloutReply, StopRolloutRequest, TaskConfig, TaskOnUnhealthyConfig,
+    UpdateNodeDynamicReply, UpdateNodeDynamicRequest, WorkerConfig, WorkerPreRegisterReply,
+    WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest,
 };
 use crate::task_plugins::validate_job_config;
 
@@ -310,6 +311,62 @@ impl ManagerAgentService {
         }
     }
 
+    fn cancel_active_rollouts_for_job(&self, job_id: &str) -> Result<(), Status> {
+        let active_rollouts = self
+            .store
+            .list_rollouts(Some(job_id), true)
+            .map_err(|e| map_store_error("Error listing active rollouts", e))?;
+
+        for rollout in active_rollouts {
+            self.store
+                .update_rollout_status(
+                    rollout.id,
+                    "cancelled",
+                    false,
+                    Some("Rollout superseded by newer job update"),
+                )
+                .map_err(|e| map_store_error("Error cancelling superseded rollout", e))?;
+            self.store
+                .append_rollout_event(
+                    rollout.id,
+                    &rollout.job_id,
+                    None,
+                    "warn",
+                    "Rollout cancelled because a newer job config was submitted",
+                    Some(&json!({ "status": "cancelled", "reason": "superseded" }).to_string()),
+                )
+                .map_err(|e| map_store_error("Error writing rollout cancel event", e))?;
+        }
+
+        Ok(())
+    }
+
+    fn remove_stale_allocations_for_new_rollout(
+        &self,
+        job_id: &str,
+        new_job_config_id: &str,
+        previous_job_config_id: Option<&str>,
+    ) -> Result<(), Status> {
+        let keep = std::iter::once(new_job_config_id)
+            .chain(previous_job_config_id.into_iter())
+            .collect::<HashSet<_>>();
+        let allocations = self
+            .store
+            .allocs_for_job(job_id)
+            .map_err(|e| map_store_error("Error loading job allocations", e))?;
+
+        for allocation in allocations {
+            if keep.contains(allocation.job_config_id.as_str()) {
+                continue;
+            }
+            self.store
+                .remove_allocation_by_id(allocation.id)
+                .map_err(|e| map_store_error("Error removing stale allocation", e))?;
+        }
+
+        Ok(())
+    }
+
     fn create_rollout_for_update(
         &self,
         job_id: &str,
@@ -318,6 +375,13 @@ impl ManagerAgentService {
         config: &JobConfig,
         create_error: &str,
     ) -> Result<bool, Status> {
+        self.cancel_active_rollouts_for_job(job_id)?;
+        self.remove_stale_allocations_for_new_rollout(
+            job_id,
+            new_job_config_id,
+            previous_job_config_id,
+        )?;
+
         let launch = build_rollout_launch_config(config)?;
         let status = if launch.is_manual {
             "waiting_manual_start"
@@ -677,6 +741,26 @@ impl Manager for ManagerAgentService {
 
         Ok(Response::new(AdvanceRolloutReply {
             message: "Rollout advance queued".to_string(),
+            rollout: Some(rollout),
+        }))
+    }
+
+    #[instrument(skip_all)]
+    async fn stop_rollout(
+        &self,
+        request: Request<StopRolloutRequest>,
+    ) -> Result<Response<StopRolloutReply>, Status> {
+        let request = request.into_inner();
+        let priority = request.priority.unwrap_or(self.store.default_eval_priority);
+        let rollout = stop_rollout_state(&self.store, request.id, request.revert, priority)
+            .map_err(|e| Status::invalid_argument(format!("Error stopping rollout: {e}")))?;
+
+        Ok(Response::new(StopRolloutReply {
+            message: if request.revert {
+                "Rollout stopped and reverted".to_string()
+            } else {
+                "Rollout stopped".to_string()
+            },
             rollout: Some(rollout),
         }))
     }
@@ -1999,6 +2083,163 @@ mod tests {
                 .any(|eval| eval.kind == "rollout_tick" && eval.job_id == "kv-job"),
             "expected rollout_tick eval after kv change"
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_job_cancels_superseded_rollouts_and_cleans_stale_allocations() -> R<()> {
+        let store = setup_store()?;
+        let manager = ManagerAgentService::new(store.clone());
+        insert_node(&store, "node-a")?;
+
+        let v1 = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "replace-rollout".into(),
+            tasks: vec![TaskConfig {
+                group: "web".into(),
+                config: json!({ "command": ["echo", "v1"] }),
+                ..TaskConfig::new("api", "exec")
+            }],
+            version: None,
+        };
+        store.handle_job_submit(&v1, &[submission()])?;
+        let v1_id = store.get_job_config(&v1.name)?.id();
+        let v1_task_id = store.get_task_configs_for_job_config(&v1_id)?[0].0;
+        let _v1_alloc = store.place_alloc("node-a", v1_task_id)?;
+
+        let v2 = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "replace-rollout".into(),
+            tasks: vec![TaskConfig {
+                group: "web".into(),
+                config: json!({ "command": ["echo", "v2"] }),
+                ..TaskConfig::new("api", "exec")
+            }],
+            version: None,
+        };
+        store.handle_job_submit(&v2, &[submission()])?;
+        let v2_id = store.get_job_config(&v2.name)?.id();
+        let v2_task_id = store.get_task_configs_for_job_config(&v2_id)?[0].0;
+        let _v2_alloc = store.place_alloc("node-a", v2_task_id)?;
+
+        let superseded = store.create_rollout(
+            "replace-rollout",
+            Some(&v1_id),
+            &v2_id,
+            "running",
+            Some("default"),
+            Some("auto"),
+            Some("createFirst"),
+            Some(false),
+            "{}",
+        )?;
+
+        let jobspec = json!({
+            "name": "replace-rollout",
+            "task": {
+                "kind": "exec",
+                "group": "web",
+                "config": {
+                    "command": ["echo", "v3"]
+                }
+            }
+        })
+        .to_string();
+
+        manager
+            .run_job(Request::new(RunJobRequest {
+                parsed_jobspec: jobspec,
+                submissions: vec![submission()],
+                priority: None,
+                force_reschedule: false,
+            }))
+            .await?;
+
+        let cancelled = store
+            .get_rollout(superseded.id)?
+            .context("missing superseded rollout")?;
+        assert_eq!(cancelled.status, "cancelled");
+
+        let stale_allocs = store
+            .allocs_for_job("replace-rollout")?
+            .into_iter()
+            .filter(|alloc| alloc.job_config_id == v1_id)
+            .collect::<Vec<_>>();
+        assert!(
+            stale_allocs.is_empty(),
+            "expected stale v1 allocations to be removed"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stop_rollout_reverts_target_allocations() -> R<()> {
+        let store = setup_store()?;
+        let manager = ManagerAgentService::new(store.clone());
+        insert_node(&store, "node-a")?;
+
+        let v1 = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "stop-rollout".into(),
+            tasks: vec![TaskConfig {
+                group: "web".into(),
+                config: json!({ "version": 1 }),
+                ..TaskConfig::new("api", "noop")
+            }],
+            version: None,
+        };
+        store.handle_job_submit(&v1, &[submission()])?;
+        let v1_id = store.get_job_config(&v1.name)?.id();
+        let v1_task_id = store.get_task_configs_for_job_config(&v1_id)?[0].0;
+        let _v1_alloc = store.place_alloc("node-a", v1_task_id)?;
+
+        let v2 = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "stop-rollout".into(),
+            tasks: vec![TaskConfig {
+                group: "web".into(),
+                config: json!({ "version": 2 }),
+                ..TaskConfig::new("api", "noop")
+            }],
+            version: None,
+        };
+        store.handle_job_submit(&v2, &[submission()])?;
+        let v2_id = store.get_job_config(&v2.name)?.id();
+        let v2_task_id = store.get_task_configs_for_job_config(&v2_id)?[0].0;
+        let _v2_alloc = store.place_alloc("node-a", v2_task_id)?;
+
+        let rollout = store.create_rollout(
+            "stop-rollout",
+            Some(&v1_id),
+            &v2_id,
+            "running",
+            Some("default"),
+            Some("auto"),
+            Some("createFirst"),
+            Some(false),
+            "{}",
+        )?;
+
+        let response = manager
+            .stop_rollout(Request::new(StopRolloutRequest {
+                id: rollout.id,
+                revert: true,
+                priority: None,
+            }))
+            .await?
+            .into_inner();
+
+        assert_eq!(response.message, "Rollout stopped and reverted");
+        let stopped = response.rollout.context("missing stopped rollout")?;
+        assert_eq!(stopped.status, "cancelled");
+        assert!(store.allocs_for_job_config(&v2_id)?.is_empty());
+        assert!(!store.allocs_for_job_config(&v1_id)?.is_empty());
 
         Ok(())
     }

@@ -54,6 +54,9 @@ service Manager {
   // Manually advances a rollout (all groups or selected groups).
   rpc AdvanceRollout (AdvanceRolloutRequest) returns (AdvanceRolloutReply);
 
+  // Stops an in-flight rollout and optionally reverts to the previous config.
+  rpc StopRollout (StopRolloutRequest) returns (StopRolloutReply);
+
   // Computes a placement plan for a jobspec without mutating cluster state.
   rpc PlanJob (PlanJobRequest) returns (PlanJobReply);
 
@@ -498,6 +501,31 @@ message AdvanceRolloutReply {
   string message = 1;
 
   // Updated rollout record after queuing manual advance.
+  optional Rollout rollout = 2;
+}
+
+// Request payload for StopRollout.
+message StopRolloutRequest {
+  // Rollout ID to stop.
+  int64 id = 1;
+
+  // When true, remove allocations for the rollout target config and re-schedule from
+  // the rollout source config (when present).
+  bool revert = 2;
+
+  // Optional eval priority for any rollback scheduling.
+  //
+  // Default when omitted: manager `default_priority`
+  // (`50` in built-in config defaults).
+  optional int64 priority = 3;
+}
+
+// Reply payload for StopRollout.
+message StopRolloutReply {
+  // Human-readable stop/revert message.
+  string message = 1;
+
+  // Updated rollout record after stop processing.
   optional Rollout rollout = 2;
 }
 
