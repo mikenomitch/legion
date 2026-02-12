@@ -44,7 +44,7 @@ export default function Nodes() {
 
   return (
     <SharedIndex
-      entityLabel="Nodes"
+      entityLabel="Workers"
       search={search()}
       onSearch={setSearch}
       sort={sort()}
@@ -55,7 +55,7 @@ export default function Nodes() {
         { label: 'Last heartbeat (newest)', value: 'last_heartbeat:desc' },
       ]}
       loading={data.loading || ledger.loading}
-      error={data.error ? 'Failed to load nodes.' : undefined}
+      error={data.error ? 'Failed to load workers.' : undefined}
       items={(data()?.nodes ?? []).map((node) => {
         const health = summarizeHealthChecks(node.healthChecks)
         return {
@@ -76,7 +76,7 @@ export default function Nodes() {
         setPageSize(size)
         setPage(1)
       }}
-      emptyLabel="No nodes found."
+      emptyLabel="No workers found."
     />
   )
 }

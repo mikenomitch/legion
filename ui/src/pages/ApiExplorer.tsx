@@ -1,6 +1,12 @@
 import { For, Show, createMemo, createSignal } from "solid-js";
+import HoverInfo from "../components/HoverInfo";
 import { managerClient } from "../grpcClient";
 import { Manager } from "../gen/legion_connect";
+import {
+  getFieldProtoComment,
+  getMessageProtoComment,
+  getMethodProtoComment,
+} from "../utils/protoDocs";
 
 type ManagerMethodName = keyof typeof Manager.methods;
 type ManagerMethodDescriptor = (typeof Manager.methods)[ManagerMethodName];
@@ -169,6 +175,9 @@ export default function ApiExplorer() {
   const selectedMethod = createMemo(
     () => Manager.methods[selectedMethodName()] as ManagerMethodDescriptor,
   );
+  const selectedMethodComment = createMemo(() =>
+    getMethodProtoComment(selectedMethod().name),
+  );
 
   const requestType = createMemo(() => selectedMethod().I as unknown as ProtoMessageCtor);
   const responseType = createMemo(() => selectedMethod().O as unknown as ProtoMessageCtor);
@@ -269,9 +278,22 @@ export default function ApiExplorer() {
             <h3 class="text-lg font-semibold text-neutral-900 dark:text-neutral-100">
               {selectedMethod().name}
             </h3>
+            <Show when={selectedMethodComment()}>
+              <p class="mt-1 whitespace-pre-wrap text-sm text-neutral-600 dark:text-neutral-300">
+                {selectedMethodComment()}
+              </p>
+            </Show>
             <div class="mt-4 grid gap-4 md:grid-cols-2">
-              <TypeTable title={`Request: ${requestType().typeName}`} fields={requestType().fields.list()} />
-              <TypeTable title={`Response: ${responseType().typeName}`} fields={responseType().fields.list()} />
+              <TypeTable
+                title={`Request: ${requestType().typeName}`}
+                typeName={requestType().typeName}
+                fields={requestType().fields.list()}
+              />
+              <TypeTable
+                title={`Response: ${responseType().typeName}`}
+                typeName={responseType().typeName}
+                fields={responseType().fields.list()}
+              />
             </div>
           </div>
 
@@ -329,13 +351,26 @@ export default function ApiExplorer() {
 
 type TypeTableProps = {
   title: string;
+  typeName: string;
   fields: readonly ProtoFieldInfo[];
 };
 
 function TypeTable(props: TypeTableProps) {
+  const messageComment = createMemo(() => getMessageProtoComment(props.typeName));
+
   return (
     <div class="rounded border border-neutral-200 p-3 dark:border-neutral-700">
-      <p class="text-sm font-semibold text-neutral-900 dark:text-neutral-100">{props.title}</p>
+      <HoverInfo content={messageComment()}>
+        <p
+          class={`text-sm font-semibold text-neutral-900 dark:text-neutral-100 ${
+            messageComment()
+              ? "cursor-help decoration-dotted underline-offset-4 hover:underline"
+              : ""
+          }`}
+        >
+          {props.title}
+        </p>
+      </HoverInfo>
       <Show
         when={props.fields.length > 0}
         fallback={<p class="mt-2 text-xs text-neutral-500">No fields.</p>}
@@ -351,13 +386,28 @@ function TypeTable(props: TypeTableProps) {
             </thead>
             <tbody>
               <For each={props.fields}>
-                {(field) => (
-                  <tr class="border-t border-neutral-200 align-top dark:border-neutral-800">
-                    <td class="py-2 pr-4 font-mono text-neutral-900 dark:text-neutral-100">{toCamelCase(field.name)}</td>
-                    <td class="py-2 pr-4 text-neutral-600 dark:text-neutral-300">{field.no}</td>
-                    <td class="py-2 text-neutral-700 dark:text-neutral-200">{describeFieldType(field)}</td>
-                  </tr>
-                )}
+                {(field) => {
+                  const fieldComment = getFieldProtoComment(props.typeName, field.no);
+                  return (
+                    <tr class="border-t border-neutral-200 align-top dark:border-neutral-800">
+                      <td class="py-2 pr-4 font-mono text-neutral-900 dark:text-neutral-100">
+                        <HoverInfo content={fieldComment}>
+                          <span
+                            class={
+                              fieldComment
+                                ? "cursor-help decoration-dotted underline-offset-4 hover:underline"
+                                : ""
+                            }
+                          >
+                            {toCamelCase(field.name)}
+                          </span>
+                        </HoverInfo>
+                      </td>
+                      <td class="py-2 pr-4 text-neutral-600 dark:text-neutral-300">{field.no}</td>
+                      <td class="py-2 text-neutral-700 dark:text-neutral-200">{describeFieldType(field)}</td>
+                    </tr>
+                  );
+                }}
               </For>
             </tbody>
           </table>

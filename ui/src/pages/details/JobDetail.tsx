@@ -1,5 +1,6 @@
 import { A, useNavigate, useParams } from '@solidjs/router'
 import { For, Show, createMemo, createResource, createSignal } from 'solid-js'
+import { DetailSection, detailDangerButtonClass, detailTabButtonClass } from '../../components/DetailPrimitives'
 import { managerClient } from '../../grpcClient'
 import { formatDate } from '../../utils/format'
 
@@ -48,50 +49,50 @@ export default function JobDetail() {
     <Show when={!jobData.loading} fallback={<p>Loading job…</p>}>
       <Show when={!jobData.error && jobData()} fallback={<p class="text-rose-500">Failed to load job.</p>}>
         <div class="space-y-4">
-          <section class="rounded border border-neutral-200 bg-white/90 p-4 dark:border-neutral-800 dark:bg-neutral-900/60">
+          <DetailSection>
             <div class="flex flex-wrap items-start justify-between gap-3">
               <div>
                 <h2 class="text-2xl font-semibold">{jobData()!.job?.name || jobData()!.job?.id}</h2>
                 <p class="text-sm text-neutral-500">Status: {jobData()!.job?.status || 'unknown'} · Allocations: {jobData()!.allocations.length}</p>
               </div>
-              <button type="button" onClick={destroyJob} class="rounded border border-rose-300 px-3 py-2 text-sm font-semibold text-rose-700 dark:border-rose-700 dark:text-rose-300">
+              <button type="button" onClick={destroyJob} class={detailDangerButtonClass}>
                 Delete Job
               </button>
             </div>
             <Show when={actionMessage()}><p class="mt-2 text-sm text-neutral-600 dark:text-neutral-300">{actionMessage()}</p></Show>
 
             <div class="mt-4 flex gap-2">
-              <button type="button" onClick={() => setActiveTab('overview')} class={`rounded border px-3 py-1.5 text-sm ${activeTab() === 'overview' ? 'border-neutral-900 bg-neutral-900 text-white dark:border-neutral-100 dark:bg-neutral-100 dark:text-neutral-900' : 'border-neutral-300'}`}>Overview</button>
-              <button type="button" onClick={() => setActiveTab('spec')} class={`rounded border px-3 py-1.5 text-sm ${activeTab() === 'spec' ? 'border-neutral-900 bg-neutral-900 text-white dark:border-neutral-100 dark:bg-neutral-100 dark:text-neutral-900' : 'border-neutral-300'}`}>Job Spec</button>
+              <button type="button" onClick={() => setActiveTab('overview')} class={detailTabButtonClass(activeTab() === 'overview')}>Overview</button>
+              <button type="button" onClick={() => setActiveTab('spec')} class={detailTabButtonClass(activeTab() === 'spec')}>Job Spec</button>
             </div>
-          </section>
+          </DetailSection>
 
           <Show when={activeTab() === 'overview'}>
             <Show when={jobData()!.activeRollout}>
-              <section class="rounded border border-amber-300 bg-amber-50/70 p-4 dark:border-amber-700 dark:bg-amber-950/30">
+              <DetailSection class="border-amber-300 bg-amber-50/70 dark:border-amber-700 dark:bg-amber-950/30">
                 <h3 class="font-semibold">Active rollout</h3>
                 <p class="text-sm">Rollout #{String(jobData()!.activeRollout!.id)} · {jobData()!.activeRollout!.status}</p>
                 <A href={`/rollouts/${jobData()!.activeRollout!.id}`} class="text-sm underline">Open rollout</A>
-              </section>
+              </DetailSection>
             </Show>
 
 
             <Show when={jobData()!.activeRollout}>
-              <section class="rounded border border-neutral-200 bg-white/90 p-4 dark:border-neutral-800 dark:bg-neutral-900/60">
+              <DetailSection>
                 <h3 class="font-semibold">Allocations in active rollout target</h3>
                 <div class="mt-2 space-y-1 text-sm">
                   <For each={jobData()!.allocations.filter((allocation) => allocation.jobConfigId === jobData()!.activeRollout!.toJobConfigId)}>
                     {(allocation) => <p>#{String(allocation.id)} on <A class="underline" href={`/nodes/${encodeURIComponent(allocation.nodeId)}`}>{allocation.nodeId}</A> · {allocation.status}</p>}
                   </For>
                 </div>
-              </section>
+              </DetailSection>
             </Show>
 
-            <section class="rounded border border-neutral-200 bg-white/90 p-4 dark:border-neutral-800 dark:bg-neutral-900/60">
+            <DetailSection>
               <h3 class="mb-2 font-semibold">Allocations</h3>
               <div class="overflow-x-auto">
                 <table class="min-w-full text-sm">
-                  <thead><tr class="text-left"><th class="py-2 pr-4">ID</th><th class="py-2 pr-4">Status</th><th class="py-2 pr-4">Node</th><th class="py-2 pr-4">Job Config</th></tr></thead>
+                  <thead><tr class="text-left"><th class="py-2 pr-4">ID</th><th class="py-2 pr-4">Status</th><th class="py-2 pr-4">Worker</th><th class="py-2 pr-4">Job Config</th></tr></thead>
                   <tbody>
                     <For each={jobData()!.allocations}>{(allocation) => (
                       <tr class="border-t border-neutral-200 dark:border-neutral-800"><td class="py-2 pr-4">{String(allocation.id)}</td><td class="py-2 pr-4">{allocation.status}</td><td class="py-2 pr-4"><A class="underline" href={`/nodes/${encodeURIComponent(allocation.nodeId)}`}>{allocation.nodeId}</A></td><td class="py-2 pr-4"><A class="underline" href={`/jobs/${encodeURIComponent(jobName())}/specs/${encodeURIComponent(allocation.jobConfigId)}`}>{allocation.jobConfigId}</A></td></tr>
@@ -99,9 +100,9 @@ export default function JobDetail() {
                   </tbody>
                 </table>
               </div>
-            </section>
+            </DetailSection>
 
-            <section class="rounded border border-neutral-200 bg-white/90 p-4 dark:border-neutral-800 dark:bg-neutral-900/60">
+            <DetailSection>
               <h3 class="mb-2 font-semibold">Associated rollouts</h3>
               <div class="space-y-2">
                 <For each={jobData()!.rollouts}>{(rollout) => (
@@ -112,11 +113,11 @@ export default function JobDetail() {
                   </div>
                 )}</For>
               </div>
-            </section>
+            </DetailSection>
           </Show>
 
           <Show when={activeTab() === 'spec'}>
-            <section class="rounded border border-neutral-200 bg-white/90 p-4 dark:border-neutral-800 dark:bg-neutral-900/60">
+            <DetailSection>
               <h3 class="font-semibold">Current spec submissions</h3>
               <For each={jobData()!.spec}>{(submission) => (
                 <div class="mt-3 rounded border border-neutral-200 p-3 dark:border-neutral-700">
@@ -124,9 +125,9 @@ export default function JobDetail() {
                   <pre class="mt-2 max-h-80 overflow-auto rounded bg-neutral-100 p-2 text-xs dark:bg-neutral-950">{submission.content}</pre>
                 </div>
               )}</For>
-            </section>
+            </DetailSection>
 
-            <section class="rounded border border-neutral-200 bg-white/90 p-4 dark:border-neutral-800 dark:bg-neutral-900/60">
+            <DetailSection>
               <h3 class="font-semibold">Spec history</h3>
               <div class="mt-2 space-y-2">
                 <For each={jobData()!.specHistory}>{(item) => (
@@ -135,7 +136,7 @@ export default function JobDetail() {
                   </A>
                 )}</For>
               </div>
-            </section>
+            </DetailSection>
           </Show>
         </div>
       </Show>

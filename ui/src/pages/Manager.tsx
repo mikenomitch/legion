@@ -32,7 +32,7 @@ export default function Manager() {
 
   return (
     <SharedIndex
-      entityLabel="Manager Nodes"
+      entityLabel="Managers"
       search={search()}
       onSearch={setSearch}
       sort={sort()}
@@ -40,10 +40,10 @@ export default function Manager() {
       sortOptions={[
         { label: 'Updated (newest)', value: 'updated_at:desc' },
         { label: 'Updated (oldest)', value: 'updated_at:asc' },
-        { label: 'Node ID', value: 'node_id:asc' },
+        { label: 'Manager ID', value: 'node_id:asc' },
       ]}
       loading={data.loading}
-      error={data.error ? 'Failed to load manager nodes.' : undefined}
+      error={data.error ? 'Failed to load managers.' : undefined}
       items={(data()?.configs ?? []).map((config) => ({
         id: config.nodeId,
         title: config.nodeId,
@@ -60,7 +60,7 @@ export default function Manager() {
         setPageSize(size)
         setPage(1)
       }}
-      emptyLabel="No manager nodes found."
+      emptyLabel="No managers found."
     />
   )
 }
