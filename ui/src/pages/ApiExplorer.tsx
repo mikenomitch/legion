@@ -155,6 +155,16 @@ export default function ApiExplorer() {
   const [requestError, setRequestError] = createSignal<string | null>(null);
   const [callError, setCallError] = createSignal<string | null>(null);
   const [isCalling, setIsCalling] = createSignal(false);
+  const [methodSearch, setMethodSearch] = createSignal("");
+
+  const filteredMethods = createMemo(() => {
+    const query = methodSearch().trim().toLowerCase();
+    if (!query) return methodEntries;
+    return methodEntries.filter(([name, method]) => {
+      const methodName = method.name.toLowerCase();
+      return methodName.includes(query) || name.toLowerCase().includes(query);
+    });
+  });
 
   const selectedMethod = createMemo(
     () => Manager.methods[selectedMethodName()] as ManagerMethodDescriptor,
@@ -207,27 +217,28 @@ export default function ApiExplorer() {
 
   return (
     <section class="space-y-4">
-      <div class="rounded border border-neutral-200 bg-white/90 p-6 shadow-[4px_4px_0_#d4d4d8] dark:border-neutral-800 dark:bg-neutral-900/60 dark:shadow-[4px_4px_0_#0b0d12]">
-        <p class="text-xs uppercase tracking-[0.12em] text-neutral-500 dark:text-neutral-400">
-          API Explorer
-        </p>
-        <h2 class="text-xl font-semibold text-neutral-900 dark:text-neutral-100">
-          Interactive gRPC interface
-        </h2>
-        <p class="mt-2 text-sm text-neutral-600 dark:text-neutral-300">
-          Powered by ConnectRPC and Buf generated protobuf descriptors. Pick any
-          Manager RPC, edit JSON request values, and execute the method directly
-          against the configured manager endpoint.
-        </p>
-      </div>
-
       <div class="grid gap-4 lg:grid-cols-[20rem,1fr]">
         <aside class="max-h-[70vh] overflow-auto rounded border border-neutral-200 bg-white/90 p-4 shadow-[4px_4px_0_#d4d4d8] dark:border-neutral-800 dark:bg-neutral-900/60 dark:shadow-[4px_4px_0_#0b0d12]">
           <p class="mb-3 text-xs uppercase tracking-[0.12em] text-neutral-500 dark:text-neutral-400">
             Methods
           </p>
+          <input
+            type="search"
+            placeholder="Search RPC methods"
+            class="mb-3 w-full rounded border border-neutral-300 bg-white px-3 py-2 text-sm text-neutral-900 placeholder:text-neutral-500 dark:border-neutral-700 dark:bg-neutral-950 dark:text-neutral-100 dark:placeholder:text-neutral-400"
+            value={methodSearch()}
+            onInput={(event) => setMethodSearch(event.currentTarget.value)}
+          />
+          <Show
+            when={filteredMethods().length > 0}
+            fallback={
+              <p class="text-sm text-neutral-500 dark:text-neutral-400">
+                No methods match your search.
+              </p>
+            }
+          >
           <div class="space-y-2">
-            <For each={methodEntries}>
+            <For each={filteredMethods()}>
               {([name, method]) => (
                 <button
                   type="button"
@@ -247,6 +258,7 @@ export default function ApiExplorer() {
               )}
             </For>
           </div>
+          </Show>
         </aside>
 
         <div class="space-y-4">
@@ -288,7 +300,7 @@ export default function ApiExplorer() {
               <Show when={callError()}>
                 <p class="mt-2 text-xs text-red-500">RPC error: {callError()}</p>
               </Show>
-              <div class="mt-3">
+              <div class="mt-3 flex justify-end">
                 <button
                   type="button"
                   class="rounded border border-neutral-900 bg-neutral-900 px-4 py-2 text-sm font-semibold text-white disabled:opacity-50 dark:border-neutral-200 dark:bg-neutral-100 dark:text-neutral-900"
