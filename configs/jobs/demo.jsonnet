@@ -3,9 +3,9 @@
     tasks: [
         {
             name: "first-task",
-            kind: "container",
+            kind: "exec",
             config: {
-                message: "Hello from first task",
+                command: ["echo", "hello", "from", "first task"],
             },
             resources: {
                 memory: 256,
@@ -15,9 +15,9 @@
         },
         {
             name: "second-task",
-            kind: "noop",
+            kind: "exec",
             config: {
-                message: "Hello from second task",
+                command: ["echo", "hello", "from", "second task"],
             },
             resources: {
                 memory: 128,

@@ -12,7 +12,7 @@
         },
         {
             name: "api",
-            kind: "noop",
+            kind: "exec",
             lifecycle: "service",
             group: "app",
             dependsOn: [
@@ -21,6 +21,9 @@
                     condition: "success",
                 },
             ],
+            config: {
+                command: ["echo", "api"],
+            },
         },
     ],
 }

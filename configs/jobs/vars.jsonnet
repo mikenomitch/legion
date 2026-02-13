@@ -6,7 +6,7 @@ function(job_name, cpu=100) {
             kind: std.extVar("task_kind"),
             count: std.parseInt(std.extVar("task_count")),
             config: {
-                message: std.extVar("message"),
+                command: ["echo", std.extVar("message")],
             },
             resources: {
                 cpu: cpu,

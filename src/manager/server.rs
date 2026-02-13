@@ -27,6 +27,7 @@ use crate::structs::{
     LedgerNode, ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobsReply, ListJobsRequest,
     ListKvReply, ListKvRequest, ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply,
     ListRolloutsRequest, ListSavedStateQueriesReply, ListSavedStateQueriesRequest, Node, NodeMsg,
+    Submission,
     PatchKvReply, PatchKvRequest, PlanJobReply, PlanJobRequest, PlannedAllocation, PutKvReply,
     PutKvRequest, QueryStateStoreReply, QueryStateStoreRequest, ReleaseKvLockReply,
     ReleaseKvLockRequest, RenewKvLockReply, RenewKvLockRequest, RestartWorkerReply,
@@ -577,8 +578,16 @@ impl Manager for ManagerAgentService {
     ) -> Result<Response<RunJobReply>, Status> {
         let inner = request.into_inner();
         let js = inner.parsed_jobspec;
-        let subs = inner.submissions;
+        let mut subs = inner.submissions;
         let priority = inner.priority.unwrap_or(self.store.default_eval_priority);
+
+        if !subs.iter().any(|sub| sub.path == "job.rendered.json") {
+            subs.push(Submission {
+                path: "job.rendered.json".into(),
+                content: js.clone(),
+                is_primary: false,
+            });
+        }
 
         let (config, kv_refs) = resolve_jobspec_kv_references(&self.store, &js).map_err(|e| {
             error!("Error parsing jobspec: {:?}", e);

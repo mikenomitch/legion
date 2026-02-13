@@ -28,13 +28,11 @@
         {
             name: "web",
             count: 2,
-            kind: "noop",
+            kind: "exec",
             group: "frontend",
             lifecycle: "service",
             config: {
-                message: "Hello from the web task",
-                retries: 3,
-                labels: ["edge", "primary"],
+                command: ["sleep", "1"],
             },
             resources: {
                 cpus: 1.5,
@@ -102,15 +100,12 @@
                 num: 3,
                 per: "region",
             },
-            kind: "noop",
+            kind: "exec",
             group: "prep",
             lifecycle: "batch",
             schedule: "every 15m",
             config: {
-                script: "echo work",
-                env: {
-                    RUST_LOG: "info",
-                },
+                command: ["sleep", "1"],
             },
             resources: {
                 cpus: 0.5,

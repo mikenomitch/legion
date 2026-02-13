@@ -11,10 +11,10 @@
     },
     tasks: {
         api: {
-            kind: "noop",
+            kind: "exec",
             count: 10,
             config: {
-                message: "slow-start rollout plugin demo",
+                command: ["sleep", "1"],
             },
         },
     },

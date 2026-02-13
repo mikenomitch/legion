@@ -3,9 +3,9 @@
   tasks: [
     {
       name: 'task-one',
-      kind: 'noop',
+      kind: 'exec',
       config: {
-        message: 'Hello from task one',
+        command: ['sleep', '1'],
       },
       resources: {
         memory: 256,
@@ -19,9 +19,9 @@
     },
     {
       name: 'task-two',
-      kind: 'noop',
+      kind: 'exec',
       config: {
-        message: 'Hello from task two',
+        command: ['sleep', '1'],
       },
       resources: {
         memory: 256,

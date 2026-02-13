@@ -4,8 +4,7 @@
     {
       kind: 'exec',
       config: {
-        command: ['touch'],
-        args: ['hi'],
+        command: ['touch', 'hi'],
         cwd: '/Users/mike/Desktop',
       },
       constraints: {

@@ -3,15 +3,21 @@
     tasks: [
         {
             name: "frontend",
-            kind: "noop",
+            kind: "exec",
             lifecycle: "service",
             group: "web",
+            config: {
+                command: ["echo", "frontend"],
+            },
         },
         {
             name: "worker",
-            kind: "noop",
+            kind: "exec",
             lifecycle: "service",
             group: "worker",
+            config: {
+                command: ["echo", "worker"],
+            },
         },
         {
             name: "metrics",

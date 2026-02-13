@@ -3,9 +3,12 @@
     tasks: [
         {
             name: "api",
-            kind: "noop",
+            kind: "exec",
             lifecycle: "service",
             group: "app",
+            config: {
+                command: ["sleep", "120"],
+            },
         },
         {
             name: "logger",

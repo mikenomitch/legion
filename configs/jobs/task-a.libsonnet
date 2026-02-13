@@ -1,8 +1,8 @@
 {
     name: "task-a",
-    kind: "container",
+    kind: "exec",
     config: {
-        message: "Hello from task A",
+        command: ["echo", "Hello from task A"],
     },
     resources: {
         memory: 256,

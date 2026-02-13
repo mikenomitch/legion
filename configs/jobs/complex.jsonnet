@@ -3,9 +3,9 @@
     tasks: {
         "first-task": {
             count: 1,
-            kind: "noop",
+            kind: "exec",
             config: {
-                message: "Hello from first task",
+                command: ["sleep", "1"],
             },
             resources: {
                 cpus: 0.1,
@@ -14,25 +14,34 @@
         },
         "second-task": {
             count: 2,
-            kind: "noop",
+            kind: "exec",
             config: {
-                message: "Hello from second task",
+                command: ["sleep", "2"],
             },
             resources: {
                 cpus: 0.5,
                 memory: 128,
             },
             constraints: [
-                ["placedWith", "first-task"],
-                ["worker", "UNIQUE"],
-                ["cpu", "amd"],
+                {
+                    key: "placedWith",
+                    value: "first-task",
+                },
+                {
+                    key: "worker",
+                    operator: "distinct",
+                },
+                {
+                    key: "cpu",
+                    value: "amd",
+                },
             ],
-            starts:{
-                onStart: "first-task"
-            },
-            ends: {
-                onComplete: "first-task",
-            },
+            dependsOn: [
+                {
+                    task: "first-task",
+                    condition: "start",
+                },
+            ],
         },
     },
 }
