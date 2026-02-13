@@ -1,0 +1,2 @@
+{"timestamp":"2026-02-13T04:28:39.592286Z","level":"ERROR","fields":{"error":"Job must be stopped before it can be destroyed"},"target":"legion::storage::store"}
+{"timestamp":"2026-02-13T04:28:39.592685Z","level":"ERROR","fields":{"message":"Error deleting job: Job must be stopped before it can be destroyed"},"target":"legion::manager::server"}

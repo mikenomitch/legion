@@ -125,6 +125,7 @@ impl<'a> Scheduler<'a> {
 
     #[instrument(skip_all)]
     pub fn plan_only(&self, job_config_id: &str, mode: PlanMode) -> R<Vec<PlannedAllocation>> {
+        info!(%job_config_id, mode = mode.as_str(), "Starting scheduler plan_only");
         let nodes = self.available_nodes()?;
         if nodes.is_empty() {
             bail!("No nodes available to place allocations");
@@ -149,7 +150,7 @@ impl<'a> Scheduler<'a> {
             &allocations_by_node,
         );
 
-        self.build_plan(
+        let plan = self.build_plan(
             job_config_id,
             nodes,
             tasks,
@@ -157,7 +158,9 @@ impl<'a> Scheduler<'a> {
             required_counts,
             &allocations_by_node,
             mode,
-        )
+        )?;
+        info!(%job_config_id, planned_allocations = plan.len(), "Completed scheduler plan_only");
+        Ok(plan)
     }
 
     #[instrument(skip_all)]
@@ -256,6 +259,7 @@ impl<'a> Scheduler<'a> {
         excluded_nodes: Option<&HashSet<String>>,
         task_targets: Option<&HashMap<i64, u32>>,
     ) -> R<PlanOutcome> {
+        info!(%job_config_id, mode = mode.as_str(), target_override = task_targets.is_some(), "Starting scheduler plan_and_apply");
         let mut nodes = self.available_nodes()?;
         if let Some(excluded) = excluded_nodes {
             nodes.retain(|node| !excluded.contains(&node.id));
@@ -299,6 +303,7 @@ impl<'a> Scheduler<'a> {
             mode.clone(),
         )?;
         if placements.is_empty() {
+            info!(%job_config_id, "No placements generated during plan_and_apply");
             return Ok(PlanOutcome {
                 allocations: Vec::new(),
                 deltas: Vec::new(),
@@ -336,10 +341,12 @@ impl<'a> Scheduler<'a> {
         };
         let deltas = Self::allocations_delta(&affected_nodes, &allocations);
 
-        Ok(PlanOutcome {
+        let outcome = PlanOutcome {
             allocations,
             deltas,
-        })
+        };
+        info!(%job_config_id, applied_allocations = outcome.allocations.len(), affected_nodes = outcome.deltas.len(), "Completed scheduler plan_and_apply");
+        Ok(outcome)
     }
 
     fn existing_alloc_counts_by_task(

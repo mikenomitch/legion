@@ -11,6 +11,12 @@ pub fn config() -> Command {
         .about("Start a manager node")
         .arg(config_path_arg())
         .arg(
+            Arg::new("o11y")
+                .long("o11y")
+                .action(ArgAction::SetTrue)
+                .help("Enable tracing export for observability UI"),
+        )
+        .arg(
             Arg::new("run-worker")
                 .long("run-worker")
                 .action(ArgAction::SetTrue)
@@ -30,6 +36,12 @@ pub fn config() -> Command {
                 .long("name")
                 .value_name("NAME")
                 .help("Override the worker name/ID"),
+        )
+        .arg(
+            Arg::new("o11y")
+                .long("o11y")
+                .action(ArgAction::SetTrue)
+                .help("Enable tracing export for observability UI"),
         );
 
     Command::new("start")

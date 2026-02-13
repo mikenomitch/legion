@@ -19,26 +19,26 @@ use crate::structs::{
     DeleteSavedStateQueryReply, DeleteSavedStateQueryRequest, DestroyJobReply, DestroyJobRequest,
     FailedAllocation, GetJobInfoReply, GetJobInfoRequest, GetJobSpecByConfigRequest,
     GetJobSpecReply, GetJobSpecRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest,
-    GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest,
-    GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest, GetRolloutReply,
-    GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest, GetStateStoreSchemaReply,
-    GetStateStoreSchemaRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply,
-    HeartbeatRequest, JobConfig, JobSpecHistoryItem, KvEntry, KvValueType, LedgerNode,
-    ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobsReply, ListJobsRequest,
-    ListKvReply, ListKvRequest, ListRolloutEventsReply, ListRolloutEventsRequest,
-    ListRolloutsReply, ListRolloutsRequest, ListSavedStateQueriesReply,
-    ListSavedStateQueriesRequest, Node, NodeMsg, PatchKvReply, PatchKvRequest, PlanJobReply,
-    PlanJobRequest, PlannedAllocation, PutKvReply, PutKvRequest, QueryStateStoreReply,
-    QueryStateStoreRequest, ReleaseKvLockReply, ReleaseKvLockRequest, RenewKvLockReply,
-    RenewKvLockRequest, RestartWorkerReply, RestartWorkerRequest, RolloutAllocationStatus,
-    RolloutEvent, RolloutGroupStatus, RolloutProgression, RolloutReplacement, RunJobReply,
-    RunJobRequest, SavedStateQuery, StopJobReply, StopJobRequest, StopRolloutReply,
-    StopRolloutRequest, TaskConfig, TaskOnUnhealthyConfig, UpdateNodeDynamicReply,
+    GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest, GetNodeReply,
+    GetNodeRequest, GetNodesReply, GetNodesRequest, GetObservabilityReply, GetObservabilityRequest,
+    GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest,
+    GetStateStoreSchemaReply, GetStateStoreSchemaRequest, HealthCheckReply, HealthCheckRequest,
+    HeartbeatReply, HeartbeatRequest, JobConfig, JobSpecHistoryItem, KvEntry, KvValueType,
+    LedgerNode, ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobsReply, ListJobsRequest,
+    ListKvReply, ListKvRequest, ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply,
+    ListRolloutsRequest, ListSavedStateQueriesReply, ListSavedStateQueriesRequest, Node, NodeMsg,
+    PatchKvReply, PatchKvRequest, PlanJobReply, PlanJobRequest, PlannedAllocation, PutKvReply,
+    PutKvRequest, QueryStateStoreReply, QueryStateStoreRequest, ReleaseKvLockReply,
+    ReleaseKvLockRequest, RenewKvLockReply, RenewKvLockRequest, RestartWorkerReply,
+    RestartWorkerRequest, RolloutAllocationStatus, RolloutEvent, RolloutGroupStatus, RolloutProgression,
+    RolloutReplacement, RunJobReply, RunJobRequest, SavedStateQuery, StopJobReply, StopJobRequest,
+    StopRolloutReply, StopRolloutRequest, TaskConfig, TaskOnUnhealthyConfig, UpdateNodeDynamicReply,
     UpdateNodeDynamicRequest, UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest,
     WorkerConfig, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply,
     WorkerRegisterRequest,
 };
 use crate::task_plugins::validate_job_config;
+use crate::tracing_util::{o11y_enabled, read_recent_observability};
 
 use time::{Duration as TimeDuration, OffsetDateTime};
 use tonic::{Request, Response, Status};
@@ -1446,6 +1446,34 @@ impl Manager for ManagerAgentService {
             total_count,
             page: page as u32,
             page_size: page_size as u32,
+        }))
+    }
+
+    #[instrument(skip_all)]
+    async fn get_observability(
+        &self,
+        request: Request<GetObservabilityRequest>,
+    ) -> Result<Response<GetObservabilityReply>, Status> {
+        let max_lines = request.into_inner().max_lines.unwrap_or(300).min(1_000) as usize;
+        let enabled = o11y_enabled();
+        let (mut logs, mut traces) = if enabled {
+            read_recent_observability()
+                .map_err(|_| Status::internal("Error reading observability data"))?
+        } else {
+            (Vec::new(), Vec::new())
+        };
+
+        if logs.len() > max_lines {
+            logs = logs.split_off(logs.len() - max_lines);
+        }
+        if traces.len() > max_lines {
+            traces = traces.split_off(traces.len() - max_lines);
+        }
+
+        Ok(Response::new(GetObservabilityReply {
+            o11y_enabled: enabled,
+            logs,
+            traces,
         }))
     }
 

@@ -23,9 +23,17 @@ fn cli() -> Command {
 
 #[tokio::main]
 async fn main() -> R<()> {
-    init_tracing()?;
-
     let matches = cli().get_matches();
+    let enable_o11y = matches!(
+        matches.subcommand(),
+        Some(("start", sub_matches))
+            if matches!(
+                sub_matches.subcommand(),
+                Some(("manager", args)) | Some(("worker", args)) if args.get_flag("o11y")
+            )
+    );
+    init_tracing(enable_o11y)?;
+
     match matches.subcommand() {
         Some(("docs", sub_matches)) => cmd::docs::handle(sub_matches).await?,
         Some(("start", sub_matches)) => cmd::start::handle(sub_matches).await?,

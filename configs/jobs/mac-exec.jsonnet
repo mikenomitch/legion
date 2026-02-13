@@ -1,11 +1,11 @@
 {
-  name: 'hi-jamie',
+  name: 'exec-me',
   tasks: [
     {
       kind: 'exec',
       config: {
         command: ['touch'],
-        args: ['hihihi'],
+        args: ['hi'],
         cwd: '/Users/mike/Desktop',
       },
       constraints: {

@@ -3586,6 +3586,108 @@ export class GetManagerConfigsReply extends Message<GetManagerConfigsReply> {
 }
 
 /**
+ * Request payload for GetObservability.
+ *
+ * @generated from message legion.GetObservabilityRequest
+ */
+export class GetObservabilityRequest extends Message<GetObservabilityRequest> {
+  /**
+   * Maximum number of recent lines to return per stream.
+   *
+   * Default and max are manager-defined.
+   *
+   * @generated from field: optional uint32 max_lines = 1;
+   */
+  maxLines?: number;
+
+  constructor(data?: PartialMessage<GetObservabilityRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetObservabilityRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "max_lines", kind: "scalar", T: 13 /* ScalarType.UINT32 */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetObservabilityRequest {
+    return new GetObservabilityRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetObservabilityRequest {
+    return new GetObservabilityRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetObservabilityRequest {
+    return new GetObservabilityRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetObservabilityRequest | PlainMessage<GetObservabilityRequest> | undefined, b: GetObservabilityRequest | PlainMessage<GetObservabilityRequest> | undefined): boolean {
+    return proto3.util.equals(GetObservabilityRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for GetObservability.
+ *
+ * @generated from message legion.GetObservabilityReply
+ */
+export class GetObservabilityReply extends Message<GetObservabilityReply> {
+  /**
+   * True when manager started with `--o11y` and trace capture is active.
+   *
+   * @generated from field: bool o11y_enabled = 1;
+   */
+  o11yEnabled = false;
+
+  /**
+   * Recent JSON log lines captured by manager.
+   *
+   * @generated from field: repeated string logs = 2;
+   */
+  logs: string[] = [];
+
+  /**
+   * Recent JSON trace/span events captured by manager.
+   *
+   * Empty when `o11y_enabled` is false.
+   *
+   * @generated from field: repeated string traces = 3;
+   */
+  traces: string[] = [];
+
+  constructor(data?: PartialMessage<GetObservabilityReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetObservabilityReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "o11y_enabled", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 2, name: "logs", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 3, name: "traces", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetObservabilityReply {
+    return new GetObservabilityReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetObservabilityReply {
+    return new GetObservabilityReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetObservabilityReply {
+    return new GetObservabilityReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetObservabilityReply | PlainMessage<GetObservabilityReply> | undefined, b: GetObservabilityReply | PlainMessage<GetObservabilityReply> | undefined): boolean {
+    return proto3.util.equals(GetObservabilityReply, a, b);
+  }
+}
+
+/**
  * KV entry record.
  *
  * @generated from message legion.KvEntry

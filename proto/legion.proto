@@ -102,6 +102,10 @@ service Manager {
   rpc GetManagerConfigs (GetManagerConfigsRequest)
     returns (GetManagerConfigsReply);
 
+  // Returns observability status and recent manager-side logs/traces.
+  rpc GetObservability (GetObservabilityRequest)
+    returns (GetObservabilityReply);
+
   // Applies dynamic attribute updates to a node and triggers affected evaluations.
   rpc UpdateNodeDynamic (UpdateNodeDynamicRequest)
     returns (UpdateNodeDynamicReply);
@@ -1005,6 +1009,28 @@ message GetManagerConfigsReply {
 
   // Page size used to produce this reply.
   uint32 page_size = 4;
+}
+
+// Request payload for GetObservability.
+message GetObservabilityRequest {
+  // Maximum number of recent lines to return per stream.
+  //
+  // Default and max are manager-defined.
+  optional uint32 max_lines = 1;
+}
+
+// Reply payload for GetObservability.
+message GetObservabilityReply {
+  // True when manager started with `--o11y` and trace capture is active.
+  bool o11y_enabled = 1;
+
+  // Recent JSON log lines captured by manager.
+  repeated string logs = 2;
+
+  // Recent JSON trace/span events captured by manager.
+  //
+  // Empty when `o11y_enabled` is false.
+  repeated string traces = 3;
 }
 
 // Type discriminator for KV values.

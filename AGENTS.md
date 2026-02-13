@@ -36,6 +36,13 @@
 - Default manager address `http://127.0.0.1:4747`; insecure listener `http://127.0.0.1:4748`.
 - Dev TLS certs live in `configs/tls/`; do not use in production.
 
+## Tracing Guidance
+- Use `#[instrument]` on async or queue/loop boundaries (RPC handlers, scheduler entrypoints, eval worker loops).
+- Include stable IDs in span fields (`job_id`, `job_config_id`, `node_id`, `eval_id`, `worker_id`) and avoid logging giant JSON blobs.
+- Keep high-frequency heartbeats and polling logs at `debug` unless the event changes state, errors, or indicates data loss.
+- Never trace secrets/tokens (join tokens, raw cert material, KV lock IDs, env var values that may contain credentials).
+- Prefer concise lifecycle logs (`started`, `planned`, `applied`, `failed`, `recovered`) over per-iteration noise.
+
 ## Docs, Plan, and To Dos
 - Docs, Plan, and To Dos live in `docs/`
 - `docs/NEXT_UP.md` contains the immediate todos for the current task that the human developer is working on

@@ -1,5 +1,6 @@
-import { A } from '@solidjs/router'
-import { For, Show, type JSX } from 'solid-js'
+import { A, useNavigate } from '@solidjs/router'
+import { createEffect, For, onCleanup, onMount, Show, createSignal, type JSX } from 'solid-js'
+import { clearCommandPaletteIndexItems, setCommandPaletteIndexItems } from '../utils/commandPalette'
 
 export type IndexSortOption = { label: string; value: string }
 
@@ -34,6 +35,107 @@ type SharedIndexProps = {
 
 export default function SharedIndex(props: SharedIndexProps) {
   const totalPages = () => Math.max(1, Math.ceil(props.totalCount / props.pageSize))
+  const [selectedIndex, setSelectedIndex] = createSignal(-1)
+  const navigate = useNavigate()
+  let indexListRef: HTMLDivElement | undefined
+
+  createEffect(() => {
+    setCommandPaletteIndexItems(
+      props.items.map((item) => ({
+        id: `${props.entityLabel}:${item.id}`,
+        label: item.title,
+        subtitle: item.subtitle,
+        href: item.href,
+        source: props.entityLabel,
+      })),
+    )
+  })
+
+  createEffect(() => {
+    const total = props.items.length
+    if (total === 0) {
+      setSelectedIndex(-1)
+      return
+    }
+    setSelectedIndex((value) => (value >= total ? total - 1 : value))
+  })
+
+  const isTextInputTarget = (event: KeyboardEvent): boolean => {
+    const target = event.target as HTMLElement | null
+    if (!target || !target.closest) return false
+    if (target.closest('[data-command-palette]')) return true
+    if (target.closest('input, textarea, select')) return true
+    if (target.closest('[contenteditable]')) return true
+    return false
+  }
+
+  const scrollSelectedItemIntoView = () => {
+    const index = selectedIndex()
+    if (index < 0) return
+    const item = indexListRef?.querySelector(`[data-index-item="${index}"]`) as HTMLAnchorElement | null
+    item?.scrollIntoView({ block: 'nearest' })
+  }
+
+  const selectNextIndexItem = () => {
+    setSelectedIndex((value) => {
+      const total = props.items.length
+      if (total === 0) return -1
+      if (value < 0) return 0
+      return Math.min(value + 1, total - 1)
+    })
+  }
+
+  const selectPreviousIndexItem = () => {
+    setSelectedIndex((value) => {
+      const total = props.items.length
+      if (total === 0) return -1
+      if (value < 0) return total - 1
+      return Math.max(value - 1, 0)
+    })
+  }
+
+  const openSelectedIndexItem = () => {
+    const item = props.items[selectedIndex()]
+    if (!item) return
+    navigate(item.href)
+  }
+
+  const onGlobalIndexNavigation = (event: KeyboardEvent) => {
+    if (event.metaKey || event.ctrlKey || event.altKey) return
+    if (document.querySelector('[data-command-palette]')) return
+    if (isTextInputTarget(event)) return
+
+    const key = event.key.toLowerCase()
+    if (key === 'j' || event.key === 'ArrowDown') {
+      event.preventDefault()
+      selectNextIndexItem()
+      return
+    }
+    if (key === 'k' || event.key === 'ArrowUp') {
+      event.preventDefault()
+      selectPreviousIndexItem()
+      return
+    }
+    if (key === 'o' || event.key === 'Enter') {
+      event.preventDefault()
+      openSelectedIndexItem()
+    }
+  }
+
+  onMount(() => {
+    window.addEventListener('keydown', onGlobalIndexNavigation)
+    onCleanup(() => {
+      window.removeEventListener('keydown', onGlobalIndexNavigation)
+    })
+  })
+
+  createEffect(() => {
+    scrollSelectedItemIntoView()
+  })
+
+  onCleanup(() => {
+    clearCommandPaletteIndexItems()
+  })
 
   return (
     <section class="space-y-4 rounded border border-neutral-200 bg-white/90 p-4 shadow-[5px_5px_0_#d4d4d8] dark:border-neutral-800 dark:bg-neutral-900/60 dark:shadow-[5px_5px_0_#0b0d12]">
@@ -67,12 +169,14 @@ export default function SharedIndex(props: SharedIndexProps) {
       <Show when={!props.loading} fallback={<p class="text-sm text-neutral-500">Loading {props.entityLabel.toLowerCase()}…</p>}>
         <Show when={!props.error} fallback={<p class="text-sm text-rose-500">{props.error}</p>}>
           <Show when={props.items.length > 0} fallback={<p class="text-sm text-neutral-500">{props.emptyLabel}</p>}>
-            <div class="space-y-2">
+            <div class="space-y-2" ref={indexListRef} data-index-list>
               <For each={props.items}>
-                {(item) => (
+                {(item, index) => (
                   <A
                     href={item.href}
-                    class="block rounded border border-neutral-200 bg-white p-3 transition hover:border-neutral-400 dark:border-neutral-700 dark:bg-neutral-950"
+                    data-index-item={index()}
+                    class={`block rounded border p-3 transition ${selectedIndex() === index() ? 'border-neutral-900 bg-neutral-900 text-white dark:border-neutral-200 dark:bg-neutral-100 dark:text-neutral-900' : 'border-neutral-200 bg-white hover:border-neutral-400 dark:border-neutral-700 dark:bg-neutral-950'}`}
+                    onMouseEnter={() => setSelectedIndex(index())}
                   >
                     <div class="flex items-center justify-between gap-2">
                       <div>

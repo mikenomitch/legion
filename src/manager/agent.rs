@@ -231,6 +231,7 @@ async fn restart_eval_worker_after_exit(
 
     let worker_id = *next_worker_id;
     *next_worker_id = next_worker_id.saturating_add(1);
+    info!(worker_id, "Spawning replacement eval worker");
     spawn_eval_worker(join_set, store, worker_id);
     true
 }
@@ -251,6 +252,7 @@ async fn eval_worker_loop(store: Store, notifier: Arc<Notify>, worker_id: usize)
         match store.claim_eval() {
             Ok(Some(eval)) => {
                 error_backoff = ERROR_BACKOFF_MIN;
+                debug!(worker_id, eval_id = %eval.id, kind = %eval.kind, "Claimed eval");
                 handle_claimed_eval(&store, worker_id, &eval);
             }
             Ok(None) => {
@@ -392,10 +394,13 @@ mod tests {
 }
 
 fn handle_claimed_eval(store: &Store, worker_id: usize, eval: &Eval) {
+    let started = std::time::Instant::now();
     match eval.handle(store) {
         Ok(message) => {
             info!(
                 worker_id,
+                eval_id = %eval.id,
+                elapsed_ms = started.elapsed().as_millis() as u64,
                 "Eval {} handled successfully: {}", eval.id, message
             );
             if let Err(e) = store.complete_eval(&eval.id, true) {
@@ -403,7 +408,7 @@ fn handle_claimed_eval(store: &Store, worker_id: usize, eval: &Eval) {
             }
         }
         Err(e) => {
-            error!(worker_id, "Error handling eval {}: {:?}", eval.id, e);
+            error!(worker_id, eval_id = %eval.id, elapsed_ms = started.elapsed().as_millis() as u64, "Error handling eval {}: {:?}", eval.id, e);
             if let Err(complete_err) = store.complete_eval(&eval.id, false) {
                 error!(
                     worker_id,

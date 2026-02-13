@@ -61,7 +61,7 @@ async fn run_worker_with_manager(
 ) -> R<()> {
     let addr = format!("{DEF_MANAGER_HOSTNAME}:{DEF_WORKER_SERVER_PORT}").parse()?;
 
-    info!("Manager node address: {}", manager_addr);
+    info!(%manager_addr, %worker_type, "Worker connecting to manager");
 
     let client: ManagerClient<Channel> = connect_manager_with_retry(&manager_addr).await?;
 
@@ -131,6 +131,7 @@ async fn run_worker_with_manager(
         health_checks,
     )
     .await?;
+    info!(worker_name = %name, "Worker registered with manager");
 
     let heartbeat_fut = start_heartbeats(name.clone(), client.clone(), task_manager.clone());
     let checks_fut = start_node_checks(
@@ -241,6 +242,7 @@ async fn start_heartbeats(
     let mut client_clone = client.clone();
 
     loop {
+        let start = std::time::Instant::now();
         let (allocations, failures, allocation_health) = {
             let mut manager = task_manager.lock().expect("task manager");
             let failures = manager
@@ -263,7 +265,7 @@ async fn start_heartbeats(
         });
 
         let response = client_clone.heartbeat(req).await?;
-        info!("RESPONSE={:?}", response);
+        debug!(worker = %name, elapsed_ms = start.elapsed().as_millis() as u64, "Heartbeat acknowledged by manager");
         let reply = response.into_inner();
         if !reply.desired_allocations.is_empty() {
             let new_allocations = task_manager

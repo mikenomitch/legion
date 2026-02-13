@@ -1167,7 +1167,7 @@ impl Store {
     #[instrument(err, skip_all)]
     pub fn get_node_ids_and_heartbeats(&self) -> R<Vec<(String, String)>> {
         let conn = self.read_connection()?;
-        let sql = "SELECT id, last_heartbeat FROM node";
+        let sql = "SELECT id, last_heartbeat FROM node WHERE status = 'active'";
         let mut stmt = conn.prepare(sql)?;
         let nodes_id_and_hb =
             Self::collect_rows(stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?)?;
