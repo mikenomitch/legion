@@ -243,6 +243,19 @@ pub fn get_migrations() -> Migrations<'static> {
         )
         .down(""),
         M::up(
+            "CREATE TABLE IF NOT EXISTS allocation_epoch_partition (
+            scope_type STRING NOT NULL,
+            scope_id STRING NOT NULL,
+            epoch INTEGER NOT NULL,
+            PRIMARY KEY(scope_type, scope_id)
+        )",
+        )
+        .down("DROP TABLE IF EXISTS allocation_epoch_partition;"),
+        M::up(
+            "CREATE INDEX IF NOT EXISTS idx_allocation_epoch_partition_scope ON allocation_epoch_partition(scope_type, scope_id);",
+        )
+        .down("DROP INDEX IF EXISTS idx_allocation_epoch_partition_scope;"),
+        M::up(
             "CREATE TABLE IF NOT EXISTS plan_submission (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             job_config_id STRING NOT NULL,

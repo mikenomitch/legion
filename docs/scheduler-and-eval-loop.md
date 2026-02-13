@@ -72,14 +72,43 @@ Modes:
 
 ## Placement Application and Conflict Safety
 
-Placement apply uses allocation epochs:
+Placement apply uses optimistic concurrency with partitioned epochs.
 
-1. Read current `allocation_epoch`.
-2. Write `plan_submission` with expected epoch.
-3. Apply only if epoch still matches.
-4. If stale, reject plan with conflict.
+### Job-config scoped epochs
 
-`Eval::plan_with_conflict_retries` retries conflict failures up to 3 times.
+Legion maintains an epoch per `job_config_id` in `allocation_epoch_partition`.
+
+1. Scheduler reads the current epoch for the target job config.
+2. Scheduler writes `plan_submission.expected_epoch` with that value.
+3. Apply path re-reads the current epoch for that same job config in-transaction.
+4. Apply proceeds only when epochs still match.
+5. On successful allocation changes, only that job config epoch is bumped.
+
+This keeps conflicts localized so unrelated jobs can schedule in parallel without invalidating each other's plans.
+
+### Conflict handling
+
+A stale epoch causes plan rejection with a conflict error. The eval handler retries conflicts with bounded attempts via `Eval::plan_with_conflict_retries`.
+
+### Tuning conflict retries
+
+Use manager `schedulerSettings.plan_conflict_max_retries` to tune retry behavior for high contention.
+
+- default: `3`
+- minimum: `1`
+- maximum: `20`
+
+Example manager config:
+
+```jsonnet
+{
+  schedulerSettings: {
+    plan_conflict_max_retries: 8,
+  },
+}
+```
+
+If you observe frequent conflict retries, increase this setting modestly and also scale by partitioning workload across more jobs/configs and spreading eval traffic.
 
 ## Node Candidate Construction
 

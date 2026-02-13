@@ -9,4 +9,7 @@
   evalThreads: 4,
   schedulingPolicy: "bin_pack",
   defaultPriority: 50,
+  schedulerSettings: {
+    plan_conflict_max_retries: 3,
+  },
 }

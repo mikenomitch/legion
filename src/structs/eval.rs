@@ -204,7 +204,8 @@ impl Eval {
 
         let scheduler = Scheduler::new(store)?;
         let excluded = self.excluded_nodes_for_mode(&mode);
-        let outcome = self.plan_with_conflict_retries(&scheduler, mode, excluded.as_ref())?;
+        let outcome =
+            self.plan_with_conflict_retries(store, &scheduler, mode, excluded.as_ref())?;
 
         store.update_task_statuses_for_allocations(&outcome.allocations)?;
         dispatch_allocations(store, &outcome.allocations)?;
@@ -221,13 +222,14 @@ impl Eval {
 
     fn plan_with_conflict_retries(
         &self,
+        store: &Store,
         scheduler: &Scheduler,
         mode: PlanMode,
         excluded: Option<&HashSet<String>>,
     ) -> R<PlanOutcome> {
-        const MAX_PLAN_RETRIES: usize = 3;
+        let max_plan_retries = Self::max_plan_conflict_retries(store);
 
-        for attempt in 1..=MAX_PLAN_RETRIES {
+        for attempt in 1..=max_plan_retries {
             match scheduler.plan_and_apply_with_exclusions(
                 &self.job_config_id,
                 mode.clone(),
@@ -239,10 +241,10 @@ impl Eval {
                         return Err(error);
                     }
 
-                    if attempt < MAX_PLAN_RETRIES {
+                    if attempt < max_plan_retries {
                         warn!(
                             attempt,
-                            max_attempts = MAX_PLAN_RETRIES,
+                            max_attempts = max_plan_retries,
                             error = %error,
                             "Plan submission rejected due to stale state; retrying"
                         );
@@ -251,7 +253,7 @@ impl Eval {
 
                     return Err(error.context(format!(
                         "plan submission failed after {} attempts",
-                        MAX_PLAN_RETRIES
+                        max_plan_retries
                     )));
                 }
             }
@@ -263,6 +265,19 @@ impl Eval {
     fn is_conflict_error(error: &anyhow::Error) -> bool {
         StorageError::from_anyhow(error)
             .is_some_and(|storage| matches!(storage, StorageError::Conflict { .. }))
+    }
+
+    fn max_plan_conflict_retries(store: &Store) -> usize {
+        const DEFAULT_RETRIES: usize = 3;
+        const MAX_RETRIES: usize = 20;
+
+        store
+            .scheduler_settings
+            .as_ref()
+            .and_then(|settings| settings.get("plan_conflict_max_retries"))
+            .and_then(|value| value.as_u64())
+            .map(|value| value.clamp(1, MAX_RETRIES as u64) as usize)
+            .unwrap_or(DEFAULT_RETRIES)
     }
 
     fn schedule_batch_follow_up(&self, store: &Store) -> R<()> {
@@ -347,6 +362,35 @@ mod tests {
 
     fn find_node<'a>(ledger: &'a [LedgerEntry], node_id: &str) -> Option<&'a LedgerEntry> {
         ledger.iter().find(|entry| entry.node.id == node_id)
+    }
+    #[test]
+    fn max_plan_conflict_retries_defaults_to_three() -> R<()> {
+        let store = setup_store()?;
+        assert_eq!(Eval::max_plan_conflict_retries(&store), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn max_plan_conflict_retries_respects_scheduler_settings() -> R<()> {
+        let store_dir = Builder::new()
+            .prefix("legion-eval-")
+            .tempdir()
+            .context("error creating temp store directory")?
+            .keep();
+        let store_config = ManagerConfigFull {
+            store_path: store_dir
+                .to_str()
+                .context("error parsing store path")?
+                .to_string(),
+            scheduler_settings: Some(json!({ "plan_conflict_max_retries": 9 })),
+            ..Default::default()
+        };
+
+        let store = Store::start_storage(&store_config)?;
+        store.reset_all_tables()?;
+        assert_eq!(Eval::max_plan_conflict_retries(&store), 9);
+
+        Ok(())
     }
 
     fn make_node(id: &str, zone: &str) -> Node {

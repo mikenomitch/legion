@@ -64,7 +64,8 @@ struct AllocationConstraintState {
 #[derive(Debug, Clone)]
 pub struct PlanSubmission {
     pub id: i64,
-    pub expected_epoch: i64,
+    pub job_config_id: String,
+    pub expected_job_epoch: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -484,27 +485,63 @@ impl Store {
         Ok(self.read_model_reader()?.nodes.values().cloned().collect())
     }
 
-    pub fn allocation_epoch(&self) -> R<i64> {
+    pub fn allocation_epoch_for_job_config(&self, job_config_id: &str) -> R<i64> {
         let conn = self.read_connection()?;
-        let epoch = conn.query_row(
-            "SELECT epoch FROM allocation_epoch WHERE singleton = 1;",
-            [],
+        let epoch: Option<i64> = conn
+            .query_row(
+                "SELECT epoch FROM allocation_epoch_partition WHERE scope_type = 'job_config' AND scope_id = ?1;",
+                [job_config_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(epoch.unwrap_or(0))
+    }
+
+    fn ensure_job_config_epoch_tx(&self, tx: &Transaction<'_>, job_config_id: &str) -> R<()> {
+        tx.execute(
+            "INSERT OR IGNORE INTO allocation_epoch_partition(scope_type, scope_id, epoch) VALUES ('job_config', ?1, 0);",
+            [job_config_id],
+        )?;
+        Ok(())
+    }
+
+    fn bump_job_config_epoch_tx(&self, tx: &Transaction<'_>, job_config_id: &str) -> R<i64> {
+        self.ensure_job_config_epoch_tx(tx, job_config_id)?;
+        tx.execute(
+            "UPDATE allocation_epoch_partition SET epoch = epoch + 1 WHERE scope_type = 'job_config' AND scope_id = ?1;",
+            [job_config_id],
+        )?;
+        let epoch = tx.query_row(
+            "SELECT epoch FROM allocation_epoch_partition WHERE scope_type = 'job_config' AND scope_id = ?1;",
+            [job_config_id],
             |row| row.get(0),
         )?;
         Ok(epoch)
     }
 
-    fn bump_allocation_epoch_tx(&self, tx: &Transaction<'_>) -> R<i64> {
-        tx.execute(
-            "UPDATE allocation_epoch SET epoch = epoch + 1 WHERE singleton = 1;",
-            [],
-        )?;
-        let epoch = tx.query_row(
-            "SELECT epoch FROM allocation_epoch WHERE singleton = 1;",
-            [],
-            |row| row.get(0),
-        )?;
-        Ok(epoch)
+    fn bump_job_config_epochs_tx(
+        &self,
+        tx: &Transaction<'_>,
+        job_config_ids: &HashSet<String>,
+    ) -> R<()> {
+        for job_config_id in job_config_ids {
+            self.bump_job_config_epoch_tx(tx, job_config_id)?;
+        }
+        Ok(())
+    }
+
+    // IMPORTANT: any transaction that mutates allocation rows must call this
+    // (or bump_job_config_epoch_tx) before commit so stale plans are rejected.
+    fn bump_epochs_for_allocations_tx(
+        &self,
+        tx: &Transaction<'_>,
+        allocations: &[Allocation],
+    ) -> R<()> {
+        let job_config_ids: HashSet<String> = allocations
+            .iter()
+            .map(|alloc| alloc.job_config_id.clone())
+            .collect();
+        self.bump_job_config_epochs_tx(tx, &job_config_ids)
     }
 
     pub fn insert_plan_submission(
@@ -512,34 +549,39 @@ impl Store {
         job_config_id: &str,
         mode: &str,
         placements: &[(String, i64)],
-        expected_epoch: i64,
+        expected_job_epoch: i64,
     ) -> R<PlanSubmission> {
         let created_at = OffsetDateTime::now_utc().format(&Rfc3339)?;
         let placements_json = serde_json::to_string(placements)?;
         let conn = self.write_connection()?;
         let id = conn.query_row(
             "INSERT INTO plan_submission(job_config_id, mode, placements, expected_epoch, status, created_at) VALUES (?1, ?2, ?3, ?4, 'queued', ?5) RETURNING id;",
-            params![job_config_id, mode, placements_json, expected_epoch, created_at],
+            params![job_config_id, mode, placements_json, expected_job_epoch, created_at],
             |row| row.get(0),
         )?;
 
-        Ok(PlanSubmission { id, expected_epoch })
+        Ok(PlanSubmission {
+            id,
+            job_config_id: job_config_id.to_string(),
+            expected_job_epoch,
+        })
     }
 
     pub fn apply_plan_submission(&self, submission: &PlanSubmission) -> R<PlanApplyOutcome> {
         let mut conn = self.write_connection()?;
         let tx = conn.transaction()?;
 
+        self.ensure_job_config_epoch_tx(&tx, &submission.job_config_id)?;
         let latest_epoch: i64 = tx.query_row(
-            "SELECT epoch FROM allocation_epoch WHERE singleton = 1;",
-            [],
+            "SELECT epoch FROM allocation_epoch_partition WHERE scope_type = 'job_config' AND scope_id = ?1;",
+            [submission.job_config_id.as_str()],
             |row| row.get(0),
         )?;
 
-        if latest_epoch != submission.expected_epoch {
+        if latest_epoch != submission.expected_job_epoch {
             let reason = format!(
-                "plan epoch {} is stale; latest epoch is {}",
-                submission.expected_epoch, latest_epoch
+                "plan epoch for job config {} is stale; expected {}, latest {}",
+                submission.job_config_id, submission.expected_job_epoch, latest_epoch
             );
             tx.execute(
                 "UPDATE plan_submission SET status = 'rejected', rejection_reason = ?1 WHERE id = ?2;",
@@ -586,7 +628,7 @@ impl Store {
                 tx.commit()?;
                 return Ok(PlanApplyOutcome::Rejected {
                     reason,
-                    latest_epoch: submission.expected_epoch,
+                    latest_epoch,
                 });
             }
 
@@ -599,7 +641,7 @@ impl Store {
         }
 
         if !allocations.is_empty() {
-            self.bump_allocation_epoch_tx(&tx)?;
+            self.bump_epochs_for_allocations_tx(&tx, &allocations)?;
         }
 
         tx.execute(
@@ -1142,12 +1184,11 @@ impl Store {
             return Ok(vec![]);
         }
 
-        let conn = self.write_connection()?;
-        conn.execute("DELETE FROM allocation WHERE node_id = ?;", [node_id])?;
-        conn.execute(
-            "UPDATE allocation_epoch SET epoch = epoch + 1 WHERE singleton = 1;",
-            [],
-        )?;
+        let mut conn = self.write_connection()?;
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM allocation WHERE node_id = ?;", [node_id])?;
+        self.bump_epochs_for_allocations_tx(&tx, &allocs)?;
+        tx.commit()?;
 
         self.cache_clear_allocations_for_node(node_id)?;
 
@@ -2121,10 +2162,6 @@ impl Store {
                 (to_job_config_id, new_task_id, allocation.id),
             )?;
         }
-        // Migration changes allocation state, so bump epoch to invalidate stale planners.
-        self.bump_allocation_epoch_tx(&tx)?;
-        tx.commit()?;
-
         let updated_allocations = allocations
             .into_iter()
             .map(|mut allocation| {
@@ -2137,6 +2174,12 @@ impl Store {
                 allocation
             })
             .collect::<Vec<_>>();
+
+        // Allocation migration mutates allocation ownership and must invalidate
+        // plan submissions for both source and destination job configs.
+        self.bump_job_config_epoch_tx(&tx, from_job_config_id)?;
+        self.bump_epochs_for_allocations_tx(&tx, &updated_allocations)?;
+        tx.commit()?;
 
         self.cache_remove_allocations(&updated_allocations)?;
         self.cache_add_allocations(&updated_allocations)?;
@@ -2285,7 +2328,7 @@ impl Store {
         let mut conn = self.write_connection()?;
         let tx = conn.transaction()?;
         let allocation = self.insert_allocation(&tx, node_id, task_id)?;
-        self.bump_allocation_epoch_tx(&tx)?;
+        self.bump_epochs_for_allocations_tx(&tx, std::slice::from_ref(&allocation))?;
         tx.commit()?;
 
         self.cache_add_allocations(std::slice::from_ref(&allocation))?;
@@ -2293,6 +2336,8 @@ impl Store {
         Ok(allocation)
     }
 
+    // NOTE: this helper only inserts allocation rows; callers must bump
+    // job-config epochs for affected configs before committing the tx.
     fn insert_allocation(
         &self,
         tx: &Transaction<'_>,
@@ -2300,7 +2345,8 @@ impl Store {
         task_id: i64,
     ) -> R<Allocation> {
         // This helper writes a single allocation row. Callers mutating allocation state
-        // must call bump_allocation_epoch_tx in the same transaction before commit.
+        // must call bump_epochs_for_allocations_tx (or bump_job_config_epoch_tx)
+        // in the same transaction before commit.
         let (job_config_id, resources): (String, Value) = tx.query_row(
             "SELECT job_config_id, resources FROM task_config WHERE id = ?;",
             [task_id],
@@ -2403,7 +2449,7 @@ impl Store {
             allocations.push(allocation);
         }
 
-        self.bump_allocation_epoch_tx(&tx)?;
+        self.bump_epochs_for_allocations_tx(&tx, &allocations)?;
         tx.commit()?;
 
         self.cache_add_allocations(&allocations)?;
@@ -2596,12 +2642,11 @@ impl Store {
             return Ok(None);
         };
 
-        let conn = self.write_connection()?;
-        conn.execute("DELETE FROM allocation WHERE id = ?;", [allocation_id])?;
-        conn.execute(
-            "UPDATE allocation_epoch SET epoch = epoch + 1 WHERE singleton = 1;",
-            [],
-        )?;
+        let mut conn = self.write_connection()?;
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM allocation WHERE id = ?;", [allocation_id])?;
+        self.bump_job_config_epoch_tx(&tx, &allocation.job_config_id)?;
+        tx.commit()?;
 
         self.cache_remove_allocations(std::slice::from_ref(&allocation))?;
 
@@ -2640,7 +2685,8 @@ impl Store {
     #[instrument(err, skip_all)]
     pub fn remove_allocs_for_job(&self, job_id: &str) -> R<()> {
         let allocations = self.allocs_for_job(job_id)?;
-        let conn = self.write_connection()?;
+        let mut conn = self.write_connection()?;
+        let tx = conn.transaction()?;
         let sql = r#"
         DELETE FROM allocation
         WHERE job_config_id IN (
@@ -2650,11 +2696,9 @@ impl Store {
 
         let params = named_params! { ":job_id": job_id };
 
-        conn.execute(sql, params)?;
-        conn.execute(
-            "UPDATE allocation_epoch SET epoch = epoch + 1 WHERE singleton = 1;",
-            [],
-        )?;
+        tx.execute(sql, params)?;
+        self.bump_epochs_for_allocations_tx(&tx, &allocations)?;
+        tx.commit()?;
 
         self.cache_remove_allocations(&allocations)?;
 
@@ -2668,15 +2712,14 @@ impl Store {
             return Ok(Vec::new());
         }
 
-        let conn = self.write_connection()?;
-        conn.execute(
+        let mut conn = self.write_connection()?;
+        let tx = conn.transaction()?;
+        tx.execute(
             "DELETE FROM allocation WHERE job_config_id = ?;",
             [job_config_id],
         )?;
-        conn.execute(
-            "UPDATE allocation_epoch SET epoch = epoch + 1 WHERE singleton = 1;",
-            [],
-        )?;
+        self.bump_job_config_epoch_tx(&tx, job_config_id)?;
+        tx.commit()?;
 
         self.cache_remove_allocations(&allocations)?;
 
@@ -4903,6 +4946,270 @@ mod tests {
             claimed.id, "1",
             "higher-priority stale eval should run first"
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn plan_submission_conflict_is_scoped_to_job_config_epoch() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "ready"))?;
+        store.insert_node(make_node_msg("node-b", "ready"))?;
+
+        let job_one = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "job-one".into(),
+            tasks: vec![TaskConfig::new("task-one", "noop")],
+            version: None,
+        };
+        let job_two = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "job-two".into(),
+            tasks: vec![TaskConfig::new("task-two", "noop")],
+            version: None,
+        };
+
+        let submission = [Submission {
+            path: "job.jsonnet".into(),
+            content: "job".into(),
+            is_primary: true,
+        }];
+
+        store.handle_job_submit(&job_one, &submission)?;
+        store.handle_job_submit(&job_two, &submission)?;
+
+        let job_one_config_id = store.get_job_config("job-one")?.id();
+        let job_two_config_id = store.get_job_config("job-two")?.id();
+        let task_one_id = task_id_for(&store, "task-one", "job-one")?;
+        let task_two_id = task_id_for(&store, "task-two", "job-two")?;
+
+        let job_one_epoch = store.allocation_epoch_for_job_config(&job_one_config_id)?;
+        let job_two_epoch = store.allocation_epoch_for_job_config(&job_two_config_id)?;
+
+        let job_one_plan = store.insert_plan_submission(
+            &job_one_config_id,
+            "fresh",
+            &[("node-a".to_string(), task_one_id)],
+            job_one_epoch,
+        )?;
+        let job_two_plan = store.insert_plan_submission(
+            &job_two_config_id,
+            "fresh",
+            &[("node-b".to_string(), task_two_id)],
+            job_two_epoch,
+        )?;
+
+        assert!(matches!(
+            store.apply_plan_submission(&job_one_plan)?,
+            PlanApplyOutcome::Applied(_)
+        ));
+        assert!(matches!(
+            store.apply_plan_submission(&job_two_plan)?,
+            PlanApplyOutcome::Applied(_)
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn place_alloc_bumps_job_config_epoch() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "ready"))?;
+
+        let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "job-epoch".into(),
+            tasks: vec![TaskConfig::new("task", "noop")],
+            version: None,
+        };
+        store.handle_job_submit(
+            &job,
+            &[Submission {
+                path: "job.jsonnet".into(),
+                content: "job".into(),
+                is_primary: true,
+            }],
+        )?;
+
+        let job_config_id = store.get_job_config("job-epoch")?.id();
+        let task_id = task_id_for(&store, "task", "job-epoch")?;
+        let before = store.allocation_epoch_for_job_config(&job_config_id)?;
+        store.place_alloc("node-a", task_id)?;
+        let after = store.allocation_epoch_for_job_config(&job_config_id)?;
+
+        assert_eq!(after, before + 1);
+        Ok(())
+    }
+
+    #[test]
+    fn migrate_allocations_bumps_source_and_destination_job_epochs() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "ready"))?;
+
+        let job_v1 = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "job-migrate".into(),
+            tasks: vec![TaskConfig::new("task", "noop")],
+            version: None,
+        };
+        store.handle_job_submit(
+            &job_v1,
+            &[Submission {
+                path: "v1.jsonnet".into(),
+                content: "v1".into(),
+                is_primary: true,
+            }],
+        )?;
+
+        let v1_id = store.get_job_config("job-migrate")?.id();
+        let v1_task = task_id_for(&store, "task", "job-migrate")?;
+        store.place_alloc("node-a", v1_task)?;
+
+        let mut v2_task = TaskConfig::new("task", "noop");
+        v2_task.config = json!({"changed": true});
+        let job_v2 = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "job-migrate".into(),
+            tasks: vec![v2_task],
+            version: None,
+        };
+        store.handle_job_submit(
+            &job_v2,
+            &[Submission {
+                path: "v2.jsonnet".into(),
+                content: "v2".into(),
+                is_primary: true,
+            }],
+        )?;
+        let v2_id = store.get_job_config("job-migrate")?.id();
+        assert_ne!(v1_id, v2_id);
+
+        let v1_before = store.allocation_epoch_for_job_config(&v1_id)?;
+        let v2_before = store.allocation_epoch_for_job_config(&v2_id)?;
+
+        let migrated = store.migrate_allocations_to_job_config(&v1_id, &v2_id)?;
+        assert_eq!(migrated.len(), 1);
+
+        let v1_after = store.allocation_epoch_for_job_config(&v1_id)?;
+        let v2_after = store.allocation_epoch_for_job_config(&v2_id)?;
+
+        assert_eq!(v1_after, v1_before + 1);
+        assert_eq!(v2_after, v2_before + 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn plan_submission_rejects_stale_epoch_for_same_job_config() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "ready"))?;
+
+        let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "job-stale".into(),
+            tasks: vec![TaskConfig::new("task", "noop")],
+            version: None,
+        };
+        store.handle_job_submit(
+            &job,
+            &[Submission {
+                path: "job.jsonnet".into(),
+                content: "job".into(),
+                is_primary: true,
+            }],
+        )?;
+
+        let job_config_id = store.get_job_config("job-stale")?.id();
+        let task_id = task_id_for(&store, "task", "job-stale")?;
+        let expected_epoch = store.allocation_epoch_for_job_config(&job_config_id)?;
+
+        let first = store.insert_plan_submission(
+            &job_config_id,
+            "fresh",
+            &[("node-a".to_string(), task_id)],
+            expected_epoch,
+        )?;
+        let second = store.insert_plan_submission(
+            &job_config_id,
+            "fresh",
+            &[("node-a".to_string(), task_id)],
+            expected_epoch,
+        )?;
+
+        assert!(matches!(
+            store.apply_plan_submission(&first)?,
+            PlanApplyOutcome::Applied(_)
+        ));
+
+        match store.apply_plan_submission(&second)? {
+            PlanApplyOutcome::Rejected { .. } => {}
+            PlanApplyOutcome::Applied(_) => {
+                panic!("expected stale plan to be rejected");
+            }
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn plan_submission_rejects_due_to_constraints_with_latest_epoch() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "ready"))?;
+        store.insert_node(make_node_msg("node-b", "ready"))?;
+
+        let constrained_task = {
+            let mut task = TaskConfig::new("task", "noop");
+            task.constraints = json!({ "node_id": "node-a" });
+            task
+        };
+        let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "job-constraints".into(),
+            tasks: vec![constrained_task],
+            version: None,
+        };
+        store.handle_job_submit(
+            &job,
+            &[Submission {
+                path: "job.jsonnet".into(),
+                content: "job".into(),
+                is_primary: true,
+            }],
+        )?;
+
+        let job_config_id = store.get_job_config("job-constraints")?.id();
+        let task_id = task_id_for(&store, "task", "job-constraints")?;
+        let expected_job_epoch = store.allocation_epoch_for_job_config(&job_config_id)?;
+
+        let submission = store.insert_plan_submission(
+            &job_config_id,
+            "fresh",
+            &[("node-b".to_string(), task_id)],
+            expected_job_epoch,
+        )?;
+        let outcome = store.apply_plan_submission(&submission)?;
+        match outcome {
+            PlanApplyOutcome::Rejected {
+                reason,
+                latest_epoch,
+            } => {
+                assert!(
+                    reason.contains("does not satisfy constraints"),
+                    "unexpected rejection reason: {reason}"
+                );
+                assert_eq!(latest_epoch, expected_job_epoch);
+            }
+            PlanApplyOutcome::Applied(_) => {
+                bail!("expected constraint-based rejection");
+            }
+        }
 
         Ok(())
     }
