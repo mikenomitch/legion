@@ -2121,6 +2121,8 @@ impl Store {
                 (to_job_config_id, new_task_id, allocation.id),
             )?;
         }
+        // Migration changes allocation state, so bump epoch to invalidate stale planners.
+        self.bump_allocation_epoch_tx(&tx)?;
         tx.commit()?;
 
         let updated_allocations = allocations
@@ -2283,6 +2285,7 @@ impl Store {
         let mut conn = self.write_connection()?;
         let tx = conn.transaction()?;
         let allocation = self.insert_allocation(&tx, node_id, task_id)?;
+        self.bump_allocation_epoch_tx(&tx)?;
         tx.commit()?;
 
         self.cache_add_allocations(std::slice::from_ref(&allocation))?;
@@ -2296,6 +2299,8 @@ impl Store {
         node_id: &str,
         task_id: i64,
     ) -> R<Allocation> {
+        // This helper writes a single allocation row. Callers mutating allocation state
+        // must call bump_allocation_epoch_tx in the same transaction before commit.
         let (job_config_id, resources): (String, Value) = tx.query_row(
             "SELECT job_config_id, resources FROM task_config WHERE id = ?;",
             [task_id],
