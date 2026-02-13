@@ -4,8 +4,8 @@ use crate::manager::join_server::get_insecure_manager_service;
 use crate::manager::server::ManagerAgentService;
 use crate::storage::store::Store;
 use crate::structs::{
-    manager_server::ManagerServer, Eval, ManagerConfig, Node, WorkerConfig as WorkerConfigMsg,
-    WorkerConfigAlt,
+    manager_server::ManagerServer, Eval, JobConfig, KvValueType, ManagerConfig, Node, NodeMsg,
+    Submission, TaskConfig, WorkerConfig as WorkerConfigMsg, WorkerConfigAlt,
 };
 use crate::worker::agent::run_worker_local;
 
@@ -15,6 +15,7 @@ use jsonnet::JsonnetVm;
 use std::fs;
 use std::sync::Arc;
 use std::time::Duration;
+use time::OffsetDateTime;
 use tokio::sync::Notify;
 use tokio::task::JoinSet;
 use tonic::transport::{Identity, Server, ServerTlsConfig};
@@ -40,6 +41,7 @@ pub async fn run_manager(config: ManagerConfig, run_worker: bool) -> R<()> {
         warn!(error = ?err, "Failed pruning retained rollout history");
     }
     load_initial_data(&store, &config).await?;
+    seed_ui_test_data(&store)?;
     store.upsert_manager_config(&manager_node_id, &full_config)?;
 
     // Spawn a separate grpc server for non-TLS calls
@@ -114,6 +116,112 @@ pub async fn run_manager(config: ManagerConfig, run_worker: bool) -> R<()> {
         eval_loop_fut,
         worker_fut
     );
+
+    Ok(())
+}
+
+fn should_seed_ui_test_data() -> bool {
+    std::env::var("LEGION_SEED_UI_DATA")
+        .ok()
+        .map(|value| {
+            let normalized = value.trim().to_ascii_lowercase();
+            matches!(normalized.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false)
+}
+
+#[instrument(err, skip_all)]
+fn seed_ui_test_data(store: &Store) -> R<()> {
+    if !should_seed_ui_test_data() {
+        return Ok(());
+    }
+
+    if !store.get_nodes()?.is_empty() || !store.get_jobs()?.is_empty() {
+        info!("Skipping UI seed data because the store already has nodes or jobs");
+        return Ok(());
+    }
+
+    info!("Seeding manager with UI preview data");
+    let now = OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339)?;
+    store.insert_node(NodeMsg {
+        id: "demo-worker-a".into(),
+        pool: "default".into(),
+        status: "active".into(),
+        availability: "available".into(),
+        config_attrs: json!({"region": "us-east-1", "instanceType": "c7g.large"}).to_string(),
+        fingerprint_attrs: json!({"os": "linux", "arch": "arm64"}).to_string(),
+        dynamic_attrs: json!({"drain": false}).to_string(),
+        health_checks: json!([
+            {
+                "name": "Heartbeat",
+                "status": "passing",
+                "output": "worker heartbeat healthy"
+            }
+        ])
+        .to_string(),
+        last_heartbeat: now.clone(),
+    })?;
+    store.insert_node(NodeMsg {
+        id: "demo-worker-b".into(),
+        pool: "batch".into(),
+        status: "active".into(),
+        availability: "available".into(),
+        config_attrs: json!({"region": "us-west-2", "instanceType": "m7i.large"}).to_string(),
+        fingerprint_attrs: json!({"os": "linux", "arch": "amd64"}).to_string(),
+        dynamic_attrs: json!({"drain": false}).to_string(),
+        health_checks: json!([
+            {
+                "name": "Disk",
+                "status": "passing",
+                "output": "83% free"
+            }
+        ])
+        .to_string(),
+        last_heartbeat: now,
+    })?;
+
+    let job = JobConfig {
+        name: "ui-preview-demo".into(),
+        tasks: vec![
+            TaskConfig::new("api", "noop"),
+            TaskConfig::new("worker", "noop"),
+        ],
+        rollout: None,
+        rollout_by_group: Default::default(),
+        version: None,
+    };
+
+    let submit_outcome = store.handle_job_submit(
+        &job,
+        &[Submission {
+            path: "seed://ui-preview".into(),
+            content: "seeded ui preview job".into(),
+            is_primary: true,
+        }],
+    )?;
+    store.enqueue_eval(
+        "job_submit",
+        Some(&job.name),
+        Some(submit_outcome.job_config_id()),
+        None,
+        None,
+    )?;
+
+    let _ = store.put_kv(
+        "preview/config/theme",
+        "dark",
+        KvValueType::String,
+        None,
+        None,
+    )?;
+    let _ = store.put_kv(
+        "preview/flags",
+        &json!({"apiExplorer": true, "seededAt": OffsetDateTime::now_utc().unix_timestamp()})
+            .to_string(),
+        KvValueType::Json,
+        None,
+        None,
+    )?;
 
     Ok(())
 }
@@ -388,6 +496,39 @@ mod tests {
 
         join_set.abort_all();
         while join_set.join_next().await.is_some() {}
+
+        Ok(())
+    }
+
+    #[test]
+    fn should_seed_ui_test_data_parses_truthy_values() {
+        std::env::set_var("LEGION_SEED_UI_DATA", "true");
+        assert!(should_seed_ui_test_data());
+
+        std::env::set_var("LEGION_SEED_UI_DATA", "1");
+        assert!(should_seed_ui_test_data());
+
+        std::env::set_var("LEGION_SEED_UI_DATA", "on");
+        assert!(should_seed_ui_test_data());
+
+        std::env::set_var("LEGION_SEED_UI_DATA", "false");
+        assert!(!should_seed_ui_test_data());
+
+        std::env::remove_var("LEGION_SEED_UI_DATA");
+        assert!(!should_seed_ui_test_data());
+    }
+
+    #[test]
+    fn seed_ui_test_data_inserts_preview_records_when_store_is_empty() -> R<()> {
+        let store = setup_store()?;
+
+        std::env::set_var("LEGION_SEED_UI_DATA", "true");
+        seed_ui_test_data(&store)?;
+        std::env::remove_var("LEGION_SEED_UI_DATA");
+
+        assert!(!store.get_nodes()?.is_empty());
+        assert!(!store.get_jobs()?.is_empty());
+        assert!(store.get_kv("preview/config/theme")?.is_some());
 
         Ok(())
     }
