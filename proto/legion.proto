@@ -33,6 +33,21 @@ service Manager {
   // and enqueue reconciliation work.
   rpc RunJob (RunJobRequest) returns (RunJobReply);
 
+  // Creates a new template version from source submissions.
+  //
+  // Templates store unrendered Jsonnet so users can later fill variable inputs
+  // and submit rendered jobs without editing Jsonnet manually.
+  rpc CreateTemplate (CreateTemplateRequest) returns (CreateTemplateReply);
+
+  // Lists templates, returning each known version.
+  rpc ListTemplates (ListTemplatesRequest) returns (ListTemplatesReply);
+
+  // Returns one template version with its source submissions and UI schema.
+  rpc GetTemplateVersion (GetTemplateVersionRequest) returns (GetTemplateVersionReply);
+
+  // Renders a template version with variables and submits the resulting job.
+  rpc RunTemplate (RunTemplateRequest) returns (RunTemplateReply);
+
   // Returns the submitted source files (submissions) associated with the latest job config.
   rpc GetJobSpec (GetJobSpecRequest) returns (GetJobSpecReply);
 
@@ -281,6 +296,11 @@ message RunJobRequest {
   //
   // Default: `false`.
   bool force_reschedule = 4;
+
+  // Optional source template reference for provenance/audit tracking.
+  //
+  // When set, manager stores this reference on the created job spec version.
+  optional TemplateReference template = 5;
 }
 
 // Reply payload for RunJob.
@@ -294,6 +314,155 @@ message RunJobReply {
   // - `"Job config unchanged; no update needed"`
   // - `"Job config unchanged; forced reschedule queued"`
   string message = 1;
+}
+
+// A specific template version reference.
+message TemplateReference {
+  // Template ID/name.
+  string template_id = 1;
+
+  // Template version number.
+  uint32 version = 2;
+}
+
+// One variable input declaration for template-driven job submission UIs.
+message TemplateVariable {
+  // Stable variable key used as the Jsonnet variable name.
+  string key = 1;
+
+  // Input type for UI rendering.
+  //
+  // Recommended values: `string`, `text`, `toggle`, `multi_select`,
+  // `number`, `code`.
+  string input_type = 2;
+
+  // Human-friendly label shown in form UIs.
+  string label = 3;
+
+  // Help text shown near this variable.
+  string description = 4;
+
+  // When true, the submit UI requires a value.
+  bool required = 5;
+
+  // Optional JSON-encoded default value.
+  optional string default_value_json = 6;
+
+  // Optional JSON-encoded option list for pickers (for example multi-select).
+  optional string options_json = 7;
+
+  // Optional JSON-encoded validation constraints (min/max/regex/etc).
+  optional string validation_json = 8;
+}
+
+// Template metadata and variable schema.
+message TemplateSpec {
+  // Display name for the template.
+  string name = 1;
+
+  // End-user guidance for what this template does.
+  string description = 2;
+
+  // Variables exposed to non-advanced users in submit UIs.
+  repeated TemplateVariable variables = 3;
+}
+
+// Stored template version.
+message TemplateVersion {
+  // Template ID/name.
+  string template_id = 1;
+
+  // Version number.
+  uint32 version = 2;
+
+  // Metadata + variable declarations for this version.
+  TemplateSpec spec = 3;
+
+  // Unrendered submissions (usually Jsonnet source files).
+  repeated Submission submissions = 4;
+
+  // RFC3339 creation timestamp.
+  string created_at = 5;
+}
+
+// Request payload for CreateTemplate.
+message CreateTemplateRequest {
+  // Template ID/name (stable across versions).
+  string template_id = 1;
+
+  // Optional explicit metadata schema.
+  //
+  // When omitted, manager may derive this from template source annotations.
+  optional TemplateSpec spec = 2;
+
+  // Unrendered source submissions to store for this version.
+  repeated Submission submissions = 3;
+}
+
+// Reply payload for CreateTemplate.
+message CreateTemplateReply {
+  // Created template version record.
+  TemplateVersion template = 1;
+}
+
+// Request payload for ListTemplates.
+message ListTemplatesRequest {
+  // Optional template-id filter.
+  optional string template_id = 1;
+}
+
+// Reply payload for ListTemplates.
+message ListTemplatesReply {
+  // Matching template versions in newest-first order.
+  repeated TemplateVersion templates = 1;
+}
+
+// Request payload for GetTemplateVersion.
+message GetTemplateVersionRequest {
+  // Template ID/name.
+  string template_id = 1;
+
+  // Version number.
+  uint32 version = 2;
+}
+
+// Reply payload for GetTemplateVersion.
+message GetTemplateVersionReply {
+  // Template version when found.
+  TemplateVersion template = 1;
+}
+
+// Input variable value for RunTemplate.
+message TemplateInput {
+  // Variable key.
+  string key = 1;
+
+  // JSON-encoded submitted value.
+  string value_json = 2;
+}
+
+// Request payload for RunTemplate.
+message RunTemplateRequest {
+  // Template version to render.
+  TemplateReference template = 1;
+
+  // Input values keyed by variable definitions.
+  repeated TemplateInput inputs = 2;
+
+  // Optional eval priority override.
+  optional int64 priority = 3;
+
+  // Force scheduling even when rendered config is unchanged.
+  bool force_reschedule = 4;
+}
+
+// Reply payload for RunTemplate.
+message RunTemplateReply {
+  // Human-readable job submission result.
+  string message = 1;
+
+  // Name of the rendered job that was submitted.
+  string job_name = 2;
 }
 
 // Request payload for GetJobInfo.

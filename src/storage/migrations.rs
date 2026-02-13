@@ -74,6 +74,32 @@ pub fn get_migrations() -> Migrations<'static> {
     )",
         )
         .down("DROP TABLE IF EXISTS job_config_submission;"),
+
+        M::up("ALTER TABLE job_config ADD COLUMN template_id STRING;").down(""),
+        M::up("ALTER TABLE job_config ADD COLUMN template_version INTEGER;").down(""),
+        M::up(
+            "CREATE TABLE IF NOT EXISTS template_version (
+            template_id STRING NOT NULL,
+            version INTEGER NOT NULL,
+            spec_json JSONB NOT NULL,
+            created_at TIMESTAMP NOT NULL,
+            PRIMARY KEY(template_id, version)
+        )",
+        )
+        .down("DROP TABLE IF EXISTS template_version;"),
+        M::up(
+            "CREATE TABLE IF NOT EXISTS template_submission (
+            id INTEGER PRIMARY KEY,
+            template_id STRING NOT NULL,
+            template_version INTEGER NOT NULL,
+            path STRING NOT NULL,
+            is_primary INTEGER NOT NULL,
+            submission_hash STRING NOT NULL,
+            FOREIGN KEY(submission_hash) REFERENCES submission(hash) ON DELETE CASCADE,
+            FOREIGN KEY(template_id, template_version) REFERENCES template_version(template_id, version) ON DELETE CASCADE
+        )",
+        )
+        .down("DROP TABLE IF EXISTS template_submission;"),
         M::up(
             "CREATE TABLE IF NOT EXISTS task_config (
             id INTEGER PRIMARY KEY,

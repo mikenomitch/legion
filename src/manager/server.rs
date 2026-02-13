@@ -15,27 +15,28 @@ use crate::storage::store::{JobKvReference, JobSubmitOutcome, Store};
 use crate::structs::manager_server::Manager;
 use crate::structs::{
     worker_client::WorkerClient, AcquireKvLockReply, AcquireKvLockRequest, AdvanceRolloutReply,
-    AdvanceRolloutRequest, AllocationHealth, DeleteKvReply, DeleteKvRequest,
-    DeleteSavedStateQueryReply, DeleteSavedStateQueryRequest, DestroyJobReply, DestroyJobRequest,
-    FailedAllocation, GetJobInfoReply, GetJobInfoRequest, GetJobSpecByConfigRequest,
-    GetJobSpecReply, GetJobSpecRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest,
-    GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest, GetNodeReply,
-    GetNodeRequest, GetNodesReply, GetNodesRequest, GetObservabilityReply, GetObservabilityRequest,
-    GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest,
-    GetStateStoreSchemaReply, GetStateStoreSchemaRequest, HealthCheckReply, HealthCheckRequest,
-    HeartbeatReply, HeartbeatRequest, JobConfig, JobSpecHistoryItem, KvEntry, KvValueType,
-    LedgerNode, ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobsReply, ListJobsRequest,
-    ListKvReply, ListKvRequest, ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply,
-    ListRolloutsRequest, ListSavedStateQueriesReply, ListSavedStateQueriesRequest, Node, NodeMsg,
-    PatchKvReply, PatchKvRequest, PlanJobReply, PlanJobRequest, PlannedAllocation, PutKvReply,
-    PutKvRequest, QueryStateStoreReply, QueryStateStoreRequest, ReleaseKvLockReply,
-    ReleaseKvLockRequest, RenewKvLockReply, RenewKvLockRequest, RestartWorkerReply,
-    RestartWorkerRequest, RolloutAllocationStatus, RolloutEvent, RolloutGroupStatus, RolloutProgression,
-    RolloutReplacement, RunJobReply, RunJobRequest, SavedStateQuery, StopJobReply, StopJobRequest,
-    StopRolloutReply, StopRolloutRequest, TaskConfig, TaskOnUnhealthyConfig, UpdateNodeDynamicReply,
-    UpdateNodeDynamicRequest, UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest,
-    WorkerConfig, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply,
-    WorkerRegisterRequest,
+    AdvanceRolloutRequest, AllocationHealth, CreateTemplateReply, CreateTemplateRequest,
+    DeleteKvReply, DeleteKvRequest, DeleteSavedStateQueryReply, DeleteSavedStateQueryRequest,
+    DestroyJobReply, DestroyJobRequest, FailedAllocation, GetJobInfoReply, GetJobInfoRequest,
+    GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest, GetKvLockReply, GetKvLockRequest,
+    GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply,
+    GetManagerConfigsRequest, GetObservabilityReply, GetObservabilityRequest, GetNodeReply,
+    GetNodeRequest, GetNodesReply, GetNodesRequest, GetRolloutReply, GetRolloutRequest,
+    GetRolloutStatusReply, GetRolloutStatusRequest, GetStateStoreSchemaReply,
+    GetStateStoreSchemaRequest, GetTemplateVersionReply, GetTemplateVersionRequest, HealthCheckReply,
+    HealthCheckRequest, HeartbeatReply, HeartbeatRequest, JobConfig, JobSpecHistoryItem, KvEntry,
+    KvValueType, LedgerNode, ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobsReply,
+    ListJobsRequest, ListKvReply, ListKvRequest, ListRolloutEventsReply, ListRolloutEventsRequest,
+    ListRolloutsReply, ListRolloutsRequest, ListSavedStateQueriesReply, ListSavedStateQueriesRequest,
+    ListTemplatesReply, ListTemplatesRequest, Node, NodeMsg, PatchKvReply, PatchKvRequest, PlanJobReply,
+    PlanJobRequest, PlannedAllocation, PutKvReply, PutKvRequest, QueryStateStoreReply,
+    QueryStateStoreRequest, ReleaseKvLockReply, ReleaseKvLockRequest, RenewKvLockReply,
+    RenewKvLockRequest, RestartWorkerReply, RestartWorkerRequest, RolloutAllocationStatus, RolloutEvent,
+    RolloutGroupStatus, RolloutProgression, RolloutReplacement, RunJobReply, RunJobRequest, RunTemplateReply,
+    RunTemplateRequest, SavedStateQuery, StopJobReply, StopJobRequest, StopRolloutReply, StopRolloutRequest,
+    TaskConfig, TaskOnUnhealthyConfig, TemplateInput, TemplateSpec, TemplateVariable,
+    UpdateNodeDynamicReply, UpdateNodeDynamicRequest, UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest,
+    WorkerConfig, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest,
 };
 use crate::task_plugins::validate_job_config;
 use crate::tracing_util::{o11y_enabled, read_recent_observability};
@@ -78,6 +79,61 @@ fn parse_page(page: Option<u32>, page_size: Option<u32>) -> (usize, usize) {
     let page = page.unwrap_or(1).max(1) as usize;
     let size = page_size.unwrap_or(DEFAULT_PAGE_SIZE as u32).max(1) as usize;
     (page, size.min(MAX_PAGE_SIZE))
+}
+
+fn parse_template_spec_from_source(source: &str) -> R<TemplateSpec> {
+    let start = source
+        .find("LEGION_TEMPLATE_START")
+        .context("missing LEGION_TEMPLATE_START annotation")?;
+    let end = source
+        .find("LEGION_TEMPLATE_END")
+        .context("missing LEGION_TEMPLATE_END annotation")?;
+    let json_blob = &source[start + "LEGION_TEMPLATE_START".len()..end];
+    Ok(serde_json::from_str(json_blob.trim())?)
+}
+
+fn validate_template_inputs(
+    spec: &TemplateSpec,
+    inputs: &[TemplateInput],
+) -> R<HashMap<String, serde_json::Value>> {
+    let mut provided = HashMap::new();
+    for input in inputs {
+        let value: serde_json::Value = serde_json::from_str(&input.value_json)
+            .with_context(|| format!("template input {} must be valid JSON", input.key))?;
+        provided.insert(input.key.clone(), value);
+    }
+
+    for var in &spec.variables {
+        if var.required && !provided.contains_key(&var.key) {
+            bail!("missing required template variable {}", var.key);
+        }
+    }
+
+    Ok(provided)
+}
+
+fn render_template_jobspec(
+    submissions: &[crate::structs::Submission],
+    values: &HashMap<String, serde_json::Value>,
+) -> R<String> {
+    let primary = submissions
+        .iter()
+        .find(|submission| submission.is_primary)
+        .context("template is missing a primary submission")?;
+    let temp_dir = tempfile::tempdir()?;
+    let primary_path = temp_dir.path().join("main.jsonnet");
+    std::fs::write(&primary_path, &primary.content)?;
+    let mut vm = jsonnet::JsonnetVm::new();
+    for (key, value) in values {
+        match value {
+            serde_json::Value::String(v) => vm.ext_var(key, v),
+            other => vm.ext_code(key, &other.to_string()),
+        };
+    }
+    let rendered = vm
+        .evaluate_file(&primary_path)
+        .map_err(|err| anyhow!("failed to render template: {err}"))?;
+    Ok(rendered.to_string())
 }
 
 fn paginate<T>(values: Vec<T>, page: usize, page_size: usize) -> (Vec<T>, u32) {
@@ -580,19 +636,21 @@ impl Manager for ManagerAgentService {
         let subs = inner.submissions;
         let priority = inner.priority.unwrap_or(self.store.default_eval_priority);
 
-        let (config, kv_refs) = resolve_jobspec_kv_references(&self.store, &js).map_err(|e| {
-            error!("Error parsing jobspec: {:?}", e);
-            Status::invalid_argument(format!("Error parsing jobspec: {e}"))
-        })?;
+        let (config, kv_refs) =
+            resolve_jobspec_kv_references(&self.store, &js).map_err(|e| {
+                error!("Error parsing jobspec: {:?}", e);
+                Status::invalid_argument(format!("Error parsing jobspec: {e}"))
+            })?;
 
         let force_reschedule = inner.force_reschedule;
+        let template_reference = inner.template.clone();
         validate_job_config(&config).map_err(|e| {
             error!("Error validating task configs: {:?}", e);
             Status::invalid_argument(format!("Error validating task configs: {e}"))
         })?;
         let submit_outcome = self
             .store
-            .handle_job_submit(&config, &subs)
+            .handle_job_submit_with_template(&config, &subs, template_reference.as_ref())
             .map_err(|e| map_store_error("Error running job", e))?;
 
         let job_config_id = submit_outcome.job_config_id().to_string();
@@ -658,6 +716,138 @@ impl Manager for ManagerAgentService {
         };
 
         Ok(Response::new(reply))
+    }
+
+    #[instrument(skip_all)]
+    async fn create_template(
+        &self,
+        request: Request<CreateTemplateRequest>,
+    ) -> Result<Response<CreateTemplateReply>, Status> {
+        let request = request.into_inner();
+        let mut spec = request.spec;
+        if spec.is_none() {
+            let primary = request
+                .submissions
+                .iter()
+                .find(|submission| submission.is_primary)
+                .ok_or_else(|| {
+                    Status::invalid_argument("template requires a primary submission")
+                })?;
+            spec = Some(
+                parse_template_spec_from_source(&primary.content).map_err(|err| {
+                    Status::invalid_argument(format!("failed to parse template metadata: {err}"))
+                })?,
+            );
+        }
+        let created = self
+            .store
+            .create_template_version(
+                &request.template_id,
+                &spec.clone().unwrap_or(TemplateSpec {
+                    name: request.template_id.clone(),
+                    description: String::new(),
+                    variables: Vec::<TemplateVariable>::new(),
+                }),
+                &request.submissions,
+            )
+            .map_err(|err| map_store_error("Error creating template", err))?;
+
+        Ok(Response::new(CreateTemplateReply {
+            template: Some(created),
+        }))
+    }
+
+    #[instrument(skip_all)]
+    async fn list_templates(
+        &self,
+        request: Request<ListTemplatesRequest>,
+    ) -> Result<Response<ListTemplatesReply>, Status> {
+        let request = request.into_inner();
+        let templates = self
+            .store
+            .list_template_versions(request.template_id.as_deref())
+            .map_err(|err| map_store_error("Error listing templates", err))?;
+        Ok(Response::new(ListTemplatesReply { templates }))
+    }
+
+    #[instrument(skip_all)]
+    async fn get_template_version(
+        &self,
+        request: Request<GetTemplateVersionRequest>,
+    ) -> Result<Response<GetTemplateVersionReply>, Status> {
+        let request = request.into_inner();
+        let template = self
+            .store
+            .get_template_version(&request.template_id, request.version)
+            .map_err(|err| map_store_error("Error loading template", err))?
+            .ok_or_else(|| Status::not_found("template version not found"))?;
+        Ok(Response::new(GetTemplateVersionReply {
+            template: Some(template),
+        }))
+    }
+
+    #[instrument(skip_all)]
+    async fn run_template(
+        &self,
+        request: Request<RunTemplateRequest>,
+    ) -> Result<Response<RunTemplateReply>, Status> {
+        let request = request.into_inner();
+        let reference = request
+            .template
+            .clone()
+            .ok_or_else(|| Status::invalid_argument("template reference is required"))?;
+        let template = self
+            .store
+            .get_template_version(&reference.template_id, reference.version)
+            .map_err(|err| map_store_error("Error loading template", err))?
+            .ok_or_else(|| Status::not_found("template version not found"))?;
+        let spec = template
+            .spec
+            .clone()
+            .ok_or_else(|| Status::failed_precondition("template is missing spec"))?;
+        let values = validate_template_inputs(&spec, &request.inputs)
+            .map_err(|err| Status::invalid_argument(format!("invalid template input: {err}")))?;
+        let rendered = render_template_jobspec(&template.submissions, &values)
+            .map_err(|err| Status::invalid_argument(format!("template render failed: {err}")))?;
+        let config: JobConfig = serde_json::from_str(&rendered)
+            .map_err(|err| Status::invalid_argument(format!("rendered jobspec invalid: {err}")))?;
+        validate_job_config(&config).map_err(|err| {
+            Status::invalid_argument(format!("Error validating task configs: {err}"))
+        })?;
+        let submit = self
+            .store
+            .handle_job_submit_with_template(&config, &template.submissions, Some(&reference))
+            .map_err(|err| map_store_error("Error running template", err))?;
+        let job_config_id = submit.job_config_id().to_string();
+        if !submit.is_unchanged() || request.force_reschedule {
+            self.store
+                .enqueue_eval(
+                    if submit.is_unchanged() {
+                        "job_update"
+                    } else {
+                        "job_submit"
+                    },
+                    Some(&config.name),
+                    Some(&job_config_id),
+                    None,
+                    Some(request.priority.unwrap_or(self.store.default_eval_priority)),
+                )
+                .map_err(|err| map_store_error("Error running template", err))?;
+        }
+        let message = if submit.is_unchanged() {
+            if request.force_reschedule {
+                "Job config unchanged; forced reschedule queued"
+            } else {
+                "Job config unchanged; no update needed"
+            }
+        } else {
+            "Job submit success"
+        };
+
+        Ok(Response::new(RunTemplateReply {
+            message: message.to_string(),
+            job_name: config.name,
+        }))
     }
 
     #[instrument(skip_all)]
@@ -2404,6 +2594,7 @@ mod tests {
                 submissions: vec![submission()],
                 priority: None,
                 force_reschedule: false,
+                template: None,
             }))
             .await?;
 
@@ -2514,6 +2705,7 @@ mod tests {
                 submissions: vec![submission()],
                 priority: None,
                 force_reschedule: false,
+                template: None,
             }))
             .await?;
 

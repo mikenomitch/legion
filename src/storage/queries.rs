@@ -211,7 +211,7 @@ lazy_static! {
 //
 
 pub const JOB_CONFIG_ATTRS: &str = r#"
-id, name, type, meta, version, created_at, job_id
+id, name, type, meta, version, created_at, job_id, template_id, template_version
 "#;
 
 // pub const JOB_CONFIG_PARAM_SET: &str = r#"
@@ -219,7 +219,7 @@ id, name, type, meta, version, created_at, job_id
 // "#;
 
 pub const JOB_CONFIG_ATTRS_VALS: &str = r#"
-:id, :name, :type, :meta, :version, :created_at, :job_id
+:id, :name, :type, :meta, :version, :created_at, :job_id, :template_id, :template_version
 "#;
 
 lazy_static! {

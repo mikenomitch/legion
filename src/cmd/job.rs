@@ -7,10 +7,10 @@ use crate::cmd::helpers::{connect_manager_client, friendly_status, json_flag, pr
 use crate::getter_rs::Client as GetterClient;
 use crate::prelude::*;
 use crate::structs::{
-    AdvanceRolloutRequest, DestroyJobRequest, GetJobInfoRequest, GetJobSpecRequest, GetKvRequest,
-    GetRolloutStatusRequest, JobPlanPrint, JobPrint, KvEntry, KvValueType, ListJobsRequest,
-    ListRolloutEventsRequest, ListRolloutsRequest, PlanJobRequest, RunJobRequest, StopJobRequest,
-    Submission,
+    AdvanceRolloutRequest, CreateTemplateRequest, DestroyJobRequest, GetJobInfoRequest,
+    GetJobSpecRequest, GetKvRequest, GetRolloutStatusRequest, JobPlanPrint, JobPrint, KvEntry,
+    KvValueType, ListJobsRequest, ListRolloutEventsRequest, ListRolloutsRequest, PlanJobRequest,
+    RunJobRequest, StopJobRequest, Submission,
 };
 use jsonnet::JsonnetVm;
 use serde::Serialize;
@@ -167,6 +167,27 @@ pub fn config() -> Command {
         .subcommand(rollout_advance_cmd)
         .subcommand(rollout_status_cmd)
         .subcommand(rollout_events_cmd);
+    let template_add_cmd = Command::new("add")
+        .about("Create a new template version from a file")
+        .arg(
+            Arg::new("template_id")
+                .value_name("TEMPLATE_ID")
+                .help("Template ID/name for the new version")
+                .required(true),
+        )
+        .arg(
+            Arg::new("path")
+                .value_name("PATH")
+                .help("Path or URL to the template source file")
+                .required(true)
+                .value_hint(ValueHint::AnyPath),
+        );
+
+    let template_cmd = Command::new("template")
+        .about("Manage templates")
+        .subcommand_required(true)
+        .arg_required_else_help(true)
+        .subcommand(template_add_cmd);
 
     Command::new("job")
         .about("Interact with jobs")
@@ -180,6 +201,7 @@ pub fn config() -> Command {
         .subcommand(spec_cmd)
         .subcommand(destroy_cmd)
         .subcommand(rollout_cmd)
+        .subcommand(template_cmd)
 }
 
 fn priority_arg() -> Arg {
@@ -532,6 +554,7 @@ pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
         Some(("info", matches)) => get_info(matches).await,
         Some(("plan", matches)) => plan_job(matches).await,
         Some(("rollout", matches)) => handle_rollout(matches).await,
+        Some(("template", matches)) => handle_template(matches).await,
         _ => unreachable!(),
     }
 }
@@ -556,6 +579,59 @@ async fn handle_rollout(arg_matches: &ArgMatches) -> R<()> {
         Some(("events", matches)) => rollout_events_cmd(matches).await,
         _ => unreachable!(),
     }
+}
+
+async fn handle_template(arg_matches: &ArgMatches) -> R<()> {
+    match arg_matches.subcommand() {
+        Some(("add", matches)) => add_template(matches).await,
+        _ => unreachable!(),
+    }
+}
+
+fn read_template_submissions(path: &Path) -> R<Vec<Submission>> {
+    let content = std::fs::read_to_string(path).context("read template file content")?;
+    let path = path
+        .to_str()
+        .context("template path is not valid UTF-8")?
+        .to_string();
+    Ok(vec![Submission {
+        path,
+        content,
+        is_primary: true,
+    }])
+}
+
+#[instrument(err, skip_all)]
+async fn add_template(arg_matches: &ArgMatches) -> R<()> {
+    let template_id = arg_matches
+        .get_one::<String>("template_id")
+        .context("missing template id")?;
+    let path = arg_matches
+        .get_one::<String>("path")
+        .map(String::as_str)
+        .context("missing template source path");
+    let path = path?;
+
+    let resolved = resolve_jobspec_source_async(path).await?;
+    let submissions = read_template_submissions(&resolved.path)?;
+
+    let mut client = connect_manager_client().await?;
+    let request = tonic::Request::new(CreateTemplateRequest {
+        template_id: template_id.to_owned(),
+        spec: None,
+        submissions,
+    });
+    let response = client
+        .create_template(request)
+        .await
+        .map_err(|status| friendly_status("failed to create template", status))?;
+    let template = response.into_inner().template.context("template response is missing")?;
+
+    println!(
+        "Created template {} v{}",
+        template.template_id, template.version
+    );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -748,6 +824,7 @@ async fn run_job(arg_matches: &ArgMatches) -> R<()> {
         submissions,
         priority,
         force_reschedule: arg_matches.get_flag("force-reschedule"),
+        template: None,
     });
 
     let response = client

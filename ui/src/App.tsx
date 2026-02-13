@@ -20,6 +20,7 @@ import ApiExplorer from './pages/ApiExplorer'
 import Observability from './pages/Observability'
 import TestingUtils from './pages/TestingUtils'
 import StateExplorer from './pages/StateExplorer'
+import Templates from './pages/Templates'
 
 type SidebarItem = {
   kind: 'item'
@@ -51,7 +52,6 @@ const baseNavItems: SidebarItem[] = [
 ]
 
 const detailRoutes = new Set(['jobs', 'nodes', 'manager', 'rollouts', 'deployments'])
-
 const decodePathSegment = (value: string) => {
   try {
     return decodeURIComponent(value)
@@ -89,6 +89,7 @@ const Layout = (props: RouteSectionProps) => {
         items: [
           { kind: 'item', label: 'Jobs', path: '/jobs', title: 'Jobs', copy: 'Jobs and their health status.' },
           { kind: 'item', label: 'Rollouts', path: '/rollouts', title: 'Rollouts', copy: 'Rollout execution details.' },
+          { kind: 'item', label: 'Templates', path: '/templates', title: 'Templates', copy: 'Reusable parameterized job specs.' },
         ],
       },
       {
@@ -525,6 +526,7 @@ const AppRoutes = () => {
       <Route path="/jobs/:id/specs/:configId" component={JobSpecDetail} />
       <Route path="/deployments" component={Deployments} />
       <Route path="/rollouts" component={Rollouts} />
+      <Route path="/templates" component={Templates} />
       <Route path="/rollouts/:id" component={RolloutDetail} />
       <Route path="/kv" component={KeyValue} />
       <Route path="/api" component={ApiExplorer} />

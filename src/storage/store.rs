@@ -15,7 +15,7 @@ use crate::structs::{
     Allocation, AllocationHealth, Eval, Job, JobConfig, KvEntry, KvLock, KvValueType, LedgerEntry,
     ManagerConfigFull, ManagerNodeConfig, Node, NodeMsg, Rollout, RolloutConfig, Submission,
     TaskCheck, TaskConfig, TaskCount, TaskDependency, TaskLifecycle, TaskOnUnhealthyConfig,
-    TaskSchedule, TaskStatusState, WorkerConfig,
+    TaskSchedule, TaskStatusState, TemplateReference, TemplateSpec, TemplateVersion, WorkerConfig,
 };
 
 use rand::{seq::SliceRandom, thread_rng, Rng};
@@ -1620,6 +1620,15 @@ impl Store {
         config: &JobConfig,
         subs: &[Submission],
     ) -> R<JobSubmitOutcome> {
+        self.handle_job_submit_with_template(config, subs, None)
+    }
+
+    pub fn handle_job_submit_with_template(
+        &self,
+        config: &JobConfig,
+        subs: &[Submission],
+        template: Option<&TemplateReference>,
+    ) -> R<JobSubmitOutcome> {
         let config = self.normalize_job_config(config)?;
         // Note: There is a race condition here with the version
         // I think this should prob be all in a single lock, but
@@ -1682,6 +1691,8 @@ impl Store {
             ":version": next_version,
             ":created_at": now,
             ":job_id": job.id,
+            ":template_id": template.map(|t| t.template_id.clone()),
+            ":template_version": template.map(|t| t.version as i64),
         };
 
         let (_config, job_config_id): (JobConfig, String) =
@@ -2162,6 +2173,113 @@ impl Store {
         })?)?;
 
         Ok(subs)
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn create_template_version(
+        &self,
+        template_id: &str,
+        spec: &TemplateSpec,
+        submissions: &[Submission],
+    ) -> R<TemplateVersion> {
+        let mut conn = self.write_connection()?;
+        let tx = conn.transaction()?;
+        let next_version: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(version), 0) + 1 FROM template_version WHERE template_id = ?1;",
+            [template_id],
+            |row| row.get(0),
+        )?;
+        let created_at = OffsetDateTime::now_utc().format(&Rfc3339)?;
+        let spec_json = serde_json::to_string(spec)?;
+        tx.execute(
+            "INSERT INTO template_version(template_id, version, spec_json, created_at) VALUES (?1, ?2, ?3, ?4);",
+            params![template_id, next_version, spec_json, created_at],
+        )?;
+        for submission in submissions {
+            let sub_hash = submission.hash();
+            tx.execute(
+                &INSERT_SUBMISSION,
+                named_params! {":content": submission.content, ":hash": sub_hash},
+            )?;
+            tx.execute(
+                "INSERT INTO template_submission(template_id, template_version, path, is_primary, submission_hash) VALUES (?1, ?2, ?3, ?4, ?5);",
+                params![template_id, next_version, submission.path, submission.is_primary, sub_hash],
+            )?;
+        }
+        tx.commit()?;
+        Ok(TemplateVersion {
+            template_id: template_id.to_string(),
+            version: next_version as u32,
+            spec: Some(spec.clone()),
+            submissions: submissions.to_vec(),
+            created_at,
+        })
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn get_template_version(
+        &self,
+        template_id: &str,
+        version: u32,
+    ) -> R<Option<TemplateVersion>> {
+        let conn = self.read_connection()?;
+        let row = conn.query_row(
+            "SELECT spec_json, created_at FROM template_version WHERE template_id = ?1 AND version = ?2;",
+            params![template_id, version as i64],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        ).optional()?;
+        let Some((spec_json, created_at)) = row else {
+            return Ok(None);
+        };
+        let spec: TemplateSpec = serde_json::from_str(&spec_json)?;
+        let mut stmt = conn.prepare("SELECT ts.path, ts.is_primary, s.content FROM template_submission ts INNER JOIN submission s ON s.hash = ts.submission_hash WHERE ts.template_id = ?1 AND ts.template_version = ?2 ORDER BY ts.id ASC;")?;
+        let submissions =
+            Self::collect_rows(stmt.query_map(params![template_id, version as i64], |row| {
+                Ok(Submission {
+                    path: row.get(0)?,
+                    is_primary: row.get(1)?,
+                    content: row.get(2)?,
+                })
+            })?)?;
+        Ok(Some(TemplateVersion {
+            template_id: template_id.to_string(),
+            version,
+            spec: Some(spec),
+            submissions,
+            created_at,
+        }))
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn list_template_versions(&self, template_filter: Option<&str>) -> R<Vec<TemplateVersion>> {
+        let conn = self.read_connection()?;
+        let sql = if template_filter.is_some() {
+            "SELECT template_id, version, spec_json, created_at FROM template_version WHERE template_id = ?1 ORDER BY created_at DESC, version DESC;"
+        } else {
+            "SELECT template_id, version, spec_json, created_at FROM template_version ORDER BY created_at DESC, version DESC;"
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let mut rows = if let Some(filter) = template_filter {
+            stmt.query(params![filter])?
+        } else {
+            stmt.query([])?
+        };
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            let template_id: String = row.get(0)?;
+            let version: i64 = row.get(1)?;
+            let spec_json: String = row.get(2)?;
+            let created_at: String = row.get(3)?;
+            let spec: TemplateSpec = serde_json::from_str(&spec_json)?;
+            out.push(TemplateVersion {
+                template_id,
+                version: version as u32,
+                spec: Some(spec),
+                submissions: vec![],
+                created_at,
+            });
+        }
+        Ok(out)
     }
 
     #[instrument(err, skip_all)]
