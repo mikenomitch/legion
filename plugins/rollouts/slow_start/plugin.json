@@ -1,0 +1,5 @@
+{
+  "kind": "rollouts",
+  "name": "slow_start",
+  "legionApiVersion": 1
+}

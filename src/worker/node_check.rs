@@ -1,3 +1,4 @@
+use crate::plugin_runtime::{plugin_paths, validate_manifest};
 use crate::prelude::*;
 
 use libloading::{Library, Symbol};
@@ -81,23 +82,30 @@ pub fn run_health_checks(
 }
 
 fn fp_plugin_name_to_path(name: &str) -> String {
-    let mut path = plugin_root_dir();
-    path.push("node_checks");
-    path.push(name);
-    path.push("target");
-    path.push("release");
-    path.push(format!(
-        "{}{}{}",
-        std::env::consts::DLL_PREFIX,
-        name,
-        std::env::consts::DLL_SUFFIX
-    ));
-
-    path.to_string_lossy().into_owned()
+    let plugin_root = plugin_root_dir();
+    plugin_paths("node_checks", name, &plugin_root)
+        .dylib
+        .to_string_lossy()
+        .into_owned()
 }
 
 #[instrument(err, skip_all)]
 fn call_dynamic(path: &str) -> R<(Library, Box<dyn NodeChecker>)> {
+    let plugin_path = std::path::Path::new(path);
+    let Some(plugin_root) = plugin_path
+        .parent()
+        .and_then(|v| v.parent())
+        .and_then(|v| v.parent())
+    else {
+        bail!("invalid node_check plugin path {}", path);
+    };
+    let name = plugin_root
+        .file_name()
+        .and_then(|v| v.to_str())
+        .context("invalid node_check plugin name")?;
+    validate_manifest("node_checks", name, plugin_root)
+        .with_context(|| format!("invalid node_check plugin manifest for {}", name))?;
+
     unsafe {
         let lib = Library::new(path)?;
         let fp = {

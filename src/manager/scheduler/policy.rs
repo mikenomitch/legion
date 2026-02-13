@@ -1,3 +1,4 @@
+use crate::plugin_runtime::{plugin_paths, validate_manifest};
 use crate::util::plugin_root_dir;
 use std::collections::HashMap;
 
@@ -378,7 +379,11 @@ pub fn load_policy(name: &str) -> R<(Option<Library>, Box<dyn SchedulingPolicy>)
         "bin_pack" => Ok((None, Box::new(BinPackPolicy))),
         "spread" => Ok((None, Box::new(SpreadPolicy))),
         other => {
-            let path = policy_plugin_name_to_path(other);
+            let plugin_root = plugin_root_dir();
+            let paths = plugin_paths("scheduling", other, &plugin_root);
+            validate_manifest("scheduling", other, &paths.root)
+                .with_context(|| format!("invalid scheduling plugin manifest for {}", other))?;
+            let path = paths.dylib.to_string_lossy().into_owned();
             unsafe {
                 let lib = Library::new(&path)?;
                 let policy = {
@@ -390,22 +395,6 @@ pub fn load_policy(name: &str) -> R<(Option<Library>, Box<dyn SchedulingPolicy>)
             }
         }
     }
-}
-
-fn policy_plugin_name_to_path(name: &str) -> String {
-    let mut path = plugin_root_dir();
-    path.push("scheduling");
-    path.push(name);
-    path.push("target");
-    path.push("release");
-    path.push(format!(
-        "{}{}{}",
-        std::env::consts::DLL_PREFIX,
-        name,
-        std::env::consts::DLL_SUFFIX
-    ));
-
-    path.to_string_lossy().into_owned()
 }
 
 #[cfg(test)]

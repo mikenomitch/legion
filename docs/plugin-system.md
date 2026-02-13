@@ -1,6 +1,27 @@
 # Plugin System
 
-This document describes the plugin system that exists today and notes plugin categories that are planned but not implemented.
+This document describes Legion's plugin architecture, loading behavior, and trade-offs.
+
+## Why Legion Uses In-Process `cdylib` Plugins
+
+Legion currently uses Rust `cdylib` plugins loaded in-process via `libloading`.
+
+This approach was chosen because it is:
+
+- **Fast**: no RPC boundary between core scheduler/worker and plugin code.
+- **Simple to deploy**: plugins are shared libraries on disk under a predictable directory.
+- **Ergonomic for Rust extension authors**: plugin authors implement traits and export a `get` constructor.
+- **Flexible**: task kinds, scheduling policies, node checks, and rollout strategies can each be extended.
+
+## Downsides and Risks to Watch
+
+The primary trade-off of in-process plugins is reliability/isolation:
+
+- **Plugin panics can terminate the host process** (manager/worker) if not contained.
+- **Memory safety/ABI mistakes are dangerous** because dynamic loading requires unsafe FFI boundaries.
+- **Version drift can break loading** if plugin and host disagree on API expectations.
+
+To reduce this risk, Legion validates plugin manifests (kind/name/API version) before loading.
 
 ## How Plugin Loading Works
 
@@ -15,6 +36,35 @@ Dynamic plugin loading pattern:
 Common directory pattern:
 
 - `plugins/<kind>/<name>/target/release/lib<name>.<ext>`
+
+### Plugin Manifest (Required for Dynamic Plugins)
+
+Each dynamic plugin root now includes a `plugin.json` manifest.
+
+Example:
+
+```json
+{
+  "kind": "tasks",
+  "name": "noop",
+  "legionApiVersion": 1
+}
+```
+
+Fields:
+
+- `kind`: plugin category directory (`tasks`, `scheduling`, `node_checks`, `rollouts`).
+- `name`: plugin name directory and library basename.
+- `legionApiVersion`: plugin API version expected by the host.
+
+Before loading the dynamic library, Legion validates:
+
+1. `plugin.json` exists.
+2. `kind` matches the expected plugin category.
+3. `name` matches the requested plugin name.
+4. `legionApiVersion` equals the host-supported version.
+
+If any check fails, plugin loading fails with contextual errors.
 
 ## Plugin Types Implemented Today
 

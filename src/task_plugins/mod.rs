@@ -1,4 +1,5 @@
 use crate::manager::rollout_strategy::validate_rollout_strategy_name;
+use crate::plugin_runtime::{plugin_paths, validate_manifest};
 use crate::prelude::*;
 use crate::structs::{Allocation, JobConfig, TaskConfig, TaskDependencyCondition, TaskLifecycle};
 use crate::util::plugin_root_dir;
@@ -312,7 +313,11 @@ fn load_task_plugin(name: &str) -> R<LoadedTaskPlugin> {
         "exec" => Ok(LoadedTaskPlugin::new(Box::new(ExecTaskPlugin), None)),
         "container" => Ok(LoadedTaskPlugin::new(Box::new(ContainerTaskPlugin), None)),
         other => {
-            let path = task_plugin_name_to_path(other);
+            let plugin_root = plugin_root_dir();
+            let paths = plugin_paths("tasks", other, &plugin_root);
+            validate_manifest("tasks", other, &paths.root)
+                .with_context(|| format!("invalid task plugin manifest for {}", other))?;
+            let path = paths.dylib.to_string_lossy().into_owned();
             unsafe {
                 let lib = Library::new(&path)?;
                 let plugin = {
@@ -326,20 +331,13 @@ fn load_task_plugin(name: &str) -> R<LoadedTaskPlugin> {
     }
 }
 
+#[cfg(test)]
 fn task_plugin_name_to_path(name: &str) -> String {
-    let mut path = plugin_root_dir();
-    path.push("tasks");
-    path.push(name);
-    path.push("target");
-    path.push("release");
-    path.push(format!(
-        "{}{}{}",
-        std::env::consts::DLL_PREFIX,
-        name,
-        std::env::consts::DLL_SUFFIX
-    ));
-
-    path.to_string_lossy().into_owned()
+    let plugin_root = plugin_root_dir();
+    plugin_paths("tasks", name, &plugin_root)
+        .dylib
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn validate_schema(schema: &Value, config: &Value) -> R<()> {

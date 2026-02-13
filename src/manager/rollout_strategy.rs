@@ -1,5 +1,6 @@
 use libloading::{Library, Symbol};
 
+use crate::plugin_runtime::{plugin_paths, validate_manifest};
 use crate::prelude::{bail, instrument, Context, R};
 use crate::structs::RolloutConfig;
 use crate::util::plugin_root_dir;
@@ -86,7 +87,12 @@ pub fn load_rollout_strategy(name: &str) -> R<LoadedRolloutStrategy> {
             None,
         )),
         other => {
-            let path = rollout_strategy_name_to_path(other);
+            let plugin_root = plugin_root_dir();
+            let paths = plugin_paths("rollouts", other, &plugin_root);
+            validate_manifest("rollouts", other, &paths.root).with_context(|| {
+                format!("invalid rollout strategy plugin manifest for {}", other)
+            })?;
+            let path = paths.dylib.to_string_lossy().into_owned();
             unsafe {
                 let lib = Library::new(&path)
                     .with_context(|| format!("failed opening rollout strategy plugin {}", path))?;
@@ -101,22 +107,6 @@ pub fn load_rollout_strategy(name: &str) -> R<LoadedRolloutStrategy> {
             }
         }
     }
-}
-
-fn rollout_strategy_name_to_path(name: &str) -> String {
-    let mut path = plugin_root_dir();
-    path.push("rollouts");
-    path.push(name);
-    path.push("target");
-    path.push("release");
-    path.push(format!(
-        "{}{}{}",
-        std::env::consts::DLL_PREFIX,
-        name,
-        std::env::consts::DLL_SUFFIX
-    ));
-
-    path.to_string_lossy().into_owned()
 }
 
 #[cfg(test)]
@@ -148,6 +138,6 @@ mod tests {
         let err = result.err().expect("expected strategy load error");
         assert!(err
             .to_string()
-            .contains("failed opening rollout strategy plugin"));
+            .contains("invalid rollout strategy plugin manifest"));
     }
 }
