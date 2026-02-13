@@ -15,24 +15,28 @@ use crate::storage::store::{JobKvReference, JobSubmitOutcome, Store};
 use crate::structs::manager_server::Manager;
 use crate::structs::{
     worker_client::WorkerClient, AcquireKvLockReply, AcquireKvLockRequest, AdvanceRolloutReply,
-    AdvanceRolloutRequest, AllocationHealth, DeleteKvReply, DeleteKvRequest, DestroyJobReply,
-    DestroyJobRequest, FailedAllocation, GetJobInfoReply, GetJobInfoRequest,
-    GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest, GetKvLockReply,
-    GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest,
-    GetManagerConfigsReply, GetManagerConfigsRequest, GetNodeReply, GetNodeRequest, GetNodesReply,
-    GetNodesRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply,
-    GetRolloutStatusRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply,
+    AdvanceRolloutRequest, AllocationHealth, DeleteKvReply, DeleteKvRequest,
+    DeleteSavedStateQueryReply, DeleteSavedStateQueryRequest, DestroyJobReply, DestroyJobRequest,
+    FailedAllocation, GetJobInfoReply, GetJobInfoRequest, GetJobSpecByConfigRequest,
+    GetJobSpecReply, GetJobSpecRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest,
+    GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest,
+    GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest, GetRolloutReply,
+    GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest, GetStateStoreSchemaReply,
+    GetStateStoreSchemaRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply,
     HeartbeatRequest, JobConfig, JobSpecHistoryItem, KvEntry, KvValueType, LedgerNode,
     ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobsReply, ListJobsRequest,
     ListKvReply, ListKvRequest, ListRolloutEventsReply, ListRolloutEventsRequest,
-    ListRolloutsReply, ListRolloutsRequest, Node, NodeMsg, PatchKvReply, PatchKvRequest,
-    PlanJobReply, PlanJobRequest, PlannedAllocation, PutKvReply, PutKvRequest, ReleaseKvLockReply,
-    ReleaseKvLockRequest, RenewKvLockReply, RenewKvLockRequest, RestartWorkerReply,
-    RestartWorkerRequest, RolloutAllocationStatus, RolloutEvent, RolloutGroupStatus,
-    RolloutProgression, RolloutReplacement, RunJobReply, RunJobRequest, StopJobReply,
-    StopJobRequest, StopRolloutReply, StopRolloutRequest, TaskConfig, TaskOnUnhealthyConfig,
-    UpdateNodeDynamicReply, UpdateNodeDynamicRequest, WorkerConfig, WorkerPreRegisterReply,
-    WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest,
+    ListRolloutsReply, ListRolloutsRequest, ListSavedStateQueriesReply,
+    ListSavedStateQueriesRequest, Node, NodeMsg, PatchKvReply, PatchKvRequest, PlanJobReply,
+    PlanJobRequest, PlannedAllocation, PutKvReply, PutKvRequest, QueryStateStoreReply,
+    QueryStateStoreRequest, ReleaseKvLockReply, ReleaseKvLockRequest, RenewKvLockReply,
+    RenewKvLockRequest, RestartWorkerReply, RestartWorkerRequest, RolloutAllocationStatus,
+    RolloutEvent, RolloutGroupStatus, RolloutProgression, RolloutReplacement, RunJobReply,
+    RunJobRequest, SavedStateQuery, StopJobReply, StopJobRequest, StopRolloutReply,
+    StopRolloutRequest, TaskConfig, TaskOnUnhealthyConfig, UpdateNodeDynamicReply,
+    UpdateNodeDynamicRequest, UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest,
+    WorkerConfig, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply,
+    WorkerRegisterRequest,
 };
 use crate::task_plugins::validate_job_config;
 
@@ -1604,6 +1608,118 @@ impl Manager for ManagerAgentService {
             .map_err(|e| map_store_error("Error getting kv lock", e))?;
 
         Ok(Response::new(GetKvLockReply { lock }))
+    }
+
+    #[instrument(skip_all)]
+    async fn query_state_store(
+        &self,
+        request: Request<QueryStateStoreRequest>,
+    ) -> Result<Response<QueryStateStoreReply>, Status> {
+        let req = request.into_inner();
+        let result = self
+            .store
+            .query_state_store(&req.sql, req.allow_write)
+            .map_err(|e| map_store_error("Error querying state store", e))?;
+
+        Ok(Response::new(QueryStateStoreReply {
+            statement_type: result.statement_type,
+            columns: result.columns,
+            rows: result
+                .rows
+                .into_iter()
+                .map(|row| crate::structs::QueryStateStoreRow { json: row.json })
+                .collect(),
+            affected_rows: result.affected_rows,
+        }))
+    }
+
+    #[instrument(skip_all)]
+    async fn get_state_store_schema(
+        &self,
+        _request: Request<GetStateStoreSchemaRequest>,
+    ) -> Result<Response<GetStateStoreSchemaReply>, Status> {
+        let objects = self
+            .store
+            .state_store_schema()
+            .map_err(|e| map_store_error("Error loading state store schema", e))?
+            .into_iter()
+            .map(|object| crate::structs::StateStoreSchemaObject {
+                kind: object.kind,
+                name: object.name,
+                create_sql: object.create_sql,
+                columns: object
+                    .columns
+                    .into_iter()
+                    .map(|column| crate::structs::StateStoreSchemaColumn {
+                        ordinal: column.ordinal,
+                        name: column.name,
+                        data_type: column.data_type,
+                        not_null: column.not_null,
+                        default_value: column.default_value,
+                        primary_key: column.primary_key,
+                    })
+                    .collect(),
+            })
+            .collect();
+
+        Ok(Response::new(GetStateStoreSchemaReply { objects }))
+    }
+
+    #[instrument(skip_all)]
+    async fn list_saved_state_queries(
+        &self,
+        _request: Request<ListSavedStateQueriesRequest>,
+    ) -> Result<Response<ListSavedStateQueriesReply>, Status> {
+        let queries = self
+            .store
+            .list_saved_state_queries()
+            .map_err(|e| map_store_error("Error listing saved state queries", e))?
+            .into_iter()
+            .map(|query| SavedStateQuery {
+                name: query.name,
+                sql: query.sql,
+                created_at: query.created_at,
+                updated_at: query.updated_at,
+            })
+            .collect();
+
+        Ok(Response::new(ListSavedStateQueriesReply { queries }))
+    }
+
+    #[instrument(skip_all)]
+    async fn upsert_saved_state_query(
+        &self,
+        request: Request<UpsertSavedStateQueryRequest>,
+    ) -> Result<Response<UpsertSavedStateQueryReply>, Status> {
+        let req = request.into_inner();
+        let query = self
+            .store
+            .upsert_saved_state_query(&req.name, &req.sql)
+            .map_err(|e| map_store_error("Error saving state query", e))?;
+
+        Ok(Response::new(UpsertSavedStateQueryReply {
+            query: Some(SavedStateQuery {
+                name: query.name,
+                sql: query.sql,
+                created_at: query.created_at,
+                updated_at: query.updated_at,
+            }),
+        }))
+    }
+
+    #[instrument(skip_all)]
+    async fn delete_saved_state_query(
+        &self,
+        request: Request<DeleteSavedStateQueryRequest>,
+    ) -> Result<Response<DeleteSavedStateQueryReply>, Status> {
+        let req = request.into_inner();
+        self.store
+            .delete_saved_state_query(&req.name)
+            .map_err(|e| map_store_error("Error deleting saved state query", e))?;
+
+        Ok(Response::new(DeleteSavedStateQueryReply {
+            message: "saved query deleted".to_string(),
+        }))
     }
 }
 

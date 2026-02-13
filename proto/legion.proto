@@ -132,6 +132,28 @@ service Manager {
 
   // Returns current non-expired lock state for a KV key.
   rpc GetKvLock (GetKvLockRequest) returns (GetKvLockReply);
+
+  // Executes a SQL statement directly against the manager state store.
+  //
+  // Read-only mode is the default safety behavior and rejects write statements
+  // unless explicitly enabled in the request.
+  rpc QueryStateStore (QueryStateStoreRequest) returns (QueryStateStoreReply);
+
+  // Returns a structured schema snapshot for the manager SQLite state store.
+  rpc GetStateStoreSchema (GetStateStoreSchemaRequest)
+    returns (GetStateStoreSchemaReply);
+
+  // Lists user-saved State Explorer query snippets.
+  rpc ListSavedStateQueries (ListSavedStateQueriesRequest)
+    returns (ListSavedStateQueriesReply);
+
+  // Creates or overwrites a saved State Explorer query by name.
+  rpc UpsertSavedStateQuery (UpsertSavedStateQueryRequest)
+    returns (UpsertSavedStateQueryReply);
+
+  // Deletes a saved State Explorer query by name.
+  rpc DeleteSavedStateQuery (DeleteSavedStateQueryRequest)
+    returns (DeleteSavedStateQueryReply);
 }
 
 // Request payload for WorkerPreRegister.
@@ -1275,6 +1297,140 @@ message GetKvLockReply {
   //
   // If the stored lock is expired, manager removes it and returns unset.
   optional KvLock lock = 1;
+}
+
+// Request payload for QueryStateStore.
+message QueryStateStoreRequest {
+  // SQL statement to execute.
+  //
+  // The server currently accepts a single statement per request.
+  string sql = 1;
+
+  // Allows write/mutating statements when true.
+  //
+  // Default behavior when false: only read/query statements are accepted.
+  bool allow_write = 2;
+}
+
+// One row from QueryStateStore results encoded as JSON object text.
+message QueryStateStoreRow {
+  // JSON object containing column name => value for one returned row.
+  string json = 1;
+}
+
+// Reply payload for QueryStateStore.
+message QueryStateStoreReply {
+  // Statement category inferred by the manager (for example: SELECT, UPDATE).
+  string statement_type = 1;
+
+  // Ordered result column names for tabular query results.
+  repeated string columns = 2;
+
+  // Returned rows for query statements.
+  //
+  // Mutating statements typically return an empty list.
+  repeated QueryStateStoreRow rows = 3;
+
+  // Number of rows affected for mutating statements.
+  //
+  // For read-only statements this is usually zero.
+  uint64 affected_rows = 4;
+}
+
+// Request payload for GetStateStoreSchema.
+message GetStateStoreSchemaRequest {}
+
+// One table/view schema in the SQLite state store.
+message StateStoreSchemaObject {
+  // Object kind such as table or view.
+  string kind = 1;
+
+  // Object name.
+  string name = 2;
+
+  // Full CREATE SQL for the object when available.
+  string create_sql = 3;
+
+  // Column definitions for this object.
+  repeated StateStoreSchemaColumn columns = 4;
+}
+
+// One column definition inside a SQLite schema object.
+message StateStoreSchemaColumn {
+  // Column ordinal position from SQLite pragma output.
+  int32 ordinal = 1;
+
+  // Column name.
+  string name = 2;
+
+  // Declared SQLite type.
+  string data_type = 3;
+
+  // Whether this column is declared NOT NULL.
+  bool not_null = 4;
+
+  // Raw SQLite default expression/value when present.
+  optional string default_value = 5;
+
+  // Whether this column participates in the primary key.
+  bool primary_key = 6;
+}
+
+// Reply payload for GetStateStoreSchema.
+message GetStateStoreSchemaReply {
+  // Ordered schema objects available in the current store.
+  repeated StateStoreSchemaObject objects = 1;
+}
+
+// Request payload for ListSavedStateQueries.
+message ListSavedStateQueriesRequest {}
+
+// Saved query metadata used by the State Explorer UI.
+message SavedStateQuery {
+  // Unique, user-visible query name.
+  string name = 1;
+
+  // SQL text.
+  string sql = 2;
+
+  // RFC3339 creation timestamp.
+  string created_at = 3;
+
+  // RFC3339 last-update timestamp.
+  string updated_at = 4;
+}
+
+// Reply payload for ListSavedStateQueries.
+message ListSavedStateQueriesReply {
+  // Saved queries sorted by name.
+  repeated SavedStateQuery queries = 1;
+}
+
+// Request payload for UpsertSavedStateQuery.
+message UpsertSavedStateQueryRequest {
+  // Query name to create or overwrite.
+  string name = 1;
+
+  // SQL text to save.
+  string sql = 2;
+}
+
+// Reply payload for UpsertSavedStateQuery.
+message UpsertSavedStateQueryReply {
+  // Saved query after create/update.
+  SavedStateQuery query = 1;
+}
+
+// Request payload for DeleteSavedStateQuery.
+message DeleteSavedStateQueryRequest {
+  // Query name to delete.
+  string name = 1;
+}
+
+// Reply payload for DeleteSavedStateQuery.
+message DeleteSavedStateQueryReply {
+  // Human-readable result message.
+  string message = 1;
 }
 
 // One ledger row grouping a node with its current allocations.

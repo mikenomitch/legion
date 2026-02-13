@@ -17,6 +17,7 @@ import Nodes from './pages/Nodes'
 import Rollouts from './pages/Rollouts'
 import ApiExplorer from './pages/ApiExplorer'
 import TestingUtils from './pages/TestingUtils'
+import StateExplorer from './pages/StateExplorer'
 
 const navItems = [
   { label: 'Overview', path: '/', title: 'Overview', copy: 'Jobs running on the cluster.' },
@@ -26,6 +27,7 @@ const navItems = [
   { label: 'Manager Nodes', path: '/manager', title: 'Manager Nodes', copy: 'Manager config snapshots.' },
   { label: 'Key/Value', path: '/kv', title: 'Key/Value', copy: 'Browse and edit key/value entries.' },
   { label: 'API', path: '/api', title: 'API', copy: 'Interactive gRPC explorer.' },
+  { label: 'Stare Explorer', path: '/state-explorer', title: 'Stare Explorer', copy: 'Explore and query manager state SQLite data.' },
 ] as const
 
 const detailRoutes = new Set(['jobs', 'nodes', 'manager', 'rollouts', 'deployments'])
@@ -164,6 +166,7 @@ const AppRoutes = () => {
       <Route path="/rollouts/:id" component={RolloutDetail} />
       <Route path="/kv" component={KeyValue} />
       <Route path="/api" component={ApiExplorer} />
+      <Route path="/state-explorer" component={StateExplorer} />
       <Route path="/testing" component={TestingUtils} />
       <Route path="*" component={() => <Homepage ledger={ledger} rollouts={rollouts} />} />
     </Route>

@@ -3,7 +3,7 @@
 /* eslint-disable */
 // @ts-nocheck
 
-import { AcquireKvLockReply, AcquireKvLockRequest, AdvanceRolloutReply, AdvanceRolloutRequest, DeleteKvReply, DeleteKvRequest, DestroyJobReply, DestroyJobRequest, GetJobInfoReply, GetJobInfoRequest, GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest, GetJoinTokenReply, GetJoinTokenRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest, GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobsReply, ListJobsRequest, ListKvReply, ListKvRequest, ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply, ListRolloutsRequest, PatchKvReply, PatchKvRequest, PlanJobReply, PlanJobRequest, PostWorkReply, PostWorkRequest, PutKvReply, PutKvRequest, ReleaseKvLockReply, ReleaseKvLockRequest, RenewKvLockReply, RenewKvLockRequest, RestartWorkerReply, RestartWorkerRequest, RunJobReply, RunJobRequest, StopJobReply, StopJobRequest, UpdateNodeDynamicReply, UpdateNodeDynamicRequest, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest } from "./legion_pb.js";
+import { AcquireKvLockReply, AcquireKvLockRequest, AdvanceRolloutReply, AdvanceRolloutRequest, DeleteKvReply, DeleteKvRequest, DeleteSavedStateQueryReply, DeleteSavedStateQueryRequest, DestroyJobReply, DestroyJobRequest, GetJobInfoReply, GetJobInfoRequest, GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest, GetJoinTokenReply, GetJoinTokenRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest, GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest, GetStateStoreSchemaReply, GetStateStoreSchemaRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobsReply, ListJobsRequest, ListKvReply, ListKvRequest, ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply, ListRolloutsRequest, ListSavedStateQueriesReply, ListSavedStateQueriesRequest, PatchKvReply, PatchKvRequest, PlanJobReply, PlanJobRequest, PostWorkReply, PostWorkRequest, PutKvReply, PutKvRequest, QueryStateStoreReply, QueryStateStoreRequest, ReleaseKvLockReply, ReleaseKvLockRequest, RenewKvLockReply, RenewKvLockRequest, RestartWorkerReply, RestartWorkerRequest, RunJobReply, RunJobRequest, StopJobReply, StopJobRequest, StopRolloutReply, StopRolloutRequest, UpdateNodeDynamicReply, UpdateNodeDynamicRequest, UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest } from "./legion_pb.js";
 import { MethodKind } from "@bufbuild/protobuf";
 
 /**
@@ -155,6 +155,17 @@ export const Manager = {
       name: "AdvanceRollout",
       I: AdvanceRolloutRequest,
       O: AdvanceRolloutReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Stops an in-flight rollout and optionally reverts to the previous config.
+     *
+     * @generated from rpc legion.Manager.StopRollout
+     */
+    stopRollout: {
+      name: "StopRollout",
+      I: StopRolloutRequest,
+      O: StopRolloutReply,
       kind: MethodKind.Unary,
     },
     /**
@@ -391,6 +402,64 @@ export const Manager = {
       name: "GetKvLock",
       I: GetKvLockRequest,
       O: GetKvLockReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Executes a SQL statement directly against the manager state store.
+     *
+     * Read-only mode is the default safety behavior and rejects write statements
+     * unless explicitly enabled in the request.
+     *
+     * @generated from rpc legion.Manager.QueryStateStore
+     */
+    queryStateStore: {
+      name: "QueryStateStore",
+      I: QueryStateStoreRequest,
+      O: QueryStateStoreReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Returns a structured schema snapshot for the manager SQLite state store.
+     *
+     * @generated from rpc legion.Manager.GetStateStoreSchema
+     */
+    getStateStoreSchema: {
+      name: "GetStateStoreSchema",
+      I: GetStateStoreSchemaRequest,
+      O: GetStateStoreSchemaReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Lists user-saved State Explorer query snippets.
+     *
+     * @generated from rpc legion.Manager.ListSavedStateQueries
+     */
+    listSavedStateQueries: {
+      name: "ListSavedStateQueries",
+      I: ListSavedStateQueriesRequest,
+      O: ListSavedStateQueriesReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Creates or overwrites a saved State Explorer query by name.
+     *
+     * @generated from rpc legion.Manager.UpsertSavedStateQuery
+     */
+    upsertSavedStateQuery: {
+      name: "UpsertSavedStateQuery",
+      I: UpsertSavedStateQueryRequest,
+      O: UpsertSavedStateQueryReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Deletes a saved State Explorer query by name.
+     *
+     * @generated from rpc legion.Manager.DeleteSavedStateQuery
+     */
+    deleteSavedStateQuery: {
+      name: "DeleteSavedStateQuery",
+      I: DeleteSavedStateQueryRequest,
+      O: DeleteSavedStateQueryReply,
       kind: MethodKind.Unary,
     },
   }
