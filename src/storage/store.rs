@@ -20,8 +20,8 @@ use crate::structs::{
 
 use rand::{seq::SliceRandom, thread_rng, Rng};
 use rusqlite::{
-    named_params, params, params_from_iter, Connection, Error as RusqliteError, OpenFlags,
-    OptionalExtension, Row, Transaction,
+    named_params, params, params_from_iter, types::ValueRef, Connection, Error as RusqliteError,
+    OpenFlags, OptionalExtension, Row, Transaction,
 };
 use rusqlite_migration::Migrations;
 use serde::Serialize;
@@ -109,6 +109,50 @@ pub struct AllocationHealthSnapshot {
     pub node_id: String,
     pub healthy: bool,
     pub status: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StateStoreQueryRow {
+    pub json: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StateStoreQueryResult {
+    pub statement_type: String,
+    pub columns: Vec<String>,
+    pub rows: Vec<StateStoreQueryRow>,
+    pub affected_rows: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StateStoreSchemaColumn {
+    pub ordinal: i32,
+    pub name: String,
+    pub data_type: String,
+    pub not_null: bool,
+    pub default_value: Option<String>,
+    pub primary_key: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StateStoreSchemaObject {
+    pub kind: String,
+    pub name: String,
+    pub create_sql: String,
+    pub columns: Vec<StateStoreSchemaColumn>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedStateQueryRecord {
+    pub name: String,
+    pub sql: String,
+    pub created_at: String,
     pub updated_at: String,
 }
 
@@ -3392,6 +3436,217 @@ impl Store {
 
         tx.commit()?;
         Ok(Some(lock))
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn query_state_store(&self, sql: &str, allow_write: bool) -> R<StateStoreQueryResult> {
+        let trimmed = sql.trim();
+        if trimmed.is_empty() {
+            return Err(anyhow::Error::new(StorageError::InvalidInput {
+                message: "sql must not be empty".to_string(),
+            }));
+        }
+
+        let statement_type = Self::sqlite_statement_type(trimmed);
+        if !allow_write && !Self::is_read_only_statement(&statement_type) {
+            return Err(anyhow::Error::new(StorageError::InvalidInput {
+                message: format!(
+                    "statement type '{statement_type}' is not allowed in read-only mode; pass allow_write to enable mutating queries"
+                ),
+            }));
+        }
+
+        if Self::is_query_statement(&statement_type) {
+            let conn = if allow_write {
+                self.write_connection()?
+            } else {
+                self.read_connection()?
+            };
+            let mut stmt = conn.prepare(trimmed)?;
+            let columns: Vec<String> = stmt
+                .column_names()
+                .iter()
+                .map(|column| (*column).to_string())
+                .collect();
+            let mut rows = stmt.query([])?;
+            let mut output_rows = Vec::new();
+            while let Some(row) = rows.next()? {
+                let mut map = serde_json::Map::new();
+                for (index, column_name) in columns.iter().enumerate() {
+                    let value = match row.get_ref(index)? {
+                        ValueRef::Null => Value::Null,
+                        ValueRef::Integer(value) => Value::from(value),
+                        ValueRef::Real(value) => Value::from(value),
+                        ValueRef::Text(value) => {
+                            Value::from(String::from_utf8_lossy(value).to_string())
+                        }
+                        ValueRef::Blob(value) => Value::from(format!(
+                            "0x{}",
+                            value
+                                .iter()
+                                .map(|byte| format!("{byte:02x}"))
+                                .collect::<String>()
+                        )),
+                    };
+                    map.insert(column_name.clone(), value);
+                }
+                output_rows.push(StateStoreQueryRow {
+                    json: Value::Object(map).to_string(),
+                });
+            }
+
+            return Ok(StateStoreQueryResult {
+                statement_type,
+                columns,
+                rows: output_rows,
+                affected_rows: 0,
+            });
+        }
+
+        let conn = if allow_write {
+            self.write_connection()?
+        } else {
+            self.read_connection()?
+        };
+        let affected_rows = conn.execute(trimmed, [])? as u64;
+
+        Ok(StateStoreQueryResult {
+            statement_type,
+            columns: Vec::new(),
+            rows: Vec::new(),
+            affected_rows,
+        })
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn state_store_schema(&self) -> R<Vec<StateStoreSchemaObject>> {
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare(
+            "SELECT type, name, COALESCE(sql, '') FROM sqlite_master WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%' ORDER BY type, name;",
+        )?;
+        let mut objects = Vec::new();
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let kind: String = row.get(0)?;
+            let name: String = row.get(1)?;
+            let create_sql: String = row.get(2)?;
+            let pragma = format!("PRAGMA table_info('{}');", name.replace('\'', "''"));
+            let mut column_stmt = conn.prepare(&pragma)?;
+            let columns_iter = column_stmt.query_map([], |column_row| {
+                Ok(StateStoreSchemaColumn {
+                    ordinal: column_row.get(0)?,
+                    name: column_row.get(1)?,
+                    data_type: column_row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                    not_null: column_row.get::<_, i64>(3)? != 0,
+                    default_value: column_row.get(4)?,
+                    primary_key: column_row.get::<_, i64>(5)? != 0,
+                })
+            })?;
+            objects.push(StateStoreSchemaObject {
+                kind,
+                name,
+                create_sql,
+                columns: Self::collect_rows(columns_iter)?,
+            });
+        }
+
+        Ok(objects)
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn list_saved_state_queries(&self) -> R<Vec<SavedStateQueryRecord>> {
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare(
+            "SELECT name, sql, created_at, updated_at FROM saved_state_query ORDER BY name ASC;",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(SavedStateQueryRecord {
+                name: row.get(0)?,
+                sql: row.get(1)?,
+                created_at: row.get(2)?,
+                updated_at: row.get(3)?,
+            })
+        })?;
+        Self::collect_rows(rows)
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn upsert_saved_state_query(&self, name: &str, sql: &str) -> R<SavedStateQueryRecord> {
+        let name = name.trim();
+        let sql = sql.trim();
+        if name.is_empty() {
+            return Err(anyhow::Error::new(StorageError::InvalidInput {
+                message: "saved query name must not be empty".to_string(),
+            }));
+        }
+        if sql.is_empty() {
+            return Err(anyhow::Error::new(StorageError::InvalidInput {
+                message: "saved query sql must not be empty".to_string(),
+            }));
+        }
+
+        let now = OffsetDateTime::now_utc().format(&Rfc3339)?;
+        let mut conn = self.write_connection()?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT INTO saved_state_query (name, sql, created_at, updated_at) VALUES (:name, :sql, :now, :now) ON CONFLICT(name) DO UPDATE SET sql = excluded.sql, updated_at = excluded.updated_at;",
+            named_params! {
+                ":name": name,
+                ":sql": sql,
+                ":now": now,
+            },
+        )?;
+        let query = tx.query_row(
+            "SELECT name, sql, created_at, updated_at FROM saved_state_query WHERE name = ?;",
+            [name],
+            |row| {
+                Ok(SavedStateQueryRecord {
+                    name: row.get(0)?,
+                    sql: row.get(1)?,
+                    created_at: row.get(2)?,
+                    updated_at: row.get(3)?,
+                })
+            },
+        )?;
+        tx.commit()?;
+        Ok(query)
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn delete_saved_state_query(&self, name: &str) -> R<()> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(anyhow::Error::new(StorageError::InvalidInput {
+                message: "saved query name must not be empty".to_string(),
+            }));
+        }
+
+        let conn = self.write_connection()?;
+        let deleted = conn.execute("DELETE FROM saved_state_query WHERE name = ?;", [name])?;
+        if deleted == 0 {
+            return Err(anyhow::Error::new(StorageError::not_found(
+                "saved_state_query",
+                name,
+            )));
+        }
+        Ok(())
+    }
+
+    fn sqlite_statement_type(sql: &str) -> String {
+        sql.trim_start()
+            .split_whitespace()
+            .next()
+            .unwrap_or("UNKNOWN")
+            .trim_matches(|c: char| !c.is_ascii_alphanumeric())
+            .to_uppercase()
+    }
+
+    fn is_query_statement(statement_type: &str) -> bool {
+        matches!(statement_type, "SELECT" | "PRAGMA" | "WITH" | "EXPLAIN")
+    }
+
+    fn is_read_only_statement(statement_type: &str) -> bool {
+        Self::is_query_statement(statement_type)
     }
 
     #[instrument(err, skip_all)]

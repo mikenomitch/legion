@@ -1618,6 +1618,116 @@ export class AdvanceRolloutReply extends Message<AdvanceRolloutReply> {
 }
 
 /**
+ * Request payload for StopRollout.
+ *
+ * @generated from message legion.StopRolloutRequest
+ */
+export class StopRolloutRequest extends Message<StopRolloutRequest> {
+  /**
+   * Rollout ID to stop.
+   *
+   * @generated from field: int64 id = 1;
+   */
+  id = protoInt64.zero;
+
+  /**
+   * When true, remove allocations for the rollout target config and re-schedule from
+   * the rollout source config (when present).
+   *
+   * @generated from field: bool revert = 2;
+   */
+  revert = false;
+
+  /**
+   * Optional eval priority for any rollback scheduling.
+   *
+   * Default when omitted: manager `default_priority`
+   * (`50` in built-in config defaults).
+   *
+   * @generated from field: optional int64 priority = 3;
+   */
+  priority?: bigint;
+
+  constructor(data?: PartialMessage<StopRolloutRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.StopRolloutRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 2, name: "revert", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 3, name: "priority", kind: "scalar", T: 3 /* ScalarType.INT64 */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): StopRolloutRequest {
+    return new StopRolloutRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): StopRolloutRequest {
+    return new StopRolloutRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): StopRolloutRequest {
+    return new StopRolloutRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: StopRolloutRequest | PlainMessage<StopRolloutRequest> | undefined, b: StopRolloutRequest | PlainMessage<StopRolloutRequest> | undefined): boolean {
+    return proto3.util.equals(StopRolloutRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for StopRollout.
+ *
+ * @generated from message legion.StopRolloutReply
+ */
+export class StopRolloutReply extends Message<StopRolloutReply> {
+  /**
+   * Human-readable stop/revert message.
+   *
+   * @generated from field: string message = 1;
+   */
+  message = "";
+
+  /**
+   * Updated rollout record after stop processing.
+   *
+   * @generated from field: optional legion.Rollout rollout = 2;
+   */
+  rollout?: Rollout;
+
+  constructor(data?: PartialMessage<StopRolloutReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.StopRolloutReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "rollout", kind: "message", T: Rollout, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): StopRolloutReply {
+    return new StopRolloutReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): StopRolloutReply {
+    return new StopRolloutReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): StopRolloutReply {
+    return new StopRolloutReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: StopRolloutReply | PlainMessage<StopRolloutReply> | undefined, b: StopRolloutReply | PlainMessage<StopRolloutReply> | undefined): boolean {
+    return proto3.util.equals(StopRolloutReply, a, b);
+  }
+}
+
+/**
  * Request payload for GetJobSpec.
  *
  * @generated from message legion.GetJobSpecRequest
@@ -4561,6 +4671,700 @@ export class GetKvLockReply extends Message<GetKvLockReply> {
 
   static equals(a: GetKvLockReply | PlainMessage<GetKvLockReply> | undefined, b: GetKvLockReply | PlainMessage<GetKvLockReply> | undefined): boolean {
     return proto3.util.equals(GetKvLockReply, a, b);
+  }
+}
+
+/**
+ * Request payload for QueryStateStore.
+ *
+ * @generated from message legion.QueryStateStoreRequest
+ */
+export class QueryStateStoreRequest extends Message<QueryStateStoreRequest> {
+  /**
+   * SQL statement to execute.
+   *
+   * The server currently accepts a single statement per request.
+   *
+   * @generated from field: string sql = 1;
+   */
+  sql = "";
+
+  /**
+   * Allows write/mutating statements when true.
+   *
+   * Default behavior when false: only read/query statements are accepted.
+   *
+   * @generated from field: bool allow_write = 2;
+   */
+  allowWrite = false;
+
+  constructor(data?: PartialMessage<QueryStateStoreRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.QueryStateStoreRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "sql", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "allow_write", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): QueryStateStoreRequest {
+    return new QueryStateStoreRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): QueryStateStoreRequest {
+    return new QueryStateStoreRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): QueryStateStoreRequest {
+    return new QueryStateStoreRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: QueryStateStoreRequest | PlainMessage<QueryStateStoreRequest> | undefined, b: QueryStateStoreRequest | PlainMessage<QueryStateStoreRequest> | undefined): boolean {
+    return proto3.util.equals(QueryStateStoreRequest, a, b);
+  }
+}
+
+/**
+ * One row from QueryStateStore results encoded as JSON object text.
+ *
+ * @generated from message legion.QueryStateStoreRow
+ */
+export class QueryStateStoreRow extends Message<QueryStateStoreRow> {
+  /**
+   * JSON object containing column name => value for one returned row.
+   *
+   * @generated from field: string json = 1;
+   */
+  json = "";
+
+  constructor(data?: PartialMessage<QueryStateStoreRow>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.QueryStateStoreRow";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): QueryStateStoreRow {
+    return new QueryStateStoreRow().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): QueryStateStoreRow {
+    return new QueryStateStoreRow().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): QueryStateStoreRow {
+    return new QueryStateStoreRow().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: QueryStateStoreRow | PlainMessage<QueryStateStoreRow> | undefined, b: QueryStateStoreRow | PlainMessage<QueryStateStoreRow> | undefined): boolean {
+    return proto3.util.equals(QueryStateStoreRow, a, b);
+  }
+}
+
+/**
+ * Reply payload for QueryStateStore.
+ *
+ * @generated from message legion.QueryStateStoreReply
+ */
+export class QueryStateStoreReply extends Message<QueryStateStoreReply> {
+  /**
+   * Statement category inferred by the manager (for example: SELECT, UPDATE).
+   *
+   * @generated from field: string statement_type = 1;
+   */
+  statementType = "";
+
+  /**
+   * Ordered result column names for tabular query results.
+   *
+   * @generated from field: repeated string columns = 2;
+   */
+  columns: string[] = [];
+
+  /**
+   * Returned rows for query statements.
+   *
+   * Mutating statements typically return an empty list.
+   *
+   * @generated from field: repeated legion.QueryStateStoreRow rows = 3;
+   */
+  rows: QueryStateStoreRow[] = [];
+
+  /**
+   * Number of rows affected for mutating statements.
+   *
+   * For read-only statements this is usually zero.
+   *
+   * @generated from field: uint64 affected_rows = 4;
+   */
+  affectedRows = protoInt64.zero;
+
+  constructor(data?: PartialMessage<QueryStateStoreReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.QueryStateStoreReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "statement_type", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "columns", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 3, name: "rows", kind: "message", T: QueryStateStoreRow, repeated: true },
+    { no: 4, name: "affected_rows", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): QueryStateStoreReply {
+    return new QueryStateStoreReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): QueryStateStoreReply {
+    return new QueryStateStoreReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): QueryStateStoreReply {
+    return new QueryStateStoreReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: QueryStateStoreReply | PlainMessage<QueryStateStoreReply> | undefined, b: QueryStateStoreReply | PlainMessage<QueryStateStoreReply> | undefined): boolean {
+    return proto3.util.equals(QueryStateStoreReply, a, b);
+  }
+}
+
+/**
+ * Request payload for GetStateStoreSchema.
+ *
+ * @generated from message legion.GetStateStoreSchemaRequest
+ */
+export class GetStateStoreSchemaRequest extends Message<GetStateStoreSchemaRequest> {
+  constructor(data?: PartialMessage<GetStateStoreSchemaRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetStateStoreSchemaRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetStateStoreSchemaRequest {
+    return new GetStateStoreSchemaRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetStateStoreSchemaRequest {
+    return new GetStateStoreSchemaRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetStateStoreSchemaRequest {
+    return new GetStateStoreSchemaRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetStateStoreSchemaRequest | PlainMessage<GetStateStoreSchemaRequest> | undefined, b: GetStateStoreSchemaRequest | PlainMessage<GetStateStoreSchemaRequest> | undefined): boolean {
+    return proto3.util.equals(GetStateStoreSchemaRequest, a, b);
+  }
+}
+
+/**
+ * One table/view schema in the SQLite state store.
+ *
+ * @generated from message legion.StateStoreSchemaObject
+ */
+export class StateStoreSchemaObject extends Message<StateStoreSchemaObject> {
+  /**
+   * Object kind such as table or view.
+   *
+   * @generated from field: string kind = 1;
+   */
+  kind = "";
+
+  /**
+   * Object name.
+   *
+   * @generated from field: string name = 2;
+   */
+  name = "";
+
+  /**
+   * Full CREATE SQL for the object when available.
+   *
+   * @generated from field: string create_sql = 3;
+   */
+  createSql = "";
+
+  /**
+   * Column definitions for this object.
+   *
+   * @generated from field: repeated legion.StateStoreSchemaColumn columns = 4;
+   */
+  columns: StateStoreSchemaColumn[] = [];
+
+  constructor(data?: PartialMessage<StateStoreSchemaObject>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.StateStoreSchemaObject";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "kind", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "create_sql", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "columns", kind: "message", T: StateStoreSchemaColumn, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): StateStoreSchemaObject {
+    return new StateStoreSchemaObject().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): StateStoreSchemaObject {
+    return new StateStoreSchemaObject().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): StateStoreSchemaObject {
+    return new StateStoreSchemaObject().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: StateStoreSchemaObject | PlainMessage<StateStoreSchemaObject> | undefined, b: StateStoreSchemaObject | PlainMessage<StateStoreSchemaObject> | undefined): boolean {
+    return proto3.util.equals(StateStoreSchemaObject, a, b);
+  }
+}
+
+/**
+ * One column definition inside a SQLite schema object.
+ *
+ * @generated from message legion.StateStoreSchemaColumn
+ */
+export class StateStoreSchemaColumn extends Message<StateStoreSchemaColumn> {
+  /**
+   * Column ordinal position from SQLite pragma output.
+   *
+   * @generated from field: int32 ordinal = 1;
+   */
+  ordinal = 0;
+
+  /**
+   * Column name.
+   *
+   * @generated from field: string name = 2;
+   */
+  name = "";
+
+  /**
+   * Declared SQLite type.
+   *
+   * @generated from field: string data_type = 3;
+   */
+  dataType = "";
+
+  /**
+   * Whether this column is declared NOT NULL.
+   *
+   * @generated from field: bool not_null = 4;
+   */
+  notNull = false;
+
+  /**
+   * Raw SQLite default expression/value when present.
+   *
+   * @generated from field: optional string default_value = 5;
+   */
+  defaultValue?: string;
+
+  /**
+   * Whether this column participates in the primary key.
+   *
+   * @generated from field: bool primary_key = 6;
+   */
+  primaryKey = false;
+
+  constructor(data?: PartialMessage<StateStoreSchemaColumn>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.StateStoreSchemaColumn";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "ordinal", kind: "scalar", T: 5 /* ScalarType.INT32 */ },
+    { no: 2, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "data_type", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "not_null", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 5, name: "default_value", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 6, name: "primary_key", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): StateStoreSchemaColumn {
+    return new StateStoreSchemaColumn().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): StateStoreSchemaColumn {
+    return new StateStoreSchemaColumn().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): StateStoreSchemaColumn {
+    return new StateStoreSchemaColumn().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: StateStoreSchemaColumn | PlainMessage<StateStoreSchemaColumn> | undefined, b: StateStoreSchemaColumn | PlainMessage<StateStoreSchemaColumn> | undefined): boolean {
+    return proto3.util.equals(StateStoreSchemaColumn, a, b);
+  }
+}
+
+/**
+ * Reply payload for GetStateStoreSchema.
+ *
+ * @generated from message legion.GetStateStoreSchemaReply
+ */
+export class GetStateStoreSchemaReply extends Message<GetStateStoreSchemaReply> {
+  /**
+   * Ordered schema objects available in the current store.
+   *
+   * @generated from field: repeated legion.StateStoreSchemaObject objects = 1;
+   */
+  objects: StateStoreSchemaObject[] = [];
+
+  constructor(data?: PartialMessage<GetStateStoreSchemaReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetStateStoreSchemaReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "objects", kind: "message", T: StateStoreSchemaObject, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetStateStoreSchemaReply {
+    return new GetStateStoreSchemaReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetStateStoreSchemaReply {
+    return new GetStateStoreSchemaReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetStateStoreSchemaReply {
+    return new GetStateStoreSchemaReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetStateStoreSchemaReply | PlainMessage<GetStateStoreSchemaReply> | undefined, b: GetStateStoreSchemaReply | PlainMessage<GetStateStoreSchemaReply> | undefined): boolean {
+    return proto3.util.equals(GetStateStoreSchemaReply, a, b);
+  }
+}
+
+/**
+ * Request payload for ListSavedStateQueries.
+ *
+ * @generated from message legion.ListSavedStateQueriesRequest
+ */
+export class ListSavedStateQueriesRequest extends Message<ListSavedStateQueriesRequest> {
+  constructor(data?: PartialMessage<ListSavedStateQueriesRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListSavedStateQueriesRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListSavedStateQueriesRequest {
+    return new ListSavedStateQueriesRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListSavedStateQueriesRequest {
+    return new ListSavedStateQueriesRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListSavedStateQueriesRequest {
+    return new ListSavedStateQueriesRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListSavedStateQueriesRequest | PlainMessage<ListSavedStateQueriesRequest> | undefined, b: ListSavedStateQueriesRequest | PlainMessage<ListSavedStateQueriesRequest> | undefined): boolean {
+    return proto3.util.equals(ListSavedStateQueriesRequest, a, b);
+  }
+}
+
+/**
+ * Saved query metadata used by the State Explorer UI.
+ *
+ * @generated from message legion.SavedStateQuery
+ */
+export class SavedStateQuery extends Message<SavedStateQuery> {
+  /**
+   * Unique, user-visible query name.
+   *
+   * @generated from field: string name = 1;
+   */
+  name = "";
+
+  /**
+   * SQL text.
+   *
+   * @generated from field: string sql = 2;
+   */
+  sql = "";
+
+  /**
+   * RFC3339 creation timestamp.
+   *
+   * @generated from field: string created_at = 3;
+   */
+  createdAt = "";
+
+  /**
+   * RFC3339 last-update timestamp.
+   *
+   * @generated from field: string updated_at = 4;
+   */
+  updatedAt = "";
+
+  constructor(data?: PartialMessage<SavedStateQuery>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.SavedStateQuery";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "sql", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "created_at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "updated_at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): SavedStateQuery {
+    return new SavedStateQuery().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): SavedStateQuery {
+    return new SavedStateQuery().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): SavedStateQuery {
+    return new SavedStateQuery().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: SavedStateQuery | PlainMessage<SavedStateQuery> | undefined, b: SavedStateQuery | PlainMessage<SavedStateQuery> | undefined): boolean {
+    return proto3.util.equals(SavedStateQuery, a, b);
+  }
+}
+
+/**
+ * Reply payload for ListSavedStateQueries.
+ *
+ * @generated from message legion.ListSavedStateQueriesReply
+ */
+export class ListSavedStateQueriesReply extends Message<ListSavedStateQueriesReply> {
+  /**
+   * Saved queries sorted by name.
+   *
+   * @generated from field: repeated legion.SavedStateQuery queries = 1;
+   */
+  queries: SavedStateQuery[] = [];
+
+  constructor(data?: PartialMessage<ListSavedStateQueriesReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListSavedStateQueriesReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "queries", kind: "message", T: SavedStateQuery, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListSavedStateQueriesReply {
+    return new ListSavedStateQueriesReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListSavedStateQueriesReply {
+    return new ListSavedStateQueriesReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListSavedStateQueriesReply {
+    return new ListSavedStateQueriesReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListSavedStateQueriesReply | PlainMessage<ListSavedStateQueriesReply> | undefined, b: ListSavedStateQueriesReply | PlainMessage<ListSavedStateQueriesReply> | undefined): boolean {
+    return proto3.util.equals(ListSavedStateQueriesReply, a, b);
+  }
+}
+
+/**
+ * Request payload for UpsertSavedStateQuery.
+ *
+ * @generated from message legion.UpsertSavedStateQueryRequest
+ */
+export class UpsertSavedStateQueryRequest extends Message<UpsertSavedStateQueryRequest> {
+  /**
+   * Query name to create or overwrite.
+   *
+   * @generated from field: string name = 1;
+   */
+  name = "";
+
+  /**
+   * SQL text to save.
+   *
+   * @generated from field: string sql = 2;
+   */
+  sql = "";
+
+  constructor(data?: PartialMessage<UpsertSavedStateQueryRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.UpsertSavedStateQueryRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "sql", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): UpsertSavedStateQueryRequest {
+    return new UpsertSavedStateQueryRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): UpsertSavedStateQueryRequest {
+    return new UpsertSavedStateQueryRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): UpsertSavedStateQueryRequest {
+    return new UpsertSavedStateQueryRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: UpsertSavedStateQueryRequest | PlainMessage<UpsertSavedStateQueryRequest> | undefined, b: UpsertSavedStateQueryRequest | PlainMessage<UpsertSavedStateQueryRequest> | undefined): boolean {
+    return proto3.util.equals(UpsertSavedStateQueryRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for UpsertSavedStateQuery.
+ *
+ * @generated from message legion.UpsertSavedStateQueryReply
+ */
+export class UpsertSavedStateQueryReply extends Message<UpsertSavedStateQueryReply> {
+  /**
+   * Saved query after create/update.
+   *
+   * @generated from field: legion.SavedStateQuery query = 1;
+   */
+  query?: SavedStateQuery;
+
+  constructor(data?: PartialMessage<UpsertSavedStateQueryReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.UpsertSavedStateQueryReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "query", kind: "message", T: SavedStateQuery },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): UpsertSavedStateQueryReply {
+    return new UpsertSavedStateQueryReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): UpsertSavedStateQueryReply {
+    return new UpsertSavedStateQueryReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): UpsertSavedStateQueryReply {
+    return new UpsertSavedStateQueryReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: UpsertSavedStateQueryReply | PlainMessage<UpsertSavedStateQueryReply> | undefined, b: UpsertSavedStateQueryReply | PlainMessage<UpsertSavedStateQueryReply> | undefined): boolean {
+    return proto3.util.equals(UpsertSavedStateQueryReply, a, b);
+  }
+}
+
+/**
+ * Request payload for DeleteSavedStateQuery.
+ *
+ * @generated from message legion.DeleteSavedStateQueryRequest
+ */
+export class DeleteSavedStateQueryRequest extends Message<DeleteSavedStateQueryRequest> {
+  /**
+   * Query name to delete.
+   *
+   * @generated from field: string name = 1;
+   */
+  name = "";
+
+  constructor(data?: PartialMessage<DeleteSavedStateQueryRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.DeleteSavedStateQueryRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): DeleteSavedStateQueryRequest {
+    return new DeleteSavedStateQueryRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): DeleteSavedStateQueryRequest {
+    return new DeleteSavedStateQueryRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): DeleteSavedStateQueryRequest {
+    return new DeleteSavedStateQueryRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: DeleteSavedStateQueryRequest | PlainMessage<DeleteSavedStateQueryRequest> | undefined, b: DeleteSavedStateQueryRequest | PlainMessage<DeleteSavedStateQueryRequest> | undefined): boolean {
+    return proto3.util.equals(DeleteSavedStateQueryRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for DeleteSavedStateQuery.
+ *
+ * @generated from message legion.DeleteSavedStateQueryReply
+ */
+export class DeleteSavedStateQueryReply extends Message<DeleteSavedStateQueryReply> {
+  /**
+   * Human-readable result message.
+   *
+   * @generated from field: string message = 1;
+   */
+  message = "";
+
+  constructor(data?: PartialMessage<DeleteSavedStateQueryReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.DeleteSavedStateQueryReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): DeleteSavedStateQueryReply {
+    return new DeleteSavedStateQueryReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): DeleteSavedStateQueryReply {
+    return new DeleteSavedStateQueryReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): DeleteSavedStateQueryReply {
+    return new DeleteSavedStateQueryReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: DeleteSavedStateQueryReply | PlainMessage<DeleteSavedStateQueryReply> | undefined, b: DeleteSavedStateQueryReply | PlainMessage<DeleteSavedStateQueryReply> | undefined): boolean {
+    return proto3.util.equals(DeleteSavedStateQueryReply, a, b);
   }
 }
 

@@ -325,5 +325,14 @@ pub fn get_migrations() -> Migrations<'static> {
             "CREATE INDEX IF NOT EXISTS idx_rollout_event_job_created ON rollout_event(job_id, created_at DESC, id DESC);",
         )
         .down("DROP INDEX IF EXISTS idx_rollout_event_job_created;"),
+        M::up(
+            "CREATE TABLE IF NOT EXISTS saved_state_query (
+            name STRING PRIMARY KEY,
+            sql TEXT NOT NULL,
+            created_at TIMESTAMP NOT NULL,
+            updated_at TIMESTAMP NOT NULL
+        )",
+        )
+        .down("DROP TABLE IF EXISTS saved_state_query;"),
     ])
 }
