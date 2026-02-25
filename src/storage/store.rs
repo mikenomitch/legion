@@ -42,7 +42,10 @@ pub enum Msg {
 }
 
 pub type MemSafeConn = Arc<Mutex<Connection>>;
+type PlanVersionVector = HashMap<String, i64>;
 const READ_MODEL_LOCK_ERROR: &str = "Error locking read model";
+const PLAN_SCOPE_JOB_CONFIG_PREFIX: &str = "job_config";
+const PLAN_SCOPE_NODE_PREFIX: &str = "node";
 
 #[derive(Debug, Clone, Default)]
 pub struct SchedulingReadModel {
@@ -61,13 +64,16 @@ struct AllocationConstraintState {
 #[derive(Debug, Clone)]
 pub struct PlanSubmission {
     pub id: i64,
-    pub expected_epoch: i64,
+    pub expected_versions: PlanVersionVector,
 }
 
 #[derive(Debug, Clone)]
 pub enum PlanApplyOutcome {
     Applied(Vec<Allocation>),
-    Rejected { reason: String, latest_epoch: i64 },
+    Rejected {
+        reason: String,
+        latest_versions: PlanVersionVector,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -420,6 +426,97 @@ impl Store {
         Ok(epoch)
     }
 
+    fn allocation_scopes(job_config_id: &str, node_ids: &[String]) -> Vec<String> {
+        let mut scopes = Vec::with_capacity(node_ids.len() + 1);
+        scopes.push(format!("{PLAN_SCOPE_JOB_CONFIG_PREFIX}:{job_config_id}"));
+        for node_id in node_ids {
+            scopes.push(format!("{PLAN_SCOPE_NODE_PREFIX}:{node_id}"));
+        }
+        scopes.sort();
+        scopes.dedup();
+        scopes
+    }
+
+    fn plan_scopes_from_placements(
+        job_config_id: &str,
+        placements: &[(String, i64)],
+    ) -> Vec<String> {
+        let scope_node_ids = placements
+            .iter()
+            .map(|(node_id, _)| node_id.clone())
+            .collect::<Vec<_>>();
+        Self::allocation_scopes(job_config_id, &scope_node_ids)
+    }
+
+    fn allocation_scopes_for_allocations(allocations: &[Allocation]) -> Vec<String> {
+        let mut scopes = Vec::with_capacity(allocations.len() * 2);
+        for allocation in allocations {
+            scopes.push(format!(
+                "{PLAN_SCOPE_JOB_CONFIG_PREFIX}:{}",
+                allocation.job_config_id
+            ));
+            scopes.push(format!("{PLAN_SCOPE_NODE_PREFIX}:{}", allocation.node_id));
+        }
+        scopes.sort();
+        scopes.dedup();
+        scopes
+    }
+
+    fn allocation_scope_versions_tx(
+        &self,
+        tx: &Transaction<'_>,
+        scopes: &[String],
+    ) -> R<PlanVersionVector> {
+        if scopes.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let mut versions = HashMap::with_capacity(scopes.len());
+        let mut stmt = tx.prepare("SELECT epoch FROM allocation_epoch_scope WHERE scope = ?1;")?;
+
+        for scope in scopes {
+            let epoch = stmt
+                .query_row([scope], |row| row.get(0))
+                .optional()?
+                .unwrap_or(0_i64);
+            versions.insert(scope.clone(), epoch);
+        }
+
+        Ok(versions)
+    }
+
+    fn bump_allocation_scopes_tx(&self, tx: &Transaction<'_>, scopes: &[String]) -> R<()> {
+        if scopes.is_empty() {
+            return Ok(());
+        }
+
+        let mut stmt = tx.prepare(
+            "INSERT INTO allocation_epoch_scope(scope, epoch) VALUES (?1, 1)
+             ON CONFLICT(scope) DO UPDATE SET epoch = epoch + 1;",
+        )?;
+        for scope in scopes {
+            stmt.execute([scope])?;
+        }
+
+        Ok(())
+    }
+
+    fn bump_allocation_scopes_conn(&self, conn: &Connection, scopes: &[String]) -> R<()> {
+        if scopes.is_empty() {
+            return Ok(());
+        }
+
+        let mut stmt = conn.prepare(
+            "INSERT INTO allocation_epoch_scope(scope, epoch) VALUES (?1, 1)
+             ON CONFLICT(scope) DO UPDATE SET epoch = epoch + 1;",
+        )?;
+        for scope in scopes {
+            stmt.execute([scope])?;
+        }
+
+        Ok(())
+    }
+
     fn bump_allocation_epoch_tx(&self, tx: &Transaction<'_>) -> R<i64> {
         tx.execute(
             "UPDATE allocation_epoch SET epoch = epoch + 1 WHERE singleton = 1;",
@@ -438,52 +535,76 @@ impl Store {
         job_config_id: &str,
         mode: &str,
         placements: &[(String, i64)],
-        expected_epoch: i64,
     ) -> R<PlanSubmission> {
         let created_at = OffsetDateTime::now_utc().format(&Rfc3339)?;
         let placements_json = serde_json::to_string(placements)?;
-        let conn = self.write_connection()?;
-        let id = conn.query_row(
-            "INSERT INTO plan_submission(job_config_id, mode, placements, expected_epoch, status, created_at) VALUES (?1, ?2, ?3, ?4, 'queued', ?5) RETURNING id;",
-            params![job_config_id, mode, placements_json, expected_epoch, created_at],
+        let scopes = Self::plan_scopes_from_placements(job_config_id, placements);
+
+        let mut conn = self.write_connection()?;
+        let tx = conn.transaction()?;
+        let expected_versions = self.allocation_scope_versions_tx(&tx, &scopes)?;
+        let expected_versions_json = serde_json::to_string(&expected_versions)?;
+
+        let id = tx.query_row(
+            "INSERT INTO plan_submission(job_config_id, mode, placements, expected_epoch, expected_versions, status, created_at) VALUES (?1, ?2, ?3, 0, ?4, 'queued', ?5) RETURNING id;",
+            params![job_config_id, mode, placements_json, expected_versions_json, created_at],
             |row| row.get(0),
         )?;
+        tx.commit()?;
 
-        Ok(PlanSubmission { id, expected_epoch })
+        Ok(PlanSubmission {
+            id,
+            expected_versions,
+        })
+    }
+
+    fn reject_plan_submission_tx(tx: &Transaction<'_>, submission_id: i64, reason: &str) -> R<()> {
+        tx.execute(
+            "UPDATE plan_submission SET status = 'rejected', rejection_reason = ?1 WHERE id = ?2;",
+            params![reason, submission_id],
+        )?;
+        Ok(())
+    }
+
+    fn load_submission_payload_tx(
+        tx: &Transaction<'_>,
+        submission_id: i64,
+    ) -> R<(String, Vec<(String, i64)>)> {
+        let job_config_id: String = tx.query_row(
+            "SELECT job_config_id FROM plan_submission WHERE id = ?1;",
+            [submission_id],
+            |row| row.get(0),
+        )?;
+        let placements_json: String = tx.query_row(
+            "SELECT placements FROM plan_submission WHERE id = ?1;",
+            [submission_id],
+            |row| row.get(0),
+        )?;
+        let placements = serde_json::from_str(&placements_json)?;
+
+        Ok((job_config_id, placements))
     }
 
     pub fn apply_plan_submission(&self, submission: &PlanSubmission) -> R<PlanApplyOutcome> {
         let mut conn = self.write_connection()?;
         let tx = conn.transaction()?;
 
-        let latest_epoch: i64 = tx.query_row(
-            "SELECT epoch FROM allocation_epoch WHERE singleton = 1;",
-            [],
-            |row| row.get(0),
-        )?;
+        let (job_config_id, placements) = Self::load_submission_payload_tx(&tx, submission.id)?;
+        let scopes = Self::plan_scopes_from_placements(&job_config_id, &placements);
+        let latest_versions = self.allocation_scope_versions_tx(&tx, &scopes)?;
 
-        if latest_epoch != submission.expected_epoch {
+        if latest_versions != submission.expected_versions {
             let reason = format!(
-                "plan epoch {} is stale; latest epoch is {}",
-                submission.expected_epoch, latest_epoch
+                "plan versions are stale; expected {:?}, latest {:?}",
+                submission.expected_versions, latest_versions
             );
-            tx.execute(
-                "UPDATE plan_submission SET status = 'rejected', rejection_reason = ?1 WHERE id = ?2;",
-                params![reason, submission.id],
-            )?;
+            Self::reject_plan_submission_tx(&tx, submission.id, &reason)?;
             tx.commit()?;
             return Ok(PlanApplyOutcome::Rejected {
                 reason,
-                latest_epoch,
+                latest_versions,
             });
         }
-
-        let placements_json: String = tx.query_row(
-            "SELECT placements FROM plan_submission WHERE id = ?1;",
-            [submission.id],
-            |row| row.get(0),
-        )?;
-        let placements: Vec<(String, i64)> = serde_json::from_str(&placements_json)?;
 
         let mut allocations = Vec::new();
         let mut constraint_states: HashMap<i64, AllocationConstraintState> = HashMap::new();
@@ -505,14 +626,11 @@ impl Store {
                     "Node {} does not satisfy constraints for task {}",
                     node_id, task_id
                 );
-                tx.execute(
-                    "UPDATE plan_submission SET status = 'rejected', rejection_reason = ?1 WHERE id = ?2;",
-                    params![reason, submission.id],
-                )?;
+                Self::reject_plan_submission_tx(&tx, submission.id, &reason)?;
                 tx.commit()?;
                 return Ok(PlanApplyOutcome::Rejected {
                     reason,
-                    latest_epoch: submission.expected_epoch,
+                    latest_versions: submission.expected_versions.clone(),
                 });
             }
 
@@ -525,6 +643,7 @@ impl Store {
         }
 
         if !allocations.is_empty() {
+            self.bump_allocation_scopes_tx(&tx, &scopes)?;
             self.bump_allocation_epoch_tx(&tx)?;
         }
 
@@ -1012,6 +1131,8 @@ impl Store {
 
         let conn = self.write_connection()?;
         conn.execute("DELETE FROM allocation WHERE node_id = ?;", [node_id])?;
+        let scopes = Self::allocation_scopes_for_allocations(&allocs);
+        self.bump_allocation_scopes_conn(&conn, &scopes)?;
         conn.execute(
             "UPDATE allocation_epoch SET epoch = epoch + 1 WHERE singleton = 1;",
             [],
@@ -1942,6 +2063,8 @@ impl Store {
             allocations.push(allocation);
         }
 
+        let scopes = Self::allocation_scopes_for_allocations(&allocations);
+        self.bump_allocation_scopes_tx(&tx, &scopes)?;
         self.bump_allocation_epoch_tx(&tx)?;
         tx.commit()?;
 
@@ -2023,6 +2146,8 @@ impl Store {
 
         let conn = self.write_connection()?;
         conn.execute("DELETE FROM allocation WHERE id = ?;", [allocation_id])?;
+        let scopes = Self::allocation_scopes_for_allocations(std::slice::from_ref(&allocation));
+        self.bump_allocation_scopes_conn(&conn, &scopes)?;
         conn.execute(
             "UPDATE allocation_epoch SET epoch = epoch + 1 WHERE singleton = 1;",
             [],
@@ -2076,6 +2201,8 @@ impl Store {
         let params = named_params! { ":job_id": job_id };
 
         conn.execute(sql, params)?;
+        let scopes = Self::allocation_scopes_for_allocations(&allocations);
+        self.bump_allocation_scopes_conn(&conn, &scopes)?;
         conn.execute(
             "UPDATE allocation_epoch SET epoch = epoch + 1 WHERE singleton = 1;",
             [],
@@ -2098,6 +2225,8 @@ impl Store {
             "DELETE FROM allocation WHERE job_config_id = ?;",
             [job_config_id],
         )?;
+        let scopes = Self::allocation_scopes_for_allocations(&allocations);
+        self.bump_allocation_scopes_conn(&conn, &scopes)?;
         conn.execute(
             "UPDATE allocation_epoch SET epoch = epoch + 1 WHERE singleton = 1;",
             [],

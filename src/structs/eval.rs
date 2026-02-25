@@ -1,4 +1,7 @@
+use rand::{thread_rng, Rng};
 use std::collections::HashSet;
+use std::thread;
+use std::time::Duration;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use tracing::{info, warn};
@@ -188,7 +191,15 @@ impl Eval {
         mode: PlanMode,
         excluded: Option<&HashSet<String>>,
     ) -> R<PlanOutcome> {
-        const MAX_PLAN_RETRIES: usize = 3;
+        const MAX_PLAN_RETRIES: usize = 8;
+
+        #[derive(Default)]
+        struct ConflictRetryMetrics {
+            retries: usize,
+            cumulative_backoff_ms: u64,
+        }
+
+        let mut retry_metrics = ConflictRetryMetrics::default();
 
         for attempt in 1..=MAX_PLAN_RETRIES {
             match scheduler.plan_and_apply_with_exclusions(
@@ -196,31 +207,74 @@ impl Eval {
                 mode.clone(),
                 excluded,
             ) {
-                Ok(outcome) => return Ok(outcome),
+                Ok(outcome) => {
+                    if retry_metrics.retries > 0 {
+                        info!(
+                            job_config_id = %self.job_config_id,
+                            attempts = attempt,
+                            conflict_retries = retry_metrics.retries,
+                            cumulative_backoff_ms = retry_metrics.cumulative_backoff_ms,
+                            "Plan conflict retry metrics"
+                        );
+                    }
+                    return Ok(outcome);
+                }
                 Err(error) => {
                     if !Self::is_conflict_error(&error) {
                         return Err(error);
                     }
 
+                    retry_metrics.retries += 1;
+
                     if attempt < MAX_PLAN_RETRIES {
+                        let sleep_ms = Self::adaptive_retry_backoff_ms(attempt);
+                        retry_metrics.cumulative_backoff_ms =
+                            retry_metrics.cumulative_backoff_ms.saturating_add(sleep_ms);
+
                         warn!(
                             attempt,
                             max_attempts = MAX_PLAN_RETRIES,
+                            conflict_retries = retry_metrics.retries,
+                            backoff_ms = sleep_ms,
+                            cumulative_backoff_ms = retry_metrics.cumulative_backoff_ms,
                             error = %error,
-                            "Plan submission rejected due to stale state; retrying"
+                            "Plan submission rejected due to stale state; retrying with adaptive backoff"
                         );
+                        thread::sleep(Duration::from_millis(sleep_ms));
                         continue;
                     }
 
+                    warn!(
+                        attempts = MAX_PLAN_RETRIES,
+                        conflict_retries = retry_metrics.retries,
+                        cumulative_backoff_ms = retry_metrics.cumulative_backoff_ms,
+                        error = %error,
+                        "Plan conflict retries exhausted"
+                    );
                     return Err(error.context(format!(
-                        "plan submission failed after {} attempts",
-                        MAX_PLAN_RETRIES
+                        "plan submission failed after {} attempts ({} conflict retries, {}ms cumulative backoff)",
+                        MAX_PLAN_RETRIES,
+                        retry_metrics.retries,
+                        retry_metrics.cumulative_backoff_ms,
                     )));
                 }
             }
         }
 
         unreachable!("retry loop returns or errors")
+    }
+
+    fn adaptive_retry_backoff_ms(attempt: usize) -> u64 {
+        const BASE_BACKOFF_MS: u64 = 10;
+        const MAX_BACKOFF_MS: u64 = 500;
+
+        // Exponential backoff (bounded) plus jitter so colliding schedulers spread out.
+        let exponent = (attempt.saturating_sub(1)).min(6) as u32;
+        let adaptive_backoff = BASE_BACKOFF_MS.saturating_mul(2_u64.pow(exponent));
+        let bounded_backoff = adaptive_backoff.min(MAX_BACKOFF_MS);
+        let jitter_ms = thread_rng().gen_range(0..=bounded_backoff / 2);
+
+        bounded_backoff + jitter_ms
     }
 
     fn is_conflict_error(error: &anyhow::Error) -> bool {

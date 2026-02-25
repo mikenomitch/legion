@@ -271,23 +271,19 @@ impl<'a> Scheduler<'a> {
             .iter()
             .map(|placement| placement.node_id.clone())
             .collect::<HashSet<_>>();
-        let expected_epoch = self.store.allocation_epoch()?;
-        let submission = self.store.insert_plan_submission(
-            job_config_id,
-            mode.as_str(),
-            &placement_pairs,
-            expected_epoch,
-        )?;
+        let submission =
+            self.store
+                .insert_plan_submission(job_config_id, mode.as_str(), &placement_pairs)?;
         let allocations = match self.store.apply_plan_submission(&submission)? {
             PlanApplyOutcome::Applied(allocations) => allocations,
             PlanApplyOutcome::Rejected {
                 reason,
-                latest_epoch,
+                latest_versions,
             } => {
                 return Err(anyhow::Error::new(StorageError::Conflict {
                     message: format!(
-                        "plan submission rejected: {reason} (expected epoch {}, latest epoch {})",
-                        submission.expected_epoch, latest_epoch
+                        "plan submission rejected: {reason} (expected versions {:?}, latest versions {:?})",
+                        submission.expected_versions, latest_versions
                     ),
                 }));
             }

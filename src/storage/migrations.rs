@@ -255,5 +255,16 @@ pub fn get_migrations() -> Migrations<'static> {
         )",
         )
         .down("DROP TABLE IF EXISTS plan_submission;"),
+        M::up(
+            "ALTER TABLE plan_submission ADD COLUMN expected_versions JSONB NOT NULL DEFAULT '{}';",
+        )
+        .down(""),
+        M::up(
+            "CREATE TABLE IF NOT EXISTS allocation_epoch_scope (
+            scope STRING PRIMARY KEY,
+            epoch INTEGER NOT NULL
+        )",
+        )
+        .down("DROP TABLE IF EXISTS allocation_epoch_scope;"),
     ])
 }
