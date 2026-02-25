@@ -61,6 +61,15 @@ struct AllocationConstraintState {
     distinct: Option<DistinctTracker>,
 }
 
+#[derive(Debug)]
+struct AllocationTaskState {
+    constraints: ConstraintSet,
+    permit: PermitSet,
+    distinct: Option<DistinctTracker>,
+    job_config_id: String,
+    resources: Value,
+}
+
 #[derive(Debug, Clone)]
 pub struct PlanSubmission {
     pub id: i64,
@@ -186,6 +195,7 @@ impl JobSubmitOutcome {
 
 pub const CONN_LOCK_ERROR: &str = "Error locking database connection";
 const READ_ONLY_CONN_POOL_SIZE: usize = 2;
+const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 // NOTE: This will become a general interface for all storage backends
 impl Store {
@@ -232,6 +242,7 @@ impl Store {
     fn create_write_conn(db_path: &Path) -> R<MemSafeConn> {
         let final_path = db_path.to_str().context("Error parsing store path")?;
         let conn = Connection::open(final_path)?;
+        Self::configure_connection(&conn, false)?;
         Ok(Arc::new(Mutex::new(conn)))
     }
 
@@ -239,8 +250,22 @@ impl Store {
     fn create_readonly_conn(db_path: &Path) -> R<MemSafeConn> {
         let final_path = db_path.to_str().context("Error parsing store path")?;
         let conn = Connection::open_with_flags(final_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        Self::configure_connection(&conn, true)?;
         conn.pragma_update(None, "query_only", "ON")?;
         Ok(Arc::new(Mutex::new(conn)))
+    }
+
+    fn configure_connection(conn: &Connection, read_only: bool) -> R<()> {
+        conn.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
+
+        if !read_only {
+            conn.pragma_update(None, "journal_mode", "WAL")?;
+            conn.pragma_update(None, "synchronous", "NORMAL")?;
+        }
+
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+
+        Ok(())
     }
 
     #[instrument(err, skip_all)]
@@ -268,9 +293,6 @@ impl Store {
     fn create_initial_tables(conn: &MemSafeConn) -> R<Migrations<'_>> {
         let migrations = get_migrations();
         let mut conn = Self::lock_conn(conn)?;
-        info!("Pragma update");
-        conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "foreign_keys", "ON")?;
         info!("Running migrations");
         migrations.to_latest(&mut conn)?;
 
@@ -601,21 +623,51 @@ impl Store {
         )?;
         let placements: Vec<(String, i64)> = serde_json::from_str(&placements_json)?;
 
+        let mut nodes_by_id: HashMap<String, Node> = HashMap::new();
+        if !placements.is_empty() {
+            let node_ids: Vec<String> = placements
+                .iter()
+                .map(|(node_id, _)| node_id.clone())
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect();
+            let placeholders = std::iter::repeat("?")
+                .take(node_ids.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT id, pool, status, availability, config_attrs, fingerprint_attrs, dynamic_attrs, health_checks, last_heartbeat FROM node WHERE id IN ({placeholders});"
+            );
+            let mut stmt = tx.prepare(&sql)?;
+            let rows = stmt.query_map(params_from_iter(node_ids.iter()), |row| {
+                self.node_from_row(row)
+            })?;
+            for row in rows {
+                let node = row?;
+                nodes_by_id.insert(node.id.clone(), node);
+            }
+        }
+
         let mut allocations = Vec::new();
-        let mut constraint_states: HashMap<i64, AllocationConstraintState> = HashMap::new();
+        let mut task_states: HashMap<i64, AllocationTaskState> = HashMap::new();
         for (node_id, task_id) in &placements {
-            let state = match constraint_states.entry(*task_id) {
+            let state = match task_states.entry(*task_id) {
                 Entry::Occupied(entry) => entry.into_mut(),
                 Entry::Vacant(entry) => {
-                    entry.insert(self.load_allocation_constraints(&tx, *task_id)?)
+                    entry.insert(self.load_allocation_task_state(&tx, *task_id)?)
                 }
             };
 
-            let node = tx.query_row(&GET_NODE, [node_id], |row| self.node_from_row(row))?;
+            let node = nodes_by_id.get(node_id).with_context(|| {
+                format!(
+                    "Node {node_id} not found while applying plan {}",
+                    submission.id
+                )
+            })?;
             if !state
                 .constraints
-                .is_satisfied(&node, state.distinct.as_ref())
-                || !state.permit.is_permitted(&node)
+                .is_satisfied(node, state.distinct.as_ref())
+                || !state.permit.is_permitted(node)
             {
                 let reason = format!(
                     "Node {} does not satisfy constraints for task {}",
@@ -633,10 +685,16 @@ impl Store {
             }
 
             if let Some(tracker) = state.distinct.as_mut() {
-                tracker.insert_from_node(&node);
+                tracker.insert_from_node(node);
             }
 
-            let allocation = self.insert_allocation(&tx, node_id, *task_id)?;
+            let allocation = self.insert_allocation_with_data(
+                &tx,
+                node_id,
+                *task_id,
+                &state.job_config_id,
+                &state.resources,
+            )?;
             allocations.push(allocation);
         }
 
@@ -2368,6 +2426,29 @@ impl Store {
         Ok(allocation)
     }
 
+    fn insert_allocation_with_data(
+        &self,
+        tx: &Transaction<'_>,
+        node_id: &str,
+        task_id: i64,
+        job_config_id: &str,
+        resources: &Value,
+    ) -> R<Allocation> {
+        let params = named_params! {
+            ":status": "placed",
+            ":resources": resources,
+            ":node_id": node_id,
+            ":job_config_id": job_config_id,
+            ":task_config_id": task_id,
+        };
+
+        let allocation = tx.query_row(&INSERT_ALLOCATION, params, |row| {
+            self.allocation_from_row(row)
+        })?;
+
+        Ok(allocation)
+    }
+
     fn load_allocation_constraints(
         &self,
         tx: &Transaction<'_>,
@@ -2404,6 +2485,49 @@ impl Store {
             constraints: constraint_set,
             permit: permit_set,
             distinct,
+        })
+    }
+
+    fn load_allocation_task_state(
+        &self,
+        tx: &Transaction<'_>,
+        task_id: i64,
+    ) -> R<AllocationTaskState> {
+        let (job_config_id, resources, constraints, permit): (String, Value, Value, Value) = tx
+            .query_row(
+            "SELECT job_config_id, resources, constraints, permit FROM task_config WHERE id = ?;",
+            [task_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+
+        let constraint_set = ConstraintSet::new(&constraints)
+            .with_context(|| format!("Failed to parse constraints for task {task_id}"))?;
+        let permit_set = PermitSet::new(&permit)
+            .with_context(|| format!("Failed to parse permit for task {task_id}"))?;
+        let distinct_keys = constraint_set.distinct_keys();
+        let distinct = if distinct_keys.is_empty() {
+            None
+        } else {
+            let mut tracker = DistinctTracker::new(&distinct_keys);
+            let sql = "SELECT node.id, node.pool, node.status, node.availability, \
+                node.config_attrs, node.fingerprint_attrs, node.dynamic_attrs, \
+                node.health_checks, node.last_heartbeat \
+                FROM node INNER JOIN allocation ON allocation.node_id = node.id \
+                WHERE allocation.task_config_id = ?;";
+            let mut stmt = tx.prepare(sql)?;
+            let rows = stmt.query_map([task_id], |row| self.node_from_row(row))?;
+            for row in rows {
+                tracker.insert_from_node(&row?);
+            }
+            Some(tracker)
+        };
+
+        Ok(AllocationTaskState {
+            constraints: constraint_set,
+            permit: permit_set,
+            distinct,
+            job_config_id,
+            resources,
         })
     }
 
@@ -2914,40 +3038,43 @@ impl Store {
         let mut conn = self.write_connection()?;
         let tx = conn.transaction()?;
 
-        let eval_id: Option<i64> = tx
+        let eval = tx
             .query_row(
-                "SELECT id FROM eval WHERE status = 'pending' AND ready_at <= :now ORDER BY priority DESC, id ASC LIMIT 1;",
+                "UPDATE eval
+                SET status = 'in_flight'
+                WHERE id = (
+                    SELECT id
+                    FROM eval
+                    WHERE status = 'pending' AND ready_at <= :now
+                    ORDER BY priority DESC, id ASC
+                    LIMIT 1
+                )
+                RETURNING id, status, type, job_id, job_config_id, node_id, priority, ready_at;",
                 named_params! {":now": Self::now_rfc3339()?},
-                |row| row.get(0),
+                |row| self.eval_from_row(row),
             )
             .optional()?;
 
-        let Some(eval_id) = eval_id else {
+        let Some(mut eval) = eval else {
             tx.commit()?;
             return Ok(None);
         };
 
-        let mut eval = tx.query_row(
-            "UPDATE eval SET status = 'in_flight' WHERE id = :id RETURNING id, status, type, job_id, job_config_id, node_id, priority, ready_at;",
-            named_params! {":id": eval_id},
-            |row| self.eval_from_row(row),
-        )?;
-
         let eval_id = eval.id.clone();
-
-        if !eval.job_id.trim().is_empty() {
-            tx.execute(
-                "DELETE FROM eval WHERE status = 'pending' AND job_id = :job_id AND id != :id;",
-                named_params! {":job_id": eval.job_id.clone(), ":id": eval_id.clone()},
-            )?;
-        }
-
-        if !eval.node_name.trim().is_empty() {
-            tx.execute(
-                "DELETE FROM eval WHERE status = 'pending' AND node_id = :node_id AND id != :id;",
-                named_params! {":node_id": eval.node_name.clone(), ":id": eval_id.clone()},
-            )?;
-        }
+        tx.execute(
+            "DELETE FROM eval
+            WHERE status = 'pending'
+              AND id != :id
+              AND (
+                (:job_id IS NOT NULL AND :job_id != '' AND job_id = :job_id)
+                OR (:node_id IS NOT NULL AND :node_id != '' AND node_id = :node_id)
+              );",
+            named_params! {
+                ":id": eval_id,
+                ":job_id": if eval.job_id.trim().is_empty() { None::<String> } else { Some(eval.job_id.clone()) },
+                ":node_id": if eval.node_name.trim().is_empty() { None::<String> } else { Some(eval.node_name.clone()) },
+            },
+        )?;
 
         tx.commit()?;
         eval.status = "in_flight".to_string();
