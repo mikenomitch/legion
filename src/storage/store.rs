@@ -32,7 +32,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{MutexGuard, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use time::format_description::well_known::Rfc3339;
 use time::macros::format_description;
 use time::{Duration as TimeDuration, OffsetDateTime};
@@ -68,6 +68,7 @@ struct AllocationTaskState {
     distinct: Option<DistinctTracker>,
     job_config_id: String,
     resources: Value,
+    lifecycle: TaskLifecycle,
 }
 
 #[derive(Debug, Clone)]
@@ -292,26 +293,36 @@ impl Store {
     #[instrument(skip_all)]
     fn create_initial_tables(conn: &MemSafeConn) -> R<Migrations<'_>> {
         let migrations = get_migrations();
-        let mut conn = Self::lock_conn(conn)?;
+        let mut conn = Self::lock_conn(conn, "migration")?;
         info!("Running migrations");
         migrations.to_latest(&mut conn)?;
 
         Ok(migrations)
     }
 
-    fn lock_conn(conn: &MemSafeConn) -> R<MutexGuard<'_, Connection>> {
-        conn.lock().map_err(|_| anyhow!(CONN_LOCK_ERROR))
+    fn lock_conn<'a>(
+        conn: &'a MemSafeConn,
+        connection_kind: &str,
+    ) -> R<MutexGuard<'a, Connection>> {
+        let lock_wait_started = Instant::now();
+        let guard = conn.lock().map_err(|_| anyhow!(CONN_LOCK_ERROR))?;
+        debug!(
+            connection_kind,
+            lock_wait_ms = lock_wait_started.elapsed().as_millis(),
+            "Acquired sqlite connection lock"
+        );
+        Ok(guard)
     }
 
     fn write_connection(&self) -> R<MutexGuard<'_, Connection>> {
-        Self::lock_conn(&self.write_conn)
+        Self::lock_conn(&self.write_conn, "write")
     }
 
     fn read_connection(&self) -> R<MutexGuard<'_, Connection>> {
         let pool = self.read_conns.as_slice();
         let index = self.read_index.fetch_add(1, Ordering::Relaxed);
         let conn = pool.get(index % pool.len()).unwrap_or(&self.write_conn);
-        Self::lock_conn(conn)
+        Self::lock_conn(conn, "read")
     }
 
     fn read_model_reader(&self) -> R<std::sync::RwLockReadGuard<'_, SchedulingReadModel>> {
@@ -590,6 +601,7 @@ impl Store {
     }
 
     pub fn apply_plan_submission(&self, submission: &PlanSubmission) -> R<PlanApplyOutcome> {
+        let tx_started = Instant::now();
         let mut conn = self.write_connection()?;
         let tx = conn.transaction()?;
 
@@ -649,6 +661,7 @@ impl Store {
         }
 
         let mut allocations = Vec::new();
+        let mut task_status_updates: HashMap<i64, TaskStatusState> = HashMap::new();
         let mut task_states: HashMap<i64, AllocationTaskState> = HashMap::new();
         for (node_id, task_id) in &placements {
             let state = match task_states.entry(*task_id) {
@@ -695,10 +708,14 @@ impl Store {
                 &state.job_config_id,
                 &state.resources,
             )?;
+            task_status_updates
+                .entry(*task_id)
+                .or_insert_with(|| Self::task_status_for_lifecycle(&state.lifecycle));
             allocations.push(allocation);
         }
 
         if !allocations.is_empty() {
+            self.apply_task_status_updates_tx(&tx, &task_status_updates)?;
             self.bump_epochs_for_allocations_tx(&tx, &allocations)?;
         }
 
@@ -707,6 +724,11 @@ impl Store {
             [submission.id],
         )?;
         tx.commit()?;
+        debug!(
+            submission_id = submission.id,
+            duration_ms = tx_started.elapsed().as_millis(),
+            "Applied plan submission transaction"
+        );
 
         self.cache_add_allocations(&allocations)?;
 
@@ -2344,13 +2366,42 @@ impl Store {
         Ok(())
     }
 
+    fn task_status_for_lifecycle(lifecycle: &TaskLifecycle) -> TaskStatusState {
+        match lifecycle {
+            TaskLifecycle::Batch => TaskStatusState::Success,
+            TaskLifecycle::Service | TaskLifecycle::Sidecar => TaskStatusState::Running,
+        }
+    }
+
+    fn apply_task_status_updates_tx(
+        &self,
+        tx: &Transaction<'_>,
+        updates: &HashMap<i64, TaskStatusState>,
+    ) -> R<()> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+
+        let now = Self::now_rfc3339()?;
+        let mut update_stmt = tx.prepare(
+            "UPDATE task_status SET status = ?1, updated_at = ?2 WHERE task_config_id = ?3;",
+        )?;
+        for (task_config_id, status) in updates {
+            update_stmt.execute(params![status.as_str(), now, task_config_id])?;
+        }
+        Ok(())
+    }
+
     pub fn update_task_statuses_for_allocations(&self, allocations: &[Allocation]) -> R<bool> {
         if allocations.is_empty() {
             return Ok(false);
         }
 
+        let tx_started = Instant::now();
+        let mut conn = self.write_connection()?;
+        let tx = conn.transaction()?;
         let mut task_cache: HashMap<String, HashMap<i64, TaskConfig>> = HashMap::new();
-        let mut updated = false;
+        let mut updates: HashMap<i64, TaskStatusState> = HashMap::new();
 
         for allocation in allocations {
             let tasks = task_cache
@@ -2366,15 +2417,22 @@ impl Store {
                 .get(&allocation.task_config_id)
                 .with_context(|| format!("Missing task config {}", allocation.task_config_id))?;
 
-            let status = match task.lifecycle {
-                TaskLifecycle::Batch => TaskStatusState::Success,
-                TaskLifecycle::Service | TaskLifecycle::Sidecar => TaskStatusState::Running,
-            };
-            self.set_task_status(allocation.task_config_id, status)?;
-            updated = true;
+            updates.insert(
+                allocation.task_config_id,
+                Self::task_status_for_lifecycle(&task.lifecycle),
+            );
         }
 
-        Ok(updated)
+        self.apply_task_status_updates_tx(&tx, &updates)?;
+        tx.commit()?;
+        debug!(
+            allocation_count = allocations.len(),
+            updated_tasks = updates.len(),
+            duration_ms = tx_started.elapsed().as_millis(),
+            "Updated task statuses for allocations"
+        );
+
+        Ok(!updates.is_empty())
     }
 
     //
@@ -2493,11 +2551,24 @@ impl Store {
         tx: &Transaction<'_>,
         task_id: i64,
     ) -> R<AllocationTaskState> {
-        let (job_config_id, resources, constraints, permit): (String, Value, Value, Value) = tx
-            .query_row(
-            "SELECT job_config_id, resources, constraints, permit FROM task_config WHERE id = ?;",
+        let (job_config_id, resources, constraints, permit, lifecycle): (
+            String,
+            Value,
+            Value,
+            Value,
+            String,
+        ) = tx.query_row(
+            "SELECT job_config_id, resources, constraints, permit, lifecycle FROM task_config WHERE id = ?;",
             [task_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
         )?;
 
         let constraint_set = ConstraintSet::new(&constraints)
@@ -2528,6 +2599,7 @@ impl Store {
             distinct,
             job_config_id,
             resources,
+            lifecycle: lifecycle.parse().map_err(|err: String| anyhow!(err))?,
         })
     }
 
@@ -3035,6 +3107,7 @@ impl Store {
 
     #[instrument(err, skip_all)]
     pub fn claim_eval(&self) -> R<Option<Eval>> {
+        let tx_started = Instant::now();
         let mut conn = self.write_connection()?;
         let tx = conn.transaction()?;
 
@@ -3077,6 +3150,11 @@ impl Store {
         )?;
 
         tx.commit()?;
+        debug!(
+            eval_id = eval.id,
+            duration_ms = tx_started.elapsed().as_millis(),
+            "Claimed eval transaction"
+        );
         eval.status = "in_flight".to_string();
 
         Ok(Some(eval))
@@ -3131,13 +3209,22 @@ impl Store {
 
     #[instrument(err, skip_all)]
     pub fn complete_eval(&self, eval_id: &str, succeeded: bool) -> R<()> {
-        let conn: MutexGuard<'_, Connection> = self.write_connection()?;
+        let tx_started = Instant::now();
+        let mut conn: MutexGuard<'_, Connection> = self.write_connection()?;
+        let tx = conn.transaction()?;
 
         if succeeded {
-            conn.execute("DELETE FROM eval WHERE id = ?;", [eval_id])?;
+            tx.execute("DELETE FROM eval WHERE id = ?;", [eval_id])?;
         } else {
-            conn.execute("UPDATE eval SET status = 'failed' WHERE id = ?;", [eval_id])?;
+            tx.execute("UPDATE eval SET status = 'failed' WHERE id = ?;", [eval_id])?;
         }
+        tx.commit()?;
+        debug!(
+            eval_id,
+            succeeded,
+            duration_ms = tx_started.elapsed().as_millis(),
+            "Completed eval transaction"
+        );
 
         Ok(())
     }
