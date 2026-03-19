@@ -93,6 +93,312 @@ struct TaskPlan<'a> {
     distinct_tracker: Option<DistinctTracker>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct CommonResourceDemand {
+    memory: f64,
+    cpu: f64,
+    cores: f64,
+    allocations: f64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct CommonResourceAvailability {
+    memory: f64,
+    cpu: f64,
+    cores: f64,
+    allocations: f64,
+}
+
+#[derive(Debug, Clone)]
+struct NodeScoringState {
+    assigned_count: usize,
+    same_task_allocations: usize,
+    same_group_allocations: usize,
+    task_presence: HashSet<i64>,
+    base_affinity: f64,
+    can_fit_task_request: bool,
+    common_resources: CommonResourceAvailability,
+    common_feasibility_bitmap: u8,
+}
+
+#[derive(Debug, Clone)]
+struct TaskAffinityCache {
+    preferences: Vec<(i64, f64)>,
+    total_weight: f64,
+}
+
+#[derive(Debug, Clone)]
+struct PlanScoringCache {
+    node_states: HashMap<String, NodeScoringState>,
+    affinity: TaskAffinityCache,
+    common_demand: CommonResourceDemand,
+    group_name: Option<String>,
+}
+
+impl PlanScoringCache {
+    const COMMON_MEMORY: u8 = 1 << 0;
+    const COMMON_CPU: u8 = 1 << 1;
+    const COMMON_CORES: u8 = 1 << 2;
+    const COMMON_ALLOCATIONS: u8 = 1 << 3;
+
+    fn from_plan(
+        candidates: &[&Node],
+        task_id: i64,
+        task_config: &TaskConfig,
+        affinity_set: &AffinitySet,
+        job_config_id: &str,
+        allocations_by_node: &HashMap<String, Vec<Allocation>>,
+        task_name_to_id: &HashMap<String, i64>,
+        task_id_to_group: &HashMap<i64, String>,
+        planned_task_allocations: &HashMap<String, Vec<i64>>,
+        planned: &HashMap<String, usize>,
+        resource_ledger: &ResourceLedger,
+        task_request: &ResourceRequest,
+    ) -> Self {
+        let group_name = task_id_to_group.get(&task_id).cloned();
+        let affinity = TaskAffinityCache::new(task_config, task_name_to_id);
+        let common_demand = CommonResourceDemand::from_request(task_request);
+
+        let node_states = candidates
+            .iter()
+            .map(|node| {
+                let node_id = node.id.clone();
+                let existing_allocs = allocations_by_node.get(&node_id);
+                let planned_ids = planned_task_allocations
+                    .get(&node_id)
+                    .cloned()
+                    .unwrap_or_default();
+
+                let mut task_presence = HashSet::new();
+                let mut same_task_allocations = 0usize;
+                let mut same_group_allocations = 0usize;
+                let assigned_count = existing_allocs.map_or(0, Vec::len)
+                    + planned.get(&node_id).copied().unwrap_or_default();
+
+                if let Some(allocs) = existing_allocs {
+                    for alloc in allocs {
+                        if alloc.job_config_id != job_config_id {
+                            continue;
+                        }
+                        task_presence.insert(alloc.task_config_id);
+                        if alloc.task_config_id == task_id {
+                            same_task_allocations += 1;
+                        }
+                        if group_name.as_ref().is_some_and(|group| {
+                            task_id_to_group
+                                .get(&alloc.task_config_id)
+                                .is_some_and(|alloc_group| alloc_group == group)
+                        }) {
+                            same_group_allocations += 1;
+                        }
+                    }
+                }
+
+                for planned_task_id in &planned_ids {
+                    task_presence.insert(*planned_task_id);
+                    if *planned_task_id == task_id {
+                        same_task_allocations += 1;
+                    }
+                    if group_name.as_ref().is_some_and(|group| {
+                        task_id_to_group
+                            .get(planned_task_id)
+                            .is_some_and(|alloc_group| alloc_group == group)
+                    }) {
+                        same_group_allocations += 1;
+                    }
+                }
+
+                let (common_resources, common_feasibility_bitmap, can_fit_task_request) =
+                    resource_ledger
+                        .pools
+                        .get(&node_id)
+                        .map(|pool| {
+                            let common_resources = CommonResourceAvailability::from_pool(pool);
+                            let bitmap = common_resources.feasibility_bitmap(&common_demand);
+                            (common_resources, bitmap, pool.can_fit(task_request))
+                        })
+                        .unwrap_or_else(|| {
+                            (
+                                CommonResourceAvailability::default(),
+                                0,
+                                resource_ledger.can_fit(&node_id, task_request),
+                            )
+                        });
+
+                (
+                    node_id,
+                    NodeScoringState {
+                        assigned_count,
+                        same_task_allocations,
+                        same_group_allocations,
+                        task_presence,
+                        base_affinity: affinity_set.score(node),
+                        can_fit_task_request,
+                        common_resources,
+                        common_feasibility_bitmap,
+                    },
+                )
+            })
+            .collect();
+
+        Self {
+            node_states,
+            affinity,
+            common_demand,
+            group_name,
+        }
+    }
+
+    fn can_fit_task_request(&self, node_id: &str) -> bool {
+        self.node_states
+            .get(node_id)
+            .map(|state| {
+                let required_bitmap = self.required_common_bitmap();
+                let common_feasible =
+                    (state.common_feasibility_bitmap & required_bitmap) == required_bitmap;
+                common_feasible && state.can_fit_task_request
+            })
+            .unwrap_or(false)
+    }
+
+    fn update_after_placement(
+        &mut self,
+        node_id: &str,
+        task_id: i64,
+        task_id_to_group: &HashMap<i64, String>,
+        resource_ledger: &ResourceLedger,
+        task_request: &ResourceRequest,
+    ) {
+        if let Some(state) = self.node_states.get_mut(node_id) {
+            state.assigned_count += 1;
+            state.same_task_allocations += 1;
+            if self.group_name.as_ref().is_some_and(|group| {
+                task_id_to_group
+                    .get(&task_id)
+                    .is_some_and(|task_group| task_group == group)
+            }) {
+                state.same_group_allocations += 1;
+            }
+            state.task_presence.insert(task_id);
+            state.common_resources.consume(&self.common_demand);
+            state.common_feasibility_bitmap = state
+                .common_resources
+                .feasibility_bitmap(&self.common_demand);
+            state.can_fit_task_request = resource_ledger.can_fit(node_id, task_request);
+        }
+    }
+
+    fn required_common_bitmap(&self) -> u8 {
+        let mut bitmap = 0u8;
+        if self.common_demand.memory > 0.0 {
+            bitmap |= Self::COMMON_MEMORY;
+        }
+        if self.common_demand.cpu > 0.0 {
+            bitmap |= Self::COMMON_CPU;
+        }
+        if self.common_demand.cores > 0.0 {
+            bitmap |= Self::COMMON_CORES;
+        }
+        if self.common_demand.allocations > 0.0 {
+            bitmap |= Self::COMMON_ALLOCATIONS;
+        }
+        bitmap
+    }
+}
+
+impl CommonResourceDemand {
+    fn from_request(request: &ResourceRequest) -> Self {
+        let mut demand = CommonResourceDemand::default();
+        for (name, value) in &request.values {
+            if let ResourceValue::Amount(amount) = value {
+                match name.as_str() {
+                    "memory" => demand.memory = *amount,
+                    "cpu" => demand.cpu = *amount,
+                    "cores" => demand.cores = *amount,
+                    "allocations" => demand.allocations = *amount,
+                    _ => {}
+                }
+            }
+        }
+        demand
+    }
+}
+
+impl CommonResourceAvailability {
+    fn from_pool(pool: &ResourcePool) -> Self {
+        fn amount(values: &HashMap<String, ResourceValue>, key: &str) -> f64 {
+            match values.get(key) {
+                Some(ResourceValue::Amount(value)) => *value,
+                _ => 0.0,
+            }
+        }
+
+        CommonResourceAvailability {
+            memory: amount(&pool.values, "memory"),
+            cpu: amount(&pool.values, "cpu"),
+            cores: amount(&pool.values, "cores"),
+            allocations: amount(&pool.values, "allocations"),
+        }
+    }
+
+    fn consume(&mut self, demand: &CommonResourceDemand) {
+        self.memory -= demand.memory;
+        self.cpu -= demand.cpu;
+        self.cores -= demand.cores;
+        self.allocations -= demand.allocations;
+    }
+
+    fn feasibility_bitmap(&self, demand: &CommonResourceDemand) -> u8 {
+        let mut bitmap = 0u8;
+        if self.memory >= demand.memory {
+            bitmap |= PlanScoringCache::COMMON_MEMORY;
+        }
+        if self.cpu >= demand.cpu {
+            bitmap |= PlanScoringCache::COMMON_CPU;
+        }
+        if self.cores >= demand.cores {
+            bitmap |= PlanScoringCache::COMMON_CORES;
+        }
+        if self.allocations >= demand.allocations {
+            bitmap |= PlanScoringCache::COMMON_ALLOCATIONS;
+        }
+        bitmap
+    }
+}
+
+impl TaskAffinityCache {
+    fn new(task_config: &TaskConfig, task_name_to_id: &HashMap<String, i64>) -> Self {
+        let mut preferences = Vec::new();
+        let mut total_weight = 0.0;
+        for (task_name, multiplier) in task_colocation_preferences(&task_config.affinities) {
+            if let Some(task_id) = task_name_to_id.get(task_name) {
+                preferences.push((*task_id, multiplier));
+                total_weight += multiplier.abs();
+            }
+        }
+
+        TaskAffinityCache {
+            preferences,
+            total_weight,
+        }
+    }
+
+    fn colocation_score(&self, state: &NodeScoringState) -> f64 {
+        if self.preferences.is_empty() || self.total_weight == 0.0 {
+            return 0.0;
+        }
+
+        let matched = self
+            .preferences
+            .iter()
+            .filter_map(|(task_id, multiplier)| {
+                state.task_presence.contains(task_id).then_some(*multiplier)
+            })
+            .sum::<f64>();
+        matched / self.total_weight
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct GroupKey {
     name: String,
@@ -841,14 +1147,28 @@ impl<'a> Scheduler<'a> {
         group_key: Option<&GroupKey>,
         group_assignments: &mut HashMap<GroupKey, String>,
     ) -> R<()> {
+        let mut scoring_cache = PlanScoringCache::from_plan(
+            candidates,
+            task_id,
+            task_config,
+            &plan.affinity_set,
+            job_config_id,
+            allocations_by_node,
+            task_name_to_id,
+            task_id_to_group,
+            planned_task_allocations,
+            planned,
+            resource_ledger,
+            &plan.task_request,
+        );
+
         for _ in 0..count {
             let eligible = Self::eligible_nodes(
                 candidates,
                 &plan.constraint_set,
                 &plan.permit_set,
                 plan.distinct_tracker.as_ref(),
-                resource_ledger,
-                &plan.task_request,
+                &scoring_cache,
             );
 
             if eligible.is_empty() {
@@ -887,6 +1207,7 @@ impl<'a> Scheduler<'a> {
                         task_id_to_group,
                         planned_task_allocations,
                         planned,
+                        &scoring_cache,
                         weights,
                     )?;
                     group_assignments.insert(group_key.clone(), selected.clone());
@@ -907,6 +1228,7 @@ impl<'a> Scheduler<'a> {
                     task_id_to_group,
                     planned_task_allocations,
                     planned,
+                    &scoring_cache,
                     weights,
                 )?
             };
@@ -922,6 +1244,13 @@ impl<'a> Scheduler<'a> {
                 }
             }
             resource_ledger.consume(&node_id, &plan.task_request)?;
+            scoring_cache.update_after_placement(
+                &node_id,
+                task_id,
+                task_id_to_group,
+                resource_ledger,
+                &plan.task_request,
+            );
             placements.push(PlannedAllocation {
                 node_id,
                 task_config_id: task_id,
@@ -946,6 +1275,7 @@ impl<'a> Scheduler<'a> {
         task_id_to_group: &HashMap<i64, String>,
         planned_task_allocations: &HashMap<String, Vec<i64>>,
         planned: &HashMap<String, usize>,
+        scoring_cache: &PlanScoringCache,
         weights: SchedulerWeights,
     ) -> R<String> {
         let eligible = self.apply_nodes_considered_with_setting(
@@ -953,6 +1283,29 @@ impl<'a> Scheduler<'a> {
             nodes_considered_setting,
             nodes_considered_rng,
         )?;
+
+        if matches!(self.policy.name(), "bin_pack" | "spread") {
+            let selected = if let Some(rng) = reschedule_rng.as_mut() {
+                self.select_cached_node_with_jitter(
+                    &eligible,
+                    affinity_set,
+                    scoring_cache,
+                    weights,
+                    rng,
+                )
+            } else {
+                self.select_cached_node(&eligible, affinity_set, scoring_cache, weights)
+            };
+
+            return selected.map(|node| node.id.clone()).with_context(|| {
+                format!(
+                    "Scheduling policy {} failed to place task {}",
+                    self.policy.name(),
+                    task_config.name
+                )
+            });
+        }
+
         let ctx = SchedulingContext::new(
             eligible,
             task_config,
@@ -984,8 +1337,7 @@ impl<'a> Scheduler<'a> {
         constraint_set: &ConstraintSet,
         permit_set: &PermitSet,
         distinct_tracker: Option<&DistinctTracker>,
-        resource_ledger: &ResourceLedger,
-        task_request: &ResourceRequest,
+        scoring_cache: &PlanScoringCache,
     ) -> Vec<&'b Node> {
         candidates
             .iter()
@@ -995,7 +1347,7 @@ impl<'a> Scheduler<'a> {
                     && distinct_tracker
                         .map(|tracker| constraint_set.distinct_satisfied(node, tracker))
                         .unwrap_or(true)
-                    && resource_ledger.can_fit(&node.id, task_request)
+                    && scoring_cache.can_fit_task_request(&node.id)
             })
             .collect()
     }
@@ -1213,6 +1565,60 @@ impl<'a> Scheduler<'a> {
         }
 
         let scored = score_nodes_for_context(ctx);
+        if scored.is_empty() {
+            return None;
+        }
+
+        let max_score = scored
+            .iter()
+            .fold(f64::NEG_INFINITY, |best, (_, score)| best.max(*score));
+        let mut top = scored
+            .into_iter()
+            .filter(|(_, score)| *score >= max_score - RESCHEDULE_SCORE_JITTER_THRESHOLD)
+            .map(|(node, _)| node)
+            .collect::<Vec<_>>();
+        top.shuffle(rng);
+        top.first().copied()
+    }
+
+    fn select_cached_node<'b>(
+        &self,
+        eligible: &[&'b Node],
+        affinity_set: &AffinitySet,
+        scoring_cache: &PlanScoringCache,
+        weights: SchedulerWeights,
+    ) -> Option<&'b Node> {
+        let scored = score_nodes_with_cache(eligible, affinity_set, scoring_cache, weights);
+        if scored.is_empty() {
+            return None;
+        }
+
+        let best_score = scored
+            .iter()
+            .fold(f64::NEG_INFINITY, |best, (_, score)| best.max(*score));
+        let mut top_nodes = scored
+            .into_iter()
+            .filter_map(|(node, score)| {
+                if (score - best_score).abs() <= 1e-9 {
+                    Some(node)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        top_nodes.shuffle(&mut rand::thread_rng());
+        top_nodes.into_iter().next()
+    }
+
+    fn select_cached_node_with_jitter<'b>(
+        &self,
+        eligible: &[&'b Node],
+        affinity_set: &AffinitySet,
+        scoring_cache: &PlanScoringCache,
+        weights: SchedulerWeights,
+        rng: &mut StdRng,
+    ) -> Option<&'b Node> {
+        let scored = score_nodes_with_cache(eligible, affinity_set, scoring_cache, weights);
         if scored.is_empty() {
             return None;
         }
@@ -1477,6 +1883,92 @@ fn score_nodes_for_context<'a>(ctx: &SchedulingContext<'a>) -> Vec<(&'a Node, f6
             (node, score)
         })
         .collect()
+}
+
+fn score_nodes_with_cache<'a>(
+    eligible: &[&'a Node],
+    affinity_set: &AffinitySet,
+    scoring_cache: &PlanScoringCache,
+    weights: SchedulerWeights,
+) -> Vec<(&'a Node, f64)> {
+    if eligible.is_empty() {
+        return Vec::new();
+    }
+
+    let mut min_load: Option<usize> = None;
+    let mut max_load: Option<usize> = None;
+    for node in eligible {
+        let load = scoring_cache
+            .node_states
+            .get(node.id.as_str())
+            .map(|state| state.assigned_count)
+            .unwrap_or_default();
+        min_load = Some(min_load.map_or(load, |min| min.min(load)));
+        max_load = Some(max_load.map_or(load, |max| max.max(load)));
+    }
+
+    let min_load = min_load.unwrap_or_default() as f64;
+    let max_load = max_load.unwrap_or_default() as f64;
+    let range = (max_load - min_load).max(0.0);
+
+    eligible
+        .iter()
+        .copied()
+        .map(|node| {
+            let state = scoring_cache.node_states.get(node.id.as_str());
+            let load = state.map(|s| s.assigned_count).unwrap_or_default() as f64;
+            let (spread_score, bin_pack_score) = if range > 0.0 {
+                ((max_load - load) / range, (load - min_load) / range)
+            } else {
+                (0.0, 0.0)
+            };
+            let affinity_score = state
+                .map(|s| s.base_affinity + scoring_cache.affinity.colocation_score(s))
+                .unwrap_or_else(|| affinity_set.score(node));
+            let anti_affinity_penalty = state
+                .map(|s| s.same_task_allocations.max(s.same_group_allocations) as f64)
+                .unwrap_or_else(|| {
+                    if scoring_cache.group_name.is_some() {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                });
+
+            (
+                node,
+                weights.affinity * affinity_score
+                    + weights.spread * spread_score
+                    + weights.bin_pack * bin_pack_score
+                    - weights.automatic_anti_affinity * anti_affinity_penalty,
+            )
+        })
+        .collect()
+}
+
+fn task_colocation_preferences(affinities: &Value) -> Vec<(&str, f64)> {
+    match affinities {
+        Value::Object(map) => map
+            .get("same_node_as")
+            .and_then(Value::as_str)
+            .map(|task| vec![(task, 1.0)])
+            .unwrap_or_default(),
+        Value::Array(items) => items
+            .iter()
+            .filter_map(|item| {
+                let obj = item.as_object()?;
+                let key = obj.get("key")?.as_str()?;
+                if key != "same_node_as" {
+                    return None;
+                }
+
+                let task = obj.get("value")?.as_str()?;
+                let multiplier = obj.get("multiplier").and_then(Value::as_f64).unwrap_or(1.0);
+                Some((task, multiplier))
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 fn node_attribute<'a>(node: &'a Node, key: &str) -> Option<&'a Value> {
@@ -1796,7 +2288,7 @@ fn value_token(value: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use serde_json::{json, Value};
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use tempfile::Builder;
 
     use super::*;
@@ -1909,6 +2401,35 @@ mod tests {
             .context("missing task")?;
 
         Ok(task.0)
+    }
+
+    fn score_with_legacy_context<'a>(
+        eligible: Vec<&'a Node>,
+        task: &'a TaskConfig,
+        task_id: i64,
+        affinity_set: &'a AffinitySet,
+        job_config_id: &'a str,
+        allocations_by_node: &'a HashMap<String, Vec<Allocation>>,
+        task_name_to_id: &'a HashMap<String, i64>,
+        task_id_to_group: &'a HashMap<i64, String>,
+        planned_task_allocations: &'a HashMap<String, Vec<i64>>,
+        planned: &'a HashMap<String, usize>,
+        weights: SchedulerWeights,
+    ) -> Vec<(&'a Node, f64)> {
+        let ctx = SchedulingContext::new(
+            eligible,
+            task,
+            task_id,
+            affinity_set,
+            job_config_id,
+            allocations_by_node,
+            task_name_to_id,
+            task_id_to_group,
+            planned_task_allocations,
+            planned,
+            weights,
+        );
+        score_nodes_for_context(&ctx)
     }
 
     #[test]
@@ -2319,6 +2840,112 @@ mod tests {
     }
 
     #[test]
+    fn distinct_constraints_cache_selection_matches_legacy_scoring() -> R<()> {
+        let nodes = vec![
+            Node {
+                id: "node-a".into(),
+                status: "active".into(),
+                pool: "default".into(),
+                availability: "available".into(),
+                last_heartbeat: String::new(),
+                config_attrs: json!({"zone": "us-east"}),
+                fingerprint_attrs: default_fingerprint(),
+                dynamic_attrs: json!({}),
+                health_checks: json!({}),
+            },
+            Node {
+                id: "node-b".into(),
+                status: "active".into(),
+                pool: "default".into(),
+                availability: "available".into(),
+                last_heartbeat: String::new(),
+                config_attrs: json!({"zone": "us-west"}),
+                fingerprint_attrs: default_fingerprint(),
+                dynamic_attrs: json!({}),
+                health_checks: json!({}),
+            },
+        ];
+        let candidate_refs = nodes.iter().collect::<Vec<_>>();
+        let task = TaskConfig {
+            count: TaskCount::new(2),
+            constraints: json!([{ "key": "zone", "operator": "distinct" }]),
+            ..TaskConfig::new("api", "noop")
+        };
+        let task_id = 7_i64;
+        let allocations_by_node: HashMap<String, Vec<Allocation>> = HashMap::new();
+        let planned_task_allocations: HashMap<String, Vec<i64>> = HashMap::new();
+        let planned: HashMap<String, usize> = HashMap::new();
+        let task_name_to_id = HashMap::from([(task.name.clone(), task_id)]);
+        let task_id_to_group = HashMap::new();
+        let affinity_set = AffinitySet::new(&task.affinities)?;
+        let constraint_set = ConstraintSet::new(&task.constraints)?;
+        let permit_set = PermitSet::new(&task.permit)?;
+        let mut distinct_tracker = DistinctTracker::new(&constraint_set.distinct_keys());
+        let mut pools = HashMap::new();
+        for node in &nodes {
+            pools.insert(node.id.clone(), ResourcePool::from_node(node)?);
+        }
+        let mut resource_ledger = ResourceLedger { pools };
+        let request =
+            ResourceRequest::from_value(&json!({"memory": 256, "cpu": 100, "allocations": 1}))?;
+        let scoring_cache = PlanScoringCache::from_plan(
+            &candidate_refs,
+            task_id,
+            &task,
+            &affinity_set,
+            "job-1",
+            &allocations_by_node,
+            &task_name_to_id,
+            &task_id_to_group,
+            &planned_task_allocations,
+            &planned,
+            &resource_ledger,
+            &request,
+        );
+
+        let eligible = Scheduler::eligible_nodes(
+            &candidate_refs,
+            &constraint_set,
+            &permit_set,
+            Some(&distinct_tracker),
+            &scoring_cache,
+        );
+        let legacy_scored = score_with_legacy_context(
+            eligible.clone(),
+            &task,
+            task_id,
+            &affinity_set,
+            "job-1",
+            &allocations_by_node,
+            &task_name_to_id,
+            &task_id_to_group,
+            &planned_task_allocations,
+            &planned,
+            SchedulerWeights::for_policy("bin_pack"),
+        );
+        let cached_scored = score_nodes_with_cache(
+            &eligible,
+            &affinity_set,
+            &scoring_cache,
+            SchedulerWeights::for_policy("bin_pack"),
+        );
+
+        assert_eq!(legacy_scored.len(), cached_scored.len());
+        for ((legacy_node, legacy_score), (cached_node, cached_score)) in
+            legacy_scored.iter().zip(cached_scored.iter())
+        {
+            assert_eq!(legacy_node.id, cached_node.id);
+            assert!((legacy_score - cached_score).abs() <= 1e-9);
+        }
+
+        let chosen = eligible[0];
+        distinct_tracker.insert_from_node(chosen);
+        resource_ledger.consume(&chosen.id, &request)?;
+
+        Ok(())
+    }
+
+    #[test]
     fn apply_time_constraints_are_rechecked() -> R<()> {
         let store = setup_store()?;
         store.insert_node(make_node_msg("node-a", json!({ "role": "web" })))?;
@@ -2492,6 +3119,82 @@ mod tests {
         assert!(err
             .to_string()
             .contains("no available nodes matching constraints, permit, or resources"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn resource_limit_cache_feasibility_matches_ledger() -> R<()> {
+        let node = Node {
+            id: "node-a".into(),
+            status: "active".into(),
+            pool: "default".into(),
+            availability: "available".into(),
+            last_heartbeat: String::new(),
+            config_attrs: json!({}),
+            fingerprint_attrs: json!({
+                "memory_total": "524288",
+                "cpus": { "cpu-1": { "frequency": "1000" } }
+            }),
+            dynamic_attrs: json!({}),
+            health_checks: json!({}),
+        };
+        let nodes = vec![node];
+        let candidate_refs = nodes.iter().collect::<Vec<_>>();
+        let task = TaskConfig {
+            count: TaskCount::new(3),
+            resources: json!({ "memory": 256 }),
+            ..TaskConfig::new("worker", "noop")
+        };
+        let task_id = 11_i64;
+        let request =
+            ResourceRequest::from_value(&json!({"memory": 256, "cpu": 100, "allocations": 1}))?;
+        let mut pools = HashMap::new();
+        pools.insert("node-a".to_string(), ResourcePool::from_node(&nodes[0])?);
+        let mut ledger = ResourceLedger { pools };
+        let allocations_by_node: HashMap<String, Vec<Allocation>> = HashMap::new();
+        let mut planned: HashMap<String, usize> = HashMap::new();
+        let mut planned_task_allocations: HashMap<String, Vec<i64>> = HashMap::new();
+        let task_name_to_id = HashMap::from([(task.name.clone(), task_id)]);
+        let task_id_to_group = HashMap::new();
+        let affinity_set = AffinitySet::new(&task.affinities)?;
+        let mut cache = PlanScoringCache::from_plan(
+            &candidate_refs,
+            task_id,
+            &task,
+            &affinity_set,
+            "job-1",
+            &allocations_by_node,
+            &task_name_to_id,
+            &task_id_to_group,
+            &planned_task_allocations,
+            &planned,
+            &ledger,
+            &request,
+        );
+
+        assert!(cache.can_fit_task_request("node-a"));
+        ledger.consume("node-a", &request)?;
+        *planned.entry("node-a".to_string()).or_default() += 1;
+        planned_task_allocations
+            .entry("node-a".to_string())
+            .or_default()
+            .push(task_id);
+        cache.update_after_placement("node-a", task_id, &task_id_to_group, &ledger, &request);
+        assert!(cache.can_fit_task_request("node-a"));
+
+        ledger.consume("node-a", &request)?;
+        *planned.entry("node-a".to_string()).or_default() += 1;
+        planned_task_allocations
+            .entry("node-a".to_string())
+            .or_default()
+            .push(task_id);
+        cache.update_after_placement("node-a", task_id, &task_id_to_group, &ledger, &request);
+        assert!(!cache.can_fit_task_request("node-a"));
+        assert_eq!(
+            ledger.can_fit("node-a", &request),
+            cache.can_fit_task_request("node-a")
+        );
 
         Ok(())
     }
