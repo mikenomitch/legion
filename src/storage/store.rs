@@ -2592,8 +2592,8 @@ impl Store {
             return Ok(false);
         }
 
-        // Multiple planned allocations can target the same task; collapse to unique ids so
-        // lifecycle lookup and writes run once per task instead of once per allocation.
+        // Multiple placements may target the same task id; dedupe first so the generated
+        // IN-list stays compact and we update each task status at most once.
         let mut task_ids = allocations
             .iter()
             .map(|allocation| allocation.task_config_id)
@@ -2601,36 +2601,21 @@ impl Store {
         task_ids.sort_unstable();
         task_ids.dedup();
 
-        // Build a parameterized IN-list for the current batch of task ids.
+        // Keep the full operation in one write transaction and derive target status directly
+        // from task_config.lifecycle in SQL, avoiding an extra lifecycle lookup round trip.
         let placeholders = vec!["?"; task_ids.len()].join(", ");
-        let task_lifecycle_sql =
-            format!("SELECT id, lifecycle FROM task_config WHERE id IN ({placeholders});");
-        let lifecycle_lookup = {
-            let conn = self.read_connection()?;
-            let mut stmt = conn.prepare(&task_lifecycle_sql)?;
-            let rows = stmt.query_map(params_from_iter(task_ids.iter()), |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-            })?;
-            let mut lookup = HashMap::new();
-            for row in rows {
-                let (task_id, lifecycle) = row?;
-                let lifecycle = lifecycle
-                    .parse::<TaskLifecycle>()
-                    .map_err(|err| anyhow!(err))?;
-                lookup.insert(task_id, lifecycle);
-            }
-            lookup
-        };
-
-        // Pre-compute final status per task, then execute all updates inside a single
-        // write transaction to reduce lock churn and commit overhead.
-        let mut statuses_to_apply = HashMap::new();
-        for task_id in task_ids {
-            let lifecycle = lifecycle_lookup
-                .get(&task_id)
-                .with_context(|| format!("Missing task config {task_id}"))?;
-            statuses_to_apply.insert(task_id, Self::task_status_for_lifecycle(lifecycle));
-        }
+        // Derive the target status directly from task_config.lifecycle in SQL (batch -> success,
+        // otherwise running) so the whole batch updates in one write. The `status !=` guard skips
+        // no-op rewrites to cut WAL traffic.
+        let update_sql = format!(
+            "UPDATE task_status \
+             SET status = CASE (SELECT lifecycle FROM task_config WHERE id = task_status.task_config_id) \
+                 WHEN 'batch' THEN 'success' ELSE 'running' END, \
+                 updated_at = ? \
+             WHERE task_config_id IN ({placeholders}) \
+               AND status != CASE (SELECT lifecycle FROM task_config WHERE id = task_status.task_config_id) \
+                 WHEN 'batch' THEN 'success' ELSE 'running' END;"
+        );
 
         let _tx_span = info_span!(
             "storage_tx",
@@ -2641,16 +2626,12 @@ impl Store {
         let mut conn = self.write_connection()?;
         let tx = conn.transaction()?;
         let now = Self::now_rfc3339()?;
-        let mut stmt = tx.prepare(
-            "UPDATE task_status SET status = ?, updated_at = ? WHERE task_config_id = ? AND status != ?;",
-        )?;
-        let mut updated_rows = 0usize;
-        for (task_id, status) in statuses_to_apply {
-            // The status inequality guard avoids no-op row rewrites and cuts WAL traffic.
-            updated_rows +=
-                stmt.execute(params![status.as_str(), now, task_id, status.as_str()])?;
-        }
-        drop(stmt);
+
+        let mut params = Vec::with_capacity(task_ids.len() + 1);
+        params.push(rusqlite::types::Value::from(now));
+        params.extend(task_ids.into_iter().map(rusqlite::types::Value::from));
+        let updated_rows = tx.execute(&update_sql, params_from_iter(params))?;
+
         tx.commit()?;
         debug!(
             tx_duration_ms = tx_started.elapsed().as_millis() as u64,

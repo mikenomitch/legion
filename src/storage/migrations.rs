@@ -195,12 +195,6 @@ pub fn get_migrations() -> Migrations<'static> {
             .down("DROP INDEX IF EXISTS idx_eval_status_job_id;"),
         M::up("CREATE INDEX IF NOT EXISTS idx_eval_status_node_id ON eval(status, node_id);")
             .down("DROP INDEX IF EXISTS idx_eval_status_node_id;"),
-        // Claim path sorts by priority/id and then applies ready_at cutoff; this index keeps
-        // the queue ordering efficient when pending eval volume is high.
-        M::up(
-            "CREATE INDEX IF NOT EXISTS idx_eval_claim_hot_path ON eval(status, priority DESC, id ASC, ready_at);",
-        )
-        .down("DROP INDEX IF EXISTS idx_eval_claim_hot_path;"),
         M::up(
             "CREATE TABLE IF NOT EXISTS manager_config (
             node_id STRING PRIMARY KEY,
