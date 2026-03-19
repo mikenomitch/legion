@@ -1,0 +1,11 @@
+{
+  "name": "churn-medium",
+  "scheduling_policy": "spread",
+  "node_count": 24,
+  "job_count": 8,
+  "tasks_per_job": 4,
+  "task_count_per_task": 2,
+  "iterations": 8,
+  "churn_every": 2,
+  "churn_nodes": 3
+}

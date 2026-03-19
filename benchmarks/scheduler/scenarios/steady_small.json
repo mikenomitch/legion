@@ -1,0 +1,11 @@
+{
+  "name": "steady-small",
+  "scheduling_policy": "bin_pack",
+  "node_count": 12,
+  "job_count": 4,
+  "tasks_per_job": 3,
+  "task_count_per_task": 3,
+  "iterations": 6,
+  "churn_every": 0,
+  "churn_nodes": 0
+}

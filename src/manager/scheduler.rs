@@ -125,7 +125,9 @@ impl<'a> Scheduler<'a> {
 
     #[instrument(skip_all)]
     pub fn plan_only(&self, job_config_id: &str, mode: PlanMode) -> R<Vec<PlannedAllocation>> {
-        info!(%job_config_id, mode = mode.as_str(), "Starting scheduler plan_only");
+        let started = std::time::Instant::now();
+        let mode_label = mode.as_str();
+        info!(%job_config_id, mode = mode_label, "Starting scheduler plan_only");
         let nodes = self.available_nodes()?;
         if nodes.is_empty() {
             bail!("No nodes available to place allocations");
@@ -159,7 +161,13 @@ impl<'a> Scheduler<'a> {
             &allocations_by_node,
             mode,
         )?;
-        info!(%job_config_id, planned_allocations = plan.len(), "Completed scheduler plan_only");
+        info!(
+            %job_config_id,
+            mode = mode_label,
+            planned_allocations = plan.len(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "Completed scheduler plan_only"
+        );
         Ok(plan)
     }
 
@@ -170,6 +178,8 @@ impl<'a> Scheduler<'a> {
         mode: PlanMode,
         clear_job_id: Option<&str>,
     ) -> R<PlanConfigOutcome> {
+        let started = std::time::Instant::now();
+        let mode_label = mode.as_str();
         let nodes = self.available_nodes()?;
         if nodes.is_empty() {
             bail!("No nodes available to place allocations");
@@ -211,6 +221,14 @@ impl<'a> Scheduler<'a> {
             &allocations_by_node,
             mode,
         )?;
+        info!(
+            job_id = %job_config.name,
+            job_config_id = %job_config.id(),
+            mode = mode_label,
+            planned_allocations = allocations.len(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "Completed scheduler plan_for_config"
+        );
 
         Ok(PlanConfigOutcome {
             allocations,
@@ -259,6 +277,7 @@ impl<'a> Scheduler<'a> {
         excluded_nodes: Option<&HashSet<String>>,
         task_targets: Option<&HashMap<i64, u32>>,
     ) -> R<PlanOutcome> {
+        let started = std::time::Instant::now();
         info!(%job_config_id, mode = mode.as_str(), target_override = task_targets.is_some(), "Starting scheduler plan_and_apply");
         let mut nodes = self.available_nodes()?;
         if let Some(excluded) = excluded_nodes {
@@ -293,6 +312,7 @@ impl<'a> Scheduler<'a> {
             &allocations_by_node,
         );
 
+        let build_started = std::time::Instant::now();
         let placements = self.build_plan(
             job_config_id,
             nodes,
@@ -302,6 +322,13 @@ impl<'a> Scheduler<'a> {
             &allocations_by_node,
             mode.clone(),
         )?;
+        debug!(
+            %job_config_id,
+            mode = mode.as_str(),
+            placement_count = placements.len(),
+            build_plan_ms = build_started.elapsed().as_millis() as u64,
+            "Scheduler build_plan completed"
+        );
         if placements.is_empty() {
             info!(%job_config_id, "No placements generated during plan_and_apply");
             return Ok(PlanOutcome {
@@ -327,6 +354,7 @@ impl<'a> Scheduler<'a> {
             &placement_pairs,
             &expected_versions,
         )?;
+        let apply_started = std::time::Instant::now();
         let allocations = match self.store.apply_plan_submission(&submission)? {
             PlanApplyOutcome::Applied(allocations) => allocations,
             PlanApplyOutcome::Rejected {
@@ -340,6 +368,13 @@ impl<'a> Scheduler<'a> {
                     .copied()
                     .unwrap_or_default();
                 let latest_epoch = latest_versions.get(&scope_key).copied().unwrap_or_default();
+                warn!(
+                    %job_config_id,
+                    submission_id = submission.id,
+                    mode = mode.as_str(),
+                    apply_plan_submission_ms = apply_started.elapsed().as_millis() as u64,
+                    "Scheduler plan submission rejected: {reason}"
+                );
                 return Err(anyhow::Error::new(StorageError::Conflict {
                     message: format!(
                         "plan submission rejected: {reason} (expected epoch {}, latest epoch {})",
@@ -354,7 +389,15 @@ impl<'a> Scheduler<'a> {
             allocations,
             deltas,
         };
-        info!(%job_config_id, applied_allocations = outcome.allocations.len(), affected_nodes = outcome.deltas.len(), "Completed scheduler plan_and_apply");
+        info!(
+            %job_config_id,
+            mode = mode.as_str(),
+            applied_allocations = outcome.allocations.len(),
+            affected_nodes = outcome.deltas.len(),
+            apply_plan_submission_ms = apply_started.elapsed().as_millis() as u64,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "Completed scheduler plan_and_apply"
+        );
         Ok(outcome)
     }
 
