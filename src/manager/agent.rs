@@ -357,18 +357,35 @@ async fn eval_worker_loop(store: Store, notifier: Arc<Notify>, worker_id: usize)
 
     let mut error_backoff = ERROR_BACKOFF_MIN;
     loop {
+        let claim_started = std::time::Instant::now();
         match store.claim_eval() {
             Ok(Some(eval)) => {
                 error_backoff = ERROR_BACKOFF_MIN;
-                debug!(worker_id, eval_id = %eval.id, kind = %eval.kind, "Claimed eval");
+                info!(
+                    worker_id,
+                    eval_id = %eval.id,
+                    kind = %eval.kind,
+                    claim_eval_ms = claim_started.elapsed().as_millis() as u64,
+                    "Claimed eval for dispatch"
+                );
                 handle_claimed_eval(&store, worker_id, &eval);
             }
             Ok(None) => {
+                debug!(
+                    worker_id,
+                    claim_eval_ms = claim_started.elapsed().as_millis() as u64,
+                    "No eval claimed; worker entering wait path"
+                );
                 // Queue is empty (or only delayed work exists), so park until notified or due.
                 wait_for_next_eval(&store, &notifier, worker_id).await;
             }
             Err(e) => {
-                error!(worker_id, "Error claiming next eval: {:?}", e);
+                error!(
+                    worker_id,
+                    claim_eval_ms = claim_started.elapsed().as_millis() as u64,
+                    "Error claiming next eval: {:?}",
+                    e
+                );
                 tokio::time::sleep(error_backoff).await;
                 error_backoff = std::cmp::min(error_backoff * 2, ERROR_BACKOFF_MAX);
             }
@@ -536,11 +553,18 @@ mod tests {
 
 fn handle_claimed_eval(store: &Store, worker_id: usize, eval: &Eval) {
     let started = std::time::Instant::now();
+    info!(
+        worker_id,
+        eval_id = %eval.id,
+        kind = %eval.kind,
+        "Dispatching claimed eval"
+    );
     match eval.handle(store) {
         Ok(message) => {
             info!(
                 worker_id,
                 eval_id = %eval.id,
+                kind = %eval.kind,
                 elapsed_ms = started.elapsed().as_millis() as u64,
                 "Eval {} handled successfully: {}", eval.id, message
             );

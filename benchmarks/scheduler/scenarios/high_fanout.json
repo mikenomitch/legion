@@ -1,0 +1,11 @@
+{
+  "name": "high-fanout",
+  "scheduling_policy": "bin_pack",
+  "node_count": 32,
+  "job_count": 10,
+  "tasks_per_job": 5,
+  "task_count_per_task": 2,
+  "iterations": 6,
+  "churn_every": 3,
+  "churn_nodes": 4
+}

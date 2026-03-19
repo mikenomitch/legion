@@ -692,6 +692,12 @@ impl Store {
 
     pub fn apply_plan_submission(&self, submission: &PlanSubmission) -> R<PlanApplyOutcome> {
         let tx_started = Instant::now();
+        debug!(
+            submission_id = submission.id,
+            job_config_id = %submission.job_config_id,
+            expected_scope_count = submission.expected_versions.len(),
+            "Applying plan submission"
+        );
         let mut conn = self.write_connection()?;
         let tx = conn.transaction()?;
 
@@ -722,6 +728,13 @@ impl Store {
                 params![reason, submission.id],
             )?;
             tx.commit()?;
+            warn!(
+                submission_id = submission.id,
+                job_config_id = %submission.job_config_id,
+                latest_scope_count = latest_versions.len(),
+                duration_ms = tx_started.elapsed().as_millis() as u64,
+                "Rejected plan submission due to stale version vector"
+            );
             return Ok(PlanApplyOutcome::Rejected {
                 reason,
                 latest_versions,
@@ -793,6 +806,12 @@ impl Store {
                 let latest_versions =
                     self.scope_vector_epochs_tx(&tx, &submission.expected_versions)?;
                 tx.commit()?;
+                warn!(
+                    submission_id = submission.id,
+                    job_config_id = %submission.job_config_id,
+                    duration_ms = tx_started.elapsed().as_millis() as u64,
+                    "Rejected plan submission after validation during apply"
+                );
                 return Ok(PlanApplyOutcome::Rejected {
                     reason,
                     latest_versions,
@@ -826,8 +845,11 @@ impl Store {
             [submission.id],
         )?;
         tx.commit()?;
-        debug!(
+        info!(
             submission_id = submission.id,
+            job_config_id = %submission.job_config_id,
+            placement_count = placements.len(),
+            applied_allocations = allocations.len(),
             duration_ms = tx_started.elapsed().as_millis(),
             "Applied plan submission transaction"
         );
@@ -3232,6 +3254,10 @@ impl Store {
 
         let Some(mut eval) = eval else {
             tx.commit()?;
+            debug!(
+                duration_ms = tx_started.elapsed().as_millis() as u64,
+                "No claimable eval was found"
+            );
             return Ok(None);
         };
 
@@ -3252,8 +3278,10 @@ impl Store {
         )?;
 
         tx.commit()?;
-        debug!(
+        info!(
             eval_id = eval.id,
+            eval_kind = %eval.kind,
+            eval_priority = eval.priority,
             duration_ms = tx_started.elapsed().as_millis(),
             "Claimed eval transaction"
         );

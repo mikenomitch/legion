@@ -41,3 +41,37 @@ jobs:
 
       - name: Run cargo clippy
         run: cargo clippy --all --locked -- -D warnings -A dead_code -A unused_variables
+
+  scheduler-benchmark-gate:
+    name: Scheduler Benchmark Gate
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Detect scheduler-impacting changes
+        id: changes
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            scheduler:
+              - 'src/manager/scheduler.rs'
+              - 'src/storage/store.rs'
+              - 'src/manager/agent.rs'
+              - 'benchmarks/scheduler/**'
+              - 'tests/scheduler_benchmark_slo.rs'
+
+      - name: Install Rust toolchain
+        if: steps.changes.outputs.scheduler == 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install protobuf compiler
+        if: steps.changes.outputs.scheduler == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Run scheduler benchmark SLO gate
+        if: steps.changes.outputs.scheduler == 'true'
+        run: cargo test --test scheduler_benchmark_slo -- --ignored --nocapture

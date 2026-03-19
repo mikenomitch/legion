@@ -34,6 +34,9 @@ Repo convention also expects running tests for Rust changes (docs/frontend-only 
 Benchmark target:
 
 - `benches/scheduler_bench.rs` (Criterion)
+- `tests/scheduler_benchmark_slo.rs` (repeatable scenario + SLO gate)
+- Scenario definitions in `benchmarks/scheduler/scenarios/*.json`
+- SLO thresholds in `benchmarks/scheduler/slo.json`
 
 What it measures:
 
@@ -46,6 +49,28 @@ What it measures:
 Run command:
 
 - `cargo bench --bench scheduler_bench`
+- `cargo test --test scheduler_benchmark_slo -- --ignored --nocapture`
+
+### Scheduler Benchmark SLOs
+
+The scheduler SLO gate validates the following across every scenario file:
+
+- minimum throughput (`evals_per_sec`)
+- maximum p99 scheduling latency (`max_p99_latency_ms`)
+- maximum conflict rejection rate (`max_conflict_rejection_rate`)
+- minimum scheduling correctness ratio (`min_correctness_ratio`)
+
+Scenario files encode:
+
+- number of jobs
+- tasks per job
+- task count per task
+- node count
+- churn cadence (`churn_every`) and churn magnitude (`churn_nodes`)
+
+CI behavior:
+
+- `.github/workflows/ci.yml` runs the SLO benchmark gate only when scheduler-impacting files are changed (`src/manager/scheduler.rs`, `src/storage/store.rs`, `src/manager/agent.rs`, benchmark scenarios, or the gate test itself).
 
 ## Plugin-Related Test Notes
 
@@ -63,4 +88,3 @@ Most store-backed tests:
 - create temp SQLite directories per test
 - reset migrations/tables for clean state
 - avoid shared mutable fixtures
-

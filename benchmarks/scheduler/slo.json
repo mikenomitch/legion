@@ -1,0 +1,6 @@
+{
+  "min_evals_per_sec": 30.0,
+  "max_p99_latency_ms": 250.0,
+  "max_conflict_rejection_rate": 0.05,
+  "min_correctness_ratio": 1.0
+}
