@@ -1031,6 +1031,21 @@ message GetObservabilityReply {
   //
   // Empty when `o11y_enabled` is false.
   repeated string traces = 3;
+
+  // Active persistence backend identifier.
+  //
+  // Current values include: `local_disk`.
+  string persistence_backend = 4;
+
+  // Manager write role as reported by the persistence backend.
+  //
+  // Current values include: `primary`, `standby`, `candidate`.
+  string persistence_role = 5;
+
+  // True when this manager currently holds the write lease/fencing token.
+  //
+  // For `local_disk` mode this is always `true`.
+  bool persistence_lease_held = 6;
 }
 
 // Type discriminator for KV values.

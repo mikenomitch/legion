@@ -19,24 +19,24 @@ use crate::structs::{
     DeleteSavedStateQueryReply, DeleteSavedStateQueryRequest, DestroyJobReply, DestroyJobRequest,
     FailedAllocation, GetJobInfoReply, GetJobInfoRequest, GetJobSpecByConfigRequest,
     GetJobSpecReply, GetJobSpecRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest,
-    GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest, GetNodeReply,
-    GetNodeRequest, GetNodesReply, GetNodesRequest, GetObservabilityReply, GetObservabilityRequest,
-    GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest,
-    GetStateStoreSchemaReply, GetStateStoreSchemaRequest, HealthCheckReply, HealthCheckRequest,
-    HeartbeatReply, HeartbeatRequest, JobConfig, JobSpecHistoryItem, KvEntry, KvValueType,
-    LedgerNode, ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobsReply, ListJobsRequest,
-    ListKvReply, ListKvRequest, ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply,
-    ListRolloutsRequest, ListSavedStateQueriesReply, ListSavedStateQueriesRequest, Node, NodeMsg,
-    Submission,
-    PatchKvReply, PatchKvRequest, PlanJobReply, PlanJobRequest, PlannedAllocation, PutKvReply,
-    PutKvRequest, QueryStateStoreReply, QueryStateStoreRequest, ReleaseKvLockReply,
-    ReleaseKvLockRequest, RenewKvLockReply, RenewKvLockRequest, RestartWorkerReply,
-    RestartWorkerRequest, RolloutAllocationStatus, RolloutEvent, RolloutGroupStatus, RolloutProgression,
+    GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest,
+    GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest, GetObservabilityReply,
+    GetObservabilityRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply,
+    GetRolloutStatusRequest, GetStateStoreSchemaReply, GetStateStoreSchemaRequest,
+    HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, JobConfig,
+    JobSpecHistoryItem, KvEntry, KvValueType, LedgerNode, ListJobSpecHistoryReply,
+    ListJobSpecHistoryRequest, ListJobsReply, ListJobsRequest, ListKvReply, ListKvRequest,
+    ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply, ListRolloutsRequest,
+    ListSavedStateQueriesReply, ListSavedStateQueriesRequest, Node, NodeMsg, PatchKvReply,
+    PatchKvRequest, PlanJobReply, PlanJobRequest, PlannedAllocation, PutKvReply, PutKvRequest,
+    QueryStateStoreReply, QueryStateStoreRequest, ReleaseKvLockReply, ReleaseKvLockRequest,
+    RenewKvLockReply, RenewKvLockRequest, RestartWorkerReply, RestartWorkerRequest,
+    RolloutAllocationStatus, RolloutEvent, RolloutGroupStatus, RolloutProgression,
     RolloutReplacement, RunJobReply, RunJobRequest, SavedStateQuery, StopJobReply, StopJobRequest,
-    StopRolloutReply, StopRolloutRequest, TaskConfig, TaskOnUnhealthyConfig, UpdateNodeDynamicReply,
-    UpdateNodeDynamicRequest, UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest,
-    WorkerConfig, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply,
-    WorkerRegisterRequest,
+    StopRolloutReply, StopRolloutRequest, Submission, TaskConfig, TaskOnUnhealthyConfig,
+    UpdateNodeDynamicReply, UpdateNodeDynamicRequest, UpsertSavedStateQueryReply,
+    UpsertSavedStateQueryRequest, WorkerConfig, WorkerPreRegisterReply, WorkerPreRegisterRequest,
+    WorkerRegisterReply, WorkerRegisterRequest,
 };
 use crate::task_plugins::validate_job_config;
 use crate::tracing_util::{o11y_enabled, read_recent_observability};
@@ -1478,11 +1478,15 @@ impl Manager for ManagerAgentService {
         if traces.len() > max_lines {
             traces = traces.split_off(traces.len() - max_lines);
         }
+        let persistence = self.store.persistence_status();
 
         Ok(Response::new(GetObservabilityReply {
             o11y_enabled: enabled,
             logs,
             traces,
+            persistence_backend: persistence.backend,
+            persistence_role: persistence.role.as_str().to_string(),
+            persistence_lease_held: persistence.lease_held,
         }))
     }
 

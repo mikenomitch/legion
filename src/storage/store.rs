@@ -3,6 +3,9 @@ use crate::prelude::*;
 use crate::resources::ResourcePolicy;
 use crate::storage::errors::StorageError;
 use crate::storage::migrations::get_migrations;
+use crate::storage::persistence::{
+    LocalDiskPersistenceDriver, PersistenceDriver, PersistenceRole, PersistenceStatus,
+};
 use crate::storage::queries::{
     GET_ALLOCATION_BY_ID, GET_ALLOCS, GET_ALLOCS_FOR_JOB, GET_ALLOCS_FOR_JOB_CONFIG,
     GET_ALLOCS_FOR_NODE, GET_EVALS, GET_JOB, GET_JOBS, GET_JOB_CONFIG, GET_JOB_CONFIG_BY_ID,
@@ -97,6 +100,7 @@ pub struct Store {
     pub rollout_retention_days: u64,
     pub scheduler_settings: Option<Value>,
     pub resource_policy: ResourcePolicy,
+    persistence_driver: Arc<dyn PersistenceDriver>,
     read_model: Arc<RwLock<SchedulingReadModel>>,
     // Cross-task wake signal for eval workers waiting on an empty queue.
     eval_notify: Arc<Notify>,
@@ -205,6 +209,10 @@ const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 impl Store {
     #[instrument(err, skip_all)]
     pub fn start_storage(config: &ManagerConfigFull) -> R<Store> {
+        let persistence_driver: Arc<dyn PersistenceDriver> =
+            Arc::new(LocalDiskPersistenceDriver::new());
+        persistence_driver.start()?;
+
         let db_path = Store::db_path(&config.store_path)?;
         let write_conn = Store::create_write_conn(&db_path)?;
         let _migrations = Store::create_initial_tables(&Arc::clone(&write_conn))?;
@@ -220,6 +228,7 @@ impl Store {
             rollout_retention_days: config.rollout_retention_days,
             scheduler_settings: config.scheduler_settings.clone(),
             resource_policy,
+            persistence_driver,
             read_model: Arc::new(RwLock::new(SchedulingReadModel::default())),
             eval_notify: Arc::new(Notify::new()),
         };
@@ -227,6 +236,14 @@ impl Store {
         store.refresh_read_model()?;
 
         Ok(store)
+    }
+
+    pub fn persistence_status(&self) -> PersistenceStatus {
+        self.persistence_driver.status()
+    }
+
+    pub fn persistence_role(&self) -> PersistenceRole {
+        self.persistence_status().role
     }
 
     #[instrument(err, skip_all)]

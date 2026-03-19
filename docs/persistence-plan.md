@@ -277,11 +277,11 @@ Recommendation: keep this as a future fourth tier, not in initial rollout.
 
 ## Recommended Rollout Plan
 
-## Phase 0: Internal abstractions (no behavior change)
+## Phase 0: Internal abstractions (no behavior change) ✅ Done (2026-03-19)
 
-- Add `PersistenceDriver` and `local_disk` implementation.
-- Add `PersistenceStatus` plumbing and manager role exposure.
-- Keep default config exactly as today.
+- [x] Add `PersistenceDriver` and `local_disk` implementation.
+- [x] Add `PersistenceStatus` plumbing and manager role exposure.
+- [x] Keep default config exactly as today.
 
 ## Phase 1: Streaming backend (Litestream-like) with optional lease failover
 
