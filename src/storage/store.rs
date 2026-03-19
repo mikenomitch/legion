@@ -74,13 +74,16 @@ struct AllocationTaskState {
 pub struct PlanSubmission {
     pub id: i64,
     pub job_config_id: String,
-    pub expected_job_epoch: i64,
+    pub expected_versions: BTreeMap<String, i64>,
 }
 
 #[derive(Debug, Clone)]
 pub enum PlanApplyOutcome {
     Applied(Vec<Allocation>),
-    Rejected { reason: String, latest_epoch: i64 },
+    Rejected {
+        reason: String,
+        latest_versions: BTreeMap<String, i64>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -508,37 +511,104 @@ impl Store {
     }
 
     pub fn allocation_epoch_for_job_config(&self, job_config_id: &str) -> R<i64> {
+        self.allocation_epoch_for_scope("job_config", job_config_id)
+    }
+
+    pub fn allocation_version_vector(
+        &self,
+        job_config_id: &str,
+        node_ids: &HashSet<String>,
+    ) -> R<BTreeMap<String, i64>> {
+        let mut versions = BTreeMap::new();
+        versions.insert(
+            Self::scope_vector_key("job_config", job_config_id),
+            self.allocation_epoch_for_scope("job_config", job_config_id)?,
+        );
+        for node_id in node_ids {
+            versions.insert(
+                Self::scope_vector_key("node", node_id),
+                self.allocation_epoch_for_scope("node", node_id)?,
+            );
+        }
+        Ok(versions)
+    }
+
+    fn allocation_epoch_for_scope(&self, scope_type: &str, scope_id: &str) -> R<i64> {
         let conn = self.read_connection()?;
         let epoch: Option<i64> = conn
             .query_row(
-                "SELECT epoch FROM allocation_epoch_partition WHERE scope_type = 'job_config' AND scope_id = ?1;",
-                [job_config_id],
+                "SELECT epoch FROM allocation_epoch_partition WHERE scope_type = ?1 AND scope_id = ?2;",
+                params![scope_type, scope_id],
                 |row| row.get(0),
             )
             .optional()?;
         Ok(epoch.unwrap_or(0))
     }
 
-    fn ensure_job_config_epoch_tx(&self, tx: &Transaction<'_>, job_config_id: &str) -> R<()> {
+    fn scope_vector_key(scope_type: &str, scope_id: &str) -> String {
+        format!("{scope_type}:{scope_id}")
+    }
+
+    fn parse_scope_vector_key(scope_key: &str) -> R<(&str, &str)> {
+        let (scope_type, scope_id) = scope_key
+            .split_once(':')
+            .with_context(|| format!("invalid scope key '{scope_key}' in plan version vector"))?;
+        Ok((scope_type, scope_id))
+    }
+
+    fn ensure_scope_epoch_tx(
+        &self,
+        tx: &Transaction<'_>,
+        scope_type: &str,
+        scope_id: &str,
+    ) -> R<()> {
         tx.execute(
-            "INSERT OR IGNORE INTO allocation_epoch_partition(scope_type, scope_id, epoch) VALUES ('job_config', ?1, 0);",
-            [job_config_id],
+            "INSERT OR IGNORE INTO allocation_epoch_partition(scope_type, scope_id, epoch) VALUES (?1, ?2, 0);",
+            params![scope_type, scope_id],
         )?;
         Ok(())
     }
 
-    fn bump_job_config_epoch_tx(&self, tx: &Transaction<'_>, job_config_id: &str) -> R<i64> {
-        self.ensure_job_config_epoch_tx(tx, job_config_id)?;
-        tx.execute(
-            "UPDATE allocation_epoch_partition SET epoch = epoch + 1 WHERE scope_type = 'job_config' AND scope_id = ?1;",
-            [job_config_id],
-        )?;
+    fn scope_epoch_tx(&self, tx: &Transaction<'_>, scope_type: &str, scope_id: &str) -> R<i64> {
+        self.ensure_scope_epoch_tx(tx, scope_type, scope_id)?;
         let epoch = tx.query_row(
-            "SELECT epoch FROM allocation_epoch_partition WHERE scope_type = 'job_config' AND scope_id = ?1;",
-            [job_config_id],
+            "SELECT epoch FROM allocation_epoch_partition WHERE scope_type = ?1 AND scope_id = ?2;",
+            params![scope_type, scope_id],
             |row| row.get(0),
         )?;
         Ok(epoch)
+    }
+
+    fn scope_vector_epochs_tx(
+        &self,
+        tx: &Transaction<'_>,
+        scopes: &BTreeMap<String, i64>,
+    ) -> R<BTreeMap<String, i64>> {
+        let mut latest = BTreeMap::new();
+        for scope_key in scopes.keys() {
+            let (scope_type, scope_id) = Self::parse_scope_vector_key(scope_key)?;
+            let epoch = self.scope_epoch_tx(tx, scope_type, scope_id)?;
+            latest.insert(scope_key.clone(), epoch);
+        }
+        Ok(latest)
+    }
+
+    fn bump_scope_epoch_tx(
+        &self,
+        tx: &Transaction<'_>,
+        scope_type: &str,
+        scope_id: &str,
+    ) -> R<i64> {
+        self.ensure_scope_epoch_tx(tx, scope_type, scope_id)?;
+        tx.execute(
+            "UPDATE allocation_epoch_partition SET epoch = epoch + 1 WHERE scope_type = ?1 AND scope_id = ?2;",
+            params![scope_type, scope_id],
+        )?;
+        self.scope_epoch_tx(tx, scope_type, scope_id)
+    }
+
+    fn bump_job_config_epoch_tx(&self, tx: &Transaction<'_>, job_config_id: &str) -> R<i64> {
+        self.bump_scope_epoch_tx(tx, "job_config", job_config_id)
     }
 
     fn bump_job_config_epochs_tx(
@@ -563,7 +633,16 @@ impl Store {
             .iter()
             .map(|alloc| alloc.job_config_id.clone())
             .collect();
-        self.bump_job_config_epochs_tx(tx, &job_config_ids)
+        self.bump_job_config_epochs_tx(tx, &job_config_ids)?;
+
+        let node_ids: HashSet<String> = allocations
+            .iter()
+            .map(|alloc| alloc.node_id.clone())
+            .collect();
+        for node_id in node_ids {
+            self.bump_scope_epoch_tx(tx, "node", &node_id)?;
+        }
+        Ok(())
     }
 
     pub fn insert_plan_submission(
@@ -571,21 +650,32 @@ impl Store {
         job_config_id: &str,
         mode: &str,
         placements: &[(String, i64)],
-        expected_job_epoch: i64,
+        expected_versions: &BTreeMap<String, i64>,
     ) -> R<PlanSubmission> {
         let created_at = OffsetDateTime::now_utc().format(&Rfc3339)?;
         let placements_json = serde_json::to_string(placements)?;
+        let expected_vector_json = serde_json::to_string(expected_versions)?;
+        let expected_job_epoch = *expected_versions
+            .get(&Self::scope_vector_key("job_config", job_config_id))
+            .unwrap_or(&0);
         let conn = self.write_connection()?;
         let id = conn.query_row(
-            "INSERT INTO plan_submission(job_config_id, mode, placements, expected_epoch, status, created_at) VALUES (?1, ?2, ?3, ?4, 'queued', ?5) RETURNING id;",
-            params![job_config_id, mode, placements_json, expected_job_epoch, created_at],
+            "INSERT INTO plan_submission(job_config_id, mode, placements, expected_epoch, expected_version_vector, status, created_at) VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6) RETURNING id;",
+            params![
+                job_config_id,
+                mode,
+                placements_json,
+                expected_job_epoch,
+                expected_vector_json,
+                created_at
+            ],
             |row| row.get(0),
         )?;
 
         Ok(PlanSubmission {
             id,
             job_config_id: job_config_id.to_string(),
-            expected_job_epoch,
+            expected_versions: expected_versions.clone(),
         })
     }
 
@@ -593,17 +683,27 @@ impl Store {
         let mut conn = self.write_connection()?;
         let tx = conn.transaction()?;
 
-        self.ensure_job_config_epoch_tx(&tx, &submission.job_config_id)?;
-        let latest_epoch: i64 = tx.query_row(
-            "SELECT epoch FROM allocation_epoch_partition WHERE scope_type = 'job_config' AND scope_id = ?1;",
-            [submission.job_config_id.as_str()],
-            |row| row.get(0),
-        )?;
-
-        if latest_epoch != submission.expected_job_epoch {
+        let latest_versions = self.scope_vector_epochs_tx(&tx, &submission.expected_versions)?;
+        if latest_versions != submission.expected_versions {
+            let latest_job_epoch = latest_versions
+                .get(&Self::scope_vector_key(
+                    "job_config",
+                    &submission.job_config_id,
+                ))
+                .copied()
+                .unwrap_or_default();
             let reason = format!(
                 "plan epoch for job config {} is stale; expected {}, latest {}",
-                submission.job_config_id, submission.expected_job_epoch, latest_epoch
+                submission.job_config_id,
+                submission
+                    .expected_versions
+                    .get(&Self::scope_vector_key(
+                        "job_config",
+                        &submission.job_config_id
+                    ))
+                    .copied()
+                    .unwrap_or_default(),
+                latest_job_epoch
             );
             tx.execute(
                 "UPDATE plan_submission SET status = 'rejected', rejection_reason = ?1 WHERE id = ?2;",
@@ -612,7 +712,7 @@ impl Store {
             tx.commit()?;
             return Ok(PlanApplyOutcome::Rejected {
                 reason,
-                latest_epoch,
+                latest_versions,
             });
         }
 
@@ -677,10 +777,12 @@ impl Store {
                     "UPDATE plan_submission SET status = 'rejected', rejection_reason = ?1 WHERE id = ?2;",
                     params![reason, submission.id],
                 )?;
+                let latest_versions =
+                    self.scope_vector_epochs_tx(&tx, &submission.expected_versions)?;
                 tx.commit()?;
                 return Ok(PlanApplyOutcome::Rejected {
                     reason,
-                    latest_epoch,
+                    latest_versions,
                 });
             }
 
@@ -5114,18 +5216,32 @@ mod tests {
 
         let job_one_epoch = store.allocation_epoch_for_job_config(&job_one_config_id)?;
         let job_two_epoch = store.allocation_epoch_for_job_config(&job_two_config_id)?;
+        let job_one_versions = BTreeMap::from([
+            (
+                Store::scope_vector_key("job_config", &job_one_config_id),
+                job_one_epoch,
+            ),
+            (Store::scope_vector_key("node", "node-a"), 0),
+        ]);
+        let job_two_versions = BTreeMap::from([
+            (
+                Store::scope_vector_key("job_config", &job_two_config_id),
+                job_two_epoch,
+            ),
+            (Store::scope_vector_key("node", "node-b"), 0),
+        ]);
 
         let job_one_plan = store.insert_plan_submission(
             &job_one_config_id,
             "fresh",
             &[("node-a".to_string(), task_one_id)],
-            job_one_epoch,
+            &job_one_versions,
         )?;
         let job_two_plan = store.insert_plan_submission(
             &job_two_config_id,
             "fresh",
             &[("node-b".to_string(), task_two_id)],
-            job_two_epoch,
+            &job_two_versions,
         )?;
 
         assert!(matches!(
@@ -5254,19 +5370,20 @@ mod tests {
 
         let job_config_id = store.get_job_config("job-stale")?.id();
         let task_id = task_id_for(&store, "task", "job-stale")?;
-        let expected_epoch = store.allocation_epoch_for_job_config(&job_config_id)?;
+        let expected_versions = store
+            .allocation_version_vector(&job_config_id, &HashSet::from(["node-a".to_string()]))?;
 
         let first = store.insert_plan_submission(
             &job_config_id,
             "fresh",
             &[("node-a".to_string(), task_id)],
-            expected_epoch,
+            &expected_versions,
         )?;
         let second = store.insert_plan_submission(
             &job_config_id,
             "fresh",
             &[("node-a".to_string(), task_id)],
-            expected_epoch,
+            &expected_versions,
         )?;
 
         assert!(matches!(
@@ -5280,6 +5397,62 @@ mod tests {
                 panic!("expected stale plan to be rejected");
             }
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn plan_submission_rejects_stale_epoch_for_shared_node_scope() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "ready"))?;
+
+        let make_job = |name: &str, task_name: &str| JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: name.into(),
+            tasks: vec![TaskConfig::new(task_name, "noop")],
+            version: None,
+        };
+
+        let submission = [Submission {
+            path: "job.jsonnet".into(),
+            content: "job".into(),
+            is_primary: true,
+        }];
+        store.handle_job_submit(&make_job("job-scope-a", "task-a"), &submission)?;
+        store.handle_job_submit(&make_job("job-scope-b", "task-b"), &submission)?;
+
+        let job_a_config = store.get_job_config("job-scope-a")?.id();
+        let job_b_config = store.get_job_config("job-scope-b")?.id();
+        let task_a = task_id_for(&store, "task-a", "job-scope-a")?;
+        let task_b = task_id_for(&store, "task-b", "job-scope-b")?;
+
+        let job_a_versions = store
+            .allocation_version_vector(&job_a_config, &HashSet::from(["node-a".to_string()]))?;
+        let job_b_versions = store
+            .allocation_version_vector(&job_b_config, &HashSet::from(["node-a".to_string()]))?;
+
+        let first = store.insert_plan_submission(
+            &job_a_config,
+            "fresh",
+            &[("node-a".to_string(), task_a)],
+            &job_a_versions,
+        )?;
+        let second = store.insert_plan_submission(
+            &job_b_config,
+            "fresh",
+            &[("node-a".to_string(), task_b)],
+            &job_b_versions,
+        )?;
+
+        assert!(matches!(
+            store.apply_plan_submission(&first)?,
+            PlanApplyOutcome::Applied(_)
+        ));
+        assert!(matches!(
+            store.apply_plan_submission(&second)?,
+            PlanApplyOutcome::Rejected { .. }
+        ));
 
         Ok(())
     }
@@ -5313,25 +5486,33 @@ mod tests {
 
         let job_config_id = store.get_job_config("job-constraints")?.id();
         let task_id = task_id_for(&store, "task", "job-constraints")?;
-        let expected_job_epoch = store.allocation_epoch_for_job_config(&job_config_id)?;
+        let expected_versions = store
+            .allocation_version_vector(&job_config_id, &HashSet::from(["node-b".to_string()]))?;
+        let expected_job_epoch = *expected_versions
+            .get(&Store::scope_vector_key("job_config", &job_config_id))
+            .unwrap_or(&0);
 
         let submission = store.insert_plan_submission(
             &job_config_id,
             "fresh",
             &[("node-b".to_string(), task_id)],
-            expected_job_epoch,
+            &expected_versions,
         )?;
         let outcome = store.apply_plan_submission(&submission)?;
         match outcome {
             PlanApplyOutcome::Rejected {
                 reason,
-                latest_epoch,
+                latest_versions,
             } => {
                 assert!(
                     reason.contains("does not satisfy constraints"),
                     "unexpected rejection reason: {reason}"
                 );
-                assert_eq!(latest_epoch, expected_job_epoch);
+                let latest_job_epoch = latest_versions
+                    .get(&Store::scope_vector_key("job_config", &job_config_id))
+                    .copied()
+                    .unwrap_or_default();
+                assert_eq!(latest_job_epoch, expected_job_epoch);
             }
             PlanApplyOutcome::Applied(_) => {
                 bail!("expected constraint-based rejection");

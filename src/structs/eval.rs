@@ -1,4 +1,7 @@
+use rand::Rng;
 use std::collections::HashSet;
+use std::time::Duration;
+use std::{cmp, thread};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use tracing::{info, warn};
@@ -228,6 +231,9 @@ impl Eval {
         excluded: Option<&HashSet<String>>,
     ) -> R<PlanOutcome> {
         let max_plan_retries = Self::max_plan_conflict_retries(store);
+        let backoff = Self::plan_conflict_backoff_settings(store);
+        let mut conflict_count = 0usize;
+        let mut total_backoff_delay = Duration::from_millis(0);
 
         for attempt in 1..=max_plan_retries {
             match scheduler.plan_and_apply_with_exclusions(
@@ -240,17 +246,29 @@ impl Eval {
                     if !Self::is_conflict_error(&error) {
                         return Err(error);
                     }
+                    conflict_count += 1;
 
                     if attempt < max_plan_retries {
+                        let delay = Self::adaptive_retry_delay(backoff, attempt, conflict_count);
+                        total_backoff_delay += delay;
                         warn!(
                             attempt,
+                            conflict_count,
                             max_attempts = max_plan_retries,
+                            retry_delay_ms = delay.as_millis(),
                             error = %error,
                             "Plan submission rejected due to stale state; retrying"
                         );
+                        thread::sleep(delay);
                         continue;
                     }
 
+                    warn!(
+                        attempts = max_plan_retries,
+                        conflict_count,
+                        total_backoff_ms = total_backoff_delay.as_millis(),
+                        "Plan conflict retry budget exhausted"
+                    );
                     return Err(error.context(format!(
                         "plan submission failed after {} attempts",
                         max_plan_retries
@@ -278,6 +296,59 @@ impl Eval {
             .and_then(|value| value.as_u64())
             .map(|value| value.clamp(1, MAX_RETRIES as u64) as usize)
             .unwrap_or(DEFAULT_RETRIES)
+    }
+
+    fn plan_conflict_backoff_settings(store: &Store) -> RetryBackoffSettings {
+        const DEFAULT_BASE_MS: u64 = 25;
+        const DEFAULT_MAX_MS: u64 = 500;
+        const DEFAULT_JITTER_MS: u64 = 35;
+        const MAX_BASE_MS: u64 = 5_000;
+        const MAX_DELAY_MS: u64 = 30_000;
+        const MAX_JITTER_MS: u64 = 10_000;
+
+        let get_setting = |key: &str| -> Option<u64> {
+            store
+                .scheduler_settings
+                .as_ref()
+                .and_then(|settings| settings.get(key))
+                .and_then(|value| value.as_u64())
+        };
+
+        let base_delay_ms = get_setting("plan_conflict_backoff_base_ms")
+            .unwrap_or(DEFAULT_BASE_MS)
+            .clamp(1, MAX_BASE_MS);
+        let max_delay_ms = get_setting("plan_conflict_backoff_max_ms")
+            .unwrap_or(DEFAULT_MAX_MS)
+            .clamp(base_delay_ms, MAX_DELAY_MS);
+        let jitter_ms = get_setting("plan_conflict_backoff_jitter_ms")
+            .unwrap_or(DEFAULT_JITTER_MS)
+            .clamp(0, MAX_JITTER_MS);
+
+        RetryBackoffSettings {
+            base_delay_ms,
+            max_delay_ms,
+            jitter_ms,
+        }
+    }
+
+    fn adaptive_retry_delay(
+        settings: RetryBackoffSettings,
+        attempt: usize,
+        conflict_count: usize,
+    ) -> Duration {
+        let exponent = cmp::min(
+            (attempt.saturating_sub(1) + conflict_count.saturating_sub(1)) as u32,
+            16,
+        );
+        let multiplier = 1_u64 << exponent;
+        let raw = settings.base_delay_ms.saturating_mul(multiplier);
+        let capped = raw.min(settings.max_delay_ms);
+        let jitter = if settings.jitter_ms == 0 {
+            0
+        } else {
+            rand::thread_rng().gen_range(0..=settings.jitter_ms)
+        };
+        Duration::from_millis(capped.saturating_add(jitter).min(settings.max_delay_ms))
     }
 
     fn schedule_batch_follow_up(&self, store: &Store) -> R<()> {
@@ -332,6 +403,13 @@ impl Eval {
             }
         })
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RetryBackoffSettings {
+    base_delay_ms: u64,
+    max_delay_ms: u64,
+    jitter_ms: u64,
 }
 
 #[cfg(test)]
@@ -391,6 +469,27 @@ mod tests {
         assert_eq!(Eval::max_plan_conflict_retries(&store), 9);
 
         Ok(())
+    }
+
+    #[test]
+    fn plan_conflict_backoff_settings_use_defaults() -> R<()> {
+        let store = setup_store()?;
+        let settings = Eval::plan_conflict_backoff_settings(&store);
+        assert_eq!(settings.base_delay_ms, 25);
+        assert_eq!(settings.max_delay_ms, 500);
+        assert_eq!(settings.jitter_ms, 35);
+        Ok(())
+    }
+
+    #[test]
+    fn adaptive_retry_delay_is_bounded() {
+        let settings = RetryBackoffSettings {
+            base_delay_ms: 10,
+            max_delay_ms: 80,
+            jitter_ms: 0,
+        };
+        let delay = Eval::adaptive_retry_delay(settings, 6, 6);
+        assert_eq!(delay, Duration::from_millis(80));
     }
 
     fn make_node(id: &str, zone: &str) -> Node {
