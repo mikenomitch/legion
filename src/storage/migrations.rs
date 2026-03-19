@@ -262,6 +262,7 @@ pub fn get_migrations() -> Migrations<'static> {
             mode STRING NOT NULL,
             placements JSONB NOT NULL,
             expected_epoch INTEGER NOT NULL,
+            expected_version_vector JSONB NOT NULL DEFAULT '{}',
             status STRING NOT NULL,
             rejection_reason STRING,
             created_at TIMESTAMP NOT NULL
