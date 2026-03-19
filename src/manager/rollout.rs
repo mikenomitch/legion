@@ -822,7 +822,6 @@ fn try_place_for_group(
                 Ok(outcome) => {
                     state.blocked_since = None;
                     if !outcome.allocations.is_empty() {
-                        store.update_task_statuses_for_allocations(&outcome.allocations)?;
                         dispatch_allocations(store, &outcome.allocations)?;
                         return Ok(GroupAction::Mutated {
                             delay: plan.config.allocation_stagger,
@@ -855,7 +854,6 @@ fn try_place_for_group(
         Ok(outcome) => {
             state.blocked_since = None;
             if !outcome.allocations.is_empty() {
-                store.update_task_statuses_for_allocations(&outcome.allocations)?;
                 dispatch_allocations(store, &outcome.allocations)?;
                 return Ok(GroupAction::Mutated {
                     delay: plan.config.allocation_stagger,
@@ -1317,7 +1315,6 @@ fn rollback_rollout(
     if let Some(from_config_id) = rollout.from_job_config_id.as_ref() {
         let outcome = scheduler.plan_and_apply(from_config_id, PlanMode::Reschedule)?;
         if !outcome.allocations.is_empty() {
-            store.update_task_statuses_for_allocations(&outcome.allocations)?;
             dispatch_allocations(store, &outcome.allocations)?;
         }
     }

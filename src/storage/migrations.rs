@@ -110,6 +110,10 @@ pub fn get_migrations() -> Migrations<'static> {
         M::up("ALTER TABLE task_config ADD COLUMN depends_on JSONB NOT NULL DEFAULT '[]';")
             .down(""),
         M::up(
+            "CREATE INDEX IF NOT EXISTS idx_task_config_job_config_id ON task_config(job_config_id);",
+        )
+        .down("DROP INDEX IF EXISTS idx_task_config_job_config_id;"),
+        M::up(
             "CREATE TABLE IF NOT EXISTS task_status (
             task_config_id INTEGER PRIMARY KEY,
             job_id STRING NOT NULL,
@@ -126,6 +130,10 @@ pub fn get_migrations() -> Migrations<'static> {
             "CREATE INDEX IF NOT EXISTS idx_task_status_job_config_id ON task_status(job_config_id);",
         )
         .down("DROP INDEX IF EXISTS idx_task_status_job_config_id;"),
+        M::up(
+            "CREATE INDEX IF NOT EXISTS idx_task_status_task_config_id ON task_status(task_config_id);",
+        )
+        .down("DROP INDEX IF EXISTS idx_task_status_task_config_id;"),
         M::up(
             "CREATE TABLE IF NOT EXISTS job_update (
             id STRING PRIMARY KEY,
@@ -153,6 +161,10 @@ pub fn get_migrations() -> Migrations<'static> {
         )",
         )
         .down("DROP TABLE IF EXISTS allocation;"),
+        M::up("CREATE INDEX IF NOT EXISTS idx_allocation_task_config_id ON allocation(task_config_id);")
+            .down("DROP INDEX IF EXISTS idx_allocation_task_config_id;"),
+        M::up("CREATE INDEX IF NOT EXISTS idx_allocation_job_config_id ON allocation(job_config_id);")
+            .down("DROP INDEX IF EXISTS idx_allocation_job_config_id;"),
         M::up(
             "CREATE TABLE IF NOT EXISTS eval (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -269,6 +281,10 @@ pub fn get_migrations() -> Migrations<'static> {
         )",
         )
         .down("DROP TABLE IF EXISTS plan_submission;"),
+        M::up(
+            "CREATE INDEX IF NOT EXISTS idx_plan_submission_job_config_status ON plan_submission(job_config_id, status);",
+        )
+        .down("DROP INDEX IF EXISTS idx_plan_submission_job_config_status;"),
         M::up(
             "CREATE TABLE IF NOT EXISTS rollout (
             id INTEGER PRIMARY KEY AUTOINCREMENT,

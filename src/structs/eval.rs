@@ -210,7 +210,6 @@ impl Eval {
         let outcome =
             self.plan_with_conflict_retries(store, &scheduler, mode, excluded.as_ref())?;
 
-        store.update_task_statuses_for_allocations(&outcome.allocations)?;
         dispatch_allocations(store, &outcome.allocations)?;
         Ok(outcome)
     }
