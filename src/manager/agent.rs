@@ -191,13 +191,14 @@ fn seed_ui_test_data(store: &Store) -> R<()> {
         version: None,
     };
 
-    let submit_outcome = store.handle_job_submit(
+    let submit_outcome = store.handle_job_submit_with_template(
         &job,
         &[Submission {
             path: "seed://ui-preview".into(),
             content: "seeded ui preview job".into(),
             is_primary: true,
         }],
+        None,
     )?;
     store.enqueue_eval(
         "job_submit",

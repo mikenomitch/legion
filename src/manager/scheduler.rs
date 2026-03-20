@@ -2454,7 +2454,7 @@ mod tests {
             version: None,
         };
 
-        store.handle_job_submit(&job, &[dummy_submission()])?;
+        store.handle_job_submit_with_template(&job, &[dummy_submission()], None)?;
         let job_config_id = store.get_job_config(&job.name)?.id();
 
         let scheduler = Scheduler::new(&store)?;
@@ -2509,7 +2509,7 @@ mod tests {
             version: None,
         };
 
-        store.handle_job_submit(&job, &[dummy_submission()])?;
+        store.handle_job_submit_with_template(&job, &[dummy_submission()], None)?;
         let job_config_id = store.get_job_config(&job.name)?.id();
         let batch_id = task_id_for(&store, &job_config_id, "batch")?;
         store.place_alloc("node-a", batch_id)?;
@@ -2552,7 +2552,7 @@ mod tests {
             version: None,
         };
 
-        store.handle_job_submit(&job, &[dummy_submission()])?;
+        store.handle_job_submit_with_template(&job, &[dummy_submission()], None)?;
         let job_config_id = store.get_job_config(&job.name)?.id();
         let scheduler = Scheduler::new(&store)?;
         let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
@@ -2595,7 +2595,7 @@ mod tests {
             version: None,
         };
 
-        store.handle_job_submit(&job, &[dummy_submission()])?;
+        store.handle_job_submit_with_template(&job, &[dummy_submission()], None)?;
         let job_config_id = store.get_job_config(&job.name)?.id();
         let task_id = task_id_for(&store, &job_config_id, "api")?;
 
@@ -2654,7 +2654,7 @@ mod tests {
             version: None,
         };
 
-        store.handle_job_submit(&job, &[dummy_submission()])?;
+        store.handle_job_submit_with_template(&job, &[dummy_submission()], None)?;
         let job_config_id = store.get_job_config(&job.name)?.id();
         let scheduler = Scheduler::new(&store)?;
         let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
@@ -2686,7 +2686,7 @@ mod tests {
             version: None,
         };
 
-        store.handle_job_submit(&job, &[dummy_submission()])?;
+        store.handle_job_submit_with_template(&job, &[dummy_submission()], None)?;
         let job_config_id = store.get_job_config(&job.name)?.id();
         let scheduler = Scheduler::new(&store)?;
         let excluded = HashSet::from(["node-a".to_string()]);
@@ -2718,7 +2718,7 @@ mod tests {
             version: None,
         };
 
-        store.handle_job_submit(&job, &[dummy_submission()])?;
+        store.handle_job_submit_with_template(&job, &[dummy_submission()], None)?;
         let job_config_id = store.get_job_config(&job.name)?.id();
         let scheduler = Scheduler::new(&store)?;
 
@@ -2790,7 +2790,7 @@ mod tests {
             version: None,
         };
 
-        store.handle_job_submit(&job, &[dummy_submission()])?;
+        store.handle_job_submit_with_template(&job, &[dummy_submission()], None)?;
         let job_config_id = store.get_job_config(&job.name)?.id();
         let scheduler = Scheduler::new(&store)?;
         let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
@@ -2823,7 +2823,7 @@ mod tests {
             version: None,
         };
 
-        store.handle_job_submit(&job, &[dummy_submission()])?;
+        store.handle_job_submit_with_template(&job, &[dummy_submission()], None)?;
         let job_config_id = store.get_job_config(&job.name)?.id();
         let scheduler = Scheduler::new(&store)?;
         let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
@@ -2961,7 +2961,7 @@ mod tests {
             version: None,
         };
 
-        store.handle_job_submit(&job, &[dummy_submission()])?;
+        store.handle_job_submit_with_template(&job, &[dummy_submission()], None)?;
         let job_config_id = store.get_job_config(&job.name)?.id();
         let task_id = task_id_for(&store, &job_config_id, "db")?;
 
@@ -2992,7 +2992,7 @@ mod tests {
             version: None,
         };
 
-        store.handle_job_submit(&job, &[dummy_submission()])?;
+        store.handle_job_submit_with_template(&job, &[dummy_submission()], None)?;
         let job_config_id = store.get_job_config(&job.name)?.id();
         let scheduler = Scheduler::new(&store)?;
         let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
@@ -3023,7 +3023,7 @@ mod tests {
             }],
             version: None,
         };
-        store.handle_job_submit(&passing_job, &[dummy_submission()])?;
+        store.handle_job_submit_with_template(&passing_job, &[dummy_submission()], None)?;
         let pass_job_config_id = store.get_job_config(&passing_job.name)?.id();
         let scheduler = Scheduler::new(&store)?;
         let pass_outcome = scheduler.plan_and_apply(&pass_job_config_id, PlanMode::Fresh)?;
@@ -3042,7 +3042,7 @@ mod tests {
             }],
             version: None,
         };
-        store.handle_job_submit(&failing_job, &[dummy_submission()])?;
+        store.handle_job_submit_with_template(&failing_job, &[dummy_submission()], None)?;
         let fail_job_config_id = store.get_job_config(&failing_job.name)?.id();
         let fail_err = scheduler
             .plan_and_apply(&fail_job_config_id, PlanMode::Fresh)
@@ -3072,7 +3072,7 @@ mod tests {
             version: None,
         };
 
-        store.handle_job_submit(&job, &[dummy_submission()])?;
+        store.handle_job_submit_with_template(&job, &[dummy_submission()], None)?;
         let job_config_id = store.get_job_config(&job.name)?.id();
         let scheduler = Scheduler::new(&store)?;
         let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
@@ -3108,7 +3108,7 @@ mod tests {
             version: None,
         };
 
-        store.handle_job_submit(&job, &[dummy_submission()])?;
+        store.handle_job_submit_with_template(&job, &[dummy_submission()], None)?;
         let job_config_id = store.get_job_config(&job.name)?.id();
         let scheduler = Scheduler::new(&store)?;
 
@@ -3224,7 +3224,7 @@ mod tests {
             version: None,
         };
 
-        store.handle_job_submit(&job, &[dummy_submission()])?;
+        store.handle_job_submit_with_template(&job, &[dummy_submission()], None)?;
         let job_config_id = store.get_job_config(&job.name)?.id();
         let scheduler = Scheduler::new(&store)?;
 
@@ -3257,7 +3257,7 @@ mod tests {
                 version: None,
             };
 
-            store.handle_job_submit(&job, &[dummy_submission()])?;
+            store.handle_job_submit_with_template(&job, &[dummy_submission()], None)?;
             let job_config_id = store.get_job_config(&job.name)?.id();
             let task_id = task_id_for(&store, &job_config_id, "api")?;
 
@@ -3299,7 +3299,7 @@ mod tests {
                 version: None,
             };
 
-            store.handle_job_submit(&job, &[dummy_submission()])?;
+            store.handle_job_submit_with_template(&job, &[dummy_submission()], None)?;
             let job_config_id = store.get_job_config(&job.name)?.id();
             let task_id = task_id_for(&store, &job_config_id, "worker")?;
 
@@ -3383,7 +3383,7 @@ mod tests {
             version: None,
         };
 
-        store.handle_job_submit(&job, &[dummy_submission()])?;
+        store.handle_job_submit_with_template(&job, &[dummy_submission()], None)?;
         let job_config_id = store.get_job_config(&job.name)?.id();
         let scheduler = Scheduler::new(&store)?;
         let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
@@ -3423,7 +3423,7 @@ mod tests {
             version: None,
         };
 
-        store.handle_job_submit(&job, &[dummy_submission()])?;
+        store.handle_job_submit_with_template(&job, &[dummy_submission()], None)?;
         let job_config_id = store.get_job_config(&job.name)?.id();
         let scheduler = Scheduler::new(&store)?;
         let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
@@ -3473,7 +3473,7 @@ mod tests {
             version: None,
         };
 
-        store.handle_job_submit(&job, &[dummy_submission()])?;
+        store.handle_job_submit_with_template(&job, &[dummy_submission()], None)?;
         let job_config_id = store.get_job_config(&job.name)?.id();
         let scheduler = Scheduler::new(&store)?;
         let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
@@ -3520,7 +3520,7 @@ mod tests {
             version: None,
         };
 
-        store.handle_job_submit(&job, &[dummy_submission()])?;
+        store.handle_job_submit_with_template(&job, &[dummy_submission()], None)?;
         let job_config_id = store.get_job_config(&job.name)?.id();
         let scheduler = Scheduler::new(&store)?;
         let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
@@ -3754,8 +3754,8 @@ mod tests {
             version: None,
         };
 
-        store.handle_job_submit(&job_one, &[dummy_submission()])?;
-        store.handle_job_submit(&job_two, &[dummy_submission()])?;
+        store.handle_job_submit_with_template(&job_one, &[dummy_submission()], None)?;
+        store.handle_job_submit_with_template(&job_two, &[dummy_submission()], None)?;
 
         let scheduler = Scheduler::new(&store)?;
         let outcome_one =
@@ -3819,7 +3819,7 @@ mod tests {
             version: None,
         };
 
-        store.handle_job_submit(&job, &[dummy_submission()])?;
+        store.handle_job_submit_with_template(&job, &[dummy_submission()], None)?;
         let job_config_id = store.get_job_config(&job.name)?.id();
         let task_id = task_id_for(&store, &job_config_id, "api")?;
         store.place_alloc("node-a", task_id)?;
@@ -3855,7 +3855,7 @@ mod tests {
             tasks: vec![TaskConfig::new("load", "noop")],
             version: None,
         };
-        store.handle_job_submit(&load_job, &[dummy_submission()])?;
+        store.handle_job_submit_with_template(&load_job, &[dummy_submission()], None)?;
         let load_job_config_id = store.get_job_config(&load_job.name)?.id();
         let load_task_id = task_id_for(&store, &load_job_config_id, "load")?;
 
@@ -3873,7 +3873,7 @@ mod tests {
             }],
             version: None,
         };
-        store.handle_job_submit(&job, &[dummy_submission()])?;
+        store.handle_job_submit_with_template(&job, &[dummy_submission()], None)?;
         let job_config_id = store.get_job_config(&job.name)?.id();
 
         let scheduler = Scheduler::new(&store)?;

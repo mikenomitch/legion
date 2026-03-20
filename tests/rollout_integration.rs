@@ -60,6 +60,7 @@ fn run_request(jobspec: String, name: &str) -> RunJobRequest {
         priority: None,
         force_reschedule: false,
         idempotency_key: None,
+        template_reference: None,
     }
 }
 

@@ -1880,7 +1880,7 @@ mod tests {
             }],
             version: None,
         };
-        store.handle_job_submit(&v1, &[submission()])?;
+        store.handle_job_submit_with_template(&v1, &[submission()], None)?;
         let v1_id = store.get_job_config(&v1.name)?.id();
         let v1_task_id = store.get_task_configs_for_job_config(&v1_id)?[0].0;
         let _old_alloc = store.place_alloc("node-a", v1_task_id)?;
@@ -1899,7 +1899,7 @@ mod tests {
             }],
             version: None,
         };
-        store.handle_job_submit(&v2, &[submission()])?;
+        store.handle_job_submit_with_template(&v2, &[submission()], None)?;
         let v2_id = store.get_job_config(&v2.name)?.id();
         let rollout = store.create_rollout(
             "in-place-demo",
@@ -1946,7 +1946,7 @@ mod tests {
             }],
             version: None,
         };
-        store.handle_job_submit(&v1, &[submission()])?;
+        store.handle_job_submit_with_template(&v1, &[submission()], None)?;
         let v1_id = store.get_job_config(&v1.name)?.id();
         let v1_task_id = store.get_task_configs_for_job_config(&v1_id)?[0].0;
         let _old_alloc = store.place_alloc("node-a", v1_task_id)?;
@@ -1965,7 +1965,7 @@ mod tests {
             }],
             version: None,
         };
-        store.handle_job_submit(&v2, &[submission()])?;
+        store.handle_job_submit_with_template(&v2, &[submission()], None)?;
         let v2_id = store.get_job_config(&v2.name)?.id();
         let v2_task_id = store.get_task_configs_for_job_config(&v2_id)?[0].0;
         let _new_alloc = store.place_alloc("node-a", v2_task_id)?;
@@ -2011,7 +2011,7 @@ mod tests {
             }],
             version: None,
         };
-        store.handle_job_submit(&job, &[submission()])?;
+        store.handle_job_submit_with_template(&job, &[submission()], None)?;
         let job_config_id = store.get_job_config(&job.name)?.id();
         let task_id = store.get_task_configs_for_job_config(&job_config_id)?[0].0;
         let allocation = store.place_alloc("node-a", task_id)?;
@@ -2089,7 +2089,7 @@ mod tests {
             }],
             version: None,
         };
-        store.handle_job_submit(&v1, &[submission()])?;
+        store.handle_job_submit_with_template(&v1, &[submission()], None)?;
         let v1_id = store.get_job_config(&v1.name)?.id();
 
         let v2 = JobConfig {
@@ -2106,7 +2106,7 @@ mod tests {
             }],
             version: None,
         };
-        store.handle_job_submit(&v2, &[submission()])?;
+        store.handle_job_submit_with_template(&v2, &[submission()], None)?;
         let v2_id = store.get_job_config(&v2.name)?.id();
         let rollout = store.create_rollout(
             &v2.name,

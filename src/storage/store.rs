@@ -19,7 +19,7 @@ use crate::structs::{
     Allocation, AllocationHealth, Eval, Job, JobConfig, KvEntry, KvLock, KvValueType, LedgerEntry,
     ManagerConfigFull, ManagerNodeConfig, Node, NodeMsg, Rollout, RolloutConfig, Submission,
     TaskCheck, TaskConfig, TaskCount, TaskDependency, TaskLifecycle, TaskOnUnhealthyConfig,
-    TaskSchedule, TaskStatusState, WorkerConfig,
+    TaskSchedule, TaskStatusState, TemplateReference, WorkerConfig,
 };
 
 use rand::{seq::SliceRandom, thread_rng, Rng};
@@ -28,7 +28,7 @@ use rusqlite::{
     OpenFlags, OptionalExtension, Row, Transaction,
 };
 use rusqlite_migration::Migrations;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{from_str, to_string, to_string_pretty, Value};
 use serde_rusqlite::to_params_named;
 use std::collections::hash_map::Entry;
@@ -186,6 +186,42 @@ pub struct RolloutEventRecord {
     pub message: String,
     pub metadata_json: String,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TemplateVariableRecord {
+    pub key: String,
+    pub r#type: String,
+    pub label: String,
+    pub description: Option<String>,
+    pub required: bool,
+    pub default_value: Option<String>,
+    #[serde(default)]
+    pub options: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TemplateVersionRecord {
+    pub template_id: String,
+    pub version: u32,
+    pub name: String,
+    pub description: Option<String>,
+    pub source_jsonnet: String,
+    pub variables: Vec<TemplateVariableRecord>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TemplateSummaryRecord {
+    pub template_id: String,
+    pub latest_version: u32,
+    pub name: String,
+    pub description: Option<String>,
+    pub variable_count: u32,
+    pub updated_at: String,
 }
 
 impl JobSubmitOutcome {
@@ -1141,6 +1177,30 @@ impl Store {
         })
     }
 
+    fn template_version_from_row(
+        &self,
+        row: &Row<'_>,
+    ) -> Result<TemplateVersionRecord, rusqlite::Error> {
+        let variables_json: String = row.get(5)?;
+        let variables = serde_json::from_str::<Vec<TemplateVariableRecord>>(&variables_json)
+            .map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    5,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+        Ok(TemplateVersionRecord {
+            template_id: row.get(0)?,
+            version: row.get::<_, i64>(1)? as u32,
+            name: row.get(2)?,
+            description: row.get(3)?,
+            source_jsonnet: row.get(4)?,
+            variables,
+            created_at: row.get(6)?,
+        })
+    }
+
     fn job_kv_reference_from_row(&self, row: &Row<'_>) -> Result<JobKvReference, RusqliteError> {
         Ok(JobKvReference {
             job_id: row.get(0)?,
@@ -1900,11 +1960,14 @@ impl Store {
             .ok_or_else(|| StorageError::not_found("job config", id).into())
     }
 
-    pub fn list_job_spec_history(&self, name: &str) -> R<Vec<(String, String, Option<i64>)>> {
+    pub fn list_job_spec_history(
+        &self,
+        name: &str,
+    ) -> R<Vec<(String, String, Option<i64>, Option<TemplateReference>)>> {
         let conn = self.read_connection()?;
         let mut stmt = conn.prepare(
             r#"
-            SELECT jc.id, jc.created_at, jc.version
+            SELECT jc.id, jc.created_at, jc.version, jc.meta
             FROM job_config jc
             INNER JOIN job j ON j.id = jc.job_id
             WHERE j.name = ?
@@ -1913,17 +1976,33 @@ impl Store {
         )?;
 
         let rows = stmt.query_map([name], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get::<_, Option<i64>>(2)?))
+            let meta: Value = row.get(3)?;
+            let template_reference = meta
+                .as_object()
+                .and_then(|map| map.get("templateReference"))
+                .and_then(|value| serde_json::from_value::<TemplateReference>(value.clone()).ok());
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get::<_, Option<i64>>(2)?,
+                template_reference,
+            ))
         })?;
 
         Self::collect_rows(rows)
     }
 
     #[allow(dead_code)]
-    pub fn handle_job_submit(
+    pub fn handle_job_submit(&self, config: &JobConfig, subs: &[Submission]) -> R<JobSubmitOutcome> {
+        self.handle_job_submit_with_template(config, subs, None)
+    }
+
+    #[allow(dead_code)]
+    pub fn handle_job_submit_with_template(
         &self,
         config: &JobConfig,
         subs: &[Submission],
+        template_reference: Option<&TemplateReference>,
     ) -> R<JobSubmitOutcome> {
         let config = self.normalize_job_config(config)?;
         // Note: There is a race condition here with the version
@@ -1971,14 +2050,14 @@ impl Store {
         }?;
 
         let now = time::OffsetDateTime::now_utc();
-        let meta = if config.rollout.is_none() && config.rollout_by_group.is_empty() {
-            json!({})
-        } else {
-            json!({
-                "rollout": config.rollout,
-                "rolloutByGroup": config.rollout_by_group,
-            })
-        };
+        let mut meta = json!({});
+        if config.rollout.is_some() || !config.rollout_by_group.is_empty() {
+            meta["rollout"] = serde_json::to_value(&config.rollout)?;
+            meta["rolloutByGroup"] = serde_json::to_value(&config.rollout_by_group)?;
+        }
+        if let Some(template_reference) = template_reference {
+            meta["templateReference"] = serde_json::to_value(template_reference)?;
+        }
         let config_params = named_params! {
             ":id": format!("{}-{}", config.name, next_version.to_string()),
             ":name": config.name,
@@ -4137,6 +4216,138 @@ impl Store {
         Ok(())
     }
 
+    #[instrument(err, skip_all)]
+    pub fn upsert_template_version(
+        &self,
+        template_id: &str,
+        name: &str,
+        description: Option<&str>,
+        source_jsonnet: &str,
+        variables: &[TemplateVariableRecord],
+    ) -> R<TemplateVersionRecord> {
+        let template_id = template_id.trim();
+        let name = name.trim();
+        if template_id.is_empty() {
+            return Err(anyhow::Error::new(StorageError::InvalidInput {
+                message: "template id must not be empty".to_string(),
+            }));
+        }
+        if name.is_empty() {
+            return Err(anyhow::Error::new(StorageError::InvalidInput {
+                message: "template name must not be empty".to_string(),
+            }));
+        }
+
+        let now = OffsetDateTime::now_utc().format(&Rfc3339)?;
+        let mut conn = self.write_connection()?;
+        let tx = conn.transaction()?;
+
+        let current_version: Option<i64> = tx
+            .query_row(
+                "SELECT latest_version FROM template WHERE id = ?;",
+                [template_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let next_version = current_version.unwrap_or(0) + 1;
+        let vars_json = serde_json::to_string(variables)?;
+
+        tx.execute(
+            "INSERT INTO template (id, latest_version, created_at, updated_at) VALUES (:id, :version, :now, :now) ON CONFLICT(id) DO UPDATE SET latest_version = excluded.latest_version, updated_at = excluded.updated_at;",
+            named_params! {
+                ":id": template_id,
+                ":version": next_version,
+                ":now": now,
+            },
+        )?;
+
+        tx.execute(
+            "INSERT INTO template_version (template_id, version, name, description, source_jsonnet, variables_json, created_at) VALUES (:template_id, :version, :name, :description, :source, :variables, :created_at);",
+            named_params! {
+                ":template_id": template_id,
+                ":version": next_version,
+                ":name": name,
+                ":description": description,
+                ":source": source_jsonnet,
+                ":variables": vars_json,
+                ":created_at": now,
+            },
+        )?;
+
+        let stored = tx.query_row(
+            "SELECT template_id, version, name, description, source_jsonnet, variables_json, created_at FROM template_version WHERE template_id = ? AND version = ?;",
+            params![template_id, next_version],
+            |row| self.template_version_from_row(row),
+        )?;
+        tx.commit()?;
+        Ok(stored)
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn get_template_version(
+        &self,
+        template_id: &str,
+        version: Option<u32>,
+    ) -> R<TemplateVersionRecord> {
+        let conn = self.read_connection()?;
+        let sql = if version.is_some() {
+            "SELECT template_id, version, name, description, source_jsonnet, variables_json, created_at FROM template_version WHERE template_id = ? AND version = ? LIMIT 1;"
+        } else {
+            "SELECT tv.template_id, tv.version, tv.name, tv.description, tv.source_jsonnet, tv.variables_json, tv.created_at
+             FROM template_version tv
+             INNER JOIN template t ON t.id = tv.template_id AND t.latest_version = tv.version
+             WHERE tv.template_id = ?
+             LIMIT 1;"
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let template = if let Some(version) = version {
+            stmt.query_row(params![template_id, i64::from(version)], |row| {
+                self.template_version_from_row(row)
+            })
+        } else {
+            stmt.query_row([template_id], |row| self.template_version_from_row(row))
+        }
+        .map_err(|error| match error {
+            RusqliteError::QueryReturnedNoRows => anyhow::Error::new(StorageError::not_found(
+                "template_version",
+                format!("{template_id}:{version:?}"),
+            )),
+            other => anyhow::Error::from(other),
+        })?;
+        Ok(template)
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn list_templates(&self) -> R<Vec<TemplateSummaryRecord>> {
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare(
+            "SELECT t.id, t.latest_version, tv.name, tv.description, tv.variables_json, t.updated_at
+             FROM template t
+             INNER JOIN template_version tv ON tv.template_id = t.id AND tv.version = t.latest_version
+             ORDER BY t.updated_at DESC;",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let variables_json: String = row.get(4)?;
+            let variables: Vec<TemplateVariableRecord> = serde_json::from_str(&variables_json)
+                .map_err(|error| {
+                    RusqliteError::FromSqlConversionFailure(
+                        4,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+            Ok(TemplateSummaryRecord {
+                template_id: row.get(0)?,
+                latest_version: row.get::<_, i64>(1)? as u32,
+                name: row.get(2)?,
+                description: row.get(3)?,
+                variable_count: variables.len() as u32,
+                updated_at: row.get(5)?,
+            })
+        })?;
+        Self::collect_rows(rows)
+    }
+
     fn sqlite_statement_type(sql: &str) -> String {
         sql.trim_start()
             .split_whitespace()
@@ -4782,7 +4993,7 @@ mod tests {
         );
 
         // NOTE: What should this return (figure it out in concontent later)
-        let submit_response = store.handle_job_submit(&job_config, &subs)?;
+        let submit_response = store.handle_job_submit_with_template(&job_config, &subs, None)?;
         assert!(matches!(submit_response, JobSubmitOutcome::Created { .. }));
 
         let job = store.get_job(&job_name)?;
@@ -4889,7 +5100,7 @@ mod tests {
         let store = setup_store()?;
 
         // Original Job is submitted
-        let submit_response = store.handle_job_submit(&job_config, &orig_submissions)?;
+        let submit_response = store.handle_job_submit_with_template(&job_config, &orig_submissions, None)?;
         assert!(matches!(submit_response, JobSubmitOutcome::Created { .. }));
 
         // Get config for initial insert
@@ -4917,8 +5128,11 @@ mod tests {
             ..job_config
         };
 
-        let submit_response =
-            store.handle_job_submit(&job_config_with_modified_kind.clone(), &orig_submissions)?;
+        let submit_response = store.handle_job_submit_with_template(
+            &job_config_with_modified_kind.clone(),
+            &orig_submissions,
+            None,
+        )?;
         assert!(matches!(submit_response, JobSubmitOutcome::Updated { .. }));
 
         // Get config for initial insert
@@ -4948,7 +5162,7 @@ mod tests {
         };
 
         let submit_response =
-            store.handle_job_submit(&job_config_with_extra_task, &orig_submissions)?;
+            store.handle_job_submit_with_template(&job_config_with_extra_task, &orig_submissions, None)?;
         assert!(matches!(submit_response, JobSubmitOutcome::Updated { .. }));
 
         // Get config for initial insert
@@ -4967,7 +5181,7 @@ mod tests {
         //     ... TODO ...
         // };
 
-        // let submit_response = store.handle_job_submit(&job_config, &orig_submissions);
+        // let submit_response = store.handle_job_submit_with_template(&job_config, &orig_submissions, None);
         // assert!(submit_response.is_ok());
 
         // // Get config for initial insert
@@ -5003,11 +5217,11 @@ mod tests {
         let store = setup_store()?;
 
         // Original Job is submitted
-        let submit_response = store.handle_job_submit(&job_config, &orig_submissions)?;
+        let submit_response = store.handle_job_submit_with_template(&job_config, &orig_submissions, None)?;
         assert!(matches!(submit_response, JobSubmitOutcome::Created { .. }));
 
         // Resubmitting with unchanged config is idempotent
-        let submit_response = store.handle_job_submit(&job_config, &orig_submissions)?;
+        let submit_response = store.handle_job_submit_with_template(&job_config, &orig_submissions, None)?;
         assert!(matches!(
             submit_response,
             JobSubmitOutcome::Unchanged { .. }
@@ -5048,7 +5262,7 @@ mod tests {
             content: "job-one".into(),
             is_primary: true,
         }];
-        store.handle_job_submit(&job_one_config, &job_one_subs)?;
+        store.handle_job_submit_with_template(&job_one_config, &job_one_subs, None)?;
 
         let job_one_config_id = store.get_job_config(&job_one_name)?.id();
         let task_one_id = task_id_for(&store, &task_one.name, &job_one_name)?;
@@ -5072,7 +5286,7 @@ mod tests {
             content: "job-two".into(),
             is_primary: true,
         }];
-        store.handle_job_submit(&job_two_config, &job_two_subs)?;
+        store.handle_job_submit_with_template(&job_two_config, &job_two_subs, None)?;
 
         let job_two_config_id = store.get_job_config(&job_two_name)?.id();
         let task_three_id = task_id_for(&store, &task_three.name, &job_two_name)?;
@@ -5166,7 +5380,7 @@ mod tests {
             version: None,
         };
 
-        store.handle_job_submit(&job_config, &submissions)?;
+        store.handle_job_submit_with_template(&job_config, &submissions, None)?;
         store.stop_job(&job_name)?;
 
         {
@@ -5235,8 +5449,8 @@ mod tests {
         let job_one_subs = vec![shared_submission.clone()];
         let job_two_subs = vec![shared_submission.clone()];
 
-        store.handle_job_submit(&job_one_config, &job_one_subs)?;
-        store.handle_job_submit(&job_two_config, &job_two_subs)?;
+        store.handle_job_submit_with_template(&job_one_config, &job_one_subs, None)?;
+        store.handle_job_submit_with_template(&job_two_config, &job_two_subs, None)?;
 
         store.stop_job("job-one")?;
         store.destroy_job("job-one")?;
@@ -5461,8 +5675,8 @@ mod tests {
             is_primary: true,
         }];
 
-        store.handle_job_submit(&job_one, &submission)?;
-        store.handle_job_submit(&job_two, &submission)?;
+        store.handle_job_submit_with_template(&job_one, &submission, None)?;
+        store.handle_job_submit_with_template(&job_two, &submission, None)?;
 
         let job_one_config_id = store.get_job_config("job-one")?.id();
         let job_two_config_id = store.get_job_config("job-two")?.id();
@@ -5674,8 +5888,8 @@ mod tests {
             content: "job".into(),
             is_primary: true,
         }];
-        store.handle_job_submit(&make_job("job-scope-a", "task-a"), &submission)?;
-        store.handle_job_submit(&make_job("job-scope-b", "task-b"), &submission)?;
+        store.handle_job_submit_with_template(&make_job("job-scope-a", "task-a"), &submission, None)?;
+        store.handle_job_submit_with_template(&make_job("job-scope-b", "task-b"), &submission, None)?;
 
         let job_a_config = store.get_job_config("job-scope-a")?.id();
         let job_b_config = store.get_job_config("job-scope-b")?.id();
@@ -5913,7 +6127,7 @@ mod tests {
             }],
             version: None,
         };
-        store.handle_job_submit(&v1, &[])?;
+        store.handle_job_submit_with_template(&v1, &[], None)?;
         let v1_id = store.get_job_config(&v1.name)?.id();
 
         let v2 = JobConfig {
@@ -5930,7 +6144,7 @@ mod tests {
             }],
             version: None,
         };
-        store.handle_job_submit(&v2, &[])?;
+        store.handle_job_submit_with_template(&v2, &[], None)?;
         let v2_id = store.get_job_config(&v2.name)?.id();
 
         let rollout = store.create_rollout(

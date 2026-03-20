@@ -414,6 +414,7 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
                 priority: None,
                 force_reschedule,
                 idempotency_key,
+                template_reference: None,
             }))
             .await
         }

@@ -374,5 +374,32 @@ pub fn get_migrations() -> Migrations<'static> {
         )",
         )
         .down("DROP TABLE IF EXISTS idempotency_record;"),
+        M::up(
+            "CREATE TABLE IF NOT EXISTS template (
+            id STRING PRIMARY KEY,
+            latest_version INTEGER NOT NULL,
+            created_at TIMESTAMP NOT NULL,
+            updated_at TIMESTAMP NOT NULL
+        )",
+        )
+        .down("DROP TABLE IF EXISTS template;"),
+        M::up(
+            "CREATE TABLE IF NOT EXISTS template_version (
+            template_id STRING NOT NULL,
+            version INTEGER NOT NULL,
+            name STRING NOT NULL,
+            description STRING,
+            source_jsonnet TEXT NOT NULL,
+            variables_json JSONB NOT NULL DEFAULT '[]',
+            created_at TIMESTAMP NOT NULL,
+            PRIMARY KEY(template_id, version),
+            FOREIGN KEY(template_id) REFERENCES template(id) ON DELETE CASCADE
+        )",
+        )
+        .down("DROP TABLE IF EXISTS template_version;"),
+        M::up(
+            "CREATE INDEX IF NOT EXISTS idx_template_version_template_created ON template_version(template_id, created_at DESC);",
+        )
+        .down("DROP INDEX IF EXISTS idx_template_version_template_created;"),
     ])
 }

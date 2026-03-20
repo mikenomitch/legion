@@ -22,6 +22,7 @@ import Observability from './pages/Observability'
 import TestingUtils from './pages/TestingUtils'
 import StateExplorer from './pages/StateExplorer'
 import Raft from './pages/Raft'
+import Templates from './pages/Templates'
 
 type SidebarItem = {
   kind: 'item'
@@ -90,6 +91,7 @@ const Layout = (props: RouteSectionProps) => {
         heading: 'Workloads',
         items: [
           { kind: 'item', label: 'Jobs', path: '/jobs', title: 'Jobs', copy: 'Jobs and their health status.' },
+          { kind: 'item', label: 'Templates', path: '/templates', title: 'Templates', copy: 'Versioned Jsonnet templates with guided variable forms.' },
           { kind: 'item', label: 'Rollouts', path: '/rollouts', title: 'Rollouts', copy: 'Rollout execution details.' },
         ],
       },
@@ -525,6 +527,7 @@ const AppRoutes = () => {
         <Route path="/raft" component={Raft} />
       <Route path="/manager/:id" component={ManagerNodeDetail} />
       <Route path="/jobs" component={Jobs} />
+      <Route path="/templates" component={Templates} />
       <Route path="/jobs/:id" component={JobDetail} />
       <Route path="/jobs/:id/tasks/:taskName" component={TaskDetail} />
       <Route path="/jobs/:id/specs/:configId" component={JobSpecDetail} />

@@ -86,13 +86,13 @@ fn eval_loop_reconciles_ledger_and_evals() -> R<()> {
     let job_config_v1 = make_job_config(job_name, 1);
     let submissions = vec![primary_submission(job_name)];
     store
-        .handle_job_submit(&job_config_v1, &submissions)
+        .handle_job_submit_with_template(&job_config_v1, &submissions, None)
         .context("first job submit")?;
     let job_config_v1_id = store.get_job_config(job_name)?.id();
 
     let job_config_v2 = make_job_config(job_name, 2);
     store
-        .handle_job_submit(&job_config_v2, &submissions)
+        .handle_job_submit_with_template(&job_config_v2, &submissions, None)
         .context("second job submit")?;
     let job_config_v2_id = store.get_job_config(job_name)?.id();
 

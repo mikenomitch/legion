@@ -94,7 +94,7 @@ impl TestCluster {
         let job_name = job_config.name.clone();
         let submissions = vec![primary_submission(&job_name)];
         self.store
-            .handle_job_submit(&job_config, &submissions)
+            .handle_job_submit_with_template(&job_config, &submissions, None)
             .with_context(|| format!("submit job {job_name}"))?;
         let job_config_id = self.store.get_job_config(&job_name)?.id();
         self.job_config_ids
@@ -109,7 +109,7 @@ impl TestCluster {
         let job_name = job_config.name.clone();
         let submissions = vec![primary_submission(&job_name)];
         self.store
-            .handle_job_submit(&job_config, &submissions)
+            .handle_job_submit_with_template(&job_config, &submissions, None)
             .with_context(|| format!("submit job {job_name}"))?;
         let job_config_id = self.store.get_job_config(&job_name)?.id();
         self.job_config_ids

@@ -33,6 +33,18 @@ service Manager {
   // and enqueue reconciliation work.
   rpc RunJob (RunJobRequest) returns (RunJobReply);
 
+  // Creates a new template version from raw Jsonnet source.
+  rpc UpsertTemplate (UpsertTemplateRequest) returns (UpsertTemplateReply);
+
+  // Lists templates with their latest version metadata.
+  rpc ListTemplates (ListTemplatesRequest) returns (ListTemplatesReply);
+
+  // Returns one template version (or latest when version is omitted).
+  rpc GetTemplateVersion (GetTemplateVersionRequest) returns (GetTemplateVersionReply);
+
+  // Renders a template version with provided variables and submits the resulting job.
+  rpc SubmitTemplateJob (SubmitTemplateJobRequest) returns (RunJobReply);
+
   // Returns the submitted source files (submissions) associated with the latest job config.
   rpc GetJobSpec (GetJobSpecRequest) returns (GetJobSpecReply);
 
@@ -279,6 +291,15 @@ message Submission {
   bool is_primary = 3;
 }
 
+// Reference to a template version that produced a rendered job submission.
+message TemplateReference {
+  // Stable template identifier.
+  string template_id = 1;
+
+  // Template version number used to render this submission.
+  uint32 version = 2;
+}
+
 // Request payload for RunJob.
 message RunJobRequest {
   // Fully rendered job specification as JSON text.
@@ -310,6 +331,9 @@ message RunJobRequest {
   // after a timeout without risking a double submission. Unset disables
   // deduplication.
   optional string idempotency_key = 5;
+
+  // Optional originating template/version metadata for auditability.
+  optional TemplateReference template_reference = 6;
 }
 
 // Reply payload for RunJob.
@@ -327,6 +351,138 @@ message RunJobReply {
   // True when this reply was replayed from a previously recorded result for the
   // request's `idempotency_key` rather than applied fresh.
   bool deduplicated = 2;
+}
+
+// One template variable definition used by the Templates UI.
+message TemplateVariableDefinition {
+  // Variable key passed to Jsonnet as an external variable.
+  string key = 1;
+
+  // Variable type used by UI rendering and validation.
+  // Supported values: `string`, `text`, `toggle`, `multi_select`, `number`, `code`.
+  string type = 2;
+
+  // Human-readable label.
+  string label = 3;
+
+  // Optional helper text shown to users.
+  optional string description = 4;
+
+  // Whether this variable must be provided by the submitter.
+  bool required = 5;
+
+  // Optional default value serialized as text.
+  optional string default_value = 6;
+
+  // Allowed options for `multi_select` variables.
+  repeated string options = 7;
+}
+
+// One template variable value provided during submit.
+message TemplateVariableValue {
+  // Variable key.
+  string key = 1;
+
+  // Raw value supplied by the user.
+  string value = 2;
+}
+
+// Template version metadata + source.
+message TemplateVersion {
+  // Stable template identifier.
+  string template_id = 1;
+
+  // Version number (1-indexed).
+  uint32 version = 2;
+
+  // Display name.
+  string name = 3;
+
+  // Optional user-facing description.
+  optional string description = 4;
+
+  // Raw unrendered Jsonnet source uploaded for this version.
+  string source_jsonnet = 5;
+
+  // Variables metadata extracted from source manifest.
+  repeated TemplateVariableDefinition variables = 6;
+
+  // RFC3339 creation timestamp.
+  string created_at = 7;
+}
+
+message UpsertTemplateRequest {
+  // Raw template Jsonnet source, including inline metadata manifest.
+  string source_jsonnet = 1;
+
+  // Optional explicit template ID. When omitted, manager derives one from manifest name.
+  optional string template_id = 2;
+}
+
+message UpsertTemplateReply {
+  // Newly stored template version.
+  TemplateVersion template = 1;
+}
+
+message ListTemplatesRequest {
+  // Optional case-insensitive search over id, name, and description.
+  optional string query = 1;
+}
+
+// Latest-version template summary for index/list UIs.
+message TemplateSummary {
+  // Stable template identifier.
+  string template_id = 1;
+
+  // Latest version number.
+  uint32 latest_version = 2;
+
+  // Display name from latest version.
+  string name = 3;
+
+  // Optional description from latest version.
+  optional string description = 4;
+
+  // Count of variables in latest version.
+  uint32 variable_count = 5;
+
+  // RFC3339 timestamp for latest version creation.
+  string updated_at = 6;
+}
+
+message ListTemplatesReply {
+  // Templates sorted by most-recent update.
+  repeated TemplateSummary templates = 1;
+}
+
+message GetTemplateVersionRequest {
+  // Template identifier.
+  string template_id = 1;
+
+  // Optional version number. Omit to fetch latest.
+  optional uint32 version = 2;
+}
+
+message GetTemplateVersionReply {
+  // Requested template version.
+  TemplateVersion template = 1;
+}
+
+message SubmitTemplateJobRequest {
+  // Template identifier to render.
+  string template_id = 1;
+
+  // Specific template version to render.
+  uint32 version = 2;
+
+  // Values keyed by variable key.
+  repeated TemplateVariableValue variables = 3;
+
+  // Optional eval priority override.
+  optional int64 priority = 4;
+
+  // When true, enqueues a reschedule even when rendered spec is unchanged.
+  bool force_reschedule = 5;
 }
 
 // Request payload for GetJobInfo.
@@ -656,6 +812,9 @@ message JobSpecHistoryItem {
 
   // Monotonic config version.
   optional int64 version = 3;
+
+  // Optional template reference that produced this config.
+  optional TemplateReference template_reference = 4;
 }
 
 // Request payload for ListJobSpecHistory.

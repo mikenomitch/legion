@@ -11,7 +11,7 @@ use crate::manager::rollout::{
 use crate::manager::rollout_strategy;
 use crate::manager::scheduler::{PlanConfigOutcome, PlanMode, Scheduler};
 use crate::storage::errors::StorageError;
-use crate::storage::store::{JobKvReference, JobSubmitOutcome, Store};
+use crate::storage::store::{JobKvReference, JobSubmitOutcome, Store, TemplateVariableRecord};
 use crate::structs::manager_server::Manager;
 use crate::structs::{
     worker_client::WorkerClient, AcquireKvLockReply, AcquireKvLockRequest, AdvanceRolloutReply,
@@ -24,25 +24,32 @@ use crate::structs::{
     GetObservabilityRequest, GetRaftJoinTokenReply, GetRaftJoinTokenRequest, GetRaftStatusReply,
     GetRaftStatusRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply,
     GetRolloutStatusRequest, GetStateStoreSchemaReply, GetStateStoreSchemaRequest,
-    HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, IssueRaftCommandReply,
-    IssueRaftCommandRequest, JobConfig, JobSpecHistoryItem, KvEntry, KvInjectionAction,
-    KvValueType, LedgerNode, ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobsReply,
-    ListJobsRequest, ListKvReply, ListKvRequest, ListRaftHistoryReply, ListRaftHistoryRequest,
-    ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply, ListRolloutsRequest,
-    ListSavedStateQueriesReply, ListSavedStateQueriesRequest, Node, NodeMsg, PatchKvReply,
-    PatchKvRequest, PlanJobReply, PlanJobRequest, PlannedAllocation, PutKvReply, PutKvRequest,
-    QueryStateStoreReply, QueryStateStoreRequest, RaftHistoryEvent, RaftStatus, ReleaseKvLockReply,
-    ReleaseKvLockRequest, RenewKvLockReply, RenewKvLockRequest, RestartWorkerReply,
-    RestartWorkerRequest, RolloutAllocationStatus, RolloutEvent, RolloutGroupStatus,
-    RolloutProgression, RolloutReplacement, RunJobReply, RunJobRequest, SavedStateQuery,
-    StopJobReply, StopJobRequest, StopRolloutReply, StopRolloutRequest, Submission, TaskConfig,
-    TaskOnUnhealthyConfig, UpdateNodeDynamicReply, UpdateNodeDynamicRequest,
-    UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest, WorkerConfig, WorkerPreRegisterReply,
-    WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest,
+    GetTemplateVersionReply, GetTemplateVersionRequest, HealthCheckReply, HealthCheckRequest,
+    HeartbeatReply, HeartbeatRequest, IssueRaftCommandReply, IssueRaftCommandRequest, JobConfig,
+    JobSpecHistoryItem, KvEntry, KvInjectionAction, KvValueType, LedgerNode, ListJobSpecHistoryReply,
+    ListJobSpecHistoryRequest, ListJobsReply, ListJobsRequest, ListKvReply, ListKvRequest,
+    ListRaftHistoryReply, ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest,
+    ListRolloutsReply, ListRolloutsRequest, ListSavedStateQueriesReply, ListSavedStateQueriesRequest,
+    ListTemplatesReply, ListTemplatesRequest, Node, NodeMsg, PatchKvReply, PatchKvRequest,
+    PlanJobReply, PlanJobRequest, PlannedAllocation, PutKvReply, PutKvRequest, QueryStateStoreReply,
+    QueryStateStoreRequest, RaftHistoryEvent, RaftStatus, ReleaseKvLockReply, ReleaseKvLockRequest,
+    RenewKvLockReply, RenewKvLockRequest, RestartWorkerReply, RestartWorkerRequest,
+    RolloutAllocationStatus, RolloutEvent, RolloutGroupStatus, RolloutProgression,
+    RolloutReplacement, RunJobReply, RunJobRequest, SavedStateQuery, StopJobReply, StopJobRequest,
+    StopRolloutReply, StopRolloutRequest, Submission, SubmitTemplateJobRequest, TaskConfig,
+    TaskOnUnhealthyConfig, TemplateReference, TemplateSummary, TemplateVariableDefinition,
+    TemplateVariableValue, TemplateVersion, UpdateNodeDynamicReply, UpdateNodeDynamicRequest,
+    UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest, UpsertTemplateReply,
+    UpsertTemplateRequest, WorkerConfig, WorkerPreRegisterReply, WorkerPreRegisterRequest,
+    WorkerRegisterReply, WorkerRegisterRequest,
 };
 use crate::task_plugins::validate_job_config;
 use crate::tracing_util::{o11y_enabled, read_recent_observability};
 
+use jsonnet::JsonnetVm;
+use regex::Regex;
+use serde::Deserialize;
+use std::io::Write;
 use time::{Duration as TimeDuration, OffsetDateTime};
 use tonic::{Request, Response, Status};
 
@@ -69,6 +76,16 @@ fn map_store_error(action: &str, err: anyhow::Error) -> Status {
 
 const DEFAULT_PAGE_SIZE: usize = 20;
 const MAX_PAGE_SIZE: usize = 100;
+const TEMPLATE_MANIFEST_REGEX: &str = r#"(?s)/\*\s*legion-template\s*(\{.*?\})\s*\*/"#;
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TemplateManifest {
+    name: String,
+    description: Option<String>,
+    #[serde(default)]
+    variables: Vec<TemplateVariableRecord>,
+}
 
 fn normalize_query(value: Option<String>) -> Option<String> {
     value.and_then(|query| {
@@ -128,6 +145,114 @@ fn map_raft_event(event: crate::storage::persistence::RaftHistoryEvent) -> RaftH
         leader_id: event.leader_id,
         created_at: event.created_at,
     }
+}
+
+fn template_id_from_name(name: &str) -> String {
+    let mut out = String::new();
+    let mut prev_dash = false;
+    for ch in name.trim().chars() {
+        let ch = ch.to_ascii_lowercase();
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch);
+            prev_dash = false;
+        } else if !prev_dash {
+            out.push('-');
+            prev_dash = true;
+        }
+    }
+    out.trim_matches('-').to_string()
+}
+
+fn extract_template_manifest(source_jsonnet: &str) -> R<TemplateManifest> {
+    let regex = Regex::new(TEMPLATE_MANIFEST_REGEX)?;
+    let captures = regex
+        .captures(source_jsonnet)
+        .ok_or_else(|| anyhow!("missing /* legion-template {{...}} */ manifest block"))?;
+    let json = captures
+        .get(1)
+        .ok_or_else(|| anyhow!("missing manifest JSON body"))?
+        .as_str();
+    let manifest: TemplateManifest = serde_json::from_str(json)
+        .map_err(|error| anyhow!("invalid template manifest JSON: {error}"))?;
+    if manifest.name.trim().is_empty() {
+        bail!("template manifest name must not be empty");
+    }
+    Ok(manifest)
+}
+
+fn validate_template_inputs(
+    defs: &[TemplateVariableRecord],
+    provided: &[TemplateVariableValue],
+) -> R<HashMap<String, String>> {
+    let provided_map: HashMap<String, String> = provided
+        .iter()
+        .map(|item| (item.key.clone(), item.value.clone()))
+        .collect();
+    for def in defs {
+        let value = provided_map
+            .get(&def.key)
+            .cloned()
+            .or_else(|| def.default_value.clone());
+        if def.required && value.as_deref().unwrap_or("").trim().is_empty() {
+            bail!("template variable '{}' is required", def.key);
+        }
+        let Some(value) = value else { continue };
+        match def.r#type.as_str() {
+            "toggle" => {
+                let normalized = value.trim().to_ascii_lowercase();
+                if !matches!(
+                    normalized.as_str(),
+                    "true" | "false" | "1" | "0" | "yes" | "no"
+                ) {
+                    bail!(
+                        "template variable '{}' expects a boolean-like value",
+                        def.key
+                    );
+                }
+            }
+            "number" => {
+                value
+                    .trim()
+                    .parse::<f64>()
+                    .map_err(|_| anyhow!("template variable '{}' expects a number", def.key))?;
+            }
+            "multi_select" => {
+                let selected: Vec<&str> = value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|part| !part.is_empty())
+                    .collect();
+                let allowed = def
+                    .options
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<HashSet<_>>();
+                if selected.iter().any(|entry| !allowed.contains(entry)) {
+                    bail!(
+                        "template variable '{}' contains values outside of defined options",
+                        def.key
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(provided_map)
+}
+
+fn render_template_jobspec(source_jsonnet: &str, variables: &HashMap<String, String>) -> R<String> {
+    let mut file = tempfile::Builder::new().suffix(".jsonnet").tempfile()?;
+    file.write_all(source_jsonnet.as_bytes())?;
+    let path = file.path().to_path_buf();
+    let mut vm = JsonnetVm::new();
+    for (key, value) in variables {
+        vm.ext_var(key, value);
+    }
+    let rendered = vm
+        .evaluate_file(&path)
+        .map_err(|error| anyhow!("failed to evaluate template jsonnet: {error}"))?
+        .to_string();
+    Ok(rendered)
 }
 
 #[derive(Debug, Clone)]
@@ -730,7 +855,7 @@ impl ManagerAgentService {
                 .map_err(|e| map_store_error("Error loading job submissions", e))?;
             let submit_outcome = self
                 .store
-                .handle_job_submit(&updated_config, &submissions)
+                .handle_job_submit_with_template(&updated_config, &submissions, None)
                 .map_err(|e| map_store_error("Error updating job for kv change", e))?;
             let new_job_config_id = submit_outcome.job_config_id().to_string();
             let updated_refs: Vec<JobKvReference> = job_refs
@@ -828,6 +953,7 @@ impl Manager for ManagerAgentService {
         let inner = request.into_inner();
         let js = inner.parsed_jobspec;
         let mut subs = inner.submissions;
+        let template_reference = inner.template_reference;
         let priority = inner.priority.unwrap_or(self.store.default_eval_priority);
         let idempotency_key = inner.idempotency_key.unwrap_or_default();
 
@@ -862,7 +988,7 @@ impl Manager for ManagerAgentService {
         })?;
         let submit_outcome = self
             .store
-            .handle_job_submit(&config, &subs)
+            .handle_job_submit_with_template(&config, &subs, template_reference.as_ref())
             .map_err(|e| map_store_error("Error running job", e))?;
 
         let job_config_id = submit_outcome.job_config_id().to_string();
@@ -933,6 +1059,251 @@ impl Manager for ManagerAgentService {
         };
 
         Ok(Response::new(reply))
+    }
+
+    #[instrument(skip_all)]
+    async fn upsert_template(
+        &self,
+        request: Request<UpsertTemplateRequest>,
+    ) -> Result<Response<UpsertTemplateReply>, Status> {
+        let request = request.into_inner();
+        let manifest = extract_template_manifest(&request.source_jsonnet)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let template_id = request
+            .template_id
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| template_id_from_name(&manifest.name));
+        if template_id.is_empty() {
+            return Err(Status::invalid_argument("template id must not be empty"));
+        }
+
+        let template = self
+            .store
+            .upsert_template_version(
+                &template_id,
+                &manifest.name,
+                manifest.description.as_deref(),
+                &request.source_jsonnet,
+                &manifest.variables,
+            )
+            .map_err(|error| map_store_error("Error upserting template", error))?;
+
+        Ok(Response::new(UpsertTemplateReply {
+            template: Some(TemplateVersion {
+                template_id: template.template_id,
+                version: template.version,
+                name: template.name,
+                description: template.description,
+                source_jsonnet: template.source_jsonnet,
+                variables: template
+                    .variables
+                    .into_iter()
+                    .map(|variable| TemplateVariableDefinition {
+                        key: variable.key,
+                        r#type: variable.r#type,
+                        label: variable.label,
+                        description: variable.description,
+                        required: variable.required,
+                        default_value: variable.default_value,
+                        options: variable.options,
+                    })
+                    .collect(),
+                created_at: template.created_at,
+            }),
+        }))
+    }
+
+    #[instrument(skip_all)]
+    async fn list_templates(
+        &self,
+        request: Request<ListTemplatesRequest>,
+    ) -> Result<Response<ListTemplatesReply>, Status> {
+        let query = normalize_query(request.into_inner().query);
+        let mut templates = self
+            .store
+            .list_templates()
+            .map_err(|error| map_store_error("Error listing templates", error))?;
+        if let Some(query) = query {
+            templates.retain(|template| {
+                template.template_id.to_lowercase().contains(&query)
+                    || template.name.to_lowercase().contains(&query)
+                    || template
+                        .description
+                        .as_deref()
+                        .unwrap_or("")
+                        .to_lowercase()
+                        .contains(&query)
+            });
+        }
+        Ok(Response::new(ListTemplatesReply {
+            templates: templates
+                .into_iter()
+                .map(|template| TemplateSummary {
+                    template_id: template.template_id,
+                    latest_version: template.latest_version,
+                    name: template.name,
+                    description: template.description,
+                    variable_count: template.variable_count,
+                    updated_at: template.updated_at,
+                })
+                .collect(),
+        }))
+    }
+
+    #[instrument(skip_all)]
+    async fn get_template_version(
+        &self,
+        request: Request<GetTemplateVersionRequest>,
+    ) -> Result<Response<GetTemplateVersionReply>, Status> {
+        let request = request.into_inner();
+        let template = self
+            .store
+            .get_template_version(&request.template_id, request.version)
+            .map_err(|error| map_store_error("Error loading template version", error))?;
+        Ok(Response::new(GetTemplateVersionReply {
+            template: Some(TemplateVersion {
+                template_id: template.template_id,
+                version: template.version,
+                name: template.name,
+                description: template.description,
+                source_jsonnet: template.source_jsonnet,
+                variables: template
+                    .variables
+                    .into_iter()
+                    .map(|variable| TemplateVariableDefinition {
+                        key: variable.key,
+                        r#type: variable.r#type,
+                        label: variable.label,
+                        description: variable.description,
+                        required: variable.required,
+                        default_value: variable.default_value,
+                        options: variable.options,
+                    })
+                    .collect(),
+                created_at: template.created_at,
+            }),
+        }))
+    }
+
+    #[instrument(skip_all)]
+    async fn submit_template_job(
+        &self,
+        request: Request<SubmitTemplateJobRequest>,
+    ) -> Result<Response<RunJobReply>, Status> {
+        let request = request.into_inner();
+        let template = self
+            .store
+            .get_template_version(&request.template_id, Some(request.version))
+            .map_err(|error| map_store_error("Error loading template version", error))?;
+        let mut values = validate_template_inputs(&template.variables, &request.variables)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        for def in &template.variables {
+            if !values.contains_key(&def.key) {
+                if let Some(default_value) = def.default_value.as_ref() {
+                    values.insert(def.key.clone(), default_value.clone());
+                }
+            }
+        }
+        let rendered = render_template_jobspec(&template.source_jsonnet, &values)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let (config, kv_refs) =
+            resolve_jobspec_kv_references(&self.store, &rendered).map_err(|e| {
+                error!("Error parsing jobspec: {:?}", e);
+                Status::invalid_argument(format!("Error parsing jobspec: {e}"))
+            })?;
+        validate_job_config(&config).map_err(|e| {
+            error!("Error validating task configs: {:?}", e);
+            Status::invalid_argument(format!("Error validating task configs: {e}"))
+        })?;
+        let priority = request.priority.unwrap_or(self.store.default_eval_priority);
+        let template_reference = TemplateReference {
+            template_id: template.template_id.clone(),
+            version: template.version,
+        };
+        let mut submissions = vec![
+            Submission {
+                path: format!("template://{}/{}", template.template_id, template.version),
+                content: template.source_jsonnet,
+                is_primary: true,
+            },
+            Submission {
+                path: "job.rendered.json".into(),
+                content: rendered.clone(),
+                is_primary: false,
+            },
+            Submission {
+                path: "template.variables.json".into(),
+                content: serde_json::to_string(&values).unwrap_or_else(|_| "{}".into()),
+                is_primary: false,
+            },
+        ];
+        submissions.retain(|submission| !submission.content.is_empty());
+        let submit_outcome = self
+            .store
+            .handle_job_submit_with_template(&config, &submissions, Some(&template_reference))
+            .map_err(|error| map_store_error("Error running job from template", error))?;
+        let job_config_id = submit_outcome.job_config_id().to_string();
+        let stored_refs: Vec<JobKvReference> = kv_refs
+            .into_iter()
+            .map(|reference| JobKvReference {
+                job_id: config.name.clone(),
+                job_config_id: job_config_id.clone(),
+                kv_key: reference.key,
+                json_pointer: reference.json_pointer,
+            })
+            .collect();
+        self.store
+            .replace_job_kv_references(&config.name, &stored_refs)
+            .map_err(|e| map_store_error("Error storing kv references", e))?;
+        let force_reschedule = request.force_reschedule;
+        let (eval_kind, message) = match submit_outcome {
+            JobSubmitOutcome::Unchanged { .. } => {
+                if force_reschedule {
+                    (
+                        Some("job_update"),
+                        "Job config unchanged; forced reschedule queued",
+                    )
+                } else {
+                    (None, "Job config unchanged; no update needed")
+                }
+            }
+            JobSubmitOutcome::Created { .. } => (Some("job_submit"), "Job submit success"),
+            JobSubmitOutcome::Updated { .. } => {
+                let previous_job_config_id = self
+                    .store
+                    .previous_job_config_id(&job_config_id)
+                    .map_err(|e| map_store_error("Error loading previous job config", e))?;
+                let is_manual = self.create_rollout_for_update(
+                    &config.name,
+                    previous_job_config_id.as_deref(),
+                    &job_config_id,
+                    &config,
+                    "Error creating rollout",
+                )?;
+
+                if is_manual {
+                    (None, "Rollout created; waiting for manual start")
+                } else {
+                    (Some("rollout_tick"), "Rollout started")
+                }
+            }
+        };
+        if let Some(kind) = eval_kind {
+            self.store
+                .enqueue_eval(
+                    kind,
+                    Some(&config.name),
+                    Some(&job_config_id),
+                    None,
+                    Some(priority),
+                )
+                .map_err(|e| map_store_error("Error running template job", e))?;
+        }
+        Ok(Response::new(RunJobReply {
+            message: message.into(),
+            deduplicated: false,
+        }))
     }
 
     #[instrument(skip_all)]
@@ -1291,11 +1662,14 @@ impl Manager for ManagerAgentService {
             .list_job_spec_history(&name)
             .map_err(|e| map_store_error("Error listing job spec history", e))?
             .into_iter()
-            .map(|(config_id, created_at, version)| JobSpecHistoryItem {
-                config_id,
-                created_at,
-                version,
-            })
+            .map(
+                |(config_id, created_at, version, template_reference)| JobSpecHistoryItem {
+                    config_id,
+                    created_at,
+                    version,
+                    template_reference,
+                },
+            )
             .collect();
 
         Ok(Response::new(ListJobSpecHistoryReply { items }))
@@ -2818,6 +3192,7 @@ mod tests {
                 priority: None,
                 force_reschedule: false,
                 idempotency_key: None,
+                template_reference: None,
             }))
             .await?;
 
@@ -2898,6 +3273,7 @@ mod tests {
                 priority: None,
                 force_reschedule: false,
                 idempotency_key: None,
+                template_reference: None,
             }))
             .await?;
 
@@ -2957,6 +3333,7 @@ mod tests {
                 priority: None,
                 force_reschedule: false,
                 idempotency_key: None,
+                template_reference: None,
             }))
             .await?;
 
@@ -2995,7 +3372,7 @@ mod tests {
             }],
             version: None,
         };
-        store.handle_job_submit(&v1, &[submission()])?;
+        store.handle_job_submit_with_template(&v1, &[submission()], None)?;
         let v1_id = store.get_job_config(&v1.name)?.id();
         let v1_task_id = store.get_task_configs_for_job_config(&v1_id)?[0].0;
         let _v1_alloc = store.place_alloc("node-a", v1_task_id)?;
@@ -3011,7 +3388,7 @@ mod tests {
             }],
             version: None,
         };
-        store.handle_job_submit(&v2, &[submission()])?;
+        store.handle_job_submit_with_template(&v2, &[submission()], None)?;
         let v2_id = store.get_job_config(&v2.name)?.id();
         let v2_task_id = store.get_task_configs_for_job_config(&v2_id)?[0].0;
         let _v2_alloc = store.place_alloc("node-a", v2_task_id)?;
@@ -3047,6 +3424,7 @@ mod tests {
                 priority: None,
                 force_reschedule: false,
                 idempotency_key: None,
+                template_reference: None,
             }))
             .await?;
 
@@ -3085,7 +3463,7 @@ mod tests {
             }],
             version: None,
         };
-        store.handle_job_submit(&v1, &[submission()])?;
+        store.handle_job_submit_with_template(&v1, &[submission()], None)?;
         let v1_id = store.get_job_config(&v1.name)?.id();
         let v1_task_id = store.get_task_configs_for_job_config(&v1_id)?[0].0;
         let _v1_alloc = store.place_alloc("node-a", v1_task_id)?;
@@ -3101,7 +3479,7 @@ mod tests {
             }],
             version: None,
         };
-        store.handle_job_submit(&v2, &[submission()])?;
+        store.handle_job_submit_with_template(&v2, &[submission()], None)?;
         let v2_id = store.get_job_config(&v2.name)?.id();
         let v2_task_id = store.get_task_configs_for_job_config(&v2_id)?[0].0;
         let _v2_alloc = store.place_alloc("node-a", v2_task_id)?;
@@ -3178,7 +3556,7 @@ mod tests {
             tasks: vec![task],
             version: None,
         };
-        store.handle_job_submit(&job, &[submission()])?;
+        store.handle_job_submit_with_template(&job, &[submission()], None)?;
         let job_config_id = store.get_job_config(&job_name)?.id();
 
         let initial_eval = Eval {
@@ -3251,7 +3629,7 @@ mod tests {
             }],
             version: None,
         };
-        store.handle_job_submit(&job, &[submission()])?;
+        store.handle_job_submit_with_template(&job, &[submission()], None)?;
         let job_config_id = store.get_job_config(&job.name)?.id();
         let task_id = store.get_task_configs_for_job_config(&job_config_id)?[0].0;
         let allocation = store.place_alloc("node-a", task_id)?;
@@ -3291,7 +3669,7 @@ mod tests {
             tasks: vec![TaskConfig::new("task", "noop")],
             version: None,
         };
-        store.handle_job_submit(&job, &[submission()])?;
+        store.handle_job_submit_with_template(&job, &[submission()], None)?;
         let job_config_id = store.get_job_config(&job.name)?.id();
         let task_id = store.get_task_configs_for_job_config(&job_config_id)?[0].0;
         let allocation = store.place_alloc("node-a", task_id)?;
@@ -3327,7 +3705,7 @@ mod tests {
             tasks: vec![TaskConfig::new("task", "noop")],
             version: None,
         };
-        store.handle_job_submit(&job, &[submission()])?;
+        store.handle_job_submit_with_template(&job, &[submission()], None)?;
         let job_config_id = store.get_job_config(&job.name)?.id();
         let task_id = store.get_task_configs_for_job_config(&job_config_id)?[0].0;
         let allocation = store.place_alloc("node-a", task_id)?;
@@ -3394,7 +3772,7 @@ mod tests {
             }],
             version: None,
         };
-        store.handle_job_submit(&v1, &[submission()])?;
+        store.handle_job_submit_with_template(&v1, &[submission()], None)?;
         let v1_id = store.get_job_config(&v1.name)?.id();
         let v1_task_id = store.get_task_configs_for_job_config(&v1_id)?[0].0;
         let old_alloc = store.place_alloc("node-a", v1_task_id)?;
@@ -3410,7 +3788,7 @@ mod tests {
             }],
             version: None,
         };
-        store.handle_job_submit(&v2, &[submission()])?;
+        store.handle_job_submit_with_template(&v2, &[submission()], None)?;
         let v2_id = store.get_job_config(&v2.name)?.id();
         let v2_task_id = store.get_task_configs_for_job_config(&v2_id)?[0].0;
         let new_alloc = store.place_alloc("node-a", v2_task_id)?;
@@ -3485,7 +3863,7 @@ mod tests {
             ],
             version: None,
         };
-        store.handle_job_submit(&v1, &[submission()])?;
+        store.handle_job_submit_with_template(&v1, &[submission()], None)?;
         let v1_id = store.get_job_config(&v1.name)?.id();
         let v1_tasks = store.get_task_configs_for_job_config(&v1_id)?;
         let v1_web = v1_tasks
@@ -3519,7 +3897,7 @@ mod tests {
             ],
             version: None,
         };
-        store.handle_job_submit(&v2, &[submission()])?;
+        store.handle_job_submit_with_template(&v2, &[submission()], None)?;
         let v2_id = store.get_job_config(&v2.name)?.id();
         let v2_tasks = store.get_task_configs_for_job_config(&v2_id)?;
         let v2_web = v2_tasks
@@ -3647,7 +4025,7 @@ mod tests {
             }],
             version: None,
         };
-        store.handle_job_submit(&v1, &[submission()])?;
+        store.handle_job_submit_with_template(&v1, &[submission()], None)?;
         let v1_id = store.get_job_config(&v1.name)?.id();
 
         let v2 = JobConfig {
@@ -3661,7 +4039,7 @@ mod tests {
             }],
             version: None,
         };
-        store.handle_job_submit(&v2, &[submission()])?;
+        store.handle_job_submit_with_template(&v2, &[submission()], None)?;
         let v2_id = store.get_job_config(&v2.name)?.id();
         let rollout = store.create_rollout(
             "rollout-events-api",
@@ -3716,7 +4094,7 @@ mod tests {
             }],
             version: None,
         };
-        store.handle_job_submit(&job, &[submission()])?;
+        store.handle_job_submit_with_template(&job, &[submission()], None)?;
         let job_config_id = store.get_job_config(&job.name)?.id();
         let task_id = store.get_task_configs_for_job_config(&job_config_id)?[0].0;
         let allocation = store.place_alloc("node-a", task_id)?;

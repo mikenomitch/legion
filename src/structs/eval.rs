@@ -567,7 +567,7 @@ mod tests {
             content: "job-one".into(),
             is_primary: true,
         }];
-        store.handle_job_submit(&job_one_config, &job_one_subs)?;
+        store.handle_job_submit_with_template(&job_one_config, &job_one_subs, None)?;
         let job_one_config_id = store.get_job_config(&job_one_name)?.id();
 
         let job_one_eval = Eval {
@@ -620,7 +620,7 @@ mod tests {
             content: "job-two".into(),
             is_primary: true,
         }];
-        store.handle_job_submit(&job_two_config, &job_two_subs)?;
+        store.handle_job_submit_with_template(&job_two_config, &job_two_subs, None)?;
         let job_two_config_id = store.get_job_config(&job_two_name)?.id();
 
         let job_two_submit_eval = Eval {
@@ -699,7 +699,7 @@ mod tests {
             content: "job".into(),
             is_primary: true,
         }];
-        store.handle_job_submit(&job_config, &job_subs)?;
+        store.handle_job_submit_with_template(&job_config, &job_subs, None)?;
         let job_config_id = store.get_job_config(&job_name)?.id();
 
         let submit_eval = Eval {
@@ -760,7 +760,7 @@ mod tests {
             content: "job".into(),
             is_primary: true,
         }];
-        store.handle_job_submit(&job_config, &job_subs)?;
+        store.handle_job_submit_with_template(&job_config, &job_subs, None)?;
         let job_config_id = store.get_job_config(&job_name)?.id();
 
         let initial_eval = Eval {
@@ -792,7 +792,7 @@ mod tests {
             tasks: vec![unchanged_task.clone()],
             version: None,
         };
-        store.handle_job_submit(&unchanged_config, &job_subs)?;
+        store.handle_job_submit_with_template(&unchanged_config, &job_subs, None)?;
         let unchanged_config_id = store.get_job_config(&job_name)?.id();
         let unchanged_eval = Eval {
             id: "2".into(),
@@ -823,7 +823,7 @@ mod tests {
             tasks: vec![moved_task.clone()],
             version: None,
         };
-        store.handle_job_submit(&moved_config, &job_subs)?;
+        store.handle_job_submit_with_template(&moved_config, &job_subs, None)?;
         let moved_config_id = store.get_job_config(&job_name)?.id();
         let moved_eval = Eval {
             id: "3".into(),
@@ -854,7 +854,7 @@ mod tests {
             tasks: vec![removed_task],
             version: None,
         };
-        store.handle_job_submit(&removed_config, &job_subs)?;
+        store.handle_job_submit_with_template(&removed_config, &job_subs, None)?;
         let removed_config_id = store.get_job_config(&job_name)?.id();
         let removed_eval = Eval {
             id: "4".into(),

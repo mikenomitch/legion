@@ -3,7 +3,7 @@
 /* eslint-disable */
 // @ts-nocheck
 
-import { AcquireKvLockReply, AcquireKvLockRequest, AdvanceRolloutReply, AdvanceRolloutRequest, DeleteKvReply, DeleteKvRequest, DeleteSavedStateQueryReply, DeleteSavedStateQueryRequest, DestroyJobReply, DestroyJobRequest, GetJobInfoReply, GetJobInfoRequest, GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest, GetJoinTokenReply, GetJoinTokenRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest, GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest, GetObservabilityReply, GetObservabilityRequest, GetRaftJoinTokenReply, GetRaftJoinTokenRequest, GetRaftStatusReply, GetRaftStatusRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest, GetStateStoreSchemaReply, GetStateStoreSchemaRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, IssueRaftCommandReply, IssueRaftCommandRequest, ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobsReply, ListJobsRequest, ListKvReply, ListKvRequest, ListRaftHistoryReply, ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply, ListRolloutsRequest, ListSavedStateQueriesReply, ListSavedStateQueriesRequest, PatchKvReply, PatchKvRequest, PlanJobReply, PlanJobRequest, PostWorkReply, PostWorkRequest, PutKvReply, PutKvRequest, QueryStateStoreReply, QueryStateStoreRequest, ReleaseKvLockReply, ReleaseKvLockRequest, RenewKvLockReply, RenewKvLockRequest, RestartWorkerReply, RestartWorkerRequest, RunJobReply, RunJobRequest, StopJobReply, StopJobRequest, StopRolloutReply, StopRolloutRequest, UpdateNodeDynamicReply, UpdateNodeDynamicRequest, UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest } from "./legion_pb.js";
+import { AcquireKvLockReply, AcquireKvLockRequest, AdvanceRolloutReply, AdvanceRolloutRequest, DeleteKvReply, DeleteKvRequest, DeleteSavedStateQueryReply, DeleteSavedStateQueryRequest, DestroyJobReply, DestroyJobRequest, GetJobInfoReply, GetJobInfoRequest, GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest, GetJoinTokenReply, GetJoinTokenRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest, GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest, GetObservabilityReply, GetObservabilityRequest, GetRaftJoinTokenReply, GetRaftJoinTokenRequest, GetRaftStatusReply, GetRaftStatusRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest, GetStateStoreSchemaReply, GetStateStoreSchemaRequest, GetTemplateVersionReply, GetTemplateVersionRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, IssueRaftCommandReply, IssueRaftCommandRequest, ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobsReply, ListJobsRequest, ListKvReply, ListKvRequest, ListRaftHistoryReply, ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply, ListRolloutsRequest, ListSavedStateQueriesReply, ListSavedStateQueriesRequest, ListTemplatesReply, ListTemplatesRequest, PatchKvReply, PatchKvRequest, PlanJobReply, PlanJobRequest, PostWorkReply, PostWorkRequest, PutKvReply, PutKvRequest, QueryStateStoreReply, QueryStateStoreRequest, ReleaseKvLockReply, ReleaseKvLockRequest, RenewKvLockReply, RenewKvLockRequest, RestartWorkerReply, RestartWorkerRequest, RunJobReply, RunJobRequest, StopJobReply, StopJobRequest, StopRolloutReply, StopRolloutRequest, SubmitTemplateJobRequest, UpdateNodeDynamicReply, UpdateNodeDynamicRequest, UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest, UpsertTemplateReply, UpsertTemplateRequest, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest } from "./legion_pb.js";
 import { MethodKind } from "@bufbuild/protobuf";
 
 /**
@@ -55,6 +55,50 @@ export const Manager = {
     runJob: {
       name: "RunJob",
       I: RunJobRequest,
+      O: RunJobReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Creates a new template version from raw Jsonnet source.
+     *
+     * @generated from rpc legion.Manager.UpsertTemplate
+     */
+    upsertTemplate: {
+      name: "UpsertTemplate",
+      I: UpsertTemplateRequest,
+      O: UpsertTemplateReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Lists templates with their latest version metadata.
+     *
+     * @generated from rpc legion.Manager.ListTemplates
+     */
+    listTemplates: {
+      name: "ListTemplates",
+      I: ListTemplatesRequest,
+      O: ListTemplatesReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Returns one template version (or latest when version is omitted).
+     *
+     * @generated from rpc legion.Manager.GetTemplateVersion
+     */
+    getTemplateVersion: {
+      name: "GetTemplateVersion",
+      I: GetTemplateVersionRequest,
+      O: GetTemplateVersionReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Renders a template version with provided variables and submits the resulting job.
+     *
+     * @generated from rpc legion.Manager.SubmitTemplateJob
+     */
+    submitTemplateJob: {
+      name: "SubmitTemplateJob",
+      I: SubmitTemplateJobRequest,
       O: RunJobReply,
       kind: MethodKind.Unary,
     },

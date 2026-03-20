@@ -1202,6 +1202,7 @@ async fn run_job(arg_matches: &ArgMatches) -> R<()> {
         priority,
         force_reschedule: arg_matches.get_flag("force-reschedule"),
         idempotency_key,
+        template_reference: None,
     });
 
     let reply =
