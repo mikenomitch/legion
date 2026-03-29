@@ -83,5 +83,4 @@ This store is local worker runtime state, not shared cluster state.
 
 ## What Is Not Implemented Yet
 
-Based on task list, durable replicated manager state (Raft/litestream-like replication) is planned but not implemented.
-
+For streaming persistence mode (Litestream + object-storage lease failover), see `docs/persistence-streaming.md`.

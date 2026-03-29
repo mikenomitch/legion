@@ -283,18 +283,95 @@ Recommendation: keep this as a future fourth tier, not in initial rollout.
 - [x] Add `PersistenceStatus` plumbing and manager role exposure.
 - [x] Keep default config exactly as today.
 
-## Phase 1: Streaming backend (Litestream-like) with optional lease failover
+## Phase 1: Streaming backend (Litestream-like) with optional lease failover ✅ Completed (2026-03-20)
+
+Delivered scope:
 
 - Implement replication integration + restore-on-start.
-- Add lease provider abstraction (`none`, `k8s_lease`, `etcd`, `consul`).
-- Enable automatic standby promotion when lease acquired.
+- Add lease provider abstraction with:
+  - `none` for manual failover.
+  - `object_storage` for automatic failover with write fencing.
+- Enable automatic standby promotion when lease acquired (`object_storage` lease mode).
 - Add admin/monitoring CLI commands.
+
+Explicitly deferred (not implemented in Phase 1):
+
+- `k8s_lease` provider
+- `etcd` provider
+- `consul` provider
 
 Exit criteria:
 
-- failover drills succeed automatically
-- split brain prevented by lease fencing tests
-- documented RPO envelope under load
+- [x] failover drills succeed automatically (with `object_storage` lease mode)
+- [x] split brain prevented by lease fencing tests
+- [x] documented RPO envelope under load
+
+### Phase 1 lease model details
+
+#### `none` lease provider (manual failover)
+
+- Intended for simple environments that can tolerate operator-driven failover.
+- Only one manager should be configured for writes at a time.
+- Promotion/demotion is an explicit admin action.
+- No automatic fencing guarantees are provided beyond operational discipline.
+
+#### `object_storage` lease provider (R2-compatible)
+
+The object-storage lease is designed against S3-compatible semantics so it works with Cloudflare R2 and standard S3 APIs.
+
+Lease record shape (single key per cluster, e.g. `leases/<cluster-id>/primary.json`):
+
+```json
+{
+  "holder_id": "mgr-a",
+  "lease_id": "01HR...ULID",
+  "term": 42,
+  "acquired_at_unix_ms": 1760000000000,
+  "expires_at_unix_ms": 1760000015000,
+  "renew_deadline_unix_ms": 1760000010000
+}
+```
+
+Fencing and concurrency rules:
+
+1. Acquire with conditional write (`If-None-Match: *`) when key does not exist.
+2. Renew only with a compare-and-swap style conditional write (`If-Match: <etag>`) so only current holder can extend.
+3. Release by conditional delete/write using the latest observed ETag.
+4. Writers must check `role == primary && lease_held && now < expires_at` before every mutating RPC.
+5. Standby promotion requires successful acquire, then final catch-up restore, then role transition.
+
+R2 compatibility notes:
+
+- Uses only S3-compatible object operations (HEAD/GET/PUT/DELETE + conditional headers).
+- Avoids provider-specific lock primitives.
+- Clock-skew tolerance is handled by conservative TTL/renew intervals and a safety margin in `renew_deadline_unix_ms`.
+
+Suggested defaults:
+
+- `ttl = 15s`
+- `renew_interval = 5s`
+- `renew_jitter = 250ms`
+- `takeover_grace = 2 * max(sync_interval, renew_interval)`
+
+### Streaming replication implementation choice (Litestream vs custom)
+
+After evaluating Rust ecosystem options for SQLite WAL shipping, the recommended Phase 1 implementation is to use **Litestream itself** as the replication engine rather than building a custom Rust WAL streamer.
+
+Reasoning:
+
+- There is no mature Rust crate that provides Litestream-equivalent SQLite WAL shipping, restore, retention, and operational hardening as a drop-in library.
+- Building a custom WAL shipper would add high correctness risk around SQLite/WAL edge cases, crash recovery, and object-store consistency behavior.
+- Litestream already solves the critical replication mechanics and has known operational behavior.
+- Legion should focus custom Rust logic on lease fencing, role transitions, and control-plane orchestration.
+
+Implementation shape:
+
+- Run/coordinate Litestream process from manager runtime (or sidecar) with generated config.
+- Keep a narrow adapter boundary in Legion:
+  - start/stop replication
+  - trigger restore/catch-up
+  - expose health/lag into `PersistenceStatus`
+- Revisit native Rust implementation only if operational constraints later require deeper embedding.
 
 ## Phase 2: Raft tech preview
 
@@ -326,10 +403,15 @@ Exit criteria:
       replica_url: "s3://bucket/legion/prod",
       sync_interval: "1s",
       lease: {
-        provider: "k8s_lease", // none | k8s_lease | etcd | consul
-        name: "legion-manager-primary",
+        provider: "object_storage", // none | object_storage
+        key: "leases/prod/primary.json",
         ttl: "15s",
         renew_interval: "5s",
+        object_storage: {
+          endpoint: "https://<account-id>.r2.cloudflarestorage.com", // optional for AWS S3
+          region: "auto", // R2 commonly uses "auto"
+          bucket: "legion-prod-ha",
+        },
       },
       standby: {
         auto_promote: true,

@@ -90,7 +90,7 @@
   - [ ] I can declare which other jobs have access to my service
   
 - [ ] Persisting state
-  - [ ] Saving the SQLite works (litestream-like)?
+  - [x] Saving the SQLite works (litestream-like)?
   - [ ] Raft Works
  
 - [ ] Stateful support
