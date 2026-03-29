@@ -4,7 +4,7 @@ use crate::resources::ResourcePolicy;
 use crate::storage::errors::StorageError;
 use crate::storage::migrations::get_migrations;
 use crate::storage::persistence::{
-    LocalDiskPersistenceDriver, PersistenceDriver, PersistenceRole, PersistenceStatus,
+    build_persistence_driver, PersistenceDriver, PersistenceRole, PersistenceStatus,
 };
 use crate::storage::queries::{
     GET_ALLOCATION_BY_ID, GET_ALLOCS, GET_ALLOCS_FOR_JOB, GET_ALLOCS_FOR_JOB_CONFIG,
@@ -209,11 +209,14 @@ const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 impl Store {
     #[instrument(err, skip_all)]
     pub fn start_storage(config: &ManagerConfigFull) -> R<Store> {
-        let persistence_driver: Arc<dyn PersistenceDriver> =
-            Arc::new(LocalDiskPersistenceDriver::new());
+        let db_path = Store::db_path(&config.store_path)?;
+        let persistence_driver: Arc<dyn PersistenceDriver> = build_persistence_driver(
+            &config.persistence.r#type,
+            db_path.clone(),
+            config.persistence.streaming.clone(),
+        );
         persistence_driver.start()?;
 
-        let db_path = Store::db_path(&config.store_path)?;
         let write_conn = Store::create_write_conn(&db_path)?;
         let _migrations = Store::create_initial_tables(&Arc::clone(&write_conn))?;
         let read_conns = Store::create_read_pool(&db_path)?;

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -33,6 +34,7 @@ pub struct ManagerConfig {
     pub scheduler_settings: Option<Value>,
     pub task_resource_defaults: Option<Value>,
     pub custom_resources: Option<Value>,
+    pub persistence: Option<PersistenceConfig>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -89,6 +91,99 @@ pub struct ManagerConfigFull {
     pub scheduler_settings: Option<Value>,
     pub task_resource_defaults: Option<Value>,
     pub custom_resources: Option<Value>,
+    #[serde(default)]
+    pub persistence: PersistenceConfigFull,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PersistenceType {
+    #[default]
+    LocalDisk,
+    Streaming,
+    Raft,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct PersistenceConfig {
+    #[serde(default)]
+    pub r#type: PersistenceType,
+    pub streaming: Option<StreamingPersistenceConfig>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct PersistenceConfigFull {
+    pub r#type: PersistenceType,
+    pub streaming: StreamingPersistenceConfigFull,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct StreamingPersistenceConfig {
+    pub litestream_binary: Option<String>,
+    pub replica_url: Option<String>,
+    pub sync_interval: Option<String>,
+    pub lease: Option<StreamingLeaseConfig>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct StreamingPersistenceConfigFull {
+    pub litestream_binary: String,
+    pub replica_url: String,
+    pub sync_interval: String,
+    pub lease: StreamingLeaseConfigFull,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamingLeaseProvider {
+    #[default]
+    None,
+    ObjectStorage,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct StreamingLeaseConfig {
+    #[serde(default)]
+    pub provider: StreamingLeaseProvider,
+    pub key: Option<String>,
+    pub ttl_seconds: Option<u64>,
+    pub renew_interval_seconds: Option<u64>,
+    pub object_storage: Option<StreamingObjectStorageLeaseConfig>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct StreamingLeaseConfigFull {
+    pub provider: StreamingLeaseProvider,
+    pub key: String,
+    pub ttl_seconds: u64,
+    pub renew_interval_seconds: u64,
+    pub object_storage: StreamingObjectStorageLeaseConfigFull,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct StreamingObjectStorageLeaseConfig {
+    pub bucket: Option<String>,
+    pub region: Option<String>,
+    pub endpoint: Option<String>,
+    pub access_key_id: Option<String>,
+    pub secret_access_key: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct StreamingObjectStorageLeaseConfigFull {
+    pub bucket: String,
+    pub region: String,
+    pub endpoint: Option<String>,
+    pub access_key_id: Option<String>,
+    pub secret_access_key: Option<String>,
 }
 
 impl From<ManagerConfigFull> for ManagerConfig {
@@ -105,6 +200,7 @@ impl From<ManagerConfigFull> for ManagerConfig {
             scheduler_settings: val.scheduler_settings,
             task_resource_defaults: val.task_resource_defaults,
             custom_resources: val.custom_resources,
+            persistence: Some(val.persistence.into()),
         }
     }
 }
@@ -140,6 +236,11 @@ impl ManagerConfig {
             scheduler_settings: self.scheduler_settings.clone(),
             task_resource_defaults: self.task_resource_defaults.clone(),
             custom_resources: self.custom_resources.clone(),
+            persistence: self
+                .persistence
+                .as_ref()
+                .map(PersistenceConfig::with_defaults)
+                .unwrap_or_default(),
         }
     }
 }
@@ -158,6 +259,164 @@ impl Default for ManagerConfigFull {
             task_resource_defaults: None,
             custom_resources: None,
             eval_threads: default_eval_threads(),
+            persistence: PersistenceConfigFull::default(),
+        }
+    }
+}
+
+impl Default for PersistenceConfigFull {
+    fn default() -> Self {
+        Self {
+            r#type: PersistenceType::LocalDisk,
+            streaming: StreamingPersistenceConfigFull::default(),
+        }
+    }
+}
+
+impl PersistenceConfig {
+    pub fn with_defaults(&self) -> PersistenceConfigFull {
+        PersistenceConfigFull {
+            r#type: self.r#type.clone(),
+            streaming: self
+                .streaming
+                .as_ref()
+                .map(StreamingPersistenceConfig::with_defaults)
+                .unwrap_or_default(),
+        }
+    }
+}
+
+impl Default for StreamingPersistenceConfigFull {
+    fn default() -> Self {
+        Self {
+            litestream_binary: "litestream".to_string(),
+            replica_url: String::new(),
+            sync_interval: "1s".to_string(),
+            lease: StreamingLeaseConfigFull::default(),
+        }
+    }
+}
+
+impl StreamingPersistenceConfig {
+    pub fn with_defaults(&self) -> StreamingPersistenceConfigFull {
+        StreamingPersistenceConfigFull {
+            litestream_binary: self
+                .litestream_binary
+                .clone()
+                .unwrap_or_else(|| "litestream".to_string()),
+            replica_url: self.replica_url.clone().unwrap_or_default(),
+            sync_interval: self
+                .sync_interval
+                .clone()
+                .unwrap_or_else(|| "1s".to_string()),
+            lease: self
+                .lease
+                .as_ref()
+                .map(StreamingLeaseConfig::with_defaults)
+                .unwrap_or_default(),
+        }
+    }
+}
+
+impl Default for StreamingLeaseConfigFull {
+    fn default() -> Self {
+        Self {
+            provider: StreamingLeaseProvider::None,
+            key: "leases/default/primary.json".to_string(),
+            ttl_seconds: 15,
+            renew_interval_seconds: 5,
+            object_storage: StreamingObjectStorageLeaseConfigFull::default(),
+        }
+    }
+}
+
+impl StreamingLeaseConfig {
+    pub fn with_defaults(&self) -> StreamingLeaseConfigFull {
+        StreamingLeaseConfigFull {
+            provider: self.provider.clone(),
+            key: self
+                .key
+                .clone()
+                .unwrap_or_else(|| "leases/default/primary.json".to_string()),
+            ttl_seconds: self.ttl_seconds.unwrap_or(15),
+            renew_interval_seconds: self.renew_interval_seconds.unwrap_or(5),
+            object_storage: self
+                .object_storage
+                .as_ref()
+                .map(StreamingObjectStorageLeaseConfig::with_defaults)
+                .unwrap_or_default(),
+        }
+    }
+
+    pub fn ttl(&self) -> Duration {
+        Duration::from_secs(self.ttl_seconds.unwrap_or(15))
+    }
+}
+
+impl Default for StreamingObjectStorageLeaseConfigFull {
+    fn default() -> Self {
+        Self {
+            bucket: String::new(),
+            region: "auto".to_string(),
+            endpoint: None,
+            access_key_id: None,
+            secret_access_key: None,
+        }
+    }
+}
+
+impl StreamingObjectStorageLeaseConfig {
+    pub fn with_defaults(&self) -> StreamingObjectStorageLeaseConfigFull {
+        StreamingObjectStorageLeaseConfigFull {
+            bucket: self.bucket.clone().unwrap_or_default(),
+            region: self.region.clone().unwrap_or_else(|| "auto".to_string()),
+            endpoint: self.endpoint.clone(),
+            access_key_id: self.access_key_id.clone(),
+            secret_access_key: self.secret_access_key.clone(),
+        }
+    }
+}
+
+impl From<PersistenceConfigFull> for PersistenceConfig {
+    fn from(value: PersistenceConfigFull) -> Self {
+        Self {
+            r#type: value.r#type,
+            streaming: Some(value.streaming.into()),
+        }
+    }
+}
+
+impl From<StreamingPersistenceConfigFull> for StreamingPersistenceConfig {
+    fn from(value: StreamingPersistenceConfigFull) -> Self {
+        Self {
+            litestream_binary: Some(value.litestream_binary),
+            replica_url: Some(value.replica_url),
+            sync_interval: Some(value.sync_interval),
+            lease: Some(value.lease.into()),
+        }
+    }
+}
+
+impl From<StreamingLeaseConfigFull> for StreamingLeaseConfig {
+    fn from(value: StreamingLeaseConfigFull) -> Self {
+        Self {
+            provider: value.provider,
+            key: Some(value.key),
+            ttl_seconds: Some(value.ttl_seconds),
+            renew_interval_seconds: Some(value.renew_interval_seconds),
+            object_storage: Some(value.object_storage.into()),
+        }
+    }
+}
+
+impl From<StreamingObjectStorageLeaseConfigFull> for StreamingObjectStorageLeaseConfig {
+    fn from(value: StreamingObjectStorageLeaseConfigFull) -> Self {
+        Self {
+            bucket: Some(value.bucket),
+            region: Some(value.region),
+            endpoint: value.endpoint,
+            access_key_id: value.access_key_id,
+            secret_access_key: value.secret_access_key,
         }
     }
 }
