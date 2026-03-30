@@ -140,6 +140,10 @@ impl TaskPlugin for ContainerTaskPlugin {
         map
     }
 
+    fn supports_kv_env_injection(&self) -> bool {
+        true
+    }
+
     fn prepare(
         &self,
         allocation: &Allocation,

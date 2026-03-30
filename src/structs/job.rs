@@ -844,6 +844,69 @@ pub struct TaskConfig {
     #[serde(default = "default_on_unhealthy")]
     #[tabled(skip)]
     pub on_unhealthy: TaskOnUnhealthyConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[tabled(skip)]
+    pub kv_injections: Option<TaskKvInjections>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum KvInjectionAction {
+    None,
+    Restart,
+    Rollout,
+    Fail,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct KvInjectionPolicy {
+    #[serde(default)]
+    pub watch: bool,
+    #[serde(default)]
+    pub on_change: Option<KvInjectionAction>,
+    #[serde(default)]
+    pub on_delete: Option<KvInjectionAction>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct KvTemplateSource {
+    #[serde(default)]
+    pub template: Option<String>,
+    #[serde(default)]
+    pub template_kv: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskKvEnvInjection {
+    pub name: String,
+    pub value: KvTemplateSource,
+    #[serde(default)]
+    pub kv: KvInjectionPolicy,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskKvFileInjection {
+    pub path: String,
+    #[serde(default)]
+    pub mode: Option<String>,
+    pub file: KvTemplateSource,
+    #[serde(default)]
+    pub kv: KvInjectionPolicy,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskKvInjections {
+    #[serde(default)]
+    pub kv: Option<KvInjectionPolicy>,
+    #[serde(default)]
+    pub env: Vec<TaskKvEnvInjection>,
+    #[serde(default)]
+    pub files: Vec<TaskKvFileInjection>,
 }
 
 #[derive(Serialize, Debug, Clone, PartialEq)]
@@ -909,6 +972,14 @@ struct TaskConfigInput {
     checks: Vec<TaskCheck>,
     #[serde(default)]
     on_unhealthy: Option<TaskOnUnhealthyConfig>,
+    #[serde(default)]
+    kv: Option<KvInjectionPolicy>,
+    #[serde(default)]
+    env: Vec<TaskKvEnvInjection>,
+    #[serde(default)]
+    files: Vec<TaskKvFileInjection>,
+    #[serde(default)]
+    kv_injections: Option<TaskKvInjections>,
 }
 
 #[derive(Deserialize)]
@@ -952,6 +1023,27 @@ impl TaskConfigInput {
             affinities: self.affinities,
             checks: self.checks,
             on_unhealthy: self.on_unhealthy.unwrap_or_default(),
+            kv_injections: Some(if let Some(existing) = self.kv_injections {
+                TaskKvInjections {
+                    kv: self.kv.or(existing.kv),
+                    env: if self.env.is_empty() {
+                        existing.env
+                    } else {
+                        self.env
+                    },
+                    files: if self.files.is_empty() {
+                        existing.files
+                    } else {
+                        self.files
+                    },
+                }
+            } else {
+                TaskKvInjections {
+                    kv: self.kv,
+                    env: self.env,
+                    files: self.files,
+                }
+            }),
         }
     }
 }
@@ -1104,6 +1196,7 @@ impl TaskConfig {
             affinities: empty_object(),
             checks: Vec::new(),
             on_unhealthy: TaskOnUnhealthyConfig::default(),
+            kv_injections: None,
         }
     }
 
@@ -1189,6 +1282,54 @@ impl TaskConfig {
         }
 
         Ok(())
+    }
+
+    pub fn validate_kv_injections(&self) -> R<()> {
+        let Some(injections) = self.kv_injections.as_ref() else {
+            return Ok(());
+        };
+
+        for env in &injections.env {
+            if env.name.trim().is_empty() {
+                bail!("task {} kv_injections.env name cannot be empty", self.name);
+            }
+            validate_template_source(
+                &format!("task {} kv_injections.env {}", self.name, env.name),
+                &env.value,
+            )?;
+        }
+
+        for file in &injections.files {
+            if file.path.trim().is_empty() {
+                bail!(
+                    "task {} kv_injections.files path cannot be empty",
+                    self.name
+                );
+            }
+            validate_template_source(
+                &format!("task {} kv_injections.files {}", self.name, file.path),
+                &file.file,
+            )?;
+        }
+
+        Ok(())
+    }
+}
+
+fn validate_template_source(scope: &str, source: &KvTemplateSource) -> R<()> {
+    let has_template = source
+        .template
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty());
+    let has_template_kv = source
+        .template_kv
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty());
+
+    match (has_template, has_template_kv) {
+        (true, false) | (false, true) => Ok(()),
+        (true, true) => bail!("{scope} cannot set both template and template_kv"),
+        (false, false) => bail!("{scope} must set exactly one of template or template_kv"),
     }
 }
 
@@ -1492,5 +1633,43 @@ mod tests {
             err.to_string().contains("unknown group"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn kv_injection_validation_rejects_both_template_sources() {
+        let spec = serde_json::json!({
+            "name": "demo",
+            "task": {
+                "kind": "exec",
+                "env": [{
+                    "name": "A",
+                    "value": { "template": "x", "templateKv": "templates/x" }
+                }]
+            }
+        });
+        let config: JobConfig = serde_json::from_value(spec).expect("config should deserialize");
+        let err = config.tasks[0]
+            .validate_kv_injections()
+            .expect_err("expected validation failure");
+        assert!(err
+            .to_string()
+            .contains("cannot set both template and template_kv"));
+    }
+
+    #[test]
+    fn kv_injection_validation_accepts_single_template_source() -> R<()> {
+        let spec = serde_json::json!({
+            "name": "demo",
+            "task": {
+                "kind": "exec",
+                "env": [{
+                    "name": "A",
+                    "value": { "template": "{{ kv \"x/y\" }}" }
+                }]
+            }
+        });
+        let config: JobConfig = serde_json::from_value(spec)?;
+        config.tasks[0].validate_kv_injections()?;
+        Ok(())
     }
 }

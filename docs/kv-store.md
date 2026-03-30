@@ -82,5 +82,4 @@ This gives automatic rollout on KV update for linked jobs.
 
 ## Important Current Behavior
 
-`delete_kv` does not trigger the KV-change job-update flow today (no `handle_kv_change` call on delete path).
-
+`delete_kv` triggers the same KV-change reconciliation path as `put_kv`/`patch_kv`, so watched KV dependencies are evaluated on explicit delete events as well.
