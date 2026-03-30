@@ -41,8 +41,6 @@ It aims to be differentiated from the above based on the following:
 - Other Benefits:
   - OTEL compliant tracing, logs, and metrics
   - Well-documented GRPC interface
-  - OpenAPI spec for HTTP API
   - Jsonnet configuration language for simple and DRY job specifications
   - Raft is optional. Making life simpler
-  - Built-in UI written completely in Rust with extensible pages
   - Can easily be used as a library
