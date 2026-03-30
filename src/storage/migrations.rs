@@ -109,6 +109,7 @@ pub fn get_migrations() -> Migrations<'static> {
         M::up("ALTER TABLE task_config ADD COLUMN schedule STRING;").down(""),
         M::up("ALTER TABLE task_config ADD COLUMN depends_on JSONB NOT NULL DEFAULT '[]';")
             .down(""),
+        M::up("ALTER TABLE task_config ADD COLUMN kv_injections JSONB;").down(""),
         M::up(
             "CREATE INDEX IF NOT EXISTS idx_task_config_job_config_id ON task_config(job_config_id);",
         )

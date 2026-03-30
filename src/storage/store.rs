@@ -367,7 +367,7 @@ impl Store {
 
         let mut task_stmt = conn.prepare(
             r#"
-            SELECT id, name, kind, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, job_config_id
+            SELECT id, name, kind, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_config_id
             FROM task_config;
             "#,
         )?;
@@ -397,8 +397,9 @@ impl Store {
                 affinities: row.get(13)?,
                 checks: self.parse_checks_column(14, row.get(14)?)?,
                 on_unhealthy: self.parse_on_unhealthy_column(15, row.get(15)?)?,
+                kv_injections: self.parse_kv_injections_column(16, row.get(16)?)?,
             };
-            let job_config_id: String = row.get(16)?;
+            let job_config_id: String = row.get(17)?;
             Ok((job_config_id, id, task))
         })?;
 
@@ -1212,6 +1213,23 @@ impl Store {
         })
     }
 
+    fn parse_kv_injections_column(
+        &self,
+        idx: usize,
+        raw: Option<String>,
+    ) -> Result<Option<crate::structs::TaskKvInjections>, rusqlite::Error> {
+        let Some(raw) = raw else {
+            return Ok(None);
+        };
+        serde_json::from_str(&raw).map(Some).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(
+                idx,
+                rusqlite::types::Type::Text,
+                Box::new(err),
+            )
+        })
+    }
+
     fn parse_task_lifecycle_column(
         &self,
         idx: usize,
@@ -1251,6 +1269,7 @@ impl Store {
             affinities: row.get(13)?,
             checks: self.parse_checks_column(14, row.get(14)?)?,
             on_unhealthy: self.parse_on_unhealthy_column(15, row.get(15)?)?,
+            kv_injections: self.parse_kv_injections_column(16, row.get(16)?)?,
         };
 
         Ok(task_config)
@@ -1969,6 +1988,11 @@ impl Store {
             let checks = serde_json::to_string(&t.checks)?;
             let on_unhealthy = serde_json::to_string(&t.on_unhealthy)?;
             let depends_on = serde_json::to_string(&t.depends_on)?;
+            let kv_injections = t
+                .kv_injections
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?;
             let schedule = t.schedule.as_ref().map(ToString::to_string);
             let task_params = named_params! {
                 ":name": t.name,
@@ -1986,6 +2010,7 @@ impl Store {
                 ":affinities": t.affinities,
                 ":checks": checks,
                 ":on_unhealthy": on_unhealthy,
+                ":kv_injections": kv_injections,
                 ":job_id": job.id,
                 ":job_config_id": job_config_id,
             };

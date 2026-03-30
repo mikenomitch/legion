@@ -34,6 +34,32 @@
             config: {
                 command: ["sleep", "1"],
             },
+            kv: {
+                watch: true,
+                on_change: "restart",
+                on_delete: "fail",
+            },
+            env: [
+                {
+                    name: "FEATURE_FLAGS",
+                    value: {
+                        template: '{{ kv "flags/global" }}',
+                    },
+                    kv: {
+                        on_change: "rollout",
+                        on_delete: "none",
+                    },
+                },
+            ],
+            files: [
+                {
+                    path: "/tmp/legion/runtime.conf",
+                    mode: "0640",
+                    file: {
+                        template: 'tenant={{ kv "tenant/id" }}\n',
+                    },
+                },
+            ],
             resources: {
                 cpus: 1.5,
                 memory: 512,

@@ -74,6 +74,18 @@ pub trait TaskPlugin: Send + Sync {
         Map::new()
     }
 
+    fn supports_kv_env_injection(&self) -> bool {
+        false
+    }
+
+    fn supports_kv_file_injection(&self) -> bool {
+        false
+    }
+
+    fn supports_live_restart(&self) -> bool {
+        true
+    }
+
     fn prepare(
         &self,
         _allocation: &Allocation,
@@ -175,11 +187,32 @@ pub fn validate_job_config(config: &JobConfig) -> R<()> {
     for task in &config.tasks {
         registry.validate_task_config(task)?;
         task.validate_checks()?;
+        task.validate_kv_injections()?;
         if task.schedule.is_some() && task.lifecycle != TaskLifecycle::Batch {
             bail!(
                 "Task {} can only set schedule when lifecycle is batch",
                 task.name
             );
+        }
+        if let Some(injections) = task.kv_injections.as_ref() {
+            registry.load_plugin(&task.kind, false)?;
+            let plugin = registry
+                .plugin(&task.kind)
+                .context("task plugin loaded but missing")?;
+            if !injections.env.is_empty() && !plugin.supports_kv_env_injection() {
+                bail!(
+                    "Task {} kind {} does not support kv env injection",
+                    task.name,
+                    task.kind
+                );
+            }
+            if !injections.files.is_empty() && !plugin.supports_kv_file_injection() {
+                bail!(
+                    "Task {} kind {} does not support kv file injection",
+                    task.name,
+                    task.kind
+                );
+            }
         }
     }
     config.validate_rollout()?;

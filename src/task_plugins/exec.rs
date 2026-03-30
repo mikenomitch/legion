@@ -7,6 +7,9 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 #[cfg(unix)]
 use std::ffi::CString;
+use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 #[cfg(target_os = "linux")]
@@ -57,10 +60,22 @@ struct ExecTaskConfig {
     #[serde(default)]
     landlock: Option<ExecLandlockConfig>,
 
+    /// Files to materialize on the host before task start.
+    #[serde(default)]
+    files: Vec<ExecInjectedFile>,
+
     /// Additional plugin-specific fields reserved for forward compatibility.
     #[serde(default, flatten)]
     #[schemars(skip)]
     _extra: HashMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+struct ExecInjectedFile {
+    path: String,
+    #[serde(default)]
+    mode: Option<String>,
+    content: String,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -207,6 +222,14 @@ impl TaskPlugin for ExecTaskPlugin {
         map
     }
 
+    fn supports_kv_env_injection(&self) -> bool {
+        true
+    }
+
+    fn supports_kv_file_injection(&self) -> bool {
+        true
+    }
+
     fn prepare(
         &self,
         allocation: &Allocation,
@@ -234,6 +257,19 @@ impl TaskPlugin for ExecTaskPlugin {
             .context("exec task command must include at least one entry")?;
 
         let linux_options = config.linux_options()?;
+        for file in &config.files {
+            let path = std::path::PathBuf::from(&file.path);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(&path, file.content.as_bytes())?;
+            #[cfg(unix)]
+            if let Some(mode) = file.mode.as_deref() {
+                if let Ok(mode_bits) = u32::from_str_radix(mode.trim_start_matches('0'), 8) {
+                    fs::set_permissions(&path, fs::Permissions::from_mode(mode_bits))?;
+                }
+            }
+        }
 
         info!(
             allocation_id = allocation.id,
