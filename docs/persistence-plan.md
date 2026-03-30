@@ -397,6 +397,7 @@ Exit criteria:
 - [ ] Snapshot/compaction pipeline for SQLite state-machine replication.
 - [ ] Rolling-upgrade and migration hardening for mixed persistence modes.
 - [ ] Durability/partition/fault-injection test matrix for replicated writes.
+- [ ] Parallelize scheduler planning across manager nodes with Raft-fenced plan ownership so multiple managers can compute placement decisions concurrently without double-apply.
 
 ---
 
