@@ -5,6 +5,7 @@ use crate::storage::errors::StorageError;
 use crate::storage::migrations::get_migrations;
 use crate::storage::persistence::{
     build_persistence_driver, PersistenceDriver, PersistenceRole, PersistenceStatus,
+    RaftHistoryEvent, RaftStatus,
 };
 use crate::storage::queries::{
     GET_ALLOCATION_BY_ID, GET_ALLOCS, GET_ALLOCS_FOR_JOB, GET_ALLOCS_FOR_JOB_CONFIG,
@@ -210,11 +211,9 @@ impl Store {
     #[instrument(err, skip_all)]
     pub fn start_storage(config: &ManagerConfigFull) -> R<Store> {
         let db_path = Store::db_path(&config.store_path)?;
-        let persistence_driver: Arc<dyn PersistenceDriver> = build_persistence_driver(
-            &config.persistence.r#type,
-            db_path.clone(),
-            config.persistence.streaming.clone(),
-        );
+        let manager_node_id = format!("{}:{}", config.server.host, config.server.port);
+        let persistence_driver: Arc<dyn PersistenceDriver> =
+            build_persistence_driver(&config.persistence, db_path.clone(), &manager_node_id);
         persistence_driver.start()?;
 
         let write_conn = Store::create_write_conn(&db_path)?;
@@ -247,6 +246,28 @@ impl Store {
 
     pub fn persistence_role(&self) -> PersistenceRole {
         self.persistence_status().role
+    }
+
+    pub fn raft_status(&self) -> Option<RaftStatus> {
+        self.persistence_driver.raft_status()
+    }
+
+    pub fn raft_history(&self, limit: usize) -> Vec<RaftHistoryEvent> {
+        self.persistence_driver.raft_history(limit)
+    }
+
+    pub fn issue_raft_command(
+        &self,
+        command: &str,
+        target: Option<&str>,
+        actor: &str,
+    ) -> R<RaftHistoryEvent> {
+        self.persistence_driver
+            .issue_raft_command(command, target, actor)
+    }
+
+    pub fn issue_raft_join_token(&self, actor: &str) -> R<(String, String)> {
+        self.persistence_driver.issue_raft_join_token(actor)
     }
 
     #[instrument(err, skip_all)]

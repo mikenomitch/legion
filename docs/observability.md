@@ -45,3 +45,8 @@ Planned but not yet complete:
 - Broader metrics/perf instrumentation.
 - Event-stream and log UX improvements.
 
+
+
+## Raft control-plane observability
+
+When manager persistence is configured as `raft`, observability includes raft role/leader/term and operator event history (elections, transfers, membership changes, join-token issuance). These signals are available via gRPC (`GetRaftStatus`, `ListRaftHistory`) and the UI Raft page.

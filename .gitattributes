@@ -1,0 +1,7 @@
+# Reduce recurring merge conflicts in generated artifacts.
+# UI gRPC stubs are generated from proto and can be regenerated locally.
+ui/src/gen/legion_pb.ts merge=ours
+ui/src/gen/legion_connect.ts merge=ours
+
+# Cargo.lock frequently receives disjoint dependency updates; union lowers conflict churn.
+Cargo.lock merge=union

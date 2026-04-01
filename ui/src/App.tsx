@@ -21,6 +21,7 @@ import ApiExplorer from './pages/ApiExplorer'
 import Observability from './pages/Observability'
 import TestingUtils from './pages/TestingUtils'
 import StateExplorer from './pages/StateExplorer'
+import Raft from './pages/Raft'
 
 type SidebarItem = {
   kind: 'item'
@@ -98,6 +99,7 @@ const Layout = (props: RouteSectionProps) => {
         items: [
           { kind: 'item', label: 'Worker Nodes', path: '/nodes', title: 'Worker Nodes', copy: 'Inventory of worker nodes.' },
           { kind: 'item', label: 'Manager Nodes', path: '/manager', title: 'Manager Nodes', copy: 'Manager config snapshots.' },
+          { kind: 'item', label: 'Raft', path: '/raft', title: 'Raft', copy: 'Raft elections, failover, and history.' },
           { kind: 'item', label: 'KV', path: '/kv', title: 'KV', copy: 'Browse and edit key/value entries.' },
         ],
       },
@@ -519,7 +521,8 @@ const AppRoutes = () => {
       <Route path="/" component={() => <Homepage ledger={ledger} rollouts={rollouts} />} />
       <Route path="/nodes" component={Nodes} />
       <Route path="/nodes/:id" component={NodeDetail} />
-      <Route path="/manager" component={Manager} />
+        <Route path="/manager" component={Manager} />
+        <Route path="/raft" component={Raft} />
       <Route path="/manager/:id" component={ManagerNodeDetail} />
       <Route path="/jobs" component={Jobs} />
       <Route path="/jobs/:id" component={JobDetail} />

@@ -3657,6 +3657,33 @@ export class GetObservabilityReply extends Message<GetObservabilityReply> {
    */
   traces: string[] = [];
 
+  /**
+   * Active persistence backend identifier.
+   *
+   * Current values include: `local_disk`.
+   *
+   * @generated from field: string persistence_backend = 4;
+   */
+  persistenceBackend = "";
+
+  /**
+   * Manager write role as reported by the persistence backend.
+   *
+   * Current values include: `primary`, `standby`, `candidate`.
+   *
+   * @generated from field: string persistence_role = 5;
+   */
+  persistenceRole = "";
+
+  /**
+   * True when this manager currently holds the write lease/fencing token.
+   *
+   * For `local_disk` mode this is always `true`.
+   *
+   * @generated from field: bool persistence_lease_held = 6;
+   */
+  persistenceLeaseHeld = false;
+
   constructor(data?: PartialMessage<GetObservabilityReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -3668,6 +3695,9 @@ export class GetObservabilityReply extends Message<GetObservabilityReply> {
     { no: 1, name: "o11y_enabled", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
     { no: 2, name: "logs", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
     { no: 3, name: "traces", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 4, name: "persistence_backend", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "persistence_role", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "persistence_lease_held", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetObservabilityReply {
@@ -3684,6 +3714,652 @@ export class GetObservabilityReply extends Message<GetObservabilityReply> {
 
   static equals(a: GetObservabilityReply | PlainMessage<GetObservabilityReply> | undefined, b: GetObservabilityReply | PlainMessage<GetObservabilityReply> | undefined): boolean {
     return proto3.util.equals(GetObservabilityReply, a, b);
+  }
+}
+
+/**
+ * Request payload for GetRaftStatus.
+ *
+ * Empty request; manager derives status from local persistence backend state.
+ *
+ * @generated from message legion.GetRaftStatusRequest
+ */
+export class GetRaftStatusRequest extends Message<GetRaftStatusRequest> {
+  constructor(data?: PartialMessage<GetRaftStatusRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetRaftStatusRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetRaftStatusRequest {
+    return new GetRaftStatusRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetRaftStatusRequest {
+    return new GetRaftStatusRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetRaftStatusRequest {
+    return new GetRaftStatusRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetRaftStatusRequest | PlainMessage<GetRaftStatusRequest> | undefined, b: GetRaftStatusRequest | PlainMessage<GetRaftStatusRequest> | undefined): boolean {
+    return proto3.util.equals(GetRaftStatusRequest, a, b);
+  }
+}
+
+/**
+ * Snapshot of one manager's current Raft control-plane status.
+ *
+ * @generated from message legion.RaftStatus
+ */
+export class RaftStatus extends Message<RaftStatus> {
+  /**
+   * True when the current persistence backend is Raft-enabled.
+   *
+   * @generated from field: bool enabled = 1;
+   */
+  enabled = false;
+
+  /**
+   * Persistence backend name reported by manager.
+   *
+   * Example: `raft`.
+   *
+   * @generated from field: string backend = 2;
+   */
+  backend = "";
+
+  /**
+   * Local manager node ID used by Raft.
+   *
+   * @generated from field: string node_id = 3;
+   */
+  nodeId = "";
+
+  /**
+   * Logical cluster identifier for this Raft group.
+   *
+   * @generated from field: string cluster_id = 4;
+   */
+  clusterId = "";
+
+  /**
+   * Local node role. Values: `primary`, `standby`, `candidate`.
+   *
+   * @generated from field: string role = 5;
+   */
+  role = "";
+
+  /**
+   * Current known leader node ID, if available.
+   *
+   * @generated from field: optional string leader_id = 6;
+   */
+  leaderId?: string;
+
+  /**
+   * Current Raft term observed by this manager.
+   *
+   * @generated from field: uint64 term = 7;
+   */
+  term = protoInt64.zero;
+
+  /**
+   * Latest committed log index observed locally.
+   *
+   * @generated from field: uint64 commit_index = 8;
+   */
+  commitIndex = protoInt64.zero;
+
+  /**
+   * Latest applied log index observed locally.
+   *
+   * @generated from field: uint64 applied_index = 9;
+   */
+  appliedIndex = protoInt64.zero;
+
+  /**
+   * True when this manager currently owns write leadership/fencing.
+   *
+   * @generated from field: bool lease_held = 10;
+   */
+  leaseHeld = false;
+
+  /**
+   * Current voting members.
+   *
+   * @generated from field: repeated string voters = 11;
+   */
+  voters: string[] = [];
+
+  /**
+   * Current learner/non-voting members.
+   *
+   * @generated from field: repeated string learners = 12;
+   */
+  learners: string[] = [];
+
+  /**
+   * Additional peer addresses or IDs discovered/configured for this node.
+   *
+   * @generated from field: repeated string peers = 13;
+   */
+  peers: string[] = [];
+
+  /**
+   * Epoch timestamp (milliseconds) when the last local election transition happened.
+   *
+   * @generated from field: int64 election_epoch_ms = 14;
+   */
+  electionEpochMs = protoInt64.zero;
+
+  /**
+   * Default lifetime for newly issued Raft join tokens.
+   *
+   * @generated from field: uint64 join_token_ttl_seconds = 15;
+   */
+  joinTokenTtlSeconds = protoInt64.zero;
+
+  /**
+   * Raft library family currently used by manager.
+   *
+   * Example: `openraft`.
+   *
+   * @generated from field: string raft_library = 16;
+   */
+  raftLibrary = "";
+
+  constructor(data?: PartialMessage<RaftStatus>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.RaftStatus";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "enabled", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 2, name: "backend", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "cluster_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "role", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "leader_id", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 7, name: "term", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 8, name: "commit_index", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 9, name: "applied_index", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 10, name: "lease_held", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 11, name: "voters", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 12, name: "learners", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 13, name: "peers", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 14, name: "election_epoch_ms", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 15, name: "join_token_ttl_seconds", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 16, name: "raft_library", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RaftStatus {
+    return new RaftStatus().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): RaftStatus {
+    return new RaftStatus().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): RaftStatus {
+    return new RaftStatus().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: RaftStatus | PlainMessage<RaftStatus> | undefined, b: RaftStatus | PlainMessage<RaftStatus> | undefined): boolean {
+    return proto3.util.equals(RaftStatus, a, b);
+  }
+}
+
+/**
+ * Reply payload for GetRaftStatus.
+ *
+ * @generated from message legion.GetRaftStatusReply
+ */
+export class GetRaftStatusReply extends Message<GetRaftStatusReply> {
+  /**
+   * Current local Raft status snapshot.
+   *
+   * @generated from field: legion.RaftStatus status = 1;
+   */
+  status?: RaftStatus;
+
+  constructor(data?: PartialMessage<GetRaftStatusReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetRaftStatusReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "status", kind: "message", T: RaftStatus },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetRaftStatusReply {
+    return new GetRaftStatusReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetRaftStatusReply {
+    return new GetRaftStatusReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetRaftStatusReply {
+    return new GetRaftStatusReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetRaftStatusReply | PlainMessage<GetRaftStatusReply> | undefined, b: GetRaftStatusReply | PlainMessage<GetRaftStatusReply> | undefined): boolean {
+    return proto3.util.equals(GetRaftStatusReply, a, b);
+  }
+}
+
+/**
+ * One Raft history event recorded by manager.
+ *
+ * @generated from message legion.RaftHistoryEvent
+ */
+export class RaftHistoryEvent extends Message<RaftHistoryEvent> {
+  /**
+   * Monotonic event sequence number (local to this manager).
+   *
+   * @generated from field: uint64 event_id = 1;
+   */
+  eventId = protoInt64.zero;
+
+  /**
+   * Event category. Examples: `election`, `failover`, `membership`.
+   *
+   * @generated from field: string event_type = 2;
+   */
+  eventType = "";
+
+  /**
+   * Human-readable summary of the event.
+   *
+   * @generated from field: string message = 3;
+   */
+  message = "";
+
+  /**
+   * Actor who initiated the event (for example `cli`, `ui`, `system`).
+   *
+   * @generated from field: string actor = 4;
+   */
+  actor = "";
+
+  /**
+   * Optional target node ID associated with the event.
+   *
+   * @generated from field: optional string target = 5;
+   */
+  target?: string;
+
+  /**
+   * Term at the time this event was recorded.
+   *
+   * @generated from field: uint64 term = 6;
+   */
+  term = protoInt64.zero;
+
+  /**
+   * Leader at the time this event was recorded, if known.
+   *
+   * @generated from field: optional string leader_id = 7;
+   */
+  leaderId?: string;
+
+  /**
+   * RFC3339 timestamp when this event was recorded.
+   *
+   * @generated from field: string created_at = 8;
+   */
+  createdAt = "";
+
+  constructor(data?: PartialMessage<RaftHistoryEvent>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.RaftHistoryEvent";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "event_id", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 2, name: "event_type", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "actor", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "target", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 6, name: "term", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 7, name: "leader_id", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 8, name: "created_at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RaftHistoryEvent {
+    return new RaftHistoryEvent().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): RaftHistoryEvent {
+    return new RaftHistoryEvent().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): RaftHistoryEvent {
+    return new RaftHistoryEvent().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: RaftHistoryEvent | PlainMessage<RaftHistoryEvent> | undefined, b: RaftHistoryEvent | PlainMessage<RaftHistoryEvent> | undefined): boolean {
+    return proto3.util.equals(RaftHistoryEvent, a, b);
+  }
+}
+
+/**
+ * Request payload for ListRaftHistory.
+ *
+ * @generated from message legion.ListRaftHistoryRequest
+ */
+export class ListRaftHistoryRequest extends Message<ListRaftHistoryRequest> {
+  /**
+   * Maximum number of recent events to return.
+   *
+   * Default: `50`. Maximum: manager-defined.
+   *
+   * @generated from field: optional uint32 limit = 1;
+   */
+  limit?: number;
+
+  constructor(data?: PartialMessage<ListRaftHistoryRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListRaftHistoryRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "limit", kind: "scalar", T: 13 /* ScalarType.UINT32 */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListRaftHistoryRequest {
+    return new ListRaftHistoryRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListRaftHistoryRequest {
+    return new ListRaftHistoryRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListRaftHistoryRequest {
+    return new ListRaftHistoryRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListRaftHistoryRequest | PlainMessage<ListRaftHistoryRequest> | undefined, b: ListRaftHistoryRequest | PlainMessage<ListRaftHistoryRequest> | undefined): boolean {
+    return proto3.util.equals(ListRaftHistoryRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for ListRaftHistory.
+ *
+ * @generated from message legion.ListRaftHistoryReply
+ */
+export class ListRaftHistoryReply extends Message<ListRaftHistoryReply> {
+  /**
+   * Most recent events first.
+   *
+   * @generated from field: repeated legion.RaftHistoryEvent events = 1;
+   */
+  events: RaftHistoryEvent[] = [];
+
+  constructor(data?: PartialMessage<ListRaftHistoryReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListRaftHistoryReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "events", kind: "message", T: RaftHistoryEvent, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListRaftHistoryReply {
+    return new ListRaftHistoryReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListRaftHistoryReply {
+    return new ListRaftHistoryReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListRaftHistoryReply {
+    return new ListRaftHistoryReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListRaftHistoryReply | PlainMessage<ListRaftHistoryReply> | undefined, b: ListRaftHistoryReply | PlainMessage<ListRaftHistoryReply> | undefined): boolean {
+    return proto3.util.equals(ListRaftHistoryReply, a, b);
+  }
+}
+
+/**
+ * Request payload for IssueRaftCommand.
+ *
+ * @generated from message legion.IssueRaftCommandRequest
+ */
+export class IssueRaftCommandRequest extends Message<IssueRaftCommandRequest> {
+  /**
+   * Command name to execute.
+   *
+   * Supported values are manager-version dependent, and commonly include:
+   * - `trigger-election`
+   * - `step-down`
+   * - `transfer-leader`
+   * - `add-voter`
+   * - `add-learner`
+   * - `remove-member`
+   *
+   * @generated from field: string command = 1;
+   */
+  command = "";
+
+  /**
+   * Optional target node ID used by commands that operate on another member.
+   *
+   * @generated from field: optional string target_node_id = 2;
+   */
+  targetNodeId?: string;
+
+  /**
+   * Free-form actor label for auditability.
+   *
+   * Default: `api`.
+   *
+   * @generated from field: optional string actor = 3;
+   */
+  actor?: string;
+
+  constructor(data?: PartialMessage<IssueRaftCommandRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.IssueRaftCommandRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "command", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "target_node_id", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 3, name: "actor", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): IssueRaftCommandRequest {
+    return new IssueRaftCommandRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): IssueRaftCommandRequest {
+    return new IssueRaftCommandRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): IssueRaftCommandRequest {
+    return new IssueRaftCommandRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: IssueRaftCommandRequest | PlainMessage<IssueRaftCommandRequest> | undefined, b: IssueRaftCommandRequest | PlainMessage<IssueRaftCommandRequest> | undefined): boolean {
+    return proto3.util.equals(IssueRaftCommandRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for IssueRaftCommand.
+ *
+ * @generated from message legion.IssueRaftCommandReply
+ */
+export class IssueRaftCommandReply extends Message<IssueRaftCommandReply> {
+  /**
+   * Echo of command executed by manager.
+   *
+   * @generated from field: string command = 1;
+   */
+  command = "";
+
+  /**
+   * Event recorded as a result of the command.
+   *
+   * @generated from field: legion.RaftHistoryEvent event = 2;
+   */
+  event?: RaftHistoryEvent;
+
+  /**
+   * Latest status after command application.
+   *
+   * @generated from field: legion.RaftStatus status = 3;
+   */
+  status?: RaftStatus;
+
+  constructor(data?: PartialMessage<IssueRaftCommandReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.IssueRaftCommandReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "command", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "event", kind: "message", T: RaftHistoryEvent },
+    { no: 3, name: "status", kind: "message", T: RaftStatus },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): IssueRaftCommandReply {
+    return new IssueRaftCommandReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): IssueRaftCommandReply {
+    return new IssueRaftCommandReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): IssueRaftCommandReply {
+    return new IssueRaftCommandReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: IssueRaftCommandReply | PlainMessage<IssueRaftCommandReply> | undefined, b: IssueRaftCommandReply | PlainMessage<IssueRaftCommandReply> | undefined): boolean {
+    return proto3.util.equals(IssueRaftCommandReply, a, b);
+  }
+}
+
+/**
+ * Request payload for GetRaftJoinToken.
+ *
+ * @generated from message legion.GetRaftJoinTokenRequest
+ */
+export class GetRaftJoinTokenRequest extends Message<GetRaftJoinTokenRequest> {
+  /**
+   * Free-form actor label for auditability.
+   *
+   * Default: `api`.
+   *
+   * @generated from field: optional string actor = 1;
+   */
+  actor?: string;
+
+  constructor(data?: PartialMessage<GetRaftJoinTokenRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetRaftJoinTokenRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "actor", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetRaftJoinTokenRequest {
+    return new GetRaftJoinTokenRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetRaftJoinTokenRequest {
+    return new GetRaftJoinTokenRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetRaftJoinTokenRequest {
+    return new GetRaftJoinTokenRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetRaftJoinTokenRequest | PlainMessage<GetRaftJoinTokenRequest> | undefined, b: GetRaftJoinTokenRequest | PlainMessage<GetRaftJoinTokenRequest> | undefined): boolean {
+    return proto3.util.equals(GetRaftJoinTokenRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for GetRaftJoinToken.
+ *
+ * @generated from message legion.GetRaftJoinTokenReply
+ */
+export class GetRaftJoinTokenReply extends Message<GetRaftJoinTokenReply> {
+  /**
+   * Opaque short-lived token for joining this cluster.
+   *
+   * @generated from field: string token = 1;
+   */
+  token = "";
+
+  /**
+   * RFC3339 expiry timestamp for the token.
+   *
+   * @generated from field: string expires_at = 2;
+   */
+  expiresAt = "";
+
+  /**
+   * Snapshot of Raft status when token was issued.
+   *
+   * @generated from field: legion.RaftStatus status = 3;
+   */
+  status?: RaftStatus;
+
+  constructor(data?: PartialMessage<GetRaftJoinTokenReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetRaftJoinTokenReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "token", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "expires_at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "status", kind: "message", T: RaftStatus },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetRaftJoinTokenReply {
+    return new GetRaftJoinTokenReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetRaftJoinTokenReply {
+    return new GetRaftJoinTokenReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetRaftJoinTokenReply {
+    return new GetRaftJoinTokenReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetRaftJoinTokenReply | PlainMessage<GetRaftJoinTokenReply> | undefined, b: GetRaftJoinTokenReply | PlainMessage<GetRaftJoinTokenReply> | undefined): boolean {
+    return proto3.util.equals(GetRaftJoinTokenReply, a, b);
   }
 }
 

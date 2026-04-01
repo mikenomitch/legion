@@ -91,7 +91,7 @@
   
 - [ ] Persisting state
   - [x] Saving the SQLite works (litestream-like)?
-  - [ ] Raft Works
+  - [x] Raft Works (leader election/failover controls, observability, CLI/UI ops)
  
 - [ ] Stateful support
   - [ ] ???

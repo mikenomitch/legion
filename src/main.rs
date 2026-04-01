@@ -19,6 +19,7 @@ fn cli() -> Command {
         .subcommand(cmd::ledger::config())
         .subcommand(cmd::kv::config())
         .subcommand(cmd::state::config())
+        .subcommand(cmd::raft::config())
 }
 
 #[tokio::main]
@@ -44,6 +45,7 @@ async fn main() -> R<()> {
         Some(("ledger", sub_matches)) => cmd::ledger::handle(sub_matches).await?,
         Some(("kv", sub_matches)) => cmd::kv::handle(sub_matches).await?,
         Some(("state", sub_matches)) => cmd::state::handle(sub_matches).await?,
+        Some(("raft", sub_matches)) => cmd::raft::handle(sub_matches).await?,
         None => unreachable!(),
         Some((_, _)) => unreachable!(),
     };
