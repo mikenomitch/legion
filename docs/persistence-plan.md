@@ -375,7 +375,7 @@ Implementation shape:
 
 ## Phase 2: Raft tech preview
 
-- Implement command-replicated writes for a subset of APIs.
+- Implement command-replicated writes for a subset of APIs. *(in progress separately)*
 - Add cluster bootstrap/join/member commands.
 - Add observability: leader, term, lag, apply latency.
 
@@ -384,11 +384,19 @@ Exit criteria:
 - deterministic apply tests pass under network partitions
 - crash/restart + snapshot restore validated
 
-## Phase 3: Raft GA
+## Phase 3: Raft GA (control-plane operations) ✅ Done (2026-03-20)
 
-- Cover all mutating store operations.
-- Production hardening (membership changes, backup, compaction, rolling upgrades).
-- Clear migration path from non-Raft modes.
+- [x] Leader election and failover controls are available in manager RPC, CLI, and UI.
+- [x] Operator commands exist for election trigger, step-down, leader transfer, and membership changes.
+- [x] Raft join-token issuance and audit history are exposed for cluster operations.
+- [x] Observability includes role/term/leader/indexes/history and actor-attributed command traces.
+
+### Remaining GA work (store replication path)
+
+- [ ] Cover all mutating store operations with committed Raft apply.
+- [ ] Snapshot/compaction pipeline for SQLite state-machine replication.
+- [ ] Rolling-upgrade and migration hardening for mixed persistence modes.
+- [ ] Durability/partition/fault-injection test matrix for replicated writes.
 
 ---
 

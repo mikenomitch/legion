@@ -106,6 +106,25 @@ service Manager {
   rpc GetObservability (GetObservabilityRequest)
     returns (GetObservabilityReply);
 
+  // Returns the local manager's Raft control-plane status.
+  //
+  // This endpoint is available even before full Raft state replication is enabled,
+  // and is intended for election/failover visibility and operator workflows.
+  rpc GetRaftStatus (GetRaftStatusRequest) returns (GetRaftStatusReply);
+
+  // Lists recent Raft control-plane events for this manager.
+  //
+  // Events include elections, leader transfers, membership updates, and token issuance.
+  rpc ListRaftHistory (ListRaftHistoryRequest) returns (ListRaftHistoryReply);
+
+  // Applies an operator-triggered Raft control command on this manager.
+  //
+  // Typical commands include election triggers, leader transfer, and membership changes.
+  rpc IssueRaftCommand (IssueRaftCommandRequest) returns (IssueRaftCommandReply);
+
+  // Issues a short-lived join token that can be used by a manager to join a Raft cluster.
+  rpc GetRaftJoinToken (GetRaftJoinTokenRequest) returns (GetRaftJoinTokenReply);
+
   // Applies dynamic attribute updates to a node and triggers affected evaluations.
   rpc UpdateNodeDynamic (UpdateNodeDynamicRequest)
     returns (UpdateNodeDynamicReply);
@@ -1046,6 +1065,167 @@ message GetObservabilityReply {
   //
   // For `local_disk` mode this is always `true`.
   bool persistence_lease_held = 6;
+}
+
+// Request payload for GetRaftStatus.
+message GetRaftStatusRequest {
+  // Empty request; manager derives status from local persistence backend state.
+}
+
+// Snapshot of one manager's current Raft control-plane status.
+message RaftStatus {
+  // True when the current persistence backend is Raft-enabled.
+  bool enabled = 1;
+
+  // Persistence backend name reported by manager.
+  //
+  // Example: `raft`.
+  string backend = 2;
+
+  // Local manager node ID used by Raft.
+  string node_id = 3;
+
+  // Logical cluster identifier for this Raft group.
+  string cluster_id = 4;
+
+  // Local node role. Values: `primary`, `standby`, `candidate`.
+  string role = 5;
+
+  // Current known leader node ID, if available.
+  optional string leader_id = 6;
+
+  // Current Raft term observed by this manager.
+  uint64 term = 7;
+
+  // Latest committed log index observed locally.
+  uint64 commit_index = 8;
+
+  // Latest applied log index observed locally.
+  uint64 applied_index = 9;
+
+  // True when this manager currently owns write leadership/fencing.
+  bool lease_held = 10;
+
+  // Current voting members.
+  repeated string voters = 11;
+
+  // Current learner/non-voting members.
+  repeated string learners = 12;
+
+  // Additional peer addresses or IDs discovered/configured for this node.
+  repeated string peers = 13;
+
+  // Epoch timestamp (milliseconds) when the last local election transition happened.
+  int64 election_epoch_ms = 14;
+
+  // Default lifetime for newly issued Raft join tokens.
+  uint64 join_token_ttl_seconds = 15;
+
+  // Raft library family currently used by manager.
+  //
+  // Example: `openraft`.
+  string raft_library = 16;
+}
+
+// Reply payload for GetRaftStatus.
+message GetRaftStatusReply {
+  // Current local Raft status snapshot.
+  RaftStatus status = 1;
+}
+
+// One Raft history event recorded by manager.
+message RaftHistoryEvent {
+  // Monotonic event sequence number (local to this manager).
+  uint64 event_id = 1;
+
+  // Event category. Examples: `election`, `failover`, `membership`.
+  string event_type = 2;
+
+  // Human-readable summary of the event.
+  string message = 3;
+
+  // Actor who initiated the event (for example `cli`, `ui`, `system`).
+  string actor = 4;
+
+  // Optional target node ID associated with the event.
+  optional string target = 5;
+
+  // Term at the time this event was recorded.
+  uint64 term = 6;
+
+  // Leader at the time this event was recorded, if known.
+  optional string leader_id = 7;
+
+  // RFC3339 timestamp when this event was recorded.
+  string created_at = 8;
+}
+
+// Request payload for ListRaftHistory.
+message ListRaftHistoryRequest {
+  // Maximum number of recent events to return.
+  //
+  // Default: `50`. Maximum: manager-defined.
+  optional uint32 limit = 1;
+}
+
+// Reply payload for ListRaftHistory.
+message ListRaftHistoryReply {
+  // Most recent events first.
+  repeated RaftHistoryEvent events = 1;
+}
+
+// Request payload for IssueRaftCommand.
+message IssueRaftCommandRequest {
+  // Command name to execute.
+  //
+  // Supported values are manager-version dependent, and commonly include:
+  // - `trigger-election`
+  // - `step-down`
+  // - `transfer-leader`
+  // - `add-voter`
+  // - `add-learner`
+  // - `remove-member`
+  string command = 1;
+
+  // Optional target node ID used by commands that operate on another member.
+  optional string target_node_id = 2;
+
+  // Free-form actor label for auditability.
+  //
+  // Default: `api`.
+  optional string actor = 3;
+}
+
+// Reply payload for IssueRaftCommand.
+message IssueRaftCommandReply {
+  // Echo of command executed by manager.
+  string command = 1;
+
+  // Event recorded as a result of the command.
+  RaftHistoryEvent event = 2;
+
+  // Latest status after command application.
+  RaftStatus status = 3;
+}
+
+// Request payload for GetRaftJoinToken.
+message GetRaftJoinTokenRequest {
+  // Free-form actor label for auditability.
+  //
+  // Default: `api`.
+  optional string actor = 1;
+}
+
+// Reply payload for GetRaftJoinToken.
+message GetRaftJoinTokenReply {
+  // Opaque short-lived token for joining this cluster.
+  string token = 1;
+
+  // RFC3339 expiry timestamp for the token.
+  string expires_at = 2;
+
+  // Snapshot of Raft status when token was issued.
+  RaftStatus status = 3;
 }
 
 // Type discriminator for KV values.

@@ -21,23 +21,24 @@ use crate::structs::{
     GetJobSpecReply, GetJobSpecRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest,
     GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest,
     GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest, GetObservabilityReply,
-    GetObservabilityRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply,
+    GetObservabilityRequest, GetRaftJoinTokenReply, GetRaftJoinTokenRequest, GetRaftStatusReply,
+    GetRaftStatusRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply,
     GetRolloutStatusRequest, GetStateStoreSchemaReply, GetStateStoreSchemaRequest,
-    HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, JobConfig,
-    JobSpecHistoryItem, KvEntry, KvInjectionAction, KvValueType, LedgerNode,
-    ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobsReply, ListJobsRequest,
-    ListKvReply, ListKvRequest, ListRolloutEventsReply, ListRolloutEventsRequest,
-    ListRolloutsReply, ListRolloutsRequest, ListSavedStateQueriesReply,
-    ListSavedStateQueriesRequest, Node, NodeMsg, PatchKvReply, PatchKvRequest, PlanJobReply,
-    PlanJobRequest, PlannedAllocation, PutKvReply, PutKvRequest, QueryStateStoreReply,
-    QueryStateStoreRequest, ReleaseKvLockReply, ReleaseKvLockRequest, RenewKvLockReply,
-    RenewKvLockRequest, RestartWorkerReply, RestartWorkerRequest, RolloutAllocationStatus,
-    RolloutEvent, RolloutGroupStatus, RolloutProgression, RolloutReplacement, RunJobReply,
-    RunJobRequest, SavedStateQuery, StopJobReply, StopJobRequest, StopRolloutReply,
-    StopRolloutRequest, Submission, TaskConfig, TaskOnUnhealthyConfig, UpdateNodeDynamicReply,
-    UpdateNodeDynamicRequest, UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest,
-    WorkerConfig, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply,
-    WorkerRegisterRequest,
+    HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, IssueRaftCommandReply,
+    IssueRaftCommandRequest, JobConfig, JobSpecHistoryItem, KvEntry, KvInjectionAction,
+    KvValueType, LedgerNode, ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobsReply,
+    ListJobsRequest, ListKvReply, ListKvRequest, ListRaftHistoryReply, ListRaftHistoryRequest,
+    ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply, ListRolloutsRequest,
+    ListSavedStateQueriesReply, ListSavedStateQueriesRequest, Node, NodeMsg, PatchKvReply,
+    PatchKvRequest, PlanJobReply, PlanJobRequest, PlannedAllocation, PutKvReply, PutKvRequest,
+    QueryStateStoreReply, QueryStateStoreRequest, RaftHistoryEvent, RaftStatus, ReleaseKvLockReply,
+    ReleaseKvLockRequest, RenewKvLockReply, RenewKvLockRequest, RestartWorkerReply,
+    RestartWorkerRequest, RolloutAllocationStatus, RolloutEvent, RolloutGroupStatus,
+    RolloutProgression, RolloutReplacement, RunJobReply, RunJobRequest, SavedStateQuery,
+    StopJobReply, StopJobRequest, StopRolloutReply, StopRolloutRequest, Submission, TaskConfig,
+    TaskOnUnhealthyConfig, UpdateNodeDynamicReply, UpdateNodeDynamicRequest,
+    UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest, WorkerConfig, WorkerPreRegisterReply,
+    WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest,
 };
 use crate::task_plugins::validate_job_config;
 use crate::tracing_util::{o11y_enabled, read_recent_observability};
@@ -93,6 +94,40 @@ fn paginate<T>(values: Vec<T>, page: usize, page_size: usize) -> (Vec<T>, u32) {
         values.into_iter().skip(start).take(end - start).collect(),
         total_count,
     )
+}
+
+fn map_raft_status(status: crate::storage::persistence::RaftStatus) -> RaftStatus {
+    RaftStatus {
+        enabled: status.enabled,
+        backend: status.backend,
+        node_id: status.node_id,
+        cluster_id: status.cluster_id,
+        role: status.role.as_str().to_string(),
+        leader_id: status.leader_id,
+        term: status.term,
+        commit_index: status.commit_index,
+        applied_index: status.applied_index,
+        lease_held: status.lease_held,
+        voters: status.voters,
+        learners: status.learners,
+        peers: status.peers,
+        election_epoch_ms: status.election_epoch_ms,
+        join_token_ttl_seconds: status.join_token_ttl_seconds,
+        raft_library: status.raft_library,
+    }
+}
+
+fn map_raft_event(event: crate::storage::persistence::RaftHistoryEvent) -> RaftHistoryEvent {
+    RaftHistoryEvent {
+        event_id: event.event_id,
+        event_type: event.event_type,
+        message: event.message,
+        actor: event.actor,
+        target: event.target,
+        term: event.term,
+        leader_id: event.leader_id,
+        created_at: event.created_at,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1701,6 +1736,102 @@ impl Manager for ManagerAgentService {
             persistence_backend: persistence.backend,
             persistence_role: persistence.role.as_str().to_string(),
             persistence_lease_held: persistence.lease_held,
+        }))
+    }
+
+    #[instrument(skip_all)]
+    async fn get_raft_status(
+        &self,
+        _request: Request<GetRaftStatusRequest>,
+    ) -> Result<Response<GetRaftStatusReply>, Status> {
+        let status = self
+            .store
+            .raft_status()
+            .map(map_raft_status)
+            .unwrap_or(RaftStatus {
+                enabled: false,
+                backend: self.store.persistence_status().backend,
+                node_id: String::new(),
+                cluster_id: String::new(),
+                role: "standby".to_string(),
+                leader_id: None,
+                term: 0,
+                commit_index: 0,
+                applied_index: 0,
+                lease_held: false,
+                voters: Vec::new(),
+                learners: Vec::new(),
+                peers: Vec::new(),
+                election_epoch_ms: 0,
+                join_token_ttl_seconds: 0,
+                raft_library: String::new(),
+            });
+        Ok(Response::new(GetRaftStatusReply {
+            status: Some(status),
+        }))
+    }
+
+    #[instrument(skip_all)]
+    async fn list_raft_history(
+        &self,
+        request: Request<ListRaftHistoryRequest>,
+    ) -> Result<Response<ListRaftHistoryReply>, Status> {
+        let limit = request.into_inner().limit.unwrap_or(50).min(500) as usize;
+        let events = self
+            .store
+            .raft_history(limit)
+            .into_iter()
+            .map(map_raft_event)
+            .collect();
+        Ok(Response::new(ListRaftHistoryReply { events }))
+    }
+
+    #[instrument(skip_all)]
+    async fn issue_raft_command(
+        &self,
+        request: Request<IssueRaftCommandRequest>,
+    ) -> Result<Response<IssueRaftCommandReply>, Status> {
+        let req = request.into_inner();
+        let actor = req.actor.unwrap_or_else(|| "api".to_string());
+        let event = self
+            .store
+            .issue_raft_command(&req.command, req.target_node_id.as_deref(), &actor)
+            .map(map_raft_event)
+            .map_err(|e| map_store_error("Error issuing raft command", e))?;
+        let status = self
+            .store
+            .raft_status()
+            .map(map_raft_status)
+            .ok_or_else(|| Status::failed_precondition("raft backend is not enabled"))?;
+        Ok(Response::new(IssueRaftCommandReply {
+            command: req.command,
+            event: Some(event),
+            status: Some(status),
+        }))
+    }
+
+    #[instrument(skip_all)]
+    async fn get_raft_join_token(
+        &self,
+        request: Request<GetRaftJoinTokenRequest>,
+    ) -> Result<Response<GetRaftJoinTokenReply>, Status> {
+        let actor = request
+            .into_inner()
+            .actor
+            .unwrap_or_else(|| "api".to_string());
+        let (token, expires_at) = self
+            .store
+            .issue_raft_join_token(&actor)
+            .map_err(|e| map_store_error("Error issuing raft join token", e))?;
+        let status = self
+            .store
+            .raft_status()
+            .map(map_raft_status)
+            .ok_or_else(|| Status::failed_precondition("raft backend is not enabled"))?;
+        Ok(Response::new(GetRaftJoinTokenReply {
+            token,
+            expires_at,
+            status: Some(status),
         }))
     }
 

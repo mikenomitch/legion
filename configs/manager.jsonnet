@@ -29,5 +29,11 @@
         },
       },
     },
+    raft: {
+      nodeId: "mgr-a",
+      bootstrap: true,
+      peers: ["mgr-a", "mgr-b", "mgr-c"],
+      joinTokenTtlSeconds: 900,
+    },
   },
 }

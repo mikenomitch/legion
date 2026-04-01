@@ -16,7 +16,7 @@ Legion currently runs as a single-manager control plane plus one or more workers
   - Runs task allocations via task-kind plugins.
   - Sends periodic heartbeat and health-check updates.
 
-Important: multi-manager state sync is not implemented yet. The manager persists local state only, and there is no Raft/federation layer currently.
+Important: Legion now includes a Raft control-plane mode for manager leader election/failover and operator workflows. Full SQLite state-machine replication through Raft is still in progress; today, managers still persist local SQLite data.
 
 ## Manager Startup
 

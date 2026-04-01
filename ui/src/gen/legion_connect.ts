@@ -3,7 +3,7 @@
 /* eslint-disable */
 // @ts-nocheck
 
-import { AcquireKvLockReply, AcquireKvLockRequest, AdvanceRolloutReply, AdvanceRolloutRequest, DeleteKvReply, DeleteKvRequest, DeleteSavedStateQueryReply, DeleteSavedStateQueryRequest, DestroyJobReply, DestroyJobRequest, GetJobInfoReply, GetJobInfoRequest, GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest, GetJoinTokenReply, GetJoinTokenRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest, GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest, GetObservabilityReply, GetObservabilityRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest, GetStateStoreSchemaReply, GetStateStoreSchemaRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobsReply, ListJobsRequest, ListKvReply, ListKvRequest, ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply, ListRolloutsRequest, ListSavedStateQueriesReply, ListSavedStateQueriesRequest, PatchKvReply, PatchKvRequest, PlanJobReply, PlanJobRequest, PostWorkReply, PostWorkRequest, PutKvReply, PutKvRequest, QueryStateStoreReply, QueryStateStoreRequest, ReleaseKvLockReply, ReleaseKvLockRequest, RenewKvLockReply, RenewKvLockRequest, RestartWorkerReply, RestartWorkerRequest, RunJobReply, RunJobRequest, StopJobReply, StopJobRequest, StopRolloutReply, StopRolloutRequest, UpdateNodeDynamicReply, UpdateNodeDynamicRequest, UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest } from "./legion_pb.js";
+import { AcquireKvLockReply, AcquireKvLockRequest, AdvanceRolloutReply, AdvanceRolloutRequest, DeleteKvReply, DeleteKvRequest, DeleteSavedStateQueryReply, DeleteSavedStateQueryRequest, DestroyJobReply, DestroyJobRequest, GetJobInfoReply, GetJobInfoRequest, GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest, GetJoinTokenReply, GetJoinTokenRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest, GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest, GetObservabilityReply, GetObservabilityRequest, GetRaftJoinTokenReply, GetRaftJoinTokenRequest, GetRaftStatusReply, GetRaftStatusRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest, GetStateStoreSchemaReply, GetStateStoreSchemaRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, IssueRaftCommandReply, IssueRaftCommandRequest, ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobsReply, ListJobsRequest, ListKvReply, ListKvRequest, ListRaftHistoryReply, ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply, ListRolloutsRequest, ListSavedStateQueriesReply, ListSavedStateQueriesRequest, PatchKvReply, PatchKvRequest, PlanJobReply, PlanJobRequest, PostWorkReply, PostWorkRequest, PutKvReply, PutKvRequest, QueryStateStoreReply, QueryStateStoreRequest, ReleaseKvLockReply, ReleaseKvLockRequest, RenewKvLockReply, RenewKvLockRequest, RestartWorkerReply, RestartWorkerRequest, RunJobReply, RunJobRequest, StopJobReply, StopJobRequest, StopRolloutReply, StopRolloutRequest, UpdateNodeDynamicReply, UpdateNodeDynamicRequest, UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest } from "./legion_pb.js";
 import { MethodKind } from "@bufbuild/protobuf";
 
 /**
@@ -306,6 +306,57 @@ export const Manager = {
       kind: MethodKind.Unary,
     },
     /**
+     * Returns the local manager's Raft control-plane status.
+     *
+     * This endpoint is available even before full Raft state replication is enabled,
+     * and is intended for election/failover visibility and operator workflows.
+     *
+     * @generated from rpc legion.Manager.GetRaftStatus
+     */
+    getRaftStatus: {
+      name: "GetRaftStatus",
+      I: GetRaftStatusRequest,
+      O: GetRaftStatusReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Lists recent Raft control-plane events for this manager.
+     *
+     * Events include elections, leader transfers, membership updates, and token issuance.
+     *
+     * @generated from rpc legion.Manager.ListRaftHistory
+     */
+    listRaftHistory: {
+      name: "ListRaftHistory",
+      I: ListRaftHistoryRequest,
+      O: ListRaftHistoryReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Applies an operator-triggered Raft control command on this manager.
+     *
+     * Typical commands include election triggers, leader transfer, and membership changes.
+     *
+     * @generated from rpc legion.Manager.IssueRaftCommand
+     */
+    issueRaftCommand: {
+      name: "IssueRaftCommand",
+      I: IssueRaftCommandRequest,
+      O: IssueRaftCommandReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Issues a short-lived join token that can be used by a manager to join a Raft cluster.
+     *
+     * @generated from rpc legion.Manager.GetRaftJoinToken
+     */
+    getRaftJoinToken: {
+      name: "GetRaftJoinToken",
+      I: GetRaftJoinTokenRequest,
+      O: GetRaftJoinTokenReply,
+      kind: MethodKind.Unary,
+    },
+    /**
      * Applies dynamic attribute updates to a node and triggers affected evaluations.
      *
      * @generated from rpc legion.Manager.UpdateNodeDynamic
@@ -533,3 +584,4 @@ export const Worker = {
     },
   }
 } as const;
+

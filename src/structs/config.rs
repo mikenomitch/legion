@@ -38,6 +38,44 @@ pub struct ManagerConfig {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PersistenceType {
+    #[default]
+    LocalDisk,
+    Streaming,
+    Raft,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct PersistenceConfig {
+    #[serde(default)]
+    pub r#type: PersistenceType,
+    pub streaming: Option<StreamingPersistenceConfig>,
+    pub raft: Option<RaftPersistenceConfig>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct RaftPersistenceConfig {
+    pub node_id: Option<String>,
+    pub bootstrap: Option<bool>,
+    pub peers: Option<Vec<String>>,
+    pub join_token_ttl_seconds: Option<u64>,
+}
+
+impl Default for RaftPersistenceConfig {
+    fn default() -> Self {
+        Self {
+            node_id: None,
+            bootstrap: Some(false),
+            peers: Some(Vec::new()),
+            join_token_ttl_seconds: Some(900),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ServerConfigFull {
     pub port: u64,
@@ -95,28 +133,12 @@ pub struct ManagerConfigFull {
     pub persistence: PersistenceConfigFull,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum PersistenceType {
-    #[default]
-    LocalDisk,
-    Streaming,
-    Raft,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct PersistenceConfig {
-    #[serde(default)]
-    pub r#type: PersistenceType,
-    pub streaming: Option<StreamingPersistenceConfig>,
-}
-
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct PersistenceConfigFull {
     pub r#type: PersistenceType,
     pub streaming: StreamingPersistenceConfigFull,
+    pub raft: RaftPersistenceConfigFull,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -135,6 +157,15 @@ pub struct StreamingPersistenceConfigFull {
     pub replica_url: String,
     pub sync_interval: String,
     pub lease: StreamingLeaseConfigFull,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct RaftPersistenceConfigFull {
+    pub node_id: String,
+    pub bootstrap: bool,
+    pub peers: Vec<String>,
+    pub join_token_ttl_seconds: u64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -269,6 +300,7 @@ impl Default for PersistenceConfigFull {
         Self {
             r#type: PersistenceType::LocalDisk,
             streaming: StreamingPersistenceConfigFull::default(),
+            raft: RaftPersistenceConfigFull::default(),
         }
     }
 }
@@ -281,6 +313,11 @@ impl PersistenceConfig {
                 .streaming
                 .as_ref()
                 .map(StreamingPersistenceConfig::with_defaults)
+                .unwrap_or_default(),
+            raft: self
+                .raft
+                .as_ref()
+                .map(RaftPersistenceConfig::with_defaults)
                 .unwrap_or_default(),
         }
     }
@@ -314,6 +351,17 @@ impl StreamingPersistenceConfig {
                 .as_ref()
                 .map(StreamingLeaseConfig::with_defaults)
                 .unwrap_or_default(),
+        }
+    }
+}
+
+impl RaftPersistenceConfig {
+    pub fn with_defaults(&self) -> RaftPersistenceConfigFull {
+        RaftPersistenceConfigFull {
+            node_id: self.node_id.clone().unwrap_or_default(),
+            bootstrap: self.bootstrap.unwrap_or(false),
+            peers: self.peers.clone().unwrap_or_default(),
+            join_token_ttl_seconds: self.join_token_ttl_seconds.unwrap_or(900),
         }
     }
 }
@@ -382,6 +430,7 @@ impl From<PersistenceConfigFull> for PersistenceConfig {
         Self {
             r#type: value.r#type,
             streaming: Some(value.streaming.into()),
+            raft: Some(value.raft.into()),
         }
     }
 }
@@ -393,6 +442,17 @@ impl From<StreamingPersistenceConfigFull> for StreamingPersistenceConfig {
             replica_url: Some(value.replica_url),
             sync_interval: Some(value.sync_interval),
             lease: Some(value.lease.into()),
+        }
+    }
+}
+
+impl From<RaftPersistenceConfigFull> for RaftPersistenceConfig {
+    fn from(value: RaftPersistenceConfigFull) -> Self {
+        Self {
+            node_id: Some(value.node_id),
+            bootstrap: Some(value.bootstrap),
+            peers: Some(value.peers),
+            join_token_ttl_seconds: Some(value.join_token_ttl_seconds),
         }
     }
 }

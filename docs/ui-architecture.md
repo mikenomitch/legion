@@ -65,3 +65,8 @@ Without these, browser gRPC-Web calls would fail.
 
 Proto compilation command is documented in `ui/README.md` and writes generated files to `ui/src/gen/`.
 
+
+
+## Raft page
+
+The UI includes a dedicated **Raft** page under Cluster navigation for manager raft status, recent raft history, and operator commands (election/failover/membership/join-token flows).
