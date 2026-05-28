@@ -11,19 +11,22 @@ const V_GAP = 32
 const PAD_X = 56
 const PAD_Y = 56
 
+// Sidecars are docked underneath their host task (they run alongside it,
+// they are not a downstream stage).
+const SIDE_H = 56
+const SIDE_GAP = 12 // gap between stacked sidecars
+const DOCK_GAP = 30 // gap between host and its first sidecar (room for the link)
+const DOCK_INSET = 22 // horizontal inset so a sidecar reads as "attached"
+
 const MIN_SCALE = 0.25
 const MAX_SCALE = 2.5
 
-// ── Types ───────────────────────────────────────────────────────────
-type NodePos = { x: number; y: number; task: JobTask; stage: number }
+const SIDECAR_COLOR = '#6366f1'
 
-type Edge = {
-  from: string
-  to: string
-  condition?: string
-  fromPos: NodePos
-  toPos: NodePos
-}
+// ── Types ───────────────────────────────────────────────────────────
+type PlacedNode = { name: string; x: number; y: number; w: number; h: number; task: JobTask; isSidecar: boolean }
+type Edge = { from: string; to: string; condition?: string; fromPos: PlacedNode; toPos: PlacedNode }
+type DockLink = { parent: string; child: string; x1: number; y1: number; x2: number; y2: number }
 
 type DagVisualizationProps = {
   tasks: JobTask[]
@@ -35,49 +38,16 @@ type DagVisualizationProps = {
 // ── Status styling ──────────────────────────────────────────────────
 type Tone = 'success' | 'warning' | 'danger' | 'neutral'
 
-const toneStyle: Record<Tone, { bar: string; bg: string; ring: string; dot: string; text: string; label: string }> = {
-  success: {
-    bar: 'bg-emerald-500',
-    bg: 'bg-white dark:bg-neutral-900',
-    ring: 'ring-emerald-400/40 dark:ring-emerald-500/30',
-    dot: 'bg-emerald-500',
-    text: 'text-emerald-700 dark:text-emerald-300',
-    label: 'Running',
-  },
-  warning: {
-    bar: 'bg-amber-500',
-    bg: 'bg-white dark:bg-neutral-900',
-    ring: 'ring-amber-400/40 dark:ring-amber-500/30',
-    dot: 'bg-amber-500',
-    text: 'text-amber-700 dark:text-amber-300',
-    label: 'Pending',
-  },
-  danger: {
-    bar: 'bg-rose-500',
-    bg: 'bg-white dark:bg-neutral-900',
-    ring: 'ring-rose-400/40 dark:ring-rose-500/30',
-    dot: 'bg-rose-500',
-    text: 'text-rose-700 dark:text-rose-300',
-    label: 'Failed',
-  },
-  neutral: {
-    bar: 'bg-neutral-300 dark:bg-neutral-600',
-    bg: 'bg-white dark:bg-neutral-900',
-    ring: 'ring-neutral-300/40 dark:ring-neutral-600/30',
-    dot: 'bg-neutral-400 dark:bg-neutral-500',
-    text: 'text-neutral-500 dark:text-neutral-400',
-    label: 'Idle',
-  },
+const toneStyle: Record<Tone, { bar: string; bg: string; ring: string; dot: string; text: string }> = {
+  success: { bar: 'bg-emerald-500', bg: 'bg-white dark:bg-neutral-900', ring: 'ring-emerald-400/40 dark:ring-emerald-500/30', dot: 'bg-emerald-500', text: 'text-emerald-700 dark:text-emerald-300' },
+  warning: { bar: 'bg-amber-500', bg: 'bg-white dark:bg-neutral-900', ring: 'ring-amber-400/40 dark:ring-amber-500/30', dot: 'bg-amber-500', text: 'text-amber-700 dark:text-amber-300' },
+  danger: { bar: 'bg-rose-500', bg: 'bg-white dark:bg-neutral-900', ring: 'ring-rose-400/40 dark:ring-rose-500/30', dot: 'bg-rose-500', text: 'text-rose-700 dark:text-rose-300' },
+  neutral: { bar: 'bg-neutral-300 dark:bg-neutral-600', bg: 'bg-white dark:bg-neutral-900', ring: 'ring-neutral-300/40 dark:ring-neutral-600/30', dot: 'bg-neutral-400 dark:bg-neutral-500', text: 'text-neutral-500 dark:text-neutral-400' },
 }
 
-const conditionStroke: Record<string, string> = {
-  success: '#10b981',
-  complete: '#0ea5e9',
-  start: '#f59e0b',
-}
+const conditionStroke: Record<string, string> = { success: '#10b981', complete: '#0ea5e9', start: '#f59e0b' }
 const strokeFor = (condition?: string) => (condition && conditionStroke[condition]) || '#94a3b8'
 
-// Distinct, accessible palette for task groups (works in light + dark).
 const GROUP_PALETTE = [
   '#6366f1', '#0ea5e9', '#14b8a6', '#f59e0b', '#ec4899',
   '#8b5cf6', '#22c55e', '#ef4444', '#f97316', '#06b6d4',
@@ -85,39 +55,32 @@ const GROUP_PALETTE = [
 
 const lifecycleGlyph = (lifecycle: string): string => {
   switch (lifecycle) {
-    case 'sidecar':
-      return '⛓'
-    case 'batch':
-      return '⧗'
-    default:
-      return '⟳'
+    case 'sidecar': return '⛓'
+    case 'batch': return '⧗'
+    default: return '⟳'
   }
 }
 
 const clamp = (value: number, lo: number, hi: number) => Math.min(Math.max(value, lo), hi)
 
 // ── Bezier path builder (left → right) ──────────────────────────────
-function edgePath(from: NodePos, to: NodePos): string {
-  const x1 = from.x + NODE_W
-  const y1 = from.y + NODE_H / 2
+function edgePath(from: PlacedNode, to: PlacedNode): string {
+  const x1 = from.x + from.w
+  const y1 = from.y + from.h / 2
   const x2 = to.x
-  const y2 = to.y + NODE_H / 2
+  const y2 = to.y + to.h / 2
   const dx = Math.max(Math.abs(x2 - x1) * 0.5, 48)
   return `M ${x1} ${y1} C ${x1 + dx} ${y1}, ${x2 - dx} ${y2}, ${x2} ${y2}`
 }
 
-function edgeMid(from: NodePos, to: NodePos): { x: number; y: number } {
-  return {
-    x: (from.x + NODE_W + to.x) / 2,
-    y: (from.y + to.y) / 2 + NODE_H / 2,
-  }
+function edgeMid(from: PlacedNode, to: PlacedNode): { x: number; y: number } {
+  return { x: (from.x + from.w + to.x) / 2, y: (from.y + from.h / 2 + to.y + to.h / 2) / 2 }
 }
 
 // ── Component ───────────────────────────────────────────────────────
 export default function DagVisualization(props: DagVisualizationProps) {
   const taskMap = createMemo(() => new Map(props.tasks.map((t) => [t.name, t])))
 
-  // Stable color per group.
   const groupColors = createMemo(() => {
     const groups = [...new Set(props.tasks.map((t) => t.group))]
     const map = new Map<string, string>()
@@ -125,37 +88,94 @@ export default function DagVisualization(props: DagVisualizationProps) {
     return map
   })
 
-  // Node positions from topological layers, each column vertically centered.
-  const nodePositions = createMemo((): Map<string, NodePos> => {
-    const positions = new Map<string, NodePos>()
-    const layers = props.layers
-    const maxLayerHeight = Math.max(1, ...layers.map((l) => l.length * (NODE_H + V_GAP) - V_GAP))
+  const sidecarNames = createMemo(() => new Set(props.tasks.filter((t) => t.lifecycle === 'sidecar').map((t) => t.name)))
 
-    layers.forEach((layer, col) => {
-      const layerHeight = layer.length * (NODE_H + V_GAP) - V_GAP
-      const yOffset = (maxLayerHeight - layerHeight) / 2
-      layer.forEach((taskName, row) => {
-        const task = taskMap().get(taskName)
-        if (!task) return
-        positions.set(taskName, {
-          x: PAD_X + col * (NODE_W + H_GAP),
-          y: PAD_Y + yOffset + row * (NODE_H + V_GAP),
-          task,
-          stage: col,
-        })
-      })
+  // Resolve each sidecar's host: the non-sidecar task it depends on, else the
+  // first non-sidecar task in its group. Sidecars without a host stay inline.
+  const hostOf = createMemo(() => {
+    const sidecars = sidecarNames()
+    const map = new Map<string, string>()
+    for (const task of props.tasks) {
+      if (task.lifecycle !== 'sidecar') continue
+      let host = task.dependsOn.map((d) => d.task).find((n) => taskMap().has(n) && !sidecars.has(n))
+      if (!host) host = props.tasks.find((o) => o.lifecycle !== 'sidecar' && o.group === task.group)?.name
+      if (host) map.set(task.name, host)
+    }
+    return map
+  })
+
+  const dockedSidecars = createMemo(() => new Set(hostOf().keys()))
+
+  const hostedBy = createMemo(() => {
+    const map = new Map<string, string[]>()
+    for (const [side, host] of hostOf()) {
+      if (!map.has(host)) map.set(host, [])
+      map.get(host)!.push(side)
+    }
+    return map
+  })
+
+  // Topological columns, with docked sidecars removed so they never form a stage.
+  const primaryLayers = createMemo(() => {
+    const docked = dockedSidecars()
+    return props.layers.map((layer) => layer.filter((n) => !docked.has(n))).filter((layer) => layer.length > 0)
+  })
+
+  // Lay each column out as a vertical stack of "blocks" (host + its sidecars).
+  const layout = createMemo(() => {
+    const placed = new Map<string, PlacedNode>()
+    const dockLinks: DockLink[] = []
+    const layers = primaryLayers()
+
+    const colBlocks = layers.map((layer) =>
+      layer.map((name) => {
+        const sides = hostedBy().get(name) ?? []
+        const sideSpan = sides.length ? DOCK_GAP + sides.length * SIDE_H + (sides.length - 1) * SIDE_GAP : 0
+        return { name, sides, h: NODE_H + sideSpan }
+      }),
+    )
+    const colHeights = colBlocks.map((blocks) => blocks.reduce((acc, b) => acc + b.h, 0) + V_GAP * Math.max(0, blocks.length - 1))
+    const maxH = Math.max(NODE_H, ...(colHeights.length ? colHeights : [NODE_H]))
+
+    colBlocks.forEach((blocks, col) => {
+      const x = PAD_X + col * (NODE_W + H_GAP)
+      let y = PAD_Y + (maxH - colHeights[col]) / 2
+      for (const block of blocks) {
+        const task = taskMap().get(block.name)
+        if (task) placed.set(block.name, { name: block.name, x, y, w: NODE_W, h: NODE_H, task, isSidecar: false })
+
+        let parentBottomY = y + NODE_H
+        let parentX = x + 28
+        let parentName = block.name
+        let sy = y + NODE_H + DOCK_GAP
+        for (const sideName of block.sides) {
+          const stask = taskMap().get(sideName)
+          const sx = x + DOCK_INSET
+          if (stask) {
+            placed.set(sideName, { name: sideName, x: sx, y: sy, w: NODE_W - DOCK_INSET, h: SIDE_H, task: stask, isSidecar: true })
+            dockLinks.push({ parent: parentName, child: sideName, x1: parentX, y1: parentBottomY, x2: sx + 18, y2: sy })
+          }
+          parentBottomY = sy + SIDE_H
+          parentX = sx + 18
+          parentName = sideName
+          sy += SIDE_H + SIDE_GAP
+        }
+        y += block.h + V_GAP
+      }
     })
-    return positions
+    return { placed, dockLinks, columns: layers.length, maxH }
   })
 
   const edges = createMemo((): Edge[] => {
     const result: Edge[] = []
-    const positions = nodePositions()
+    const placed = layout().placed
+    const docked = dockedSidecars()
     for (const task of props.tasks) {
-      const toPos = positions.get(task.name)
+      if (docked.has(task.name)) continue // shown via its dock link instead
+      const toPos = placed.get(task.name)
       if (!toPos) continue
       for (const dep of task.dependsOn) {
-        const fromPos = positions.get(dep.task)
+        const fromPos = placed.get(dep.task)
         if (!fromPos) continue
         result.push({ from: dep.task, to: task.name, condition: dep.condition, fromPos, toPos })
       }
@@ -163,13 +183,10 @@ export default function DagVisualization(props: DagVisualizationProps) {
     return result
   })
 
-  const canvasW = createMemo(() => PAD_X * 2 + props.layers.length * (NODE_W + H_GAP) - H_GAP)
-  const canvasH = createMemo(() => {
-    const maxInLayer = Math.max(1, ...props.layers.map((l) => l.length))
-    return PAD_Y * 2 + maxInLayer * (NODE_H + V_GAP) - V_GAP
-  })
+  const canvasW = createMemo(() => PAD_X * 2 + Math.max(1, layout().columns) * (NODE_W + H_GAP) - H_GAP)
+  const canvasH = createMemo(() => PAD_Y * 2 + layout().maxH)
 
-  const hasDependencies = createMemo(() => props.tasks.some((t) => t.dependsOn.length > 0))
+  const hasSidecars = createMemo(() => dockedSidecars().size > 0)
 
   const statusFor = (taskName: string): { status: string; tone: Tone } => {
     const runtime = props.taskRuntime.get(taskName)
@@ -228,7 +245,6 @@ export default function DagVisualization(props: DagVisualizationProps) {
   const onPanEnd = () => setPanning(false)
 
   const onBackgroundMouseDown = (e: MouseEvent) => {
-    // Only pan from empty canvas, not from a node (so links keep working).
     if ((e.target as HTMLElement).closest('[data-dag-node]')) return
     e.preventDefault()
     panStart = { x: e.clientX, y: e.clientY, tx: tx(), ty: ty() }
@@ -245,7 +261,7 @@ export default function DagVisualization(props: DagVisualizationProps) {
     })
   })
 
-  // Highlight set: hovered node + its direct neighbors.
+  // Highlight set: hovered node + its direct neighbors (edges and dock links).
   const neighbors = createMemo(() => {
     const h = hovered()
     if (!h) return null
@@ -254,6 +270,10 @@ export default function DagVisualization(props: DagVisualizationProps) {
       if (e.from === h) set.add(e.to)
       if (e.to === h) set.add(e.from)
     }
+    for (const link of layout().dockLinks) {
+      if (link.parent === h) set.add(link.child)
+      if (link.child === h) set.add(link.parent)
+    }
     return set
   })
 
@@ -261,6 +281,11 @@ export default function DagVisualization(props: DagVisualizationProps) {
     const h = hovered()
     if (!h) return true
     return edge.from === h || edge.to === h
+  }
+
+  const isDimmed = (name: string) => {
+    const set = neighbors()
+    return set ? !set.has(name) : false
   }
 
   return (
@@ -277,9 +302,13 @@ export default function DagVisualization(props: DagVisualizationProps) {
           <span class="inline-flex items-center gap-1.5"><span class="h-2.5 w-2.5 rounded-full bg-amber-500" /> Pending</span>
           <span class="inline-flex items-center gap-1.5"><span class="h-2.5 w-2.5 rounded-full bg-rose-500" /> Failed</span>
           <span class="inline-flex items-center gap-1.5"><span class="h-2.5 w-2.5 rounded-full bg-neutral-400" /> Idle</span>
-          <Show when={hasDependencies()}>
-            <span class="border-l border-neutral-300 pl-3 dark:border-neutral-700">drag to pan · scroll to zoom</span>
+          <Show when={hasSidecars()}>
+            <span class="inline-flex items-center gap-1.5">
+              <svg width="20" height="8" class="shrink-0"><line x1="1" y1="4" x2="19" y2="4" stroke={SIDECAR_COLOR} stroke-width="2" stroke-dasharray="4 3" /></svg>
+              Sidecar (runs alongside)
+            </span>
           </Show>
+          <span class="border-l border-neutral-300 pl-3 dark:border-neutral-700">drag to pan · scroll to zoom</span>
         </div>
         <div class="flex items-center gap-1">
           <button type="button" onClick={() => zoomButton(1 / 1.2)} class="h-7 w-7 rounded border border-neutral-300 text-sm font-semibold text-neutral-600 transition hover:bg-neutral-100 dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-800" aria-label="Zoom out">−</button>
@@ -296,26 +325,16 @@ export default function DagVisualization(props: DagVisualizationProps) {
         class="relative h-[560px] w-full overflow-hidden rounded-xl border border-neutral-200 bg-neutral-50 dark:border-neutral-800 dark:bg-neutral-950"
         style={{
           cursor: panning() ? 'grabbing' : 'grab',
-          'background-image':
-            'radial-gradient(circle, rgba(120,120,140,0.18) 1px, transparent 1px)',
+          'background-image': 'radial-gradient(circle, rgba(120,120,140,0.18) 1px, transparent 1px)',
           'background-size': '22px 22px',
         }}
       >
-        {/* Transformed world */}
         <div
           class="absolute left-0 top-0 origin-top-left"
-          style={{
-            transform: `translate(${tx()}px, ${ty()}px) scale(${scale()})`,
-            width: `${canvasW()}px`,
-            height: `${canvasH()}px`,
-          }}
+          style={{ transform: `translate(${tx()}px, ${ty()}px) scale(${scale()})`, width: `${canvasW()}px`, height: `${canvasH()}px` }}
         >
           {/* SVG edge layer */}
-          <svg
-            class="absolute inset-0 overflow-visible"
-            width={canvasW()}
-            height={canvasH()}
-          >
+          <svg class="absolute inset-0 overflow-visible" width={canvasW()} height={canvasH()}>
             <defs>
               <For each={['success', 'complete', 'start', 'none']}>
                 {(key) => (
@@ -327,30 +346,13 @@ export default function DagVisualization(props: DagVisualizationProps) {
             </defs>
 
             {/* Stage column guides + labels */}
-            <For each={props.layers}>
+            <For each={primaryLayers()}>
               {(_layer, colIdx) => {
                 const x = PAD_X + colIdx() * (NODE_W + H_GAP) - 16
                 return (
                   <>
-                    <rect
-                      x={x}
-                      y={20}
-                      width={NODE_W + 32}
-                      height={canvasH() - 40}
-                      rx="12"
-                      fill="currentColor"
-                      class="text-neutral-200/30 dark:text-neutral-800/40"
-                    />
-                    <text
-                      x={x + (NODE_W + 32) / 2}
-                      y={40}
-                      text-anchor="middle"
-                      font-size="11"
-                      font-weight="700"
-                      letter-spacing="0.12em"
-                      fill="currentColor"
-                      class="text-neutral-400 dark:text-neutral-500"
-                    >
+                    <rect x={x} y={20} width={NODE_W + 32} height={canvasH() - 40} rx="12" fill="currentColor" class="text-neutral-200/30 dark:text-neutral-800/40" />
+                    <text x={x + (NODE_W + 32) / 2} y={40} text-anchor="middle" font-size="11" font-weight="700" letter-spacing="0.12em" fill="currentColor" class="text-neutral-400 dark:text-neutral-500">
                       STAGE {colIdx() + 1}
                     </text>
                   </>
@@ -358,7 +360,7 @@ export default function DagVisualization(props: DagVisualizationProps) {
               }}
             </For>
 
-            {/* Edges */}
+            {/* Dependency edges */}
             <For each={edges()}>
               {(edge) => {
                 const path = edgePath(edge.fromPos, edge.toPos)
@@ -366,28 +368,39 @@ export default function DagVisualization(props: DagVisualizationProps) {
                 const color = strokeFor(edge.condition)
                 const markerKey = edge.condition ?? 'none'
                 const active = () => edgeActive(edge)
-                // Animate flow into nodes that are currently in progress.
                 const flowing = () => statusFor(edge.to).tone === 'warning'
                 return (
                   <g style={{ opacity: active() ? 1 : 0.12, transition: 'opacity 0.15s' }}>
                     <path d={path} fill="none" stroke-width="5" class="stroke-neutral-200/70 dark:stroke-neutral-800/70" stroke-linecap="round" />
-                    <path
-                      d={path}
-                      fill="none"
-                      stroke={color}
-                      stroke-width={active() && hovered() ? 2.75 : 2}
-                      stroke-linecap="round"
-                      marker-end={`url(#dag-arrow-${markerKey})`}
-                      classList={{ 'dag-edge-flow': flowing() }}
-                    />
+                    <path d={path} fill="none" stroke={color} stroke-width={active() && hovered() ? 2.75 : 2} stroke-linecap="round" marker-end={`url(#dag-arrow-${markerKey})`} classList={{ 'dag-edge-flow': flowing() }} />
                     <Show when={edge.condition}>
                       <g>
                         <rect x={mid.x - 27} y={mid.y - 9} width="54" height="17" rx="8" fill={color} opacity="0.14" />
-                        <text x={mid.x} y={mid.y + 3} text-anchor="middle" font-size="9" font-weight="700" letter-spacing="0.06em" fill={color}>
-                          {(edge.condition ?? '').toUpperCase()}
-                        </text>
+                        <text x={mid.x} y={mid.y + 3} text-anchor="middle" font-size="9" font-weight="700" letter-spacing="0.06em" fill={color}>{(edge.condition ?? '').toUpperCase()}</text>
                       </g>
                     </Show>
+                  </g>
+                )
+              }}
+            </For>
+
+            {/* Sidecar dock links (dashed — "runs alongside", not a stage) */}
+            <For each={layout().dockLinks}>
+              {(link) => {
+                const midY = (link.y1 + link.y2) / 2
+                const path = `M ${link.x1} ${link.y1} C ${link.x1} ${midY}, ${link.x2} ${midY}, ${link.x2} ${link.y2}`
+                const active = () => {
+                  const h = hovered()
+                  return !h || h === link.parent || h === link.child
+                }
+                return (
+                  <g style={{ opacity: active() ? 1 : 0.12, transition: 'opacity 0.15s' }}>
+                    <path d={path} fill="none" stroke={SIDECAR_COLOR} stroke-width="2" stroke-dasharray="4 3" stroke-linecap="round" />
+                    <circle cx={link.x2} cy={link.y2} r="2.6" fill={SIDECAR_COLOR} />
+                    <g>
+                      <rect x={link.x2 + 6} y={midY - 8} width="58" height="16" rx="8" fill={SIDECAR_COLOR} opacity="0.14" />
+                      <text x={link.x2 + 35} y={midY + 3} text-anchor="middle" font-size="8.5" font-weight="700" letter-spacing="0.06em" fill={SIDECAR_COLOR}>SIDECAR</text>
+                    </g>
                   </g>
                 )
               }}
@@ -395,42 +408,68 @@ export default function DagVisualization(props: DagVisualizationProps) {
           </svg>
 
           {/* Node layer */}
-          <For each={[...nodePositions().entries()]}>
+          <For each={[...layout().placed.entries()]}>
             {([taskName, pos]) => {
               const info = () => statusFor(taskName)
               const tone = () => info().tone
               const style = () => toneStyle[tone()]
               const inProgress = () => tone() === 'warning'
-              const dimmed = () => {
-                const set = neighbors()
-                return set ? !set.has(taskName) : false
-              }
+              const dimmed = () => isDimmed(taskName)
               const groupColor = () => groupColors().get(pos.task.group) ?? '#64748b'
+              const href = `/jobs/${encodeURIComponent(props.jobName)}/tasks/${encodeURIComponent(taskName)}`
 
+              // ── Sidecar: compact, dashed-indigo, clearly badged ──
+              if (pos.isSidecar) {
+                return (
+                  <A
+                    href={href}
+                    data-dag-node
+                    onMouseEnter={() => setHovered(taskName)}
+                    onMouseLeave={() => setHovered(null)}
+                    draggable={false}
+                    class={`absolute flex items-stretch overflow-hidden rounded-lg border border-dashed shadow-sm ring-1 transition-all duration-150 hover:-translate-y-0.5 hover:shadow-lg ${style().ring}`}
+                    style={{
+                      left: `${pos.x}px`, top: `${pos.y}px`, width: `${pos.w}px`, height: `${pos.h}px`,
+                      'border-color': SIDECAR_COLOR,
+                      'background-color': 'color-mix(in srgb, ' + SIDECAR_COLOR + ' 7%, white)',
+                      opacity: dimmed() ? 0.35 : 1,
+                      'z-index': hovered() === taskName ? 20 : 1,
+                    }}
+                  >
+                    <div class={`w-1.5 shrink-0 ${style().bar} ${inProgress() ? 'animate-pulse' : ''}`} />
+                    <div class="flex flex-1 flex-col justify-center gap-0.5 px-2.5 py-1.5 min-w-0">
+                      <div class="flex items-center gap-1.5 min-w-0">
+                        <span class="shrink-0 text-[11px]" style={{ color: SIDECAR_COLOR }}>{lifecycleGlyph('sidecar')}</span>
+                        <span class={`h-1.5 w-1.5 shrink-0 rounded-full ${style().dot} ${inProgress() ? 'animate-pulse' : ''}`} />
+                        <span class="truncate text-[12px] font-semibold text-neutral-900 dark:text-neutral-100">{pos.task.name}</span>
+                        <span class="ml-auto shrink-0 rounded px-1.5 py-0.5 text-[8px] font-bold uppercase tracking-wider text-white" style={{ 'background-color': SIDECAR_COLOR }}>Sidecar</span>
+                      </div>
+                      <div class="flex items-center gap-1.5 text-[9px] min-w-0">
+                        <span class={`font-semibold uppercase tracking-wide ${style().text}`}>{info().status}</span>
+                        <span class="ml-auto inline-flex shrink-0 items-center gap-1 truncate font-medium" style={{ color: groupColor() }}>
+                          <span class="h-1.5 w-1.5 rounded-full" style={{ 'background-color': groupColor() }} />
+                          {pos.task.group}
+                        </span>
+                      </div>
+                    </div>
+                  </A>
+                )
+              }
+
+              // ── Primary task node ──
               return (
                 <A
-                  href={`/jobs/${encodeURIComponent(props.jobName)}/tasks/${encodeURIComponent(taskName)}`}
+                  href={href}
                   data-dag-node
                   onMouseEnter={() => setHovered(taskName)}
                   onMouseLeave={() => setHovered(null)}
                   draggable={false}
                   class={`group absolute flex flex-col overflow-hidden rounded-xl border border-neutral-200 shadow-sm ring-1 transition-all duration-150 hover:-translate-y-0.5 hover:shadow-lg dark:border-neutral-700 ${style().ring} ${style().bg}`}
-                  style={{
-                    left: `${pos.x}px`,
-                    top: `${pos.y}px`,
-                    width: `${NODE_W}px`,
-                    height: `${NODE_H}px`,
-                    opacity: dimmed() ? 0.35 : 1,
-                    'z-index': hovered() === taskName ? 20 : 1,
-                  }}
+                  style={{ left: `${pos.x}px`, top: `${pos.y}px`, width: `${pos.w}px`, height: `${pos.h}px`, opacity: dimmed() ? 0.35 : 1, 'z-index': hovered() === taskName ? 20 : 1 }}
                 >
-                  {/* Top accent strip in group color */}
                   <div class="h-1 w-full shrink-0" style={{ 'background-color': groupColor() }} />
-
                   <div class="flex flex-1 items-stretch">
-                    {/* Status bar */}
                     <div class={`w-1.5 shrink-0 ${style().bar} ${inProgress() ? 'animate-pulse' : ''}`} />
-
                     <div class="flex flex-1 flex-col justify-center gap-1 px-3 py-2 min-w-0">
                       <div class="flex items-center gap-2 min-w-0">
                         <span class={`h-2 w-2 shrink-0 rounded-full ${style().dot} ${inProgress() ? 'animate-pulse' : ''}`} />
@@ -438,21 +477,13 @@ export default function DagVisualization(props: DagVisualizationProps) {
                       </div>
                       <div class="flex items-center gap-1.5 text-[10px] text-neutral-500 dark:text-neutral-400 min-w-0">
                         <span class="shrink-0 rounded bg-neutral-100 px-1.5 py-0.5 font-medium dark:bg-neutral-800">{pos.task.kind}</span>
-                        <span class="inline-flex shrink-0 items-center gap-0.5" title={`${pos.task.lifecycle} lifecycle`}>
-                          {lifecycleGlyph(pos.task.lifecycle)} {pos.task.lifecycle}
-                        </span>
-                        <span
-                          class="ml-auto inline-flex shrink-0 items-center gap-1 truncate font-medium"
-                          style={{ color: groupColor() }}
-                          title={`group: ${pos.task.group}`}
-                        >
+                        <span class="inline-flex shrink-0 items-center gap-0.5" title={`${pos.task.lifecycle} lifecycle`}>{lifecycleGlyph(pos.task.lifecycle)} {pos.task.lifecycle}</span>
+                        <span class="ml-auto inline-flex shrink-0 items-center gap-1 truncate font-medium" style={{ color: groupColor() }} title={`group: ${pos.task.group}`}>
                           <span class="h-1.5 w-1.5 rounded-full" style={{ 'background-color': groupColor() }} />
                           {pos.task.group}
                         </span>
                       </div>
-                      <div class={`text-[10px] font-semibold uppercase tracking-wide ${style().text}`}>
-                        {info().status}
-                      </div>
+                      <div class={`text-[10px] font-semibold uppercase tracking-wide ${style().text}`}>{info().status}</div>
                     </div>
                   </div>
                 </A>

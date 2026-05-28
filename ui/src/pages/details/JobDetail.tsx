@@ -86,6 +86,16 @@ export default function JobDetail() {
     return jobData()?.taskRuntime ?? new Map<string, TaskRuntimeSummary>()
   })
 
+  // The DAG is only meaningful when tasks actually depend on each other.
+  // Single-task and independent-task jobs render as the "Tasks by group" cards
+  // instead of a big empty canvas with disconnected nodes.
+  const dagHasEdges = createMemo(() => {
+    const tasks = jobData()?.taskSpec?.tasks ?? []
+    if (tasks.length < 2) return false
+    const names = new Set(tasks.map((task) => task.name))
+    return tasks.some((task) => task.dependsOn.some((dependency) => names.has(dependency.task)))
+  })
+
   const destroyJob = async () => {
     try {
       const response = await managerClient.destroyJob({ name: jobName() })
@@ -190,20 +200,17 @@ export default function JobDetail() {
               </Show>
             </DetailSection>
 
-            <DetailSection>
-              <h3 class="mb-2 font-semibold">Task DAG</h3>
-              <Show
-                when={jobData()!.taskSpec?.tasks.length}
-                fallback={<p class="text-sm text-neutral-500">DAG unavailable because the job spec could not be parsed.</p>}
-              >
+            <Show when={dagHasEdges()}>
+              <DetailSection>
+                <h3 class="mb-2 font-semibold">Task DAG</h3>
                 <DagVisualization
                   tasks={jobData()!.taskSpec!.tasks}
                   layers={topoSortTaskNames(jobData()!.taskSpec!.tasks)}
                   taskRuntime={taskRuntime()}
                   jobName={jobName()}
                 />
-              </Show>
-            </DetailSection>
+              </DetailSection>
+            </Show>
 
             <DetailSection>
               <h3 class="mb-2 font-semibold">Allocations</h3>
