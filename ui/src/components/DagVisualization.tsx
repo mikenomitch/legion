@@ -1,17 +1,18 @@
 import { A } from '@solidjs/router'
-import { For, Show, createMemo } from 'solid-js'
+import { For, Show, createMemo, createSignal, onCleanup, onMount } from 'solid-js'
 import type { JobTask, TaskRuntimeSummary } from '../utils/jobspec'
 import { taskStatusTone } from '../utils/jobspec'
-import { DetailBadge } from './DetailPrimitives'
 
 // ── Layout constants ────────────────────────────────────────────────
-const NODE_W = 220
-const NODE_H = 76
-const H_GAP = 100
-const V_GAP = 28
-const PAD_X = 48
-const PAD_Y = 40
-const EDGE_LABEL_OFFSET = 6
+const NODE_W = 232
+const NODE_H = 84
+const H_GAP = 120
+const V_GAP = 32
+const PAD_X = 56
+const PAD_Y = 56
+
+const MIN_SCALE = 0.25
+const MAX_SCALE = 2.5
 
 // ── Types ───────────────────────────────────────────────────────────
 type NodePos = { x: number; y: number; task: JobTask; stage: number }
@@ -31,125 +32,122 @@ type DagVisualizationProps = {
   jobName: string
 }
 
-// ── Status helpers ──────────────────────────────────────────────────
-const toneToAccent: Record<string, { bar: string; bg: string; ring: string; dot: string }> = {
+// ── Status styling ──────────────────────────────────────────────────
+type Tone = 'success' | 'warning' | 'danger' | 'neutral'
+
+const toneStyle: Record<Tone, { bar: string; bg: string; ring: string; dot: string; text: string; label: string }> = {
   success: {
     bar: 'bg-emerald-500',
-    bg: 'bg-emerald-50 dark:bg-emerald-950/40',
-    ring: 'ring-emerald-400/30 dark:ring-emerald-500/20',
+    bg: 'bg-white dark:bg-neutral-900',
+    ring: 'ring-emerald-400/40 dark:ring-emerald-500/30',
     dot: 'bg-emerald-500',
+    text: 'text-emerald-700 dark:text-emerald-300',
+    label: 'Running',
   },
   warning: {
     bar: 'bg-amber-500',
-    bg: 'bg-amber-50 dark:bg-amber-950/40',
-    ring: 'ring-amber-400/30 dark:ring-amber-500/20',
+    bg: 'bg-white dark:bg-neutral-900',
+    ring: 'ring-amber-400/40 dark:ring-amber-500/30',
     dot: 'bg-amber-500',
+    text: 'text-amber-700 dark:text-amber-300',
+    label: 'Pending',
   },
   danger: {
     bar: 'bg-rose-500',
-    bg: 'bg-rose-50 dark:bg-rose-950/40',
-    ring: 'ring-rose-400/30 dark:ring-rose-500/20',
+    bg: 'bg-white dark:bg-neutral-900',
+    ring: 'ring-rose-400/40 dark:ring-rose-500/30',
     dot: 'bg-rose-500',
+    text: 'text-rose-700 dark:text-rose-300',
+    label: 'Failed',
   },
   neutral: {
-    bar: 'bg-neutral-400 dark:bg-neutral-600',
-    bg: 'bg-neutral-50 dark:bg-neutral-900/60',
-    ring: 'ring-neutral-300/30 dark:ring-neutral-600/20',
+    bar: 'bg-neutral-300 dark:bg-neutral-600',
+    bg: 'bg-white dark:bg-neutral-900',
+    ring: 'ring-neutral-300/40 dark:ring-neutral-600/30',
     dot: 'bg-neutral-400 dark:bg-neutral-500',
+    text: 'text-neutral-500 dark:text-neutral-400',
+    label: 'Idle',
   },
 }
 
-const conditionColor = (condition?: string): string => {
-  if (!condition) return 'stroke-neutral-400 dark:stroke-neutral-500'
-  switch (condition) {
-    case 'success':
-      return 'stroke-emerald-400 dark:stroke-emerald-600'
-    case 'complete':
-      return 'stroke-sky-400 dark:stroke-sky-600'
-    case 'start':
-      return 'stroke-amber-400 dark:stroke-amber-600'
-    default:
-      return 'stroke-neutral-400 dark:stroke-neutral-500'
-  }
+const conditionStroke: Record<string, string> = {
+  success: '#10b981',
+  complete: '#0ea5e9',
+  start: '#f59e0b',
 }
+const strokeFor = (condition?: string) => (condition && conditionStroke[condition]) || '#94a3b8'
 
-const conditionTextColor = (condition?: string): string => {
-  if (!condition) return 'fill-neutral-500 dark:fill-neutral-400'
-  switch (condition) {
-    case 'success':
-      return 'fill-emerald-600 dark:fill-emerald-400'
-    case 'complete':
-      return 'fill-sky-600 dark:fill-sky-400'
-    case 'start':
-      return 'fill-amber-600 dark:fill-amber-400'
-    default:
-      return 'fill-neutral-500 dark:fill-neutral-400'
-  }
-}
+// Distinct, accessible palette for task groups (works in light + dark).
+const GROUP_PALETTE = [
+  '#6366f1', '#0ea5e9', '#14b8a6', '#f59e0b', '#ec4899',
+  '#8b5cf6', '#22c55e', '#ef4444', '#f97316', '#06b6d4',
+]
 
-const lifecycleIcon = (lifecycle: string): string => {
+const lifecycleGlyph = (lifecycle: string): string => {
   switch (lifecycle) {
     case 'sidecar':
       return '⛓'
     case 'batch':
-      return '⧖'
+      return '⧗'
     default:
-      return '●'
+      return '⟳'
   }
 }
 
-// ── Bezier path builder ─────────────────────────────────────────────
+const clamp = (value: number, lo: number, hi: number) => Math.min(Math.max(value, lo), hi)
+
+// ── Bezier path builder (left → right) ──────────────────────────────
 function edgePath(from: NodePos, to: NodePos): string {
   const x1 = from.x + NODE_W
   const y1 = from.y + NODE_H / 2
   const x2 = to.x
   const y2 = to.y + NODE_H / 2
-  const dx = Math.abs(x2 - x1)
-  const cp = Math.max(dx * 0.45, 40)
-  return `M ${x1} ${y1} C ${x1 + cp} ${y1}, ${x2 - cp} ${y2}, ${x2} ${y2}`
+  const dx = Math.max(Math.abs(x2 - x1) * 0.5, 48)
+  return `M ${x1} ${y1} C ${x1 + dx} ${y1}, ${x2 - dx} ${y2}, ${x2} ${y2}`
 }
 
-function edgeMidpoint(from: NodePos, to: NodePos): { x: number; y: number } {
-  const x1 = from.x + NODE_W
-  const y1 = from.y + NODE_H / 2
-  const x2 = to.x
-  const y2 = to.y + NODE_H / 2
-  return { x: (x1 + x2) / 2, y: (y1 + y2) / 2 }
+function edgeMid(from: NodePos, to: NodePos): { x: number; y: number } {
+  return {
+    x: (from.x + NODE_W + to.x) / 2,
+    y: (from.y + to.y) / 2 + NODE_H / 2,
+  }
 }
 
 // ── Component ───────────────────────────────────────────────────────
 export default function DagVisualization(props: DagVisualizationProps) {
   const taskMap = createMemo(() => new Map(props.tasks.map((t) => [t.name, t])))
 
-  // Compute node positions from topological layers
+  // Stable color per group.
+  const groupColors = createMemo(() => {
+    const groups = [...new Set(props.tasks.map((t) => t.group))]
+    const map = new Map<string, string>()
+    groups.forEach((g, i) => map.set(g, GROUP_PALETTE[i % GROUP_PALETTE.length]))
+    return map
+  })
+
+  // Node positions from topological layers, each column vertically centered.
   const nodePositions = createMemo((): Map<string, NodePos> => {
     const positions = new Map<string, NodePos>()
     const layers = props.layers
+    const maxLayerHeight = Math.max(1, ...layers.map((l) => l.length * (NODE_H + V_GAP) - V_GAP))
 
-    // Find the tallest column to center all columns vertically
-    const maxLayerHeight = Math.max(...layers.map((l) => l.length * (NODE_H + V_GAP) - V_GAP))
-
-    for (let col = 0; col < layers.length; col++) {
-      const layer = layers[col]
+    layers.forEach((layer, col) => {
       const layerHeight = layer.length * (NODE_H + V_GAP) - V_GAP
       const yOffset = (maxLayerHeight - layerHeight) / 2
-
-      for (let row = 0; row < layer.length; row++) {
-        const taskName = layer[row]
+      layer.forEach((taskName, row) => {
         const task = taskMap().get(taskName)
-        if (!task) continue
+        if (!task) return
         positions.set(taskName, {
           x: PAD_X + col * (NODE_W + H_GAP),
           y: PAD_Y + yOffset + row * (NODE_H + V_GAP),
           task,
           stage: col,
         })
-      }
-    }
+      })
+    })
     return positions
   })
 
-  // Build edge list
   const edges = createMemo((): Edge[] => {
     const result: Edge[] = []
     const positions = nodePositions()
@@ -159,173 +157,236 @@ export default function DagVisualization(props: DagVisualizationProps) {
       for (const dep of task.dependsOn) {
         const fromPos = positions.get(dep.task)
         if (!fromPos) continue
-        result.push({
-          from: dep.task,
-          to: task.name,
-          condition: dep.condition,
-          fromPos,
-          toPos,
-        })
+        result.push({ from: dep.task, to: task.name, condition: dep.condition, fromPos, toPos })
       }
     }
     return result
   })
 
-  // Canvas size
-  const canvasW = createMemo(() => {
-    const layers = props.layers
-    return PAD_X * 2 + layers.length * (NODE_W + H_GAP) - H_GAP
-  })
-
+  const canvasW = createMemo(() => PAD_X * 2 + props.layers.length * (NODE_W + H_GAP) - H_GAP)
   const canvasH = createMemo(() => {
     const maxInLayer = Math.max(1, ...props.layers.map((l) => l.length))
     return PAD_Y * 2 + maxInLayer * (NODE_H + V_GAP) - V_GAP
   })
 
-  // Check if there are any dependencies at all
   const hasDependencies = createMemo(() => props.tasks.some((t) => t.dependsOn.length > 0))
+
+  const statusFor = (taskName: string): { status: string; tone: Tone } => {
+    const runtime = props.taskRuntime.get(taskName)
+    const status = runtime?.statuses[0] ?? 'not allocated'
+    return { status, tone: taskStatusTone(status) as Tone }
+  }
+
+  // ── Pan & zoom state ──────────────────────────────────────────────
+  let viewport: HTMLDivElement | undefined
+  const [scale, setScale] = createSignal(1)
+  const [tx, setTx] = createSignal(0)
+  const [ty, setTy] = createSignal(0)
+  const [panning, setPanning] = createSignal(false)
+  const [hovered, setHovered] = createSignal<string | null>(null)
+
+  const fitToView = () => {
+    if (!viewport) return
+    const vw = viewport.clientWidth
+    const vh = viewport.clientHeight
+    const cw = canvasW()
+    const ch = canvasH()
+    if (cw <= 0 || ch <= 0) return
+    const s = clamp(Math.min(vw / cw, vh / ch) * 0.92, MIN_SCALE, 1.4)
+    setScale(s)
+    setTx((vw - cw * s) / 2)
+    setTy((vh - ch * s) / 2)
+  }
+
+  const zoomAround = (factor: number, cx: number, cy: number) => {
+    const next = clamp(scale() * factor, MIN_SCALE, MAX_SCALE)
+    const wx = (cx - tx()) / scale()
+    const wy = (cy - ty()) / scale()
+    setTx(cx - wx * next)
+    setTy(cy - wy * next)
+    setScale(next)
+  }
+
+  const zoomButton = (factor: number) => {
+    if (!viewport) return
+    zoomAround(factor, viewport.clientWidth / 2, viewport.clientHeight / 2)
+  }
+
+  const onWheel = (e: WheelEvent) => {
+    if (!viewport) return
+    e.preventDefault()
+    const rect = viewport.getBoundingClientRect()
+    zoomAround(Math.exp(-e.deltaY * 0.0015), e.clientX - rect.left, e.clientY - rect.top)
+  }
+
+  let panStart = { x: 0, y: 0, tx: 0, ty: 0 }
+  const onPanMove = (e: MouseEvent) => {
+    if (!panning()) return
+    setTx(panStart.tx + (e.clientX - panStart.x))
+    setTy(panStart.ty + (e.clientY - panStart.y))
+  }
+  const onPanEnd = () => setPanning(false)
+
+  const onBackgroundMouseDown = (e: MouseEvent) => {
+    // Only pan from empty canvas, not from a node (so links keep working).
+    if ((e.target as HTMLElement).closest('[data-dag-node]')) return
+    e.preventDefault()
+    panStart = { x: e.clientX, y: e.clientY, tx: tx(), ty: ty() }
+    setPanning(true)
+  }
+
+  onMount(() => {
+    window.addEventListener('mousemove', onPanMove)
+    window.addEventListener('mouseup', onPanEnd)
+    requestAnimationFrame(fitToView)
+    onCleanup(() => {
+      window.removeEventListener('mousemove', onPanMove)
+      window.removeEventListener('mouseup', onPanEnd)
+    })
+  })
+
+  // Highlight set: hovered node + its direct neighbors.
+  const neighbors = createMemo(() => {
+    const h = hovered()
+    if (!h) return null
+    const set = new Set<string>([h])
+    for (const e of edges()) {
+      if (e.from === h) set.add(e.to)
+      if (e.to === h) set.add(e.from)
+    }
+    return set
+  })
+
+  const edgeActive = (edge: Edge) => {
+    const h = hovered()
+    if (!h) return true
+    return edge.from === h || edge.to === h
+  }
 
   return (
     <div class="space-y-3">
-      {/* Legend */}
-      <div class="flex flex-wrap items-center gap-x-5 gap-y-1 text-xs text-neutral-500 dark:text-neutral-400">
-        <span class="font-semibold uppercase tracking-wide">Legend</span>
-        <span class="inline-flex items-center gap-1.5">
-          <span class="inline-block h-2.5 w-2.5 rounded-full bg-emerald-500" />
-          Running / Healthy
-        </span>
-        <span class="inline-flex items-center gap-1.5">
-          <span class="inline-block h-2.5 w-2.5 rounded-full bg-amber-500" />
-          Pending / Starting
-        </span>
-        <span class="inline-flex items-center gap-1.5">
-          <span class="inline-block h-2.5 w-2.5 rounded-full bg-rose-500" />
-          Failed / Error
-        </span>
-        <span class="inline-flex items-center gap-1.5">
-          <span class="inline-block h-2.5 w-2.5 rounded-full bg-neutral-400" />
-          Not allocated
-        </span>
-        <Show when={hasDependencies()}>
-          <span class="ml-2 border-l border-neutral-300 pl-3 dark:border-neutral-700">
-            Edge: dependency condition
-          </span>
-        </Show>
+      <style>{`
+        @keyframes dag-flow { to { stroke-dashoffset: -16; } }
+        .dag-edge-flow { stroke-dasharray: 5 7; animation: dag-flow 0.7s linear infinite; }
+      `}</style>
+
+      {/* Toolbar / legend */}
+      <div class="flex flex-wrap items-center justify-between gap-3">
+        <div class="flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-neutral-500 dark:text-neutral-400">
+          <span class="inline-flex items-center gap-1.5"><span class="h-2.5 w-2.5 rounded-full bg-emerald-500" /> Running</span>
+          <span class="inline-flex items-center gap-1.5"><span class="h-2.5 w-2.5 rounded-full bg-amber-500" /> Pending</span>
+          <span class="inline-flex items-center gap-1.5"><span class="h-2.5 w-2.5 rounded-full bg-rose-500" /> Failed</span>
+          <span class="inline-flex items-center gap-1.5"><span class="h-2.5 w-2.5 rounded-full bg-neutral-400" /> Idle</span>
+          <Show when={hasDependencies()}>
+            <span class="border-l border-neutral-300 pl-3 dark:border-neutral-700">drag to pan · scroll to zoom</span>
+          </Show>
+        </div>
+        <div class="flex items-center gap-1">
+          <button type="button" onClick={() => zoomButton(1 / 1.2)} class="h-7 w-7 rounded border border-neutral-300 text-sm font-semibold text-neutral-600 transition hover:bg-neutral-100 dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-800" aria-label="Zoom out">−</button>
+          <button type="button" onClick={() => zoomButton(1.2)} class="h-7 w-7 rounded border border-neutral-300 text-sm font-semibold text-neutral-600 transition hover:bg-neutral-100 dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-800" aria-label="Zoom in">+</button>
+          <button type="button" onClick={fitToView} class="h-7 rounded border border-neutral-300 px-2 text-[11px] font-semibold uppercase tracking-wide text-neutral-600 transition hover:bg-neutral-100 dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-800">Fit</button>
+        </div>
       </div>
 
       {/* DAG canvas */}
-      <div class="overflow-x-auto rounded-lg border border-neutral-200 bg-neutral-25 dark:border-neutral-800 dark:bg-neutral-950/50">
+      <div
+        ref={viewport}
+        onWheel={onWheel}
+        onMouseDown={onBackgroundMouseDown}
+        class="relative h-[560px] w-full overflow-hidden rounded-xl border border-neutral-200 bg-neutral-50 dark:border-neutral-800 dark:bg-neutral-950"
+        style={{
+          cursor: panning() ? 'grabbing' : 'grab',
+          'background-image':
+            'radial-gradient(circle, rgba(120,120,140,0.18) 1px, transparent 1px)',
+          'background-size': '22px 22px',
+        }}
+      >
+        {/* Transformed world */}
         <div
-          class="relative"
-          style={{ width: `${canvasW()}px`, height: `${canvasH()}px`, "min-width": '100%' }}
+          class="absolute left-0 top-0 origin-top-left"
+          style={{
+            transform: `translate(${tx()}px, ${ty()}px) scale(${scale()})`,
+            width: `${canvasW()}px`,
+            height: `${canvasH()}px`,
+          }}
         >
           {/* SVG edge layer */}
           <svg
-            class="absolute inset-0 pointer-events-none"
+            class="absolute inset-0 overflow-visible"
             width={canvasW()}
             height={canvasH()}
-            viewBox={`0 0 ${canvasW()} ${canvasH()}`}
           >
             <defs>
-              {/* Arrowhead markers for each condition */}
-              <marker id="dag-arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
-                <path d="M 0 0 L 8 3 L 0 6 Z" class="fill-neutral-400 dark:fill-neutral-500" />
-              </marker>
-              <marker id="dag-arrow-success" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
-                <path d="M 0 0 L 8 3 L 0 6 Z" class="fill-emerald-400 dark:fill-emerald-600" />
-              </marker>
-              <marker id="dag-arrow-complete" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
-                <path d="M 0 0 L 8 3 L 0 6 Z" class="fill-sky-400 dark:fill-sky-600" />
-              </marker>
-              <marker id="dag-arrow-start" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
-                <path d="M 0 0 L 8 3 L 0 6 Z" class="fill-amber-400 dark:fill-amber-600" />
-              </marker>
+              <For each={['success', 'complete', 'start', 'none']}>
+                {(key) => (
+                  <marker id={`dag-arrow-${key}`} markerWidth="9" markerHeight="7" refX="7.5" refY="3.5" orient="auto">
+                    <path d="M 0 0 L 9 3.5 L 0 7 Z" fill={strokeFor(key === 'none' ? undefined : key)} />
+                  </marker>
+                )}
+              </For>
             </defs>
 
-            {/* Stage background columns */}
+            {/* Stage column guides + labels */}
             <For each={props.layers}>
               {(_layer, colIdx) => {
-                const x = PAD_X + colIdx() * (NODE_W + H_GAP) - 12
+                const x = PAD_X + colIdx() * (NODE_W + H_GAP) - 16
                 return (
-                  <rect
-                    x={x}
-                    y={8}
-                    width={NODE_W + 24}
-                    height={canvasH() - 16}
-                    rx="8"
-                    class="fill-neutral-100/60 dark:fill-neutral-800/30"
-                  />
+                  <>
+                    <rect
+                      x={x}
+                      y={20}
+                      width={NODE_W + 32}
+                      height={canvasH() - 40}
+                      rx="12"
+                      fill="currentColor"
+                      class="text-neutral-200/30 dark:text-neutral-800/40"
+                    />
+                    <text
+                      x={x + (NODE_W + 32) / 2}
+                      y={40}
+                      text-anchor="middle"
+                      font-size="11"
+                      font-weight="700"
+                      letter-spacing="0.12em"
+                      fill="currentColor"
+                      class="text-neutral-400 dark:text-neutral-500"
+                    >
+                      STAGE {colIdx() + 1}
+                    </text>
+                  </>
                 )
               }}
             </For>
 
-            {/* Stage labels */}
-            <For each={props.layers}>
-              {(_layer, colIdx) => {
-                const x = PAD_X + colIdx() * (NODE_W + H_GAP) + NODE_W / 2
-                return (
-                  <text
-                    x={x}
-                    y={PAD_Y - 16}
-                    text-anchor="middle"
-                    class="fill-neutral-400 dark:fill-neutral-500"
-                    font-size="11"
-                    font-weight="600"
-                    letter-spacing="0.08em"
-                  >
-                    STAGE {colIdx() + 1}
-                  </text>
-                )
-              }}
-            </For>
-
-            {/* Edge paths */}
+            {/* Edges */}
             <For each={edges()}>
               {(edge) => {
                 const path = edgePath(edge.fromPos, edge.toPos)
-                const mid = edgeMidpoint(edge.fromPos, edge.toPos)
-                const markerId = edge.condition ? `dag-arrow-${edge.condition}` : 'dag-arrow'
+                const mid = edgeMid(edge.fromPos, edge.toPos)
+                const color = strokeFor(edge.condition)
+                const markerKey = edge.condition ?? 'none'
+                const active = () => edgeActive(edge)
+                // Animate flow into nodes that are currently in progress.
+                const flowing = () => statusFor(edge.to).tone === 'warning'
                 return (
-                  <g>
-                    {/* Shadow/glow for depth */}
+                  <g style={{ opacity: active() ? 1 : 0.12, transition: 'opacity 0.15s' }}>
+                    <path d={path} fill="none" stroke-width="5" class="stroke-neutral-200/70 dark:stroke-neutral-800/70" stroke-linecap="round" />
                     <path
                       d={path}
                       fill="none"
-                      stroke-width="4"
-                      class="stroke-neutral-200/60 dark:stroke-neutral-700/40"
+                      stroke={color}
+                      stroke-width={active() && hovered() ? 2.75 : 2}
                       stroke-linecap="round"
+                      marker-end={`url(#dag-arrow-${markerKey})`}
+                      classList={{ 'dag-edge-flow': flowing() }}
                     />
-                    {/* Main edge */}
-                    <path
-                      d={path}
-                      fill="none"
-                      stroke-width="2"
-                      class={conditionColor(edge.condition)}
-                      stroke-linecap="round"
-                      marker-end={`url(#${markerId})`}
-                    />
-                    {/* Condition label */}
                     <Show when={edge.condition}>
-                      <rect
-                        x={mid.x - 26}
-                        y={mid.y - EDGE_LABEL_OFFSET - 8}
-                        width="52"
-                        height="16"
-                        rx="4"
-                        class="fill-white dark:fill-neutral-900"
-                        opacity="0.9"
-                      />
-                      <text
-                        x={mid.x}
-                        y={mid.y - EDGE_LABEL_OFFSET}
-                        text-anchor="middle"
-                        font-size="9"
-                        font-weight="600"
-                        letter-spacing="0.05em"
-                        class={conditionTextColor(edge.condition)}
-                      >
-                        {(edge.condition ?? '').toUpperCase()}
-                      </text>
+                      <g>
+                        <rect x={mid.x - 27} y={mid.y - 9} width="54" height="17" rx="8" fill={color} opacity="0.14" />
+                        <text x={mid.x} y={mid.y + 3} text-anchor="middle" font-size="9" font-weight="700" letter-spacing="0.06em" fill={color}>
+                          {(edge.condition ?? '').toUpperCase()}
+                        </text>
+                      </g>
                     </Show>
                   </g>
                 )
@@ -333,45 +394,65 @@ export default function DagVisualization(props: DagVisualizationProps) {
             </For>
           </svg>
 
-          {/* HTML node layer */}
+          {/* Node layer */}
           <For each={[...nodePositions().entries()]}>
             {([taskName, pos]) => {
-              const runtime = () => props.taskRuntime.get(taskName)
-              const primaryStatus = () => runtime()?.statuses[0] ?? 'not allocated'
-              const tone = () => taskStatusTone(primaryStatus())
-              const accent = () => toneToAccent[tone()] ?? toneToAccent.neutral
-              const isInProgress = () => tone() === 'warning'
+              const info = () => statusFor(taskName)
+              const tone = () => info().tone
+              const style = () => toneStyle[tone()]
+              const inProgress = () => tone() === 'warning'
+              const dimmed = () => {
+                const set = neighbors()
+                return set ? !set.has(taskName) : false
+              }
+              const groupColor = () => groupColors().get(pos.task.group) ?? '#64748b'
 
               return (
                 <A
                   href={`/jobs/${encodeURIComponent(props.jobName)}/tasks/${encodeURIComponent(taskName)}`}
-                  class={`absolute flex overflow-hidden rounded-lg border border-neutral-200 shadow-sm ring-1 transition-all duration-150 hover:shadow-md hover:scale-[1.03] hover:z-10 dark:border-neutral-700 ${accent().ring} ${accent().bg}`}
+                  data-dag-node
+                  onMouseEnter={() => setHovered(taskName)}
+                  onMouseLeave={() => setHovered(null)}
+                  draggable={false}
+                  class={`group absolute flex flex-col overflow-hidden rounded-xl border border-neutral-200 shadow-sm ring-1 transition-all duration-150 hover:-translate-y-0.5 hover:shadow-lg dark:border-neutral-700 ${style().ring} ${style().bg}`}
                   style={{
                     left: `${pos.x}px`,
                     top: `${pos.y}px`,
                     width: `${NODE_W}px`,
                     height: `${NODE_H}px`,
+                    opacity: dimmed() ? 0.35 : 1,
+                    'z-index': hovered() === taskName ? 20 : 1,
                   }}
                 >
-                  {/* Left accent bar */}
-                  <div class={`w-1.5 shrink-0 ${accent().bar} ${isInProgress() ? 'animate-pulse' : ''}`} />
+                  {/* Top accent strip in group color */}
+                  <div class="h-1 w-full shrink-0" style={{ 'background-color': groupColor() }} />
 
-                  {/* Content */}
-                  <div class="flex flex-1 flex-col justify-center gap-1 px-3 py-2 min-w-0">
-                    <div class="flex items-center justify-between gap-2">
-                      <span class="truncate text-sm font-semibold text-neutral-900 dark:text-neutral-100">
-                        {pos.task.name}
-                      </span>
-                      <DetailBadge tone={tone()}>{primaryStatus()}</DetailBadge>
-                    </div>
-                    <div class="flex items-center gap-2 text-[11px] text-neutral-500 dark:text-neutral-400">
-                      <span class="truncate">{pos.task.kind}</span>
-                      <span class="text-neutral-300 dark:text-neutral-600">|</span>
-                      <span class="inline-flex items-center gap-0.5">
-                        {lifecycleIcon(pos.task.lifecycle)} {pos.task.lifecycle}
-                      </span>
-                      <span class="text-neutral-300 dark:text-neutral-600">|</span>
-                      <span class="truncate">{pos.task.group}</span>
+                  <div class="flex flex-1 items-stretch">
+                    {/* Status bar */}
+                    <div class={`w-1.5 shrink-0 ${style().bar} ${inProgress() ? 'animate-pulse' : ''}`} />
+
+                    <div class="flex flex-1 flex-col justify-center gap-1 px-3 py-2 min-w-0">
+                      <div class="flex items-center gap-2 min-w-0">
+                        <span class={`h-2 w-2 shrink-0 rounded-full ${style().dot} ${inProgress() ? 'animate-pulse' : ''}`} />
+                        <span class="truncate text-[13px] font-semibold text-neutral-900 dark:text-neutral-100">{pos.task.name}</span>
+                      </div>
+                      <div class="flex items-center gap-1.5 text-[10px] text-neutral-500 dark:text-neutral-400 min-w-0">
+                        <span class="shrink-0 rounded bg-neutral-100 px-1.5 py-0.5 font-medium dark:bg-neutral-800">{pos.task.kind}</span>
+                        <span class="inline-flex shrink-0 items-center gap-0.5" title={`${pos.task.lifecycle} lifecycle`}>
+                          {lifecycleGlyph(pos.task.lifecycle)} {pos.task.lifecycle}
+                        </span>
+                        <span
+                          class="ml-auto inline-flex shrink-0 items-center gap-1 truncate font-medium"
+                          style={{ color: groupColor() }}
+                          title={`group: ${pos.task.group}`}
+                        >
+                          <span class="h-1.5 w-1.5 rounded-full" style={{ 'background-color': groupColor() }} />
+                          {pos.task.group}
+                        </span>
+                      </div>
+                      <div class={`text-[10px] font-semibold uppercase tracking-wide ${style().text}`}>
+                        {info().status}
+                      </div>
                     </div>
                   </div>
                 </A>
@@ -379,35 +460,27 @@ export default function DagVisualization(props: DagVisualizationProps) {
             }}
           </For>
         </div>
-      </div>
 
-      {/* Dependency list (compact, below graph) */}
-      <Show when={hasDependencies()}>
-        <div class="flex flex-wrap gap-2 text-xs">
-          <For each={edges()}>
-            {(edge) => {
-              const condCls = () => {
-                switch (edge.condition) {
-                  case 'success': return 'border-emerald-300 text-emerald-700 dark:border-emerald-700 dark:text-emerald-400'
-                  case 'complete': return 'border-sky-300 text-sky-700 dark:border-sky-700 dark:text-sky-400'
-                  case 'start': return 'border-amber-300 text-amber-700 dark:border-amber-700 dark:text-amber-400'
-                  default: return 'border-neutral-300 text-neutral-600 dark:border-neutral-600 dark:text-neutral-400'
-                }
-              }
-              return (
-                <span class={`inline-flex items-center gap-1 rounded-full border px-2.5 py-0.5 ${condCls()}`}>
-                  <span class="font-semibold">{edge.from}</span>
-                  <span class="text-neutral-400 dark:text-neutral-500">→</span>
-                  <span class="font-semibold">{edge.to}</span>
-                  <Show when={edge.condition}>
-                    <span class="opacity-70">({edge.condition})</span>
-                  </Show>
+        {/* Group legend overlay */}
+        <Show when={groupColors().size > 1}>
+          <div class="pointer-events-none absolute bottom-3 left-3 flex max-w-[70%] flex-wrap gap-x-3 gap-y-1 rounded-lg border border-neutral-200/80 bg-white/85 px-3 py-2 text-[10px] shadow-sm backdrop-blur dark:border-neutral-700/80 dark:bg-neutral-900/85">
+            <span class="font-semibold uppercase tracking-wide text-neutral-400">Groups</span>
+            <For each={[...groupColors().entries()]}>
+              {([group, color]) => (
+                <span class="inline-flex items-center gap-1 text-neutral-600 dark:text-neutral-300">
+                  <span class="h-2 w-2 rounded-full" style={{ 'background-color': color }} />
+                  {group}
                 </span>
-              )
-            }}
-          </For>
+              )}
+            </For>
+          </div>
+        </Show>
+
+        {/* Zoom indicator */}
+        <div class="pointer-events-none absolute bottom-3 right-3 rounded-md border border-neutral-200/80 bg-white/85 px-2 py-1 text-[10px] font-semibold tabular-nums text-neutral-500 shadow-sm backdrop-blur dark:border-neutral-700/80 dark:bg-neutral-900/85 dark:text-neutral-400">
+          {Math.round(scale() * 100)}%
         </div>
-      </Show>
+      </div>
     </div>
   )
 }
