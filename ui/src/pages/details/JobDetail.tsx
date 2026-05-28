@@ -1,9 +1,10 @@
 import { A, useNavigate, useParams } from '@solidjs/router'
-import { For, Show, createMemo, createResource, createSignal } from 'solid-js'
+import { For, Show, createMemo, createResource, createSignal, onCleanup, onMount } from 'solid-js'
 import { DetailBadge, DetailSection, detailDangerButtonClass, detailTabButtonClass } from '../../components/DetailPrimitives'
+import DagVisualization from '../../components/DagVisualization'
 import { managerClient } from '../../grpcClient'
 import { formatDate } from '../../utils/format'
-import { buildTaskRuntimeByName, extractJobSpecData, taskStatusTone, topoSortTaskNames } from '../../utils/jobspec'
+import { buildTaskRuntimeByName, buildTaskRuntimeFromStatuses, extractJobSpecData, taskStatusTone, topoSortTaskNames, type TaskRuntimeSummary } from '../../utils/jobspec'
 
 export default function JobDetail() {
   const params = useParams()
@@ -39,6 +40,66 @@ export default function JobDetail() {
       taskSpec: specData,
       taskRuntime: buildTaskRuntimeByName(rolloutStatus?.groups ?? []),
     }
+  })
+
+  // Live per-task status, polled from the manager state store. The ledger only
+  // exposes task_config_id (not names) and initial deploys have no rollout, so
+  // we join task_config -> allocation -> task_status to get authoritative
+  // running/success/failed status per task. Falls back gracefully on error.
+  const [statusTick, setStatusTick] = createSignal(0)
+  onMount(() => {
+    const timer = setInterval(() => setStatusTick((value) => value + 1), 3000)
+    onCleanup(() => clearInterval(timer))
+  })
+
+  const [liveRuntime] = createResource(
+    () => [jobName(), statusTick()] as const,
+    async ([name]) => {
+      try {
+        const escaped = name.replace(/'/g, "''")
+        const sql =
+          'SELECT tc.name AS task_name, COALESCE(ts.status, a.status) AS status ' +
+          'FROM allocation a JOIN task_config tc ON tc.id = a.task_config_id ' +
+          'LEFT JOIN task_status ts ON ts.task_config_id = a.task_config_id ' +
+          `WHERE tc.job_id = '${escaped}'`
+        const response = await managerClient.queryStateStore({ sql })
+        const statusByName = new Map<string, string>()
+        for (const row of response.rows) {
+          try {
+            const parsed = JSON.parse(row.json) as { task_name?: string; status?: string }
+            if (parsed.task_name) statusByName.set(parsed.task_name, parsed.status ?? '')
+          } catch {
+            // ignore malformed rows
+          }
+        }
+        return buildTaskRuntimeFromStatuses(statusByName)
+      } catch {
+        return new Map<string, TaskRuntimeSummary>()
+      }
+    },
+  )
+
+  // Prefer live state-store status; fall back to rollout-derived runtime.
+  const taskRuntime = createMemo(() => {
+    const live = liveRuntime()
+    if (live && live.size > 0) return live
+    return jobData()?.taskRuntime ?? new Map<string, TaskRuntimeSummary>()
+  })
+
+  // True until the first status fetch resolves and there is no fallback data,
+  // so tasks show "loading…" instead of a misleading "not allocated" on first paint.
+  const statusLoading = createMemo(
+    () => liveRuntime() === undefined && (jobData()?.taskRuntime?.size ?? 0) === 0,
+  )
+
+  // The DAG is only meaningful when tasks actually depend on each other.
+  // Single-task and independent-task jobs render as the "Tasks by group" cards
+  // instead of a big empty canvas with disconnected nodes.
+  const dagHasEdges = createMemo(() => {
+    const tasks = jobData()?.taskSpec?.tasks ?? []
+    if (tasks.length < 2) return false
+    const names = new Set(tasks.map((task) => task.name))
+    return tasks.some((task) => task.dependsOn.some((dependency) => names.has(dependency.task)))
   })
 
   const destroyJob = async () => {
@@ -109,8 +170,9 @@ export default function JobDetail() {
                         <div class="mt-3 grid gap-2 md:grid-cols-2 xl:grid-cols-3">
                           <For each={jobData()!.taskSpec!.tasks.filter((task) => task.group === groupName)}>
                             {(task) => {
-                              const runtime = jobData()!.taskRuntime.get(task.name)
-                              const primaryStatus = runtime?.statuses[0] ?? 'not allocated'
+                              const runtime = () => taskRuntime().get(task.name)
+                              const primaryStatus = () =>
+                                runtime()?.statuses[0] ?? (statusLoading() ? 'loading…' : 'not allocated')
                               return (
                                 <A
                                   href={`/jobs/${encodeURIComponent(jobName())}/tasks/${encodeURIComponent(task.name)}`}
@@ -121,7 +183,9 @@ export default function JobDetail() {
                                       <p class="text-sm font-semibold">{task.name}</p>
                                       <p class="text-xs text-neutral-500">{task.kind} · lifecycle {task.lifecycle}</p>
                                     </div>
-                                    <DetailBadge tone={taskStatusTone(primaryStatus)}>{primaryStatus}</DetailBadge>
+                                    <DetailBadge tone={taskStatusTone(primaryStatus())}>
+                                      <span class={statusLoading() && !runtime() ? 'animate-pulse' : ''}>{primaryStatus()}</span>
+                                    </DetailBadge>
                                   </div>
                                   <Show when={task.lifecycle === 'sidecar'}>
                                     <p class="mt-2 text-xs text-indigo-600 dark:text-indigo-300">
@@ -145,59 +209,18 @@ export default function JobDetail() {
               </Show>
             </DetailSection>
 
-            <DetailSection>
-              <h3 class="mb-2 font-semibold">Task DAG</h3>
-              <Show
-                when={jobData()!.taskSpec?.tasks.length}
-                fallback={<p class="text-sm text-neutral-500">DAG unavailable because the job spec could not be parsed.</p>}
-              >
-                <div class="overflow-x-auto">
-                  <div class="inline-flex min-w-full gap-3 pb-2">
-                    <For each={topoSortTaskNames(jobData()!.taskSpec!.tasks)}>
-                      {(layer, layerIndex) => (
-                        <div class="min-w-64 flex-1 rounded border border-neutral-200 bg-neutral-50 p-3 dark:border-neutral-700 dark:bg-neutral-900">
-                          <p class="mb-2 text-xs font-semibold uppercase tracking-wide text-neutral-500">Stage {layerIndex() + 1}</p>
-                          <div class="space-y-2">
-                            <For each={layer}>
-                              {(taskName) => {
-                                const task = jobData()!.taskSpec!.tasks.find((item) => item.name === taskName)
-                                if (!task) return null
-                                const runtime = jobData()!.taskRuntime.get(task.name)
-                                const status = runtime?.statuses[0] ?? 'not allocated'
-                                return (
-                                  <A href={`/jobs/${encodeURIComponent(jobName())}/tasks/${encodeURIComponent(task.name)}`} class="block rounded border border-neutral-200 bg-white p-2 text-sm hover:border-neutral-400 dark:border-neutral-700 dark:bg-neutral-950">
-                                    <div class="flex items-center justify-between gap-2">
-                                      <span class="font-semibold">{task.name}</span>
-                                      <DetailBadge tone={taskStatusTone(status)}>{status}</DetailBadge>
-                                    </div>
-                                    <p class="mt-1 text-xs text-neutral-500">{task.group} · {task.lifecycle}</p>
-                                    <Show when={task.lifecycle === 'sidecar'}>
-                                      <p class="mt-1 text-xs text-indigo-600 dark:text-indigo-300">Sidecar task</p>
-                                    </Show>
-                                  </A>
-                                )
-                              }}
-                            </For>
-                          </div>
-                        </div>
-                      )}
-                    </For>
-                  </div>
-                </div>
-                <div class="mt-3 rounded border border-dashed border-neutral-300 p-3 text-xs text-neutral-600 dark:border-neutral-700 dark:text-neutral-300">
-                  <p class="font-semibold">Dependency edges</p>
-                  <ul class="mt-2 space-y-1">
-                    <For each={jobData()!.taskSpec!.tasks.filter((task) => task.dependsOn.length > 0)}>
-                      {(task) => (
-                        <li>
-                          {task.dependsOn.map((dependency) => `${dependency.task} → ${task.name}${dependency.condition ? ` (${dependency.condition})` : ''}`).join(', ')}
-                        </li>
-                      )}
-                    </For>
-                  </ul>
-                </div>
-              </Show>
-            </DetailSection>
+            <Show when={dagHasEdges()}>
+              <DetailSection>
+                <h3 class="mb-2 font-semibold">Task DAG</h3>
+                <DagVisualization
+                  tasks={jobData()!.taskSpec!.tasks}
+                  layers={topoSortTaskNames(jobData()!.taskSpec!.tasks)}
+                  taskRuntime={taskRuntime()}
+                  statusLoading={statusLoading()}
+                  jobName={jobName()}
+                />
+              </DetailSection>
+            </Show>
 
             <DetailSection>
               <h3 class="mb-2 font-semibold">Allocations</h3>
