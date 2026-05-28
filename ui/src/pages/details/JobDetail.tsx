@@ -86,6 +86,12 @@ export default function JobDetail() {
     return jobData()?.taskRuntime ?? new Map<string, TaskRuntimeSummary>()
   })
 
+  // True until the first status fetch resolves and there is no fallback data,
+  // so tasks show "loading…" instead of a misleading "not allocated" on first paint.
+  const statusLoading = createMemo(
+    () => liveRuntime() === undefined && (jobData()?.taskRuntime?.size ?? 0) === 0,
+  )
+
   // The DAG is only meaningful when tasks actually depend on each other.
   // Single-task and independent-task jobs render as the "Tasks by group" cards
   // instead of a big empty canvas with disconnected nodes.
@@ -164,8 +170,9 @@ export default function JobDetail() {
                         <div class="mt-3 grid gap-2 md:grid-cols-2 xl:grid-cols-3">
                           <For each={jobData()!.taskSpec!.tasks.filter((task) => task.group === groupName)}>
                             {(task) => {
-                              const runtime = taskRuntime().get(task.name)
-                              const primaryStatus = runtime?.statuses[0] ?? 'not allocated'
+                              const runtime = () => taskRuntime().get(task.name)
+                              const primaryStatus = () =>
+                                runtime()?.statuses[0] ?? (statusLoading() ? 'loading…' : 'not allocated')
                               return (
                                 <A
                                   href={`/jobs/${encodeURIComponent(jobName())}/tasks/${encodeURIComponent(task.name)}`}
@@ -176,7 +183,9 @@ export default function JobDetail() {
                                       <p class="text-sm font-semibold">{task.name}</p>
                                       <p class="text-xs text-neutral-500">{task.kind} · lifecycle {task.lifecycle}</p>
                                     </div>
-                                    <DetailBadge tone={taskStatusTone(primaryStatus)}>{primaryStatus}</DetailBadge>
+                                    <DetailBadge tone={taskStatusTone(primaryStatus())}>
+                                      <span class={statusLoading() && !runtime() ? 'animate-pulse' : ''}>{primaryStatus()}</span>
+                                    </DetailBadge>
                                   </div>
                                   <Show when={task.lifecycle === 'sidecar'}>
                                     <p class="mt-2 text-xs text-indigo-600 dark:text-indigo-300">
@@ -207,6 +216,7 @@ export default function JobDetail() {
                   tasks={jobData()!.taskSpec!.tasks}
                   layers={topoSortTaskNames(jobData()!.taskSpec!.tasks)}
                   taskRuntime={taskRuntime()}
+                  statusLoading={statusLoading()}
                   jobName={jobName()}
                 />
               </DetailSection>

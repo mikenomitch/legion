@@ -32,6 +32,7 @@ type DagVisualizationProps = {
   tasks: JobTask[]
   layers: string[][]
   taskRuntime: Map<string, TaskRuntimeSummary>
+  statusLoading?: boolean
   jobName: string
 }
 
@@ -190,7 +191,8 @@ export default function DagVisualization(props: DagVisualizationProps) {
 
   const statusFor = (taskName: string): { status: string; tone: Tone } => {
     const runtime = props.taskRuntime.get(taskName)
-    const status = runtime?.statuses[0] ?? 'not allocated'
+    const fallback = props.statusLoading ? 'loading…' : 'not allocated'
+    const status = runtime?.statuses[0] ?? fallback
     return { status, tone: taskStatusTone(status) as Tone }
   }
 
