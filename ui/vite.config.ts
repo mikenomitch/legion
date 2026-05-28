@@ -14,6 +14,9 @@ export default defineConfig({
   plugins: [solid()],
   server: {
     host: true,
+    // Allow access through forwarded ports / tunnel domains (Vite otherwise
+    // rejects non-localhost Host headers with "Blocked request").
+    allowedHosts: true,
     proxy: {
       // All Manager RPCs are POSTed to /legion.Manager/<Method>.
       '/legion.Manager': {
