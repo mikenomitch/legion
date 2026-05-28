@@ -129,6 +129,24 @@ export const buildTaskRuntimeByName = (
   return runtime
 }
 
+// Builds a runtime summary map from a plain task-name -> status map. Used to
+// drive live node coloring in the DAG from the manager state store, which is
+// authoritative even for jobs that were deployed without a rollout.
+export const buildTaskRuntimeFromStatuses = (
+  statusByName: ReadonlyMap<string, string>,
+): Map<string, TaskRuntimeSummary> => {
+  const runtime = new Map<string, TaskRuntimeSummary>()
+  for (const [name, status] of statusByName) {
+    runtime.set(name, {
+      statuses: status ? [status] : [],
+      health: [],
+      healthy: undefined,
+      allocations: [],
+    })
+  }
+  return runtime
+}
+
 export const topoSortTaskNames = (tasks: readonly JobTask[]): string[][] => {
   const indegree = new Map<string, number>()
   const dependents = new Map<string, string[]>()

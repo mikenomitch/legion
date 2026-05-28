@@ -1,10 +1,10 @@
 import { A, useNavigate, useParams } from '@solidjs/router'
-import { For, Show, createMemo, createResource, createSignal } from 'solid-js'
+import { For, Show, createMemo, createResource, createSignal, onCleanup, onMount } from 'solid-js'
 import { DetailBadge, DetailSection, detailDangerButtonClass, detailTabButtonClass } from '../../components/DetailPrimitives'
 import DagVisualization from '../../components/DagVisualization'
 import { managerClient } from '../../grpcClient'
 import { formatDate } from '../../utils/format'
-import { buildTaskRuntimeByName, extractJobSpecData, taskStatusTone, topoSortTaskNames } from '../../utils/jobspec'
+import { buildTaskRuntimeByName, buildTaskRuntimeFromStatuses, extractJobSpecData, taskStatusTone, topoSortTaskNames, type TaskRuntimeSummary } from '../../utils/jobspec'
 
 export default function JobDetail() {
   const params = useParams()
@@ -40,6 +40,50 @@ export default function JobDetail() {
       taskSpec: specData,
       taskRuntime: buildTaskRuntimeByName(rolloutStatus?.groups ?? []),
     }
+  })
+
+  // Live per-task status, polled from the manager state store. The ledger only
+  // exposes task_config_id (not names) and initial deploys have no rollout, so
+  // we join task_config -> allocation -> task_status to get authoritative
+  // running/success/failed status per task. Falls back gracefully on error.
+  const [statusTick, setStatusTick] = createSignal(0)
+  onMount(() => {
+    const timer = setInterval(() => setStatusTick((value) => value + 1), 3000)
+    onCleanup(() => clearInterval(timer))
+  })
+
+  const [liveRuntime] = createResource(
+    () => [jobName(), statusTick()] as const,
+    async ([name]) => {
+      try {
+        const escaped = name.replace(/'/g, "''")
+        const sql =
+          'SELECT tc.name AS task_name, COALESCE(ts.status, a.status) AS status ' +
+          'FROM allocation a JOIN task_config tc ON tc.id = a.task_config_id ' +
+          'LEFT JOIN task_status ts ON ts.task_config_id = a.task_config_id ' +
+          `WHERE tc.job_id = '${escaped}'`
+        const response = await managerClient.queryStateStore({ sql })
+        const statusByName = new Map<string, string>()
+        for (const row of response.rows) {
+          try {
+            const parsed = JSON.parse(row.json) as { task_name?: string; status?: string }
+            if (parsed.task_name) statusByName.set(parsed.task_name, parsed.status ?? '')
+          } catch {
+            // ignore malformed rows
+          }
+        }
+        return buildTaskRuntimeFromStatuses(statusByName)
+      } catch {
+        return new Map<string, TaskRuntimeSummary>()
+      }
+    },
+  )
+
+  // Prefer live state-store status; fall back to rollout-derived runtime.
+  const taskRuntime = createMemo(() => {
+    const live = liveRuntime()
+    if (live && live.size > 0) return live
+    return jobData()?.taskRuntime ?? new Map<string, TaskRuntimeSummary>()
   })
 
   const destroyJob = async () => {
@@ -110,7 +154,7 @@ export default function JobDetail() {
                         <div class="mt-3 grid gap-2 md:grid-cols-2 xl:grid-cols-3">
                           <For each={jobData()!.taskSpec!.tasks.filter((task) => task.group === groupName)}>
                             {(task) => {
-                              const runtime = jobData()!.taskRuntime.get(task.name)
+                              const runtime = taskRuntime().get(task.name)
                               const primaryStatus = runtime?.statuses[0] ?? 'not allocated'
                               return (
                                 <A
@@ -155,7 +199,7 @@ export default function JobDetail() {
                 <DagVisualization
                   tasks={jobData()!.taskSpec!.tasks}
                   layers={topoSortTaskNames(jobData()!.taskSpec!.tasks)}
-                  taskRuntime={jobData()!.taskRuntime}
+                  taskRuntime={taskRuntime()}
                   jobName={jobName()}
                 />
               </Show>
