@@ -83,7 +83,7 @@
   - [x] When I update one of these, the task restarts (if configured to do so)
   - [x] I can use one of these in the defintion
 
-- [ ] Service Discovery
+- [ ] Service Discovery ([plan](plans/service-discovery-plan.md))
   - [ ] I can declare a named service on a task
   - [ ] I can declare health checks on that task
   - [ ] Can query address and port from other services
