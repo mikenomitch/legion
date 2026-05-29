@@ -1,6 +1,6 @@
 use legion::cmd;
 use legion::prelude::*;
-use legion::tracing_util::init_tracing;
+use legion::tracing_util::init_tracing_with_options;
 
 fn cli() -> Command {
     Command::new("legion")
@@ -11,6 +11,7 @@ fn cli() -> Command {
         .subcommand_required(true)
         .arg_required_else_help(true)
         .subcommand(cmd::capabilities::config())
+        .subcommand(cmd::mcp::config())
         .subcommand(cmd::docs::config())
         .subcommand(cmd::job::config())
         .subcommand(cmd::node::config())
@@ -34,10 +35,14 @@ async fn main() -> R<()> {
                 Some(("manager", args)) | Some(("worker", args)) if args.get_flag("o11y")
             )
     );
-    init_tracing(enable_o11y)?;
+    // The MCP server speaks JSON-RPC on stdout, so console logs must go to
+    // stderr to avoid corrupting the protocol stream.
+    let mcp_mode = matches!(matches.subcommand(), Some(("mcp", _)));
+    init_tracing_with_options(enable_o11y, mcp_mode)?;
 
     match matches.subcommand() {
         Some(("capabilities", sub_matches)) => cmd::capabilities::handle(sub_matches).await?,
+        Some(("mcp", sub_matches)) => cmd::mcp::handle(sub_matches).await?,
         Some(("docs", sub_matches)) => cmd::docs::handle(sub_matches).await?,
         Some(("start", sub_matches)) => cmd::start::handle(sub_matches).await?,
         Some(("job", sub_matches)) => cmd::job::handle(sub_matches).await?,

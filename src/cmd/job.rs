@@ -481,7 +481,7 @@ async fn job_schema(arg_matches: &ArgMatches) -> R<()> {
 
 /// Assemble the jobspec JSON Schema: a documented top-level envelope plus the
 /// live, per-kind task config schemas derived from the built-in plugins.
-fn build_jobspec_schema() -> Value {
+pub(crate) fn build_jobspec_schema() -> Value {
     let mut task_kinds = serde_json::Map::new();
     for plugin in builtin_task_plugin_schemas() {
         task_kinds.insert(plugin.name, plugin.schema);
