@@ -8,6 +8,11 @@
 > [Workload Identity via OIDC](workload-identity-oidc-plan.md). Read those for the
 > primitives this plan builds *on top of*; this doc owns *how a workload names,
 > finds, reaches, and authorizes another workload*.
+>
+> **Companions:** the [config cookbook, observability & mesh extensions](service-discovery-mesh-and-config.md)
+> show how to configure all of this and how the mesh/observability layers attach; the
+> [self-critique & revisions](service-discovery-critique.md) red-teams this plan against
+> real-world failure modes. Revisions marked **[R]** below were folded in from that review.
 
 ## Problem Statement
 
@@ -76,6 +81,19 @@ Cilium, SmartStack, Eureka, and fly.io. Each tenet names the pain it avoids.
    address and forwards a packet differs per platform/network. That mechanism is a
    **datapath plugin** (our modern CNI). This is the single design decision that makes
    macOS support tractable (see §8).
+8. **[R] AP read, CP write — discovery survives a manager outage.** The catalog *write*
+   path is CP (it projects Raft-committed scheduler truth — we *want* consistency when
+   recording an endpoint). The discovery *read* path is **AP**: every node's resolver and
+   forwarder serve their **last-known-good** endpoint set and keep resolving through a
+   manager/Raft partition. New registrations may stall during a partition; existing
+   discovery must not. This is the Eureka self-preservation / Fly local-DB / Tailscale
+   pushed-map lesson — the whole survey agrees discovery wants A over C. Endpoint
+   presence is further tied to a **worker heartbeat lease** (ZK-ephemeral / etcd-lease
+   model): a dead worker's endpoints auto-expire with its lease, so there is no zombie
+   reaper and no stale entry. And failure detection is **self-preserving**: when a large
+   fraction of a node's or zone's endpoints fail health *at once*, suspect the
+   network/observer, not mass death — hold last-good and alarm rather than mass-evict
+   (the Lifeguard "a degraded detector distrusts its own judgment" lesson).
 
 ---
 
@@ -207,6 +225,12 @@ service: {
 - **Only-healthy:** an endpoint enters the catalog only after `boot`+`readiness` checks
   pass and leaves it on the first `health` failure (the existing `on_unhealthy` policy
   still governs restart/reschedule independently).
+- **[R] Deregister-before-stop (graceful drain).** On rollout/drain/stop the endpoint is
+  **withdrawn first**, the resolver/forwarder is given a drain window to converge, and
+  *only then* is the task sent SIGTERM. This closes the K8s "connection-refused during
+  rolling update" race (endpoint-withdrawal vs. termination ordering). Because our
+  forwarder is **per-node, not per-task**, it does not die with the app — structurally
+  dodging the mesh "proxy died first" bug.
 - **Service health aggregate:** a service exposes `healthy/total` endpoint counts for
   the UI and for L7 routing decisions.
 
@@ -238,18 +262,37 @@ configurable to dodge a host `systemd-resolved` on `127.0.0.53` (Open Question 1
 | `_<port>._tcp.<service>.svc.legion` | SRV records (port + target), for non-default ports |
 | `<slot>.<service>.svc.legion` | a **specific instance** (slot-mode instance identity) — headless/StatefulSet analog |
 | `vip.<service>.svc.legion` | the service's stable virtual address (L4 forwarder entry, §6) |
+| `meta.<service>.svc.legion` (TXT) | **[R]** `service.meta` key/values — fly's `regions.`/DNS-SD TXT idiom, a metadata API over plain DNS |
+| `_services.legion` (PTR) | **[R]** enumeration of all service types — the DNS-SD (RFC 6763) PTR convention |
 
 We ship `resolv.conf` with `ndots:1` and a single `search svc.legion`, so
 `db.svc.legion` (one trailing dot of intent) resolves in one query and external names
 (`api.stripe.com`) never pay failed search-domain probes — the explicit fix for K8s's
-worst-known DNS pathology.
+worst-known DNS pathology. On macOS, where `/etc/resolv.conf` is not authoritative, the
+worker installs a **scoped resolver at `/etc/resolver/legion`** instead. **[R]**
+
+> ★ [R] Two DNS hazards the K8s ecosystem learned the hard way, designed out here:
+> - **No UDP-over-NAT (the conntrack 5s race).** The resolver is reachable from a task
+>   **without host masquerade** (bound on the bridge gateway / inside the task netns), so
+>   task→resolver queries never traverse SNAT/DNAT and never hit the netfilter insert
+>   race that gives K8s its infamous 5-second DNS tails. The resolver↔manager push path
+>   is **TCP/stream**, not racy UDP.
+> - **Bounded answers + TCP fallback (the headless-truncation trap).** A huge endpoint set
+>   overflows a UDP DNS message (~88 A records); K8s silently returns a truncated set and
+>   Go's pure resolver fails on the TC bit. We **cap + randomize** the UDP answer, set TC,
+>   and serve the full set only over **TCP** or the `ResolveService` API. Big-fanout
+>   consumers are steered to the **forwarder VIP** (real LB) rather than raw record sets —
+>   which also fixes DNS's single-A-record load-imbalance.
 
 **Freshness is push, not poll (Tenet 4):** the manager pushes per-service endpoint
 deltas to each worker resolver over the existing worker gRPC stream
 ([proto/legion.proto:1783](../../proto/legion.proto) `service Worker`), sharded per
-service. The resolver answers from that always-fresh local view; the DNS TTL (a few
-seconds) is only a backstop for clients that cache. No central DNS server on the hot
-path → no single bottleneck, no cross-node hop.
+service. **[R]** Pushes are **per-resource validated and partially applied** — a single
+malformed service entry is dropped and alarmed, never rejecting the whole node update
+(the xDS NACK-all lesson). The resolver answers from that always-fresh local view, and
+**keeps serving its last-known-good set through a manager partition** (Tenet 8); the DNS
+TTL (a few seconds) is only a backstop for clients that cache. No central DNS server on
+the hot path → no single bottleneck, no cross-node hop.
 
 ### 5) Template discovery (the change-reactive path)
 
@@ -272,6 +315,15 @@ When the endpoint set changes, Legion re-renders and applies the same
 `on_change` action vocabulary the [KV reactive path](../kv-store.md) already implements
 (`restart`/`rollout`/`fail`, plus `signal` from the WI plan). This unifies "config
 changed" handling across KV, identity tokens, and service endpoints under one mechanism.
+
+**[R] Two anti-stampede rules, learned from Nomad's `consul-template` pain:**
+- **Coalesce + splay + cap.** Endpoint deltas are debounced and `on_change` actions fire
+  after a randomized `splay`, with a cap on concurrent restarts — so a popular service
+  changing does not restart all its consumers in one thundering herd.
+- **Fail static, never fail the task.** If a template can't render (a discovery blip),
+  Legion **keeps the last-good rendering** and marks the task degraded — it never kills a
+  healthy task because discovery hiccuped (Nomad's "task fails on render failure" +
+  recovery-retry-storm is a documented cascading-outage generator).
 
 ### 6) The data path: L4 default, L7 opt-in (Tenet 5)
 
@@ -478,7 +530,13 @@ L4 + L7 intentions, template `endpoints` function).
 
 ## Implementation Phases
 
-Each phase is independently shippable and leaves the tree green.
+Each phase is independently shippable and leaves the tree green. **[R]** A hard line
+separates **v1** (a complete product — discoverable + reachable by DNS/env/template, with
+*no new data-plane component*) from **v2** (the opt-in mesh). The full TASK-LIST is
+satisfied by v1 plus Phase 5's intentions; everything else is separately adopted. See the
+[critique](service-discovery-critique.md) Part E for the rationale.
+
+> **── v1: the actual product (no new data-plane component) ──**
 
 ### Phase 1 — Ports & env-var discovery
 - `network` block, dynamic/static port assignment in the scheduler, `AllocNetwork` on
@@ -488,17 +546,25 @@ Each phase is independently shippable and leaves the tree green.
 
 ### Phase 2 — Service catalog (the projection)
 - `service` block; catalog tables as a projection over alloc + check health; only-healthy
-  registration/deregistration on health transitions; `ListServices`/`GetService`/
-  `ResolveService` RPCs; UI surfacing.
+  registration + **deregister-before-stop** drain; **[R] liveness-as-lease** (endpoints
+  tied to worker heartbeat) and **self-preservation** (no mass-evict on correlated
+  failure); `ListServices`/`GetService`/`ResolveService` RPCs; UI surfacing.
 - **Exit:** registering `db` shows exactly its healthy endpoints; killing a `db` alloc
-  removes its endpoint within one health interval.
+  removes its endpoint within one health interval; a dead worker's endpoints vanish on
+  lease expiry; a rolling update drains without connection-refused.
 
 ### Phase 3 — DNS + template discovery
-- Node-local resolver, `.svc.legion` zone, `ndots:1` resolv.conf, push-based endpoint
-  deltas over the worker stream; `endpoints`/`service` template functions wired to the
-  existing `on_change` reconcile path.
+- Node-local resolver (**[R] no-NAT path, TCP fallback, bounded answers, PTR/SRV/TXT**),
+  `.svc.legion` zone, `ndots:1` resolv.conf (`/etc/resolver/legion` on macOS), push-based
+  endpoint deltas over the worker stream (**per-resource validated, partial apply,
+  last-known-good through partition**); `endpoints`/`service` template functions wired to
+  the existing `on_change` path with **[R] coalesce/splay/cap + fail-static**.
 - **Exit:** `web` resolves `db.svc.legion` to only-healthy endpoints; a config template
-  re-renders + restarts on endpoint change; external DNS pays no search-domain tax.
+  re-renders + reloads on endpoint change without a thundering herd; a discovery blip
+  does not kill consumers; external DNS pays no search-domain tax; lookups keep working
+  during a manager partition.
+
+> **── v2: the opt-in mesh (each independently justified) ──**
 
 ### Phase 4 — Datapath plugin ABI + bridge/CNI
 - `datapath` plugin kind; built-in `host` (Phase 1 already), `bridge` (Linux netns +
@@ -509,15 +575,35 @@ Each phase is independently shippable and leaves the tree green.
 
 ### Phase 5 — L4 forwarder + mTLS + L4 intentions
 - Per-node userspace forwarder; service VIP + `connect.upstreams` local ports;
-  mTLS via workload-identity certs; `allow` L4 intentions enforced at connect.
+  mTLS via workload-identity certs (**[R] depends on the WI plan; jittered renewal to
+  avoid rotation storms; a non-mTLS L4 mode for clusters pre-WI**); `allow` L4 intentions
+  enforced at connect. **[R] Forwarder has explicit SLOs** (added-p99 budget, zero-drop
+  reload via FD hand-off / `SO_REUSEPORT`); DNS-direct + client retry remains a
+  first-class fallback so the forwarder is never the *only* path.
 - **Exit:** `web` dials `localhost:6379` → reaches healthy `db` over mTLS; a caller not
-  in `allow` is refused at connection with a clear diagnostic.
+  in `allow` is refused at connection with a clear diagnostic; a forwarder upgrade drops
+  zero connections.
 
 ### Phase 6 — L7 waypoint (opt-in)
 - `connect.l7` waypoint plugin (HTTP/gRPC routing, retries, timeouts, traffic split);
-  L7 intentions (path/method).
+  L7 intentions (path/method); **[R] fail-open locality** (locality is a preference, never
+  a partition — widen to region/global rather than serve zero/dead local endpoints).
 - **Exit:** a canary split and a path-scoped intention work for an L7-enabled service;
-  L4-only services pay no L7 cost.
+  L4-only services pay no L7 cost; killing all local-zone endpoints fails over instead of
+  black-holing.
+
+### Phase 7 — WASM middleware → 7b native cdylib
+- Sandboxed proxy-wasm-style middleware with non-optional fuel/memory/fail-policy limits;
+  then operator-only native cdylib behind a cluster flag. See the
+  [mesh companion](service-discovery-mesh-and-config.md) Part D.
+
+### Phase 8 (later) — Prepared-query failover + multi-region
+- **[R]** `<name>.query.legion` named queries with embedded RTT-aware failover policy
+  (Consul prepared-query idiom); cross-region single-hop zone-ingress (Kuma idiom).
+
+### Phase 9 (later) — `legion://` gRPC proxyless resolver
+- **[R]** A gRPC name-resolver returning endpoints **+ LB/routing config** so gRPC apps
+  skip the forwarder hop (proxyless path), per-resource (no NACK-all).
 
 ---
 
@@ -549,6 +635,22 @@ Each phase is independently shippable and leaves the tree green.
   method.
 - Reconcile idempotency: crash the worker mid-`reconcile_alloc`; on restart no leaked
   interfaces/ports (GC verified).
+- **[R] AP read under partition:** sever the worker↔manager link; existing names still
+  resolve to last-known-good endpoints; new registrations stall (not error existing).
+- **[R] Liveness-as-lease:** kill a worker process without graceful deregister; its
+  endpoints disappear on lease expiry with no manual reaping.
+- **[R] Self-preservation:** fail a large fraction of a zone's checks simultaneously
+  (simulated network blip); endpoints are held, not mass-evicted, and an alarm fires.
+- **[R] Deregister-before-stop:** during a rolling update, a continuous client sees zero
+  connection-refused (endpoint withdrawn + drained before SIGTERM).
+- **[R] No-UDP-over-NAT + truncation:** task→resolver path crosses no SNAT/DNAT; a
+  service with thousands of endpoints returns a capped UDP set with TC + working TCP
+  fallback (verified against a Go pure-resolver client).
+- **[R] Render anti-stampede:** a popular service's change does not restart all consumers
+  at once (splay/cap honored); a forced render failure keeps last-good and does not kill
+  the task.
+- **[R] Partial apply:** a malformed single service in a push is dropped + alarmed; other
+  services on that node keep resolving (no NACK-all).
 
 ### Regression
 - Jobs with **no** `network`/`service` block behave exactly as today (no ports, no
@@ -560,8 +662,10 @@ Each phase is independently shippable and leaves the tree green.
 
 1. **Resolver address & host DNS coexistence.** `127.0.1.53` vs a ULA vs a link-local
    address — how to guarantee no clash with host `systemd-resolved` (`127.0.0.53`) and
-   how to inject into both `exec` (host resolv.conf) and `container` (per-container DNS)
-   tasks uniformly?
+   how to inject into both `exec` (host resolv.conf / macOS `/etc/resolver/legion`) and
+   `container` (per-container DNS) tasks uniformly? **[R]** The no-NAT requirement (bind
+   on bridge gateway / in-netns) narrows the options — confirm a single scheme works
+   across `host`/`bridge`/`cni` datapaths and both OSes.
 2. **macOS host-mode port collisions.** Without netns every alloc shares the host port
    space; dynamic ports mostly handle it, but static-port jobs can collide. Reject at
    placement, or auto-remap with a warning?
@@ -571,10 +675,11 @@ Each phase is independently shippable and leaves the tree green.
 4. **L4 forwarder data path on Linux.** Userspace-always (simple, uniform with Mac) vs.
    eBPF/IPVS acceleration via the datapath plugin (faster, Linux-only) — when does the
    accelerated path kick in, and how do we keep semantics identical to userspace?
-5. **Endpoint push fan-out.** Per-service sharding bounds payload, but a 10k-consumer
-   service still fans out widely. Do consumers subscribe only to services they declare
-   in `connect.upstreams`/templates (scoped push) rather than every worker getting every
-   service?
+5. **Endpoint push fan-out (scoped subscription).** Per-service sharding bounds payload,
+   but a 10k-consumer service still fans out widely. **[R] Leaning yes:** consumers
+   subscribe only to services they declare in `connect.upstreams`/templates (scoped push),
+   not every worker getting every service — confirm this is sufficient and how
+   wildcard/DNS-only consumers (no declared upstream) are handled.
 6. **Intention default & rollout.** Cluster-wide default-deny is the zero-trust ideal but
    breaks first-run ergonomics. Default allow-all with a one-flag flip, or per-namespace?
 7. **Stateful/headless interplay.** Slot-mode per-instance DNS (`<slot>.<svc>.svc.legion`)
@@ -583,6 +688,13 @@ Each phase is independently shippable and leaves the tree green.
 8. **Resolver/forwarder as core vs split job.** Start in-core (Day 1 simplicity) with a
    clean seam to split into their own jobs at scale (differentiators pattern) — what is
    that seam exactly?
+9. **[R] Lease vs check health interplay.** Endpoint presence is gated by *both* the
+   worker heartbeat lease (liveness) and check health (readiness). What is the precedence
+   when they disagree (e.g. lease alive but checks failing during a node brown-out), and
+   how does self-preservation's "correlated-failure" threshold get tuned per cluster?
+10. **[R] Drain window length.** Deregister-before-stop needs a convergence window before
+    SIGTERM; too short reintroduces the connection-refused race, too long slows rollouts.
+    Fixed default, per-service `drain` knob, or derived from DNS TTL + push latency?
 
 ---
 
