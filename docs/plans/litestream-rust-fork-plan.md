@@ -8,30 +8,29 @@
 
 ---
 
-## 0. Decisions to Make Before Launch (BLOCKING)
+## 0. Decisions (DECIDED — recorded in `OPEN_QUESTIONS.md`)
 
-The agent **must not start** until these are answered. Each one changes what
-gets built or how it gets verified. Defaults/recommendations in **bold**.
+These were the blocking decisions; all are now answered. Each changes what gets
+built or how it gets verified. The agent treats this table as settled fact.
 
-| # | Decision | Recommendation | Why it matters |
-|---|----------|----------------|----------------|
-| **D-1** | Be **wire-compatible** with upstream Litestream v0.5's LTX object-store layout? | **YES** | This is the backbone of verification. If we match the layout, the real `litestream` binary can restore our backups and vice-versa, giving us a *differential oracle* (§6). If NO, that oracle disappears and one-shot confidence drops sharply. |
-| **D-2** | Which upstream version to pin? | **A specific `v0.5.x` tag** (latest stable) | We port and differentially test against one frozen target. Need the exact tag for both source and the comparison binary. |
-| **D-3** | Can the build/CI environment run (a) the pinned `litestream` binary and (b) MinIO (Docker) ? | **YES — provision both** | Differential (§6 D1–D3) and integration tests require them. If unavailable, the strongest verification layer cannot run in the one-shot — a major confidence loss that must be consciously accepted. |
-| **D-4** | SQLite binding | **`rusqlite` with bundled SQLite** | No system dependency, fixed version, supports the "single static binary, no CGo headaches" goal. |
-| **D-5** | Object I/O | **`object_store` crate** | One trait for S3/R2/file now, other clouds for near-free later behind features. |
-| **D-6** | LTX format: hand-roll vs depend on a Rust `ltx` crate | **Agent investigates first, human decides** | If a correct, maintained Rust `ltx` crate exists, use it; otherwise hand-roll (we control the most correctness-critical code). This is the #1 unknown — resolve it in T2's spike before committing. |
-| **D-7** | Confirm one-shot scope = **KEEP set only** (§2): LTX, **L0-only (no compaction)**, single replica, S3 + file clients, lease fencing. Compaction levels, VFS read replicas, and extra cloud clients are **explicitly OUT** (follow-on milestones). | **Confirm** | Bounds the blast radius of the autonomous run. |
-| **D-8** | License = **Apache-2.0 + NOTICE** attributing Litestream | **Confirm** | Litestream is Apache-2.0; the fork must carry attribution. |
-| **D-9** | Async runtime = **Tokio** | **Confirm** | Pervasive assumption in the module design. |
-| **D-10** | MSRV + edition (e.g. Rust 2021, MSRV pinned in CI) | **Rust 2021, MSRV = pinned recent stable** | CI determinism. |
+| # | Topic | Answer (DECIDED) | Why it matters |
+|---|-------|------------------|----------------|
+| **D-1** | Wire-compatible with upstream Litestream v0.5's LTX object-store layout? | **YES** | The backbone of verification. Matching the layout lets the real `litestream` binary restore our backups and vice-versa — the *differential oracle* (§6). |
+| **D-2** | Upstream version to pin | **`v0.5.11`** (latest stable, Apr 2026) | We port and differentially test against one frozen target — same tag for source *and* the comparison binary. |
+| **D-3** | CI runs the pinned `litestream` binary **and** MinIO (Docker)? | **YES — CI provisions both** | Differential (§6 D1–D3) + integration tests require them. CI installs the `v0.5.11` binary and runs MinIO as a service. |
+| **D-4** | SQLite binding | **`rusqlite`, bundled SQLite** | No system dependency, fixed version, supports the "single static binary, no CGo" goal. |
+| **D-5** | Object I/O | **`object_store` crate** | One trait for S3/R2/file now; other clouds near-free behind features later. |
+| **D-6** | LTX: hand-roll vs Rust `ltx` crate | **Default hand-roll; T2 spike decides** | If a correct, maintained Rust `ltx` crate exists, the spike may adopt it; otherwise hand-roll (control the most correctness-critical code). The spike result is logged before T2 proceeds. |
+| **D-7** | One-shot scope | **KEEP set only** (§2): LTX, **L0-only (no compaction)**, single replica, S3 + file clients, lease fencing. Compaction levels, VFS read replicas, extra cloud clients **OUT** (follow-on). | Bounds the blast radius of the autonomous run. |
+| **D-8** | License | **Apache-2.0 + NOTICE** attributing Litestream | Litestream is Apache-2.0; the fork carries attribution. |
+| **D-9** | Async runtime | **Tokio** | Pervasive assumption in the module design. |
+| **D-10** | Edition / MSRV | **Rust 2021; MSRV pinned via `rust-toolchain.toml`** (latest stable at seed time) | CI determinism. |
 
-**Non-blocking but please note:** repo/crate name is `rustyriver`; whether to ship
-a thin debug CLI (`src/bin/`) is optional and OUT of one-shot scope unless you
-say otherwise.
+**Non-blocking notes:** repo/crate name is `rustyriver`; a thin debug CLI
+(`src/bin/`) is OUT of one-shot scope.
 
-> ⚠️ **The single most consequential answer is D-1.** Say YES unless you have a
-> strong reason not to — most of §6 depends on it.
+> D-1 = YES is load-bearing: most of §6's verification depends on it. It is
+> settled YES; do not revisit without re-opening the verification plan.
 
 ---
 
