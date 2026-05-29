@@ -71,7 +71,10 @@ all console logs to **stderr** so stdout stays a clean protocol stream.
 
 ## 2. Structured output envelope
 
-Every CLI command accepts `--json` / `-j` and emits exactly one of two shapes:
+The agent-facing commands (`job`, `state`, `node`, `kv`, `capabilities`) accept
+`--json` / `-j` and emit exactly one of two shapes (bootstrap/cluster-admin
+commands such as `start`, `join`, and `raft` are operator-oriented and are not
+part of the agent surface):
 
 ```json
 { "ok": true,  "data": <command-specific value> }

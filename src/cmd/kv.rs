@@ -1,10 +1,10 @@
-use crate::cmd::helpers::{connect_manager_client, friendly_status, json_flag, print_table};
+use crate::cmd::helpers::{connect_manager_client, json_flag, print_table};
+use crate::cmd::output::{self, OutputFormat};
 use crate::prelude::*;
 use crate::structs::{
     DeleteKvRequest, GetKvRequest, KvEntry, KvValueType, ListKvRequest, PatchKvRequest,
     PutKvRequest,
 };
-use serde_json::to_string_pretty;
 use tabled::Tabled;
 
 pub fn config() -> Command {
@@ -147,24 +147,24 @@ pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
                 .transpose()
                 .context("Invalid expected version")?;
             let lock_id = arg_matches.get_one::<String>("lock-id");
-            let is_json = arg_matches.get_flag("json");
+            let format = OutputFormat::from_matches(arg_matches);
 
-            put_kv(key, value, value_type, expected_version, lock_id, is_json).await
+            put_kv(key, value, value_type, expected_version, lock_id, format).await
         }
         Some(("get", arg_matches)) => {
             let key = arg_matches
                 .get_one::<String>("key")
                 .context("Must provide key")?;
-            let is_json = arg_matches.get_flag("json");
-            get_kv(key, is_json).await
+            let format = OutputFormat::from_matches(arg_matches);
+            get_kv(key, format).await
         }
         Some(("list", arg_matches)) => {
             let prefix = arg_matches
                 .get_one::<String>("prefix")
                 .map(String::as_str)
                 .unwrap_or("");
-            let is_json = arg_matches.get_flag("json");
-            list_kv(prefix, is_json).await
+            let format = OutputFormat::from_matches(arg_matches);
+            list_kv(prefix, format).await
         }
         Some(("delete", arg_matches)) => {
             let key = arg_matches
@@ -176,8 +176,8 @@ pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
                 .transpose()
                 .context("Invalid expected version")?;
             let lock_id = arg_matches.get_one::<String>("lock-id");
-            let is_json = arg_matches.get_flag("json");
-            delete_kv(key, expected_version, lock_id, is_json).await
+            let format = OutputFormat::from_matches(arg_matches);
+            delete_kv(key, expected_version, lock_id, format).await
         }
         Some(("patch", arg_matches)) => {
             let key = arg_matches
@@ -192,8 +192,8 @@ pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
                 .transpose()
                 .context("Invalid expected version")?;
             let lock_id = arg_matches.get_one::<String>("lock-id");
-            let is_json = arg_matches.get_flag("json");
-            patch_kv(key, patch, expected_version, lock_id, is_json).await
+            let format = OutputFormat::from_matches(arg_matches);
+            patch_kv(key, patch, expected_version, lock_id, format).await
         }
         _ => unreachable!(),
     }
@@ -234,7 +234,7 @@ async fn put_kv(
     value_type: KvValueType,
     expected_version: Option<i64>,
     lock_id: Option<&String>,
-    is_json: bool,
+    format: OutputFormat,
 ) -> R<()> {
     let mut client = connect_manager_client().await?;
     let request = PutKvRequest {
@@ -245,31 +245,34 @@ async fn put_kv(
         lock_id: lock_id.cloned(),
     };
 
-    let response = client
-        .put_kv(tonic::Request::new(request))
-        .await
-        .map_err(|status| friendly_status("failed to put kv entry", status))?;
+    let response = output::resolve(
+        format,
+        "failed to put kv entry",
+        client.put_kv(tonic::Request::new(request)).await,
+    )?;
     let entry = response
         .into_inner()
         .entry
         .context("manager did not return kv entry")?;
-    print_entry(&entry, is_json)?;
+    print_entry(&entry, format)?;
 
     Ok(())
 }
 
 #[instrument(err, skip_all)]
-async fn get_kv(key: &str, is_json: bool) -> R<()> {
+async fn get_kv(key: &str, format: OutputFormat) -> R<()> {
     let mut client = connect_manager_client().await?;
     let request = GetKvRequest {
         key: key.to_string(),
     };
-    let response = client
-        .get_kv(tonic::Request::new(request))
-        .await
-        .map_err(|status| friendly_status("failed to get kv entry", status))?;
+    let response = output::resolve(
+        format,
+        "failed to get kv entry",
+        client.get_kv(tonic::Request::new(request)).await,
+    )?;
     match response.into_inner().entry {
-        Some(entry) => print_entry(&entry, is_json)?,
+        Some(entry) => print_entry(&entry, format)?,
+        None if format.is_json() => output::print_success(&Value::Null),
         None => println!("kv entry not found"),
     }
 
@@ -277,18 +280,19 @@ async fn get_kv(key: &str, is_json: bool) -> R<()> {
 }
 
 #[instrument(err, skip_all)]
-async fn list_kv(prefix: &str, is_json: bool) -> R<()> {
+async fn list_kv(prefix: &str, format: OutputFormat) -> R<()> {
     let mut client = connect_manager_client().await?;
     let request = ListKvRequest {
         prefix: prefix.to_string(),
     };
-    let response = client
-        .list_kv(tonic::Request::new(request))
-        .await
-        .map_err(|status| friendly_status("failed to list kv entries", status))?;
+    let response = output::resolve(
+        format,
+        "failed to list kv entries",
+        client.list_kv(tonic::Request::new(request)).await,
+    )?;
     let entries = response.into_inner().entries;
-    if is_json {
-        println!("{}", to_string_pretty(&entries)?);
+    if format.is_json() {
+        output::print_success(&entries);
         return Ok(());
     }
 
@@ -311,7 +315,7 @@ async fn delete_kv(
     key: &str,
     expected_version: Option<i64>,
     lock_id: Option<&String>,
-    is_json: bool,
+    format: OutputFormat,
 ) -> R<()> {
     let mut client = connect_manager_client().await?;
     let request = DeleteKvRequest {
@@ -319,12 +323,13 @@ async fn delete_kv(
         expected_version,
         lock_id: lock_id.cloned(),
     };
-    let response = client
-        .delete_kv(tonic::Request::new(request))
-        .await
-        .map_err(|status| friendly_status("failed to delete kv entry", status))?;
-    if is_json {
-        println!("{}", to_string_pretty(&response.into_inner())?);
+    let response = output::resolve(
+        format,
+        "failed to delete kv entry",
+        client.delete_kv(tonic::Request::new(request)).await,
+    )?;
+    if format.is_json() {
+        output::print_success(&response.into_inner());
     } else {
         println!("kv entry deleted");
     }
@@ -338,7 +343,7 @@ async fn patch_kv(
     patch: &str,
     expected_version: Option<i64>,
     lock_id: Option<&String>,
-    is_json: bool,
+    format: OutputFormat,
 ) -> R<()> {
     let mut client = connect_manager_client().await?;
     let request = PatchKvRequest {
@@ -347,22 +352,23 @@ async fn patch_kv(
         expected_version,
         lock_id: lock_id.cloned(),
     };
-    let response = client
-        .patch_kv(tonic::Request::new(request))
-        .await
-        .map_err(|status| friendly_status("failed to patch kv entry", status))?;
+    let response = output::resolve(
+        format,
+        "failed to patch kv entry",
+        client.patch_kv(tonic::Request::new(request)).await,
+    )?;
     let entry = response
         .into_inner()
         .entry
         .context("manager did not return kv entry")?;
-    print_entry(&entry, is_json)?;
+    print_entry(&entry, format)?;
 
     Ok(())
 }
 
-fn print_entry(entry: &KvEntry, is_json: bool) -> R<()> {
-    if is_json {
-        println!("{}", to_string_pretty(entry)?);
+fn print_entry(entry: &KvEntry, format: OutputFormat) -> R<()> {
+    if format.is_json() {
+        output::print_success(entry);
         return Ok(());
     }
 
