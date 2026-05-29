@@ -22,7 +22,7 @@
   - [x] A "bin-pack" scheduler works
   - [x] A "spread" scheduler works (inverse of bin-pack)
   - [x] Affinities and anti-affinities work
-  - [ ] Some task group equivalent works
+  - [x] Some task group equivalent works
   - [ ] Worker groups + taint/toleration equiv
   - [ ] Scheduling on same node as existing job works
   - [ ] Priorities and eviction works (eviction toggled at the pool level)
@@ -36,15 +36,15 @@
     - [x] Failure after N times forces a reschedule
 
 - [ ] Observability & Perf
-  - [ ] Add tracing to the scheduler
+  - [x] Add tracing to the scheduler
   - [ ] Add a way to nicely view traces in the UI (make dev only one day)
-  - [ ] Write some benchmarks in a dedicated directory
+  - [x] Write some benchmarks in a dedicated directory
   - [ ] Fix the slowest bits of the scheduler using the perf tests
   - [ ] Add to Agents.md that any changes to the scheduler should come with a before and after perf test benchmark
 
 - [ ] Running workloads
   - [x] A framework is set up to run workload plugins
-  - [ ] A "noop" kind "works" - Test
+  - [x] A "noop" kind "works" - Test
   - [x] An "exec" kind works - Test
     - [x] The command and args given are run
     - [x] It runs as a specific user
@@ -52,7 +52,7 @@
     - [x] It can join an existing cgroup (v2 only)
     - [x] It uses landlock appropriately
     - [ ] It handles network namespaces well? (use netavark lib?)
-  - [ ] A "container" kind works
+  - [x] A "container" kind works
     - Does it just user docker? Apple's container' runtime if on MacOS?
     - MUST work on a Mac easily (and on linux)
         1. Think about Kamal
@@ -70,18 +70,18 @@
   - [ ] Have plugin system for this
 
 - [ ] Rollouts
-  - [ ] A new version of a job starts a deployment
-  - [ ] A framework is set up for deployments
-  - [ ] An "immediate" deployment kind "works" and cycles out everything in place automatically
-  - [ ] A "rolling" deployment kind is created and works
+  - [x] A new version of a job starts a deployment
+  - [x] A framework is set up for deployments
+  - [x] An "immediate" deployment kind "works" and cycles out everything in place automatically
+  - [x] A "rolling" deployment kind is created and works
   - [ ] A "blue-green" deployment kind is created and works
   - [ ] A "canary" deployment kind is created and works
-  - [ ] Nice UI for this
+  - [x] Nice UI for this
   
-- [ ] KV & Secrets
-  - [ ] I can get one of these from a task
-  - [ ] When I update one of these, the task restarts (if configured to do so)
-  - [ ] I can use one of these in the defintion
+- [x] KV & Secrets
+  - [x] I can get one of these from a task
+  - [x] When I update one of these, the task restarts (if configured to do so)
+  - [x] I can use one of these in the defintion
 
 - [ ] Service Discovery
   - [ ] I can declare a named service on a task
@@ -89,7 +89,7 @@
   - [ ] Can query address and port from other services
   - [ ] I can declare which other jobs have access to my service
   
-- [ ] Persisting state
+- [x] Persisting state
   - [x] Saving the SQLite works (litestream-like)?
   - [x] Raft Works (leader election/failover controls, observability, CLI/UI ops)
  
