@@ -4070,6 +4070,53 @@ impl Store {
         Ok(query)
     }
 
+    /// Look up a previously recorded response for an idempotency `key`.
+    ///
+    /// Returns `Some(response_message)` when a request with this key was already
+    /// applied, allowing the caller to replay the prior outcome instead of
+    /// re-applying. An empty key disables deduplication and always returns
+    /// `None`.
+    pub fn idempotency_lookup(&self, key: &str) -> R<Option<String>> {
+        let key = key.trim();
+        if key.is_empty() {
+            return Ok(None);
+        }
+        let conn = self.read_connection()?;
+        let result = conn
+            .query_row(
+                "SELECT response_message FROM idempotency_record WHERE key = ?;",
+                [key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(result)
+    }
+
+    /// Record the response for an idempotency `key`.
+    ///
+    /// Uses `INSERT OR IGNORE` so a concurrent duplicate cannot overwrite an
+    /// existing record. Returns `true` when the record was newly inserted and
+    /// `false` when a record already existed (the caller raced another request
+    /// carrying the same key). An empty key is a no-op and returns `true`.
+    pub fn idempotency_record(&self, key: &str, operation: &str, message: &str) -> R<bool> {
+        let key = key.trim();
+        if key.is_empty() {
+            return Ok(true);
+        }
+        let now = OffsetDateTime::now_utc().format(&Rfc3339)?;
+        let conn = self.write_connection()?;
+        let changed = conn.execute(
+            "INSERT OR IGNORE INTO idempotency_record (key, operation, response_message, created_at) VALUES (:key, :op, :msg, :now);",
+            named_params! {
+                ":key": key,
+                ":op": operation,
+                ":msg": message,
+                ":now": now,
+            },
+        )?;
+        Ok(changed > 0)
+    }
+
     #[instrument(err, skip_all)]
     pub fn delete_saved_state_query(&self, name: &str) -> R<()> {
         let name = name.trim();
@@ -4241,6 +4288,33 @@ mod tests {
         let store = Store::start_storage(&store_config)?;
         store.reset_all_tables()?;
         Ok(store)
+    }
+
+    #[test]
+    fn idempotency_record_and_lookup_roundtrip() -> R<()> {
+        let store = setup_store()?;
+
+        // Unknown key: no recorded response.
+        assert_eq!(store.idempotency_lookup("k1")?, None);
+
+        // First record wins and is replayable.
+        assert!(store.idempotency_record("k1", "run_job", "Job submit success")?);
+        assert_eq!(
+            store.idempotency_lookup("k1")?.as_deref(),
+            Some("Job submit success")
+        );
+
+        // A second record for the same key is a no-op and keeps the original.
+        assert!(!store.idempotency_record("k1", "run_job", "different")?);
+        assert_eq!(
+            store.idempotency_lookup("k1")?.as_deref(),
+            Some("Job submit success")
+        );
+
+        // Empty key disables deduplication entirely.
+        assert_eq!(store.idempotency_lookup("")?, None);
+        assert!(store.idempotency_record("", "run_job", "ignored")?);
+        Ok(())
     }
 
     fn make_node(id: &str) -> Node {
