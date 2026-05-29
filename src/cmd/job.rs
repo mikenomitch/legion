@@ -1068,7 +1068,7 @@ async fn stop_job(arg_matches: &ArgMatches) -> R<()> {
 
 #[instrument(err, skip_all)]
 async fn get_job_spec(arg_matches: &ArgMatches) -> R<()> {
-    let is_json = arg_matches.get_flag("json");
+    let format = OutputFormat::from_matches(arg_matches);
 
     let mut client = connect_manager_client().await?;
     let job_name = arg_matches
@@ -1079,14 +1079,15 @@ async fn get_job_spec(arg_matches: &ArgMatches) -> R<()> {
         name: job_name.to_owned(),
     });
 
-    let response = client
-        .get_job_spec(request)
-        .await
-        .map_err(|status| friendly_status("failed to fetch job spec", status))?;
+    let response = output::resolve(
+        format,
+        "failed to fetch job spec",
+        client.get_job_spec(request).await,
+    )?;
 
     let subs = response.into_inner().submissions;
 
-    if is_json {
+    if format.is_json() {
         print_json(&subs);
     } else {
         subs.iter().for_each(|s| {
@@ -1137,7 +1138,7 @@ async fn destroy_job(arg_matches: &ArgMatches) -> R<()> {
 
 #[instrument(err, skip_all)]
 async fn plan_job(arg_matches: &ArgMatches) -> R<()> {
-    let is_json = arg_matches.get_flag("json");
+    let format = OutputFormat::from_matches(arg_matches);
     let mut client = connect_manager_client().await?;
     let path = arg_matches
         .get_one::<String>("path")
@@ -1152,11 +1153,8 @@ async fn plan_job(arg_matches: &ArgMatches) -> R<()> {
         parsed_jobspec: rendered,
     });
 
-    let response = client
-        .plan_job(request)
-        .await
-        .map_err(|status| friendly_status("failed to plan job", status))?;
-    if is_json {
+    let response = output::resolve(format, "failed to plan job", client.plan_job(request).await)?;
+    if format.is_json() {
         let reply = response.into_inner();
         print_json(&reply);
         return Ok(());
@@ -1239,19 +1237,20 @@ async fn run_job(arg_matches: &ArgMatches) -> R<()> {
 
 #[instrument(err, skip_all)]
 async fn list_jobs(arg_matches: &ArgMatches) -> R<()> {
-    let is_json = arg_matches.get_flag("json");
+    let format = OutputFormat::from_matches(arg_matches);
 
     let mut client = connect_manager_client().await?;
     let request = tonic::Request::new(ListJobsRequest {
         ..Default::default()
     });
-    let response = client
-        .list_jobs(request)
-        .await
-        .map_err(|status| friendly_status("failed to list jobs", status))?;
+    let response = output::resolve(
+        format,
+        "failed to list jobs",
+        client.list_jobs(request).await,
+    )?;
     let jobs_list = response.into_inner().jobs;
 
-    if is_json {
+    if format.is_json() {
         print_json(&jobs_list);
     } else {
         let printable_jobs: Vec<JobPrint> = jobs_list.into_iter().map(Into::into).collect();
@@ -1263,7 +1262,7 @@ async fn list_jobs(arg_matches: &ArgMatches) -> R<()> {
 
 #[instrument(err, skip_all)]
 async fn list_rollouts(arg_matches: &ArgMatches) -> R<()> {
-    let is_json = arg_matches.get_flag("json");
+    let format = OutputFormat::from_matches(arg_matches);
     let active_only = arg_matches.get_flag("active");
     let job_id = arg_matches.get_one::<String>("job").cloned();
 
@@ -1273,13 +1272,14 @@ async fn list_rollouts(arg_matches: &ArgMatches) -> R<()> {
         active_only,
         ..Default::default()
     });
-    let response = client
-        .list_rollouts(request)
-        .await
-        .map_err(|status| friendly_status("failed to list rollouts", status))?;
+    let response = output::resolve(
+        format,
+        "failed to list rollouts",
+        client.list_rollouts(request).await,
+    )?;
     let rollouts = response.into_inner().rollouts;
 
-    if is_json {
+    if format.is_json() {
         print_json(&rollouts);
     } else {
         let printable = rollouts
@@ -1314,7 +1314,7 @@ async fn advance_rollout_cmd(arg_matches: &ArgMatches) -> R<()> {
         .map(|values| values.cloned().collect::<Vec<_>>())
         .unwrap_or_default();
     let priority = priority_from_matches(arg_matches);
-    let is_json = arg_matches.get_flag("json");
+    let format = OutputFormat::from_matches(arg_matches);
 
     let mut client = connect_manager_client().await?;
     let request = tonic::Request::new(AdvanceRolloutRequest {
@@ -1322,13 +1322,14 @@ async fn advance_rollout_cmd(arg_matches: &ArgMatches) -> R<()> {
         groups,
         priority,
     });
-    let response = client
-        .advance_rollout(request)
-        .await
-        .map_err(|status| friendly_status("failed to advance rollout", status))?
-        .into_inner();
+    let response = output::resolve(
+        format,
+        "failed to advance rollout",
+        client.advance_rollout(request).await,
+    )?
+    .into_inner();
 
-    if is_json {
+    if format.is_json() {
         print_json(&response.rollout);
     } else if let Some(rollout) = response.rollout {
         println!(
@@ -1380,17 +1381,18 @@ async fn rollout_status_cmd(arg_matches: &ArgMatches) -> R<()> {
     let rollout_id = *arg_matches
         .get_one::<i64>("id")
         .context("missing rollout id")?;
-    let is_json = arg_matches.get_flag("json");
+    let format = OutputFormat::from_matches(arg_matches);
 
     let mut client = connect_manager_client().await?;
     let request = tonic::Request::new(GetRolloutStatusRequest { id: rollout_id });
-    let response = client
-        .get_rollout_status(request)
-        .await
-        .map_err(|status| friendly_status("failed to load rollout status", status))?
-        .into_inner();
+    let response = output::resolve(
+        format,
+        "failed to load rollout status",
+        client.get_rollout_status(request).await,
+    )?
+    .into_inner();
 
-    if is_json {
+    if format.is_json() {
         print_json(&response);
         return Ok(());
     }
@@ -1486,17 +1488,18 @@ async fn rollout_events_cmd(arg_matches: &ArgMatches) -> R<()> {
         .get_one::<i64>("id")
         .context("missing rollout id")?;
     let limit = arg_matches.get_one::<u32>("limit").copied();
-    let is_json = arg_matches.get_flag("json");
+    let format = OutputFormat::from_matches(arg_matches);
 
     let mut client = connect_manager_client().await?;
     let request = tonic::Request::new(ListRolloutEventsRequest { rollout_id, limit });
-    let response = client
-        .list_rollout_events(request)
-        .await
-        .map_err(|status| friendly_status("failed to load rollout events", status))?
-        .into_inner();
+    let response = output::resolve(
+        format,
+        "failed to load rollout events",
+        client.list_rollout_events(request).await,
+    )?
+    .into_inner();
 
-    if is_json {
+    if format.is_json() {
         print_json(&response.events);
         return Ok(());
     }
@@ -1523,19 +1526,20 @@ async fn rollout_events_cmd(arg_matches: &ArgMatches) -> R<()> {
 
 #[instrument(err, skip_all)]
 async fn get_info(arg_matches: &ArgMatches) -> R<()> {
-    let is_json = arg_matches.get_flag("json");
+    let format = OutputFormat::from_matches(arg_matches);
 
     let mut client = connect_manager_client().await?;
     let job_name = arg_matches.get_one::<String>("name").context("need name")?;
     let request = tonic::Request::new(GetJobInfoRequest {
         name: job_name.to_owned(),
     });
-    let response = client
-        .get_job_info(request)
-        .await
-        .map_err(|status| friendly_status("failed to fetch job info", status))?;
+    let response = output::resolve(
+        format,
+        "failed to fetch job info",
+        client.get_job_info(request).await,
+    )?;
 
-    if is_json {
+    if format.is_json() {
         print_json(&response.into_inner().job);
     } else {
         let printable_job: JobPrint = response.into_inner().job.context("no job found")?.into();
