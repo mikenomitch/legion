@@ -24,9 +24,9 @@ use crate::cmd::output::CliError;
 use crate::prelude::*;
 use crate::structs::manager_client::ManagerClient;
 use crate::structs::{
-    DestroyJobRequest, GetJobInfoRequest, GetJobSpecRequest, GetNodesRequest,
-    GetRolloutStatusRequest, GetStateStoreSchemaRequest, JobConfig, ListJobsRequest,
-    ListRolloutsRequest, QueryStateStoreRequest, RunJobRequest, StopJobRequest,
+    DestroyJobRequest, GetAllocationLogsRequest, GetJobInfoRequest, GetJobSpecRequest,
+    GetNodesRequest, GetRolloutStatusRequest, GetStateStoreSchemaRequest, JobConfig,
+    ListJobsRequest, ListRolloutsRequest, QueryStateStoreRequest, RunJobRequest, StopJobRequest,
 };
 use crate::task_plugins::validate_job_config;
 use serde::Serialize;
@@ -158,6 +158,22 @@ fn tool_defs() -> Vec<ToolDef> {
             name: "legion_node_list",
             description: "List worker nodes and their health.",
             input_schema: empty_schema,
+            mutates: false,
+        },
+        ToolDef {
+            name: "legion_job_logs",
+            description: "Fetch captured stdout/stderr for a job's allocations (or one allocation). Use this to diagnose task failures.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "Job name to gather allocation logs for." },
+                    "allocation_id": { "type": "integer", "description": "Optional: read a single allocation id instead of a whole job." },
+                    "stream": { "type": "string", "enum": ["stdout", "stderr", "all"], "description": "Which stream to read (default all)." },
+                    "max_bytes": { "type": "integer", "description": "Max bytes per stream (0 = worker default cap)." },
+                    "tail": { "type": "boolean", "description": "Return trailing bytes instead of leading bytes." }
+                },
+                "additionalProperties": false
+            }),
             mutates: false,
         },
         ToolDef {
@@ -386,6 +402,25 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             let mut client = connect().await?;
             grpc(client.get_nodes(GetNodesRequest::default())).await
         }
+        "legion_job_logs" => {
+            let job = opt_str_arg(&args, "name").unwrap_or_default();
+            let allocation_id = args.get("allocation_id").and_then(Value::as_i64);
+            if job.is_empty() && allocation_id.is_none() {
+                return Err("provide a job name or allocation_id".to_string());
+            }
+            let stream = opt_str_arg(&args, "stream").unwrap_or_else(|| "all".to_string());
+            let max_bytes = args.get("max_bytes").and_then(Value::as_i64).unwrap_or(0);
+            let tail = args.get("tail").and_then(Value::as_bool).unwrap_or(false);
+            let mut client = connect().await?;
+            grpc(client.get_allocation_logs(GetAllocationLogsRequest {
+                job,
+                allocation_id,
+                stream,
+                max_bytes,
+                tail,
+            }))
+            .await
+        }
         "legion_state_query" => {
             let sql = str_arg(&args, "sql")?;
             let mut client = connect().await?;
@@ -528,6 +563,12 @@ mod tests {
         assert!(names.contains(&"legion_job_list"));
         assert!(!names.contains(&"legion_job_run"));
         assert!(!names.contains(&"legion_job_destroy"));
+    }
+
+    #[test]
+    fn job_logs_tool_is_read_only() {
+        let names: Vec<&str> = available_tools(false).iter().map(|t| t.name).collect();
+        assert!(names.contains(&"legion_job_logs"));
     }
 
     #[test]

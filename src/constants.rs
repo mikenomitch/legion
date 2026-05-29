@@ -27,3 +27,7 @@ pub const WORKER_NODE_CHECK_DURATION_SEC: u64 = 30;
 pub const DEF_WORKER_SERVER_PORT: u64 = 4848;
 pub const DEF_WORKER_STATE_DIR: &str = ".legion/workers";
 pub const DEF_WORKER_STATE_PATH: &str = ".legion/workers/default/worker_state.json";
+
+// Default per-stream cap (bytes) when reading captured task logs and no explicit
+// limit is requested. 256 KiB keeps replies small enough for an agent context.
+pub const DEF_TASK_LOG_MAX_BYTES: i64 = 256 * 1024;

@@ -95,6 +95,13 @@ service Manager {
   // Proxies a restart request to a worker node.
   rpc RestartWorker (RestartWorkerRequest) returns (RestartWorkerReply);
 
+  // Retrieves captured task stdout/stderr for a job's allocations.
+  //
+  // The manager locates the node hosting each allocation and proxies the read
+  // to that worker's `Worker.GetTaskLogs` RPC.
+  rpc GetAllocationLogs (GetAllocationLogsRequest)
+    returns (GetAllocationLogsReply);
+
   // Returns node + allocation view of cluster state (the "ledger").
   rpc GetLedger (GetLedgerRequest) returns (GetLedgerReply);
 
@@ -1814,6 +1821,95 @@ service Worker {
 
   // Requests the worker process to restart itself.
   rpc RestartWorker (RestartWorkerRequest) returns (RestartWorkerReply);
+
+  // Reads captured stdout/stderr files for one allocation on this node.
+  rpc GetTaskLogs (GetTaskLogsRequest) returns (GetTaskLogsReply);
+}
+
+// Selects which captured stream(s) to read for a task.
+//
+// Used by both `Worker.GetTaskLogs` and `Manager.GetAllocationLogs`.
+message GetTaskLogsRequest {
+  // Allocation whose logs are requested.
+  int64 allocation_id = 1;
+
+  // Stream filter: "stdout", "stderr", or "all" (default when empty).
+  string stream = 2;
+
+  // Maximum number of bytes to return per stream.
+  //
+  // `0` selects the worker's built-in default cap. When a stream's file is
+  // larger than the cap the returned content is truncated.
+  int64 max_bytes = 3;
+
+  // When true, return the trailing bytes of each stream (tail) rather than the
+  // leading bytes. Defaults to false (head).
+  bool tail = 4;
+}
+
+// One captured stream's content for a single allocation.
+message TaskLogStream {
+  // Stream name ("stdout" or "stderr").
+  string stream = 1;
+
+  // UTF-8 (lossy) content of the (possibly truncated) stream.
+  string content = 2;
+
+  // Total size of the underlying log file in bytes, before truncation.
+  int64 size_bytes = 3;
+
+  // Whether `content` was truncated to satisfy `max_bytes`.
+  bool truncated = 4;
+}
+
+// Reply payload for Worker.GetTaskLogs.
+message GetTaskLogsReply {
+  // Captured streams for the allocation. Streams with no log file are omitted.
+  repeated TaskLogStream streams = 1;
+}
+
+// Request payload for Manager.GetAllocationLogs.
+message GetAllocationLogsRequest {
+  // Job name to gather allocation logs for. Required unless `allocation_id` is
+  // set.
+  string job = 1;
+
+  // Optional: restrict the read to a single allocation id. When set, `job` is
+  // ignored.
+  optional int64 allocation_id = 2;
+
+  // Stream filter: "stdout", "stderr", or "all" (default when empty).
+  string stream = 3;
+
+  // Maximum number of bytes to return per stream (`0` = worker default).
+  int64 max_bytes = 4;
+
+  // When true, return the trailing bytes of each stream rather than the leading.
+  bool tail = 5;
+}
+
+// Captured logs for a single allocation, annotated with where they came from.
+message AllocationLog {
+  // Allocation id.
+  int64 allocation_id = 1;
+
+  // Node hosting the allocation.
+  string node_id = 2;
+
+  // Task name for the allocation, when resolvable.
+  string task_name = 3;
+
+  // Captured streams for the allocation.
+  repeated TaskLogStream streams = 4;
+
+  // Per-allocation error (for example: node unreachable). Empty on success.
+  string error = 5;
+}
+
+// Reply payload for Manager.GetAllocationLogs.
+message GetAllocationLogsReply {
+  // One entry per matched allocation.
+  repeated AllocationLog allocations = 1;
 }
 
 // Allocation payload sent to workers.

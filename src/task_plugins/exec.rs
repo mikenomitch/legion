@@ -1,6 +1,8 @@
 use crate::prelude::*;
 use crate::structs::{Allocation, TaskConfig};
-use crate::task_plugins::{derived_schema, spawn_task_process, TaskPlugin, TaskRuntime};
+use crate::task_plugins::{
+    configure_task_log_capture, derived_schema, spawn_task_process, TaskPlugin, TaskRuntime,
+};
 #[cfg(target_os = "linux")]
 use landlock::{AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr, ABI};
 use schemars::JsonSchema;
@@ -294,6 +296,7 @@ impl TaskPlugin for ExecTaskPlugin {
         }
 
         configure_linux_process_options(&mut cmd, &linux_options, &allocation.id, &task.name)?;
+        configure_task_log_capture(&mut cmd, runtime)?;
 
         let child = spawn_task_process(&mut cmd).with_context(|| {
             format!(

@@ -3,6 +3,7 @@ use crate::structs::{
     Allocation, AllocationHealth, TaskAllocation, TaskConfig, TaskOnUnhealthyConfig,
 };
 use crate::task_plugins::{TaskPluginRegistry, TaskRuntime};
+use crate::worker::logs::{read_allocation_logs, CapturedStream};
 use crate::worker::state::{pid_is_running, PersistedAllocation, WorkerStateStore};
 use crate::worker::task_health::HealthMonitorHandle;
 use std::collections::HashMap;
@@ -216,10 +217,12 @@ impl WorkerTaskManager {
             .registry
             .plugin(&task.kind)
             .context("Task plugin not loaded")?;
+        let log_dir = self.state_store.allocation_log_dir(allocation.id);
         let runtime = self
             .runtimes
             .entry(allocation.id)
             .or_insert_with(TaskRuntime::default);
+        runtime.log_dir = Some(log_dir);
 
         info!(
             allocation_id = allocation.id,
@@ -277,6 +280,18 @@ impl WorkerTaskManager {
         Ok(())
     }
 
+    /// Read captured stdout/stderr for an allocation hosted on this worker.
+    pub fn read_allocation_logs(
+        &self,
+        allocation_id: i64,
+        stream: &str,
+        max_bytes: i64,
+        tail: bool,
+    ) -> R<Vec<CapturedStream>> {
+        let log_dir = self.state_store.allocation_log_dir(allocation_id);
+        read_allocation_logs(&log_dir, stream, max_bytes, tail)
+    }
+
     pub fn register_health_monitor(&mut self, allocation_id: i64, handle: HealthMonitorHandle) {
         self.health_monitors.insert(allocation_id, handle);
     }
@@ -307,6 +322,7 @@ impl WorkerTaskManager {
 
             let runtime = TaskRuntime {
                 pid: Some(pid),
+                log_dir: Some(self.state_store.allocation_log_dir(record.allocation.id)),
                 ..TaskRuntime::default()
             };
             self.runtimes.insert(record.allocation.id, runtime);
@@ -427,6 +443,34 @@ mod tests {
         };
 
         manager.run_allocation(&alloc(), &task)?;
+        Ok(())
+    }
+
+    #[test]
+    fn captures_and_reads_exec_task_logs() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let state_store = WorkerStateStore::new(temp_dir.path().join("worker_state.json"));
+        let mut manager = WorkerTaskManager::with_state_store(state_store);
+        manager.load_builtin_plugins();
+
+        let task = TaskConfig {
+            config: json!({"command": ["sh", "-c", "echo captured-stdout"]}),
+            ..TaskConfig::new("exec-task", "exec")
+        };
+        let allocation = alloc();
+        manager.run_allocation(&allocation, &task)?;
+
+        // Give the short-lived process time to write and exit.
+        thread::sleep(Duration::from_millis(300));
+
+        let streams = manager.read_allocation_logs(allocation.id, "stdout", 0, false)?;
+        assert_eq!(streams.len(), 1);
+        assert_eq!(streams[0].stream, "stdout");
+        assert!(
+            streams[0].content.contains("captured-stdout"),
+            "unexpected stdout: {:?}",
+            streams[0].content
+        );
         Ok(())
     }
 

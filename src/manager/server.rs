@@ -15,19 +15,20 @@ use crate::storage::store::{JobKvReference, JobSubmitOutcome, Store};
 use crate::structs::manager_server::Manager;
 use crate::structs::{
     worker_client::WorkerClient, AcquireKvLockReply, AcquireKvLockRequest, AdvanceRolloutReply,
-    AdvanceRolloutRequest, AllocationHealth, DeleteKvReply, DeleteKvRequest,
+    AdvanceRolloutRequest, AllocationHealth, AllocationLog, DeleteKvReply, DeleteKvRequest,
     DeleteSavedStateQueryReply, DeleteSavedStateQueryRequest, DestroyJobReply, DestroyJobRequest,
-    FailedAllocation, GetJobInfoReply, GetJobInfoRequest, GetJobSpecByConfigRequest,
-    GetJobSpecReply, GetJobSpecRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest,
-    GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest,
-    GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest, GetObservabilityReply,
-    GetObservabilityRequest, GetRaftJoinTokenReply, GetRaftJoinTokenRequest, GetRaftStatusReply,
-    GetRaftStatusRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply,
-    GetRolloutStatusRequest, GetStateStoreSchemaReply, GetStateStoreSchemaRequest,
-    HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, IssueRaftCommandReply,
-    IssueRaftCommandRequest, JobConfig, JobSpecHistoryItem, KvEntry, KvInjectionAction,
-    KvValueType, LedgerNode, ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobsReply,
-    ListJobsRequest, ListKvReply, ListKvRequest, ListRaftHistoryReply, ListRaftHistoryRequest,
+    FailedAllocation, GetAllocationLogsReply, GetAllocationLogsRequest, GetJobInfoReply,
+    GetJobInfoRequest, GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest,
+    GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest,
+    GetManagerConfigsReply, GetManagerConfigsRequest, GetNodeReply, GetNodeRequest, GetNodesReply,
+    GetNodesRequest, GetObservabilityReply, GetObservabilityRequest, GetRaftJoinTokenReply,
+    GetRaftJoinTokenRequest, GetRaftStatusReply, GetRaftStatusRequest, GetRolloutReply,
+    GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest, GetStateStoreSchemaReply,
+    GetStateStoreSchemaRequest, GetTaskLogsRequest, HealthCheckReply, HealthCheckRequest,
+    HeartbeatReply, HeartbeatRequest, IssueRaftCommandReply, IssueRaftCommandRequest, JobConfig,
+    JobSpecHistoryItem, KvEntry, KvInjectionAction, KvValueType, LedgerNode,
+    ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobsReply, ListJobsRequest,
+    ListKvReply, ListKvRequest, ListRaftHistoryReply, ListRaftHistoryRequest,
     ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply, ListRolloutsRequest,
     ListSavedStateQueriesReply, ListSavedStateQueriesRequest, Node, NodeMsg, PatchKvReply,
     PatchKvRequest, PlanJobReply, PlanJobRequest, PlannedAllocation, PutKvReply, PutKvRequest,
@@ -44,6 +45,7 @@ use crate::task_plugins::validate_job_config;
 use crate::tracing_util::{o11y_enabled, read_recent_observability};
 
 use time::{Duration as TimeDuration, OffsetDateTime};
+use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Response, Status};
 
 fn map_store_error(action: &str, err: anyhow::Error) -> Status {
@@ -1672,6 +1674,82 @@ impl Manager for ManagerAgentService {
     }
 
     #[instrument(skip_all)]
+    async fn get_allocation_logs(
+        &self,
+        request: Request<GetAllocationLogsRequest>,
+    ) -> Result<Response<GetAllocationLogsReply>, Status> {
+        let req = request.into_inner();
+
+        // Resolve which allocations to read: a single allocation id when given,
+        // otherwise every allocation belonging to the named job.
+        let allocations = if let Some(allocation_id) = req.allocation_id {
+            let alloc = self
+                .store
+                .get_allocation_by_id(allocation_id)
+                .map_err(|e| map_store_error("Error loading allocation", e))?
+                .ok_or_else(|| {
+                    Status::not_found(format!("allocation {allocation_id} not found"))
+                })?;
+            vec![alloc]
+        } else {
+            if req.job.trim().is_empty() {
+                return Err(Status::invalid_argument(
+                    "either job or allocation_id is required",
+                ));
+            }
+            let job = self
+                .store
+                .get_job(&req.job)
+                .map_err(|e| map_store_error("Error loading job", e))?;
+            self.store
+                .allocs_for_job(&job.id)
+                .map_err(|e| map_store_error("Error loading job allocations", e))?
+        };
+
+        // Caches keyed by node / job config so we reuse worker connections and
+        // task-config lookups across the (often co-located) allocations.
+        let mut clients: HashMap<String, WorkerClient<Channel>> = HashMap::new();
+        let mut task_names: HashMap<String, HashMap<i64, String>> = HashMap::new();
+        let mut logs = Vec::new();
+
+        for allocation in allocations {
+            let task_name = task_names
+                .entry(allocation.job_config_id.clone())
+                .or_insert_with(|| {
+                    self.store
+                        .get_task_configs_for_job_config(&allocation.job_config_id)
+                        .map(|configs| {
+                            configs
+                                .into_iter()
+                                .map(|(id, task)| (id, task.name))
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                })
+                .get(&allocation.task_config_id)
+                .cloned()
+                .unwrap_or_default();
+
+            let mut entry = AllocationLog {
+                allocation_id: allocation.id,
+                node_id: allocation.node_id.clone(),
+                task_name,
+                streams: Vec::new(),
+                error: String::new(),
+            };
+
+            match fetch_allocation_logs(&self.store, &allocation, &req, &mut clients).await {
+                Ok(streams) => entry.streams = streams,
+                Err(message) => entry.error = message,
+            }
+
+            logs.push(entry);
+        }
+
+        Ok(Response::new(GetAllocationLogsReply { allocations: logs }))
+    }
+
+    #[instrument(skip_all)]
     async fn update_node_dynamic(
         &self,
         request: Request<UpdateNodeDynamicRequest>,
@@ -2172,6 +2250,48 @@ fn worker_address_for_node(node: &Node) -> Option<String> {
         .map(|value| value.to_string())
 }
 
+/// Proxy a single allocation's log read to the worker hosting it.
+///
+/// Returns the captured streams, or a human-readable error string suitable for
+/// the per-allocation `error` field (so one unreachable node does not fail the
+/// whole request). Worker clients are reused across allocations on the same node.
+async fn fetch_allocation_logs(
+    store: &Store,
+    allocation: &crate::structs::Allocation,
+    req: &GetAllocationLogsRequest,
+    clients: &mut HashMap<String, WorkerClient<Channel>>,
+) -> Result<Vec<crate::structs::TaskLogStream>, String> {
+    let node = store
+        .get_node(&allocation.node_id)
+        .map_err(|e| format!("failed to load node {}: {e}", allocation.node_id))?;
+    let worker_address = worker_address_for_node(&node)
+        .ok_or_else(|| format!("worker address missing for node {}", allocation.node_id))?;
+
+    if !clients.contains_key(&worker_address) {
+        let endpoint = Endpoint::from_shared(worker_address.clone())
+            .map_err(|e| format!("invalid worker address {worker_address}: {e}"))?;
+        clients.insert(
+            worker_address.clone(),
+            WorkerClient::new(endpoint.connect_lazy()),
+        );
+    }
+    let client = clients
+        .get_mut(&worker_address)
+        .expect("worker client just inserted");
+
+    let reply = client
+        .get_task_logs(GetTaskLogsRequest {
+            allocation_id: allocation.id,
+            stream: req.stream.clone(),
+            max_bytes: req.max_bytes,
+            tail: req.tail,
+        })
+        .await
+        .map_err(|status| format!("worker on {} returned {}", allocation.node_id, status))?;
+
+    Ok(reply.into_inner().streams)
+}
+
 fn handle_failed_allocations(
     store: &Store,
     failure_tracker: &Arc<Mutex<AllocationFailureTracker>>,
@@ -2602,9 +2722,9 @@ mod tests {
     use crate::structs::config::ManagerConfigFull;
     use crate::structs::worker_server::Worker;
     use crate::structs::{
-        AllocationHealth, Eval, JobConfig, ListRolloutEventsRequest, NodeMsg, PostWorkReply,
-        PostWorkRequest, PutKvRequest, RestartWorkerReply, RestartWorkerRequest, RunJobRequest,
-        Submission, TaskConfig, UpdateNodeDynamicRequest,
+        AllocationHealth, Eval, GetAllocationLogsRequest, JobConfig, ListRolloutEventsRequest,
+        NodeMsg, PostWorkReply, PostWorkRequest, PutKvRequest, RestartWorkerReply,
+        RestartWorkerRequest, RunJobRequest, Submission, TaskConfig, UpdateNodeDynamicRequest,
     };
     use serde_json::{json, Map, Value};
     use tempfile::Builder;
@@ -2727,6 +2847,21 @@ mod tests {
                 message: "ok".into(),
             }))
         }
+
+        async fn get_task_logs(
+            &self,
+            request: Request<GetTaskLogsRequest>,
+        ) -> Result<Response<crate::structs::GetTaskLogsReply>, Status> {
+            let allocation_id = request.into_inner().allocation_id;
+            Ok(Response::new(crate::structs::GetTaskLogsReply {
+                streams: vec![crate::structs::TaskLogStream {
+                    stream: "stdout".into(),
+                    content: format!("logs for {allocation_id}"),
+                    size_bytes: 0,
+                    truncated: false,
+                }],
+            }))
+        }
     }
 
     #[tokio::test]
@@ -2779,6 +2914,44 @@ mod tests {
         assert_eq!(guard.as_deref(), Some("node-1"));
 
         let _ = shutdown_tx.send(());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_allocation_logs_requires_a_target() -> R<()> {
+        let store = setup_store()?;
+        let manager = ManagerAgentService::new(store);
+
+        let status = manager
+            .get_allocation_logs(Request::new(GetAllocationLogsRequest {
+                job: String::new(),
+                allocation_id: None,
+                stream: "all".into(),
+                max_bytes: 0,
+                tail: false,
+            }))
+            .await
+            .expect_err("missing target should error");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_allocation_logs_unknown_job_is_not_found() -> R<()> {
+        let store = setup_store()?;
+        let manager = ManagerAgentService::new(store);
+
+        let status = manager
+            .get_allocation_logs(Request::new(GetAllocationLogsRequest {
+                job: "missing-job".into(),
+                allocation_id: None,
+                stream: "all".into(),
+                max_bytes: 0,
+                tail: false,
+            }))
+            .await
+            .expect_err("unknown job should error");
+        assert_eq!(status.code(), tonic::Code::NotFound);
         Ok(())
     }
 
