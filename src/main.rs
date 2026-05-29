@@ -10,6 +10,7 @@ fn cli() -> Command {
         .propagate_version(true)
         .subcommand_required(true)
         .arg_required_else_help(true)
+        .subcommand(cmd::capabilities::config())
         .subcommand(cmd::docs::config())
         .subcommand(cmd::job::config())
         .subcommand(cmd::node::config())
@@ -36,6 +37,7 @@ async fn main() -> R<()> {
     init_tracing(enable_o11y)?;
 
     match matches.subcommand() {
+        Some(("capabilities", sub_matches)) => cmd::capabilities::handle(sub_matches).await?,
         Some(("docs", sub_matches)) => cmd::docs::handle(sub_matches).await?,
         Some(("start", sub_matches)) => cmd::start::handle(sub_matches).await?,
         Some(("job", sub_matches)) => cmd::job::handle(sub_matches).await?,
