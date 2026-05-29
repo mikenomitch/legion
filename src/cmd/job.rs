@@ -4,17 +4,18 @@ use std::vec;
 use clap::value_parser;
 
 use crate::cmd::helpers::{connect_manager_client, friendly_status, json_flag, print_table};
+use crate::cmd::output::{self, CliError, OutputFormat};
 use crate::getter_rs::Client as GetterClient;
 use crate::prelude::*;
 use crate::structs::{
     AdvanceRolloutRequest, DestroyJobRequest, GetJobInfoRequest, GetJobSpecRequest, GetKvRequest,
-    GetRolloutStatusRequest, JobPlanPrint, JobPrint, KvEntry, KvValueType, ListJobsRequest,
-    ListRolloutEventsRequest, ListRolloutsRequest, PlanJobRequest, RunJobRequest, StopJobRequest,
-    Submission,
+    GetRolloutStatusRequest, JobConfig, JobPlanPrint, JobPrint, KvEntry, KvValueType,
+    ListJobsRequest, ListRolloutEventsRequest, ListRolloutsRequest, PlanJobRequest, RunJobRequest,
+    StopJobRequest, Submission,
 };
+use crate::task_plugins::{builtin_task_plugin_schemas, validate_job_config};
 use jsonnet::JsonnetVm;
 use serde::Serialize;
-use serde_json::to_string;
 use tabled::Tabled;
 use tempfile::TempDir;
 use url::Url;
@@ -36,6 +37,10 @@ pub fn config() -> Command {
                 .help("Force a reschedule even if the job spec is unchanged")
                 .action(ArgAction::SetTrue),
         )
+        .arg(idempotency_arg())
+        .arg(wait_flag())
+        .arg(timeout_arg())
+        .arg(json_flag())
         .args(jsonnet_var_args());
 
     let stop_cmd = Command::new("stop")
@@ -46,7 +51,9 @@ pub fn config() -> Command {
                 .help("Name of the job to stop"),
         )
         .arg(priority_arg())
-        .arg(asap_flag());
+        .arg(asap_flag())
+        .arg(idempotency_arg())
+        .arg(json_flag());
 
     let destroy_cmd = Command::new("destroy")
         .about("Destroy a job")
@@ -56,7 +63,36 @@ pub fn config() -> Command {
                 .help("Name of the job to remove"),
         )
         .arg(priority_arg())
-        .arg(asap_flag());
+        .arg(asap_flag())
+        .arg(idempotency_arg())
+        .arg(json_flag());
+
+    let validate_cmd = Command::new("validate")
+        .about("Render and validate a jobspec locally without submitting it")
+        .arg(
+            Arg::new("path")
+                .value_name("PATH")
+                .help("Path or URL to the job specification to validate")
+                .required(true)
+                .value_hint(ValueHint::AnyPath),
+        )
+        .arg(json_flag())
+        .args(jsonnet_var_args());
+
+    let schema_cmd = Command::new("schema")
+        .about("Emit the JSON Schema for jobspecs and built-in task kinds")
+        .arg(json_flag());
+
+    let wait_cmd = Command::new("wait")
+        .about("Block until a job's active rollout converges or times out")
+        .arg(
+            Arg::new("name")
+                .value_name("NAME")
+                .help("Name of the job to wait on")
+                .required(true),
+        )
+        .arg(timeout_arg())
+        .arg(json_flag());
 
     let info_cmd = Command::new("info")
         .about("Get job info")
@@ -175,11 +211,344 @@ pub fn config() -> Command {
         .subcommand(run_cmd)
         .subcommand(info_cmd)
         .subcommand(plan_cmd)
+        .subcommand(validate_cmd)
+        .subcommand(schema_cmd)
+        .subcommand(wait_cmd)
         .subcommand(list_cmd)
         .subcommand(stop_cmd)
         .subcommand(spec_cmd)
         .subcommand(destroy_cmd)
         .subcommand(rollout_cmd)
+}
+
+/// Optional idempotency key for mutating job operations. When supplied, the
+/// manager deduplicates retried requests carrying the same key, so an agent
+/// can safely retry on timeout without risking a double-apply.
+fn idempotency_arg() -> Arg {
+    Arg::new("idempotency-key")
+        .long("idempotency-key")
+        .value_name("KEY")
+        .help("Deduplicate retries of this mutating request (safe for agent retries)")
+}
+
+/// Flag requesting that `job run` block until the resulting rollout converges.
+fn wait_flag() -> Arg {
+    Arg::new("wait")
+        .long("wait")
+        .help("Block until the job's rollout converges to a terminal state")
+        .action(ArgAction::SetTrue)
+}
+
+/// Timeout (seconds) for convergence waits.
+fn timeout_arg() -> Arg {
+    Arg::new("timeout")
+        .long("timeout")
+        .value_name("SECONDS")
+        .help("Maximum seconds to wait for convergence (default 120)")
+        .value_parser(value_parser!(u64))
+}
+
+/// Default convergence-wait timeout when `--timeout` is not supplied.
+const DEFAULT_WAIT_SECS: u64 = 120;
+
+fn wait_timeout(matches: &ArgMatches) -> std::time::Duration {
+    let secs = matches
+        .get_one::<u64>("timeout")
+        .copied()
+        .unwrap_or(DEFAULT_WAIT_SECS);
+    std::time::Duration::from_secs(secs)
+}
+
+/// Outcome of waiting for a job's rollout to converge.
+///
+/// `wait` tracks the job's most recent rollout (the canonical signal for
+/// whether an update has finished applying). A fresh job with no prior version
+/// has no rollout to track, in which case `status` is `no_rollout`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WaitResult {
+    /// True when the rollout reached a settled state (terminal or paused), or
+    /// there was no rollout to wait on.
+    pub converged: bool,
+    /// True only when the rollout completed successfully (or there was nothing
+    /// to wait on).
+    pub success: bool,
+    /// Final rollout status, or `no_rollout` / `timeout`.
+    pub status: String,
+    /// Rollout id that was tracked, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rollout_id: Option<i64>,
+    /// Seconds spent waiting.
+    pub waited_secs: u64,
+}
+
+impl WaitResult {
+    fn human_summary(&self) -> String {
+        match (&self.rollout_id, self.converged) {
+            (Some(id), true) => format!(
+                "Rollout {id} converged: {} (waited {}s)",
+                self.status, self.waited_secs
+            ),
+            (Some(id), false) => format!(
+                "Timed out after {}s waiting for rollout {id} (status={})",
+                self.waited_secs, self.status
+            ),
+            (None, _) => format!("No rollout to wait on (status={})", self.status),
+        }
+    }
+}
+
+/// Rollout statuses past which no further automatic progress will happen.
+fn is_settled_rollout_status(status: &str) -> bool {
+    matches!(
+        status,
+        "completed" | "failed" | "cancelled" | "completed_incomplete" | "paused"
+    )
+}
+
+/// Poll the job's most recent rollout until it settles or the timeout elapses.
+async fn wait_for_convergence(
+    client: &mut crate::structs::manager_client::ManagerClient<tonic::transport::Channel>,
+    job_name: &str,
+    timeout: std::time::Duration,
+    format: OutputFormat,
+) -> R<WaitResult> {
+    let start = std::time::Instant::now();
+
+    loop {
+        // Find the most recent rollout for this job.
+        let list = output::resolve(
+            format,
+            "failed to list rollouts while waiting",
+            client
+                .list_rollouts(tonic::Request::new(ListRolloutsRequest {
+                    job_id: Some(job_name.to_string()),
+                    active_only: false,
+                    ..Default::default()
+                }))
+                .await,
+        )?
+        .into_inner();
+
+        let current = list.rollouts.into_iter().next();
+
+        // No rollout exists to track (e.g. a fresh job with no prior version).
+        let Some(rollout) = current else {
+            return Ok(WaitResult {
+                converged: true,
+                success: true,
+                status: "no_rollout".to_string(),
+                rollout_id: None,
+                waited_secs: start.elapsed().as_secs(),
+            });
+        };
+
+        // Settled: terminal or paused (no further automatic progress).
+        if is_settled_rollout_status(&rollout.status) {
+            return Ok(WaitResult {
+                converged: true,
+                success: rollout.status == "completed",
+                status: rollout.status,
+                rollout_id: Some(rollout.id),
+                waited_secs: start.elapsed().as_secs(),
+            });
+        }
+
+        // Still in progress: give up once the deadline passes.
+        if start.elapsed() >= timeout {
+            return Ok(WaitResult {
+                converged: false,
+                success: false,
+                status: rollout.status,
+                rollout_id: Some(rollout.id),
+                waited_secs: start.elapsed().as_secs(),
+            });
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+    }
+}
+
+#[instrument(err, skip_all)]
+async fn wait_job(arg_matches: &ArgMatches) -> R<()> {
+    let format = OutputFormat::from_matches(arg_matches);
+    let job_name = arg_matches
+        .get_one::<String>("name")
+        .context("missing job name")?;
+    let timeout = wait_timeout(arg_matches);
+    let mut client = connect_manager_client().await?;
+
+    let result = wait_for_convergence(&mut client, job_name, timeout, format).await?;
+
+    if format.is_json() {
+        output::print_success(&result);
+    } else {
+        println!("{}", result.human_summary());
+    }
+
+    // A non-converged wait is a failure for scripting/agent purposes.
+    if !result.converged {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+#[instrument(err, skip_all)]
+async fn validate_job(arg_matches: &ArgMatches) -> R<()> {
+    let format = OutputFormat::from_matches(arg_matches);
+    let path = arg_matches
+        .get_one::<String>("path")
+        .context("missing jobspec path")?;
+
+    // Resolve jsonnet vars. KV-backed vars require the manager; plain vars do
+    // not, so validation stays usable offline for the common case.
+    let vars = jsonnet_vars_from_matches(arg_matches)?;
+    let vars = if kv_keys_from_vars(&vars).is_empty() {
+        vars
+    } else {
+        let mut client = connect_manager_client().await?;
+        resolve_kv_jsonnet_vars_from_manager(&mut client, vars).await?
+    };
+
+    let resolved = resolve_jobspec_source_async(path).await?;
+    let (rendered, _submissions) = render_jobspec(&resolved.path, &vars)?;
+
+    // Parse the rendered jobspec into a JobConfig.
+    let config: JobConfig = match serde_json::from_str(&rendered) {
+        Ok(config) => config,
+        Err(err) => {
+            return Err(output::fail_local(
+                format,
+                CliError::local(
+                    "InvalidArgument",
+                    format!("jobspec is not a valid job configuration: {err}"),
+                    Some("check field names and types against `legion job schema`"),
+                ),
+            ));
+        }
+    };
+
+    // Run the same deep validation the manager applies on submit.
+    if let Err(err) = validate_job_config(&config) {
+        return Err(output::fail_local(
+            format,
+            CliError::local(
+                "InvalidArgument",
+                format!("jobspec failed validation: {err}"),
+                None,
+            ),
+        ));
+    }
+
+    let task_count = config.tasks.len();
+    let groups: std::collections::BTreeSet<&str> = config
+        .tasks
+        .iter()
+        .map(|task| task.group.as_str())
+        .collect();
+
+    if format.is_json() {
+        output::print_success(&json!({
+            "valid": true,
+            "job": config.name,
+            "tasks": task_count,
+            "groups": groups.iter().collect::<Vec<_>>(),
+        }));
+    } else {
+        println!(
+            "Jobspec '{}' is valid: {} task(s) across {} group(s)",
+            config.name,
+            task_count,
+            groups.len()
+        );
+    }
+
+    Ok(())
+}
+
+#[instrument(err, skip_all)]
+async fn job_schema(arg_matches: &ArgMatches) -> R<()> {
+    let format = OutputFormat::from_matches(arg_matches);
+    let schema = build_jobspec_schema();
+
+    if format.is_json() {
+        output::print_success(&schema);
+    } else {
+        println!("{}", serde_json::to_string_pretty(&schema)?);
+    }
+    Ok(())
+}
+
+/// Assemble the jobspec JSON Schema: a documented top-level envelope plus the
+/// live, per-kind task config schemas derived from the built-in plugins.
+pub(crate) fn build_jobspec_schema() -> Value {
+    let mut task_kinds = serde_json::Map::new();
+    for plugin in builtin_task_plugin_schemas() {
+        task_kinds.insert(plugin.name, plugin.schema);
+    }
+
+    json!({
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "title": "Legion Jobspec",
+        "description": "A Legion job specification (the JSON a jsonnet jobspec renders to). \
+            A job has a name and one or more tasks (use `task` for a single task or `tasks` for many). \
+            Each task's `config` object is validated against the schema for its `kind` under `taskKinds`.",
+        "type": "object",
+        "required": ["name"],
+        "properties": {
+            "name": { "type": "string", "description": "Unique job name." },
+            "task": { "$ref": "#/$defs/task", "description": "A single task (shorthand for tasks: [task])." },
+            "tasks": { "type": "array", "items": { "$ref": "#/$defs/task" }, "description": "List of tasks." },
+            "version": { "type": "integer", "description": "Optional jobspec version." },
+            "rollout": { "$ref": "#/$defs/rollout", "description": "Default rollout strategy for the job." },
+            "rolloutByGroup": {
+                "type": "object",
+                "additionalProperties": { "$ref": "#/$defs/rollout" },
+                "description": "Per-group rollout overrides keyed by group name."
+            }
+        },
+        "$defs": {
+            "task": {
+                "type": "object",
+                "required": ["kind"],
+                "properties": {
+                    "name": { "type": "string", "description": "Task name (unique within the job)." },
+                    "kind": { "type": "string", "description": "Task kind/plugin (e.g. exec, container, noop)." },
+                    "group": { "type": "string", "description": "Task group; tasks in a group are placed together." },
+                    "lifecycle": { "type": "string", "enum": ["service", "batch", "sidecar"], "description": "Task lifecycle." },
+                    "count": {
+                        "description": "Number of instances, or {num, per} for spread placement.",
+                        "oneOf": [
+                            { "type": "integer", "minimum": 0 },
+                            { "type": "object", "required": ["num", "per"], "properties": {
+                                "num": { "type": "integer" },
+                                "per": { "type": "string" }
+                            }}
+                        ]
+                    },
+                    "config": { "type": "object", "description": "Kind-specific config; validated against taskKinds[kind]." },
+                    "dependsOn": {
+                        "type": "array",
+                        "items": { "type": "object", "required": ["task"], "properties": {
+                            "task": { "type": "string" },
+                            "condition": { "type": "string", "enum": ["running", "healthy", "complete", "success"] }
+                        }},
+                        "description": "Task dependencies that gate start."
+                    },
+                    "schedule": { "description": "Batch-only schedule (cron string or {every: duration})." }
+                }
+            },
+            "rollout": {
+                "type": "object",
+                "properties": {
+                    "strategy": { "type": "string", "description": "Rollout strategy name (e.g. default)." },
+                    "maxParallel": { "type": "integer", "description": "Max allocations updated in parallel." },
+                    "autoPromote": { "type": "boolean", "description": "Advance automatically between steps." }
+                }
+            }
+        },
+        "taskKinds": task_kinds
+    })
 }
 
 fn priority_arg() -> Arg {
@@ -410,10 +779,11 @@ async fn resolve_kv_jsonnet_vars_from_manager(
     })
 }
 
+/// Emit a value as the standard agent-friendly success envelope
+/// (`{"ok":true,"data":...}`). Kept as a thin wrapper so every job read
+/// command shares the one shape that mutating commands use.
 fn print_json<T: Serialize>(value: &T) {
-    if let Ok(json) = to_string(value) {
-        println!("{json}");
-    }
+    output::print_success(value);
 }
 
 struct ResolvedJobspec {
@@ -531,6 +901,9 @@ pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
         Some(("list", matches)) => list_jobs(matches).await,
         Some(("info", matches)) => get_info(matches).await,
         Some(("plan", matches)) => plan_job(matches).await,
+        Some(("validate", matches)) => validate_job(matches).await,
+        Some(("schema", matches)) => job_schema(matches).await,
+        Some(("wait", matches)) => wait_job(matches).await,
         Some(("rollout", matches)) => handle_rollout(matches).await,
         _ => unreachable!(),
     }
@@ -569,6 +942,59 @@ mod tests {
         let cmd = config();
         let result = cmd.try_get_matches_from(["job", "run", "--priority", "75", "--asap"]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn settled_rollout_statuses() {
+        for status in [
+            "completed",
+            "failed",
+            "cancelled",
+            "completed_incomplete",
+            "paused",
+        ] {
+            assert!(is_settled_rollout_status(status), "{status} should settle");
+        }
+        for status in ["pending", "running", "active"] {
+            assert!(
+                !is_settled_rollout_status(status),
+                "{status} should not settle"
+            );
+        }
+    }
+
+    #[test]
+    fn jobspec_schema_embeds_task_kinds() {
+        let schema = build_jobspec_schema();
+        assert_eq!(schema["title"], "Legion Jobspec");
+        let kinds = schema["taskKinds"].as_object().expect("taskKinds object");
+        // Built-in kinds must be present and carry real derived schemas.
+        assert!(kinds.contains_key("exec"));
+        assert!(kinds.contains_key("container"));
+        assert!(kinds["exec"]["properties"].is_object());
+    }
+
+    #[test]
+    fn validate_and_schema_subcommands_parse() {
+        let cmd = config();
+        assert!(cmd
+            .clone()
+            .try_get_matches_from(["job", "validate", "spec.jsonnet", "--json"])
+            .is_ok());
+        assert!(cmd
+            .clone()
+            .try_get_matches_from(["job", "wait", "demo", "--timeout", "5"])
+            .is_ok());
+        assert!(cmd
+            .try_get_matches_from([
+                "job",
+                "run",
+                "x.jsonnet",
+                "--wait",
+                "--idempotency-key",
+                "abc"
+            ])
+            .is_ok());
     }
 
     #[test]
@@ -611,29 +1037,38 @@ mod tests {
 
 #[instrument(err, skip_all)]
 async fn stop_job(arg_matches: &ArgMatches) -> R<()> {
+    let format = OutputFormat::from_matches(arg_matches);
     let mut client = connect_manager_client().await?;
     let job_name = arg_matches
         .get_one::<String>("name")
         .map_or("demo", String::as_str);
     let priority = priority_from_matches(arg_matches);
+    let idempotency_key = arg_matches.get_one::<String>("idempotency-key").cloned();
 
     let request = tonic::Request::new(StopJobRequest {
         name: job_name.to_owned(),
         priority,
+        idempotency_key,
     });
 
-    let response = client
-        .stop_job(request)
-        .await
-        .map_err(|status| friendly_status("failed to stop job", status))?;
-    println!("{}", response.into_inner().message);
+    let reply =
+        output::resolve(format, "failed to stop job", client.stop_job(request).await)?.into_inner();
+
+    if format.is_json() {
+        output::print_success(&json!({
+            "message": reply.message,
+            "deduplicated": reply.deduplicated,
+        }));
+    } else {
+        println!("{}", reply.message);
+    }
 
     Ok(())
 }
 
 #[instrument(err, skip_all)]
 async fn get_job_spec(arg_matches: &ArgMatches) -> R<()> {
-    let is_json = arg_matches.get_flag("json");
+    let format = OutputFormat::from_matches(arg_matches);
 
     let mut client = connect_manager_client().await?;
     let job_name = arg_matches
@@ -644,14 +1079,15 @@ async fn get_job_spec(arg_matches: &ArgMatches) -> R<()> {
         name: job_name.to_owned(),
     });
 
-    let response = client
-        .get_job_spec(request)
-        .await
-        .map_err(|status| friendly_status("failed to fetch job spec", status))?;
+    let response = output::resolve(
+        format,
+        "failed to fetch job spec",
+        client.get_job_spec(request).await,
+    )?;
 
     let subs = response.into_inner().submissions;
 
-    if is_json {
+    if format.is_json() {
         print_json(&subs);
     } else {
         subs.iter().for_each(|s| {
@@ -667,29 +1103,42 @@ async fn get_job_spec(arg_matches: &ArgMatches) -> R<()> {
 
 #[instrument(err, skip_all)]
 async fn destroy_job(arg_matches: &ArgMatches) -> R<()> {
+    let format = OutputFormat::from_matches(arg_matches);
     let mut client = connect_manager_client().await?;
     let job_name = arg_matches
         .get_one::<String>("name")
         .map_or("demo", String::as_str);
     let priority = priority_from_matches(arg_matches);
+    let idempotency_key = arg_matches.get_one::<String>("idempotency-key").cloned();
 
     let request = tonic::Request::new(DestroyJobRequest {
         name: job_name.to_owned(),
         priority,
+        idempotency_key,
     });
 
-    let response = client
-        .destroy_job(request)
-        .await
-        .map_err(|status| friendly_status("failed to destroy job", status))?;
-    println!("{}", response.into_inner().message);
+    let reply = output::resolve(
+        format,
+        "failed to destroy job",
+        client.destroy_job(request).await,
+    )?
+    .into_inner();
+
+    if format.is_json() {
+        output::print_success(&json!({
+            "message": reply.message,
+            "deduplicated": reply.deduplicated,
+        }));
+    } else {
+        println!("{}", reply.message);
+    }
 
     Ok(())
 }
 
 #[instrument(err, skip_all)]
 async fn plan_job(arg_matches: &ArgMatches) -> R<()> {
-    let is_json = arg_matches.get_flag("json");
+    let format = OutputFormat::from_matches(arg_matches);
     let mut client = connect_manager_client().await?;
     let path = arg_matches
         .get_one::<String>("path")
@@ -704,11 +1153,8 @@ async fn plan_job(arg_matches: &ArgMatches) -> R<()> {
         parsed_jobspec: rendered,
     });
 
-    let response = client
-        .plan_job(request)
-        .await
-        .map_err(|status| friendly_status("failed to plan job", status))?;
-    if is_json {
+    let response = output::resolve(format, "failed to plan job", client.plan_job(request).await)?;
+    if format.is_json() {
         let reply = response.into_inner();
         print_json(&reply);
         return Ok(());
@@ -732,49 +1178,79 @@ async fn plan_job(arg_matches: &ArgMatches) -> R<()> {
 
 #[instrument(err, skip_all)]
 async fn run_job(arg_matches: &ArgMatches) -> R<()> {
+    let format = OutputFormat::from_matches(arg_matches);
     let mut client = connect_manager_client().await?;
 
     let job_path = arg_matches
         .get_one::<String>("path")
         .map_or("./configs/jobs/demo.jsonnet", String::as_str);
     let priority = priority_from_matches(arg_matches);
+    let idempotency_key = arg_matches.get_one::<String>("idempotency-key").cloned();
     let vars = jsonnet_vars_from_matches(arg_matches)?;
     let vars = resolve_kv_jsonnet_vars_from_manager(&mut client, vars).await?;
     let resolved = resolve_jobspec_source_async(job_path).await?;
     let (rendered, submissions) = render_jobspec(&resolved.path, &vars)?;
+
+    // Capture the job name so we can optionally wait for convergence below.
+    let job_name = serde_json::from_str::<JobConfig>(&rendered)
+        .map(|config| config.name)
+        .ok();
 
     let request = tonic::Request::new(RunJobRequest {
         parsed_jobspec: rendered,
         submissions,
         priority,
         force_reschedule: arg_matches.get_flag("force-reschedule"),
+        idempotency_key,
     });
 
-    let response = client
-        .run_job(request)
-        .await
-        .map_err(|status| friendly_status("failed to run job", status))?;
+    let reply =
+        output::resolve(format, "failed to run job", client.run_job(request).await)?.into_inner();
 
-    println!("{}", response.into_inner().message);
+    let wait = arg_matches.get_flag("wait");
+    let timeout = wait_timeout(arg_matches);
+
+    let wait_result = if wait {
+        match job_name.as_deref() {
+            Some(name) => Some(wait_for_convergence(&mut client, name, timeout, format).await?),
+            None => None,
+        }
+    } else {
+        None
+    };
+
+    if format.is_json() {
+        output::print_success(&json!({
+            "message": reply.message,
+            "deduplicated": reply.deduplicated,
+            "wait": wait_result,
+        }));
+    } else {
+        println!("{}", reply.message);
+        if let Some(result) = &wait_result {
+            println!("{}", result.human_summary());
+        }
+    }
 
     Ok(())
 }
 
 #[instrument(err, skip_all)]
 async fn list_jobs(arg_matches: &ArgMatches) -> R<()> {
-    let is_json = arg_matches.get_flag("json");
+    let format = OutputFormat::from_matches(arg_matches);
 
     let mut client = connect_manager_client().await?;
     let request = tonic::Request::new(ListJobsRequest {
         ..Default::default()
     });
-    let response = client
-        .list_jobs(request)
-        .await
-        .map_err(|status| friendly_status("failed to list jobs", status))?;
+    let response = output::resolve(
+        format,
+        "failed to list jobs",
+        client.list_jobs(request).await,
+    )?;
     let jobs_list = response.into_inner().jobs;
 
-    if is_json {
+    if format.is_json() {
         print_json(&jobs_list);
     } else {
         let printable_jobs: Vec<JobPrint> = jobs_list.into_iter().map(Into::into).collect();
@@ -786,7 +1262,7 @@ async fn list_jobs(arg_matches: &ArgMatches) -> R<()> {
 
 #[instrument(err, skip_all)]
 async fn list_rollouts(arg_matches: &ArgMatches) -> R<()> {
-    let is_json = arg_matches.get_flag("json");
+    let format = OutputFormat::from_matches(arg_matches);
     let active_only = arg_matches.get_flag("active");
     let job_id = arg_matches.get_one::<String>("job").cloned();
 
@@ -796,13 +1272,14 @@ async fn list_rollouts(arg_matches: &ArgMatches) -> R<()> {
         active_only,
         ..Default::default()
     });
-    let response = client
-        .list_rollouts(request)
-        .await
-        .map_err(|status| friendly_status("failed to list rollouts", status))?;
+    let response = output::resolve(
+        format,
+        "failed to list rollouts",
+        client.list_rollouts(request).await,
+    )?;
     let rollouts = response.into_inner().rollouts;
 
-    if is_json {
+    if format.is_json() {
         print_json(&rollouts);
     } else {
         let printable = rollouts
@@ -837,7 +1314,7 @@ async fn advance_rollout_cmd(arg_matches: &ArgMatches) -> R<()> {
         .map(|values| values.cloned().collect::<Vec<_>>())
         .unwrap_or_default();
     let priority = priority_from_matches(arg_matches);
-    let is_json = arg_matches.get_flag("json");
+    let format = OutputFormat::from_matches(arg_matches);
 
     let mut client = connect_manager_client().await?;
     let request = tonic::Request::new(AdvanceRolloutRequest {
@@ -845,13 +1322,14 @@ async fn advance_rollout_cmd(arg_matches: &ArgMatches) -> R<()> {
         groups,
         priority,
     });
-    let response = client
-        .advance_rollout(request)
-        .await
-        .map_err(|status| friendly_status("failed to advance rollout", status))?
-        .into_inner();
+    let response = output::resolve(
+        format,
+        "failed to advance rollout",
+        client.advance_rollout(request).await,
+    )?
+    .into_inner();
 
-    if is_json {
+    if format.is_json() {
         print_json(&response.rollout);
     } else if let Some(rollout) = response.rollout {
         println!(
@@ -903,17 +1381,18 @@ async fn rollout_status_cmd(arg_matches: &ArgMatches) -> R<()> {
     let rollout_id = *arg_matches
         .get_one::<i64>("id")
         .context("missing rollout id")?;
-    let is_json = arg_matches.get_flag("json");
+    let format = OutputFormat::from_matches(arg_matches);
 
     let mut client = connect_manager_client().await?;
     let request = tonic::Request::new(GetRolloutStatusRequest { id: rollout_id });
-    let response = client
-        .get_rollout_status(request)
-        .await
-        .map_err(|status| friendly_status("failed to load rollout status", status))?
-        .into_inner();
+    let response = output::resolve(
+        format,
+        "failed to load rollout status",
+        client.get_rollout_status(request).await,
+    )?
+    .into_inner();
 
-    if is_json {
+    if format.is_json() {
         print_json(&response);
         return Ok(());
     }
@@ -1009,17 +1488,18 @@ async fn rollout_events_cmd(arg_matches: &ArgMatches) -> R<()> {
         .get_one::<i64>("id")
         .context("missing rollout id")?;
     let limit = arg_matches.get_one::<u32>("limit").copied();
-    let is_json = arg_matches.get_flag("json");
+    let format = OutputFormat::from_matches(arg_matches);
 
     let mut client = connect_manager_client().await?;
     let request = tonic::Request::new(ListRolloutEventsRequest { rollout_id, limit });
-    let response = client
-        .list_rollout_events(request)
-        .await
-        .map_err(|status| friendly_status("failed to load rollout events", status))?
-        .into_inner();
+    let response = output::resolve(
+        format,
+        "failed to load rollout events",
+        client.list_rollout_events(request).await,
+    )?
+    .into_inner();
 
-    if is_json {
+    if format.is_json() {
         print_json(&response.events);
         return Ok(());
     }
@@ -1046,19 +1526,20 @@ async fn rollout_events_cmd(arg_matches: &ArgMatches) -> R<()> {
 
 #[instrument(err, skip_all)]
 async fn get_info(arg_matches: &ArgMatches) -> R<()> {
-    let is_json = arg_matches.get_flag("json");
+    let format = OutputFormat::from_matches(arg_matches);
 
     let mut client = connect_manager_client().await?;
     let job_name = arg_matches.get_one::<String>("name").context("need name")?;
     let request = tonic::Request::new(GetJobInfoRequest {
         name: job_name.to_owned(),
     });
-    let response = client
-        .get_job_info(request)
-        .await
-        .map_err(|status| friendly_status("failed to fetch job info", status))?;
+    let response = output::resolve(
+        format,
+        "failed to fetch job info",
+        client.get_job_info(request).await,
+    )?;
 
-    if is_json {
+    if format.is_json() {
         print_json(&response.into_inner().job);
     } else {
         let printable_job: JobPrint = response.into_inner().job.context("no job found")?.into();

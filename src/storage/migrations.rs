@@ -365,5 +365,14 @@ pub fn get_migrations() -> Migrations<'static> {
         )",
         )
         .down("DROP TABLE IF EXISTS saved_state_query;"),
+        M::up(
+            "CREATE TABLE IF NOT EXISTS idempotency_record (
+            key TEXT PRIMARY KEY,
+            operation TEXT NOT NULL,
+            response_message TEXT NOT NULL,
+            created_at TIMESTAMP NOT NULL
+        )",
+        )
+        .down("DROP TABLE IF EXISTS idempotency_record;"),
     ])
 }

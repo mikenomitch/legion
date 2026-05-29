@@ -300,6 +300,16 @@ message RunJobRequest {
   //
   // Default: `false`.
   bool force_reschedule = 4;
+
+  // Optional idempotency key.
+  //
+  // When set and non-empty, the manager deduplicates retried requests carrying
+  // the same key: the first request is applied and its outcome recorded; any
+  // later request with the same key returns the recorded reply without
+  // re-applying. This lets clients (especially automated agents) safely retry
+  // after a timeout without risking a double submission. Unset disables
+  // deduplication.
+  optional string idempotency_key = 5;
 }
 
 // Reply payload for RunJob.
@@ -313,6 +323,10 @@ message RunJobReply {
   // - `"Job config unchanged; no update needed"`
   // - `"Job config unchanged; forced reschedule queued"`
   string message = 1;
+
+  // True when this reply was replayed from a previously recorded result for the
+  // request's `idempotency_key` rather than applied fresh.
+  bool deduplicated = 2;
 }
 
 // Request payload for GetJobInfo.
@@ -699,6 +713,9 @@ message StopJobRequest {
   // Default when omitted: manager `default_priority`
   // (`50` in built-in config defaults).
   optional int64 priority = 2;
+
+  // Optional idempotency key. See `RunJobRequest.idempotency_key`.
+  optional string idempotency_key = 3;
 }
 
 // Reply payload for StopJob.
@@ -707,6 +724,10 @@ message StopJobReply {
   //
   // Current manager reply format: `"Stopped <job-name>"`.
   string message = 1;
+
+  // True when replayed from a recorded result for the request's
+  // `idempotency_key` rather than applied fresh.
+  bool deduplicated = 2;
 }
 
 // Request payload for DestroyJob.
@@ -718,6 +739,9 @@ message DestroyJobRequest {
   //
   // Current manager implementation ignores this field.
   optional int64 priority = 2;
+
+  // Optional idempotency key. See `RunJobRequest.idempotency_key`.
+  optional string idempotency_key = 3;
 }
 
 // Reply payload for DestroyJob.
@@ -726,6 +750,10 @@ message DestroyJobReply {
   //
   // Current manager reply format: `"Destroyed <job-name>"`.
   string message = 1;
+
+  // True when replayed from a recorded result for the request's
+  // `idempotency_key` rather than applied fresh.
+  bool deduplicated = 2;
 }
 
 // Request payload for ListJobs.

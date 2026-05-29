@@ -18,6 +18,7 @@ A distributed scheduler similar to Kubernetes or Nomad.
 - [KV Store](docs/kv-store.md)
 - [Testing and Benchmarks](docs/testing-and-benchmarks.md)
 - [Codebase Conventions](docs/codebase-conventions.md)
+- [Agent Readiness (MCP, structured output, agent workflow)](docs/agent-readiness.md)
 
 It aims to be differentiated from the above based on the following:
 - Ease:

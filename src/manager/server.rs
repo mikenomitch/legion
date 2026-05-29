@@ -829,6 +829,18 @@ impl Manager for ManagerAgentService {
         let js = inner.parsed_jobspec;
         let mut subs = inner.submissions;
         let priority = inner.priority.unwrap_or(self.store.default_eval_priority);
+        let idempotency_key = inner.idempotency_key.unwrap_or_default();
+
+        if let Some(message) = self
+            .store
+            .idempotency_lookup(&idempotency_key)
+            .map_err(|e| map_store_error("Error checking idempotency", e))?
+        {
+            return Ok(Response::new(RunJobReply {
+                message,
+                deduplicated: true,
+            }));
+        }
 
         if !subs.iter().any(|sub| sub.path == "job.rendered.json") {
             subs.push(Submission {
@@ -911,8 +923,13 @@ impl Manager for ManagerAgentService {
                 .map_err(|e| map_store_error("Error running job", e))?;
         }
 
+        self.store
+            .idempotency_record(&idempotency_key, "run_job", message)
+            .map_err(|e| map_store_error("Error recording idempotency", e))?;
+
         let reply = RunJobReply {
             message: message.into(),
+            deduplicated: false,
         };
 
         Ok(Response::new(reply))
@@ -1343,6 +1360,18 @@ impl Manager for ManagerAgentService {
         let inner = request.into_inner();
         let name = inner.name;
         let priority = inner.priority.unwrap_or(self.store.default_eval_priority);
+        let idempotency_key = inner.idempotency_key.unwrap_or_default();
+
+        if let Some(message) = self
+            .store
+            .idempotency_lookup(&idempotency_key)
+            .map_err(|e| map_store_error("Error checking idempotency", e))?
+        {
+            return Ok(Response::new(StopJobReply {
+                message,
+                deduplicated: true,
+            }));
+        }
 
         let job_config_id = self
             .store
@@ -1366,7 +1395,13 @@ impl Manager for ManagerAgentService {
             .map_err(|e| map_store_error("Error stopping job", e))?;
 
         let message = format!("Stopped {}", name);
-        let reply = StopJobReply { message };
+        self.store
+            .idempotency_record(&idempotency_key, "stop_job", &message)
+            .map_err(|e| map_store_error("Error recording idempotency", e))?;
+        let reply = StopJobReply {
+            message,
+            deduplicated: false,
+        };
 
         Ok(Response::new(reply))
     }
@@ -1376,7 +1411,20 @@ impl Manager for ManagerAgentService {
         &self,
         request: Request<DestroyJobRequest>,
     ) -> Result<Response<DestroyJobReply>, Status> {
-        let name = request.into_inner().name;
+        let inner = request.into_inner();
+        let name = inner.name;
+        let idempotency_key = inner.idempotency_key.unwrap_or_default();
+
+        if let Some(message) = self
+            .store
+            .idempotency_lookup(&idempotency_key)
+            .map_err(|e| map_store_error("Error checking idempotency", e))?
+        {
+            return Ok(Response::new(DestroyJobReply {
+                message,
+                deduplicated: true,
+            }));
+        }
 
         let _ = self
             .store
@@ -1385,7 +1433,13 @@ impl Manager for ManagerAgentService {
 
         // TODO: Conditionalize
         let message = format!("Destroyed {}", name);
-        let reply = DestroyJobReply { message };
+        self.store
+            .idempotency_record(&idempotency_key, "destroy_job", &message)
+            .map_err(|e| map_store_error("Error recording idempotency", e))?;
+        let reply = DestroyJobReply {
+            message,
+            deduplicated: false,
+        };
 
         Ok(Response::new(reply))
     }
@@ -2763,6 +2817,7 @@ mod tests {
                 submissions: vec![submission()],
                 priority: None,
                 force_reschedule: false,
+                idempotency_key: None,
             }))
             .await?;
 
@@ -2842,6 +2897,7 @@ mod tests {
                 submissions: vec![submission()],
                 priority: None,
                 force_reschedule: false,
+                idempotency_key: None,
             }))
             .await?;
 
@@ -2900,6 +2956,7 @@ mod tests {
                 submissions: vec![submission()],
                 priority: None,
                 force_reschedule: false,
+                idempotency_key: None,
             }))
             .await?;
 
@@ -2989,6 +3046,7 @@ mod tests {
                 submissions: vec![submission()],
                 priority: None,
                 force_reschedule: false,
+                idempotency_key: None,
             }))
             .await?;
 

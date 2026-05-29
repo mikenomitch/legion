@@ -20,9 +20,27 @@ pub fn o11y_enabled() -> bool {
 
 #[instrument(skip_all)]
 pub fn init_tracing(enable_o11y: bool) -> R<()> {
+    init_tracing_with_options(enable_o11y, false)
+}
+
+/// Initialize tracing, optionally routing the human-readable console layer to
+/// stderr instead of stdout.
+///
+/// Routing to stderr is required for stdio protocol servers (for example
+/// `legion mcp serve`), where stdout is reserved for protocol messages and any
+/// stray log line would corrupt the stream.
+#[instrument(skip_all)]
+pub fn init_tracing_with_options(enable_o11y: bool, console_to_stderr: bool) -> R<()> {
     O11Y_ENABLED.store(enable_o11y, Ordering::Relaxed);
 
-    let stdout_log = tracing_subscriber::fmt::layer().pretty();
+    let stdout_log = if console_to_stderr {
+        tracing_subscriber::fmt::layer()
+            .pretty()
+            .with_writer(std::io::stderr)
+            .boxed()
+    } else {
+        tracing_subscriber::fmt::layer().pretty().boxed()
+    };
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     std::fs::create_dir_all("./logs")?;

@@ -43,8 +43,40 @@
 - Never trace secrets/tokens (join tokens, raw cert material, KV lock IDs, env var values that may contain credentials).
 - Prefer concise lifecycle logs (`started`, `planned`, `applied`, `failed`, `recovered`) over per-iteration noise.
 
+## Agent-Friendly Contributions
+Legion is operated by humans **and** by autonomous agents (via the CLI, gRPC, and
+the MCP server). Keep these surfaces agent-friendly when contributing. See
+`docs/agent-readiness.md` for the full picture.
+
+- **Structured output is mandatory.** Every CLI command must accept `--json`/`-j`
+  (`crate::cmd::helpers::json_flag`) and emit the standard envelope via
+  `crate::cmd::output`: `output::print_success(&data)` on success, and route gRPC
+  calls through `output::resolve(format, action, result)` so failures become the
+  typed `{ ok: false, error: { code, message, hint, retryable } }` envelope. Do
+  not hand-print ad-hoc JSON.
+- **Keep the capability catalog in sync.** When you add, rename, or remove a CLI
+  command or a user-facing gRPC method, update `catalog()` in
+  `src/cmd/capabilities.rs` (name, summary, `mutates`, `read_only_safe`). Mutating
+  operations must have `read_only_safe: false` (enforced by a unit test).
+- **Expose agent-relevant operations over MCP.** If an operation is useful to an
+  agent, add a tool in `src/cmd/mcp.rs`. Read-only tools are always listed;
+  mutating tools must set `mutates: true` so they are gated behind `--allow-write`.
+  Never write logs to stdout in MCP mode — stdout is the JSON-RPC stream (use
+  `init_tracing_with_options(.., console_to_stderr = true)`, already wired for
+  `mcp serve`).
+- **Mutating RPCs should be retry-safe.** New mutating manager RPCs should accept
+  an optional `idempotency_key` and report `deduplicated`, using
+  `Store::idempotency_lookup` / `Store::idempotency_record` (see RunJob/StopJob/
+  DestroyJob for the pattern).
+- **Prefer read-only-by-default and dry-runs.** Anything that can offer a
+  validate/plan/preview path (like `job validate` / `job plan`) should, so agents
+  can self-correct before mutating the cluster.
+- **Document new agent surfaces** in `docs/agent-readiness.md`.
+
 ## Docs, Plan, and To Dos
 - Docs, Plan, and To Dos live in `docs/`
+- `docs/agent-readiness.md` describes the agent-facing surfaces (MCP, structured
+  output, capabilities, validate/schema, idempotency, wait, saved queries)
 - `docs/NEXT_UP.md` contains the immediate todos for the current task that the human developer is working on
 - `docs/TASK-LIST.md` contains a higher-level To Do list
 - `docs/differentiators.md` contains a list of reasons that legion is different from K8s and Nomad
@@ -64,3 +96,4 @@
   - `docs/kv-store.md`
   - `docs/testing-and-benchmarks.md`
   - `docs/codebase-conventions.md`
+  - `docs/agent-readiness.md`

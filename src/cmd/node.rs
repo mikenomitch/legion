@@ -1,10 +1,10 @@
-use crate::cmd::helpers::{connect_manager_client, friendly_status, json_flag, print_table};
+use crate::cmd::helpers::{connect_manager_client, json_flag, print_table};
+use crate::cmd::output::{self, OutputFormat};
 use crate::prelude::*;
 use crate::structs::{
     GetNodeRequest, GetNodesRequest, Node, NodePrint, RestartWorkerRequest,
     UpdateNodeDynamicRequest,
 };
-use serde_json::to_string;
 
 pub fn config() -> Command {
     let get_nodes_cmd = Command::new("list").about("List nodes").arg(json_flag());
@@ -68,8 +68,8 @@ pub fn config() -> Command {
 pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
     match sub_matches.subcommand() {
         Some(("list", arg_matches)) => {
-            let is_json = arg_matches.get_flag("json");
-            get_nodes(is_json).await
+            let format = OutputFormat::from_matches(arg_matches);
+            get_nodes(format).await
         }
         Some(("update", arg_matches)) => {
             let id = arg_matches
@@ -105,46 +105,45 @@ pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
                 bail!(msg);
             }
 
-            let is_json = arg_matches.get_flag("json");
-            update_node(id.into(), dynamic_diff, is_json).await
+            let format = OutputFormat::from_matches(arg_matches);
+            update_node(id.into(), dynamic_diff, format).await
         }
         Some(("info", arg_matches)) => {
             let id = arg_matches
                 .get_one::<String>("id")
                 .context("Must provide id")?;
 
-            let is_json = arg_matches.get_flag("json");
-            get_node_info(id.to_string(), is_json).await
+            let format = OutputFormat::from_matches(arg_matches);
+            get_node_info(id.to_string(), format).await
         }
         Some(("restart", arg_matches)) => {
             let id = arg_matches
                 .get_one::<String>("id")
                 .context("Must provide id")?;
 
-            let is_json = arg_matches.get_flag("json");
-            restart_node(id.to_string(), is_json).await
+            let format = OutputFormat::from_matches(arg_matches);
+            restart_node(id.to_string(), format).await
         }
         _ => unreachable!(),
     }
 }
 
 #[instrument(err, skip_all)]
-async fn get_nodes(is_json: bool) -> R<()> {
+async fn get_nodes(format: OutputFormat) -> R<()> {
     let mut client = connect_manager_client().await?;
     let request = tonic::Request::new(GetNodesRequest {
         ..Default::default()
     });
-    let response = client
-        .get_nodes(request)
-        .await
-        .map_err(|status| friendly_status("failed to list nodes", status))?;
-    let nodes_msg_list = response.into_inner().nodes;
-    let nodes: Vec<Node> = nodes_msg_list.into_iter().map(Into::into).collect();
+    let reply = output::resolve(
+        format,
+        "failed to list nodes",
+        client.get_nodes(request).await,
+    )?
+    .into_inner();
+    let nodes: Vec<Node> = reply.nodes.into_iter().map(Into::into).collect();
 
-    if is_json {
-        if let Ok(json) = to_string(&nodes) {
-            println!("{json}");
-        }
+    if format.is_json() {
+        output::print_success(&nodes);
     } else {
         let printable_nodes: Vec<NodePrint> = nodes.into_iter().map(Into::into).collect();
         print_table(printable_nodes);
@@ -154,7 +153,11 @@ async fn get_nodes(is_json: bool) -> R<()> {
 }
 
 #[instrument(err, skip_all)]
-async fn update_node(node_id: String, dynamic_diff: Map<String, Value>, is_json: bool) -> R<()> {
+async fn update_node(
+    node_id: String,
+    dynamic_diff: Map<String, Value>,
+    format: OutputFormat,
+) -> R<()> {
     let mut client = connect_manager_client().await?;
 
     let request = tonic::Request::new(UpdateNodeDynamicRequest {
@@ -162,61 +165,63 @@ async fn update_node(node_id: String, dynamic_diff: Map<String, Value>, is_json:
         dynamic_diff: serde_json::to_string(&dynamic_diff)?,
     });
 
-    let response = client
-        .update_node_dynamic(request)
-        .await
-        .map_err(|status| friendly_status("failed to update node", status))?;
+    let reply = output::resolve(
+        format,
+        "failed to update node",
+        client.update_node_dynamic(request).await,
+    )?
+    .into_inner();
+    let node = reply.node.map(Node::from);
 
-    match response.into_inner().node {
-        Some(node_msg) => {
-            let node: Node = node_msg.into();
-
-            if is_json {
-                node.print_long_json();
-            } else {
-                node.print_long();
-            };
+    if format.is_json() {
+        output::print_success(&node);
+    } else {
+        match node {
+            Some(node) => node.print_long(),
+            None => println!("Node not found"),
         }
-        None => println!("Node not found"),
     }
 
     Ok(())
 }
 
 #[instrument(err, skip_all)]
-async fn get_node_info(node_id: String, is_json: bool) -> R<()> {
+async fn get_node_info(node_id: String, format: OutputFormat) -> R<()> {
     let mut client = connect_manager_client().await?;
     let request = tonic::Request::new(GetNodeRequest { id: node_id });
-    let response = client
-        .get_node(request)
-        .await
-        .map_err(|status| friendly_status("failed to fetch node info", status))?;
+    let reply = output::resolve(
+        format,
+        "failed to fetch node info",
+        client.get_node(request).await,
+    )?
+    .into_inner();
+    let node = reply.node.map(Node::from);
 
-    match response.into_inner().node {
-        Some(node_msg) => {
-            let node: Node = node_msg.into();
-
-            if is_json {
-                node.print_long_json();
-            } else {
-                node.print_long();
-            };
+    if format.is_json() {
+        output::print_success(&node);
+    } else {
+        match node {
+            Some(node) => node.print_long(),
+            None => println!("Node not found"),
         }
-        None => println!("Node not found"),
     }
 
     Ok(())
 }
 
 #[instrument(err, skip_all)]
-async fn restart_node(node_id: String, is_json: bool) -> R<()> {
+async fn restart_node(node_id: String, format: OutputFormat) -> R<()> {
     let mut client = connect_manager_client().await?;
     let request = tonic::Request::new(RestartWorkerRequest { node_id });
-    let response = client.restart_worker(request).await?;
-    let reply = response.into_inner();
+    let reply = output::resolve(
+        format,
+        "failed to restart worker",
+        client.restart_worker(request).await,
+    )?
+    .into_inner();
 
-    if is_json {
-        println!("{}", json!({ "message": reply.message }));
+    if format.is_json() {
+        output::print_success(&json!({ "message": reply.message }));
     } else {
         println!("{}", reply.message);
     }
