@@ -388,7 +388,7 @@ impl Store {
 
         let mut task_stmt = conn.prepare(
             r#"
-            SELECT id, name, kind, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_config_id, identities
+            SELECT id, name, kind, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_config_id, identities, stateful
             FROM task_config;
             "#,
         )?;
@@ -420,6 +420,7 @@ impl Store {
                 on_unhealthy: self.parse_on_unhealthy_column(15, row.get(15)?)?,
                 kv_injections: self.parse_kv_injections_column(16, row.get(16)?)?,
                 identities: self.parse_identities_column(18, row.get(18)?)?,
+                stateful: self.parse_stateful_column(19, row.get(19)?)?,
             };
             let job_config_id: String = row.get(17)?;
             Ok((job_config_id, id, task))
@@ -1269,6 +1270,130 @@ impl Store {
         })
     }
 
+    fn parse_stateful_column(
+        &self,
+        idx: usize,
+        raw: Option<String>,
+    ) -> Result<Option<crate::structs::StatefulConfig>, rusqlite::Error> {
+        let Some(raw) = raw else {
+            return Ok(None);
+        };
+        serde_json::from_str(&raw).map(Some).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(
+                idx,
+                rusqlite::types::Type::Text,
+                Box::new(err),
+            )
+        })
+    }
+
+    fn instance_from_row(
+        &self,
+        row: &Row<'_>,
+    ) -> Result<crate::manager::instances::Instance, rusqlite::Error> {
+        let mode_raw: String = row.get(3)?;
+        let mode = match mode_raw.as_str() {
+            "slot" => crate::structs::StatefulMode::Slot,
+            "keyed" => crate::structs::StatefulMode::Keyed,
+            other => {
+                return Err(rusqlite::Error::FromSqlConversionFailure(
+                    3,
+                    rusqlite::types::Type::Text,
+                    Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("unknown instance mode {other:?}"),
+                    )),
+                ))
+            }
+        };
+        Ok(crate::manager::instances::Instance {
+            id: row.get(0)?,
+            job_id: row.get(1)?,
+            group: row.get(2)?,
+            mode,
+            ordinal: row.get::<_, Option<i64>>(4)?.map(|o| o as u32),
+            key: row.get(5)?,
+            desired: row.get(6)?,
+            tombstoned: row.get(7)?,
+            current_alloc: row.get(8)?,
+            node_id: row.get(9)?,
+            network_id: row.get(10)?,
+            created_at: row.get(11)?,
+        })
+    }
+
+    /// Insert or update a stable instance identity (stateful-workloads plan).
+    pub fn upsert_instance(&self, instance: &crate::manager::instances::Instance) -> R<()> {
+        let conn = self.write_connection()?;
+        let mode = match instance.mode {
+            crate::structs::StatefulMode::Slot => "slot",
+            crate::structs::StatefulMode::Keyed => "keyed",
+        };
+        conn.execute(
+            "INSERT INTO instance
+                (id, job_id, group_name, mode, ordinal, instance_key, desired, tombstoned,
+                 current_alloc, node_id, network_id, created_at)
+             VALUES
+                (:id, :job_id, :group_name, :mode, :ordinal, :instance_key, :desired, :tombstoned,
+                 :current_alloc, :node_id, :network_id, :created_at)
+             ON CONFLICT(id) DO UPDATE SET
+                desired = excluded.desired,
+                tombstoned = excluded.tombstoned,
+                current_alloc = excluded.current_alloc,
+                node_id = excluded.node_id,
+                network_id = excluded.network_id;",
+            named_params! {
+                ":id": instance.id,
+                ":job_id": instance.job_id,
+                ":group_name": instance.group,
+                ":mode": mode,
+                ":ordinal": instance.ordinal.map(|o| o as i64),
+                ":instance_key": instance.key,
+                ":desired": instance.desired,
+                ":tombstoned": instance.tombstoned,
+                ":current_alloc": instance.current_alloc,
+                ":node_id": instance.node_id,
+                ":network_id": instance.network_id,
+                ":created_at": instance.created_at,
+            },
+        )?;
+        Ok(())
+    }
+
+    /// All instances (including tombstoned) for a job+group, ordered by ordinal
+    /// then id so slot ordinals come back densely.
+    pub fn get_instances(
+        &self,
+        job_id: &str,
+        group: &str,
+    ) -> R<Vec<crate::manager::instances::Instance>> {
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, job_id, group_name, mode, ordinal, instance_key, desired, tombstoned,
+                    current_alloc, node_id, network_id, created_at
+             FROM instance
+             WHERE job_id = ?1 AND group_name = ?2
+             ORDER BY ordinal IS NULL, ordinal, id;",
+        )?;
+        let rows = stmt.query_map([job_id, group], |row| self.instance_from_row(row))?;
+        Self::collect_rows(rows)
+    }
+
+    /// Look up a single instance by its stable id.
+    pub fn get_instance(&self, id: &str) -> R<Option<crate::manager::instances::Instance>> {
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, job_id, group_name, mode, ordinal, instance_key, desired, tombstoned,
+                    current_alloc, node_id, network_id, created_at
+             FROM instance WHERE id = ?1;",
+        )?;
+        let mut rows = stmt.query_map([id], |row| self.instance_from_row(row))?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
     fn parse_task_lifecycle_column(
         &self,
         idx: usize,
@@ -1310,6 +1435,7 @@ impl Store {
             on_unhealthy: self.parse_on_unhealthy_column(15, row.get(15)?)?,
             kv_injections: self.parse_kv_injections_column(16, row.get(16)?)?,
             identities: self.parse_identities_column(19, row.get(19)?)?,
+            stateful: self.parse_stateful_column(20, row.get(20)?)?,
         };
 
         Ok(task_config)
@@ -2038,6 +2164,7 @@ impl Store {
             } else {
                 Some(serde_json::to_string(&t.identities)?)
             };
+            let stateful = t.stateful.as_ref().map(serde_json::to_string).transpose()?;
             let schedule = t.schedule.as_ref().map(ToString::to_string);
             let task_params = named_params! {
                 ":name": t.name,
@@ -2059,6 +2186,7 @@ impl Store {
                 ":job_id": job.id,
                 ":job_config_id": job_config_id,
                 ":identities": identities,
+                ":stateful": stateful,
             };
 
             let task_id: i64 = tx.query_row(&INSERT_TASK, task_params, |row| row.get(0))?;
@@ -4539,6 +4667,81 @@ mod tests {
         )?;
         let loaded = store.get_job_config(&job.name)?;
         assert!(loaded.tasks[0].identities.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn instance_round_trips_and_upserts() -> R<()> {
+        use crate::manager::instances::reconcile_slots;
+        use crate::structs::{StatefulConfig, StatefulMode};
+
+        let store = setup_store()?;
+        let cfg = StatefulConfig {
+            mode: StatefulMode::Slot,
+            stable_network_id: true,
+            volume_affinity: true,
+        };
+
+        let instances = reconcile_slots(&[], "db", "data", 3, &cfg, "auto", "2026-01-01T00:00:00Z");
+        for inst in &instances {
+            store.upsert_instance(inst)?;
+        }
+
+        let loaded = store.get_instances("db", "data")?;
+        assert_eq!(loaded.len(), 3);
+        assert_eq!(loaded, instances);
+        assert_eq!(loaded[1].network_id.as_deref(), Some("data-1.db.auto"));
+
+        // Scale down: ordinal 1,2 become undesired; upsert updates in place.
+        let scaled = reconcile_slots(
+            &loaded,
+            "db",
+            "data",
+            1,
+            &cfg,
+            "auto",
+            "2026-01-02T00:00:00Z",
+        );
+        for inst in &scaled {
+            store.upsert_instance(inst)?;
+        }
+        let reloaded = store.get_instances("db", "data")?;
+        assert_eq!(reloaded.len(), 3, "rows retained, not deleted");
+        assert!(reloaded[0].desired);
+        assert!(!reloaded[1].desired);
+
+        Ok(())
+    }
+
+    #[test]
+    fn tombstoned_keyed_instance_persists() -> R<()> {
+        use crate::manager::instances::{create_keyed, destroy_keyed};
+        use crate::structs::{StatefulConfig, StatefulMode};
+
+        let store = setup_store()?;
+        let cfg = StatefulConfig {
+            mode: StatefulMode::Keyed,
+            stable_network_id: false,
+            volume_affinity: false,
+        };
+
+        let acme = create_keyed(
+            &[],
+            "sb",
+            "main",
+            "acme",
+            &cfg,
+            "auto",
+            "2026-01-01T00:00:00Z",
+        )?;
+        store.upsert_instance(&acme)?;
+        store.upsert_instance(&destroy_keyed(acme.clone()))?;
+
+        let loaded = store
+            .get_instance("sb:main:acme")?
+            .expect("instance present");
+        assert!(loaded.tombstoned);
+        assert!(!loaded.desired);
         Ok(())
     }
 

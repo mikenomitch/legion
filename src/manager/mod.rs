@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod dispatcher;
+pub mod instances;
 pub mod join_server;
 pub mod rollout;
 pub mod rollout_strategy;

@@ -377,5 +377,28 @@ pub fn get_migrations() -> Migrations<'static> {
         // Workload identities declared on a task (workload-identity OIDC plan).
         // JSON-encoded Vec<WorkloadIdentity>; NULL/absent == no identities.
         M::up("ALTER TABLE task_config ADD COLUMN identities JSONB;").down(""),
+        // Stateful instance-identity config (stateful-workloads plan).
+        // JSON-encoded StatefulConfig; NULL/absent == stateless.
+        M::up("ALTER TABLE task_config ADD COLUMN stateful JSONB;").down(""),
+        // Stable instance identities (stateful-workloads plan). One row per
+        // instance; survives reschedules. `tombstoned` keyed instances are kept
+        // so a destroyed key can never be silently recycled.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS instance (
+            id STRING PRIMARY KEY,
+            job_id STRING NOT NULL,
+            group_name STRING NOT NULL,
+            mode STRING NOT NULL,
+            ordinal INTEGER,
+            instance_key STRING,
+            desired BOOLEAN NOT NULL DEFAULT 1,
+            tombstoned BOOLEAN NOT NULL DEFAULT 0,
+            current_alloc STRING,
+            node_id STRING,
+            network_id STRING,
+            created_at TIMESTAMP NOT NULL
+        )",
+        )
+        .down("DROP TABLE IF EXISTS instance;"),
     ])
 }
