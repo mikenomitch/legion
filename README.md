@@ -16,6 +16,7 @@ A distributed scheduler similar to Kubernetes or Nomad.
 - [Observability](docs/observability.md)
 - [UI Architecture](docs/ui-architecture.md)
 - [KV Store](docs/kv-store.md)
+- [Workload Identity (OIDC)](docs/workload-identity.md)
 - [Testing and Benchmarks](docs/testing-and-benchmarks.md)
 - [Codebase Conventions](docs/codebase-conventions.md)
 - [Agent Readiness (MCP, structured output, agent workflow)](docs/agent-readiness.md)

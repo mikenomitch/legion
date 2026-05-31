@@ -86,6 +86,22 @@ pub trait TaskPlugin: Send + Sync {
         true
     }
 
+    /// Whether this kind can deliver a workload-identity token as an env var.
+    fn supports_identity_env(&self) -> bool {
+        false
+    }
+
+    /// Whether this kind can deliver a workload-identity token as a file.
+    fn supports_identity_file(&self) -> bool {
+        false
+    }
+
+    /// Whether this kind can deliver a Unix signal to the running task (needed
+    /// for an identity with `changeMode: signal`).
+    fn supports_signal(&self) -> bool {
+        false
+    }
+
     fn prepare(
         &self,
         _allocation: &Allocation,
@@ -188,6 +204,42 @@ pub fn validate_job_config(config: &JobConfig) -> R<()> {
         registry.validate_task_config(task)?;
         task.validate_checks()?;
         task.validate_kv_injections()?;
+        task.validate_identities()?;
+        if !task.identities.is_empty() {
+            registry.load_plugin(&task.kind, false)?;
+            let plugin = registry
+                .plugin(&task.kind)
+                .context("task plugin loaded but missing")?;
+            for identity in &task.identities {
+                if identity.delivers_env() && !plugin.supports_identity_env() {
+                    bail!(
+                        "Task {} kind {} does not support identity env delivery (identity {})",
+                        task.name,
+                        task.kind,
+                        identity.name
+                    );
+                }
+                if identity.delivers_file() && !plugin.supports_identity_file() {
+                    bail!(
+                        "Task {} kind {} does not support identity file delivery (identity {})",
+                        task.name,
+                        task.kind,
+                        identity.name
+                    );
+                }
+                if identity.change_mode == crate::structs::workload_identity::ChangeMode::Signal
+                    && !plugin.supports_signal()
+                {
+                    bail!(
+                        "Task {} kind {} does not support signaling required by identity {} \
+                         changeMode signal",
+                        task.name,
+                        task.kind,
+                        identity.name
+                    );
+                }
+            }
+        }
         if task.schedule.is_some() && task.lifecycle != TaskLifecycle::Batch {
             bail!(
                 "Task {} can only set schedule when lifecycle is batch",
@@ -614,5 +666,99 @@ mod tests {
     fn builtin_plugin_schemas_have_descriptions_and_defaults() -> R<()> {
         validate_builtin_task_plugin_schemas()?;
         Ok(())
+    }
+
+    // --- workload identity capability gating ---
+
+    use crate::structs::workload_identity::{ChangeMode, WorkloadIdentity, WorkloadIdentityFile};
+
+    fn job_with(task: TaskConfig) -> JobConfig {
+        JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "identity-job".into(),
+            tasks: vec![task],
+            version: None,
+        }
+    }
+
+    fn file_identity(name: &str) -> WorkloadIdentity {
+        WorkloadIdentity {
+            name: name.into(),
+            audience: vec!["sts.amazonaws.com".into()],
+            file: Some(WorkloadIdentityFile {
+                path: "/var/run/legion/identity/token".into(),
+                mode: Some("0400".into()),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn exec_task_accepts_file_identity() -> R<()> {
+        let task = TaskConfig {
+            identities: vec![file_identity("aws")],
+            config: json!({"command": ["true"]}),
+            ..TaskConfig::new("api", "exec")
+        };
+        validate_job_config(&job_with(task))
+    }
+
+    #[test]
+    fn container_task_rejects_file_identity() {
+        let task = TaskConfig {
+            identities: vec![file_identity("aws")],
+            config: json!({"image": "alpine", "command": ["echo", "hi"]}),
+            ..TaskConfig::new("api", "container")
+        };
+        let err = validate_job_config(&job_with(task)).expect_err("container has no file delivery");
+        assert!(err.to_string().contains("identity file delivery"), "{err}");
+    }
+
+    #[test]
+    fn container_task_accepts_env_identity_with_restart() -> R<()> {
+        let identity = WorkloadIdentity {
+            name: "vault".into(),
+            audience: vec!["vault.internal".into()],
+            env: Some("VAULT_TOKEN".into()),
+            change_mode: ChangeMode::Restart,
+            ..Default::default()
+        };
+        let task = TaskConfig {
+            identities: vec![identity],
+            config: json!({"image": "alpine", "command": ["echo", "hi"]}),
+            ..TaskConfig::new("api", "container")
+        };
+        validate_job_config(&job_with(task))
+    }
+
+    #[test]
+    fn container_task_rejects_signal_change_mode() {
+        let identity = WorkloadIdentity {
+            name: "vault".into(),
+            audience: vec!["vault.internal".into()],
+            env: Some("VAULT_TOKEN".into()),
+            change_mode: ChangeMode::Signal,
+            change_signal: Some("SIGHUP".into()),
+            ..Default::default()
+        };
+        let task = TaskConfig {
+            identities: vec![identity],
+            config: json!({"image": "alpine", "command": ["echo", "hi"]}),
+            ..TaskConfig::new("api", "container")
+        };
+        let err = validate_job_config(&job_with(task)).expect_err("container cannot signal");
+        assert!(err.to_string().contains("signaling"), "{err}");
+    }
+
+    #[test]
+    fn duplicate_identity_names_rejected_in_job_validation() {
+        let task = TaskConfig {
+            identities: vec![file_identity("aws"), file_identity("aws")],
+            config: json!({"command": ["true"]}),
+            ..TaskConfig::new("api", "exec")
+        };
+        let err = validate_job_config(&job_with(task)).expect_err("duplicate identity name");
+        assert!(err.to_string().contains("duplicate identity"), "{err}");
     }
 }

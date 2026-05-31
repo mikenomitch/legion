@@ -144,6 +144,15 @@ impl TaskPlugin for ContainerTaskPlugin {
         true
     }
 
+    // Identity delivery mirrors the container kind's existing injection surface:
+    // env injection is supported, file injection is not (delivering a file into a
+    // container needs volume plumbing the container plugin doesn't yet implement,
+    // same as kv file injection). An env-delivered identity on a container must
+    // therefore refresh via `changeMode: restart`.
+    fn supports_identity_env(&self) -> bool {
+        true
+    }
+
     fn prepare(
         &self,
         allocation: &Allocation,
