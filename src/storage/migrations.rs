@@ -374,5 +374,8 @@ pub fn get_migrations() -> Migrations<'static> {
         )",
         )
         .down("DROP TABLE IF EXISTS idempotency_record;"),
+        // Workload identities declared on a task (workload-identity OIDC plan).
+        // JSON-encoded Vec<WorkloadIdentity>; NULL/absent == no identities.
+        M::up("ALTER TABLE task_config ADD COLUMN identities JSONB;").down(""),
     ])
 }

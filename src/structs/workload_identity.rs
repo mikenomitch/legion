@@ -1,0 +1,636 @@
+//! Workload identity spec types, claims, and the `sub` template renderer.
+//!
+//! See `docs/plans/workload-identity-oidc-plan.md`. This module owns the
+//! *spec-level* and *claims-level* primitives:
+//!
+//! - [`WorkloadIdentity`] — one named identity declared on a task.
+//! - [`WorkloadIdentityClaims`] — the scheduling facts the manager turns into a
+//!   JWT (the manager derives these; they are never trusted from a worker).
+//! - The dumb `{field}` `sub` template renderer + its admission validation,
+//!   which is the single most security-sensitive decision in the design: the
+//!   rendered `sub` is the only fine-grained routing key AWS IAM can match.
+//!
+//! The crypto/issuer side (signing, JWKS, discovery doc) lives in
+//! `crate::manager::workload_identity`.
+
+use std::collections::BTreeMap;
+use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
+
+use crate::prelude::*;
+
+/// The reserved (built-in) identity name that, when present, the manager issues
+/// with `aud` set to the cluster's own issuer so a workload can authenticate
+/// back to Legion itself. Reserved here so the spec/issuance path is
+/// audience-agnostic and the control-plane identity (a later phase) is a
+/// config/authz change rather than a re-architecture.
+pub const CONTROL_PLANE_IDENTITY_NAME: &str = "legion";
+
+/// JWT claim namespace for Legion-specific scheduling facts.
+pub const LEGION_CLAIM_PREFIX: &str = "legion.io/";
+
+/// Registered JWT claims that operators may never override via `extra_claims`
+/// or a `sub` template — overriding them would forge the trust-critical fields.
+pub const RESERVED_CLAIMS: &[&str] = &["iss", "sub", "aud", "exp", "iat", "nbf", "jti", "kid"];
+
+/// Placeholders allowed in a `sub` template that are present on every workload.
+const STABLE_SUB_FIELDS: &[&str] = &["region", "job", "group", "task"];
+
+/// Placeholders allowed in a `sub` template only for stateful tasks.
+const STATEFUL_SUB_FIELDS: &[&str] = &["instance", "slot"];
+
+/// The cluster-default `sub` template. Mirrors Nomad's composed subject minus
+/// the namespace segment Legion lacks: stable across reschedules, per-task
+/// least privilege.
+pub const DEFAULT_SUB_TEMPLATE: &str = "{region}:{job}:{group}:{task}";
+
+/// What happens when an identity's token is re-issued before expiry. Mirrors
+/// the existing reconcile-action vocabulary rather than inventing a new one.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum ChangeMode {
+    /// Just rewrite the delivered token value (atomic file rewrite for files).
+    /// Most cloud SDKs re-read the token file on each call, so no reload needed.
+    #[default]
+    Noop,
+    /// Rewrite, then send `change_signal` so a long-running process reloads the
+    /// token without restarting. The only way to refresh an env-delivered token.
+    Signal,
+    /// Rewrite, then restart the allocation/task in place.
+    Restart,
+}
+
+/// File delivery target for an identity token.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkloadIdentityFile {
+    pub path: String,
+    /// Octal file mode string, e.g. "0400". Defaults applied at delivery time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+}
+
+/// One named workload identity declared on a task. Mirrors Nomad's `identity`
+/// blocks: a task may declare several so one workload can federate into AWS
+/// *and* Vault with correctly-scoped tokens.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkloadIdentity {
+    /// Unique within the task; the selector used in the issuance RPC and in
+    /// delivery paths.
+    pub name: String,
+    /// One or more audiences. Manager-enforced, never empty: an audience-less
+    /// token is replayable against any trusting provider.
+    #[serde(default)]
+    pub audience: Vec<String>,
+    /// Token lifetime (humantime, e.g. "15m"). Falls back to the cluster default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<String>,
+    /// Deliver the token as this env var.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env: Option<String>,
+    /// Deliver the token as a file (recommended; refreshable in place).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<WorkloadIdentityFile>,
+    #[serde(default)]
+    pub change_mode: ChangeMode,
+    /// Signal to send on refresh when `change_mode` is `signal`, e.g. "SIGHUP".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_signal: Option<String>,
+    /// Operator-defined static claims merged into the JWT. Reserved keys and the
+    /// `legion.io/*` namespace are rejected at validation.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra_claims: BTreeMap<String, String>,
+    /// Per-identity `sub` template override (gated; multi-cloud workloads
+    /// sometimes need different subject shapes per provider).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sub_template: Option<String>,
+}
+
+impl WorkloadIdentity {
+    /// Whether this identity declares file delivery.
+    pub fn delivers_file(&self) -> bool {
+        self.file
+            .as_ref()
+            .is_some_and(|f| !f.path.trim().is_empty())
+    }
+
+    /// Whether this identity declares env delivery.
+    pub fn delivers_env(&self) -> bool {
+        self.env.as_deref().is_some_and(|e| !e.trim().is_empty())
+    }
+
+    /// Parse the configured TTL, if any.
+    pub fn parsed_ttl(&self) -> R<Option<Duration>> {
+        match self.ttl.as_deref() {
+            None => Ok(None),
+            Some(raw) => {
+                let parsed: Duration = raw
+                    .parse::<humantime::Duration>()
+                    .with_context(|| format!("invalid ttl {raw:?} (use e.g. \"15m\")"))?
+                    .into();
+                Ok(Some(parsed))
+            }
+        }
+    }
+
+    /// Validate a single identity for a task. `stateful` gates the
+    /// `{instance}`/`{slot}` placeholders in a per-identity `sub_template`.
+    pub fn validate(&self, task_name: &str, stateful: bool) -> R<()> {
+        let scope = format!("task {task_name} identity {:?}", self.name);
+
+        if self.name.trim().is_empty() {
+            bail!("task {task_name} declares an identity with an empty name");
+        }
+
+        if self.audience.is_empty() {
+            bail!("{scope} must declare at least one audience");
+        }
+        if self.audience.iter().any(|a| a.trim().is_empty()) {
+            bail!("{scope} audience entries cannot be empty");
+        }
+
+        if !self.delivers_env() && !self.delivers_file() {
+            bail!("{scope} must set at least one of env or file delivery");
+        }
+
+        // Parse TTL eagerly so a bad value fails admission, not first issuance.
+        self.parsed_ttl()
+            .with_context(|| format!("{scope} ttl is invalid"))?;
+
+        match self.change_mode {
+            ChangeMode::Noop => {
+                // env can never refresh in place — fixed at exec time.
+                if self.delivers_env() {
+                    bail!(
+                        "{scope} delivers env with changeMode noop, which can never \
+                         refresh; use signal or restart for env delivery"
+                    );
+                }
+            }
+            ChangeMode::Signal => {
+                if self
+                    .change_signal
+                    .as_deref()
+                    .is_none_or(|s| s.trim().is_empty())
+                {
+                    bail!("{scope} changeMode signal requires a non-empty changeSignal");
+                }
+            }
+            ChangeMode::Restart => {}
+        }
+
+        for key in self.extra_claims.keys() {
+            validate_extra_claim_key(&scope, key)?;
+        }
+
+        if let Some(template) = self.sub_template.as_deref() {
+            validate_sub_template(template, stateful)
+                .with_context(|| format!("{scope} subTemplate is invalid"))?;
+        }
+
+        Ok(())
+    }
+}
+
+/// Reject `extra_claims` keys that would forge a trust-critical claim.
+fn validate_extra_claim_key(scope: &str, key: &str) -> R<()> {
+    if RESERVED_CLAIMS.contains(&key) {
+        bail!("{scope} extra claim {key:?} is a reserved JWT claim and cannot be overridden");
+    }
+    if key.starts_with(LEGION_CLAIM_PREFIX) {
+        bail!("{scope} extra claim {key:?} uses the reserved {LEGION_CLAIM_PREFIX:?} namespace");
+    }
+    Ok(())
+}
+
+/// Validate every identity declared on a task: unique names plus per-identity
+/// rules. `stateful` gates the stateful-only `sub` template placeholders.
+pub fn validate_identities(
+    task_name: &str,
+    identities: &[WorkloadIdentity],
+    stateful: bool,
+) -> R<()> {
+    let mut seen = std::collections::HashSet::new();
+    for identity in identities {
+        identity.validate(task_name, stateful)?;
+        if !seen.insert(identity.name.as_str()) {
+            bail!(
+                "task {task_name} declares duplicate identity name {:?}",
+                identity.name
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Validate a `sub` template at admission time.
+///
+/// `sub` is a security boundary, so a template can *break* the two invariants
+/// the system otherwise guarantees structurally (stability across reschedules,
+/// uniqueness across workloads). This enforces:
+/// - allow-list only (unknown placeholder rejected; `{alloc}`/`{node}` rejected
+///   explicitly because they churn);
+/// - `{instance}`/`{slot}` only on stateful tasks;
+/// - a uniqueness floor (job + group + task must all survive);
+/// - at least one placeholder (a literal-only template renders the same `sub`
+///   for every workload).
+pub fn validate_sub_template(template: &str, stateful: bool) -> R<()> {
+    let placeholders = parse_placeholders(template)?;
+
+    if placeholders.is_empty() {
+        bail!(
+            "sub template {template:?} has no placeholders; it would render the same \
+             subject for every workload"
+        );
+    }
+
+    for field in &placeholders {
+        if field == "alloc" || field == "node" {
+            bail!(
+                "sub template {template:?} uses {{{field}}}, which churns across reschedules \
+                 and would destroy reschedule-stable identity; it is available only as a \
+                 legion.io/{field} claim"
+            );
+        }
+        let is_stable = STABLE_SUB_FIELDS.contains(&field.as_str());
+        let is_stateful = STATEFUL_SUB_FIELDS.contains(&field.as_str());
+        if is_stateful && !stateful {
+            bail!(
+                "sub template {template:?} uses {{{field}}}, which is only valid on tasks \
+                 that declare a stateful block"
+            );
+        }
+        if !is_stable && !is_stateful {
+            bail!("sub template {template:?} uses unknown placeholder {{{field}}}");
+        }
+    }
+
+    // Uniqueness floor: dropping below job+group+task granularity collapses
+    // distinct workloads into one shared identity. Hard reject (see plan open
+    // question #1 — we chose the strict rail).
+    for required in ["job", "group", "task"] {
+        if !placeholders.iter().any(|p| p == required) {
+            bail!(
+                "sub template {template:?} drops {{{required}}}; templates must keep at least \
+                 job+group+task granularity so distinct workloads stay distinct"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Extract the `{field}` placeholder names from a template, in order. Errors on
+/// an unclosed brace so a typo fails loud rather than rendering garbage.
+fn parse_placeholders(template: &str) -> R<Vec<String>> {
+    let mut fields = Vec::new();
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        let after = &rest[open + 1..];
+        let close = after
+            .find('}')
+            .with_context(|| format!("sub template {template:?} has an unclosed '{{'"))?;
+        let field = &after[..close];
+        if field.is_empty() {
+            bail!("sub template {template:?} contains an empty placeholder '{{}}'");
+        }
+        fields.push(field.to_string());
+        rest = &after[close + 1..];
+    }
+    Ok(fields)
+}
+
+/// Claims describing a workload's verifiable identity. The manager derives
+/// these from the scheduling record; it never trusts claims sent by a worker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkloadIdentityClaims {
+    pub region: String,
+    pub job: String,
+    pub group: String,
+    pub task: String,
+    pub node_id: String,
+    pub alloc_id: String,
+    /// Stable per-instance key for stateful workloads (see the stateful plan).
+    pub instance: Option<String>,
+    /// Slot index for slot-mode stateful workloads.
+    pub slot: Option<u32>,
+}
+
+impl WorkloadIdentityClaims {
+    /// Build the default OIDC `sub` claim. Mirrors Nomad's composed subject
+    /// (minus the namespace segment Legion lacks): stable across reschedules,
+    /// per-task least privilege. Deliberately omits alloc_id/node_id (they
+    /// churn → no stable policy); those ride along as `legion.io/*` claims.
+    pub fn subject(&self) -> String {
+        format!("{}:{}:{}:{}", self.region, self.job, self.group, self.task)
+    }
+
+    /// Whether these claims describe a stateful instance.
+    pub fn is_stateful(&self) -> bool {
+        self.instance.is_some()
+    }
+
+    /// Look up a single template field value. `None` means the placeholder is
+    /// not available for this workload (e.g. `{instance}` on a stateless task).
+    fn field(&self, name: &str) -> Option<String> {
+        match name {
+            "region" => Some(self.region.clone()),
+            "job" => Some(self.job.clone()),
+            "group" => Some(self.group.clone()),
+            "task" => Some(self.task.clone()),
+            "instance" => self.instance.clone(),
+            "slot" => self.slot.map(|s| s.to_string()),
+            _ => None,
+        }
+    }
+
+    /// Render a `sub` from a template (dumb `{field}` substitution over the
+    /// stable-field allow-list). Callers should have validated the template
+    /// with [`validate_sub_template`] first; this still rejects unknown fields
+    /// and an empty render as a defense-in-depth check.
+    pub fn render_subject(&self, template: &str) -> R<String> {
+        let mut out = String::with_capacity(template.len());
+        let mut rest = template;
+        while let Some(open) = rest.find('{') {
+            out.push_str(&rest[..open]);
+            let after = &rest[open + 1..];
+            let close = after
+                .find('}')
+                .with_context(|| format!("sub template {template:?} has an unclosed '{{'"))?;
+            let field = &after[..close];
+            let value = self
+                .field(field)
+                .with_context(|| format!("sub template {template:?} field {{{field}}} is not available for this workload"))?;
+            out.push_str(&value);
+            rest = &after[close + 1..];
+        }
+        out.push_str(rest);
+
+        if out.is_empty() {
+            bail!("sub template {template:?} rendered an empty subject");
+        }
+        Ok(out)
+    }
+
+    /// Render the `sub` using `template` if provided, else the built-in default.
+    pub fn subject_for(&self, template: Option<&str>) -> R<String> {
+        match template {
+            Some(t) => self.render_subject(t),
+            None => Ok(self.subject()),
+        }
+    }
+
+    /// The discrete `legion.io/*` claims, so providers that can match arbitrary
+    /// claims (GCP, Vault) don't have to parse `sub`.
+    pub fn legion_claims(&self) -> BTreeMap<String, String> {
+        let mut claims = BTreeMap::new();
+        claims.insert(format!("{LEGION_CLAIM_PREFIX}region"), self.region.clone());
+        claims.insert(format!("{LEGION_CLAIM_PREFIX}job"), self.job.clone());
+        claims.insert(format!("{LEGION_CLAIM_PREFIX}group"), self.group.clone());
+        claims.insert(format!("{LEGION_CLAIM_PREFIX}task"), self.task.clone());
+        claims.insert(format!("{LEGION_CLAIM_PREFIX}node"), self.node_id.clone());
+        claims.insert(format!("{LEGION_CLAIM_PREFIX}alloc"), self.alloc_id.clone());
+        if let Some(instance) = &self.instance {
+            claims.insert(format!("{LEGION_CLAIM_PREFIX}instance"), instance.clone());
+        }
+        if let Some(slot) = self.slot {
+            claims.insert(format!("{LEGION_CLAIM_PREFIX}slot"), slot.to_string());
+        }
+        claims
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn claims() -> WorkloadIdentityClaims {
+        WorkloadIdentityClaims {
+            region: "auto".into(),
+            job: "api".into(),
+            group: "web".into(),
+            task: "server".into(),
+            node_id: "node-1".into(),
+            alloc_id: "alloc-42".into(),
+            instance: None,
+            slot: None,
+        }
+    }
+
+    fn identity(name: &str) -> WorkloadIdentity {
+        WorkloadIdentity {
+            name: name.into(),
+            audience: vec!["sts.amazonaws.com".into()],
+            file: Some(WorkloadIdentityFile {
+                path: "/var/run/legion/identity/token".into(),
+                mode: Some("0400".into()),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn default_subject_matches_nomad_shape() {
+        assert_eq!(claims().subject(), "auto:api:web:server");
+    }
+
+    #[test]
+    fn legion_claims_expose_discrete_facts() {
+        let c = claims().legion_claims();
+        assert_eq!(c["legion.io/region"], "auto");
+        assert_eq!(c["legion.io/alloc"], "alloc-42");
+        assert_eq!(c["legion.io/node"], "node-1");
+        assert!(!c.contains_key("legion.io/instance"));
+    }
+
+    #[test]
+    fn stateful_claims_carry_instance_and_slot() {
+        let c = WorkloadIdentityClaims {
+            instance: Some("api-web-0".into()),
+            slot: Some(0),
+            ..claims()
+        };
+        assert!(c.is_stateful());
+        let lc = c.legion_claims();
+        assert_eq!(lc["legion.io/instance"], "api-web-0");
+        assert_eq!(lc["legion.io/slot"], "0");
+    }
+
+    #[test]
+    fn template_renders_known_fields() {
+        let s = claims().render_subject("legion/{job}/{task}").unwrap();
+        assert_eq!(s, "legion/api/server");
+    }
+
+    #[test]
+    fn default_template_equals_builtin_subject() {
+        let s = claims().render_subject(DEFAULT_SUB_TEMPLATE).unwrap();
+        assert_eq!(s, claims().subject());
+    }
+
+    #[test]
+    fn render_rejects_unknown_field() {
+        let err = claims().render_subject("{job}:{bogus}").unwrap_err();
+        assert!(err.to_string().contains("bogus"));
+    }
+
+    #[test]
+    fn render_rejects_unavailable_stateful_field() {
+        // instance is unset on a stateless workload.
+        let err = claims()
+            .render_subject("{job}:{group}:{task}:{instance}")
+            .unwrap_err();
+        assert!(err.to_string().contains("instance"));
+    }
+
+    #[test]
+    fn subject_for_falls_back_to_default() {
+        assert_eq!(claims().subject_for(None).unwrap(), "auto:api:web:server");
+    }
+
+    // --- sub template admission validation ---
+
+    #[test]
+    fn validate_template_accepts_default() {
+        validate_sub_template(DEFAULT_SUB_TEMPLATE, false).unwrap();
+    }
+
+    #[test]
+    fn validate_template_rejects_alloc_and_node() {
+        for field in ["{alloc}", "{node}"] {
+            let t = format!("{{job}}:{{group}}:{{task}}:{field}");
+            let err = validate_sub_template(&t, false).unwrap_err();
+            assert!(err.to_string().contains("churns"), "{}", err);
+        }
+    }
+
+    #[test]
+    fn validate_template_rejects_unknown_placeholder() {
+        let err = validate_sub_template("{job}:{group}:{task}:{tenant}", false).unwrap_err();
+        assert!(err.to_string().contains("unknown placeholder"));
+    }
+
+    #[test]
+    fn validate_template_rejects_below_uniqueness_floor() {
+        let err = validate_sub_template("legion/{job}", false).unwrap_err();
+        assert!(err.to_string().contains("granularity"));
+    }
+
+    #[test]
+    fn validate_template_rejects_literal_only() {
+        let err = validate_sub_template("static-subject", false).unwrap_err();
+        assert!(err.to_string().contains("no placeholders"));
+    }
+
+    #[test]
+    fn validate_template_rejects_unclosed_brace() {
+        let err = validate_sub_template("{job}:{group}:{task", false).unwrap_err();
+        assert!(err.to_string().contains("unclosed"));
+    }
+
+    #[test]
+    fn validate_template_gates_instance_on_stateful() {
+        let t = "{job}:{group}:{task}:{instance}";
+        assert!(validate_sub_template(t, false).is_err());
+        validate_sub_template(t, true).unwrap();
+    }
+
+    // --- identity validation ---
+
+    #[test]
+    fn identity_requires_audience() {
+        let mut id = identity("aws");
+        id.audience.clear();
+        let err = id.validate("api", false).unwrap_err();
+        assert!(err.to_string().contains("audience"));
+    }
+
+    #[test]
+    fn identity_requires_a_delivery_mode() {
+        let mut id = identity("aws");
+        id.file = None;
+        let err = id.validate("api", false).unwrap_err();
+        assert!(err.to_string().contains("delivery"));
+    }
+
+    #[test]
+    fn env_with_noop_change_mode_is_rejected() {
+        let id = WorkloadIdentity {
+            name: "vault".into(),
+            audience: vec!["vault.internal".into()],
+            env: Some("VAULT_TOKEN".into()),
+            change_mode: ChangeMode::Noop,
+            ..Default::default()
+        };
+        let err = id.validate("api", false).unwrap_err();
+        assert!(err.to_string().contains("can never"));
+    }
+
+    #[test]
+    fn signal_change_mode_requires_change_signal() {
+        let id = WorkloadIdentity {
+            name: "vault".into(),
+            audience: vec!["vault.internal".into()],
+            env: Some("VAULT_TOKEN".into()),
+            change_mode: ChangeMode::Signal,
+            change_signal: None,
+            ..Default::default()
+        };
+        let err = id.validate("api", false).unwrap_err();
+        assert!(err.to_string().contains("changeSignal"));
+    }
+
+    #[test]
+    fn env_with_signal_change_mode_is_allowed() {
+        let id = WorkloadIdentity {
+            name: "vault".into(),
+            audience: vec!["vault.internal".into()],
+            env: Some("VAULT_TOKEN".into()),
+            change_mode: ChangeMode::Signal,
+            change_signal: Some("SIGHUP".into()),
+            ..Default::default()
+        };
+        id.validate("api", false).unwrap();
+    }
+
+    #[test]
+    fn extra_claims_reject_reserved_and_namespaced_keys() {
+        for key in ["sub", "aud", "legion.io/region"] {
+            let mut id = identity("aws");
+            id.extra_claims.insert(key.into(), "x".into());
+            let err = id.validate("api", false).unwrap_err();
+            assert!(err.to_string().contains(key), "{}", err);
+        }
+    }
+
+    #[test]
+    fn extra_claims_allow_custom_namespaced_keys() {
+        let mut id = identity("aws");
+        id.extra_claims
+            .insert("app.example.com/tier".into(), "backend".into());
+        id.validate("api", false).unwrap();
+    }
+
+    #[test]
+    fn bad_ttl_is_rejected_at_validation() {
+        let mut id = identity("aws");
+        id.ttl = Some("15".into()); // missing unit
+        let err = id.validate("api", false).unwrap_err();
+        assert!(err.to_string().contains("ttl"));
+    }
+
+    #[test]
+    fn duplicate_identity_names_rejected() {
+        let ids = vec![identity("aws"), identity("aws")];
+        let err = validate_identities("api", &ids, false).unwrap_err();
+        assert!(err.to_string().contains("duplicate identity"));
+    }
+
+    #[test]
+    fn distinct_identities_validate() {
+        let ids = vec![identity("aws"), identity("gcp")];
+        validate_identities("api", &ids, false).unwrap();
+    }
+}

@@ -35,6 +35,92 @@ pub struct ManagerConfig {
     pub task_resource_defaults: Option<Value>,
     pub custom_resources: Option<Value>,
     pub persistence: Option<PersistenceConfig>,
+    #[serde(default)]
+    pub workload_identity: Option<WorkloadIdentityConfig>,
+}
+
+/// Default token TTL when an identity does not set its own.
+pub const DEF_WORKLOAD_IDENTITY_TTL: &str = "15m";
+/// Default signing-key rotation age.
+pub const DEF_WORKLOAD_IDENTITY_ROTATION_AGE: &str = "24h";
+/// Default JWKS route relative to the issuer URL.
+pub const DEF_WORKLOAD_IDENTITY_JWKS_PATH: &str = "/.well-known/jwks.json";
+
+/// Manager OIDC issuer / workload-identity configuration. Off by default; the
+/// OIDC HTTP listener only binds when `enabled` is true (see the plan rollout).
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkloadIdentityConfig {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// Public HTTPS issuer URL relying parties trust (must match discovery doc).
+    pub issuer: Option<String>,
+    pub jwks_path: Option<String>,
+    pub signing_alg: Option<String>,
+    pub default_ttl: Option<String>,
+    pub rotation_age: Option<String>,
+    pub default_audience: Option<Vec<String>>,
+    /// Cluster-default `sub` template; per-identity `subTemplate` overrides it.
+    pub sub_template: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkloadIdentityConfigFull {
+    pub enabled: bool,
+    pub issuer: Option<String>,
+    pub jwks_path: String,
+    pub signing_alg: String,
+    pub default_ttl: String,
+    pub rotation_age: String,
+    pub default_audience: Vec<String>,
+    pub sub_template: String,
+}
+
+impl Default for WorkloadIdentityConfigFull {
+    fn default() -> Self {
+        WorkloadIdentityConfigFull {
+            enabled: false,
+            issuer: None,
+            jwks_path: DEF_WORKLOAD_IDENTITY_JWKS_PATH.into(),
+            signing_alg: "ES256".into(),
+            default_ttl: DEF_WORKLOAD_IDENTITY_TTL.into(),
+            rotation_age: DEF_WORKLOAD_IDENTITY_ROTATION_AGE.into(),
+            default_audience: Vec::new(),
+            sub_template: crate::structs::workload_identity::DEFAULT_SUB_TEMPLATE.into(),
+        }
+    }
+}
+
+impl From<WorkloadIdentityConfigFull> for WorkloadIdentityConfig {
+    fn from(val: WorkloadIdentityConfigFull) -> Self {
+        WorkloadIdentityConfig {
+            enabled: Some(val.enabled),
+            issuer: val.issuer,
+            jwks_path: Some(val.jwks_path),
+            signing_alg: Some(val.signing_alg),
+            default_ttl: Some(val.default_ttl),
+            rotation_age: Some(val.rotation_age),
+            default_audience: Some(val.default_audience),
+            sub_template: Some(val.sub_template),
+        }
+    }
+}
+
+impl WorkloadIdentityConfig {
+    pub fn with_defaults(&self) -> WorkloadIdentityConfigFull {
+        let d = WorkloadIdentityConfigFull::default();
+        WorkloadIdentityConfigFull {
+            enabled: self.enabled.unwrap_or(d.enabled),
+            issuer: self.issuer.clone(),
+            jwks_path: self.jwks_path.clone().unwrap_or(d.jwks_path),
+            signing_alg: self.signing_alg.clone().unwrap_or(d.signing_alg),
+            default_ttl: self.default_ttl.clone().unwrap_or(d.default_ttl),
+            rotation_age: self.rotation_age.clone().unwrap_or(d.rotation_age),
+            default_audience: self.default_audience.clone().unwrap_or(d.default_audience),
+            sub_template: self.sub_template.clone().unwrap_or(d.sub_template),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -131,6 +217,8 @@ pub struct ManagerConfigFull {
     pub custom_resources: Option<Value>,
     #[serde(default)]
     pub persistence: PersistenceConfigFull,
+    #[serde(default)]
+    pub workload_identity: WorkloadIdentityConfigFull,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -232,6 +320,7 @@ impl From<ManagerConfigFull> for ManagerConfig {
             task_resource_defaults: val.task_resource_defaults,
             custom_resources: val.custom_resources,
             persistence: Some(val.persistence.into()),
+            workload_identity: Some(val.workload_identity.into()),
         }
     }
 }
@@ -272,6 +361,11 @@ impl ManagerConfig {
                 .as_ref()
                 .map(PersistenceConfig::with_defaults)
                 .unwrap_or_default(),
+            workload_identity: self
+                .workload_identity
+                .as_ref()
+                .map(WorkloadIdentityConfig::with_defaults)
+                .unwrap_or_default(),
         }
     }
 }
@@ -291,6 +385,7 @@ impl Default for ManagerConfigFull {
             custom_resources: None,
             eval_threads: default_eval_threads(),
             persistence: PersistenceConfigFull::default(),
+            workload_identity: WorkloadIdentityConfigFull::default(),
         }
     }
 }

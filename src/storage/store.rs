@@ -388,7 +388,7 @@ impl Store {
 
         let mut task_stmt = conn.prepare(
             r#"
-            SELECT id, name, kind, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_config_id
+            SELECT id, name, kind, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_config_id, identities
             FROM task_config;
             "#,
         )?;
@@ -419,6 +419,7 @@ impl Store {
                 checks: self.parse_checks_column(14, row.get(14)?)?,
                 on_unhealthy: self.parse_on_unhealthy_column(15, row.get(15)?)?,
                 kv_injections: self.parse_kv_injections_column(16, row.get(16)?)?,
+                identities: self.parse_identities_column(18, row.get(18)?)?,
             };
             let job_config_id: String = row.get(17)?;
             Ok((job_config_id, id, task))
@@ -1251,6 +1252,23 @@ impl Store {
         })
     }
 
+    fn parse_identities_column(
+        &self,
+        idx: usize,
+        raw: Option<String>,
+    ) -> Result<Vec<crate::structs::WorkloadIdentity>, rusqlite::Error> {
+        let Some(raw) = raw else {
+            return Ok(Vec::new());
+        };
+        serde_json::from_str(&raw).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(
+                idx,
+                rusqlite::types::Type::Text,
+                Box::new(err),
+            )
+        })
+    }
+
     fn parse_task_lifecycle_column(
         &self,
         idx: usize,
@@ -1291,6 +1309,7 @@ impl Store {
             checks: self.parse_checks_column(14, row.get(14)?)?,
             on_unhealthy: self.parse_on_unhealthy_column(15, row.get(15)?)?,
             kv_injections: self.parse_kv_injections_column(16, row.get(16)?)?,
+            identities: self.parse_identities_column(19, row.get(19)?)?,
         };
 
         Ok(task_config)
@@ -2014,6 +2033,11 @@ impl Store {
                 .as_ref()
                 .map(serde_json::to_string)
                 .transpose()?;
+            let identities = if t.identities.is_empty() {
+                None
+            } else {
+                Some(serde_json::to_string(&t.identities)?)
+            };
             let schedule = t.schedule.as_ref().map(ToString::to_string);
             let task_params = named_params! {
                 ":name": t.name,
@@ -2034,6 +2058,7 @@ impl Store {
                 ":kv_injections": kv_injections,
                 ":job_id": job.id,
                 ":job_config_id": job_config_id,
+                ":identities": identities,
             };
 
             let task_id: i64 = tx.query_row(&INSERT_TASK, task_params, |row| row.get(0))?;
@@ -4448,6 +4473,72 @@ mod tests {
         assert_eq!(node.status, "lost");
         assert_eq!(node.availability, "unavailable");
 
+        Ok(())
+    }
+
+    #[test]
+    fn task_identities_round_trip_through_persistence() -> R<()> {
+        use crate::structs::workload_identity::{WorkloadIdentity, WorkloadIdentityFile};
+
+        let store = setup_store()?;
+
+        let identity = WorkloadIdentity {
+            name: "aws".into(),
+            audience: vec!["sts.amazonaws.com".into()],
+            ttl: Some("15m".into()),
+            file: Some(WorkloadIdentityFile {
+                path: "/var/run/legion/identity/aws/token".into(),
+                mode: Some("0400".into()),
+            }),
+            ..Default::default()
+        };
+        let task = TaskConfig {
+            identities: vec![identity.clone()],
+            ..task("worker")
+        };
+        let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "identity-persist".into(),
+            tasks: vec![task],
+            version: None,
+        };
+
+        store.handle_job_submit(
+            &job,
+            &[Submission {
+                path: "job.jsonnet".into(),
+                content: "{}".into(),
+                is_primary: true,
+            }],
+        )?;
+
+        let loaded = store.get_job_config(&job.name)?;
+        assert_eq!(loaded.tasks.len(), 1);
+        assert_eq!(loaded.tasks[0].identities, vec![identity]);
+        Ok(())
+    }
+
+    #[test]
+    fn tasks_without_identities_round_trip_empty() -> R<()> {
+        let store = setup_store()?;
+        let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "no-identity-persist".into(),
+            tasks: vec![task("worker")],
+            version: None,
+        };
+        store.handle_job_submit(
+            &job,
+            &[Submission {
+                path: "job.jsonnet".into(),
+                content: "{}".into(),
+                is_primary: true,
+            }],
+        )?;
+        let loaded = store.get_job_config(&job.name)?;
+        assert!(loaded.tasks[0].identities.is_empty());
         Ok(())
     }
 
