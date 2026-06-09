@@ -1,7 +1,9 @@
 use crate::manager::rollout_strategy::validate_rollout_strategy_name;
 use crate::plugin_runtime::{plugin_paths, validate_manifest};
 use crate::prelude::*;
-use crate::structs::{Allocation, JobConfig, TaskConfig, TaskDependencyCondition, TaskLifecycle};
+use crate::structs::{
+    Allocation, InstanceMode, JobConfig, TaskConfig, TaskDependencyCondition, TaskLifecycle,
+};
 use crate::util::plugin_root_dir;
 use jsonschema::JSONSchema;
 use libloading::{Library, Symbol};
@@ -204,6 +206,7 @@ pub fn validate_job_config(config: &JobConfig) -> R<()> {
         registry.validate_task_config(task)?;
         task.validate_checks()?;
         task.validate_kv_injections()?;
+        task.validate_stateful()?;
         task.validate_identities()?;
         if !task.identities.is_empty() {
             registry.load_plugin(&task.kind, false)?;
@@ -263,6 +266,28 @@ pub fn validate_job_config(config: &JobConfig) -> R<()> {
                     "Task {} kind {} does not support kv file injection",
                     task.name,
                     task.kind
+                );
+            }
+        }
+    }
+    // Slot instance ids are derived from (job, group, slot), so two slot-mode
+    // stateful tasks in one group would collide on instance identity.
+    let mut slot_stateful_by_group: HashMap<&str, &str> = HashMap::new();
+    for task in &config.tasks {
+        if task
+            .stateful
+            .as_ref()
+            .is_some_and(|stateful| stateful.mode == InstanceMode::Slot)
+        {
+            if let Some(existing) =
+                slot_stateful_by_group.insert(task.group.as_str(), task.name.as_str())
+            {
+                bail!(
+                    "Group {} declares multiple slot-mode stateful tasks ({} and {}); slot \
+                     instance ids are derived from (job, group, slot) and would collide",
+                    task.group,
+                    existing,
+                    task.name
                 );
             }
         }
@@ -453,6 +478,7 @@ mod tests {
             job_config_id: "job-1".into(),
             task_config_id: 1,
             job_id: "job".into(),
+            instance_id: None,
         }
     }
 

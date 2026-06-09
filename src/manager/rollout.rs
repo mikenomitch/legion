@@ -1833,6 +1833,7 @@ mod tests {
                         job_config_id: "job-1".to_string(),
                         task_config_id: 1,
                         job_id: "job".to_string(),
+                        instance_id: None,
                     },
                     Allocation {
                         id: 2,
@@ -1842,6 +1843,7 @@ mod tests {
                         job_config_id: "job-1".to_string(),
                         task_config_id: 1,
                         job_id: "job".to_string(),
+                        instance_id: None,
                     },
                     Allocation {
                         id: 3,
@@ -1851,6 +1853,7 @@ mod tests {
                         job_config_id: "job-1".to_string(),
                         task_config_id: 1,
                         job_id: "job".to_string(),
+                        instance_id: None,
                     },
                 ],
             }],

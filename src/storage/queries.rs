@@ -53,28 +53,29 @@ lazy_static! {
 //
 
 pub const ALLOCATION_ATTRS: &str = r#"
-id, status, resources, node_id, job_config_id, task_config_id
+id, status, resources, node_id, job_config_id, task_config_id, instance_id
 "#;
 
 pub const ALLOCATION_WITH_JOB_ATTRS: &str = r#"
-allocation.id, allocation.status, allocation.resources, allocation.node_id, allocation.job_config_id, allocation.task_config_id, job_config.job_id
+allocation.id, allocation.status, allocation.resources, allocation.node_id, allocation.job_config_id, allocation.task_config_id, job_config.job_id, allocation.instance_id
 "#;
 
 pub const ALLOCATION_SELECT_ATTRS: &str = r#"
-allocation.id, allocation.status, allocation.resources, allocation.node_id, allocation.job_config_id, allocation.task_config_id, task_config.job_id
+allocation.id, allocation.status, allocation.resources, allocation.node_id, allocation.job_config_id, allocation.task_config_id, task_config.job_id, allocation.instance_id
 "#;
 
 pub const ALLOCATION_RETURNING_ATTRS: &str = r#"
 id, status, resources, node_id, job_config_id, task_config_id,
-    (SELECT job_id FROM job_config WHERE job_config.id = allocation.job_config_id) as job_id
+    (SELECT job_id FROM job_config WHERE job_config.id = allocation.job_config_id) as job_id,
+    instance_id
 "#;
 
 pub const ALLOCATION_INSERT_ATTRS: &str = r#"
-status, resources, node_id, job_config_id, task_config_id
+status, resources, node_id, job_config_id, task_config_id, instance_id
 "#;
 
 pub const ALLOCATION_ATTRS_VALS: &str = r#"
-:status, :resources, :node_id, :job_config_id, :task_config_id
+:status, :resources, :node_id, :job_config_id, :task_config_id, :instance_id
 "#;
 
 lazy_static! {
@@ -123,6 +124,48 @@ lazy_static! {
     VALUES ({ALLOCATION_ATTRS_VALS})
     RETURNING {ALLOCATION_RETURNING_ATTRS};
     "#,
+    );
+}
+
+//
+// INSTANCE
+//
+
+pub const INSTANCE_ATTRS: &str = r#"
+instance_id, job_id, group_name, task_name, mode, state, slot_index, current_alloc_id, storage_handle, created_at, updated_at
+"#;
+
+pub const INSTANCE_ATTRS_VALS: &str = r#"
+:instance_id, :job_id, :group_name, :task_name, :mode, :state, :slot_index, :current_alloc_id, :storage_handle, :created_at, :updated_at
+"#;
+
+pub const INSTANCE_PARAM_SET: &str = r#"
+job_id = :job_id, group_name = :group_name, task_name = :task_name, mode = :mode, state = :state, slot_index = :slot_index, current_alloc_id = :current_alloc_id, storage_handle = :storage_handle, updated_at = :updated_at
+"#;
+
+lazy_static! {
+    pub static ref GET_INSTANCE: String = format!(
+        r#"
+    SELECT {INSTANCE_ATTRS}
+    FROM instance
+    WHERE instance_id = ?;
+    "#
+    );
+    pub static ref GET_INSTANCES_FOR_JOB: String = format!(
+        r#"
+    SELECT {INSTANCE_ATTRS}
+    FROM instance
+    WHERE job_id = ?
+    ORDER BY group_name ASC, slot_index ASC, instance_id ASC;
+    "#
+    );
+    pub static ref UPSERT_INSTANCE: String = format!(
+        r#"
+    INSERT INTO instance ({INSTANCE_ATTRS})
+    VALUES ({INSTANCE_ATTRS_VALS})
+    ON CONFLICT(instance_id) DO UPDATE SET {INSTANCE_PARAM_SET}
+    RETURNING {INSTANCE_ATTRS};
+    "#
     );
 }
 
@@ -260,11 +303,11 @@ lazy_static! {
 //
 
 pub const TASK_CONFIG_ATTRS: &str = r#"
-id, name, kind, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_id, job_config_id, identities
+id, name, kind, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_id, job_config_id, identities, stateful
 "#;
 
 pub const TASK_CONFIG_INSERT_ATTRS: &str = r#"
-name, kind, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_id, job_config_id, identities
+name, kind, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_id, job_config_id, identities, stateful
 "#;
 
 // pub const TASK_CONFIG_PARAM_SET: &str = r#"
@@ -272,7 +315,7 @@ name, kind, count, count_per, group_name, lifecycle, schedule, depends_on, confi
 // "#;
 
 pub const TASK_CONFIG_ATTRS_VALS: &str = r#"
-:name, :kind, :count, :count_per, :group_name, :lifecycle, :schedule, :depends_on, :config, :resources, :constraints, :permit, :affinities, :checks, :on_unhealthy, :kv_injections, :job_id, :job_config_id, :identities
+:name, :kind, :count, :count_per, :group_name, :lifecycle, :schedule, :depends_on, :config, :resources, :constraints, :permit, :affinities, :checks, :on_unhealthy, :kv_injections, :job_id, :job_config_id, :identities, :stateful
 "#;
 
 lazy_static! {

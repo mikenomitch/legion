@@ -177,6 +177,10 @@ impl Eval {
         }
 
         store.remove_allocs_for_job(&self.job_id)?;
+        // Stateful instances of a stopped job are terminated but retained
+        // (rows + storage handles), so a later re-run re-materializes the same
+        // identities. No-op for stateless jobs.
+        store.terminate_instances_for_job(&self.job_id)?;
 
         Ok(format!("Job {} stopped", self.job_id))
     }
@@ -672,6 +676,84 @@ mod tests {
         let total_allocations: usize = ledger.iter().map(|entry| entry.allocations.len()).sum();
         assert_eq!(total_allocations, 0);
 
+        Ok(())
+    }
+
+    #[test]
+    fn job_stop_terminates_stateful_instances_but_retains_rows() -> R<()> {
+        use crate::structs::{InstanceMode, InstanceState, StatefulConfig, StatefulStorageConfig};
+
+        let store = setup_store()?;
+        store.insert_node(NodeMsg::from(make_node("node-a", "east")))?;
+
+        let job_name = "stateful-stop".to_string();
+        let task = TaskConfig {
+            count: TaskCount::new(2),
+            resources: json!({ "memory": 64 }),
+            stateful: Some(StatefulConfig {
+                mode: InstanceMode::Slot,
+                id_source: None,
+                storage: Some(StatefulStorageConfig {
+                    path: "/var/lib/data".into(),
+                    retain_on_scale_in: None,
+                }),
+            }),
+            ..TaskConfig::new("db", "service")
+        };
+        let job_config = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: job_name.clone(),
+            tasks: vec![task],
+            version: None,
+        };
+        store.handle_job_submit(
+            &job_config,
+            &[Submission {
+                path: "job.jsonnet".into(),
+                content: "job".into(),
+                is_primary: true,
+            }],
+        )?;
+        let job_config_id = store.get_job_config(&job_name)?.id();
+
+        Eval {
+            id: "1".into(),
+            status: "pending".into(),
+            kind: "job_submit".into(),
+            job_id: job_name.clone(),
+            job_config_id: job_config_id.clone(),
+            node_name: String::new(),
+            priority: 50,
+        }
+        .handle(&store)?;
+
+        let instances = store.list_instances(&job_name)?;
+        assert_eq!(instances.len(), 2);
+        let handles: Vec<Option<String>> = instances
+            .iter()
+            .map(|instance| instance.storage_handle.clone())
+            .collect();
+        assert!(handles.iter().all(Option::is_some));
+
+        Eval {
+            id: "2".into(),
+            status: "pending".into(),
+            kind: "job_stop".into(),
+            job_id: job_name.clone(),
+            job_config_id,
+            node_name: String::new(),
+            priority: 50,
+        }
+        .handle(&store)?;
+
+        let stopped = store.list_instances(&job_name)?;
+        assert_eq!(stopped.len(), 2, "instance rows retained after stop");
+        for (instance, handle) in stopped.iter().zip(&handles) {
+            assert_eq!(instance.state, InstanceState::Terminated);
+            assert_eq!(instance.current_alloc_id, None);
+            assert_eq!(&instance.storage_handle, handle, "storage handles retained");
+        }
         Ok(())
     }
 

@@ -30,9 +30,11 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
 use crate::prelude::*;
+use crate::storage::store::Store;
 use crate::structs::workload_identity::{
     WorkloadIdentity, WorkloadIdentityClaims, CONTROL_PLANE_IDENTITY_NAME,
 };
+use crate::structs::{Allocation, TaskConfig};
 
 /// Standard OIDC discovery route.
 pub const DISCOVERY_PATH: &str = "/.well-known/openid-configuration";
@@ -330,6 +332,39 @@ impl Issuer {
         });
         Ok(before - self.keys.len())
     }
+}
+
+/// Derive workload-identity claims for an allocation from the scheduling
+/// record. This is the manager-side source of truth the (future) issuance RPC
+/// stamps into tokens — claims are never trusted from a worker.
+///
+/// For stateful allocations the claims carry the stable `instance` key (and
+/// `slot` in slot mode) read from the allocation's instance record, which is
+/// what makes the token's identity stable across reschedules: every allocation
+/// for slot N of a group resolves to the same `legion.io/instance` and the
+/// same instance-keyed `sub` template rendering. Stateless allocations yield
+/// `instance: None` / `slot: None`, exactly today's behavior.
+pub fn claims_for_allocation(
+    store: &Store,
+    allocation: &Allocation,
+    task: &TaskConfig,
+    region: &str,
+) -> R<WorkloadIdentityClaims> {
+    let instance = match allocation.instance_id.as_deref() {
+        Some(instance_id) => store.get_instance(instance_id)?,
+        None => None,
+    };
+
+    Ok(WorkloadIdentityClaims {
+        region: region.to_string(),
+        job: allocation.job_id.clone(),
+        group: task.group.clone(),
+        task: task.name.clone(),
+        node_id: allocation.node_id.clone(),
+        alloc_id: allocation.id.to_string(),
+        instance: instance.as_ref().map(|i| i.instance_id.clone()),
+        slot: instance.as_ref().and_then(|i| i.slot_index),
+    })
 }
 
 /// Seconds since the Unix epoch.
@@ -640,6 +675,115 @@ mod tests {
         let second = iss.issue(&claims(), &aws_identity(), now()).unwrap();
         assert_ne!(first.kid, second.kid);
         assert_eq!(second.kid, iss.active_key().unwrap().kid);
+    }
+
+    // --- claims derivation from the scheduling record ---
+
+    fn claims_test_store() -> R<Store> {
+        let store_dir = tempfile::Builder::new()
+            .prefix("legion-wi-claims-")
+            .tempdir()
+            .context("error creating temp store directory")?
+            .keep();
+        let config = crate::structs::ManagerConfigFull {
+            store_path: store_dir
+                .to_str()
+                .context("error parsing store path")?
+                .to_string(),
+            ..Default::default()
+        };
+        let store = Store::start_storage(&config)?;
+        store.reset_all_tables()?;
+        Ok(store)
+    }
+
+    fn submit_and_place(store: &Store, task: crate::structs::TaskConfig) -> R<Allocation> {
+        use crate::structs::{JobConfig, NodeMsg, Submission};
+        store.insert_node(NodeMsg {
+            id: "node-1".into(),
+            pool: "default".into(),
+            status: "active".into(),
+            availability: "available".into(),
+            config_attrs: "{}".into(),
+            fingerprint_attrs: "{}".into(),
+            dynamic_attrs: "{}".into(),
+            health_checks: "{}".into(),
+            last_heartbeat: "2026-01-01 00:00:00 +00:00:00".into(),
+        })?;
+        let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "claims-job".into(),
+            tasks: vec![task],
+            version: None,
+        };
+        store.handle_job_submit(
+            &job,
+            &[Submission {
+                path: "job.jsonnet".into(),
+                content: "{}".into(),
+                is_primary: true,
+            }],
+        )?;
+        let job_config_id = store.get_job_config("claims-job")?.id();
+        let (task_id, _) = store
+            .get_task_configs_for_job_config(&job_config_id)?
+            .into_iter()
+            .next()
+            .context("missing task config")?;
+        store.place_alloc("node-1", task_id)
+    }
+
+    #[test]
+    fn claims_for_stateless_allocation_have_no_instance() -> R<()> {
+        let store = claims_test_store()?;
+        let task = crate::structs::TaskConfig::new("server", "noop");
+        let allocation = submit_and_place(&store, task.clone())?;
+
+        let derived = claims_for_allocation(&store, &allocation, &task, "auto")?;
+        assert_eq!(derived.job, "claims-job");
+        assert_eq!(derived.task, "server");
+        assert_eq!(derived.group, "default");
+        assert_eq!(derived.alloc_id, allocation.id.to_string());
+        assert_eq!(derived.node_id, "node-1");
+        assert_eq!(derived.instance, None);
+        assert_eq!(derived.slot, None);
+        assert!(!derived.is_stateful());
+        Ok(())
+    }
+
+    #[test]
+    fn claims_for_stateful_allocation_carry_instance_and_slot() -> R<()> {
+        use crate::structs::{InstanceMode, StatefulConfig, TaskConfig};
+
+        let store = claims_test_store()?;
+        let task = TaskConfig {
+            stateful: Some(StatefulConfig {
+                mode: InstanceMode::Slot,
+                id_source: None,
+                storage: None,
+            }),
+            ..TaskConfig::new("db", "noop")
+        };
+        let allocation = submit_and_place(&store, task.clone())?;
+        assert!(allocation.instance_id.is_some());
+
+        let derived = claims_for_allocation(&store, &allocation, &task, "auto")?;
+        assert_eq!(derived.instance.as_deref(), Some("claims-job-default-0"));
+        assert_eq!(derived.slot, Some(0));
+        assert!(derived.is_stateful());
+
+        // The instance-keyed sub template now renders, and the legion claims
+        // carry the stable instance key.
+        let sub = derived.render_subject("{region}:{job}:{group}:{task}:{instance}")?;
+        assert_eq!(sub, "auto:claims-job:default:db:claims-job-default-0");
+        let legion = derived.legion_claims();
+        assert_eq!(
+            legion.get("legion.io/instance").map(String::as_str),
+            Some("claims-job-default-0")
+        );
+        assert_eq!(legion.get("legion.io/slot").map(String::as_str), Some("0"));
+        Ok(())
     }
 
     #[test]

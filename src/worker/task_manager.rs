@@ -388,6 +388,9 @@ fn task_from_allocation(allocation: &TaskAllocation) -> R<(Allocation, TaskConfi
         job_config_id: allocation.job_config_id.clone(),
         task_config_id: allocation.task_config_id,
         job_id: allocation.job_id.clone(),
+        // The worker never needs the instance binding: instance env vars are
+        // already injected into task_config by the manager at dispatch time.
+        instance_id: None,
     };
 
     Ok((alloc, task))
@@ -412,6 +415,7 @@ mod tests {
             job_config_id: "job-1".into(),
             task_config_id: 1,
             job_id: "job".into(),
+            instance_id: None,
         }
     }
 

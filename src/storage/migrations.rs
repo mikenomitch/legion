@@ -377,5 +377,42 @@ pub fn get_migrations() -> Migrations<'static> {
         // Workload identities declared on a task (workload-identity OIDC plan).
         // JSON-encoded Vec<WorkloadIdentity>; NULL/absent == no identities.
         M::up("ALTER TABLE task_config ADD COLUMN identities JSONB;").down(""),
+        // Stateful block declared on a task (stateful-workloads plan).
+        // JSON-encoded StatefulConfig; NULL/absent == stateless task.
+        M::up("ALTER TABLE task_config ADD COLUMN stateful JSONB;").down(""),
+        // Stable instances for stateful workloads (stateful-workloads plan).
+        // One row per logical instance; allocations reference instance_id and
+        // churn underneath it. Terminated rows are retained: slot rows so a
+        // scale-out re-materializes the same id/storage, keyed rows forever so
+        // ids are never recycled.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS instance (
+            instance_id STRING PRIMARY KEY,
+            job_id STRING NOT NULL,
+            group_name STRING NOT NULL,
+            task_name STRING NOT NULL,
+            mode STRING NOT NULL,
+            state STRING NOT NULL,
+            slot_index INTEGER,
+            current_alloc_id INTEGER,
+            storage_handle STRING,
+            created_at TIMESTAMP NOT NULL,
+            updated_at TIMESTAMP NOT NULL,
+            FOREIGN KEY(job_id) REFERENCES job(id) ON DELETE CASCADE
+        )",
+        )
+        .down("DROP TABLE IF EXISTS instance;"),
+        M::up(
+            "CREATE INDEX IF NOT EXISTS idx_instance_job_group ON instance(job_id, group_name);",
+        )
+        .down("DROP INDEX IF EXISTS idx_instance_job_group;"),
+        // The stable instance an allocation currently fulfills (NULL for
+        // stateless tasks). No FK: instance rows outlive allocations and the
+        // column is assigned inside the allocation-insert transaction.
+        M::up("ALTER TABLE allocation ADD COLUMN instance_id STRING;").down(""),
+        M::up(
+            "CREATE INDEX IF NOT EXISTS idx_allocation_instance_id ON allocation(instance_id);",
+        )
+        .down("DROP INDEX IF EXISTS idx_allocation_instance_id;"),
     ])
 }

@@ -17,6 +17,9 @@ pub struct Allocation {
     pub job_config_id: String,
     pub task_config_id: i64,
     pub job_id: String,
+    /// Stable instance this allocation fulfills, when the task is stateful
+    /// (see `docs/stateful-workloads.md`). None for stateless tasks.
+    pub instance_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -100,6 +103,9 @@ impl From<Allocation> for LedgerAllocation {
             job_config_id,
             task_config_id,
             job_id,
+            // The ledger proto message has no instance field yet; instance
+            // identity is surfaced via the instance table and task env vars.
+            instance_id: _,
         } = allocation;
 
         let resources = to_string(&resources).unwrap_or_else(|_| "{}".into());
@@ -139,6 +145,7 @@ impl LedgerAllocation {
             job_config_id,
             task_config_id,
             job_id,
+            instance_id: None,
         })
     }
 }

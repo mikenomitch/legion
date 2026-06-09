@@ -10,6 +10,7 @@ use tabled::Tabled;
 
 use crate::prelude::{bail, R};
 
+use super::instance::InstanceMode;
 use super::workload_identity::{validate_identities, WorkloadIdentity};
 use super::{Job, PlannedAllocation, Submission};
 
@@ -811,6 +812,50 @@ impl RolloutConfig {
     }
 }
 
+/// Declares a task stateful: its replicas become stable *instances* that
+/// survive reschedules (see `docs/stateful-workloads.md`). Absent = today's
+/// stateless behavior; the feature is opt-in per task.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct StatefulConfig {
+    /// Instance id assignment mode: `slot` (fixed ordinal pool `0..count-1`,
+    /// ids reused within the pool) or `keyed` (created on demand via API,
+    /// ids never recycled; management RPCs are a follow-up workstream).
+    pub mode: InstanceMode,
+    /// Where keyed instance ids come from: `caller` (supplied on create) or
+    /// `uuid` (server-minted). Only valid in keyed mode; slot ids are always
+    /// derived from the ordinal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id_source: Option<String>,
+    /// Optional persistent storage bound to each instance (contract only in
+    /// v1; drivers are a follow-up, see
+    /// `docs/plans/volume-plugin-system-plan.md`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage: Option<StatefulStorageConfig>,
+}
+
+/// Persistent storage contract for a stateful task. Each instance gets an
+/// opaque `storage_handle` minted on first placement and reattached on every
+/// subsequent allocation for that instance.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct StatefulStorageConfig {
+    /// Absolute path inside the task where the instance's storage is exposed.
+    pub path: String,
+    /// Whether to keep an instance's storage handle when its slot is scaled
+    /// in (so a later scale-out reattaches the same data). Defaults to true,
+    /// mirroring K8s PVC retention.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retain_on_scale_in: Option<bool>,
+}
+
+impl StatefulStorageConfig {
+    /// Effective retention policy (defaults to retain).
+    pub fn retains_on_scale_in(&self) -> bool {
+        self.retain_on_scale_in.unwrap_or(true)
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Tabled)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskConfig {
@@ -853,6 +898,11 @@ pub struct TaskConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[tabled(skip)]
     pub identities: Vec<WorkloadIdentity>,
+    /// Stable instance identity for stateful workloads (see
+    /// `docs/stateful-workloads.md`). None = stateless, today's behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[tabled(skip)]
+    pub stateful: Option<StatefulConfig>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -988,6 +1038,8 @@ struct TaskConfigInput {
     kv_injections: Option<TaskKvInjections>,
     #[serde(default)]
     identities: Vec<WorkloadIdentity>,
+    #[serde(default)]
+    stateful: Option<StatefulConfig>,
 }
 
 #[derive(Deserialize)]
@@ -1053,6 +1105,7 @@ impl TaskConfigInput {
                 }
             }),
             identities: self.identities,
+            stateful: self.stateful,
         }
     }
 }
@@ -1207,17 +1260,74 @@ impl TaskConfig {
             on_unhealthy: TaskOnUnhealthyConfig::default(),
             kv_injections: None,
             identities: Vec::new(),
+            stateful: None,
         }
     }
 
     /// Whether this task declares a stateful block. Gates the stateful-only
-    /// `{instance}`/`{slot}` placeholders in a `sub` template. Stateful
-    /// workloads are defined by a separate plan; until that lands, a task is
-    /// considered stateful if its kind config carries a `stateful` object.
-    fn is_stateful(&self) -> bool {
-        self.config
-            .get("stateful")
-            .is_some_and(|value| !value.is_null())
+    /// `{instance}`/`{slot}` placeholders in a `sub` template and the
+    /// instance-assignment path in the scheduler/store.
+    pub fn is_stateful(&self) -> bool {
+        self.stateful.is_some()
+    }
+
+    /// Validate the task's stateful block (see `docs/stateful-workloads.md`).
+    /// No stateful block = today's stateless behavior, always valid.
+    pub fn validate_stateful(&self) -> R<()> {
+        let Some(stateful) = self.stateful.as_ref() else {
+            return Ok(());
+        };
+
+        match stateful.mode {
+            InstanceMode::Slot => {
+                if stateful.id_source.is_some() {
+                    bail!(
+                        "task {} stateful.idSource is only valid in keyed mode; slot ids are \
+                         always derived from the ordinal",
+                        self.name
+                    );
+                }
+                if self.count.num < 1 {
+                    bail!(
+                        "task {} stateful slot mode requires count.num >= 1 (slots are 0..count-1)",
+                        self.name
+                    );
+                }
+                if self.count.per.is_some() {
+                    bail!(
+                        "task {} stateful slot mode cannot be combined with count.per; per-attribute \
+                         pools would produce colliding slot instance ids",
+                        self.name
+                    );
+                }
+            }
+            InstanceMode::Keyed => {
+                if let Some(id_source) = stateful.id_source.as_deref() {
+                    if !matches!(id_source, "caller" | "uuid") {
+                        bail!(
+                            "task {} stateful.idSource must be \"caller\" or \"uuid\", got {:?}",
+                            self.name,
+                            id_source
+                        );
+                    }
+                }
+            }
+        }
+
+        if let Some(storage) = stateful.storage.as_ref() {
+            if storage.path.trim().is_empty() {
+                bail!("task {} stateful.storage.path cannot be empty", self.name);
+            }
+            if !storage.path.starts_with('/') {
+                bail!(
+                    "task {} stateful.storage.path must be an absolute path, got {:?}",
+                    self.name,
+                    storage.path
+                );
+            }
+        }
+
+        Ok(())
     }
 
     /// Validate workload identities declared on this task (see the
@@ -1738,6 +1848,191 @@ mod tests {
             .validate_identities()
             .expect_err("empty audience must be rejected");
         assert!(err.to_string().contains("audience"), "{err}");
+    }
+
+    #[test]
+    fn stateful_block_deserializes_and_round_trips() -> R<()> {
+        let spec = serde_json::json!({
+            "name": "demo",
+            "task": {
+                "kind": "exec",
+                "count": 3,
+                "stateful": {
+                    "mode": "slot",
+                    "storage": { "path": "/var/lib/db", "retainOnScaleIn": true }
+                }
+            }
+        });
+        let config: JobConfig = serde_json::from_value(spec)?;
+        let task = &config.tasks[0];
+        let stateful = task.stateful.as_ref().expect("stateful block parsed");
+        assert_eq!(stateful.mode, InstanceMode::Slot);
+        assert!(stateful.id_source.is_none());
+        let storage = stateful.storage.as_ref().expect("storage parsed");
+        assert_eq!(storage.path, "/var/lib/db");
+        assert!(storage.retains_on_scale_in());
+        task.validate_stateful()?;
+        assert!(task.is_stateful());
+
+        // Round trip: serialize the task config and re-parse.
+        let serialized = serde_json::to_value(task)?;
+        assert_eq!(serialized["stateful"]["mode"], "slot");
+        let reparsed: TaskConfig = serde_json::from_value(serialized)?;
+        assert_eq!(reparsed.stateful, task.stateful);
+        Ok(())
+    }
+
+    #[test]
+    fn stateful_keyed_block_accepts_id_source() -> R<()> {
+        let spec = serde_json::json!({
+            "name": "demo",
+            "task": {
+                "kind": "container",
+                "stateful": {
+                    "mode": "keyed",
+                    "idSource": "caller",
+                    "storage": { "path": "/workspace" }
+                }
+            }
+        });
+        let config: JobConfig = serde_json::from_value(spec)?;
+        let stateful = config.tasks[0].stateful.as_ref().expect("stateful parsed");
+        assert_eq!(stateful.mode, InstanceMode::Keyed);
+        assert_eq!(stateful.id_source.as_deref(), Some("caller"));
+        config.tasks[0].validate_stateful()?;
+        Ok(())
+    }
+
+    #[test]
+    fn stateful_storage_retain_defaults_to_true() -> R<()> {
+        let spec = serde_json::json!({
+            "name": "demo",
+            "task": {
+                "kind": "exec",
+                "stateful": { "mode": "slot", "storage": { "path": "/data" } }
+            }
+        });
+        let config: JobConfig = serde_json::from_value(spec)?;
+        let storage = config.tasks[0]
+            .stateful
+            .as_ref()
+            .and_then(|stateful| stateful.storage.as_ref())
+            .expect("storage parsed");
+        assert!(storage.retain_on_scale_in.is_none());
+        assert!(storage.retains_on_scale_in());
+        Ok(())
+    }
+
+    #[test]
+    fn stateful_validation_rejects_id_source_in_slot_mode() {
+        let task = TaskConfig {
+            stateful: Some(StatefulConfig {
+                mode: InstanceMode::Slot,
+                id_source: Some("uuid".into()),
+                storage: None,
+            }),
+            ..TaskConfig::new("db", "exec")
+        };
+        let err = task
+            .validate_stateful()
+            .expect_err("idSource must be rejected in slot mode");
+        assert!(err.to_string().contains("idSource"), "{err}");
+    }
+
+    #[test]
+    fn stateful_validation_rejects_zero_count_in_slot_mode() {
+        let task = TaskConfig {
+            count: TaskCount::new(0),
+            stateful: Some(StatefulConfig {
+                mode: InstanceMode::Slot,
+                id_source: None,
+                storage: None,
+            }),
+            ..TaskConfig::new("db", "exec")
+        };
+        let err = task
+            .validate_stateful()
+            .expect_err("slot mode requires count >= 1");
+        assert!(err.to_string().contains("count.num >= 1"), "{err}");
+    }
+
+    #[test]
+    fn stateful_validation_rejects_count_per_in_slot_mode() {
+        let task = TaskConfig {
+            count: TaskCount::per(2, "region"),
+            stateful: Some(StatefulConfig {
+                mode: InstanceMode::Slot,
+                id_source: None,
+                storage: None,
+            }),
+            ..TaskConfig::new("db", "exec")
+        };
+        let err = task
+            .validate_stateful()
+            .expect_err("slot mode cannot combine with count.per");
+        assert!(err.to_string().contains("count.per"), "{err}");
+    }
+
+    #[test]
+    fn stateful_validation_rejects_bad_storage_paths() {
+        for bad_path in ["", "   ", "relative/path"] {
+            let task = TaskConfig {
+                stateful: Some(StatefulConfig {
+                    mode: InstanceMode::Slot,
+                    id_source: None,
+                    storage: Some(StatefulStorageConfig {
+                        path: bad_path.into(),
+                        retain_on_scale_in: None,
+                    }),
+                }),
+                ..TaskConfig::new("db", "exec")
+            };
+            let err = task
+                .validate_stateful()
+                .expect_err("storage path must be rejected");
+            assert!(
+                err.to_string().contains("path"),
+                "{err} (path {bad_path:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn stateful_validation_rejects_unknown_keyed_id_source() {
+        let task = TaskConfig {
+            stateful: Some(StatefulConfig {
+                mode: InstanceMode::Keyed,
+                id_source: Some("dice-roll".into()),
+                storage: None,
+            }),
+            ..TaskConfig::new("sandbox", "container")
+        };
+        let err = task
+            .validate_stateful()
+            .expect_err("unknown idSource must be rejected");
+        assert!(err.to_string().contains("idSource"), "{err}");
+    }
+
+    #[test]
+    fn stateless_task_passes_stateful_validation_and_is_not_stateful() -> R<()> {
+        let task = TaskConfig::new("web", "exec");
+        assert!(!task.is_stateful());
+        task.validate_stateful()?;
+        Ok(())
+    }
+
+    #[test]
+    fn stateful_validation_rejects_unknown_mode_at_parse_time() {
+        let spec = serde_json::json!({
+            "name": "demo",
+            "task": {
+                "kind": "exec",
+                "stateful": { "mode": "ordinal" }
+            }
+        });
+        let err = serde_json::from_value::<JobConfig>(spec)
+            .expect_err("unknown stateful mode must fail to parse");
+        assert!(err.to_string().contains("ordinal") || err.to_string().contains("variant"));
     }
 
     #[test]

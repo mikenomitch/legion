@@ -32,6 +32,12 @@ Important `TaskConfig` fields:
 - `lifecycle`: `service`, `batch`, `sidecar`
 - `schedule`: only valid for `batch`
 - `checks` and `on_unhealthy`: health and restart/reschedule policy
+- `stateful`: opt-in stable instance identity for the task's replicas. In
+  `slot` mode each replica gets an ordinal slot `0..count-1` whose instance id
+  and storage handle survive reschedules; replacements reuse the same slot.
+  See [Stateful Workloads](stateful-workloads.md) for the full job-spec
+  reference, env vars, and scale-in/out semantics. Tasks without a `stateful`
+  block behave exactly as before.
 
 ## Task Lists and Dependency Readiness
 

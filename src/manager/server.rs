@@ -2590,7 +2590,11 @@ fn build_desired_allocations(
         let task = tasks
             .get(&allocation.task_config_id)
             .with_context(|| format!("Missing task config {}", allocation.task_config_id))?;
-        allocations.push(build_task_allocation(task, &allocation)?);
+        let instance = match allocation.instance_id.as_deref() {
+            Some(instance_id) => store.get_instance(instance_id)?,
+            None => None,
+        };
+        allocations.push(build_task_allocation(task, &allocation, instance.as_ref())?);
     }
 
     Ok(allocations)

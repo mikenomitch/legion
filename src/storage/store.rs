@@ -9,18 +9,21 @@ use crate::storage::persistence::{
 };
 use crate::storage::queries::{
     GET_ALLOCATION_BY_ID, GET_ALLOCS, GET_ALLOCS_FOR_JOB, GET_ALLOCS_FOR_JOB_CONFIG,
-    GET_ALLOCS_FOR_NODE, GET_EVALS, GET_JOB, GET_JOBS, GET_JOB_CONFIG, GET_JOB_CONFIG_BY_ID,
-    GET_JOB_UPDATE_FOR_CONFIG, GET_MANAGER_CONFIGS, GET_NEXT_EVAL, GET_NODE, GET_NODES,
-    GET_TASK_FOR_JOB_CONIFG, GET_WORKER_TYPE, INSERT_ALLOCATION, INSERT_EVAL, INSERT_JOB,
-    INSERT_JOB_CONFIG, INSERT_JOB_CONFIG_SUBMISSION, INSERT_JOB_UPDATE, INSERT_NODE,
-    INSERT_SUBMISSION, INSERT_TASK, INSERT_WORKER_TYPE, NODE_ATTRS, UPSERT_MANAGER_CONFIG,
+    GET_ALLOCS_FOR_NODE, GET_EVALS, GET_INSTANCE, GET_INSTANCES_FOR_JOB, GET_JOB, GET_JOBS,
+    GET_JOB_CONFIG, GET_JOB_CONFIG_BY_ID, GET_JOB_UPDATE_FOR_CONFIG, GET_MANAGER_CONFIGS,
+    GET_NEXT_EVAL, GET_NODE, GET_NODES, GET_TASK_FOR_JOB_CONIFG, GET_WORKER_TYPE,
+    INSERT_ALLOCATION, INSERT_EVAL, INSERT_JOB, INSERT_JOB_CONFIG, INSERT_JOB_CONFIG_SUBMISSION,
+    INSERT_JOB_UPDATE, INSERT_NODE, INSERT_SUBMISSION, INSERT_TASK, INSERT_WORKER_TYPE, NODE_ATTRS,
+    UPSERT_INSTANCE, UPSERT_MANAGER_CONFIG,
 };
 use crate::structs::{
-    Allocation, AllocationHealth, Eval, Job, JobConfig, KvEntry, KvLock, KvValueType, LedgerEntry,
-    ManagerConfigFull, ManagerNodeConfig, Node, NodeMsg, Rollout, RolloutConfig, Submission,
+    slot_instance_id, Allocation, AllocationHealth, Eval, Instance, InstanceMode, InstanceState,
+    Job, JobConfig, KvEntry, KvLock, KvValueType, LedgerEntry, ManagerConfigFull,
+    ManagerNodeConfig, Node, NodeMsg, Rollout, RolloutConfig, StatefulConfig, Submission,
     TaskCheck, TaskConfig, TaskCount, TaskDependency, TaskLifecycle, TaskOnUnhealthyConfig,
     TaskSchedule, TaskStatusState, WorkerConfig,
 };
+use crate::util::random_string;
 
 use rand::{seq::SliceRandom, thread_rng, Rng};
 use rusqlite::{
@@ -388,7 +391,7 @@ impl Store {
 
         let mut task_stmt = conn.prepare(
             r#"
-            SELECT id, name, kind, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_config_id, identities
+            SELECT id, name, kind, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_config_id, identities, stateful
             FROM task_config;
             "#,
         )?;
@@ -420,6 +423,7 @@ impl Store {
                 on_unhealthy: self.parse_on_unhealthy_column(15, row.get(15)?)?,
                 kv_injections: self.parse_kv_injections_column(16, row.get(16)?)?,
                 identities: self.parse_identities_column(18, row.get(18)?)?,
+                stateful: self.parse_stateful_column(19, row.get(19)?)?,
             };
             let job_config_id: String = row.get(17)?;
             Ok((job_config_id, id, task))
@@ -1269,6 +1273,23 @@ impl Store {
         })
     }
 
+    fn parse_stateful_column(
+        &self,
+        idx: usize,
+        raw: Option<String>,
+    ) -> Result<Option<StatefulConfig>, rusqlite::Error> {
+        let Some(raw) = raw else {
+            return Ok(None);
+        };
+        serde_json::from_str(&raw).map(Some).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(
+                idx,
+                rusqlite::types::Type::Text,
+                Box::new(err),
+            )
+        })
+    }
+
     fn parse_task_lifecycle_column(
         &self,
         idx: usize,
@@ -1310,6 +1331,7 @@ impl Store {
             on_unhealthy: self.parse_on_unhealthy_column(15, row.get(15)?)?,
             kv_injections: self.parse_kv_injections_column(16, row.get(16)?)?,
             identities: self.parse_identities_column(19, row.get(19)?)?,
+            stateful: self.parse_stateful_column(20, row.get(20)?)?,
         };
 
         Ok(task_config)
@@ -1324,9 +1346,37 @@ impl Store {
             job_config_id: row.get(4)?,
             task_config_id: row.get(5)?,
             job_id: row.get(6)?,
+            instance_id: row.get(7)?,
         };
 
         Ok(allocation)
+    }
+
+    fn instance_from_row(&self, row: &Row<'_>) -> Result<Instance, rusqlite::Error> {
+        let mode: String = row.get(4)?;
+        let state: String = row.get(5)?;
+        let parse_err = |idx: usize, err: String| {
+            rusqlite::Error::FromSqlConversionFailure(
+                idx,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, err)),
+            )
+        };
+        let instance = Instance {
+            instance_id: row.get(0)?,
+            job_id: row.get(1)?,
+            group: row.get(2)?,
+            task_name: row.get(3)?,
+            mode: mode.parse().map_err(|err| parse_err(4, err))?,
+            state: state.parse().map_err(|err| parse_err(5, err))?,
+            slot_index: row.get::<_, Option<i64>>(6)?.map(|slot| slot as u32),
+            current_alloc_id: row.get(7)?,
+            storage_handle: row.get(8)?,
+            created_at: row.get(9)?,
+            updated_at: row.get(10)?,
+        };
+
+        Ok(instance)
     }
 
     fn manager_config_from_row(&self, row: &Row<'_>) -> Result<ManagerNodeConfig, rusqlite::Error> {
@@ -1470,6 +1520,7 @@ impl Store {
         let mut conn = self.write_connection()?;
         let tx = conn.transaction()?;
         tx.execute("DELETE FROM allocation WHERE node_id = ?;", [node_id])?;
+        self.release_instance_bindings_tx(&tx, &allocs)?;
         self.bump_epochs_for_allocations_tx(&tx, &allocs)?;
         tx.commit()?;
 
@@ -2038,6 +2089,7 @@ impl Store {
             } else {
                 Some(serde_json::to_string(&t.identities)?)
             };
+            let stateful = t.stateful.as_ref().map(serde_json::to_string).transpose()?;
             let schedule = t.schedule.as_ref().map(ToString::to_string);
             let task_params = named_params! {
                 ":name": t.name,
@@ -2059,6 +2111,7 @@ impl Store {
                 ":job_id": job.id,
                 ":job_config_id": job_config_id,
                 ":identities": identities,
+                ":stateful": stateful,
             };
 
             let task_id: i64 = tx.query_row(&INSERT_TASK, task_params, |row| row.get(0))?;
@@ -2684,19 +2737,7 @@ impl Store {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
 
-        let params = named_params! {
-            ":status": "placed",
-            ":resources": resources,
-            ":node_id": node_id,
-            ":job_config_id": job_config_id,
-            ":task_config_id": task_id,
-        };
-
-        let allocation = tx.query_row(&INSERT_ALLOCATION, params, |row| {
-            self.allocation_from_row(row)
-        })?;
-
-        Ok(allocation)
+        self.insert_allocation_with_data(tx, node_id, task_id, &job_config_id, &resources)
     }
 
     fn insert_allocation_with_data(
@@ -2707,19 +2748,257 @@ impl Store {
         job_config_id: &str,
         resources: &Value,
     ) -> R<Allocation> {
+        // Stateful slot tasks: pick (or re-materialize) the instance this
+        // allocation will fulfill before writing the row, so the binding is
+        // atomic with the placement.
+        let instance_id = self.assign_slot_instance_tx(tx, task_id)?;
+
         let params = named_params! {
             ":status": "placed",
             ":resources": resources,
             ":node_id": node_id,
             ":job_config_id": job_config_id,
             ":task_config_id": task_id,
+            ":instance_id": instance_id,
         };
 
         let allocation = tx.query_row(&INSERT_ALLOCATION, params, |row| {
             self.allocation_from_row(row)
         })?;
 
+        if let Some(instance_id) = allocation.instance_id.as_deref() {
+            let now = Self::now_rfc3339()?;
+            tx.execute(
+                "UPDATE instance SET state = 'active', current_alloc_id = ?1, updated_at = ?2 \
+                 WHERE instance_id = ?3;",
+                params![allocation.id, now, instance_id],
+            )?;
+        }
+
         Ok(allocation)
+    }
+
+    /// For a slot-mode stateful task, find the lowest slot `0..count.num-1`
+    /// whose instance is not currently fulfilled by an allocation of this task
+    /// config, creating or re-activating the instance row as needed. Returns
+    /// `None` for stateless tasks (and keyed mode, which is driven by the
+    /// management API, a follow-up workstream). Must run inside the same
+    /// transaction that inserts the allocation.
+    fn assign_slot_instance_tx(&self, tx: &Transaction<'_>, task_id: i64) -> R<Option<String>> {
+        let (job_id, group, task_name, count, stateful): (
+            String,
+            String,
+            String,
+            i64,
+            Option<String>,
+        ) = tx.query_row(
+            "SELECT job_id, group_name, name, count, stateful FROM task_config WHERE id = ?;",
+            [task_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )?;
+
+        let Some(stateful) = stateful else {
+            return Ok(None);
+        };
+        let stateful: StatefulConfig = serde_json::from_str(&stateful)
+            .with_context(|| format!("invalid stateful config for task {task_name}"))?;
+        if stateful.mode != InstanceMode::Slot {
+            return Ok(None);
+        }
+
+        // Slots already fulfilled by live allocations of this task config.
+        // Scoped per config so a create-first rollout's new allocations can
+        // take over instances still referenced by the outgoing config.
+        let mut taken_stmt = tx.prepare(
+            "SELECT instance.slot_index FROM allocation \
+             INNER JOIN instance ON instance.instance_id = allocation.instance_id \
+             WHERE allocation.task_config_id = ?1 AND allocation.instance_id IS NOT NULL;",
+        )?;
+        let taken: HashSet<u32> = Self::collect_rows(
+            taken_stmt.query_map([task_id], |row| row.get::<_, Option<i64>>(0))?,
+        )?
+        .into_iter()
+        .flatten()
+        .map(|slot| slot as u32)
+        .collect();
+
+        let desired = count.max(0) as u32;
+        let slot = (0..desired)
+            .find(|slot| !taken.contains(slot))
+            .with_context(|| {
+                format!(
+                "no free slot for stateful task {task_name} (group {group}); all {desired} slots \
+                 already have allocations for this job config"
+            )
+            })?;
+
+        let instance_id = slot_instance_id(&job_id, &group, slot);
+        let now = Self::now_rfc3339()?;
+        let existing = tx
+            .query_row(&GET_INSTANCE, [instance_id.as_str()], |row| {
+                self.instance_from_row(row)
+            })
+            .optional()?;
+
+        match existing {
+            Some(existing) => {
+                // Re-activation handles both reschedule (Rescheduling -> Active
+                // via the caller's binding update) and scale-out of a retained
+                // Terminated slot: the same id and storage handle come back.
+                // Mint a handle only if none was retained and the task (still)
+                // declares storage.
+                let storage_handle = existing
+                    .storage_handle
+                    .or_else(|| stateful.storage.as_ref().map(|_| mint_storage_handle()));
+                tx.execute(
+                    "UPDATE instance SET task_name = ?1, storage_handle = ?2, updated_at = ?3 \
+                     WHERE instance_id = ?4;",
+                    params![task_name, storage_handle, now, instance_id],
+                )?;
+            }
+            None => {
+                let storage_handle = stateful.storage.as_ref().map(|_| mint_storage_handle());
+                tx.execute(
+                    "INSERT INTO instance (instance_id, job_id, group_name, task_name, mode, \
+                     state, slot_index, current_alloc_id, storage_handle, created_at, updated_at) \
+                     VALUES (?1, ?2, ?3, ?4, 'slot', 'pending', ?5, NULL, ?6, ?7, ?7);",
+                    params![
+                        instance_id,
+                        job_id,
+                        group,
+                        task_name,
+                        slot,
+                        storage_handle,
+                        now
+                    ],
+                )?;
+            }
+        }
+
+        Ok(Some(instance_id))
+    }
+
+    /// After allocation rows are deleted, transition the instances they
+    /// fulfilled. Instances still referenced by another live allocation (for
+    /// example the already-placed replacement during a config update) keep
+    /// running and just re-point `current_alloc_id`. Orphaned instances become
+    /// `rescheduling` while their slot is still desired, or `terminated` when
+    /// the latest job config no longer wants the slot (scale-in) — retaining
+    /// the row, and the storage handle unless `retain_on_scale_in` is false.
+    /// Must run in the same transaction as the deletion, before commit.
+    fn release_instance_bindings_tx(&self, tx: &Transaction<'_>, removed: &[Allocation]) -> R<()> {
+        let instance_ids: HashSet<&str> = removed
+            .iter()
+            .filter_map(|alloc| alloc.instance_id.as_deref())
+            .collect();
+        if instance_ids.is_empty() {
+            return Ok(());
+        }
+
+        let now = Self::now_rfc3339()?;
+        for instance_id in instance_ids {
+            let surviving_alloc: Option<i64> = tx
+                .query_row(
+                    "SELECT MAX(id) FROM allocation WHERE instance_id = ?;",
+                    [instance_id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .flatten();
+
+            if let Some(alloc_id) = surviving_alloc {
+                tx.execute(
+                    "UPDATE instance SET current_alloc_id = ?1, updated_at = ?2 \
+                     WHERE instance_id = ?3 AND current_alloc_id IS NOT ?1;",
+                    params![alloc_id, now, instance_id],
+                )?;
+                continue;
+            }
+
+            let instance = tx
+                .query_row(&GET_INSTANCE, [instance_id], |row| {
+                    self.instance_from_row(row)
+                })
+                .optional()?;
+            let Some(instance) = instance else {
+                continue;
+            };
+            if instance.state == InstanceState::Terminated {
+                continue;
+            }
+
+            let (still_desired, retain_storage) = self.slot_still_desired_tx(tx, &instance)?;
+            if still_desired {
+                tx.execute(
+                    "UPDATE instance SET state = 'rescheduling', current_alloc_id = NULL, \
+                     updated_at = ?1 WHERE instance_id = ?2;",
+                    params![now, instance_id],
+                )?;
+            } else {
+                let storage_handle = if retain_storage {
+                    instance.storage_handle.clone()
+                } else {
+                    None
+                };
+                info!(
+                    instance_id,
+                    job_id = %instance.job_id,
+                    retain_storage,
+                    "Terminating scaled-in instance"
+                );
+                tx.execute(
+                    "UPDATE instance SET state = 'terminated', current_alloc_id = NULL, \
+                     storage_handle = ?1, updated_at = ?2 WHERE instance_id = ?3;",
+                    params![storage_handle, now, instance_id],
+                )?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Whether the instance's slot is still inside the latest job config's
+    /// desired range, plus the effective storage retention policy. Keyed
+    /// instances are always "still desired" here — their lifecycle is owned by
+    /// the management API (follow-up workstream), never by allocation churn.
+    fn slot_still_desired_tx(&self, tx: &Transaction<'_>, instance: &Instance) -> R<(bool, bool)> {
+        let (InstanceMode::Slot, Some(slot)) = (instance.mode, instance.slot_index) else {
+            return Ok((true, true));
+        };
+
+        let latest_task: Option<(i64, Option<String>)> = tx
+            .query_row(
+                "SELECT task_config.count, task_config.stateful FROM task_config \
+                 INNER JOIN job_config ON job_config.id = task_config.job_config_id \
+                 WHERE task_config.job_id = ?1 AND task_config.group_name = ?2 \
+                 AND task_config.name = ?3 \
+                 ORDER BY job_config.version DESC LIMIT 1;",
+                params![instance.job_id, instance.group, instance.task_name],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+
+        let Some((count, stateful)) = latest_task else {
+            // Task disappeared from the job entirely: terminate, retain storage.
+            return Ok((false, true));
+        };
+
+        let retain = stateful
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<StatefulConfig>(raw).ok())
+            .and_then(|stateful| stateful.storage)
+            .map(|storage| storage.retains_on_scale_in())
+            .unwrap_or(true);
+
+        Ok(((slot as i64) < count, retain))
     }
 
     fn load_allocation_constraints(
@@ -3056,6 +3335,7 @@ impl Store {
         let mut conn = self.write_connection()?;
         let tx = conn.transaction()?;
         tx.execute("DELETE FROM allocation WHERE id = ?;", [allocation_id])?;
+        self.release_instance_bindings_tx(&tx, std::slice::from_ref(&allocation))?;
         self.bump_job_config_epoch_tx(&tx, &allocation.job_config_id)?;
         tx.commit()?;
 
@@ -3108,6 +3388,7 @@ impl Store {
         let params = named_params! { ":job_id": job_id };
 
         tx.execute(sql, params)?;
+        self.release_instance_bindings_tx(&tx, &allocations)?;
         self.bump_epochs_for_allocations_tx(&tx, &allocations)?;
         tx.commit()?;
 
@@ -3129,6 +3410,7 @@ impl Store {
             "DELETE FROM allocation WHERE job_config_id = ?;",
             [job_config_id],
         )?;
+        self.release_instance_bindings_tx(&tx, &allocations)?;
         self.bump_job_config_epoch_tx(&tx, job_config_id)?;
         tx.commit()?;
 
@@ -3261,6 +3543,140 @@ impl Store {
         }
 
         Ok(ledger)
+    }
+
+    //
+    // INSTANCES (stateful workloads; see docs/stateful-workloads.md)
+    //
+
+    #[instrument(err, skip_all)]
+    pub fn get_instance(&self, instance_id: &str) -> R<Option<Instance>> {
+        let conn = self.read_connection()?;
+        let instance = conn
+            .query_row(&GET_INSTANCE, [instance_id], |row| {
+                self.instance_from_row(row)
+            })
+            .optional()?;
+        Ok(instance)
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn list_instances(&self, job_id: &str) -> R<Vec<Instance>> {
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare(GET_INSTANCES_FOR_JOB.as_str())?;
+        let rows = stmt.query_map([job_id], |row| self.instance_from_row(row))?;
+        Self::collect_rows(rows)
+    }
+
+    /// Insert or fully replace an instance row (terminated keyed rows are
+    /// never deleted — the never-recycle guarantee depends on them remaining).
+    #[instrument(err, skip_all)]
+    pub fn upsert_instance(&self, instance: &Instance) -> R<Instance> {
+        let now = Self::now_rfc3339()?;
+        let created_at = if instance.created_at.is_empty() {
+            now.clone()
+        } else {
+            instance.created_at.clone()
+        };
+        let conn = self.write_connection()?;
+        let params = named_params! {
+            ":instance_id": instance.instance_id,
+            ":job_id": instance.job_id,
+            ":group_name": instance.group,
+            ":task_name": instance.task_name,
+            ":mode": instance.mode.as_str(),
+            ":state": instance.state.as_str(),
+            ":slot_index": instance.slot_index,
+            ":current_alloc_id": instance.current_alloc_id,
+            ":storage_handle": instance.storage_handle,
+            ":created_at": created_at,
+            ":updated_at": now,
+        };
+        let instance =
+            conn.query_row(&UPSERT_INSTANCE, params, |row| self.instance_from_row(row))?;
+        Ok(instance)
+    }
+
+    /// Fetch the deterministic slot instance for (job, group, slot), creating
+    /// a Pending row (no storage handle) if it does not exist yet. The
+    /// allocation-insert path is what activates instances and mints storage
+    /// handles; this method exists for introspection and pre-materialization.
+    #[instrument(err, skip_all)]
+    pub fn get_or_create_slot_instance(
+        &self,
+        job_id: &str,
+        group: &str,
+        task_name: &str,
+        slot: u32,
+    ) -> R<Instance> {
+        let instance_id = slot_instance_id(job_id, group, slot);
+        if let Some(existing) = self.get_instance(&instance_id)? {
+            return Ok(existing);
+        }
+
+        let now = Self::now_rfc3339()?;
+        let conn = self.write_connection()?;
+        // INSERT OR IGNORE + re-read keeps this race-safe against the
+        // allocation-insert path creating the same slot concurrently.
+        conn.execute(
+            "INSERT OR IGNORE INTO instance (instance_id, job_id, group_name, task_name, mode, \
+             state, slot_index, current_alloc_id, storage_handle, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, 'slot', 'pending', ?5, NULL, NULL, ?6, ?6);",
+            params![instance_id, job_id, group, task_name, slot, now],
+        )?;
+        let instance = conn.query_row(&GET_INSTANCE, [instance_id.as_str()], |row| {
+            self.instance_from_row(row)
+        })?;
+        Ok(instance)
+    }
+
+    /// Point an instance at its (new) current allocation, or clear the binding.
+    #[instrument(err, skip_all)]
+    pub fn set_instance_current_alloc(
+        &self,
+        instance_id: &str,
+        current_alloc_id: Option<i64>,
+    ) -> R<()> {
+        let now = Self::now_rfc3339()?;
+        let conn = self.write_connection()?;
+        let updated = conn.execute(
+            "UPDATE instance SET current_alloc_id = ?1, updated_at = ?2 WHERE instance_id = ?3;",
+            params![current_alloc_id, now, instance_id],
+        )?;
+        if updated == 0 {
+            bail!("instance {instance_id} not found");
+        }
+        Ok(())
+    }
+
+    /// Transition an instance's lifecycle state.
+    #[instrument(err, skip_all)]
+    pub fn set_instance_state(&self, instance_id: &str, state: InstanceState) -> R<()> {
+        let now = Self::now_rfc3339()?;
+        let conn = self.write_connection()?;
+        let updated = conn.execute(
+            "UPDATE instance SET state = ?1, updated_at = ?2 WHERE instance_id = ?3;",
+            params![state.as_str(), now, instance_id],
+        )?;
+        if updated == 0 {
+            bail!("instance {instance_id} not found");
+        }
+        Ok(())
+    }
+
+    /// Terminate every instance of a stopped job, retaining rows and storage
+    /// handles so a later re-run re-materializes the same identities. Called
+    /// from the job_stop eval after its allocations are removed.
+    #[instrument(err, skip_all)]
+    pub fn terminate_instances_for_job(&self, job_id: &str) -> R<u64> {
+        let now = Self::now_rfc3339()?;
+        let conn = self.write_connection()?;
+        let updated = conn.execute(
+            "UPDATE instance SET state = 'terminated', current_alloc_id = NULL, updated_at = ?1 \
+             WHERE job_id = ?2 AND state != 'terminated';",
+            params![now, job_id],
+        )?;
+        Ok(updated as u64)
     }
 
     //
@@ -4218,6 +4634,14 @@ impl Store {
         let rows = stmt.query_map([job_id], |row| self.job_kv_reference_from_row(row))?;
         Self::collect_rows(rows)
     }
+}
+
+/// Mint an opaque storage handle for an instance. The `local-dir/` scheme is
+/// the placeholder contract for v1: attach/detach drivers are a follow-up (see
+/// `docs/plans/volume-plugin-system-plan.md`); today the handle only proves
+/// identity stability (same instance => same handle across reschedules).
+fn mint_storage_handle() -> String {
+    format!("local-dir/{}", random_string(32))
 }
 
 fn group_nodes_by_attr<'a>(nodes: &'a [&'a Node], key: &str) -> HashMap<String, Vec<&'a Node>> {
@@ -6211,6 +6635,355 @@ mod tests {
         assert_eq!(store.allocs_for_job_config(&v2_id)?.len(), 1);
 
         Ok(())
+    }
+
+    //
+    // INSTANCES (stateful workloads)
+    //
+
+    fn stateful_slot_task(name: &str, count: u32, with_storage: bool) -> TaskConfig {
+        TaskConfig {
+            count: TaskCount::new(count),
+            stateful: Some(crate::structs::StatefulConfig {
+                mode: InstanceMode::Slot,
+                id_source: None,
+                storage: with_storage.then(|| crate::structs::StatefulStorageConfig {
+                    path: "/var/lib/data".into(),
+                    retain_on_scale_in: None,
+                }),
+            }),
+            ..TaskConfig::new(name, "noop")
+        }
+    }
+
+    fn submit_job(store: &Store, name: &str, tasks: Vec<TaskConfig>) -> R<String> {
+        let config = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: name.into(),
+            tasks,
+            version: None,
+        };
+        store.handle_job_submit(
+            &config,
+            &[Submission {
+                path: "job.jsonnet".into(),
+                content: "{}".into(),
+                is_primary: true,
+            }],
+        )?;
+        Ok(store.get_job_config(name)?.id())
+    }
+
+    #[test]
+    fn stateful_task_config_round_trips_through_persistence() -> R<()> {
+        let store = setup_store()?;
+        let job_config_id = submit_job(
+            &store,
+            "stateful-rt",
+            vec![stateful_slot_task("db", 2, true)],
+        )?;
+
+        let tasks = store.get_task_configs_for_job_config(&job_config_id)?;
+        let (_, task) = tasks.first().context("missing task")?;
+        let stateful = task.stateful.as_ref().context("stateful must persist")?;
+        assert_eq!(stateful.mode, InstanceMode::Slot);
+        assert_eq!(
+            stateful.storage.as_ref().map(|s| s.path.as_str()),
+            Some("/var/lib/data")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stateless_task_config_round_trips_without_stateful() -> R<()> {
+        let store = setup_store()?;
+        let job_config_id = submit_job(&store, "stateless-rt", vec![task("web")])?;
+        let tasks = store.get_task_configs_for_job_config(&job_config_id)?;
+        assert!(tasks[0].1.stateful.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn place_alloc_assigns_lowest_free_slot_and_activates_instance() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "active"))?;
+        let job_id = "slot-place";
+        submit_job(&store, job_id, vec![stateful_slot_task("db", 3, true)])?;
+        let task_id = task_id_for(&store, "db", job_id)?;
+
+        let first = store.place_alloc("node-a", task_id)?;
+        let second = store.place_alloc("node-a", task_id)?;
+        let third = store.place_alloc("node-a", task_id)?;
+
+        assert_eq!(first.instance_id.as_deref(), Some("slot-place-default-0"));
+        assert_eq!(second.instance_id.as_deref(), Some("slot-place-default-1"));
+        assert_eq!(third.instance_id.as_deref(), Some("slot-place-default-2"));
+
+        let instances = store.list_instances(job_id)?;
+        assert_eq!(instances.len(), 3);
+        for (slot, instance) in instances.iter().enumerate() {
+            assert_eq!(instance.mode, InstanceMode::Slot);
+            assert_eq!(instance.state, InstanceState::Active);
+            assert_eq!(instance.slot_index, Some(slot as u32));
+            assert!(
+                instance
+                    .storage_handle
+                    .as_deref()
+                    .is_some_and(|handle| handle.starts_with("local-dir/")),
+                "storage handle minted on first placement"
+            );
+        }
+        assert_eq!(instances[0].current_alloc_id, Some(first.id));
+        assert_eq!(instances[2].current_alloc_id, Some(third.id));
+
+        // A fourth placement would exceed the slot pool and must fail loudly.
+        assert!(store.place_alloc("node-a", task_id).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn removed_allocation_reuses_slot_instance_and_storage_handle() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "active"))?;
+        let job_id = "slot-reuse";
+        submit_job(&store, job_id, vec![stateful_slot_task("db", 2, true)])?;
+        let task_id = task_id_for(&store, "db", job_id)?;
+
+        let slot0 = store.place_alloc("node-a", task_id)?;
+        let slot1 = store.place_alloc("node-a", task_id)?;
+        let slot1_instance = store
+            .get_instance(slot1.instance_id.as_deref().context("instance id")?)?
+            .context("instance row")?;
+        let original_handle = slot1_instance.storage_handle.clone();
+        assert!(original_handle.is_some());
+
+        // Kill slot 1's allocation: instance transitions to rescheduling and
+        // keeps its handle.
+        store.remove_allocation_by_id(slot1.id)?;
+        let rescheduling = store
+            .get_instance(&slot1_instance.instance_id)?
+            .context("instance retained")?;
+        assert_eq!(rescheduling.state, InstanceState::Rescheduling);
+        assert_eq!(rescheduling.current_alloc_id, None);
+        assert_eq!(rescheduling.storage_handle, original_handle);
+
+        // The replacement reuses slot 1's instance id and storage handle.
+        let replacement = store.place_alloc("node-a", task_id)?;
+        assert_eq!(
+            replacement.instance_id.as_deref(),
+            Some(slot1_instance.instance_id.as_str())
+        );
+        let reactivated = store
+            .get_instance(&slot1_instance.instance_id)?
+            .context("instance reactivated")?;
+        assert_eq!(reactivated.state, InstanceState::Active);
+        assert_eq!(reactivated.current_alloc_id, Some(replacement.id));
+        assert_eq!(reactivated.storage_handle, original_handle);
+
+        // Slot 0 was never disturbed.
+        let slot0_instance = store
+            .get_instance(slot0.instance_id.as_deref().context("instance id")?)?
+            .context("slot 0 instance")?;
+        assert_eq!(slot0_instance.state, InstanceState::Active);
+        assert_eq!(slot0_instance.current_alloc_id, Some(slot0.id));
+        Ok(())
+    }
+
+    #[test]
+    fn scale_in_terminates_high_slots_and_scale_out_reattaches_them() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "active"))?;
+        let job_id = "slot-scale";
+        submit_job(&store, job_id, vec![stateful_slot_task("db", 3, true)])?;
+        let v1_task = task_id_for(&store, "db", job_id)?;
+        for _ in 0..3 {
+            store.place_alloc("node-a", v1_task)?;
+        }
+        let handles_before: Vec<Option<String>> = store
+            .list_instances(job_id)?
+            .into_iter()
+            .map(|instance| instance.storage_handle)
+            .collect();
+
+        // Scale in to 2: submit v2, place its allocations, then drop v1's
+        // (mirrors the job_submit eval flow: plan fresh, then remove previous).
+        let v2_config_id = submit_job(&store, job_id, vec![stateful_slot_task("db", 2, true)])?;
+        let v1_config_id = format!("{job_id}-1");
+        let v2_task = task_id_for_config(&store, "db", &v2_config_id)?;
+        store.place_alloc("node-a", v2_task)?;
+        store.place_alloc("node-a", v2_task)?;
+        store.remove_allocs_for_job_config(&v1_config_id)?;
+
+        let instances = store.list_instances(job_id)?;
+        assert_eq!(instances.len(), 3, "terminated rows are retained");
+        assert_eq!(instances[0].state, InstanceState::Active);
+        assert_eq!(instances[1].state, InstanceState::Active);
+        assert_eq!(instances[2].state, InstanceState::Terminated);
+        assert_eq!(
+            instances[2].storage_handle, handles_before[2],
+            "scale-in retains the storage handle by default"
+        );
+        // Slots 0/1 kept their identity and storage across the config update.
+        assert_eq!(instances[0].storage_handle, handles_before[0]);
+        assert_eq!(instances[1].storage_handle, handles_before[1]);
+
+        // Scale back out to 3: the same slot id is re-materialized with the
+        // retained handle.
+        let v3_config_id = submit_job(&store, job_id, vec![stateful_slot_task("db", 3, true)])?;
+        let v3_task = task_id_for_config(&store, "db", &v3_config_id)?;
+        for _ in 0..3 {
+            store.place_alloc("node-a", v3_task)?;
+        }
+        store.remove_allocs_for_job_config(&v2_config_id)?;
+
+        let instances = store.list_instances(job_id)?;
+        assert_eq!(instances.len(), 3);
+        assert_eq!(instances[2].instance_id, "slot-scale-default-2");
+        assert_eq!(instances[2].state, InstanceState::Active);
+        assert_eq!(instances[2].storage_handle, handles_before[2]);
+        Ok(())
+    }
+
+    #[test]
+    fn scale_in_drops_storage_handle_when_retention_disabled() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "active"))?;
+        let job_id = "slot-noretain";
+        let no_retain_task = |count: u32| TaskConfig {
+            count: TaskCount::new(count),
+            stateful: Some(crate::structs::StatefulConfig {
+                mode: InstanceMode::Slot,
+                id_source: None,
+                storage: Some(crate::structs::StatefulStorageConfig {
+                    path: "/var/lib/data".into(),
+                    retain_on_scale_in: Some(false),
+                }),
+            }),
+            ..TaskConfig::new("db", "noop")
+        };
+
+        submit_job(&store, job_id, vec![no_retain_task(2)])?;
+        let v1_task = task_id_for(&store, "db", job_id)?;
+        store.place_alloc("node-a", v1_task)?;
+        store.place_alloc("node-a", v1_task)?;
+
+        let v2_config_id = submit_job(&store, job_id, vec![no_retain_task(1)])?;
+        let v2_task = task_id_for_config(&store, "db", &v2_config_id)?;
+        store.place_alloc("node-a", v2_task)?;
+        store.remove_allocs_for_job_config(&format!("{job_id}-1"))?;
+
+        let instances = store.list_instances(job_id)?;
+        assert_eq!(instances[1].state, InstanceState::Terminated);
+        assert_eq!(instances[1].storage_handle, None);
+        Ok(())
+    }
+
+    #[test]
+    fn stateless_jobs_create_no_instance_rows() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "active"))?;
+        let job_id = "stateless-job";
+        submit_job(&store, job_id, vec![task("web")])?;
+        let task_id = task_id_for(&store, "web", job_id)?;
+
+        let allocation = store.place_alloc("node-a", task_id)?;
+        assert_eq!(allocation.instance_id, None);
+        assert!(store.list_instances(job_id)?.is_empty());
+
+        store.remove_allocation_by_id(allocation.id)?;
+        assert!(store.list_instances(job_id)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn instance_store_methods_round_trip() -> R<()> {
+        let store = setup_store()?;
+        let job_id = "inst-crud";
+        submit_job(&store, job_id, vec![stateful_slot_task("db", 2, false)])?;
+
+        assert!(store.get_instance("missing")?.is_none());
+
+        let created = store.get_or_create_slot_instance(job_id, "default", "db", 0)?;
+        assert_eq!(created.instance_id, "inst-crud-default-0");
+        assert_eq!(created.state, InstanceState::Pending);
+        assert_eq!(created.slot_index, Some(0));
+        assert_eq!(created.storage_handle, None);
+
+        // Idempotent: a second call returns the same row.
+        let again = store.get_or_create_slot_instance(job_id, "default", "db", 0)?;
+        assert_eq!(again.instance_id, created.instance_id);
+        assert_eq!(again.created_at, created.created_at);
+
+        store.set_instance_state(&created.instance_id, InstanceState::Active)?;
+        store.set_instance_current_alloc(&created.instance_id, Some(77))?;
+        let updated = store
+            .get_instance(&created.instance_id)?
+            .context("instance exists")?;
+        assert_eq!(updated.state, InstanceState::Active);
+        assert_eq!(updated.current_alloc_id, Some(77));
+
+        store.set_instance_current_alloc(&created.instance_id, None)?;
+        let cleared = store
+            .get_instance(&created.instance_id)?
+            .context("instance exists")?;
+        assert_eq!(cleared.current_alloc_id, None);
+
+        // Upsert overwrites mutable fields and keeps identity.
+        let upserted = store.upsert_instance(&Instance {
+            storage_handle: Some("local-dir/manual".into()),
+            state: InstanceState::Terminated,
+            ..cleared
+        })?;
+        assert_eq!(upserted.state, InstanceState::Terminated);
+        assert_eq!(upserted.storage_handle.as_deref(), Some("local-dir/manual"));
+
+        // Errors on unknown ids.
+        assert!(store
+            .set_instance_state("missing", InstanceState::Active)
+            .is_err());
+        assert!(store.set_instance_current_alloc("missing", None).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn terminate_instances_for_job_retains_rows_and_handles() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "active"))?;
+        let job_id = "inst-stop";
+        submit_job(&store, job_id, vec![stateful_slot_task("db", 2, true)])?;
+        let task_id = task_id_for(&store, "db", job_id)?;
+        store.place_alloc("node-a", task_id)?;
+        store.place_alloc("node-a", task_id)?;
+
+        let handles: Vec<Option<String>> = store
+            .list_instances(job_id)?
+            .into_iter()
+            .map(|instance| instance.storage_handle)
+            .collect();
+
+        assert_eq!(store.terminate_instances_for_job(job_id)?, 2);
+        let instances = store.list_instances(job_id)?;
+        assert_eq!(instances.len(), 2);
+        for (instance, handle) in instances.iter().zip(&handles) {
+            assert_eq!(instance.state, InstanceState::Terminated);
+            assert_eq!(instance.current_alloc_id, None);
+            assert_eq!(&instance.storage_handle, handle);
+        }
+
+        // Idempotent.
+        assert_eq!(store.terminate_instances_for_job(job_id)?, 0);
+        Ok(())
+    }
+
+    fn task_id_for_config(store: &Store, task_name: &str, job_config_id: &str) -> R<i64> {
+        let conn = store.read_connection()?;
+        let id = conn.query_row(
+            "SELECT id FROM task_config WHERE name = ? AND job_config_id = ?;",
+            [task_name, job_config_id],
+            |row| row.get(0),
+        )?;
+        Ok(id)
     }
 
     // #[test]

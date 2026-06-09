@@ -31,6 +31,18 @@
             kind: "exec",
             group: "frontend",
             lifecycle: "service",
+            // Stable instance identity (see docs/stateful-workloads.md):
+            // slot mode gives each replica an ordinal slot 0..count-1 whose
+            // instance id and storage handle survive reschedules. The task
+            // sees LEGION_INSTANCE_ID / LEGION_INSTANCE_SLOT /
+            // LEGION_INSTANCE_MODE (and LEGION_ALLOC_ID) in its env.
+            stateful: {
+                mode: "slot",
+                storage: {
+                    path: "/var/lib/web",
+                    retainOnScaleIn: true,
+                },
+            },
             config: {
                 command: ["sleep", "1"],
             },
