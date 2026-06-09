@@ -69,6 +69,8 @@
   - [ ] Able to do some auth for this
   - [ ] Able to grab files and put them on disk
   - [ ] Have plugin system for this
+  - [ ] Artifact cache + pre-warming/pre-pull + scheduler locality scoring
+    - Plan: [docs/plans/artifact-cache-and-prewarm-plan.md](plans/artifact-cache-and-prewarm-plan.md)
 
 - [ ] Rollouts
   - [x] A new version of a job starts a deployment
@@ -163,5 +165,13 @@
   - Uses Libvirt? Uses cloud-hypervisor? QEMU?
 
 - [ ] ACL System
+  - [ ] !! KV ACLs: artifact auth (`auth.kv` in the artifact plan) lets any job read any
+    KV credential path today — accepted for now, but `GetArtifactCredential` must become
+    an early ACL enforcement point. See docs/plans/artifact-system-plan.md (Auth) and the
+    SECURITY BOUNDARY comment slated for src/artifacts/auth.rs.
+
+- [ ] Windows support pass
+  - [ ] Artifact staging on Windows: hardlink/reflink fallbacks, path semantics, image
+    consumption (see Follow-Ups in docs/plans/artifact-system-plan.md)
 
 - [ ] Workload identity tokens
