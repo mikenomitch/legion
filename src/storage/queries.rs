@@ -548,3 +548,44 @@ lazy_static! {
     "#,
     );
 }
+
+//
+// SIGNING KEYS (workload identity OIDC issuer; see docs/workload-identity.md)
+//
+
+pub const SIGNING_KEY_ATTRS: &str = r#"
+kid, alg, private_key_pem, public_jwk_x, public_jwk_y, created_at, not_after, state
+"#;
+
+pub const SIGNING_KEY_ATTRS_VALS: &str = r#"
+:kid, :alg, :private_key_pem, :public_jwk_x, :public_jwk_y, :created_at, :not_after, :state
+"#;
+
+lazy_static! {
+    pub static ref INSERT_SIGNING_KEY: String = format!(
+        r#"
+    INSERT INTO signing_key ({SIGNING_KEY_ATTRS})
+    VALUES ({SIGNING_KEY_ATTRS_VALS});
+    "#
+    );
+    pub static ref GET_SIGNING_KEYS: String = format!(
+        r#"
+    SELECT {SIGNING_KEY_ATTRS}
+    FROM signing_key
+    ORDER BY created_at DESC, kid ASC;
+    "#
+    );
+    // COALESCE keeps the recorded overlap window when a key is expired
+    // (callers pass NULL to mean "leave not_after as-is").
+    pub static ref UPDATE_SIGNING_KEY_STATE: String = r#"
+    UPDATE signing_key
+    SET state = :state, not_after = COALESCE(:not_after, not_after)
+    WHERE kid = :kid;
+    "#
+    .to_string();
+    pub static ref DELETE_SIGNING_KEY: String = r#"
+    DELETE FROM signing_key
+    WHERE kid = :kid;
+    "#
+    .to_string();
+}

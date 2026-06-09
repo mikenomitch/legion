@@ -163,4 +163,4 @@
 
 - [ ] ACL System
 
-- [ ] Workload identity tokens
+- [x] Workload identity tokens (OIDC; see docs/workload-identity.md)

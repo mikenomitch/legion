@@ -12,6 +12,20 @@
   schedulerSettings: {
     plan_conflict_max_retries: 3,
   },
+  // Workload identity (OIDC issuer; see docs/workload-identity.md).
+  // Off by default. When enabled the manager signs short-lived per-task JWTs
+  // and serves the OIDC discovery document + JWKS over plain HTTP on the main
+  // listener. `issuer` is the externally-published URL relying parties trust
+  // (it must be reachable by AWS/GCP/Vault — typically via an HTTPS proxy).
+  // workloadIdentity: {
+  //   enabled: true,
+  //   issuer: "https://manager.example.com:4747",
+  //   jwksPath: "/.well-known/jwks.json",
+  //   signingAlg: "ES256",
+  //   defaultTtl: "15m",      // token TTL when an identity sets none
+  //   rotationAge: "24h",     // rotate the signing key past this age
+  //   subTemplate: "{region}:{job}:{group}:{task}",
+  // },
   persistence: {
     type: "local_disk",
     streaming: {

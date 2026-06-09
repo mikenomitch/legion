@@ -7,6 +7,7 @@ use crate::structs::{
 };
 use crate::util::random_string;
 use crate::worker::{
+    identity::{ManagerTokenIssuer, PreparedIdentity, WorkerIdentityManager},
     node_check::{fingerprint_node, run_health_checks},
     server::WorkerAgentService,
     state::WorkerStateStore,
@@ -85,11 +86,32 @@ async fn run_worker_with_manager(
             Vec::new()
         })
     };
+    // Workload-identity delivery/refresh: tokens are requested from the
+    // manager under this worker's node id.
+    let identity_manager = Arc::new(WorkerIdentityManager::new(Arc::new(ManagerTokenIssuer {
+        client: client.clone(),
+        node_id: name.clone(),
+    })));
     for (allocation, task) in restored_allocations {
+        // Restored allocations were issued tokens by a previous worker
+        // process; seed their refresh loops with an already-expired token so
+        // they re-issue immediately.
+        if !task.identities.is_empty() {
+            let prepared = task
+                .identities
+                .iter()
+                .map(|identity| PreparedIdentity {
+                    identity: identity.clone(),
+                    expires_at: 0,
+                })
+                .collect();
+            identity_manager.spawn_refreshers(allocation.id, prepared, task_manager.clone());
+        }
         spawn_health_monitor(task_manager.clone(), allocation, task);
     }
     let worker_node = WorkerAgentService {
         task_manager: task_manager.clone(),
+        identity: Some(identity_manager.clone()),
     };
     let worker_server_fut = Server::builder()
         .add_service(WorkerServer::new(worker_node))
@@ -133,7 +155,12 @@ async fn run_worker_with_manager(
     .await?;
     info!(worker_name = %name, "Worker registered with manager");
 
-    let heartbeat_fut = start_heartbeats(name.clone(), client.clone(), task_manager.clone());
+    let heartbeat_fut = start_heartbeats(
+        name.clone(),
+        client.clone(),
+        task_manager.clone(),
+        identity_manager.clone(),
+    );
     let checks_fut = start_node_checks(
         name.clone(),
         config.additional_node_checks.clone(),
@@ -238,6 +265,7 @@ async fn start_heartbeats(
     name: String,
     client: ManagerClient<Channel>,
     task_manager: Arc<Mutex<WorkerTaskManager>>,
+    identity_manager: Arc<WorkerIdentityManager>,
 ) -> R<()> {
     let mut client_clone = client.clone();
 
@@ -256,6 +284,7 @@ async fn start_heartbeats(
             let allocation_health = manager.allocation_health_snapshot();
             (manager.allocations_snapshot(), failures, allocation_health)
         };
+        let running = allocations.clone();
 
         let req = tonic::Request::new(HeartbeatRequest {
             id: name.clone(),
@@ -268,14 +297,55 @@ async fn start_heartbeats(
         debug!(worker = %name, elapsed_ms = start.elapsed().as_millis() as u64, "Heartbeat acknowledged by manager");
         let reply = response.into_inner();
         if !reply.desired_allocations.is_empty() {
+            // Deliver identity tokens for not-yet-running allocations BEFORE
+            // reconcile starts them: env tokens must be present at exec time.
+            let mut desired = reply.desired_allocations;
+            let mut prepared_by_alloc: HashMap<i64, Vec<PreparedIdentity>> = HashMap::new();
+            let running_set: std::collections::HashSet<i64> = running.iter().copied().collect();
+            let mut failed_prepare = Vec::new();
+            for allocation in desired
+                .iter_mut()
+                .filter(|allocation| !running_set.contains(&allocation.allocation_id))
+            {
+                match identity_manager.prepare_task_allocation(allocation).await {
+                    Ok(prepared) => {
+                        prepared_by_alloc.insert(allocation.allocation_id, prepared);
+                    }
+                    Err(err) => {
+                        // The task must not start without its identities;
+                        // report the failure so the manager can reschedule.
+                        failed_prepare.push(allocation.allocation_id);
+                        task_manager.lock().expect("task manager").record_failure(
+                            allocation.allocation_id,
+                            format!("Failed to deliver workload identities: {err}"),
+                        );
+                    }
+                }
+            }
+            desired.retain(|allocation| !failed_prepare.contains(&allocation.allocation_id));
+
             let new_allocations = task_manager
                 .lock()
                 .expect("task manager")
-                .reconcile_allocations(&reply.desired_allocations);
+                .reconcile_allocations(&desired);
             for (allocation, task) in new_allocations {
+                if let Some(prepared) = prepared_by_alloc.remove(&allocation.id) {
+                    identity_manager.spawn_refreshers(
+                        allocation.id,
+                        prepared,
+                        task_manager.clone(),
+                    );
+                }
                 spawn_health_monitor(task_manager.clone(), allocation, task);
             }
         }
+
+        // Refresh loops must never outlive their allocation.
+        let live = task_manager
+            .lock()
+            .expect("task manager")
+            .allocations_snapshot();
+        identity_manager.retain(&live);
 
         tokio::time::sleep(tokio::time::Duration::from_secs(
             WORKER_HEARTBEAT_DURATION_SEC,

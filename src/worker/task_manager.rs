@@ -64,6 +64,68 @@ impl WorkerTaskManager {
         allocations
     }
 
+    /// Whether this worker currently runs the allocation (used by identity
+    /// refresh loops to stop once the allocation is gone).
+    pub fn has_allocation(&self, allocation_id: i64) -> bool {
+        self.runtimes.contains_key(&allocation_id)
+    }
+
+    /// The tracked process id for an allocation, if any.
+    pub fn allocation_pid(&self, allocation_id: i64) -> Option<u32> {
+        self.runtimes
+            .get(&allocation_id)
+            .and_then(|runtime| runtime.pid)
+    }
+
+    /// Read a single env value from the stored task config (test/diagnostic
+    /// helper; values may be secrets — never log them).
+    pub fn task_env(&self, allocation_id: i64, key: &str) -> Option<String> {
+        self.task_configs
+            .get(&allocation_id)?
+            .config
+            .get("env")?
+            .get(key)?
+            .as_str()
+            .map(str::to_string)
+    }
+
+    /// Update one env var in the *stored* task config so any subsequent
+    /// (re)start launches with the new value. The live process env cannot
+    /// change — that is exactly why env-delivered identities pair with
+    /// `changeMode: signal`/`restart` (see src/worker/identity.rs).
+    /// `value` may be a secret: it is never logged here.
+    pub fn update_task_env(&mut self, allocation_id: i64, key: &str, value: &str) -> R<()> {
+        let task = self
+            .task_configs
+            .get_mut(&allocation_id)
+            .context("Allocation not found for env update")?;
+        let config = task
+            .config
+            .as_object_mut()
+            .context("Task config is not an object; cannot update env")?;
+        let env = config
+            .entry("env")
+            .or_insert_with(|| Value::Object(Default::default()));
+        let env = env
+            .as_object_mut()
+            .context("Task config env is not an object")?;
+        env.insert(key.to_string(), Value::String(value.to_string()));
+        self.persist_state();
+        Ok(())
+    }
+
+    /// Deliver a Unix signal (e.g. "SIGHUP") to the allocation's process —
+    /// the `changeMode: signal` pathway for refreshed identity tokens.
+    pub fn signal_allocation(&self, allocation_id: i64, signal: &str) -> R<()> {
+        let pid = self
+            .allocation_pid(allocation_id)
+            .context("Allocation has no tracked pid to signal")?;
+        send_signal(pid, signal)
+            .with_context(|| format!("Failed to deliver {signal} to allocation {allocation_id}"))?;
+        info!(allocation_id, signal, pid, "Signaled allocation process");
+        Ok(())
+    }
+
     pub fn allocation_health_snapshot(&self) -> Vec<AllocationHealth> {
         let mut entries = self.allocation_health.values().cloned().collect::<Vec<_>>();
         entries.sort_by_key(|entry| entry.allocation_id);
@@ -359,6 +421,43 @@ impl WorkerTaskManager {
     }
 }
 
+/// Resolve a signal name like "SIGHUP"/"HUP" and deliver it to `pid`.
+#[cfg(unix)]
+fn send_signal(pid: u32, signal: &str) -> R<()> {
+    let signum = parse_signal(signal)?;
+    // SAFETY: plain kill(2) with a validated signal number.
+    let rc = unsafe { libc::kill(pid as libc::pid_t, signum) };
+    if rc != 0 {
+        bail!(
+            "kill({pid}, {signal}) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn send_signal(_pid: u32, signal: &str) -> R<()> {
+    bail!("signal delivery ({signal}) is not supported on this platform");
+}
+
+#[cfg(unix)]
+fn parse_signal(name: &str) -> R<libc::c_int> {
+    let normalized = name.trim().to_ascii_uppercase();
+    let stripped = normalized.strip_prefix("SIG").unwrap_or(&normalized);
+    Ok(match stripped {
+        "HUP" => libc::SIGHUP,
+        "INT" => libc::SIGINT,
+        "QUIT" => libc::SIGQUIT,
+        "TERM" => libc::SIGTERM,
+        "USR1" => libc::SIGUSR1,
+        "USR2" => libc::SIGUSR2,
+        "CONT" => libc::SIGCONT,
+        "WINCH" => libc::SIGWINCH,
+        other => bail!("unsupported signal {other:?}"),
+    })
+}
+
 fn task_from_allocation(allocation: &TaskAllocation) -> R<(Allocation, TaskConfig)> {
     let task_config: serde_json::Value =
         serde_json::from_str(&allocation.task_config).context("Invalid task configuration JSON")?;
@@ -373,11 +472,16 @@ fn task_from_allocation(allocation: &TaskAllocation) -> R<(Allocation, TaskConfi
         serde_json::from_str(&allocation.task_on_unhealthy)
             .context("Invalid task on_unhealthy JSON")?
     };
+    // Identity specs ride along so refresh loops (and post-restart restores)
+    // know each identity's delivery and change mode.
+    let identities = crate::worker::identity::parse_identities(&allocation.task_identities)
+        .context("Invalid task identities JSON")?;
 
     let task = TaskConfig {
         config: task_config,
         checks,
         on_unhealthy,
+        identities,
         ..TaskConfig::new(&allocation.task_name, &allocation.task_kind)
     };
     let alloc = Allocation {

@@ -302,6 +302,34 @@ fn parse_placeholders(template: &str) -> R<Vec<String>> {
     Ok(fields)
 }
 
+/// Persisted form of an OIDC signing key (the `signing_key` table).
+///
+/// The private key PEM is stored in the manager's SQLite — the same trust
+/// domain as the CA material: whoever can read the store can mint identities.
+/// Persistence is what keeps externally-held tokens verifiable across manager
+/// restarts (same JWKS, same active signer). `state` is one of
+/// `active`/`retiring`/`expired`; expired rows are retained for audit but
+/// never loaded into the issuer or published in the JWKS.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SigningKeyRecord {
+    pub kid: String,
+    /// JWS algorithm name, e.g. "ES256".
+    pub alg: String,
+    /// PKCS#8 PEM of the private key. Never serialized into tokens or RPCs.
+    pub private_key_pem: String,
+    /// base64url(P-256 affine X coordinate) — the public JWK `x`.
+    pub public_jwk_x: String,
+    /// base64url(P-256 affine Y coordinate) — the public JWK `y`.
+    pub public_jwk_y: String,
+    /// Unix seconds the key was generated.
+    pub created_at: u64,
+    /// Last instant a token signed by this key can still be valid; `None`
+    /// while the key is active.
+    pub not_after: Option<u64>,
+    /// `active` | `retiring` | `expired`.
+    pub state: String,
+}
+
 /// Claims describing a workload's verifiable identity. The manager derives
 /// these from the scheduling record; it never trusts claims sent by a worker.
 #[derive(Debug, Clone, PartialEq, Eq)]

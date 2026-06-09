@@ -1,7 +1,10 @@
 use crate::prelude::*;
 
 use crate::manager::join_server::get_insecure_manager_service;
+use crate::manager::oidc_http::OidcHttpLayer;
 use crate::manager::server::ManagerAgentService;
+use crate::manager::workload_identity::WorkloadIdentityState;
+use crate::storage::persistence::PersistenceRole;
 use crate::storage::store::Store;
 use crate::structs::{
     manager_server::ManagerServer, Eval, JobConfig, KvValueType, ManagerConfig, Node, NodeMsg,
@@ -60,7 +63,35 @@ pub async fn run_manager(config: ManagerConfig, run_worker: bool) -> R<()> {
 
     let store_copy_b = store.clone();
 
-    let manager_node = ManagerAgentService::new(store);
+    let store_for_rotation = store.clone();
+
+    // Workload identity (OIDC issuer): only constructed when enabled. The
+    // signing keys are restored from (or first-boot persisted to) the store,
+    // so tokens held by third parties stay verifiable across restarts.
+    let workload_identity_state = if full_config.workload_identity.enabled {
+        let default_issuer = format!(
+            "http://{}:{}",
+            resolve_manager_host(&full_config.server.host),
+            full_config.server.port
+        );
+        let state = WorkloadIdentityState::initialize(
+            &store,
+            &full_config.workload_identity,
+            &default_issuer,
+            std::time::SystemTime::now(),
+        )?;
+        info!(
+            issuer = %state.issuer_url()?,
+            jwks_path = %state.jwks_path(),
+            "Workload identity enabled; serving OIDC discovery and JWKS"
+        );
+        Some(Arc::new(state))
+    } else {
+        None
+    };
+
+    let manager_node =
+        ManagerAgentService::new(store).with_workload_identity(workload_identity_state.clone());
 
     let addr = format!("{}:{}", full_config.server.host, full_config.server.port).parse()?;
 
@@ -87,8 +118,12 @@ pub async fn run_manager(config: ManagerConfig, run_worker: bool) -> R<()> {
             http::header::HeaderName::from_static("grpc-encoding"),
         ]);
 
+    // The OIDC layer sits outermost so generic HTTP clients (AWS/GCP/Vault)
+    // can GET the discovery document and JWKS on this listener; with workload
+    // identity disabled it is a pure passthrough and mounts no routes.
     let start_server_fut = server_builder
         .accept_http1(true)
+        .layer(OidcHttpLayer::new(workload_identity_state.clone()))
         .layer(cors)
         .layer(GrpcWebLayer::new())
         .add_service(manager_service)
@@ -109,15 +144,57 @@ pub async fn run_manager(config: ManagerConfig, run_worker: bool) -> R<()> {
         }
         Ok::<(), anyhow::Error>(())
     };
+    let rotation_fut = async move {
+        if let Some(state) = workload_identity_state {
+            start_workload_identity_rotation(store_for_rotation, state).await?;
+        }
+        Ok::<(), anyhow::Error>(())
+    };
     let _res = join!(
         join_server_fut,
         start_server_fut,
         node_checker_fut,
         eval_loop_fut,
-        worker_fut
+        worker_fut,
+        rotation_fut
     );
 
     Ok(())
+}
+
+/// Background signing-key rotation for the workload-identity issuer: rotate
+/// the active key past `rotationAge`, expire retiring keys past their overlap
+/// window. Every transition is persisted, so a restart mid-overlap restores
+/// the exact same key set.
+///
+/// HA note: in a multi-manager deployment only the primary acts (same
+/// leader-only convention as other store-mutating loops); standbys share the
+/// replicated `signing_key` table and keep serving an identical JWKS.
+#[instrument(err, skip_all)]
+async fn start_workload_identity_rotation(
+    store: Store,
+    state: Arc<WorkloadIdentityState>,
+) -> R<()> {
+    let rotation_age = state.config().parsed_rotation_age();
+    // Check often enough to rotate promptly, but never more than once a minute.
+    let interval = Duration::from_secs((rotation_age.as_secs() / 10).max(60));
+    info!(
+        rotation_age_secs = rotation_age.as_secs(),
+        check_interval_secs = interval.as_secs(),
+        "Beginning workload identity key rotation loop"
+    );
+    loop {
+        if store.persistence_role() == PersistenceRole::Primary {
+            match state.rotation_tick(&store, std::time::SystemTime::now()) {
+                Ok(true) => info!("Workload identity signing key rotated"),
+                Ok(false) => debug!("Workload identity rotation not due"),
+                Err(err) => warn!(error = ?err, "Workload identity rotation tick failed"),
+            }
+        } else {
+            debug!("Skipping workload identity rotation on non-primary manager");
+        }
+        tokio::time::sleep(interval).await;
+    }
 }
 
 fn should_seed_ui_test_data() -> bool {

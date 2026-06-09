@@ -18,6 +18,10 @@ pub const DEF_EVAL_PRIORITY: i64 = 50;
 pub const DEF_ROLLOUT_RETENTION_DAYS: u64 = 30;
 // Amount of time since last heartbeat before a node is considered lost
 pub const DEF_LOST_NODE_AT_SEC: i64 = 10;
+// Cluster region stamped into workload-identity claims/sub. Legion has no
+// multi-region concept yet; "auto" matches the documented default subject
+// shape (see docs/workload-identity.md).
+pub const DEF_CLUSTER_REGION: &str = "auto";
 
 // === Worker ===
 // How often the worker should ping the manager

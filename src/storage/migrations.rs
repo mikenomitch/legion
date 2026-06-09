@@ -414,5 +414,26 @@ pub fn get_migrations() -> Migrations<'static> {
             "CREATE INDEX IF NOT EXISTS idx_allocation_instance_id ON allocation(instance_id);",
         )
         .down("DROP INDEX IF EXISTS idx_allocation_instance_id;"),
+        // OIDC signing keys for workload identity (workload-identity plan).
+        // Persisting the keypair is what keeps externally-held tokens
+        // verifiable across manager restarts: the JWKS must keep publishing
+        // the same public keys, and the active private key must keep signing.
+        // The private key PEM lives here in the manager's SQLite — the same
+        // trust domain as the CA material; whoever can read the store can
+        // mint identities. state ∈ {active, retiring, expired}; expired rows
+        // are retained for audit and dropped from the JWKS.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS signing_key (
+            kid STRING PRIMARY KEY,
+            alg STRING NOT NULL,
+            private_key_pem TEXT NOT NULL,
+            public_jwk_x STRING NOT NULL,
+            public_jwk_y STRING NOT NULL,
+            created_at INTEGER NOT NULL,
+            not_after INTEGER,
+            state STRING NOT NULL
+        )",
+        )
+        .down("DROP TABLE IF EXISTS signing_key;"),
     ])
 }

@@ -10,6 +10,7 @@ use crate::manager::rollout::{
 };
 use crate::manager::rollout_strategy;
 use crate::manager::scheduler::{PlanConfigOutcome, PlanMode, Scheduler};
+use crate::manager::workload_identity::{claims_for_allocation, WorkloadIdentityState};
 use crate::storage::errors::StorageError;
 use crate::storage::store::{DestroyInstanceOutcome, JobKvReference, JobSubmitOutcome, Store};
 use crate::structs::manager_server::Manager;
@@ -27,21 +28,22 @@ use crate::structs::{
     GetRaftStatusRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply,
     GetRolloutStatusRequest, GetStateStoreSchemaReply, GetStateStoreSchemaRequest,
     HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, Instance, InstanceInfo,
-    InstanceMode, IssueRaftCommandReply, IssueRaftCommandRequest, JobConfig, JobSpecHistoryItem,
-    KvEntry, KvInjectionAction, KvValueType, LedgerNode, ListInstancesReply, ListInstancesRequest,
-    ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobsReply, ListJobsRequest,
-    ListKvReply, ListKvRequest, ListRaftHistoryReply, ListRaftHistoryRequest,
-    ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply, ListRolloutsRequest,
-    ListSavedStateQueriesReply, ListSavedStateQueriesRequest, Node, NodeMsg, PatchKvReply,
-    PatchKvRequest, PlanJobReply, PlanJobRequest, PlannedAllocation, PutKvReply, PutKvRequest,
-    QueryStateStoreReply, QueryStateStoreRequest, RaftHistoryEvent, RaftStatus, ReleaseKvLockReply,
-    ReleaseKvLockRequest, RenewKvLockReply, RenewKvLockRequest, RestartWorkerReply,
-    RestartWorkerRequest, RolloutAllocationStatus, RolloutEvent, RolloutGroupStatus,
-    RolloutProgression, RolloutReplacement, RunJobReply, RunJobRequest, SavedStateQuery,
-    StopJobReply, StopJobRequest, StopRolloutReply, StopRolloutRequest, Submission, TaskConfig,
-    TaskOnUnhealthyConfig, UpdateNodeDynamicReply, UpdateNodeDynamicRequest,
-    UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest, WorkerConfig, WorkerPreRegisterReply,
-    WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest,
+    InstanceMode, IssueRaftCommandReply, IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply,
+    IssueWorkloadIdentityTokenRequest, JobConfig, JobSpecHistoryItem, KvEntry, KvInjectionAction,
+    KvValueType, LedgerNode, ListInstancesReply, ListInstancesRequest, ListJobSpecHistoryReply,
+    ListJobSpecHistoryRequest, ListJobsReply, ListJobsRequest, ListKvReply, ListKvRequest,
+    ListRaftHistoryReply, ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest,
+    ListRolloutsReply, ListRolloutsRequest, ListSavedStateQueriesReply,
+    ListSavedStateQueriesRequest, Node, NodeMsg, PatchKvReply, PatchKvRequest, PlanJobReply,
+    PlanJobRequest, PlannedAllocation, PutKvReply, PutKvRequest, QueryStateStoreReply,
+    QueryStateStoreRequest, RaftHistoryEvent, RaftStatus, ReleaseKvLockReply, ReleaseKvLockRequest,
+    RenewKvLockReply, RenewKvLockRequest, RestartWorkerReply, RestartWorkerRequest,
+    RolloutAllocationStatus, RolloutEvent, RolloutGroupStatus, RolloutProgression,
+    RolloutReplacement, RunJobReply, RunJobRequest, SavedStateQuery, StopJobReply, StopJobRequest,
+    StopRolloutReply, StopRolloutRequest, Submission, TaskConfig, TaskOnUnhealthyConfig,
+    UpdateNodeDynamicReply, UpdateNodeDynamicRequest, UpsertSavedStateQueryReply,
+    UpsertSavedStateQueryRequest, WorkerConfig, WorkerPreRegisterReply, WorkerPreRegisterRequest,
+    WorkerRegisterReply, WorkerRegisterRequest,
 };
 use crate::task_plugins::validate_job_config;
 use crate::tracing_util::{o11y_enabled, read_recent_observability};
@@ -530,6 +532,10 @@ fn build_rollout_launch_config(config: &JobConfig) -> Result<RolloutLaunchConfig
 pub struct ManagerAgentService {
     pub store: Store,
     allocation_failures: Arc<Mutex<AllocationFailureTracker>>,
+    /// OIDC issuer state; `None` when `workloadIdentity.enabled` is false
+    /// (the default), in which case IssueWorkloadIdentityToken returns
+    /// FailedPrecondition.
+    workload_identity: Option<Arc<WorkloadIdentityState>>,
 }
 
 impl ManagerAgentService {
@@ -537,7 +543,15 @@ impl ManagerAgentService {
         Self {
             store,
             allocation_failures: Arc::new(Mutex::new(AllocationFailureTracker::default())),
+            workload_identity: None,
         }
+    }
+
+    /// Attach the workload-identity issuer (only constructed when the
+    /// feature is enabled in the manager config).
+    pub fn with_workload_identity(mut self, state: Option<Arc<WorkloadIdentityState>>) -> Self {
+        self.workload_identity = state;
+        self
     }
 
     fn cancel_active_rollouts_for_job(&self, job_id: &str) -> Result<(), Status> {
@@ -1695,6 +1709,98 @@ impl Manager for ManagerAgentService {
 
         Ok(Response::new(GetInstanceReply {
             instance: Some(map_instance_info(instance)),
+        }))
+    }
+
+    #[instrument(skip_all, fields(alloc_id, identity_name, node_id))]
+    async fn issue_workload_identity_token(
+        &self,
+        request: Request<IssueWorkloadIdentityTokenRequest>,
+    ) -> Result<Response<IssueWorkloadIdentityTokenReply>, Status> {
+        let req = request.into_inner();
+        tracing::Span::current().record("alloc_id", req.alloc_id);
+        tracing::Span::current().record("identity_name", req.identity_name.as_str());
+        tracing::Span::current().record("node_id", req.node_id.as_str());
+
+        let Some(state) = self.workload_identity.as_ref() else {
+            return Err(Status::failed_precondition(
+                "workload identity is not enabled on this manager \
+                 (set workloadIdentity.enabled: true in the manager config)",
+            ));
+        };
+
+        let allocation = self
+            .store
+            .get_allocation_by_id(req.alloc_id)
+            .map_err(|e| map_store_error("Error loading allocation", e))?
+            .ok_or_else(|| Status::not_found(format!("allocation {} not found", req.alloc_id)))?;
+
+        // AuthZ: a worker may only request tokens for allocations placed on
+        // it. This is the same trust model as Heartbeat — workers are
+        // admitted via join token and identified by their claimed node id;
+        // there is no per-request worker credential today.
+        // TODO(worker-authn): bind worker RPCs to a per-node credential
+        // (mTLS or a join-token-derived bearer) so node_id is proven rather
+        // than claimed; see the join-token trust model in src/structs/token.rs.
+        if allocation.node_id != req.node_id {
+            return Err(Status::permission_denied(format!(
+                "allocation {} is not placed on node {:?}",
+                req.alloc_id, req.node_id
+            )));
+        }
+
+        let task = self
+            .store
+            .get_task_configs_for_job_config(&allocation.job_config_id)
+            .map_err(|e| map_store_error("Error loading task configs", e))?
+            .into_iter()
+            .find(|(id, _)| *id == allocation.task_config_id)
+            .map(|(_, task)| task)
+            .ok_or_else(|| {
+                Status::internal(format!(
+                    "task config {} missing for allocation {}",
+                    allocation.task_config_id, req.alloc_id
+                ))
+            })?;
+
+        // The named identity in the *stored spec* owns audience / TTL /
+        // sub template / extra claims — never the request.
+        let identity = task
+            .identities
+            .iter()
+            .find(|identity| identity.name == req.identity_name)
+            .ok_or_else(|| {
+                Status::not_found(format!(
+                    "task {} declares no identity named {:?}",
+                    task.name, req.identity_name
+                ))
+            })?;
+
+        // All claims are derived server-side from the scheduling record.
+        let claims = claims_for_allocation(&self.store, &allocation, &task, DEF_CLUSTER_REGION)
+            .map_err(|e| {
+                error!(error = ?e, "Error deriving workload identity claims");
+                Status::internal("failed to derive workload identity claims")
+            })?;
+
+        let issued = state
+            .issue(&claims, identity, std::time::SystemTime::now())
+            .map_err(|e| {
+                error!(error = ?e, "Error signing workload identity token");
+                Status::internal("failed to sign workload identity token")
+            })?;
+
+        // Lifecycle log only — never the token bytes.
+        info!(
+            expires_at = issued.expires_at,
+            kid = %issued.kid,
+            "Issued workload identity token"
+        );
+
+        Ok(Response::new(IssueWorkloadIdentityTokenReply {
+            token: issued.token,
+            expires_at: issued.expires_at as i64,
+            name: req.identity_name,
         }))
     }
 
@@ -2917,6 +3023,184 @@ mod tests {
             content: "{}".into(),
             is_primary: true,
         }
+    }
+
+    // --- IssueWorkloadIdentityToken ---
+
+    fn wi_state(store: &Store) -> R<Arc<WorkloadIdentityState>> {
+        let config = crate::structs::WorkloadIdentityConfigFull {
+            enabled: true,
+            issuer: Some("https://manager.test:4747".into()),
+            ..Default::default()
+        };
+        Ok(Arc::new(WorkloadIdentityState::initialize(
+            store,
+            &config,
+            "http://127.0.0.1:4747",
+            std::time::SystemTime::now(),
+        )?))
+    }
+
+    fn aws_identity_task(task_name: &str) -> TaskConfig {
+        use crate::structs::workload_identity::{WorkloadIdentity, WorkloadIdentityFile};
+        TaskConfig {
+            identities: vec![WorkloadIdentity {
+                name: "aws".into(),
+                audience: vec!["sts.amazonaws.com".into()],
+                file: Some(WorkloadIdentityFile {
+                    path: "/var/run/legion/identity/aws/token".into(),
+                    mode: Some("0400".into()),
+                }),
+                ..Default::default()
+            }],
+            ..TaskConfig::new(task_name, "noop")
+        }
+    }
+
+    /// Submit a single-task job and place its allocation on `node-1`.
+    fn submit_and_place_identity_task(
+        store: &Store,
+        job_name: &str,
+        task: TaskConfig,
+    ) -> R<crate::structs::Allocation> {
+        insert_node(store, "node-1")?;
+        let job = JobConfig {
+            name: job_name.into(),
+            tasks: vec![task],
+            rollout: None,
+            rollout_by_group: Default::default(),
+            version: None,
+        };
+        store.handle_job_submit(&job, &[submission()])?;
+        let job_config_id = store.get_job_config(job_name)?.id();
+        let (task_id, _) = store
+            .get_task_configs_for_job_config(&job_config_id)?
+            .into_iter()
+            .next()
+            .context("missing task config")?;
+        store.place_alloc("node-1", task_id)
+    }
+
+    fn issue_request(
+        alloc_id: i64,
+        identity_name: &str,
+        node_id: &str,
+    ) -> Request<IssueWorkloadIdentityTokenRequest> {
+        Request::new(IssueWorkloadIdentityTokenRequest {
+            alloc_id,
+            identity_name: identity_name.into(),
+            node_id: node_id.into(),
+        })
+    }
+
+    #[tokio::test]
+    async fn issue_token_derives_claims_from_the_allocation_record() -> R<()> {
+        let store = setup_store()?;
+        let allocation =
+            submit_and_place_identity_task(&store, "wi-job", aws_identity_task("api"))?;
+        let state = wi_state(&store)?;
+        let manager = ManagerAgentService::new(store).with_workload_identity(Some(state.clone()));
+
+        let reply = manager
+            .issue_workload_identity_token(issue_request(allocation.id, "aws", "node-1"))
+            .await?
+            .into_inner();
+        assert_eq!(reply.name, "aws");
+        assert!(reply.expires_at > 0);
+
+        // The token verifies against the issuer and carries claims derived
+        // from the scheduling record — not from anything the caller sent.
+        let claims = state.verify(&reply.token, "sts.amazonaws.com")?;
+        assert_eq!(claims["sub"], json!("auto:wi-job:default:api"));
+        assert_eq!(claims["aud"], json!(["sts.amazonaws.com"]));
+        assert_eq!(claims["legion.io/job"], json!("wi-job"));
+        assert_eq!(claims["legion.io/task"], json!("api"));
+        assert_eq!(claims["legion.io/node"], json!("node-1"));
+        assert_eq!(claims["legion.io/alloc"], json!(allocation.id.to_string()));
+        assert_eq!(claims["exp"], json!(reply.expires_at));
+        assert!(claims.get("legion.io/instance").is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn issue_token_for_stateful_allocation_carries_instance_claims() -> R<()> {
+        use crate::structs::StatefulConfig;
+        let store = setup_store()?;
+        let task = TaskConfig {
+            stateful: Some(StatefulConfig {
+                mode: InstanceMode::Slot,
+                id_source: None,
+                storage: None,
+            }),
+            ..aws_identity_task("db")
+        };
+        let allocation = submit_and_place_identity_task(&store, "wi-stateful", task)?;
+        assert!(allocation.instance_id.is_some());
+        let state = wi_state(&store)?;
+        let manager = ManagerAgentService::new(store).with_workload_identity(Some(state.clone()));
+
+        let reply = manager
+            .issue_workload_identity_token(issue_request(allocation.id, "aws", "node-1"))
+            .await?
+            .into_inner();
+        let claims = state.verify(&reply.token, "sts.amazonaws.com")?;
+        assert_eq!(claims["legion.io/instance"], json!("wi-stateful-default-0"));
+        assert_eq!(claims["legion.io/slot"], json!("0"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn issue_token_rejects_foreign_node_requests() -> R<()> {
+        let store = setup_store()?;
+        let allocation =
+            submit_and_place_identity_task(&store, "wi-job", aws_identity_task("api"))?;
+        let state = wi_state(&store)?;
+        let manager = ManagerAgentService::new(store).with_workload_identity(Some(state));
+
+        let err = manager
+            .issue_workload_identity_token(issue_request(allocation.id, "aws", "node-evil"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn issue_token_rejects_unknown_identity_and_unknown_alloc() -> R<()> {
+        let store = setup_store()?;
+        let allocation =
+            submit_and_place_identity_task(&store, "wi-job", aws_identity_task("api"))?;
+        let state = wi_state(&store)?;
+        let manager = ManagerAgentService::new(store).with_workload_identity(Some(state));
+
+        let err = manager
+            .issue_workload_identity_token(issue_request(allocation.id, "bogus", "node-1"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound);
+
+        let err = manager
+            .issue_workload_identity_token(issue_request(999_999, "aws", "node-1"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn issue_token_requires_workload_identity_enabled() -> R<()> {
+        let store = setup_store()?;
+        let allocation =
+            submit_and_place_identity_task(&store, "wi-job", aws_identity_task("api"))?;
+        // No workload-identity state attached == feature disabled.
+        let manager = ManagerAgentService::new(store);
+
+        let err = manager
+            .issue_workload_identity_token(issue_request(allocation.id, "aws", "node-1"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        Ok(())
     }
 
     #[test]

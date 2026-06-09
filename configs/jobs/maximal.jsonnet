@@ -46,6 +46,23 @@
             config: {
                 command: ["sleep", "1"],
             },
+            // Workload identities (see docs/workload-identity.md): each named
+            // identity gets its own short-lived OIDC token, delivered as a
+            // file and/or env var and refreshed in place by the worker.
+            // Requires workloadIdentity.enabled on the manager; inert
+            // otherwise.
+            identities: [
+                {
+                    name: "aws",
+                    audience: ["sts.amazonaws.com"],
+                    ttl: "15m",
+                    file: {
+                        path: "/var/run/legion/identity/aws/token",
+                        mode: "0400",
+                    },
+                    changeMode: "noop",
+                },
+            ],
             kv: {
                 watch: true,
                 on_change: "restart",

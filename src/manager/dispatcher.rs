@@ -125,6 +125,10 @@ pub fn build_task_allocation(
     let task_config = serde_json::to_string(&config)?;
     let task_checks = serde_json::to_string(&task.checks)?;
     let task_on_unhealthy = serde_json::to_string(&task.on_unhealthy)?;
+    // Identity *specs* only (delivery/refresh instructions) — the tokens
+    // themselves are fetched by the worker via IssueWorkloadIdentityToken and
+    // never transit the desired-state payload.
+    let task_identities = serde_json::to_string(&task.identities)?;
     Ok(TaskAllocation {
         allocation_id: allocation.id,
         job_id: allocation.job_id.clone(),
@@ -136,6 +140,7 @@ pub fn build_task_allocation(
         task_config,
         task_checks,
         task_on_unhealthy,
+        task_identities,
     })
 }
 

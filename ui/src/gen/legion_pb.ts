@@ -3163,6 +3163,129 @@ export class ListJobsReply extends Message<ListJobsReply> {
 }
 
 /**
+ * Request payload for IssueWorkloadIdentityToken.
+ *
+ * @generated from message legion.IssueWorkloadIdentityTokenRequest
+ */
+export class IssueWorkloadIdentityTokenRequest extends Message<IssueWorkloadIdentityTokenRequest> {
+  /**
+   * Allocation the token is requested for. Must exist and be placed on
+   * `node_id`. All token claims are derived from this allocation's
+   * scheduling record on the manager — never from the request.
+   *
+   * @generated from field: int64 alloc_id = 1;
+   */
+  allocId = protoInt64.zero;
+
+  /**
+   * Name of the identity declared in the allocation's task spec
+   * (`identities[].name`). Selects the audience, TTL, subject template,
+   * delivery, and extra claims. Unknown names are rejected with NotFound.
+   *
+   * @generated from field: string identity_name = 2;
+   */
+  identityName = "";
+
+  /**
+   * Node id of the calling worker (the same id used in Heartbeat). The
+   * manager rejects the request with PermissionDenied unless the allocation
+   * is placed on this node. See the RPC comment for the trust model.
+   *
+   * @generated from field: string node_id = 3;
+   */
+  nodeId = "";
+
+  constructor(data?: PartialMessage<IssueWorkloadIdentityTokenRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.IssueWorkloadIdentityTokenRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "alloc_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 2, name: "identity_name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): IssueWorkloadIdentityTokenRequest {
+    return new IssueWorkloadIdentityTokenRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): IssueWorkloadIdentityTokenRequest {
+    return new IssueWorkloadIdentityTokenRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): IssueWorkloadIdentityTokenRequest {
+    return new IssueWorkloadIdentityTokenRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: IssueWorkloadIdentityTokenRequest | PlainMessage<IssueWorkloadIdentityTokenRequest> | undefined, b: IssueWorkloadIdentityTokenRequest | PlainMessage<IssueWorkloadIdentityTokenRequest> | undefined): boolean {
+    return proto3.util.equals(IssueWorkloadIdentityTokenRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for IssueWorkloadIdentityToken.
+ *
+ * @generated from message legion.IssueWorkloadIdentityTokenReply
+ */
+export class IssueWorkloadIdentityTokenReply extends Message<IssueWorkloadIdentityTokenReply> {
+  /**
+   * The signed JWT (ES256, `kid` header references a key in the published
+   * JWKS). Treat as a secret: never log it; deliver it only to the task it
+   * was issued for.
+   *
+   * @generated from field: string token = 1;
+   */
+  token = "";
+
+  /**
+   * Token expiry (`exp`) as Unix seconds. Workers schedule the refresh loop
+   * from this (re-issue at roughly half the remaining TTL).
+   *
+   * @generated from field: int64 expires_at = 2;
+   */
+  expiresAt = protoInt64.zero;
+
+  /**
+   * Echo of the identity name the token was issued for.
+   *
+   * @generated from field: string name = 3;
+   */
+  name = "";
+
+  constructor(data?: PartialMessage<IssueWorkloadIdentityTokenReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.IssueWorkloadIdentityTokenReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "token", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "expires_at", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 3, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): IssueWorkloadIdentityTokenReply {
+    return new IssueWorkloadIdentityTokenReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): IssueWorkloadIdentityTokenReply {
+    return new IssueWorkloadIdentityTokenReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): IssueWorkloadIdentityTokenReply {
+    return new IssueWorkloadIdentityTokenReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: IssueWorkloadIdentityTokenReply | PlainMessage<IssueWorkloadIdentityTokenReply> | undefined, b: IssueWorkloadIdentityTokenReply | PlainMessage<IssueWorkloadIdentityTokenReply> | undefined): boolean {
+    return proto3.util.equals(IssueWorkloadIdentityTokenReply, a, b);
+  }
+}
+
+/**
  * Request payload for Heartbeat.
  *
  * @generated from message legion.HeartbeatRequest
@@ -7270,6 +7393,19 @@ export class TaskAllocation extends Message<TaskAllocation> {
    */
   taskOnUnhealthy = "";
 
+  /**
+   * JSON-encoded list of workload identities declared on the task
+   * (`identities[]`, see docs/workload-identity.md). Empty string or `[]`
+   * when the task declares none. The worker uses this to know which tokens
+   * to request via IssueWorkloadIdentityToken, how to deliver them
+   * (env/file), and what to do on refresh (changeMode). The identity specs
+   * carry no secrets — tokens themselves are fetched separately by the
+   * worker and never transit the desired-state payload.
+   *
+   * @generated from field: string task_identities = 11;
+   */
+  taskIdentities = "";
+
   constructor(data?: PartialMessage<TaskAllocation>) {
     super();
     proto3.util.initPartial(data, this);
@@ -7288,6 +7424,7 @@ export class TaskAllocation extends Message<TaskAllocation> {
     { no: 8, name: "task_config", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 9, name: "task_checks", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 10, name: "task_on_unhealthy", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 11, name: "task_identities", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): TaskAllocation {

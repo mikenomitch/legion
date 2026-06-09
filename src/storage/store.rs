@@ -8,20 +8,21 @@ use crate::storage::persistence::{
     RaftHistoryEvent, RaftStatus,
 };
 use crate::storage::queries::{
-    GET_ALLOCATION_BY_ID, GET_ALLOCS, GET_ALLOCS_FOR_JOB, GET_ALLOCS_FOR_JOB_CONFIG,
-    GET_ALLOCS_FOR_NODE, GET_EVALS, GET_INSTANCE, GET_INSTANCES_FOR_JOB, GET_JOB, GET_JOBS,
-    GET_JOB_CONFIG, GET_JOB_CONFIG_BY_ID, GET_JOB_UPDATE_FOR_CONFIG, GET_MANAGER_CONFIGS,
-    GET_NEXT_EVAL, GET_NODE, GET_NODES, GET_TASK_FOR_JOB_CONIFG, GET_WORKER_TYPE,
-    INSERT_ALLOCATION, INSERT_EVAL, INSERT_JOB, INSERT_JOB_CONFIG, INSERT_JOB_CONFIG_SUBMISSION,
-    INSERT_JOB_UPDATE, INSERT_NODE, INSERT_SUBMISSION, INSERT_TASK, INSERT_WORKER_TYPE, NODE_ATTRS,
-    UPSERT_INSTANCE, UPSERT_MANAGER_CONFIG,
+    DELETE_SIGNING_KEY, GET_ALLOCATION_BY_ID, GET_ALLOCS, GET_ALLOCS_FOR_JOB,
+    GET_ALLOCS_FOR_JOB_CONFIG, GET_ALLOCS_FOR_NODE, GET_EVALS, GET_INSTANCE, GET_INSTANCES_FOR_JOB,
+    GET_JOB, GET_JOBS, GET_JOB_CONFIG, GET_JOB_CONFIG_BY_ID, GET_JOB_UPDATE_FOR_CONFIG,
+    GET_MANAGER_CONFIGS, GET_NEXT_EVAL, GET_NODE, GET_NODES, GET_SIGNING_KEYS,
+    GET_TASK_FOR_JOB_CONIFG, GET_WORKER_TYPE, INSERT_ALLOCATION, INSERT_EVAL, INSERT_JOB,
+    INSERT_JOB_CONFIG, INSERT_JOB_CONFIG_SUBMISSION, INSERT_JOB_UPDATE, INSERT_NODE,
+    INSERT_SIGNING_KEY, INSERT_SUBMISSION, INSERT_TASK, INSERT_WORKER_TYPE, NODE_ATTRS,
+    UPDATE_SIGNING_KEY_STATE, UPSERT_INSTANCE, UPSERT_MANAGER_CONFIG,
 };
 use crate::structs::{
     slot_instance_id, Allocation, AllocationHealth, Eval, Instance, InstanceMode, InstanceState,
     Job, JobConfig, KvEntry, KvLock, KvValueType, LedgerEntry, ManagerConfigFull,
-    ManagerNodeConfig, Node, NodeMsg, Rollout, RolloutConfig, StatefulConfig, Submission,
-    TaskCheck, TaskConfig, TaskCount, TaskDependency, TaskLifecycle, TaskOnUnhealthyConfig,
-    TaskSchedule, TaskStatusState, WorkerConfig,
+    ManagerNodeConfig, Node, NodeMsg, Rollout, RolloutConfig, SigningKeyRecord, StatefulConfig,
+    Submission, TaskCheck, TaskConfig, TaskCount, TaskDependency, TaskLifecycle,
+    TaskOnUnhealthyConfig, TaskSchedule, TaskStatusState, WorkerConfig,
 };
 use crate::util::random_string;
 
@@ -3658,6 +3659,88 @@ impl Store {
         let mut stmt = conn.prepare(GET_INSTANCES_FOR_JOB.as_str())?;
         let rows = stmt.query_map([job_id], |row| self.instance_from_row(row))?;
         Self::collect_rows(rows)
+    }
+
+    //
+    // SIGNING KEYS (workload-identity OIDC issuer; see docs/workload-identity.md)
+    //
+    // The private key PEM is persisted in this SQLite store — the same trust
+    // domain as the CA material. Persistence is what keeps externally-held
+    // tokens verifiable across manager restarts.
+    //
+
+    fn signing_key_from_row(row: &Row<'_>) -> Result<SigningKeyRecord, rusqlite::Error> {
+        Ok(SigningKeyRecord {
+            kid: row.get(0)?,
+            alg: row.get(1)?,
+            private_key_pem: row.get(2)?,
+            public_jwk_x: row.get(3)?,
+            public_jwk_y: row.get(4)?,
+            created_at: row.get::<_, i64>(5)? as u64,
+            not_after: row.get::<_, Option<i64>>(6)?.map(|v| v as u64),
+            state: row.get(7)?,
+        })
+    }
+
+    /// Persist a freshly generated signing key.
+    #[instrument(err, skip_all, fields(kid = %record.kid, state = %record.state))]
+    pub fn insert_signing_key(&self, record: &SigningKeyRecord) -> R<()> {
+        let conn = self.write_connection()?;
+        conn.execute(
+            &INSERT_SIGNING_KEY,
+            named_params! {
+                ":kid": record.kid,
+                ":alg": record.alg,
+                ":private_key_pem": record.private_key_pem,
+                ":public_jwk_x": record.public_jwk_x,
+                ":public_jwk_y": record.public_jwk_y,
+                ":created_at": record.created_at as i64,
+                ":not_after": record.not_after.map(|v| v as i64),
+                ":state": record.state,
+            },
+        )?;
+        Ok(())
+    }
+
+    /// All persisted signing keys (including expired rows, newest first).
+    #[instrument(err, skip_all)]
+    pub fn list_signing_keys(&self) -> R<Vec<SigningKeyRecord>> {
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare(GET_SIGNING_KEYS.as_str())?;
+        let rows = stmt.query_map([], Self::signing_key_from_row)?;
+        Self::collect_rows(rows)
+    }
+
+    /// Persist a key lifecycle transition (`active` → `retiring` → `expired`).
+    #[instrument(err, skip_all, fields(kid = %kid, state = %state))]
+    pub fn update_signing_key_state(
+        &self,
+        kid: &str,
+        state: &str,
+        not_after: Option<u64>,
+    ) -> R<()> {
+        let conn = self.write_connection()?;
+        let updated = conn.execute(
+            &UPDATE_SIGNING_KEY_STATE,
+            named_params! {
+                ":kid": kid,
+                ":state": state,
+                ":not_after": not_after.map(|v| v as i64),
+            },
+        )?;
+        if updated == 0 {
+            bail!("signing key {kid} not found");
+        }
+        Ok(())
+    }
+
+    /// Remove a signing key row entirely. Normal rotation keeps expired rows
+    /// for audit; this exists for operator cleanup.
+    #[instrument(err, skip_all, fields(kid = %kid))]
+    pub fn delete_signing_key(&self, kid: &str) -> R<()> {
+        let conn = self.write_connection()?;
+        conn.execute(&DELETE_SIGNING_KEY, named_params! { ":kid": kid })?;
+        Ok(())
     }
 
     /// Insert or fully replace an instance row (terminated keyed rows are

@@ -77,6 +77,26 @@ pub struct WorkloadIdentityConfigFull {
     pub sub_template: String,
 }
 
+impl WorkloadIdentityConfigFull {
+    /// Default token lifetime when an identity does not set its own `ttl`.
+    pub fn parsed_default_ttl(&self) -> Duration {
+        parse_humantime_or(&self.default_ttl, DEF_WORKLOAD_IDENTITY_TTL)
+    }
+
+    /// How old the active signing key may get before the rotation loop
+    /// rotates it.
+    pub fn parsed_rotation_age(&self) -> Duration {
+        parse_humantime_or(&self.rotation_age, DEF_WORKLOAD_IDENTITY_ROTATION_AGE)
+    }
+}
+
+fn parse_humantime_or(raw: &str, fallback: &str) -> Duration {
+    raw.parse::<humantime::Duration>()
+        .or_else(|_| fallback.parse::<humantime::Duration>())
+        .map(Into::into)
+        .unwrap_or(Duration::from_secs(900))
+}
+
 impl Default for WorkloadIdentityConfigFull {
     fn default() -> Self {
         WorkloadIdentityConfigFull {
