@@ -99,9 +99,9 @@ Cilium, SmartStack, Eureka, and fly.io. Each tenet names the pain it avoids.
 
 ## Goals
 
-- **Declare a service in one line.** `service: true` on a task with a port is enough to
-  get a DNS name, env vars, only-healthy endpoints, and L4 reachability. Progressive
-  disclosure for everything beyond.
+- **Declare a service in one line.** `service: { port: 6379 }` on a task is enough to
+  get a port, a DNS name, env vars, only-healthy endpoints, and L4 reachability — no
+  separate `network` block required. Progressive disclosure for everything beyond.
 - **Query address + port three ways**, each strictly simpler than the last to adopt:
   env vars (static, zero-dependency), DNS (dynamic, language-agnostic), and the
   existing template engine (`{{ service "db" }}`, config-file rendering, change-reactive).
@@ -209,10 +209,11 @@ checks pass and removes it when the allocation stops or goes unhealthy — the a
 nothing.
 
 ```jsonnet
-// Minimal — the one-liner:
-service: { port: 'http' }     // name defaults to the task name
+// Minimal — the genuine one-liner (no separate `network` block needed):
+service: { port: 6379 }       // bare int → declares a static port AND advertises it
+service: { port: 'dynamic' }  // → allocates a dynamic port and advertises it
 
-// Fuller:
+// Fuller — `port` as a STRING references a named network.ports label (decoupled):
 service: {
   name: 'api',                // DNS label; defaults to task name
   port: 'http',               // named port from network.ports
@@ -222,6 +223,18 @@ service: {
 }
 ```
 
+- **`port` int vs. string — sugar over the two layers.** `network.ports` is the
+  *allocation-level* primitive (what the scheduler assigns, what env vars expose, what the
+  datapath programs); `service` is the *catalog-level* primitive (name/tags/meta/DNS/
+  intentions) that advertises *one* port. They are joined by the port **label**, which is
+  also what `checks` reference — so three subsystems agree on one port. For the common
+  one-port case that indirection is pure boilerplate, so an **integer/`'dynamic'`
+  `service.port` declares the `network.ports` entry inline** (desugaring to a `network`
+  block + a string reference). You only write an explicit `network` block when the
+  one-to-one breaks: **multiple ports**, a **port that isn't a service** (metrics scraped
+  by a check but never advertised), **several services on one task**, or custom
+  host↔container mapping (`to:`). Then `service` becomes a list and each entry references a
+  label by string.
 - **Only-healthy:** an endpoint enters the catalog only after `boot`+`readiness` checks
   pass and leaves it on the first `health` failure (the existing `on_unhealthy` policy
   still governs restart/reschedule independently).
@@ -458,13 +471,12 @@ forward-compatible with it.
 
 ## Job Spec API (consolidated)
 
-Minimal — discoverable, reachable, in one block:
+Minimal — discoverable, reachable, in one block (inline `service.port`, no `network`):
 
 ```jsonnet
 {
   name: 'db', kind: 'container',
-  network: { ports: [{ name: 'redis', static: 6379 }] },
-  service: { port: 'redis' },
+  service: { port: 6379 },
   checks: [{ type: 'health', kind: 'tcp', port: 6379, every: '10s' }],
 }
 ```
@@ -617,8 +629,12 @@ satisfied by v1 plus Phase 5's intentions; everything else is separately adopted
 - DNS: A/AAAA/SRV/region/tag/slot record generation; resolv.conf emits `ndots:1`;
   an external name resolves in a single upstream query (no search-domain probes).
 - Intentions: `allow` matching by job / job+task / identity; default-deny vs allow-all.
-- Spec validation: `service.port` must reference a declared `network.ports` label; `l7`
+- Spec validation: `service.port` accepts an **integer** or `'dynamic'` (declares the
+  port inline) **or** a **string** that must reference a declared `network.ports` label;
+  an inline int and an explicit `network.ports` entry for the same port conflict; `l7`
   intentions require `connect.l7`; `mode` values validated against fingerprint.
+- Desugar: an integer/`'dynamic'` `service.port` materializes the equivalent
+  `network.ports` entry; env vars and checks resolve identically to the explicit form.
 - Template funcs: `endpoints`/`service` render correctly; `on_change` maps to the
   existing action vocabulary.
 

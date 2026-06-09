@@ -20,14 +20,16 @@ adds exactly one concept.
 {
   name: 'redis', kind: 'container',
   config: { image: 'redis:7' },
-  network: { ports: [{ name: 'redis', static: 6379 }] },
-  service: { port: 'redis' },        // name defaults to task name -> redis.svc.legion
+  service: { port: 6379 },           // bare int declares the port inline; no `network` block.
+                                      // name defaults to task name -> redis.svc.legion
 }
 ```
 
 Result: `redis.svc.legion` resolves to this instance; `LEGION_ADDR_redis` is set in the
 task; it's in the catalog and the UI. No checks yet → it registers as soon as the alloc
-is running.
+is running. (An integer/`'dynamic'` `service.port` desugars to a `network.ports` entry —
+you only write an explicit `network` block when a task has multiple ports, non-service
+ports, or custom host↔container mapping; see A4/A6 and plan §3.)
 
 ### A2. Add only-healthy semantics (reuse existing `checks`)
 
@@ -35,8 +37,7 @@ is running.
 {
   name: 'redis', kind: 'container',
   config: { image: 'redis:7' },
-  network: { ports: [{ name: 'redis', static: 6379 }] },
-  service: { port: 'redis' },
+  service: { port: 6379 },           // inline port; checks probe the same port number
   checks: [
     { type: 'readiness', kind: 'tcp', port: 6379, every: '5s', timeout: '2s' },
     { type: 'health',    kind: 'tcp', port: 6379, every: '10s', timeout: '2s',
