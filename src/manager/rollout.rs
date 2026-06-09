@@ -1398,10 +1398,22 @@ fn build_group_plans(
             let new_entry = new_tasks.get(&name).cloned();
             let old_entry = old_tasks.get(&name).cloned();
 
-            let desired_new = new_entry
-                .as_ref()
-                .map(|(_, task)| task.count.num)
-                .unwrap_or(0);
+            // Keyed-mode stateful tasks are not driven by count.num: their
+            // desired count is the number of live instances created via the
+            // instance management API, so a config rollout replaces every
+            // live keyed instance's allocation instead of converging to
+            // count.num.
+            let desired_new = match new_entry.as_ref() {
+                Some((_, task))
+                    if task.stateful.as_ref().is_some_and(|stateful| {
+                        stateful.mode == crate::structs::InstanceMode::Keyed
+                    }) =>
+                {
+                    store.count_live_keyed_instances(&rollout.job_id, &group, &name)?
+                }
+                Some((_, task)) => task.count.num,
+                None => 0,
+            };
             base_count = base_count.max(desired_new);
 
             let lifecycle = new_entry

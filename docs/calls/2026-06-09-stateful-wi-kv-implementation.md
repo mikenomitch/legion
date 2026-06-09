@@ -80,6 +80,37 @@ old allocation's deletion re-points `current_alloc_id` to the surviving allocati
 The transient double-attach window is documented as a storage-driver concern, not a
 scheduler concern.
 
+## 10. Keyed mode: `count` is ignored, instances drive cardinality
+
+A keyed task's desired allocations = its live (pending/active/rescheduling)
+instances; `count.num` is ignored and `count.per` is rejected at validation. The
+alternative (treating count as a floor/ceiling) couples two control loops for no
+clear benefit. Submitting a keyed job places zero allocations until
+`CreateInstance` is called.
+
+## 11. Keyed storage drops on destroy — deliberately opposite of slot scale-in
+
+Slot scale-in retains storage by default (the slot will run again and must
+reattach its data). A destroyed keyed id can never run again (never-recycle), so
+keeping its state attachable would be a data leak. Destroy always drops the
+handle; the tombstone row is retained forever to enforce never-recycle (collision
+with any row, including tombstones, is `AlreadyExists`).
+
+## 12. `idSource` declares the default, caller-supplied ids are always honored
+
+`idSource: 'caller'` makes `--id` required; `'uuid'`/unset lets the server mint.
+A valid caller-supplied id is accepted regardless — rejecting it under
+`idSource: 'uuid'` would add friction without a safety benefit (ids are validated
+for charset/length/collision either way: `[A-Za-z0-9._-]{1,128}`, since ids flow
+into env vars, WI subjects, and CLI args).
+
+## 13. Allocation churn never terminates a keyed instance
+
+Only `DestroyInstance` (or job stop/destroy) terminates keyed instances; the
+allocation-release hook moves them to `rescheduling` so the reconciler replaces
+them. `--group`/`--task` on create are only required when a job has more than one
+keyed task — ambiguity is rejected, never guessed.
+
 ---
 
 *(Further entries are appended below as implementation proceeds.)*

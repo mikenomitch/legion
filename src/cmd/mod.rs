@@ -3,6 +3,7 @@
 pub mod capabilities;
 pub mod docs;
 pub mod helpers;
+pub mod instance;
 pub mod job;
 pub mod join;
 pub mod join_token;

@@ -819,12 +819,16 @@ impl RolloutConfig {
 #[serde(rename_all = "camelCase")]
 pub struct StatefulConfig {
     /// Instance id assignment mode: `slot` (fixed ordinal pool `0..count-1`,
-    /// ids reused within the pool) or `keyed` (created on demand via API,
-    /// ids never recycled; management RPCs are a follow-up workstream).
+    /// ids reused within the pool) or `keyed` (created on demand via the
+    /// CreateInstance/DestroyInstance RPCs, ids never recycled). In keyed
+    /// mode `count.num` is ignored: the set of live instances created via
+    /// the API is the desired allocation count.
     pub mode: InstanceMode,
-    /// Where keyed instance ids come from: `caller` (supplied on create) or
-    /// `uuid` (server-minted). Only valid in keyed mode; slot ids are always
-    /// derived from the ordinal.
+    /// Where keyed instance ids come from by default: `caller` (the
+    /// CreateInstance request must supply one) or `uuid` (server-minted when
+    /// the request omits one). A valid caller-supplied id is always honored
+    /// regardless of this setting. Only valid in keyed mode; slot ids are
+    /// always derived from the ordinal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id_source: Option<String>,
     /// Optional persistent storage bound to each instance (contract only in
@@ -1310,6 +1314,17 @@ impl TaskConfig {
                             id_source
                         );
                     }
+                }
+                // Keyed cardinality is driven entirely by the management API
+                // (CreateInstance/DestroyInstance); count.num is ignored and
+                // count.per (per-attribute counts) has no meaningful keyed
+                // interpretation, so reject it rather than silently ignore.
+                if self.count.per.is_some() {
+                    bail!(
+                        "task {} stateful keyed mode cannot be combined with count.per; keyed \
+                         instance cardinality is driven by the instance management API, not count",
+                        self.name
+                    );
                 }
             }
         }
@@ -2011,6 +2026,42 @@ mod tests {
             .validate_stateful()
             .expect_err("unknown idSource must be rejected");
         assert!(err.to_string().contains("idSource"), "{err}");
+    }
+
+    #[test]
+    fn stateful_validation_rejects_count_per_in_keyed_mode() {
+        let task = TaskConfig {
+            count: TaskCount::per(2, "region"),
+            stateful: Some(StatefulConfig {
+                mode: InstanceMode::Keyed,
+                id_source: None,
+                storage: None,
+            }),
+            ..TaskConfig::new("sandbox", "container")
+        };
+        let err = task
+            .validate_stateful()
+            .expect_err("keyed mode cannot combine with count.per");
+        assert!(err.to_string().contains("count.per"), "{err}");
+    }
+
+    #[test]
+    fn stateful_keyed_mode_does_not_require_count() {
+        // count.num is ignored for keyed tasks (the management API drives
+        // cardinality), so any count.num — including 0 — validates.
+        for count in [0, 1, 7] {
+            let task = TaskConfig {
+                count: TaskCount::new(count),
+                stateful: Some(StatefulConfig {
+                    mode: InstanceMode::Keyed,
+                    id_source: Some("uuid".into()),
+                    storage: None,
+                }),
+                ..TaskConfig::new("sandbox", "container")
+            };
+            task.validate_stateful()
+                .expect("keyed tasks must not require count.num");
+        }
     }
 
     #[test]

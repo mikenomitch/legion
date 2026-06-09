@@ -75,6 +75,64 @@ service Manager {
   // Lists jobs known by the manager.
   rpc ListJobs (ListJobsRequest) returns (ListJobsReply);
 
+  // Creates a keyed-mode stateful instance for a job's keyed task and
+  // enqueues placement.
+  //
+  // Keyed instances (see docs/stateful-workloads.md) are the sandbox/dispatch
+  // primitive: each instance is a long-lived logical entity with a unique,
+  // **never-recycled** id that persists across allocations. Unlike slot mode,
+  // `count.num` does not drive keyed tasks — the number of live instances
+  // created through this RPC is the task's desired allocation count (zero
+  // instances = zero allocations).
+  //
+  // Id assignment: the target task's `stateful.idSource` declares the default
+  // source. With `idSource: "caller"` the request must supply `instance_id`;
+  // with `idSource: "uuid"` (or unset) the server mints an id when
+  // `instance_id` is absent. A caller-supplied `instance_id` is always
+  // accepted when valid, regardless of `idSource` — the setting picks the
+  // default, it does not forbid explicit keys.
+  //
+  // Errors:
+  // - NotFound: the job does not exist.
+  // - InvalidArgument: no keyed task matches `group`/`task`, the match is
+  //   ambiguous, the id has an invalid charset (must match
+  //   `[A-Za-z0-9._-]{1,128}`), or `idSource: "caller"` and no id was given.
+  // - AlreadyExists: the id collides with ANY existing instance row,
+  //   including Terminated tombstones — destroyed ids can never be created
+  //   again (the never-recycle guarantee).
+  rpc CreateInstance (CreateInstanceRequest) returns (CreateInstanceReply);
+
+  // Destroys a keyed-mode instance: stops its current allocation, drops its
+  // storage handle, and marks the instance Terminated.
+  //
+  // The instance row is retained forever as a tombstone so its id can never
+  // be re-created (never-recycle guarantee), and its workload identity `sub`
+  // can never be re-minted for a different workload. The storage handle is
+  // always dropped on destroy — a destroyed sandbox's state must not be
+  // reattachable. (This is intentionally stricter than slot-mode scale-in,
+  // which retains storage by default for a later scale-out.)
+  //
+  // Destroying an already-Terminated instance succeeds as a no-op, so the
+  // call is safe to retry even without an idempotency key.
+  //
+  // Errors:
+  // - NotFound: no instance row with this id exists.
+  // - InvalidArgument: the instance is slot-mode (slot lifecycles are owned
+  //   by the scheduler via `count.num`, not this API).
+  rpc DestroyInstance (DestroyInstanceRequest) returns (DestroyInstanceReply);
+
+  // Lists stateful instances (slot and keyed) for a job, optionally filtered
+  // by group. Includes Terminated rows (slot rows retained for scale-out
+  // re-materialization; keyed rows retained forever as never-recycle
+  // tombstones).
+  rpc ListInstances (ListInstancesRequest) returns (ListInstancesReply);
+
+  // Returns one stateful instance by id.
+  //
+  // Errors:
+  // - NotFound: no instance row with this id exists.
+  rpc GetInstance (GetInstanceRequest) returns (GetInstanceReply);
+
   // Worker heartbeat endpoint.
   //
   // Workers send runtime state, failures, and allocation health snapshots.
@@ -754,6 +812,149 @@ message DestroyJobReply {
   // True when replayed from a recorded result for the request's
   // `idempotency_key` rather than applied fresh.
   bool deduplicated = 2;
+}
+
+// Request payload for CreateInstance.
+message CreateInstanceRequest {
+  // Job name (also used as job ID in current manager implementation). The
+  // job's latest config must declare at least one keyed-mode stateful task.
+  string job_id = 1;
+
+  // Optional task-group filter used to resolve the target task.
+  //
+  // May be omitted when the job has exactly one keyed task. Required (along
+  // with `task` when a group holds several keyed tasks) whenever the keyed
+  // task would otherwise be ambiguous; ambiguity is rejected with
+  // InvalidArgument rather than guessed.
+  optional string group = 2;
+
+  // Optional task-name filter used to resolve the target task. Same
+  // disambiguation rules as `group`.
+  optional string task = 3;
+
+  // Optional caller-supplied instance key.
+  //
+  // Must match `[A-Za-z0-9._-]{1,128}` and must not collide with any
+  // existing instance id of any job — including Terminated tombstones
+  // (destroyed ids are never reusable). Required when the task declares
+  // `stateful.idSource: "caller"`; optional otherwise (the server mints an
+  // id when absent). A valid explicit key is always honored regardless of
+  // `idSource`.
+  optional string instance_id = 4;
+
+  // Optional idempotency key. See `RunJobRequest.idempotency_key`. The
+  // recorded replay carries the originally created instance id.
+  optional string idempotency_key = 5;
+}
+
+// Reply payload for CreateInstance.
+message CreateInstanceReply {
+  // The created instance's stable id (caller-supplied or server-minted).
+  // This is the value the task sees as `LEGION_INSTANCE_ID` and the key its
+  // storage handle and workload identity bind to.
+  string instance_id = 1;
+
+  // True when replayed from a recorded result for the request's
+  // `idempotency_key` rather than applied fresh.
+  bool deduplicated = 2;
+}
+
+// Request payload for DestroyInstance.
+message DestroyInstanceRequest {
+  // Stable instance id to destroy. Must reference a keyed-mode instance.
+  string instance_id = 1;
+
+  // Optional idempotency key. See `RunJobRequest.idempotency_key`.
+  optional string idempotency_key = 2;
+}
+
+// Reply payload for DestroyInstance.
+message DestroyInstanceReply {
+  // Human-readable status message.
+  //
+  // Current manager reply values:
+  // - `"Destroyed instance <id>"` — terminated by this request.
+  // - `"Instance <id> already terminated"` — no-op on a tombstone.
+  string message = 1;
+
+  // True when replayed from a recorded result for the request's
+  // `idempotency_key` rather than applied fresh.
+  bool deduplicated = 2;
+}
+
+// One stateful instance (see docs/stateful-workloads.md). An instance is the
+// stable identity one level above an allocation: it survives reschedules,
+// owns the storage binding, and feeds the workload-identity subject.
+message InstanceInfo {
+  // Stable id, unique within the cluster. Slot mode: the deterministic
+  // `{job}-{group}-{slot}` ordinal id. Keyed mode: the caller-supplied or
+  // server-minted key, never recycled after destroy.
+  string instance_id = 1;
+
+  // Owning job name.
+  string job_id = 2;
+
+  // Task group the instance belongs to.
+  string group = 3;
+
+  // Task name the instance currently belongs to (informational; identity is
+  // keyed by `instance_id`).
+  string task = 4;
+
+  // Id-assignment mode: `slot` or `keyed`.
+  string mode = 5;
+
+  // Lifecycle state: `pending` (never placed), `active` (live allocation),
+  // `rescheduling` (lost its allocation; a replacement will re-bind the same
+  // id and storage), or `terminated` (slot scale-in / job stop / keyed
+  // destroy; rows retained).
+  string state = 6;
+
+  // Ordinal slot index `0..count.num-1`; present only in slot mode.
+  optional uint32 slot_index = 7;
+
+  // The allocation currently fulfilling this instance, if any.
+  optional int64 current_alloc_id = 8;
+
+  // Opaque persistent-storage handle bound to the instance, when the task
+  // declares `stateful.storage`. Stable across reschedules. Dropped on keyed
+  // destroy; retained on slot scale-in unless `retainOnScaleIn: false`.
+  optional string storage_handle = 9;
+
+  // RFC3339 creation timestamp.
+  string created_at = 10;
+
+  // RFC3339 timestamp of the last state/binding change.
+  string updated_at = 11;
+}
+
+// Request payload for ListInstances.
+message ListInstancesRequest {
+  // Job name whose instances to list.
+  string job_id = 1;
+
+  // Optional exact-match group filter.
+  optional string group = 2;
+}
+
+// Reply payload for ListInstances.
+message ListInstancesReply {
+  // Instances ordered by group, slot index, then instance id. Includes
+  // Terminated rows (tombstones).
+  repeated InstanceInfo instances = 1;
+}
+
+// Request payload for GetInstance.
+message GetInstanceRequest {
+  // Stable instance id to fetch.
+  string instance_id = 1;
+}
+
+// Reply payload for GetInstance.
+message GetInstanceReply {
+  // The requested instance. Manager returns NotFound instead of returning
+  // this field unset.
+  InstanceInfo instance = 1;
 }
 
 // Request payload for ListJobs.

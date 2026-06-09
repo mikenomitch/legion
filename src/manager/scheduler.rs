@@ -492,7 +492,10 @@ impl<'a> Scheduler<'a> {
         }
 
         let status_map = HashMap::new();
-        let tasks = Self::tasks_for_plan(job_config, &status_map)?;
+        let mut tasks = Self::tasks_for_plan(job_config, &status_map)?;
+        // Keyed tasks plan against live instances, not count.num, even for
+        // not-yet-submitted configs (a fresh job simply has zero instances).
+        Self::apply_keyed_instance_counts(self.store, &job_config.name, &mut tasks)?;
         let all_tasks = job_config
             .tasks
             .iter()
@@ -1373,7 +1376,34 @@ impl<'a> Scheduler<'a> {
             })
             .collect::<HashMap<_, _>>();
 
-        Self::ready_tasks(tasks, &status_map)
+        let mut tasks = Self::ready_tasks(tasks, &status_map)?;
+        if let Some(job_id) = self.store.job_id_for_job_config(job_config_id)? {
+            Self::apply_keyed_instance_counts(self.store, &job_id, &mut tasks)?;
+        }
+        Ok(tasks)
+    }
+
+    /// Replace `count.num`-derived desired counts with live keyed-instance
+    /// counts for keyed-mode stateful tasks. `count.num` does not drive keyed
+    /// tasks: their desired allocation count is exactly the number of
+    /// instances in Pending/Active/Rescheduling state, created and destroyed
+    /// through the instance management API (zero instances = zero
+    /// allocations). Slot-mode and stateless tasks are untouched.
+    fn apply_keyed_instance_counts(
+        store: &Store,
+        job_id: &str,
+        tasks: &mut [(i64, TaskConfig, u32)],
+    ) -> R<()> {
+        for (_task_id, task, desired) in tasks.iter_mut() {
+            let keyed = task
+                .stateful
+                .as_ref()
+                .is_some_and(|stateful| stateful.mode == crate::structs::InstanceMode::Keyed);
+            if keyed {
+                *desired = store.count_live_keyed_instances(job_id, &task.group, &task.name)?;
+            }
+        }
+        Ok(())
     }
 
     fn tasks_for_plan(
@@ -2691,6 +2721,142 @@ mod tests {
                 "storage handle reattached on the new node"
             );
         }
+        Ok(())
+    }
+
+    fn stateful_keyed_task(name: &str) -> TaskConfig {
+        TaskConfig {
+            // count.num is deliberately non-zero to prove it is ignored for
+            // keyed tasks: live instances drive the desired count.
+            count: TaskCount::new(3),
+            stateful: Some(crate::structs::StatefulConfig {
+                mode: crate::structs::InstanceMode::Keyed,
+                id_source: None,
+                storage: Some(crate::structs::StatefulStorageConfig {
+                    path: "/workspace".into(),
+                    retain_on_scale_in: None,
+                }),
+            }),
+            ..TaskConfig::new(name, "noop")
+        }
+    }
+
+    #[test]
+    fn keyed_task_with_zero_instances_plans_zero_allocations() -> R<()> {
+        let store = setup_store()?;
+        insert_test_nodes(&store)?;
+        let job_id = "keyed-zero";
+        let job_config_id = submit_job(&store, job_id, vec![stateful_keyed_task("sandbox")])?;
+
+        // count.num = 3, but no instances exist: nothing to place.
+        let scheduler = Scheduler::new(&store)?;
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+        assert!(outcome.allocations.is_empty(), "count.num must be ignored");
+        assert!(store.allocs_for_job(job_id)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn keyed_instances_drive_desired_count_and_each_binds_a_distinct_instance() -> R<()> {
+        use crate::structs::InstanceState;
+
+        let store = setup_store()?;
+        insert_test_nodes(&store)?;
+        let job_id = "keyed-drive";
+        let job_config_id = submit_job(&store, job_id, vec![stateful_keyed_task("sandbox")])?;
+        for key in ["user-a", "user-b"] {
+            store.create_keyed_instance(job_id, "default", "sandbox", Some(key))?;
+        }
+
+        let scheduler = Scheduler::new(&store)?;
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+        assert_eq!(outcome.allocations.len(), 2, "one allocation per instance");
+
+        let mut bound: Vec<String> = outcome
+            .allocations
+            .iter()
+            .map(|alloc| alloc.instance_id.clone().expect("keyed alloc bound"))
+            .collect();
+        bound.sort();
+        assert_eq!(bound, vec!["user-a", "user-b"]);
+
+        for instance in store.list_instances(job_id)? {
+            assert_eq!(instance.state, InstanceState::Active);
+            assert_eq!(instance.slot_index, None);
+            assert!(instance
+                .storage_handle
+                .as_deref()
+                .is_some_and(|handle| handle.starts_with("local-dir/")));
+        }
+
+        // Replanning when everything is placed adds nothing.
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Reschedule)?;
+        assert!(outcome.allocations.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn killed_keyed_allocation_replacement_reuses_id_and_storage() -> R<()> {
+        use crate::structs::InstanceState;
+
+        let store = setup_store()?;
+        insert_test_nodes(&store)?;
+        let job_id = "keyed-resched-plan";
+        let job_config_id = submit_job(&store, job_id, vec![stateful_keyed_task("sandbox")])?;
+        store.create_keyed_instance(job_id, "default", "sandbox", Some("user-a"))?;
+        store.create_keyed_instance(job_id, "default", "sandbox", Some("user-b"))?;
+
+        let scheduler = Scheduler::new(&store)?;
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+        let victim = outcome
+            .allocations
+            .iter()
+            .find(|alloc| alloc.instance_id.as_deref() == Some("user-a"))
+            .cloned()
+            .expect("user-a placed");
+        let original_handle = store
+            .get_instance("user-a")?
+            .expect("instance")
+            .storage_handle;
+
+        store.remove_allocation_by_id(victim.id)?;
+        assert_eq!(
+            store.get_instance("user-a")?.expect("retained").state,
+            InstanceState::Rescheduling
+        );
+
+        // Exactly one replacement, re-bound to the same identity + storage.
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Reschedule)?;
+        assert_eq!(outcome.allocations.len(), 1);
+        assert_eq!(
+            outcome.allocations[0].instance_id.as_deref(),
+            Some("user-a")
+        );
+        let reactivated = store.get_instance("user-a")?.expect("reactivated");
+        assert_eq!(reactivated.state, InstanceState::Active);
+        assert_eq!(reactivated.storage_handle, original_handle);
+        Ok(())
+    }
+
+    #[test]
+    fn destroyed_keyed_instance_is_not_replaced_by_reconciliation() -> R<()> {
+        let store = setup_store()?;
+        insert_test_nodes(&store)?;
+        let job_id = "keyed-destroyed";
+        let job_config_id = submit_job(&store, job_id, vec![stateful_keyed_task("sandbox")])?;
+        store.create_keyed_instance(job_id, "default", "sandbox", Some("user-a"))?;
+        store.create_keyed_instance(job_id, "default", "sandbox", Some("user-b"))?;
+
+        let scheduler = Scheduler::new(&store)?;
+        scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+        store.destroy_keyed_instance("user-b")?;
+
+        // The tombstone is not desired: nothing is re-placed for it.
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Reschedule)?;
+        assert!(outcome.allocations.is_empty());
+        let allocations = store.allocs_for_job(job_id)?;
+        assert_eq!(allocations.len(), 1);
+        assert_eq!(allocations[0].instance_id.as_deref(), Some("user-a"));
         Ok(())
     }
 

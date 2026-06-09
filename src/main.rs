@@ -14,6 +14,7 @@ fn cli() -> Command {
         .subcommand(cmd::mcp::config())
         .subcommand(cmd::docs::config())
         .subcommand(cmd::job::config())
+        .subcommand(cmd::instance::config())
         .subcommand(cmd::node::config())
         .subcommand(cmd::start::config())
         .subcommand(cmd::join_token::config())
@@ -46,6 +47,7 @@ async fn main() -> R<()> {
         Some(("docs", sub_matches)) => cmd::docs::handle(sub_matches).await?,
         Some(("start", sub_matches)) => cmd::start::handle(sub_matches).await?,
         Some(("job", sub_matches)) => cmd::job::handle(sub_matches).await?,
+        Some(("instance", sub_matches)) => cmd::instance::handle(sub_matches).await?,
         Some(("node", sub_matches)) => cmd::node::handle(sub_matches).await?,
         Some(("join-token", sub_matches)) => cmd::join_token::handle(sub_matches).await?,
         Some(("join", sub_matches)) => cmd::join::handle(sub_matches).await?,

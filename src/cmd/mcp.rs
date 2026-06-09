@@ -14,7 +14,8 @@
 //! ## Safety
 //!
 //! By default only read-only / introspection tools are exposed. Mutating tools
-//! (`legion_job_run`, `legion_job_stop`, `legion_job_destroy`) are gated behind
+//! (`legion_job_run`, `legion_job_stop`, `legion_job_destroy`,
+//! `legion_instance_create`, `legion_instance_destroy`) are gated behind
 //! `--allow-write`, mirroring the `read_only_safe` flag in the capabilities
 //! catalog. Even with `--allow-write`, `legion_state_query` always runs in
 //! read-only mode (no SQL writes).
@@ -24,8 +25,9 @@ use crate::cmd::output::CliError;
 use crate::prelude::*;
 use crate::structs::manager_client::ManagerClient;
 use crate::structs::{
-    DestroyJobRequest, GetJobInfoRequest, GetJobSpecRequest, GetNodesRequest,
-    GetRolloutStatusRequest, GetStateStoreSchemaRequest, JobConfig, ListJobsRequest,
+    CreateInstanceRequest, DestroyInstanceRequest, DestroyJobRequest, GetInstanceRequest,
+    GetJobInfoRequest, GetJobSpecRequest, GetNodesRequest, GetRolloutStatusRequest,
+    GetStateStoreSchemaRequest, JobConfig, ListInstancesRequest, ListJobsRequest,
     ListRolloutsRequest, QueryStateStoreRequest, RunJobRequest, StopJobRequest,
 };
 use crate::task_plugins::validate_job_config;
@@ -155,6 +157,31 @@ fn tool_defs() -> Vec<ToolDef> {
             mutates: false,
         },
         ToolDef {
+            name: "legion_instance_list",
+            description: "List a job's stateful instances (slot and keyed, including terminated tombstones).",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "job_id": { "type": "string", "description": "Job name." },
+                    "group": { "type": "string", "description": "Optional task-group filter." }
+                },
+                "required": ["job_id"],
+                "additionalProperties": false
+            }),
+            mutates: false,
+        },
+        ToolDef {
+            name: "legion_instance_get",
+            description: "Inspect one stateful instance by id (state, slot, current allocation, storage handle).",
+            input_schema: || json!({
+                "type": "object",
+                "properties": { "instance_id": { "type": "string", "description": "Instance id." } },
+                "required": ["instance_id"],
+                "additionalProperties": false
+            }),
+            mutates: false,
+        },
+        ToolDef {
             name: "legion_node_list",
             description: "List worker nodes and their health.",
             input_schema: empty_schema,
@@ -216,6 +243,37 @@ fn tool_defs() -> Vec<ToolDef> {
                     "idempotency_key": { "type": "string", "description": "Optional key to dedupe retries." }
                 },
                 "required": ["name"],
+                "additionalProperties": false
+            }),
+            mutates: true,
+        },
+        ToolDef {
+            name: "legion_instance_create",
+            description: "Create a keyed-mode stateful instance for a job's keyed task (never-recycled id). Mutating.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "job_id": { "type": "string", "description": "Job name." },
+                    "group": { "type": "string", "description": "Task group, when the keyed task is ambiguous." },
+                    "task": { "type": "string", "description": "Task name, when the keyed task is ambiguous." },
+                    "instance_id": { "type": "string", "description": "Explicit instance key ([A-Za-z0-9._-]{1,128}); server-minted when omitted." },
+                    "idempotency_key": { "type": "string", "description": "Optional key to dedupe retries." }
+                },
+                "required": ["job_id"],
+                "additionalProperties": false
+            }),
+            mutates: true,
+        },
+        ToolDef {
+            name: "legion_instance_destroy",
+            description: "Destroy a keyed-mode instance: stop its allocation, drop its storage, tombstone the id forever. Mutating.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "instance_id": { "type": "string", "description": "Instance id to destroy." },
+                    "idempotency_key": { "type": "string", "description": "Optional key to dedupe retries." }
+                },
+                "required": ["instance_id"],
                 "additionalProperties": false
             }),
             mutates: true,
@@ -386,6 +444,43 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             let mut client = connect().await?;
             grpc(client.get_nodes(GetNodesRequest::default())).await
         }
+        "legion_instance_list" => {
+            let job_id = str_arg(&args, "job_id")?;
+            let group = opt_str_arg(&args, "group");
+            let mut client = connect().await?;
+            grpc(client.list_instances(ListInstancesRequest { job_id, group })).await
+        }
+        "legion_instance_get" => {
+            let instance_id = str_arg(&args, "instance_id")?;
+            let mut client = connect().await?;
+            grpc(client.get_instance(GetInstanceRequest { instance_id })).await
+        }
+        "legion_instance_create" => {
+            let job_id = str_arg(&args, "job_id")?;
+            let group = opt_str_arg(&args, "group");
+            let task = opt_str_arg(&args, "task");
+            let instance_id = opt_str_arg(&args, "instance_id");
+            let idempotency_key = opt_str_arg(&args, "idempotency_key");
+            let mut client = connect().await?;
+            grpc(client.create_instance(CreateInstanceRequest {
+                job_id,
+                group,
+                task,
+                instance_id,
+                idempotency_key,
+            }))
+            .await
+        }
+        "legion_instance_destroy" => {
+            let instance_id = str_arg(&args, "instance_id")?;
+            let idempotency_key = opt_str_arg(&args, "idempotency_key");
+            let mut client = connect().await?;
+            grpc(client.destroy_instance(DestroyInstanceRequest {
+                instance_id,
+                idempotency_key,
+            }))
+            .await
+        }
         "legion_state_query" => {
             let sql = str_arg(&args, "sql")?;
             let mut client = connect().await?;
@@ -526,8 +621,12 @@ mod tests {
     fn read_only_hides_mutating_tools() {
         let names: Vec<&str> = available_tools(false).iter().map(|t| t.name).collect();
         assert!(names.contains(&"legion_job_list"));
+        assert!(names.contains(&"legion_instance_list"));
+        assert!(names.contains(&"legion_instance_get"));
         assert!(!names.contains(&"legion_job_run"));
         assert!(!names.contains(&"legion_job_destroy"));
+        assert!(!names.contains(&"legion_instance_create"));
+        assert!(!names.contains(&"legion_instance_destroy"));
     }
 
     #[test]
@@ -535,6 +634,8 @@ mod tests {
         let names: Vec<&str> = available_tools(true).iter().map(|t| t.name).collect();
         assert!(names.contains(&"legion_job_run"));
         assert!(names.contains(&"legion_job_stop"));
+        assert!(names.contains(&"legion_instance_create"));
+        assert!(names.contains(&"legion_instance_destroy"));
     }
 
     #[tokio::test]

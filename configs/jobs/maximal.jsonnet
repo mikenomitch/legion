@@ -202,6 +202,44 @@
             },
         },
         {
+            name: "sandbox",
+            kind: "exec",
+            group: "sandboxes",
+            lifecycle: "service",
+            // Keyed-mode stateful task (see docs/stateful-workloads.md):
+            // instances are created/destroyed on demand via
+            // `legion instance create maximal-demo --group sandboxes` /
+            // `legion instance destroy <id>`. count does NOT drive keyed
+            // tasks — zero instances means zero allocations — and each id is
+            // never recycled after destroy. The task sees
+            // LEGION_INSTANCE_ID / LEGION_INSTANCE_MODE ("keyed") and
+            // LEGION_ALLOC_ID in its env (no LEGION_INSTANCE_SLOT).
+            stateful: {
+                mode: "keyed",
+                // "uuid": server mints ids when --id is omitted;
+                // "caller": --id is required. Explicit ids always honored.
+                idSource: "uuid",
+                storage: {
+                    // Opaque per-instance handle, reattached across
+                    // reschedules and dropped on destroy.
+                    path: "/workspace",
+                },
+            },
+            config: {
+                command: ["sleep", "600"],
+            },
+            resources: {
+                cpus: 0.25,
+                memory: 128,
+            },
+            constraints: {
+                os: "linux",
+            },
+            affinities: {
+                node_class: "sandbox",
+            },
+        },
+        {
             name: "container",
             count: 1,
             kind: "container",

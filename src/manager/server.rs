@@ -11,23 +11,26 @@ use crate::manager::rollout::{
 use crate::manager::rollout_strategy;
 use crate::manager::scheduler::{PlanConfigOutcome, PlanMode, Scheduler};
 use crate::storage::errors::StorageError;
-use crate::storage::store::{JobKvReference, JobSubmitOutcome, Store};
+use crate::storage::store::{DestroyInstanceOutcome, JobKvReference, JobSubmitOutcome, Store};
 use crate::structs::manager_server::Manager;
 use crate::structs::{
-    worker_client::WorkerClient, AcquireKvLockReply, AcquireKvLockRequest, AdvanceRolloutReply,
-    AdvanceRolloutRequest, AllocationHealth, DeleteKvReply, DeleteKvRequest,
-    DeleteSavedStateQueryReply, DeleteSavedStateQueryRequest, DestroyJobReply, DestroyJobRequest,
-    FailedAllocation, GetJobInfoReply, GetJobInfoRequest, GetJobSpecByConfigRequest,
+    validate_keyed_instance_id, worker_client::WorkerClient, AcquireKvLockReply,
+    AcquireKvLockRequest, AdvanceRolloutReply, AdvanceRolloutRequest, AllocationHealth,
+    CreateInstanceReply, CreateInstanceRequest, DeleteKvReply, DeleteKvRequest,
+    DeleteSavedStateQueryReply, DeleteSavedStateQueryRequest, DestroyInstanceReply,
+    DestroyInstanceRequest, DestroyJobReply, DestroyJobRequest, FailedAllocation, GetInstanceReply,
+    GetInstanceRequest, GetJobInfoReply, GetJobInfoRequest, GetJobSpecByConfigRequest,
     GetJobSpecReply, GetJobSpecRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest,
     GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest,
     GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest, GetObservabilityReply,
     GetObservabilityRequest, GetRaftJoinTokenReply, GetRaftJoinTokenRequest, GetRaftStatusReply,
     GetRaftStatusRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply,
     GetRolloutStatusRequest, GetStateStoreSchemaReply, GetStateStoreSchemaRequest,
-    HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, IssueRaftCommandReply,
-    IssueRaftCommandRequest, JobConfig, JobSpecHistoryItem, KvEntry, KvInjectionAction,
-    KvValueType, LedgerNode, ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobsReply,
-    ListJobsRequest, ListKvReply, ListKvRequest, ListRaftHistoryReply, ListRaftHistoryRequest,
+    HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, Instance, InstanceInfo,
+    InstanceMode, IssueRaftCommandReply, IssueRaftCommandRequest, JobConfig, JobSpecHistoryItem,
+    KvEntry, KvInjectionAction, KvValueType, LedgerNode, ListInstancesReply, ListInstancesRequest,
+    ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobsReply, ListJobsRequest,
+    ListKvReply, ListKvRequest, ListRaftHistoryReply, ListRaftHistoryRequest,
     ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply, ListRolloutsRequest,
     ListSavedStateQueriesReply, ListSavedStateQueriesRequest, Node, NodeMsg, PatchKvReply,
     PatchKvRequest, PlanJobReply, PlanJobRequest, PlannedAllocation, PutKvReply, PutKvRequest,
@@ -127,6 +130,24 @@ fn map_raft_event(event: crate::storage::persistence::RaftHistoryEvent) -> RaftH
         term: event.term,
         leader_id: event.leader_id,
         created_at: event.created_at,
+    }
+}
+
+/// Map a stored [`Instance`] to its wire shape (`InstanceInfo` in
+/// `proto/legion.proto`).
+fn map_instance_info(instance: Instance) -> InstanceInfo {
+    InstanceInfo {
+        instance_id: instance.instance_id,
+        job_id: instance.job_id,
+        group: instance.group,
+        task: instance.task_name,
+        mode: instance.mode.to_string(),
+        state: instance.state.to_string(),
+        slot_index: instance.slot_index,
+        current_alloc_id: instance.current_alloc_id,
+        storage_handle: instance.storage_handle,
+        created_at: instance.created_at,
+        updated_at: instance.updated_at,
     }
 }
 
@@ -1442,6 +1463,239 @@ impl Manager for ManagerAgentService {
         };
 
         Ok(Response::new(reply))
+    }
+
+    /// Create a keyed-mode stateful instance and enqueue placement. See the
+    /// proto comments on `CreateInstance` for the full contract (task
+    /// resolution, id-source policy, never-recycle collision rules).
+    #[instrument(skip_all)]
+    async fn create_instance(
+        &self,
+        request: Request<CreateInstanceRequest>,
+    ) -> Result<Response<CreateInstanceReply>, Status> {
+        let inner = request.into_inner();
+        let idempotency_key = inner.idempotency_key.unwrap_or_default();
+
+        if let Some(instance_id) = self
+            .store
+            .idempotency_lookup(&idempotency_key)
+            .map_err(|e| map_store_error("Error checking idempotency", e))?
+        {
+            return Ok(Response::new(CreateInstanceReply {
+                instance_id,
+                deduplicated: true,
+            }));
+        }
+
+        let job = self
+            .store
+            .get_job(&inner.job_id)
+            .map_err(|e| map_store_error("Error loading job", e))?;
+        if job.status == "stopped" {
+            return Err(Status::failed_precondition(format!(
+                "job {} is stopped; run it before creating instances",
+                inner.job_id
+            )));
+        }
+        let config = self
+            .store
+            .get_job_config(&inner.job_id)
+            .map_err(|e| map_store_error("Error loading job config", e))?;
+
+        // Resolve the target keyed task. group/task may be omitted when
+        // unambiguous; ambiguity is rejected, never guessed.
+        let group_filter = inner.group.as_deref().filter(|g| !g.trim().is_empty());
+        let task_filter = inner.task.as_deref().filter(|t| !t.trim().is_empty());
+        let mut candidates: Vec<&TaskConfig> = config
+            .tasks
+            .iter()
+            .filter(|task| {
+                task.stateful
+                    .as_ref()
+                    .is_some_and(|stateful| stateful.mode == InstanceMode::Keyed)
+            })
+            .filter(|task| group_filter.is_none_or(|group| task.group == group))
+            .filter(|task| task_filter.is_none_or(|name| task.name == name))
+            .collect();
+        let task = match candidates.len() {
+            0 => {
+                return Err(Status::invalid_argument(format!(
+                    "job {} has no keyed-mode stateful task matching group={} task={}; keyed \
+                     instances can only be created for tasks declaring stateful.mode = \"keyed\"",
+                    inner.job_id,
+                    group_filter.unwrap_or("<any>"),
+                    task_filter.unwrap_or("<any>"),
+                )));
+            }
+            1 => candidates.remove(0),
+            _ => {
+                let matches: Vec<String> = candidates
+                    .iter()
+                    .map(|task| format!("{}/{}", task.group, task.name))
+                    .collect();
+                return Err(Status::invalid_argument(format!(
+                    "multiple keyed tasks match in job {} ({}); disambiguate with group and task",
+                    inner.job_id,
+                    matches.join(", "),
+                )));
+            }
+        };
+
+        // Id policy: idSource declares the default source; a valid explicit
+        // key is always honored. See proto comments.
+        let requested_id = inner.instance_id.as_deref().filter(|id| !id.is_empty());
+        let id_source = task
+            .stateful
+            .as_ref()
+            .and_then(|stateful| stateful.id_source.as_deref());
+        match requested_id {
+            Some(id) => validate_keyed_instance_id(id).map_err(Status::invalid_argument)?,
+            None => {
+                if id_source == Some("caller") {
+                    return Err(Status::invalid_argument(format!(
+                        "task {} declares stateful.idSource = \"caller\"; CreateInstance must \
+                         supply instance_id",
+                        task.name
+                    )));
+                }
+            }
+        }
+
+        let instance = self
+            .store
+            .create_keyed_instance(&inner.job_id, &task.group, &task.name, requested_id)
+            .map_err(|e| map_store_error("Error creating instance", e))?;
+
+        // Place promptly: a reschedule plan adds exactly the missing keyed
+        // allocations without disturbing live ones.
+        self.store
+            .enqueue_eval(
+                "job_reschedule",
+                Some(&inner.job_id),
+                Some(&config.id()),
+                None,
+                Some(self.store.default_eval_priority),
+            )
+            .map_err(|e| map_store_error("Error scheduling instance placement", e))?;
+
+        self.store
+            .idempotency_record(&idempotency_key, "create_instance", &instance.instance_id)
+            .map_err(|e| map_store_error("Error recording idempotency", e))?;
+
+        Ok(Response::new(CreateInstanceReply {
+            instance_id: instance.instance_id,
+            deduplicated: false,
+        }))
+    }
+
+    /// Destroy a keyed-mode instance: stop its allocation, drop its storage
+    /// handle, retain the row as a never-recycle tombstone. Idempotent-ish:
+    /// destroying an already-terminated instance succeeds as a no-op.
+    #[instrument(skip_all)]
+    async fn destroy_instance(
+        &self,
+        request: Request<DestroyInstanceRequest>,
+    ) -> Result<Response<DestroyInstanceReply>, Status> {
+        let inner = request.into_inner();
+        let idempotency_key = inner.idempotency_key.unwrap_or_default();
+
+        if let Some(message) = self
+            .store
+            .idempotency_lookup(&idempotency_key)
+            .map_err(|e| map_store_error("Error checking idempotency", e))?
+        {
+            return Ok(Response::new(DestroyInstanceReply {
+                message,
+                deduplicated: true,
+            }));
+        }
+
+        let instance = self
+            .store
+            .get_instance(&inner.instance_id)
+            .map_err(|e| map_store_error("Error loading instance", e))?
+            .ok_or_else(|| {
+                Status::not_found(format!("instance {} not found", inner.instance_id))
+            })?;
+
+        let outcome = self
+            .store
+            .destroy_keyed_instance(&inner.instance_id)
+            .map_err(|e| map_store_error("Error destroying instance", e))?;
+
+        let message = match outcome {
+            DestroyInstanceOutcome::Destroyed { .. } => {
+                // Reconcile promptly. The destroy itself already removed the
+                // allocation rows (workers stop on their next heartbeat); the
+                // eval just confirms nothing else needs (re)placement.
+                if let Ok(config) = self.store.get_job_config(&instance.job_id) {
+                    self.store
+                        .enqueue_eval(
+                            "job_reschedule",
+                            Some(&instance.job_id),
+                            Some(&config.id()),
+                            None,
+                            Some(self.store.default_eval_priority),
+                        )
+                        .map_err(|e| map_store_error("Error scheduling reconcile", e))?;
+                }
+                format!("Destroyed instance {}", inner.instance_id)
+            }
+            DestroyInstanceOutcome::AlreadyTerminated => {
+                format!("Instance {} already terminated", inner.instance_id)
+            }
+        };
+
+        self.store
+            .idempotency_record(&idempotency_key, "destroy_instance", &message)
+            .map_err(|e| map_store_error("Error recording idempotency", e))?;
+
+        Ok(Response::new(DestroyInstanceReply {
+            message,
+            deduplicated: false,
+        }))
+    }
+
+    /// List a job's stateful instances (slot and keyed, including terminated
+    /// tombstones), optionally filtered by group.
+    #[instrument(skip_all)]
+    async fn list_instances(
+        &self,
+        request: Request<ListInstancesRequest>,
+    ) -> Result<Response<ListInstancesReply>, Status> {
+        let inner = request.into_inner();
+        let group = inner.group.filter(|group| !group.trim().is_empty());
+
+        let instances = self
+            .store
+            .list_instances(&inner.job_id)
+            .map_err(|e| map_store_error("Error listing instances", e))?
+            .into_iter()
+            .filter(|instance| group.as_deref().is_none_or(|group| instance.group == group))
+            .map(map_instance_info)
+            .collect();
+
+        Ok(Response::new(ListInstancesReply { instances }))
+    }
+
+    /// Fetch one stateful instance by id.
+    #[instrument(skip_all)]
+    async fn get_instance(
+        &self,
+        request: Request<GetInstanceRequest>,
+    ) -> Result<Response<GetInstanceReply>, Status> {
+        let inner = request.into_inner();
+        let instance = self
+            .store
+            .get_instance(&inner.instance_id)
+            .map_err(|e| map_store_error("Error loading instance", e))?
+            .ok_or_else(|| {
+                Status::not_found(format!("instance {} not found", inner.instance_id))
+            })?;
+
+        Ok(Response::new(GetInstanceReply {
+            instance: Some(map_instance_info(instance)),
+        }))
     }
 
     #[instrument(skip_all)]
@@ -3731,6 +3985,401 @@ mod tests {
         let desired = build_desired_allocations(&store, "node-a", &[allocation.id])?;
         assert_eq!(desired.len(), 1);
 
+        Ok(())
+    }
+
+    //
+    // KEYED-MODE INSTANCE RPCs (see docs/stateful-workloads.md)
+    //
+
+    fn keyed_task(name: &str, group: &str, id_source: Option<&str>) -> TaskConfig {
+        TaskConfig {
+            group: group.into(),
+            stateful: Some(crate::structs::StatefulConfig {
+                mode: InstanceMode::Keyed,
+                id_source: id_source.map(String::from),
+                storage: Some(crate::structs::StatefulStorageConfig {
+                    path: "/workspace".into(),
+                    retain_on_scale_in: None,
+                }),
+            }),
+            ..TaskConfig::new(name, "noop")
+        }
+    }
+
+    fn submit_keyed_job(store: &Store, name: &str, tasks: Vec<TaskConfig>) -> R<String> {
+        let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: name.into(),
+            tasks,
+            version: None,
+        };
+        store.handle_job_submit(&job, &[submission()])?;
+        let job_config_id = store.get_job_config(name)?.id();
+        Eval {
+            id: format!("{name}-submit"),
+            status: "pending".into(),
+            kind: "job_submit".into(),
+            job_id: name.into(),
+            job_config_id: job_config_id.clone(),
+            node_name: String::new(),
+            priority: 50,
+        }
+        .handle(store)?;
+        Ok(job_config_id)
+    }
+
+    /// Handle (and complete) all pending evals of `kind` for `job`, returning
+    /// how many were processed — stands in for the background eval workers.
+    fn handle_pending_evals(store: &Store, kind: &str, job: &str) -> R<usize> {
+        let mut handled = 0;
+        for eval in store.get_evals()? {
+            if eval.kind == kind && eval.job_id == job && eval.status == "pending" {
+                eval.handle(store)?;
+                store.complete_eval(&eval.id, true)?;
+                handled += 1;
+            }
+        }
+        Ok(handled)
+    }
+
+    #[test]
+    fn keyed_instance_rpc_lifecycle_create_place_kill_replace_destroy() -> R<()> {
+        use crate::structs::InstanceState;
+
+        let store = setup_store()?;
+        insert_node(&store, "node-a")?;
+        let manager = ManagerAgentService::new(store.clone());
+        let job_id = "sandbox-rpc";
+        submit_keyed_job(&store, job_id, vec![keyed_task("sandbox", "default", None)])?;
+        // Keyed task with zero instances: the submit eval placed nothing.
+        assert!(store.allocs_for_job(job_id)?.is_empty());
+
+        let runtime = tokio::runtime::Runtime::new()?;
+
+        // Create -> the eval places one allocation bound to the new id.
+        let reply = runtime
+            .block_on(manager.create_instance(Request::new(CreateInstanceRequest {
+                job_id: job_id.into(),
+                group: None,
+                task: None,
+                instance_id: Some("user-a".into()),
+                idempotency_key: None,
+            })))
+            .map_err(|err| anyhow!(err))?
+            .into_inner();
+        assert_eq!(reply.instance_id, "user-a");
+        assert!(!reply.deduplicated);
+        assert_eq!(handle_pending_evals(&store, "job_reschedule", job_id)?, 1);
+
+        let allocations = store.allocs_for_job(job_id)?;
+        assert_eq!(allocations.len(), 1);
+        assert_eq!(allocations[0].instance_id.as_deref(), Some("user-a"));
+        let placed = store.get_instance("user-a")?.context("instance")?;
+        assert_eq!(placed.state, InstanceState::Active);
+        let original_handle = placed.storage_handle.clone();
+        assert!(original_handle.is_some());
+
+        // Kill the allocation: the replacement reuses id + storage handle.
+        store.remove_allocation_by_id(allocations[0].id)?;
+        store.enqueue_eval(
+            "job_reschedule",
+            Some(job_id),
+            Some(&store.get_job_config(job_id)?.id()),
+            None,
+            None,
+        )?;
+        handle_pending_evals(&store, "job_reschedule", job_id)?;
+        let replacement = store.allocs_for_job(job_id)?;
+        assert_eq!(replacement.len(), 1);
+        assert_eq!(replacement[0].instance_id.as_deref(), Some("user-a"));
+        let rebound = store.get_instance("user-a")?.context("instance")?;
+        assert_eq!(rebound.state, InstanceState::Active);
+        assert_eq!(rebound.storage_handle, original_handle);
+
+        // Destroy: allocation stopped, instance tombstoned, handle dropped.
+        let reply = runtime
+            .block_on(
+                manager.destroy_instance(Request::new(DestroyInstanceRequest {
+                    instance_id: "user-a".into(),
+                    idempotency_key: None,
+                })),
+            )
+            .map_err(|err| anyhow!(err))?
+            .into_inner();
+        assert_eq!(reply.message, "Destroyed instance user-a");
+        handle_pending_evals(&store, "job_reschedule", job_id)?;
+        assert!(store.allocs_for_job(job_id)?.is_empty());
+        let tombstone = store.get_instance("user-a")?.context("tombstone")?;
+        assert_eq!(tombstone.state, InstanceState::Terminated);
+        assert_eq!(tombstone.storage_handle, None);
+
+        // Destroying again is a no-op, not an error.
+        let reply = runtime
+            .block_on(
+                manager.destroy_instance(Request::new(DestroyInstanceRequest {
+                    instance_id: "user-a".into(),
+                    idempotency_key: None,
+                })),
+            )
+            .map_err(|err| anyhow!(err))?
+            .into_inner();
+        assert_eq!(reply.message, "Instance user-a already terminated");
+
+        // Never-recycle: re-creating the destroyed id is rejected ...
+        let status = runtime
+            .block_on(manager.create_instance(Request::new(CreateInstanceRequest {
+                job_id: job_id.into(),
+                group: None,
+                task: None,
+                instance_id: Some("user-a".into()),
+                idempotency_key: None,
+            })))
+            .expect_err("tombstoned id must be rejected");
+        assert_eq!(status.code(), tonic::Code::AlreadyExists);
+
+        // ... while a fresh (server-minted) instance gets a different id and
+        // a FRESH storage handle after placement.
+        let reply = runtime
+            .block_on(manager.create_instance(Request::new(CreateInstanceRequest {
+                job_id: job_id.into(),
+                group: None,
+                task: None,
+                instance_id: None,
+                idempotency_key: None,
+            })))
+            .map_err(|err| anyhow!(err))?
+            .into_inner();
+        assert_ne!(reply.instance_id, "user-a");
+        handle_pending_evals(&store, "job_reschedule", job_id)?;
+        let minted = store
+            .get_instance(&reply.instance_id)?
+            .context("minted instance")?;
+        assert_eq!(minted.state, InstanceState::Active);
+        assert!(minted.storage_handle.is_some());
+        assert_ne!(
+            minted.storage_handle, original_handle,
+            "a new sandbox must never inherit a dead one's storage"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn create_instance_validates_job_task_resolution_and_id_policy() -> R<()> {
+        let store = setup_store()?;
+        insert_node(&store, "node-a")?;
+        let manager = ManagerAgentService::new(store.clone());
+        let runtime = tokio::runtime::Runtime::new()?;
+        let create = |job: &str, group: Option<&str>, task: Option<&str>, id: Option<&str>| {
+            runtime.block_on(manager.create_instance(Request::new(CreateInstanceRequest {
+                job_id: job.into(),
+                group: group.map(String::from),
+                task: task.map(String::from),
+                instance_id: id.map(String::from),
+                idempotency_key: None,
+            })))
+        };
+
+        // Unknown job.
+        let status = create("ghost", None, None, None).expect_err("unknown job");
+        assert_eq!(status.code(), tonic::Code::NotFound);
+
+        // Job without a keyed task.
+        submit_keyed_job(&store, "plain", vec![TaskConfig::new("web", "noop")])?;
+        let status = create("plain", None, None, None).expect_err("no keyed task");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+
+        // Two keyed tasks: ambiguous unless disambiguated by group/task.
+        submit_keyed_job(
+            &store,
+            "multi",
+            vec![
+                keyed_task("sandbox", "sandboxes", None),
+                keyed_task("runner", "runners", Some("caller")),
+            ],
+        )?;
+        let status = create("multi", None, None, None).expect_err("ambiguous keyed task");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(status.message().contains("sandboxes/sandbox"));
+        assert!(status.message().contains("runners/runner"));
+
+        // Group filter resolves; the server-minted id lands on that task.
+        let reply = create("multi", Some("sandboxes"), None, None)
+            .map_err(|err| anyhow!(err))?
+            .into_inner();
+        let instance = store
+            .get_instance(&reply.instance_id)?
+            .context("created instance")?;
+        assert_eq!(instance.group, "sandboxes");
+        assert_eq!(instance.task_name, "sandbox");
+
+        // idSource = "caller": the id is required ...
+        let status = create("multi", None, Some("runner"), None).expect_err("caller id required");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(status.message().contains("idSource"));
+        // ... and an explicit one is accepted.
+        let reply = create("multi", None, Some("runner"), Some("tenant-1"))
+            .map_err(|err| anyhow!(err))?
+            .into_inner();
+        assert_eq!(reply.instance_id, "tenant-1");
+
+        // Explicit ids are accepted even when idSource is unset/uuid ...
+        let reply = create("multi", Some("sandboxes"), None, Some("explicit.id_OK-1"))
+            .map_err(|err| anyhow!(err))?
+            .into_inner();
+        assert_eq!(reply.instance_id, "explicit.id_OK-1");
+        // ... but the charset is always enforced.
+        for bad in ["has space", "slash/y", "", "a:b"] {
+            let result = create("multi", Some("sandboxes"), None, Some(bad));
+            match bad {
+                // Empty string is treated as absent => server mints instead.
+                "" => assert!(result.is_ok()),
+                _ => {
+                    let status = result.expect_err("invalid charset");
+                    assert_eq!(status.code(), tonic::Code::InvalidArgument, "{bad:?}");
+                }
+            }
+        }
+
+        // Collision with a live id of another task is also rejected: ids are
+        // unique cluster-wide.
+        let status = create("multi", Some("sandboxes"), None, Some("tenant-1"))
+            .expect_err("cluster-wide id collision");
+        assert_eq!(status.code(), tonic::Code::AlreadyExists);
+
+        // Stopped jobs cannot grow new instances.
+        store.stop_job("multi")?;
+        let status = create("multi", Some("sandboxes"), None, None).expect_err("stopped job");
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        Ok(())
+    }
+
+    #[test]
+    fn instance_rpcs_replay_idempotency_keys() -> R<()> {
+        let store = setup_store()?;
+        insert_node(&store, "node-a")?;
+        let manager = ManagerAgentService::new(store.clone());
+        let job_id = "sandbox-idem";
+        submit_keyed_job(&store, job_id, vec![keyed_task("sandbox", "default", None)])?;
+        let runtime = tokio::runtime::Runtime::new()?;
+
+        // Create twice with the same key: one instance, replayed reply.
+        let first = runtime
+            .block_on(manager.create_instance(Request::new(CreateInstanceRequest {
+                job_id: job_id.into(),
+                group: None,
+                task: None,
+                instance_id: None,
+                idempotency_key: Some("create-1".into()),
+            })))
+            .map_err(|err| anyhow!(err))?
+            .into_inner();
+        let second = runtime
+            .block_on(manager.create_instance(Request::new(CreateInstanceRequest {
+                job_id: job_id.into(),
+                group: None,
+                task: None,
+                instance_id: None,
+                idempotency_key: Some("create-1".into()),
+            })))
+            .map_err(|err| anyhow!(err))?
+            .into_inner();
+        assert!(!first.deduplicated);
+        assert!(second.deduplicated);
+        assert_eq!(first.instance_id, second.instance_id);
+        assert_eq!(store.list_instances(job_id)?.len(), 1);
+
+        // Destroy twice with the same key: replayed reply, still one tombstone.
+        let first = runtime
+            .block_on(
+                manager.destroy_instance(Request::new(DestroyInstanceRequest {
+                    instance_id: second.instance_id.clone(),
+                    idempotency_key: Some("destroy-1".into()),
+                })),
+            )
+            .map_err(|err| anyhow!(err))?
+            .into_inner();
+        let replay = runtime
+            .block_on(
+                manager.destroy_instance(Request::new(DestroyInstanceRequest {
+                    instance_id: second.instance_id.clone(),
+                    idempotency_key: Some("destroy-1".into()),
+                })),
+            )
+            .map_err(|err| anyhow!(err))?
+            .into_inner();
+        assert!(!first.deduplicated);
+        assert!(replay.deduplicated);
+        assert_eq!(first.message, replay.message);
+        Ok(())
+    }
+
+    #[test]
+    fn list_and_get_instance_rpcs_filter_and_round_trip() -> R<()> {
+        let store = setup_store()?;
+        insert_node(&store, "node-a")?;
+        let manager = ManagerAgentService::new(store.clone());
+        let job_id = "sandbox-list";
+        submit_keyed_job(
+            &store,
+            job_id,
+            vec![
+                keyed_task("sandbox", "sandboxes", None),
+                keyed_task("runner", "runners", None),
+            ],
+        )?;
+        store.create_keyed_instance(job_id, "sandboxes", "sandbox", Some("s-1"))?;
+        store.create_keyed_instance(job_id, "sandboxes", "sandbox", Some("s-2"))?;
+        store.create_keyed_instance(job_id, "runners", "runner", Some("r-1"))?;
+
+        let runtime = tokio::runtime::Runtime::new()?;
+
+        let all = runtime
+            .block_on(manager.list_instances(Request::new(ListInstancesRequest {
+                job_id: job_id.into(),
+                group: None,
+            })))
+            .map_err(|err| anyhow!(err))?
+            .into_inner();
+        assert_eq!(all.instances.len(), 3);
+
+        let filtered = runtime
+            .block_on(manager.list_instances(Request::new(ListInstancesRequest {
+                job_id: job_id.into(),
+                group: Some("sandboxes".into()),
+            })))
+            .map_err(|err| anyhow!(err))?
+            .into_inner();
+        let ids: Vec<&str> = filtered
+            .instances
+            .iter()
+            .map(|instance| instance.instance_id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["s-1", "s-2"]);
+        assert!(filtered
+            .instances
+            .iter()
+            .all(|instance| instance.mode == "keyed" && instance.state == "pending"));
+
+        let fetched = runtime
+            .block_on(manager.get_instance(Request::new(GetInstanceRequest {
+                instance_id: "r-1".into(),
+            })))
+            .map_err(|err| anyhow!(err))?
+            .into_inner();
+        let instance = fetched.instance.context("instance present")?;
+        assert_eq!(instance.job_id, job_id);
+        assert_eq!(instance.group, "runners");
+        assert_eq!(instance.task, "runner");
+        assert_eq!(instance.slot_index, None);
+
+        let status = runtime
+            .block_on(manager.get_instance(Request::new(GetInstanceRequest {
+                instance_id: "missing".into(),
+            })))
+            .expect_err("unknown instance");
+        assert_eq!(status.code(), tonic::Code::NotFound);
         Ok(())
     }
 }

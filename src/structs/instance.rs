@@ -24,8 +24,9 @@ pub enum InstanceMode {
     /// Fixed pool of ordinal slots `0..count.num-1` (StatefulSet style). Slot
     /// ids are deterministic and reused across reschedules and scale cycles.
     Slot,
-    /// Instances created on demand via API with never-recycled ids (sandbox /
-    /// dispatch style). The management RPCs are a follow-up workstream.
+    /// Instances created on demand via the CreateInstance/DestroyInstance
+    /// management RPCs with never-recycled ids (sandbox / dispatch style).
+    /// `count.num` does not drive keyed tasks: live instances do.
     Keyed,
 }
 
@@ -146,6 +147,37 @@ pub fn slot_instance_id(job_id: &str, group: &str, slot: u32) -> String {
     format!("{job_id}-{group}-{slot}")
 }
 
+/// Maximum length of a keyed instance id.
+pub const KEYED_INSTANCE_ID_MAX_LEN: usize = 128;
+
+/// Validate a keyed instance id: `[A-Za-z0-9._-]{1,128}`.
+///
+/// The charset is deliberately conservative — keyed ids flow into env vars
+/// (`LEGION_INSTANCE_ID`), workload-identity subjects, file-ish storage
+/// handles, and CLI arguments, so anything beyond URL-safe punctuation is a
+/// foot-gun. Enforced for caller-supplied ids on CreateInstance; server-minted
+/// ids satisfy it by construction.
+pub fn validate_keyed_instance_id(id: &str) -> Result<(), String> {
+    if id.is_empty() {
+        return Err("keyed instance id cannot be empty".to_string());
+    }
+    if id.len() > KEYED_INSTANCE_ID_MAX_LEN {
+        return Err(format!(
+            "keyed instance id is {} characters; max is {KEYED_INSTANCE_ID_MAX_LEN}",
+            id.len()
+        ));
+    }
+    if let Some(bad) = id
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')))
+    {
+        return Err(format!(
+            "keyed instance id contains invalid character {bad:?}; allowed: [A-Za-z0-9._-]"
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,6 +192,21 @@ mod tests {
         assert_ne!(first, slot_instance_id("db", "default", 3));
         assert_ne!(first, slot_instance_id("db", "replicas", 2));
         assert_ne!(first, slot_instance_id("cache", "default", 2));
+    }
+
+    #[test]
+    fn keyed_instance_id_validation_enforces_charset_and_length() {
+        assert!(validate_keyed_instance_id("sandbox-user.42_A").is_ok());
+        assert!(validate_keyed_instance_id(&"a".repeat(KEYED_INSTANCE_ID_MAX_LEN)).is_ok());
+
+        assert!(validate_keyed_instance_id("").is_err());
+        assert!(validate_keyed_instance_id(&"a".repeat(KEYED_INSTANCE_ID_MAX_LEN + 1)).is_err());
+        for bad in ["has space", "slash/y", "emoji-✨", "colon:id", "at@id"] {
+            assert!(
+                validate_keyed_instance_id(bad).is_err(),
+                "{bad:?} must be rejected"
+            );
+        }
     }
 
     #[test]

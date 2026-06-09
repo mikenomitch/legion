@@ -104,7 +104,20 @@ fn maximal_job_spec_parse() {
 
     assert_eq!(config.name, "maximal-demo");
     assert_eq!(config.version, Some(1));
-    assert_eq!(config.tasks.len(), 4);
+    assert_eq!(config.tasks.len(), 5);
+
+    // The keyed-mode stateful task (sandbox group) round-trips and validates.
+    let sandbox = config
+        .tasks
+        .iter()
+        .find(|task| task.name == "sandbox")
+        .expect("maximal must declare the keyed sandbox task");
+    let stateful = sandbox.stateful.as_ref().expect("stateful block parsed");
+    assert_eq!(stateful.mode, legion::structs::InstanceMode::Keyed);
+    assert_eq!(stateful.id_source.as_deref(), Some("uuid"));
+    sandbox
+        .validate_stateful()
+        .expect("keyed sandbox task validates");
     for task in &config.tasks {
         assert!(!task.name.is_empty(), "task name should be set");
         assert!(

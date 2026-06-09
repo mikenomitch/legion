@@ -121,6 +121,41 @@ pub fn catalog() -> Vec<Capability> {
             mutates: true,
             read_only_safe: false,
         },
+        // --- Stateful instances (keyed mode; see docs/stateful-workloads.md) ---
+        Capability {
+            name: "instance.list",
+            cli: "legion instance list <JOB>",
+            grpc: Some("Manager/ListInstances"),
+            summary: "List a job's stateful instances (slot and keyed, incl. tombstones).",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "instance.get",
+            cli: "legion instance get <ID>",
+            grpc: Some("Manager/GetInstance"),
+            summary: "Inspect one stateful instance by id.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "instance.create",
+            cli: "legion instance create <JOB> [--id <KEY>]",
+            grpc: Some("Manager/CreateInstance"),
+            summary:
+                "Create a keyed-mode instance (never-recycled id). Supports --idempotency-key.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "instance.destroy",
+            cli: "legion instance destroy <ID>",
+            grpc: Some("Manager/DestroyInstance"),
+            summary:
+                "Destroy a keyed-mode instance and drop its storage. Supports --idempotency-key.",
+            mutates: true,
+            read_only_safe: false,
+        },
         // --- Rollouts ---
         Capability {
             name: "rollout.list",
