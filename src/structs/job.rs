@@ -831,6 +831,26 @@ pub struct StatefulConfig {
     /// always derived from the ordinal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id_source: Option<String>,
+    /// Keyed mode only: instance ids to SEED on job submit
+    /// (`initialInstances` in the jobspec).
+    ///
+    /// On every submit, after the config is persisted and before placement
+    /// is evaluated, the manager ensures each listed id exists: ids that
+    /// have NEVER existed are created (`pending`) and flow into the submit's
+    /// normal placement eval; ids that already exist in ANY state — live,
+    /// stopped, or a terminated tombstone — are skipped silently. Resubmits
+    /// are therefore idempotent, and a deliberately destroyed id is never
+    /// resurrected by a resubmit.
+    ///
+    /// This is a SEED list, not a reconciled desired set: removing an id
+    /// from the list on resubmit does not stop or destroy that instance —
+    /// only `legion instance stop/destroy` (or a job stop/destroy) does.
+    ///
+    /// Each id must match `[A-Za-z0-9._-]{1,128}` and the list must not
+    /// contain duplicates (both enforced at validation time). Invalid in
+    /// slot mode (slot ids are derived from ordinals).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_instances: Option<Vec<String>>,
     /// Optional persistent storage bound to each instance (contract only in
     /// v1; drivers are a follow-up, see
     /// `docs/plans/volume-plugin-system-plan.md`).
@@ -1356,6 +1376,13 @@ impl TaskConfig {
                         self.name
                     );
                 }
+                if stateful.initial_instances.is_some() {
+                    bail!(
+                        "task {} stateful.initialInstances is only valid in keyed mode; slot ids \
+                         are always derived from the ordinal",
+                        self.name
+                    );
+                }
             }
             InstanceMode::Keyed => {
                 if let Some(id_source) = stateful.id_source.as_deref() {
@@ -1378,6 +1405,29 @@ impl TaskConfig {
                          instance cardinality is driven by the instance management API, not count",
                         self.name
                     );
+                }
+                // The seed list is validated here (not at seeding time) so a
+                // bad jobspec fails `job validate`/submit before any state
+                // changes. Duplicates are rejected because the list is a set
+                // of identities — a duplicate is always a spec mistake.
+                if let Some(initial) = stateful.initial_instances.as_ref() {
+                    let mut seen = std::collections::BTreeSet::new();
+                    for id in initial {
+                        crate::structs::validate_keyed_instance_id(id).map_err(|err| {
+                            anyhow::anyhow!(
+                                "task {} stateful.initialInstances entry {:?}: {err}",
+                                self.name,
+                                id
+                            )
+                        })?;
+                        if !seen.insert(id.as_str()) {
+                            bail!(
+                                "task {} stateful.initialInstances contains duplicate id {:?}",
+                                self.name,
+                                id
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -2101,6 +2151,7 @@ mod tests {
             stateful: Some(StatefulConfig {
                 mode: InstanceMode::Slot,
                 id_source: Some("uuid".into()),
+                initial_instances: None,
                 storage: None,
             }),
             ..TaskConfig::new("db", "exec")
@@ -2118,6 +2169,7 @@ mod tests {
             stateful: Some(StatefulConfig {
                 mode: InstanceMode::Slot,
                 id_source: None,
+                initial_instances: None,
                 storage: None,
             }),
             ..TaskConfig::new("db", "exec")
@@ -2135,6 +2187,7 @@ mod tests {
             stateful: Some(StatefulConfig {
                 mode: InstanceMode::Slot,
                 id_source: None,
+                initial_instances: None,
                 storage: None,
             }),
             ..TaskConfig::new("db", "exec")
@@ -2152,6 +2205,7 @@ mod tests {
                 stateful: Some(StatefulConfig {
                     mode: InstanceMode::Slot,
                     id_source: None,
+                    initial_instances: None,
                     storage: Some(StatefulStorageConfig {
                         path: bad_path.into(),
                         retain_on_scale_in: None,
@@ -2175,6 +2229,7 @@ mod tests {
             stateful: Some(StatefulConfig {
                 mode: InstanceMode::Keyed,
                 id_source: Some("dice-roll".into()),
+                initial_instances: None,
                 storage: None,
             }),
             ..TaskConfig::new("sandbox", "container")
@@ -2192,6 +2247,7 @@ mod tests {
             stateful: Some(StatefulConfig {
                 mode: InstanceMode::Keyed,
                 id_source: None,
+                initial_instances: None,
                 storage: None,
             }),
             ..TaskConfig::new("sandbox", "container")
@@ -2212,6 +2268,7 @@ mod tests {
                 stateful: Some(StatefulConfig {
                     mode: InstanceMode::Keyed,
                     id_source: Some("uuid".into()),
+                    initial_instances: None,
                     storage: None,
                 }),
                 ..TaskConfig::new("sandbox", "container")

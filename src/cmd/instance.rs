@@ -6,16 +6,20 @@
 //! never-recycled id; `count.num` does not drive keyed tasks — the set of
 //! live instances created here is the desired allocation count.
 //!
-//! `list`/`get` also show slot-mode instances for inspection; `create` and
-//! `destroy` only apply to keyed mode (slot lifecycles are owned by the
-//! scheduler via `count.num`).
+//! `list`/`get` also show slot-mode instances for inspection; `create`,
+//! `stop`, `start`, and `destroy` only apply to keyed mode (slot lifecycles
+//! are owned by the scheduler via `count.num`).
+//!
+//! `create` speaks two RPCs: a request for exactly one instance uses the
+//! single `CreateInstance`; repeated `--id` flags and/or `--count` switch to
+//! the atomic batch `CreateInstances` (all-or-nothing).
 
 use crate::cmd::helpers::{connect_manager_client, json_flag, print_table};
 use crate::cmd::output::{self, OutputFormat};
 use crate::prelude::*;
 use crate::structs::{
-    CreateInstanceRequest, DestroyInstanceRequest, GetInstanceRequest, InstanceInfo,
-    ListInstancesRequest,
+    CreateInstanceRequest, CreateInstancesRequest, DestroyInstanceRequest, GetInstanceRequest,
+    InstanceInfo, ListInstancesRequest, StartInstanceRequest, StopInstanceRequest,
 };
 use tabled::Tabled;
 
@@ -33,21 +37,26 @@ pub fn config() -> Command {
     let create_cmd = Command::new("create")
         .about(
             "\
-            Create a keyed-mode instance for a job's keyed task\n\
+            Create keyed-mode instance(s) for a job's keyed task\n\
             \n\
             The target task must declare stateful.mode = \"keyed\". --group/--task\n\
             may be omitted when the job has exactly one keyed task. --id supplies\n\
             an explicit key (required when the task sets idSource = \"caller\";\n\
-            otherwise the server mints one). Ids are never recycled: a destroyed\n\
-            id can never be created again.\n\
+            otherwise the server mints one) and may repeat; --count N asks the\n\
+            server to mint N additional ids. Requests for more than one instance\n\
+            are atomic (all-or-nothing): any collision or invalid id creates\n\
+            nothing. Ids are never recycled: a destroyed id can never be created\n\
+            again, and a stopped instance still owns its id.\n\
             \n\
-            Example: legion instance create sandbox-demo --id user-42\
+            Examples:\n\
+              legion instance create sandbox-demo --id user-42\n\
+              legion instance create sandbox-demo --id a --id b --count 3\
             ",
         )
         .arg(
             Arg::new("job")
                 .value_name("JOB")
-                .help("Job whose keyed task gets the new instance")
+                .help("Job whose keyed task gets the new instance(s)")
                 .required(true),
         )
         .arg(
@@ -68,7 +77,59 @@ pub fn config() -> Command {
             Arg::new("id")
                 .long("id")
                 .value_name("KEY")
-                .help("Explicit instance key ([A-Za-z0-9._-]{1,128}); server-minted when omitted"),
+                .action(ArgAction::Append)
+                .help(
+                    "Explicit instance key ([A-Za-z0-9._-]{1,128}); repeatable. \
+                     Server-minted when omitted",
+                ),
+        )
+        .arg(
+            Arg::new("count")
+                .long("count")
+                .value_name("N")
+                .value_parser(clap::value_parser!(u32))
+                .help("Create N additional server-minted instances (atomic with any --id keys)"),
+        )
+        .arg(idempotency_arg())
+        .arg(json_flag());
+
+    let stop_cmd = Command::new("stop")
+        .about(
+            "\
+            Stop (pause) a keyed-mode instance without destroying it\n\
+            \n\
+            Stops its allocation but RETAINS the row and storage handle; the id\n\
+            stays owned (creates still collide). Revive it later with\n\
+            `legion instance start <ID>`. Stopping an already-stopped instance\n\
+            is a no-op; terminated (destroyed) instances cannot be stopped.\
+            ",
+        )
+        .arg(
+            Arg::new("id")
+                .value_name("ID")
+                .help("Instance id to stop")
+                .required(true),
+        )
+        .arg(idempotency_arg())
+        .arg(json_flag());
+
+    let start_cmd = Command::new("start")
+        .about(
+            "\
+            Start (resume) a stopped keyed-mode instance\n\
+            \n\
+            Moves it back to pending and enqueues placement; the replacement\n\
+            allocation re-binds the same instance id and its retained storage\n\
+            handle. Starting an already-running instance is a no-op; terminated\n\
+            instances can never be started (create a new id instead), and the\n\
+            owning job must be running (`legion job run` first).\
+            ",
+        )
+        .arg(
+            Arg::new("id")
+                .value_name("ID")
+                .help("Instance id to start")
+                .required(true),
         )
         .arg(idempotency_arg())
         .arg(json_flag());
@@ -120,10 +181,12 @@ pub fn config() -> Command {
         .arg(json_flag());
 
     Command::new("instance")
-        .about("Manage stateful instances (keyed-mode create/destroy, introspection)")
+        .about("Manage stateful instances (keyed-mode create/stop/start/destroy, introspection)")
         .subcommand_required(true)
         .arg_required_else_help(true)
         .subcommand(create_cmd)
+        .subcommand(stop_cmd)
+        .subcommand(start_cmd)
         .subcommand(destroy_cmd)
         .subcommand(list_cmd)
         .subcommand(get_cmd)
@@ -133,6 +196,8 @@ pub fn config() -> Command {
 pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
     match sub_matches.subcommand() {
         Some(("create", arg_matches)) => create_instance(arg_matches).await,
+        Some(("stop", arg_matches)) => stop_instance(arg_matches).await,
+        Some(("start", arg_matches)) => start_instance(arg_matches).await,
         Some(("destroy", arg_matches)) => destroy_instance(arg_matches).await,
         Some(("list", arg_matches)) => list_instances(arg_matches).await,
         Some(("get", arg_matches)) => get_instance(arg_matches).await,
@@ -147,29 +212,134 @@ async fn create_instance(arg_matches: &ArgMatches) -> R<()> {
         .get_one::<String>("job")
         .context("Must provide job")?
         .clone();
-    let request = tonic::Request::new(CreateInstanceRequest {
+    let group = arg_matches.get_one::<String>("group").cloned();
+    let task = arg_matches.get_one::<String>("task").cloned();
+    let idempotency_key = arg_matches.get_one::<String>("idempotency-key").cloned();
+    let ids: Vec<String> = arg_matches
+        .get_many::<String>("id")
+        .map(|values| values.cloned().collect())
+        .unwrap_or_default();
+    let count = arg_matches.get_one::<u32>("count").copied().unwrap_or(0);
+
+    let mut client = connect_manager_client().await?;
+
+    // Exactly-one-instance requests keep using the single CreateInstance RPC
+    // (which also covers "no --id, no --count" = one server-minted id);
+    // anything bigger goes through the atomic batch CreateInstances RPC.
+    if count == 0 && ids.len() <= 1 {
+        let request = tonic::Request::new(CreateInstanceRequest {
+            job_id: job,
+            group,
+            task,
+            instance_id: ids.into_iter().next(),
+            idempotency_key,
+        });
+        let reply = output::resolve(
+            format,
+            "failed to create instance",
+            client.create_instance(request).await,
+        )?
+        .into_inner();
+
+        if format.is_json() {
+            output::print_success(&json!({
+                "instanceIds": [reply.instance_id],
+                "deduplicated": reply.deduplicated,
+            }));
+        } else {
+            println!("Created instance {}", reply.instance_id);
+        }
+        return Ok(());
+    }
+
+    let request = tonic::Request::new(CreateInstancesRequest {
         job_id: job,
-        group: arg_matches.get_one::<String>("group").cloned(),
-        task: arg_matches.get_one::<String>("task").cloned(),
-        instance_id: arg_matches.get_one::<String>("id").cloned(),
+        group,
+        task,
+        instance_ids: ids,
+        count,
+        idempotency_key,
+    });
+    let reply = output::resolve(
+        format,
+        "failed to create instances",
+        client.create_instances(request).await,
+    )?
+    .into_inner();
+
+    if format.is_json() {
+        output::print_success(&json!({
+            "instanceIds": reply.instance_ids,
+            "deduplicated": reply.deduplicated,
+        }));
+    } else {
+        println!(
+            "Created {} instance(s): {}",
+            reply.instance_ids.len(),
+            reply.instance_ids.join(", ")
+        );
+    }
+    Ok(())
+}
+
+#[instrument(err, skip_all)]
+async fn stop_instance(arg_matches: &ArgMatches) -> R<()> {
+    let format = OutputFormat::from_matches(arg_matches);
+    let id = arg_matches
+        .get_one::<String>("id")
+        .context("Must provide id")?
+        .clone();
+    let request = tonic::Request::new(StopInstanceRequest {
+        instance_id: id,
         idempotency_key: arg_matches.get_one::<String>("idempotency-key").cloned(),
     });
 
     let mut client = connect_manager_client().await?;
     let reply = output::resolve(
         format,
-        "failed to create instance",
-        client.create_instance(request).await,
+        "failed to stop instance",
+        client.stop_instance(request).await,
     )?
     .into_inner();
 
     if format.is_json() {
         output::print_success(&json!({
-            "instanceId": reply.instance_id,
+            "message": reply.message,
             "deduplicated": reply.deduplicated,
         }));
     } else {
-        println!("Created instance {}", reply.instance_id);
+        println!("{}", reply.message);
+    }
+    Ok(())
+}
+
+#[instrument(err, skip_all)]
+async fn start_instance(arg_matches: &ArgMatches) -> R<()> {
+    let format = OutputFormat::from_matches(arg_matches);
+    let id = arg_matches
+        .get_one::<String>("id")
+        .context("Must provide id")?
+        .clone();
+    let request = tonic::Request::new(StartInstanceRequest {
+        instance_id: id,
+        idempotency_key: arg_matches.get_one::<String>("idempotency-key").cloned(),
+    });
+
+    let mut client = connect_manager_client().await?;
+    let reply = output::resolve(
+        format,
+        "failed to start instance",
+        client.start_instance(request).await,
+    )?
+    .into_inner();
+
+    if format.is_json() {
+        output::print_success(&json!({
+            "message": reply.message,
+            "deduplicated": reply.deduplicated,
+        }));
+    } else {
+        println!("{}", reply.message);
     }
     Ok(())
 }

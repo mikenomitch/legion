@@ -68,6 +68,12 @@ pub enum InstanceState {
     /// Lost its allocation and is awaiting a replacement that will reuse the
     /// same instance id and storage handle.
     Rescheduling,
+    /// Keyed only: paused via StopInstance (or the whole job being stopped).
+    /// The allocation is stopped but the row AND storage handle are retained,
+    /// and the id stays owned (creating it again still collides). Not desired
+    /// by the scheduler; StartInstance moves it back to `Pending`. Unlike
+    /// `Terminated` this is fully reversible.
+    Stopped,
     /// No longer desired (scaled in, job stopped, or destroyed). Slot-mode
     /// rows are retained so a later scale-out re-materializes the same id and
     /// reattaches the retained storage handle; keyed-mode rows are retained
@@ -81,6 +87,7 @@ impl InstanceState {
             InstanceState::Pending => "pending",
             InstanceState::Active => "active",
             InstanceState::Rescheduling => "rescheduling",
+            InstanceState::Stopped => "stopped",
             InstanceState::Terminated => "terminated",
         }
     }
@@ -100,6 +107,7 @@ impl std::str::FromStr for InstanceState {
             "pending" => Ok(InstanceState::Pending),
             "active" => Ok(InstanceState::Active),
             "rescheduling" => Ok(InstanceState::Rescheduling),
+            "stopped" => Ok(InstanceState::Stopped),
             "terminated" => Ok(InstanceState::Terminated),
             other => Err(format!("Unknown instance state {other}")),
         }
@@ -229,6 +237,7 @@ mod tests {
             InstanceState::Pending,
             InstanceState::Active,
             InstanceState::Rescheduling,
+            InstanceState::Stopped,
             InstanceState::Terminated,
         ] {
             let json = serde_json::to_string(&state)?;

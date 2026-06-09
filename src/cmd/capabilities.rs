@@ -148,6 +148,34 @@ pub fn catalog() -> Vec<Capability> {
             read_only_safe: false,
         },
         Capability {
+            name: "instance.create-batch",
+            cli: "legion instance create <JOB> --id <KEY>... --count <N>",
+            grpc: Some("Manager/CreateInstances"),
+            summary:
+                "Create several keyed instances atomically (all-or-nothing: explicit ids plus N \
+                 server-minted). Supports --idempotency-key.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "instance.stop",
+            cli: "legion instance stop <ID>",
+            grpc: Some("Manager/StopInstance"),
+            summary: "Pause a keyed instance: stop its allocation, retain row + storage handle \
+                 (reversible via instance.start). Supports --idempotency-key.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "instance.start",
+            cli: "legion instance start <ID>",
+            grpc: Some("Manager/StartInstance"),
+            summary: "Resume a stopped keyed instance: re-place it with the same id and retained \
+                 storage handle. Supports --idempotency-key.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
             name: "instance.destroy",
             cli: "legion instance destroy <ID>",
             grpc: Some("Manager/DestroyInstance"),

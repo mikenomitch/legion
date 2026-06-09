@@ -15,20 +15,22 @@
 //!
 //! By default only read-only / introspection tools are exposed. Mutating tools
 //! (`legion_job_run`, `legion_job_stop`, `legion_job_destroy`,
-//! `legion_instance_create`, `legion_instance_destroy`) are gated behind
-//! `--allow-write`, mirroring the `read_only_safe` flag in the capabilities
-//! catalog. Even with `--allow-write`, `legion_state_query` always runs in
-//! read-only mode (no SQL writes).
+//! `legion_instance_create`, `legion_instance_stop`, `legion_instance_start`,
+//! `legion_instance_destroy`) are gated behind `--allow-write`, mirroring the
+//! `read_only_safe` flag in the capabilities catalog. Even with
+//! `--allow-write`, `legion_state_query` always runs in read-only mode (no SQL
+//! writes).
 
 use crate::cmd::helpers::connect_manager_client;
 use crate::cmd::output::CliError;
 use crate::prelude::*;
 use crate::structs::manager_client::ManagerClient;
 use crate::structs::{
-    CreateInstanceRequest, DestroyInstanceRequest, DestroyJobRequest, GetInstanceRequest,
-    GetJobInfoRequest, GetJobSpecRequest, GetNodesRequest, GetRolloutStatusRequest,
-    GetStateStoreSchemaRequest, JobConfig, ListInstancesRequest, ListJobsRequest,
-    ListRolloutsRequest, QueryStateStoreRequest, RunJobRequest, StopJobRequest,
+    CreateInstanceRequest, CreateInstancesRequest, DestroyInstanceRequest, DestroyJobRequest,
+    GetInstanceRequest, GetJobInfoRequest, GetJobSpecRequest, GetNodesRequest,
+    GetRolloutStatusRequest, GetStateStoreSchemaRequest, JobConfig, ListInstancesRequest,
+    ListJobsRequest, ListRolloutsRequest, QueryStateStoreRequest, RunJobRequest,
+    StartInstanceRequest, StopInstanceRequest, StopJobRequest,
 };
 use crate::task_plugins::validate_job_config;
 use serde::Serialize;
@@ -249,7 +251,7 @@ fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_instance_create",
-            description: "Create a keyed-mode stateful instance for a job's keyed task (never-recycled id). Mutating.",
+            description: "Create keyed-mode stateful instance(s) for a job's keyed task (never-recycled ids). A single instance_id (or neither instance_ids nor count) uses CreateInstance; instance_ids and/or count use the atomic all-or-nothing batch CreateInstances. Mutating.",
             input_schema: || json!({
                 "type": "object",
                 "properties": {
@@ -257,9 +259,39 @@ fn tool_defs() -> Vec<ToolDef> {
                     "group": { "type": "string", "description": "Task group, when the keyed task is ambiguous." },
                     "task": { "type": "string", "description": "Task name, when the keyed task is ambiguous." },
                     "instance_id": { "type": "string", "description": "Explicit instance key ([A-Za-z0-9._-]{1,128}); server-minted when omitted." },
+                    "instance_ids": { "type": "array", "items": { "type": "string" }, "description": "Batch of explicit instance keys, created atomically (all-or-nothing). Mutually exclusive with instance_id." },
+                    "count": { "type": "integer", "minimum": 1, "description": "Create this many additional server-minted instances (atomic with instance_ids)." },
                     "idempotency_key": { "type": "string", "description": "Optional key to dedupe retries." }
                 },
                 "required": ["job_id"],
+                "additionalProperties": false
+            }),
+            mutates: true,
+        },
+        ToolDef {
+            name: "legion_instance_stop",
+            description: "Stop (pause) a keyed-mode instance: stop its allocation, retain the row and storage handle, keep the id owned. Reversible via legion_instance_start. Mutating.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "instance_id": { "type": "string", "description": "Instance id to stop." },
+                    "idempotency_key": { "type": "string", "description": "Optional key to dedupe retries." }
+                },
+                "required": ["instance_id"],
+                "additionalProperties": false
+            }),
+            mutates: true,
+        },
+        ToolDef {
+            name: "legion_instance_start",
+            description: "Start (resume) a stopped keyed-mode instance: re-place it with the same id and retained storage handle. The owning job must be running. Mutating.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "instance_id": { "type": "string", "description": "Instance id to start." },
+                    "idempotency_key": { "type": "string", "description": "Optional key to dedupe retries." }
+                },
+                "required": ["instance_id"],
                 "additionalProperties": false
             }),
             mutates: true,
@@ -460,12 +492,66 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             let group = opt_str_arg(&args, "group");
             let task = opt_str_arg(&args, "task");
             let instance_id = opt_str_arg(&args, "instance_id");
+            let instance_ids: Vec<String> = args
+                .get("instance_ids")
+                .and_then(Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let count = args.get("count").and_then(Value::as_u64).unwrap_or(0) as u32;
             let idempotency_key = opt_str_arg(&args, "idempotency_key");
             let mut client = connect().await?;
-            grpc(client.create_instance(CreateInstanceRequest {
-                job_id,
-                group,
-                task,
+            // instance_ids/count select the atomic batch RPC; a lone
+            // instance_id keeps the single-create semantics (incl. server
+            // minting when absent).
+            if !instance_ids.is_empty() || count > 0 {
+                if instance_id.is_some() {
+                    return Err(
+                        "pass either instance_id (single create) or instance_ids/count \
+                         (batch create), not both"
+                            .into(),
+                    );
+                }
+                grpc(client.create_instances(CreateInstancesRequest {
+                    job_id,
+                    group,
+                    task,
+                    instance_ids,
+                    count,
+                    idempotency_key,
+                }))
+                .await
+            } else {
+                grpc(client.create_instance(CreateInstanceRequest {
+                    job_id,
+                    group,
+                    task,
+                    instance_id,
+                    idempotency_key,
+                }))
+                .await
+            }
+        }
+        "legion_instance_stop" => {
+            let instance_id = str_arg(&args, "instance_id")?;
+            let idempotency_key = opt_str_arg(&args, "idempotency_key");
+            let mut client = connect().await?;
+            grpc(client.stop_instance(StopInstanceRequest {
+                instance_id,
+                idempotency_key,
+            }))
+            .await
+        }
+        "legion_instance_start" => {
+            let instance_id = str_arg(&args, "instance_id")?;
+            let idempotency_key = opt_str_arg(&args, "idempotency_key");
+            let mut client = connect().await?;
+            grpc(client.start_instance(StartInstanceRequest {
                 instance_id,
                 idempotency_key,
             }))
@@ -626,6 +712,8 @@ mod tests {
         assert!(!names.contains(&"legion_job_run"));
         assert!(!names.contains(&"legion_job_destroy"));
         assert!(!names.contains(&"legion_instance_create"));
+        assert!(!names.contains(&"legion_instance_stop"));
+        assert!(!names.contains(&"legion_instance_start"));
         assert!(!names.contains(&"legion_instance_destroy"));
     }
 
@@ -635,6 +723,8 @@ mod tests {
         assert!(names.contains(&"legion_job_run"));
         assert!(names.contains(&"legion_job_stop"));
         assert!(names.contains(&"legion_instance_create"));
+        assert!(names.contains(&"legion_instance_stop"));
+        assert!(names.contains(&"legion_instance_start"));
         assert!(names.contains(&"legion_instance_destroy"));
     }
 

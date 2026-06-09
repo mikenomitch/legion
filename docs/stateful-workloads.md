@@ -252,7 +252,7 @@ placement when the task declares `stateful.storage` (currently a
 - handles survive reschedules, config updates, and (by default) scale cycles.
 
 What v1 deliberately does **not** do: actually attach/mount anything, pin
-node-affine handles to nodes, or garbage-collect dropped handles. Concrete
+node-local handles to nodes, or garbage-collect dropped handles. Concrete
 drivers (local dir, network volumes, attach-before-start/detach-on-stop
 hooks) are specified in the
 [volume plugin system plan](plans/volume-plugin-system-plan.md).

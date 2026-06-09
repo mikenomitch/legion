@@ -99,9 +99,46 @@ service Manager {
   //   ambiguous, the id has an invalid charset (must match
   //   `[A-Za-z0-9._-]{1,128}`), or `idSource: "caller"` and no id was given.
   // - AlreadyExists: the id collides with ANY existing instance row,
-  //   including Terminated tombstones — destroyed ids can never be created
+  //   including Stopped instances and Terminated tombstones — a stopped
+  //   instance still owns its id, and destroyed ids can never be created
   //   again (the never-recycle guarantee).
   rpc CreateInstance (CreateInstanceRequest) returns (CreateInstanceReply);
+
+  // Creates several keyed-mode stateful instances in one atomic call and
+  // enqueues a single placement evaluation for the batch.
+  //
+  // The request may carry explicit `instance_ids`, a `count` of server-minted
+  // ids, or both; the call creates every explicit id PLUS `count` freshly
+  // minted ids. Creation is ALL-OR-NOTHING inside one storage transaction:
+  // if any explicit id is invalid or collides with ANY existing instance row
+  // (live, Stopped, or a Terminated tombstone — ids are never recycled), the
+  // whole call fails and NO instance is created. The reply lists every id
+  // that was created, in request order (explicit ids first, then minted ids).
+  //
+  // Task resolution (`group`/`task`) follows the same disambiguation rules as
+  // `CreateInstance`: filters may be omitted when the job has exactly one
+  // keyed task; ambiguity is rejected, never guessed.
+  //
+  // Interaction with `stateful.idSource`:
+  // - `idSource: "caller"` requires every id to be caller-supplied, so
+  //   `count > 0` (server minting) contradicts the policy and is rejected
+  //   with InvalidArgument.
+  // - `idSource: "uuid"` (or unset) accepts any mix of explicit ids and
+  //   minted ids.
+  //
+  // Errors:
+  // - NotFound: the job does not exist.
+  // - FailedPrecondition: the job is stopped (run it before creating
+  //   instances).
+  // - InvalidArgument: no keyed task matches `group`/`task` or the match is
+  //   ambiguous; `instance_ids` is empty AND `count` is 0 (nothing to
+  //   create); an id has an invalid charset (must match
+  //   `[A-Za-z0-9._-]{1,128}`, the offending id is named); or the task
+  //   declares `idSource: "caller"` and `count > 0`.
+  // - AlreadyExists: an id (named in the message) collides with an existing
+  //   instance row — including duplicates within the request itself, Stopped
+  //   instances, and Terminated tombstones. Nothing is created.
+  rpc CreateInstances (CreateInstancesRequest) returns (CreateInstancesReply);
 
   // Destroys a keyed-mode instance: stops its current allocation, drops its
   // storage handle, and marks the instance Terminated.
@@ -116,11 +153,63 @@ service Manager {
   // Destroying an already-Terminated instance succeeds as a no-op, so the
   // call is safe to retry even without an idempotency key.
   //
+  // Destroy also applies to Stopped instances: the row transitions
+  // stopped -> terminated and its retained storage handle is dropped.
+  //
   // Errors:
   // - NotFound: no instance row with this id exists.
   // - InvalidArgument: the instance is slot-mode (slot lifecycles are owned
   //   by the scheduler via `count.num`, not this API).
   rpc DestroyInstance (DestroyInstanceRequest) returns (DestroyInstanceReply);
+
+  // Stops (pauses) a keyed-mode instance WITHOUT tombstoning it.
+  //
+  // The instance's current allocation is stopped through the normal
+  // allocation-stop path (the hosting worker stops the task on its next
+  // heartbeat reconcile), and the instance transitions to `stopped`. Unlike
+  // `DestroyInstance` this is fully reversible:
+  // - the row is RETAINED and the id stays owned — `CreateInstance` with the
+  //   same id still fails with AlreadyExists (stopped is not destroyed);
+  // - the storage handle is RETAINED, so a later `StartInstance` revives the
+  //   instance with its persisted state;
+  // - `StartInstance` moves it back to `pending` and re-places it.
+  //
+  // While stopped, the instance is NOT part of the keyed task's desired
+  // allocation count: the scheduler plans no allocation for it, and job
+  // resubmits / config updates / reschedules will not resurrect it. Only an
+  // explicit `StartInstance` does.
+  //
+  // Stopping an already-stopped instance succeeds as a no-op, so the call is
+  // safe to retry even without an idempotency key.
+  //
+  // Errors:
+  // - NotFound: no instance row with this id exists.
+  // - InvalidArgument: the instance is slot-mode (slot lifecycles are owned
+  //   by the scheduler via `count.num`; stop the job or scale in instead).
+  // - FailedPrecondition: the instance is Terminated. Destroyed instances
+  //   are tombstoned forever (never-recycle) and can never be stopped,
+  //   started, or re-created.
+  rpc StopInstance (StopInstanceRequest) returns (StopInstanceReply);
+
+  // Starts (resumes) a stopped keyed-mode instance.
+  //
+  // The instance transitions `stopped -> pending` and a placement evaluation
+  // is enqueued (exactly like `CreateInstance` does), so the scheduler
+  // places a new allocation bound to the same instance id and its RETAINED
+  // storage handle — the revived workload is *the same* logical instance.
+  //
+  // Starting an instance that is already live (pending, active, or
+  // rescheduling) succeeds as a no-op, so the call is safe to retry even
+  // without an idempotency key.
+  //
+  // Errors:
+  // - NotFound: no instance row with this id exists.
+  // - InvalidArgument: the instance is slot-mode (slot lifecycles are owned
+  //   by the scheduler via `count.num`, not this API).
+  // - FailedPrecondition: the instance is Terminated (destroyed ids are
+  //   tombstoned forever — create a NEW id instead), or the owning job is
+  //   stopped (run the job first; a stopped job schedules nothing).
+  rpc StartInstance (StartInstanceRequest) returns (StartInstanceReply);
 
   // Lists stateful instances (slot and keyed) for a job, optionally filtered
   // by group. Includes Terminated rows (slot rows retained for scale-out
@@ -908,6 +997,50 @@ message CreateInstanceReply {
   bool deduplicated = 2;
 }
 
+// Request payload for CreateInstances (atomic batch create).
+message CreateInstancesRequest {
+  // Job name (also used as job ID in current manager implementation). The
+  // job's latest config must declare at least one keyed-mode stateful task.
+  string job_id = 1;
+
+  // Optional task-group filter used to resolve the target task. Same
+  // disambiguation rules as `CreateInstanceRequest.group`.
+  optional string group = 2;
+
+  // Optional task-name filter used to resolve the target task. Same
+  // disambiguation rules as `CreateInstanceRequest.task`.
+  optional string task = 3;
+
+  // Explicit instance keys to create. Each must match
+  // `[A-Za-z0-9._-]{1,128}` and must not collide with any existing instance
+  // id (including Stopped instances and Terminated tombstones) nor repeat
+  // within this list. Any violation fails the WHOLE call (nothing is
+  // created), naming the offending id. May be empty when `count > 0`.
+  repeated string instance_ids = 4;
+
+  // Number of additional server-minted instances to create on top of
+  // `instance_ids`. Rejected (InvalidArgument) when the task declares
+  // `stateful.idSource: "caller"`, which requires caller-supplied ids. At
+  // least one of `instance_ids` / `count` must be non-empty/non-zero.
+  uint32 count = 5;
+
+  // Optional idempotency key. See `RunJobRequest.idempotency_key`. The
+  // recorded replay carries the originally created instance ids.
+  optional string idempotency_key = 6;
+}
+
+// Reply payload for CreateInstances.
+message CreateInstancesReply {
+  // Every instance id created by this call, in request order: the explicit
+  // `instance_ids` first, then the `count` server-minted ids. On failure
+  // nothing is created and this RPC returns an error status instead.
+  repeated string instance_ids = 1;
+
+  // True when replayed from a recorded result for the request's
+  // `idempotency_key` rather than applied fresh.
+  bool deduplicated = 2;
+}
+
 // Request payload for DestroyInstance.
 message DestroyInstanceRequest {
   // Stable instance id to destroy. Must reference a keyed-mode instance.
@@ -924,6 +1057,56 @@ message DestroyInstanceReply {
   // Current manager reply values:
   // - `"Destroyed instance <id>"` — terminated by this request.
   // - `"Instance <id> already terminated"` — no-op on a tombstone.
+  string message = 1;
+
+  // True when replayed from a recorded result for the request's
+  // `idempotency_key` rather than applied fresh.
+  bool deduplicated = 2;
+}
+
+// Request payload for StopInstance.
+message StopInstanceRequest {
+  // Stable instance id to stop. Must reference a keyed-mode instance that is
+  // not Terminated (tombstones can never be stopped or restarted).
+  string instance_id = 1;
+
+  // Optional idempotency key. See `RunJobRequest.idempotency_key`.
+  optional string idempotency_key = 2;
+}
+
+// Reply payload for StopInstance.
+message StopInstanceReply {
+  // Human-readable status message.
+  //
+  // Current manager reply values:
+  // - `"Stopped instance <id>"` — stopped by this request.
+  // - `"Instance <id> already stopped"` — no-op on a stopped instance.
+  string message = 1;
+
+  // True when replayed from a recorded result for the request's
+  // `idempotency_key` rather than applied fresh.
+  bool deduplicated = 2;
+}
+
+// Request payload for StartInstance.
+message StartInstanceRequest {
+  // Stable instance id to start. Must reference a keyed-mode instance that
+  // is not Terminated, on a job that is not stopped.
+  string instance_id = 1;
+
+  // Optional idempotency key. See `RunJobRequest.idempotency_key`.
+  optional string idempotency_key = 2;
+}
+
+// Reply payload for StartInstance.
+message StartInstanceReply {
+  // Human-readable status message.
+  //
+  // Current manager reply values:
+  // - `"Started instance <id>"` — moved stopped -> pending and queued for
+  //  placement by this request.
+  // - `"Instance <id> already running"` — no-op on a live
+  //  (pending/active/rescheduling) instance.
   string message = 1;
 
   // True when replayed from a recorded result for the request's
@@ -953,10 +1136,13 @@ message InstanceInfo {
   // Id-assignment mode: `slot` or `keyed`.
   string mode = 5;
 
-  // Lifecycle state: `pending` (never placed), `active` (live allocation),
-  // `rescheduling` (lost its allocation; a replacement will re-bind the same
-  // id and storage), or `terminated` (slot scale-in / job stop / keyed
-  // destroy; rows retained).
+  // Lifecycle state: `pending` (never placed, or queued for re-placement
+  // after StartInstance), `active` (live allocation), `rescheduling` (lost
+  // its allocation; a replacement will re-bind the same id and storage),
+  // `stopped` (keyed only: paused via StopInstance or a job stop; row and
+  // storage handle retained, id still owned, revivable via StartInstance),
+  // or `terminated` (slot scale-in / keyed destroy / job destroy; rows
+  // retained — keyed tombstones forever).
   string state = 6;
 
   // Ordinal slot index `0..count.num-1`; present only in slot mode.
@@ -966,8 +1152,9 @@ message InstanceInfo {
   optional int64 current_alloc_id = 8;
 
   // Opaque persistent-storage handle bound to the instance, when the task
-  // declares `stateful.storage`. Stable across reschedules. Dropped on keyed
-  // destroy; retained on slot scale-in unless `retainOnScaleIn: false`.
+  // declares `stateful.storage`. Stable across reschedules and retained
+  // while `stopped` (StopInstance / job stop). Dropped on keyed destroy;
+  // retained on slot scale-in unless `retainOnScaleIn: false`.
   optional string storage_handle = 9;
 
   // RFC3339 creation timestamp.

@@ -12,38 +12,43 @@ use crate::manager::rollout_strategy;
 use crate::manager::scheduler::{PlanConfigOutcome, PlanMode, Scheduler};
 use crate::manager::workload_identity::{claims_for_allocation, WorkloadIdentityState};
 use crate::storage::errors::StorageError;
-use crate::storage::store::{DestroyInstanceOutcome, JobKvReference, JobSubmitOutcome, Store};
+use crate::storage::store::{
+    DestroyInstanceOutcome, JobKvReference, JobSubmitOutcome, StartInstanceOutcome,
+    StopInstanceOutcome, Store,
+};
 use crate::structs::manager_server::Manager;
 use crate::structs::{
     validate_keyed_instance_id, worker_client::WorkerClient, AcquireKvLockReply,
     AcquireKvLockRequest, AdvanceRolloutReply, AdvanceRolloutRequest, AllocationHealth,
-    CreateInstanceReply, CreateInstanceRequest, DeleteKvReply, DeleteKvRequest,
-    DeleteSavedStateQueryReply, DeleteSavedStateQueryRequest, DestroyInstanceReply,
-    DestroyInstanceRequest, DestroyJobReply, DestroyJobRequest, FailedAllocation, GetInstanceReply,
-    GetInstanceRequest, GetJobInfoReply, GetJobInfoRequest, GetJobSpecByConfigRequest,
-    GetJobSpecReply, GetJobSpecRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest,
-    GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest,
-    GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest, GetObservabilityReply,
-    GetObservabilityRequest, GetRaftJoinTokenReply, GetRaftJoinTokenRequest, GetRaftStatusReply,
-    GetRaftStatusRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply,
-    GetRolloutStatusRequest, GetStateStoreSchemaReply, GetStateStoreSchemaRequest,
-    HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, Instance, InstanceInfo,
-    InstanceMode, IssueRaftCommandReply, IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply,
-    IssueWorkloadIdentityTokenRequest, JobConfig, JobSpecHistoryItem, KvEntry, KvInjectionAction,
-    KvValueType, LedgerNode, ListInstancesReply, ListInstancesRequest, ListJobSpecHistoryReply,
-    ListJobSpecHistoryRequest, ListJobsReply, ListJobsRequest, ListKvReply, ListKvRequest,
-    ListRaftHistoryReply, ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest,
-    ListRolloutsReply, ListRolloutsRequest, ListSavedStateQueriesReply,
-    ListSavedStateQueriesRequest, Node, NodeMsg, PatchKvReply, PatchKvRequest, PlanJobReply,
-    PlanJobRequest, PlannedAllocation, PutKvReply, PutKvRequest, QueryStateStoreReply,
-    QueryStateStoreRequest, RaftHistoryEvent, RaftStatus, ReleaseKvLockReply, ReleaseKvLockRequest,
-    RenewKvLockReply, RenewKvLockRequest, RestartWorkerReply, RestartWorkerRequest,
-    RolloutAllocationStatus, RolloutEvent, RolloutGroupStatus, RolloutProgression,
-    RolloutReplacement, RunJobReply, RunJobRequest, SavedStateQuery, StopJobReply, StopJobRequest,
-    StopRolloutReply, StopRolloutRequest, Submission, TaskConfig, TaskOnUnhealthyConfig,
-    UpdateNodeDynamicReply, UpdateNodeDynamicRequest, UpsertSavedStateQueryReply,
-    UpsertSavedStateQueryRequest, WorkerConfig, WorkerPreRegisterReply, WorkerPreRegisterRequest,
-    WorkerRegisterReply, WorkerRegisterRequest,
+    CreateInstanceReply, CreateInstanceRequest, CreateInstancesReply, CreateInstancesRequest,
+    DeleteKvReply, DeleteKvRequest, DeleteSavedStateQueryReply, DeleteSavedStateQueryRequest,
+    DestroyInstanceReply, DestroyInstanceRequest, DestroyJobReply, DestroyJobRequest,
+    FailedAllocation, GetInstanceReply, GetInstanceRequest, GetJobInfoReply, GetJobInfoRequest,
+    GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest, GetKvLockReply,
+    GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest,
+    GetManagerConfigsReply, GetManagerConfigsRequest, GetNodeReply, GetNodeRequest, GetNodesReply,
+    GetNodesRequest, GetObservabilityReply, GetObservabilityRequest, GetRaftJoinTokenReply,
+    GetRaftJoinTokenRequest, GetRaftStatusReply, GetRaftStatusRequest, GetRolloutReply,
+    GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest, GetStateStoreSchemaReply,
+    GetStateStoreSchemaRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply,
+    HeartbeatRequest, Instance, InstanceInfo, InstanceMode, InstanceState, IssueRaftCommandReply,
+    IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply, IssueWorkloadIdentityTokenRequest,
+    JobConfig, JobSpecHistoryItem, KvEntry, KvInjectionAction, KvValueType, LedgerNode,
+    ListInstancesReply, ListInstancesRequest, ListJobSpecHistoryReply, ListJobSpecHistoryRequest,
+    ListJobsReply, ListJobsRequest, ListKvReply, ListKvRequest, ListRaftHistoryReply,
+    ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply,
+    ListRolloutsRequest, ListSavedStateQueriesReply, ListSavedStateQueriesRequest, Node, NodeMsg,
+    PatchKvReply, PatchKvRequest, PlanJobReply, PlanJobRequest, PlannedAllocation, PutKvReply,
+    PutKvRequest, QueryStateStoreReply, QueryStateStoreRequest, RaftHistoryEvent, RaftStatus,
+    ReleaseKvLockReply, ReleaseKvLockRequest, RenewKvLockReply, RenewKvLockRequest,
+    RestartWorkerReply, RestartWorkerRequest, RolloutAllocationStatus, RolloutEvent,
+    RolloutGroupStatus, RolloutProgression, RolloutReplacement, RunJobReply, RunJobRequest,
+    SavedStateQuery, StartInstanceReply, StartInstanceRequest, StopInstanceReply,
+    StopInstanceRequest, StopJobReply, StopJobRequest, StopRolloutReply, StopRolloutRequest,
+    Submission, TaskConfig, TaskOnUnhealthyConfig, UpdateNodeDynamicReply,
+    UpdateNodeDynamicRequest, UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest,
+    WorkerConfig, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply,
+    WorkerRegisterRequest,
 };
 use crate::task_plugins::validate_job_config;
 use crate::tracing_util::{o11y_enabled, read_recent_observability};
@@ -69,6 +74,74 @@ fn map_store_error(action: &str, err: anyhow::Error) -> Status {
         StorageError::DatabaseCorrupt
         | StorageError::DatabaseIo { .. }
         | StorageError::Sqlite { .. } => Status::internal(message),
+    }
+}
+
+/// Load the latest config of a job that must be runnable for keyed-instance
+/// mutations (CreateInstance/CreateInstances). A stopped job schedules
+/// nothing, so growing it would only strand pending rows — reject loudly.
+// `Status` is a large error type, but these helpers mirror the gRPC handlers
+// that call them (which return `Result<_, Status>` throughout this file).
+#[allow(clippy::result_large_err)]
+fn keyed_job_config(store: &Store, job_id: &str) -> Result<JobConfig, Status> {
+    let job = store
+        .get_job(job_id)
+        .map_err(|e| map_store_error("Error loading job", e))?;
+    if job.status == "stopped" {
+        return Err(Status::failed_precondition(format!(
+            "job {job_id} is stopped; run it before creating instances"
+        )));
+    }
+    store
+        .get_job_config(job_id)
+        .map_err(|e| map_store_error("Error loading job config", e))
+}
+
+/// Resolve the single keyed-mode stateful task an instance-create request
+/// targets. `group`/`task` filters may be omitted when the job has exactly
+/// one keyed task; ambiguity is rejected with InvalidArgument, never guessed
+/// (see the CreateInstance/CreateInstances proto comments). Shared by the
+/// single and batch create handlers so both apply identical rules.
+#[allow(clippy::result_large_err)]
+fn resolve_keyed_task<'a>(
+    config: &'a JobConfig,
+    job_id: &str,
+    group: Option<&str>,
+    task: Option<&str>,
+) -> Result<&'a TaskConfig, Status> {
+    let group_filter = group.filter(|group| !group.trim().is_empty());
+    let task_filter = task.filter(|task| !task.trim().is_empty());
+    let mut candidates: Vec<&TaskConfig> = config
+        .tasks
+        .iter()
+        .filter(|task| {
+            task.stateful
+                .as_ref()
+                .is_some_and(|stateful| stateful.mode == InstanceMode::Keyed)
+        })
+        .filter(|task| group_filter.is_none_or(|group| task.group == group))
+        .filter(|task| task_filter.is_none_or(|name| task.name == name))
+        .collect();
+    match candidates.len() {
+        0 => Err(Status::invalid_argument(format!(
+            "job {} has no keyed-mode stateful task matching group={} task={}; keyed \
+             instances can only be created for tasks declaring stateful.mode = \"keyed\"",
+            job_id,
+            group_filter.unwrap_or("<any>"),
+            task_filter.unwrap_or("<any>"),
+        ))),
+        1 => Ok(candidates.remove(0)),
+        _ => {
+            let matches: Vec<String> = candidates
+                .iter()
+                .map(|task| format!("{}/{}", task.group, task.name))
+                .collect();
+            Err(Status::invalid_argument(format!(
+                "multiple keyed tasks match in job {} ({}); disambiguate with group and task",
+                job_id,
+                matches.join(", "),
+            )))
+        }
     }
 }
 
@@ -1142,6 +1215,14 @@ impl Manager for ManagerAgentService {
             .handle_job_submit(&config, &subs)
             .map_err(|e| map_store_error("Error running job", e))?;
 
+        // Resubmitting revives a previously stopped job: clear the stopped
+        // status so the instance-management RPCs accept it again. Stopped
+        // keyed instances stay stopped — each needs an explicit
+        // `instance start` (see docs/stateful-workloads.md).
+        self.store
+            .clear_job_stopped_status(&config.name)
+            .map_err(|e| map_store_error("Error clearing stopped job status", e))?;
+
         let job_config_id = submit_outcome.job_config_id().to_string();
         let stored_refs: Vec<JobKvReference> = kv_refs
             .into_iter()
@@ -1155,6 +1236,30 @@ impl Manager for ManagerAgentService {
         self.store
             .replace_job_kv_references(&config.name, &stored_refs)
             .map_err(|e| map_store_error("Error storing kv references", e))?;
+
+        // Seed keyed instances declared via `stateful.initialInstances` now —
+        // after the config is persisted, BEFORE any placement eval is
+        // enqueued — so the seeded rows exist when that eval plans. Ids that
+        // already exist in ANY state (live, stopped, or a terminated
+        // tombstone) are skipped silently: the list is a SEED, not a
+        // reconciled desired set, so resubmits are idempotent, destroyed ids
+        // stay destroyed, and stopped instances stay stopped until an
+        // explicit `instance start`.
+        let mut seeded = 0usize;
+        for task in &config.tasks {
+            let keyed_seed = task.stateful.as_ref().and_then(|stateful| {
+                (stateful.mode == InstanceMode::Keyed)
+                    .then_some(stateful.initial_instances.as_ref())
+                    .flatten()
+            });
+            let Some(ids) = keyed_seed else { continue };
+            seeded += self
+                .store
+                .seed_keyed_instances(&config.name, &task.group, &task.name, ids)
+                .map_err(|e| map_store_error("Error seeding initial instances", e))?
+                .len();
+        }
+
         let (eval_kind, message) = match submit_outcome {
             JobSubmitOutcome::Unchanged { .. } => {
                 if force_reschedule {
@@ -1199,6 +1304,19 @@ impl Manager for ManagerAgentService {
                     Some(priority),
                 )
                 .map_err(|e| map_store_error("Error running job", e))?;
+        } else if seeded > 0 {
+            // An unchanged resubmit normally needs no eval, but if it seeded
+            // rows (possible when a previous submit failed between persisting
+            // the config and seeding), the new instances still need placing.
+            self.store
+                .enqueue_eval(
+                    "job_reschedule",
+                    Some(&config.name),
+                    Some(&job_config_id),
+                    None,
+                    Some(priority),
+                )
+                .map_err(|e| map_store_error("Error scheduling seeded instance placement", e))?;
         }
 
         self.store
@@ -1744,59 +1862,13 @@ impl Manager for ManagerAgentService {
             }));
         }
 
-        let job = self
-            .store
-            .get_job(&inner.job_id)
-            .map_err(|e| map_store_error("Error loading job", e))?;
-        if job.status == "stopped" {
-            return Err(Status::failed_precondition(format!(
-                "job {} is stopped; run it before creating instances",
-                inner.job_id
-            )));
-        }
-        let config = self
-            .store
-            .get_job_config(&inner.job_id)
-            .map_err(|e| map_store_error("Error loading job config", e))?;
-
-        // Resolve the target keyed task. group/task may be omitted when
-        // unambiguous; ambiguity is rejected, never guessed.
-        let group_filter = inner.group.as_deref().filter(|g| !g.trim().is_empty());
-        let task_filter = inner.task.as_deref().filter(|t| !t.trim().is_empty());
-        let mut candidates: Vec<&TaskConfig> = config
-            .tasks
-            .iter()
-            .filter(|task| {
-                task.stateful
-                    .as_ref()
-                    .is_some_and(|stateful| stateful.mode == InstanceMode::Keyed)
-            })
-            .filter(|task| group_filter.is_none_or(|group| task.group == group))
-            .filter(|task| task_filter.is_none_or(|name| task.name == name))
-            .collect();
-        let task = match candidates.len() {
-            0 => {
-                return Err(Status::invalid_argument(format!(
-                    "job {} has no keyed-mode stateful task matching group={} task={}; keyed \
-                     instances can only be created for tasks declaring stateful.mode = \"keyed\"",
-                    inner.job_id,
-                    group_filter.unwrap_or("<any>"),
-                    task_filter.unwrap_or("<any>"),
-                )));
-            }
-            1 => candidates.remove(0),
-            _ => {
-                let matches: Vec<String> = candidates
-                    .iter()
-                    .map(|task| format!("{}/{}", task.group, task.name))
-                    .collect();
-                return Err(Status::invalid_argument(format!(
-                    "multiple keyed tasks match in job {} ({}); disambiguate with group and task",
-                    inner.job_id,
-                    matches.join(", "),
-                )));
-            }
-        };
+        let config = keyed_job_config(&self.store, &inner.job_id)?;
+        let task = resolve_keyed_task(
+            &config,
+            &inner.job_id,
+            inner.group.as_deref(),
+            inner.task.as_deref(),
+        )?;
 
         // Id policy: idSource declares the default source; a valid explicit
         // key is always honored. See proto comments.
@@ -1841,6 +1913,283 @@ impl Manager for ManagerAgentService {
 
         Ok(Response::new(CreateInstanceReply {
             instance_id: instance.instance_id,
+            deduplicated: false,
+        }))
+    }
+
+    /// Create a batch of keyed-mode instances atomically (explicit ids plus
+    /// `count` server-minted ones) and enqueue ONE placement eval for the
+    /// whole batch. All-or-nothing: any invalid or colliding id fails the
+    /// call and creates nothing. See the proto comments on `CreateInstances`
+    /// for the full contract.
+    #[instrument(skip_all)]
+    async fn create_instances(
+        &self,
+        request: Request<CreateInstancesRequest>,
+    ) -> Result<Response<CreateInstancesReply>, Status> {
+        let inner = request.into_inner();
+        let idempotency_key = inner.idempotency_key.unwrap_or_default();
+
+        if let Some(recorded) = self
+            .store
+            .idempotency_lookup(&idempotency_key)
+            .map_err(|e| map_store_error("Error checking idempotency", e))?
+        {
+            // The recorded replay is the comma-joined created ids (the id
+            // charset cannot contain commas, so the join is unambiguous).
+            return Ok(Response::new(CreateInstancesReply {
+                instance_ids: recorded
+                    .split(',')
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+                deduplicated: true,
+            }));
+        }
+
+        if inner.instance_ids.is_empty() && inner.count == 0 {
+            return Err(Status::invalid_argument(
+                "CreateInstances has nothing to create: supply instance_ids, a non-zero count, \
+                 or both",
+            ));
+        }
+        for id in &inner.instance_ids {
+            validate_keyed_instance_id(id).map_err(|err| {
+                Status::invalid_argument(format!("instance id {id:?} is invalid: {err}"))
+            })?;
+        }
+
+        let config = keyed_job_config(&self.store, &inner.job_id)?;
+        let task = resolve_keyed_task(
+            &config,
+            &inner.job_id,
+            inner.group.as_deref(),
+            inner.task.as_deref(),
+        )?;
+
+        // idSource "caller" requires every id to be caller-supplied;
+        // server-minting (`count`) contradicts that policy.
+        let id_source = task
+            .stateful
+            .as_ref()
+            .and_then(|stateful| stateful.id_source.as_deref());
+        if id_source == Some("caller") && inner.count > 0 {
+            return Err(Status::invalid_argument(format!(
+                "task {} declares stateful.idSource = \"caller\", so every id must be \
+                 caller-supplied; count > 0 asks the server to mint ids — list explicit \
+                 instance_ids instead",
+                task.name
+            )));
+        }
+
+        let created = self
+            .store
+            .create_keyed_instances(
+                &inner.job_id,
+                &task.group,
+                &task.name,
+                &inner.instance_ids,
+                inner.count,
+            )
+            .map_err(|e| map_store_error("Error creating instances", e))?;
+
+        // One placement eval covers the whole batch: a reschedule plan adds
+        // exactly the missing keyed allocations without disturbing live ones.
+        self.store
+            .enqueue_eval(
+                "job_reschedule",
+                Some(&inner.job_id),
+                Some(&config.id()),
+                None,
+                Some(self.store.default_eval_priority),
+            )
+            .map_err(|e| map_store_error("Error scheduling instance placement", e))?;
+
+        self.store
+            .idempotency_record(&idempotency_key, "create_instances", &created.join(","))
+            .map_err(|e| map_store_error("Error recording idempotency", e))?;
+
+        Ok(Response::new(CreateInstancesReply {
+            instance_ids: created,
+            deduplicated: false,
+        }))
+    }
+
+    /// Stop (pause) a keyed-mode instance: stop its allocation, RETAIN the
+    /// row and storage handle, keep the id owned. Reversible via
+    /// StartInstance — see the proto comments on `StopInstance`.
+    #[instrument(skip_all)]
+    async fn stop_instance(
+        &self,
+        request: Request<StopInstanceRequest>,
+    ) -> Result<Response<StopInstanceReply>, Status> {
+        let inner = request.into_inner();
+        let idempotency_key = inner.idempotency_key.unwrap_or_default();
+
+        if let Some(message) = self
+            .store
+            .idempotency_lookup(&idempotency_key)
+            .map_err(|e| map_store_error("Error checking idempotency", e))?
+        {
+            return Ok(Response::new(StopInstanceReply {
+                message,
+                deduplicated: true,
+            }));
+        }
+
+        let instance = self
+            .store
+            .get_instance(&inner.instance_id)
+            .map_err(|e| map_store_error("Error loading instance", e))?
+            .ok_or_else(|| {
+                Status::not_found(format!("instance {} not found", inner.instance_id))
+            })?;
+        if instance.mode != InstanceMode::Keyed {
+            return Err(Status::invalid_argument(format!(
+                "instance {} is slot-mode; slot lifecycles are owned by the scheduler via \
+                 count.num — stop the job or scale in instead of StopInstance",
+                inner.instance_id
+            )));
+        }
+        if instance.state == InstanceState::Terminated {
+            return Err(Status::failed_precondition(format!(
+                "instance {} is terminated; destroyed instances are tombstoned forever \
+                 (never recycled) and can never be stopped or started again",
+                inner.instance_id
+            )));
+        }
+
+        let outcome = self
+            .store
+            .stop_keyed_instance(&inner.instance_id)
+            .map_err(|e| map_store_error("Error stopping instance", e))?;
+
+        let message = match outcome {
+            StopInstanceOutcome::Stopped { .. } => {
+                // Reconcile promptly. The stop itself already removed the
+                // allocation rows (workers stop on their next heartbeat); the
+                // eval just confirms nothing else needs (re)placement.
+                if let Ok(config) = self.store.get_job_config(&instance.job_id) {
+                    self.store
+                        .enqueue_eval(
+                            "job_reschedule",
+                            Some(&instance.job_id),
+                            Some(&config.id()),
+                            None,
+                            Some(self.store.default_eval_priority),
+                        )
+                        .map_err(|e| map_store_error("Error scheduling reconcile", e))?;
+                }
+                format!("Stopped instance {}", inner.instance_id)
+            }
+            StopInstanceOutcome::AlreadyStopped => {
+                format!("Instance {} already stopped", inner.instance_id)
+            }
+        };
+
+        self.store
+            .idempotency_record(&idempotency_key, "stop_instance", &message)
+            .map_err(|e| map_store_error("Error recording idempotency", e))?;
+
+        Ok(Response::new(StopInstanceReply {
+            message,
+            deduplicated: false,
+        }))
+    }
+
+    /// Start (resume) a stopped keyed-mode instance: stopped -> pending plus
+    /// a placement eval, re-binding the same id and retained storage handle.
+    /// See the proto comments on `StartInstance`.
+    #[instrument(skip_all)]
+    async fn start_instance(
+        &self,
+        request: Request<StartInstanceRequest>,
+    ) -> Result<Response<StartInstanceReply>, Status> {
+        let inner = request.into_inner();
+        let idempotency_key = inner.idempotency_key.unwrap_or_default();
+
+        if let Some(message) = self
+            .store
+            .idempotency_lookup(&idempotency_key)
+            .map_err(|e| map_store_error("Error checking idempotency", e))?
+        {
+            return Ok(Response::new(StartInstanceReply {
+                message,
+                deduplicated: true,
+            }));
+        }
+
+        let instance = self
+            .store
+            .get_instance(&inner.instance_id)
+            .map_err(|e| map_store_error("Error loading instance", e))?
+            .ok_or_else(|| {
+                Status::not_found(format!("instance {} not found", inner.instance_id))
+            })?;
+        if instance.mode != InstanceMode::Keyed {
+            return Err(Status::invalid_argument(format!(
+                "instance {} is slot-mode; slot lifecycles are owned by the scheduler via \
+                 count.num, not StartInstance",
+                inner.instance_id
+            )));
+        }
+        if instance.state == InstanceState::Terminated {
+            return Err(Status::failed_precondition(format!(
+                "instance {} is terminated; destroyed ids are never recycled — create a NEW \
+                 instance id instead",
+                inner.instance_id
+            )));
+        }
+        // A stopped job schedules nothing: starting one of its instances
+        // would only strand it in pending, so reject loudly and point at the
+        // fix. (Run the job again, then start its instances — job stop marks
+        // keyed instances stopped, and a resubmit deliberately does NOT
+        // resurrect them.)
+        let job = self
+            .store
+            .get_job(&instance.job_id)
+            .map_err(|e| map_store_error("Error loading job", e))?;
+        if job.status == "stopped" {
+            return Err(Status::failed_precondition(format!(
+                "job {} is stopped; run the job first, then start its instances",
+                instance.job_id
+            )));
+        }
+
+        let outcome = self
+            .store
+            .start_keyed_instance(&inner.instance_id)
+            .map_err(|e| map_store_error("Error starting instance", e))?;
+
+        let message = match outcome {
+            StartInstanceOutcome::Started => {
+                // Place promptly, exactly like CreateInstance does.
+                let config = self
+                    .store
+                    .get_job_config(&instance.job_id)
+                    .map_err(|e| map_store_error("Error loading job config", e))?;
+                self.store
+                    .enqueue_eval(
+                        "job_reschedule",
+                        Some(&instance.job_id),
+                        Some(&config.id()),
+                        None,
+                        Some(self.store.default_eval_priority),
+                    )
+                    .map_err(|e| map_store_error("Error scheduling instance placement", e))?;
+                format!("Started instance {}", inner.instance_id)
+            }
+            StartInstanceOutcome::AlreadyRunning => {
+                format!("Instance {} already running", inner.instance_id)
+            }
+        };
+
+        self.store
+            .idempotency_record(&idempotency_key, "start_instance", &message)
+            .map_err(|e| map_store_error("Error recording idempotency", e))?;
+
+        Ok(Response::new(StartInstanceReply {
+            message,
             deduplicated: false,
         }))
     }
@@ -3379,6 +3728,7 @@ mod tests {
             stateful: Some(StatefulConfig {
                 mode: InstanceMode::Slot,
                 id_source: None,
+                initial_instances: None,
                 storage: None,
             }),
             ..aws_identity_task("db")
@@ -5109,6 +5459,7 @@ mod tests {
             stateful: Some(crate::structs::StatefulConfig {
                 mode: InstanceMode::Keyed,
                 id_source: id_source.map(String::from),
+                initial_instances: None,
                 storage: Some(crate::structs::StatefulStorageConfig {
                     path: "/workspace".into(),
                     retain_on_scale_in: None,

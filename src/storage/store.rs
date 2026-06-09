@@ -129,6 +129,27 @@ pub enum DestroyInstanceOutcome {
     AlreadyTerminated,
 }
 
+/// Result of [`Store::stop_keyed_instance`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopInstanceOutcome {
+    /// The instance was live and is now `stopped` (row and storage handle
+    /// retained); `removed_allocations` allocation rows were deleted (0 when
+    /// it had no current placement).
+    Stopped { removed_allocations: usize },
+    /// The instance was already stopped; nothing changed (idempotent no-op).
+    AlreadyStopped,
+}
+
+/// Result of [`Store::start_keyed_instance`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartInstanceOutcome {
+    /// The instance was `stopped` and is now `pending`, awaiting placement.
+    Started,
+    /// The instance was already live (pending/active/rescheduling); nothing
+    /// changed (idempotent no-op).
+    AlreadyRunning,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobKvReference {
     pub job_id: String,
@@ -1845,6 +1866,23 @@ impl Store {
         Ok(updated > 0)
     }
 
+    /// Clear a `stopped` job status (back to `done`) when the job is
+    /// resubmitted via RunJob. A resubmit revives the job, so the
+    /// instance-management RPCs (CreateInstance/StartInstance), which reject
+    /// stopped jobs, must accept it again. Stopped keyed instances
+    /// deliberately stay `stopped` through this — reviving each one takes an
+    /// explicit StartInstance. No-op when the job is not currently stopped.
+    /// Returns whether a row was updated.
+    #[instrument(err, skip(self))]
+    pub fn clear_job_stopped_status(&self, job_id: &str) -> R<bool> {
+        let conn = self.write_connection()?;
+        let updated = conn.execute(
+            "UPDATE job SET status = 'done' WHERE id = ?1 AND status = 'stopped';",
+            [job_id],
+        )?;
+        Ok(updated > 0)
+    }
+
     #[instrument(err, skip_all)]
     pub fn destroy_job(&self, name: &str) -> R<()> {
         let mut conn = self.write_connection()?;
@@ -2964,10 +3002,12 @@ impl Store {
     /// rollout's new allocations can take over instances still referenced by
     /// the outgoing config. The oldest unbound instance is picked for
     /// determinism; since keyed ids are not ordinals, any unbound instance is
-    /// a correct choice. A storage handle is minted on first placement when
-    /// the task declares `stateful.storage`, and the retained handle is
-    /// reattached on every re-bind — that is what makes a replacement
-    /// allocation *the same sandbox*.
+    /// a correct choice. Stopped instances are never bound (they are paused,
+    /// not awaiting placement), and terminated ones are tombstones. A storage
+    /// handle is minted on first placement when the task declares
+    /// `stateful.storage`, and the retained handle is reattached on every
+    /// re-bind — that is what makes a replacement allocation *the same
+    /// sandbox*.
     fn assign_keyed_instance_tx(
         &self,
         tx: &Transaction<'_>,
@@ -2982,7 +3022,7 @@ impl Store {
                 "SELECT instance_id, job_id, group_name, task_name, mode, state, slot_index, \
                  current_alloc_id, storage_handle, created_at, updated_at FROM instance \
                  WHERE job_id = ?1 AND group_name = ?2 AND task_name = ?3 \
-                 AND mode = 'keyed' AND state != 'terminated' \
+                 AND mode = 'keyed' AND state NOT IN ('terminated', 'stopped') \
                  AND instance_id NOT IN (\
                      SELECT instance_id FROM allocation \
                      WHERE task_config_id = ?4 AND instance_id IS NOT NULL\
@@ -3018,10 +3058,15 @@ impl Store {
     /// become `rescheduling` while their slot is still desired, or
     /// `terminated` when the latest job config no longer wants the slot
     /// (scale-in) — retaining the row, and the storage handle unless
-    /// `retain_on_scale_in` is false. Orphaned keyed instances always become
-    /// `rescheduling`: allocation churn never terminates a keyed instance,
-    /// only DestroyInstance (or job stop) does. Must run in the same
-    /// transaction as the deletion, before commit.
+    /// `retain_on_scale_in` is false. Orphaned keyed instances become
+    /// `rescheduling`: allocation churn never terminates or stops a keyed
+    /// instance, only DestroyInstance/StopInstance (or a job stop) does.
+    /// `Stopped` rows are skipped exactly like `Terminated` ones — the
+    /// stop/destroy paths set those states in the SAME transaction that
+    /// removes the allocations, so this hook can never flip a deliberately
+    /// stopped instance back to `rescheduling` (nor can a later, unrelated
+    /// allocation death resurrect it). Must run in the same transaction as
+    /// the deletion, before commit.
     fn release_instance_bindings_tx(&self, tx: &Transaction<'_>, removed: &[Allocation]) -> R<()> {
         let instance_ids: HashSet<&str> = removed
             .iter()
@@ -3059,7 +3104,10 @@ impl Store {
             let Some(instance) = instance else {
                 continue;
             };
-            if instance.state == InstanceState::Terminated {
+            if matches!(
+                instance.state,
+                InstanceState::Terminated | InstanceState::Stopped
+            ) {
                 continue;
             }
 
@@ -3874,66 +3922,67 @@ impl Store {
         Ok(())
     }
 
-    /// Terminate every instance of a stopped job. Rows are always retained:
-    /// slot rows keep their storage handles so a later re-run re-materializes
-    /// the same identities; keyed rows become permanent tombstones and their
-    /// storage handles are dropped (matching DestroyInstance — a terminated
-    /// keyed instance's state must never be reattachable, since the id can
-    /// never run again). Called from the job_stop eval after its allocations
-    /// are removed.
+    /// Settle every instance of a stopped job. Rows AND storage handles are
+    /// always retained, but the two modes land in different states:
+    ///
+    /// - slot rows become `terminated` (with handles retained), so a later
+    ///   `job run` re-materializes the same ordinal identities and reattaches
+    ///   their data — exactly today's scale-out semantics;
+    /// - keyed rows become `stopped` (with handles retained), so resubmitting
+    ///   the job and running `legion instance start <id>` revives the same
+    ///   sandbox with its persisted state. A job stop is a pause, not a
+    ///   destroy: only DestroyInstance / job destroy is forever. Stopped
+    ///   keyed instances stay stopped when the job is resubmitted — they are
+    ///   not desired by the scheduler until explicitly started.
+    ///
+    /// Called from the job_stop eval after its allocations are removed.
+    /// Idempotent: already-stopped/terminated rows are untouched.
     #[instrument(err, skip_all)]
-    pub fn terminate_instances_for_job(&self, job_id: &str) -> R<u64> {
+    pub fn stop_instances_for_job(&self, job_id: &str) -> R<u64> {
         let now = Self::now_rfc3339()?;
         let conn = self.write_connection()?;
         let updated = conn.execute(
-            "UPDATE instance SET state = 'terminated', current_alloc_id = NULL, \
-             storage_handle = CASE WHEN mode = 'keyed' THEN NULL ELSE storage_handle END, \
-             updated_at = ?1 \
-             WHERE job_id = ?2 AND state != 'terminated';",
+            "UPDATE instance SET \
+             state = CASE WHEN mode = 'keyed' THEN 'stopped' ELSE 'terminated' END, \
+             current_alloc_id = NULL, updated_at = ?1 \
+             WHERE job_id = ?2 AND state NOT IN ('terminated', 'stopped');",
             params![now, job_id],
         )?;
         Ok(updated as u64)
     }
 
-    /// Register a new keyed-mode instance (the CreateInstance RPC's storage
-    /// half; task resolution and id policy live in the server handler).
-    ///
-    /// When `requested_id` is `Some` it must not collide with ANY existing
-    /// instance row — including Terminated tombstones — enforcing the
-    /// never-recycle guarantee; collisions surface as
-    /// [`StorageError::Conflict`]. When `None`, a random id is minted
-    /// (`{task}-{16 alphanumerics}`). The row starts `pending` with no storage
-    /// handle; the first placement mints one if the task declares storage.
-    #[instrument(err, skip_all)]
-    pub fn create_keyed_instance(
+    /// Whether ANY instance row (live, stopped, or tombstone) owns this id.
+    fn instance_id_exists_tx(tx: &Transaction<'_>, id: &str) -> R<bool> {
+        let found: Option<i64> = tx
+            .query_row(
+                "SELECT 1 FROM instance WHERE instance_id = ?;",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(found.is_some())
+    }
+
+    /// Insert one pending keyed instance row inside `tx`, enforcing the
+    /// never-recycle collision rule. `requested_id: None` mints
+    /// `{task}-{16 alphanumerics}`. Shared by the single and batch create
+    /// paths so both apply identical rules.
+    fn insert_keyed_instance_tx(
         &self,
+        tx: &Transaction<'_>,
         job_id: &str,
         group: &str,
         task_name: &str,
         requested_id: Option<&str>,
-    ) -> R<Instance> {
+    ) -> R<String> {
         let now = Self::now_rfc3339()?;
-        let mut conn = self.write_connection()?;
-        let tx = conn.transaction()?;
-
-        let exists = |tx: &Transaction<'_>, id: &str| -> R<bool> {
-            let found: Option<i64> = tx
-                .query_row(
-                    "SELECT 1 FROM instance WHERE instance_id = ?;",
-                    [id],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            Ok(found.is_some())
-        };
-
         let instance_id = match requested_id {
             Some(id) => {
-                if exists(&tx, id)? {
+                if Self::instance_id_exists_tx(tx, id)? {
                     bail!(StorageError::Conflict {
                         message: format!(
                             "instance id {id} already exists (keyed ids are never recycled, \
-                             including destroyed ones); choose a different id"
+                             including stopped and destroyed ones); choose a different id"
                         ),
                     });
                 }
@@ -3943,7 +3992,7 @@ impl Store {
                 // Collisions on 16 random alphanumerics are practically
                 // impossible; the loop is belt-and-braces.
                 let candidate = format!("{task_name}-{}", random_string(16));
-                if !exists(&tx, &candidate)? {
+                if !Self::instance_id_exists_tx(tx, &candidate)? {
                     break candidate;
                 }
             },
@@ -3955,6 +4004,30 @@ impl Store {
              VALUES (?1, ?2, ?3, ?4, 'keyed', 'pending', NULL, NULL, NULL, ?5, ?5);",
             params![instance_id, job_id, group, task_name, now],
         )?;
+        Ok(instance_id)
+    }
+
+    /// Register a new keyed-mode instance (the CreateInstance RPC's storage
+    /// half; task resolution and id policy live in the server handler).
+    ///
+    /// When `requested_id` is `Some` it must not collide with ANY existing
+    /// instance row — including Stopped rows and Terminated tombstones —
+    /// enforcing the never-recycle guarantee; collisions surface as
+    /// [`StorageError::Conflict`]. When `None`, a random id is minted
+    /// (`{task}-{16 alphanumerics}`). The row starts `pending` with no storage
+    /// handle; the first placement mints one if the task declares storage.
+    #[instrument(err, skip_all)]
+    pub fn create_keyed_instance(
+        &self,
+        job_id: &str,
+        group: &str,
+        task_name: &str,
+        requested_id: Option<&str>,
+    ) -> R<Instance> {
+        let mut conn = self.write_connection()?;
+        let tx = conn.transaction()?;
+        let instance_id =
+            self.insert_keyed_instance_tx(&tx, job_id, group, task_name, requested_id)?;
         let instance = tx.query_row(&GET_INSTANCE, [instance_id.as_str()], |row| {
             self.instance_from_row(row)
         })?;
@@ -3962,14 +4035,97 @@ impl Store {
         Ok(instance)
     }
 
+    /// Register a batch of keyed-mode instances ALL-OR-NOTHING (the
+    /// CreateInstances RPC's storage half): every id in `requested_ids` plus
+    /// `mint_count` server-minted ids, in one transaction. Any collision —
+    /// with an existing row (live/stopped/tombstone) or a duplicate within
+    /// `requested_ids` itself — aborts the whole batch with
+    /// [`StorageError::Conflict`] naming the offending id, creating nothing.
+    /// Returns the created ids in request order (explicit first, then
+    /// minted).
+    #[instrument(err, skip_all)]
+    pub fn create_keyed_instances(
+        &self,
+        job_id: &str,
+        group: &str,
+        task_name: &str,
+        requested_ids: &[String],
+        mint_count: u32,
+    ) -> R<Vec<String>> {
+        let mut conn = self.write_connection()?;
+        let tx = conn.transaction()?;
+        let mut created = Vec::with_capacity(requested_ids.len() + mint_count as usize);
+        for id in requested_ids {
+            created.push(self.insert_keyed_instance_tx(&tx, job_id, group, task_name, Some(id))?);
+        }
+        for _ in 0..mint_count {
+            created.push(self.insert_keyed_instance_tx(&tx, job_id, group, task_name, None)?);
+        }
+        tx.commit()?;
+        Ok(created)
+    }
+
+    /// Ensure each seed id from `stateful.initialInstances` exists (the
+    /// RunJob seeding half; see the field docs on
+    /// [`crate::structs::StatefulConfig::initial_instances`]).
+    ///
+    /// Ids that have never existed are created as `pending` keyed rows; ids
+    /// that already exist in ANY state — live, stopped, or a terminated
+    /// tombstone, even under another job — are skipped silently
+    /// (`INSERT OR IGNORE`), so resubmits are idempotent and a deliberately
+    /// destroyed id is never resurrected. Returns the ids actually created
+    /// by this call.
+    #[instrument(err, skip_all)]
+    pub fn seed_keyed_instances(
+        &self,
+        job_id: &str,
+        group: &str,
+        task_name: &str,
+        ids: &[String],
+    ) -> R<Vec<String>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let now = Self::now_rfc3339()?;
+        let mut conn = self.write_connection()?;
+        let tx = conn.transaction()?;
+        let mut created = Vec::new();
+        for id in ids {
+            let inserted = tx.execute(
+                "INSERT OR IGNORE INTO instance (instance_id, job_id, group_name, task_name, \
+                 mode, state, slot_index, current_alloc_id, storage_handle, created_at, \
+                 updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, 'keyed', 'pending', NULL, NULL, NULL, ?5, ?5);",
+                params![id, job_id, group, task_name, now],
+            )?;
+            if inserted > 0 {
+                created.push(id.clone());
+            }
+        }
+        tx.commit()?;
+        if !created.is_empty() {
+            info!(
+                job_id,
+                group,
+                task_name,
+                seeded = created.len(),
+                "Seeded keyed instances from initialInstances"
+            );
+        }
+        Ok(created)
+    }
+
     /// Destroy a keyed-mode instance (the DestroyInstance RPC's storage half):
     /// delete its allocations through the normal allocation-removal path,
     /// transition the row to `terminated`, and drop its storage handle.
     ///
     /// The row is retained forever as a tombstone so the id can never be
-    /// created again. Destroying an already-terminated instance is a no-op
-    /// (returns [`DestroyInstanceOutcome::AlreadyTerminated`]). Slot-mode
-    /// instances are rejected: their lifecycle is owned by the scheduler via
+    /// created again. Destroying a `stopped` instance works the same way
+    /// (stopped -> terminated; the retained handle is dropped) — stop is the
+    /// reversible pause, destroy is forever. Destroying an
+    /// already-terminated instance is a no-op (returns
+    /// [`DestroyInstanceOutcome::AlreadyTerminated`]). Slot-mode instances
+    /// are rejected: their lifecycle is owned by the scheduler via
     /// `count.num`.
     #[instrument(err, skip_all)]
     pub fn destroy_keyed_instance(&self, instance_id: &str) -> R<DestroyInstanceOutcome> {
@@ -4035,16 +4191,167 @@ impl Store {
         })
     }
 
+    /// Stop (pause) a keyed-mode instance (the StopInstance RPC's storage
+    /// half): delete its allocations through the normal allocation-removal
+    /// path and transition the row to `stopped`, RETAINING the row and its
+    /// storage handle. The id stays owned (creates still collide) and
+    /// [`Self::start_keyed_instance`] reverses the whole thing — unlike
+    /// destroy, stop is not forever.
+    ///
+    /// The state flips to `stopped` in the SAME transaction that removes the
+    /// allocations (mirroring [`Self::destroy_keyed_instance`]), so the
+    /// release hook — which skips `stopped` rows — can never race this and
+    /// flip the instance to `rescheduling`.
+    ///
+    /// Stopping an already-stopped instance is a no-op (returns
+    /// [`StopInstanceOutcome::AlreadyStopped`]). Slot-mode instances and
+    /// terminated tombstones are rejected with
+    /// [`StorageError::InvalidInput`]; the RPC layer pre-checks the
+    /// terminated case to surface FailedPrecondition.
+    #[instrument(err, skip_all)]
+    pub fn stop_keyed_instance(&self, instance_id: &str) -> R<StopInstanceOutcome> {
+        let instance = self
+            .get_instance(instance_id)?
+            .ok_or_else(|| StorageError::not_found("instance", instance_id))?;
+        if instance.mode != InstanceMode::Keyed {
+            bail!(StorageError::InvalidInput {
+                message: format!(
+                    "instance {instance_id} is slot-mode; slot instances are managed by the \
+                     scheduler via count.num, not StopInstance"
+                ),
+            });
+        }
+        match instance.state {
+            InstanceState::Stopped => return Ok(StopInstanceOutcome::AlreadyStopped),
+            InstanceState::Terminated => bail!(StorageError::InvalidInput {
+                message: format!(
+                    "instance {instance_id} is terminated; destroyed instances are tombstoned \
+                     forever and cannot be stopped"
+                ),
+            }),
+            InstanceState::Pending | InstanceState::Active | InstanceState::Rescheduling => {}
+        }
+
+        let now = Self::now_rfc3339()?;
+        let mut conn = self.write_connection()?;
+        let tx = conn.transaction()?;
+
+        // Stop the instance's allocation(s) through the normal removal path
+        // (delete row + epoch bump + cache eviction); the worker stops the
+        // task on its next heartbeat reconcile. The instance is marked
+        // stopped in the same transaction, so the release hook (which skips
+        // stopped instances) can never flip it to rescheduling.
+        let mut stmt = tx.prepare(
+            "SELECT allocation.id, allocation.status, allocation.resources, allocation.node_id, \
+             allocation.job_config_id, allocation.task_config_id, job_config.job_id, \
+             allocation.instance_id \
+             FROM allocation \
+             INNER JOIN job_config ON job_config.id = allocation.job_config_id \
+             WHERE allocation.instance_id = ?;",
+        )?;
+        let allocations = Self::collect_rows(
+            stmt.query_map([instance_id], |row| self.allocation_from_row(row))?,
+        )?;
+        drop(stmt);
+
+        tx.execute(
+            "DELETE FROM allocation WHERE instance_id = ?;",
+            [instance_id],
+        )?;
+        tx.execute(
+            "UPDATE instance SET state = 'stopped', current_alloc_id = NULL, updated_at = ?1 \
+             WHERE instance_id = ?2;",
+            params![now, instance_id],
+        )?;
+        self.bump_epochs_for_allocations_tx(&tx, &allocations)?;
+        tx.commit()?;
+
+        self.cache_remove_allocations(&allocations)?;
+
+        info!(
+            instance_id,
+            job_id = %instance.job_id,
+            removed_allocations = allocations.len(),
+            "Stopped keyed instance"
+        );
+        Ok(StopInstanceOutcome::Stopped {
+            removed_allocations: allocations.len(),
+        })
+    }
+
+    /// Start (resume) a stopped keyed-mode instance (the StartInstance RPC's
+    /// storage half): transition `stopped -> pending` so the next placement
+    /// eval binds a fresh allocation to the same instance id and its
+    /// RETAINED storage handle. Job-status gating (a stopped job schedules
+    /// nothing) lives in the RPC handler.
+    ///
+    /// Starting an already-live (pending/active/rescheduling) instance is a
+    /// no-op (returns [`StartInstanceOutcome::AlreadyRunning`]). Slot-mode
+    /// instances and terminated tombstones are rejected with
+    /// [`StorageError::InvalidInput`]; the RPC layer pre-checks the
+    /// terminated case to surface FailedPrecondition.
+    #[instrument(err, skip_all)]
+    pub fn start_keyed_instance(&self, instance_id: &str) -> R<StartInstanceOutcome> {
+        let instance = self
+            .get_instance(instance_id)?
+            .ok_or_else(|| StorageError::not_found("instance", instance_id))?;
+        if instance.mode != InstanceMode::Keyed {
+            bail!(StorageError::InvalidInput {
+                message: format!(
+                    "instance {instance_id} is slot-mode; slot instances are managed by the \
+                     scheduler via count.num, not StartInstance"
+                ),
+            });
+        }
+        match instance.state {
+            InstanceState::Pending | InstanceState::Active | InstanceState::Rescheduling => {
+                return Ok(StartInstanceOutcome::AlreadyRunning);
+            }
+            InstanceState::Terminated => bail!(StorageError::InvalidInput {
+                message: format!(
+                    "instance {instance_id} is terminated; destroyed ids are never recycled — \
+                     create a new instance instead"
+                ),
+            }),
+            InstanceState::Stopped => {}
+        }
+
+        let now = Self::now_rfc3339()?;
+        let conn = self.write_connection()?;
+        // Guard on the current state so a concurrent destroy/stop cannot be
+        // overwritten by this transition.
+        let updated = conn.execute(
+            "UPDATE instance SET state = 'pending', updated_at = ?1 \
+             WHERE instance_id = ?2 AND state = 'stopped';",
+            params![now, instance_id],
+        )?;
+        if updated == 0 {
+            bail!(StorageError::Conflict {
+                message: format!(
+                    "instance {instance_id} changed state concurrently; retry StartInstance"
+                ),
+            });
+        }
+        info!(
+            instance_id,
+            job_id = %instance.job_id,
+            "Started keyed instance (stopped -> pending)"
+        );
+        Ok(StartInstanceOutcome::Started)
+    }
+
     /// Count the live (pending/active/rescheduling) keyed instances of a
     /// (job, group, task). This is the desired allocation count for a
-    /// keyed-mode task — `count.num` is ignored for keyed tasks.
+    /// keyed-mode task — `count.num` is ignored for keyed tasks. `stopped`
+    /// instances are NOT live: they are paused and get no allocation until
+    /// StartInstance; `terminated` rows are tombstones.
     #[instrument(err, skip_all)]
     pub fn count_live_keyed_instances(&self, job_id: &str, group: &str, task_name: &str) -> R<u32> {
         let conn = self.read_connection()?;
         let count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM instance \
              WHERE job_id = ?1 AND group_name = ?2 AND task_name = ?3 \
-             AND mode = 'keyed' AND state != 'terminated';",
+             AND mode = 'keyed' AND state NOT IN ('terminated', 'stopped');",
             params![job_id, group, task_name],
             |row| row.get(0),
         )?;
@@ -7019,6 +7326,7 @@ mod tests {
             stateful: Some(crate::structs::StatefulConfig {
                 mode: InstanceMode::Slot,
                 id_source: None,
+                initial_instances: None,
                 storage: with_storage.then(|| crate::structs::StatefulStorageConfig {
                     path: "/var/lib/data".into(),
                     retain_on_scale_in: None,
@@ -7227,6 +7535,7 @@ mod tests {
             stateful: Some(crate::structs::StatefulConfig {
                 mode: InstanceMode::Slot,
                 id_source: None,
+                initial_instances: None,
                 storage: Some(crate::structs::StatefulStorageConfig {
                     path: "/var/lib/data".into(),
                     retain_on_scale_in: Some(false),
@@ -7319,7 +7628,7 @@ mod tests {
     }
 
     #[test]
-    fn terminate_instances_for_job_retains_rows_and_handles() -> R<()> {
+    fn stop_instances_for_job_terminates_slot_rows_and_retains_handles() -> R<()> {
         let store = setup_store()?;
         store.insert_node(make_node_msg("node-a", "active"))?;
         let job_id = "inst-stop";
@@ -7334,7 +7643,7 @@ mod tests {
             .map(|instance| instance.storage_handle)
             .collect();
 
-        assert_eq!(store.terminate_instances_for_job(job_id)?, 2);
+        assert_eq!(store.stop_instances_for_job(job_id)?, 2);
         let instances = store.list_instances(job_id)?;
         assert_eq!(instances.len(), 2);
         for (instance, handle) in instances.iter().zip(&handles) {
@@ -7344,7 +7653,7 @@ mod tests {
         }
 
         // Idempotent.
-        assert_eq!(store.terminate_instances_for_job(job_id)?, 0);
+        assert_eq!(store.stop_instances_for_job(job_id)?, 0);
         Ok(())
     }
 
@@ -7367,6 +7676,7 @@ mod tests {
             stateful: Some(crate::structs::StatefulConfig {
                 mode: InstanceMode::Keyed,
                 id_source: None,
+                initial_instances: None,
                 storage: with_storage.then(|| crate::structs::StatefulStorageConfig {
                     path: "/workspace".into(),
                     retain_on_scale_in: None,
@@ -7557,7 +7867,7 @@ mod tests {
     }
 
     #[test]
-    fn job_stop_termination_drops_keyed_handles_but_retains_slot_handles() -> R<()> {
+    fn job_stop_stops_keyed_instances_and_terminates_slot_instances() -> R<()> {
         let store = setup_store()?;
         store.insert_node(make_node_msg("node-a", "active"))?;
         let job_id = "keyed-stop";
@@ -7572,16 +7882,31 @@ mod tests {
         store.create_keyed_instance(job_id, "default", "sandbox", Some("user-a"))?;
         store.place_alloc("node-a", task_id_for(&store, "sandbox", job_id)?)?;
         store.place_alloc("node-a", task_id_for(&store, "db", job_id)?)?;
+        let keyed_handle = store
+            .get_instance("user-a")?
+            .context("keyed row")?
+            .storage_handle;
+        assert!(keyed_handle.is_some());
 
-        assert_eq!(store.terminate_instances_for_job(job_id)?, 2);
+        // Keyed rows are merely STOPPED (handle retained — a job stop is a
+        // pause, revivable via start_keyed_instance); slot rows keep today's
+        // terminated-with-handle behavior so a re-run re-materializes them.
+        assert_eq!(store.stop_instances_for_job(job_id)?, 2);
         let keyed = store.get_instance("user-a")?.context("keyed row")?;
-        assert_eq!(keyed.state, InstanceState::Terminated);
-        assert_eq!(keyed.storage_handle, None, "keyed handles dropped on stop");
+        assert_eq!(keyed.state, InstanceState::Stopped);
+        assert_eq!(keyed.current_alloc_id, None);
+        assert_eq!(
+            keyed.storage_handle, keyed_handle,
+            "keyed handles retained on job stop"
+        );
         let slot = store
             .get_instance(&slot_instance_id(job_id, "default", 0))?
             .context("slot row")?;
         assert_eq!(slot.state, InstanceState::Terminated);
         assert!(slot.storage_handle.is_some(), "slot handles retained");
+
+        // Idempotent: stopped/terminated rows are not touched again.
+        assert_eq!(store.stop_instances_for_job(job_id)?, 0);
         Ok(())
     }
 
@@ -7609,6 +7934,19 @@ mod tests {
             1
         );
 
+        // Stopped instances do not count as desired either: a stopped
+        // instance gets no allocation until start_keyed_instance.
+        store.stop_keyed_instance("b")?;
+        assert_eq!(
+            store.count_live_keyed_instances(job_id, "default", "sandbox")?,
+            0
+        );
+        store.start_keyed_instance("b")?;
+        assert_eq!(
+            store.count_live_keyed_instances(job_id, "default", "sandbox")?,
+            1
+        );
+
         // Other (job, group, task) scopes are not counted.
         assert_eq!(
             store.count_live_keyed_instances(job_id, "other", "sandbox")?,
@@ -7617,6 +7955,368 @@ mod tests {
         assert_eq!(
             store.count_live_keyed_instances("nope", "default", "sandbox")?,
             0
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stop_keyed_instance_pauses_alloc_retains_row_and_handle() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "active"))?;
+        let job_id = "keyed-pause";
+        submit_job(&store, job_id, vec![stateful_keyed_task("sandbox", true)])?;
+        let task_id = task_id_for(&store, "sandbox", job_id)?;
+        store.create_keyed_instance(job_id, "default", "sandbox", Some("user-a"))?;
+        let alloc = store.place_alloc("node-a", task_id)?;
+        let handle = store
+            .get_instance("user-a")?
+            .context("instance")?
+            .storage_handle;
+        assert!(handle.is_some());
+
+        // Stop: allocation removed through the normal stop path, state
+        // stopped — NOT rescheduling (the release hook must not fire on a
+        // stop) — and the row + storage handle retained.
+        let outcome = store.stop_keyed_instance("user-a")?;
+        assert_eq!(
+            outcome,
+            StopInstanceOutcome::Stopped {
+                removed_allocations: 1
+            }
+        );
+        assert!(
+            store.get_allocation_by_id(alloc.id)?.is_none(),
+            "the allocation is deleted through the normal stop path"
+        );
+        let stopped = store.get_instance("user-a")?.context("row retained")?;
+        assert_eq!(stopped.state, InstanceState::Stopped);
+        assert_eq!(stopped.current_alloc_id, None);
+        assert_eq!(stopped.storage_handle, handle, "handle retained on stop");
+
+        // The id is still owned: creating it again collides (stopped is not
+        // destroyed).
+        let err = store
+            .create_keyed_instance(job_id, "default", "sandbox", Some("user-a"))
+            .expect_err("stopped ids still collide");
+        assert!(matches!(
+            StorageError::from_anyhow(&err),
+            Some(StorageError::Conflict { .. })
+        ));
+
+        // A stopped instance is never bound by placement: with only the
+        // stopped instance, there is nothing to place.
+        let err = store
+            .place_alloc("node-a", task_id)
+            .expect_err("stopped instances are not placement candidates");
+        assert!(err.to_string().contains("no unbound keyed instance"));
+
+        // Idempotent no-op on an already-stopped instance.
+        assert_eq!(
+            store.stop_keyed_instance("user-a")?,
+            StopInstanceOutcome::AlreadyStopped
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stop_keyed_instance_rejects_slot_terminated_and_missing() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "active"))?;
+        let job_id = "keyed-pause-reject";
+        submit_job(
+            &store,
+            job_id,
+            vec![
+                stateful_keyed_task("sandbox", true),
+                stateful_slot_task("db", 1, true),
+            ],
+        )?;
+        let slot_alloc = store.place_alloc("node-a", task_id_for(&store, "db", job_id)?)?;
+
+        // Slot instances are owned by the scheduler, not this API.
+        let slot_id = slot_alloc.instance_id.context("slot bound")?;
+        let err = store
+            .stop_keyed_instance(&slot_id)
+            .expect_err("slot rejected");
+        assert!(matches!(
+            StorageError::from_anyhow(&err),
+            Some(StorageError::InvalidInput { .. })
+        ));
+
+        // Terminated tombstones can never be stopped.
+        store.create_keyed_instance(job_id, "default", "sandbox", Some("user-gone"))?;
+        store.destroy_keyed_instance("user-gone")?;
+        let err = store
+            .stop_keyed_instance("user-gone")
+            .expect_err("terminated rejected");
+        assert!(matches!(
+            StorageError::from_anyhow(&err),
+            Some(StorageError::InvalidInput { .. })
+        ));
+
+        // Unknown ids surface NotFound.
+        let err = store
+            .stop_keyed_instance("missing")
+            .expect_err("missing rejected");
+        assert!(matches!(
+            StorageError::from_anyhow(&err),
+            Some(StorageError::NotFound { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn start_keyed_instance_revives_stopped_row_with_same_identity_and_handle() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "active"))?;
+        let job_id = "keyed-revive";
+        submit_job(&store, job_id, vec![stateful_keyed_task("sandbox", true)])?;
+        let task_id = task_id_for(&store, "sandbox", job_id)?;
+        store.create_keyed_instance(job_id, "default", "sandbox", Some("user-a"))?;
+        store.place_alloc("node-a", task_id)?;
+        let handle = store
+            .get_instance("user-a")?
+            .context("instance")?
+            .storage_handle;
+
+        store.stop_keyed_instance("user-a")?;
+        assert_eq!(
+            store.start_keyed_instance("user-a")?,
+            StartInstanceOutcome::Started
+        );
+        let pending = store.get_instance("user-a")?.context("instance")?;
+        assert_eq!(pending.state, InstanceState::Pending);
+        assert_eq!(pending.storage_handle, handle, "handle survives the cycle");
+
+        // The next placement re-binds the SAME id and storage handle: the
+        // revived workload is the same logical instance.
+        let replacement = store.place_alloc("node-a", task_id)?;
+        assert_eq!(replacement.instance_id.as_deref(), Some("user-a"));
+        let active = store.get_instance("user-a")?.context("instance")?;
+        assert_eq!(active.state, InstanceState::Active);
+        assert_eq!(active.storage_handle, handle);
+
+        // Idempotent no-op on a live instance, in every live state.
+        assert_eq!(
+            store.start_keyed_instance("user-a")?,
+            StartInstanceOutcome::AlreadyRunning
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn start_keyed_instance_rejects_slot_terminated_and_missing() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "active"))?;
+        let job_id = "keyed-revive-reject";
+        submit_job(
+            &store,
+            job_id,
+            vec![
+                stateful_keyed_task("sandbox", true),
+                stateful_slot_task("db", 1, true),
+            ],
+        )?;
+        let slot_alloc = store.place_alloc("node-a", task_id_for(&store, "db", job_id)?)?;
+
+        let slot_id = slot_alloc.instance_id.context("slot bound")?;
+        let err = store
+            .start_keyed_instance(&slot_id)
+            .expect_err("slot rejected");
+        assert!(matches!(
+            StorageError::from_anyhow(&err),
+            Some(StorageError::InvalidInput { .. })
+        ));
+
+        // Terminated is forever: a destroyed id can never be started again.
+        store.create_keyed_instance(job_id, "default", "sandbox", Some("user-gone"))?;
+        store.destroy_keyed_instance("user-gone")?;
+        let err = store
+            .start_keyed_instance("user-gone")
+            .expect_err("terminated rejected");
+        assert!(matches!(
+            StorageError::from_anyhow(&err),
+            Some(StorageError::InvalidInput { .. })
+        ));
+
+        let err = store
+            .start_keyed_instance("missing")
+            .expect_err("missing rejected");
+        assert!(matches!(
+            StorageError::from_anyhow(&err),
+            Some(StorageError::NotFound { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn destroy_after_stop_terminates_and_drops_retained_handle() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "active"))?;
+        let job_id = "keyed-stop-destroy";
+        submit_job(&store, job_id, vec![stateful_keyed_task("sandbox", true)])?;
+        let task_id = task_id_for(&store, "sandbox", job_id)?;
+        store.create_keyed_instance(job_id, "default", "sandbox", Some("user-a"))?;
+        store.place_alloc("node-a", task_id)?;
+
+        store.stop_keyed_instance("user-a")?;
+        assert!(store
+            .get_instance("user-a")?
+            .context("stopped row")?
+            .storage_handle
+            .is_some());
+
+        // Stop is a pause; destroy is forever — even from stopped, destroy
+        // drops the retained handle and tombstones the id.
+        let outcome = store.destroy_keyed_instance("user-a")?;
+        assert_eq!(
+            outcome,
+            DestroyInstanceOutcome::Destroyed {
+                removed_allocations: 0
+            }
+        );
+        let tombstone = store.get_instance("user-a")?.context("tombstone")?;
+        assert_eq!(tombstone.state, InstanceState::Terminated);
+        assert_eq!(tombstone.storage_handle, None, "handle dropped on destroy");
+        Ok(())
+    }
+
+    #[test]
+    fn release_hook_leaves_stopped_instances_stopped() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "active"))?;
+        let job_id = "keyed-release-stop";
+        submit_job(&store, job_id, vec![stateful_keyed_task("sandbox", true)])?;
+        let task_id = task_id_for(&store, "sandbox", job_id)?;
+        store.create_keyed_instance(job_id, "default", "sandbox", Some("user-a"))?;
+        let alloc = store.place_alloc("node-a", task_id)?;
+
+        // Simulate an allocation death racing a stop: the instance is
+        // already marked stopped when its (stale) allocation is removed. The
+        // release hook must NOT flip it back to rescheduling — that would
+        // resurrect a deliberately paused instance.
+        store.set_instance_state("user-a", InstanceState::Stopped)?;
+        store.remove_allocation_by_id(alloc.id)?;
+        let instance = store.get_instance("user-a")?.context("instance")?;
+        assert_eq!(instance.state, InstanceState::Stopped);
+        let handle = instance.storage_handle;
+        assert!(handle.is_some(), "handle untouched by the release hook");
+        Ok(())
+    }
+
+    #[test]
+    fn create_keyed_instances_batch_is_all_or_nothing() -> R<()> {
+        let store = setup_store()?;
+        let job_id = "keyed-batch";
+        submit_job(&store, job_id, vec![stateful_keyed_task("sandbox", true)])?;
+
+        // Explicit ids + minted extras, in request order.
+        let created = store.create_keyed_instances(
+            job_id,
+            "default",
+            "sandbox",
+            &["a".to_string(), "b".to_string()],
+            2,
+        )?;
+        assert_eq!(created.len(), 4);
+        assert_eq!(&created[..2], &["a".to_string(), "b".to_string()]);
+        assert!(created[2..].iter().all(|id| id.starts_with("sandbox-")));
+        for id in &created {
+            let instance = store.get_instance(id)?.context("created row")?;
+            assert_eq!(instance.state, InstanceState::Pending);
+            assert_eq!(instance.mode, InstanceMode::Keyed);
+        }
+
+        // Any collision — here "b", including with a tombstone — fails the
+        // whole batch and creates NOTHING.
+        store.destroy_keyed_instance("b")?;
+        let err = store
+            .create_keyed_instances(
+                job_id,
+                "default",
+                "sandbox",
+                &[
+                    "fresh-1".to_string(),
+                    "b".to_string(),
+                    "fresh-2".to_string(),
+                ],
+                1,
+            )
+            .expect_err("tombstone collision aborts the batch");
+        assert!(matches!(
+            StorageError::from_anyhow(&err),
+            Some(StorageError::Conflict { .. })
+        ));
+        assert!(err.to_string().contains("b"), "offending id named: {err}");
+        assert!(store.get_instance("fresh-1")?.is_none(), "nothing created");
+        assert!(store.get_instance("fresh-2")?.is_none(), "nothing created");
+        assert_eq!(store.list_instances(job_id)?.len(), 4);
+
+        // Duplicates WITHIN the request also abort atomically.
+        let err = store
+            .create_keyed_instances(
+                job_id,
+                "default",
+                "sandbox",
+                &["dupe".to_string(), "dupe".to_string()],
+                0,
+            )
+            .expect_err("in-request duplicate aborts the batch");
+        assert!(matches!(
+            StorageError::from_anyhow(&err),
+            Some(StorageError::Conflict { .. })
+        ));
+        assert!(store.get_instance("dupe")?.is_none(), "nothing created");
+
+        // Count-only mints N distinct ids.
+        let minted = store.create_keyed_instances(job_id, "default", "sandbox", &[], 3)?;
+        assert_eq!(minted.len(), 3);
+        let unique: HashSet<&String> = minted.iter().collect();
+        assert_eq!(unique.len(), 3, "minted ids are distinct");
+        Ok(())
+    }
+
+    #[test]
+    fn seed_keyed_instances_creates_new_and_skips_any_existing() -> R<()> {
+        let store = setup_store()?;
+        let job_id = "keyed-seed";
+        submit_job(&store, job_id, vec![stateful_keyed_task("sandbox", true)])?;
+
+        let ids = vec!["seed-a".to_string(), "seed-b".to_string()];
+        let created = store.seed_keyed_instances(job_id, "default", "sandbox", &ids)?;
+        assert_eq!(created, ids);
+        assert_eq!(
+            store.count_live_keyed_instances(job_id, "default", "sandbox")?,
+            2
+        );
+
+        // Re-seeding is a silent no-op (resubmits are idempotent).
+        let created = store.seed_keyed_instances(job_id, "default", "sandbox", &ids)?;
+        assert!(created.is_empty());
+
+        // A destroyed id is skipped, NOT resurrected: the seed list never
+        // overrides a deliberate destroy.
+        store.destroy_keyed_instance("seed-a")?;
+        let created = store.seed_keyed_instances(job_id, "default", "sandbox", &ids)?;
+        assert!(created.is_empty());
+        assert_eq!(
+            store
+                .get_instance("seed-a")?
+                .context("tombstone retained")?
+                .state,
+            InstanceState::Terminated
+        );
+
+        // A stopped id is skipped too: it stays stopped until StartInstance.
+        store.stop_keyed_instance("seed-b")?;
+        let created = store.seed_keyed_instances(job_id, "default", "sandbox", &ids)?;
+        assert!(created.is_empty());
+        assert_eq!(
+            store
+                .get_instance("seed-b")?
+                .context("stopped retained")?
+                .state,
+            InstanceState::Stopped
         );
         Ok(())
     }

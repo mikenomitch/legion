@@ -1054,6 +1054,7 @@ mod tests {
             stateful: Some(StatefulConfig {
                 mode: InstanceMode::Slot,
                 id_source: None,
+                initial_instances: None,
                 storage: None,
             }),
             ..TaskConfig::new("db", "noop")
