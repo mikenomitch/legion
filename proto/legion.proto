@@ -1914,6 +1914,15 @@ message LedgerAllocation {
 
   // Job ID this allocation belongs to.
   string job_id = 7;
+
+  // Stable instance id this allocation fulfills, set only when the backing
+  // task is stateful (slot or keyed mode; see `docs/stateful-workloads.md`).
+  //
+  // The instance id survives reschedules: a replacement allocation for the
+  // same slot/keyed instance reports the same value here. Unset for
+  // stateless tasks. Full instance metadata (mode, state, slot index,
+  // storage handle) is available via `GetInstance` / `ListInstances`.
+  optional string instance_id = 8;
 }
 
 // Request payload for UpdateNodeDynamic.

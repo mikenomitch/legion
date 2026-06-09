@@ -103,9 +103,7 @@ impl From<Allocation> for LedgerAllocation {
             job_config_id,
             task_config_id,
             job_id,
-            // The ledger proto message has no instance field yet; instance
-            // identity is surfaced via the instance table and task env vars.
-            instance_id: _,
+            instance_id,
         } = allocation;
 
         let resources = to_string(&resources).unwrap_or_else(|_| "{}".into());
@@ -118,7 +116,43 @@ impl From<Allocation> for LedgerAllocation {
             job_config_id,
             task_config_id,
             job_id,
+            instance_id,
         }
+    }
+}
+
+#[cfg(test)]
+mod ledger_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn allocation(instance_id: Option<&str>) -> Allocation {
+        Allocation {
+            id: 7,
+            status: "running".into(),
+            resources: json!({"cpu": 100}),
+            node_id: "node-a".into(),
+            job_config_id: "jc-1".into(),
+            task_config_id: 3,
+            job_id: "db".into(),
+            instance_id: instance_id.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn ledger_allocation_round_trips_instance_id() {
+        let msg = LedgerAllocation::from(allocation(Some("db-default-2")));
+        assert_eq!(msg.instance_id.as_deref(), Some("db-default-2"));
+        let back = msg.into_allocation().unwrap();
+        assert_eq!(back.instance_id.as_deref(), Some("db-default-2"));
+    }
+
+    #[test]
+    fn ledger_allocation_omits_instance_id_for_stateless() {
+        let msg = LedgerAllocation::from(allocation(None));
+        assert_eq!(msg.instance_id, None);
+        let back = msg.into_allocation().unwrap();
+        assert_eq!(back.instance_id, None);
     }
 }
 
@@ -132,6 +166,7 @@ impl LedgerAllocation {
             job_config_id,
             task_config_id,
             job_id,
+            instance_id,
         } = self;
 
         let resources: Value =
@@ -145,7 +180,7 @@ impl LedgerAllocation {
             job_config_id,
             task_config_id,
             job_id,
-            instance_id: None,
+            instance_id,
         })
     }
 }
