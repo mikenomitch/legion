@@ -16,6 +16,10 @@ pub const DEF_WORKER_CHECK_SEC: u64 = 2;
 pub const DEF_SCHEDULING_POLICY: &str = "bin_pack";
 pub const DEF_EVAL_PRIORITY: i64 = 50;
 pub const DEF_ROLLOUT_RETENTION_DAYS: u64 = 30;
+// Debounce window (ms) for KV-driven job reconciliation: rapid puts/deletes
+// to watched keys are coalesced and applied once per quiet window. 0 applies
+// every KV write synchronously (see docs/kv-store.md).
+pub const DEF_KV_DEBOUNCE_MS: u64 = 500;
 // Amount of time since last heartbeat before a node is considered lost
 pub const DEF_LOST_NODE_AT_SEC: i64 = 10;
 // Cluster region stamped into workload-identity claims/sub. Legion has no

@@ -63,10 +63,12 @@
                     changeMode: "noop",
                 },
             ],
+            // Task-level KV policy defaults; entries override field-by-field
+            // (see docs/kv-store.md "Reactive updates"). Keys are camelCase.
             kv: {
                 watch: true,
-                on_change: "restart",
-                on_delete: "fail",
+                onChange: "restart",
+                onDelete: "fail",
             },
             env: [
                 {
@@ -74,9 +76,10 @@
                     value: {
                         template: '{{ kv "flags/global" }}',
                     },
+                    // watch is inherited from the task defaults above.
                     kv: {
-                        on_change: "rollout",
-                        on_delete: "none",
+                        onChange: "rollout",
+                        onDelete: "none",
                     },
                 },
             ],

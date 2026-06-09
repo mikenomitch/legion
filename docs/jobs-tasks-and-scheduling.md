@@ -38,6 +38,12 @@ Important `TaskConfig` fields:
   See [Stateful Workloads](stateful-workloads.md) for the full job-spec
   reference, env vars, and scale-in/out semantics. Tasks without a `stateful`
   block behave exactly as before.
+- `kv` / `env` / `files` (KV injections): KV-backed env vars and rendered
+  files with per-reference `watch`/`onChange`/`onDelete` policies that can
+  restart, roll out, or fail the job when watched keys change or are
+  deleted. Full semantics (policy precedence, debounce, fail/recovery,
+  per-kind capability matrix) live in the
+  ["Reactive updates" section of the KV store doc](kv-store.md#reactive-updates-kv-driven-task-updates).
 
 ## Task Lists and Dependency Readiness
 

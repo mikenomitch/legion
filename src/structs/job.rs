@@ -909,7 +909,7 @@ pub struct TaskConfig {
     pub stateful: Option<StatefulConfig>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum KvInjectionAction {
     None,
@@ -918,15 +918,48 @@ pub enum KvInjectionAction {
     Fail,
 }
 
+/// Per-reference KV reactivity policy. Every field is optional so an entry
+/// can override the task-level defaults field-by-field: a field left unset
+/// on the entry inherits the defaults block, and a field unset in both
+/// places falls back to the documented hard defaults (`watch=false`,
+/// `onChange=none`, `onDelete=fail`). See `docs/kv-store.md`.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct KvInjectionPolicy {
-    #[serde(default)]
-    pub watch: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watch: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_change: Option<KvInjectionAction>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_delete: Option<KvInjectionAction>,
+}
+
+/// Fully-resolved KV policy for one injection edge after defaults and hard
+/// fallbacks are applied (the only shape reconciliation reasons about).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedKvInjectionPolicy {
+    pub watch: bool,
+    pub on_change: KvInjectionAction,
+    pub on_delete: KvInjectionAction,
+}
+
+impl KvInjectionPolicy {
+    /// Resolve this entry-level policy against the task-level defaults
+    /// block. Precedence per field: entry value, then defaults value, then
+    /// the hard default (`watch=false`, `onChange=none`, `onDelete=fail`).
+    pub fn resolve_with_defaults(&self, defaults: &KvInjectionPolicy) -> ResolvedKvInjectionPolicy {
+        ResolvedKvInjectionPolicy {
+            watch: self.watch.or(defaults.watch).unwrap_or(false),
+            on_change: self
+                .on_change
+                .or(defaults.on_change)
+                .unwrap_or(KvInjectionAction::None),
+            on_delete: self
+                .on_delete
+                .or(defaults.on_delete)
+                .unwrap_or(KvInjectionAction::Fail),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
@@ -1805,6 +1838,51 @@ mod tests {
         assert!(err
             .to_string()
             .contains("cannot set both template and template_kv"));
+    }
+
+    #[test]
+    fn kv_policy_resolution_uses_hard_defaults_when_everything_is_silent() {
+        let resolved =
+            KvInjectionPolicy::default().resolve_with_defaults(&KvInjectionPolicy::default());
+        assert!(!resolved.watch);
+        assert_eq!(resolved.on_change, KvInjectionAction::None);
+        assert_eq!(resolved.on_delete, KvInjectionAction::Fail);
+    }
+
+    #[test]
+    fn kv_policy_resolution_inherits_defaults_for_silent_entry_fields() {
+        let defaults = KvInjectionPolicy {
+            watch: Some(true),
+            on_change: Some(KvInjectionAction::Restart),
+            on_delete: Some(KvInjectionAction::None),
+        };
+        // Entry only overrides on_change; watch and on_delete inherit.
+        let entry = KvInjectionPolicy {
+            watch: None,
+            on_change: Some(KvInjectionAction::Rollout),
+            on_delete: None,
+        };
+        let resolved = entry.resolve_with_defaults(&defaults);
+        assert!(resolved.watch);
+        assert_eq!(resolved.on_change, KvInjectionAction::Rollout);
+        assert_eq!(resolved.on_delete, KvInjectionAction::None);
+    }
+
+    #[test]
+    fn kv_policy_resolution_lets_entry_disable_watch_explicitly() {
+        let defaults = KvInjectionPolicy {
+            watch: Some(true),
+            on_change: Some(KvInjectionAction::Rollout),
+            on_delete: Some(KvInjectionAction::Fail),
+        };
+        let entry = KvInjectionPolicy {
+            watch: Some(false),
+            on_change: None,
+            on_delete: None,
+        };
+        let resolved = entry.resolve_with_defaults(&defaults);
+        assert!(!resolved.watch);
+        assert_eq!(resolved.on_change, KvInjectionAction::Rollout);
     }
 
     #[test]

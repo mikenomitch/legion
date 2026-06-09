@@ -12,6 +12,11 @@
   schedulerSettings: {
     plan_conflict_max_retries: 3,
   },
+  // Debounce window (ms) for KV-driven job updates (see docs/kv-store.md).
+  // Rapid puts/deletes to watched keys within the window are coalesced into
+  // a single restart/rollout per job; the final config always reflects the
+  // latest KV state. 0 reconciles synchronously on every KV write.
+  // kvDebounceMs: 500,
   // Workload identity (OIDC issuer; see docs/workload-identity.md).
   // Off by default. When enabled the manager signs short-lived per-task JWTs
   // and serves the OIDC discovery document + JWKS over plain HTTP on the main

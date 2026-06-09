@@ -118,6 +118,23 @@ fn maximal_job_spec_parse() {
     sandbox
         .validate_stateful()
         .expect("keyed sandbox task validates");
+
+    // The KV injection policy keys are camelCase and actually parse (a
+    // snake_case `on_change` would be silently dropped by serde).
+    let injected = config
+        .tasks
+        .iter()
+        .find_map(|task| task.kv_injections.as_ref().and_then(|kv| kv.kv.as_ref()))
+        .expect("maximal must declare task-level kv injection defaults");
+    assert_eq!(injected.watch, Some(true));
+    assert_eq!(
+        injected.on_change,
+        Some(legion::structs::KvInjectionAction::Restart)
+    );
+    assert_eq!(
+        injected.on_delete,
+        Some(legion::structs::KvInjectionAction::Fail)
+    );
     for task in &config.tasks {
         assert!(!task.name.is_empty(), "task name should be set");
         assert!(

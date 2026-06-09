@@ -1810,6 +1810,41 @@ impl Store {
         Ok(())
     }
 
+    /// Mark a job failed because a required KV dependency vanished
+    /// (`onDelete: fail`). The job status becomes `failed` and every live
+    /// allocation status is stamped `failed:<reason>` so the diagnostic is
+    /// visible in `job list`, the ledger, and state-store queries. The
+    /// allocation rows are retained (the workload is not torn down and no
+    /// reschedule storm starts); a later KV put that triggers a restart or
+    /// rollout recovers the job (see `docs/kv-store.md`).
+    #[instrument(err, skip(self))]
+    pub fn mark_job_failed_for_kv(&self, job_id: &str, reason: &str) -> R<()> {
+        let mut conn = self.write_connection()?;
+        let tx = conn.transaction()?;
+        tx.execute("UPDATE job SET status = 'failed' WHERE id = ?;", [job_id])?;
+        tx.execute(
+            "UPDATE allocation SET status = ?1
+             WHERE job_config_id IN (SELECT id FROM job_config WHERE job_id = ?2);",
+            (format!("failed:{reason}"), job_id),
+        )?;
+        tx.commit()?;
+        self.refresh_read_model()?;
+        Ok(())
+    }
+
+    /// Clear a `failed` job status (back to `done`) when a KV-triggered
+    /// restart or rollout actively recovers the job. No-op when the job is
+    /// not currently failed. Returns whether a row was updated.
+    #[instrument(err, skip(self))]
+    pub fn clear_job_failed_status(&self, job_id: &str) -> R<bool> {
+        let conn = self.write_connection()?;
+        let updated = conn.execute(
+            "UPDATE job SET status = 'done' WHERE id = ?1 AND status = 'failed';",
+            [job_id],
+        )?;
+        Ok(updated > 0)
+    }
+
     #[instrument(err, skip_all)]
     pub fn destroy_job(&self, name: &str) -> R<()> {
         let mut conn = self.write_connection()?;

@@ -498,6 +498,14 @@ export const Manager = {
     /**
      * Creates or updates a KV entry.
      *
+     * Jobs that reference the key (legacy `$key` jobspec references or
+     * watched task kv injections) are reconciled: their configs are
+     * re-rendered from the new value and the per-reference `onChange` policy
+     * (none/restart/rollout/fail) is applied. Rapid writes are coalesced per
+     * the manager's `kvDebounceMs` window (default 500ms; with a non-zero
+     * window reconciliation errors are logged on the manager instead of
+     * failing this RPC). See docs/kv-store.md "Reactive updates".
+     *
      * @generated from rpc legion.Manager.PutKv
      */
     putKv: {
@@ -531,6 +539,13 @@ export const Manager = {
     /**
      * Deletes one KV entry by key.
      *
+     * Deletion is a first-class reconciliation event: jobs watching the key
+     * resolve their per-reference `onDelete` policy (default `fail`, which
+     * marks the job and its allocations failed with reason
+     * `missing_kv_dependency`; a later PutKv to the key recovers the job via
+     * `onChange`). Legacy `$key` references treat deletion as `fail`. Events
+     * are debounced like PutKv. See docs/kv-store.md "Reactive updates".
+     *
      * @generated from rpc legion.Manager.DeleteKv
      */
     deleteKv: {
@@ -541,6 +556,8 @@ export const Manager = {
     },
     /**
      * Applies an RFC6902 JSON patch to a JSON-typed KV entry.
+     *
+     * Triggers the same KV-change reconciliation (and debouncing) as PutKv.
      *
      * @generated from rpc legion.Manager.PatchKv
      */

@@ -289,6 +289,19 @@ fn resolve_kv_references_in_value(
     Ok(())
 }
 
+/// How materialization treats a referenced KV key that is missing from the
+/// store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MissingKvBehavior {
+    /// Fail the whole render. Used on the submit path: a jobspec must not be
+    /// admitted while one of its required KV references is unresolvable.
+    Error,
+    /// Keep the previously materialized value in the task config. Used
+    /// during KV-change reconciliation, where a deleted key resolves through
+    /// the edge's `onDelete` policy instead of failing the entire re-render.
+    KeepExisting,
+}
+
 fn resolve_jobspec_kv_references(store: &Store, jobspec: &str) -> R<(JobConfig, Vec<KvReference>)> {
     let mut value: Value = serde_json::from_str(jobspec)?;
     let mut refs = Vec::new();
@@ -304,15 +317,23 @@ fn resolve_jobspec_kv_references(store: &Store, jobspec: &str) -> R<(JobConfig, 
         })
         .collect::<R<Vec<_>>>()?;
     let mut config: JobConfig = serde_json::from_value(value)?;
-    refs.extend(apply_job_kv_injections(store, &mut config)?);
+    refs.extend(apply_job_kv_injections(
+        store,
+        &mut config,
+        MissingKvBehavior::Error,
+    )?);
     Ok((config, refs))
 }
 
+/// Re-materialize a stored job config from the current KV state. Returns the
+/// updated config plus the refreshed injection dependency edges (legacy `$`
+/// reference edges are positional and do not change here).
 fn apply_kv_references_to_config(
     store: &Store,
     config: &JobConfig,
     refs: &[JobKvReference],
-) -> R<JobConfig> {
+    missing: MissingKvBehavior,
+) -> R<(JobConfig, Vec<KvReference>)> {
     let mut value = serde_json::to_value(config)?;
     for reference in refs {
         if !reference.json_pointer.starts_with('/') {
@@ -321,9 +342,16 @@ fn apply_kv_references_to_config(
         if reference.json_pointer.contains("/kvInjections/") {
             continue;
         }
-        let entry = store
-            .get_kv(&reference.kv_key)?
-            .ok_or_else(|| anyhow!("kv entry {} not found", reference.kv_key))?;
+        let Some(entry) = store.get_kv(&reference.kv_key)? else {
+            match missing {
+                MissingKvBehavior::Error => {
+                    bail!("kv entry {} not found", reference.kv_key)
+                }
+                // Deleted key: leave the last rendered value in place; the
+                // edge's delete policy decides what happens to the job.
+                MissingKvBehavior::KeepExisting => continue,
+            }
+        };
         let replacement = kv_entry_value(&entry)?;
         let pointer = reference.json_pointer.as_str();
         let target = if pointer.is_empty() {
@@ -337,8 +365,8 @@ fn apply_kv_references_to_config(
         *target = replacement;
     }
     let mut updated: JobConfig = serde_json::from_value(value)?;
-    let _ = apply_job_kv_injections(store, &mut updated)?;
-    Ok(updated)
+    let injection_refs = apply_job_kv_injections(store, &mut updated, missing)?;
+    Ok((updated, injection_refs))
 }
 
 fn extract_template_kv_keys(template: &str) -> Vec<String> {
@@ -359,61 +387,101 @@ fn extract_template_kv_keys(template: &str) -> Vec<String> {
     keys
 }
 
-fn render_template_with_kv(store: &Store, template: &str) -> R<String> {
-    let mut rendered = template.to_string();
-    for key in extract_template_kv_keys(template) {
-        let entry = store
-            .get_kv(&key)?
-            .ok_or_else(|| anyhow!("kv entry {} not found", key))?;
-        let replacement = entry.value;
-        let token = format!("kv \"{key}\"");
-        rendered = rendered.replace(&token, &replacement);
-        let token = format!("{{{{ {token} }}}}");
-        rendered = rendered.replace(&token, &replacement);
-    }
-    Ok(rendered)
+/// Outcome of rendering a template against the current KV state.
+enum RenderedTemplate {
+    Value(String),
+    /// The first KV key the template needs that is missing from the store.
+    MissingKey(String),
 }
 
-fn resolve_template_source(
+fn render_template_with_kv(store: &Store, template: &str) -> R<RenderedTemplate> {
+    let mut rendered = template.to_string();
+    for key in extract_template_kv_keys(template) {
+        let Some(entry) = store.get_kv(&key)? else {
+            return Ok(RenderedTemplate::MissingKey(key));
+        };
+        let replacement = entry.value;
+        // Replace the braced form first; replacing the bare token first
+        // would leave the surrounding `{{ }}` behind.
+        let token = format!("kv \"{key}\"");
+        let braced = format!("{{{{ {token} }}}}");
+        rendered = rendered.replace(&braced, &replacement);
+        rendered = rendered.replace(&token, &replacement);
+    }
+    Ok(RenderedTemplate::Value(rendered))
+}
+
+fn render_template_source(
     store: &Store,
     source: &crate::structs::KvTemplateSource,
-) -> R<(String, Vec<String>)> {
+) -> R<RenderedTemplate> {
     if let Some(key) = source.template_kv.as_deref() {
-        let entry = store
-            .get_kv(key)?
-            .ok_or_else(|| anyhow!("kv entry {} not found", key))?;
-        let template = entry.value;
-        let mut deps = vec![key.to_string()];
-        deps.extend(extract_template_kv_keys(&template));
-        let rendered = render_template_with_kv(store, &template)?;
-        return Ok((rendered, deps));
+        let Some(entry) = store.get_kv(key)? else {
+            return Ok(RenderedTemplate::MissingKey(key.to_string()));
+        };
+        return render_template_with_kv(store, &entry.value);
     }
     let template = source
         .template
         .as_deref()
         .context("template or template_kv must be set")?;
-    let deps = extract_template_kv_keys(template);
-    let rendered = render_template_with_kv(store, template)?;
-    Ok((rendered, deps))
+    render_template_with_kv(store, template)
 }
 
-fn apply_task_kv_injections(store: &Store, task: &mut TaskConfig) -> R<Vec<KvReference>> {
+/// KV keys an injection depends on: the `templateKv` pointer key itself plus
+/// every `kv "..."` lookup inside the (inline or KV-stored) template text.
+/// Tolerates missing keys so dependency edges survive deletes — when the
+/// `templateKv` key is gone its transitive lookups are unknowable, but the
+/// direct edge is still reported.
+fn template_source_deps(
+    store: &Store,
+    source: &crate::structs::KvTemplateSource,
+) -> R<Vec<String>> {
+    if let Some(key) = source.template_kv.as_deref() {
+        let mut deps = vec![key.to_string()];
+        if let Some(entry) = store.get_kv(key)? {
+            deps.extend(extract_template_kv_keys(&entry.value));
+        }
+        return Ok(deps);
+    }
+    let template = source
+        .template
+        .as_deref()
+        .context("template or template_kv must be set")?;
+    Ok(extract_template_kv_keys(template))
+}
+
+fn apply_task_kv_injections(
+    store: &Store,
+    task: &mut TaskConfig,
+    missing: MissingKvBehavior,
+) -> R<Vec<KvReference>> {
     let Some(injections) = task.kv_injections.as_ref() else {
         return Ok(Vec::new());
     };
     let mut refs = Vec::new();
 
     for env in &injections.env {
-        let (rendered, deps) = resolve_template_source(store, &env.value)?;
-        let map = task
-            .config
-            .as_object_mut()
-            .context("task config must be an object")?;
-        let env_value = map.entry("env").or_insert_with(|| json!({}));
-        let env_map = env_value
-            .as_object_mut()
-            .context("task config env must be an object")?;
-        env_map.insert(env.name.clone(), Value::String(rendered));
+        let deps = template_source_deps(store, &env.value)?;
+        match render_template_source(store, &env.value)? {
+            RenderedTemplate::Value(rendered) => {
+                let map = task
+                    .config
+                    .as_object_mut()
+                    .context("task config must be an object")?;
+                let env_value = map.entry("env").or_insert_with(|| json!({}));
+                let env_map = env_value
+                    .as_object_mut()
+                    .context("task config env must be an object")?;
+                env_map.insert(env.name.clone(), Value::String(rendered));
+            }
+            RenderedTemplate::MissingKey(key) => match missing {
+                MissingKvBehavior::Error => bail!("kv entry {key} not found"),
+                // Keep the previously rendered value already present in the
+                // stored task config.
+                MissingKvBehavior::KeepExisting => {}
+            },
+        }
         for key in deps {
             refs.push(KvReference {
                 key,
@@ -423,20 +491,37 @@ fn apply_task_kv_injections(store: &Store, task: &mut TaskConfig) -> R<Vec<KvRef
     }
 
     for file in &injections.files {
-        let (rendered, deps) = resolve_template_source(store, &file.file)?;
-        let map = task
-            .config
-            .as_object_mut()
-            .context("task config must be an object")?;
-        let files_value = map.entry("files").or_insert_with(|| json!([]));
-        let files = files_value
-            .as_array_mut()
-            .context("task config files must be an array")?;
-        files.push(json!({
-            "path": file.path,
-            "mode": file.mode,
-            "content": rendered
-        }));
+        let deps = template_source_deps(store, &file.file)?;
+        match render_template_source(store, &file.file)? {
+            RenderedTemplate::Value(rendered) => {
+                let map = task
+                    .config
+                    .as_object_mut()
+                    .context("task config must be an object")?;
+                let files_value = map.entry("files").or_insert_with(|| json!([]));
+                let files = files_value
+                    .as_array_mut()
+                    .context("task config files must be an array")?;
+                let entry = json!({
+                    "path": file.path,
+                    "mode": file.mode,
+                    "content": rendered
+                });
+                // Upsert by path so re-materialization replaces the previous
+                // render instead of appending a duplicate file entry.
+                if let Some(existing) = files.iter_mut().find(|value| {
+                    value.get("path").and_then(Value::as_str) == Some(file.path.as_str())
+                }) {
+                    *existing = entry;
+                } else {
+                    files.push(entry);
+                }
+            }
+            RenderedTemplate::MissingKey(key) => match missing {
+                MissingKvBehavior::Error => bail!("kv entry {key} not found"),
+                MissingKvBehavior::KeepExisting => {}
+            },
+        }
         for key in deps {
             refs.push(KvReference {
                 key,
@@ -447,10 +532,14 @@ fn apply_task_kv_injections(store: &Store, task: &mut TaskConfig) -> R<Vec<KvRef
     Ok(refs)
 }
 
-fn apply_job_kv_injections(store: &Store, config: &mut JobConfig) -> R<Vec<KvReference>> {
+fn apply_job_kv_injections(
+    store: &Store,
+    config: &mut JobConfig,
+    missing: MissingKvBehavior,
+) -> R<Vec<KvReference>> {
     let mut refs = Vec::new();
     for task in &mut config.tasks {
-        refs.extend(apply_task_kv_injections(store, task)?);
+        refs.extend(apply_task_kv_injections(store, task, missing)?);
     }
     Ok(refs)
 }
@@ -528,6 +617,19 @@ fn build_rollout_launch_config(config: &JobConfig) -> Result<RolloutLaunchConfig
     })
 }
 
+/// Reason stamped onto a job and its allocations when a watched KV key is
+/// deleted and the resolved policy is `fail`.
+const MISSING_KV_DEPENDENCY_REASON: &str = "missing_kv_dependency";
+
+/// Pending coalesced KV events while a debounce window is open. Keyed by KV
+/// key; the value is the latest event type (`true` = delete), so a delete
+/// arriving after a put within the window still resolves through `onDelete`.
+#[derive(Debug, Default)]
+struct KvDebounceState {
+    events: HashMap<String, bool>,
+    flush_scheduled: bool,
+}
+
 #[derive(Debug)]
 pub struct ManagerAgentService {
     pub store: Store,
@@ -536,6 +638,10 @@ pub struct ManagerAgentService {
     /// (the default), in which case IssueWorkloadIdentityToken returns
     /// FailedPrecondition.
     workload_identity: Option<Arc<WorkloadIdentityState>>,
+    /// Debounce window for KV-driven reconciliation (`kvDebounceMs` in the
+    /// manager config). Zero reconciles synchronously inside the KV RPC.
+    kv_debounce: Duration,
+    kv_pending: Arc<Mutex<KvDebounceState>>,
 }
 
 impl ManagerAgentService {
@@ -544,6 +650,11 @@ impl ManagerAgentService {
             store,
             allocation_failures: Arc::new(Mutex::new(AllocationFailureTracker::default())),
             workload_identity: None,
+            // Constructor default is "no debounce" so direct service users
+            // (tests, embedding) see synchronous behavior; `run_manager`
+            // always passes the configured window (default 500ms).
+            kv_debounce: Duration::ZERO,
+            kv_pending: Arc::new(Mutex::new(KvDebounceState::default())),
         }
     }
 
@@ -554,282 +665,413 @@ impl ManagerAgentService {
         self
     }
 
-    fn cancel_active_rollouts_for_job(&self, job_id: &str) -> Result<(), Status> {
-        let active_rollouts = self
-            .store
-            .list_rollouts(Some(job_id), true)
-            .map_err(|e| map_store_error("Error listing active rollouts", e))?;
-
-        for rollout in active_rollouts {
-            self.store
-                .update_rollout_status(
-                    rollout.id,
-                    "cancelled",
-                    false,
-                    Some("Rollout superseded by newer job update"),
-                )
-                .map_err(|e| map_store_error("Error cancelling superseded rollout", e))?;
-            self.store
-                .append_rollout_event(
-                    rollout.id,
-                    &rollout.job_id,
-                    None,
-                    "warn",
-                    "Rollout cancelled because a newer job config was submitted",
-                    Some(&json!({ "status": "cancelled", "reason": "superseded" }).to_string()),
-                )
-                .map_err(|e| map_store_error("Error writing rollout cancel event", e))?;
-        }
-
-        Ok(())
+    /// Set the debounce window for KV-driven job reconciliation
+    /// (`kvDebounceMs`). Zero disables debouncing.
+    pub fn with_kv_debounce(mut self, window: Duration) -> Self {
+        self.kv_debounce = window;
+        self
     }
 
-    fn remove_stale_allocations_for_new_rollout(
-        &self,
-        job_id: &str,
-        new_job_config_id: &str,
-        previous_job_config_id: Option<&str>,
-    ) -> Result<(), Status> {
-        let keep = std::iter::once(new_job_config_id)
-            .chain(previous_job_config_id.into_iter())
-            .collect::<HashSet<_>>();
-        let allocations = self
-            .store
-            .allocs_for_job(job_id)
-            .map_err(|e| map_store_error("Error loading job allocations", e))?;
+    /// Defer a KV event into the debounce window; returns false when
+    /// debouncing is disabled and the caller must reconcile synchronously
+    /// (errors then surface on the KV RPC).
+    ///
+    /// With a non-zero window the event is coalesced into the pending batch
+    /// (per key, last event wins — so a delete after a put still resolves
+    /// through `onDelete`) and a single flush task applies the whole batch
+    /// after the window elapses. The first event opens the window; later
+    /// events join the open window without extending it, so reconciliation
+    /// latency is bounded by one window. Events are only ever coalesced,
+    /// never dropped: everything recorded before the flush drains the map is
+    /// part of the flushed batch, and anything arriving after the drain
+    /// opens the next window. Flush errors are logged (there is no caller to
+    /// surface them to); the next KV write retriggers reconciliation from
+    /// current state.
+    fn queue_kv_change(&self, key: &str, is_delete: bool) -> bool {
+        if self.kv_debounce.is_zero() {
+            return false;
+        }
 
-        for allocation in allocations {
-            if keep.contains(allocation.job_config_id.as_str()) {
-                continue;
+        let mut pending = self.kv_pending.lock().expect("kv debounce state");
+        pending.events.insert(key.to_string(), is_delete);
+        if pending.flush_scheduled {
+            return true;
+        }
+        pending.flush_scheduled = true;
+        drop(pending);
+
+        let store = self.store.clone();
+        let state = Arc::clone(&self.kv_pending);
+        let window = self.kv_debounce;
+        tokio::spawn(async move {
+            tokio::time::sleep(window).await;
+            let changes: Vec<(String, bool)> = {
+                let mut pending = state.lock().expect("kv debounce state");
+                pending.flush_scheduled = false;
+                pending.events.drain().collect()
+            };
+            if let Err(status) = reconcile_kv_changes(&store, &changes) {
+                error!(
+                    error = %status.message(),
+                    keys = changes.len(),
+                    "Debounced KV reconciliation failed"
+                );
             }
-            self.store
-                .remove_allocation_by_id(allocation.id)
-                .map_err(|e| map_store_error("Error removing stale allocation", e))?;
-        }
-
-        Ok(())
+        });
+        true
     }
+}
 
-    fn create_rollout_for_update(
-        &self,
-        job_id: &str,
-        previous_job_config_id: Option<&str>,
-        new_job_config_id: &str,
-        config: &JobConfig,
-        create_error: &str,
-    ) -> Result<bool, Status> {
-        self.cancel_active_rollouts_for_job(job_id)?;
-        self.remove_stale_allocations_for_new_rollout(
-            job_id,
-            new_job_config_id,
-            previous_job_config_id,
-        )?;
+fn cancel_active_rollouts_for_job(store: &Store, job_id: &str) -> Result<(), Status> {
+    let active_rollouts = store
+        .list_rollouts(Some(job_id), true)
+        .map_err(|e| map_store_error("Error listing active rollouts", e))?;
 
-        let launch = build_rollout_launch_config(config)?;
-        let status = if launch.is_manual {
-            "waiting_manual_start"
-        } else {
-            "pending"
-        };
-        let rollout = self
-            .store
-            .create_rollout(
-                job_id,
-                previous_job_config_id,
-                new_job_config_id,
-                status,
-                launch.strategy.as_deref(),
-                launch.progression.as_deref(),
-                launch.replacement.as_deref(),
-                launch.in_place,
-                &launch.config_json,
+    for rollout in active_rollouts {
+        store
+            .update_rollout_status(
+                rollout.id,
+                "cancelled",
+                false,
+                Some("Rollout superseded by newer job update"),
             )
-            .map_err(|e| map_store_error(create_error, e))?;
-        self.store
+            .map_err(|e| map_store_error("Error cancelling superseded rollout", e))?;
+        store
             .append_rollout_event(
                 rollout.id,
                 &rollout.job_id,
                 None,
-                "info",
-                if launch.is_manual {
-                    "Rollout created; waiting for manual start"
-                } else {
-                    "Rollout started"
-                },
-                Some(
-                    &json!({
-                        "status": rollout.status,
-                        "progression": rollout.progression,
-                    })
-                    .to_string(),
-                ),
+                "warn",
+                "Rollout cancelled because a newer job config was submitted",
+                Some(&json!({ "status": "cancelled", "reason": "superseded" }).to_string()),
             )
-            .map_err(|e| map_store_error("Error writing rollout event", e))?;
-
-        Ok(launch.is_manual)
+            .map_err(|e| map_store_error("Error writing rollout cancel event", e))?;
     }
 
-    fn handle_kv_change(&self, key: &str, is_delete: bool) -> Result<(), Status> {
-        let refs = self
-            .store
+    Ok(())
+}
+
+fn remove_stale_allocations_for_new_rollout(
+    store: &Store,
+    job_id: &str,
+    new_job_config_id: &str,
+    previous_job_config_id: Option<&str>,
+) -> Result<(), Status> {
+    let keep = std::iter::once(new_job_config_id)
+        .chain(previous_job_config_id.into_iter())
+        .collect::<HashSet<_>>();
+    let allocations = store
+        .allocs_for_job(job_id)
+        .map_err(|e| map_store_error("Error loading job allocations", e))?;
+
+    for allocation in allocations {
+        if keep.contains(allocation.job_config_id.as_str()) {
+            continue;
+        }
+        store
+            .remove_allocation_by_id(allocation.id)
+            .map_err(|e| map_store_error("Error removing stale allocation", e))?;
+    }
+
+    Ok(())
+}
+
+fn create_rollout_for_update(
+    store: &Store,
+    job_id: &str,
+    previous_job_config_id: Option<&str>,
+    new_job_config_id: &str,
+    config: &JobConfig,
+    create_error: &str,
+) -> Result<bool, Status> {
+    cancel_active_rollouts_for_job(store, job_id)?;
+    remove_stale_allocations_for_new_rollout(
+        store,
+        job_id,
+        new_job_config_id,
+        previous_job_config_id,
+    )?;
+
+    let launch = build_rollout_launch_config(config)?;
+    let status = if launch.is_manual {
+        "waiting_manual_start"
+    } else {
+        "pending"
+    };
+    let rollout = store
+        .create_rollout(
+            job_id,
+            previous_job_config_id,
+            new_job_config_id,
+            status,
+            launch.strategy.as_deref(),
+            launch.progression.as_deref(),
+            launch.replacement.as_deref(),
+            launch.in_place,
+            &launch.config_json,
+        )
+        .map_err(|e| map_store_error(create_error, e))?;
+    store
+        .append_rollout_event(
+            rollout.id,
+            &rollout.job_id,
+            None,
+            "info",
+            if launch.is_manual {
+                "Rollout created; waiting for manual start"
+            } else {
+                "Rollout started"
+            },
+            Some(
+                &json!({
+                    "status": rollout.status,
+                    "progression": rollout.progression,
+                })
+                .to_string(),
+            ),
+        )
+        .map_err(|e| map_store_error("Error writing rollout event", e))?;
+
+    Ok(launch.is_manual)
+}
+
+/// Resolve the coalesced action for one job given a batch of KV changes
+/// (`key -> latest event was a delete`). Returns the strongest action across
+/// all matching dependency edges plus whether any matched edge saw a delete
+/// (delete-triggered restart/rollout must fire even when the re-rendered
+/// config is byte-identical, because the rendered value cannot change when
+/// the key is gone).
+///
+/// Edge semantics:
+/// - Legacy `$key` jobspec references are implicitly watched: puts roll out
+///   (historical behavior) and deletes fail the job (the reference is
+///   required and can no longer be rendered).
+/// - Injection edges resolve their entry policy against the task defaults
+///   (`KvInjectionPolicy::resolve_with_defaults`) and are skipped unless
+///   `watch` resolves to true.
+fn resolve_job_kv_action(
+    store: &Store,
+    config: &JobConfig,
+    job_refs: &[JobKvReference],
+    changed: &HashMap<String, bool>,
+) -> R<(KvInjectionAction, bool)> {
+    let mut action = KvInjectionAction::None;
+    let mut delete_matched = false;
+
+    for reference in job_refs {
+        if reference.json_pointer.contains("/kvInjections/") {
+            continue;
+        }
+        let Some(&is_delete) = changed.get(&reference.kv_key) else {
+            continue;
+        };
+        let selected = if is_delete {
+            delete_matched = true;
+            KvInjectionAction::Fail
+        } else {
+            KvInjectionAction::Rollout
+        };
+        action = strongest_action(action, selected);
+    }
+
+    for task in &config.tasks {
+        let Some(injections) = task.kv_injections.as_ref() else {
+            continue;
+        };
+        let defaults = injections.kv.clone().unwrap_or_default();
+        let edges = injections
+            .env
+            .iter()
+            .map(|env| (&env.kv, &env.value))
+            .chain(injections.files.iter().map(|file| (&file.kv, &file.file)));
+        for (policy, source) in edges {
+            let policy = policy.resolve_with_defaults(&defaults);
+            if !policy.watch {
+                continue;
+            }
+            let deps = template_source_deps(store, source)
+                .context("resolving kv injection dependencies")?;
+            for dep in deps {
+                let Some(&is_delete) = changed.get(&dep) else {
+                    continue;
+                };
+                let selected = if is_delete {
+                    delete_matched = true;
+                    policy.on_delete
+                } else {
+                    policy.on_change
+                };
+                action = strongest_action(action, selected);
+            }
+        }
+    }
+
+    Ok((action, delete_matched))
+}
+
+/// Apply a batch of KV changes to every job that references one of the
+/// changed keys. `changes` is a list of `(key, is_delete)` events; within
+/// the batch the last event per key wins (the batch is reconciled against
+/// the *current* KV state, so this only matters for choosing between
+/// `onChange` and `onDelete`).
+///
+/// Per affected job:
+/// 1. Resolve the strongest action across all matching dependency edges
+///    (`none < restart < rollout < fail`).
+/// 2. `fail`: mark the job + allocations failed with reason
+///    `missing_kv_dependency` and stop — no re-render, no rollout, no eval.
+///    Dependency edges are retained so a later put can recover the job.
+/// 3. Otherwise re-materialize the config from current KV state (deleted
+///    keys keep their last rendered value), store it, refresh the dependency
+///    edges, and schedule the resolved action. A previously failed job is
+///    flipped back to `done` when a restart/rollout actively recovers it.
+fn reconcile_kv_changes(store: &Store, changes: &[(String, bool)]) -> Result<(), Status> {
+    if changes.is_empty() {
+        return Ok(());
+    }
+
+    // Last event per key wins within the batch.
+    let mut changed: HashMap<String, bool> = HashMap::new();
+    for (key, is_delete) in changes {
+        changed.insert(key.clone(), *is_delete);
+    }
+
+    let mut jobs_to_update: HashMap<String, String> = HashMap::new();
+    for key in changed.keys() {
+        let refs = store
             .job_kv_references_for_key(key)
             .map_err(|e| map_store_error("Error loading kv references", e))?;
-        if refs.is_empty() {
-            return Ok(());
-        }
-
-        let mut jobs_to_update: HashMap<String, String> = HashMap::new();
         for reference in refs {
             jobs_to_update
                 .entry(reference.job_id)
                 .or_insert(reference.job_config_id);
         }
+    }
 
-        for (job_id, job_config_id) in jobs_to_update {
-            let job_refs = self
-                .store
-                .job_kv_references_for_job(&job_id)
-                .map_err(|e| map_store_error("Error loading job kv references", e))?;
-            if job_refs.is_empty() {
-                continue;
-            }
-            let current_config = self
-                .store
-                .get_job_config_by_id(&job_config_id)
-                .map_err(|e| map_store_error("Error loading job config", e))?;
-            let updated_config =
-                apply_kv_references_to_config(&self.store, &current_config, &job_refs)
-                    .map_err(|e| map_store_error("Error applying kv references", e))?;
-            let has_legacy_refs = job_refs
-                .iter()
-                .any(|reference| !reference.json_pointer.contains("/kvInjections/"));
-            let mut action = if has_legacy_refs {
-                KvInjectionAction::Rollout
-            } else {
-                KvInjectionAction::None
-            };
-            for task in &updated_config.tasks {
-                let Some(injections) = task.kv_injections.as_ref() else {
-                    continue;
-                };
-                let defaults = injections.kv.clone().unwrap_or_default();
-                for env in &injections.env {
-                    let policy =
-                        if env.kv.watch || env.kv.on_change.is_some() || env.kv.on_delete.is_some()
-                        {
-                            env.kv.clone()
-                        } else {
-                            defaults.clone()
-                        };
-                    if !policy.watch {
-                        continue;
-                    }
-                    let (_, deps) = resolve_template_source(&self.store, &env.value)
-                        .map_err(|e| map_store_error("Error resolving kv env injection", e))?;
-                    if deps.iter().any(|dep| dep == key) {
-                        let selected = if is_delete {
-                            policy.on_delete.unwrap_or(KvInjectionAction::Fail)
-                        } else {
-                            policy.on_change.unwrap_or(KvInjectionAction::None)
-                        };
-                        action = strongest_action(action, selected);
-                    }
-                }
-                for file in &injections.files {
-                    let policy = if file.kv.watch
-                        || file.kv.on_change.is_some()
-                        || file.kv.on_delete.is_some()
-                    {
-                        file.kv.clone()
-                    } else {
-                        defaults.clone()
-                    };
-                    if !policy.watch {
-                        continue;
-                    }
-                    let (_, deps) = resolve_template_source(&self.store, &file.file)
-                        .map_err(|e| map_store_error("Error resolving kv file injection", e))?;
-                    if deps.iter().any(|dep| dep == key) {
-                        let selected = if is_delete {
-                            policy.on_delete.unwrap_or(KvInjectionAction::Fail)
-                        } else {
-                            policy.on_change.unwrap_or(KvInjectionAction::None)
-                        };
-                        action = strongest_action(action, selected);
-                    }
-                }
-            }
-            let submissions = self
-                .store
-                .get_submissions_for_config(&job_config_id)
-                .map_err(|e| map_store_error("Error loading job submissions", e))?;
-            let submit_outcome = self
-                .store
-                .handle_job_submit(&updated_config, &submissions)
-                .map_err(|e| map_store_error("Error updating job for kv change", e))?;
-            let new_job_config_id = submit_outcome.job_config_id().to_string();
-            let updated_refs: Vec<JobKvReference> = job_refs
-                .iter()
-                .map(|reference| JobKvReference {
-                    job_id: job_id.clone(),
-                    job_config_id: new_job_config_id.clone(),
-                    kv_key: reference.kv_key.clone(),
-                    json_pointer: reference.json_pointer.clone(),
-                })
-                .collect();
-            self.store
-                .replace_job_kv_references(&job_id, &updated_refs)
-                .map_err(|e| map_store_error("Error updating kv references", e))?;
+    for (job_id, job_config_id) in jobs_to_update {
+        let job_refs = store
+            .job_kv_references_for_job(&job_id)
+            .map_err(|e| map_store_error("Error loading job kv references", e))?;
+        if job_refs.is_empty() {
+            continue;
+        }
+        let current_config = store
+            .get_job_config_by_id(&job_config_id)
+            .map_err(|e| map_store_error("Error loading job config", e))?;
 
-            if submit_outcome.is_unchanged() {
-                continue;
-            }
+        let (action, delete_matched) =
+            resolve_job_kv_action(store, &current_config, &job_refs, &changed)
+                .map_err(|e| map_store_error("Error resolving kv change action", e))?;
 
-            match action {
-                KvInjectionAction::None => {}
-                KvInjectionAction::Restart => {
-                    self.store
+        if action == KvInjectionAction::Fail {
+            store
+                .mark_job_failed_for_kv(&job_id, MISSING_KV_DEPENDENCY_REASON)
+                .map_err(|e| map_store_error("Error failing job for missing kv dependency", e))?;
+            warn!(
+                job_id = %job_id,
+                reason = MISSING_KV_DEPENDENCY_REASON,
+                "Watched KV key deleted with onDelete=fail; job marked failed"
+            );
+            // Keep the dependency edges: a later put to the missing key is
+            // the recovery path (it resolves through onChange).
+            continue;
+        }
+
+        let (updated_config, injection_refs) = apply_kv_references_to_config(
+            store,
+            &current_config,
+            &job_refs,
+            MissingKvBehavior::KeepExisting,
+        )
+        .map_err(|e| map_store_error("Error applying kv references", e))?;
+        let submissions = store
+            .get_submissions_for_config(&job_config_id)
+            .map_err(|e| map_store_error("Error loading job submissions", e))?;
+        let submit_outcome = store
+            .handle_job_submit(&updated_config, &submissions)
+            .map_err(|e| map_store_error("Error updating job for kv change", e))?;
+        let new_job_config_id = submit_outcome.job_config_id().to_string();
+
+        // Refresh dependency edges: legacy `$` reference pointers are
+        // positional and survive as-is; injection edges are recomputed so
+        // template content changes re-track their transitive keys.
+        let mut updated_refs: Vec<JobKvReference> = job_refs
+            .iter()
+            .filter(|reference| !reference.json_pointer.contains("/kvInjections/"))
+            .map(|reference| JobKvReference {
+                job_id: job_id.clone(),
+                job_config_id: new_job_config_id.clone(),
+                kv_key: reference.kv_key.clone(),
+                json_pointer: reference.json_pointer.clone(),
+            })
+            .collect();
+        updated_refs.extend(injection_refs.into_iter().map(|reference| JobKvReference {
+            job_id: job_id.clone(),
+            job_config_id: new_job_config_id.clone(),
+            kv_key: reference.key,
+            json_pointer: reference.json_pointer,
+        }));
+        store
+            .replace_job_kv_references(&job_id, &updated_refs)
+            .map_err(|e| map_store_error("Error updating kv references", e))?;
+
+        // An unchanged config needs no action for puts (idempotent rewrite),
+        // but a delete-triggered restart/rollout still fires: the rendered
+        // value cannot change when the key is gone.
+        if submit_outcome.is_unchanged() && !delete_matched {
+            continue;
+        }
+
+        match action {
+            KvInjectionAction::None => {}
+            KvInjectionAction::Restart => {
+                store
+                    .clear_job_failed_status(&job_id)
+                    .map_err(|e| map_store_error("Error clearing failed job status", e))?;
+                store
+                    .enqueue_eval(
+                        "job_update",
+                        Some(&job_id),
+                        Some(&new_job_config_id),
+                        None,
+                        Some(store.default_eval_priority),
+                    )
+                    .map_err(|e| map_store_error("Error scheduling kv update restart", e))?;
+            }
+            KvInjectionAction::Rollout => {
+                store
+                    .clear_job_failed_status(&job_id)
+                    .map_err(|e| map_store_error("Error clearing failed job status", e))?;
+                let previous_job_config_id = store
+                    .previous_job_config_id(&new_job_config_id)
+                    .map_err(|e| map_store_error("Error loading previous job config", e))?;
+                let is_manual = create_rollout_for_update(
+                    store,
+                    &job_id,
+                    previous_job_config_id.as_deref(),
+                    &new_job_config_id,
+                    &updated_config,
+                    "Error creating rollout for kv update",
+                )?;
+
+                if !is_manual {
+                    store
                         .enqueue_eval(
-                            "job_update",
+                            "rollout_tick",
                             Some(&job_id),
                             Some(&new_job_config_id),
                             None,
-                            Some(self.store.default_eval_priority),
+                            Some(store.default_eval_priority),
                         )
-                        .map_err(|e| map_store_error("Error scheduling kv update restart", e))?;
-                }
-                KvInjectionAction::Rollout | KvInjectionAction::Fail => {
-                    let previous_job_config_id = self
-                        .store
-                        .previous_job_config_id(&new_job_config_id)
-                        .map_err(|e| map_store_error("Error loading previous job config", e))?;
-                    let is_manual = self.create_rollout_for_update(
-                        &job_id,
-                        previous_job_config_id.as_deref(),
-                        &new_job_config_id,
-                        &updated_config,
-                        "Error creating rollout for kv update",
-                    )?;
-
-                    if !is_manual {
-                        self.store
-                            .enqueue_eval(
-                                "rollout_tick",
-                                Some(&job_id),
-                                Some(&new_job_config_id),
-                                None,
-                                Some(self.store.default_eval_priority),
-                            )
-                            .map_err(|e| {
-                                map_store_error("Error scheduling kv update rollout", e)
-                            })?;
-                    }
+                        .map_err(|e| map_store_error("Error scheduling kv update rollout", e))?;
                 }
             }
+            // Fail is fully handled above (before re-materialization).
+            KvInjectionAction::Fail => unreachable!("fail action handled before materialization"),
         }
-
-        Ok(())
     }
+
+    Ok(())
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -930,7 +1172,8 @@ impl Manager for ManagerAgentService {
                     .store
                     .previous_job_config_id(&job_config_id)
                     .map_err(|e| map_store_error("Error loading previous job config", e))?;
-                let is_manual = self.create_rollout_for_update(
+                let is_manual = create_rollout_for_update(
+                    &self.store,
                     &config.name,
                     previous_job_config_id.as_deref(),
                     &job_config_id,
@@ -2281,7 +2524,9 @@ impl Manager for ManagerAgentService {
             )
             .map_err(|e| map_store_error("Error putting kv entry", e))?;
 
-        self.handle_kv_change(&req.key, false)?;
+        if !self.queue_kv_change(&req.key, false) {
+            reconcile_kv_changes(&self.store, &[(req.key.clone(), false)])?;
+        }
 
         Ok(Response::new(PutKvReply { entry: Some(entry) }))
     }
@@ -2320,7 +2565,9 @@ impl Manager for ManagerAgentService {
         self.store
             .delete_kv(&req.key, req.expected_version, req.lock_id.as_deref())
             .map_err(|e| map_store_error("Error deleting kv entry", e))?;
-        self.handle_kv_change(&req.key, true)?;
+        if !self.queue_kv_change(&req.key, true) {
+            reconcile_kv_changes(&self.store, &[(req.key.clone(), true)])?;
+        }
 
         Ok(Response::new(DeleteKvReply {
             message: "kv entry deleted".to_string(),
@@ -2343,7 +2590,9 @@ impl Manager for ManagerAgentService {
             )
             .map_err(|e| map_store_error("Error patching kv entry", e))?;
 
-        self.handle_kv_change(&req.key, false)?;
+        if !self.queue_kv_change(&req.key, false) {
+            reconcile_kv_changes(&self.store, &[(req.key.clone(), false)])?;
+        }
 
         Ok(Response::new(PatchKvReply { entry: Some(entry) }))
     }
@@ -3517,6 +3766,584 @@ mod tests {
             .iter()
             .any(|eval| { eval.kind == "rollout_tick" && eval.job_id == "kv-rollout-policy-job" }));
 
+        Ok(())
+    }
+
+    // --- KV-driven task updates (reactive injections) ---
+
+    async fn put_kv_entry(manager: &ManagerAgentService, key: &str, value: &str) -> R<()> {
+        manager
+            .put_kv(Request::new(PutKvRequest {
+                key: key.into(),
+                value: value.into(),
+                value_type: KvValueType::String as i32,
+                expected_version: None,
+                lock_id: None,
+            }))
+            .await?;
+        Ok(())
+    }
+
+    async fn delete_kv_entry(manager: &ManagerAgentService, key: &str) -> R<()> {
+        manager
+            .delete_kv(Request::new(crate::structs::DeleteKvRequest {
+                key: key.into(),
+                expected_version: None,
+                lock_id: None,
+            }))
+            .await?;
+        Ok(())
+    }
+
+    async fn run_jobspec(manager: &ManagerAgentService, jobspec: Value) -> Result<(), Status> {
+        manager
+            .run_job(Request::new(RunJobRequest {
+                parsed_jobspec: jobspec.to_string(),
+                submissions: vec![submission()],
+                priority: None,
+                force_reschedule: false,
+                idempotency_key: None,
+            }))
+            .await?;
+        Ok(())
+    }
+
+    fn evals_of_kind(store: &Store, job_id: &str, kind: &str) -> R<usize> {
+        Ok(store
+            .get_evals()?
+            .iter()
+            .filter(|eval| eval.kind == kind && eval.job_id == job_id)
+            .count())
+    }
+
+    fn task_env_value(store: &Store, job: &str, task: usize, name: &str) -> R<String> {
+        let config = store.get_job_config(job)?;
+        config.tasks[task]
+            .config
+            .get("env")
+            .and_then(|env| env.get(name))
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+            .with_context(|| format!("missing env var {name} on task {task}"))
+    }
+
+    /// One exec task with a single watched env injection on `key`.
+    fn watched_env_jobspec(job: &str, key: &str, on_change: &str, on_delete: &str) -> Value {
+        json!({
+            "name": job,
+            "task": {
+                "kind": "exec",
+                "kv": { "watch": true, "onChange": on_change, "onDelete": on_delete },
+                "env": [
+                    {
+                        "name": "WATCHED",
+                        "value": { "template": format!("{{{{ kv \"{key}\" }}}}") }
+                    }
+                ],
+                "config": { "command": ["echo", "hi"] }
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn kv_delete_with_on_delete_none_takes_no_action() -> R<()> {
+        let store = setup_store()?;
+        let manager = ManagerAgentService::new(store);
+
+        put_kv_entry(&manager, "del/none", "v1").await?;
+        run_jobspec(
+            &manager,
+            watched_env_jobspec("kv-del-none", "del/none", "restart", "none"),
+        )
+        .await?;
+
+        delete_kv_entry(&manager, "del/none").await?;
+
+        assert_eq!(
+            evals_of_kind(&manager.store, "kv-del-none", "job_update")?,
+            0
+        );
+        assert_eq!(
+            evals_of_kind(&manager.store, "kv-del-none", "rollout_tick")?,
+            0
+        );
+        assert_eq!(manager.store.get_job("kv-del-none")?.status, "done");
+        // The last rendered value is kept in the desired config.
+        assert_eq!(
+            task_env_value(&manager.store, "kv-del-none", 0, "WATCHED")?,
+            "v1"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn kv_delete_with_on_delete_restart_enqueues_job_update() -> R<()> {
+        let store = setup_store()?;
+        let manager = ManagerAgentService::new(store);
+
+        put_kv_entry(&manager, "del/restart", "v1").await?;
+        run_jobspec(
+            &manager,
+            watched_env_jobspec("kv-del-restart", "del/restart", "none", "restart"),
+        )
+        .await?;
+
+        delete_kv_entry(&manager, "del/restart").await?;
+
+        assert_eq!(
+            evals_of_kind(&manager.store, "kv-del-restart", "job_update")?,
+            1
+        );
+        assert_eq!(manager.store.get_job("kv-del-restart")?.status, "done");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn kv_delete_with_on_delete_rollout_creates_rollout() -> R<()> {
+        let store = setup_store()?;
+        let manager = ManagerAgentService::new(store);
+
+        put_kv_entry(&manager, "del/rollout", "v1").await?;
+        run_jobspec(
+            &manager,
+            watched_env_jobspec("kv-del-rollout", "del/rollout", "none", "rollout"),
+        )
+        .await?;
+        assert!(manager
+            .store
+            .list_rollouts(Some("kv-del-rollout"), false)?
+            .is_empty());
+
+        delete_kv_entry(&manager, "del/rollout").await?;
+
+        assert_eq!(
+            manager
+                .store
+                .list_rollouts(Some("kv-del-rollout"), false)?
+                .len(),
+            1
+        );
+        assert_eq!(
+            evals_of_kind(&manager.store, "kv-del-rollout", "rollout_tick")?,
+            1
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn kv_delete_with_on_delete_fail_marks_job_failed_with_reason() -> R<()> {
+        let store = setup_store()?;
+        let manager = ManagerAgentService::new(store.clone());
+
+        put_kv_entry(&manager, "del/fail", "v1").await?;
+        run_jobspec(
+            &manager,
+            watched_env_jobspec("kv-del-fail", "del/fail", "restart", "fail"),
+        )
+        .await?;
+
+        // Place an allocation so the failure reason is visible on it.
+        insert_node(&store, "node-1")?;
+        let job_config_id = store.get_job_config("kv-del-fail")?.id();
+        let (task_id, _) = store
+            .get_task_configs_for_job_config(&job_config_id)?
+            .into_iter()
+            .next()
+            .context("missing task config")?;
+        let allocation = store.place_alloc("node-1", task_id)?;
+
+        delete_kv_entry(&manager, "del/fail").await?;
+
+        // Job and allocation surface the failure with the explicit reason.
+        assert_eq!(store.get_job("kv-del-fail")?.status, "failed");
+        let allocs = store.allocs_for_job("kv-del-fail")?;
+        let failed = allocs
+            .iter()
+            .find(|alloc| alloc.id == allocation.id)
+            .context("allocation missing after fail")?;
+        assert_eq!(failed.status, "failed:missing_kv_dependency");
+
+        // No restart/rollout storm: nothing scheduled, no rollout created.
+        assert_eq!(evals_of_kind(&store, "kv-del-fail", "job_update")?, 0);
+        assert_eq!(evals_of_kind(&store, "kv-del-fail", "rollout_tick")?, 0);
+        assert!(store.list_rollouts(Some("kv-del-fail"), false)?.is_empty());
+
+        // The dependency edges survive so the job can recover later.
+        assert!(!store.job_kv_references_for_job("kv-del-fail")?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn kv_put_after_fail_recovers_job_via_on_change() -> R<()> {
+        let store = setup_store()?;
+        let manager = ManagerAgentService::new(store.clone());
+
+        put_kv_entry(&manager, "recover/key", "v1").await?;
+        run_jobspec(
+            &manager,
+            watched_env_jobspec("kv-recover", "recover/key", "restart", "fail"),
+        )
+        .await?;
+
+        delete_kv_entry(&manager, "recover/key").await?;
+        assert_eq!(store.get_job("kv-recover")?.status, "failed");
+
+        // Recovery path: putting the key back resolves through onChange.
+        put_kv_entry(&manager, "recover/key", "v2").await?;
+
+        assert_eq!(store.get_job("kv-recover")?.status, "done");
+        assert_eq!(evals_of_kind(&store, "kv-recover", "job_update")?, 1);
+        assert_eq!(task_env_value(&store, "kv-recover", 0, "WATCHED")?, "v2");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn kv_changes_ignored_when_watch_false() -> R<()> {
+        let store = setup_store()?;
+        let manager = ManagerAgentService::new(store);
+
+        put_kv_entry(&manager, "unwatched/key", "v1").await?;
+        let jobspec = json!({
+            "name": "kv-unwatched",
+            "task": {
+                "kind": "exec",
+                // Defaults would watch, but the entry opts out explicitly.
+                "kv": { "watch": true, "onChange": "restart", "onDelete": "fail" },
+                "env": [
+                    {
+                        "name": "WATCHED",
+                        "value": { "template": "{{ kv \"unwatched/key\" }}" },
+                        "kv": { "watch": false }
+                    }
+                ],
+                "config": { "command": ["echo", "hi"] }
+            }
+        });
+        run_jobspec(&manager, jobspec).await?;
+
+        put_kv_entry(&manager, "unwatched/key", "v2").await?;
+        delete_kv_entry(&manager, "unwatched/key").await?;
+
+        assert_eq!(
+            evals_of_kind(&manager.store, "kv-unwatched", "job_update")?,
+            0
+        );
+        assert_eq!(
+            evals_of_kind(&manager.store, "kv-unwatched", "rollout_tick")?,
+            0
+        );
+        assert_eq!(manager.store.get_job("kv-unwatched")?.status, "done");
+        // The put still refreshed the desired config (state-only update).
+        assert_eq!(
+            task_env_value(&manager.store, "kv-unwatched", 0, "WATCHED")?,
+            "v2"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn kv_entry_policy_overrides_defaults_field_by_field() -> R<()> {
+        let store = setup_store()?;
+        let manager = ManagerAgentService::new(store);
+
+        put_kv_entry(&manager, "prec/a", "a1").await?;
+        put_kv_entry(&manager, "prec/b", "b1").await?;
+        let jobspec = json!({
+            "name": "kv-precedence",
+            "task": {
+                "kind": "exec",
+                "kv": { "watch": true, "onChange": "restart" },
+                "env": [
+                    {
+                        // Silent entry: inherits watch + onChange=restart.
+                        "name": "A",
+                        "value": { "template": "{{ kv \"prec/a\" }}" }
+                    },
+                    {
+                        // Overrides onChange only; watch inherited from defaults.
+                        "name": "B",
+                        "value": { "template": "{{ kv \"prec/b\" }}" },
+                        "kv": { "onChange": "rollout" }
+                    }
+                ],
+                "config": { "command": ["echo", "hi"] }
+            }
+        });
+        run_jobspec(&manager, jobspec).await?;
+
+        put_kv_entry(&manager, "prec/a", "a2").await?;
+        assert_eq!(
+            evals_of_kind(&manager.store, "kv-precedence", "job_update")?,
+            1
+        );
+        assert_eq!(
+            evals_of_kind(&manager.store, "kv-precedence", "rollout_tick")?,
+            0
+        );
+
+        put_kv_entry(&manager, "prec/b", "b2").await?;
+        assert_eq!(
+            evals_of_kind(&manager.store, "kv-precedence", "rollout_tick")?,
+            1
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn kv_template_kv_source_tracks_template_and_transitive_keys() -> R<()> {
+        let store = setup_store()?;
+        let manager = ManagerAgentService::new(store.clone());
+
+        put_kv_entry(&manager, "ui/banner", "hello").await?;
+        put_kv_entry(&manager, "templates/banner", "msg={{ kv \"ui/banner\" }}").await?;
+        let jobspec = json!({
+            "name": "kv-template-kv",
+            "task": {
+                "kind": "exec",
+                "kv": { "watch": true, "onChange": "restart", "onDelete": "fail" },
+                "env": [
+                    {
+                        "name": "BANNER",
+                        "value": { "templateKv": "templates/banner" }
+                    }
+                ],
+                "config": { "command": ["echo", "hi"] }
+            }
+        });
+        run_jobspec(&manager, jobspec).await?;
+        assert_eq!(
+            task_env_value(&store, "kv-template-kv", 0, "BANNER")?,
+            "msg=hello"
+        );
+
+        // Both the template key and its transitive lookup are tracked edges.
+        let keys: Vec<String> = store
+            .job_kv_references_for_job("kv-template-kv")?
+            .into_iter()
+            .map(|reference| reference.kv_key)
+            .collect();
+        assert!(keys.iter().any(|key| key == "templates/banner"));
+        assert!(keys.iter().any(|key| key == "ui/banner"));
+
+        // Changing a transitive key triggers the edge's policy.
+        put_kv_entry(&manager, "ui/banner", "world").await?;
+        assert_eq!(evals_of_kind(&store, "kv-template-kv", "job_update")?, 1);
+        assert_eq!(
+            task_env_value(&store, "kv-template-kv", 0, "BANNER")?,
+            "msg=world"
+        );
+
+        // Changing the template key itself also triggers the policy.
+        put_kv_entry(&manager, "templates/banner", "v2={{ kv \"ui/banner\" }}").await?;
+        assert_eq!(evals_of_kind(&store, "kv-template-kv", "job_update")?, 2);
+        assert_eq!(
+            task_env_value(&store, "kv-template-kv", 0, "BANNER")?,
+            "v2=world"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn kv_put_only_affects_tasks_watching_the_key() -> R<()> {
+        let store = setup_store()?;
+        let manager = ManagerAgentService::new(store.clone());
+
+        put_kv_entry(&manager, "iso/a", "v1").await?;
+        let jobspec = json!({
+            "name": "kv-isolation",
+            "tasks": [
+                {
+                    "name": "watcher",
+                    "kind": "exec",
+                    "kv": { "watch": true, "onChange": "restart", "onDelete": "none" },
+                    "env": [
+                        { "name": "A", "value": { "template": "{{ kv \"iso/a\" }}" } }
+                    ],
+                    "config": { "command": ["echo", "hi"] }
+                },
+                {
+                    "name": "bystander",
+                    "kind": "exec",
+                    "config": { "command": ["echo", "bye"], "env": { "STATIC": "fixed" } }
+                }
+            ]
+        });
+        run_jobspec(&manager, jobspec).await?;
+
+        let before = store.get_job_config("kv-isolation")?;
+        let bystander_before = before
+            .tasks
+            .iter()
+            .find(|task| task.name == "bystander")
+            .context("missing bystander task")?
+            .config
+            .clone();
+
+        put_kv_entry(&manager, "iso/a", "v2").await?;
+
+        let after = store.get_job_config("kv-isolation")?;
+        let watcher = after
+            .tasks
+            .iter()
+            .find(|task| task.name == "watcher")
+            .context("missing watcher task")?;
+        let bystander = after
+            .tasks
+            .iter()
+            .find(|task| task.name == "bystander")
+            .context("missing bystander task")?;
+
+        assert_eq!(
+            watcher.config.get("env").and_then(|env| env.get("A")),
+            Some(&Value::String("v2".into()))
+        );
+        assert_eq!(bystander.config, bystander_before);
+        assert_eq!(evals_of_kind(&store, "kv-isolation", "job_update")?, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn kv_file_injection_rerender_replaces_existing_entry() -> R<()> {
+        let store = setup_store()?;
+        let manager = ManagerAgentService::new(store.clone());
+
+        put_kv_entry(&manager, "file/key", "v1").await?;
+        let jobspec = json!({
+            "name": "kv-file-rerender",
+            "task": {
+                "kind": "exec",
+                "kv": { "watch": true, "onChange": "restart", "onDelete": "none" },
+                "files": [
+                    {
+                        "path": "/tmp/kv-rerender.conf",
+                        "file": { "template": "value={{ kv \"file/key\" }}" }
+                    }
+                ],
+                "config": { "command": ["echo", "hi"] }
+            }
+        });
+        run_jobspec(&manager, jobspec).await?;
+
+        put_kv_entry(&manager, "file/key", "v2").await?;
+
+        let config = store.get_job_config("kv-file-rerender")?;
+        let files = config.tasks[0]
+            .config
+            .get("files")
+            .and_then(Value::as_array)
+            .context("missing files array")?;
+        assert_eq!(files.len(), 1, "re-render must replace, not append");
+        assert_eq!(
+            files[0].get("content").and_then(Value::as_str),
+            Some("value=v2")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn kv_debounce_coalesces_rapid_puts_into_one_action() -> R<()> {
+        let store = setup_store()?;
+        // Seed without opening a debounce window.
+        store.put_kv("burst/key", "v0", KvValueType::String, None, None)?;
+        let manager =
+            ManagerAgentService::new(store.clone()).with_kv_debounce(Duration::from_millis(100));
+
+        run_jobspec(
+            &manager,
+            watched_env_jobspec("kv-burst", "burst/key", "restart", "fail"),
+        )
+        .await?;
+
+        for value in ["v1", "v2", "v3", "v4", "v5"] {
+            put_kv_entry(&manager, "burst/key", value).await?;
+        }
+
+        // Inside the window: nothing applied yet.
+        assert_eq!(evals_of_kind(&store, "kv-burst", "job_update")?, 0);
+        assert_eq!(task_env_value(&store, "kv-burst", 0, "WATCHED")?, "v0");
+
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        // Exactly one coalesced action, rendered from the latest KV state.
+        assert_eq!(evals_of_kind(&store, "kv-burst", "job_update")?, 1);
+        assert_eq!(task_env_value(&store, "kv-burst", 0, "WATCHED")?, "v5");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn kv_debounce_put_then_delete_resolves_through_on_delete() -> R<()> {
+        let store = setup_store()?;
+        store.put_kv("burst/del", "v0", KvValueType::String, None, None)?;
+        let manager =
+            ManagerAgentService::new(store.clone()).with_kv_debounce(Duration::from_millis(100));
+
+        run_jobspec(
+            &manager,
+            watched_env_jobspec("kv-burst-del", "burst/del", "restart", "fail"),
+        )
+        .await?;
+
+        // Put then delete inside the same window: the delete wins and the
+        // edge resolves through onDelete (fail), not onChange.
+        put_kv_entry(&manager, "burst/del", "v1").await?;
+        delete_kv_entry(&manager, "burst/del").await?;
+
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        assert_eq!(store.get_job("kv-burst-del")?.status, "failed");
+        assert_eq!(evals_of_kind(&store, "kv-burst-del", "job_update")?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_job_fails_when_required_kv_key_is_missing() -> R<()> {
+        let store = setup_store()?;
+        let manager = ManagerAgentService::new(store);
+
+        let err = run_jobspec(
+            &manager,
+            watched_env_jobspec("kv-missing-key", "nope/missing", "restart", "fail"),
+        )
+        .await
+        .expect_err("submit should fail for missing kv key");
+
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(
+            err.message().contains("kv entry nope/missing not found"),
+            "unexpected error message: {}",
+            err.message()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_job_rejects_file_injection_for_container_tasks() -> R<()> {
+        let store = setup_store()?;
+        let manager = ManagerAgentService::new(store);
+
+        let jobspec = json!({
+            "name": "kv-container-files",
+            "task": {
+                "kind": "container",
+                "files": [
+                    {
+                        "path": "/etc/app/conf",
+                        "file": { "template": "static-content" }
+                    }
+                ],
+                "config": { "image": "alpine", "command": ["echo", "hi"] }
+            }
+        });
+        let err = run_jobspec(&manager, jobspec)
+            .await
+            .expect_err("submit should fail for unsupported file injection");
+
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(
+            err.message().contains("does not support kv file injection"),
+            "unexpected error message: {}",
+            err.message()
+        );
         Ok(())
     }
 

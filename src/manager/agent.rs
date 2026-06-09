@@ -90,8 +90,9 @@ pub async fn run_manager(config: ManagerConfig, run_worker: bool) -> R<()> {
         None
     };
 
-    let manager_node =
-        ManagerAgentService::new(store).with_workload_identity(workload_identity_state.clone());
+    let manager_node = ManagerAgentService::new(store)
+        .with_workload_identity(workload_identity_state.clone())
+        .with_kv_debounce(Duration::from_millis(full_config.kv_debounce_ms));
 
     let addr = format!("{}:{}", full_config.server.host, full_config.server.port).parse()?;
 
