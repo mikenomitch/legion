@@ -853,6 +853,39 @@ pub struct TaskConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[tabled(skip)]
     pub identities: Vec<WorkloadIdentity>,
+    /// Stateful instance-identity config (stateful-workloads plan). Absent =
+    /// today's stateless, fungible-allocation behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[tabled(skip)]
+    pub stateful: Option<StatefulConfig>,
+}
+
+/// How instance identities are assigned for a stateful task.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum StatefulMode {
+    /// Dense, ordinal-based (`db-0`, `db-1`), StatefulSet-style. The scheduler
+    /// owns slot assignment; freed ordinals are recycled.
+    #[default]
+    Slot,
+    /// Sparse, caller-supplied stable keys (`tenant-acme`). The API caller owns
+    /// the key space; destroyed keys are tombstoned and never recycled.
+    Keyed,
+}
+
+/// Opt-in stateful behavior for a task. See `docs/stateful-workloads.md`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct StatefulConfig {
+    #[serde(default)]
+    pub mode: StatefulMode,
+    /// Give each instance a deterministic, stable DNS-style name across reschedules.
+    #[serde(default)]
+    pub stable_network_id: bool,
+    /// Record the instance→node binding so a future storage layer can return an
+    /// instance to its data on reschedule.
+    #[serde(default)]
+    pub volume_affinity: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -988,6 +1021,8 @@ struct TaskConfigInput {
     kv_injections: Option<TaskKvInjections>,
     #[serde(default)]
     identities: Vec<WorkloadIdentity>,
+    #[serde(default)]
+    stateful: Option<StatefulConfig>,
 }
 
 #[derive(Deserialize)]
@@ -1053,6 +1088,7 @@ impl TaskConfigInput {
                 }
             }),
             identities: self.identities,
+            stateful: self.stateful,
         }
     }
 }
@@ -1207,17 +1243,36 @@ impl TaskConfig {
             on_unhealthy: TaskOnUnhealthyConfig::default(),
             kv_injections: None,
             identities: Vec::new(),
+            stateful: None,
         }
     }
 
-    /// Whether this task declares a stateful block. Gates the stateful-only
-    /// `{instance}`/`{slot}` placeholders in a `sub` template. Stateful
-    /// workloads are defined by a separate plan; until that lands, a task is
-    /// considered stateful if its kind config carries a `stateful` object.
-    fn is_stateful(&self) -> bool {
-        self.config
-            .get("stateful")
-            .is_some_and(|value| !value.is_null())
+    /// Whether this task declares a `stateful` block. Gates the stateful-only
+    /// `{instance}`/`{slot}` placeholders in a workload-identity `sub` template.
+    pub fn is_stateful(&self) -> bool {
+        self.stateful.is_some()
+    }
+
+    /// The stateful mode, if this task is stateful.
+    pub fn stateful_mode(&self) -> Option<StatefulMode> {
+        self.stateful.as_ref().map(|s| s.mode)
+    }
+
+    /// Validate the stateful block (stateful-workloads plan). Stateless = ok.
+    pub fn validate_stateful(&self) -> R<()> {
+        let Some(stateful) = self.stateful.as_ref() else {
+            return Ok(());
+        };
+        // Slot mode is driven by `count`; keyed mode is driven by the API and
+        // ignores `count`, so a non-default count there is a likely mistake.
+        if stateful.mode == StatefulMode::Keyed && self.count.num != default_task_count().num {
+            bail!(
+                "task {} is keyed-stateful: count is ignored (instances are created via API), \
+                 so remove the explicit count",
+                self.name
+            );
+        }
+        Ok(())
     }
 
     /// Validate workload identities declared on this task (see the
@@ -1719,6 +1774,72 @@ mod tests {
             "backend"
         );
         task.validate_identities()?;
+        Ok(())
+    }
+
+    #[test]
+    fn stateful_block_deserializes_and_defaults_to_slot() -> R<()> {
+        let spec = serde_json::json!({
+            "name": "db",
+            "task": {
+                "kind": "container",
+                "count": 3,
+                "stateful": { "stableNetworkId": true, "volumeAffinity": true }
+            }
+        });
+        let config: JobConfig = serde_json::from_value(spec)?;
+        let task = &config.tasks[0];
+        assert!(task.is_stateful());
+        assert_eq!(task.stateful_mode(), Some(StatefulMode::Slot));
+        assert!(task.stateful.as_ref().unwrap().stable_network_id);
+        task.validate_stateful()?;
+        Ok(())
+    }
+
+    #[test]
+    fn keyed_stateful_with_explicit_count_is_rejected() {
+        let spec = serde_json::json!({
+            "name": "sb",
+            "task": {
+                "kind": "container",
+                "count": 5,
+                "stateful": { "mode": "keyed" }
+            }
+        });
+        let config: JobConfig = serde_json::from_value(spec).expect("should deserialize");
+        let err = config.tasks[0]
+            .validate_stateful()
+            .expect_err("keyed + count must be rejected");
+        assert!(err.to_string().contains("count is ignored"), "{err}");
+    }
+
+    #[test]
+    fn stateless_task_is_not_stateful() {
+        let task = TaskConfig::new("api", "exec");
+        assert!(!task.is_stateful());
+        assert_eq!(task.stateful_mode(), None);
+        task.validate_stateful().unwrap();
+    }
+
+    #[test]
+    fn stateful_task_allows_instance_sub_template() -> R<()> {
+        // The stateful block now gates {instance}/{slot} in a sub template.
+        let spec = serde_json::json!({
+            "name": "db",
+            "task": {
+                "kind": "container",
+                "count": 2,
+                "stateful": { "mode": "slot" },
+                "identities": [{
+                    "name": "aws",
+                    "audience": ["sts.amazonaws.com"],
+                    "file": { "path": "/run/token" },
+                    "subTemplate": "{region}:{job}:{group}:{task}:{instance}"
+                }]
+            }
+        });
+        let config: JobConfig = serde_json::from_value(spec)?;
+        config.tasks[0].validate_identities()?;
         Ok(())
     }
 

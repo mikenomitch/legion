@@ -205,6 +205,7 @@ pub fn validate_job_config(config: &JobConfig) -> R<()> {
         task.validate_checks()?;
         task.validate_kv_injections()?;
         task.validate_identities()?;
+        task.validate_stateful()?;
         if !task.identities.is_empty() {
             registry.load_plugin(&task.kind, false)?;
             let plugin = registry
