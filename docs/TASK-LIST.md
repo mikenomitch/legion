@@ -64,6 +64,7 @@
   - Everything has an easily accessible type and spec
   
 - [ ] Artifact system
+  - Plan: [docs/plans/artifact-system-plan.md](plans/artifact-system-plan.md)
   - [ ] Able to grab docker images
   - [ ] Able to do some auth for this
   - [ ] Able to grab files and put them on disk
