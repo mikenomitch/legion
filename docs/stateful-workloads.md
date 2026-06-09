@@ -44,7 +44,7 @@ the manager's state store (`instance` table) and outlives any allocation.
   on demand via the management API (`legion instance create` /
   `CreateInstance`), each with a unique, **never-recycled** id, so a new
   sandbox can never inherit a dead one's identity or persisted state.
-  `count.num` does not drive keyed tasks: the set of live instances does
+  keyed tasks define no `count` (a parse-time error): the set of live instances
   (zero instances = zero allocations). See
   [Keyed Mode: the Management API](#keyed-mode-the-management-api).
 
@@ -90,8 +90,11 @@ Validation rules (enforced at `job validate` / submit time):
 - `idSource` is only valid in keyed mode (`'caller'` or `'uuid'`).
 - Slot mode requires `count.num >= 1` and cannot be combined with `count.per`
   (per-attribute pools would collide on slot ids).
-- Keyed mode cannot be combined with `count.per`; `count.num` is **ignored**
-  for keyed tasks (cardinality is driven by the instance management API).
+- Keyed mode **cannot define `count` at all** — the spec is rejected at parse
+  time with `task <name> is stateful keyed mode and cannot define count: keyed
+  instance cardinality is driven by the instance management API (legion
+  instance create/destroy), not the job spec`. There is no fixed pool to size:
+  the set of live instances *is* the cardinality.
 - `storage.path` must be a non-empty absolute path.
 - At most one slot-mode stateful task per group (slot ids are derived from
   `(job, group, slot)`). Multiple keyed tasks per group are fine — their ids
@@ -149,7 +152,7 @@ CreateInstance ──> pending ──placed──> active ──alloc dies──
 
 - **Create** registers the instance (state `pending`) and enqueues placement.
   The scheduler derives a keyed task's desired allocation count from its live
-  (pending/active/rescheduling) instances — `count.num` is ignored, and a
+  (pending/active/rescheduling) instances — keyed tasks define no `count`, and a
   keyed task with zero instances runs zero allocations.
 - **Placement** binds the new allocation to an unbound live instance inside
   the same transaction that inserts the allocation (the same choke point slot
@@ -216,11 +219,12 @@ handles (slot handles are retained).
 
 ### Count interaction
 
-`count.num` does not drive keyed tasks — submitting the job places nothing
-until instances are created, and config updates/rollouts converge each keyed
-task to its live-instance count, replacing every live instance's allocation
-on the new config. `count.per` is rejected at validation time for keyed
-tasks.
+Keyed tasks have no `count` — defining one is a parse-time error (see the
+validation rules above), because cardinality is owned entirely by the
+instance management API. Submitting the job places nothing until instances
+are created, and config updates/rollouts converge each keyed task to its
+live-instance count, replacing every live instance's allocation on the new
+config.
 
 ## Scale-In / Scale-Out Retention
 

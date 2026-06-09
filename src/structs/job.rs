@@ -1040,8 +1040,10 @@ enum TaskConfigList {
 struct TaskConfigInput {
     #[serde(default)]
     name: Option<String>,
-    #[serde(default = "default_task_count")]
-    count: TaskCount,
+    // Optional so keyed-mode validation can tell an explicit `count` apart
+    // from the default; resolved via `unwrap_or_default()` in conversion.
+    #[serde(default)]
+    count: Option<TaskCount>,
     kind: String,
     #[serde(default = "default_task_group")]
     group: String,
@@ -1091,7 +1093,22 @@ enum TaskDependencyInput {
 }
 
 impl TaskConfigInput {
-    fn into_task_config(self, name: String) -> TaskConfig {
+    fn into_task_config(self, name: String) -> Result<TaskConfig, String> {
+        let name = self.name.unwrap_or(name);
+        // Keyed-mode cardinality is owned by the instance management API
+        // (CreateInstance/DestroyInstance), never by the job spec. An explicit
+        // `count` on a keyed task would be silently meaningless, so reject it
+        // loudly at parse time (only here do we still know it was explicit).
+        if let Some(stateful) = self.stateful.as_ref() {
+            if stateful.mode == InstanceMode::Keyed && self.count.is_some() {
+                return Err(format!(
+                    "task {name} is stateful keyed mode and cannot define count: keyed \
+                     instance cardinality is driven by the instance management API \
+                     (legion instance create/destroy), not the job spec; remove the \
+                     count field (see docs/stateful-workloads.md)"
+                ));
+            }
+        }
         let depends_on = self
             .depends_on
             .into_iter()
@@ -1105,9 +1122,9 @@ impl TaskConfigInput {
                 }
             })
             .collect();
-        TaskConfig {
-            name: self.name.unwrap_or(name),
-            count: self.count,
+        Ok(TaskConfig {
+            name,
+            count: self.count.unwrap_or_default(),
             kind: self.kind,
             group: self.group,
             depends_on,
@@ -1143,11 +1160,11 @@ impl TaskConfigInput {
             }),
             identities: self.identities,
             stateful: self.stateful,
-        }
+        })
     }
 }
 
-fn task_list_to_vec(configs: TaskConfigList) -> Vec<TaskConfig> {
+fn task_list_to_vec(configs: TaskConfigList) -> Result<Vec<TaskConfig>, String> {
     match configs {
         TaskConfigList::List(tasks) => tasks
             .into_iter()
@@ -1173,8 +1190,10 @@ impl<'de> Deserialize<'de> for JobConfig {
                     "jobspec must define only one of task or tasks",
                 ))
             }
-            (Some(tasks), None) => task_list_to_vec(tasks),
-            (None, Some(task)) => vec![task.into_task_config(String::from("task"))],
+            (Some(tasks), None) => task_list_to_vec(tasks).map_err(D::Error::custom)?,
+            (None, Some(task)) => vec![task
+                .into_task_config(String::from("task"))
+                .map_err(D::Error::custom)?],
             (None, None) => return Err(D::Error::custom("jobspec must define at least one task")),
         };
 
@@ -1349,9 +1368,10 @@ impl TaskConfig {
                     }
                 }
                 // Keyed cardinality is driven entirely by the management API
-                // (CreateInstance/DestroyInstance); count.num is ignored and
-                // count.per (per-attribute counts) has no meaningful keyed
-                // interpretation, so reject it rather than silently ignore.
+                // (CreateInstance/DestroyInstance). An explicit `count` in the
+                // job spec is rejected at parse time (see TaskConfigInput);
+                // this guard re-checks `count.per` for directly-constructed
+                // configs, which would otherwise be silently meaningless.
                 if self.count.per.is_some() {
                     bail!(
                         "task {} stateful keyed mode cannot be combined with count.per; keyed \
@@ -1993,6 +2013,65 @@ mod tests {
         assert_eq!(stateful.mode, InstanceMode::Keyed);
         assert_eq!(stateful.id_source.as_deref(), Some("caller"));
         config.tasks[0].validate_stateful()?;
+        Ok(())
+    }
+
+    #[test]
+    fn stateful_keyed_mode_rejects_explicit_count_at_parse_time() {
+        for count in [
+            serde_json::json!(3),
+            serde_json::json!({ "num": 2, "per": "arch" }),
+        ] {
+            let spec = serde_json::json!({
+                "name": "demo",
+                "task": {
+                    "kind": "exec",
+                    "count": count,
+                    "stateful": { "mode": "keyed" }
+                }
+            });
+            let err = serde_json::from_value::<JobConfig>(spec)
+                .expect_err("keyed task with explicit count must fail to parse");
+            let message = err.to_string();
+            assert!(
+                message.contains("cannot define count")
+                    && message.contains("instance management API"),
+                "unexpected error message: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn stateful_keyed_mode_rejects_explicit_count_in_task_list() {
+        let spec = serde_json::json!({
+            "name": "demo",
+            "tasks": {
+                "sandbox": {
+                    "kind": "exec",
+                    "count": 1,
+                    "stateful": { "mode": "keyed" }
+                }
+            }
+        });
+        let err = serde_json::from_value::<JobConfig>(spec)
+            .expect_err("keyed task with explicit count must fail to parse");
+        assert!(err.to_string().contains("task sandbox"));
+    }
+
+    #[test]
+    fn stateful_keyed_mode_parses_without_count_and_slot_mode_keeps_count() -> R<()> {
+        let spec = serde_json::json!({
+            "name": "demo",
+            "tasks": [
+                { "kind": "exec", "stateful": { "mode": "keyed" } },
+                { "kind": "exec", "count": 3, "stateful": { "mode": "slot" } },
+                { "kind": "exec", "group": "plain" }
+            ]
+        });
+        let config: JobConfig = serde_json::from_value(spec)?;
+        assert_eq!(config.tasks[0].count, TaskCount::new(1));
+        assert_eq!(config.tasks[1].count, TaskCount::new(3));
+        assert_eq!(config.tasks[2].count, TaskCount::new(1));
         Ok(())
     }
 

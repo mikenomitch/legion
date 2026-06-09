@@ -1,8 +1,9 @@
 // Keyed-mode stateful job (sandbox / dispatch style; see
 // docs/stateful-workloads.md).
 //
-// Unlike slot mode, `count` does NOT drive this task. Submitting the job
-// runs ZERO sandboxes; instances are created and destroyed on demand:
+// Unlike slot mode, keyed tasks define no `count` (doing so is a parse-time
+// error). Submitting the job runs ZERO sandboxes; instances are created and
+// destroyed on demand:
 //
 //   # create a sandbox with an explicit key (or omit --id for a minted one)
 //   legion instance create sandbox-demo --id user-42

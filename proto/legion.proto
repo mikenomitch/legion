@@ -81,7 +81,8 @@ service Manager {
   // Keyed instances (see docs/stateful-workloads.md) are the sandbox/dispatch
   // primitive: each instance is a long-lived logical entity with a unique,
   // **never-recycled** id that persists across allocations. Unlike slot mode,
-  // `count.num` does not drive keyed tasks — the number of live instances
+  // Keyed tasks cannot define `count` (rejected at job parse time) — the
+  // number of live instances
   // created through this RPC is the task's desired allocation count (zero
   // instances = zero allocations).
   //
