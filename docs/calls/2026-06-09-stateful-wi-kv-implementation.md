@@ -111,6 +111,13 @@ allocation-release hook moves them to `rescheduling` so the reconciler replaces
 them. `--group`/`--task` on create are only required when a job has more than one
 keyed task — ambiguity is rejected, never guessed.
 
+## 14. UI shows instances read-only
+
+The job detail page surfaces stateful badges, an instances panel, and instance
+pills on allocations, but offers no create/destroy buttons for keyed instances —
+a hint points at `legion instance create/destroy`. UI-driven mutations (and the
+authz story around them) are a separate decision; visibility was the requirement.
+
 ---
 
 *(Further entries are appended below as implementation proceeds.)*
