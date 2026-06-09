@@ -162,6 +162,13 @@ pub fn config() -> Command {
                 .help("Return the trailing bytes of each stream instead of the leading bytes")
                 .action(ArgAction::SetTrue),
         )
+        .arg(
+            Arg::new("follow")
+                .long("follow")
+                .short('f')
+                .help("Stream new log output until interrupted (incompatible with --json)")
+                .action(ArgAction::SetTrue),
+        )
         .arg(json_flag());
 
     let rollout_list_cmd = Command::new("list")
@@ -974,6 +981,7 @@ async fn job_logs(arg_matches: &ArgMatches) -> R<()> {
         .copied()
         .unwrap_or(0);
     let tail = arg_matches.get_flag("tail");
+    let follow = arg_matches.get_flag("follow");
 
     if name.is_none() && allocation_id.is_none() {
         return Err(output::fail_local(
@@ -986,13 +994,30 @@ async fn job_logs(arg_matches: &ArgMatches) -> R<()> {
         ));
     }
 
+    let job = name.unwrap_or_default();
     let mut client = connect_manager_client().await?;
+
+    if follow {
+        if format.is_json() {
+            return Err(output::fail_local(
+                format,
+                CliError::local(
+                    "InvalidArgument",
+                    "--follow cannot be combined with --json",
+                    Some("drop --json to stream logs, or drop --follow for a one-shot JSON read"),
+                ),
+            ));
+        }
+        return follow_logs(&mut client, &job, allocation_id, &stream).await;
+    }
+
     let request = tonic::Request::new(GetAllocationLogsRequest {
-        job: name.unwrap_or_default(),
+        job,
         allocation_id,
         stream,
         max_bytes,
         tail,
+        offset: 0,
     });
     let response = output::resolve(
         format,
@@ -1012,14 +1037,11 @@ async fn job_logs(arg_matches: &ArgMatches) -> R<()> {
     }
 
     for alloc in &response.allocations {
-        let task = if alloc.task_name.is_empty() {
-            "?".to_string()
-        } else {
-            alloc.task_name.clone()
-        };
         println!(
             "== allocation {} (task {}) on {} ==",
-            alloc.allocation_id, task, alloc.node_id
+            alloc.allocation_id,
+            task_label(&alloc.task_name),
+            alloc.node_id
         );
         if !alloc.error.is_empty() {
             println!("  error: {}", alloc.error);
@@ -1036,13 +1058,110 @@ async fn job_logs(arg_matches: &ArgMatches) -> R<()> {
                 String::new()
             };
             println!("--- {}{} ---", stream.stream, suffix);
-            print!("{}", stream.content);
-            if !stream.content.ends_with('\n') {
-                println!();
-            }
+            print_stream_content(&stream.content);
         }
     }
     Ok(())
+}
+
+fn task_label(task_name: &str) -> String {
+    if task_name.is_empty() {
+        "?".to_string()
+    } else {
+        task_name.to_string()
+    }
+}
+
+fn print_stream_content(content: &str) {
+    use std::io::Write;
+    let mut stdout = std::io::stdout();
+    let _ = stdout.write_all(content.as_bytes());
+    if !content.is_empty() && !content.ends_with('\n') {
+        let _ = stdout.write_all(b"\n");
+    }
+    let _ = stdout.flush();
+}
+
+/// Live-tail logs by polling `GetAllocationLogs` for each stream's trailing
+/// window and printing only the bytes beyond what was already shown, tracked by
+/// the per-(allocation, stream) `next_offset`. Runs until interrupted (Ctrl-C).
+async fn follow_logs(
+    client: &mut crate::structs::manager_client::ManagerClient<tonic::transport::Channel>,
+    job: &str,
+    allocation_id: Option<i64>,
+    stream: &str,
+) -> R<()> {
+    use std::collections::{HashMap, HashSet};
+
+    // Last printed byte offset per (allocation, stream).
+    let mut printed_to: HashMap<(i64, String), i64> = HashMap::new();
+    let mut header_shown: HashSet<i64> = HashSet::new();
+    let mut error_shown: HashSet<i64> = HashSet::new();
+
+    loop {
+        let request = tonic::Request::new(GetAllocationLogsRequest {
+            job: job.to_string(),
+            allocation_id,
+            stream: stream.to_string(),
+            max_bytes: 0,
+            tail: true,
+            offset: 0,
+        });
+        let response = match client.get_allocation_logs(request).await {
+            Ok(resp) => resp.into_inner(),
+            Err(status) => {
+                return Err(crate::cmd::helpers::friendly_status(
+                    "failed to fetch allocation logs",
+                    status,
+                ))
+            }
+        };
+
+        for alloc in &response.allocations {
+            if !alloc.error.is_empty() {
+                if error_shown.insert(alloc.allocation_id) {
+                    eprintln!(
+                        "== allocation {} on {}: {} ==",
+                        alloc.allocation_id, alloc.node_id, alloc.error
+                    );
+                }
+                continue;
+            }
+            for s in &alloc.streams {
+                let key = (alloc.allocation_id, s.stream.clone());
+                let prev = printed_to.get(&key).copied();
+
+                // Determine which slice of the returned window is new.
+                let new_text = match prev {
+                    None => s.content.clone(),
+                    Some(prev) if s.next_offset <= prev => String::new(),
+                    Some(prev) if prev >= s.start_offset => {
+                        let skip = (prev - s.start_offset) as usize;
+                        s.content.get(skip..).unwrap_or("").to_string()
+                    }
+                    // Window slid past what we last printed (very chatty stream):
+                    // emit the whole window; a small gap may have been dropped.
+                    Some(_) => s.content.clone(),
+                };
+
+                if !new_text.is_empty() {
+                    if header_shown.insert(alloc.allocation_id) {
+                        println!(
+                            "== allocation {} (task {}) on {} ==",
+                            alloc.allocation_id,
+                            task_label(&alloc.task_name),
+                            alloc.node_id
+                        );
+                    }
+                    print!("[{}] ", s.stream);
+                    print_stream_content(&new_text);
+                }
+                printed_to.insert(key, s.next_offset.max(prev.unwrap_or(0)));
+            }
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+    }
 }
 
 async fn handle_rollout(arg_matches: &ArgMatches) -> R<()> {

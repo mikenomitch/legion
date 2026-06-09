@@ -181,7 +181,15 @@ legion job logs demo --allocation 42 --stream stderr --max-bytes 4096 --tail
 Flags: `--allocation <ID>` targets one allocation instead of the whole job;
 `--stream stdout|stderr|all` (default `all`); `--max-bytes <N>` caps each stream
 (`0` uses the worker's built-in 256 KiB cap); `--tail` returns the trailing
-bytes rather than the leading bytes. The MCP tool is `legion_job_logs`.
+bytes rather than the leading bytes; `--follow`/`-f` live-tails until interrupted.
+The MCP tool is `legion_job_logs`, and the web UI exposes a live-tailing **Logs**
+tab on jobs and tasks.
+
+Workers rotate and prune these files (size cap + retention) so a chatty task
+cannot fill a node's disk, and the files are ready to ship to an external
+collector. See **[Logging](logging.md)** for the full picture: capture, the
+`LogSink` seam, rotation config, tailing, external shipping, and exporting
+Legion's own traces over OpenTelemetry.
 
 Each returned allocation carries its `allocationId`, `nodeId`, `taskName`, the
 captured `streams` (with `sizeBytes` and a `truncated` flag), and a per-allocation

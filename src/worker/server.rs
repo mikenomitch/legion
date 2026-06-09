@@ -59,7 +59,13 @@ impl Worker for WorkerAgentService {
                 .lock()
                 .map_err(|_| Status::internal("Task manager lock poisoned"))?;
             manager
-                .read_allocation_logs(req.allocation_id, &req.stream, req.max_bytes, req.tail)
+                .read_allocation_logs(
+                    req.allocation_id,
+                    &req.stream,
+                    req.offset,
+                    req.max_bytes,
+                    req.tail,
+                )
                 .map_err(|err| Status::internal(format!("Failed to read task logs: {err}")))?
         };
 
@@ -70,6 +76,8 @@ impl Worker for WorkerAgentService {
                 content: stream.content,
                 size_bytes: stream.size_bytes,
                 truncated: stream.truncated,
+                start_offset: stream.start_offset,
+                next_offset: stream.next_offset,
             })
             .collect();
 

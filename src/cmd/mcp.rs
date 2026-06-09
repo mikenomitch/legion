@@ -418,6 +418,7 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
                 stream,
                 max_bytes,
                 tail,
+                offset: 0,
             }))
             .await
         }

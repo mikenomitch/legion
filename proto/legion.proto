@@ -1845,6 +1845,11 @@ message GetTaskLogsRequest {
   // When true, return the trailing bytes of each stream (tail) rather than the
   // leading bytes. Defaults to false (head).
   bool tail = 4;
+
+  // Byte offset to read forward from (incremental tail / follow). When > 0 the
+  // worker returns bytes from this position to EOF and ignores `tail`. When the
+  // offset is past EOF (the file was rotated) the read restarts from the front.
+  int64 offset = 5;
 }
 
 // One captured stream's content for a single allocation.
@@ -1855,11 +1860,19 @@ message TaskLogStream {
   // UTF-8 (lossy) content of the (possibly truncated) stream.
   string content = 2;
 
-  // Total size of the underlying log file in bytes, before truncation.
+  // Total size of the underlying active log file in bytes.
   int64 size_bytes = 3;
 
   // Whether `content` was truncated to satisfy `max_bytes`.
   bool truncated = 4;
+
+  // Byte offset within the file where `content` begins.
+  int64 start_offset = 5;
+
+  // Byte offset to resume from on the next incremental read
+  // (`start_offset` + bytes returned). Clients following a stream pass this
+  // back as the request `offset`.
+  int64 next_offset = 6;
 }
 
 // Reply payload for Worker.GetTaskLogs.
@@ -1886,6 +1899,10 @@ message GetAllocationLogsRequest {
 
   // When true, return the trailing bytes of each stream rather than the leading.
   bool tail = 5;
+
+  // Byte offset to read forward from (incremental tail / follow). Applied per
+  // stream; see `GetTaskLogsRequest.offset`.
+  int64 offset = 6;
 }
 
 // Captured logs for a single allocation, annotated with where they came from.

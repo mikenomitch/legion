@@ -461,6 +461,20 @@ export class RunJobRequest extends Message<RunJobRequest> {
    */
   forceReschedule = false;
 
+  /**
+   * Optional idempotency key.
+   *
+   * When set and non-empty, the manager deduplicates retried requests carrying
+   * the same key: the first request is applied and its outcome recorded; any
+   * later request with the same key returns the recorded reply without
+   * re-applying. This lets clients (especially automated agents) safely retry
+   * after a timeout without risking a double submission. Unset disables
+   * deduplication.
+   *
+   * @generated from field: optional string idempotency_key = 5;
+   */
+  idempotencyKey?: string;
+
   constructor(data?: PartialMessage<RunJobRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -473,6 +487,7 @@ export class RunJobRequest extends Message<RunJobRequest> {
     { no: 2, name: "submissions", kind: "message", T: Submission, repeated: true },
     { no: 3, name: "priority", kind: "scalar", T: 3 /* ScalarType.INT64 */, opt: true },
     { no: 4, name: "force_reschedule", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 5, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RunJobRequest {
@@ -512,6 +527,14 @@ export class RunJobReply extends Message<RunJobReply> {
    */
   message = "";
 
+  /**
+   * True when this reply was replayed from a previously recorded result for the
+   * request's `idempotency_key` rather than applied fresh.
+   *
+   * @generated from field: bool deduplicated = 2;
+   */
+  deduplicated = false;
+
   constructor(data?: PartialMessage<RunJobReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -521,6 +544,7 @@ export class RunJobReply extends Message<RunJobReply> {
   static readonly typeName = "legion.RunJobReply";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "deduplicated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RunJobReply {
@@ -2177,6 +2201,13 @@ export class StopJobRequest extends Message<StopJobRequest> {
    */
   priority?: bigint;
 
+  /**
+   * Optional idempotency key. See `RunJobRequest.idempotency_key`.
+   *
+   * @generated from field: optional string idempotency_key = 3;
+   */
+  idempotencyKey?: string;
+
   constructor(data?: PartialMessage<StopJobRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -2187,6 +2218,7 @@ export class StopJobRequest extends Message<StopJobRequest> {
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 2, name: "priority", kind: "scalar", T: 3 /* ScalarType.INT64 */, opt: true },
+    { no: 3, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): StopJobRequest {
@@ -2221,6 +2253,14 @@ export class StopJobReply extends Message<StopJobReply> {
    */
   message = "";
 
+  /**
+   * True when replayed from a recorded result for the request's
+   * `idempotency_key` rather than applied fresh.
+   *
+   * @generated from field: bool deduplicated = 2;
+   */
+  deduplicated = false;
+
   constructor(data?: PartialMessage<StopJobReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -2230,6 +2270,7 @@ export class StopJobReply extends Message<StopJobReply> {
   static readonly typeName = "legion.StopJobReply";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "deduplicated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): StopJobReply {
@@ -2271,6 +2312,13 @@ export class DestroyJobRequest extends Message<DestroyJobRequest> {
    */
   priority?: bigint;
 
+  /**
+   * Optional idempotency key. See `RunJobRequest.idempotency_key`.
+   *
+   * @generated from field: optional string idempotency_key = 3;
+   */
+  idempotencyKey?: string;
+
   constructor(data?: PartialMessage<DestroyJobRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -2281,6 +2329,7 @@ export class DestroyJobRequest extends Message<DestroyJobRequest> {
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 2, name: "priority", kind: "scalar", T: 3 /* ScalarType.INT64 */, opt: true },
+    { no: 3, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): DestroyJobRequest {
@@ -2315,6 +2364,14 @@ export class DestroyJobReply extends Message<DestroyJobReply> {
    */
   message = "";
 
+  /**
+   * True when replayed from a recorded result for the request's
+   * `idempotency_key` rather than applied fresh.
+   *
+   * @generated from field: bool deduplicated = 2;
+   */
+  deduplicated = false;
+
   constructor(data?: PartialMessage<DestroyJobReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -2324,6 +2381,7 @@ export class DestroyJobReply extends Message<DestroyJobReply> {
   static readonly typeName = "legion.DestroyJobReply";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "deduplicated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): DestroyJobReply {
@@ -6571,6 +6629,409 @@ export class Eval extends Message<Eval> {
 
   static equals(a: Eval | PlainMessage<Eval> | undefined, b: Eval | PlainMessage<Eval> | undefined): boolean {
     return proto3.util.equals(Eval, a, b);
+  }
+}
+
+/**
+ * Selects which captured stream(s) to read for a task.
+ *
+ * Used by both `Worker.GetTaskLogs` and `Manager.GetAllocationLogs`.
+ *
+ * @generated from message legion.GetTaskLogsRequest
+ */
+export class GetTaskLogsRequest extends Message<GetTaskLogsRequest> {
+  /**
+   * Allocation whose logs are requested.
+   *
+   * @generated from field: int64 allocation_id = 1;
+   */
+  allocationId = protoInt64.zero;
+
+  /**
+   * Stream filter: "stdout", "stderr", or "all" (default when empty).
+   *
+   * @generated from field: string stream = 2;
+   */
+  stream = "";
+
+  /**
+   * Maximum number of bytes to return per stream.
+   *
+   * `0` selects the worker's built-in default cap. When a stream's file is
+   * larger than the cap the returned content is truncated.
+   *
+   * @generated from field: int64 max_bytes = 3;
+   */
+  maxBytes = protoInt64.zero;
+
+  /**
+   * When true, return the trailing bytes of each stream (tail) rather than the
+   * leading bytes. Defaults to false (head).
+   *
+   * @generated from field: bool tail = 4;
+   */
+  tail = false;
+
+  /**
+   * Byte offset to read forward from (incremental tail / follow). When > 0 the
+   * worker returns bytes from this position to EOF and ignores `tail`. When the
+   * offset is past EOF (the file was rotated) the read restarts from the front.
+   *
+   * @generated from field: int64 offset = 5;
+   */
+  offset = protoInt64.zero;
+
+  constructor(data?: PartialMessage<GetTaskLogsRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetTaskLogsRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "allocation_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 2, name: "stream", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "max_bytes", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 4, name: "tail", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 5, name: "offset", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetTaskLogsRequest {
+    return new GetTaskLogsRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetTaskLogsRequest {
+    return new GetTaskLogsRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetTaskLogsRequest {
+    return new GetTaskLogsRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetTaskLogsRequest | PlainMessage<GetTaskLogsRequest> | undefined, b: GetTaskLogsRequest | PlainMessage<GetTaskLogsRequest> | undefined): boolean {
+    return proto3.util.equals(GetTaskLogsRequest, a, b);
+  }
+}
+
+/**
+ * One captured stream's content for a single allocation.
+ *
+ * @generated from message legion.TaskLogStream
+ */
+export class TaskLogStream extends Message<TaskLogStream> {
+  /**
+   * Stream name ("stdout" or "stderr").
+   *
+   * @generated from field: string stream = 1;
+   */
+  stream = "";
+
+  /**
+   * UTF-8 (lossy) content of the (possibly truncated) stream.
+   *
+   * @generated from field: string content = 2;
+   */
+  content = "";
+
+  /**
+   * Total size of the underlying active log file in bytes.
+   *
+   * @generated from field: int64 size_bytes = 3;
+   */
+  sizeBytes = protoInt64.zero;
+
+  /**
+   * Whether `content` was truncated to satisfy `max_bytes`.
+   *
+   * @generated from field: bool truncated = 4;
+   */
+  truncated = false;
+
+  /**
+   * Byte offset within the file where `content` begins.
+   *
+   * @generated from field: int64 start_offset = 5;
+   */
+  startOffset = protoInt64.zero;
+
+  /**
+   * Byte offset to resume from on the next incremental read
+   * (`start_offset` + bytes returned). Clients following a stream pass this
+   * back as the request `offset`.
+   *
+   * @generated from field: int64 next_offset = 6;
+   */
+  nextOffset = protoInt64.zero;
+
+  constructor(data?: PartialMessage<TaskLogStream>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.TaskLogStream";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "stream", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "content", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "size_bytes", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 4, name: "truncated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 5, name: "start_offset", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 6, name: "next_offset", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): TaskLogStream {
+    return new TaskLogStream().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): TaskLogStream {
+    return new TaskLogStream().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): TaskLogStream {
+    return new TaskLogStream().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: TaskLogStream | PlainMessage<TaskLogStream> | undefined, b: TaskLogStream | PlainMessage<TaskLogStream> | undefined): boolean {
+    return proto3.util.equals(TaskLogStream, a, b);
+  }
+}
+
+/**
+ * Reply payload for Worker.GetTaskLogs.
+ *
+ * @generated from message legion.GetTaskLogsReply
+ */
+export class GetTaskLogsReply extends Message<GetTaskLogsReply> {
+  /**
+   * Captured streams for the allocation. Streams with no log file are omitted.
+   *
+   * @generated from field: repeated legion.TaskLogStream streams = 1;
+   */
+  streams: TaskLogStream[] = [];
+
+  constructor(data?: PartialMessage<GetTaskLogsReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetTaskLogsReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "streams", kind: "message", T: TaskLogStream, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetTaskLogsReply {
+    return new GetTaskLogsReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetTaskLogsReply {
+    return new GetTaskLogsReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetTaskLogsReply {
+    return new GetTaskLogsReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetTaskLogsReply | PlainMessage<GetTaskLogsReply> | undefined, b: GetTaskLogsReply | PlainMessage<GetTaskLogsReply> | undefined): boolean {
+    return proto3.util.equals(GetTaskLogsReply, a, b);
+  }
+}
+
+/**
+ * Request payload for Manager.GetAllocationLogs.
+ *
+ * @generated from message legion.GetAllocationLogsRequest
+ */
+export class GetAllocationLogsRequest extends Message<GetAllocationLogsRequest> {
+  /**
+   * Job name to gather allocation logs for. Required unless `allocation_id` is
+   * set.
+   *
+   * @generated from field: string job = 1;
+   */
+  job = "";
+
+  /**
+   * Optional: restrict the read to a single allocation id. When set, `job` is
+   * ignored.
+   *
+   * @generated from field: optional int64 allocation_id = 2;
+   */
+  allocationId?: bigint;
+
+  /**
+   * Stream filter: "stdout", "stderr", or "all" (default when empty).
+   *
+   * @generated from field: string stream = 3;
+   */
+  stream = "";
+
+  /**
+   * Maximum number of bytes to return per stream (`0` = worker default).
+   *
+   * @generated from field: int64 max_bytes = 4;
+   */
+  maxBytes = protoInt64.zero;
+
+  /**
+   * When true, return the trailing bytes of each stream rather than the leading.
+   *
+   * @generated from field: bool tail = 5;
+   */
+  tail = false;
+
+  /**
+   * Byte offset to read forward from (incremental tail / follow). Applied per
+   * stream; see `GetTaskLogsRequest.offset`.
+   *
+   * @generated from field: int64 offset = 6;
+   */
+  offset = protoInt64.zero;
+
+  constructor(data?: PartialMessage<GetAllocationLogsRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetAllocationLogsRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "job", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "allocation_id", kind: "scalar", T: 3 /* ScalarType.INT64 */, opt: true },
+    { no: 3, name: "stream", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "max_bytes", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 5, name: "tail", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 6, name: "offset", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetAllocationLogsRequest {
+    return new GetAllocationLogsRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetAllocationLogsRequest {
+    return new GetAllocationLogsRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetAllocationLogsRequest {
+    return new GetAllocationLogsRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetAllocationLogsRequest | PlainMessage<GetAllocationLogsRequest> | undefined, b: GetAllocationLogsRequest | PlainMessage<GetAllocationLogsRequest> | undefined): boolean {
+    return proto3.util.equals(GetAllocationLogsRequest, a, b);
+  }
+}
+
+/**
+ * Captured logs for a single allocation, annotated with where they came from.
+ *
+ * @generated from message legion.AllocationLog
+ */
+export class AllocationLog extends Message<AllocationLog> {
+  /**
+   * Allocation id.
+   *
+   * @generated from field: int64 allocation_id = 1;
+   */
+  allocationId = protoInt64.zero;
+
+  /**
+   * Node hosting the allocation.
+   *
+   * @generated from field: string node_id = 2;
+   */
+  nodeId = "";
+
+  /**
+   * Task name for the allocation, when resolvable.
+   *
+   * @generated from field: string task_name = 3;
+   */
+  taskName = "";
+
+  /**
+   * Captured streams for the allocation.
+   *
+   * @generated from field: repeated legion.TaskLogStream streams = 4;
+   */
+  streams: TaskLogStream[] = [];
+
+  /**
+   * Per-allocation error (for example: node unreachable). Empty on success.
+   *
+   * @generated from field: string error = 5;
+   */
+  error = "";
+
+  constructor(data?: PartialMessage<AllocationLog>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.AllocationLog";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "allocation_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 2, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "task_name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "streams", kind: "message", T: TaskLogStream, repeated: true },
+    { no: 5, name: "error", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): AllocationLog {
+    return new AllocationLog().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): AllocationLog {
+    return new AllocationLog().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): AllocationLog {
+    return new AllocationLog().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: AllocationLog | PlainMessage<AllocationLog> | undefined, b: AllocationLog | PlainMessage<AllocationLog> | undefined): boolean {
+    return proto3.util.equals(AllocationLog, a, b);
+  }
+}
+
+/**
+ * Reply payload for Manager.GetAllocationLogs.
+ *
+ * @generated from message legion.GetAllocationLogsReply
+ */
+export class GetAllocationLogsReply extends Message<GetAllocationLogsReply> {
+  /**
+   * One entry per matched allocation.
+   *
+   * @generated from field: repeated legion.AllocationLog allocations = 1;
+   */
+  allocations: AllocationLog[] = [];
+
+  constructor(data?: PartialMessage<GetAllocationLogsReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetAllocationLogsReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "allocations", kind: "message", T: AllocationLog, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetAllocationLogsReply {
+    return new GetAllocationLogsReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetAllocationLogsReply {
+    return new GetAllocationLogsReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetAllocationLogsReply {
+    return new GetAllocationLogsReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetAllocationLogsReply | PlainMessage<GetAllocationLogsReply> | undefined, b: GetAllocationLogsReply | PlainMessage<GetAllocationLogsReply> | undefined): boolean {
+    return proto3.util.equals(GetAllocationLogsReply, a, b);
   }
 }
 

@@ -1,0 +1,31 @@
+# Example Vector (https://vector.dev) config for shipping Legion task logs.
+#
+# Equivalent to the OpenTelemetry Collector recipe: it tails the per-allocation
+# stdout/stderr files a Legion worker writes, derives resource fields from the
+# path, and forwards them to your sink. Run one Vector per worker host:
+#
+#   vector --config configs/observability/vector.toml
+
+# Tail every task's stdout/stderr under the worker state dir (default shown).
+[sources.legion_task_logs]
+type = "file"
+include = [".legion/workers/*/logs/*/*.log"]
+# Resume across restarts; ignore rotated generations (*.log.N) by default.
+ignore_older_secs = 86400
+read_from = "end"
+
+# Parse the allocation id and stream out of the file path and tag the event.
+[transforms.enrich]
+type = "remap"
+inputs = ["legion_task_logs"]
+source = '''
+. = parse_regex!(.file, r'logs/(?P<allocation_id>\d+)/(?P<stream>stdout|stderr)\.log$') ?? .
+.service = "legion-tasks"
+'''
+
+# Replace this sink with your destination (Loki, Elasticsearch, OTLP, …).
+# `console` just prints, so you can try the pipeline end-to-end immediately.
+[sinks.out]
+type = "console"
+inputs = ["enrich"]
+encoding.codec = "json"

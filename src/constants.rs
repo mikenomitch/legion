@@ -31,3 +31,12 @@ pub const DEF_WORKER_STATE_PATH: &str = ".legion/workers/default/worker_state.js
 // Default per-stream cap (bytes) when reading captured task logs and no explicit
 // limit is requested. 256 KiB keeps replies small enough for an agent context.
 pub const DEF_TASK_LOG_MAX_BYTES: i64 = 256 * 1024;
+
+// Task log rotation/retention defaults (worker-side). These keep a chatty task
+// from filling a worker's disk while preserving a useful recent window. All are
+// overridable via env vars (LEGION_LOG_MAX_FILE_BYTES / LEGION_LOG_MAX_FILES /
+// LEGION_LOG_RETENTION_DAYS).
+pub const DEF_TASK_LOG_MAX_FILE_BYTES: u64 = 10 * 1024 * 1024; // 10 MiB per stream
+pub const DEF_TASK_LOG_MAX_FILES: u32 = 5; // rotated generations kept per stream
+pub const DEF_TASK_LOG_RETENTION_DAYS: u64 = 7; // age-based prune of rotated files
+pub const DEF_TASK_LOG_MAINTENANCE_SEC: u64 = 10; // rotation/retention sweep cadence

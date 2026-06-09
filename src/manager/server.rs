@@ -2285,6 +2285,7 @@ async fn fetch_allocation_logs(
             stream: req.stream.clone(),
             max_bytes: req.max_bytes,
             tail: req.tail,
+            offset: req.offset,
         })
         .await
         .map_err(|status| format!("worker on {} returned {}", allocation.node_id, status))?;
@@ -2859,6 +2860,8 @@ mod tests {
                     content: format!("logs for {allocation_id}"),
                     size_bytes: 0,
                     truncated: false,
+                    start_offset: 0,
+                    next_offset: 0,
                 }],
             }))
         }
@@ -2929,6 +2932,7 @@ mod tests {
                 stream: "all".into(),
                 max_bytes: 0,
                 tail: false,
+                offset: 0,
             }))
             .await
             .expect_err("missing target should error");
@@ -2948,6 +2952,7 @@ mod tests {
                 stream: "all".into(),
                 max_bytes: 0,
                 tail: false,
+                offset: 0,
             }))
             .await
             .expect_err("unknown job should error");

@@ -1,0 +1,59 @@
+# Example OpenTelemetry Collector config for shipping Legion task logs.
+#
+# It tails the per-allocation stdout/stderr files a Legion worker writes, attaches
+# OpenTelemetry resource attributes derived from the file path, and exports OTLP
+# logs to your backend. Run one collector per worker host:
+#
+#   otelcol --config configs/observability/otel-collector.yaml
+#
+# This is the recommended baseline for external log shipping: Legion writes
+# stably-named files and a meta.json manifest, so no Legion-side config is needed.
+
+receivers:
+  # Tail every task's stdout/stderr. Adjust the glob to your worker state dir
+  # (default: .legion/workers/<worker-id>/logs/<allocation-id>/<stream>.log).
+  filelog:
+    include:
+      - .legion/workers/*/logs/*/stdout.log
+      - .legion/workers/*/logs/*/stderr.log
+    # Resume where we left off across collector restarts.
+    start_at: end
+    include_file_path: true
+    operators:
+      # Pull the allocation id and stream name out of the file path.
+      - type: regex_parser
+        parse_from: attributes["log.file.path"]
+        regex: 'logs/(?P<allocation_id>\d+)/(?P<stream>stdout|stderr)\.log$'
+      # Promote them to resource attributes (service.name should match the job;
+      # if you want the job name, enrich from meta.json with a follow-up step).
+      - type: move
+        from: attributes.allocation_id
+        to: resource["legion.allocation.id"]
+      - type: move
+        from: attributes.stream
+        to: resource["legion.stream"]
+
+processors:
+  batch: {}
+  # Tag everything coming from this host/worker.
+  resource:
+    attributes:
+      - key: service.name
+        value: legion-tasks
+        action: upsert
+
+exporters:
+  # Replace with your backend. Examples:
+  #   otlphttp -> any OTLP logs endpoint (Tempo/Loki via OTel, Honeycomb, …)
+  #   debug    -> print to the collector's stdout (handy for trying this out)
+  otlphttp:
+    endpoint: http://localhost:4318
+  debug:
+    verbosity: basic
+
+service:
+  pipelines:
+    logs:
+      receivers: [filelog]
+      processors: [resource, batch]
+      exporters: [otlphttp, debug]
