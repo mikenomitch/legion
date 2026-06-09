@@ -1,10 +1,12 @@
 import { A, useNavigate, useParams } from '@solidjs/router'
 import { For, Show, createMemo, createResource, createSignal, onCleanup, onMount } from 'solid-js'
-import { DetailBadge, DetailSection, detailDangerButtonClass, detailTabButtonClass } from '../../components/DetailPrimitives'
+import { DetailBadge, DetailSection, InstancePill, detailDangerButtonClass, detailTabButtonClass } from '../../components/DetailPrimitives'
 import DagVisualization from '../../components/DagVisualization'
+import { InstanceInfo } from '../../gen/legion_pb'
 import { managerClient } from '../../grpcClient'
 import { formatDate } from '../../utils/format'
-import { buildTaskRuntimeByName, buildTaskRuntimeFromStatuses, extractJobSpecData, taskStatusTone, topoSortTaskNames, type TaskRuntimeSummary } from '../../utils/jobspec'
+import { buildTaskRuntimeByName, buildTaskRuntimeFromStatuses, extractJobSpecData, instanceStateTone, taskStatusTone, topoSortTaskNames, type TaskRuntimeSummary } from '../../utils/jobspec'
+import { POLL_INTERVAL_MS } from '../../utils/polling'
 
 export default function JobDetail() {
   const params = useParams()
@@ -90,6 +92,47 @@ export default function JobDetail() {
   // so tasks show "loading…" instead of a misleading "not allocated" on first paint.
   const statusLoading = createMemo(
     () => liveRuntime() === undefined && (jobData()?.taskRuntime?.size ?? 0) === 0,
+  )
+
+  const statefulTasks = createMemo(() => (jobData()?.taskSpec?.tasks ?? []).filter((task) => task.stateful))
+
+  // Stateful instances for this job, polled at the standard interval while the
+  // page is mounted (scoped to this route; the interval is torn down on
+  // navigation). The fetcher returns the previous array when nothing changed
+  // so polling does not cause needless table rerenders.
+  const [instanceTick, setInstanceTick] = createSignal(0)
+  onMount(() => {
+    const timer = setInterval(() => setInstanceTick((value) => value + 1), POLL_INTERVAL_MS)
+    onCleanup(() => clearInterval(timer))
+  })
+
+  let lastInstances: InstanceInfo[] = []
+  const [instances] = createResource(
+    () => [jobName(), instanceTick()] as const,
+    async ([name]) => {
+      try {
+        const response = await managerClient.listInstances({ jobId: name })
+        const next = response.instances
+        const unchanged =
+          next.length === lastInstances.length &&
+          next.every((instance, index) => InstanceInfo.equals(instance, lastInstances[index]))
+        if (!unchanged) lastInstances = next
+        return lastInstances
+      } catch {
+        // Stateless jobs (or older managers) simply have no instances to show.
+        return lastInstances
+      }
+    },
+  )
+
+  // The instances panel appears for jobs that declare stateful tasks, or that
+  // have instance rows anyway (e.g. the spec failed to parse but the manager
+  // knows about instances).
+  const showInstancesPanel = createMemo(() => statefulTasks().length > 0 || (instances()?.length ?? 0) > 0)
+  const hasKeyedTasks = createMemo(
+    () =>
+      statefulTasks().some((task) => task.stateful?.mode === 'keyed') ||
+      (instances() ?? []).some((instance) => instance.mode === 'keyed'),
   )
 
   // The DAG is only meaningful when tasks actually depend on each other.
@@ -187,6 +230,16 @@ export default function JobDetail() {
                                       <span class={statusLoading() && !runtime() ? 'animate-pulse' : ''}>{primaryStatus()}</span>
                                     </DetailBadge>
                                   </div>
+                                  <Show when={task.stateful}>
+                                    <div class="mt-2 flex flex-wrap items-center gap-2">
+                                      <DetailBadge tone="neutral">stateful · {task.stateful!.mode}</DetailBadge>
+                                      <Show when={task.stateful!.storagePath}>
+                                        <span class="font-mono text-[11px] text-neutral-500" title="Persistent storage path">
+                                          {task.stateful!.storagePath}
+                                        </span>
+                                      </Show>
+                                    </div>
+                                  </Show>
                                   <Show when={task.lifecycle === 'sidecar'}>
                                     <p class="mt-2 text-xs text-indigo-600 dark:text-indigo-300">
                                       Sidecar task for group <span class="font-semibold">{task.group}</span>
@@ -222,14 +275,75 @@ export default function JobDetail() {
               </DetailSection>
             </Show>
 
+            <Show when={showInstancesPanel()}>
+              <DetailSection>
+                <h3 class="mb-2 font-semibold">Instances</h3>
+                <p class="mb-2 text-xs text-neutral-500">
+                  Stable identities for stateful tasks — instance ids and storage survive allocation reschedules.
+                </p>
+                <Show
+                  when={(instances() ?? []).length > 0}
+                  fallback={
+                    <p class="text-sm text-neutral-500">
+                      {instances() === undefined ? 'Loading instances…' : 'No instances yet.'}
+                    </p>
+                  }
+                >
+                  <div class="overflow-x-auto">
+                    <table class="min-w-full text-sm">
+                      <thead>
+                        <tr class="text-left">
+                          <th class="py-2 pr-4">Instance</th>
+                          <th class="py-2 pr-4">Mode</th>
+                          <th class="py-2 pr-4">State</th>
+                          <th class="py-2 pr-4">Slot</th>
+                          <th class="py-2 pr-4">Allocation</th>
+                          <th class="py-2 pr-4">Storage</th>
+                          <th class="py-2 pr-4">Created</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        <For each={instances() ?? []}>
+                          {(instance) => (
+                            <tr class="border-t border-neutral-200 dark:border-neutral-800">
+                              <td class="py-2 pr-4 font-mono text-xs">{instance.instanceId}</td>
+                              <td class="py-2 pr-4">{instance.mode}</td>
+                              <td class="py-2 pr-4">
+                                <DetailBadge tone={instanceStateTone(instance.state)}>{instance.state}</DetailBadge>
+                              </td>
+                              <td class="py-2 pr-4">{instance.slotIndex !== undefined ? String(instance.slotIndex) : '—'}</td>
+                              <td class="py-2 pr-4">{instance.currentAllocId !== undefined ? `#${String(instance.currentAllocId)}` : '—'}</td>
+                              <td class="py-2 pr-4">
+                                <Show when={instance.storageHandle} fallback={<span class="text-neutral-500">—</span>}>
+                                  <span class="inline-block max-w-[12rem] truncate align-bottom font-mono text-xs" title={instance.storageHandle}>
+                                    {instance.storageHandle}
+                                  </span>
+                                </Show>
+                              </td>
+                              <td class="py-2 pr-4 text-xs text-neutral-500">{formatDate(instance.createdAt)}</td>
+                            </tr>
+                          )}
+                        </For>
+                      </tbody>
+                    </table>
+                  </div>
+                </Show>
+                <Show when={hasKeyedTasks()}>
+                  <p class="mt-3 text-xs text-neutral-500">
+                    Keyed instances are managed from the CLI via <code class="rounded bg-neutral-100 px-1 font-mono dark:bg-neutral-800">legion instance create/destroy</code> — read-only here.
+                  </p>
+                </Show>
+              </DetailSection>
+            </Show>
+
             <DetailSection>
               <h3 class="mb-2 font-semibold">Allocations</h3>
               <div class="overflow-x-auto">
                 <table class="min-w-full text-sm">
-                  <thead><tr class="text-left"><th class="py-2 pr-4">ID</th><th class="py-2 pr-4">Status</th><th class="py-2 pr-4">Worker</th><th class="py-2 pr-4">Job Config</th></tr></thead>
+                  <thead><tr class="text-left"><th class="py-2 pr-4">ID</th><th class="py-2 pr-4">Instance</th><th class="py-2 pr-4">Status</th><th class="py-2 pr-4">Worker</th><th class="py-2 pr-4">Job Config</th></tr></thead>
                   <tbody>
                     <For each={jobData()!.allocations}>{(allocation) => (
-                      <tr class="border-t border-neutral-200 dark:border-neutral-800"><td class="py-2 pr-4">{String(allocation.id)}</td><td class="py-2 pr-4">{allocation.status}</td><td class="py-2 pr-4"><A class="underline" href={`/nodes/${encodeURIComponent(allocation.nodeId)}`}>{allocation.nodeId}</A></td><td class="py-2 pr-4"><A class="underline" href={`/jobs/${encodeURIComponent(jobName())}/specs/${encodeURIComponent(allocation.jobConfigId)}`}>{allocation.jobConfigId}</A></td></tr>
+                      <tr class="border-t border-neutral-200 dark:border-neutral-800"><td class="py-2 pr-4">{String(allocation.id)}</td><td class="py-2 pr-4"><Show when={allocation.instanceId} fallback={<span class="text-neutral-500">—</span>}><InstancePill id={allocation.instanceId!} /></Show></td><td class="py-2 pr-4">{allocation.status}</td><td class="py-2 pr-4"><A class="underline" href={`/nodes/${encodeURIComponent(allocation.nodeId)}`}>{allocation.nodeId}</A></td><td class="py-2 pr-4"><A class="underline" href={`/jobs/${encodeURIComponent(jobName())}/specs/${encodeURIComponent(allocation.jobConfigId)}`}>{allocation.jobConfigId}</A></td></tr>
                     )}</For>
                   </tbody>
                 </table>

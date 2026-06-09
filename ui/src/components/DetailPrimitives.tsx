@@ -47,6 +47,19 @@ export function DetailBadge(props: DetailBadgeProps) {
   )
 }
 
+// Compact mono pill for a stateful instance id (e.g. "db-default-2") shown
+// next to allocations so a rescheduled allocation is visibly the same instance.
+export function InstancePill(props: { id: string }) {
+  return (
+    <span
+      class="rounded border border-indigo-300 bg-indigo-50 px-1.5 py-0.5 font-mono text-[11px] text-indigo-700 dark:border-indigo-700 dark:bg-indigo-950/40 dark:text-indigo-300"
+      title={`Stateful instance ${props.id}`}
+    >
+      {props.id}
+    </span>
+  )
+}
+
 export const detailPrimaryButtonClass = 'rounded border px-3 py-2 text-sm font-semibold'
 export const detailDangerButtonClass = 'rounded border border-rose-300 px-3 py-2 text-sm font-semibold text-rose-700 dark:border-rose-700 dark:text-rose-300'
 
