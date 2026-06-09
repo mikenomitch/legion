@@ -30,7 +30,7 @@ spirit of CNI's exec-plugin model and Nomad's host/CSI volumes.
   ship inside the Legion binary so a single-binary cluster gets working stateful
   storage with no external plugins installed.
 - **Capability-driven scheduling**: each plugin declares whether its volumes are
-  node-affine (local) or attachable anywhere (network), and what access modes it
+  node-local (local) or attachable anywhere (network), and what access modes it
   supports; the scheduler uses this to constrain placement.
 - **CSI compatibility layer (optional, later phase)**: a single `csi-bridge` plugin
   that translates the Legion volume contract onto the CSI gRPC services, so the entire
@@ -46,7 +46,7 @@ spirit of CNI's exec-plugin model and Nomad's host/CSI volumes.
   to CSI; Legion core never speaks CSI directly.
 - **Snapshots, cloning, expansion in v1.** The contract reserves operation names so
   they can be added without an ABI break, but no v1 plugin implements them.
-- **Cross-node data migration.** A node-affine volume pins its instance; moving the
+- **Cross-node data migration.** A node-local volume pins its instance; moving the
   data is the operator's (or a future tool's) job.
 - **Networking plugins.** CNI proper (networking) is a separate planned plugin
   category; this plan only borrows CNI's *plugin invocation model*.
@@ -96,8 +96,8 @@ and partial failures, so "already done" must be a success, not an error.
 
 | Op | Runs on | Purpose |
 | --- | --- | --- |
-| `capabilities` | manager + worker | Report contract version, access modes, `node_affine` (bool), and which optional ops are supported. |
-| `create` | manager (controller) | Provision a volume; returns `volume_id` + attrs. For node-affine plugins this may be deferred to first `attach`. |
+| `capabilities` | manager + worker | Report contract version, access modes, `node_local` (bool), and which optional ops are supported. |
+| `create` | manager (controller) | Provision a volume; returns `volume_id` + attrs. For node-local plugins this may be deferred to first `attach`. |
 | `attach` | worker (node) | Make the volume available on this node (e.g. attach an EBS device, ensure a local dir exists). Returns a node-local staging context. |
 | `mount` | worker (node) | Expose the attached volume at a concrete path for one allocation; returns `mount_path`. |
 | `unmount` | worker (node) | Release the per-allocation mount. |
@@ -156,16 +156,16 @@ the rest of the system is agnostic to whether a plugin is in-process or exec'd.
 
 1. **`local-dir`** *(the default)* — dynamically provisions a directory under
    `<data_dir>/volumes/local-dir/<volume_id>` on the node of first placement.
-   `node_affine: true`: the scheduler pins the instance to that node thereafter.
+   `node_local: true`: the scheduler pins the instance to that node thereafter.
    `destroy` removes the directory. Zero configuration; this is what a bare
    `stateful: { storage: { path: … } }` block uses when no plugin is named.
 2. **`host`** — Nomad-host-volume style: the operator declares named host paths in the
    worker config (`worker.host_volumes: { models: '/mnt/models' }`); jobs claim them by
-   name. No provisioning; `create`/`destroy` are no-ops; `node_affine: true`; supports
+   name. No provisioning; `create`/`destroy` are no-ops; `node_local: true`; supports
    read-only mounts. The escape hatch for "the data is already on the machine."
 
 Suggested early exec plugins (separate small repos / `plugins/volumes/`, not blocking
-v1): `nfs` (mount an export — first *non*-node-affine plugin, exercises free
+v1): `nfs` (mount an export — first *non*-node-local plugin, exercises free
 rescheduling), `zfs` (datasets + future snapshot support).
 
 ### 4) CSI compatibility layer (optional phase)
@@ -213,10 +213,10 @@ access-mode conflicts (two writers on a single-writer volume) are rejected.
 
 ### 6) Scheduler integration
 
-- `capabilities.node_affine: true` → after first placement, the instance record pins
+- `capabilities.node_local: true` → after first placement, the instance record pins
   `node_id`; the reconciler only places replacements on that node and surfaces a clear
-  diagnostic (`volume is node-affine; waiting for node <id>`) if it's gone.
-- `node_affine: false` → no constraint; reschedule anywhere, `attach` follows.
+  diagnostic (`volume is node-local; waiting for node <id>`) if it's gone.
+- `node_local: false` → no constraint; reschedule anywhere, `attach` follows.
 - Worker fingerprinting advertises installed volume plugins (name + version) the same
   way task-kind support is advertised, so placement can require `plugin ∈ node.volume_plugins`.
 
@@ -258,19 +258,19 @@ access-mode conflicts (two writers on a single-writer volume) are rejected.
   non-zero exit, timeout), capability parsing, admission validation errors.
 - **Integration:** slot reschedule on the same node reattaches the same `local-dir`
   volume with data intact; keyed destroy removes the volume; `retain_on_scale_in`
-  honored both ways; node-affine instance blocks placement when its node is down and
+  honored both ways; node-local instance blocks placement when its node is down and
   reports the diagnostic.
 - **Regression:** stateless jobs and stateful jobs predating volumes (bare `path`)
   behave unchanged.
 
 ## Open Questions
 
-1. Should `create` for node-affine plugins be lazy (at first attach) always, or should
+1. Should `create` for node-local plugins be lazy (at first attach) always, or should
    the contract have an explicit `topology` hint so the scheduler picks the node first?
    (Leaning: lazy-create on first attach; simplest and matches local-dir reality.)
 2. Volume sharing across instances (many-readers): defer entirely, or reserve
    `access_mode` in the spec now? (Leaning: reserve the field, reject ≠ single-writer.)
-3. Who runs `destroy` for node-affine volumes when the node is permanently gone?
+3. Who runs `destroy` for node-local volumes when the node is permanently gone?
    (Likely: operator-forced `legion volume delete --force`, marking state without
    plugin confirmation.)
 4. Exec plugin privileges: run as the worker's user always, or support a per-plugin
