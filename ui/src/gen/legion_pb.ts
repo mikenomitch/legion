@@ -461,6 +461,20 @@ export class RunJobRequest extends Message<RunJobRequest> {
    */
   forceReschedule = false;
 
+  /**
+   * Optional idempotency key.
+   *
+   * When set and non-empty, the manager deduplicates retried requests carrying
+   * the same key: the first request is applied and its outcome recorded; any
+   * later request with the same key returns the recorded reply without
+   * re-applying. This lets clients (especially automated agents) safely retry
+   * after a timeout without risking a double submission. Unset disables
+   * deduplication.
+   *
+   * @generated from field: optional string idempotency_key = 5;
+   */
+  idempotencyKey?: string;
+
   constructor(data?: PartialMessage<RunJobRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -473,6 +487,7 @@ export class RunJobRequest extends Message<RunJobRequest> {
     { no: 2, name: "submissions", kind: "message", T: Submission, repeated: true },
     { no: 3, name: "priority", kind: "scalar", T: 3 /* ScalarType.INT64 */, opt: true },
     { no: 4, name: "force_reschedule", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 5, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RunJobRequest {
@@ -512,6 +527,14 @@ export class RunJobReply extends Message<RunJobReply> {
    */
   message = "";
 
+  /**
+   * True when this reply was replayed from a previously recorded result for the
+   * request's `idempotency_key` rather than applied fresh.
+   *
+   * @generated from field: bool deduplicated = 2;
+   */
+  deduplicated = false;
+
   constructor(data?: PartialMessage<RunJobReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -521,6 +544,7 @@ export class RunJobReply extends Message<RunJobReply> {
   static readonly typeName = "legion.RunJobReply";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "deduplicated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RunJobReply {
@@ -2177,6 +2201,13 @@ export class StopJobRequest extends Message<StopJobRequest> {
    */
   priority?: bigint;
 
+  /**
+   * Optional idempotency key. See `RunJobRequest.idempotency_key`.
+   *
+   * @generated from field: optional string idempotency_key = 3;
+   */
+  idempotencyKey?: string;
+
   constructor(data?: PartialMessage<StopJobRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -2187,6 +2218,7 @@ export class StopJobRequest extends Message<StopJobRequest> {
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 2, name: "priority", kind: "scalar", T: 3 /* ScalarType.INT64 */, opt: true },
+    { no: 3, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): StopJobRequest {
@@ -2221,6 +2253,14 @@ export class StopJobReply extends Message<StopJobReply> {
    */
   message = "";
 
+  /**
+   * True when replayed from a recorded result for the request's
+   * `idempotency_key` rather than applied fresh.
+   *
+   * @generated from field: bool deduplicated = 2;
+   */
+  deduplicated = false;
+
   constructor(data?: PartialMessage<StopJobReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -2230,6 +2270,7 @@ export class StopJobReply extends Message<StopJobReply> {
   static readonly typeName = "legion.StopJobReply";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "deduplicated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): StopJobReply {
@@ -2271,6 +2312,13 @@ export class DestroyJobRequest extends Message<DestroyJobRequest> {
    */
   priority?: bigint;
 
+  /**
+   * Optional idempotency key. See `RunJobRequest.idempotency_key`.
+   *
+   * @generated from field: optional string idempotency_key = 3;
+   */
+  idempotencyKey?: string;
+
   constructor(data?: PartialMessage<DestroyJobRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -2281,6 +2329,7 @@ export class DestroyJobRequest extends Message<DestroyJobRequest> {
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 2, name: "priority", kind: "scalar", T: 3 /* ScalarType.INT64 */, opt: true },
+    { no: 3, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): DestroyJobRequest {
@@ -2315,6 +2364,14 @@ export class DestroyJobReply extends Message<DestroyJobReply> {
    */
   message = "";
 
+  /**
+   * True when replayed from a recorded result for the request's
+   * `idempotency_key` rather than applied fresh.
+   *
+   * @generated from field: bool deduplicated = 2;
+   */
+  deduplicated = false;
+
   constructor(data?: PartialMessage<DestroyJobReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -2324,6 +2381,7 @@ export class DestroyJobReply extends Message<DestroyJobReply> {
   static readonly typeName = "legion.DestroyJobReply";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "deduplicated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): DestroyJobReply {
@@ -2340,6 +2398,554 @@ export class DestroyJobReply extends Message<DestroyJobReply> {
 
   static equals(a: DestroyJobReply | PlainMessage<DestroyJobReply> | undefined, b: DestroyJobReply | PlainMessage<DestroyJobReply> | undefined): boolean {
     return proto3.util.equals(DestroyJobReply, a, b);
+  }
+}
+
+/**
+ * Request payload for CreateInstance.
+ *
+ * @generated from message legion.CreateInstanceRequest
+ */
+export class CreateInstanceRequest extends Message<CreateInstanceRequest> {
+  /**
+   * Job name (also used as job ID in current manager implementation). The
+   * job's latest config must declare at least one keyed-mode stateful task.
+   *
+   * @generated from field: string job_id = 1;
+   */
+  jobId = "";
+
+  /**
+   * Optional task-group filter used to resolve the target task.
+   *
+   * May be omitted when the job has exactly one keyed task. Required (along
+   * with `task` when a group holds several keyed tasks) whenever the keyed
+   * task would otherwise be ambiguous; ambiguity is rejected with
+   * InvalidArgument rather than guessed.
+   *
+   * @generated from field: optional string group = 2;
+   */
+  group?: string;
+
+  /**
+   * Optional task-name filter used to resolve the target task. Same
+   * disambiguation rules as `group`.
+   *
+   * @generated from field: optional string task = 3;
+   */
+  task?: string;
+
+  /**
+   * Optional caller-supplied instance key.
+   *
+   * Must match `[A-Za-z0-9._-]{1,128}` and must not collide with any
+   * existing instance id of any job — including Terminated tombstones
+   * (destroyed ids are never reusable). Required when the task declares
+   * `stateful.idSource: "caller"`; optional otherwise (the server mints an
+   * id when absent). A valid explicit key is always honored regardless of
+   * `idSource`.
+   *
+   * @generated from field: optional string instance_id = 4;
+   */
+  instanceId?: string;
+
+  /**
+   * Optional idempotency key. See `RunJobRequest.idempotency_key`. The
+   * recorded replay carries the originally created instance id.
+   *
+   * @generated from field: optional string idempotency_key = 5;
+   */
+  idempotencyKey?: string;
+
+  constructor(data?: PartialMessage<CreateInstanceRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.CreateInstanceRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "job_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "group", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 3, name: "task", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 4, name: "instance_id", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 5, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): CreateInstanceRequest {
+    return new CreateInstanceRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): CreateInstanceRequest {
+    return new CreateInstanceRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): CreateInstanceRequest {
+    return new CreateInstanceRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: CreateInstanceRequest | PlainMessage<CreateInstanceRequest> | undefined, b: CreateInstanceRequest | PlainMessage<CreateInstanceRequest> | undefined): boolean {
+    return proto3.util.equals(CreateInstanceRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for CreateInstance.
+ *
+ * @generated from message legion.CreateInstanceReply
+ */
+export class CreateInstanceReply extends Message<CreateInstanceReply> {
+  /**
+   * The created instance's stable id (caller-supplied or server-minted).
+   * This is the value the task sees as `LEGION_INSTANCE_ID` and the key its
+   * storage handle and workload identity bind to.
+   *
+   * @generated from field: string instance_id = 1;
+   */
+  instanceId = "";
+
+  /**
+   * True when replayed from a recorded result for the request's
+   * `idempotency_key` rather than applied fresh.
+   *
+   * @generated from field: bool deduplicated = 2;
+   */
+  deduplicated = false;
+
+  constructor(data?: PartialMessage<CreateInstanceReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.CreateInstanceReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "instance_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "deduplicated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): CreateInstanceReply {
+    return new CreateInstanceReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): CreateInstanceReply {
+    return new CreateInstanceReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): CreateInstanceReply {
+    return new CreateInstanceReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: CreateInstanceReply | PlainMessage<CreateInstanceReply> | undefined, b: CreateInstanceReply | PlainMessage<CreateInstanceReply> | undefined): boolean {
+    return proto3.util.equals(CreateInstanceReply, a, b);
+  }
+}
+
+/**
+ * Request payload for DestroyInstance.
+ *
+ * @generated from message legion.DestroyInstanceRequest
+ */
+export class DestroyInstanceRequest extends Message<DestroyInstanceRequest> {
+  /**
+   * Stable instance id to destroy. Must reference a keyed-mode instance.
+   *
+   * @generated from field: string instance_id = 1;
+   */
+  instanceId = "";
+
+  /**
+   * Optional idempotency key. See `RunJobRequest.idempotency_key`.
+   *
+   * @generated from field: optional string idempotency_key = 2;
+   */
+  idempotencyKey?: string;
+
+  constructor(data?: PartialMessage<DestroyInstanceRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.DestroyInstanceRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "instance_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): DestroyInstanceRequest {
+    return new DestroyInstanceRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): DestroyInstanceRequest {
+    return new DestroyInstanceRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): DestroyInstanceRequest {
+    return new DestroyInstanceRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: DestroyInstanceRequest | PlainMessage<DestroyInstanceRequest> | undefined, b: DestroyInstanceRequest | PlainMessage<DestroyInstanceRequest> | undefined): boolean {
+    return proto3.util.equals(DestroyInstanceRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for DestroyInstance.
+ *
+ * @generated from message legion.DestroyInstanceReply
+ */
+export class DestroyInstanceReply extends Message<DestroyInstanceReply> {
+  /**
+   * Human-readable status message.
+   *
+   * Current manager reply values:
+   * - `"Destroyed instance <id>"` — terminated by this request.
+   * - `"Instance <id> already terminated"` — no-op on a tombstone.
+   *
+   * @generated from field: string message = 1;
+   */
+  message = "";
+
+  /**
+   * True when replayed from a recorded result for the request's
+   * `idempotency_key` rather than applied fresh.
+   *
+   * @generated from field: bool deduplicated = 2;
+   */
+  deduplicated = false;
+
+  constructor(data?: PartialMessage<DestroyInstanceReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.DestroyInstanceReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "deduplicated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): DestroyInstanceReply {
+    return new DestroyInstanceReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): DestroyInstanceReply {
+    return new DestroyInstanceReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): DestroyInstanceReply {
+    return new DestroyInstanceReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: DestroyInstanceReply | PlainMessage<DestroyInstanceReply> | undefined, b: DestroyInstanceReply | PlainMessage<DestroyInstanceReply> | undefined): boolean {
+    return proto3.util.equals(DestroyInstanceReply, a, b);
+  }
+}
+
+/**
+ * One stateful instance (see docs/stateful-workloads.md). An instance is the
+ * stable identity one level above an allocation: it survives reschedules,
+ * owns the storage binding, and feeds the workload-identity subject.
+ *
+ * @generated from message legion.InstanceInfo
+ */
+export class InstanceInfo extends Message<InstanceInfo> {
+  /**
+   * Stable id, unique within the cluster. Slot mode: the deterministic
+   * `{job}-{group}-{slot}` ordinal id. Keyed mode: the caller-supplied or
+   * server-minted key, never recycled after destroy.
+   *
+   * @generated from field: string instance_id = 1;
+   */
+  instanceId = "";
+
+  /**
+   * Owning job name.
+   *
+   * @generated from field: string job_id = 2;
+   */
+  jobId = "";
+
+  /**
+   * Task group the instance belongs to.
+   *
+   * @generated from field: string group = 3;
+   */
+  group = "";
+
+  /**
+   * Task name the instance currently belongs to (informational; identity is
+   * keyed by `instance_id`).
+   *
+   * @generated from field: string task = 4;
+   */
+  task = "";
+
+  /**
+   * Id-assignment mode: `slot` or `keyed`.
+   *
+   * @generated from field: string mode = 5;
+   */
+  mode = "";
+
+  /**
+   * Lifecycle state: `pending` (never placed), `active` (live allocation),
+   * `rescheduling` (lost its allocation; a replacement will re-bind the same
+   * id and storage), or `terminated` (slot scale-in / job stop / keyed
+   * destroy; rows retained).
+   *
+   * @generated from field: string state = 6;
+   */
+  state = "";
+
+  /**
+   * Ordinal slot index `0..count.num-1`; present only in slot mode.
+   *
+   * @generated from field: optional uint32 slot_index = 7;
+   */
+  slotIndex?: number;
+
+  /**
+   * The allocation currently fulfilling this instance, if any.
+   *
+   * @generated from field: optional int64 current_alloc_id = 8;
+   */
+  currentAllocId?: bigint;
+
+  /**
+   * Opaque persistent-storage handle bound to the instance, when the task
+   * declares `stateful.storage`. Stable across reschedules. Dropped on keyed
+   * destroy; retained on slot scale-in unless `retainOnScaleIn: false`.
+   *
+   * @generated from field: optional string storage_handle = 9;
+   */
+  storageHandle?: string;
+
+  /**
+   * RFC3339 creation timestamp.
+   *
+   * @generated from field: string created_at = 10;
+   */
+  createdAt = "";
+
+  /**
+   * RFC3339 timestamp of the last state/binding change.
+   *
+   * @generated from field: string updated_at = 11;
+   */
+  updatedAt = "";
+
+  constructor(data?: PartialMessage<InstanceInfo>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.InstanceInfo";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "instance_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "job_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "group", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "task", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "mode", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "state", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 7, name: "slot_index", kind: "scalar", T: 13 /* ScalarType.UINT32 */, opt: true },
+    { no: 8, name: "current_alloc_id", kind: "scalar", T: 3 /* ScalarType.INT64 */, opt: true },
+    { no: 9, name: "storage_handle", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 10, name: "created_at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 11, name: "updated_at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): InstanceInfo {
+    return new InstanceInfo().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): InstanceInfo {
+    return new InstanceInfo().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): InstanceInfo {
+    return new InstanceInfo().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: InstanceInfo | PlainMessage<InstanceInfo> | undefined, b: InstanceInfo | PlainMessage<InstanceInfo> | undefined): boolean {
+    return proto3.util.equals(InstanceInfo, a, b);
+  }
+}
+
+/**
+ * Request payload for ListInstances.
+ *
+ * @generated from message legion.ListInstancesRequest
+ */
+export class ListInstancesRequest extends Message<ListInstancesRequest> {
+  /**
+   * Job name whose instances to list.
+   *
+   * @generated from field: string job_id = 1;
+   */
+  jobId = "";
+
+  /**
+   * Optional exact-match group filter.
+   *
+   * @generated from field: optional string group = 2;
+   */
+  group?: string;
+
+  constructor(data?: PartialMessage<ListInstancesRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListInstancesRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "job_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "group", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListInstancesRequest {
+    return new ListInstancesRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListInstancesRequest {
+    return new ListInstancesRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListInstancesRequest {
+    return new ListInstancesRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListInstancesRequest | PlainMessage<ListInstancesRequest> | undefined, b: ListInstancesRequest | PlainMessage<ListInstancesRequest> | undefined): boolean {
+    return proto3.util.equals(ListInstancesRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for ListInstances.
+ *
+ * @generated from message legion.ListInstancesReply
+ */
+export class ListInstancesReply extends Message<ListInstancesReply> {
+  /**
+   * Instances ordered by group, slot index, then instance id. Includes
+   * Terminated rows (tombstones).
+   *
+   * @generated from field: repeated legion.InstanceInfo instances = 1;
+   */
+  instances: InstanceInfo[] = [];
+
+  constructor(data?: PartialMessage<ListInstancesReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListInstancesReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "instances", kind: "message", T: InstanceInfo, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListInstancesReply {
+    return new ListInstancesReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListInstancesReply {
+    return new ListInstancesReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListInstancesReply {
+    return new ListInstancesReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListInstancesReply | PlainMessage<ListInstancesReply> | undefined, b: ListInstancesReply | PlainMessage<ListInstancesReply> | undefined): boolean {
+    return proto3.util.equals(ListInstancesReply, a, b);
+  }
+}
+
+/**
+ * Request payload for GetInstance.
+ *
+ * @generated from message legion.GetInstanceRequest
+ */
+export class GetInstanceRequest extends Message<GetInstanceRequest> {
+  /**
+   * Stable instance id to fetch.
+   *
+   * @generated from field: string instance_id = 1;
+   */
+  instanceId = "";
+
+  constructor(data?: PartialMessage<GetInstanceRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetInstanceRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "instance_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetInstanceRequest {
+    return new GetInstanceRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetInstanceRequest {
+    return new GetInstanceRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetInstanceRequest {
+    return new GetInstanceRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetInstanceRequest | PlainMessage<GetInstanceRequest> | undefined, b: GetInstanceRequest | PlainMessage<GetInstanceRequest> | undefined): boolean {
+    return proto3.util.equals(GetInstanceRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for GetInstance.
+ *
+ * @generated from message legion.GetInstanceReply
+ */
+export class GetInstanceReply extends Message<GetInstanceReply> {
+  /**
+   * The requested instance. Manager returns NotFound instead of returning
+   * this field unset.
+   *
+   * @generated from field: legion.InstanceInfo instance = 1;
+   */
+  instance?: InstanceInfo;
+
+  constructor(data?: PartialMessage<GetInstanceReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetInstanceReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "instance", kind: "message", T: InstanceInfo },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetInstanceReply {
+    return new GetInstanceReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetInstanceReply {
+    return new GetInstanceReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetInstanceReply {
+    return new GetInstanceReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetInstanceReply | PlainMessage<GetInstanceReply> | undefined, b: GetInstanceReply | PlainMessage<GetInstanceReply> | undefined): boolean {
+    return proto3.util.equals(GetInstanceReply, a, b);
   }
 }
 
@@ -6250,6 +6856,19 @@ export class LedgerAllocation extends Message<LedgerAllocation> {
    */
   jobId = "";
 
+  /**
+   * Stable instance id this allocation fulfills, set only when the backing
+   * task is stateful (slot or keyed mode; see `docs/stateful-workloads.md`).
+   *
+   * The instance id survives reschedules: a replacement allocation for the
+   * same slot/keyed instance reports the same value here. Unset for
+   * stateless tasks. Full instance metadata (mode, state, slot index,
+   * storage handle) is available via `GetInstance` / `ListInstances`.
+   *
+   * @generated from field: optional string instance_id = 8;
+   */
+  instanceId?: string;
+
   constructor(data?: PartialMessage<LedgerAllocation>) {
     super();
     proto3.util.initPartial(data, this);
@@ -6265,6 +6884,7 @@ export class LedgerAllocation extends Message<LedgerAllocation> {
     { no: 5, name: "job_config_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 6, name: "task_config_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
     { no: 7, name: "job_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 8, name: "instance_id", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): LedgerAllocation {

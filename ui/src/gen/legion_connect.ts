@@ -3,7 +3,7 @@
 /* eslint-disable */
 // @ts-nocheck
 
-import { AcquireKvLockReply, AcquireKvLockRequest, AdvanceRolloutReply, AdvanceRolloutRequest, DeleteKvReply, DeleteKvRequest, DeleteSavedStateQueryReply, DeleteSavedStateQueryRequest, DestroyJobReply, DestroyJobRequest, GetJobInfoReply, GetJobInfoRequest, GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest, GetJoinTokenReply, GetJoinTokenRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest, GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest, GetObservabilityReply, GetObservabilityRequest, GetRaftJoinTokenReply, GetRaftJoinTokenRequest, GetRaftStatusReply, GetRaftStatusRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest, GetStateStoreSchemaReply, GetStateStoreSchemaRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, IssueRaftCommandReply, IssueRaftCommandRequest, ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobsReply, ListJobsRequest, ListKvReply, ListKvRequest, ListRaftHistoryReply, ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply, ListRolloutsRequest, ListSavedStateQueriesReply, ListSavedStateQueriesRequest, PatchKvReply, PatchKvRequest, PlanJobReply, PlanJobRequest, PostWorkReply, PostWorkRequest, PutKvReply, PutKvRequest, QueryStateStoreReply, QueryStateStoreRequest, ReleaseKvLockReply, ReleaseKvLockRequest, RenewKvLockReply, RenewKvLockRequest, RestartWorkerReply, RestartWorkerRequest, RunJobReply, RunJobRequest, StopJobReply, StopJobRequest, StopRolloutReply, StopRolloutRequest, UpdateNodeDynamicReply, UpdateNodeDynamicRequest, UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest } from "./legion_pb.js";
+import { AcquireKvLockReply, AcquireKvLockRequest, AdvanceRolloutReply, AdvanceRolloutRequest, CreateInstanceReply, CreateInstanceRequest, DeleteKvReply, DeleteKvRequest, DeleteSavedStateQueryReply, DeleteSavedStateQueryRequest, DestroyInstanceReply, DestroyInstanceRequest, DestroyJobReply, DestroyJobRequest, GetInstanceReply, GetInstanceRequest, GetJobInfoReply, GetJobInfoRequest, GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest, GetJoinTokenReply, GetJoinTokenRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest, GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest, GetObservabilityReply, GetObservabilityRequest, GetRaftJoinTokenReply, GetRaftJoinTokenRequest, GetRaftStatusReply, GetRaftStatusRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest, GetStateStoreSchemaReply, GetStateStoreSchemaRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, IssueRaftCommandReply, IssueRaftCommandRequest, ListInstancesReply, ListInstancesRequest, ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobsReply, ListJobsRequest, ListKvReply, ListKvRequest, ListRaftHistoryReply, ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply, ListRolloutsRequest, ListSavedStateQueriesReply, ListSavedStateQueriesRequest, PatchKvReply, PatchKvRequest, PlanJobReply, PlanJobRequest, PostWorkReply, PostWorkRequest, PutKvReply, PutKvRequest, QueryStateStoreReply, QueryStateStoreRequest, ReleaseKvLockReply, ReleaseKvLockRequest, RenewKvLockReply, RenewKvLockRequest, RestartWorkerReply, RestartWorkerRequest, RunJobReply, RunJobRequest, StopJobReply, StopJobRequest, StopRolloutReply, StopRolloutRequest, UpdateNodeDynamicReply, UpdateNodeDynamicRequest, UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest } from "./legion_pb.js";
 import { MethodKind } from "@bufbuild/protobuf";
 
 /**
@@ -210,6 +210,96 @@ export const Manager = {
       name: "ListJobs",
       I: ListJobsRequest,
       O: ListJobsReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Creates a keyed-mode stateful instance for a job's keyed task and
+     * enqueues placement.
+     *
+     * Keyed instances (see docs/stateful-workloads.md) are the sandbox/dispatch
+     * primitive: each instance is a long-lived logical entity with a unique,
+     * **never-recycled** id that persists across allocations. Unlike slot mode,
+     * `count.num` does not drive keyed tasks — the number of live instances
+     * created through this RPC is the task's desired allocation count (zero
+     * instances = zero allocations).
+     *
+     * Id assignment: the target task's `stateful.idSource` declares the default
+     * source. With `idSource: "caller"` the request must supply `instance_id`;
+     * with `idSource: "uuid"` (or unset) the server mints an id when
+     * `instance_id` is absent. A caller-supplied `instance_id` is always
+     * accepted when valid, regardless of `idSource` — the setting picks the
+     * default, it does not forbid explicit keys.
+     *
+     * Errors:
+     * - NotFound: the job does not exist.
+     * - InvalidArgument: no keyed task matches `group`/`task`, the match is
+     *   ambiguous, the id has an invalid charset (must match
+     *   `[A-Za-z0-9._-]{1,128}`), or `idSource: "caller"` and no id was given.
+     * - AlreadyExists: the id collides with ANY existing instance row,
+     *   including Terminated tombstones — destroyed ids can never be created
+     *   again (the never-recycle guarantee).
+     *
+     * @generated from rpc legion.Manager.CreateInstance
+     */
+    createInstance: {
+      name: "CreateInstance",
+      I: CreateInstanceRequest,
+      O: CreateInstanceReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Destroys a keyed-mode instance: stops its current allocation, drops its
+     * storage handle, and marks the instance Terminated.
+     *
+     * The instance row is retained forever as a tombstone so its id can never
+     * be re-created (never-recycle guarantee), and its workload identity `sub`
+     * can never be re-minted for a different workload. The storage handle is
+     * always dropped on destroy — a destroyed sandbox's state must not be
+     * reattachable. (This is intentionally stricter than slot-mode scale-in,
+     * which retains storage by default for a later scale-out.)
+     *
+     * Destroying an already-Terminated instance succeeds as a no-op, so the
+     * call is safe to retry even without an idempotency key.
+     *
+     * Errors:
+     * - NotFound: no instance row with this id exists.
+     * - InvalidArgument: the instance is slot-mode (slot lifecycles are owned
+     *   by the scheduler via `count.num`, not this API).
+     *
+     * @generated from rpc legion.Manager.DestroyInstance
+     */
+    destroyInstance: {
+      name: "DestroyInstance",
+      I: DestroyInstanceRequest,
+      O: DestroyInstanceReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Lists stateful instances (slot and keyed) for a job, optionally filtered
+     * by group. Includes Terminated rows (slot rows retained for scale-out
+     * re-materialization; keyed rows retained forever as never-recycle
+     * tombstones).
+     *
+     * @generated from rpc legion.Manager.ListInstances
+     */
+    listInstances: {
+      name: "ListInstances",
+      I: ListInstancesRequest,
+      O: ListInstancesReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Returns one stateful instance by id.
+     *
+     * Errors:
+     * - NotFound: no instance row with this id exists.
+     *
+     * @generated from rpc legion.Manager.GetInstance
+     */
+    getInstance: {
+      name: "GetInstance",
+      I: GetInstanceRequest,
+      O: GetInstanceReply,
       kind: MethodKind.Unary,
     },
     /**
