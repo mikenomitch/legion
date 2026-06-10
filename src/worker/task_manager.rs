@@ -29,7 +29,7 @@ pub struct StagingJob {
 /// What `begin_task_allocation` did with a new allocation.
 pub enum BeginOutcome {
     /// No artifacts: the task was prepared and started synchronously.
-    Started(Allocation, TaskConfig),
+    Started(Box<(Allocation, TaskConfig)>),
     /// Artifacts declared: the allocation is registered as
     /// `staging artifacts` and the caller must run the staging job on a
     /// blocking thread (see [`launch_task_allocation`]).
@@ -49,6 +49,12 @@ pub struct WorkerTaskManager {
     alloc_root: PathBuf,
     artifact_status: ArtifactStatusBoard,
     stager: Arc<ArtifactStager>,
+}
+
+impl Default for WorkerTaskManager {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl WorkerTaskManager {
@@ -154,9 +160,8 @@ impl WorkerTaskManager {
     fn prepare_runtime(&self, allocation: &Allocation, task: &TaskConfig) -> R<TaskRuntime> {
         let alloc_dir = self.alloc_dir(allocation.id);
         let task_dir = alloc_dir.join(&task.name);
-        std::fs::create_dir_all(&task_dir).with_context(|| {
-            format!("create task directory {}", task_dir.display())
-        })?;
+        std::fs::create_dir_all(&task_dir)
+            .with_context(|| format!("create task directory {}", task_dir.display()))?;
         let mut runtime = TaskRuntime::default();
         runtime
             .extra_env
@@ -330,13 +335,15 @@ impl WorkerTaskManager {
 
         let staged = runtime.staged_artifacts.clone();
         for artifact in &staged {
-            plugin.consume_artifact(artifact, runtime).with_context(|| {
-                format!(
-                    "consume artifact {} for task {}",
-                    artifact.name.as_deref().unwrap_or("<unnamed>"),
-                    task.name
-                )
-            })?;
+            plugin
+                .consume_artifact(artifact, runtime)
+                .with_context(|| {
+                    format!(
+                        "consume artifact {} for task {}",
+                        artifact.name.as_deref().unwrap_or("<unnamed>"),
+                        task.name
+                    )
+                })?;
         }
 
         info!(
@@ -370,7 +377,7 @@ impl WorkerTaskManager {
         let (alloc, task) = task_from_allocation(allocation)?;
         if task.artifacts.is_empty() {
             self.run_allocation(&alloc, &task)?;
-            return Ok(BeginOutcome::Started(alloc, task));
+            return Ok(BeginOutcome::Started(Box::new((alloc, task))));
         }
 
         info!(
@@ -432,8 +439,7 @@ impl WorkerTaskManager {
         for artifact in &staged {
             if let Some(name) = artifact.name.as_deref() {
                 let path = artifact.reference_path().display().to_string();
-                let env_name =
-                    format!("LEGION_ARTIFACT_{}", name.to_uppercase().replace('-', "_"));
+                let env_name = format!("LEGION_ARTIFACT_{}", name.to_uppercase().replace('-', "_"));
                 runtime.extra_env.insert(env_name, path.clone());
                 artifact_paths.insert(name.to_string(), path);
             }
@@ -590,7 +596,8 @@ pub fn launch_task_allocation(
     };
 
     match outcome {
-        BeginOutcome::Started(alloc, task) => {
+        BeginOutcome::Started(started) => {
+            let (alloc, task) = *started;
             spawn_health_monitor(manager.clone(), alloc, task);
             Ok(())
         }
@@ -675,8 +682,7 @@ fn task_from_allocation(allocation: &TaskAllocation) -> R<(Allocation, TaskConfi
     let artifacts = if allocation.task_artifacts.trim().is_empty() {
         Vec::new()
     } else {
-        serde_json::from_str(&allocation.task_artifacts)
-            .context("Invalid task artifacts JSON")?
+        serde_json::from_str(&allocation.task_artifacts).context("Invalid task artifacts JSON")?
     };
 
     let task = TaskConfig {
@@ -868,7 +874,10 @@ mod tests {
         assert!(manager.is_allocation_active(11));
 
         let health = manager.allocation_health_snapshot();
-        let entry = health.iter().find(|h| h.allocation_id == 11).expect("health");
+        let entry = health
+            .iter()
+            .find(|h| h.allocation_id == 11)
+            .expect("health");
         assert_eq!(entry.status, "staging artifacts");
         let states = entry.artifact_states.as_deref().expect("artifact states");
         assert!(states.contains("\"state\":\"pending\""), "{states}");
@@ -896,7 +905,9 @@ mod tests {
         let runtime = manager.prepare_runtime(&allocation, &task)?;
         let task_dir = runtime.task_dir.clone().unwrap();
         manager.runtimes.insert(allocation.id, runtime);
-        manager.allocations.insert(allocation.id, allocation.clone());
+        manager
+            .allocations
+            .insert(allocation.id, allocation.clone());
         manager.task_configs.insert(allocation.id, task.clone());
 
         let staged_dir = task_dir.join("tool");
@@ -913,7 +924,10 @@ mod tests {
 
         let runtime = manager.runtimes.get(&allocation.id).expect("runtime");
         assert_eq!(
-            runtime.extra_env.get("LEGION_ARTIFACT_TOOL").map(String::as_str),
+            runtime
+                .extra_env
+                .get("LEGION_ARTIFACT_TOOL")
+                .map(String::as_str),
             Some(staged_dir.to_str().unwrap())
         );
         // The stored (started) task config is interpolated.
@@ -1013,7 +1027,10 @@ mod tests {
             let guard = manager.lock().expect("task manager");
             assert!(guard.health_monitors.contains_key(&allocation.id));
             let runtime = guard.runtimes.get(&allocation.id).expect("runtime");
-            assert!(runtime.task_dir.is_some(), "restored runtime keeps task dir");
+            assert!(
+                runtime.task_dir.is_some(),
+                "restored runtime keeps task dir"
+            );
         }
 
         let pid = {

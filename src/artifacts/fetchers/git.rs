@@ -60,12 +60,18 @@ fn git_command(credential: Option<&Credential>) -> R<Command> {
                 base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"));
             cmd.env("GIT_CONFIG_COUNT", "1");
             cmd.env("GIT_CONFIG_KEY_0", "http.extraHeader");
-            cmd.env("GIT_CONFIG_VALUE_0", format!("Authorization: Basic {encoded}"));
+            cmd.env(
+                "GIT_CONFIG_VALUE_0",
+                format!("Authorization: Basic {encoded}"),
+            );
         }
         Some(Credential::Bearer { token }) => {
             cmd.env("GIT_CONFIG_COUNT", "1");
             cmd.env("GIT_CONFIG_KEY_0", "http.extraHeader");
-            cmd.env("GIT_CONFIG_VALUE_0", format!("Authorization: Bearer {token}"));
+            cmd.env(
+                "GIT_CONFIG_VALUE_0",
+                format!("Authorization: Bearer {token}"),
+            );
         }
         Some(other) => bail!("git artifacts do not support {other:?}"),
     }
@@ -261,7 +267,12 @@ mod tests {
             let output = Command::new("git")
                 // Host-level signing/hooks config must not leak into the
                 // fixture repo.
-                .args(["-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null"])
+                .args([
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                ])
                 .args(args)
                 .current_dir(dir.path())
                 .env("GIT_AUTHOR_NAME", "t")
@@ -334,7 +345,9 @@ mod tests {
             .expect("branch resolves");
         assert!(is_full_sha(&resolved.digest), "{}", resolved.digest);
         assert!(
-            resolved.pinned_source.contains(&format!("ref={}", resolved.digest)),
+            resolved
+                .pinned_source
+                .contains(&format!("ref={}", resolved.digest)),
             "{}",
             resolved.pinned_source
         );

@@ -4,9 +4,7 @@
 use std::io::Read;
 use std::path::Path;
 
-use crate::artifacts::fetcher::{
-    ArtifactFetcher, FetchRequest, FetchedArtifact, FetchedPayload,
-};
+use crate::artifacts::fetcher::{ArtifactFetcher, FetchRequest, FetchedArtifact, FetchedPayload};
 use crate::artifacts::stage::ArtifactSink;
 use crate::prelude::*;
 

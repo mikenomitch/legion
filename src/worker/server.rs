@@ -26,11 +26,10 @@ impl Worker for WorkerAgentService {
         // artifact-bearing tasks stage on a background thread and report
         // staging failures through the heartbeat failure path.
         let task_manager = self.task_manager.clone();
-        let launched = tokio::task::spawn_blocking(move || {
-            launch_task_allocation(&task_manager, &allocation)
-        })
-        .await
-        .map_err(|err| Status::internal(format!("launch task panicked: {err}")))?;
+        let launched =
+            tokio::task::spawn_blocking(move || launch_task_allocation(&task_manager, &allocation))
+                .await
+                .map_err(|err| Status::internal(format!("launch task panicked: {err}")))?;
         if let Err(err) = launched {
             return Err(Status::internal(format!("Failed to start task: {err}")));
         }

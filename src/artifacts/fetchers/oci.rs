@@ -332,10 +332,7 @@ impl OciFetcher {
                 },
             }],
         });
-        std::fs::write(
-            layout_root.join("index.json"),
-            serde_json::to_vec(&index)?,
-        )?;
+        std::fs::write(layout_root.join("index.json"), serde_json::to_vec(&index)?)?;
         std::fs::write(
             layout_root.join("oci-layout"),
             br#"{"imageLayoutVersion":"1.0.0"}"#,
@@ -395,7 +392,10 @@ mod tests {
         assert_eq!(reference.tag(), Some("v42"));
         assert_eq!(protocol, ClientProtocol::Https);
 
-        let digest_source = format!("oci://registry.acme.io/models/embedder@sha256:{}", "a".repeat(64));
+        let digest_source = format!(
+            "oci://registry.acme.io/models/embedder@sha256:{}",
+            "a".repeat(64)
+        );
         let parsed = parse_artifact_source(&digest_source)?;
         let (reference, _) = parse_reference(&request(&parsed, &limits, &digest_source))?;
         assert!(reference.digest().is_some());
@@ -432,10 +432,7 @@ mod tests {
     fn blob_paths_are_digest_addressed() -> R<()> {
         let root = std::path::Path::new("/layout");
         let path = blob_path(root, &format!("sha256:{}", "b".repeat(64)))?;
-        assert_eq!(
-            path,
-            root.join("blobs").join("sha256").join("b".repeat(64))
-        );
+        assert_eq!(path, root.join("blobs").join("sha256").join("b".repeat(64)));
         assert!(blob_path(root, "garbage").is_err());
         assert!(blob_path(root, "sha256:../escape").is_err());
         Ok(())

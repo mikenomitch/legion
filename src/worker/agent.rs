@@ -78,10 +78,11 @@ async fn run_worker_with_manager(
     let task_manager = Arc::new(Mutex::new(WorkerTaskManager::with_state_store(
         WorkerStateStore::new(state_path),
     )));
-    let artifact_fetch_config = parse_artifact_fetch_config(&config.artifacts).unwrap_or_else(|err| {
-        warn!(error = ?err, "Invalid worker artifacts config; using defaults");
-        crate::structs::WorkerArtifactFetchConfigFull::default()
-    });
+    let artifact_fetch_config =
+        parse_artifact_fetch_config(&config.artifacts).unwrap_or_else(|err| {
+            warn!(error = ?err, "Invalid worker artifacts config; using defaults");
+            crate::structs::WorkerArtifactFetchConfigFull::default()
+        });
     let restored_allocations = {
         let mut manager = task_manager.lock().expect("task manager");
         manager.load_builtin_plugins();

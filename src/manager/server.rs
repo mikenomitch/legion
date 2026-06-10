@@ -18,17 +18,17 @@ use crate::structs::{
     AdvanceRolloutRequest, AllocationHealth, DeleteKvReply, DeleteKvRequest,
     DeleteSavedStateQueryReply, DeleteSavedStateQueryRequest, DestroyJobReply, DestroyJobRequest,
     FailedAllocation, GetArtifactCredentialReply, GetArtifactCredentialRequest, GetJobInfoReply,
-    GetJobInfoRequest, GetJobSpecByConfigRequest,
-    GetJobSpecReply, GetJobSpecRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest,
-    GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest,
-    GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest, GetObservabilityReply,
-    GetObservabilityRequest, GetRaftJoinTokenReply, GetRaftJoinTokenRequest, GetRaftStatusReply,
-    GetRaftStatusRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply,
-    GetRolloutStatusRequest, GetStateStoreSchemaReply, GetStateStoreSchemaRequest,
-    HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, IssueRaftCommandReply,
-    IssueRaftCommandRequest, JobConfig, JobSpecHistoryItem, KvEntry, KvInjectionAction,
-    KvValueType, LedgerNode, ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobsReply,
-    ListJobsRequest, ListKvReply, ListKvRequest, ListRaftHistoryReply, ListRaftHistoryRequest,
+    GetJobInfoRequest, GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest,
+    GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest,
+    GetManagerConfigsReply, GetManagerConfigsRequest, GetNodeReply, GetNodeRequest, GetNodesReply,
+    GetNodesRequest, GetObservabilityReply, GetObservabilityRequest, GetRaftJoinTokenReply,
+    GetRaftJoinTokenRequest, GetRaftStatusReply, GetRaftStatusRequest, GetRolloutReply,
+    GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest, GetStateStoreSchemaReply,
+    GetStateStoreSchemaRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply,
+    HeartbeatRequest, IssueRaftCommandReply, IssueRaftCommandRequest, JobConfig,
+    JobSpecHistoryItem, KvEntry, KvInjectionAction, KvValueType, LedgerNode,
+    ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobsReply, ListJobsRequest,
+    ListKvReply, ListKvRequest, ListRaftHistoryReply, ListRaftHistoryRequest,
     ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply, ListRolloutsRequest,
     ListSavedStateQueriesReply, ListSavedStateQueriesRequest, Node, NodeMsg, PatchKvReply,
     PatchKvRequest, PlanJobReply, PlanJobRequest, PlannedAllocation, PutKvReply, PutKvRequest,
@@ -139,6 +139,11 @@ struct KvReference {
 
 fn parse_kv_reference(value: &str) -> Option<&str> {
     let value = value.strip_prefix('$')?;
+    // `${…}` is interpolation syntax (`${artifact.tool}` and friends), not a
+    // KV reference — KV references are bare `$path/key` strings.
+    if value.starts_with('{') {
+        return None;
+    }
     if value.is_empty() || !value.contains('/') {
         return None;
     }
@@ -601,10 +606,7 @@ impl ManagerAgentService {
                 &self.artifacts_config,
                 &self.node_identity_names,
             )?;
-            crate::artifacts::auth::apply_cluster_auth(
-                &mut task.artifacts,
-                &self.artifacts_config,
-            );
+            crate::artifacts::auth::apply_cluster_auth(&mut task.artifacts, &self.artifacts_config);
 
             if !resolve_pins {
                 continue;
@@ -1016,10 +1018,11 @@ impl Manager for ManagerAgentService {
             });
         }
 
-        let (mut config, kv_refs) = resolve_jobspec_kv_references(&self.store, &js).map_err(|e| {
-            error!("Error parsing jobspec: {:?}", e);
-            Status::invalid_argument(format!("Error parsing jobspec: {e}"))
-        })?;
+        let (mut config, kv_refs) =
+            resolve_jobspec_kv_references(&self.store, &js).map_err(|e| {
+                error!("Error parsing jobspec: {:?}", e);
+                Status::invalid_argument(format!("Error parsing jobspec: {e}"))
+            })?;
 
         let force_reschedule = inner.force_reschedule;
         validate_job_config(&config).map_err(|e| {
@@ -1317,13 +1320,11 @@ impl Manager for ManagerAgentService {
         })?;
         // Artifact admission for plan mirrors run: pins resolve here too so
         // the plan shows the digests a submit would ship.
-        let pin_notes =
-            run_blocking_admission(|| self.normalize_job_artifacts(&mut config, true)).map_err(
-                |e| {
-                    error!("Error normalizing artifacts: {:?}", e);
-                    Status::invalid_argument(format!("Error normalizing artifacts: {e:#}"))
-                },
-            )?;
+        let pin_notes = run_blocking_admission(|| self.normalize_job_artifacts(&mut config, true))
+            .map_err(|e| {
+                error!("Error normalizing artifacts: {:?}", e);
+                Status::invalid_argument(format!("Error normalizing artifacts: {e:#}"))
+            })?;
         let config = config;
 
         let scheduler = Scheduler::new(&self.store).map_err(|e| {
@@ -2514,9 +2515,7 @@ fn handle_failed_allocations(
 /// (tests) run inline.
 fn run_blocking_admission<T>(work: impl FnOnce() -> T) -> T {
     match tokio::runtime::Handle::try_current() {
-        Ok(handle)
-            if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread =>
-        {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
             tokio::task::block_in_place(work)
         }
         _ => work(),
@@ -2956,6 +2955,17 @@ mod tests {
         let store = Store::start_storage(&store_config)?;
         store.reset_all_tables()?;
         Ok(store)
+    }
+
+    #[test]
+    fn kv_references_ignore_interpolation_tokens() {
+        // Bare `$path/key` strings are KV references…
+        assert_eq!(parse_kv_reference("$flags/global"), Some("flags/global"));
+        // …but `${…}` interpolation tokens are not, even with slashes.
+        assert_eq!(parse_kv_reference("${artifact.tool}/bin/run"), None);
+        assert_eq!(parse_kv_reference("${artifact.model}"), None);
+        assert_eq!(parse_kv_reference("no-dollar"), None);
+        assert_eq!(parse_kv_reference("$nokey"), None);
     }
 
     fn insert_node(store: &Store, id: &str) -> R<()> {

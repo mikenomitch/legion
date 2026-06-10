@@ -103,10 +103,7 @@ impl Credential {
                 .with_context(|| format!("artifact credential type {kind} requires {name}"))
         };
         let opt_field = |name: &str| -> Option<String> {
-            value
-                .get(name)
-                .and_then(Value::as_str)
-                .map(str::to_string)
+            value.get(name).and_then(Value::as_str).map(str::to_string)
         };
         match kind {
             "basic" => Ok(Credential::Basic {
@@ -174,7 +171,10 @@ pub struct ResolvedIdentity {
 pub enum FetchedPayload {
     /// A single file (the common http/s3 case). `digest` is the sha256 of
     /// the bytes, computed while streaming.
-    File { path: std::path::PathBuf, digest: String },
+    File {
+        path: std::path::PathBuf,
+        digest: String,
+    },
     /// A directory tree (git clone, file:// directory copy).
     Tree { dir: std::path::PathBuf },
     /// An OCI image laid out as an on-disk OCI layout directory.
@@ -361,8 +361,7 @@ mod tests {
             other => panic!("expected aws credential, got {other:?}"),
         }
 
-        let headers =
-            Credential::from_json(r#"{"type":"headers","headers":{"X-Api-Key":"k"}}"#)?;
+        let headers = Credential::from_json(r#"{"type":"headers","headers":{"X-Api-Key":"k"}}"#)?;
         assert!(matches!(headers, Credential::Headers { .. }));
 
         assert!(Credential::from_json(r#"{"type":"unknown"}"#).is_err());
@@ -395,6 +394,49 @@ mod tests {
             registry.fetcher(scheme)?;
         }
         assert!(registry.fetcher("doesnotexist").is_err());
+        Ok(())
+    }
+
+    /// Phase 6 acceptance: the sample out-of-tree fetcher dylib
+    /// (`plugins/artifacts/demo/`) resolves its custom scheme end to end.
+    /// Gated on the dylib being built (LEGION_BUILD_PLUGINS=1), mirroring the
+    /// noop task-plugin test.
+    #[test]
+    fn demo_fetcher_plugin_resolves_custom_scheme_when_built() -> R<()> {
+        if std::env::var("LEGION_SKIP_PLUGIN_BUILD").is_ok() {
+            return Ok(());
+        }
+        let plugin_root = crate::util::plugin_root_dir();
+        let paths = crate::plugin_runtime::plugin_paths("artifacts", "demo", &plugin_root);
+        if !paths.dylib.exists() {
+            return Ok(());
+        }
+
+        let mut registry = FetcherRegistry::with_builtins();
+        let fetcher = registry.fetcher("demo")?;
+
+        let staging = tempfile::tempdir()?;
+        let mut sink =
+            crate::artifacts::ArtifactSink::new(staging.path().join("sink"), 1024 * 1024)?;
+        let source = "demo://example/hello.txt?content=hi-from-plugin";
+        let parsed = crate::structs::parse_artifact_source(source)?;
+        let limits = FetchLimits::default();
+        let request = FetchRequest {
+            scheme: &parsed.scheme,
+            url: &parsed.url,
+            redacted_source: source,
+            checksum: None,
+            media_type: None,
+            credential: None,
+            limits: &limits,
+        };
+        let fetched = fetcher.fetch(&request, &mut sink)?;
+        match fetched.payload {
+            FetchedPayload::File { path, .. } => {
+                assert_eq!(std::fs::read_to_string(path)?, "hi-from-plugin");
+            }
+            other => bail!("expected file payload, got {other:?}"),
+        }
         Ok(())
     }
 }

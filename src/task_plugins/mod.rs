@@ -818,4 +818,82 @@ mod tests {
         let err = validate_job_config(&job_with(task)).expect_err("duplicate identity name");
         assert!(err.to_string().contains("duplicate identity"), "{err}");
     }
+
+    // --- artifact capability gating (artifact system plan §8) ---
+
+    use crate::structs::ArtifactSpec;
+
+    #[test]
+    fn exec_task_accepts_artifacts_with_valid_references() -> R<()> {
+        let task = TaskConfig {
+            artifacts: vec![
+                ArtifactSpec::from_source("https://releases.example.com/tool.tar.gz").named("tool"),
+            ],
+            config: json!({"command": ["${artifact.tool}/run", "--once"]}),
+            ..TaskConfig::new("batch", "exec")
+        };
+        validate_job_config(&job_with(task))
+    }
+
+    #[test]
+    fn container_task_accepts_artifacts() -> R<()> {
+        let task = TaskConfig {
+            artifacts: vec![ArtifactSpec::from_source("oci://ghcr.io/acme/extra:v1")],
+            config: json!({"image": "alpine", "command": ["echo", "hi"]}),
+            ..TaskConfig::new("api", "container")
+        };
+        validate_job_config(&job_with(task))
+    }
+
+    #[test]
+    fn unknown_artifact_interpolation_fails_validation() {
+        let task = TaskConfig {
+            artifacts: vec![
+                ArtifactSpec::from_source("https://releases.example.com/tool.tar.gz").named("tool"),
+            ],
+            config: json!({"command": ["${artifact.tool}/run", "--w", "${artifact.modle}/w"]}),
+            ..TaskConfig::new("batch", "exec")
+        };
+        let err = validate_job_config(&job_with(task)).expect_err("typo'd reference");
+        assert!(err.to_string().contains("artifact.modle"), "{err}");
+    }
+
+    #[test]
+    fn noop_kind_rejects_artifacts_when_plugin_available() {
+        // The noop plugin is a dylib; gate the assertion on its presence like
+        // the other noop tests.
+        if std::env::var("LEGION_SKIP_PLUGIN_BUILD").is_ok() {
+            return;
+        }
+        let path = task_plugin_name_to_path("noop");
+        if !Path::new(&path).exists() {
+            return;
+        }
+        let task = TaskConfig {
+            artifacts: vec![ArtifactSpec::from_source("https://example.com/x.tar.gz")],
+            config: json!({}),
+            ..TaskConfig::new("noop-task", "noop")
+        };
+        let err = validate_job_config(&job_with(task)).expect_err("noop has no artifacts");
+        assert!(
+            err.to_string().contains("does not support artifacts"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn container_implicit_artifacts_desugar_image() -> R<()> {
+        let plugin = ContainerTaskPlugin;
+        assert!(plugin.supports_artifacts());
+        let implicit = plugin
+            .implicit_artifacts(&json!({"image": "ghcr.io/acme/api:v42", "command": ["x"]}))?;
+        assert_eq!(implicit.len(), 1);
+        assert_eq!(implicit[0].source, "oci://ghcr.io/acme/api:v42");
+        assert_eq!(implicit[0].name.as_deref(), Some("image"));
+
+        // Docker Hub shorthand expands to a fully-qualified reference.
+        let implicit = plugin.implicit_artifacts(&json!({"image": "alpine:latest"}))?;
+        assert_eq!(implicit[0].source, "oci://docker.io/library/alpine:latest");
+        Ok(())
+    }
 }

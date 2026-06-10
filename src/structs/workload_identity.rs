@@ -789,4 +789,82 @@ mod tests {
         let ids = vec![identity("aws"), identity("gcp")];
         validate_identities("api", &ids, false).unwrap();
     }
+
+    // --- node identities (artifact system plan §6) ---
+
+    fn node_identity(name: &str) -> NodeIdentityConfig {
+        NodeIdentityConfig {
+            name: name.into(),
+            audience: vec!["sts.amazonaws.com".into()],
+            ttl: Some("15m".into()),
+            sub_template: None,
+        }
+    }
+
+    #[test]
+    fn node_identity_validates_with_defaults() {
+        validate_node_identities(&[node_identity("artifact-pull")]).unwrap();
+    }
+
+    #[test]
+    fn node_identity_requires_audience() {
+        let mut id = node_identity("pull");
+        id.audience.clear();
+        let err = id.validate().unwrap_err();
+        assert!(err.to_string().contains("audience"), "{err}");
+    }
+
+    #[test]
+    fn duplicate_node_identity_names_rejected() {
+        let err =
+            validate_node_identities(&[node_identity("pull"), node_identity("pull")]).unwrap_err();
+        assert!(err.to_string().contains("duplicate"), "{err}");
+    }
+
+    #[test]
+    fn node_sub_template_allows_region_and_pool_only() {
+        validate_node_sub_template("{region}:node:{pool}").unwrap();
+        validate_node_sub_template("legion-{region}-{pool}").unwrap();
+
+        // {node} churns and is claims-only, exactly like {alloc} for tasks.
+        let err = validate_node_sub_template("{region}:{node}").unwrap_err();
+        assert!(err.to_string().contains("legion.io/node"), "{err}");
+
+        // Task placeholders are not valid in node scope.
+        let err = validate_node_sub_template("{region}:{job}").unwrap_err();
+        assert!(err.to_string().contains("unknown placeholder"), "{err}");
+
+        // Literal-only templates render the same subject everywhere.
+        let err = validate_node_sub_template("static").unwrap_err();
+        assert!(err.to_string().contains("no placeholders"), "{err}");
+    }
+
+    #[test]
+    fn node_claims_render_subject_and_scope() -> crate::prelude::R<()> {
+        let claims = NodeIdentityClaims {
+            region: "prod".into(),
+            pool: "default".into(),
+            node_id: "node-abc".into(),
+        };
+        assert_eq!(claims.subject_for(None)?, "prod:node:default");
+        assert_eq!(
+            claims.subject_for(Some("legion-{region}-{pool}"))?,
+            "legion-prod-default"
+        );
+
+        let legion_claims = claims.legion_claims();
+        assert_eq!(
+            legion_claims.get("legion.io/scope").map(String::as_str),
+            Some("node")
+        );
+        assert_eq!(
+            legion_claims.get("legion.io/node").map(String::as_str),
+            Some("node-abc")
+        );
+        assert_eq!(
+            legion_claims.get("legion.io/pool").map(String::as_str),
+            Some("default")
+        );
+        Ok(())
+    }
 }

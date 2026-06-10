@@ -235,7 +235,7 @@ impl<'de> Deserialize<'de> for ArtifactSpec {
         #[serde(untagged)]
         enum Input {
             Source(String),
-            Full(ArtifactSpecObject),
+            Full(Box<ArtifactSpecObject>),
         }
 
         match Input::deserialize(deserializer)? {
@@ -243,7 +243,7 @@ impl<'de> Deserialize<'de> for ArtifactSpec {
                 source,
                 ..ArtifactSpec::default()
             }),
-            Input::Full(full) => Ok(full.into()),
+            Input::Full(full) => Ok((*full).into()),
         }
     }
 }
@@ -363,12 +363,27 @@ impl ArtifactSpec {
     }
 
     /// The implicit OCI image artifact a container task's `image` field
-    /// desugars into.
+    /// desugars into. Docker Hub shorthand (`alpine:latest`,
+    /// `acme/api:v1`) expands to a fully-qualified `docker.io` reference so
+    /// the `oci://` source always carries a registry host.
     pub fn oci_image(image: &str) -> Self {
         let source = if image.contains("://") {
             image.to_string()
         } else {
-            format!("oci://{image}")
+            let first_segment = image.split('/').next().unwrap_or("");
+            // A registry host is only present before a `/`; a colon in a
+            // single-segment image (`alpine:latest`) is the tag, not a port.
+            let has_registry = image.contains('/')
+                && (first_segment.contains('.')
+                    || first_segment.contains(':')
+                    || first_segment == "localhost");
+            if has_registry {
+                format!("oci://{image}")
+            } else if image.contains('/') {
+                format!("oci://docker.io/{image}")
+            } else {
+                format!("oci://docker.io/library/{image}")
+            }
         };
         ArtifactSpec {
             source,
@@ -703,10 +718,8 @@ mod tests {
         let tag = ArtifactSpec::from_source("oci://registry/app:v1");
         assert!(tag.is_mutable_reference()?);
 
-        let digest = ArtifactSpec::from_source(format!(
-            "oci://registry/app@sha256:{}",
-            "a".repeat(64)
-        ));
+        let digest =
+            ArtifactSpec::from_source(format!("oci://registry/app@sha256:{}", "a".repeat(64)));
         assert!(!digest.is_mutable_reference()?);
 
         let git_branch = ArtifactSpec::from_source("git::https://github.com/acme/repo?ref=main");
@@ -760,8 +773,7 @@ mod tests {
             ArtifactSpec::from_source("https://x/a").named("tool"),
             ArtifactSpec::from_source("https://x/b").named("tool"),
         ];
-        let err =
-            validate_task_artifacts("t", &duplicate, &json!({}), &identities).unwrap_err();
+        let err = validate_task_artifacts("t", &duplicate, &json!({}), &identities).unwrap_err();
         assert!(err.to_string().contains("duplicate artifact name"), "{err}");
 
         // Unknown interpolation reference rejected.

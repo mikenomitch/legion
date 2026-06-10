@@ -154,7 +154,11 @@ pub fn validate_cluster_artifacts_config(
 mod tests {
     use super::*;
 
-    fn matcher(pattern: &str, kv: Option<&str>, node_identity: Option<&str>) -> ArtifactAuthMatcher {
+    fn matcher(
+        pattern: &str,
+        kv: Option<&str>,
+        node_identity: Option<&str>,
+    ) -> ArtifactAuthMatcher {
         ArtifactAuthMatcher {
             r#match: pattern.into(),
             kv: kv.map(str::to_string),
@@ -164,12 +168,18 @@ mod tests {
 
     #[test]
     fn glob_semantics() {
-        assert!(glob_match("oci://ghcr.io/acme/**", "oci://ghcr.io/acme/api"));
+        assert!(glob_match(
+            "oci://ghcr.io/acme/**",
+            "oci://ghcr.io/acme/api"
+        ));
         assert!(glob_match(
             "oci://ghcr.io/acme/**",
             "oci://ghcr.io/acme/deep/nested"
         ));
-        assert!(!glob_match("oci://ghcr.io/acme/**", "oci://ghcr.io/other/api"));
+        assert!(!glob_match(
+            "oci://ghcr.io/acme/**",
+            "oci://ghcr.io/other/api"
+        ));
         // Single * stays within a segment.
         assert!(glob_match("s3://acme-*/tool", "s3://acme-builds/tool"));
         assert!(!glob_match("s3://acme-*/tool", "s3://acme-builds/sub/tool"));
@@ -194,7 +204,11 @@ mod tests {
 
     #[test]
     fn git_prefix_sources_match_git_patterns() {
-        let matchers = vec![matcher("git://github.com/acme/**", Some("secrets/git"), None)];
+        let matchers = vec![matcher(
+            "git://github.com/acme/**",
+            Some("secrets/git"),
+            None,
+        )];
         assert!(
             match_cluster_auth(&matchers, "git::https://github.com/acme/repo?ref=v1").is_some()
         );
@@ -203,11 +217,7 @@ mod tests {
     #[test]
     fn apply_cluster_auth_annotates_origins() {
         let cluster = ArtifactsManagerConfigFull {
-            auth: vec![matcher(
-                "s3://acme-tooling/**",
-                None,
-                Some("artifact-pull"),
-            )],
+            auth: vec![matcher("s3://acme-tooling/**", None, Some("artifact-pull"))],
             ..Default::default()
         };
 
@@ -229,7 +239,10 @@ mod tests {
         apply_cluster_auth(&mut artifacts, &cluster);
 
         assert_eq!(artifacts[0].auth_origin.as_deref(), Some("task"));
-        assert_eq!(artifacts[0].auth.as_ref().unwrap().kv.as_deref(), Some("secrets/own"));
+        assert_eq!(
+            artifacts[0].auth.as_ref().unwrap().kv.as_deref(),
+            Some("secrets/own")
+        );
 
         assert_eq!(artifacts[1].auth_origin.as_deref(), Some("cluster"));
         assert_eq!(
@@ -250,8 +263,7 @@ mod tests {
     fn cluster_validation_rejects_disallowed_scheme_and_unknown_node_identity() {
         let cluster = ArtifactsManagerConfigFull::default();
         let artifacts = vec![ArtifactSpec::from_source("http://insecure.example.com/x")];
-        let err =
-            validate_artifacts_against_cluster("t", &artifacts, &cluster, &[]).unwrap_err();
+        let err = validate_artifacts_against_cluster("t", &artifacts, &cluster, &[]).unwrap_err();
         assert!(err.to_string().contains("allowedSchemes"), "{err}");
 
         let mut with_node_identity = ArtifactSpec::from_source("s3://bucket/key");

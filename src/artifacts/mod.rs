@@ -48,7 +48,10 @@ pub enum StagedPayload {
     Tree { dir: PathBuf },
     /// An OCI image as an on-disk OCI layout. Image-consuming kinds turn
     /// this into whatever their runtime wants.
-    Image { oci_layout: PathBuf, reference: String },
+    Image {
+        oci_layout: PathBuf,
+        reference: String,
+    },
     /// mediaType-selected ORAS layers staged into `dir`.
     Layers {
         dir: PathBuf,
@@ -123,8 +126,8 @@ pub fn fetch_source_to_dir(source: &str, dest_dir: &Path) -> R<PathBuf> {
 }
 
 fn copy_local_path(path: &Path, dest_dir: &Path) -> R<PathBuf> {
-    let metadata = std::fs::metadata(path)
-        .with_context(|| format!("read metadata for {}", path.display()))?;
+    let metadata =
+        std::fs::metadata(path).with_context(|| format!("read metadata for {}", path.display()))?;
     if metadata.is_dir() {
         let target = dest_dir.join(path.file_name().unwrap_or("source".as_ref()));
         copy_dir_recursive(path, &target)?;
@@ -140,8 +143,8 @@ fn copy_local_path(path: &Path, dest_dir: &Path) -> R<PathBuf> {
 
 pub(crate) fn copy_dir_recursive(source: &Path, dest: &Path) -> R<()> {
     std::fs::create_dir_all(dest)?;
-    for entry in std::fs::read_dir(source)
-        .with_context(|| format!("read directory {}", source.display()))?
+    for entry in
+        std::fs::read_dir(source).with_context(|| format!("read directory {}", source.display()))?
     {
         let entry = entry?;
         let path = entry.path();
@@ -149,9 +152,8 @@ pub(crate) fn copy_dir_recursive(source: &Path, dest: &Path) -> R<()> {
         if entry.file_type()?.is_dir() {
             copy_dir_recursive(&path, &target)?;
         } else {
-            std::fs::copy(&path, &target).with_context(|| {
-                format!("copy {} to {}", path.display(), target.display())
-            })?;
+            std::fs::copy(&path, &target)
+                .with_context(|| format!("copy {} to {}", path.display(), target.display()))?;
         }
     }
     Ok(())

@@ -137,7 +137,10 @@ mod tests {
         (format!("http://{addr}"), handle)
     }
 
-    fn fetch(source: &str, credential: Option<Credential>) -> R<(FetchedArtifact, tempfile::TempDir)> {
+    fn fetch(
+        source: &str,
+        credential: Option<Credential>,
+    ) -> R<(FetchedArtifact, tempfile::TempDir)> {
         let staging = tempdir()?;
         let mut sink = ArtifactSink::new(staging.path().join("sink"), 10 * 1024 * 1024)?;
         let parsed = parse_artifact_source(source)?;

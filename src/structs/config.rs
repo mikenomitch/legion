@@ -844,3 +844,90 @@ pub fn parse_byte_size(raw: &str) -> R<u64> {
     }
     Ok((value * multiplier as f64) as u64)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn byte_sizes_parse_decimal_and_binary_suffixes() -> R<()> {
+        assert_eq!(parse_byte_size("1024")?, 1024);
+        assert_eq!(parse_byte_size("10MB")?, 10_000_000);
+        assert_eq!(parse_byte_size("512MiB")?, 512 * 1024 * 1024);
+        assert_eq!(parse_byte_size("50GiB")?, 50 * 1024 * 1024 * 1024);
+        assert_eq!(parse_byte_size("1.5KiB")?, 1536);
+        assert!(parse_byte_size("10XB").is_err());
+        assert!(parse_byte_size("abc").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn worker_artifact_fetch_defaults_and_overrides() -> R<()> {
+        let defaults = WorkerArtifactsConfig::default().fetch_with_defaults()?;
+        assert_eq!(defaults.parallelism, DEF_ARTIFACT_FETCH_PARALLELISM);
+        assert_eq!(defaults.attempts, DEF_ARTIFACT_FETCH_ATTEMPTS);
+        assert_eq!(defaults.timeout_secs, 600);
+        assert!(!defaults.allowed_schemes.contains(&"http".to_string()));
+
+        let config: WorkerArtifactsConfig = serde_json::from_value(serde_json::json!({
+            "fetch": {
+                "parallelism": 8,
+                "attempts": 5,
+                "timeout": "2m",
+                "maxArtifactSize": "1GiB",
+                "allowedSchemes": ["https", "http"],
+            }
+        }))?;
+        let full = config.fetch_with_defaults()?;
+        assert_eq!(full.parallelism, 8);
+        assert_eq!(full.attempts, 5);
+        assert_eq!(full.timeout_secs, 120);
+        assert_eq!(full.max_artifact_size_bytes, 1024 * 1024 * 1024);
+        assert!(full.allowed_schemes.contains(&"http".to_string()));
+
+        let zero: WorkerArtifactsConfig =
+            serde_json::from_value(serde_json::json!({"fetch": {"parallelism": 0}}))?;
+        assert!(zero.fetch_with_defaults().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn artifact_auth_matcher_one_of_enforced() {
+        let both = ArtifactAuthMatcher {
+            r#match: "oci://x/**".into(),
+            kv: Some("secrets/x".into()),
+            node_identity: Some("pull".into()),
+        };
+        assert!(both.validate().is_err());
+
+        let neither = ArtifactAuthMatcher {
+            r#match: "oci://x/**".into(),
+            kv: None,
+            node_identity: None,
+        };
+        assert!(neither.validate().is_err());
+
+        let kv_only = ArtifactAuthMatcher {
+            r#match: "oci://x/**".into(),
+            kv: Some("secrets/x".into()),
+            node_identity: None,
+        };
+        kv_only.validate().expect("kv matcher valid");
+    }
+
+    #[test]
+    fn manager_artifacts_defaults_exclude_plain_http() {
+        let full = ArtifactsManagerConfigFull::default();
+        assert!(!full.allowed_schemes.contains(&"http".to_string()));
+        for scheme in ["https", "s3", "oci", "git", "file"] {
+            assert!(
+                full.allowed_schemes.contains(&scheme.to_string()),
+                "{scheme}"
+            );
+        }
+        assert!(
+            !full.container_image_desugar,
+            "desugar off until cache plan"
+        );
+    }
+}

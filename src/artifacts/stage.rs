@@ -112,9 +112,8 @@ pub struct ArtifactSink {
 
 impl ArtifactSink {
     pub fn new(staging_dir: PathBuf, max_bytes: u64) -> R<Self> {
-        fs::create_dir_all(&staging_dir).with_context(|| {
-            format!("create artifact staging dir {}", staging_dir.display())
-        })?;
+        fs::create_dir_all(&staging_dir)
+            .with_context(|| format!("create artifact staging dir {}", staging_dir.display()))?;
         Ok(ArtifactSink {
             staging_dir,
             max_bytes,
@@ -325,8 +324,8 @@ pub fn unpack_archive(archive: &Path, dest_dir: &Path, size_budget: u64) -> R<()
         let file = fs::File::open(archive)?;
         let mut decoder = flate2::read::GzDecoder::new(file).take(size_budget.saturating_add(1));
         let target = dest_dir.join(name.trim_end_matches(".gz"));
-        let mut out = fs::File::create(&target)
-            .with_context(|| format!("create {}", target.display()))?;
+        let mut out =
+            fs::File::create(&target).with_context(|| format!("create {}", target.display()))?;
         let copied = std::io::copy(&mut decoder, &mut out)?;
         if copied > size_budget {
             let _ = fs::remove_file(&target);
@@ -486,7 +485,8 @@ impl ArtifactStager {
                 std::thread::sleep(std::time::Duration::from_millis(500 * u64::from(attempt)));
             }
             if let Err(err) = limits.check_deadline(&redacted) {
-                last_err = Some(last_err.map_or(err, |prior| prior.context("fetch deadline exceeded")));
+                last_err =
+                    Some(last_err.map_or(err, |prior| prior.context("fetch deadline exceeded")));
                 break;
             }
             board.update(allocation_id, index, |row| {
@@ -655,9 +655,7 @@ fn verify_checksum(spec: &ArtifactSpec, fetched: &FetchedArtifact) -> R<()> {
         }
         FetchedPayload::Image { digest, .. } | FetchedPayload::Layers { digest, .. } => {
             if digest != expected {
-                bail!(
-                    "checksum mismatch: expected {expected}, manifest digest is {digest}"
-                );
+                bail!("checksum mismatch: expected {expected}, manifest digest is {digest}");
             }
             Ok(())
         }
@@ -739,8 +737,10 @@ fn place_fetched_artifact(
             digest,
         } => {
             let default_dest = format!(".oci/{}", spec.name.as_deref().unwrap_or("image"));
-            let dest_dir =
-                resolve_dest_dir(task_dir, Some(spec.dest.as_deref().unwrap_or(&default_dest)))?;
+            let dest_dir = resolve_dest_dir(
+                task_dir,
+                Some(spec.dest.as_deref().unwrap_or(&default_dest)),
+            )?;
             merge_move(&oci_layout, &dest_dir)?;
             Ok(StagedArtifact {
                 name: spec.name.clone(),
@@ -831,9 +831,8 @@ fn merge_move(src_dir: &Path, dest_dir: &Path) -> R<()> {
                 target.display()
             );
         }
-        fs::rename(entry.path(), &target).with_context(|| {
-            format!("move staged artifact entry into {}", target.display())
-        })?;
+        fs::rename(entry.path(), &target)
+            .with_context(|| format!("move staged artifact entry into {}", target.display()))?;
     }
     Ok(())
 }
@@ -855,6 +854,10 @@ fn apply_mode(path: &Path, mode: Option<&str>) -> R<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::artifacts::status::ArtifactState;
+    use crate::structs::ArtifactAuth;
+    use std::io::Write as _;
+    use tempfile::tempdir;
 
     #[test]
     fn archive_detection() {
@@ -864,5 +867,423 @@ mod tests {
         assert!(looks_like_archive("a.gz"));
         assert!(!looks_like_archive("binary"));
         assert!(!looks_like_archive("a.zip"));
+    }
+
+    /// Builds a .tar.gz holding `entries` of (path, content).
+    fn tar_gz(entries: &[(&str, &str)]) -> Vec<u8> {
+        let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::default(),
+        ));
+        for (path, content) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(content.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, path, content.as_bytes())
+                .expect("append tar entry");
+        }
+        builder
+            .into_inner()
+            .expect("finish tar")
+            .finish()
+            .expect("finish gzip")
+    }
+
+    fn write_archive(dir: &Path, name: &str, entries: &[(&str, &str)]) -> PathBuf {
+        let path = dir.join(name);
+        fs::write(&path, tar_gz(entries)).expect("write archive");
+        path
+    }
+
+    #[test]
+    fn unpack_extracts_safe_entries() -> R<()> {
+        let dir = tempdir()?;
+        let archive = write_archive(
+            dir.path(),
+            "tool.tar.gz",
+            &[("tool/bin/run", "#!/bin/sh"), ("tool/README", "docs")],
+        );
+        let dest = dir.path().join("out");
+        unpack_archive(&archive, &dest, 1024 * 1024)?;
+        assert_eq!(fs::read_to_string(dest.join("tool/bin/run"))?, "#!/bin/sh");
+        assert_eq!(fs::read_to_string(dest.join("tool/README"))?, "docs");
+        Ok(())
+    }
+
+    #[test]
+    fn unpack_rejects_path_traversal() -> R<()> {
+        let dir = tempdir()?;
+        // The tar builder refuses to *create* `..` entries, so write the
+        // header name bytes directly the way a hostile archive would.
+        let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::default(),
+        ));
+        let content = b"pwn";
+        let mut header = tar::Header::new_gnu();
+        {
+            let gnu = header.as_gnu_mut().expect("gnu header");
+            let name = b"../escape.txt";
+            gnu.name[..name.len()].copy_from_slice(name);
+        }
+        header.set_size(content.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append(&header, content.as_slice())?;
+        let bytes = builder.into_inner()?.finish()?;
+        let archive = dir.path().join("evil.tar.gz");
+        fs::write(&archive, bytes)?;
+
+        let dest = dir.path().join("out");
+        let err = unpack_archive(&archive, &dest, 1024 * 1024).unwrap_err();
+        assert!(err.to_string().contains("escapes"), "{err}");
+        assert!(!dir.path().join("escape.txt").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn unpack_rejects_escaping_symlink() -> R<()> {
+        let dir = tempdir()?;
+        let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::default(),
+        ));
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Symlink);
+        header.set_size(0);
+        header.set_cksum();
+        builder.append_link(&mut header, "link", "../../etc/passwd")?;
+        let bytes = builder.into_inner()?.finish()?;
+        let archive = dir.path().join("symlink.tar.gz");
+        fs::write(&archive, bytes)?;
+
+        let err = unpack_archive(&archive, &dir.path().join("out"), 1024 * 1024).unwrap_err();
+        assert!(err.to_string().contains("escapes"), "{err}");
+
+        // Absolute symlink targets are rejected too.
+        let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::default(),
+        ));
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Symlink);
+        header.set_size(0);
+        header.set_cksum();
+        builder.append_link(&mut header, "link", "/etc/passwd")?;
+        let bytes = builder.into_inner()?.finish()?;
+        let archive = dir.path().join("abs.tar.gz");
+        fs::write(&archive, bytes)?;
+        let err = unpack_archive(&archive, &dir.path().join("out2"), 1024 * 1024).unwrap_err();
+        assert!(err.to_string().contains("absolute"), "{err}");
+        Ok(())
+    }
+
+    #[test]
+    fn unpack_enforces_decompressed_size_budget() -> R<()> {
+        let dir = tempdir()?;
+        let big = "x".repeat(4096);
+        let archive = write_archive(dir.path(), "big.tar.gz", &[("big.txt", &big)]);
+        let err = unpack_archive(&archive, &dir.path().join("out"), 100).unwrap_err();
+        assert!(err.to_string().contains("maxArtifactSize"), "{err}");
+        Ok(())
+    }
+
+    #[test]
+    fn gunzips_bare_gz_files() -> R<()> {
+        let dir = tempdir()?;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(b"raw contents")?;
+        let archive = dir.path().join("data.txt.gz");
+        fs::write(&archive, encoder.finish()?)?;
+
+        let dest = dir.path().join("out");
+        unpack_archive(&archive, &dest, 1024)?;
+        assert_eq!(fs::read_to_string(dest.join("data.txt"))?, "raw contents");
+        Ok(())
+    }
+
+    #[test]
+    fn fetch_semaphore_bounds_concurrency() {
+        let semaphore = Arc::new(FetchSemaphore::new(2));
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let semaphore = semaphore.clone();
+            let active = active.clone();
+            let peak = peak.clone();
+            handles.push(std::thread::spawn(move || {
+                let _permit = semaphore.acquire();
+                let now = active.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                peak.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("worker thread");
+        }
+        assert!(peak.load(std::sync::atomic::Ordering::SeqCst) <= 2);
+    }
+
+    fn test_stager(attempts: u32) -> ArtifactStager {
+        ArtifactStager::new(
+            WorkerArtifactFetchConfigFull {
+                attempts,
+                allowed_schemes: vec!["http".into(), "https".into(), "file".into()],
+                ..Default::default()
+            },
+            Box::new(AnonymousCredentials),
+        )
+    }
+
+    fn spec(source: &str) -> ArtifactSpec {
+        ArtifactSpec::from_source(source)
+    }
+
+    #[test]
+    fn stages_archive_and_reports_states() -> R<()> {
+        let src = tempdir()?;
+        let archive = write_archive(src.path(), "tool.tar.gz", &[("tool/run.sh", "echo hi")]);
+
+        let task_dir = tempdir()?;
+        let board = ArtifactStatusBoard::new();
+        let mut artifact = spec(&format!("file://{}", archive.display()));
+        artifact.name = Some("tool".into());
+        board.init(1, std::slice::from_ref(&artifact));
+
+        let staged =
+            test_stager(1).stage_task_artifacts(1, task_dir.path(), &[artifact], &board)?;
+
+        assert_eq!(staged.len(), 1);
+        // Archives auto-unpack into the task directory root by default.
+        assert_eq!(
+            fs::read_to_string(task_dir.path().join("tool/run.sh"))?,
+            "echo hi"
+        );
+        assert_eq!(staged[0].reference_path(), task_dir.path());
+        assert!(staged[0].digest.as_deref().unwrap().starts_with("sha256:"));
+        assert!(
+            !task_dir.path().join(".staging").exists(),
+            "staging cleaned"
+        );
+
+        let rows = board.snapshot(1).expect("rows");
+        assert_eq!(rows[0].state, ArtifactState::Staged);
+        assert!(rows[0].duration_ms.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn stages_single_file_with_mode_and_dest() -> R<()> {
+        let src = tempdir()?;
+        let binary = src.path().join("tool");
+        fs::write(&binary, "#!/bin/sh")?;
+
+        let task_dir = tempdir()?;
+        let board = ArtifactStatusBoard::new();
+        let mut artifact = spec(&format!("file://{}", binary.display()));
+        artifact.name = Some("tool".into());
+        artifact.dest = Some("bin/".into());
+        artifact.mode = Some("0755".into());
+        board.init(1, std::slice::from_ref(&artifact));
+
+        let staged =
+            test_stager(1).stage_task_artifacts(1, task_dir.path(), &[artifact], &board)?;
+        let staged_path = task_dir.path().join("bin/tool");
+        assert!(staged_path.is_file());
+        assert_eq!(staged[0].reference_path(), staged_path);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&staged_path)?.permissions().mode();
+            assert_eq!(mode & 0o777, 0o755, "mode applied");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn checksum_mismatch_fails_and_discards_bytes() -> R<()> {
+        let src = tempdir()?;
+        let file = src.path().join("tool.bin");
+        fs::write(&file, "actual contents")?;
+
+        let task_dir = tempdir()?;
+        let board = ArtifactStatusBoard::new();
+        let mut artifact = spec(&format!("file://{}", file.display()));
+        artifact.checksum = Some(format!("sha256:{}", "0".repeat(64)));
+        board.init(1, std::slice::from_ref(&artifact));
+
+        let err = test_stager(2)
+            .stage_task_artifacts(1, task_dir.path(), &[artifact], &board)
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("checksum mismatch"), "{err:#}");
+
+        // Corrupt bytes never reach the task dir; staging temp is cleaned.
+        assert!(!task_dir.path().join("tool.bin").exists());
+        assert!(!task_dir.path().join(".staging").exists());
+
+        let rows = board.snapshot(1).expect("rows");
+        assert_eq!(rows[0].state, ArtifactState::Failed);
+        assert_eq!(rows[0].attempts, Some(2), "retries exhausted");
+        assert!(rows[0].error.as_deref().unwrap().contains("checksum"));
+        Ok(())
+    }
+
+    #[test]
+    fn checksum_match_stages_file() -> R<()> {
+        let src = tempdir()?;
+        let file = src.path().join("tool.bin");
+        fs::write(&file, "bytes")?;
+        let digest = {
+            use sha2::Digest as _;
+            format!("sha256:{:x}", Sha256::digest(b"bytes"))
+        };
+
+        let task_dir = tempdir()?;
+        let board = ArtifactStatusBoard::new();
+        let mut artifact = spec(&format!("file://{}", file.display()));
+        artifact.checksum = Some(digest.clone());
+        board.init(1, std::slice::from_ref(&artifact));
+
+        let staged =
+            test_stager(1).stage_task_artifacts(1, task_dir.path(), &[artifact], &board)?;
+        assert_eq!(staged[0].digest.as_deref(), Some(digest.as_str()));
+        Ok(())
+    }
+
+    #[test]
+    fn disallowed_scheme_rejected_on_worker() -> R<()> {
+        let task_dir = tempdir()?;
+        let board = ArtifactStatusBoard::new();
+        let artifact = spec("s3://bucket/key");
+        board.init(1, std::slice::from_ref(&artifact));
+
+        // Stager config allows only http/https/file (see test_stager).
+        let err = test_stager(1)
+            .stage_task_artifacts(1, task_dir.path(), &[artifact], &board)
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("allowedSchemes"), "{err:#}");
+        Ok(())
+    }
+
+    #[test]
+    fn all_or_nothing_staging_stops_at_first_failure() -> R<()> {
+        let src = tempdir()?;
+        let good = src.path().join("good.bin");
+        fs::write(&good, "ok")?;
+
+        let task_dir = tempdir()?;
+        let board = ArtifactStatusBoard::new();
+        let artifacts = vec![
+            spec(&format!("file://{}", good.display())).named("good"),
+            spec(&format!("file://{}/missing.bin", src.path().display())).named("missing"),
+        ];
+        board.init(1, &artifacts);
+
+        let err = test_stager(1)
+            .stage_task_artifacts(1, task_dir.path(), &artifacts, &board)
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("missing.bin"), "{err:#}");
+
+        let rows = board.snapshot(1).expect("rows");
+        assert_eq!(rows[0].state, ArtifactState::Staged, "first staged");
+        assert_eq!(rows[1].state, ArtifactState::Failed, "second failed");
+        Ok(())
+    }
+
+    #[test]
+    fn kv_auth_without_credential_source_names_the_path() -> R<()> {
+        let src = tempdir()?;
+        let file = src.path().join("tool.bin");
+        fs::write(&file, "x")?;
+
+        let task_dir = tempdir()?;
+        let board = ArtifactStatusBoard::new();
+        let mut artifact = spec(&format!("file://{}", file.display()));
+        artifact.auth = Some(ArtifactAuth {
+            kv: Some("secrets/build-store".into()),
+            ..Default::default()
+        });
+        board.init(1, std::slice::from_ref(&artifact));
+
+        let err = test_stager(1)
+            .stage_task_artifacts(1, task_dir.path(), &[artifact], &board)
+            .unwrap_err();
+        let rendered = format!("{err:#}");
+        // Errors name the auth *source* (the KV path), never values.
+        assert!(rendered.contains("secrets/build-store"), "{rendered}");
+        Ok(())
+    }
+
+    #[test]
+    fn identity_auth_fails_actionably_until_wi_issuance_lands() -> R<()> {
+        let src = tempdir()?;
+        let file = src.path().join("tool.bin");
+        fs::write(&file, "x")?;
+
+        let task_dir = tempdir()?;
+        let board = ArtifactStatusBoard::new();
+        let mut artifact = spec(&format!("file://{}", file.display()));
+        artifact.auth = Some(ArtifactAuth {
+            node_identity: Some("artifact-pull".into()),
+            ..Default::default()
+        });
+        board.init(1, std::slice::from_ref(&artifact));
+
+        let err = test_stager(1)
+            .stage_task_artifacts(1, task_dir.path(), &[artifact], &board)
+            .unwrap_err();
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("workload-identity"), "{rendered}");
+        assert!(rendered.contains("artifact-pull"), "{rendered}");
+        Ok(())
+    }
+
+    #[test]
+    fn collision_with_existing_task_file_fails() -> R<()> {
+        let src = tempdir()?;
+        let archive = write_archive(src.path(), "tool.tar.gz", &[("config.json", "new")]);
+
+        let task_dir = tempdir()?;
+        fs::write(task_dir.path().join("config.json"), "existing")?;
+
+        let board = ArtifactStatusBoard::new();
+        let artifact = spec(&format!("file://{}", archive.display()));
+        board.init(1, std::slice::from_ref(&artifact));
+
+        let err = test_stager(1)
+            .stage_task_artifacts(1, task_dir.path(), &[artifact], &board)
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("collides"), "{err:#}");
+        // The pre-existing file is untouched.
+        assert_eq!(
+            fs::read_to_string(task_dir.path().join("config.json"))?,
+            "existing"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unpack_file_mode_stages_archive_as_is() -> R<()> {
+        let src = tempdir()?;
+        let archive = write_archive(src.path(), "data.tar.gz", &[("inner.txt", "x")]);
+
+        let task_dir = tempdir()?;
+        let board = ArtifactStatusBoard::new();
+        let mut artifact = spec(&format!("file://{}", archive.display()));
+        artifact.unpack = crate::structs::ArtifactUnpack::File;
+        board.init(1, std::slice::from_ref(&artifact));
+
+        let staged =
+            test_stager(1).stage_task_artifacts(1, task_dir.path(), &[artifact], &board)?;
+        assert!(task_dir.path().join("data.tar.gz").is_file());
+        assert!(matches!(
+            staged[0].payload,
+            crate::artifacts::StagedPayload::File { .. }
+        ));
+        Ok(())
     }
 }

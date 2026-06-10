@@ -8,7 +8,7 @@ use std::io::Write;
 
 use futures::StreamExt;
 use object_store::aws::AmazonS3Builder;
-use object_store::{ObjectStore, path::Path as ObjectPath};
+use object_store::{path::Path as ObjectPath, ObjectStore};
 
 use crate::artifacts::fetcher::{
     ArtifactFetcher, Credential, FetchRequest, FetchedArtifact, FetchedPayload,
@@ -162,7 +162,8 @@ mod tests {
 
     #[test]
     fn query_params_override_credential_endpoint() -> R<()> {
-        let source = "s3://acme-builds/api/v42.tar.gz?endpoint=http://minio.internal:9000&region=auto";
+        let source =
+            "s3://acme-builds/api/v42.tar.gz?endpoint=http://minio.internal:9000&region=auto";
         let parsed = parse_artifact_source(source)?;
         let limits = FetchLimits::default();
         let credential = Credential::Aws {
