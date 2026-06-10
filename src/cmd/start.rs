@@ -1,8 +1,8 @@
 use crate::prelude::*;
 
-use crate::manager::agent::run_manager;
+use crate::manager::daemon::run_manager;
 use crate::structs::ManagerConfig;
-use crate::worker::agent::run_worker;
+use crate::worker::daemon::run_worker;
 
 use jsonnet::JsonnetVm;
 
@@ -45,7 +45,7 @@ pub fn config() -> Command {
         );
 
     Command::new("start")
-        .about("Start an agent")
+        .about("Start a daemon")
         .arg(config_path_arg())
         .subcommand(manager_cmd)
         .subcommand(worker_cmd)
