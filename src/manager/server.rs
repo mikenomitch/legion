@@ -1421,13 +1421,9 @@ impl Manager for ManagerAgentService {
             .collect();
 
         let mut message = message;
-        for note in pin_notes {
-            message.push_str("\n");
-            message.push_str(&note);
-        }
-        for diff in artifact_diffs {
-            message.push_str("\n");
-            message.push_str(&diff);
+        for note in pin_notes.iter().chain(artifact_diffs.iter()) {
+            message.push('\n');
+            message.push_str(note);
         }
 
         let reply = PlanJobReply {
