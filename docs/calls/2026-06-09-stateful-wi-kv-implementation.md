@@ -257,6 +257,51 @@ in this work. The right fix is worker mTLS binding all worker RPCs to a per-node
 credential; faking a one-off scheme for this single RPC would create a second
 auth system. Surfaced here and in the proto/`server.rs` comments so it's visible.
 
+## 28. K8s retention parity maps `whenDeleted` to job *stop*
+
+`retainOnStop` (default true) governs slot storage handles at `job stop`;
+`job destroy` stays an unconditional purge. Legion's destroy removes the job's
+entire record history, so stop is the honest analog of "deleting the
+StatefulSet". Keyed semantics stay fixed per instance and the knob is rejected
+there. Handles drop only for rows the stop itself transitions — scale-in
+leftovers keep theirs, matching the K8s caveat that `whenDeleted` doesn't touch
+PVCs from prior scale-downs.
+
+## 29. Fencing is two cooperating timers, not a new state machine
+
+`stateful.onLost.selfTerminateAfter` (default 90s) has the worker kill stateful
+tasks after losing manager contact; `replaceAfter` (default 2×, `'never'`
+supported) has the manager hold a lost node's stateful allocations until the
+loss is *confirmed* — by which point the worker has provably self-fenced or is
+truly dead. Validation enforces `replaceAfter > selfTerminateAfter`. Gated
+allocations keep their rows and the instance stays bound (no new lifecycle
+state); the diagnostic is a computed `pending-loss-confirmation` detail, and
+`legion instance replace` is the operator force path (K8s force-delete analog).
+Known bounded hole, documented: config updates still replace allocations on
+partitioned nodes — overlap is bounded by `selfTerminateAfter`. Drive-by fix:
+the worker heartbeat loop used to die on a single failed heartbeat (`?`); it
+now retries with backoff and redrives failure reports.
+
+## 30. Ordered rollouts: `order: 'sequential'` + `updateFrom`, not K8s names
+
+OrderedReady → `rollout.slots.order: 'sequential'` (one slot at a time,
+highest-first like StatefulSet updates, health-gated); partition →
+`updateFrom: N` (only slots ≥ N update; lowering N on resubmit promotes the
+rest, ordered and gated). `updateFrom` requires `sequential` — a partition is
+incoherent without ordinal replacement — and `updateFrom >= count` is rejected
+("would update nothing"). Fresh-job bring-up ordering (place slot 0 before 1)
+is deferred and documented honestly; updates are the safety-critical half.
+
+## 31. CI greening: fixed the 33 pre-existing clippy errors
+
+CI runs `cargo clippy -D warnings` and fails on lint errors that predate this
+branch (the local "33-error baseline" we'd been holding steady). Auto-fixable
+lints were fixed properly; `too_many_arguments` and tonic-`Status`
+`result_large_err` sites got targeted `#[allow]`s pending real refactors. The
+Scheduler Benchmark Gate failure was a workflow-token permission
+(`paths-filter` needs `pull-requests: read`), not code; the SLO gate passes
+locally (255 evals/sec, p99 5.5ms, correctness 1.0).
+
 ### Comparison to Nomad/K8s
 
 `docs/stateful-vs-nomad-k8s.md` records the honest gaps in the basic primitives:
