@@ -8,7 +8,7 @@ use crate::structs::{
 use crate::util::random_string;
 use crate::worker::{
     node_check::{fingerprint_node, run_health_checks},
-    server::WorkerAgentService,
+    server::WorkerDaemonService,
     state::WorkerStateStore,
     task_health::spawn_health_monitor,
     task_manager::WorkerTaskManager,
@@ -88,7 +88,7 @@ async fn run_worker_with_manager(
     for (allocation, task) in restored_allocations {
         spawn_health_monitor(task_manager.clone(), allocation, task);
     }
-    let worker_node = WorkerAgentService {
+    let worker_node = WorkerDaemonService {
         task_manager: task_manager.clone(),
     };
     let worker_server_fut = Server::builder()

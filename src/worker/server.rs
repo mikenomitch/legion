@@ -8,11 +8,11 @@ use crate::worker::task_manager::WorkerTaskManager;
 use std::sync::{Arc, Mutex};
 use tonic::{Request, Response, Status};
 
-pub struct WorkerAgentService {
+pub struct WorkerDaemonService {
     pub task_manager: Arc<Mutex<WorkerTaskManager>>,
 }
 #[tonic::async_trait]
-impl Worker for WorkerAgentService {
+impl Worker for WorkerDaemonService {
     #[instrument(err, skip_all)]
     async fn post_work(
         &self,

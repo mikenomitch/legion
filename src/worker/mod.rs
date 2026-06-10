@@ -1,4 +1,4 @@
-pub mod agent;
+pub mod daemon;
 pub mod log_sink;
 pub mod logs;
 pub mod node_check;

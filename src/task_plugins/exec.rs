@@ -232,6 +232,18 @@ impl TaskPlugin for ExecTaskPlugin {
         true
     }
 
+    fn supports_identity_env(&self) -> bool {
+        true
+    }
+
+    fn supports_identity_file(&self) -> bool {
+        true
+    }
+
+    fn supports_signal(&self) -> bool {
+        true
+    }
+
     fn prepare(
         &self,
         allocation: &Allocation,

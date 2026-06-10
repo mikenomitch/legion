@@ -10,6 +10,7 @@ use tabled::Tabled;
 
 use crate::prelude::{bail, R};
 
+use super::workload_identity::{validate_identities, WorkloadIdentity};
 use super::{Job, PlannedAllocation, Submission};
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Tabled)]
@@ -847,6 +848,11 @@ pub struct TaskConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[tabled(skip)]
     pub kv_injections: Option<TaskKvInjections>,
+    /// Workload identities issued to this task (workload-identity OIDC plan).
+    /// Empty = today's behavior; the feature is opt-in per task.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[tabled(skip)]
+    pub identities: Vec<WorkloadIdentity>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -980,6 +986,8 @@ struct TaskConfigInput {
     files: Vec<TaskKvFileInjection>,
     #[serde(default)]
     kv_injections: Option<TaskKvInjections>,
+    #[serde(default)]
+    identities: Vec<WorkloadIdentity>,
 }
 
 #[derive(Deserialize)]
@@ -1044,6 +1052,7 @@ impl TaskConfigInput {
                     files: self.files,
                 }
             }),
+            identities: self.identities,
         }
     }
 }
@@ -1197,7 +1206,24 @@ impl TaskConfig {
             checks: Vec::new(),
             on_unhealthy: TaskOnUnhealthyConfig::default(),
             kv_injections: None,
+            identities: Vec::new(),
         }
+    }
+
+    /// Whether this task declares a stateful block. Gates the stateful-only
+    /// `{instance}`/`{slot}` placeholders in a `sub` template. Stateful
+    /// workloads are defined by a separate plan; until that lands, a task is
+    /// considered stateful if its kind config carries a `stateful` object.
+    fn is_stateful(&self) -> bool {
+        self.config
+            .get("stateful")
+            .is_some_and(|value| !value.is_null())
+    }
+
+    /// Validate workload identities declared on this task (see the
+    /// workload-identity OIDC plan). No identities = today's behavior.
+    pub fn validate_identities(&self) -> R<()> {
+        validate_identities(&self.name, &self.identities, self.is_stateful())
     }
 
     pub fn validate_checks(&self) -> R<()> {
@@ -1654,6 +1680,64 @@ mod tests {
         assert!(err
             .to_string()
             .contains("cannot set both template and template_kv"));
+    }
+
+    #[test]
+    fn identities_deserialize_from_camel_case_spec() -> R<()> {
+        let spec = serde_json::json!({
+            "name": "demo",
+            "task": {
+                "kind": "exec",
+                "identities": [
+                    {
+                        "name": "aws",
+                        "audience": ["sts.amazonaws.com"],
+                        "ttl": "15m",
+                        "file": { "path": "/var/run/legion/identity/aws/token", "mode": "0400" },
+                        "changeMode": "noop"
+                    },
+                    {
+                        "name": "vault",
+                        "audience": ["vault.internal"],
+                        "ttl": "5m",
+                        "env": "VAULT_WORKLOAD_TOKEN",
+                        "changeMode": "signal",
+                        "changeSignal": "SIGHUP",
+                        "extraClaims": { "app.example.com/tier": "backend" }
+                    }
+                ]
+            }
+        });
+        let config: JobConfig = serde_json::from_value(spec)?;
+        let task = &config.tasks[0];
+        assert_eq!(task.identities.len(), 2);
+        assert_eq!(task.identities[0].name, "aws");
+        assert!(task.identities[0].delivers_file());
+        assert_eq!(task.identities[1].change_signal.as_deref(), Some("SIGHUP"));
+        assert_eq!(
+            task.identities[1].extra_claims["app.example.com/tier"],
+            "backend"
+        );
+        task.validate_identities()?;
+        Ok(())
+    }
+
+    #[test]
+    fn identity_with_empty_audience_fails_validation() {
+        let spec = serde_json::json!({
+            "name": "demo",
+            "task": {
+                "kind": "exec",
+                "identities": [
+                    { "name": "aws", "audience": [], "env": "TOKEN", "changeMode": "restart" }
+                ]
+            }
+        });
+        let config: JobConfig = serde_json::from_value(spec).expect("should deserialize");
+        let err = config.tasks[0]
+            .validate_identities()
+            .expect_err("empty audience must be rejected");
+        assert!(err.to_string().contains("audience"), "{err}");
     }
 
     #[test]

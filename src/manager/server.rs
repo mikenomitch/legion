@@ -508,12 +508,12 @@ fn build_rollout_launch_config(config: &JobConfig) -> Result<RolloutLaunchConfig
 }
 
 #[derive(Debug)]
-pub struct ManagerAgentService {
+pub struct ManagerDaemonService {
     pub store: Store,
     allocation_failures: Arc<Mutex<AllocationFailureTracker>>,
 }
 
-impl ManagerAgentService {
+impl ManagerDaemonService {
     pub fn new(store: Store) -> Self {
         Self {
             store,
@@ -821,7 +821,7 @@ struct AllocationFailureTracker {
 }
 
 #[tonic::async_trait]
-impl Manager for ManagerAgentService {
+impl Manager for ManagerDaemonService {
     #[instrument(skip_all)]
     async fn run_job(
         &self,
@@ -2904,7 +2904,7 @@ mod tests {
             health_checks: json!({}),
         };
         store.insert_node(NodeMsg::from(node))?;
-        let manager = ManagerAgentService::new(store);
+        let manager = ManagerDaemonService::new(store);
 
         let response = manager
             .restart_worker(Request::new(RestartWorkerRequest {
@@ -2923,7 +2923,7 @@ mod tests {
     #[tokio::test]
     async fn get_allocation_logs_requires_a_target() -> R<()> {
         let store = setup_store()?;
-        let manager = ManagerAgentService::new(store);
+        let manager = ManagerDaemonService::new(store);
 
         let status = manager
             .get_allocation_logs(Request::new(GetAllocationLogsRequest {
@@ -2943,7 +2943,7 @@ mod tests {
     #[tokio::test]
     async fn get_allocation_logs_unknown_job_is_not_found() -> R<()> {
         let store = setup_store()?;
-        let manager = ManagerAgentService::new(store);
+        let manager = ManagerDaemonService::new(store);
 
         let status = manager
             .get_allocation_logs(Request::new(GetAllocationLogsRequest {
@@ -2963,7 +2963,7 @@ mod tests {
     #[tokio::test]
     async fn kv_reference_updates_trigger_job_restart() -> R<()> {
         let store = setup_store()?;
-        let manager = ManagerAgentService::new(store);
+        let manager = ManagerDaemonService::new(store);
 
         manager
             .put_kv(Request::new(PutKvRequest {
@@ -3041,7 +3041,7 @@ mod tests {
     #[tokio::test]
     async fn kv_task_env_restart_policy_enqueues_job_update() -> R<()> {
         let store = setup_store()?;
-        let manager = ManagerAgentService::new(store);
+        let manager = ManagerDaemonService::new(store);
 
         manager
             .put_kv(Request::new(PutKvRequest {
@@ -3100,7 +3100,7 @@ mod tests {
     #[tokio::test]
     async fn kv_task_env_rollout_policy_enqueues_rollout_tick() -> R<()> {
         let store = setup_store()?;
-        let manager = ManagerAgentService::new(store);
+        let manager = ManagerDaemonService::new(store);
 
         manager
             .put_kv(Request::new(PutKvRequest {
@@ -3159,7 +3159,7 @@ mod tests {
     #[tokio::test]
     async fn run_job_cancels_superseded_rollouts_and_cleans_stale_allocations() -> R<()> {
         let store = setup_store()?;
-        let manager = ManagerAgentService::new(store.clone());
+        let manager = ManagerDaemonService::new(store.clone());
         insert_node(&store, "node-a")?;
 
         let v1 = JobConfig {
@@ -3249,7 +3249,7 @@ mod tests {
     #[tokio::test]
     async fn stop_rollout_reverts_target_allocations() -> R<()> {
         let store = setup_store()?;
-        let manager = ManagerAgentService::new(store.clone());
+        let manager = ManagerDaemonService::new(store.clone());
         insert_node(&store, "node-a")?;
 
         let v1 = JobConfig {
@@ -3317,7 +3317,7 @@ mod tests {
     #[test]
     fn update_node_metadata_evicts_allocations_with_invalid_constraints() -> R<()> {
         let store = setup_store()?;
-        let manager = ManagerAgentService::new(store.clone());
+        let manager = ManagerDaemonService::new(store.clone());
 
         let node_a = Node {
             id: "node-a".into(),
@@ -3812,7 +3812,7 @@ mod tests {
     #[tokio::test]
     async fn list_rollout_events_returns_persisted_events() -> R<()> {
         let store = setup_store()?;
-        let manager = ManagerAgentService::new(store.clone());
+        let manager = ManagerDaemonService::new(store.clone());
         insert_node(&store, "node-a")?;
 
         let v1 = JobConfig {
