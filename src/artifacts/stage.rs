@@ -792,7 +792,12 @@ fn place_fetched_artifact(
 fn resolve_dest_dir(task_dir: &Path, dest: Option<&str>) -> R<PathBuf> {
     let dest = dest.unwrap_or(".");
     crate::structs::validate_artifact_dest(dest)?;
-    let resolved = task_dir.join(dest);
+    // Avoid `…/tool-task/.` showing up in env vars and status surfaces.
+    let resolved = if dest == "." || dest == "./" {
+        task_dir.to_path_buf()
+    } else {
+        task_dir.join(dest)
+    };
     fs::create_dir_all(&resolved)
         .with_context(|| format!("create artifact dest {}", resolved.display()))?;
     Ok(resolved)

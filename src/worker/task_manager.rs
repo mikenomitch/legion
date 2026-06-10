@@ -85,11 +85,22 @@ impl WorkerTaskManager {
     /// Task directories live beside the worker state file:
     /// `.legion/workers/<id>/allocs/`.
     fn alloc_root_for(state_store: &WorkerStateStore) -> PathBuf {
-        state_store
+        let root = state_store
             .path()
             .parent()
             .map(|parent| parent.join("allocs"))
-            .unwrap_or_else(|| PathBuf::from("allocs"))
+            .unwrap_or_else(|| PathBuf::from("allocs"));
+        // Task dirs become env vars, interpolated `${artifact.*}` paths, and
+        // the exec cwd — all of which break if they are relative (a command
+        // resolved against a cwd that is itself the task dir). Absolutize
+        // once here.
+        if root.is_absolute() {
+            root
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(&root))
+                .unwrap_or(root)
+        }
     }
 
     /// Applies the worker's artifact fetch settings and credential source
@@ -375,6 +386,24 @@ impl WorkerTaskManager {
     /// and heartbeats must keep flowing).
     pub fn begin_task_allocation(&mut self, allocation: &TaskAllocation) -> R<BeginOutcome> {
         let (alloc, task) = task_from_allocation(allocation)?;
+        // A re-dispatch of an id we already run is an in-place update (for
+        // example a config change reusing the allocation): stop the old
+        // instance first so dirs are fresh and the old process is gone —
+        // otherwise staging would collide with the previous content.
+        if self.runtimes.contains_key(&alloc.id) {
+            info!(
+                allocation_id = alloc.id,
+                task_name = %task.name,
+                "Re-dispatched allocation; stopping previous instance before relaunch"
+            );
+            if let Err(err) = self.stop_allocation(alloc.id) {
+                warn!(
+                    allocation_id = alloc.id,
+                    error = ?err,
+                    "Failed to stop previous instance of re-dispatched allocation"
+                );
+            }
+        }
         if task.artifacts.is_empty() {
             self.run_allocation(&alloc, &task)?;
             return Ok(BeginOutcome::Started(Box::new((alloc, task))));
@@ -769,6 +798,15 @@ mod tests {
         );
         assert!(runtime.extra_env.contains_key("LEGION_ALLOC_DIR"));
         Ok(())
+    }
+
+    #[test]
+    fn task_dirs_are_absolute_even_for_relative_state_paths() {
+        // Relative task dirs would break interpolated paths and env vars the
+        // moment exec's cwd defaults to the task dir.
+        let state_store = WorkerStateStore::new(PathBuf::from(".test-relative/worker_state.json"));
+        let manager = WorkerTaskManager::with_state_store(state_store);
+        assert!(manager.alloc_root.is_absolute());
     }
 
     #[test]
