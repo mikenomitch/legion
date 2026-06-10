@@ -377,5 +377,36 @@ pub fn get_migrations() -> Migrations<'static> {
         // Workload identities declared on a task (workload-identity OIDC plan).
         // JSON-encoded Vec<WorkloadIdentity>; NULL/absent == no identities.
         M::up("ALTER TABLE task_config ADD COLUMN identities JSONB;").down(""),
+        // Scheduler event journal backing ListEvents/StreamEvents.
+        // No foreign keys: events must outlive the jobs/nodes they describe
+        // (e.g. a job.destroyed event survives the job row's deletion).
+        M::up(
+            "CREATE TABLE IF NOT EXISTS scheduler_event (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind TEXT NOT NULL,
+            level TEXT NOT NULL,
+            job_id TEXT,
+            node_id TEXT,
+            eval_id TEXT,
+            allocation_id INTEGER,
+            rollout_id INTEGER,
+            message TEXT NOT NULL,
+            metadata_json JSONB NOT NULL DEFAULT '{}',
+            created_at TIMESTAMP NOT NULL
+        )",
+        )
+        .down("DROP TABLE IF EXISTS scheduler_event;"),
+        M::up(
+            "CREATE INDEX IF NOT EXISTS idx_scheduler_event_job_id ON scheduler_event(job_id, id);",
+        )
+        .down("DROP INDEX IF EXISTS idx_scheduler_event_job_id;"),
+        M::up(
+            "CREATE INDEX IF NOT EXISTS idx_scheduler_event_node_id ON scheduler_event(node_id, id);",
+        )
+        .down("DROP INDEX IF EXISTS idx_scheduler_event_node_id;"),
+        M::up(
+            "CREATE INDEX IF NOT EXISTS idx_scheduler_event_kind ON scheduler_event(kind, id);",
+        )
+        .down("DROP INDEX IF EXISTS idx_scheduler_event_kind;"),
     ])
 }

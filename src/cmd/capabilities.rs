@@ -163,6 +163,23 @@ pub fn catalog() -> Vec<Capability> {
             mutates: false,
             read_only_safe: true,
         },
+        // --- Scheduler events ---
+        Capability {
+            name: "events.list",
+            cli: "legion events list",
+            grpc: Some("Manager/ListEvents"),
+            summary: "List recent scheduler events with filters and an after-id cursor.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "events.follow",
+            cli: "legion events follow",
+            grpc: Some("Manager/StreamEvents"),
+            summary: "Stream scheduler events live (NDJSON envelopes in --json mode).",
+            mutates: false,
+            read_only_safe: true,
+        },
         // --- State store (the agent's introspection workhorse) ---
         Capability {
             name: "state.query",

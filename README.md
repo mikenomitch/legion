@@ -7,6 +7,7 @@ A distributed scheduler similar to Kubernetes or Nomad.
 - [Managers and Workers](docs/architecture-managers-workers.md)
 - [Plugin System](docs/plugin-system.md)
 - [Scheduler and Eval Loop](docs/scheduler-and-eval-loop.md)
+- [Event Stream](docs/event-stream.md)
 - [Jobs, Tasks, and Scheduling](docs/jobs-tasks-and-scheduling.md)
 - [Task Kind Plugins](docs/task-kind-plugins.md)
 - [Task Kind: exec](docs/task-kind-exec.md)
