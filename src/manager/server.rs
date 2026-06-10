@@ -41,14 +41,14 @@ use crate::structs::{
     PatchKvReply, PatchKvRequest, PlanJobReply, PlanJobRequest, PlannedAllocation, PutKvReply,
     PutKvRequest, QueryStateStoreReply, QueryStateStoreRequest, RaftHistoryEvent, RaftStatus,
     ReleaseKvLockReply, ReleaseKvLockRequest, RenewKvLockReply, RenewKvLockRequest,
-    RestartWorkerReply, RestartWorkerRequest, RolloutAllocationStatus, RolloutEvent,
-    RolloutGroupStatus, RolloutProgression, RolloutReplacement, RunJobReply, RunJobRequest,
-    SavedStateQuery, StartInstanceReply, StartInstanceRequest, StopInstanceReply,
-    StopInstanceRequest, StopJobReply, StopJobRequest, StopRolloutReply, StopRolloutRequest,
-    Submission, TaskConfig, TaskOnUnhealthyConfig, UpdateNodeDynamicReply,
-    UpdateNodeDynamicRequest, UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest,
-    WorkerConfig, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply,
-    WorkerRegisterRequest,
+    ReplaceInstanceReply, ReplaceInstanceRequest, RestartWorkerReply, RestartWorkerRequest,
+    RolloutAllocationStatus, RolloutEvent, RolloutGroupStatus, RolloutProgression,
+    RolloutReplacement, RunJobReply, RunJobRequest, SavedStateQuery, StartInstanceReply,
+    StartInstanceRequest, StopInstanceReply, StopInstanceRequest, StopJobReply, StopJobRequest,
+    StopRolloutReply, StopRolloutRequest, Submission, TaskConfig, TaskOnUnhealthyConfig,
+    UpdateNodeDynamicReply, UpdateNodeDynamicRequest, UpsertSavedStateQueryReply,
+    UpsertSavedStateQueryRequest, WorkerConfig, WorkerPreRegisterReply, WorkerPreRegisterRequest,
+    WorkerRegisterReply, WorkerRegisterRequest,
 };
 use crate::task_plugins::validate_job_config;
 use crate::tracing_util::{o11y_enabled, read_recent_observability};
@@ -209,8 +209,10 @@ fn map_raft_event(event: crate::storage::persistence::RaftHistoryEvent) -> RaftH
 }
 
 /// Map a stored [`Instance`] to its wire shape (`InstanceInfo` in
-/// `proto/legion.proto`).
-fn map_instance_info(instance: Instance) -> InstanceInfo {
+/// `proto/legion.proto`), attaching the node-loss diagnostic when the
+/// instance is gated (see [`instance_loss_detail`]).
+fn map_instance_info(store: &Store, instance: Instance) -> InstanceInfo {
+    let detail = instance_loss_detail(store, &instance);
     InstanceInfo {
         instance_id: instance.instance_id,
         job_id: instance.job_id,
@@ -223,7 +225,35 @@ fn map_instance_info(instance: Instance) -> InstanceInfo {
         storage_handle: instance.storage_handle,
         created_at: instance.created_at,
         updated_at: instance.updated_at,
+        detail,
     }
+}
+
+/// `pending-loss-confirmation` diagnostic for instance get/list: when an
+/// instance's current allocation sits on a LOST node, explain why no
+/// replacement has been planned yet (the node-loss confirmation gate, see
+/// docs/stateful-workloads.md "Node loss and fencing"). `None` in every
+/// other situation. Lookup failures degrade to no detail — diagnostics must
+/// never fail the read path.
+fn instance_loss_detail(store: &Store, instance: &Instance) -> Option<String> {
+    let alloc_id = instance.current_alloc_id?;
+    let allocation = store.get_allocation_by_id(alloc_id).ok()??;
+    let node = store.get_node(&allocation.node_id).ok()?;
+    if node.status != "lost" {
+        return None;
+    }
+    let lost_at = store
+        .node_lost_at(&node.id)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "unknown".into());
+    Some(format!(
+        "pending-loss-confirmation: allocation {alloc_id} is on lost node {} (lost at \
+         {lost_at}); the manager replaces it only once the loss-confirmation window \
+         (stateful.onLost.replaceAfter) elapses, keeps it if the node returns first, or \
+         replaces it immediately on operator override (`legion instance replace {}`)",
+        node.id, instance.instance_id
+    ))
 }
 
 #[derive(Debug, Clone)]
@@ -2339,6 +2369,108 @@ impl Manager for ManagerAgentService {
         }))
     }
 
+    /// Operator override for the node-loss confirmation gate: immediately
+    /// free a stateful instance's allocation on a LOST node for replacement
+    /// (K8s analog: force-deleting a pod stuck on a lost node). See the
+    /// proto comments on `ReplaceInstance` for the contract and the
+    /// split-brain warning.
+    #[instrument(skip_all)]
+    async fn replace_instance(
+        &self,
+        request: Request<ReplaceInstanceRequest>,
+    ) -> Result<Response<ReplaceInstanceReply>, Status> {
+        let inner = request.into_inner();
+        let idempotency_key = inner.idempotency_key.unwrap_or_default();
+
+        if let Some(message) = self
+            .store
+            .idempotency_lookup(&idempotency_key)
+            .map_err(|e| map_store_error("Error checking idempotency", e))?
+        {
+            return Ok(Response::new(ReplaceInstanceReply {
+                message,
+                deduplicated: true,
+            }));
+        }
+
+        let instance = self
+            .store
+            .get_instance(&inner.instance_id)
+            .map_err(|e| map_store_error("Error loading instance", e))?
+            .ok_or_else(|| {
+                Status::not_found(format!("instance {} not found", inner.instance_id))
+            })?;
+        let Some(alloc_id) = instance.current_alloc_id else {
+            return Err(Status::failed_precondition(format!(
+                "instance {} has no current allocation; nothing is gated — a missing \
+                 allocation reschedules through the normal eval paths",
+                inner.instance_id
+            )));
+        };
+        let allocation = self
+            .store
+            .get_allocation_by_id(alloc_id)
+            .map_err(|e| map_store_error("Error loading allocation", e))?
+            .ok_or_else(|| {
+                Status::failed_precondition(format!(
+                    "instance {} points at allocation {alloc_id}, which no longer exists; \
+                     it is already being replaced",
+                    inner.instance_id
+                ))
+            })?;
+        let node = self
+            .store
+            .get_node(&allocation.node_id)
+            .map_err(|e| map_store_error("Error loading node", e))?;
+        if node.status != "lost" {
+            return Err(Status::failed_precondition(format!(
+                "instance {} allocation {alloc_id} is on node {} (status {:?}), not a lost \
+                 node; the loss-confirmation gate only ever holds allocations on lost nodes \
+                 — there is nothing to force here",
+                inner.instance_id, node.id, node.status
+            )));
+        }
+
+        // Free the gated allocation (instance -> rescheduling, id and
+        // storage handle retained) and re-place excluding the lost node.
+        self.store
+            .remove_allocation_by_id(allocation.id)
+            .map_err(|e| map_store_error("Error removing gated allocation", e))?;
+        let config = self
+            .store
+            .get_job_config(&instance.job_id)
+            .map_err(|e| map_store_error("Error loading job config", e))?;
+        self.store
+            .enqueue_eval(
+                "job_reschedule",
+                Some(&instance.job_id),
+                Some(&config.id()),
+                Some(&allocation.node_id),
+                Some(self.store.default_eval_priority),
+            )
+            .map_err(|e| map_store_error("Error scheduling replacement", e))?;
+
+        warn!(
+            instance_id = %inner.instance_id,
+            allocation_id = alloc_id,
+            node_id = %allocation.node_id,
+            "Operator override: force-replacing instance allocation on lost node \
+             (skipping the loss-confirmation window)"
+        );
+        let message = format!(
+            "Replacing instance {}: freed allocation {alloc_id} on lost node {}",
+            inner.instance_id, allocation.node_id
+        );
+        self.store
+            .idempotency_record(&idempotency_key, "replace_instance", &message)
+            .map_err(|e| map_store_error("Error recording idempotency", e))?;
+
+        Ok(Response::new(ReplaceInstanceReply {
+            message,
+            deduplicated: false,
+        }))
+    }
+
     /// List a job's stateful instances (slot and keyed, including terminated
     /// tombstones), optionally filtered by group.
     #[instrument(skip_all)]
@@ -2355,7 +2487,7 @@ impl Manager for ManagerAgentService {
             .map_err(|e| map_store_error("Error listing instances", e))?
             .into_iter()
             .filter(|instance| group.as_deref().is_none_or(|group| instance.group == group))
-            .map(map_instance_info)
+            .map(|instance| map_instance_info(&self.store, instance))
             .collect();
 
         Ok(Response::new(ListInstancesReply { instances }))
@@ -2377,7 +2509,7 @@ impl Manager for ManagerAgentService {
             })?;
 
         Ok(Response::new(GetInstanceReply {
-            instance: Some(map_instance_info(instance)),
+            instance: Some(map_instance_info(&self.store, instance)),
         }))
     }
 
@@ -3806,6 +3938,7 @@ mod tests {
                 mode: InstanceMode::Slot,
                 id_source: None,
                 initial_instances: None,
+                on_lost: None,
                 storage: None,
             }),
             ..aws_identity_task("db")
@@ -3876,6 +4009,169 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        Ok(())
+    }
+
+    // --- ReplaceInstance / node-loss diagnostics ---
+
+    /// Submit a single stateful slot task (count 1) and place it on `node-1`.
+    fn submit_and_place_stateful_task(
+        store: &Store,
+        job_name: &str,
+    ) -> R<crate::structs::Allocation> {
+        insert_node(store, "node-1")?;
+        insert_node(store, "node-2")?;
+        let task = TaskConfig {
+            stateful: Some(crate::structs::StatefulConfig {
+                mode: crate::structs::InstanceMode::Slot,
+                id_source: None,
+                initial_instances: None,
+                on_lost: None,
+                storage: Some(crate::structs::StatefulStorageConfig {
+                    path: "/var/lib/db".into(),
+                    retain_on_scale_in: None,
+                    retain_on_stop: None,
+                }),
+            }),
+            ..TaskConfig::new("db", "noop")
+        };
+        let job = JobConfig {
+            name: job_name.into(),
+            tasks: vec![task],
+            rollout: None,
+            rollout_by_group: Default::default(),
+            version: None,
+        };
+        store.handle_job_submit(&job, &[submission()])?;
+        let job_config_id = store.get_job_config(job_name)?.id();
+        let (task_id, _) = store
+            .get_task_configs_for_job_config(&job_config_id)?
+            .into_iter()
+            .next()
+            .context("missing task config")?;
+        store.place_alloc("node-1", task_id)
+    }
+
+    #[tokio::test]
+    async fn replace_instance_frees_gated_allocation_and_enqueues_reschedule() -> R<()> {
+        let store = setup_store()?;
+        let allocation = submit_and_place_stateful_task(&store, "fence-job")?;
+        let instance_id = allocation.instance_id.clone().context("instance bound")?;
+        store.mark_nodes_as_lost(&["node-1".to_string()])?;
+        // Gated: still on the lost node.
+        assert_eq!(store.allocs_for_node("node-1")?.len(), 1);
+
+        let manager = ManagerAgentService::new(store.clone());
+        let reply = manager
+            .replace_instance(tonic::Request::new(ReplaceInstanceRequest {
+                instance_id: instance_id.clone(),
+                idempotency_key: None,
+            }))
+            .await?
+            .into_inner();
+        assert!(
+            reply.message.contains("freed allocation"),
+            "{}",
+            reply.message
+        );
+
+        // The gated allocation is gone; the instance awaits its replacement
+        // with id and storage handle intact; a reschedule eval excluding the
+        // lost node is queued.
+        assert!(store.allocs_for_node("node-1")?.is_empty());
+        let instance = store.get_instance(&instance_id)?.context("instance")?;
+        assert_eq!(instance.state, crate::structs::InstanceState::Rescheduling);
+        assert!(instance.storage_handle.is_some());
+        let evals = store.get_evals()?;
+        let reschedule = evals
+            .iter()
+            .find(|eval| eval.kind == "job_reschedule")
+            .context("reschedule eval queued")?;
+        assert_eq!(reschedule.node_name, "node-1");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replace_instance_rejects_allocations_on_healthy_nodes() -> R<()> {
+        let store = setup_store()?;
+        let allocation = submit_and_place_stateful_task(&store, "fence-healthy")?;
+        let instance_id = allocation.instance_id.clone().context("instance bound")?;
+
+        let manager = ManagerAgentService::new(store.clone());
+        let err = manager
+            .replace_instance(tonic::Request::new(ReplaceInstanceRequest {
+                instance_id,
+                idempotency_key: None,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            err.message().contains("not a lost node"),
+            "{}",
+            err.message()
+        );
+        // Nothing happened.
+        assert_eq!(store.allocs_for_node("node-1")?.len(), 1);
+
+        let missing = manager
+            .replace_instance(tonic::Request::new(ReplaceInstanceRequest {
+                instance_id: "no-such-instance".into(),
+                idempotency_key: None,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(missing.code(), tonic::Code::NotFound);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn instance_get_surfaces_pending_loss_confirmation_detail() -> R<()> {
+        let store = setup_store()?;
+        let allocation = submit_and_place_stateful_task(&store, "fence-detail")?;
+        let instance_id = allocation.instance_id.clone().context("instance bound")?;
+        let manager = ManagerAgentService::new(store.clone());
+
+        // Healthy node: no detail.
+        let reply = manager
+            .get_instance(tonic::Request::new(GetInstanceRequest {
+                instance_id: instance_id.clone(),
+            }))
+            .await?
+            .into_inner();
+        assert_eq!(reply.instance.and_then(|info| info.detail), None);
+
+        // Lost node, gated allocation: the diagnostic explains the wait.
+        store.mark_nodes_as_lost(&["node-1".to_string()])?;
+        let reply = manager
+            .get_instance(tonic::Request::new(GetInstanceRequest {
+                instance_id: instance_id.clone(),
+            }))
+            .await?
+            .into_inner();
+        let detail = reply
+            .instance
+            .and_then(|info| info.detail)
+            .context("detail set while gated")?;
+        assert!(
+            detail.starts_with("pending-loss-confirmation:")
+                && detail.contains("node-1")
+                && detail.contains("replaceAfter"),
+            "{detail}"
+        );
+
+        // list_instances carries the same diagnostic.
+        let listed = manager
+            .list_instances(tonic::Request::new(ListInstancesRequest {
+                job_id: "fence-detail".into(),
+                group: None,
+            }))
+            .await?
+            .into_inner();
+        assert!(listed.instances[0]
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.starts_with("pending-loss-confirmation:")));
         Ok(())
     }
 
@@ -5720,6 +6016,7 @@ mod tests {
                 mode: InstanceMode::Keyed,
                 id_source: id_source.map(String::from),
                 initial_instances: None,
+                on_lost: None,
                 storage: Some(crate::structs::StatefulStorageConfig {
                     path: "/workspace".into(),
                     retain_on_scale_in: None,

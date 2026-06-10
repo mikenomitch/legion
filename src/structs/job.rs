@@ -856,6 +856,125 @@ pub struct StatefulConfig {
     /// `docs/plans/volume-plugin-system-plan.md`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage: Option<StatefulStorageConfig>,
+    /// Node-loss fencing policy (`onLost`): worker self-fence window plus
+    /// the manager's loss-confirmation gate. Absent = the safe defaults
+    /// (`selfTerminateAfter: 90s`, `replaceAfter: 2 x selfTerminateAfter`)
+    /// — see [`StatefulOnLostConfig`] and docs/stateful-workloads.md
+    /// "Node loss and fencing".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_lost: Option<StatefulOnLostConfig>,
+}
+
+/// Default worker self-fence window for stateful tasks (see
+/// [`StatefulOnLostConfig::self_terminate_after`]). Applies whenever a
+/// stateful task declares no `onLost` block — fencing is on by default.
+pub const DEFAULT_SELF_TERMINATE_AFTER: Duration = Duration::from_secs(90);
+
+/// Fencing policy for manager<->worker partitions (the at-most-one
+/// guarantee; see docs/stateful-workloads.md "Node loss and fencing").
+///
+/// Two cooperating timers make a node loss *confirmable*: the worker kills
+/// its stateful allocations after losing manager contact for
+/// `selfTerminateAfter`, and the manager refuses to plan a replacement until
+/// the node has been lost for `replaceAfter` (> `selfTerminateAfter`). By
+/// the time the replacement binds the instance id and storage handle, the
+/// original allocation has provably self-fenced or its node is truly dead.
+///
+/// Every stateful task gets this policy — an absent block means the defaults
+/// below (safe by default; tune `selfTerminateAfter` down for faster
+/// failover).
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct StatefulOnLostConfig {
+    /// How long the worker tolerates failed heartbeats before killing this
+    /// task's allocations locally (humantime string, e.g. `"90s"`). Default
+    /// `"90s"`. Must be greater than zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_terminate_after: Option<String>,
+    /// How long a node must have been lost before the manager replaces this
+    /// task's allocations on it (humantime string, e.g. `"3m"`), or the
+    /// special value `"never"` (K8s StatefulSet-style: the allocation is
+    /// only freed when the node returns or an operator forces it via
+    /// ReplaceInstance). Default: `2 x selfTerminateAfter`. Must be greater
+    /// than `selfTerminateAfter` — otherwise a replacement could start
+    /// before the worker has provably self-fenced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replace_after: Option<String>,
+}
+
+/// Resolved manager-side replacement gate for allocations on a lost node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplaceAfter {
+    /// Replace once the node has been lost longer than this.
+    After(Duration),
+    /// Never auto-replace; node recovery or operator override required.
+    Never,
+}
+
+/// [`StatefulOnLostConfig`] with defaults applied and durations parsed — the
+/// only shape the manager gate and the dispatcher reason about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedOnLostPolicy {
+    pub self_terminate_after: Duration,
+    pub replace_after: ReplaceAfter,
+}
+
+impl StatefulOnLostConfig {
+    /// Parse and default the policy. Errors carry actionable messages and
+    /// surface at `job validate`/submit time via
+    /// [`TaskConfig::validate_stateful`].
+    pub fn resolve(&self) -> R<ResolvedOnLostPolicy> {
+        let self_terminate_after = match self.self_terminate_after.as_deref() {
+            None => DEFAULT_SELF_TERMINATE_AFTER,
+            Some(raw) => humantime::parse_duration(raw).map_err(|err| {
+                anyhow::anyhow!(
+                    "stateful.onLost.selfTerminateAfter {raw:?} is not a valid duration \
+                     (use e.g. \"90s\"): {err}"
+                )
+            })?,
+        };
+        if self_terminate_after.is_zero() {
+            bail!("stateful.onLost.selfTerminateAfter must be greater than 0");
+        }
+
+        let replace_after = match self.replace_after.as_deref() {
+            None => ReplaceAfter::After(self_terminate_after * 2),
+            Some("never") => ReplaceAfter::Never,
+            Some(raw) => {
+                let parsed = humantime::parse_duration(raw).map_err(|err| {
+                    anyhow::anyhow!(
+                        "stateful.onLost.replaceAfter {raw:?} is not a valid duration \
+                         (use e.g. \"3m\", or the special value \"never\"): {err}"
+                    )
+                })?;
+                if parsed <= self_terminate_after {
+                    bail!(
+                        "stateful.onLost.replaceAfter ({raw}) must be greater than \
+                         selfTerminateAfter ({}): the manager must wait until the worker has \
+                         provably self-fenced before re-binding the instance, otherwise the \
+                         workload can run twice. Raise replaceAfter, lower selfTerminateAfter, \
+                         or use replaceAfter: \"never\"",
+                        humantime::format_duration(self_terminate_after)
+                    );
+                }
+                ReplaceAfter::After(parsed)
+            }
+        };
+
+        Ok(ResolvedOnLostPolicy {
+            self_terminate_after,
+            replace_after,
+        })
+    }
+}
+
+impl StatefulConfig {
+    /// The effective node-loss fencing policy: the declared `onLost` block,
+    /// or the safe defaults when absent. Stateful tasks ALWAYS have one —
+    /// only stateless tasks are replaced eagerly.
+    pub fn resolved_on_lost(&self) -> R<ResolvedOnLostPolicy> {
+        self.on_lost.clone().unwrap_or_default().resolve()
+    }
 }
 
 /// Persistent storage contract for a stateful task. Each instance gets an
@@ -1116,6 +1235,12 @@ struct TaskConfigInput {
     identities: Vec<WorkloadIdentity>,
     #[serde(default)]
     stateful: Option<StatefulConfig>,
+    // `onLost` is only valid INSIDE the stateful block. Without this field
+    // serde would silently ignore a task-level `onLost`, which is exactly
+    // the misplacement users will type (and on a stateless task there is
+    // nothing to fence) — so catch it and reject loudly at parse time.
+    #[serde(default)]
+    on_lost: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -1145,6 +1270,22 @@ impl TaskConfigInput {
                      count field (see docs/stateful-workloads.md)"
                 ));
             }
+        }
+        if self.on_lost.is_some() {
+            return Err(if self.stateful.is_some() {
+                format!(
+                    "task {name} declares onLost at the task level; the node-loss fencing \
+                     policy belongs inside the stateful block — move it to \
+                     stateful.onLost (see docs/stateful-workloads.md)"
+                )
+            } else {
+                format!(
+                    "task {name} declares onLost but is not stateful; onLost is the \
+                     node-loss fencing policy for stateful instances and is only valid \
+                     inside a stateful block. Stateless tasks are always replaced eagerly \
+                     on node loss (see docs/stateful-workloads.md)"
+                )
+            });
         }
         let depends_on = self
             .depends_on
@@ -1473,6 +1614,14 @@ impl TaskConfig {
                 );
             }
         }
+
+        // Node-loss fencing: durations must parse and replaceAfter must
+        // exceed selfTerminateAfter (or be "never"). Resolving here also
+        // covers the defaulted case, so a stateful task can never reach the
+        // scheduler with an unresolvable policy.
+        stateful
+            .resolved_on_lost()
+            .map_err(|err| anyhow::anyhow!("task {}: {err}", self.name))?;
 
         Ok(())
     }
@@ -2223,6 +2372,7 @@ mod tests {
                     mode: InstanceMode::Keyed,
                     id_source: None,
                     initial_instances: None,
+                    on_lost: None,
                     storage: Some(StatefulStorageConfig {
                         path: "/workspace".into(),
                         retain_on_scale_in: None,
@@ -2250,6 +2400,7 @@ mod tests {
                 mode: InstanceMode::Slot,
                 id_source: Some("uuid".into()),
                 initial_instances: None,
+                on_lost: None,
                 storage: None,
             }),
             ..TaskConfig::new("db", "exec")
@@ -2268,6 +2419,7 @@ mod tests {
                 mode: InstanceMode::Slot,
                 id_source: None,
                 initial_instances: None,
+                on_lost: None,
                 storage: None,
             }),
             ..TaskConfig::new("db", "exec")
@@ -2286,6 +2438,7 @@ mod tests {
                 mode: InstanceMode::Slot,
                 id_source: None,
                 initial_instances: None,
+                on_lost: None,
                 storage: None,
             }),
             ..TaskConfig::new("db", "exec")
@@ -2304,6 +2457,7 @@ mod tests {
                     mode: InstanceMode::Slot,
                     id_source: None,
                     initial_instances: None,
+                    on_lost: None,
                     storage: Some(StatefulStorageConfig {
                         path: bad_path.into(),
                         retain_on_scale_in: None,
@@ -2329,6 +2483,7 @@ mod tests {
                 mode: InstanceMode::Keyed,
                 id_source: Some("dice-roll".into()),
                 initial_instances: None,
+                on_lost: None,
                 storage: None,
             }),
             ..TaskConfig::new("sandbox", "container")
@@ -2347,6 +2502,7 @@ mod tests {
                 mode: InstanceMode::Keyed,
                 id_source: None,
                 initial_instances: None,
+                on_lost: None,
                 storage: None,
             }),
             ..TaskConfig::new("sandbox", "container")
@@ -2368,6 +2524,7 @@ mod tests {
                     mode: InstanceMode::Keyed,
                     id_source: Some("uuid".into()),
                     initial_instances: None,
+                    on_lost: None,
                     storage: None,
                 }),
                 ..TaskConfig::new("sandbox", "container")
@@ -2413,6 +2570,202 @@ mod tests {
         });
         let config: JobConfig = serde_json::from_value(spec)?;
         config.tasks[0].validate_kv_injections()?;
+        Ok(())
+    }
+
+    fn slot_task_with_on_lost(on_lost: StatefulOnLostConfig) -> TaskConfig {
+        TaskConfig {
+            stateful: Some(StatefulConfig {
+                mode: InstanceMode::Slot,
+                id_source: None,
+                initial_instances: None,
+                on_lost: Some(on_lost),
+                storage: None,
+            }),
+            ..TaskConfig::new("db", "exec")
+        }
+    }
+
+    #[test]
+    fn on_lost_defaults_apply_to_every_stateful_task() -> R<()> {
+        // No onLost block: the safe defaults still apply (90s self-fence,
+        // 2x that for the manager gate) — fencing is on by default.
+        let task = TaskConfig {
+            stateful: Some(StatefulConfig {
+                mode: InstanceMode::Slot,
+                id_source: None,
+                initial_instances: None,
+                on_lost: None,
+                storage: None,
+            }),
+            ..TaskConfig::new("db", "exec")
+        };
+        let policy = task.stateful.as_ref().unwrap().resolved_on_lost()?;
+        assert_eq!(policy.self_terminate_after, Duration::from_secs(90));
+        assert_eq!(
+            policy.replace_after,
+            ReplaceAfter::After(Duration::from_secs(180))
+        );
+        task.validate_stateful()?;
+        Ok(())
+    }
+
+    #[test]
+    fn on_lost_replace_after_defaults_to_twice_self_terminate_after() -> R<()> {
+        let policy = StatefulOnLostConfig {
+            self_terminate_after: Some("45s".into()),
+            replace_after: None,
+        }
+        .resolve()?;
+        assert_eq!(policy.self_terminate_after, Duration::from_secs(45));
+        assert_eq!(
+            policy.replace_after,
+            ReplaceAfter::After(Duration::from_secs(90))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn on_lost_parses_explicit_durations_and_never() -> R<()> {
+        let task = slot_task_with_on_lost(StatefulOnLostConfig {
+            self_terminate_after: Some("30s".into()),
+            replace_after: Some("3m".into()),
+        });
+        task.validate_stateful()?;
+        let policy = task.stateful.as_ref().unwrap().resolved_on_lost()?;
+        assert_eq!(policy.self_terminate_after, Duration::from_secs(30));
+        assert_eq!(
+            policy.replace_after,
+            ReplaceAfter::After(Duration::from_secs(180))
+        );
+
+        // The special value "never" is accepted: K8s StatefulSet-style
+        // manual recovery (node return or operator override).
+        let never = slot_task_with_on_lost(StatefulOnLostConfig {
+            self_terminate_after: None,
+            replace_after: Some("never".into()),
+        });
+        never.validate_stateful()?;
+        let policy = never.stateful.as_ref().unwrap().resolved_on_lost()?;
+        assert_eq!(policy.replace_after, ReplaceAfter::Never);
+        Ok(())
+    }
+
+    #[test]
+    fn on_lost_rejects_replace_after_not_exceeding_self_terminate_after() {
+        for replace_after in ["90s", "60s"] {
+            let task = slot_task_with_on_lost(StatefulOnLostConfig {
+                self_terminate_after: Some("90s".into()),
+                replace_after: Some(replace_after.into()),
+            });
+            let err = task
+                .validate_stateful()
+                .expect_err("replaceAfter <= selfTerminateAfter must be rejected");
+            let message = err.to_string();
+            assert!(
+                message.contains("must be greater than")
+                    && message.contains("self-fenced")
+                    && message.contains("task db"),
+                "unexpected error: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn on_lost_rejects_bad_duration_strings() {
+        // selfTerminateAfter: not a duration / missing unit / zero.
+        for bad in ["soon", "90", "0s"] {
+            let task = slot_task_with_on_lost(StatefulOnLostConfig {
+                self_terminate_after: Some(bad.into()),
+                replace_after: None,
+            });
+            let err = task
+                .validate_stateful()
+                .expect_err("bad selfTerminateAfter must be rejected");
+            assert!(err.to_string().contains("selfTerminateAfter"), "{err}");
+        }
+
+        // replaceAfter: anything unparsable that is not the literal "never".
+        for bad in ["later", "180", "Never"] {
+            let task = slot_task_with_on_lost(StatefulOnLostConfig {
+                self_terminate_after: None,
+                replace_after: Some(bad.into()),
+            });
+            let err = task
+                .validate_stateful()
+                .expect_err("bad replaceAfter must be rejected");
+            assert!(err.to_string().contains("replaceAfter"), "{err}");
+        }
+    }
+
+    #[test]
+    fn on_lost_at_task_level_is_rejected_at_parse_time() {
+        // Stateless task: there is nothing to fence.
+        let spec = serde_json::json!({
+            "name": "demo",
+            "task": {
+                "kind": "exec",
+                "onLost": { "selfTerminateAfter": "90s" }
+            }
+        });
+        let err = serde_json::from_value::<JobConfig>(spec)
+            .expect_err("onLost on a stateless task must be rejected");
+        let message = err.to_string();
+        assert!(
+            message.contains("not stateful") && message.contains("onLost"),
+            "unexpected error: {message}"
+        );
+
+        // Stateful task with onLost misplaced at the task level: point the
+        // user at the right nesting instead of silently ignoring it.
+        let spec = serde_json::json!({
+            "name": "demo",
+            "task": {
+                "kind": "exec",
+                "count": 2,
+                "stateful": { "mode": "slot" },
+                "onLost": { "selfTerminateAfter": "90s" }
+            }
+        });
+        let err = serde_json::from_value::<JobConfig>(spec)
+            .expect_err("task-level onLost must be rejected");
+        assert!(err.to_string().contains("stateful.onLost"), "{err}");
+    }
+
+    #[test]
+    fn on_lost_deserializes_inside_stateful_and_round_trips() -> R<()> {
+        let spec = serde_json::json!({
+            "name": "demo",
+            "task": {
+                "kind": "exec",
+                "count": 2,
+                "stateful": {
+                    "mode": "slot",
+                    "onLost": {
+                        "selfTerminateAfter": "30s",
+                        "replaceAfter": "2m"
+                    }
+                }
+            }
+        });
+        let config: JobConfig = serde_json::from_value(spec)?;
+        let task = &config.tasks[0];
+        task.validate_stateful()?;
+        let on_lost = task
+            .stateful
+            .as_ref()
+            .and_then(|stateful| stateful.on_lost.as_ref())
+            .expect("onLost parsed");
+        assert_eq!(on_lost.self_terminate_after.as_deref(), Some("30s"));
+        assert_eq!(on_lost.replace_after.as_deref(), Some("2m"));
+
+        let serialized = serde_json::to_value(task)?;
+        assert_eq!(
+            serialized["stateful"]["onLost"]["selfTerminateAfter"],
+            "30s"
+        );
+        let reparsed: TaskConfig = serde_json::from_value(serialized)?;
+        assert_eq!(reparsed.stateful, task.stateful);
         Ok(())
     }
 }

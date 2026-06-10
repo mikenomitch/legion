@@ -23,6 +23,20 @@
                 // for on-demand, never-recycled instances (sandbox style;
                 // management API is a follow-up).
                 mode: "slot",
+                // Node-loss fencing (at-most-one; see docs/stateful-workloads.md
+                // "Node loss and fencing"). Optional — the values below are the
+                // defaults that apply even without the block. Two cooperating
+                // timers: the worker kills this task after losing manager
+                // contact for selfTerminateAfter, and the manager only replaces
+                // an allocation on a lost node after replaceAfter
+                // (> selfTerminateAfter), so a replacement can never overlap
+                // the original. Lower selfTerminateAfter for faster failover;
+                // set replaceAfter to "never" for K8s StatefulSet-style manual
+                // recovery (node return or `legion instance replace <id>`).
+                // onLost: {
+                //     selfTerminateAfter: "90s",
+                //     replaceAfter: "3m",  // default 2x selfTerminateAfter; or "never"
+                // },
                 storage: {
                     // Contract only in v1: the instance gets an opaque
                     // storage handle bound to this path. Attach/detach

@@ -19,7 +19,8 @@ use crate::cmd::output::{self, OutputFormat};
 use crate::prelude::*;
 use crate::structs::{
     CreateInstanceRequest, CreateInstancesRequest, DestroyInstanceRequest, GetInstanceRequest,
-    InstanceInfo, ListInstancesRequest, StartInstanceRequest, StopInstanceRequest,
+    InstanceInfo, ListInstancesRequest, ReplaceInstanceRequest, StartInstanceRequest,
+    StopInstanceRequest,
 };
 use tabled::Tabled;
 
@@ -153,6 +154,32 @@ pub fn config() -> Command {
         .arg(idempotency_arg())
         .arg(json_flag());
 
+    let replace_cmd = Command::new("replace")
+        .about(
+            "\
+            Force-replace a stateful instance's allocation on a LOST node\n\
+            \n\
+            Operator override for the node-loss confirmation gate (K8s analog:\n\
+            force-deleting a pod stuck on a lost node). Frees the gated\n\
+            allocation immediately — without waiting for stateful.onLost\n\
+            .replaceAfter, and despite replaceAfter \"never\" — and reschedules\n\
+            the instance elsewhere with the same id and storage handle.\n\
+            \n\
+            DANGER: this asserts the lost node's workload is dead. If the node\n\
+            is merely partitioned and its worker has not yet self-fenced, the\n\
+            instance can briefly run twice (split-brain). Works for slot and\n\
+            keyed instances; fails unless the allocation's node is lost.\
+            ",
+        )
+        .arg(
+            Arg::new("id")
+                .value_name("ID")
+                .help("Instance id whose lost-node allocation to force-replace")
+                .required(true),
+        )
+        .arg(idempotency_arg())
+        .arg(json_flag());
+
     let list_cmd = Command::new("list")
         .about("List a job's stateful instances (slot and keyed, including terminated tombstones)")
         .arg(
@@ -188,6 +215,7 @@ pub fn config() -> Command {
         .subcommand(stop_cmd)
         .subcommand(start_cmd)
         .subcommand(destroy_cmd)
+        .subcommand(replace_cmd)
         .subcommand(list_cmd)
         .subcommand(get_cmd)
 }
@@ -199,6 +227,7 @@ pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
         Some(("stop", arg_matches)) => stop_instance(arg_matches).await,
         Some(("start", arg_matches)) => start_instance(arg_matches).await,
         Some(("destroy", arg_matches)) => destroy_instance(arg_matches).await,
+        Some(("replace", arg_matches)) => replace_instance(arg_matches).await,
         Some(("list", arg_matches)) => list_instances(arg_matches).await,
         Some(("get", arg_matches)) => get_instance(arg_matches).await,
         _ => unreachable!(),
@@ -361,6 +390,37 @@ async fn destroy_instance(arg_matches: &ArgMatches) -> R<()> {
         format,
         "failed to destroy instance",
         client.destroy_instance(request).await,
+    )?
+    .into_inner();
+
+    if format.is_json() {
+        output::print_success(&json!({
+            "message": reply.message,
+            "deduplicated": reply.deduplicated,
+        }));
+    } else {
+        println!("{}", reply.message);
+    }
+    Ok(())
+}
+
+#[instrument(err, skip_all)]
+async fn replace_instance(arg_matches: &ArgMatches) -> R<()> {
+    let format = OutputFormat::from_matches(arg_matches);
+    let id = arg_matches
+        .get_one::<String>("id")
+        .context("Must provide id")?
+        .clone();
+    let request = tonic::Request::new(ReplaceInstanceRequest {
+        instance_id: id,
+        idempotency_key: arg_matches.get_one::<String>("idempotency-key").cloned(),
+    });
+
+    let mut client = connect_manager_client().await?;
+    let reply = output::resolve(
+        format,
+        "failed to replace instance",
+        client.replace_instance(request).await,
     )?
     .into_inner();
 
@@ -544,6 +604,31 @@ mod tests {
     }
 
     #[test]
+    fn instance_replace_command_parses() -> R<()> {
+        let matches = config().try_get_matches_from([
+            "instance",
+            "replace",
+            "db-default-2",
+            "--idempotency-key",
+            "k1",
+            "-j",
+        ])?;
+        let (subcommand, args) = matches.subcommand().context("Missing subcommand")?;
+        assert_eq!(subcommand, "replace");
+        assert_eq!(
+            args.get_one::<String>("id").map(String::as_str),
+            Some("db-default-2")
+        );
+        assert_eq!(
+            args.get_one::<String>("idempotency-key")
+                .map(String::as_str),
+            Some("k1")
+        );
+        assert!(args.get_flag("json"));
+        Ok(())
+    }
+
+    #[test]
     fn instance_row_renders_optional_fields_as_dashes() {
         let info = InstanceInfo {
             instance_id: "sandbox-1".into(),
@@ -557,6 +642,7 @@ mod tests {
             storage_handle: None,
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
+            detail: None,
         };
         let row = InstanceRow::from(&info);
         assert_eq!(row.slot, "-");

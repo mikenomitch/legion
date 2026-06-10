@@ -15,7 +15,7 @@ will compare us to. Written 2026-06; updated as primitives land.
 | Persistent volumes | ✅ PVC templates + CSI ecosystem | ✅ Host volumes + CSI + sticky dynamic host volumes | ❌ **Contract only** — opaque `storage_handle`, no drivers ([plan](plans/volume-plugin-system-plan.md)) |
 | Storage retention policy | `persistentVolumeClaimRetentionPolicy` (whenScaled / whenDeleted) | Volume lifecycle is operator-managed | ✅ `retainOnScaleIn` (= whenScaled) + `retainOnStop` (= whenDeleted, governs `job stop`; `job destroy` always deletes) |
 | Stable network identity | ✅ Per-pod DNS via headless Service | ⚠️ Via Consul service registration | ❌ **None** — instances are not addressable by name |
-| At-most-one instance (fencing) | ✅ StatefulSet never replaces a pod on a lost node without confirmation/force-delete | ⚠️ `prevent_reschedule_on_lost` opt-in | ❌ **No guarantee** — node-loss replacement and create-first rollouts allow transient double-attach |
+| At-most-one instance (fencing) | ✅ StatefulSet never replaces a pod on a lost node without confirmation/force-delete | ⚠️ `prevent_reschedule_on_lost` opt-in | ✅ Lease-based fencing on by default (`stateful.onLost`): worker self-fences after `selfTerminateAfter`, manager replaces only after `replaceAfter` > that — stronger than K8s's manual default; `'never'` + `instance replace` for the K8s flavor. Create-first rollouts remain rejected for stateful tasks |
 | Ordered startup / scaling | ✅ OrderedReady (0..N-1, one at a time) | ❌ | ❌ Slots place in parallel |
 | Staged/partitioned stateful updates | ✅ `partition` rolling updates by ordinal | ⚠️ Generic update stanza (canary/max_parallel), not ordinal-aware | ⚠️ Generic rollout strategies, not slot-aware |
 | Storage-aware placement | ✅ Volume topology constraints | ✅ Volume-aware scheduling | ❌ Deferred to volume plugins (node-local pinning) |
@@ -38,14 +38,15 @@ will compare us to. Written 2026-06; updated as primitives land.
    primitive (DNS or registry API) keyed on `instance_id`. This is the biggest
    non-storage gap.
 
-3. **At-most-one / fencing guarantees.** Single-writer systems (most databases)
-   need certainty that slot N's old allocation is dead before a replacement
-   binds slot N's storage. Today a lost node's allocation is replaced
-   optimistically, and create-first rollouts deliberately overlap old+new on
-   the same instance. Needed: a per-task `replace_on_lost: never | fenced |
-   eager` knob and a stop-then-start update mode for stateful groups, so the
-   safe behavior is *declarable* (K8s makes it the default; Nomad gates it
-   behind `prevent_reschedule_on_lost`).
+3. ~~**At-most-one / fencing guarantees.**~~ **Landed** (`stateful.onLost`,
+   see [stateful-workloads.md](stateful-workloads.md#node-loss-and-fencing-at-most-one)):
+   node-loss replacement is now gated behind a loss-confirmation window
+   coordinated with a worker-side self-fence, on by default for every
+   stateful task — stronger than K8s (which needs manual force-delete) and
+   Nomad (opt-in `prevent_reschedule_on_lost`, no worker-side kill).
+   Remaining in this area: create-first rollouts for stateful groups stay
+   *rejected* rather than fenced (a deliberate same-instance overlap needs
+   storage-level fencing tokens, a volume-plugin concern).
 
 4. **Ordinal-aware orchestration.** Ordered bring-up (slot 0 before slot 1),
    one-at-a-time updates in reverse ordinal order, and partitioned rollouts

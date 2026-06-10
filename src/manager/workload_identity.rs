@@ -1225,6 +1225,7 @@ mod tests {
                 mode: InstanceMode::Slot,
                 id_source: None,
                 initial_instances: None,
+                on_lost: None,
                 storage: None,
             }),
             ..TaskConfig::new("db", "noop")

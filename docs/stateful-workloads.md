@@ -67,6 +67,11 @@ pending -> active -> rescheduling -> active -> ... -> stopped/terminated
 
 - `pending` — row exists, never placed.
 - `active` — a live allocation fulfills it (`current_alloc_id` points at it).
+  An instance whose allocation sits on a **lost** node stays `active` and
+  bound while the manager waits out the loss-confirmation window — `legion
+  instance get/list` then carries a `pending-loss-confirmation` detail
+  explaining the wait (see [Node loss and fencing
+  (at-most-one)](#node-loss-and-fencing-at-most-one)).
 - `rescheduling` — its allocation died; the replacement will reuse the same
   instance id and storage handle.
 - `stopped` — paused (keyed only): the allocation was stopped but the row AND
@@ -91,6 +96,16 @@ pending -> active -> rescheduling -> active -> ... -> stopped/terminated
       mode: 'slot',              // 'slot' | 'keyed'
       // idSource: 'caller',     // keyed only: 'caller' | 'uuid'
       // initialInstances: ['user-1', 'user-2'],  // keyed only: seed list
+      onLost: {                  // optional; node-loss fencing policy — see
+                                 // "Node loss and fencing (at-most-one)"
+        selfTerminateAfter: '90s', // worker kills this task after losing
+                                   // manager contact this long (default 90s)
+        replaceAfter: '3m',        // manager replaces a lost-node allocation
+                                   // only after this long; default 2x
+                                   // selfTerminateAfter; must be greater than
+                                   // selfTerminateAfter; 'never' = wait for
+                                   // node recovery or operator override
+      },
       storage: {                 // optional persistent-state contract
         path: '/var/lib/db',     // absolute path the state is exposed at
         retainOnScaleIn: true,   // default true (K8s whenScaled: Retain)
@@ -124,6 +139,13 @@ Validation rules (enforced at `job validate` / submit time):
 - At most one slot-mode stateful task per group (slot ids are derived from
   `(job, group, slot)`). Multiple keyed tasks per group are fine — their ids
   are explicit keys, not ordinals.
+- `onLost` durations must parse (humantime strings like `'90s'`, `'3m'`);
+  `selfTerminateAfter` must be greater than zero; `replaceAfter` must be
+  **greater than** `selfTerminateAfter` (or the special value `'never'`) —
+  otherwise a replacement could start before the worker has provably
+  self-fenced. `onLost` belongs *inside* the `stateful` block; declaring it
+  at the task level — including on a stateless task, which has nothing to
+  fence — is rejected at parse time with a pointer to the right nesting.
 
 ### Seed list (`initialInstances`) semantics
 
@@ -179,6 +201,110 @@ When a slot's allocation dies (process failure, node loss, drain):
 Config updates behave the same way: instances are keyed by *job* (not job
 config version), so replica N keeps its identity and storage across deploys.
 
+**Node loss is the exception**: a dead *process* is reported by a live
+worker and replaced immediately, but a dead *heartbeat* only proves the
+manager can't reach the node — the workload may still be running. Stateful
+allocations on lost nodes are therefore gated behind a loss-confirmation
+window before step 1 happens at all; see the next section.
+
+## Node loss and fencing (at-most-one)
+
+Single-writer systems need certainty that slot N's old allocation is dead
+before a replacement binds slot N's identity, storage handle, and
+workload-identity `sub`. A missed heartbeat alone cannot give that
+certainty: a network partition looks exactly like a dead node, and eagerly
+replacing a partitioned node's allocation would run the same instance twice
+(split-brain). Legion closes this with **lease-based fencing**: two
+cooperating timers, one on each side of the partition.
+
+1. **Worker self-fence** (`onLost.selfTerminateAfter`, default `90s`): if a
+   worker cannot complete a heartbeat against the manager for longer than
+   this window, it kills its stateful allocations locally (the heartbeat
+   loop itself never exits on failure — it retries with backoff forever
+   while an independent watchdog tracks the time since the last *successful*
+   heartbeat). The fenced allocation is recorded as failed, so the first
+   post-reconnect heartbeat reports it failed/stopped rather than running.
+2. **Manager confirmation gate** (`onLost.replaceAfter`, default
+   `2 x selfTerminateAfter`): a stateful allocation on a lost node is **not**
+   freed for replacement until the node has been lost longer than this. The
+   node row records `lost_at` when it is marked lost (cleared when it
+   heartbeats again or re-registers), and the same monitor loop that marks
+   nodes lost re-checks gated allocations every tick, so replacement
+   proceeds automatically — no operator action — once the window elapses.
+
+**Why this confirms the loss**: validation enforces
+`replaceAfter > selfTerminateAfter`. By the time the manager frees the
+allocation, one of two things is true on the unreachable node: the worker is
+alive-but-partitioned and has already self-fenced (its window expired
+strictly earlier, by the manager's own clock plus the safety margin), or the
+worker is truly dead and so is the workload. Either way the replacement that
+re-binds the instance can never run concurrently with the original — at most
+one live allocation per instance, even across partitions.
+
+While gated, nothing visibly changes: the allocation row stays put, the
+instance stays `active` and bound, and `legion instance get/list` shows a
+`pending-loss-confirmation` detail naming the lost node and what would
+unblock it. Stateless tasks are untouched by all of this — they carry no
+fencing window and are replaced eagerly the moment their node is marked
+lost, exactly like today.
+
+One bound to be aware of: a **config update** deliberately replaces every
+allocation, including ones on an unreachable node that cannot be told to
+stop. If you deploy while a node is partitioned, the outgoing allocation
+there may overlap its replacement for up to `selfTerminateAfter` (the
+worker's self-fence still bounds it — that lease is exactly why the window
+exists). Prefer not deploying stateful jobs while nodes are lost, or size
+`selfTerminateAfter` to an overlap your workload tolerates.
+
+### Defaults, tuning, and `'never'`
+
+Every stateful task gets the policy — an absent `onLost` block means
+`selfTerminateAfter: '90s'`, `replaceAfter: '180s'`. **Safe by default
+means stateful failover is deliberately slower than stateless failover**: a
+replica on a lost node waits out the confirmation window (~3 minutes by
+default) where a stateless task moves in seconds. For workloads where fast
+failover matters more than a long partition grace (and whose checks/restarts
+tolerate it), tune the *worker* side down — e.g. `selfTerminateAfter: '15s'`
+lets `replaceAfter` default to 30s. The worker pays for that with less
+tolerance of manager downtime: any manager outage longer than the window
+kills the task locally (it is rescheduled when the manager returns).
+
+`replaceAfter: 'never'` is the K8s StatefulSet behavior: the manager never
+auto-replaces the allocation. Recovery requires the node coming back (the
+allocation simply keeps running; `lost_at` clears) or an operator override.
+
+### Operator override
+
+`legion instance replace <id>` (RPC `ReplaceInstance`, MCP
+`legion_instance_replace`; supports `--idempotency-key`) is the analog of
+force-deleting a pod stuck on a lost K8s node: it frees the gated allocation
+immediately — skipping the rest of the window, and despite `'never'` — and
+enqueues a reschedule that excludes the lost node, so the replacement
+re-binds the same instance id and storage handle elsewhere. It refuses to
+act unless the instance's allocation actually sits on a `lost` node. Use it
+only when the node is confirmed dead or isolated: forcing while the node is
+merely partitioned and the worker has not yet self-fenced is exactly the
+split-brain the gate exists to prevent.
+
+### State walkthrough
+
+`db-default-2` is `active` on `node-w3` with the default policy
+(self-fence 90s, replace 180s) when `node-w3` drops off the network:
+
+| t | manager view | worker view (partitioned) |
+| --- | --- | --- |
+| 0s | heartbeats from `node-w3` stop arriving | heartbeats to the manager start failing; retry with backoff |
+| ~10s | monitor marks `node-w3` lost, sets `lost_at`; stateless allocations replaced now; `db-default-2` gated (`pending-loss-confirmation` in `instance get`) | task still running; self-fence clock at ~10s |
+| 90s | still gated (90 < 180) | watchdog kills the allocation: `self-fencing allocation …: lost manager contact for 90s` |
+| 180s+ | monitor tick confirms the loss: allocation freed, instance `rescheduling`, replacement planned on a live node, instance `active` again with the **same id and storage handle** | nothing running |
+| later | if `node-w3` reconnects, its heartbeat reports the fenced allocation as failed and clears `lost_at`; the manager treats it as a normal dead allocation (it may already have been replaced) | worker rejoins cleanly |
+
+Had the node returned before 180s, the gate would simply release: the
+allocation (already self-fenced at 90s, or still running if the outage was
+shorter than 90s) is reported by the returning worker and normal
+reconciliation takes over — an allocation that never stopped keeps running
+with its binding intact, and no replacement is ever planned.
+
 ## Rollouts and the single-live-allocation invariant
 
 The "at most one live allocation per instance" invariant must hold even during
@@ -186,8 +312,10 @@ a rollout. The only rollout strategy that would break it is `createFirst`
 (replace-before-stop), which starts the incoming allocation *before* stopping
 the outgoing one — for a stateful task that means two live allocations sharing
 one instance id, storage handle, and workload-identity subject at the same
-time. Legion has no fencing to make that safe (see
-[stateful-vs-nomad-k8s.md](stateful-vs-nomad-k8s.md)).
+time. The node-loss fencing described in [Node loss and fencing
+(at-most-one)](#node-loss-and-fencing-at-most-one) cannot help here — a
+createFirst overlap is deliberate and on healthy nodes, not a partition
+artifact (see [stateful-vs-nomad-k8s.md](stateful-vs-nomad-k8s.md)).
 
 Therefore **a stateful task may not use a `createFirst` rollout**: the combo is
 rejected at job admission with an actionable error pointing at this invariant.

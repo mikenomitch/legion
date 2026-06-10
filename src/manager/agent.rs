@@ -364,6 +364,13 @@ async fn start_node_status_checker(store: Store, check_seconds: u64) -> R<()> {
             .collect::<Vec<String>>();
 
         store.mark_nodes_as_lost(&node_ids_to_update)?;
+        // Stateful allocations on lost nodes are gated behind their
+        // onLost.replaceAfter loss-confirmation window (see
+        // docs/stateful-workloads.md "Node loss and fencing"). Re-run the
+        // reschedule path for still-lost nodes every tick so replacement
+        // proceeds automatically once a window elapses — no operator action
+        // needed.
+        store.recheck_lost_nodes();
         if let Err(err) = store.reconcile_incomplete_rollouts() {
             warn!(error = ?err, "Failed reconciling completed_incomplete rollouts");
         }

@@ -700,6 +700,7 @@ mod tests {
                 mode: InstanceMode::Slot,
                 id_source: None,
                 initial_instances: None,
+                on_lost: None,
                 storage: Some(StatefulStorageConfig {
                     path: "/var/lib/data".into(),
                     retain_on_scale_in: None,
@@ -779,6 +780,7 @@ mod tests {
                 mode: InstanceMode::Keyed,
                 id_source: None,
                 initial_instances: None,
+                on_lost: None,
                 storage: Some(StatefulStorageConfig {
                     path: "/workspace".into(),
                     retain_on_scale_in: None,

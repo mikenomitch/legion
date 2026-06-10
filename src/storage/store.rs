@@ -20,9 +20,10 @@ use crate::storage::queries::{
 use crate::structs::{
     slot_instance_id, Allocation, AllocationHealth, Eval, Instance, InstanceMode, InstanceState,
     Job, JobConfig, KvEntry, KvLock, KvValueType, LedgerEntry, ManagerConfigFull,
-    ManagerNodeConfig, Node, NodeMsg, Rollout, RolloutConfig, SigningKeyRecord, StatefulConfig,
-    Submission, TaskCheck, TaskConfig, TaskCount, TaskDependency, TaskLifecycle,
-    TaskOnUnhealthyConfig, TaskSchedule, TaskStatusState, WorkerConfig,
+    ManagerNodeConfig, Node, NodeMsg, ReplaceAfter, ResolvedOnLostPolicy, Rollout, RolloutConfig,
+    SigningKeyRecord, StatefulConfig, StatefulOnLostConfig, Submission, TaskCheck, TaskConfig,
+    TaskCount, TaskDependency, TaskLifecycle, TaskOnUnhealthyConfig, TaskSchedule, TaskStatusState,
+    WorkerConfig,
 };
 use crate::util::random_string;
 
@@ -1496,9 +1497,13 @@ impl Store {
     #[instrument(err, skip_all)]
     pub fn mark_node_ready(&self, id: &str, last_heartbeat: &str) -> R<()> {
         let conn = self.write_connection()?;
+        // A ready node is by definition not lost: clear lost_at so the
+        // node-loss confirmation gate stops counting (its gated allocations
+        // keep running, bound to their instances).
         let sql = r#"
         UPDATE node
-        SET status = :status, availability = :availability, last_heartbeat = :last_heartbeat
+        SET status = :status, availability = :availability, last_heartbeat = :last_heartbeat,
+            lost_at = NULL
         WHERE id = :id;
         "#;
 
@@ -1521,9 +1526,13 @@ impl Store {
     #[instrument(err, skip_all)]
     pub fn mark_node_lost(&self, id: &str) -> R<()> {
         let conn = self.write_connection()?;
+        // lost_at is set once (COALESCE) so repeated marks never push the
+        // loss-confirmation clock back; it is cleared when the node
+        // heartbeats again or re-registers.
         let sql = r#"
         UPDATE node
-        SET status = :status, availability = :availability
+        SET status = :status, availability = :availability,
+            lost_at = COALESCE(lost_at, :lost_at)
         WHERE id = :id;
         "#;
 
@@ -1531,6 +1540,7 @@ impl Store {
             ":id": id,
             ":status": "lost",
             ":availability": "unavailable",
+            ":lost_at": Self::now_rfc3339()?,
         };
 
         conn.execute(sql, params)?;
@@ -1592,8 +1602,12 @@ impl Store {
         {
             let conn = self.write_connection()?;
             let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+            // See mark_node_lost: lost_at is set once and never refreshed
+            // while the node stays lost.
             let sql = format!(
-                "UPDATE node SET status = 'lost', availability = 'unavailable' WHERE id IN ({})",
+                "UPDATE node SET status = 'lost', availability = 'unavailable', \
+                 lost_at = COALESCE(lost_at, '{}') WHERE id IN ({})",
+                Self::now_rfc3339()?,
                 placeholders
             );
 
@@ -1608,6 +1622,69 @@ impl Store {
         }
 
         Ok(())
+    }
+
+    /// When the node was marked lost (RFC3339), or `None` while it is not
+    /// lost. Drives the stateful node-loss confirmation gate (see
+    /// [`Self::reschedule_allocations_for_lost_node`]).
+    #[instrument(err, skip_all)]
+    pub fn node_lost_at(&self, node_id: &str) -> R<Option<String>> {
+        let conn = self.read_connection()?;
+        let lost_at: Option<String> = conn
+            .query_row("SELECT lost_at FROM node WHERE id = ?;", [node_id], |row| {
+                row.get(0)
+            })
+            .optional()?
+            .flatten();
+        Ok(lost_at)
+    }
+
+    /// Overwrite a node's `lost_at` timestamp. Test/ops helper for the
+    /// node-loss confirmation gate: lets a loss be backdated so the
+    /// `replaceAfter` threshold can be exercised without real waiting.
+    #[instrument(err, skip_all)]
+    pub fn set_node_lost_at(&self, node_id: &str, lost_at: &str) -> R<()> {
+        let conn = self.write_connection()?;
+        conn.execute(
+            "UPDATE node SET lost_at = ? WHERE id = ?;",
+            params![lost_at, node_id],
+        )?;
+        Ok(())
+    }
+
+    /// Ids of all nodes currently marked lost.
+    #[instrument(err, skip_all)]
+    pub fn lost_node_ids(&self) -> R<Vec<String>> {
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare("SELECT id FROM node WHERE status = 'lost';")?;
+        let ids = Self::collect_rows(stmt.query_map([], |row| row.get(0))?)?;
+        Ok(ids)
+    }
+
+    /// Re-run the lost-node reschedule path for every node still marked
+    /// lost, so stateful allocations whose `onLost.replaceAfter` threshold
+    /// has since elapsed get replaced WITHOUT operator action. Called by the
+    /// manager's node-status monitor on every tick (the same loop that marks
+    /// nodes lost); errors are logged per node so one wedged job cannot
+    /// stall the sweep.
+    #[instrument(skip_all)]
+    pub fn recheck_lost_nodes(&self) {
+        let node_ids = match self.lost_node_ids() {
+            Ok(node_ids) => node_ids,
+            Err(err) => {
+                warn!(error = ?err, "Failed listing lost nodes for loss-confirmation recheck");
+                return;
+            }
+        };
+        for node_id in node_ids {
+            if let Err(err) = self.reschedule_allocations_for_lost_node(&node_id) {
+                warn!(
+                    %node_id,
+                    error = ?err,
+                    "Failed rechecking lost node for confirmed-loss replacements"
+                );
+            }
+        }
     }
 
     #[instrument(err, skip_all)]
@@ -1676,7 +1753,7 @@ impl Store {
         let conn = self.write_connection()?;
         let sql = r#"
         UPDATE node
-        SET last_heartbeat = :ts, status = 'active'
+        SET last_heartbeat = :ts, status = 'active', lost_at = NULL
         WHERE id = :id;
 "#;
         info!(
@@ -3742,24 +3819,159 @@ impl Store {
         Ok(())
     }
 
+    /// Free a lost node's allocations for replacement — gated for stateful
+    /// tasks (the at-most-one fencing guarantee, see
+    /// docs/stateful-workloads.md "Node loss and fencing"):
+    ///
+    /// - Stateless allocations are removed and replaced immediately (today's
+    ///   eager behavior).
+    /// - A stateful allocation is only removed once the node has been lost
+    ///   longer than its task's `onLost.replaceAfter` — i.e. provably past
+    ///   the worker's `selfTerminateAfter` self-fence window — so the
+    ///   replacement can never run concurrently with the original. With
+    ///   `replaceAfter: "never"` it is never removed here; only node
+    ///   recovery or an operator override (ReplaceInstance) frees it.
+    ///
+    /// Gated allocations keep their rows: the instance stays `active` and
+    /// bound (`current_alloc_id` intact), the scheduler keeps counting the
+    /// allocation as placed (so no plan path double-places the instance),
+    /// and instance get/list surfaces a `pending-loss-confirmation` detail.
+    /// The node-status monitor re-runs this method every tick (see
+    /// [`Self::recheck_lost_nodes`]), so replacement proceeds automatically
+    /// once the threshold elapses. Idempotent.
     #[instrument(err, skip_all)]
     pub fn reschedule_allocations_for_lost_node(&self, node_id: &str) -> R<()> {
-        let removed_allocs = self.remove_allocs_for_node(node_id)?;
-
-        if removed_allocs.is_empty() {
+        let allocs = self.allocs_for_node(node_id)?;
+        if allocs.is_empty() {
             return Ok(());
         }
 
-        let affected_job_configs: HashSet<String> = removed_allocs
-            .into_iter()
-            .map(|alloc| alloc.job_config_id)
-            .collect();
+        let lost_for = self.node_lost_for(node_id)?;
+        let mut removable = Vec::new();
+        for alloc in allocs {
+            if self.lost_allocation_replaceable(&alloc, lost_for)? {
+                removable.push(alloc);
+            } else {
+                info!(
+                    allocation_id = alloc.id,
+                    %node_id,
+                    instance_id = alloc.instance_id.as_deref().unwrap_or_default(),
+                    lost_for_secs = lost_for.map(TimeDuration::whole_seconds),
+                    "Holding stateful allocation on lost node pending loss confirmation"
+                );
+            }
+        }
+        if removable.is_empty() {
+            return Ok(());
+        }
 
+        let affected_job_configs = self.remove_allocations(&removable)?;
         for job_config_id in affected_job_configs {
             self.reconcile_job_config_allocations(&job_config_id)?;
         }
 
         Ok(())
+    }
+
+    /// How long the node has been lost, when known. `None` means the node is
+    /// not (or no longer) marked lost — callers treat that as "not
+    /// confirmable yet", never as "free to replace".
+    fn node_lost_for(&self, node_id: &str) -> R<Option<TimeDuration>> {
+        let Some(lost_at) = self.node_lost_at(node_id)? else {
+            return Ok(None);
+        };
+        let lost_at = OffsetDateTime::parse(&lost_at, &Rfc3339)
+            .with_context(|| format!("invalid lost_at timestamp {lost_at:?} for node {node_id}"))?;
+        Ok(Some(OffsetDateTime::now_utc() - lost_at))
+    }
+
+    /// Whether a lost node's allocation may be freed for replacement now.
+    /// Stateless tasks: always (eager). Stateful tasks: only once the loss
+    /// is confirmed per the task's `onLost` policy.
+    fn lost_allocation_replaceable(
+        &self,
+        alloc: &Allocation,
+        lost_for: Option<TimeDuration>,
+    ) -> R<bool> {
+        let Some(stateful) = self.task_stateful_config(alloc.task_config_id)? else {
+            return Ok(true);
+        };
+        let policy = Self::on_lost_policy_or_safe_default(&alloc.job_id, &stateful);
+        match policy.replace_after {
+            ReplaceAfter::Never => Ok(false),
+            ReplaceAfter::After(threshold) => {
+                // Unknown loss duration = unconfirmable = hold (safe side).
+                let Some(lost_for) = lost_for else {
+                    return Ok(false);
+                };
+                let threshold = TimeDuration::try_from(threshold)
+                    .context("onLost.replaceAfter overflows the comparable duration range")?;
+                Ok(lost_for > threshold)
+            }
+        }
+    }
+
+    /// Resolve a stored stateful block's `onLost` policy. Validation rejects
+    /// unresolvable policies at submit time, so a failure here means a row
+    /// predating validation or hand-edited state — fall back to the safe
+    /// defaults rather than wedging the whole lost-node sweep.
+    fn on_lost_policy_or_safe_default(
+        job_id: &str,
+        stateful: &StatefulConfig,
+    ) -> ResolvedOnLostPolicy {
+        stateful.resolved_on_lost().unwrap_or_else(|err| {
+            warn!(
+                %job_id,
+                error = ?err,
+                "Stored stateful onLost policy failed to resolve; using defaults"
+            );
+            StatefulOnLostConfig::default()
+                .resolve()
+                .expect("default onLost policy resolves")
+        })
+    }
+
+    /// The task's stored stateful block, if any (`None` = stateless task).
+    fn task_stateful_config(&self, task_config_id: i64) -> R<Option<StatefulConfig>> {
+        let conn = self.read_connection()?;
+        let raw: Option<String> = conn
+            .query_row(
+                "SELECT stateful FROM task_config WHERE id = ?;",
+                [task_config_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        raw.map(|raw| {
+            serde_json::from_str(&raw)
+                .with_context(|| format!("invalid stateful config for task {task_config_id}"))
+        })
+        .transpose()
+    }
+
+    /// Remove specific allocation rows (releasing instance bindings and
+    /// bumping epochs, like every other allocation-removal path) and return
+    /// the affected job config ids.
+    pub(crate) fn remove_allocations(&self, allocs: &[Allocation]) -> R<HashSet<String>> {
+        if allocs.is_empty() {
+            return Ok(HashSet::new());
+        }
+
+        let mut conn = self.write_connection()?;
+        let tx = conn.transaction()?;
+        for alloc in allocs {
+            tx.execute("DELETE FROM allocation WHERE id = ?;", [alloc.id])?;
+        }
+        self.release_instance_bindings_tx(&tx, allocs)?;
+        self.bump_epochs_for_allocations_tx(&tx, allocs)?;
+        tx.commit()?;
+
+        self.cache_remove_allocations(allocs)?;
+
+        Ok(allocs
+            .iter()
+            .map(|alloc| alloc.job_config_id.clone())
+            .collect())
     }
 
     #[instrument(err, skip_all)]
@@ -6064,6 +6276,229 @@ mod tests {
         Ok(())
     }
 
+    /// Slot-mode stateful task with an explicit onLost policy (None values =
+    /// the defaults).
+    fn fenced_slot_task(
+        name: &str,
+        self_terminate_after: Option<&str>,
+        replace_after: Option<&str>,
+    ) -> TaskConfig {
+        let mut task = stateful_slot_task(name, 1, true);
+        if self_terminate_after.is_some() || replace_after.is_some() {
+            if let Some(stateful) = task.stateful.as_mut() {
+                stateful.on_lost = Some(StatefulOnLostConfig {
+                    self_terminate_after: self_terminate_after.map(String::from),
+                    replace_after: replace_after.map(String::from),
+                });
+            }
+        }
+        task
+    }
+
+    fn backdated_rfc3339(minutes_ago: i64) -> R<String> {
+        Ok((OffsetDateTime::now_utc() - TimeDuration::minutes(minutes_ago)).format(&Rfc3339)?)
+    }
+
+    #[test]
+    fn mark_node_lost_sets_lost_at_once_and_heartbeat_clears_it() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-one", "active"))?;
+        assert_eq!(store.node_lost_at("node-one")?, None);
+
+        store.mark_node_lost("node-one")?;
+        let first = store.node_lost_at("node-one")?.context("lost_at set")?;
+
+        // A repeated mark never pushes the loss-confirmation clock back.
+        store.mark_node_lost("node-one")?;
+        assert_eq!(store.node_lost_at("node-one")?.as_deref(), Some(&*first));
+
+        // A heartbeat means the node is back: lost_at clears, status resets.
+        store.update_node_heartbeat("node-one".into())?;
+        assert_eq!(store.node_lost_at("node-one")?, None);
+        assert_eq!(store.get_node("node-one")?.status, "active");
+
+        // Re-registration (the upsert path) also clears a stale lost_at.
+        store.mark_node_lost("node-one")?;
+        assert!(store.node_lost_at("node-one")?.is_some());
+        store.insert_node(make_node_msg("node-one", "active"))?;
+        assert_eq!(store.node_lost_at("node-one")?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn stateful_alloc_on_lost_node_is_held_before_replace_threshold() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-one", "active"))?;
+        store.insert_node(make_node_msg("node-two", "active"))?;
+
+        let job_id = "fence-hold";
+        submit_job(&store, job_id, vec![fenced_slot_task("db", None, None)])?;
+        let task_id = task_id_for(&store, "db", job_id)?;
+        let alloc = store.place_alloc("node-one", task_id)?;
+        let instance_id = alloc.instance_id.clone().context("instance bound")?;
+
+        // Node just lost: well inside the default 180s replaceAfter window.
+        store.mark_nodes_as_lost(&["node-one".to_string()])?;
+
+        // NOT freed: the allocation row stays on the lost node, the instance
+        // stays active and bound, and nothing was placed elsewhere.
+        let held = store.allocs_for_node("node-one")?;
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].id, alloc.id);
+        assert!(store.allocs_for_node("node-two")?.is_empty());
+        let instance = store.get_instance(&instance_id)?.context("instance")?;
+        assert_eq!(instance.state, InstanceState::Active);
+        assert_eq!(instance.current_alloc_id, Some(alloc.id));
+
+        // Re-running the sweep (the monitor tick) is idempotent while the
+        // threshold has not elapsed.
+        store.recheck_lost_nodes();
+        assert_eq!(store.allocs_for_node("node-one")?.len(), 1);
+        assert!(store.allocs_for_node("node-two")?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn stateful_alloc_freed_after_threshold_rebinds_same_instance() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-one", "active"))?;
+        store.insert_node(make_node_msg("node-two", "active"))?;
+
+        let job_id = "fence-free";
+        submit_job(
+            &store,
+            job_id,
+            vec![fenced_slot_task("db", Some("30s"), Some("2m"))],
+        )?;
+        let task_id = task_id_for(&store, "db", job_id)?;
+        let alloc = store.place_alloc("node-one", task_id)?;
+        let instance_id = alloc.instance_id.clone().context("instance bound")?;
+        let original_handle = store
+            .get_instance(&instance_id)?
+            .context("instance")?
+            .storage_handle;
+        assert!(original_handle.is_some());
+
+        store.mark_nodes_as_lost(&["node-one".to_string()])?;
+        // Held while inside the window...
+        assert_eq!(store.allocs_for_node("node-one")?.len(), 1);
+
+        // ...then the loss is confirmed: backdate lost_at past replaceAfter
+        // and run the monitor sweep.
+        store.set_node_lost_at("node-one", &backdated_rfc3339(10)?)?;
+        store.recheck_lost_nodes();
+
+        assert!(store.allocs_for_node("node-one")?.is_empty());
+        let replacements = store.allocs_for_node("node-two")?;
+        assert_eq!(replacements.len(), 1);
+        // The replacement re-binds the SAME instance id and storage handle.
+        assert_eq!(replacements[0].instance_id.as_deref(), Some(&*instance_id));
+        let rebound = store.get_instance(&instance_id)?.context("instance")?;
+        assert_eq!(rebound.state, InstanceState::Active);
+        assert_eq!(rebound.current_alloc_id, Some(replacements[0].id));
+        assert_eq!(rebound.storage_handle, original_handle);
+        Ok(())
+    }
+
+    #[test]
+    fn stateful_alloc_with_replace_after_never_blocks_until_node_returns() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-one", "active"))?;
+        store.insert_node(make_node_msg("node-two", "active"))?;
+
+        let job_id = "fence-never";
+        submit_job(
+            &store,
+            job_id,
+            vec![fenced_slot_task("db", None, Some("never"))],
+        )?;
+        let task_id = task_id_for(&store, "db", job_id)?;
+        let alloc = store.place_alloc("node-one", task_id)?;
+        let instance_id = alloc.instance_id.clone().context("instance bound")?;
+
+        store.mark_nodes_as_lost(&["node-one".to_string()])?;
+        // Even an ancient loss never auto-replaces with "never".
+        store.set_node_lost_at("node-one", &backdated_rfc3339(60 * 24)?)?;
+        store.recheck_lost_nodes();
+        assert_eq!(store.allocs_for_node("node-one")?.len(), 1);
+        assert!(store.allocs_for_node("node-two")?.is_empty());
+
+        // The node returning is what frees it: binding intact, no churn.
+        store.update_node_heartbeat("node-one".into())?;
+        store.recheck_lost_nodes();
+        let kept = store.allocs_for_node("node-one")?;
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].id, alloc.id);
+        let instance = store.get_instance(&instance_id)?.context("instance")?;
+        assert_eq!(instance.state, InstanceState::Active);
+        assert_eq!(instance.current_alloc_id, Some(alloc.id));
+        Ok(())
+    }
+
+    #[test]
+    fn node_recovery_before_threshold_keeps_binding_and_clears_lost_at() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-one", "active"))?;
+        store.insert_node(make_node_msg("node-two", "active"))?;
+
+        let job_id = "fence-recover";
+        submit_job(&store, job_id, vec![fenced_slot_task("db", None, None)])?;
+        let task_id = task_id_for(&store, "db", job_id)?;
+        let alloc = store.place_alloc("node-one", task_id)?;
+        let instance_id = alloc.instance_id.clone().context("instance bound")?;
+
+        store.mark_nodes_as_lost(&["node-one".to_string()])?;
+        assert!(store.node_lost_at("node-one")?.is_some());
+
+        // Node heartbeats again BEFORE the threshold: lost_at clears and the
+        // allocation/instance binding is untouched — no replacement ever
+        // happened.
+        store.update_node_heartbeat("node-one".into())?;
+        assert_eq!(store.node_lost_at("node-one")?, None);
+        store.recheck_lost_nodes();
+
+        let kept = store.allocs_for_node("node-one")?;
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].id, alloc.id);
+        assert!(store.allocs_for_node("node-two")?.is_empty());
+        let instance = store.get_instance(&instance_id)?.context("instance")?;
+        assert_eq!(instance.state, InstanceState::Active);
+        assert_eq!(instance.current_alloc_id, Some(alloc.id));
+        Ok(())
+    }
+
+    #[test]
+    fn stateless_allocs_on_lost_node_replaced_immediately_while_stateful_held() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-one", "active"))?;
+        store.insert_node(make_node_msg("node-two", "active"))?;
+
+        let job_id = "fence-mixed";
+        submit_job(
+            &store,
+            job_id,
+            vec![task("web"), fenced_slot_task("db", None, None)],
+        )?;
+        let web_task = task_id_for(&store, "web", job_id)?;
+        let db_task = task_id_for(&store, "db", job_id)?;
+        store.place_alloc("node-one", web_task)?;
+        let db_alloc = store.place_alloc("node-one", db_task)?;
+
+        store.mark_nodes_as_lost(&["node-one".to_string()])?;
+
+        // Stateless web: replaced eagerly on node-two. Stateful db: held on
+        // the lost node pending loss confirmation.
+        let lost_node_allocs = store.allocs_for_node("node-one")?;
+        assert_eq!(lost_node_allocs.len(), 1);
+        assert_eq!(lost_node_allocs[0].id, db_alloc.id);
+        assert_eq!(lost_node_allocs[0].task_config_id, db_task);
+
+        let replaced = store.allocs_for_node("node-two")?;
+        assert_eq!(replaced.len(), 1);
+        assert_eq!(replaced[0].task_config_id, web_task);
+        Ok(())
+    }
+
     #[test]
     fn dynamic_attrs_can_be_updated_after_join() -> R<()> {
         let store = setup_store()?;
@@ -7503,6 +7938,7 @@ mod tests {
                 mode: InstanceMode::Slot,
                 id_source: None,
                 initial_instances: None,
+                on_lost: None,
                 storage: with_storage.then(|| crate::structs::StatefulStorageConfig {
                     path: "/var/lib/data".into(),
                     retain_on_scale_in: None,
@@ -7713,6 +8149,7 @@ mod tests {
                 mode: InstanceMode::Slot,
                 id_source: None,
                 initial_instances: None,
+                on_lost: None,
                 storage: Some(crate::structs::StatefulStorageConfig {
                     path: "/var/lib/data".into(),
                     retain_on_scale_in: Some(false),
@@ -7868,6 +8305,7 @@ mod tests {
                 mode: InstanceMode::Slot,
                 id_source: None,
                 initial_instances: None,
+                on_lost: None,
                 storage: Some(crate::structs::StatefulStorageConfig {
                     path: "/var/lib/data".into(),
                     retain_on_scale_in: None,
@@ -7943,6 +8381,7 @@ mod tests {
                 mode: InstanceMode::Slot,
                 id_source: None,
                 initial_instances: None,
+                on_lost: None,
                 storage: Some(crate::structs::StatefulStorageConfig {
                     path: "/var/lib/data".into(),
                     retain_on_scale_in: None,
@@ -8012,6 +8451,7 @@ mod tests {
                 mode: InstanceMode::Keyed,
                 id_source: None,
                 initial_instances: None,
+                on_lost: None,
                 storage: with_storage.then(|| crate::structs::StatefulStorageConfig {
                     path: "/workspace".into(),
                     retain_on_scale_in: None,

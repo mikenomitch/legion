@@ -129,6 +129,15 @@ pub fn build_task_allocation(
     // themselves are fetched by the worker via IssueWorkloadIdentityToken and
     // never transit the desired-state payload.
     let task_identities = serde_json::to_string(&task.identities)?;
+    // Worker self-fence window (the worker half of the at-most-one fencing
+    // guarantee, see docs/stateful-workloads.md "Node loss and fencing").
+    // Stateful tasks always carry a non-zero window — the 90s default applies
+    // even without an `onLost` block. Stateless tasks carry 0 (no fencing;
+    // the manager replaces them eagerly on node loss).
+    let self_terminate_after_seconds = match task.stateful.as_ref() {
+        Some(stateful) => stateful.resolved_on_lost()?.self_terminate_after.as_secs(),
+        None => 0,
+    };
     Ok(TaskAllocation {
         allocation_id: allocation.id,
         job_id: allocation.job_id.clone(),
@@ -141,6 +150,7 @@ pub fn build_task_allocation(
         task_checks,
         task_on_unhealthy,
         task_identities,
+        self_terminate_after_seconds,
     })
 }
 
@@ -317,6 +327,66 @@ mod tests {
         assert_eq!(env["LEGION_INSTANCE_ID"], json!("job-default-1"));
         assert_eq!(env["LEGION_ALLOC_ID"], json!("42"));
         assert_eq!(env["USER_VAR"], json!("kept"));
+        Ok(())
+    }
+
+    #[test]
+    fn stateless_tasks_carry_no_self_fence_window() -> R<()> {
+        let task = TaskConfig {
+            config: json!({ "command": ["true"] }),
+            ..TaskConfig::new("web", "exec")
+        };
+        let built = build_task_allocation(&task, &allocation(None), None)?;
+        assert_eq!(built.self_terminate_after_seconds, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn stateful_tasks_carry_the_default_self_fence_window_without_on_lost() -> R<()> {
+        // Even without an onLost block, stateful tasks get the 90s default —
+        // fencing is on by default.
+        let task = TaskConfig {
+            config: json!({ "command": ["true"] }),
+            stateful: Some(crate::structs::StatefulConfig {
+                mode: InstanceMode::Slot,
+                id_source: None,
+                initial_instances: None,
+                on_lost: None,
+                storage: None,
+            }),
+            ..TaskConfig::new("db", "exec")
+        };
+        let built = build_task_allocation(
+            &task,
+            &allocation(Some("job-default-1")),
+            Some(&slot_instance()),
+        )?;
+        assert_eq!(built.self_terminate_after_seconds, 90);
+        Ok(())
+    }
+
+    #[test]
+    fn stateful_tasks_carry_their_declared_self_fence_window() -> R<()> {
+        let task = TaskConfig {
+            config: json!({ "command": ["true"] }),
+            stateful: Some(crate::structs::StatefulConfig {
+                mode: InstanceMode::Slot,
+                id_source: None,
+                initial_instances: None,
+                on_lost: Some(crate::structs::StatefulOnLostConfig {
+                    self_terminate_after: Some("30s".into()),
+                    replace_after: Some("2m".into()),
+                }),
+                storage: None,
+            }),
+            ..TaskConfig::new("db", "exec")
+        };
+        let built = build_task_allocation(
+            &task,
+            &allocation(Some("job-default-1")),
+            Some(&slot_instance()),
+        )?;
+        assert_eq!(built.self_terminate_after_seconds, 30);
         Ok(())
     }
 

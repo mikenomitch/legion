@@ -21,6 +21,11 @@ pub struct WorkerTaskManager {
     health_monitors: HashMap<i64, HealthMonitorHandle>,
     allocation_health: HashMap<i64, AllocationHealth>,
     failed: Vec<FailedAllocationReport>,
+    // Per-allocation self-fence windows (stateful tasks only; see
+    // `TaskAllocation.self_terminate_after_seconds`). The watchdog kills any
+    // allocation whose window is exceeded by the time since the last
+    // successful manager heartbeat.
+    self_fence_windows: HashMap<i64, std::time::Duration>,
     state_store: WorkerStateStore,
 }
 
@@ -38,6 +43,7 @@ impl WorkerTaskManager {
             health_monitors: HashMap::new(),
             allocation_health: HashMap::new(),
             failed: Vec::new(),
+            self_fence_windows: HashMap::new(),
             state_store,
         }
     }
@@ -161,11 +167,68 @@ impl WorkerTaskManager {
         self.allocations.remove(&allocation_id);
         self.task_configs.remove(&allocation_id);
         self.allocation_health.remove(&allocation_id);
+        self.self_fence_windows.remove(&allocation_id);
         self.failed.push(FailedAllocationReport {
             allocation_id,
             reason: reason.into(),
         });
         self.persist_state();
+    }
+
+    /// Allocations whose self-fence window is exceeded by
+    /// `since_last_contact` (time since the last successful manager
+    /// heartbeat), with their windows. Pure decision logic — separated from
+    /// [`Self::self_fence_expired_allocations`] so it is unit-testable
+    /// without clocks or sleeps. Allocations without a window (stateless)
+    /// are never candidates.
+    pub fn fence_candidates(
+        &self,
+        since_last_contact: std::time::Duration,
+    ) -> Vec<(i64, std::time::Duration)> {
+        let mut candidates = self
+            .self_fence_windows
+            .iter()
+            .filter(|(_, window)| since_last_contact > **window)
+            .map(|(allocation_id, window)| (*allocation_id, *window))
+            .collect::<Vec<_>>();
+        candidates.sort_unstable_by_key(|(allocation_id, _)| *allocation_id);
+        candidates
+    }
+
+    /// Self-fence every stateful allocation whose window has been exceeded:
+    /// kill it locally (the same destroy path failed allocations take) and
+    /// record it as failed, so the post-reconnect heartbeat reports it
+    /// failed/stopped rather than running. This is the worker half of the
+    /// at-most-one guarantee (see docs/stateful-workloads.md "Node loss and
+    /// fencing"). Returns the fenced allocation ids.
+    pub fn self_fence_expired_allocations(
+        &mut self,
+        since_last_contact: std::time::Duration,
+    ) -> Vec<i64> {
+        let candidates = self.fence_candidates(since_last_contact);
+        // Whole seconds only: sub-second noise helps nobody in fence logs.
+        let lost_for = std::time::Duration::from_secs(since_last_contact.as_secs());
+        let mut fenced = Vec::with_capacity(candidates.len());
+        for (allocation_id, window) in candidates {
+            warn!(
+                allocation_id,
+                window_secs = window.as_secs(),
+                lost_contact_secs = lost_for.as_secs(),
+                "self-fencing allocation {allocation_id}: lost manager contact for {}",
+                humantime::format_duration(lost_for)
+            );
+            self.record_failure(
+                allocation_id,
+                format!(
+                    "self-fenced: worker lost manager contact for {} \
+                     (> onLost.selfTerminateAfter {})",
+                    humantime::format_duration(lost_for),
+                    humantime::format_duration(window)
+                ),
+            );
+            fenced.push(allocation_id);
+        }
+        fenced
     }
 
     pub fn set_allocation_health(
@@ -257,6 +320,7 @@ impl WorkerTaskManager {
         self.allocations.remove(&allocation_id);
         self.task_configs.remove(&allocation_id);
         self.allocation_health.remove(&allocation_id);
+        self.self_fence_windows.remove(&allocation_id);
         self.persist_state();
 
         Ok(())
@@ -311,7 +375,23 @@ impl WorkerTaskManager {
     ) -> R<(Allocation, TaskConfig)> {
         let (alloc, task) = task_from_allocation(allocation)?;
         self.run_allocation(&alloc, &task)?;
+        // Arm the self-fence watchdog for stateful allocations (0 = no
+        // fencing; see the TaskAllocation proto comments). Registered after
+        // a successful start and persisted so it survives worker restarts.
+        if allocation.self_terminate_after_seconds > 0 {
+            self.set_self_fence_window(
+                alloc.id,
+                std::time::Duration::from_secs(allocation.self_terminate_after_seconds),
+            );
+        }
         Ok((alloc, task))
+    }
+
+    /// Arm (or re-arm) the self-fence window for a running allocation and
+    /// persist it.
+    pub fn set_self_fence_window(&mut self, allocation_id: i64, window: std::time::Duration) {
+        self.self_fence_windows.insert(allocation_id, window);
+        self.persist_state();
     }
 
     pub fn restart_allocation(&mut self, allocation_id: i64) -> R<()> {
@@ -376,6 +456,12 @@ impl WorkerTaskManager {
                 .insert(record.allocation.id, record.allocation.clone());
             self.task_configs
                 .insert(record.allocation.id, record.task.clone());
+            if let Some(window_secs) = record.self_terminate_after_secs {
+                self.self_fence_windows.insert(
+                    record.allocation.id,
+                    std::time::Duration::from_secs(window_secs),
+                );
+            }
             self.set_allocation_health(record.allocation.id, false, "restored");
             active.push(record.clone());
             restored.push((record.allocation, record.task));
@@ -408,6 +494,10 @@ impl WorkerTaskManager {
                 allocation: allocation.clone(),
                 task: task.clone(),
                 pid,
+                self_terminate_after_secs: self
+                    .self_fence_windows
+                    .get(allocation_id)
+                    .map(std::time::Duration::as_secs),
             });
         }
 
@@ -604,6 +694,129 @@ mod tests {
         assert_eq!(health.status, "healthy (no checks configured)");
         assert!(!guard.health_monitors.contains_key(&allocation.id));
 
+        Ok(())
+    }
+
+    fn insert_running_allocation(
+        manager: &mut WorkerTaskManager,
+        allocation_id: i64,
+        window: Option<Duration>,
+    ) {
+        let allocation = Allocation {
+            id: allocation_id,
+            ..alloc()
+        };
+        manager
+            .runtimes
+            .insert(allocation_id, TaskRuntime::default());
+        manager.allocations.insert(allocation_id, allocation);
+        manager
+            .task_configs
+            .insert(allocation_id, TaskConfig::new("noop-task", "noop"));
+        if let Some(window) = window {
+            manager.self_fence_windows.insert(allocation_id, window);
+        }
+    }
+
+    #[test]
+    fn fence_candidates_respects_per_allocation_windows() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let state_store = WorkerStateStore::new(temp_dir.path().join("worker_state.json"));
+        let mut manager = WorkerTaskManager::with_state_store(state_store);
+
+        // Stateless (no window), short window, long window.
+        insert_running_allocation(&mut manager, 1, None);
+        insert_running_allocation(&mut manager, 2, Some(Duration::from_secs(30)));
+        insert_running_allocation(&mut manager, 3, Some(Duration::from_secs(90)));
+
+        // Under every window: nothing to fence.
+        assert!(manager.fence_candidates(Duration::from_secs(10)).is_empty());
+        // Past 30s but not 90s: only allocation 2.
+        assert_eq!(
+            manager.fence_candidates(Duration::from_secs(45)),
+            vec![(2, Duration::from_secs(30))]
+        );
+        // Exactly at the window is NOT past it.
+        assert_eq!(
+            manager.fence_candidates(Duration::from_secs(30)),
+            Vec::new()
+        );
+        // Past both windows: stateless allocation 1 is still never fenced.
+        assert_eq!(
+            manager.fence_candidates(Duration::from_secs(120)),
+            vec![(2, Duration::from_secs(30)), (3, Duration::from_secs(90)),]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn self_fence_kills_only_expired_stateful_allocations_and_reports_them() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let state_store = WorkerStateStore::new(temp_dir.path().join("worker_state.json"));
+        let mut manager = WorkerTaskManager::with_state_store(state_store);
+
+        insert_running_allocation(&mut manager, 1, None); // stateless
+        insert_running_allocation(&mut manager, 2, Some(Duration::from_secs(30)));
+        insert_running_allocation(&mut manager, 3, Some(Duration::from_secs(300)));
+
+        let fenced = manager.self_fence_expired_allocations(Duration::from_secs(60));
+        assert_eq!(fenced, vec![2]);
+
+        // The fenced allocation is gone and reported as failed; the others
+        // keep running untouched.
+        assert!(!manager.allocations.contains_key(&2));
+        assert!(!manager.runtimes.contains_key(&2));
+        assert!(manager.allocations.contains_key(&1));
+        assert!(manager.allocations.contains_key(&3));
+        let failures = manager.drain_failures();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].allocation_id, 2);
+        assert!(
+            failures[0].reason.contains("self-fenced")
+                && failures[0].reason.contains("lost manager contact"),
+            "{}",
+            failures[0].reason
+        );
+
+        // Idempotent: a second sweep finds nothing left to fence.
+        assert!(manager
+            .self_fence_expired_allocations(Duration::from_secs(60))
+            .is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn self_fence_window_persists_and_restores_across_restart() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let state_path = temp_dir.path().join("worker_state.json");
+
+        let mut manager =
+            WorkerTaskManager::with_state_store(WorkerStateStore::new(state_path.clone()));
+        manager.load_builtin_plugins();
+        let task = TaskConfig {
+            config: json!({"command": ["sleep", "5"]}),
+            ..TaskConfig::new("exec-task", "exec")
+        };
+        manager.run_allocation(&alloc(), &task)?;
+        manager.set_self_fence_window(alloc().id, Duration::from_secs(45));
+
+        let mut restarted = WorkerTaskManager::with_state_store(WorkerStateStore::new(state_path));
+        restarted.load_builtin_plugins();
+        let restored = restarted.restore_allocations()?;
+        assert_eq!(restored.len(), 1);
+        assert_eq!(
+            restarted.fence_candidates(Duration::from_secs(60)),
+            vec![(alloc().id, Duration::from_secs(45))]
+        );
+
+        // Cleanup the spawned sleep.
+        if let Some(pid) = restarted.allocation_pid(alloc().id) {
+            let mut system = sysinfo::System::new();
+            system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+            if let Some(process) = system.process(sysinfo::Pid::from_u32(pid)) {
+                process.kill();
+            }
+        }
         Ok(())
     }
 

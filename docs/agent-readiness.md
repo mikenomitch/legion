@@ -66,6 +66,7 @@ Even with `--allow-write`, `legion_state_query` is forced to read-only.
 | `legion_job_destroy` | **yes** | Destroy a job. |
 | `legion_instance_create` | **yes** | Create a keyed-mode stateful instance (never-recycled id; supports `idempotency_key`). |
 | `legion_instance_destroy` | **yes** | Destroy a keyed instance, stop its allocation, drop its storage (supports `idempotency_key`). |
+| `legion_instance_replace` | **yes** | Force-replace an instance's allocation stuck on a LOST node (skips the `onLost.replaceAfter` loss-confirmation gate; split-brain risk if the node is only partitioned; supports `idempotency_key`). |
 
 Tool errors are returned in-band (`result.isError = true` with a text payload),
 following MCP convention; transport/protocol errors use JSON-RPC `error`.

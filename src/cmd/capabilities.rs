@@ -184,6 +184,16 @@ pub fn catalog() -> Vec<Capability> {
             mutates: true,
             read_only_safe: false,
         },
+        Capability {
+            name: "instance.replace",
+            cli: "legion instance replace <ID>",
+            grpc: Some("Manager/ReplaceInstance"),
+            summary: "Operator override: force-replace an instance's allocation stuck on a LOST \
+                 node without waiting for onLost.replaceAfter (split-brain risk if the node is \
+                 only partitioned). Supports --idempotency-key.",
+            mutates: true,
+            read_only_safe: false,
+        },
         // --- Rollouts ---
         Capability {
             name: "rollout.list",

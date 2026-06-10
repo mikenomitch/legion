@@ -435,5 +435,13 @@ pub fn get_migrations() -> Migrations<'static> {
         )",
         )
         .down("DROP TABLE IF EXISTS signing_key;"),
+        // When the node was marked lost (RFC3339); NULL while active/ready.
+        // Set once by mark_node_lost/mark_nodes_as_lost (not refreshed while
+        // the node stays lost) and cleared when the node heartbeats again or
+        // re-registers. Drives the stateful node-loss confirmation gate: a
+        // stateful allocation on a lost node is only freed for replacement
+        // once `now - lost_at > stateful.onLost.replaceAfter` (see
+        // docs/stateful-workloads.md "Node loss and fencing").
+        M::up("ALTER TABLE node ADD COLUMN lost_at TIMESTAMP;").down(""),
     ])
 }

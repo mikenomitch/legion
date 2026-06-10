@@ -8,8 +8,10 @@ pub const NODE_ATTRS: &str = r#"
 id, pool, status, availability, config_attrs, fingerprint_attrs, dynamic_attrs, health_checks, last_heartbeat
 "#;
 
+// `lost_at = NULL`: a (re-)registering node is by definition not lost, so the
+// stateful node-loss confirmation clock resets (see mark_node_lost).
 pub const NODE_PARAM_SET: &str = r#"
-pool = :pool, status = :status, availability = :availability, config_attrs = :config_attrs, fingerprint_attrs = :fingerprint_attrs, dynamic_attrs = :dynamic_attrs, health_checks = :health_checks, last_heartbeat = :last_heartbeat
+pool = :pool, status = :status, availability = :availability, config_attrs = :config_attrs, fingerprint_attrs = :fingerprint_attrs, dynamic_attrs = :dynamic_attrs, health_checks = :health_checks, last_heartbeat = :last_heartbeat, lost_at = NULL
 "#;
 
 pub const NODE_ATTRS_VALS: &str = r#"

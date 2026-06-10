@@ -48,6 +48,17 @@
             // LEGION_INSTANCE_MODE (and LEGION_ALLOC_ID) in its env.
             stateful: {
                 mode: "slot",
+                // Node-loss fencing (at-most-one; see docs/stateful-workloads.md
+                // "Node loss and fencing"): the worker self-fences this task
+                // after losing manager contact for selfTerminateAfter; the
+                // manager only replaces an allocation on a lost node after
+                // replaceAfter (must be > selfTerminateAfter; "never" = wait
+                // for node recovery or `legion instance replace`). Optional:
+                // defaults are selfTerminateAfter 90s, replaceAfter 2x that.
+                onLost: {
+                    selfTerminateAfter: "90s",
+                    replaceAfter: "3m",
+                },
                 storage: {
                     path: "/var/lib/web",
                     // K8s persistentVolumeClaimRetentionPolicy analogs (both

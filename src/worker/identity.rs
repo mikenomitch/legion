@@ -825,6 +825,7 @@ mod tests {
             task_checks: String::new(),
             task_on_unhealthy: String::new(),
             task_identities: serde_json::to_string(&identities)?,
+            self_terminate_after_seconds: 0,
         };
 
         let prepared = manager.prepare_task_allocation(&mut allocation).await?;
@@ -880,6 +881,7 @@ mod tests {
             task_checks: String::new(),
             task_on_unhealthy: String::new(),
             task_identities: serde_json::to_string(&identities)?,
+            self_terminate_after_seconds: 0,
         };
 
         let prepared = manager.prepare_task_allocation(&mut allocation).await?;

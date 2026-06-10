@@ -219,6 +219,32 @@ service Manager {
   //   stopped (run the job first; a stopped job schedules nothing).
   rpc StartInstance (StartInstanceRequest) returns (StartInstanceReply);
 
+  // Operator override for the node-loss confirmation gate (the K8s analog is
+  // force-deleting a pod stuck on a lost node): immediately frees a stateful
+  // instance's allocation on a LOST node for replacement, without waiting for
+  // `stateful.onLost.replaceAfter` to elapse (and despite `replaceAfter:
+  // "never"`). See docs/stateful-workloads.md "Node loss and fencing".
+  //
+  // The gated allocation row is removed (the instance transitions to
+  // `rescheduling`, keeping its id and storage handle) and a reschedule
+  // evaluation is enqueued that excludes the lost node, so the replacement
+  // re-binds the same instance elsewhere.
+  //
+  // DANGER: this asserts the lost node's workload is dead. If the node is
+  // merely partitioned and its worker has not yet self-fenced
+  // (`onLost.selfTerminateAfter`), forcing a replacement can run the
+  // instance twice (split-brain on its storage handle and workload-identity
+  // subject). Only force when the node is confirmed dead/isolated.
+  //
+  // Works for slot and keyed instances alike.
+  //
+  // Errors:
+  // - NotFound: no instance row with this id exists.
+  // - FailedPrecondition: the instance has no current allocation, or its
+  //   allocation's node is not `lost` (the gate only ever holds allocations
+  //   on lost nodes; everything else reschedules through the normal paths).
+  rpc ReplaceInstance (ReplaceInstanceRequest) returns (ReplaceInstanceReply);
+
   // Lists stateful instances (slot and keyed) for a job, optionally filtered
   // by group. Includes Terminated rows (slot rows retained for scale-out
   // re-materialization; keyed rows retained forever as never-recycle
@@ -1122,6 +1148,30 @@ message StartInstanceReply {
   bool deduplicated = 2;
 }
 
+// Request payload for ReplaceInstance.
+message ReplaceInstanceRequest {
+  // Stable instance id whose lost-node allocation to force-replace. Must
+  // reference an instance whose current allocation sits on a `lost` node.
+  string instance_id = 1;
+
+  // Optional idempotency key. See `RunJobRequest.idempotency_key`.
+  optional string idempotency_key = 2;
+}
+
+// Reply payload for ReplaceInstance.
+message ReplaceInstanceReply {
+  // Human-readable status message.
+  //
+  // Current manager reply value:
+  // - `"Replacing instance <id>: freed allocation <alloc> on lost node
+  //   <node>"` — the gate was overridden and a reschedule eval enqueued.
+  string message = 1;
+
+  // True when replayed from a recorded result for the request's
+  // `idempotency_key` rather than applied fresh.
+  bool deduplicated = 2;
+}
+
 // One stateful instance (see docs/stateful-workloads.md). An instance is the
 // stable identity one level above an allocation: it survives reschedules,
 // owns the storage binding, and feeds the workload-identity subject.
@@ -1172,6 +1222,17 @@ message InstanceInfo {
 
   // RFC3339 timestamp of the last state/binding change.
   string updated_at = 11;
+
+  // Diagnostic detail explaining a non-obvious lifecycle situation; unset in
+  // the common case. Currently the only producer is the node-loss
+  // confirmation gate (see docs/stateful-workloads.md "Node loss and
+  // fencing"): when the instance's current allocation sits on a `lost` node,
+  // this carries `pending-loss-confirmation: ...` describing why the
+  // instance has not been replaced yet (the manager is waiting out
+  // `stateful.onLost.replaceAfter`, or `replaceAfter: "never"` requires node
+  // recovery / ReplaceInstance). The instance stays `active` while gated —
+  // its workload may well still be running on the partitioned node.
+  optional string detail = 12;
 }
 
 // Request payload for ListInstances.
@@ -2345,6 +2406,23 @@ message TaskAllocation {
   // carry no secrets — tokens themselves are fetched separately by the
   // worker and never transit the desired-state payload.
   string task_identities = 11;
+
+  // Worker self-fence window, in seconds (`stateful.onLost.selfTerminateAfter`,
+  // see docs/stateful-workloads.md "Node loss and fencing"). When non-zero,
+  // the worker MUST locally kill this allocation once it has been unable to
+  // complete a heartbeat against the manager for this long, and report it as
+  // failed on the next successful heartbeat. This is the worker half of the
+  // at-most-one guarantee: the manager will not plan a replacement for a
+  // stateful allocation on a lost node until the node has been lost for
+  // longer than this window plus a safety margin (`onLost.replaceAfter`), so
+  // by the time a replacement binds the same instance id and storage handle,
+  // the original is provably dead or fenced.
+  //
+  // 0 = no self-fencing (stateless tasks, which the manager replaces
+  // eagerly). Stateful tasks always carry a non-zero value — the manager
+  // applies the 90s default even when the jobspec declares no `onLost`
+  // block.
+  uint64 self_terminate_after_seconds = 12;
 }
 
 // Request payload for PostWork.

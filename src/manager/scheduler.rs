@@ -2571,6 +2571,7 @@ mod tests {
                 mode: crate::structs::InstanceMode::Slot,
                 id_source: None,
                 initial_instances: None,
+                on_lost: None,
                 storage: Some(crate::structs::StatefulStorageConfig {
                     path: "/var/lib/data".into(),
                     retain_on_scale_in: None,
@@ -2735,6 +2736,7 @@ mod tests {
                 mode: crate::structs::InstanceMode::Keyed,
                 id_source: None,
                 initial_instances: None,
+                on_lost: None,
                 storage: Some(crate::structs::StatefulStorageConfig {
                     path: "/workspace".into(),
                     retain_on_scale_in: None,

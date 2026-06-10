@@ -29,8 +29,8 @@ use crate::structs::{
     CreateInstanceRequest, CreateInstancesRequest, DestroyInstanceRequest, DestroyJobRequest,
     GetInstanceRequest, GetJobInfoRequest, GetJobSpecRequest, GetNodesRequest,
     GetRolloutStatusRequest, GetStateStoreSchemaRequest, JobConfig, ListInstancesRequest,
-    ListJobsRequest, ListRolloutsRequest, QueryStateStoreRequest, RunJobRequest,
-    StartInstanceRequest, StopInstanceRequest, StopJobRequest,
+    ListJobsRequest, ListRolloutsRequest, QueryStateStoreRequest, ReplaceInstanceRequest,
+    RunJobRequest, StartInstanceRequest, StopInstanceRequest, StopJobRequest,
 };
 use crate::task_plugins::validate_job_config;
 use serde::Serialize;
@@ -310,6 +310,20 @@ fn tool_defs() -> Vec<ToolDef> {
             }),
             mutates: true,
         },
+        ToolDef {
+            name: "legion_instance_replace",
+            description: "Operator override for the node-loss confirmation gate: force-replace a stateful instance's allocation stuck on a LOST node without waiting for stateful.onLost.replaceAfter (K8s analog: force-delete a pod). DANGER: split-brain risk if the node is only partitioned and has not self-fenced yet. Mutating.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "instance_id": { "type": "string", "description": "Instance id whose lost-node allocation to force-replace." },
+                    "idempotency_key": { "type": "string", "description": "Optional key to dedupe retries." }
+                },
+                "required": ["instance_id"],
+                "additionalProperties": false
+            }),
+            mutates: true,
+        },
     ]
 }
 
@@ -562,6 +576,16 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             let idempotency_key = opt_str_arg(&args, "idempotency_key");
             let mut client = connect().await?;
             grpc(client.destroy_instance(DestroyInstanceRequest {
+                instance_id,
+                idempotency_key,
+            }))
+            .await
+        }
+        "legion_instance_replace" => {
+            let instance_id = str_arg(&args, "instance_id")?;
+            let idempotency_key = opt_str_arg(&args, "idempotency_key");
+            let mut client = connect().await?;
+            grpc(client.replace_instance(ReplaceInstanceRequest {
                 instance_id,
                 idempotency_key,
             }))
