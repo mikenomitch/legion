@@ -202,40 +202,127 @@ the per-stream `nextOffset`, the same incremental-tail mechanism as the CLI.
 
 ## Shipping logs externally
 
-Legion writes plain, stably-named files plus a resource manifest, so any file
--tailing collector can ship them with **no Legion-side configuration**. Point a
-collector at the worker log root:
+There is **nothing to enable in Legion**. Workers already write plain,
+stably-named files; "shipping" just means running a standard file-tailing agent
+(the OpenTelemetry Collector or Vector) next to each worker and pointing it at
+those files. Here is the whole process, end to end.
+
+### Step 1 — Find the log files on the worker host
+
+Each worker writes (relative to the **worker process's working directory**):
 
 ```
-<worker-state-dir>/logs/<allocation-id>/{stdout,stderr}.log
-# default: .legion/workers/*/logs/*/*.log
+.legion/workers/<worker-id>/logs/<allocation-id>/stdout.log
+.legion/workers/<worker-id>/logs/<allocation-id>/stderr.log
+.legion/workers/<worker-id>/logs/<allocation-id>/meta.json   # resource attributes
 ```
 
-Ready-to-use examples live in [`configs/observability/`](../configs/observability/):
+> **Gotcha:** that path is relative to wherever you launched `legion start
+> worker`. If you run the worker from `/opt/legion`, the glob is
+> `/opt/legion/.legion/workers/*/logs/*/*.log`. Confirm the absolute location
+> with:
+>
+> ```bash
+> find / -path '*/.legion/workers/*/logs/*/stdout.log' 2>/dev/null | head
+> ```
+>
+> (`LEGION_WORKER_STATE_PATH` overrides the base directory.)
 
-### OpenTelemetry Collector (recommended)
+The collector runs **on the same host as the worker** so it can read those local
+files. One collector per worker host.
 
-[`configs/observability/otel-collector.yaml`](../configs/observability/otel-collector.yaml)
-uses the `filelog` receiver to tail the stream files, parses the allocation id
-from the path, and (optionally) enriches from `meta.json`. Run it next to each
-worker:
+### Step 2 — Install a collector that can tail files
+
+Use the OpenTelemetry Collector **contrib** distribution — the `filelog`
+receiver is *not* in the core `otelcol` build:
 
 ```bash
-otelcol --config configs/observability/otel-collector.yaml
+# Binary: download "otelcol-contrib" from
+#   https://github.com/open-telemetry/opentelemetry-collector-releases/releases
+# Docker image:
+docker pull otel/opentelemetry-collector-contrib:latest
 ```
 
-It exports OTLP logs to whatever backend you configure (Loki, Elasticsearch,
-an OTLP endpoint, …). This is the recommended baseline: the files are already
-structured for it and the manifest supplies OpenTelemetry resource attributes.
+(Or use [Vector](https://vector.dev), which has file tailing built in.)
 
-### Vector
+### Step 3 — Run it with the provided config and confirm logs flow
 
-[`configs/observability/vector.toml`](../configs/observability/vector.toml) is an
-equivalent recipe using [Vector](https://vector.dev):
+The repo ships a working config at
+[`configs/observability/otel-collector.yaml`](../configs/observability/otel-collector.yaml).
+Out of the box it tails the files, parses the allocation id and stream from the
+path, and prints to the collector's own stdout via the `debug` exporter — so you
+can verify the pipeline **before** wiring up a real backend:
 
 ```bash
-vector --config configs/observability/vector.toml
+# from the worker's working directory (so the relative glob matches):
+otelcol-contrib --config /path/to/configs/observability/otel-collector.yaml
 ```
+
+Run a job that prints something, then watch the collector's console — you should
+see your task's lines, tagged with `legion.allocation.id` and `legion.stream`.
+If you see them, shipping works; everything after this is just choosing a
+destination.
+
+### Step 4 — Point it at your real backend
+
+Edit the `exporters:` block in the config and swap `debug` for your backend.
+Concrete examples:
+
+```yaml
+exporters:
+  # A) Any OTLP logs endpoint (Grafana Cloud, Honeycomb, another collector, …)
+  otlphttp/backend:
+    endpoint: https://otlp.example.com           # /v1/logs is appended
+    headers: { "authorization": "Bearer ${TOKEN}" }
+
+  # B) Grafana Loki (Loki 3.x exposes a native OTLP endpoint)
+  otlphttp/loki:
+    endpoint: http://loki:3100/otlp
+
+  # C) Elasticsearch (contrib distro)
+  elasticsearch:
+    endpoints: ["http://elasticsearch:9200"]
+```
+
+then reference it in the pipeline:
+
+```yaml
+service:
+  pipelines:
+    logs:
+      receivers: [filelog]
+      processors: [resource, batch]
+      exporters: [otlphttp/loki]   # whichever you configured
+```
+
+That's it — there is no Legion-side step. The same shape applies to Vector
+([`configs/observability/vector.toml`](../configs/observability/vector.toml)):
+swap its `[sinks.out]` for `loki`, `elasticsearch`, `http`, etc.
+
+### Try the whole thing locally (Docker Compose)
+
+[`configs/observability/docker-compose.yaml`](../configs/observability/docker-compose.yaml)
+brings up a collector (+ optional Loki/Grafana) wired to tail a log directory you
+mount in. From the repo root, after a worker has produced some logs:
+
+```bash
+# Point it at your worker's log root and start the collector:
+LEGION_LOG_DIR="$(pwd)/.legion" docker compose \
+  -f configs/observability/docker-compose.yaml up
+```
+
+The collector container prints the parsed log records (`docker compose logs
+otel-collector`). Uncomment the `loki` and `grafana` services in that file to
+view them in Grafana at <http://localhost:3000> (Explore → Loki).
+
+### A note on rotation + at-least-once delivery
+
+Legion rotates with **copy-truncate** (see [above](#rotation--retention)). As
+with `logrotate`'s `copytruncate` + any file tailer, a small number of bytes
+written in the instant between the collector's last read and the truncate can be
+missed. For most workloads this is negligible. If you need stricter delivery,
+raise `LEGION_LOG_MAX_FILE_BYTES` (rotate less often) and/or lower the
+collector's `poll_interval`, or ship from the application itself.
 
 ### Why a collector instead of built-in forwarding?
 

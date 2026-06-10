@@ -1,31 +1,42 @@
 # Example OpenTelemetry Collector config for shipping Legion task logs.
 #
-# It tails the per-allocation stdout/stderr files a Legion worker writes, attaches
-# OpenTelemetry resource attributes derived from the file path, and exports OTLP
-# logs to your backend. Run one collector per worker host:
+# Requires the *contrib* distribution (the `filelog` receiver is not in core):
+#   https://github.com/open-telemetry/opentelemetry-collector-releases
+#   docker image: otel/opentelemetry-collector-contrib
 #
-#   otelcol --config configs/observability/otel-collector.yaml
+# Run one collector per worker host, from the worker's working directory so the
+# relative glob matches:
 #
-# This is the recommended baseline for external log shipping: Legion writes
-# stably-named files and a meta.json manifest, so no Legion-side config is needed.
+#   otelcol-contrib --config configs/observability/otel-collector.yaml
+#
+# As shipped it prints parsed log records to the collector's own stdout (the
+# `debug` exporter) so you can confirm the pipeline works before pointing it at a
+# real backend. See docs/logging.md → "Shipping logs externally" for the full
+# walkthrough and backend examples.
 
 receivers:
-  # Tail every task's stdout/stderr. Adjust the glob to your worker state dir
-  # (default: .legion/workers/<worker-id>/logs/<allocation-id>/<stream>.log).
+  # Tail every task's active stdout/stderr. The `*.log` glob intentionally
+  # excludes rotated generations (stdout.log.1, .2, …); their bytes were already
+  # tailed from the active file before rotation.
   filelog:
     include:
+      # Standalone: paths relative to the worker's working directory.
       - .legion/workers/*/logs/*/stdout.log
       - .legion/workers/*/logs/*/stderr.log
-    # Resume where we left off across collector restarts.
-    start_at: end
+      # Docker Compose: the host .legion dir is mounted at /logs (see
+      # docker-compose.yaml in this directory).
+      - /logs/workers/*/logs/*/stdout.log
+      - /logs/workers/*/logs/*/stderr.log
+    start_at: end          # resume at the end on (re)start
+    poll_interval: 250ms   # how often to check for new bytes
     include_file_path: true
     operators:
       # Pull the allocation id and stream name out of the file path.
       - type: regex_parser
         parse_from: attributes["log.file.path"]
         regex: 'logs/(?P<allocation_id>\d+)/(?P<stream>stdout|stderr)\.log$'
-      # Promote them to resource attributes (service.name should match the job;
-      # if you want the job name, enrich from meta.json with a follow-up step).
+      # Promote them to resource attributes. (For the job name and other
+      # identity, read the sibling meta.json — see docs/logging.md.)
       - type: move
         from: attributes.allocation_id
         to: resource["legion.allocation.id"]
@@ -35,7 +46,6 @@ receivers:
 
 processors:
   batch: {}
-  # Tag everything coming from this host/worker.
   resource:
     attributes:
       - key: service.name
@@ -43,17 +53,29 @@ processors:
         action: upsert
 
 exporters:
-  # Replace with your backend. Examples:
-  #   otlphttp -> any OTLP logs endpoint (Tempo/Loki via OTel, Honeycomb, …)
-  #   debug    -> print to the collector's stdout (handy for trying this out)
-  otlphttp:
-    endpoint: http://localhost:4318
+  # `debug` prints to the collector's stdout — handy for verifying the pipeline.
   debug:
     verbosity: basic
+
+  # --- Swap `debug` below for one of these to ship to a real backend ---
+  #
+  # A) Any OTLP logs endpoint (Grafana Cloud, Honeycomb, another collector, …):
+  # otlphttp/backend:
+  #   endpoint: https://otlp.example.com
+  #   headers: { "authorization": "Bearer ${TOKEN}" }
+  #
+  # B) Grafana Loki (Loki 3.x native OTLP endpoint):
+  # otlphttp/loki:
+  #   endpoint: http://loki:3100/otlp
+  #
+  # C) Elasticsearch (contrib distro):
+  # elasticsearch:
+  #   endpoints: ["http://elasticsearch:9200"]
 
 service:
   pipelines:
     logs:
       receivers: [filelog]
       processors: [resource, batch]
-      exporters: [otlphttp, debug]
+      # Add your real exporter here, e.g. [debug, otlphttp/loki]
+      exporters: [debug]

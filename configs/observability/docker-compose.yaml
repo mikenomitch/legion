@@ -1,0 +1,42 @@
+# Runnable local demo of shipping Legion task logs with the OpenTelemetry
+# Collector. It mounts a Legion worker's log directory into a collector that
+# tails the files and prints the parsed records.
+#
+# Usage (from the repo root, after a worker has produced some logs):
+#
+#   LEGION_LOG_DIR="$(pwd)/.legion" docker compose \
+#     -f configs/observability/docker-compose.yaml up
+#
+# Then watch the collector:  docker compose -f configs/observability/docker-compose.yaml logs -f otel-collector
+#
+# To view logs in Grafana instead of the console, uncomment the `loki` and
+# `grafana` services below and switch the collector's exporter to Loki (see
+# otel-collector.yaml, exporter B), then open http://localhost:3000.
+
+services:
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    command: ["--config=/etc/otel/config.yaml"]
+    volumes:
+      # The collector config shipped in this directory.
+      - ./otel-collector.yaml:/etc/otel/config.yaml:ro
+      # Your Legion worker's .legion dir, mounted read-only at /logs. The config
+      # tails /logs/workers/*/logs/*/*.log.
+      - ${LEGION_LOG_DIR:-../../.legion}:/logs:ro
+    # ports:
+    #   - "4318:4318"   # expose if you also send OTLP into this collector
+
+  # --- Uncomment for a full Loki + Grafana stack ---
+  #
+  # loki:
+  #   image: grafana/loki:3.1.1
+  #   command: ["-config.file=/etc/loki/local-config.yaml"]
+  #   ports: ["3100:3100"]
+  #
+  # grafana:
+  #   image: grafana/grafana:11.2.0
+  #   environment:
+  #     GF_AUTH_ANONYMOUS_ENABLED: "true"
+  #     GF_AUTH_ANONYMOUS_ORG_ROLE: "Admin"
+  #   ports: ["3000:3000"]
+  #   depends_on: [loki]
