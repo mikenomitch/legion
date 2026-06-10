@@ -837,8 +837,7 @@ impl Store {
                 .collect::<HashSet<_>>()
                 .into_iter()
                 .collect();
-            let placeholders = std::iter::repeat("?")
-                .take(node_ids.len())
+            let placeholders = std::iter::repeat_n("?", node_ids.len())
                 .collect::<Vec<_>>()
                 .join(",");
             let sql = format!(
@@ -2422,6 +2421,7 @@ impl Store {
     }
 
     #[instrument(err, skip_all)]
+    #[allow(clippy::too_many_arguments)]
     pub fn create_rollout(
         &self,
         job_id: &str,
@@ -2900,7 +2900,7 @@ impl Store {
         for allocation in allocations {
             let tasks = task_cache
                 .entry(allocation.job_config_id.clone())
-                .or_insert_with(HashMap::new);
+                .or_default();
             if tasks.is_empty() {
                 let configs = self.get_task_configs_for_job_config(&allocation.job_config_id)?;
                 for (id, config) in configs {
@@ -3634,8 +3634,7 @@ impl Store {
             return Ok(HashMap::new());
         }
 
-        let placeholders = std::iter::repeat("?")
-            .take(allocation_ids.len())
+        let placeholders = std::iter::repeat_n("?", allocation_ids.len())
             .collect::<Vec<_>>()
             .join(",");
         let sql = format!(
@@ -5723,8 +5722,7 @@ impl Store {
     }
 
     fn sqlite_statement_type(sql: &str) -> String {
-        sql.trim_start()
-            .split_whitespace()
+        sql.split_whitespace()
             .next()
             .unwrap_or("UNKNOWN")
             .trim_matches(|c: char| !c.is_ascii_alphanumeric())

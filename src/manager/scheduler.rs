@@ -141,6 +141,7 @@ impl PlanScoringCache {
     const COMMON_CORES: u8 = 1 << 2;
     const COMMON_ALLOCATIONS: u8 = 1 << 3;
 
+    #[allow(clippy::too_many_arguments)]
     fn from_plan(
         candidates: &[&Node],
         task_id: i64,
@@ -812,6 +813,7 @@ impl<'a> Scheduler<'a> {
         Ok(nodes)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_plan(
         &self,
         job_config_id: &str,
@@ -1137,6 +1139,7 @@ impl<'a> Scheduler<'a> {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn place_task_allocations<'b>(
         &self,
         count: u32,
@@ -1273,9 +1276,10 @@ impl<'a> Scheduler<'a> {
         Ok(())
     }
 
-    fn select_node_id<'b>(
+    #[allow(clippy::too_many_arguments)]
+    fn select_node_id(
         &self,
-        eligible: Vec<&'b Node>,
+        eligible: Vec<&Node>,
         reschedule_rng: &mut Option<StdRng>,
         nodes_considered_setting: Option<&NodesConsidered>,
         nodes_considered_rng: &mut StdRng,

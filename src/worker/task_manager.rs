@@ -29,6 +29,12 @@ pub struct WorkerTaskManager {
     state_store: WorkerStateStore,
 }
 
+impl Default for WorkerTaskManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl WorkerTaskManager {
     pub fn new() -> Self {
         Self::with_state_store(WorkerStateStore::new(WorkerStateStore::default_path()))
@@ -342,10 +348,7 @@ impl WorkerTaskManager {
             .registry
             .plugin(&task.kind)
             .context("Task plugin not loaded")?;
-        let runtime = self
-            .runtimes
-            .entry(allocation.id)
-            .or_insert_with(TaskRuntime::default);
+        let runtime = self.runtimes.entry(allocation.id).or_default();
 
         info!(
             allocation_id = allocation.id,

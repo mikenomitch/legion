@@ -685,6 +685,7 @@ fn rollout_replacement_name(value: &RolloutReplacement) -> &'static str {
     }
 }
 
+#[allow(clippy::result_large_err)] // tonic::Status, matching handler signatures
 fn build_rollout_launch_config(config: &JobConfig) -> Result<RolloutLaunchConfig, Status> {
     let config_json = serde_json::to_string(&json!({
         "rollout": &config.rollout,
@@ -825,6 +826,7 @@ impl ManagerAgentService {
     }
 }
 
+#[allow(clippy::result_large_err)] // tonic::Status, matching handler signatures
 fn cancel_active_rollouts_for_job(store: &Store, job_id: &str) -> Result<(), Status> {
     let active_rollouts = store
         .list_rollouts(Some(job_id), true)
@@ -854,6 +856,7 @@ fn cancel_active_rollouts_for_job(store: &Store, job_id: &str) -> Result<(), Sta
     Ok(())
 }
 
+#[allow(clippy::result_large_err)] // tonic::Status, matching handler signatures
 fn remove_stale_allocations_for_new_rollout(
     store: &Store,
     job_id: &str,
@@ -861,7 +864,7 @@ fn remove_stale_allocations_for_new_rollout(
     previous_job_config_id: Option<&str>,
 ) -> Result<(), Status> {
     let keep = std::iter::once(new_job_config_id)
-        .chain(previous_job_config_id.into_iter())
+        .chain(previous_job_config_id)
         .collect::<HashSet<_>>();
     let allocations = store
         .allocs_for_job(job_id)
@@ -888,6 +891,7 @@ fn remove_stale_allocations_for_new_rollout(
     Ok(())
 }
 
+#[allow(clippy::result_large_err)] // tonic::Status, matching handler signatures
 fn create_rollout_for_update(
     store: &Store,
     job_id: &str,
@@ -1078,6 +1082,7 @@ fn resolve_job_kv_action(
 ///    keys keep their last rendered value), store it, refresh the dependency
 ///    edges, and schedule the resolved action. A previously failed job is
 ///    flipped back to `done` when a restart/rollout actively recovers it.
+#[allow(clippy::result_large_err)] // tonic::Status, matching handler signatures
 fn reconcile_kv_changes(store: &Store, changes: &[(String, bool)]) -> Result<(), Status> {
     if changes.is_empty() {
         return Ok(());
@@ -1786,10 +1791,7 @@ impl Manager for ManagerAgentService {
             .get_submissions_for_config(&config_id)
             .map_err(|e| map_store_error("Error getting submissions", e))?;
 
-        Ok(Response::new(GetJobSpecReply {
-            submissions,
-            ..Default::default()
-        }))
+        Ok(Response::new(GetJobSpecReply { submissions }))
     }
 
     #[instrument(skip_all)]
@@ -3775,7 +3777,7 @@ fn build_desired_allocations(
     for allocation in desired {
         let tasks = task_cache
             .entry(allocation.job_config_id.clone())
-            .or_insert_with(HashMap::new);
+            .or_default();
         if tasks.is_empty() {
             let task_configs = store.get_task_configs_for_job_config(&allocation.job_config_id)?;
             for (id, config) in task_configs {

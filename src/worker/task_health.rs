@@ -248,6 +248,7 @@ fn track_failure(failures: &mut Vec<Instant>, now: Instant, runtime: &CheckRunti
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_unhealthy(
     manager: &Arc<Mutex<WorkerTaskManager>>,
     allocation: &Allocation,

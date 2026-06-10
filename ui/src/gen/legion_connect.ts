@@ -3,7 +3,7 @@
 /* eslint-disable */
 // @ts-nocheck
 
-import { AcquireKvLockReply, AcquireKvLockRequest, AdvanceRolloutReply, AdvanceRolloutRequest, CreateInstanceReply, CreateInstanceRequest, DeleteKvReply, DeleteKvRequest, DeleteSavedStateQueryReply, DeleteSavedStateQueryRequest, DestroyInstanceReply, DestroyInstanceRequest, DestroyJobReply, DestroyJobRequest, GetInstanceReply, GetInstanceRequest, GetJobInfoReply, GetJobInfoRequest, GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest, GetJoinTokenReply, GetJoinTokenRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest, GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest, GetObservabilityReply, GetObservabilityRequest, GetRaftJoinTokenReply, GetRaftJoinTokenRequest, GetRaftStatusReply, GetRaftStatusRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest, GetStateStoreSchemaReply, GetStateStoreSchemaRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, IssueRaftCommandReply, IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply, IssueWorkloadIdentityTokenRequest, ListInstancesReply, ListInstancesRequest, ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobsReply, ListJobsRequest, ListKvReply, ListKvRequest, ListRaftHistoryReply, ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply, ListRolloutsRequest, ListSavedStateQueriesReply, ListSavedStateQueriesRequest, PatchKvReply, PatchKvRequest, PlanJobReply, PlanJobRequest, PostWorkReply, PostWorkRequest, PutKvReply, PutKvRequest, QueryStateStoreReply, QueryStateStoreRequest, ReleaseKvLockReply, ReleaseKvLockRequest, RenewKvLockReply, RenewKvLockRequest, RestartWorkerReply, RestartWorkerRequest, RunJobReply, RunJobRequest, StopJobReply, StopJobRequest, StopRolloutReply, StopRolloutRequest, UpdateNodeDynamicReply, UpdateNodeDynamicRequest, UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest } from "./legion_pb.js";
+import { AcquireKvLockReply, AcquireKvLockRequest, AdvanceRolloutReply, AdvanceRolloutRequest, CreateInstanceReply, CreateInstanceRequest, CreateInstancesReply, CreateInstancesRequest, DeleteKvReply, DeleteKvRequest, DeleteSavedStateQueryReply, DeleteSavedStateQueryRequest, DestroyInstanceReply, DestroyInstanceRequest, DestroyJobReply, DestroyJobRequest, GetInstanceReply, GetInstanceRequest, GetJobInfoReply, GetJobInfoRequest, GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest, GetJoinTokenReply, GetJoinTokenRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest, GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest, GetObservabilityReply, GetObservabilityRequest, GetRaftJoinTokenReply, GetRaftJoinTokenRequest, GetRaftStatusReply, GetRaftStatusRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest, GetStateStoreSchemaReply, GetStateStoreSchemaRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, IssueRaftCommandReply, IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply, IssueWorkloadIdentityTokenRequest, ListInstancesReply, ListInstancesRequest, ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobsReply, ListJobsRequest, ListKvReply, ListKvRequest, ListRaftHistoryReply, ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply, ListRolloutsRequest, ListSavedStateQueriesReply, ListSavedStateQueriesRequest, PatchKvReply, PatchKvRequest, PlanJobReply, PlanJobRequest, PostWorkReply, PostWorkRequest, PutKvReply, PutKvRequest, QueryStateStoreReply, QueryStateStoreRequest, ReleaseKvLockReply, ReleaseKvLockRequest, RenewKvLockReply, RenewKvLockRequest, ReplaceInstanceReply, ReplaceInstanceRequest, RestartWorkerReply, RestartWorkerRequest, RunJobReply, RunJobRequest, StartInstanceReply, StartInstanceRequest, StopInstanceReply, StopInstanceRequest, StopJobReply, StopJobRequest, StopRolloutReply, StopRolloutRequest, UpdateNodeDynamicReply, UpdateNodeDynamicRequest, UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest } from "./legion_pb.js";
 import { MethodKind } from "@bufbuild/protobuf";
 
 /**
@@ -219,7 +219,8 @@ export const Manager = {
      * Keyed instances (see docs/stateful-workloads.md) are the sandbox/dispatch
      * primitive: each instance is a long-lived logical entity with a unique,
      * **never-recycled** id that persists across allocations. Unlike slot mode,
-     * `count.num` does not drive keyed tasks — the number of live instances
+     * Keyed tasks cannot define `count` (rejected at job parse time) — the
+     * number of live instances
      * created through this RPC is the task's desired allocation count (zero
      * instances = zero allocations).
      *
@@ -235,9 +236,15 @@ export const Manager = {
      * - InvalidArgument: no keyed task matches `group`/`task`, the match is
      *   ambiguous, the id has an invalid charset (must match
      *   `[A-Za-z0-9._-]{1,128}`), or `idSource: "caller"` and no id was given.
-     * - AlreadyExists: the id collides with ANY existing instance row,
-     *   including Terminated tombstones — destroyed ids can never be created
-     *   again (the never-recycle guarantee).
+     * - AlreadyExists: the id collides with ANY existing instance row of the
+     *   job — including Stopped instances and Terminated tombstones — or
+     *   structurally aliases the reserved slot-id pattern
+     *   `{job}-{group}-{slot}` of a slot-mode stateful task in the same job
+     *   (the slot and keyed id spaces are kept disjoint so a keyed id can never
+     *   adopt, or be adopted by, a slot placement). A stopped instance still
+     *   owns its id, and a destroyed id can never be created again for the
+     *   lifetime of the job (the never-recycle guarantee; destroying the whole
+     *   job clears its instance history — see DestroyJob).
      *
      * @generated from rpc legion.Manager.CreateInstance
      */
@@ -248,18 +255,68 @@ export const Manager = {
       kind: MethodKind.Unary,
     },
     /**
+     * Creates several keyed-mode stateful instances in one atomic call and
+     * enqueues a single placement evaluation for the batch.
+     *
+     * The request may carry explicit `instance_ids`, a `count` of server-minted
+     * ids, or both; the call creates every explicit id PLUS `count` freshly
+     * minted ids. Creation is ALL-OR-NOTHING inside one storage transaction:
+     * if any explicit id is invalid or collides with ANY existing instance row
+     * (live, Stopped, or a Terminated tombstone — ids are never recycled), the
+     * whole call fails and NO instance is created. The reply lists every id
+     * that was created, in request order (explicit ids first, then minted ids).
+     *
+     * Task resolution (`group`/`task`) follows the same disambiguation rules as
+     * `CreateInstance`: filters may be omitted when the job has exactly one
+     * keyed task; ambiguity is rejected, never guessed.
+     *
+     * Interaction with `stateful.idSource`:
+     * - `idSource: "caller"` requires every id to be caller-supplied, so
+     *   `count > 0` (server minting) contradicts the policy and is rejected
+     *   with InvalidArgument.
+     * - `idSource: "uuid"` (or unset) accepts any mix of explicit ids and
+     *   minted ids.
+     *
+     * Errors:
+     * - NotFound: the job does not exist.
+     * - FailedPrecondition: the job is stopped (run it before creating
+     *   instances).
+     * - InvalidArgument: no keyed task matches `group`/`task` or the match is
+     *   ambiguous; `instance_ids` is empty AND `count` is 0 (nothing to
+     *   create); an id has an invalid charset (must match
+     *   `[A-Za-z0-9._-]{1,128}`, the offending id is named); or the task
+     *   declares `idSource: "caller"` and `count > 0`.
+     * - AlreadyExists: an id (named in the message) collides with an existing
+     *   instance row — including duplicates within the request itself, Stopped
+     *   instances, and Terminated tombstones. Nothing is created.
+     *
+     * @generated from rpc legion.Manager.CreateInstances
+     */
+    createInstances: {
+      name: "CreateInstances",
+      I: CreateInstancesRequest,
+      O: CreateInstancesReply,
+      kind: MethodKind.Unary,
+    },
+    /**
      * Destroys a keyed-mode instance: stops its current allocation, drops its
      * storage handle, and marks the instance Terminated.
      *
-     * The instance row is retained forever as a tombstone so its id can never
-     * be re-created (never-recycle guarantee), and its workload identity `sub`
-     * can never be re-minted for a different workload. The storage handle is
-     * always dropped on destroy — a destroyed sandbox's state must not be
-     * reattachable. (This is intentionally stricter than slot-mode scale-in,
-     * which retains storage by default for a later scale-out.)
+     * The instance row is retained as a tombstone so its id can never be
+     * re-created — and its workload identity `sub` never re-minted for a
+     * different workload — for the lifetime of the job (the never-recycle
+     * guarantee). Destroying the whole job (DestroyJob) cascades and clears its
+     * instance history, after which the id is free again; a live job never
+     * recycles a destroyed id. The storage handle is always dropped on destroy
+     * — a destroyed sandbox's state must not be reattachable. (This is
+     * intentionally stricter than slot-mode scale-in, which retains storage by
+     * default for a later scale-out.)
      *
      * Destroying an already-Terminated instance succeeds as a no-op, so the
      * call is safe to retry even without an idempotency key.
+     *
+     * Destroy also applies to Stopped instances: the row transitions
+     * stopped -> terminated and its retained storage handle is dropped.
      *
      * Errors:
      * - NotFound: no instance row with this id exists.
@@ -272,6 +329,105 @@ export const Manager = {
       name: "DestroyInstance",
       I: DestroyInstanceRequest,
       O: DestroyInstanceReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Stops (pauses) a keyed-mode instance WITHOUT tombstoning it.
+     *
+     * The instance's current allocation is stopped through the normal
+     * allocation-stop path (the hosting worker stops the task on its next
+     * heartbeat reconcile), and the instance transitions to `stopped`. Unlike
+     * `DestroyInstance` this is fully reversible:
+     * - the row is RETAINED and the id stays owned — `CreateInstance` with the
+     *   same id still fails with AlreadyExists (stopped is not destroyed);
+     * - the storage handle is RETAINED, so a later `StartInstance` revives the
+     *   instance with its persisted state;
+     * - `StartInstance` moves it back to `pending` and re-places it.
+     *
+     * While stopped, the instance is NOT part of the keyed task's desired
+     * allocation count: the scheduler plans no allocation for it, and job
+     * resubmits / config updates / reschedules will not resurrect it. Only an
+     * explicit `StartInstance` does.
+     *
+     * Stopping an already-stopped instance succeeds as a no-op, so the call is
+     * safe to retry even without an idempotency key.
+     *
+     * Errors:
+     * - NotFound: no instance row with this id exists.
+     * - InvalidArgument: the instance is slot-mode (slot lifecycles are owned
+     *   by the scheduler via `count.num`; stop the job or scale in instead).
+     * - FailedPrecondition: the instance is Terminated. Destroyed instances
+     *   are tombstoned forever (never-recycle) and can never be stopped,
+     *   started, or re-created.
+     *
+     * @generated from rpc legion.Manager.StopInstance
+     */
+    stopInstance: {
+      name: "StopInstance",
+      I: StopInstanceRequest,
+      O: StopInstanceReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Starts (resumes) a stopped keyed-mode instance.
+     *
+     * The instance transitions `stopped -> pending` and a placement evaluation
+     * is enqueued (exactly like `CreateInstance` does), so the scheduler
+     * places a new allocation bound to the same instance id and its RETAINED
+     * storage handle — the revived workload is *the same* logical instance.
+     *
+     * Starting an instance that is already live (pending, active, or
+     * rescheduling) succeeds as a no-op, so the call is safe to retry even
+     * without an idempotency key.
+     *
+     * Errors:
+     * - NotFound: no instance row with this id exists.
+     * - InvalidArgument: the instance is slot-mode (slot lifecycles are owned
+     *   by the scheduler via `count.num`, not this API).
+     * - FailedPrecondition: the instance is Terminated (destroyed ids are
+     *   tombstoned forever — create a NEW id instead), or the owning job is
+     *   stopped (run the job first; a stopped job schedules nothing).
+     *
+     * @generated from rpc legion.Manager.StartInstance
+     */
+    startInstance: {
+      name: "StartInstance",
+      I: StartInstanceRequest,
+      O: StartInstanceReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Operator override for the node-loss confirmation gate (the K8s analog is
+     * force-deleting a pod stuck on a lost node): immediately frees a stateful
+     * instance's allocation on a LOST node for replacement, without waiting for
+     * `stateful.onLost.replaceAfter` to elapse (and despite `replaceAfter:
+     * "never"`). See docs/stateful-workloads.md "Node loss and fencing".
+     *
+     * The gated allocation row is removed (the instance transitions to
+     * `rescheduling`, keeping its id and storage handle) and a reschedule
+     * evaluation is enqueued that excludes the lost node, so the replacement
+     * re-binds the same instance elsewhere.
+     *
+     * DANGER: this asserts the lost node's workload is dead. If the node is
+     * merely partitioned and its worker has not yet self-fenced
+     * (`onLost.selfTerminateAfter`), forcing a replacement can run the
+     * instance twice (split-brain on its storage handle and workload-identity
+     * subject). Only force when the node is confirmed dead/isolated.
+     *
+     * Works for slot and keyed instances alike.
+     *
+     * Errors:
+     * - NotFound: no instance row with this id exists.
+     * - FailedPrecondition: the instance has no current allocation, or its
+     *   allocation's node is not `lost` (the gate only ever holds allocations
+     *   on lost nodes; everything else reschedules through the normal paths).
+     *
+     * @generated from rpc legion.Manager.ReplaceInstance
+     */
+    replaceInstance: {
+      name: "ReplaceInstance",
+      I: ReplaceInstanceRequest,
+      O: ReplaceInstanceReply,
       kind: MethodKind.Unary,
     },
     /**

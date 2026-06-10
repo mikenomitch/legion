@@ -62,6 +62,7 @@ pub struct SchedulingContext<'a> {
 
 #[allow(dead_code)]
 impl<'a> SchedulingContext<'a> {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         eligible_nodes: Vec<&'a Node>,
         task: &'a TaskConfig,
