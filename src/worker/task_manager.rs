@@ -431,6 +431,10 @@ impl WorkerTaskManager {
             );
         }
 
+        // Fresh staging must start from a clean slate: a worker that died
+        // mid-staging leaves partial content behind, which would otherwise
+        // collide with the re-staged artifacts.
+        self.cleanup_alloc_dir(alloc.id);
         let runtime = self.prepare_runtime(&alloc, &task)?;
         let task_dir = runtime
             .task_dir
@@ -880,6 +884,42 @@ mod tests {
         manager.runtimes.insert(9, TaskRuntime::default());
         let new = manager.reconcile_allocations(std::slice::from_ref(&ta));
         assert!(new.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn begin_task_allocation_cleans_stale_dirs_from_interrupted_staging() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+
+        // Simulate a worker that died mid-staging: leftover content exists
+        // but the allocation is not registered in this (restarted) manager.
+        let stale = temp_dir
+            .path()
+            .join("allocs")
+            .join("11")
+            .join("exec-task")
+            .join("leftover");
+        std::fs::create_dir_all(stale.parent().unwrap())?;
+        std::fs::write(&stale, "partial")?;
+
+        let artifacts = vec![ArtifactSpec::from_source("https://example.com/tool.tar.gz")];
+        let ta = TaskAllocation {
+            allocation_id: 11,
+            job_id: "job".into(),
+            job_config_id: "job-1".into(),
+            node_id: "node-1".into(),
+            task_config_id: 1,
+            task_name: "exec-task".into(),
+            task_kind: "exec".into(),
+            task_config: json!({"command": ["true"]}).to_string(),
+            task_checks: String::new(),
+            task_on_unhealthy: String::new(),
+            task_artifacts: serde_json::to_string(&artifacts)?,
+        };
+        let outcome = manager.begin_task_allocation(&ta)?;
+        assert!(matches!(outcome, BeginOutcome::Staging(_)));
+        assert!(!stale.exists(), "stale staging leftovers must be removed");
         Ok(())
     }
 

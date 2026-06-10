@@ -15,7 +15,8 @@ Required:
 Optional:
 
 - `env`: map of string env vars.
-- `cwd`: working directory.
+- `cwd`: working directory. Defaults to the allocation's private task
+  directory when unset (see Artifacts Support below).
 - `user` (unix): run as given user (resolved to uid/gid).
 - `oom_adj` / `oom_score_adj` (linux): one of these, range `-1000..1000`.
 - `cgroup` (linux): cgroup path.
@@ -37,6 +38,33 @@ Optional:
 - `destroy` delegates to `stop`.
 
 Spawn helper sets a new session (`setsid`) on Unix so task processes survive worker restarts and are signal-isolated from worker process handling.
+
+## Artifacts Support
+
+`exec` reports `supports_artifacts()` and gets the full artifact surface
+(see [docs/artifacts.md](artifacts.md)):
+
+- File/Tree artifacts stage into the per-allocation task directory
+  (`allocs/<alloc_id>/<task_name>/` under the worker state dir) before
+  `prepare`/`start`.
+- `${artifact.<name>}` interpolation expands in all string config fields
+  (command, env values, cwd, ...).
+- Worker-injected env is applied at start: `LEGION_TASK_DIR`,
+  `LEGION_ALLOC_DIR`, and `LEGION_ARTIFACT_<NAME>` (explicit task `env`
+  wins on collision).
+- `cwd` defaults to the task directory when unset.
+- When `landlock` is configured, the task directory is appended to
+  `read_write_paths` automatically so staged artifacts stay readable.
+
+## Capability Summary
+
+| Capability | Supported |
+| --- | --- |
+| KV env injection | ✅ |
+| KV file injection | ✅ |
+| Identity env / file delivery | ✅ / ✅ |
+| Signal delivery | ✅ |
+| Artifacts | ✅ (File/Tree + interpolation + env) |
 
 ## Notes
 

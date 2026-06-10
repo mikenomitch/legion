@@ -53,7 +53,7 @@ Example:
 
 Fields:
 
-- `kind`: plugin category directory (`tasks`, `scheduling`, `node_checks`, `rollouts`).
+- `kind`: plugin category directory (`tasks`, `scheduling`, `node_checks`, `rollouts`, `artifacts`).
 - `name`: plugin name directory and library basename.
 - `legionApiVersion`: plugin API version expected by the host.
 
@@ -116,6 +116,43 @@ Purpose: transform/resolve rollout config before rollout execution.
   - `slow_start` (`plugins/rollouts/slow_start/`)
 
 Entry trait: `RolloutStrategyPlugin` in `src/manager/rollout_strategy.rs`.
+
+## 5) Artifact Fetcher Plugins
+
+Purpose: serve artifact source schemes beyond the built-ins
+(`http`/`https`, `file`, `git`, `s3`, `oci`). See
+[docs/artifacts.md](artifacts.md) for the artifact system itself.
+
+- Built-in fetchers register in `FetcherRegistry::with_builtins()`
+  (`src/artifacts/fetcher.rs`, implementations in `src/artifacts/fetchers/`).
+- Dynamic example plugin:
+  - `demo` (`plugins/artifacts/demo/`) — serves `demo://`, materializing the
+    URL's `content` query parameter as a staged file.
+
+Entry trait: `ArtifactFetcher` in `src/artifacts/fetcher.rs`.
+
+Contract specifics (the rest follows the common pattern above):
+
+- Directory layout: `plugins/artifacts/<scheme>/` with a `plugin.json` of
+  `{"kind": "artifacts", "name": "<scheme>", "legionApiVersion": 1}` and the
+  dylib at `plugins/artifacts/<scheme>/target/release/lib<scheme>.<ext>`.
+- Exported symbol: `get() -> Box<dyn ArtifactFetcher>` (the usual `get`
+  constructor, returning the fetcher trait object).
+- The trait is deliberately **blocking** (`fetch` streams bytes into an
+  `ArtifactSink`, which hashes, counts, and enforces size limits): fetchers
+  run on worker staging threads, never the async runtime, and a blocking
+  trait keeps the dylib ABI free of async-trait hazards. `resolve()` is an
+  optional second method that pins mutable references to digests for
+  `resolve: 'pin'`.
+- **Registry resolution order: built-ins first, then dynamic plugins.** A
+  plugin is only consulted (lazily loaded, manifest validated) when no
+  built-in serves the requested scheme, and loading fails if the plugin's
+  `schemes()` does not include the scheme it was loaded for.
+- Auth resolution, checksum verification, unpacking, retries, and status
+  reporting are all shared pipeline code in the worker core — a fetcher
+  plugin only moves bytes. Custom schemes must also be added to the
+  cluster's `artifacts.allowedSchemes` (and the worker-side allowlist if
+  customized).
 
 ## Build Behavior
 
