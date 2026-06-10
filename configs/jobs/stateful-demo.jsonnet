@@ -29,7 +29,11 @@
                     // drivers land with the volume plugin system.
                     path: "/var/lib/replica",
                     // Keep slot storage when scaling in so a later scale-out
-                    // reattaches the same data (default: true).
+                    // reattaches the same data (default: true). The job-stop
+                    // analog is `retainOnStop` (also default true): set it to
+                    // false to drop slot handles on `job stop` so a re-run
+                    // mints fresh ones (K8s whenDeleted: Delete; `job
+                    // destroy` always deletes regardless).
                     retainOnScaleIn: true,
                 },
             },

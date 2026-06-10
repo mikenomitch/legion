@@ -93,7 +93,9 @@ pending -> active -> rescheduling -> active -> ... -> stopped/terminated
       // initialInstances: ['user-1', 'user-2'],  // keyed only: seed list
       storage: {                 // optional persistent-state contract
         path: '/var/lib/db',     // absolute path the state is exposed at
-        retainOnScaleIn: true,   // default true (K8s PVC-style retention)
+        retainOnScaleIn: true,   // default true (K8s whenScaled: Retain)
+        retainOnStop: true,      // default true (K8s whenDeleted: Retain);
+                                 // slot mode only — see retention section
       },
     },
     config: { command: ['run-db'] },
@@ -115,6 +117,10 @@ Validation rules (enforced at `job validate` / submit time):
 - `initialInstances` is valid only in keyed mode; each id must match
   `[A-Za-z0-9._-]{1,128}` and the list must contain no duplicates.
 - `storage.path` must be a non-empty absolute path.
+- `storage.retainOnStop` is only valid in slot mode: keyed stop/destroy
+  semantics are fixed per instance (instance stop / job stop always retains
+  the handle, instance destroy always drops it), so the knob is rejected on
+  keyed tasks with a validation error.
 - At most one slot-mode stateful task per group (slot ids are derived from
   `(job, group, slot)`). Multiple keyed tasks per group are fine — their ids
   are explicit keys, not ordinals.
@@ -352,7 +358,9 @@ never run again, so letting its state remain attachable would be a leak.
 Stopping the whole job (`job stop`) is **not** a destroy: keyed instances are
 moved to `stopped` (not `terminated`) with their storage handles **retained**,
 so `job run` + `instance start` revives them with their data. Slot instances
-become `terminated` with handles retained too, so a later `job run`
+become `terminated` with handles retained too (unless the task sets
+`retainOnStop: false`, see [Scale-In / Scale-Out
+Retention](#scale-in--scale-out-retention)), so a later `job run`
 re-materializes the same ordinal identities. Only `instance destroy` / `job
 destroy` drops keyed handles.
 
@@ -375,14 +383,34 @@ config.
   id**, and a retained storage handle is reattached. If no handle was retained
   a fresh one is minted.
 - **Job stop**: rows are retained for all instances. Slot instances become
-  `terminated` (handles retained), so a later `job run` re-materializes the
-  same identities. Keyed instances become `stopped` (handles retained), so
-  `job run` + `legion instance start <id>` revives each one with its data (see
-  [Stopping and starting](#stopping-and-starting)). A stop is a pause, not a
-  destroy.
-- **Job destroy**: instance rows are deleted with the job (FK cascade). This
-  is the only thing that clears a job's keyed-id history — the never-recycle
-  guarantee holds for the lifetime of the job, not beyond it.
+  `terminated`, so a later `job run` re-materializes the same identities;
+  their handles are retained by default (`retainOnStop: true`) so the re-run
+  reattaches the same data, while `retainOnStop: false` drops the handles on
+  stop and the revived slots mint fresh ones — identity comes back, the data
+  binding doesn't. Keyed instances become `stopped` (handles retained,
+  always), so `job run` + `legion instance start <id>` revives each one with
+  its data (see [Stopping and starting](#stopping-and-starting)). A stop is a
+  pause, not a destroy.
+- **Job destroy**: instance rows are deleted with the job (FK cascade),
+  storage handles included, regardless of `retainOnStop` — that knob governs
+  `job stop` only. This is the only thing that clears a job's keyed-id
+  history — the never-recycle guarantee holds for the lifetime of the job,
+  not beyond it.
+
+### K8s mapping
+
+The two knobs are the slot-mode analog of a StatefulSet's
+`persistentVolumeClaimRetentionPolicy` (both default Retain):
+
+| K8s | Legion |
+| --- | --- |
+| `whenScaled: Retain/Delete` | `retainOnScaleIn: true/false` |
+| `whenDeleted: Retain/Delete` | `retainOnStop: true/false` (`job stop`; `job destroy` always deletes) |
+
+`whenDeleted` maps to `job stop` — not `job destroy` — because stopping is
+Legion's analog of deleting a StatefulSet (the spec lingers, identities can
+come back), whereas `job destroy` purges the job's entire record history
+unconditionally.
 
 ## Storage Handle Contract
 

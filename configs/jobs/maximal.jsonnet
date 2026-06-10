@@ -50,7 +50,12 @@
                 mode: "slot",
                 storage: {
                     path: "/var/lib/web",
+                    // K8s persistentVolumeClaimRetentionPolicy analogs (both
+                    // default true = Retain). retainOnScaleIn ~ whenScaled;
+                    // retainOnStop ~ whenDeleted and governs `job stop` only
+                    // (`job destroy` always deletes every instance record).
                     retainOnScaleIn: true,
+                    retainOnStop: true,
                 },
             },
             config: {

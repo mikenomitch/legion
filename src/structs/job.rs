@@ -868,15 +868,32 @@ pub struct StatefulStorageConfig {
     pub path: String,
     /// Whether to keep an instance's storage handle when its slot is scaled
     /// in (so a later scale-out reattaches the same data). Defaults to true,
-    /// mirroring K8s PVC retention.
+    /// mirroring K8s PVC retention (`whenScaled: Retain`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retain_on_scale_in: Option<bool>,
+    /// Whether to keep slot instances' storage handles when the JOB is
+    /// stopped (`legion job stop` — Legion's analog of deleting a
+    /// StatefulSet, i.e. K8s `whenDeleted`). Defaults to true (K8s Retain).
+    /// With `false`, a job stop still terminates the slot instances and
+    /// retains their rows (a later `job run` re-materializes the same
+    /// ordinal identities), but their storage handles are DROPPED, so the
+    /// revived slots mint fresh handles. Slot mode only: keyed stop/destroy
+    /// semantics are fixed per instance (stop retains, destroy drops).
+    /// `job destroy` is unaffected — it always purges every instance row
+    /// (and handle) with the job, regardless of this flag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retain_on_stop: Option<bool>,
 }
 
 impl StatefulStorageConfig {
-    /// Effective retention policy (defaults to retain).
+    /// Effective scale-in retention policy (defaults to retain).
     pub fn retains_on_scale_in(&self) -> bool {
         self.retain_on_scale_in.unwrap_or(true)
+    }
+
+    /// Effective job-stop retention policy (defaults to retain).
+    pub fn retains_on_stop(&self) -> bool {
+        self.retain_on_stop.unwrap_or(true)
     }
 }
 
@@ -1385,6 +1402,18 @@ impl TaskConfig {
                 }
             }
             InstanceMode::Keyed => {
+                if stateful
+                    .storage
+                    .as_ref()
+                    .is_some_and(|storage| storage.retain_on_stop.is_some())
+                {
+                    bail!(
+                        "task {} stateful.storage.retainOnStop is only valid in slot mode; keyed \
+                         stop/destroy semantics are fixed per instance (instance stop / job stop \
+                         always retains the storage handle, instance destroy always drops it)",
+                        self.name
+                    );
+                }
                 if let Some(id_source) = stateful.id_source.as_deref() {
                     if !matches!(id_source, "caller" | "uuid") {
                         bail!(
@@ -2142,7 +2171,76 @@ mod tests {
             .expect("storage parsed");
         assert!(storage.retain_on_scale_in.is_none());
         assert!(storage.retains_on_scale_in());
+        // Both retention knobs default to Retain, like K8s
+        // persistentVolumeClaimRetentionPolicy.
+        assert!(storage.retain_on_stop.is_none());
+        assert!(storage.retains_on_stop());
         Ok(())
+    }
+
+    #[test]
+    fn stateful_storage_retain_on_stop_parses_in_slot_mode() -> R<()> {
+        let spec = serde_json::json!({
+            "name": "demo",
+            "task": {
+                "kind": "exec",
+                "count": 2,
+                "stateful": {
+                    "mode": "slot",
+                    "storage": {
+                        "path": "/data",
+                        "retainOnScaleIn": true,
+                        "retainOnStop": false
+                    }
+                }
+            }
+        });
+        let config: JobConfig = serde_json::from_value(spec)?;
+        let task = &config.tasks[0];
+        let storage = task
+            .stateful
+            .as_ref()
+            .and_then(|stateful| stateful.storage.as_ref())
+            .expect("storage parsed");
+        assert_eq!(storage.retain_on_stop, Some(false));
+        assert!(!storage.retains_on_stop());
+        assert!(storage.retains_on_scale_in(), "the knobs are independent");
+        task.validate_stateful()?;
+
+        // Round trip: the camelCase key survives serialization.
+        let serialized = serde_json::to_value(task)?;
+        assert_eq!(serialized["stateful"]["storage"]["retainOnStop"], false);
+        let reparsed: TaskConfig = serde_json::from_value(serialized)?;
+        assert_eq!(reparsed.stateful, task.stateful);
+        Ok(())
+    }
+
+    #[test]
+    fn stateful_validation_rejects_retain_on_stop_in_keyed_mode() {
+        for value in [true, false] {
+            let task = TaskConfig {
+                stateful: Some(StatefulConfig {
+                    mode: InstanceMode::Keyed,
+                    id_source: None,
+                    initial_instances: None,
+                    storage: Some(StatefulStorageConfig {
+                        path: "/workspace".into(),
+                        retain_on_scale_in: None,
+                        retain_on_stop: Some(value),
+                    }),
+                }),
+                ..TaskConfig::new("sandbox", "container")
+            };
+            let err = task
+                .validate_stateful()
+                .expect_err("retainOnStop must be rejected in keyed mode");
+            assert!(
+                err.to_string().contains("retainOnStop")
+                    && err.to_string().contains("slot mode")
+                    && err.to_string().contains("fixed per instance"),
+                "{err}"
+            );
+        }
     }
 
     #[test]
@@ -2209,6 +2307,7 @@ mod tests {
                     storage: Some(StatefulStorageConfig {
                         path: bad_path.into(),
                         retain_on_scale_in: None,
+                        retain_on_stop: None,
                     }),
                 }),
                 ..TaskConfig::new("db", "exec")

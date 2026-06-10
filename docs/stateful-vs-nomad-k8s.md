@@ -13,7 +13,7 @@ will compare us to. Written 2026-06; updated as primitives land.
 | On-demand keyed instances | ❌ (no native analog; operators build it) | ⚠️ Parameterized/dispatch jobs (one-shot batch flavor) | ✅ Keyed mode: never-recycled ids, create/destroy/list API |
 | Identity → credentials | Projected SA tokens per pod | Workload identity per alloc/task | ✅ OIDC tokens with instance-keyed `sub` |
 | Persistent volumes | ✅ PVC templates + CSI ecosystem | ✅ Host volumes + CSI + sticky dynamic host volumes | ❌ **Contract only** — opaque `storage_handle`, no drivers ([plan](plans/volume-plugin-system-plan.md)) |
-| Storage retention policy | `persistentVolumeClaimRetentionPolicy` (whenScaled / whenDeleted) | Volume lifecycle is operator-managed | ⚠️ `retainOnScaleIn` (= whenScaled); destroy semantics fixed per mode, no whenDeleted knob |
+| Storage retention policy | `persistentVolumeClaimRetentionPolicy` (whenScaled / whenDeleted) | Volume lifecycle is operator-managed | ✅ `retainOnScaleIn` (= whenScaled) + `retainOnStop` (= whenDeleted, governs `job stop`; `job destroy` always deletes) |
 | Stable network identity | ✅ Per-pod DNS via headless Service | ⚠️ Via Consul service registration | ❌ **None** — instances are not addressable by name |
 | At-most-one instance (fencing) | ✅ StatefulSet never replaces a pod on a lost node without confirmation/force-delete | ⚠️ `prevent_reschedule_on_lost` opt-in | ❌ **No guarantee** — node-loss replacement and create-first rollouts allow transient double-attach |
 | Ordered startup / scaling | ✅ OrderedReady (0..N-1, one at a time) | ❌ | ❌ Slots place in parallel |

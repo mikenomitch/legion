@@ -3995,32 +3995,94 @@ impl Store {
         Ok(())
     }
 
-    /// Settle every instance of a stopped job. Rows AND storage handles are
-    /// always retained, but the two modes land in different states:
+    /// Settle every instance of a stopped job. Rows are always retained, but
+    /// the two modes land in different states:
     ///
-    /// - slot rows become `terminated` (with handles retained), so a later
-    ///   `job run` re-materializes the same ordinal identities and reattaches
-    ///   their data — exactly today's scale-out semantics;
-    /// - keyed rows become `stopped` (with handles retained), so resubmitting
-    ///   the job and running `legion instance start <id>` revives the same
-    ///   sandbox with its persisted state. A job stop is a pause, not a
-    ///   destroy: only DestroyInstance / job destroy is forever. Stopped
-    ///   keyed instances stay stopped when the job is resubmitted — they are
-    ///   not desired by the scheduler until explicitly started.
+    /// - slot rows become `terminated`, so a later `job run` re-materializes
+    ///   the same ordinal identities. Their storage handles are retained by
+    ///   default (the re-run reattaches the same data — exactly today's
+    ///   scale-out semantics), but a task with
+    ///   `stateful.storage.retainOnStop: false` (the K8s
+    ///   `whenDeleted: Delete` analog) has its slot handles DROPPED here, so
+    ///   the revived slots mint fresh handles;
+    /// - keyed rows become `stopped` (with handles retained, always — keyed
+    ///   stop semantics are fixed per instance), so resubmitting the job and
+    ///   running `legion instance start <id>` revives the same sandbox with
+    ///   its persisted state. A job stop is a pause, not a destroy: only
+    ///   DestroyInstance / job destroy is forever. Stopped keyed instances
+    ///   stay stopped when the job is resubmitted — they are not desired by
+    ///   the scheduler until explicitly started.
+    ///
+    /// `job destroy` never reaches this path — it unconditionally deletes
+    /// every instance row (and handle) via the job FK cascade, regardless of
+    /// `retainOnStop`.
     ///
     /// Called from the job_stop eval after its allocations are removed.
     /// Idempotent: already-stopped/terminated rows are untouched.
     #[instrument(err, skip_all)]
     pub fn stop_instances_for_job(&self, job_id: &str) -> R<u64> {
         let now = Self::now_rfc3339()?;
-        let conn = self.write_connection()?;
-        let updated = conn.execute(
+        let mut conn = self.write_connection()?;
+        let tx = conn.transaction()?;
+
+        // Resolve the per-task job-stop retention policy from the LATEST job
+        // config version (mirroring how `slot_still_desired_tx` resolves the
+        // scale-in policy) and drop the handles of the slot rows this stop is
+        // about to terminate when `retainOnStop: false`. Already-settled
+        // (terminated/stopped) rows are untouched, keeping the stop
+        // idempotent; keyed rows are never targeted (their stop semantics are
+        // fixed, and validation rejects the knob in keyed mode anyway).
+        let mut stmt = tx.prepare(
+            "SELECT DISTINCT group_name, task_name FROM instance \
+             WHERE job_id = ?1 AND mode = 'slot' AND storage_handle IS NOT NULL \
+             AND state NOT IN ('terminated', 'stopped');",
+        )?;
+        let slot_tasks: Vec<(String, String)> =
+            Self::collect_rows(stmt.query_map([job_id], |row| Ok((row.get(0)?, row.get(1)?)))?)?;
+        drop(stmt);
+        for (group, task_name) in slot_tasks {
+            let stateful: Option<Option<String>> = tx
+                .query_row(
+                    "SELECT task_config.stateful FROM task_config \
+                     INNER JOIN job_config ON job_config.id = task_config.job_config_id \
+                     WHERE task_config.job_id = ?1 AND task_config.group_name = ?2 \
+                     AND task_config.name = ?3 \
+                     ORDER BY job_config.version DESC LIMIT 1;",
+                    params![job_id, group, task_name],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let retain = stateful
+                .flatten()
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<StatefulConfig>(raw).ok())
+                .and_then(|stateful| stateful.storage)
+                .map(|storage| storage.retains_on_stop())
+                .unwrap_or(true);
+            if !retain {
+                info!(
+                    job_id,
+                    group,
+                    task = %task_name,
+                    "Dropping slot storage handles on job stop (retainOnStop: false)"
+                );
+                tx.execute(
+                    "UPDATE instance SET storage_handle = NULL, updated_at = ?1 \
+                     WHERE job_id = ?2 AND group_name = ?3 AND task_name = ?4 \
+                     AND mode = 'slot' AND state NOT IN ('terminated', 'stopped');",
+                    params![now, job_id, group, task_name],
+                )?;
+            }
+        }
+
+        let updated = tx.execute(
             "UPDATE instance SET \
              state = CASE WHEN mode = 'keyed' THEN 'stopped' ELSE 'terminated' END, \
              current_alloc_id = NULL, updated_at = ?1 \
              WHERE job_id = ?2 AND state NOT IN ('terminated', 'stopped');",
             params![now, job_id],
         )?;
+        tx.commit()?;
         Ok(updated as u64)
     }
 
@@ -7444,6 +7506,7 @@ mod tests {
                 storage: with_storage.then(|| crate::structs::StatefulStorageConfig {
                     path: "/var/lib/data".into(),
                     retain_on_scale_in: None,
+                    retain_on_stop: None,
                 }),
             }),
             ..TaskConfig::new(name, "noop")
@@ -7653,6 +7716,7 @@ mod tests {
                 storage: Some(crate::structs::StatefulStorageConfig {
                     path: "/var/lib/data".into(),
                     retain_on_scale_in: Some(false),
+                    retain_on_stop: None,
                 }),
             }),
             ..TaskConfig::new("db", "noop")
@@ -7757,6 +7821,10 @@ mod tests {
             .map(|instance| instance.storage_handle)
             .collect();
 
+        // Mirror the job_stop eval: allocations are removed first, then the
+        // instances are settled. Default retainOnStop (absent = true) keeps
+        // every slot handle, like K8s `whenDeleted: Retain`.
+        store.remove_allocs_for_job(job_id)?;
         assert_eq!(store.stop_instances_for_job(job_id)?, 2);
         let instances = store.list_instances(job_id)?;
         assert_eq!(instances.len(), 2);
@@ -7768,6 +7836,159 @@ mod tests {
 
         // Idempotent.
         assert_eq!(store.stop_instances_for_job(job_id)?, 0);
+
+        // Resubmitting the job re-materializes the SAME ordinal identities
+        // with the SAME retained handles.
+        let v2_config_id = submit_job(&store, job_id, vec![stateful_slot_task("db", 2, true)])?;
+        let v2_task = task_id_for_config(&store, "db", &v2_config_id)?;
+        store.place_alloc("node-a", v2_task)?;
+        store.place_alloc("node-a", v2_task)?;
+        let revived = store.list_instances(job_id)?;
+        assert_eq!(revived.len(), 2);
+        assert_eq!(revived[0].instance_id, "inst-stop-default-0");
+        assert_eq!(revived[1].instance_id, "inst-stop-default-1");
+        for (instance, handle) in revived.iter().zip(&handles) {
+            assert_eq!(instance.state, InstanceState::Active);
+            assert_eq!(
+                &instance.storage_handle, handle,
+                "re-run reattaches the retained handle"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn job_stop_drops_slot_handles_when_retain_on_stop_disabled() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "active"))?;
+        let job_id = "stop-noretain";
+        let no_stop_retain_task = || TaskConfig {
+            count: TaskCount::new(2),
+            stateful: Some(crate::structs::StatefulConfig {
+                mode: InstanceMode::Slot,
+                id_source: None,
+                initial_instances: None,
+                storage: Some(crate::structs::StatefulStorageConfig {
+                    path: "/var/lib/data".into(),
+                    retain_on_scale_in: None,
+                    retain_on_stop: Some(false),
+                }),
+            }),
+            ..TaskConfig::new("db", "noop")
+        };
+
+        submit_job(&store, job_id, vec![no_stop_retain_task()])?;
+        let task_id = task_id_for(&store, "db", job_id)?;
+        store.place_alloc("node-a", task_id)?;
+        store.place_alloc("node-a", task_id)?;
+        let original_handles: Vec<Option<String>> = store
+            .list_instances(job_id)?
+            .into_iter()
+            .map(|instance| instance.storage_handle)
+            .collect();
+        assert!(original_handles.iter().all(Option::is_some));
+
+        // Job stop (the K8s `whenDeleted: Delete` analog): rows are retained
+        // — identity comes back — but the data binding is dropped.
+        store.remove_allocs_for_job(job_id)?;
+        assert_eq!(store.stop_instances_for_job(job_id)?, 2);
+        let instances = store.list_instances(job_id)?;
+        assert_eq!(instances.len(), 2, "rows retained despite handle drop");
+        for instance in &instances {
+            assert_eq!(instance.state, InstanceState::Terminated);
+            assert_eq!(instance.current_alloc_id, None);
+            assert_eq!(
+                instance.storage_handle, None,
+                "retainOnStop: false drops the handle on job stop"
+            );
+        }
+
+        // Idempotent.
+        assert_eq!(store.stop_instances_for_job(job_id)?, 0);
+
+        // Resubmit: the same ordinal ids come back, but with FRESH handles —
+        // the identity survives the stop, the data binding does not.
+        let v2_config_id = submit_job(&store, job_id, vec![no_stop_retain_task()])?;
+        let v2_task = task_id_for_config(&store, "db", &v2_config_id)?;
+        store.place_alloc("node-a", v2_task)?;
+        store.place_alloc("node-a", v2_task)?;
+        let revived = store.list_instances(job_id)?;
+        assert_eq!(revived.len(), 2);
+        assert_eq!(revived[0].instance_id, "stop-noretain-default-0");
+        assert_eq!(revived[1].instance_id, "stop-noretain-default-1");
+        for (instance, original) in revived.iter().zip(&original_handles) {
+            assert_eq!(instance.state, InstanceState::Active);
+            assert!(instance.storage_handle.is_some(), "fresh handle minted");
+            assert_ne!(&instance.storage_handle, original);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn job_stop_drops_handles_only_for_tasks_with_retain_on_stop_disabled() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "active"))?;
+        let job_id = "stop-mixed";
+        // Three groups: a slot task that keeps the default (retain), a slot
+        // task that opts out, and a keyed task to prove the slot-only knob
+        // never touches keyed handles.
+        let keep_task = TaskConfig {
+            group: "keep".into(),
+            ..stateful_slot_task("keep-db", 1, true)
+        };
+        let drop_task = TaskConfig {
+            group: "drop".into(),
+            count: TaskCount::new(1),
+            stateful: Some(crate::structs::StatefulConfig {
+                mode: InstanceMode::Slot,
+                id_source: None,
+                initial_instances: None,
+                storage: Some(crate::structs::StatefulStorageConfig {
+                    path: "/var/lib/data".into(),
+                    retain_on_scale_in: None,
+                    retain_on_stop: Some(false),
+                }),
+            }),
+            ..TaskConfig::new("drop-db", "noop")
+        };
+        let keyed_task = TaskConfig {
+            group: "sandboxes".into(),
+            ..stateful_keyed_task("sandbox", true)
+        };
+        submit_job(&store, job_id, vec![keep_task, drop_task, keyed_task])?;
+        store.create_keyed_instance(job_id, "sandboxes", "sandbox", Some("user-a"))?;
+        store.place_alloc("node-a", task_id_for(&store, "keep-db", job_id)?)?;
+        store.place_alloc("node-a", task_id_for(&store, "drop-db", job_id)?)?;
+        store.place_alloc("node-a", task_id_for(&store, "sandbox", job_id)?)?;
+
+        let keep_id = slot_instance_id(job_id, "keep", 0);
+        let drop_id = slot_instance_id(job_id, "drop", 0);
+        let keep_handle = store
+            .get_instance(&keep_id)?
+            .context("keep")?
+            .storage_handle;
+        let keyed_handle = store
+            .get_instance("user-a")?
+            .context("keyed")?
+            .storage_handle;
+        assert!(keep_handle.is_some());
+        assert!(keyed_handle.is_some());
+
+        store.remove_allocs_for_job(job_id)?;
+        assert_eq!(store.stop_instances_for_job(job_id)?, 3);
+
+        // Only the opted-out task's slot handle is dropped.
+        let keep = store.get_instance(&keep_id)?.context("keep")?;
+        assert_eq!(keep.state, InstanceState::Terminated);
+        assert_eq!(keep.storage_handle, keep_handle, "default task retains");
+        let dropped = store.get_instance(&drop_id)?.context("drop")?;
+        assert_eq!(dropped.state, InstanceState::Terminated);
+        assert_eq!(dropped.storage_handle, None, "opted-out task drops");
+        // Keyed instances are paused with handles retained, regardless of any
+        // slot task's retainOnStop.
+        let keyed = store.get_instance("user-a")?.context("keyed")?;
+        assert_eq!(keyed.state, InstanceState::Stopped);
+        assert_eq!(keyed.storage_handle, keyed_handle, "keyed always retains");
         Ok(())
     }
 
@@ -7794,6 +8015,7 @@ mod tests {
                 storage: with_storage.then(|| crate::structs::StatefulStorageConfig {
                     path: "/workspace".into(),
                     retain_on_scale_in: None,
+                    retain_on_stop: None,
                 }),
             }),
             ..TaskConfig::new(name, "noop")

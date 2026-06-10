@@ -1162,7 +1162,9 @@ message InstanceInfo {
   // Opaque persistent-storage handle bound to the instance, when the task
   // declares `stateful.storage`. Stable across reschedules and retained
   // while `stopped` (StopInstance / job stop). Dropped on keyed destroy;
-  // retained on slot scale-in unless `retainOnScaleIn: false`.
+  // retained on slot scale-in unless `retainOnScaleIn: false`, and retained
+  // on job stop unless `retainOnStop: false` (slot mode only; the K8s
+  // `whenDeleted` analog — job destroy always deletes every instance row).
   optional string storage_handle = 9;
 
   // RFC3339 creation timestamp.

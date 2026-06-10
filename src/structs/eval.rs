@@ -177,12 +177,15 @@ impl Eval {
         }
 
         store.remove_allocs_for_job(&self.job_id)?;
-        // Stateful instances of a stopped job are retained (rows + storage
-        // handles): slot rows are terminated so a later re-run
-        // re-materializes the same ordinal identities; keyed rows are merely
-        // stopped, so resubmitting the job + `legion instance start` revives
-        // them with their old handles (only DestroyInstance / job destroy is
-        // forever). No-op for stateless jobs.
+        // Stateful instance ROWS of a stopped job are always retained: slot
+        // rows are terminated so a later re-run re-materializes the same
+        // ordinal identities; keyed rows are merely stopped, so resubmitting
+        // the job + `legion instance start` revives them with their old
+        // handles (only DestroyInstance / job destroy is forever). Slot
+        // storage handles are retained too unless the task opts out with
+        // `stateful.storage.retainOnStop: false` (the K8s
+        // `whenDeleted: Delete` analog), in which case the handles are
+        // dropped and a re-run mints fresh ones. No-op for stateless jobs.
         store.stop_instances_for_job(&self.job_id)?;
 
         Ok(format!("Job {} stopped", self.job_id))
@@ -700,6 +703,7 @@ mod tests {
                 storage: Some(StatefulStorageConfig {
                     path: "/var/lib/data".into(),
                     retain_on_scale_in: None,
+                    retain_on_stop: None,
                 }),
             }),
             ..TaskConfig::new("db", "service")
@@ -778,6 +782,7 @@ mod tests {
                 storage: Some(StatefulStorageConfig {
                     path: "/workspace".into(),
                     retain_on_scale_in: None,
+                    retain_on_stop: None,
                 }),
             }),
             ..TaskConfig::new("sandbox", "service")

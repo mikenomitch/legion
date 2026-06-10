@@ -2574,6 +2574,7 @@ mod tests {
                 storage: Some(crate::structs::StatefulStorageConfig {
                     path: "/var/lib/data".into(),
                     retain_on_scale_in: None,
+                    retain_on_stop: None,
                 }),
             }),
             ..TaskConfig::new(name, "noop")
@@ -2737,6 +2738,7 @@ mod tests {
                 storage: Some(crate::structs::StatefulStorageConfig {
                     path: "/workspace".into(),
                     retain_on_scale_in: None,
+                    retain_on_stop: None,
                 }),
             }),
             ..TaskConfig::new(name, "noop")
