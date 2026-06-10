@@ -168,6 +168,19 @@ export class WorkerConfig extends Message<WorkerConfig> {
    */
   maxAllocations?: number;
 
+  /**
+   * JSON-encoded artifact fetch settings for this worker.
+   *
+   * Shape: `{"fetch":{"parallelism":4,"attempts":3,"timeout":"10m",
+   *          "maxArtifactSize":"50GiB","allowedSchemes":["https","s3",
+   *          "oci","git","file"]}}`.
+   *
+   * Default: empty string (worker applies conservative built-in defaults).
+   *
+   * @generated from field: string artifacts = 9;
+   */
+  artifacts = "";
+
   constructor(data?: PartialMessage<WorkerConfig>) {
     super();
     proto3.util.initPartial(data, this);
@@ -184,6 +197,7 @@ export class WorkerConfig extends Message<WorkerConfig> {
     { no: 6, name: "resources", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 7, name: "reserved_resources", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 8, name: "max_allocations", kind: "scalar", T: 13 /* ScalarType.UINT32 */, opt: true },
+    { no: 9, name: "artifacts", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): WorkerConfig {
@@ -461,6 +475,20 @@ export class RunJobRequest extends Message<RunJobRequest> {
    */
   forceReschedule = false;
 
+  /**
+   * Optional idempotency key.
+   *
+   * When set and non-empty, the manager deduplicates retried requests carrying
+   * the same key: the first request is applied and its outcome recorded; any
+   * later request with the same key returns the recorded reply without
+   * re-applying. This lets clients (especially automated agents) safely retry
+   * after a timeout without risking a double submission. Unset disables
+   * deduplication.
+   *
+   * @generated from field: optional string idempotency_key = 5;
+   */
+  idempotencyKey?: string;
+
   constructor(data?: PartialMessage<RunJobRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -473,6 +501,7 @@ export class RunJobRequest extends Message<RunJobRequest> {
     { no: 2, name: "submissions", kind: "message", T: Submission, repeated: true },
     { no: 3, name: "priority", kind: "scalar", T: 3 /* ScalarType.INT64 */, opt: true },
     { no: 4, name: "force_reschedule", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 5, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RunJobRequest {
@@ -512,6 +541,14 @@ export class RunJobReply extends Message<RunJobReply> {
    */
   message = "";
 
+  /**
+   * True when this reply was replayed from a previously recorded result for the
+   * request's `idempotency_key` rather than applied fresh.
+   *
+   * @generated from field: bool deduplicated = 2;
+   */
+  deduplicated = false;
+
   constructor(data?: PartialMessage<RunJobReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -521,6 +558,7 @@ export class RunJobReply extends Message<RunJobReply> {
   static readonly typeName = "legion.RunJobReply";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "deduplicated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RunJobReply {
@@ -1111,6 +1149,19 @@ export class RolloutAllocationStatus extends Message<RolloutAllocationStatus> {
    */
   allocationHealth?: string;
 
+  /**
+   * Optional JSON-encoded per-artifact staging states from the latest worker
+   * snapshot. Same payload as `AllocationHealth.artifact_states`: an array of
+   * `{"name","source","state","bytesFetched","bytesTotal","digest",
+   *   "attempts","durationMs","error"}` objects.
+   *
+   * Unset when the allocation's task declares no artifacts or no snapshot
+   * has been received yet.
+   *
+   * @generated from field: optional string artifact_states = 12;
+   */
+  artifactStates?: string;
+
   constructor(data?: PartialMessage<RolloutAllocationStatus>) {
     super();
     proto3.util.initPartial(data, this);
@@ -1130,6 +1181,7 @@ export class RolloutAllocationStatus extends Message<RolloutAllocationStatus> {
     { no: 9, name: "node_healthy", kind: "scalar", T: 8 /* ScalarType.BOOL */, opt: true },
     { no: 10, name: "allocation_healthy", kind: "scalar", T: 8 /* ScalarType.BOOL */, opt: true },
     { no: 11, name: "allocation_health", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 12, name: "artifact_states", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RolloutAllocationStatus {
@@ -2177,6 +2229,13 @@ export class StopJobRequest extends Message<StopJobRequest> {
    */
   priority?: bigint;
 
+  /**
+   * Optional idempotency key. See `RunJobRequest.idempotency_key`.
+   *
+   * @generated from field: optional string idempotency_key = 3;
+   */
+  idempotencyKey?: string;
+
   constructor(data?: PartialMessage<StopJobRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -2187,6 +2246,7 @@ export class StopJobRequest extends Message<StopJobRequest> {
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 2, name: "priority", kind: "scalar", T: 3 /* ScalarType.INT64 */, opt: true },
+    { no: 3, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): StopJobRequest {
@@ -2221,6 +2281,14 @@ export class StopJobReply extends Message<StopJobReply> {
    */
   message = "";
 
+  /**
+   * True when replayed from a recorded result for the request's
+   * `idempotency_key` rather than applied fresh.
+   *
+   * @generated from field: bool deduplicated = 2;
+   */
+  deduplicated = false;
+
   constructor(data?: PartialMessage<StopJobReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -2230,6 +2298,7 @@ export class StopJobReply extends Message<StopJobReply> {
   static readonly typeName = "legion.StopJobReply";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "deduplicated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): StopJobReply {
@@ -2271,6 +2340,13 @@ export class DestroyJobRequest extends Message<DestroyJobRequest> {
    */
   priority?: bigint;
 
+  /**
+   * Optional idempotency key. See `RunJobRequest.idempotency_key`.
+   *
+   * @generated from field: optional string idempotency_key = 3;
+   */
+  idempotencyKey?: string;
+
   constructor(data?: PartialMessage<DestroyJobRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -2281,6 +2357,7 @@ export class DestroyJobRequest extends Message<DestroyJobRequest> {
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 2, name: "priority", kind: "scalar", T: 3 /* ScalarType.INT64 */, opt: true },
+    { no: 3, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): DestroyJobRequest {
@@ -2315,6 +2392,14 @@ export class DestroyJobReply extends Message<DestroyJobReply> {
    */
   message = "";
 
+  /**
+   * True when replayed from a recorded result for the request's
+   * `idempotency_key` rather than applied fresh.
+   *
+   * @generated from field: bool deduplicated = 2;
+   */
+  deduplicated = false;
+
   constructor(data?: PartialMessage<DestroyJobReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -2324,6 +2409,7 @@ export class DestroyJobReply extends Message<DestroyJobReply> {
   static readonly typeName = "legion.DestroyJobReply";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "deduplicated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): DestroyJobReply {
@@ -2756,6 +2842,24 @@ export class AllocationHealth extends Message<AllocationHealth> {
    */
   status = "";
 
+  /**
+   * JSON-encoded per-artifact staging states for this allocation.
+   *
+   * Array of objects, one per declared artifact:
+   * `[{"name":"tool","source":"https://…","state":"fetching",
+   *    "bytesFetched":123,"bytesTotal":456,"digest":"sha256:…",
+   *    "attempts":1,"durationMs":412,"error":"…"}]`.
+   * States progress `pending` -> `fetching` -> `verifying` -> `staged`,
+   * or end in `failed`. Sources are redacted (no userinfo or query secrets)
+   * and errors reference auth *sources* (KV path or identity name), never
+   * credential values.
+   *
+   * Unset when the task declares no artifacts.
+   *
+   * @generated from field: optional string artifact_states = 4;
+   */
+  artifactStates?: string;
+
   constructor(data?: PartialMessage<AllocationHealth>) {
     super();
     proto3.util.initPartial(data, this);
@@ -2767,6 +2871,7 @@ export class AllocationHealth extends Message<AllocationHealth> {
     { no: 1, name: "allocation_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
     { no: 2, name: "healthy", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
     { no: 3, name: "status", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "artifact_states", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): AllocationHealth {
@@ -5453,6 +5558,118 @@ export class GetKvLockReply extends Message<GetKvLockReply> {
 }
 
 /**
+ * Request payload for GetArtifactCredential.
+ *
+ * @generated from message legion.GetArtifactCredentialRequest
+ */
+export class GetArtifactCredentialRequest extends Message<GetArtifactCredentialRequest> {
+  /**
+   * Worker/node ID requesting the credential.
+   *
+   * Used for audit logging only; the credential value itself is never logged.
+   *
+   * @generated from field: string node_id = 1;
+   */
+  nodeId = "";
+
+  /**
+   * KV path holding the credential value (for example: "secrets/ghcr-pull").
+   *
+   * The KV value must be a JSON object with a `type` discriminator:
+   * `{"type":"basic","username":"…","password":"…"}`,
+   * `{"type":"bearer","token":"…"}`,
+   * `{"type":"aws","accessKeyId":"…","secretAccessKey":"…","sessionToken":"…",
+   *   "region":"…","endpoint":"…"}`, or
+   * `{"type":"headers","headers":{"X-Api-Key":"…"}}`.
+   *
+   * @generated from field: string kv_path = 2;
+   */
+  kvPath = "";
+
+  /**
+   * Redacted artifact source the credential will be used for.
+   *
+   * Audit context only (scheme://host/path with userinfo and query stripped).
+   *
+   * @generated from field: string source = 3;
+   */
+  source = "";
+
+  constructor(data?: PartialMessage<GetArtifactCredentialRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetArtifactCredentialRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "kv_path", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "source", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetArtifactCredentialRequest {
+    return new GetArtifactCredentialRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetArtifactCredentialRequest {
+    return new GetArtifactCredentialRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetArtifactCredentialRequest {
+    return new GetArtifactCredentialRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetArtifactCredentialRequest | PlainMessage<GetArtifactCredentialRequest> | undefined, b: GetArtifactCredentialRequest | PlainMessage<GetArtifactCredentialRequest> | undefined): boolean {
+    return proto3.util.equals(GetArtifactCredentialRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for GetArtifactCredential.
+ *
+ * @generated from message legion.GetArtifactCredentialReply
+ */
+export class GetArtifactCredentialReply extends Message<GetArtifactCredentialReply> {
+  /**
+   * JSON-encoded credential value read from KV at request time.
+   *
+   * Returned to the worker for immediate use; never persisted on allocation
+   * rows. Rotating the KV value affects the next fetch with no job changes.
+   *
+   * @generated from field: string credential_json = 1;
+   */
+  credentialJson = "";
+
+  constructor(data?: PartialMessage<GetArtifactCredentialReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetArtifactCredentialReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "credential_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetArtifactCredentialReply {
+    return new GetArtifactCredentialReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetArtifactCredentialReply {
+    return new GetArtifactCredentialReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetArtifactCredentialReply {
+    return new GetArtifactCredentialReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetArtifactCredentialReply | PlainMessage<GetArtifactCredentialReply> | undefined, b: GetArtifactCredentialReply | PlainMessage<GetArtifactCredentialReply> | undefined): boolean {
+    return proto3.util.equals(GetArtifactCredentialReply, a, b);
+  }
+}
+
+/**
  * Request payload for QueryStateStore.
  *
  * @generated from message legion.QueryStateStoreRequest
@@ -6250,6 +6467,17 @@ export class LedgerAllocation extends Message<LedgerAllocation> {
    */
   jobId = "";
 
+  /**
+   * Optional JSON-encoded per-artifact staging states from the latest worker
+   * health snapshot. Same payload as `AllocationHealth.artifact_states`.
+   *
+   * Unset when the allocation's task declares no artifacts or no snapshot
+   * has been received yet.
+   *
+   * @generated from field: optional string artifact_states = 8;
+   */
+  artifactStates?: string;
+
   constructor(data?: PartialMessage<LedgerAllocation>) {
     super();
     proto3.util.initPartial(data, this);
@@ -6265,6 +6493,7 @@ export class LedgerAllocation extends Message<LedgerAllocation> {
     { no: 5, name: "job_config_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 6, name: "task_config_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
     { no: 7, name: "job_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 8, name: "artifact_states", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): LedgerAllocation {
@@ -6650,6 +6879,22 @@ export class TaskAllocation extends Message<TaskAllocation> {
    */
   taskOnUnhealthy = "";
 
+  /**
+   * JSON-encoded list of normalized artifact specs for this task.
+   *
+   * This is the post-admission form: kind-implicit artifacts (for example a
+   * container `image`) are already desugared in, `resolve: "pin"` references
+   * are already pinned to digests, and cluster-level auth matchers are
+   * already applied. Workers stage exactly this list and never re-derive or
+   * re-resolve artifacts.
+   *
+   * Empty string when the task declares no artifacts (the staging step is
+   * skipped entirely).
+   *
+   * @generated from field: string task_artifacts = 11;
+   */
+  taskArtifacts = "";
+
   constructor(data?: PartialMessage<TaskAllocation>) {
     super();
     proto3.util.initPartial(data, this);
@@ -6668,6 +6913,7 @@ export class TaskAllocation extends Message<TaskAllocation> {
     { no: 8, name: "task_config", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 9, name: "task_checks", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 10, name: "task_on_unhealthy", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 11, name: "task_artifacts", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): TaskAllocation {

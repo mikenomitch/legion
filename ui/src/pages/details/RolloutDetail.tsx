@@ -3,6 +3,7 @@ import { For, Show, createMemo, createResource, createSignal } from 'solid-js'
 import { DetailBadge, DetailSection, detailDangerButtonClass, detailPrimaryButtonClass } from '../../components/DetailPrimitives'
 import { managerClient } from '../../grpcClient'
 import { formatDate } from '../../utils/format'
+import { artifactProgressPercent, artifactStateTone, parseArtifactStates } from '../../utils/jobspec'
 
 const isRolloutDone = (status: string) => {
   const normalizedStatus = status.toLowerCase()
@@ -97,17 +98,41 @@ export default function RolloutDetail() {
               <DetailSection title="Allocation health">
                 <div class="grid gap-2 md:grid-cols-2 xl:grid-cols-3">
                   <For each={data()!.status.groups.flatMap((group) => group.allocations)}>
-                    {(allocation) => (
-                      <div class="rounded border border-neutral-200 p-3 dark:border-neutral-700">
-                        <div class="font-semibold">Allocation #{String(allocation.allocationId)}</div>
-                        <p class="text-xs text-neutral-500">{allocation.role} · {allocation.status}</p>
-                        <p class="text-xs text-neutral-500">Worker <A class="underline" href={`/nodes/${encodeURIComponent(allocation.nodeId)}`}>{allocation.nodeId}</A></p>
-                        <div class="mt-2 flex gap-2 text-[11px] uppercase">
-                          <DetailBadge tone={allocation.nodeHealthy ? 'success' : 'danger'}>Worker {allocation.nodeHealthy ? 'healthy' : 'unhealthy'}</DetailBadge>
-                          <DetailBadge tone={allocation.allocationHealthy ? 'success' : 'danger'}>Alloc {allocation.allocationHealthy ? 'healthy' : 'unhealthy'}</DetailBadge>
+                    {(allocation) => {
+                      const artifactRows = parseArtifactStates(allocation.artifactStates)
+                      const stagedCount = artifactRows.filter((row) => row.state === 'staged').length
+                      const staging = artifactRows.length > 0 && stagedCount < artifactRows.length
+                      return (
+                        <div class="rounded border border-neutral-200 p-3 dark:border-neutral-700">
+                          <div class="font-semibold">Allocation #{String(allocation.allocationId)}</div>
+                          <p class="text-xs text-neutral-500">{allocation.role} · {allocation.status}</p>
+                          <p class="text-xs text-neutral-500">Worker <A class="underline" href={`/nodes/${encodeURIComponent(allocation.nodeId)}`}>{allocation.nodeId}</A></p>
+                          <div class="mt-2 flex gap-2 text-[11px] uppercase">
+                            <DetailBadge tone={allocation.nodeHealthy ? 'success' : 'danger'}>Worker {allocation.nodeHealthy ? 'healthy' : 'unhealthy'}</DetailBadge>
+                            <DetailBadge tone={allocation.allocationHealthy ? 'success' : 'danger'}>Alloc {allocation.allocationHealthy ? 'healthy' : 'unhealthy'}</DetailBadge>
+                          </div>
+                          <Show when={staging}>
+                            <div class="mt-2 border-t border-neutral-200 pt-2 text-xs dark:border-neutral-700">
+                              <p class="font-semibold text-amber-700 dark:text-amber-300">staging artifacts: {stagedCount}/{artifactRows.length} staged</p>
+                              <ul class="mt-1 space-y-1">
+                                <For each={artifactRows}>{(artifact) => (
+                                  <li class="flex flex-wrap items-center gap-2">
+                                    <DetailBadge tone={artifactStateTone(artifact.state)}>{artifact.state}</DetailBadge>
+                                    <span class="max-w-[200px] truncate font-mono" title={artifact.source}>{artifact.name ?? artifact.source}</span>
+                                    <Show when={artifactProgressPercent(artifact) !== undefined}>
+                                      <span class="text-neutral-500">{artifactProgressPercent(artifact)}%</span>
+                                    </Show>
+                                    <Show when={artifact.state === 'failed' && artifact.error}>
+                                      <span class="text-rose-500">{artifact.error}</span>
+                                    </Show>
+                                  </li>
+                                )}</For>
+                              </ul>
+                            </div>
+                          </Show>
                         </div>
-                      </div>
-                    )}
+                      )
+                    }}
                   </For>
                 </div>
               </DetailSection>
