@@ -15,7 +15,6 @@
   persistence: {
     type: "local_disk",
     streaming: {
-      litestreamBinary: "litestream",
       replicaUrl: "",
       syncInterval: "1s",
       lease: {
