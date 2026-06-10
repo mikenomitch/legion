@@ -148,8 +148,12 @@ several edges of a job, the strongest action wins:
 Actions:
 
 - `none`: desired state is re-rendered and stored; nothing is scheduled.
-- `restart`: re-render, then enqueue a `job_update` eval (allocations are
-  replaced in place).
+- `restart`: re-render, then enqueue a `job_update` eval. This re-evaluates the
+  **whole job's** allocations against the new config — not just the task that
+  owns the changed key. A watched-key restart therefore replaces every task's
+  allocations in the job (in place, without a staged rollout), so co-located
+  tasks pick up the change together. Use `rollout` if you need staged
+  progression instead.
 - `rollout`: re-render, then create a rollout for the new config revision
   (manual progression is honored) and enqueue `rollout_tick`.
 - `fail`: mark the job failed (see below). Typically used as `onDelete`.
@@ -183,22 +187,29 @@ When the resolved action is `fail` (usually `onDelete: fail` and the key was
 deleted):
 
 - The job status becomes `failed` (visible in `job list` / `job info`).
-- Every allocation of the job has its status stamped
+- The **impacted** allocations have their status stamped
   `failed:missing_kv_dependency` (visible in the ledger, the UI, and
-  state-store queries). The allocations are *not* torn down and nothing is
-  rescheduled — the job sits failed with the stale config; no restart or
-  rollout storm.
+  state-store queries). Scope is precise: a missing *injection* key only stamps
+  the allocations of the task(s) that depend on it — sibling tasks in the same
+  job are left untouched. A missing *legacy `$key`* reference is not scoped to
+  one task (it makes the whole rendered config unresolvable), so it stamps
+  every allocation of the job. Either way the allocations are *not* torn down
+  and nothing is rescheduled — the job sits failed with the stale config; no
+  restart or rollout storm.
 - The KV dependency edges are retained.
 
 Recovery paths:
 
 - Put the missing key back: the put resolves through the edge's `onChange`;
-  a `restart` or `rollout` action re-renders the config, flips the job
-  status back to `done`, and replaces the failed allocations. (With
-  `onChange: none` nothing is scheduled — the job stays failed until a
-  restart/rollout-triggering change or a manual update.)
-- Or submit an updated jobspec (`job run`), which goes through the normal
-  update flow.
+  a `restart` or `rollout` action re-renders the config, clears the
+  `failed:missing_kv_dependency` stamps, flips the job status back to `done`,
+  and replaces the failed allocations.
+- `onChange: none` does **not** auto-recover: a put re-renders and stores the
+  desired config but schedules nothing, so the job stays `failed` with its
+  stamped allocations until an explicit action.
+- A manual `job run` (resubmitting the jobspec) is the recovery path for the
+  `onChange: none` case — and works generally: it clears the failed status and
+  re-runs the job through the normal submit/eval flow with the latest KV state.
 
 ### Capability matrix
 

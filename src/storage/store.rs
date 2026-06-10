@@ -1832,25 +1832,75 @@ impl Store {
     }
 
     /// Mark a job failed because a required KV dependency vanished
-    /// (`onDelete: fail`). The job status becomes `failed` and every live
-    /// allocation status is stamped `failed:<reason>` so the diagnostic is
-    /// visible in `job list`, the ledger, and state-store queries. The
-    /// allocation rows are retained (the workload is not torn down and no
+    /// (`onDelete: fail`). The job status becomes `failed` and the impacted
+    /// allocations' status is stamped `failed:<reason>` so the diagnostic is
+    /// visible in `job list`, the ledger, and state-store queries.
+    ///
+    /// Scope: when `impacted_tasks` is `Some`, only allocations whose task
+    /// config is one of those (by name, across all of the job's config
+    /// versions) are stamped — a missing injection key impacts just the tasks
+    /// that depend on it, leaving sibling tasks' allocations untouched. When
+    /// `None` (a legacy `$key` reference, which is not scoped to one task and
+    /// makes the whole config unrenderable), every allocation of the job is
+    /// stamped.
+    ///
+    /// The allocation rows are retained (the workload is not torn down and no
     /// reschedule storm starts); a later KV put that triggers a restart or
     /// rollout recovers the job (see `docs/kv-store.md`).
     #[instrument(err, skip(self))]
-    pub fn mark_job_failed_for_kv(&self, job_id: &str, reason: &str) -> R<()> {
+    pub fn mark_job_failed_for_kv(
+        &self,
+        job_id: &str,
+        reason: &str,
+        impacted_tasks: Option<&[String]>,
+    ) -> R<()> {
         let mut conn = self.write_connection()?;
         let tx = conn.transaction()?;
         tx.execute("UPDATE job SET status = 'failed' WHERE id = ?;", [job_id])?;
-        tx.execute(
-            "UPDATE allocation SET status = ?1
-             WHERE job_config_id IN (SELECT id FROM job_config WHERE job_id = ?2);",
-            (format!("failed:{reason}"), job_id),
-        )?;
+        let stamp = format!("failed:{reason}");
+        match impacted_tasks {
+            Some(tasks) if !tasks.is_empty() => {
+                // Build an IN (...) list of task-config ids for the named tasks
+                // across every config version of the job. rusqlite has no array
+                // binding, so bind the names positionally.
+                let placeholders = std::iter::repeat_n("?", tasks.len())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let sql = format!(
+                    "UPDATE allocation SET status = ?1 \
+                     WHERE task_config_id IN (\
+                         SELECT id FROM task_config WHERE job_id = ?2 AND name IN ({placeholders})\
+                     );"
+                );
+                let mut params: Vec<&dyn rusqlite::ToSql> = vec![&stamp, &job_id];
+                for task in tasks {
+                    params.push(task);
+                }
+                tx.execute(&sql, params.as_slice())?;
+            }
+            _ => {
+                tx.execute(
+                    "UPDATE allocation SET status = ?1 \
+                     WHERE job_config_id IN (SELECT id FROM job_config WHERE job_id = ?2);",
+                    (stamp.as_str(), job_id),
+                )?;
+            }
+        }
         tx.commit()?;
         self.refresh_read_model()?;
         Ok(())
+    }
+
+    /// Look up a job's status by its job id (== name). Returns `None` when the
+    /// job row is absent.
+    pub fn job_status_by_id(&self, job_id: &str) -> R<Option<String>> {
+        let conn = self.read_connection()?;
+        let status: Option<String> = conn
+            .query_row("SELECT status FROM job WHERE id = ?;", [job_id], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        Ok(status)
     }
 
     /// Clear a `failed` job status (back to `done`) when a KV-triggered
@@ -2959,6 +3009,29 @@ impl Store {
 
         match existing {
             Some(existing) => {
+                // The slot id space is EXCLUSIVE: a row carrying this derived id
+                // must be this very (job, group, task, slot) slot. If a row with
+                // the same id exists but belongs to a different job/group/slot or
+                // a different mode (e.g. a keyed instance some caller created with
+                // `--id otherjob-default-0`), adopting it would let two jobs share
+                // one instance row, storage handle, and workload-identity subject.
+                // Refuse — never hijack. (Cross-job collisions are prevented at
+                // create time too, see `keyed_id_collides_with_slot_pattern`, so
+                // this is defence in depth.)
+                if existing.mode != InstanceMode::Slot
+                    || existing.job_id != job_id
+                    || existing.group != group
+                    || existing.slot_index != Some(slot)
+                {
+                    bail!(StorageError::Conflict {
+                        message: format!(
+                            "slot instance id {instance_id} is already owned by a different \
+                             instance (job {}, group {}, mode {:?}, slot {:?}); slot ids are \
+                             exclusive to their (job, group, slot) and cannot be adopted",
+                            existing.job_id, existing.group, existing.mode, existing.slot_index
+                        ),
+                    });
+                }
                 // Re-activation handles both reschedule (Rescheduling -> Active
                 // via the caller's binding update) and scale-out of a retained
                 // Terminated slot: the same id and storage handle come back.
@@ -3963,6 +4036,38 @@ impl Store {
         Ok(found.is_some())
     }
 
+    /// Whether a caller-supplied keyed id structurally aliases a slot id of a
+    /// slot-mode stateful task in the SAME job. Slot ids are the deterministic
+    /// `{job_id}-{group}-{slot}` pattern and the slot id space is exclusive, so
+    /// a keyed id that lands on `job-group-N` for some slot task with
+    /// `count.num > N` would, once that slot materializes, fight over one
+    /// instance row. We forbid it at create time so the two id spaces stay
+    /// disjoint within a job (cross-job aliasing is additionally caught when
+    /// the slot binds, see `assign_stateful_instance_tx`). Checks every job
+    /// config version's slot tasks so a not-yet-current (or future) slot can't
+    /// be aliased either.
+    fn keyed_id_collides_with_slot_pattern_tx(
+        tx: &Transaction<'_>,
+        job_id: &str,
+        id: &str,
+    ) -> R<bool> {
+        let mut stmt = tx.prepare(
+            "SELECT DISTINCT group_name, count FROM task_config \
+             WHERE job_id = ?1 AND stateful IS NOT NULL \
+             AND json_extract(stateful, '$.mode') = 'slot';",
+        )?;
+        let slot_tasks: Vec<(String, i64)> =
+            Self::collect_rows(stmt.query_map([job_id], |row| Ok((row.get(0)?, row.get(1)?)))?)?;
+        for (group, count) in slot_tasks {
+            for slot in 0..count.max(0) as u32 {
+                if slot_instance_id(job_id, &group, slot) == id {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
     /// Insert one pending keyed instance row inside `tx`, enforcing the
     /// never-recycle collision rule. `requested_id: None` mints
     /// `{task}-{16 alphanumerics}`. Shared by the single and batch create
@@ -3983,6 +4088,15 @@ impl Store {
                         message: format!(
                             "instance id {id} already exists (keyed ids are never recycled, \
                              including stopped and destroyed ones); choose a different id"
+                        ),
+                    });
+                }
+                if Self::keyed_id_collides_with_slot_pattern_tx(tx, job_id, id)? {
+                    bail!(StorageError::Conflict {
+                        message: format!(
+                            "instance id {id} collides with the reserved slot-id pattern \
+                             {{job}}-{{group}}-{{slot}} of a slot-mode stateful task in job \
+                             {job_id}; slot and keyed id spaces are disjoint within a job"
                         ),
                     });
                 }
@@ -7727,6 +7841,75 @@ mod tests {
             err.to_string().contains("CreateInstance"),
             "error should point at the management API: {err}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn keyed_instance_cannot_hijack_another_jobs_slot_id() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "active"))?;
+
+        // Job A owns slot ids `job-a-default-{0,1,2}`.
+        let job_a = "job-a";
+        submit_job(&store, job_a, vec![stateful_slot_task("db", 3, true)])?;
+        let slot_task = task_id_for(&store, "db", job_a)?;
+
+        // Job B is a keyed sandbox job. A caller tries to create a keyed
+        // instance whose id is exactly job A's slot-0 id.
+        let job_b = "job-b";
+        submit_job(&store, job_b, vec![stateful_keyed_task("sandbox", true)])?;
+        let hijack_id = slot_instance_id(job_a, "default", 0); // "job-a-default-0"
+        let created = store.create_keyed_instance(job_b, "default", "sandbox", Some(&hijack_id))?;
+
+        // Job A's slot-0 placement must NOT adopt job B's row — it is a hard
+        // error, because the slot id space is exclusive.
+        let err = store
+            .place_alloc("node-a", slot_task)
+            .expect_err("slot placement must refuse to adopt a foreign row");
+        assert!(
+            err.to_string().contains("exclusive"),
+            "error should explain slot ids are exclusive: {err}"
+        );
+
+        // Job B's row is untouched: still keyed, still owned by job B.
+        let row = store.get_instance(&hijack_id)?.context("job B row")?;
+        assert_eq!(row.job_id, job_b);
+        assert_eq!(row.mode, InstanceMode::Keyed);
+        assert_eq!(row.created_at, created.created_at);
+
+        Ok(())
+    }
+
+    #[test]
+    fn keyed_create_rejects_id_aliasing_same_job_slot_pattern() -> R<()> {
+        let store = setup_store()?;
+        // One job with both a slot task (slots 0,1) and a keyed task.
+        let job_id = "mixed";
+        submit_job(
+            &store,
+            job_id,
+            vec![
+                stateful_slot_task("db", 2, true),
+                TaskConfig {
+                    group: "sandboxes".into(),
+                    ..stateful_keyed_task("sandbox", true)
+                },
+            ],
+        )?;
+
+        // A keyed id matching the slot pattern of the slot task is rejected.
+        let colliding = slot_instance_id(job_id, "default", 1); // "mixed-default-1"
+        let err = store
+            .create_keyed_instance(job_id, "sandboxes", "sandbox", Some(&colliding))
+            .expect_err("keyed id aliasing a slot id must be rejected");
+        assert!(
+            err.to_string().contains("slot-id pattern"),
+            "error should mention the reserved slot-id pattern: {err}"
+        );
+
+        // A slot index beyond the pool (slot 2) is NOT a slot id, so it's fine.
+        let ok_id = slot_instance_id(job_id, "default", 2); // "mixed-default-2"
+        store.create_keyed_instance(job_id, "sandboxes", "sandbox", Some(&ok_id))?;
         Ok(())
     }
 

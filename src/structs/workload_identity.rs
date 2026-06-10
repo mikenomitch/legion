@@ -140,9 +140,14 @@ impl WorkloadIdentity {
     pub fn validate(&self, task_name: &str, stateful: bool) -> R<()> {
         let scope = format!("task {task_name} identity {:?}", self.name);
 
-        if self.name.trim().is_empty() {
-            bail!("task {task_name} declares an identity with an empty name");
-        }
+        // The name is used as the issuance-RPC selector, in env-file fallback
+        // paths (`.legion/identity/<alloc>/<name>/token`), and in delivery
+        // directories. A permissive name (`.`/`/`/`..`) would let a jobspec
+        // escape the task directory via path traversal, so enforce a strict
+        // charset at admission (the worker re-checks before any path join as
+        // defense in depth — see `validate_identity_name`).
+        validate_identity_name(&self.name)
+            .with_context(|| format!("task {task_name} declares an invalid identity name"))?;
 
         if self.audience.is_empty() {
             bail!("{scope} must declare at least one audience");
@@ -192,6 +197,45 @@ impl WorkloadIdentity {
 
         Ok(())
     }
+}
+
+/// Maximum length of an identity `name`.
+pub const MAX_IDENTITY_NAME_LEN: usize = 64;
+
+/// Validate an identity `name` against a strict charset: `[A-Za-z0-9_-]{1,64}`.
+///
+/// The name flows into a filesystem path (the env-delivery backing file at
+/// `.legion/identity/<alloc>/<name>/token` and per-identity delivery
+/// directories) and into the issuance-RPC selector. Allowing `.`, `/`, or `..`
+/// would permit path traversal out of the task directory, so reject anything
+/// outside the allow-list. Enforced at admission and re-checked on the worker
+/// before any path join (defense in depth).
+pub fn validate_identity_name(name: &str) -> R<()> {
+    if name.is_empty() {
+        bail!("identity name must not be empty");
+    }
+    if name.len() > MAX_IDENTITY_NAME_LEN {
+        bail!("identity name {name:?} is too long (max {MAX_IDENTITY_NAME_LEN} characters)");
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        bail!(
+            "identity name {name:?} is invalid; names must match [A-Za-z0-9_-] \
+             (no '.', '/', '..', whitespace, or other characters) to avoid \
+             filesystem path traversal"
+        );
+    }
+    Ok(())
+}
+
+/// Whether a claim key is one the signer must never let `extra_claims`
+/// override: a registered/reserved JWT claim or a key in the `legion.io/*`
+/// namespace. Admission already rejects these, but the signing sink re-checks
+/// so a derived claim can never be forged even if admission were bypassed.
+pub fn is_protected_claim_key(key: &str) -> bool {
+    RESERVED_CLAIMS.contains(&key) || key.starts_with(LEGION_CLAIM_PREFIX)
 }
 
 /// Reject `extra_claims` keys that would forge a trust-critical claim.
@@ -647,6 +691,48 @@ mod tests {
         id.ttl = Some("15".into()); // missing unit
         let err = id.validate("api", false).unwrap_err();
         assert!(err.to_string().contains("ttl"));
+    }
+
+    #[test]
+    fn identity_name_rejects_path_traversal_and_bad_charset() {
+        for bad in [
+            "../evil",
+            "a/b",
+            "..",
+            "",
+            &"x".repeat(65),
+            "has space",
+            "a.b",
+        ] {
+            assert!(
+                validate_identity_name(bad).is_err(),
+                "expected {bad:?} to be rejected"
+            );
+            let mut id = identity("aws");
+            id.name = bad.to_string();
+            assert!(
+                id.validate("api", false).is_err(),
+                "expected identity name {bad:?} to be rejected at admission"
+            );
+        }
+    }
+
+    #[test]
+    fn identity_name_accepts_valid_charset() {
+        for good in [
+            "aws",
+            "vault-prod",
+            "gcp_west",
+            "a",
+            &"x".repeat(64),
+            "legion",
+        ] {
+            validate_identity_name(good).unwrap_or_else(|e| panic!("{good:?}: {e}"));
+            let mut id = identity("aws");
+            id.name = good.to_string();
+            id.validate("api", false)
+                .unwrap_or_else(|e| panic!("{good:?}: {e}"));
+        }
     }
 
     #[test]

@@ -42,25 +42,41 @@ the manager's state store (`instance` table) and outlives any allocation.
 
 - **`keyed`** (sandbox / dispatch style) — implemented. Instances are created
   on demand via the management API (`legion instance create` /
-  `CreateInstance`), each with a unique, **never-recycled** id, so a new
-  sandbox can never inherit a dead one's identity or persisted state.
+  `CreateInstance`), each with a unique id that is **never recycled for the
+  lifetime of the job**, so a new sandbox can never inherit a dead one's
+  identity or persisted state while the job lives (destroying the job clears
+  its instance history; see the [Id rules](#id-rules)).
   keyed tasks define no `count` (a parse-time error): the set of live instances
   (zero instances = zero allocations). See
   [Keyed Mode: the Management API](#keyed-mode-the-management-api).
 
+An instance has **at most one live allocation at a time, by construction**:
+every placement binds inside the allocation-insert transaction, and the one
+rollout strategy that would run two live allocations concurrently —
+`createFirst` (replace-before-stop) — is rejected at job admission for stateful
+tasks (see [Rollouts and the single-live-allocation
+invariant](#rollouts-and-the-single-live-allocation-invariant)).
+
 ### Instance lifecycle
 
 ```
-pending -> active -> rescheduling -> active -> ... -> terminated
+pending -> active -> rescheduling -> active -> ... -> stopped/terminated
+                          ^                              │
+                          └────── start (keyed) ─────────┘  (stopped only)
 ```
 
 - `pending` — row exists, never placed.
 - `active` — a live allocation fulfills it (`current_alloc_id` points at it).
 - `rescheduling` — its allocation died; the replacement will reuse the same
   instance id and storage handle.
-- `terminated` — no longer desired (scaled in or job stopped). **Rows are
-  retained**: slot rows so a later scale-out re-materializes the same id,
-  keyed rows forever (the never-recycle guarantee).
+- `stopped` — paused (keyed only): the allocation was stopped but the row AND
+  storage handle are retained, so `legion instance start <id>` revives the
+  same identity with its data. A job stop puts keyed instances here. Not part
+  of the scheduler's desired set until explicitly started.
+- `terminated` — no longer desired (slot scale-in, keyed destroy, or job
+  stop for slot rows). **Rows are retained**: slot rows so a later scale-out
+  re-materializes the same id, keyed tombstones so a destroyed id is never
+  recycled for the lifetime of the job.
 
 ## Job Spec Reference
 
@@ -74,6 +90,7 @@ pending -> active -> rescheduling -> active -> ... -> terminated
     stateful: {
       mode: 'slot',              // 'slot' | 'keyed'
       // idSource: 'caller',     // keyed only: 'caller' | 'uuid'
+      // initialInstances: ['user-1', 'user-2'],  // keyed only: seed list
       storage: {                 // optional persistent-state contract
         path: '/var/lib/db',     // absolute path the state is exposed at
         retainOnScaleIn: true,   // default true (K8s PVC-style retention)
@@ -95,10 +112,31 @@ Validation rules (enforced at `job validate` / submit time):
   instance cardinality is driven by the instance management API (legion
   instance create/destroy), not the job spec`. There is no fixed pool to size:
   the set of live instances *is* the cardinality.
+- `initialInstances` is valid only in keyed mode; each id must match
+  `[A-Za-z0-9._-]{1,128}` and the list must contain no duplicates.
 - `storage.path` must be a non-empty absolute path.
 - At most one slot-mode stateful task per group (slot ids are derived from
   `(job, group, slot)`). Multiple keyed tasks per group are fine — their ids
   are explicit keys, not ordinals.
+
+### Seed list (`initialInstances`) semantics
+
+`stateful.initialInstances` (keyed mode only) is a **seed list, not a
+reconciled desired set**. On every submit, after the config is persisted and
+before placement is evaluated, the manager ensures each listed id exists:
+
+- Ids that have **never existed** are created (`pending`) and flow into the
+  submit's normal placement eval.
+- Ids that already exist in **any** state — live, `stopped`, or a `terminated`
+  tombstone (even under another job) — are skipped silently. Resubmits are
+  therefore idempotent, and a deliberately **destroyed id is never
+  resurrected** by appearing in the seed list.
+
+Because it is a seed and not a desired set, **removing** an id from the list on
+a resubmit does *not* stop or destroy that instance — only `legion instance
+stop`/`destroy` (or a job stop/destroy) changes a live instance's lifecycle.
+Think of it as "create these on first run if they don't already exist", not
+"the set of instances that should exist".
 
 ## Environment Variables
 
@@ -135,48 +173,82 @@ When a slot's allocation dies (process failure, node loss, drain):
 Config updates behave the same way: instances are keyed by *job* (not job
 config version), so replica N keeps its identity and storage across deploys.
 
+## Rollouts and the single-live-allocation invariant
+
+The "at most one live allocation per instance" invariant must hold even during
+a rollout. The only rollout strategy that would break it is `createFirst`
+(replace-before-stop), which starts the incoming allocation *before* stopping
+the outgoing one — for a stateful task that means two live allocations sharing
+one instance id, storage handle, and workload-identity subject at the same
+time. Legion has no fencing to make that safe (see
+[stateful-vs-nomad-k8s.md](stateful-vs-nomad-k8s.md)).
+
+Therefore **a stateful task may not use a `createFirst` rollout**: the combo is
+rejected at job admission with an actionable error pointing at this invariant.
+Stateful groups must use the default stop-then-start (`destroyFirst`)
+replacement, which guarantees the single-live-allocation invariant by
+construction. (This is a temporary restriction until instance fencing exists.)
+
 ## Keyed Mode: the Management API
 
 Keyed mode is the sandbox/dispatch primitive: 0..thousands of long-lived
 logical instances per (job, group, task), created and destroyed on demand,
-each with a unique id that is **never recycled**.
+each with a unique id that is **never recycled for the lifetime of the job**.
 
 ### Lifecycle
 
 ```
 CreateInstance ──> pending ──placed──> active ──alloc dies──> rescheduling
-                                         ^                          │
-                                         └────replacement re-binds──┘
-                          DestroyInstance / job stop ──> terminated (tombstone, forever)
+                     ^                   │ ^                        │
+   StartInstance ────┘    StopInstance / │ └──replacement re-binds──┘
+   (from stopped)         job stop       v
+                                      stopped ──StopInstance/DestroyInstance──┐
+                                         │                                     v
+                          DestroyInstance / job destroy ──> terminated (tombstone,
+                                                             for the job's lifetime)
 ```
 
 - **Create** registers the instance (state `pending`) and enqueues placement.
   The scheduler derives a keyed task's desired allocation count from its live
   (pending/active/rescheduling) instances — keyed tasks define no `count`, and a
-  keyed task with zero instances runs zero allocations.
+  keyed task with zero instances runs zero allocations. Stopped instances are
+  NOT in the desired set.
 - **Placement** binds the new allocation to an unbound live instance inside
   the same transaction that inserts the allocation (the same choke point slot
   mode uses), and mints the storage handle on first placement if the task
   declares `stateful.storage`.
 - **Failure** of the allocation moves the instance to `rescheduling`; the
   replacement allocation re-binds the *same* instance id and storage handle.
-  Allocation churn never terminates a keyed instance.
+  Allocation churn never terminates or stops a keyed instance.
+- **Stop** (`StopInstance` / `legion instance stop`) pauses the instance:
+  stops its allocation through the normal allocation-stop path and transitions
+  the row to `stopped`, **retaining the row and its storage handle**. The id
+  stays owned (creates still collide) and the instance is not scheduled until
+  started. See [Stopping and starting](#stopping-and-starting).
+- **Start** (`StartInstance` / `legion instance start`) reverses a stop:
+  `stopped -> pending`, re-placed against the same id and retained handle.
 - **Destroy** stops the instance's allocation through the normal
-  allocation-stop path, **drops the storage handle**, and retains the row
-  forever as a `terminated` tombstone.
+  allocation-stop path, **drops the storage handle**, and retains the row as a
+  `terminated` tombstone for the lifetime of the job (destroying the job clears
+  it).
 
 ### API / CLI
 
 Four manager RPCs (`CreateInstance`, `DestroyInstance`, `ListInstances`,
 `GetInstance` — see `proto/legion.proto` for the authoritative contract),
 surfaced as `legion instance ...` and as MCP tools
-(`legion_instance_create/destroy/list/get`):
+(`legion_instance_create/destroy/stop/start/list/get`):
 
 ```bash
 # create with an explicit key (idSource 'caller' requires one; with 'uuid'
 # or unset the server mints an id when --id is omitted)
 legion instance create sandbox-demo --id user-42 -j
 # => { "ok": true, "data": { "instanceId": "user-42", "deduplicated": false } }
+
+# Batch create: repeated --id flags and/or --count switch to the atomic
+# CreateInstances RPC (all-or-nothing). This creates user-a, user-b, plus 3
+# server-minted ids — 5 instances, or none if any id collides.
+legion instance create sandbox-demo --id a --id b --count 3 -j
 
 legion instance list sandbox-demo -j
 # => { "ok": true, "data": [ { "instanceId": "user-42", "jobId": "sandbox-demo",
@@ -186,15 +258,67 @@ legion instance list sandbox-demo -j
 
 legion instance get user-42 -j
 
-legion instance destroy user-42 -j
+# Pause (reversible): stop the allocation, retain row + storage handle
+legion instance stop user-42 -j        # state -> "stopped"
+# Resume: re-place against the same id and retained handle
+legion instance start user-42 -j       # state -> "pending" -> "active"
+
+legion instance destroy user-42 -j     # forever (tombstone, handle dropped)
 # => { "ok": true, "data": { "message": "Destroyed instance user-42",
 #      "deduplicated": false } }
 ```
 
-`create` and `destroy` accept `--idempotency-key` and report `deduplicated`,
-like the other mutating RPCs. Destroying an already-terminated instance
-succeeds as a no-op. `--group`/`--task` are only needed when the job declares
+`create`, `destroy`, `stop`, and `start` accept `--idempotency-key` and report
+`deduplicated`, like the other mutating RPCs. Destroying an already-terminated
+instance, stopping an already-stopped one, and starting an already-live one all
+succeed as no-ops. `--group`/`--task` are only needed when the job declares
 more than one keyed task; ambiguity is rejected, never guessed.
+
+### Stopping and starting
+
+`stop` and `start` (keyed mode only — slot lifecycles are owned by the
+scheduler via `count.num`) make a keyed instance a *reversible pause*, distinct
+from the irreversible `destroy`:
+
+| | `stop` | `destroy` |
+| --- | --- | --- |
+| Row | retained (`stopped`) | retained (`terminated` tombstone) |
+| Storage handle | **retained** | **dropped** |
+| Id | stays owned (creates collide) | stays owned for the job's lifetime |
+| Reversible | yes, via `start` | no — create a new id instead |
+| In desired set | no (not scheduled until started) | no, ever |
+
+- **Stop** removes the instance's allocation in the same transaction that flips
+  the row to `stopped`, so the release hook can never race it back to
+  `rescheduling`. While stopped the instance is not part of the keyed task's
+  desired count: resubmits, config updates, and reschedules will not resurrect
+  it. Only `start` does.
+- **Start** transitions `stopped -> pending` and enqueues placement; the new
+  allocation re-binds the same instance id and its retained storage handle, so
+  the revived sandbox is *the same* logical instance with its data.
+- **Terminated** (destroyed) instances cannot be stopped or started — the id is
+  tombstoned for the job's lifetime; create a new id instead.
+
+Revival walkthrough (stop, then bring it back):
+
+```bash
+legion instance create sandbox-demo --id user-42   # active
+legion instance stop user-42                        # paused, handle kept
+legion instance get user-42 -j                      # state: "stopped"
+legion instance start user-42                        # re-placed, same handle
+legion instance get user-42 -j                      # state: "active" again
+
+# A job stop is a bulk pause for keyed instances:
+legion job stop sandbox-demo                         # keyed -> stopped (handles kept)
+legion job run configs/jobs/sandbox-demo.jsonnet     # job revived...
+legion instance list sandbox-demo -j                 # ...but instances still "stopped"
+legion instance start user-42                        # each one revived explicitly
+```
+
+Note that resubmitting a stopped job (`job run`) clears the *job's* stopped
+status but **does not** auto-start its stopped keyed instances — each needs an
+explicit `instance start`. This keeps revival intentional (you choose which
+sandboxes come back).
 
 ### Id rules
 
@@ -203,10 +327,20 @@ more than one keyed task; ambiguity is rejected, never guessed.
 - `stateful.idSource` declares the *default* source: `'caller'` makes the id
   required on create; `'uuid'` (or unset) lets the server mint one. A valid
   caller-supplied id is always honored regardless of `idSource`.
-- Ids are unique cluster-wide and **never recycled**: creating an id that
-  collides with any existing row — including a `terminated` tombstone — is
-  rejected (`AlreadyExists`). A dead sandbox's identity (and so its WI `sub`)
-  can never be handed to a new one.
+- Ids are unique within the job and **never recycled for the lifetime of the
+  job**: creating an id that collides with any existing row of the job —
+  including a `stopped` instance or a `terminated` tombstone — is rejected
+  (`AlreadyExists`). So a dead sandbox's identity (and its WI `sub`) can never
+  be handed to a new one while the job lives. Destroying the whole job
+  (`job destroy`) cascades and clears its instance history (rows are deleted
+  with the job, see [Scale-In / Scale-Out Retention](#scale-in--scale-out-retention)),
+  after which an id from that job is free again — the never-recycle guarantee
+  is scoped to the job's lifetime, not eternal.
+- Keyed ids may not collide with the reserved slot-id pattern
+  `{job}-{group}-{slot}` of a slot-mode stateful task **in the same job**: the
+  slot and keyed id spaces are kept disjoint so a keyed id can never adopt, or
+  be adopted by, a slot placement (a create supplying such an id is rejected,
+  and a slot binding never adopts a foreign row).
 
 ### Storage on destroy
 
@@ -214,8 +348,13 @@ Destroy always drops the storage handle. This is deliberately the opposite of
 slot scale-in (which retains storage by default for a later scale-out): a
 slot id will run again and must reattach its data; a destroyed keyed id can
 never run again, so letting its state remain attachable would be a leak.
-Stopping the whole job likewise terminates keyed instances and drops their
-handles (slot handles are retained).
+
+Stopping the whole job (`job stop`) is **not** a destroy: keyed instances are
+moved to `stopped` (not `terminated`) with their storage handles **retained**,
+so `job run` + `instance start` revives them with their data. Slot instances
+become `terminated` with handles retained too, so a later `job run`
+re-materializes the same ordinal identities. Only `instance destroy` / `job
+destroy` drops keyed handles.
 
 ### Count interaction
 
@@ -235,11 +374,15 @@ config.
 - **Scale-out** (2 → 3): slot 2 is re-materialized with the **same instance
   id**, and a retained storage handle is reattached. If no handle was retained
   a fresh one is minted.
-- **Job stop**: all instances are terminated with rows retained. Slot
-  handles are retained too, so a later `job run` re-materializes the same
-  identities; keyed handles are dropped (terminated keyed ids never run
-  again — see [Storage on destroy](#storage-on-destroy)).
-- **Job destroy**: instance rows are deleted with the job.
+- **Job stop**: rows are retained for all instances. Slot instances become
+  `terminated` (handles retained), so a later `job run` re-materializes the
+  same identities. Keyed instances become `stopped` (handles retained), so
+  `job run` + `legion instance start <id>` revives each one with its data (see
+  [Stopping and starting](#stopping-and-starting)). A stop is a pause, not a
+  destroy.
+- **Job destroy**: instance rows are deleted with the job (FK cascade). This
+  is the only thing that clears a job's keyed-id history — the never-recycle
+  guarantee holds for the lifetime of the job, not beyond it.
 
 ## Storage Handle Contract
 
@@ -323,11 +466,12 @@ cargo run -- instance list sandbox-demo        # both active, distinct handles
 # `state query` to find the alloc) — the replacement re-binds user-42's id
 # and storage handle.
 
-# Destroy: allocation stops, handle dropped, id tombstoned forever
+# Destroy: allocation stops, handle dropped, id tombstoned for the job's life
 cargo run -- instance destroy user-42
 cargo run -- instance get user-42 -j           # state: "terminated", no handle
 cargo run -- instance create sandbox-demo --id user-42
-# => error: AlreadyExists — destroyed ids are never recycled
+# => error: AlreadyExists — destroyed ids are not recycled while the job lives
+#    (job destroy would clear the history and free the id)
 ```
 
 ## Stateless Jobs Are Unaffected

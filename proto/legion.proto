@@ -98,10 +98,15 @@ service Manager {
   // - InvalidArgument: no keyed task matches `group`/`task`, the match is
   //   ambiguous, the id has an invalid charset (must match
   //   `[A-Za-z0-9._-]{1,128}`), or `idSource: "caller"` and no id was given.
-  // - AlreadyExists: the id collides with ANY existing instance row,
-  //   including Stopped instances and Terminated tombstones — a stopped
-  //   instance still owns its id, and destroyed ids can never be created
-  //   again (the never-recycle guarantee).
+  // - AlreadyExists: the id collides with ANY existing instance row of the
+  //   job — including Stopped instances and Terminated tombstones — or
+  //   structurally aliases the reserved slot-id pattern
+  //   `{job}-{group}-{slot}` of a slot-mode stateful task in the same job
+  //   (the slot and keyed id spaces are kept disjoint so a keyed id can never
+  //   adopt, or be adopted by, a slot placement). A stopped instance still
+  //   owns its id, and a destroyed id can never be created again for the
+  //   lifetime of the job (the never-recycle guarantee; destroying the whole
+  //   job clears its instance history — see DestroyJob).
   rpc CreateInstance (CreateInstanceRequest) returns (CreateInstanceReply);
 
   // Creates several keyed-mode stateful instances in one atomic call and
@@ -143,12 +148,15 @@ service Manager {
   // Destroys a keyed-mode instance: stops its current allocation, drops its
   // storage handle, and marks the instance Terminated.
   //
-  // The instance row is retained forever as a tombstone so its id can never
-  // be re-created (never-recycle guarantee), and its workload identity `sub`
-  // can never be re-minted for a different workload. The storage handle is
-  // always dropped on destroy — a destroyed sandbox's state must not be
-  // reattachable. (This is intentionally stricter than slot-mode scale-in,
-  // which retains storage by default for a later scale-out.)
+  // The instance row is retained as a tombstone so its id can never be
+  // re-created — and its workload identity `sub` never re-minted for a
+  // different workload — for the lifetime of the job (the never-recycle
+  // guarantee). Destroying the whole job (DestroyJob) cascades and clears its
+  // instance history, after which the id is free again; a live job never
+  // recycles a destroyed id. The storage handle is always dropped on destroy
+  // — a destroyed sandbox's state must not be reattachable. (This is
+  // intentionally stricter than slot-mode scale-in, which retains storage by
+  // default for a later scale-out.)
   //
   // Destroying an already-Terminated instance succeeds as a no-op, so the
   // call is safe to retry even without an idempotency key.

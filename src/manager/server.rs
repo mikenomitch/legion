@@ -908,6 +908,42 @@ fn create_rollout_for_update(
     Ok(launch.is_manual)
 }
 
+/// Which allocations a `fail` action should stamp `failed:missing_kv_dependency`.
+///
+/// Injection edges name the task they belong to, so a missing key only impacts
+/// that task's allocations. Legacy `$key` jobspec references are positional and
+/// not scoped to one task config (a missing one can no longer render the whole
+/// config), so they fail the whole job. `WholeJob` therefore subsumes `Tasks`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum KvFailScope {
+    /// No edge resolved to `fail`.
+    None,
+    /// Only injection edges on these task names failed.
+    Tasks(std::collections::BTreeSet<String>),
+    /// A legacy `$` reference failed: the whole job is impacted.
+    WholeJob,
+}
+
+impl KvFailScope {
+    fn add_task(&mut self, task: &str) {
+        match self {
+            KvFailScope::None => {
+                let mut set = std::collections::BTreeSet::new();
+                set.insert(task.to_string());
+                *self = KvFailScope::Tasks(set);
+            }
+            KvFailScope::Tasks(set) => {
+                set.insert(task.to_string());
+            }
+            KvFailScope::WholeJob => {}
+        }
+    }
+
+    fn add_whole_job(&mut self) {
+        *self = KvFailScope::WholeJob;
+    }
+}
+
 /// Resolve the coalesced action for one job given a batch of KV changes
 /// (`key -> latest event was a delete`). Returns the strongest action across
 /// all matching dependency edges plus whether any matched edge saw a delete
@@ -927,9 +963,10 @@ fn resolve_job_kv_action(
     config: &JobConfig,
     job_refs: &[JobKvReference],
     changed: &HashMap<String, bool>,
-) -> R<(KvInjectionAction, bool)> {
+) -> R<(KvInjectionAction, bool, KvFailScope)> {
     let mut action = KvInjectionAction::None;
     let mut delete_matched = false;
+    let mut fail_scope = KvFailScope::None;
 
     for reference in job_refs {
         if reference.json_pointer.contains("/kvInjections/") {
@@ -940,6 +977,7 @@ fn resolve_job_kv_action(
         };
         let selected = if is_delete {
             delete_matched = true;
+            fail_scope.add_whole_job();
             KvInjectionAction::Fail
         } else {
             KvInjectionAction::Rollout
@@ -974,12 +1012,15 @@ fn resolve_job_kv_action(
                 } else {
                     policy.on_change
                 };
+                if selected == KvInjectionAction::Fail {
+                    fail_scope.add_task(&task.name);
+                }
                 action = strongest_action(action, selected);
             }
         }
     }
 
-    Ok((action, delete_matched))
+    Ok((action, delete_matched, fail_scope))
 }
 
 /// Apply a batch of KV changes to every job that references one of the
@@ -1028,17 +1069,44 @@ fn reconcile_kv_changes(store: &Store, changes: &[(String, bool)]) -> Result<(),
         if job_refs.is_empty() {
             continue;
         }
+
+        // A stopped job schedules nothing: a watched-key delete must NOT flip
+        // it to `failed`, and a put must NOT re-place its (gone) allocations.
+        // We still refresh the stored rendered config below for non-stopped
+        // jobs; for a stopped one we skip entirely — there are no allocations
+        // to act on and the config is re-rendered on the next `job run`.
+        let job_status = store
+            .job_status_by_id(&job_id)
+            .map_err(|e| map_store_error("Error loading job status", e))?;
+        if job_status.as_deref() == Some("stopped") {
+            debug!(
+                job_id = %job_id,
+                "Skipping KV reconcile for stopped job"
+            );
+            continue;
+        }
+
         let current_config = store
             .get_job_config_by_id(&job_config_id)
             .map_err(|e| map_store_error("Error loading job config", e))?;
 
-        let (action, delete_matched) =
+        let (action, delete_matched, fail_scope) =
             resolve_job_kv_action(store, &current_config, &job_refs, &changed)
                 .map_err(|e| map_store_error("Error resolving kv change action", e))?;
 
         if action == KvInjectionAction::Fail {
+            let impacted_tasks = match &fail_scope {
+                // Defensive: an action of Fail always sets a scope. Treat an
+                // unexpected None as whole-job rather than stamping nothing.
+                KvFailScope::None | KvFailScope::WholeJob => None,
+                KvFailScope::Tasks(tasks) => Some(tasks.iter().cloned().collect::<Vec<_>>()),
+            };
             store
-                .mark_job_failed_for_kv(&job_id, MISSING_KV_DEPENDENCY_REASON)
+                .mark_job_failed_for_kv(
+                    &job_id,
+                    MISSING_KV_DEPENDENCY_REASON,
+                    impacted_tasks.as_deref(),
+                )
                 .map_err(|e| map_store_error("Error failing job for missing kv dependency", e))?;
             warn!(
                 job_id = %job_id,
@@ -1222,6 +1290,15 @@ impl Manager for ManagerAgentService {
         self.store
             .clear_job_stopped_status(&config.name)
             .map_err(|e| map_store_error("Error clearing stopped job status", e))?;
+
+        // A manual `job run` is also the recovery path for a job stuck
+        // `failed` by a missing KV dependency under onChange:none (which never
+        // auto-recovers). Clearing the failed status here re-runs the job's
+        // allocations through the normal submit/eval flow with the latest KV
+        // state (see docs/kv-store.md).
+        self.store
+            .clear_job_failed_status(&config.name)
+            .map_err(|e| map_store_error("Error clearing failed job status", e))?;
 
         let job_config_id = submit_outcome.job_config_id().to_string();
         let stored_refs: Vec<JobKvReference> = kv_refs
@@ -4344,6 +4421,189 @@ mod tests {
         assert_eq!(store.get_job("kv-recover")?.status, "done");
         assert_eq!(evals_of_kind(&store, "kv-recover", "job_update")?, 1);
         assert_eq!(task_env_value(&store, "kv-recover", 0, "WATCHED")?, "v2");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn kv_reconcile_skips_stopped_job() -> R<()> {
+        let store = setup_store()?;
+        let manager = ManagerAgentService::new(store.clone());
+
+        put_kv_entry(&manager, "stopped/key", "v1").await?;
+        run_jobspec(
+            &manager,
+            watched_env_jobspec("kv-stopped", "stopped/key", "restart", "fail"),
+        )
+        .await?;
+
+        // Stop the job: KV events must now be inert.
+        store.stop_job("kv-stopped")?;
+        assert_eq!(store.get_job("kv-stopped")?.status, "stopped");
+
+        // A watched-key delete (onDelete: fail) must NOT flip a stopped job to
+        // failed, and a put (onChange: restart) must NOT re-place allocations.
+        delete_kv_entry(&manager, "stopped/key").await?;
+        assert_eq!(store.get_job("kv-stopped")?.status, "stopped");
+
+        put_kv_entry(&manager, "stopped/key", "v2").await?;
+        assert_eq!(store.get_job("kv-stopped")?.status, "stopped");
+
+        assert_eq!(evals_of_kind(&store, "kv-stopped", "job_update")?, 0);
+        assert_eq!(evals_of_kind(&store, "kv-stopped", "rollout_tick")?, 0);
+        assert!(store.list_rollouts(Some("kv-stopped"), false)?.is_empty());
+        Ok(())
+    }
+
+    /// Two exec tasks, each with its own watched env key and onDelete: fail.
+    fn two_task_watched_jobspec(job: &str, key_a: &str, key_b: &str) -> Value {
+        json!({
+            "name": job,
+            "tasks": [
+                {
+                    "name": "task-a",
+                    "kind": "exec",
+                    "kv": { "watch": true, "onChange": "restart", "onDelete": "fail" },
+                    "env": [
+                        {
+                            "name": "WATCHED",
+                            "value": { "template": format!("{{{{ kv \"{key_a}\" }}}}") }
+                        }
+                    ],
+                    "config": { "command": ["echo", "a"] }
+                },
+                {
+                    "name": "task-b",
+                    "kind": "exec",
+                    "kv": { "watch": true, "onChange": "restart", "onDelete": "fail" },
+                    "env": [
+                        {
+                            "name": "WATCHED",
+                            "value": { "template": format!("{{{{ kv \"{key_b}\" }}}}") }
+                        }
+                    ],
+                    "config": { "command": ["echo", "b"] }
+                }
+            ]
+        })
+    }
+
+    #[tokio::test]
+    async fn kv_fail_stamps_only_impacted_tasks_allocations() -> R<()> {
+        let store = setup_store()?;
+        let manager = ManagerAgentService::new(store.clone());
+
+        put_kv_entry(&manager, "scope/a", "a1").await?;
+        put_kv_entry(&manager, "scope/b", "b1").await?;
+        run_jobspec(
+            &manager,
+            two_task_watched_jobspec("kv-scope", "scope/a", "scope/b"),
+        )
+        .await?;
+
+        // Place one allocation per task so we can observe per-task stamping.
+        insert_node(&store, "node-1")?;
+        let job_config_id = store.get_job_config("kv-scope")?.id();
+        let tasks = store.get_task_configs_for_job_config(&job_config_id)?;
+        let task_a = tasks
+            .iter()
+            .find(|(_, t)| t.name == "task-a")
+            .map(|(id, _)| *id)
+            .context("task-a config")?;
+        let task_b = tasks
+            .iter()
+            .find(|(_, t)| t.name == "task-b")
+            .map(|(id, _)| *id)
+            .context("task-b config")?;
+        let alloc_a = store.place_alloc("node-1", task_a)?;
+        let alloc_b = store.place_alloc("node-1", task_b)?;
+
+        // Delete only task-a's key: only task-a's allocation is stamped.
+        delete_kv_entry(&manager, "scope/a").await?;
+
+        assert_eq!(store.get_job("kv-scope")?.status, "failed");
+        let allocs = store.allocs_for_job("kv-scope")?;
+        let a = allocs
+            .iter()
+            .find(|alloc| alloc.id == alloc_a.id)
+            .context("alloc a")?;
+        let b = allocs
+            .iter()
+            .find(|alloc| alloc.id == alloc_b.id)
+            .context("alloc b")?;
+        assert_eq!(a.status, "failed:missing_kv_dependency");
+        assert_ne!(
+            b.status, "failed:missing_kv_dependency",
+            "task-b's allocation must be untouched: it does not depend on scope/a"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn kv_put_after_fail_with_restart_clears_stamps_and_replaces_allocations() -> R<()> {
+        let store = setup_store()?;
+        let manager = ManagerAgentService::new(store.clone());
+
+        put_kv_entry(&manager, "clr/key", "v1").await?;
+        run_jobspec(
+            &manager,
+            watched_env_jobspec("kv-clr", "clr/key", "restart", "fail"),
+        )
+        .await?;
+
+        insert_node(&store, "node-1")?;
+        let job_config_id = store.get_job_config("kv-clr")?.id();
+        let (task_id, _) = store
+            .get_task_configs_for_job_config(&job_config_id)?
+            .into_iter()
+            .next()
+            .context("task config")?;
+        let failed_alloc = store.place_alloc("node-1", task_id)?;
+
+        delete_kv_entry(&manager, "clr/key").await?;
+        assert_eq!(store.get_job("kv-clr")?.status, "failed");
+        let stamped = store
+            .allocs_for_job("kv-clr")?
+            .into_iter()
+            .find(|alloc| alloc.id == failed_alloc.id)
+            .context("failed alloc")?;
+        assert_eq!(stamped.status, "failed:missing_kv_dependency");
+
+        // Put the key back: onChange=restart recovers — job status back to
+        // done and a job_update enqueued to replace the failed allocations.
+        put_kv_entry(&manager, "clr/key", "v2").await?;
+        assert_eq!(store.get_job("kv-clr")?.status, "done");
+        assert_eq!(evals_of_kind(&store, "kv-clr", "job_update")?, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn job_run_recovers_kv_failed_job_under_on_change_none() -> R<()> {
+        let store = setup_store()?;
+        let manager = ManagerAgentService::new(store.clone());
+
+        put_kv_entry(&manager, "none/key", "v1").await?;
+        // onChange: none — a later put does NOT auto-recover.
+        run_jobspec(
+            &manager,
+            watched_env_jobspec("kv-none", "none/key", "none", "fail"),
+        )
+        .await?;
+
+        delete_kv_entry(&manager, "none/key").await?;
+        assert_eq!(store.get_job("kv-none")?.status, "failed");
+
+        // Putting the key back with onChange: none leaves the job failed.
+        put_kv_entry(&manager, "none/key", "v2").await?;
+        assert_eq!(store.get_job("kv-none")?.status, "failed");
+
+        // A manual `job run` is the documented recovery path: it clears the
+        // failed status.
+        run_jobspec(
+            &manager,
+            watched_env_jobspec("kv-none", "none/key", "none", "fail"),
+        )
+        .await?;
+        assert_eq!(store.get_job("kv-none")?.status, "done");
         Ok(())
     }
 

@@ -2,7 +2,8 @@ use crate::manager::rollout_strategy::validate_rollout_strategy_name;
 use crate::plugin_runtime::{plugin_paths, validate_manifest};
 use crate::prelude::*;
 use crate::structs::{
-    Allocation, InstanceMode, JobConfig, TaskConfig, TaskDependencyCondition, TaskLifecycle,
+    Allocation, InstanceMode, JobConfig, RolloutReplacement, TaskConfig, TaskDependencyCondition,
+    TaskLifecycle,
 };
 use crate::util::plugin_root_dir;
 use jsonschema::JSONSchema;
@@ -290,6 +291,32 @@ pub fn validate_job_config(config: &JobConfig) -> R<()> {
                     task.name
                 );
             }
+        }
+    }
+    // A `createFirst` (replace-before-stop) rollout runs the incoming and
+    // outgoing allocations concurrently. For a stateful task that means two
+    // live allocations sharing one instance id, storage handle, and workload
+    // identity at once — violating the "at most one live allocation per
+    // instance" invariant (docs/stateful-workloads.md) with no fencing to make
+    // it safe (docs/stateful-vs-nomad-k8s.md). Reject the combo at admission:
+    // stateful groups must roll with the default stop-then-start strategy until
+    // fencing exists.
+    for task in &config.tasks {
+        if !task.is_stateful() {
+            continue;
+        }
+        let replacement = config
+            .rollout_config_for_group(&task.group)
+            .and_then(|rollout| rollout.replacement);
+        if replacement == Some(RolloutReplacement::CreateFirst) {
+            bail!(
+                "task {} (group {}) is stateful and cannot use a createFirst \
+                 (replace-before-stop) rollout: it would run two live allocations on the same \
+                 instance id and storage handle at once, breaking the at-most-one-live-allocation \
+                 invariant. Use the default stop-first replacement for stateful groups.",
+                task.name,
+                task.group
+            );
         }
     }
     config.validate_rollout()?;
@@ -686,6 +713,68 @@ mod tests {
 
         let err = validate_job_config(&config).expect_err("unknown strategy should fail");
         assert!(err.to_string().contains("invalid rollout.strategy"));
+    }
+
+    fn stateful_slot_task() -> TaskConfig {
+        TaskConfig {
+            count: crate::structs::TaskCount::new(2),
+            stateful: Some(crate::structs::StatefulConfig {
+                mode: InstanceMode::Slot,
+                id_source: None,
+                initial_instances: None,
+                storage: None,
+            }),
+            config: json!({"command": ["true"]}),
+            ..TaskConfig::new("db", "exec")
+        }
+    }
+
+    #[test]
+    fn rejects_create_first_rollout_on_stateful_task() {
+        let config = JobConfig {
+            rollout: Some(crate::structs::RolloutConfig {
+                replacement: Some(RolloutReplacement::CreateFirst),
+                ..Default::default()
+            }),
+            rollout_by_group: Default::default(),
+            name: "stateful-createfirst".into(),
+            tasks: vec![stateful_slot_task()],
+            version: None,
+        };
+
+        let err = validate_job_config(&config)
+            .expect_err("createFirst over a stateful task must be rejected");
+        assert!(
+            err.to_string().contains("createFirst"),
+            "error should name the createFirst combo: {err}"
+        );
+    }
+
+    #[test]
+    fn allows_stop_first_rollout_on_stateful_task() -> R<()> {
+        // Default (stop-first) replacement on a stateful task is fine.
+        let config = JobConfig {
+            rollout: Some(crate::structs::RolloutConfig {
+                replacement: Some(RolloutReplacement::DestroyFirst),
+                ..Default::default()
+            }),
+            rollout_by_group: Default::default(),
+            name: "stateful-stopfirst".into(),
+            tasks: vec![stateful_slot_task()],
+            version: None,
+        };
+        validate_job_config(&config)?;
+
+        // No rollout block at all is also fine.
+        let no_rollout = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "stateful-norollout".into(),
+            tasks: vec![stateful_slot_task()],
+            version: None,
+        };
+        validate_job_config(&no_rollout)?;
+        Ok(())
     }
 
     #[test]

@@ -4,7 +4,12 @@
     rollout: {
         strategy: "default",
         progression: "auto",
-        replacement: "createFirst",
+        // Stateful groups (frontend's slot task, sandboxes' keyed task) cannot
+        // use createFirst — two live allocations would share one instance id +
+        // storage handle (see docs/stateful-workloads.md). Default to the safe
+        // stop-first replacement globally; exercise createFirst on the
+        // stateless `prep` group below.
+        replacement: "destroyFirst",
         inPlace: false,
         percentSteps: [10, 25, 50, 100],
         stepStagger: "15s",
@@ -22,6 +27,11 @@
         frontend: {
             countEachStep: 1,
             inPlace: true,
+        },
+        // prep is stateless, so createFirst (replace-before-stop) is safe here
+        // and exercises the strategy that stateful groups forbid.
+        prep: {
+            replacement: "createFirst",
         },
     },
     tasks: [

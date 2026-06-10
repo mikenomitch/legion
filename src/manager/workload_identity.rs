@@ -36,7 +36,8 @@ use sha2::{Digest, Sha256};
 use crate::prelude::*;
 use crate::storage::store::Store;
 use crate::structs::workload_identity::{
-    SigningKeyRecord, WorkloadIdentity, WorkloadIdentityClaims, CONTROL_PLANE_IDENTITY_NAME,
+    is_protected_claim_key, SigningKeyRecord, WorkloadIdentity, WorkloadIdentityClaims,
+    CONTROL_PLANE_IDENTITY_NAME,
 };
 use crate::structs::{Allocation, TaskConfig, WorkloadIdentityConfigFull};
 
@@ -210,6 +211,14 @@ pub struct Issuer {
     issuer_url: String,
     jwks_path: String,
     default_ttl: Duration,
+    /// The largest lifetime any single token may have, equal to the rotation
+    /// overlap window `max(rotationAge, defaultTtl)`. A token's `exp` is clamped
+    /// to at most `now + max_token_ttl` (P1): a long-TTL identity signed just
+    /// before rotation would otherwise outlive its signing key's `not_after`
+    /// (the key's overlap window is exactly this long) and become
+    /// valid-but-unverifiable once the key expires. Clamping `exp` at issuance
+    /// guarantees every token a key signs expires inside that key's overlap.
+    max_token_ttl: Duration,
     /// Cluster-default `sub` template; `None` means use the built-in default.
     sub_template: Option<String>,
     /// Active key first, then any retiring keys still inside their overlap window.
@@ -227,11 +236,35 @@ impl Issuer {
         sub_template: Option<String>,
         now: SystemTime,
     ) -> R<Self> {
+        Self::new_with_max_ttl(
+            issuer_url,
+            jwks_path,
+            default_ttl,
+            default_ttl,
+            sub_template,
+            now,
+        )
+    }
+
+    /// Like [`Issuer::new`], but with an explicit `max_token_ttl` (the rotation
+    /// overlap window). Production paths derive `max_token_ttl` from the
+    /// manager config (`max(rotationAge, defaultTtl)`); the simple [`Issuer::new`]
+    /// uses `default_ttl` for both, which is correct for tests that never set a
+    /// per-identity TTL above the default.
+    pub fn new_with_max_ttl(
+        issuer_url: impl Into<String>,
+        jwks_path: impl Into<String>,
+        default_ttl: Duration,
+        max_token_ttl: Duration,
+        sub_template: Option<String>,
+        now: SystemTime,
+    ) -> R<Self> {
         let key = SigningKey::generate(unix_secs(now)?)?;
         Ok(Self {
             issuer_url: issuer_url.into(),
             jwks_path: jwks_path.into(),
             default_ttl,
+            max_token_ttl,
             sub_template,
             keys: vec![key],
         })
@@ -247,6 +280,29 @@ impl Issuer {
         issuer_url: impl Into<String>,
         jwks_path: impl Into<String>,
         default_ttl: Duration,
+        sub_template: Option<String>,
+        now: SystemTime,
+    ) -> R<Self> {
+        Self::load_or_generate_with_max_ttl(
+            store,
+            issuer_url,
+            jwks_path,
+            default_ttl,
+            default_ttl,
+            sub_template,
+            now,
+        )
+    }
+
+    /// Like [`Issuer::load_or_generate`], but with an explicit `max_token_ttl`
+    /// (the rotation overlap window) used to clamp every token's `exp` (P1).
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_or_generate_with_max_ttl(
+        store: &Store,
+        issuer_url: impl Into<String>,
+        jwks_path: impl Into<String>,
+        default_ttl: Duration,
+        max_token_ttl: Duration,
         sub_template: Option<String>,
         now: SystemTime,
     ) -> R<Self> {
@@ -274,6 +330,7 @@ impl Issuer {
             issuer_url: issuer_url.into(),
             jwks_path: jwks_path.into(),
             default_ttl,
+            max_token_ttl,
             sub_template,
             keys,
         })
@@ -347,7 +404,21 @@ impl Issuer {
         let key = self.active_key()?;
         let iat = unix_secs(now)?;
         let ttl = identity.parsed_ttl()?.unwrap_or(self.default_ttl);
-        let exp = iat + ttl.as_secs();
+
+        // P1: clamp `exp` so no token outlives the overlap window its signing
+        // key gets when it retires. A per-identity `ttl` is unbounded at
+        // admission (rotationAge isn't reachable at spec-validation time), so a
+        // long-TTL token signed just before rotation could otherwise expire
+        // after its key's `not_after` and become valid-but-unverifiable. The
+        // bound is `now + max_token_ttl` where `max_token_ttl == overlap ==
+        // max(rotationAge, defaultTtl)`; we additionally clamp to the active
+        // key's `not_after` if one is ever set (a key should not sign once
+        // retiring, but be defensive). See docs/workload-identity.md.
+        let ttl = ttl.min(self.max_token_ttl);
+        let mut exp = iat + ttl.as_secs();
+        if let Some(not_after) = key.not_after {
+            exp = exp.min(not_after);
+        }
 
         let template = identity
             .sub_template
@@ -375,8 +446,20 @@ impl Issuer {
         for (claim, value) in claims.legion_claims() {
             body.insert(claim, json!(value));
         }
-        // Static, non-reserved extra claims (reserved keys rejected at admission).
+        // Static, non-reserved extra claims. Admission already rejects reserved
+        // and `legion.io/*` keys, but the signing sink re-checks (belt and
+        // suspenders): the signer must never let an extra claim overwrite a
+        // derived/trust-critical claim (iss/sub/aud/exp/iat/nbf/jti or
+        // legion.io/*), even if admission validation were somehow bypassed.
         for (claim, value) in &identity.extra_claims {
+            if is_protected_claim_key(claim) {
+                warn!(
+                    claim = %claim,
+                    identity = %identity.name,
+                    "Refusing to let extra_claims override a protected claim"
+                );
+                continue;
+            }
             body.insert(claim.clone(), json!(value));
         }
 
@@ -535,11 +618,35 @@ impl WorkloadIdentityState {
             .issuer
             .clone()
             .unwrap_or_else(|| default_issuer_url.to_string());
-        let issuer = Issuer::load_or_generate(
+
+        // P2: validate the cluster-default `sub` template the same way a
+        // per-identity override is validated. Without this a cluster default
+        // like `"{job}"` (below the uniqueness floor, or using a churning
+        // `{alloc}`/`{node}` placeholder) would silently collapse distinct
+        // workloads into one shared identity, since `render_subject` only
+        // checks field availability, not the floor. Fail manager startup with
+        // a clear error instead. `stateful = false` here: the cluster default
+        // must render for every task, including stateless ones, so the
+        // stateful-only `{instance}`/`{slot}` placeholders are disallowed in a
+        // cluster default.
+        crate::structs::workload_identity::validate_sub_template(&config.sub_template, false)
+            .with_context(|| {
+                format!(
+                    "cluster-default workloadIdentity.subTemplate {:?} is invalid",
+                    config.sub_template
+                )
+            })?;
+
+        // Token `exp` is clamped to the rotation overlap window (P1).
+        let overlap = config
+            .parsed_rotation_age()
+            .max(config.parsed_default_ttl());
+        let issuer = Issuer::load_or_generate_with_max_ttl(
             store,
             issuer_url,
             config.jwks_path.clone(),
             config.parsed_default_ttl(),
+            overlap,
             Some(config.sub_template.clone()),
             now,
         )?;
@@ -873,6 +980,69 @@ mod tests {
     }
 
     #[test]
+    fn extra_claims_cannot_override_derived_or_legion_claims() {
+        // Belt-and-suspenders (P2): even with admission bypassed, the signing
+        // sink must never let extra_claims overwrite a derived/trust-critical
+        // claim. We inject `sub` and `legion.io/job` directly into the spec.
+        let iss = issuer();
+        let mut id = aws_identity();
+        id.extra_claims.insert("sub".into(), "attacker".into());
+        id.extra_claims
+            .insert("legion.io/job".into(), "spoofed".into());
+        id.extra_claims.insert("iss".into(), "evil-issuer".into());
+        let issued = iss.issue(&claims(), &id, now()).unwrap();
+        let decoded = iss.verify(&issued.token, "sts.amazonaws.com").unwrap();
+        // Derived values win; the forged extra claims are dropped.
+        assert_eq!(decoded["sub"], json!("auto:api:web:server"));
+        assert_eq!(decoded["legion.io/job"], json!("api"));
+        assert_eq!(decoded["iss"], json!(iss.issuer_url()));
+    }
+
+    #[test]
+    fn token_exp_is_clamped_to_the_overlap_window() {
+        // rotationAge/overlap is 900s here (Issuer::new uses default_ttl for
+        // both). A per-identity ttl far above that must be clamped so the token
+        // cannot outlive a retiring key's not_after.
+        let iss = issuer();
+        let long = WorkloadIdentity {
+            ttl: Some("48h".into()),
+            ..aws_identity()
+        };
+        let when = now();
+        let issued = iss.issue(&claims(), &long, when).unwrap();
+        let iat = when.duration_since(UNIX_EPOCH).unwrap().as_secs();
+        // exp clamped to iat + overlap (900s), not iat + 48h.
+        assert!(
+            issued.expires_at <= iat + 900,
+            "exp {} not clamped (iat {iat})",
+            issued.expires_at
+        );
+        assert!(issued.expires_at >= iat + 899);
+    }
+
+    #[test]
+    fn long_ttl_token_signed_before_rotation_still_verifies_after_rotation() {
+        // The whole point of P1: a token signed right before rotation must stay
+        // verifiable until it expires, because its (clamped) exp falls inside
+        // the retiring key's overlap window.
+        let mut iss = issuer();
+        let overlap = Duration::from_secs(900);
+        let long = WorkloadIdentity {
+            ttl: Some("24h".into()), // would outlive the key without clamping
+            ..aws_identity()
+        };
+        let issued = iss.issue(&claims(), &long, now()).unwrap();
+
+        // Rotate immediately after signing: the just-used key starts retiring
+        // with not_after = now + overlap.
+        iss.rotate(now(), overlap).unwrap();
+
+        // The pre-rotation token still verifies during the overlap window — its
+        // exp was clamped to <= the key's not_after.
+        iss.verify(&issued.token, "sts.amazonaws.com").unwrap();
+    }
+
+    #[test]
     fn control_plane_identity_audience_defaults_to_issuer() {
         let iss = issuer();
         let id = WorkloadIdentity {
@@ -1181,6 +1351,48 @@ mod tests {
         let reloaded = store_issuer(&store);
         assert!(reloaded.key(&original_kid).is_none());
         assert_eq!(reloaded.jwks()["keys"].as_array().unwrap().len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_cluster_default_sub_template_fails_initialize() -> R<()> {
+        let store = claims_test_store()?;
+        // Below the uniqueness floor: collapses distinct workloads into one.
+        let config = WorkloadIdentityConfigFull {
+            enabled: true,
+            issuer: Some("https://manager.example.com:4747".into()),
+            sub_template: "{job}".into(),
+            ..Default::default()
+        };
+        let err =
+            WorkloadIdentityState::initialize(&store, &config, "http://127.0.0.1:4747", now())
+                .unwrap_err();
+        assert!(err.to_string().contains("subTemplate"), "{err}");
+
+        // A churning placeholder in the cluster default is also rejected.
+        let config = WorkloadIdentityConfigFull {
+            enabled: true,
+            issuer: Some("https://manager.example.com:4747".into()),
+            sub_template: "{job}:{group}:{task}:{alloc}".into(),
+            ..Default::default()
+        };
+        let err =
+            WorkloadIdentityState::initialize(&store, &config, "http://127.0.0.1:4747", now())
+                .unwrap_err();
+        assert!(err.to_string().contains("subTemplate"), "{err}");
+        Ok(())
+    }
+
+    #[test]
+    fn valid_cluster_default_sub_template_passes_initialize() -> R<()> {
+        let store = claims_test_store()?;
+        let config = WorkloadIdentityConfigFull {
+            enabled: true,
+            issuer: Some("https://manager.example.com:4747".into()),
+            sub_template: "{region}/{job}/{group}/{task}".into(),
+            ..Default::default()
+        };
+        WorkloadIdentityState::initialize(&store, &config, "http://127.0.0.1:4747", now())?;
         Ok(())
     }
 

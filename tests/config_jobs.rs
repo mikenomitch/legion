@@ -119,6 +119,25 @@ fn maximal_job_spec_parse() {
         .validate_stateful()
         .expect("keyed sandbox task validates");
 
+    // No stateful task may sit under a createFirst (replace-before-stop)
+    // rollout: that would double-bind one instance id + storage handle (see
+    // docs/stateful-workloads.md). Verify the shipped spec honors this.
+    for task in &config.tasks {
+        if !task.is_stateful() {
+            continue;
+        }
+        let replacement = config
+            .rollout_config_for_group(&task.group)
+            .and_then(|rollout| rollout.replacement);
+        assert_ne!(
+            replacement,
+            Some(legion::structs::RolloutReplacement::CreateFirst),
+            "stateful task {} (group {}) must not use createFirst",
+            task.name,
+            task.group
+        );
+    }
+
     // The KV injection policy keys are camelCase and actually parse (a
     // snake_case `on_change` would be silently dropped by serde).
     let injected = config

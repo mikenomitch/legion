@@ -286,11 +286,44 @@ fn backing_file_path(identity: &WorkloadIdentity, alloc_id: i64) -> Option<PathB
 /// Well-known per-identity token path backing env-delivered identities:
 /// `.legion/identity/<alloc>/<name>/token`, relative to the worker's working
 /// directory.
+///
+/// Defense in depth: the manager already rejects identity names that aren't
+/// `[A-Za-z0-9_-]{1,64}` at admission (`validate_identity_name`), but the
+/// worker re-checks before joining the name into a path so a name like
+/// `../../tmp/evil` can never escape the per-allocation token directory even if
+/// a malformed spec reached the worker. An invalid name is reduced to a safe
+/// `_`-only placeholder rather than panicking, so token delivery degrades
+/// instead of writing outside the task dir.
 pub fn fallback_token_path(alloc_id: i64, identity_name: &str) -> PathBuf {
+    let safe_name = sanitize_identity_name_component(identity_name);
     PathBuf::from(IDENTITY_TOKEN_DIR)
         .join(alloc_id.to_string())
-        .join(identity_name)
+        .join(safe_name)
         .join("token")
+}
+
+/// Return `identity_name` unchanged if it passes the strict admission charset,
+/// otherwise a placeholder built only from its allowed characters (and never
+/// empty, never `.`/`..`), so it can never act as a path-traversal component.
+fn sanitize_identity_name_component(identity_name: &str) -> String {
+    use crate::structs::workload_identity::validate_identity_name;
+    if validate_identity_name(identity_name).is_ok() {
+        return identity_name.to_string();
+    }
+    warn!(
+        "Identity name failed the strict charset check on the worker; \
+         sanitizing before path join (defense in depth)"
+    );
+    let filtered: String = identity_name
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .take(crate::structs::workload_identity::MAX_IDENTITY_NAME_LEN)
+        .collect();
+    if filtered.is_empty() {
+        "_invalid".to_string()
+    } else {
+        filtered
+    }
 }
 
 /// Write/rewrite every file this identity is materialized at.
@@ -325,17 +358,51 @@ pub fn write_token_file(path: &Path, token: &str, mode: u32) -> R<()> {
             .unwrap_or_else(|| "token".into()),
         random_string(6)
     ));
-    fs::write(&tmp, token).with_context(|| format!("failed to write token file {tmp:?}"))?;
+
+    // Create the temp file with the restrictive mode *from the start* so the
+    // token bytes are never observable at the process umask (e.g. 0644) in the
+    // window between create and chmod. On any error after creation, remove the
+    // temp file so a failed write never leaves a stray (and potentially
+    // readable) token fragment behind.
+    let result = write_token_tmp(&tmp, token, mode);
+    if let Err(err) = result {
+        let _ = fs::remove_file(&tmp);
+        return Err(err);
+    }
+
+    if let Err(err) = fs::rename(&tmp, path)
+        .with_context(|| format!("failed to move token file into place at {path:?}"))
+    {
+        let _ = fs::remove_file(&tmp);
+        return Err(err);
+    }
+    Ok(())
+}
+
+/// Create the temp file at `mode` (atomically, before any bytes exist),
+/// write the token, and fsync so the rename publishes durable content.
+fn write_token_tmp(tmp: &Path, token: &str, mode: u32) -> R<()> {
+    use std::io::Write;
+
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&tmp, fs::Permissions::from_mode(mode))
-            .with_context(|| format!("failed to set token file mode on {tmp:?}"))?;
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(mode);
     }
     #[cfg(not(unix))]
     let _ = mode;
-    fs::rename(&tmp, path)
-        .with_context(|| format!("failed to move token file into place at {path:?}"))?;
+
+    let mut file = options
+        .open(tmp)
+        .with_context(|| format!("failed to create token temp file {tmp:?}"))?;
+    file.write_all(token.as_bytes())
+        .with_context(|| format!("failed to write token file {tmp:?}"))?;
+    file.flush()
+        .with_context(|| format!("failed to flush token file {tmp:?}"))?;
+    file.sync_all()
+        .with_context(|| format!("failed to fsync token file {tmp:?}"))?;
     Ok(())
 }
 
@@ -627,6 +694,88 @@ mod tests {
             "temp files left behind: {leftovers:?}"
         );
         Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn temp_file_is_never_observable_at_a_broader_mode() -> R<()> {
+        // Use a deliberately custom target mode (0600, broader than the 0400
+        // default) and assert the *temp* file already carries exactly that mode
+        // the instant it exists — proving there is no umask window before a
+        // chmod. We intercept the temp file by overriding the create step:
+        // since write_token_file removes the temp on success via rename, we
+        // assert on a freshly created temp directly through write_token_tmp.
+        let dir = TempDir::new()?;
+        let tmp = dir.path().join(".token.tmp-test");
+        write_token_tmp(&tmp, "secret", 0o600)?;
+        assert_eq!(mode_of(&tmp), 0o600);
+        assert_eq!(fs::read_to_string(&tmp)?, "secret");
+
+        // And the public path: the final file equals the requested mode and no
+        // temp remains.
+        let path = dir.path().join("identity/token");
+        write_token_file(&path, "secret", 0o600)?;
+        assert_eq!(mode_of(&path), 0o600);
+        let leftovers: Vec<_> = fs::read_dir(path.parent().unwrap())?
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name() != "token")
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn temp_file_is_removed_after_a_mid_write_failure() -> R<()> {
+        // Simulate a mid-write failure by pre-creating the temp file so
+        // `create_new` fails; write_token_tmp must error and write_token_file
+        // must leave no stray temp behind. We reproduce the temp naming by
+        // calling write_token_tmp directly on an existing path, then assert the
+        // public API cleans up by checking the directory has no leftovers after
+        // a failing write into a path whose parent is a file (forcing rename to
+        // fail) is not portable; instead assert create_new semantics directly.
+        let dir = TempDir::new()?;
+        let tmp = dir.path().join(".token.tmp-existing");
+        fs::write(&tmp, "stale")?;
+        // create_new must refuse to clobber → error.
+        assert!(write_token_tmp(&tmp, "secret", 0o400).is_err());
+
+        // Now prove write_token_file removes its temp on a rename failure: make
+        // the destination's parent read-only so rename fails after the temp is
+        // created, then assert no temp file with our prefix survives.
+        let target_dir = dir.path().join("sub");
+        fs::create_dir_all(&target_dir)?;
+        let path = target_dir.join("token");
+        // Pre-create the destination as a directory so the rename of a file
+        // over a non-empty directory fails on all platforms.
+        fs::create_dir_all(&path)?;
+        fs::write(path.join("keep"), "x")?;
+        let err = write_token_file(&path, "secret", 0o400);
+        assert!(err.is_err(), "expected rename to fail onto a directory");
+        let leftovers: Vec<_> = fs::read_dir(&target_dir)?
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".token.tmp-"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp file not cleaned after failure: {leftovers:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn fallback_token_path_sanitizes_traversal_names() {
+        // A traversal name must not escape the per-alloc identity directory.
+        let p = fallback_token_path(7, "../../tmp/evil");
+        let s = p.to_string_lossy();
+        assert!(!s.contains(".."), "path still contains traversal: {s}");
+        assert!(s.starts_with(IDENTITY_TOKEN_DIR), "{s}");
+        assert!(s.ends_with("token"), "{s}");
+        // A valid name is preserved verbatim.
+        let ok = fallback_token_path(7, "vault");
+        assert!(ok.to_string_lossy().contains("/vault/"), "{ok:?}");
     }
 
     #[test]
