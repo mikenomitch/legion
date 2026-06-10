@@ -2,7 +2,7 @@ use crate::cmd::helpers::friendly_status;
 use crate::prelude::*;
 use crate::structs::insecure_manager_client::InsecureManagerClient;
 use crate::structs::GetJoinTokenRequest;
-use crate::worker::agent::run_worker;
+use crate::worker::daemon::run_worker;
 
 use crate::constants::DEF_INSECURE_ADDR;
 

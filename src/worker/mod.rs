@@ -1,4 +1,4 @@
-pub mod agent;
+pub mod daemon;
 pub mod node_check;
 pub mod server;
 pub mod state;
