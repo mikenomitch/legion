@@ -2,6 +2,7 @@ use crate::prelude::*;
 
 use crate::manager::join_server::get_insecure_manager_service;
 use crate::manager::server::ManagerAgentService;
+use crate::storage::events::drafts;
 use crate::storage::store::Store;
 use crate::structs::{
     manager_server::ManagerServer, Eval, JobConfig, KvValueType, ManagerConfig, Node, NodeMsg,
@@ -570,16 +571,15 @@ fn handle_claimed_eval(store: &Store, worker_id: usize, eval: &Eval) {
                 elapsed_ms = started.elapsed().as_millis() as u64,
                 "Eval {} handled successfully: {}", eval.id, message
             );
-            if let Err(e) = store.complete_eval(&eval.id, true) {
+            let completed = drafts::eval_completed(eval, &message, started.elapsed());
+            if let Err(e) = store.complete_eval_with_event(&eval.id, true, completed) {
                 error!(worker_id, "Error completing eval {}: {:?}", eval.id, e);
             }
-            store
-                .events()
-                .eval_completed(eval, &message, started.elapsed());
         }
         Err(e) => {
             error!(worker_id, eval_id = %eval.id, elapsed_ms = started.elapsed().as_millis() as u64, "Error handling eval {}: {:?}", eval.id, e);
-            if let Err(complete_err) = store.complete_eval(&eval.id, false) {
+            let failed = drafts::eval_failed(eval, &e, started.elapsed());
+            if let Err(complete_err) = store.complete_eval_with_event(&eval.id, false, failed) {
                 error!(
                     worker_id,
                     "Error marking eval {} as failed after handling error: {:?}",
@@ -587,7 +587,6 @@ fn handle_claimed_eval(store: &Store, worker_id: usize, eval: &Eval) {
                     complete_err
                 );
             }
-            store.events().eval_failed(eval, &e, started.elapsed());
         }
     }
 }

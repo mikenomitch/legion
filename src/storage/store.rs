@@ -2,7 +2,7 @@ use crate::constraints::{ConstraintSet, DistinctTracker, PermitSet};
 use crate::prelude::*;
 use crate::resources::ResourcePolicy;
 use crate::storage::errors::StorageError;
-use crate::storage::events::{EventDraft, SchedulerEventFilter, SchedulerEventRecord};
+use crate::storage::events::{drafts, EventDraft, SchedulerEventFilter, SchedulerEventRecord};
 use crate::storage::migrations::get_migrations;
 use crate::storage::persistence::{
     build_persistence_driver, PersistenceDriver, PersistenceRole, PersistenceStatus,
@@ -746,21 +746,6 @@ impl Store {
     }
 
     pub fn apply_plan_submission(&self, submission: &PlanSubmission) -> R<PlanApplyOutcome> {
-        let outcome = self.apply_plan_submission_inner(submission)?;
-
-        match &outcome {
-            PlanApplyOutcome::Applied(allocations) => self
-                .events()
-                .allocations_placed(&submission.job_config_id, allocations),
-            PlanApplyOutcome::Rejected { reason, .. } => self
-                .events()
-                .plan_rejected(&submission.job_config_id, reason),
-        }
-
-        Ok(outcome)
-    }
-
-    fn apply_plan_submission_inner(&self, submission: &PlanSubmission) -> R<PlanApplyOutcome> {
         let tx_started = Instant::now();
         debug!(
             submission_id = submission.id,
@@ -797,7 +782,12 @@ impl Store {
                 "UPDATE plan_submission SET status = 'rejected', rejection_reason = ?1 WHERE id = ?2;",
                 params![reason, submission.id],
             )?;
+            let rejected_event = self.stage_event_locked(
+                &tx,
+                drafts::plan_rejected(&submission.job_config_id, &reason),
+            );
             tx.commit()?;
+            self.publish_staged(rejected_event);
             warn!(
                 submission_id = submission.id,
                 job_config_id = %submission.job_config_id,
@@ -875,7 +865,12 @@ impl Store {
                 )?;
                 let latest_versions =
                     self.scope_vector_epochs_tx(&tx, &submission.expected_versions)?;
+                let rejected_event = self.stage_event_locked(
+                    &tx,
+                    drafts::plan_rejected(&submission.job_config_id, &reason),
+                );
                 tx.commit()?;
+                self.publish_staged(rejected_event);
                 warn!(
                     submission_id = submission.id,
                     job_config_id = %submission.job_config_id,
@@ -914,7 +909,10 @@ impl Store {
             "UPDATE plan_submission SET status = 'applied', rejection_reason = NULL WHERE id = ?1;",
             [submission.id],
         )?;
+        let placed_event = drafts::allocations_placed(&submission.job_config_id, &allocations)
+            .and_then(|draft| self.stage_event_locked(&tx, draft));
         tx.commit()?;
+        self.publish_staged(placed_event);
         info!(
             submission_id = submission.id,
             job_config_id = %submission.job_config_id,
@@ -2151,20 +2149,21 @@ impl Store {
 
         Self::insert_task_statuses(&tx, &task_ids, &job.id, &job_config_id)?;
 
-        tx.commit()
-            .map_err(|_| anyhow!("Error committing transaction"))?;
-        drop(conn);
-
-        let cached_tasks = self.get_task_configs_for_job_config(&job_config_id)?;
-        self.cache_set_task_configs_for_job_config(&job_config_id, cached_tasks)?;
-
         let outcome = if was_update {
             JobSubmitOutcome::Updated { job_config_id }
         } else {
             JobSubmitOutcome::Created { job_config_id }
         };
-        self.events()
-            .job_submit_outcome(&job.id, &outcome, next_version, config.tasks.len());
+        let submit_event =
+            drafts::job_submit_outcome(&job.id, &outcome, next_version, config.tasks.len())
+                .and_then(|draft| self.stage_event_locked(&tx, draft));
+        tx.commit()
+            .map_err(|_| anyhow!("Error committing transaction"))?;
+        self.publish_staged(submit_event);
+        drop(conn);
+
+        let cached_tasks = self.get_task_configs_for_job_config(outcome.job_config_id())?;
+        self.cache_set_task_configs_for_job_config(outcome.job_config_id(), cached_tasks)?;
 
         Ok(outcome)
     }
@@ -2449,26 +2448,68 @@ impl Store {
     /// Record a scheduler event: persist it to the journal and publish it to
     /// live `StreamEvents` subscribers.
     ///
+    /// Takes the write lock for the insert, so only use this from code that
+    /// is not already holding a write connection; code with an open write
+    /// transaction stages the event inside it via `stage_event_locked` +
+    /// `publish_staged` instead, which costs no extra lock acquisition or
+    /// WAL commit.
+    ///
     /// Emission is strictly best-effort — scheduling work must never fail
     /// because the event journal could not be written, so errors are logged
     /// and swallowed here.
     pub fn emit_event(&self, draft: EventDraft) {
-        match self.persist_event(&draft) {
-            Ok(event) => {
-                // send only fails when there are no live subscribers; fine.
-                let _ = self.event_tx.send(event);
+        let conn = match self.write_connection() {
+            Ok(conn) => conn,
+            Err(err) => {
+                warn!(kind = %draft.kind, error = ?err, "Failed locking store for scheduler event");
+                return;
             }
+        };
+        let event = self.stage_event_locked(&conn, draft);
+        self.publish_staged(event);
+    }
+
+    /// Insert `draft` through an already-held write connection or open
+    /// transaction, returning the persisted record for later publication.
+    ///
+    /// Best-effort: failures are logged and `None` is returned. When called
+    /// with a transaction, the event commits or rolls back atomically with
+    /// the state change it describes.
+    fn stage_event_locked(
+        &self,
+        conn: &Connection,
+        draft: EventDraft,
+    ) -> Option<SchedulerEventRecord> {
+        // Operator escape hatch: silences event persistence and streaming
+        // entirely. Also how the benches A/B the cost of emission itself
+        // (see docs/event-stream.md).
+        if std::env::var_os("LEGION_EVENTS_OFF").is_some() {
+            return None;
+        }
+        match self.insert_event(conn, &draft) {
+            Ok(event) => Some(event),
             Err(err) => {
                 warn!(
                     kind = %draft.kind,
                     error = ?err,
                     "Failed recording scheduler event"
                 );
+                None
             }
         }
     }
 
-    fn persist_event(&self, draft: &EventDraft) -> R<SchedulerEventRecord> {
+    /// Publish a staged event to live subscribers once its transaction has
+    /// committed. Call while still holding the write guard the event was
+    /// staged under, so subscribers observe events in strict ID order.
+    fn publish_staged(&self, event: Option<SchedulerEventRecord>) {
+        if let Some(event) = event {
+            // send only fails when there are no live subscribers; fine.
+            let _ = self.event_tx.send(event);
+        }
+    }
+
+    fn insert_event(&self, conn: &Connection, draft: &EventDraft) -> R<SchedulerEventRecord> {
         let created_at = Self::now_rfc3339()?;
         let metadata_json = if draft.metadata.is_object() {
             draft.metadata.to_string()
@@ -2476,7 +2517,6 @@ impl Store {
             json!({ "value": draft.metadata }).to_string()
         };
 
-        let conn = self.write_connection()?;
         conn.execute(
             "INSERT INTO scheduler_event (
                 kind, level, job_id, node_id, eval_id, allocation_id, rollout_id,
@@ -2505,7 +2545,6 @@ impl Store {
                 [id - EVENT_RETAINED_ROWS],
             )?;
         }
-        drop(conn);
 
         Ok(SchedulerEventRecord {
             id,
@@ -3690,6 +3729,28 @@ impl Store {
 
     #[instrument(err, skip_all)]
     pub fn complete_eval(&self, eval_id: &str, succeeded: bool) -> R<()> {
+        self.complete_eval_impl(eval_id, succeeded, None)
+    }
+
+    /// Complete an eval and record its lifecycle event (`eval.completed` /
+    /// `eval.failed`, built via `drafts`) in the same transaction, so the
+    /// event costs no extra lock acquisition on the eval critical path.
+    #[instrument(err, skip_all)]
+    pub fn complete_eval_with_event(
+        &self,
+        eval_id: &str,
+        succeeded: bool,
+        event: EventDraft,
+    ) -> R<()> {
+        self.complete_eval_impl(eval_id, succeeded, Some(event))
+    }
+
+    fn complete_eval_impl(
+        &self,
+        eval_id: &str,
+        succeeded: bool,
+        event: Option<EventDraft>,
+    ) -> R<()> {
         let tx_started = Instant::now();
         let mut conn: MutexGuard<'_, Connection> = self.write_connection()?;
         let tx = conn.transaction()?;
@@ -3699,7 +3760,9 @@ impl Store {
         } else {
             tx.execute("UPDATE eval SET status = 'failed' WHERE id = ?;", [eval_id])?;
         }
+        let staged = event.and_then(|draft| self.stage_event_locked(&tx, draft));
         tx.commit()?;
+        self.publish_staged(staged);
         debug!(
             eval_id,
             succeeded,
@@ -3777,15 +3840,15 @@ impl Store {
             priority: priority.unwrap_or(self.default_eval_priority),
         };
 
+        let enqueue_event = self.stage_event_locked(&tx, drafts::eval_enqueued(&eval, delay));
         tx.commit()?;
+        self.publish_staged(enqueue_event);
         drop(conn);
 
         if delay.is_zero() {
             // Zero-delay evals are immediately claimable, so wake one sleeping worker.
             self.eval_notify.notify_one();
         }
-
-        self.events().eval_enqueued(&eval, delay);
 
         Ok(eval)
     }
@@ -6314,29 +6377,32 @@ mod tests {
         let store = setup_store()?;
 
         // Empty inputs are no-ops, so callers don't need their own guards.
-        store.events().allocations_placed("cfg-1", &[]);
         store.events().allocations_removed_from_node("node-a", &[]);
         store.events().allocations_removed_for_job("demo", 0);
-        store.events().job_submit_outcome(
+        assert!(drafts::allocations_placed("cfg-1", &[]).is_none());
+        assert!(drafts::job_submit_outcome(
             "demo",
             &JobSubmitOutcome::Unchanged {
                 job_config_id: "cfg-1".into(),
             },
             1,
             1,
-        );
+        )
+        .is_none());
         assert!(store
             .list_scheduler_events(&SchedulerEventFilter::default())?
             .is_empty());
 
-        store.events().job_submit_outcome(
+        let submitted = drafts::job_submit_outcome(
             "demo",
             &JobSubmitOutcome::Created {
                 job_config_id: "cfg-1".into(),
             },
             1,
             2,
-        );
+        )
+        .context("created outcome should produce an event")?;
+        store.emit_event(submitted);
         store
             .events()
             .allocation_failed(7, "node-a", "demo", "cfg-1", 3, "task crashed");
@@ -6361,6 +6427,31 @@ mod tests {
             lost.metadata_json,
             json!({ "reason": "heartbeat" }).to_string()
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn complete_eval_with_event_records_event_atomically() -> R<()> {
+        let store = setup_store()?;
+        let eval = store.enqueue_eval("job_submit", None, None, None, None)?;
+        let claimed = store.claim_eval()?.context("eval should be claimable")?;
+        assert_eq!(claimed.id, eval.id);
+
+        store.complete_eval_with_event(
+            &eval.id,
+            true,
+            drafts::eval_completed(&claimed, "done", std::time::Duration::from_millis(5)),
+        )?;
+
+        assert!(store.get_evals()?.is_empty());
+        let events = store.list_scheduler_events(&SchedulerEventFilter {
+            kind: Some("eval.completed".into()),
+            ..Default::default()
+        })?;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].eval_id.as_deref(), Some(eval.id.as_str()));
+        assert!(events[0].message.contains("done"));
 
         Ok(())
     }

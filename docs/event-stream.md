@@ -100,3 +100,35 @@ See `proto/legion.proto` for the authoritative message documentation.
   proper (jobs, rollouts, rollout events).
 - Events deliberately have no foreign keys so they can outlive the objects they
   describe (a `job.destroyed` event survives the job row's deletion).
+
+## Performance
+
+Event emission sits on the scheduler's hottest write paths (eval enqueue,
+plan apply, eval completion), so it is engineered to add as little serialized
+work as possible:
+
+- **In-transaction staging.** Hot paths insert the event row inside the same
+  write transaction as the state change it describes (`stage_event_locked` +
+  `publish_staged`), so emission costs no extra lock acquisition and no extra
+  WAL commit — and the event commits or rolls back atomically with the change.
+  Cold paths (node/job lifecycle, the rollout bridge) use the one-line
+  `store.events()` recorder, which takes the lock itself.
+- **Index-free journal.** `scheduler_event` has no secondary indexes and no
+  `AUTOINCREMENT`, keeping the insert to a single b-tree append. Cursor reads
+  use the rowid PK; filtered reads scan the ≤10k-row table in about a
+  millisecond, which is fine for their human/agent-paced call rate.
+- **Ordered publication.** Events are broadcast while the write guard is still
+  held, so `StreamEvents` subscribers observe strictly increasing IDs and the
+  lag/backfill dedupe logic stays correct.
+
+Measured on `eval_critical_path_bench` (the worst case: tight multi-threaded
+enqueue→claim→apply→complete loops with no other work), A/B'd in the same
+binary via the toggle below: emission costs ~0–5% on that path — at or below
+the noise floor at 4 and 8 workers — and shows no detectable change on
+`scheduler_bench` placement throughput. Earlier designs that re-acquired the
+write lock per event and maintained three secondary indexes cost 25–30% on
+the same benchmark, which is why the constraints above exist.
+
+`LEGION_EVENTS_OFF=1` disables persistence and streaming entirely (an
+operator escape hatch, and the lever the A/B benchmarks use). `ListEvents`
+then serves only pre-existing rows and `StreamEvents` goes quiet.
