@@ -11,7 +11,7 @@ use crate::manager::rollout::{
 use crate::manager::rollout_strategy;
 use crate::manager::scheduler::{PlanConfigOutcome, PlanMode, Scheduler};
 use crate::storage::errors::StorageError;
-use crate::storage::events::{EventDraft, SchedulerEventFilter, SchedulerEventRecord};
+use crate::storage::events::{SchedulerEventFilter, SchedulerEventRecord};
 use crate::storage::store::{JobKvReference, JobSubmitOutcome, Store};
 use crate::structs::manager_server::Manager;
 use crate::structs::{
@@ -2392,22 +2392,13 @@ fn handle_failed_allocations(
 
         store.remove_allocation_by_id(allocation_id)?;
 
-        store.emit_event(
-            EventDraft::warn(
-                "allocation.failed",
-                format!(
-                    "Allocation {allocation_id} failed on node {node_id}: {}",
-                    failure.reason
-                ),
-            )
-            .job(&context.job_id)
-            .node(node_id)
-            .allocation(allocation_id)
-            .meta(json!({
-                "reason": failure.reason,
-                "taskConfigId": context.task_config_id,
-                "jobConfigId": context.job_config_id,
-            })),
+        store.events().allocation_failed(
+            allocation_id,
+            node_id,
+            &context.job_id,
+            &context.job_config_id,
+            context.task_config_id,
+            &failure.reason,
         );
 
         let move_decision = {

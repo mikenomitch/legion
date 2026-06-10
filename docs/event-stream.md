@@ -80,10 +80,15 @@ See `proto/legion.proto` for the authoritative message documentation.
 
 ## How it works
 
-- `Store::emit_event` writes the event to the `scheduler_event` table and
-  publishes it on an in-process `tokio::sync::broadcast` channel
-  ([`src/storage/events.rs`](../src/storage/events.rs),
-  [`src/storage/store.rs`](../src/storage/store.rs)).
+- Emission sites call one named method per event kind on the recorder facade —
+  `store.events().job_stopped(name)` — so scheduler code stays legible. The
+  `EventRecorder` in [`src/storage/events.rs`](../src/storage/events.rs) is the
+  authoritative catalog of kinds and owns each event's message, level, scopes,
+  and metadata shape.
+- Under the hood, `Store::emit_event` writes the event to the
+  `scheduler_event` table and publishes it on an in-process
+  `tokio::sync::broadcast` channel
+  ([`src/storage/store.rs`](../src/storage/store.rs)).
 - Emission is **best-effort by design**: scheduling work never fails because an
   event could not be recorded (errors are logged and swallowed).
 - `StreamEvents` subscribers that lag behind the broadcast buffer are

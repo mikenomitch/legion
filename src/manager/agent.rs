@@ -2,7 +2,6 @@ use crate::prelude::*;
 
 use crate::manager::join_server::get_insecure_manager_service;
 use crate::manager::server::ManagerAgentService;
-use crate::storage::events::EventDraft;
 use crate::storage::store::Store;
 use crate::structs::{
     manager_server::ManagerServer, Eval, JobConfig, KvValueType, ManagerConfig, Node, NodeMsg,
@@ -302,21 +301,9 @@ async fn start_eval_loop(store: Store, max_threads: usize) -> R<()> {
     let requeued = store.requeue_in_flight_evals()?;
     if requeued > 0 {
         warn!(requeued, "Recovered stale in-flight evals at startup");
-        store.emit_event(
-            EventDraft::warn(
-                "scheduler.recovered",
-                format!("Requeued {requeued} stale in-flight eval(s) at startup"),
-            )
-            .meta(json!({ "requeued": requeued })),
-        );
+        store.events().scheduler_recovered(requeued);
     }
-    store.emit_event(
-        EventDraft::info(
-            "scheduler.started",
-            format!("Scheduler started with {max_threads} eval worker(s)"),
-        )
-        .meta(json!({ "evalThreads": max_threads })),
-    );
+    store.events().scheduler_started(max_threads);
 
     let mut join_set = JoinSet::new();
     for worker_id in 0..max_threads {
@@ -586,19 +573,9 @@ fn handle_claimed_eval(store: &Store, worker_id: usize, eval: &Eval) {
             if let Err(e) = store.complete_eval(&eval.id, true) {
                 error!(worker_id, "Error completing eval {}: {:?}", eval.id, e);
             }
-            store.emit_event(
-                EventDraft::info(
-                    "eval.completed",
-                    format!("Eval {} ({}) completed: {message}", eval.id, eval.kind),
-                )
-                .job(&eval.job_id)
-                .node(&eval.node_name)
-                .eval(&eval.id)
-                .meta(json!({
-                    "evalKind": eval.kind,
-                    "elapsedMs": started.elapsed().as_millis() as u64,
-                })),
-            );
+            store
+                .events()
+                .eval_completed(eval, &message, started.elapsed());
         }
         Err(e) => {
             error!(worker_id, eval_id = %eval.id, elapsed_ms = started.elapsed().as_millis() as u64, "Error handling eval {}: {:?}", eval.id, e);
@@ -610,20 +587,7 @@ fn handle_claimed_eval(store: &Store, worker_id: usize, eval: &Eval) {
                     complete_err
                 );
             }
-            store.emit_event(
-                EventDraft::error(
-                    "eval.failed",
-                    format!("Eval {} ({}) failed: {e:#}", eval.id, eval.kind),
-                )
-                .job(&eval.job_id)
-                .node(&eval.node_name)
-                .eval(&eval.id)
-                .meta(json!({
-                    "evalKind": eval.kind,
-                    "elapsedMs": started.elapsed().as_millis() as u64,
-                    "error": format!("{e:#}"),
-                })),
-            );
+            store.events().eval_failed(eval, &e, started.elapsed());
         }
     }
 }

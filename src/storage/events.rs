@@ -9,6 +9,11 @@
 
 use serde::Serialize;
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
+use std::time::Duration;
+
+use crate::storage::store::{JobSubmitOutcome, Store};
+use crate::structs::{Allocation, Eval, Node};
 
 /// Severity levels used by scheduler events.
 pub const EVENT_LEVEL_INFO: &str = "info";
@@ -126,6 +131,355 @@ impl EventDraft {
     pub fn meta(mut self, metadata: Value) -> Self {
         self.metadata = metadata;
         self
+    }
+}
+
+impl Store {
+    /// Named emission facade for scheduler events.
+    ///
+    /// Call sites stay one line and read as domain facts —
+    /// `store.events().job_stopped(name)` — while the kind, level, message,
+    /// scopes, and metadata for each event are defined once, in
+    /// [`EventRecorder`]. Like `emit_event`, every recorder method is
+    /// best-effort and never fails the calling operation.
+    pub fn events(&self) -> EventRecorder<'_> {
+        EventRecorder { store: self }
+    }
+}
+
+/// One named constructor per scheduler event kind.
+///
+/// This is the catalog of everything Legion emits; `docs/event-stream.md`
+/// mirrors it. Methods that take a slice of affected rows skip emission when
+/// the slice is empty, so callers don't need their own guards.
+#[derive(Clone, Copy)]
+pub struct EventRecorder<'a> {
+    store: &'a Store,
+}
+
+impl EventRecorder<'_> {
+    fn emit(self, draft: EventDraft) {
+        self.store.emit_event(draft);
+    }
+
+    /// `scheduler.started` — the eval loop began running.
+    pub fn scheduler_started(self, eval_threads: usize) {
+        self.emit(
+            EventDraft::info(
+                "scheduler.started",
+                format!("Scheduler started with {eval_threads} eval worker(s)"),
+            )
+            .meta(json!({ "evalThreads": eval_threads })),
+        );
+    }
+
+    /// `scheduler.recovered` — stale in-flight evals were requeued at startup.
+    pub fn scheduler_recovered(self, requeued_evals: u64) {
+        self.emit(
+            EventDraft::warn(
+                "scheduler.recovered",
+                format!("Requeued {requeued_evals} stale in-flight eval(s) at startup"),
+            )
+            .meta(json!({ "requeued": requeued_evals })),
+        );
+    }
+
+    /// `eval.enqueued` — an eval was added to the queue.
+    pub fn eval_enqueued(self, eval: &Eval, delay: Duration) {
+        self.emit(
+            EventDraft::info(
+                "eval.enqueued",
+                format!("Eval {} ({}) enqueued", eval.id, eval.kind),
+            )
+            .job(&eval.job_id)
+            .node(&eval.node_name)
+            .eval(&eval.id)
+            .meta(json!({
+                "evalKind": eval.kind,
+                "priority": eval.priority,
+                "delayMs": delay.as_millis() as u64,
+            })),
+        );
+    }
+
+    /// `eval.completed` — an eval handler finished successfully.
+    pub fn eval_completed(self, eval: &Eval, outcome: &str, elapsed: Duration) {
+        self.emit(
+            EventDraft::info(
+                "eval.completed",
+                format!("Eval {} ({}) completed: {outcome}", eval.id, eval.kind),
+            )
+            .job(&eval.job_id)
+            .node(&eval.node_name)
+            .eval(&eval.id)
+            .meta(json!({
+                "evalKind": eval.kind,
+                "elapsedMs": elapsed.as_millis() as u64,
+            })),
+        );
+    }
+
+    /// `eval.failed` — an eval handler returned an error.
+    pub fn eval_failed(self, eval: &Eval, error: &anyhow::Error, elapsed: Duration) {
+        self.emit(
+            EventDraft::error(
+                "eval.failed",
+                format!("Eval {} ({}) failed: {error:#}", eval.id, eval.kind),
+            )
+            .job(&eval.job_id)
+            .node(&eval.node_name)
+            .eval(&eval.id)
+            .meta(json!({
+                "evalKind": eval.kind,
+                "elapsedMs": elapsed.as_millis() as u64,
+                "error": format!("{error:#}"),
+            })),
+        );
+    }
+
+    /// `allocation.placed` — a plan was applied. One event per apply with up
+    /// to 20 placements detailed in metadata. No-op when nothing was placed.
+    pub fn allocations_placed(self, job_config_id: &str, placed: &[Allocation]) {
+        if placed.is_empty() {
+            return;
+        }
+        let job_id = placed
+            .first()
+            .map(|alloc| alloc.job_id.clone())
+            .unwrap_or_default();
+        let placements: Vec<Value> = placed
+            .iter()
+            .take(20)
+            .map(|alloc| {
+                json!({
+                    "allocationId": alloc.id,
+                    "nodeId": alloc.node_id,
+                    "taskConfigId": alloc.task_config_id,
+                })
+            })
+            .collect();
+        self.emit(
+            EventDraft::info(
+                "allocation.placed",
+                format!("Placed {} allocation(s) for job {job_id}", placed.len()),
+            )
+            .job(&job_id)
+            .meta(json!({
+                "jobConfigId": job_config_id,
+                "count": placed.len(),
+                "placements": placements,
+            })),
+        );
+    }
+
+    /// `allocation.plan_rejected` — a placement plan lost an optimistic
+    /// concurrency check and will be retried by the eval handler.
+    pub fn plan_rejected(self, job_config_id: &str, reason: &str) {
+        self.emit(
+            EventDraft::warn(
+                "allocation.plan_rejected",
+                format!("Plan for job config {job_config_id} rejected: {reason}"),
+            )
+            .meta(json!({ "jobConfigId": job_config_id })),
+        );
+    }
+
+    /// `allocation.removed` (warn) — a node's allocations were cleared,
+    /// typically because the node was lost. No-op when nothing was removed.
+    pub fn allocations_removed_from_node(self, node_id: &str, removed: &[Allocation]) {
+        if removed.is_empty() {
+            return;
+        }
+        let affected_jobs: BTreeMap<&str, usize> =
+            removed.iter().fold(BTreeMap::new(), |mut jobs, alloc| {
+                *jobs.entry(alloc.job_id.as_str()).or_default() += 1;
+                jobs
+            });
+        self.emit(
+            EventDraft::warn(
+                "allocation.removed",
+                format!(
+                    "Removed {} allocation(s) from node {node_id}",
+                    removed.len()
+                ),
+            )
+            .node(node_id)
+            .meta(json!({ "count": removed.len(), "jobs": affected_jobs })),
+        );
+    }
+
+    /// `allocation.removed` (info) — a job's allocations were removed (stop or
+    /// update path). No-op when nothing was removed.
+    pub fn allocations_removed_for_job(self, job_id: &str, removed_count: usize) {
+        if removed_count == 0 {
+            return;
+        }
+        self.emit(
+            EventDraft::info(
+                "allocation.removed",
+                format!("Removed {removed_count} allocation(s) for job {job_id}"),
+            )
+            .job(job_id)
+            .meta(json!({ "count": removed_count })),
+        );
+    }
+
+    /// `allocation.removed` (info) — a superseded job config's allocations
+    /// were cleaned up. No-op when nothing was removed.
+    pub fn allocations_removed_for_job_config(self, job_config_id: &str, removed: &[Allocation]) {
+        if removed.is_empty() {
+            return;
+        }
+        let job_id = removed
+            .first()
+            .map(|alloc| alloc.job_id.clone())
+            .unwrap_or_default();
+        self.emit(
+            EventDraft::info(
+                "allocation.removed",
+                format!(
+                    "Removed {} allocation(s) for job config {job_config_id}",
+                    removed.len()
+                ),
+            )
+            .job(&job_id)
+            .meta(json!({
+                "count": removed.len(),
+                "jobConfigId": job_config_id,
+            })),
+        );
+    }
+
+    /// `allocation.failed` — a worker reported an allocation failure.
+    pub fn allocation_failed(
+        self,
+        allocation_id: i64,
+        node_id: &str,
+        job_id: &str,
+        job_config_id: &str,
+        task_config_id: i64,
+        reason: &str,
+    ) {
+        self.emit(
+            EventDraft::warn(
+                "allocation.failed",
+                format!("Allocation {allocation_id} failed on node {node_id}: {reason}"),
+            )
+            .job(job_id)
+            .node(node_id)
+            .allocation(allocation_id)
+            .meta(json!({
+                "reason": reason,
+                "taskConfigId": task_config_id,
+                "jobConfigId": job_config_id,
+            })),
+        );
+    }
+
+    /// `node.registered` — a worker registered (or re-registered).
+    pub fn node_registered(self, node: &Node) {
+        self.emit(
+            EventDraft::info(
+                "node.registered",
+                format!("Node {} registered in pool {}", node.id, node.pool),
+            )
+            .node(&node.id)
+            .meta(json!({ "pool": node.pool, "status": node.status })),
+        );
+    }
+
+    /// `node.ready` — a known node rejoined and was marked ready.
+    pub fn node_ready(self, node_id: &str) {
+        self.emit(EventDraft::info("node.ready", format!("Node {node_id} is ready")).node(node_id));
+    }
+
+    /// `node.lost` — a node was explicitly marked lost.
+    pub fn node_lost(self, node_id: &str) {
+        self.emit(
+            EventDraft::warn("node.lost", format!("Node {node_id} marked lost")).node(node_id),
+        );
+    }
+
+    /// `node.lost` — the health checker marked a node lost after missed
+    /// heartbeats.
+    pub fn node_lost_after_missed_heartbeats(self, node_id: &str) {
+        self.emit(
+            EventDraft::warn(
+                "node.lost",
+                format!("Node {node_id} marked lost after missed heartbeats"),
+            )
+            .node(node_id)
+            .meta(json!({ "reason": "heartbeat" })),
+        );
+    }
+
+    /// `job.submitted` / `job.updated` — a job config was written. Unchanged
+    /// outcomes are a no-op (nothing happened worth streaming).
+    pub fn job_submit_outcome(
+        self,
+        job_id: &str,
+        outcome: &JobSubmitOutcome,
+        version: u32,
+        task_count: usize,
+    ) {
+        let (kind, action) = match outcome {
+            JobSubmitOutcome::Created { .. } => ("job.submitted", "submitted"),
+            JobSubmitOutcome::Updated { .. } => ("job.updated", "updated"),
+            JobSubmitOutcome::Unchanged { .. } => return,
+        };
+        self.emit(
+            EventDraft::info(kind, format!("Job {job_id} {action} (version {version})"))
+                .job(job_id)
+                .meta(json!({
+                    "jobConfigId": outcome.job_config_id(),
+                    "version": version,
+                    "tasks": task_count,
+                })),
+        );
+    }
+
+    /// `job.stopped` — a job was stopped.
+    pub fn job_stopped(self, job_id: &str) {
+        self.emit(EventDraft::info("job.stopped", format!("Job {job_id} stopped")).job(job_id));
+    }
+
+    /// `job.failed` — a job was marked failed (e.g. move limit exceeded).
+    pub fn job_failed(self, job_id: &str) {
+        self.emit(
+            EventDraft::error("job.failed", format!("Job {job_id} marked failed")).job(job_id),
+        );
+    }
+
+    /// `job.destroyed` — a job and its records were removed.
+    pub fn job_destroyed(self, job_id: &str) {
+        self.emit(EventDraft::info("job.destroyed", format!("Job {job_id} destroyed")).job(job_id));
+    }
+
+    /// `rollout.event` — mirror of one rollout event into the unified stream,
+    /// so consumers see rollout activity without polling per-rollout history.
+    pub fn rollout_event(
+        self,
+        rollout_id: i64,
+        job_id: &str,
+        level: &str,
+        message: &str,
+        group_name: Option<&str>,
+        metadata_json: &str,
+    ) {
+        let details: Value = serde_json::from_str(metadata_json).unwrap_or_else(|_| json!({}));
+        let level = match level {
+            EVENT_LEVEL_WARN | EVENT_LEVEL_ERROR => level,
+            _ => EVENT_LEVEL_INFO,
+        };
+        self.emit(
+            EventDraft::new(level, "rollout.event", message)
+                .job(job_id)
+                .rollout(rollout_id)
+                .meta(json!({
+                    "groupName": group_name,
+                    "details": details,
+                })),
+        );
     }
 }
 

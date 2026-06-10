@@ -749,51 +749,12 @@ impl Store {
         let outcome = self.apply_plan_submission_inner(submission)?;
 
         match &outcome {
-            PlanApplyOutcome::Applied(allocations) if !allocations.is_empty() => {
-                let job_id = allocations
-                    .first()
-                    .map(|alloc| alloc.job_id.clone())
-                    .unwrap_or_default();
-                let placements: Vec<Value> = allocations
-                    .iter()
-                    .take(20)
-                    .map(|alloc| {
-                        json!({
-                            "allocationId": alloc.id,
-                            "nodeId": alloc.node_id,
-                            "taskConfigId": alloc.task_config_id,
-                        })
-                    })
-                    .collect();
-                self.emit_event(
-                    EventDraft::info(
-                        "allocation.placed",
-                        format!(
-                            "Placed {} allocation(s) for job {job_id}",
-                            allocations.len()
-                        ),
-                    )
-                    .job(&job_id)
-                    .meta(json!({
-                        "jobConfigId": submission.job_config_id,
-                        "count": allocations.len(),
-                        "placements": placements,
-                    })),
-                );
-            }
-            PlanApplyOutcome::Applied(_) => {}
-            PlanApplyOutcome::Rejected { reason, .. } => {
-                self.emit_event(
-                    EventDraft::warn(
-                        "allocation.plan_rejected",
-                        format!(
-                            "Plan for job config {} rejected: {reason}",
-                            submission.job_config_id
-                        ),
-                    )
-                    .meta(json!({ "jobConfigId": submission.job_config_id })),
-                );
-            }
+            PlanApplyOutcome::Applied(allocations) => self
+                .events()
+                .allocations_placed(&submission.job_config_id, allocations),
+            PlanApplyOutcome::Rejected { reason, .. } => self
+                .events()
+                .plan_rejected(&submission.job_config_id, reason),
         }
 
         Ok(outcome)
@@ -1498,7 +1459,7 @@ impl Store {
         let node = self.get_node(id)?;
         self.cache_node(node)?;
 
-        self.emit_event(EventDraft::info("node.ready", format!("Node {id} is ready")).node(id));
+        self.events().node_ready(id);
 
         Ok(())
     }
@@ -1524,7 +1485,7 @@ impl Store {
         let node = self.get_node(id)?;
         self.cache_node(node)?;
 
-        self.emit_event(EventDraft::warn("node.lost", format!("Node {id} marked lost")).node(id));
+        self.events().node_lost(id);
 
         Ok(())
     }
@@ -1546,19 +1507,8 @@ impl Store {
 
         self.cache_clear_allocations_for_node(node_id)?;
 
-        let affected_jobs: BTreeMap<&str, usize> =
-            allocs.iter().fold(BTreeMap::new(), |mut jobs, alloc| {
-                *jobs.entry(alloc.job_id.as_str()).or_default() += 1;
-                jobs
-            });
-        self.emit_event(
-            EventDraft::warn(
-                "allocation.removed",
-                format!("Removed {} allocation(s) from node {node_id}", allocs.len()),
-            )
-            .node(node_id)
-            .meta(json!({ "count": allocs.len(), "jobs": affected_jobs })),
-        );
+        self.events()
+            .allocations_removed_from_node(node_id, &allocs);
 
         Ok(allocs)
     }
@@ -1605,14 +1555,7 @@ impl Store {
         self.cache_nodes_lost(ids)?;
 
         for node_id in ids {
-            self.emit_event(
-                EventDraft::warn(
-                    "node.lost",
-                    format!("Node {node_id} marked lost after missed heartbeats"),
-                )
-                .node(node_id)
-                .meta(json!({ "reason": "heartbeat" })),
-            );
+            self.events().node_lost_after_missed_heartbeats(node_id);
         }
 
         for node_id in ids {
@@ -1640,14 +1583,7 @@ impl Store {
 
         self.cache_node(node.clone())?;
 
-        self.emit_event(
-            EventDraft::info(
-                "node.registered",
-                format!("Node {} registered in pool {}", node.id, node.pool),
-            )
-            .node(&node.id)
-            .meta(json!({ "pool": node.pool, "status": node.status })),
-        );
+        self.events().node_registered(&node);
 
         Ok(node)
     }
@@ -1839,7 +1775,7 @@ impl Store {
         // that kicks off the eval?
         // ... or maybe just this adds the eval straight up?
 
-        self.emit_event(EventDraft::info("job.stopped", format!("Job {name} stopped")).job(name));
+        self.events().job_stopped(name);
 
         Ok(())
     }
@@ -1855,9 +1791,7 @@ impl Store {
         conn.execute(sql, [job_id])?;
         drop(conn);
 
-        self.emit_event(
-            EventDraft::error("job.failed", format!("Job {job_id} marked failed")).job(job_id),
-        );
+        self.events().job_failed(job_id);
 
         Ok(())
     }
@@ -1913,9 +1847,7 @@ impl Store {
             .map_err(|_| anyhow!("Error committing transaction"))?;
         drop(conn);
 
-        self.emit_event(
-            EventDraft::info("job.destroyed", format!("Job {name} destroyed")).job(name),
-        );
+        self.events().job_destroyed(name);
 
         Ok(())
     }
@@ -2226,29 +2158,15 @@ impl Store {
         let cached_tasks = self.get_task_configs_for_job_config(&job_config_id)?;
         self.cache_set_task_configs_for_job_config(&job_config_id, cached_tasks)?;
 
-        let (kind, action) = if was_update {
-            ("job.updated", "updated")
+        let outcome = if was_update {
+            JobSubmitOutcome::Updated { job_config_id }
         } else {
-            ("job.submitted", "submitted")
+            JobSubmitOutcome::Created { job_config_id }
         };
-        self.emit_event(
-            EventDraft::info(
-                kind,
-                format!("Job {} {action} (version {next_version})", job.id),
-            )
-            .job(&job.id)
-            .meta(json!({
-                "jobConfigId": job_config_id,
-                "version": next_version,
-                "tasks": config.tasks.len(),
-            })),
-        );
+        self.events()
+            .job_submit_outcome(&job.id, &outcome, next_version, config.tasks.len());
 
-        if was_update {
-            Ok(JobSubmitOutcome::Updated { job_config_id })
-        } else {
-            Ok(JobSubmitOutcome::Created { job_config_id })
-        }
+        Ok(outcome)
     }
 
     pub fn normalize_job_config(&self, config: &JobConfig) -> R<JobConfig> {
@@ -2491,23 +2409,13 @@ impl Store {
         )?;
         drop(conn);
 
-        // Mirror rollout activity into the unified scheduler event stream so
-        // ListEvents/StreamEvents consumers see rollouts alongside everything
-        // else without polling per-rollout event history.
-        let metadata: Value =
-            serde_json::from_str(&event.metadata_json).unwrap_or_else(|_| json!({}));
-        let bridge_level = match level {
-            "warn" | "error" => level,
-            _ => "info",
-        };
-        self.emit_event(
-            EventDraft::new(bridge_level, "rollout.event", &event.message)
-                .job(job_id)
-                .rollout(rollout_id)
-                .meta(json!({
-                    "groupName": event.group_name,
-                    "details": metadata,
-                })),
+        self.events().rollout_event(
+            rollout_id,
+            job_id,
+            level,
+            &event.message,
+            event.group_name.as_deref(),
+            &event.metadata_json,
         );
 
         Ok(event)
@@ -2561,7 +2469,6 @@ impl Store {
     }
 
     fn persist_event(&self, draft: &EventDraft) -> R<SchedulerEventRecord> {
-        let conn = self.write_connection()?;
         let created_at = Self::now_rfc3339()?;
         let metadata_json = if draft.metadata.is_object() {
             draft.metadata.to_string()
@@ -2569,13 +2476,12 @@ impl Store {
             json!({ "value": draft.metadata }).to_string()
         };
 
-        let event = conn.query_row(
+        let conn = self.write_connection()?;
+        conn.execute(
             "INSERT INTO scheduler_event (
                 kind, level, job_id, node_id, eval_id, allocation_id, rollout_id,
                 message, metadata_json, created_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-            RETURNING id, kind, level, job_id, node_id, eval_id, allocation_id,
-                rollout_id, message, metadata_json, created_at;",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10);",
             params![
                 draft.kind,
                 draft.level,
@@ -2588,17 +2494,32 @@ impl Store {
                 metadata_json,
                 created_at
             ],
-            |row| self.scheduler_event_from_row(row),
         )?;
+        // Safe under the held write-connection guard: nothing can insert
+        // between the statement above and this read.
+        let id = conn.last_insert_rowid();
 
-        if event.id % EVENT_PRUNE_INTERVAL == 0 {
+        if id % EVENT_PRUNE_INTERVAL == 0 {
             conn.execute(
                 "DELETE FROM scheduler_event WHERE id <= ?1;",
-                [event.id - EVENT_RETAINED_ROWS],
+                [id - EVENT_RETAINED_ROWS],
             )?;
         }
+        drop(conn);
 
-        Ok(event)
+        Ok(SchedulerEventRecord {
+            id,
+            kind: draft.kind.clone(),
+            level: draft.level.clone(),
+            job_id: draft.job_id.clone(),
+            node_id: draft.node_id.clone(),
+            eval_id: draft.eval_id.clone(),
+            allocation_id: draft.allocation_id,
+            rollout_id: draft.rollout_id,
+            message: draft.message.clone(),
+            metadata_json,
+            created_at,
+        })
     }
 
     /// Subscribe to live scheduler events. Receivers that lag behind the
@@ -3445,19 +3366,8 @@ impl Store {
 
         self.cache_remove_allocations(&allocations)?;
 
-        if !allocations.is_empty() {
-            self.emit_event(
-                EventDraft::info(
-                    "allocation.removed",
-                    format!(
-                        "Removed {} allocation(s) for job {job_id}",
-                        allocations.len()
-                    ),
-                )
-                .job(job_id)
-                .meta(json!({ "count": allocations.len() })),
-            );
-        }
+        self.events()
+            .allocations_removed_for_job(job_id, allocations.len());
 
         Ok(())
     }
@@ -3481,24 +3391,8 @@ impl Store {
 
         self.cache_remove_allocations(&allocations)?;
 
-        let job_id = allocations
-            .first()
-            .map(|alloc| alloc.job_id.clone())
-            .unwrap_or_default();
-        self.emit_event(
-            EventDraft::info(
-                "allocation.removed",
-                format!(
-                    "Removed {} allocation(s) for job config {job_config_id}",
-                    allocations.len()
-                ),
-            )
-            .job(&job_id)
-            .meta(json!({
-                "count": allocations.len(),
-                "jobConfigId": job_config_id,
-            })),
-        );
+        self.events()
+            .allocations_removed_for_job_config(job_config_id, &allocations);
 
         Ok(allocations)
     }
@@ -3891,20 +3785,7 @@ impl Store {
             self.eval_notify.notify_one();
         }
 
-        self.emit_event(
-            EventDraft::info(
-                "eval.enqueued",
-                format!("Eval {} ({}) enqueued", eval.id, eval.kind),
-            )
-            .job(&eval.job_id)
-            .node(&eval.node_name)
-            .eval(&eval.id)
-            .meta(json!({
-                "evalKind": eval.kind,
-                "priority": eval.priority,
-                "delayMs": delay.as_millis() as u64,
-            })),
-        );
+        self.events().eval_enqueued(&eval, delay);
 
         Ok(eval)
     }
@@ -6424,6 +6305,62 @@ mod tests {
 
         let placed = &all[2];
         assert_eq!(placed.metadata_json, json!({ "count": 2 }).to_string());
+
+        Ok(())
+    }
+
+    #[test]
+    fn event_recorder_emits_expected_kinds_and_skips_empty() -> R<()> {
+        let store = setup_store()?;
+
+        // Empty inputs are no-ops, so callers don't need their own guards.
+        store.events().allocations_placed("cfg-1", &[]);
+        store.events().allocations_removed_from_node("node-a", &[]);
+        store.events().allocations_removed_for_job("demo", 0);
+        store.events().job_submit_outcome(
+            "demo",
+            &JobSubmitOutcome::Unchanged {
+                job_config_id: "cfg-1".into(),
+            },
+            1,
+            1,
+        );
+        assert!(store
+            .list_scheduler_events(&SchedulerEventFilter::default())?
+            .is_empty());
+
+        store.events().job_submit_outcome(
+            "demo",
+            &JobSubmitOutcome::Created {
+                job_config_id: "cfg-1".into(),
+            },
+            1,
+            2,
+        );
+        store
+            .events()
+            .allocation_failed(7, "node-a", "demo", "cfg-1", 3, "task crashed");
+        store.events().node_lost_after_missed_heartbeats("node-a");
+
+        let events = store.list_scheduler_events(&SchedulerEventFilter::default())?;
+        let kinds: Vec<&str> = events.iter().map(|event| event.kind.as_str()).collect();
+        assert_eq!(
+            kinds,
+            vec!["job.submitted", "allocation.failed", "node.lost"]
+        );
+
+        let failed = &events[1];
+        assert_eq!(failed.level, "warn");
+        assert_eq!(failed.job_id.as_deref(), Some("demo"));
+        assert_eq!(failed.node_id.as_deref(), Some("node-a"));
+        assert_eq!(failed.allocation_id, Some(7));
+        assert!(failed.message.contains("task crashed"));
+
+        let lost = &events[2];
+        assert_eq!(
+            lost.metadata_json,
+            json!({ "reason": "heartbeat" }).to_string()
+        );
 
         Ok(())
     }
