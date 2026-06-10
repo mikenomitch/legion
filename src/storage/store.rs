@@ -129,6 +129,9 @@ pub struct AllocationHealthSnapshot {
     pub healthy: bool,
     pub status: String,
     pub updated_at: String,
+    /// JSON-encoded per-artifact staging states from the worker heartbeat
+    /// (`Vec<ArtifactStatus>`); `None` when the task declares no artifacts.
+    pub artifact_states: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -388,7 +391,7 @@ impl Store {
 
         let mut task_stmt = conn.prepare(
             r#"
-            SELECT id, name, kind, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_config_id, identities
+            SELECT id, name, kind, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_config_id, identities, artifacts
             FROM task_config;
             "#,
         )?;
@@ -420,6 +423,7 @@ impl Store {
                 on_unhealthy: self.parse_on_unhealthy_column(15, row.get(15)?)?,
                 kv_injections: self.parse_kv_injections_column(16, row.get(16)?)?,
                 identities: self.parse_identities_column(18, row.get(18)?)?,
+                artifacts: self.parse_artifacts_column(19, row.get(19)?)?,
             };
             let job_config_id: String = row.get(17)?;
             Ok((job_config_id, id, task))
@@ -1126,6 +1130,7 @@ impl Store {
             healthy: row.get::<_, i64>(2)? != 0,
             status: row.get(3)?,
             updated_at: row.get(4)?,
+            artifact_states: row.get(5)?,
         })
     }
 
@@ -1159,6 +1164,7 @@ impl Store {
         let resources = row.get(5)?;
         let reserved_resources = row.get(6)?;
         let max_allocations = row.get(7)?;
+        let artifacts = row.get(8)?;
 
         Ok(WorkerConfig {
             name: row.get(0)?,
@@ -1173,6 +1179,7 @@ impl Store {
             resources,
             reserved_resources,
             max_allocations,
+            artifacts,
         })
     }
 
@@ -1252,6 +1259,23 @@ impl Store {
         })
     }
 
+    fn parse_artifacts_column(
+        &self,
+        idx: usize,
+        raw: Option<String>,
+    ) -> Result<Vec<crate::structs::ArtifactSpec>, rusqlite::Error> {
+        let Some(raw) = raw else {
+            return Ok(Vec::new());
+        };
+        serde_json::from_str(&raw).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(
+                idx,
+                rusqlite::types::Type::Text,
+                Box::new(err),
+            )
+        })
+    }
+
     fn parse_identities_column(
         &self,
         idx: usize,
@@ -1310,6 +1334,7 @@ impl Store {
             on_unhealthy: self.parse_on_unhealthy_column(15, row.get(15)?)?,
             kv_injections: self.parse_kv_injections_column(16, row.get(16)?)?,
             identities: self.parse_identities_column(19, row.get(19)?)?,
+            artifacts: self.parse_artifacts_column(20, row.get(20)?)?,
         };
 
         Ok(task_config)
@@ -1683,6 +1708,7 @@ impl Store {
             ":resources": resources_to_save,
             ":reserved_resources": reserved_resources_to_save,
             ":max_allocations": config.max_allocations,
+            ":artifacts": config.artifacts,
         };
 
         let config = conn.query_row(&INSERT_WORKER_TYPE, params, |row| {
@@ -2038,6 +2064,11 @@ impl Store {
             } else {
                 Some(serde_json::to_string(&t.identities)?)
             };
+            let artifacts = if t.artifacts.is_empty() {
+                None
+            } else {
+                Some(serde_json::to_string(&t.artifacts)?)
+            };
             let schedule = t.schedule.as_ref().map(ToString::to_string);
             let task_params = named_params! {
                 ":name": t.name,
@@ -2059,6 +2090,7 @@ impl Store {
                 ":job_id": job.id,
                 ":job_config_id": job_config_id,
                 ":identities": identities,
+                ":artifacts": artifacts,
             };
 
             let task_id: i64 = tx.query_row(&INSERT_TASK, task_params, |row| row.get(0))?;
@@ -2952,21 +2984,24 @@ impl Store {
                     node_id,
                     healthy,
                     status,
-                    updated_at
+                    updated_at,
+                    artifact_states
                 )
-                SELECT ?1, ?2, ?3, ?4, ?5
+                SELECT ?1, ?2, ?3, ?4, ?5, ?6
                 WHERE EXISTS (SELECT 1 FROM allocation WHERE id = ?1 AND node_id = ?2)
                 ON CONFLICT(allocation_id) DO UPDATE
                 SET node_id = excluded.node_id,
                     healthy = excluded.healthy,
                     status = excluded.status,
-                    updated_at = excluded.updated_at;",
+                    updated_at = excluded.updated_at,
+                    artifact_states = excluded.artifact_states;",
                 params![
                     snapshot.allocation_id,
                     node_id,
                     i64::from(snapshot.healthy),
                     snapshot.status.as_str(),
-                    now.as_str()
+                    now.as_str(),
+                    snapshot.artifact_states.as_deref()
                 ],
             )?;
         }
@@ -3008,7 +3043,7 @@ impl Store {
             .collect::<Vec<_>>()
             .join(",");
         let sql = format!(
-            "SELECT allocation_id, node_id, healthy, status, updated_at
+            "SELECT allocation_id, node_id, healthy, status, updated_at, artifact_states
              FROM allocation_health
              WHERE allocation_id IN ({placeholders});"
         );
@@ -3031,7 +3066,8 @@ impl Store {
     ) -> R<HashMap<i64, AllocationHealthSnapshot>> {
         let conn = self.read_connection()?;
         let mut stmt = conn.prepare(
-            "SELECT ah.allocation_id, ah.node_id, ah.healthy, ah.status, ah.updated_at
+            "SELECT ah.allocation_id, ah.node_id, ah.healthy, ah.status, ah.updated_at, \
+                    ah.artifact_states
              FROM allocation_health ah
              INNER JOIN allocation a ON a.id = ah.allocation_id
              WHERE a.job_config_id = ?1;",
@@ -4671,6 +4707,7 @@ mod tests {
             resources: "{}".into(),
             reserved_resources: "{}".into(),
             max_allocations: None,
+            artifacts: String::new(),
         };
 
         let returned_config = store.insert_worker_type(&worker_config)?;
@@ -4702,6 +4739,7 @@ mod tests {
             resources: "{}".into(),
             reserved_resources: "{}".into(),
             max_allocations: None,
+            artifacts: String::new(),
         };
 
         store.insert_worker_type(&worker_config)?;
@@ -5948,6 +5986,7 @@ mod tests {
                 allocation_id: allocation.id,
                 healthy: false,
                 status: "starting".into(),
+                artifact_states: None,
             }],
         )?;
         store.upsert_allocation_health_snapshots(
@@ -5956,6 +5995,7 @@ mod tests {
                 allocation_id: allocation.id,
                 healthy: true,
                 status: "healthy".into(),
+                artifact_states: None,
             }],
         )?;
 
@@ -5972,6 +6012,7 @@ mod tests {
                 allocation_id: allocation.id,
                 healthy: false,
                 status: "spoofed".into(),
+                artifact_states: None,
             }],
         )?;
         let health = store.allocation_health_for_allocations(&[allocation.id])?;

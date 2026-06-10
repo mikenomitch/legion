@@ -52,6 +52,20 @@ pub struct TaskRuntime {
     pub state: Value,
     pub child: Option<Child>,
     pub pid: Option<u32>,
+    /// Private per-allocation directory (`allocs/<alloc_id>/`), created by
+    /// the worker before `prepare()` and removed on destroy.
+    pub alloc_dir: Option<std::path::PathBuf>,
+    /// Private task directory (`allocs/<alloc_id>/<task_name>/`). Artifacts
+    /// stage here; the exec kind's `cwd` defaults here.
+    pub task_dir: Option<std::path::PathBuf>,
+    /// Env vars injected by the worker core (`LEGION_ALLOC_DIR`,
+    /// `LEGION_TASK_DIR`, `LEGION_ARTIFACT_<NAME>`). Kinds that run host
+    /// processes apply these at start; kinds with isolated filesystems
+    /// (container) skip them until they grow volume plumbing.
+    pub extra_env: std::collections::BTreeMap<String, String>,
+    /// Typed staged artifacts (artifact system plan §8), attached before
+    /// `prepare()` so plugins consume payloads instead of guessing paths.
+    pub staged_artifacts: Vec<crate::artifacts::StagedArtifact>,
 }
 
 pub trait TaskPlugin: Send + Sync {
@@ -100,6 +114,35 @@ pub trait TaskPlugin: Send + Sync {
     /// for an identity with `changeMode: signal`).
     fn supports_signal(&self) -> bool {
         false
+    }
+
+    /// Capability gate for the `artifacts` task field, mirroring
+    /// `supports_kv_env_injection` and friends. Admission rejects
+    /// artifact-bearing specs for kinds that return false. Kinds that return
+    /// true get File/Tree payloads with zero further code: the worker core
+    /// stages them into the task dir and exposes `${artifact.<name>}` /
+    /// `LEGION_ARTIFACT_<NAME>`.
+    fn supports_artifacts(&self) -> bool {
+        false
+    }
+
+    /// Desugars kind-config fields into artifacts (artifact system plan §8).
+    /// The manager calls this at admission; this is how `container.image`
+    /// joins the shared pipeline without changing its user-facing spec.
+    fn implicit_artifacts(&self, task_config: &Value) -> R<Vec<crate::structs::ArtifactSpec>> {
+        let _ = task_config;
+        Ok(Vec::new())
+    }
+
+    /// Consumes non-file payloads during prepare (OCI images, ORAS layers).
+    /// The default handles nothing because File/Tree need no consumption.
+    fn consume_artifact(
+        &self,
+        staged: &crate::artifacts::StagedArtifact,
+        runtime: &mut TaskRuntime,
+    ) -> R<()> {
+        let _ = (staged, runtime);
+        Ok(())
     }
 
     fn prepare(
@@ -205,6 +248,20 @@ pub fn validate_job_config(config: &JobConfig) -> R<()> {
         task.validate_checks()?;
         task.validate_kv_injections()?;
         task.validate_identities()?;
+        task.validate_artifacts()?;
+        if !task.artifacts.is_empty() {
+            registry.load_plugin(&task.kind, false)?;
+            let plugin = registry
+                .plugin(&task.kind)
+                .context("task plugin loaded but missing")?;
+            if !plugin.supports_artifacts() {
+                bail!(
+                    "Task {} kind {} does not support artifacts",
+                    task.name,
+                    task.kind
+                );
+            }
+        }
         if !task.identities.is_empty() {
             registry.load_plugin(&task.kind, false)?;
             let plugin = registry

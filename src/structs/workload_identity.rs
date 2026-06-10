@@ -402,6 +402,162 @@ impl WorkloadIdentityClaims {
     }
 }
 
+/// Default `sub` template for node identities. Same stability rule as task
+/// identities: policy-friendly fields only — the churning node id is
+/// claims-only (`legion.io/node`), exactly like `{alloc}` for tasks.
+pub const DEFAULT_NODE_SUB_TEMPLATE: &str = "{region}:node:{pool}";
+
+/// Placeholders allowed in a node-identity `sub` template.
+const NODE_SUB_FIELDS: &[&str] = &["region", "pool"];
+
+/// One cluster-level identity issued to *worker nodes* rather than tasks
+/// (artifact system plan §6). Node identities let store policies say "any
+/// Legion worker node in region X, pool Y may read" — the cluster-grain
+/// credential that cluster artifact-auth matchers and pre-warming use.
+/// Declared under `workloadIdentity.nodeIdentities` in manager config.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeIdentityConfig {
+    /// Unique cluster-wide; the selector used in `auth.nodeIdentity` and in
+    /// cluster artifact-auth matchers.
+    pub name: String,
+    /// One or more audiences. Never empty, like task identities.
+    #[serde(default)]
+    pub audience: Vec<String>,
+    /// Token lifetime (humantime). Falls back to the cluster default TTL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<String>,
+    /// `sub` template override; defaults to [`DEFAULT_NODE_SUB_TEMPLATE`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sub_template: Option<String>,
+}
+
+impl NodeIdentityConfig {
+    pub fn parsed_ttl(&self) -> R<Option<Duration>> {
+        match self.ttl.as_deref() {
+            None => Ok(None),
+            Some(raw) => {
+                let parsed: Duration = raw
+                    .parse::<humantime::Duration>()
+                    .with_context(|| format!("invalid ttl {raw:?} (use e.g. \"15m\")"))?
+                    .into();
+                Ok(Some(parsed))
+            }
+        }
+    }
+
+    pub fn validate(&self) -> R<()> {
+        let scope = format!("nodeIdentity {:?}", self.name);
+        if self.name.trim().is_empty() {
+            bail!("nodeIdentities entries must have a non-empty name");
+        }
+        if self.audience.is_empty() {
+            bail!("{scope} must declare at least one audience");
+        }
+        if self.audience.iter().any(|a| a.trim().is_empty()) {
+            bail!("{scope} audience entries cannot be empty");
+        }
+        self.parsed_ttl()
+            .with_context(|| format!("{scope} ttl is invalid"))?;
+        if let Some(template) = self.sub_template.as_deref() {
+            validate_node_sub_template(template)
+                .with_context(|| format!("{scope} subTemplate is invalid"))?;
+        }
+        Ok(())
+    }
+}
+
+/// Validate the cluster's node-identity list: unique names plus per-entry
+/// rules.
+pub fn validate_node_identities(identities: &[NodeIdentityConfig]) -> R<()> {
+    let mut seen = std::collections::HashSet::new();
+    for identity in identities {
+        identity.validate()?;
+        if !seen.insert(identity.name.as_str()) {
+            bail!("duplicate nodeIdentity name {:?}", identity.name);
+        }
+    }
+    Ok(())
+}
+
+/// Validate a node-identity `sub` template: allow-list only (`{region}` and
+/// `{pool}`); `{node}` rejected explicitly because node ids churn — the node
+/// id rides along as a `legion.io/node` claim, never in `sub`.
+pub fn validate_node_sub_template(template: &str) -> R<()> {
+    let placeholders = parse_placeholders(template)?;
+    if placeholders.is_empty() {
+        bail!(
+            "node sub template {template:?} has no placeholders; it would render the same \
+             subject for every cluster"
+        );
+    }
+    for field in &placeholders {
+        if field == "node" {
+            bail!(
+                "node sub template {template:?} uses {{node}}, which churns as nodes are \
+                 replaced; it is available only as a legion.io/node claim"
+            );
+        }
+        if !NODE_SUB_FIELDS.contains(&field.as_str()) {
+            bail!("node sub template {template:?} uses unknown placeholder {{{field}}}");
+        }
+    }
+    Ok(())
+}
+
+/// Claims describing a worker node's verifiable identity. The manager derives
+/// these from the node's registration record at issuance time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeIdentityClaims {
+    pub region: String,
+    pub pool: String,
+    pub node_id: String,
+}
+
+impl NodeIdentityClaims {
+    /// Render the `sub` from a template, defaulting to
+    /// [`DEFAULT_NODE_SUB_TEMPLATE`].
+    pub fn subject_for(&self, template: Option<&str>) -> R<String> {
+        let template = template.unwrap_or(DEFAULT_NODE_SUB_TEMPLATE);
+        let mut out = String::with_capacity(template.len());
+        let mut rest = template;
+        while let Some(open) = rest.find('{') {
+            out.push_str(&rest[..open]);
+            let after = &rest[open + 1..];
+            let close = after
+                .find('}')
+                .with_context(|| format!("node sub template {template:?} has an unclosed '{{'"))?;
+            let value = match &after[..close] {
+                "region" => self.region.clone(),
+                "pool" => self.pool.clone(),
+                field => bail!(
+                    "node sub template {template:?} field {{{field}}} is not available for \
+                     node identities"
+                ),
+            };
+            out.push_str(&value);
+            rest = &after[close + 1..];
+        }
+        out.push_str(rest);
+        if out.is_empty() {
+            bail!("node sub template {template:?} rendered an empty subject");
+        }
+        Ok(out)
+    }
+
+    /// The discrete `legion.io/*` claims for a node token. `legion.io/scope`
+    /// is `"node"` so relying parties can distinguish node tokens from task
+    /// tokens issued by the same cluster; `legion.io/node` is audit-only.
+    pub fn legion_claims(&self) -> BTreeMap<String, String> {
+        let mut claims = BTreeMap::new();
+        claims.insert(format!("{LEGION_CLAIM_PREFIX}scope"), "node".to_string());
+        claims.insert(format!("{LEGION_CLAIM_PREFIX}region"), self.region.clone());
+        claims.insert(format!("{LEGION_CLAIM_PREFIX}pool"), self.pool.clone());
+        claims.insert(format!("{LEGION_CLAIM_PREFIX}node"), self.node_id.clone());
+        claims
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -55,6 +55,10 @@ url = "2.5.4"
 tempfile = "3"
 libc = "0.2"
 object_store = { version = "0.11.2", features = ["aws"] }
+tar = "0.4"
+flate2 = "1.0"
+base64 = "0.22"
+oci-client = { version = "0.15", default-features = false, features = ["rustls-tls"] }
 openraft = "0.9.21"
 
 [target.'cfg(target_os = "linux")'.dependencies]

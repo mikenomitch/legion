@@ -7,10 +7,11 @@ use serde_json::Value;
 pub const DEF_SCHEDULER_AUTO_ANTI_AFFINITY_WEIGHT: f64 = 0.2;
 
 use crate::prelude::{
-    DEF_EVAL_PRIORITY, DEF_MANAGER_HOSTNAME, DEF_MANAGER_INSECURE_PORT, DEF_MANAGER_SERVER_PORT,
-    DEF_ROLLOUT_RETENTION_DAYS, DEF_SCHEDULING_POLICY, DEF_STORE_PATH, DEF_WORKER_CHECK_SEC,
-    DEF_WORKER_CONFIG_PATH,
+    bail, Context, DEF_EVAL_PRIORITY, DEF_MANAGER_HOSTNAME, DEF_MANAGER_INSECURE_PORT,
+    DEF_MANAGER_SERVER_PORT, DEF_ROLLOUT_RETENTION_DAYS, DEF_SCHEDULING_POLICY, DEF_STORE_PATH,
+    DEF_WORKER_CHECK_SEC, DEF_WORKER_CONFIG_PATH, R,
 };
+use crate::structs::workload_identity::NodeIdentityConfig;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -37,6 +38,113 @@ pub struct ManagerConfig {
     pub persistence: Option<PersistenceConfig>,
     #[serde(default)]
     pub workload_identity: Option<WorkloadIdentityConfig>,
+    #[serde(default)]
+    pub artifacts: Option<ArtifactsManagerConfig>,
+}
+
+/// Default artifact scheme allowlist. Plain `http` requires explicit opt-in.
+pub const DEF_ARTIFACT_ALLOWED_SCHEMES: &[&str] = &["https", "s3", "oci", "git", "file"];
+
+/// One cluster-level artifact auth matcher: routes sources matching a glob to
+/// a KV credential or a node identity. First match wins. Cluster entries may
+/// never attach a *task* identity — task identities are a per-task security
+/// boundary (artifact plan judgement call 6); node identity exists precisely
+/// to be the cluster-grain credential.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtifactAuthMatcher {
+    /// Source glob: `scheme://host/path` segments where `*` matches within a
+    /// path segment and `**` crosses segments (for example
+    /// `oci://ghcr.io/acme/**`).
+    pub r#match: String,
+    /// KV path holding the credential JSON for matching sources.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv: Option<String>,
+    /// Node identity name (from `workloadIdentity.nodeIdentities`) used for
+    /// matching sources.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_identity: Option<String>,
+}
+
+impl ArtifactAuthMatcher {
+    pub fn validate(&self) -> R<()> {
+        if self.r#match.trim().is_empty() {
+            bail!("artifacts.auth matcher requires a non-empty match pattern");
+        }
+        match (self.kv.as_deref(), self.node_identity.as_deref()) {
+            (Some(kv), None) if !kv.trim().is_empty() => Ok(()),
+            (None, Some(node_identity)) if !node_identity.trim().is_empty() => Ok(()),
+            (Some(_), Some(_)) => bail!(
+                "artifacts.auth matcher {:?} must set exactly one of kv or nodeIdentity",
+                self.r#match
+            ),
+            _ => bail!(
+                "artifacts.auth matcher {:?} must set one of kv or nodeIdentity (task \
+                 identities are per-task and cannot be attached cluster-wide)",
+                self.r#match
+            ),
+        }
+    }
+}
+
+/// Cluster-level artifact settings (manager config `artifacts` block).
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtifactsManagerConfig {
+    /// Source schemes jobs may use. Defaults to
+    /// [`DEF_ARTIFACT_ALLOWED_SCHEMES`] (everything except plain `http`).
+    pub allowed_schemes: Option<Vec<String>>,
+    /// Cluster auth matchers applied when a task artifact carries no `auth`.
+    pub auth: Option<Vec<ArtifactAuthMatcher>>,
+    /// Whether container `image` fields desugar into Legion-managed `oci://`
+    /// artifacts. Off by default until the artifact cache lands (without a
+    /// cache this would re-download images per allocation and regress
+    /// runtimes that cache images themselves).
+    pub container_image_desugar: Option<bool>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtifactsManagerConfigFull {
+    pub allowed_schemes: Vec<String>,
+    pub auth: Vec<ArtifactAuthMatcher>,
+    pub container_image_desugar: bool,
+}
+
+impl Default for ArtifactsManagerConfigFull {
+    fn default() -> Self {
+        ArtifactsManagerConfigFull {
+            allowed_schemes: DEF_ARTIFACT_ALLOWED_SCHEMES
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            auth: Vec::new(),
+            container_image_desugar: false,
+        }
+    }
+}
+
+impl ArtifactsManagerConfig {
+    pub fn with_defaults(&self) -> ArtifactsManagerConfigFull {
+        let d = ArtifactsManagerConfigFull::default();
+        ArtifactsManagerConfigFull {
+            allowed_schemes: self.allowed_schemes.clone().unwrap_or(d.allowed_schemes),
+            auth: self.auth.clone().unwrap_or(d.auth),
+            container_image_desugar: self
+                .container_image_desugar
+                .unwrap_or(d.container_image_desugar),
+        }
+    }
+}
+
+impl From<ArtifactsManagerConfigFull> for ArtifactsManagerConfig {
+    fn from(val: ArtifactsManagerConfigFull) -> Self {
+        ArtifactsManagerConfig {
+            allowed_schemes: Some(val.allowed_schemes),
+            auth: Some(val.auth),
+            container_image_desugar: Some(val.container_image_desugar),
+        }
+    }
 }
 
 /// Default token TTL when an identity does not set its own.
@@ -62,6 +170,11 @@ pub struct WorkloadIdentityConfig {
     pub default_audience: Option<Vec<String>>,
     /// Cluster-default `sub` template; per-identity `subTemplate` overrides it.
     pub sub_template: Option<String>,
+    /// Identities issued to worker nodes rather than tasks (artifact system
+    /// plan §6). Referenced by `auth.nodeIdentity` and cluster artifact-auth
+    /// matchers.
+    #[serde(default)]
+    pub node_identities: Option<Vec<NodeIdentityConfig>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -75,6 +188,8 @@ pub struct WorkloadIdentityConfigFull {
     pub rotation_age: String,
     pub default_audience: Vec<String>,
     pub sub_template: String,
+    #[serde(default)]
+    pub node_identities: Vec<NodeIdentityConfig>,
 }
 
 impl Default for WorkloadIdentityConfigFull {
@@ -88,6 +203,7 @@ impl Default for WorkloadIdentityConfigFull {
             rotation_age: DEF_WORKLOAD_IDENTITY_ROTATION_AGE.into(),
             default_audience: Vec::new(),
             sub_template: crate::structs::workload_identity::DEFAULT_SUB_TEMPLATE.into(),
+            node_identities: Vec::new(),
         }
     }
 }
@@ -103,6 +219,7 @@ impl From<WorkloadIdentityConfigFull> for WorkloadIdentityConfig {
             rotation_age: Some(val.rotation_age),
             default_audience: Some(val.default_audience),
             sub_template: Some(val.sub_template),
+            node_identities: Some(val.node_identities),
         }
     }
 }
@@ -119,6 +236,7 @@ impl WorkloadIdentityConfig {
             rotation_age: self.rotation_age.clone().unwrap_or(d.rotation_age),
             default_audience: self.default_audience.clone().unwrap_or(d.default_audience),
             sub_template: self.sub_template.clone().unwrap_or(d.sub_template),
+            node_identities: self.node_identities.clone().unwrap_or(d.node_identities),
         }
     }
 }
@@ -219,6 +337,8 @@ pub struct ManagerConfigFull {
     pub persistence: PersistenceConfigFull,
     #[serde(default)]
     pub workload_identity: WorkloadIdentityConfigFull,
+    #[serde(default)]
+    pub artifacts: ArtifactsManagerConfigFull,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -321,6 +441,7 @@ impl From<ManagerConfigFull> for ManagerConfig {
             custom_resources: val.custom_resources,
             persistence: Some(val.persistence.into()),
             workload_identity: Some(val.workload_identity.into()),
+            artifacts: Some(val.artifacts.into()),
         }
     }
 }
@@ -366,6 +487,11 @@ impl ManagerConfig {
                 .as_ref()
                 .map(WorkloadIdentityConfig::with_defaults)
                 .unwrap_or_default(),
+            artifacts: self
+                .artifacts
+                .as_ref()
+                .map(ArtifactsManagerConfig::with_defaults)
+                .unwrap_or_default(),
         }
     }
 }
@@ -386,6 +512,7 @@ impl Default for ManagerConfigFull {
             eval_threads: default_eval_threads(),
             persistence: PersistenceConfigFull::default(),
             workload_identity: WorkloadIdentityConfigFull::default(),
+            artifacts: ArtifactsManagerConfigFull::default(),
         }
     }
 }
@@ -593,4 +720,127 @@ pub struct WorkerConfigAlt {
     pub resources: Option<Value>,
     pub reserved_resources: Option<Value>,
     pub max_allocations: Option<u32>,
+    #[serde(default)]
+    pub artifacts: Option<WorkerArtifactsConfig>,
+}
+
+/// Default concurrent artifact fetches per worker.
+pub const DEF_ARTIFACT_FETCH_PARALLELISM: usize = 4;
+/// Default per-artifact fetch attempts before the allocation fails.
+pub const DEF_ARTIFACT_FETCH_ATTEMPTS: u32 = 3;
+/// Default overall fetch deadline per artifact.
+pub const DEF_ARTIFACT_FETCH_TIMEOUT: &str = "10m";
+/// Default per-artifact size cap (also bounds decompression).
+pub const DEF_ARTIFACT_MAX_SIZE: &str = "50GiB";
+
+/// Worker-level artifact settings (worker config `artifacts` block). The
+/// cache plan later adds a sibling `cache` block under the same key.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerArtifactsConfig {
+    pub fetch: Option<WorkerArtifactFetchConfig>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerArtifactFetchConfig {
+    /// Concurrent fetches per worker.
+    pub parallelism: Option<usize>,
+    /// Per-artifact retries before the allocation fails.
+    pub attempts: Option<u32>,
+    /// Overall fetch deadline per artifact (humantime, e.g. "10m").
+    pub timeout: Option<String>,
+    /// Per-artifact size cap (e.g. "50GiB"); also bounds decompression.
+    pub max_artifact_size: Option<String>,
+    /// Worker-side scheme allowlist (defense in depth alongside admission).
+    pub allowed_schemes: Option<Vec<String>>,
+}
+
+/// Resolved worker fetch settings with defaults applied.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerArtifactFetchConfigFull {
+    pub parallelism: usize,
+    pub attempts: u32,
+    pub timeout_secs: u64,
+    pub max_artifact_size_bytes: u64,
+    pub allowed_schemes: Vec<String>,
+}
+
+impl Default for WorkerArtifactFetchConfigFull {
+    fn default() -> Self {
+        WorkerArtifactFetchConfigFull {
+            parallelism: DEF_ARTIFACT_FETCH_PARALLELISM,
+            attempts: DEF_ARTIFACT_FETCH_ATTEMPTS,
+            timeout_secs: 600,
+            max_artifact_size_bytes: 50 * 1024 * 1024 * 1024,
+            allowed_schemes: DEF_ARTIFACT_ALLOWED_SCHEMES
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        }
+    }
+}
+
+impl WorkerArtifactsConfig {
+    pub fn fetch_with_defaults(&self) -> R<WorkerArtifactFetchConfigFull> {
+        let d = WorkerArtifactFetchConfigFull::default();
+        let Some(fetch) = self.fetch.as_ref() else {
+            return Ok(d);
+        };
+        let timeout_secs = match fetch.timeout.as_deref() {
+            None => d.timeout_secs,
+            Some(raw) => raw
+                .parse::<humantime::Duration>()
+                .with_context(|| format!("invalid artifacts.fetch.timeout {raw:?}"))?
+                .as_secs(),
+        };
+        let max_artifact_size_bytes = match fetch.max_artifact_size.as_deref() {
+            None => d.max_artifact_size_bytes,
+            Some(raw) => parse_byte_size(raw)
+                .with_context(|| format!("invalid artifacts.fetch.maxArtifactSize {raw:?}"))?,
+        };
+        if fetch.parallelism == Some(0) {
+            bail!("artifacts.fetch.parallelism must be at least 1");
+        }
+        if fetch.attempts == Some(0) {
+            bail!("artifacts.fetch.attempts must be at least 1");
+        }
+        Ok(WorkerArtifactFetchConfigFull {
+            parallelism: fetch.parallelism.unwrap_or(d.parallelism),
+            attempts: fetch.attempts.unwrap_or(d.attempts),
+            timeout_secs,
+            max_artifact_size_bytes,
+            allowed_schemes: fetch.allowed_schemes.clone().unwrap_or(d.allowed_schemes),
+        })
+    }
+}
+
+/// Parses human byte sizes like "512MiB", "50GiB", "10MB", or plain bytes.
+/// Decimal (KB/MB/GB/TB) and binary (KiB/MiB/GiB/TiB) suffixes supported.
+pub fn parse_byte_size(raw: &str) -> R<u64> {
+    let trimmed = raw.trim();
+    let split = trimmed
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(trimmed.len());
+    let (number, suffix) = trimmed.split_at(split);
+    let value: f64 = number
+        .parse()
+        .with_context(|| format!("invalid byte size {raw:?}"))?;
+    let multiplier: u64 = match suffix.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 1,
+        "kb" => 1000,
+        "mb" => 1000 * 1000,
+        "gb" => 1000 * 1000 * 1000,
+        "tb" => 1000 * 1000 * 1000 * 1000,
+        "kib" | "k" => 1 << 10,
+        "mib" | "m" => 1 << 20,
+        "gib" | "g" => 1 << 30,
+        "tib" | "t" => 1 << 40,
+        other => bail!("invalid byte size suffix {other:?} in {raw:?}"),
+    };
+    if value < 0.0 {
+        bail!("byte size {raw:?} cannot be negative");
+    }
+    Ok((value * multiplier as f64) as u64)
 }

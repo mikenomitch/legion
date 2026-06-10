@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod artifact_credentials;
 pub mod node_check;
 pub mod server;
 pub mod state;

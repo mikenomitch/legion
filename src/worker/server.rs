@@ -2,8 +2,7 @@ use crate::prelude::*;
 use crate::structs::{
     worker_server::Worker, PostWorkReply, PostWorkRequest, RestartWorkerReply, RestartWorkerRequest,
 };
-use crate::worker::task_health::spawn_health_monitor;
-use crate::worker::task_manager::WorkerTaskManager;
+use crate::worker::task_manager::{launch_task_allocation, WorkerTaskManager};
 use std::sync::{Arc, Mutex};
 use tonic::{Request, Response, Status};
 
@@ -23,21 +22,18 @@ impl Worker for WorkerAgentService {
             .allocation
             .ok_or_else(|| Status::invalid_argument("Missing allocation"))?;
 
-        let started = {
-            let mut manager = self
-                .task_manager
-                .lock()
-                .map_err(|_| Status::internal("Task manager lock poisoned"))?;
-            match manager.run_task_allocation(&allocation) {
-                Ok(started) => started,
-                Err(err) => {
-                    manager.record_failure(allocation.allocation_id, err.to_string());
-                    return Err(Status::internal(format!("Failed to start task: {err}")));
-                }
-            }
-        };
-
-        spawn_health_monitor(self.task_manager.clone(), started.0, started.1);
+        // Synchronous failures (bad config, unknown kind) surface here;
+        // artifact-bearing tasks stage on a background thread and report
+        // staging failures through the heartbeat failure path.
+        let task_manager = self.task_manager.clone();
+        let launched = tokio::task::spawn_blocking(move || {
+            launch_task_allocation(&task_manager, &allocation)
+        })
+        .await
+        .map_err(|err| Status::internal(format!("launch task panicked: {err}")))?;
+        if let Err(err) = launched {
+            return Err(Status::internal(format!("Failed to start task: {err}")));
+        }
 
         let reply = PostWorkReply {
             message: "Task accepted".into(),

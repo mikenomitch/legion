@@ -35,6 +35,22 @@ pub async fn run_manager(config: ManagerConfig, run_worker: bool) -> R<()> {
     info!("Starting manager node");
 
     let full_config = config.with_defaults();
+    // Fail fast on malformed artifact/auth/node-identity config: a bad
+    // matcher or unknown nodeIdentity reference should stop the manager at
+    // startup, not break job admission later.
+    crate::structs::workload_identity::validate_node_identities(
+        &full_config.workload_identity.node_identities,
+    )?;
+    let node_identity_names: Vec<String> = full_config
+        .workload_identity
+        .node_identities
+        .iter()
+        .map(|identity| identity.name.clone())
+        .collect();
+    crate::artifacts::auth::validate_cluster_artifacts_config(
+        &full_config.artifacts,
+        &node_identity_names,
+    )?;
     let manager_node_id = format!("{}:{}", full_config.server.host, full_config.server.port);
     let store = Store::start_storage(&full_config)?;
     if let Err(err) = store.prune_rollouts() {
@@ -60,7 +76,7 @@ pub async fn run_manager(config: ManagerConfig, run_worker: bool) -> R<()> {
 
     let store_copy_b = store.clone();
 
-    let manager_node = ManagerAgentService::new(store);
+    let manager_node = ManagerAgentService::with_manager_config(store, &full_config);
 
     let addr = format!("{}:{}", full_config.server.host, full_config.server.port).parse()?;
 
@@ -630,6 +646,18 @@ async fn load_initial_data(store: &Store, config: &ManagerConfig) -> R<()> {
             .transpose()?
             .unwrap_or_else(|| "{}".to_string());
 
+        let artifacts = match wcp.artifacts.as_ref() {
+            None => String::new(),
+            Some(config) => {
+                // Fail fast on malformed fetch settings (bad humantime /
+                // byte-size strings) at manager startup, not on the worker.
+                config.fetch_with_defaults().with_context(|| {
+                    format!("invalid artifacts config in worker config {path_str}")
+                })?;
+                serde_json::to_string(config)?
+            }
+        };
+
         let wc = WorkerConfigMsg {
             name: wcp.worker_type.clone(),
             pool: wcp.pool.unwrap_or("default".into()),
@@ -639,6 +667,7 @@ async fn load_initial_data(store: &Store, config: &ManagerConfig) -> R<()> {
             resources,
             reserved_resources,
             max_allocations: wcp.max_allocations,
+            artifacts,
         };
 
         store.insert_worker_type(&wc)?;

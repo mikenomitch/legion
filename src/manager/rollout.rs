@@ -2058,6 +2058,7 @@ mod tests {
                 allocation_id: allocation.id,
                 healthy: true,
                 status: "healthy".into(),
+                artifact_states: None,
             }],
         )?;
         allocation_health = store.allocation_health_for_allocations(&[allocation.id])?;

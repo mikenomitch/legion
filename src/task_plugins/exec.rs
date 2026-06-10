@@ -242,6 +242,10 @@ impl TaskPlugin for ExecTaskPlugin {
         true
     }
 
+    fn supports_artifacts(&self) -> bool {
+        true
+    }
+
     fn prepare(
         &self,
         allocation: &Allocation,
@@ -268,7 +272,16 @@ impl TaskPlugin for ExecTaskPlugin {
             .split_first()
             .context("exec task command must include at least one entry")?;
 
-        let linux_options = config.linux_options()?;
+        let mut linux_options = config.linux_options()?;
+        // Artifacts stage into the task directory; a landlocked task must be
+        // able to read them, so the task dir rides along automatically.
+        if let (Some(landlock), Some(task_dir)) =
+            (linux_options.landlock.as_mut(), runtime.task_dir.as_ref())
+        {
+            landlock
+                .read_write_paths
+                .push(task_dir.display().to_string());
+        }
         for file in &config.files {
             let path = std::path::PathBuf::from(&file.path);
             if let Some(parent) = path.parent() {
@@ -292,8 +305,16 @@ impl TaskPlugin for ExecTaskPlugin {
 
         let mut cmd = Command::new(program);
         cmd.args(args);
-        if let Some(cwd) = config.cwd.as_deref() {
-            cmd.current_dir(cwd);
+        // cwd defaults to the private task directory when the spec sets none.
+        match config.cwd.as_deref() {
+            Some(cwd) => {
+                cmd.current_dir(cwd);
+            }
+            None => {
+                if let Some(task_dir) = runtime.task_dir.as_ref() {
+                    cmd.current_dir(task_dir);
+                }
+            }
         }
         #[cfg(unix)]
         if let Some(user) = config.user_spec()? {
@@ -301,6 +322,11 @@ impl TaskPlugin for ExecTaskPlugin {
             cmd.gid(user.gid);
         }
 
+        // Worker-injected env (LEGION_TASK_DIR, LEGION_ARTIFACT_*) first, so
+        // explicit task env can override on collision.
+        if !runtime.extra_env.is_empty() {
+            cmd.envs(&runtime.extra_env);
+        }
         if !config.env.is_empty() {
             cmd.envs(&config.env);
         }

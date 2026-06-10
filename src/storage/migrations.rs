@@ -377,5 +377,16 @@ pub fn get_migrations() -> Migrations<'static> {
         // Workload identities declared on a task (workload-identity OIDC plan).
         // JSON-encoded Vec<WorkloadIdentity>; NULL/absent == no identities.
         M::up("ALTER TABLE task_config ADD COLUMN identities JSONB;").down(""),
+        // Artifacts declared on a task (artifact system plan). JSON-encoded
+        // Vec<ArtifactSpec> in normalized (post-admission) form; NULL/absent
+        // == no artifacts.
+        M::up("ALTER TABLE task_config ADD COLUMN artifacts JSONB;").down(""),
+        // Worker-type artifact fetch settings (JSON WorkerArtifactsConfig;
+        // empty string == worker built-in defaults).
+        M::up("ALTER TABLE worker_type ADD COLUMN artifacts TEXT NOT NULL DEFAULT '';")
+            .down(""),
+        // Per-artifact staging states from the latest worker heartbeat
+        // (JSON Vec<ArtifactStatus>); NULL == task declares no artifacts.
+        M::up("ALTER TABLE allocation_health ADD COLUMN artifact_states TEXT;").down(""),
     ])
 }

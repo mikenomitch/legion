@@ -17,7 +17,8 @@ use crate::structs::{
     worker_client::WorkerClient, AcquireKvLockReply, AcquireKvLockRequest, AdvanceRolloutReply,
     AdvanceRolloutRequest, AllocationHealth, DeleteKvReply, DeleteKvRequest,
     DeleteSavedStateQueryReply, DeleteSavedStateQueryRequest, DestroyJobReply, DestroyJobRequest,
-    FailedAllocation, GetJobInfoReply, GetJobInfoRequest, GetJobSpecByConfigRequest,
+    FailedAllocation, GetArtifactCredentialReply, GetArtifactCredentialRequest, GetJobInfoReply,
+    GetJobInfoRequest, GetJobSpecByConfigRequest,
     GetJobSpecReply, GetJobSpecRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest,
     GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest,
     GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest, GetObservabilityReply,
@@ -509,6 +510,15 @@ fn build_rollout_launch_config(config: &JobConfig) -> Result<RolloutLaunchConfig
 pub struct ManagerAgentService {
     pub store: Store,
     allocation_failures: Arc<Mutex<AllocationFailureTracker>>,
+    /// Cluster artifact settings (allowed schemes, auth matchers, container
+    /// image desugar flag) applied at admission.
+    artifacts_config: crate::structs::ArtifactsManagerConfigFull,
+    /// Names of `workloadIdentity.nodeIdentities` for `auth.nodeIdentity`
+    /// reference validation.
+    node_identity_names: Vec<String>,
+    /// Fetcher registry used to resolve `resolve: "pin"` references at
+    /// submit (blocking; callers wrap in block_in_place).
+    fetcher_registry: Arc<Mutex<crate::artifacts::FetcherRegistry>>,
 }
 
 impl ManagerAgentService {
@@ -516,7 +526,163 @@ impl ManagerAgentService {
         Self {
             store,
             allocation_failures: Arc::new(Mutex::new(AllocationFailureTracker::default())),
+            artifacts_config: crate::structs::ArtifactsManagerConfigFull::default(),
+            node_identity_names: Vec::new(),
+            fetcher_registry: Arc::new(Mutex::new(
+                crate::artifacts::FetcherRegistry::with_builtins(),
+            )),
         }
+    }
+
+    /// Service wired with cluster config (artifact admission settings + node
+    /// identity names). `run_manager` validates the config before this.
+    pub fn with_manager_config(
+        store: Store,
+        config: &crate::structs::config::ManagerConfigFull,
+    ) -> Self {
+        let mut service = Self::new(store);
+        service.artifacts_config = config.artifacts.clone();
+        service.node_identity_names = config
+            .workload_identity
+            .node_identities
+            .iter()
+            .map(|identity| identity.name.clone())
+            .collect();
+        service
+    }
+
+    /// Admission normalization for artifacts (artifact system plan §§1,6,7,8):
+    /// desugars kind-implicit artifacts (behind `containerImageDesugar`),
+    /// enforces cluster-scoped rules (scheme allowlist, nodeIdentity refs),
+    /// bakes the effective auth from cluster matchers, and pins mutable
+    /// references at submit. Returns human-readable pin notes
+    /// (`task api: pinned oci://… -> sha256:…`) for plan/run messages.
+    ///
+    /// Workers receive exactly this normalized list and never re-derive
+    /// implicit artifacts or re-resolve pinned tags.
+    fn normalize_job_artifacts(
+        &self,
+        config: &mut JobConfig,
+        resolve_pins: bool,
+    ) -> R<Vec<String>> {
+        use crate::structs::ArtifactResolve;
+
+        let mut notes = Vec::new();
+        let mut registry = crate::task_plugins::TaskPluginRegistry::new();
+        for task in &mut config.tasks {
+            if self.artifacts_config.container_image_desugar {
+                registry.load_plugin(&task.kind, false)?;
+                let plugin = registry
+                    .plugin(&task.kind)
+                    .context("task plugin loaded but missing")?;
+                if plugin.supports_artifacts() {
+                    for implicit in plugin.implicit_artifacts(&task.config)? {
+                        let already_declared = implicit.name.as_deref().is_some_and(|name| {
+                            task.artifacts
+                                .iter()
+                                .any(|artifact| artifact.name.as_deref() == Some(name))
+                        });
+                        if !already_declared {
+                            task.artifacts.push(implicit);
+                        }
+                    }
+                }
+            }
+            if task.artifacts.is_empty() {
+                continue;
+            }
+
+            // Re-validate after desugaring so implicit specs obey the same
+            // rules as user-declared ones.
+            task.validate_artifacts()?;
+            crate::artifacts::auth::validate_artifacts_against_cluster(
+                &task.name,
+                &task.artifacts,
+                &self.artifacts_config,
+                &self.node_identity_names,
+            )?;
+            crate::artifacts::auth::apply_cluster_auth(
+                &mut task.artifacts,
+                &self.artifacts_config,
+            );
+
+            if !resolve_pins {
+                continue;
+            }
+            for spec in &mut task.artifacts {
+                if spec.effective_resolve() != ArtifactResolve::Pin
+                    || !spec.is_mutable_reference()?
+                {
+                    continue;
+                }
+                let resolved = self.resolve_pin(spec).with_context(|| {
+                    format!(
+                        "resolve artifact {} at submit failed; fix the reference or set \
+                         resolve: \"always\" to re-resolve at staging instead",
+                        spec.redacted_source()
+                    )
+                })?;
+                notes.push(format!(
+                    "task {}: pinned {} -> {}",
+                    task.name,
+                    spec.redacted_source(),
+                    resolved.digest
+                ));
+                spec.pinned_from = Some(spec.source.clone());
+                spec.source = resolved.pinned_source;
+            }
+        }
+        Ok(notes)
+    }
+
+    /// Resolves one mutable reference to its digest using the same auth chain
+    /// a worker would: KV credentials are read directly from the store the
+    /// manager owns. Identity-authed resolution needs token issuance (WI plan
+    /// phases 2/4); until then it fails with the documented suggestion.
+    fn resolve_pin(
+        &self,
+        spec: &crate::structs::ArtifactSpec,
+    ) -> R<crate::artifacts::fetcher::ResolvedIdentity> {
+        use crate::artifacts::fetcher::{FetchLimits, FetchRequest};
+
+        let parsed = crate::structs::parse_artifact_source(&spec.source)?;
+        let credential = match spec.auth.as_ref() {
+            None => None,
+            Some(auth) => {
+                if let Some(kv_path) = auth.kv.as_deref() {
+                    let entry = self
+                        .store
+                        .get_kv(kv_path)?
+                        .with_context(|| format!("credentials from kv {kv_path}: not found"))?;
+                    Some(crate::artifacts::Credential::from_json(&entry.value)?)
+                } else {
+                    bail!(
+                        "identity-authenticated sources cannot be resolved manager-side yet \
+                         (workload-identity issuance is not wired); set resolve: \"always\""
+                    );
+                }
+            }
+        };
+
+        let fetcher = self
+            .fetcher_registry
+            .lock()
+            .expect("fetcher registry")
+            .fetcher(&parsed.scheme)?;
+        let limits = FetchLimits::default();
+        let redacted = spec.redacted_source();
+        let request = FetchRequest {
+            scheme: &parsed.scheme,
+            url: &parsed.url,
+            redacted_source: &redacted,
+            checksum: spec.checksum.as_deref(),
+            media_type: spec.media_type.as_deref(),
+            credential: credential.as_ref(),
+            limits: &limits,
+        };
+        fetcher
+            .resolve(&request)?
+            .with_context(|| format!("{redacted} has no resolvable identity"))
     }
 
     fn cancel_active_rollouts_for_job(&self, job_id: &str) -> Result<(), Status> {
@@ -850,7 +1016,7 @@ impl Manager for ManagerAgentService {
             });
         }
 
-        let (config, kv_refs) = resolve_jobspec_kv_references(&self.store, &js).map_err(|e| {
+        let (mut config, kv_refs) = resolve_jobspec_kv_references(&self.store, &js).map_err(|e| {
             error!("Error parsing jobspec: {:?}", e);
             Status::invalid_argument(format!("Error parsing jobspec: {e}"))
         })?;
@@ -860,6 +1026,15 @@ impl Manager for ManagerAgentService {
             error!("Error validating task configs: {:?}", e);
             Status::invalid_argument(format!("Error validating task configs: {e}"))
         })?;
+        // Artifact admission: desugar/auth/pin. Pin resolution can reach
+        // registries, so it runs as blocking work.
+        run_blocking_admission(|| self.normalize_job_artifacts(&mut config, true)).map_err(
+            |e| {
+                error!("Error normalizing artifacts: {:?}", e);
+                Status::invalid_argument(format!("Error normalizing artifacts: {e:#}"))
+            },
+        )?;
+        let config = config;
         let submit_outcome = self
             .store
             .handle_job_submit(&config, &subs)
@@ -1132,7 +1307,7 @@ impl Manager for ManagerAgentService {
                 error!("Error parsing jobspec for plan: {:?}", e);
                 Status::invalid_argument(format!("Error parsing jobspec: {e}"))
             })?;
-        let config = self
+        let mut config = self
             .store
             .normalize_job_config(&config)
             .map_err(|e| map_store_error("Error normalizing jobspec", e))?;
@@ -1140,6 +1315,16 @@ impl Manager for ManagerAgentService {
             error!("Error validating task configs: {:?}", e);
             Status::invalid_argument(format!("Error validating task configs: {e}"))
         })?;
+        // Artifact admission for plan mirrors run: pins resolve here too so
+        // the plan shows the digests a submit would ship.
+        let pin_notes =
+            run_blocking_admission(|| self.normalize_job_artifacts(&mut config, true)).map_err(
+                |e| {
+                    error!("Error normalizing artifacts: {:?}", e);
+                    Status::invalid_argument(format!("Error normalizing artifacts: {e:#}"))
+                },
+            )?;
+        let config = config;
 
         let scheduler = Scheduler::new(&self.store).map_err(|e| {
             error!("Error building scheduler: {:?}", e);
@@ -1150,6 +1335,14 @@ impl Manager for ManagerAgentService {
             .store
             .get_job_config_optional(&config.name)
             .map_err(|e| map_store_error("Error getting job config", e))?;
+
+        // Digest provenance for the plan: where a pinned reference differs
+        // from the stored config's pin, surface `old -> new` so a moved tag
+        // is visible before submitting (artifact system plan §7).
+        let artifact_diffs = existing_config
+            .as_ref()
+            .map(|existing| artifact_pin_diffs(existing, &config))
+            .unwrap_or_default();
 
         let (plan, task_lookup, message, matches_existing, same_content) = match existing_config {
             Some(existing) if existing.is_same_as(&config) => {
@@ -1225,6 +1418,16 @@ impl Manager for ManagerAgentService {
                     .unwrap_or_default(),
             })
             .collect();
+
+        let mut message = message;
+        for note in pin_notes {
+            message.push_str("\n");
+            message.push_str(&note);
+        }
+        for diff in artifact_diffs {
+            message.push_str("\n");
+            message.push_str(&diff);
+        }
 
         let reply = PlanJobReply {
             allocations,
@@ -1528,6 +1731,7 @@ impl Manager for ManagerAgentService {
             resources: worker_config.resources,
             reserved_resources: worker_config.reserved_resources,
             max_allocations: worker_config.max_allocations,
+            artifacts: worker_config.artifacts,
         };
 
         let reply = WorkerPreRegisterReply {
@@ -1899,7 +2103,25 @@ impl Manager for ManagerAgentService {
             .get_ledger()
             .map_err(|e| map_store_error("Error getting ledger", e))?;
 
-        let nodes: Vec<LedgerNode> = ledger.into_iter().map(Into::into).collect();
+        // Enrich allocations with per-artifact staging states from the
+        // latest worker health snapshots (artifact system plan §9).
+        let allocation_ids: Vec<i64> = ledger
+            .iter()
+            .flat_map(|entry| entry.allocations.iter().map(|allocation| allocation.id))
+            .collect();
+        let allocation_health = self
+            .store
+            .allocation_health_for_allocations(&allocation_ids)
+            .map_err(|e| map_store_error("Error getting allocation health", e))?;
+
+        let mut nodes: Vec<LedgerNode> = ledger.into_iter().map(Into::into).collect();
+        for node in &mut nodes {
+            for allocation in &mut node.allocations {
+                allocation.artifact_states = allocation_health
+                    .get(&allocation.id)
+                    .and_then(|snapshot| snapshot.artifact_states.clone());
+            }
+        }
 
         let reply: GetLedgerReply = GetLedgerReply { nodes };
 
@@ -1935,6 +2157,47 @@ impl Manager for ManagerAgentService {
             .map_err(|e| map_store_error("Error getting kv entry", e))?;
 
         Ok(Response::new(GetKvReply { entry }))
+    }
+
+    /// Resolves an artifact credential from KV for a worker about to fetch.
+    /// The value is returned for immediate use and never persisted on
+    /// allocations or logged (the span carries node/path/source only).
+    ///
+    /// SECURITY BOUNDARY (KV ACLs do not exist yet): any task spec may
+    /// reference any KV path via auth.kv, so possession of job-submit access
+    /// implies read access to every KV credential. Revisit when the ACL
+    /// system lands — this credential read must become an early enforcement
+    /// point. Tracked in docs/TASK-LIST.md (ACL System).
+    #[instrument(skip_all, fields(node_id = %request.get_ref().node_id, kv_path = %request.get_ref().kv_path, source = %request.get_ref().source))]
+    async fn get_artifact_credential(
+        &self,
+        request: Request<GetArtifactCredentialRequest>,
+    ) -> Result<Response<GetArtifactCredentialReply>, Status> {
+        let req = request.into_inner();
+        let entry = self
+            .store
+            .get_kv(&req.kv_path)
+            .map_err(|e| map_store_error("Error reading artifact credential", e))?
+            .ok_or_else(|| {
+                Status::not_found(format!(
+                    "artifact credential kv path {} not found",
+                    req.kv_path
+                ))
+            })?;
+
+        // Validate the credential shape server-side so a malformed KV value
+        // fails with an actionable error naming the path, not a worker-side
+        // parse error mid-staging. The parsed form is dropped immediately.
+        crate::artifacts::Credential::from_json(&entry.value).map_err(|err| {
+            Status::failed_precondition(format!(
+                "kv {} does not hold a valid artifact credential: {err:#}",
+                req.kv_path
+            ))
+        })?;
+
+        Ok(Response::new(GetArtifactCredentialReply {
+            credential_json: entry.value,
+        }))
     }
 
     #[instrument(skip_all)]
@@ -2245,6 +2508,65 @@ fn handle_failed_allocations(
     Ok(())
 }
 
+/// Runs blocking admission work (artifact pin resolution can reach
+/// registries) without stalling the async runtime where possible.
+/// `block_in_place` needs the multi-thread runtime; current-thread callers
+/// (tests) run inline.
+fn run_blocking_admission<T>(work: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle)
+            if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread =>
+        {
+            tokio::task::block_in_place(work)
+        }
+        _ => work(),
+    }
+}
+
+/// Lines describing artifacts whose pinned source changed between the stored
+/// job config and a newly normalized one (`job plan` digest diffs, plan §7).
+/// Artifacts are matched by task + name (or original mutable reference).
+fn artifact_pin_diffs(existing: &JobConfig, planned: &JobConfig) -> Vec<String> {
+    let mut diffs = Vec::new();
+    for planned_task in &planned.tasks {
+        let Some(existing_task) = existing
+            .tasks
+            .iter()
+            .find(|task| task.name == planned_task.name)
+        else {
+            continue;
+        };
+        for planned_artifact in &planned_task.artifacts {
+            let matched = existing_task.artifacts.iter().find(|artifact| {
+                match (planned_artifact.name.as_deref(), artifact.name.as_deref()) {
+                    (Some(a), Some(b)) => a == b,
+                    _ => artifact.pinned_from == planned_artifact.pinned_from,
+                }
+            });
+            let Some(existing_artifact) = matched else {
+                continue;
+            };
+            if existing_artifact.pinned_from.is_some()
+                && planned_artifact.pinned_from.is_some()
+                && existing_artifact.source != planned_artifact.source
+            {
+                diffs.push(format!(
+                    "task {}: artifact {} moved: {} -> {}",
+                    planned_task.name,
+                    planned_artifact
+                        .pinned_from
+                        .as_deref()
+                        .map(crate::structs::redact_source)
+                        .unwrap_or_default(),
+                    crate::structs::redact_source(&existing_artifact.source),
+                    crate::structs::redact_source(&planned_artifact.source),
+                ));
+            }
+        }
+    }
+    diffs
+}
+
 fn update_allocation_health_snapshots(
     store: &Store,
     node_id: &str,
@@ -2463,6 +2785,9 @@ fn build_rollout_group_status(
                 allocation_health: allocation_health
                     .get(&allocation.id)
                     .map(|h| h.status.clone()),
+                artifact_states: allocation_health
+                    .get(&allocation.id)
+                    .and_then(|h| h.artifact_states.clone()),
             });
     }
     for allocation in &from_allocations {
@@ -2488,6 +2813,9 @@ fn build_rollout_group_status(
                 allocation_health: allocation_health
                     .get(&allocation.id)
                     .map(|h| h.status.clone()),
+                artifact_states: allocation_health
+                    .get(&allocation.id)
+                    .and_then(|h| h.artifact_states.clone()),
             });
     }
 
@@ -3339,6 +3667,7 @@ mod tests {
                 allocation_id: allocation.id,
                 healthy: false,
                 status: "starting".into(),
+                artifact_states: None,
             }],
         )?;
         update_allocation_health_snapshots(
@@ -3348,6 +3677,7 @@ mod tests {
                 allocation_id: allocation.id,
                 healthy: true,
                 status: "healthy".into(),
+                artifact_states: None,
             }],
         )?;
 
@@ -3365,6 +3695,7 @@ mod tests {
                 allocation_id: allocation.id,
                 healthy: false,
                 status: "wrong node".into(),
+                artifact_states: None,
             }],
         )?;
         let health = store.allocation_health_for_allocations(&[allocation.id])?;
@@ -3434,6 +3765,7 @@ mod tests {
                 allocation_id: new_alloc.id,
                 healthy: true,
                 status: "http passed".into(),
+                artifact_states: None,
             }],
         )?;
         let groups = build_rollout_group_status(&store, &rollout)?;
@@ -3543,11 +3875,13 @@ mod tests {
                     allocation_id: new_web.id,
                     healthy: true,
                     status: "healthy".into(),
+                    artifact_states: None,
                 },
                 AllocationHealth {
                     allocation_id: new_api.id,
                     healthy: false,
                     status: "starting".into(),
+                    artifact_states: None,
                 },
             ],
         )?;
