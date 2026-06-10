@@ -824,7 +824,7 @@ impl<'a> Scheduler<'a> {
         allocations_by_node: &HashMap<String, Vec<Allocation>>,
         mode: PlanMode,
     ) -> R<Vec<PlannedAllocation>> {
-        tasks.sort_by(|a, b| a.0.cmp(&b.0));
+        tasks.sort_by_key(|task| task.0);
 
         let mut placements = Vec::new();
         let mut planned: HashMap<String, usize> = HashMap::new();
