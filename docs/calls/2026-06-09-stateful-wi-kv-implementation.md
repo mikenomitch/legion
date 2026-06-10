@@ -209,6 +209,57 @@ locked by tests. Two other latent bugs fixed in passing: bare-before-braced `kv`
 token replacement corrupting rendered templates, and file injections duplicating
 on every re-render (now upserted by path).
 
----
+## 25. Keyed tasks reject an explicit `count` at parse time
 
-*(Further entries are appended below as implementation proceeds.)*
+Rather than silently ignoring `count` on a keyed task (the original "count is
+ignored" behavior), the spec parser now distinguishes an explicit `count` from
+the default and rejects it with an actionable error. Cardinality is owned by the
+instance management API; a meaningless knob in the spec is a footgun, so we fail
+loud. Slot tasks still require `count`.
+
+## 26. Keyed instance stop/start (pause without tombstoning)
+
+Added `InstanceState::Stopped`: `instance stop` pauses an instance (allocation
+stopped, row + storage handle retained, id still owned) and `instance start`
+revives it — distinct from `destroy`, which tombstones the id forever. Job stop
+now *stops* keyed instances instead of terminating them, so resubmit + start
+revives them with their data; only destroy/job-destroy is permanent. Seed lists
+(`stateful.initialInstances`) and batch create (`CreateInstances`, `instance
+create --id a --id b --count N`) let a keyed job spin up many instances at once;
+seed ids are a one-time seed, not a reconciled desired set.
+
+## 27. Red-team fixes (see docs review findings, 2026-06)
+
+Two adversarial reviews ran against the committed branch. Fixed:
+- **P0** — slot placement could adopt another job's instance row sharing a
+  derived slot id (cross-job storage/identity leak). Slot binding now verifies
+  job/group/slot/mode; keyed ids can't alias a same-job slot pattern; the global
+  id-collision check backstops cross-job cases.
+- **P1** — reactive KV reconciliation now skips stopped jobs; `on_delete=fail`
+  scopes the failed stamp to the impacted task and recovers (incl. manual `job
+  run` under `on_change=none`); create-first rollouts are rejected for stateful
+  tasks at admission (preserving at-most-one-live-allocation until fencing
+  exists — see the gap analysis).
+- **WI hardening** — token `exp` is clamped to the active key's rotation overlap
+  (chosen over admission rejection because task validation can't see
+  `rotationAge`); identity names are charset-validated against path traversal;
+  token temp files are created at their final mode with no umask window; the
+  signer refuses `extra_claims` that would override reserved/`legion.io/*`
+  claims; the cluster-default `sub_template` is validated at startup.
+
+### Known limitation deliberately left documented, not fake-fixed
+
+The WI issuance RPC's authorization checks the allocation's `node_id` against a
+**caller-supplied, unauthenticated** node id — because Legion has no per-worker
+credential today (heartbeats are unauthenticated too; workers are admitted by
+join token). This is the cluster-wide `TODO(worker-authn)` gap, not a regression
+in this work. The right fix is worker mTLS binding all worker RPCs to a per-node
+credential; faking a one-off scheme for this single RPC would create a second
+auth system. Surfaced here and in the proto/`server.rs` comments so it's visible.
+
+### Comparison to Nomad/K8s
+
+`docs/stateful-vs-nomad-k8s.md` records the honest gaps in the basic primitives:
+volumes (handle-only today), stable network identity (no name→address mapping),
+at-most-one/fencing guarantees, and ordinal-aware orchestration are the four that
+matter; keyed mode and instance-keyed OIDC subjects are where Legion leads.
