@@ -9,7 +9,7 @@ use crate::util::random_string;
 use crate::worker::{
     identity::{ManagerTokenIssuer, PreparedIdentity, WorkerIdentityManager},
     node_check::{fingerprint_node, run_health_checks},
-    server::WorkerAgentService,
+    server::WorkerDaemonService,
     state::WorkerStateStore,
     task_health::spawn_health_monitor,
     task_manager::WorkerTaskManager,
@@ -109,7 +109,7 @@ async fn run_worker_with_manager(
         }
         spawn_health_monitor(task_manager.clone(), allocation, task);
     }
-    let worker_node = WorkerAgentService {
+    let worker_node = WorkerDaemonService {
         task_manager: task_manager.clone(),
         identity: Some(identity_manager.clone()),
     };

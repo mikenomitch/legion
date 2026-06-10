@@ -58,7 +58,7 @@ jobs:
             scheduler:
               - 'src/manager/scheduler.rs'
               - 'src/storage/store.rs'
-              - 'src/manager/agent.rs'
+              - 'src/manager/daemon.rs'
               - 'benchmarks/scheduler/**'
               - 'tests/scheduler_benchmark_slo.rs'
 

@@ -2,7 +2,7 @@ use crate::prelude::*;
 
 use crate::manager::join_server::get_insecure_manager_service;
 use crate::manager::oidc_http::OidcHttpLayer;
-use crate::manager::server::ManagerAgentService;
+use crate::manager::server::ManagerDaemonService;
 use crate::manager::workload_identity::WorkloadIdentityState;
 use crate::storage::persistence::PersistenceRole;
 use crate::storage::store::Store;
@@ -10,7 +10,7 @@ use crate::structs::{
     manager_server::ManagerServer, Eval, JobConfig, KvValueType, ManagerConfig, Node, NodeMsg,
     Submission, TaskConfig, WorkerConfig as WorkerConfigMsg, WorkerConfigAlt,
 };
-use crate::worker::agent::run_worker_local;
+use crate::worker::daemon::run_worker_local;
 
 use futures::join;
 use http::Method;
@@ -90,7 +90,7 @@ pub async fn run_manager(config: ManagerConfig, run_worker: bool) -> R<()> {
         None
     };
 
-    let manager_node = ManagerAgentService::new(store)
+    let manager_node = ManagerDaemonService::new(store)
         .with_workload_identity(workload_identity_state.clone())
         .with_kv_debounce(Duration::from_millis(full_config.kv_debounce_ms));
 

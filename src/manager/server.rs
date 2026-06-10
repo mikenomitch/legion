@@ -735,7 +735,7 @@ struct KvDebounceState {
 }
 
 #[derive(Debug)]
-pub struct ManagerAgentService {
+pub struct ManagerDaemonService {
     pub store: Store,
     allocation_failures: Arc<Mutex<AllocationFailureTracker>>,
     /// OIDC issuer state; `None` when `workloadIdentity.enabled` is false
@@ -748,7 +748,7 @@ pub struct ManagerAgentService {
     kv_pending: Arc<Mutex<KvDebounceState>>,
 }
 
-impl ManagerAgentService {
+impl ManagerDaemonService {
     pub fn new(store: Store) -> Self {
         Self {
             store,
@@ -1281,7 +1281,7 @@ struct AllocationFailureTracker {
 }
 
 #[tonic::async_trait]
-impl Manager for ManagerAgentService {
+impl Manager for ManagerDaemonService {
     #[instrument(skip_all)]
     async fn run_job(
         &self,
@@ -3936,7 +3936,7 @@ mod tests {
         let allocation =
             submit_and_place_identity_task(&store, "wi-job", aws_identity_task("api"))?;
         let state = wi_state(&store)?;
-        let manager = ManagerAgentService::new(store).with_workload_identity(Some(state.clone()));
+        let manager = ManagerDaemonService::new(store).with_workload_identity(Some(state.clone()));
 
         let reply = manager
             .issue_workload_identity_token(issue_request(allocation.id, "aws", "node-1"))
@@ -3976,7 +3976,7 @@ mod tests {
         let allocation = submit_and_place_identity_task(&store, "wi-stateful", task)?;
         assert!(allocation.instance_id.is_some());
         let state = wi_state(&store)?;
-        let manager = ManagerAgentService::new(store).with_workload_identity(Some(state.clone()));
+        let manager = ManagerDaemonService::new(store).with_workload_identity(Some(state.clone()));
 
         let reply = manager
             .issue_workload_identity_token(issue_request(allocation.id, "aws", "node-1"))
@@ -3994,7 +3994,7 @@ mod tests {
         let allocation =
             submit_and_place_identity_task(&store, "wi-job", aws_identity_task("api"))?;
         let state = wi_state(&store)?;
-        let manager = ManagerAgentService::new(store).with_workload_identity(Some(state));
+        let manager = ManagerDaemonService::new(store).with_workload_identity(Some(state));
 
         let err = manager
             .issue_workload_identity_token(issue_request(allocation.id, "aws", "node-evil"))
@@ -4010,7 +4010,7 @@ mod tests {
         let allocation =
             submit_and_place_identity_task(&store, "wi-job", aws_identity_task("api"))?;
         let state = wi_state(&store)?;
-        let manager = ManagerAgentService::new(store).with_workload_identity(Some(state));
+        let manager = ManagerDaemonService::new(store).with_workload_identity(Some(state));
 
         let err = manager
             .issue_workload_identity_token(issue_request(allocation.id, "bogus", "node-1"))
@@ -4032,7 +4032,7 @@ mod tests {
         let allocation =
             submit_and_place_identity_task(&store, "wi-job", aws_identity_task("api"))?;
         // No workload-identity state attached == feature disabled.
-        let manager = ManagerAgentService::new(store);
+        let manager = ManagerDaemonService::new(store);
 
         let err = manager
             .issue_workload_identity_token(issue_request(allocation.id, "aws", "node-1"))
@@ -4091,7 +4091,7 @@ mod tests {
         // Gated: still on the lost node.
         assert_eq!(store.allocs_for_node("node-1")?.len(), 1);
 
-        let manager = ManagerAgentService::new(store.clone());
+        let manager = ManagerDaemonService::new(store.clone());
         let reply = manager
             .replace_instance(tonic::Request::new(ReplaceInstanceRequest {
                 instance_id: instance_id.clone(),
@@ -4127,7 +4127,7 @@ mod tests {
         let allocation = submit_and_place_stateful_task(&store, "fence-healthy")?;
         let instance_id = allocation.instance_id.clone().context("instance bound")?;
 
-        let manager = ManagerAgentService::new(store.clone());
+        let manager = ManagerDaemonService::new(store.clone());
         let err = manager
             .replace_instance(tonic::Request::new(ReplaceInstanceRequest {
                 instance_id,
@@ -4160,7 +4160,7 @@ mod tests {
         let store = setup_store()?;
         let allocation = submit_and_place_stateful_task(&store, "fence-detail")?;
         let instance_id = allocation.instance_id.clone().context("instance bound")?;
-        let manager = ManagerAgentService::new(store.clone());
+        let manager = ManagerDaemonService::new(store.clone());
 
         // Healthy node: no detail.
         let reply = manager
@@ -4310,7 +4310,7 @@ mod tests {
             health_checks: json!({}),
         };
         store.insert_node(NodeMsg::from(node))?;
-        let manager = ManagerAgentService::new(store);
+        let manager = ManagerDaemonService::new(store);
 
         let response = manager
             .restart_worker(Request::new(RestartWorkerRequest {
@@ -4329,7 +4329,7 @@ mod tests {
     #[tokio::test]
     async fn kv_reference_updates_trigger_job_restart() -> R<()> {
         let store = setup_store()?;
-        let manager = ManagerAgentService::new(store);
+        let manager = ManagerDaemonService::new(store);
 
         manager
             .put_kv(Request::new(PutKvRequest {
@@ -4407,7 +4407,7 @@ mod tests {
     #[tokio::test]
     async fn kv_task_env_restart_policy_enqueues_job_update() -> R<()> {
         let store = setup_store()?;
-        let manager = ManagerAgentService::new(store);
+        let manager = ManagerDaemonService::new(store);
 
         manager
             .put_kv(Request::new(PutKvRequest {
@@ -4466,7 +4466,7 @@ mod tests {
     #[tokio::test]
     async fn kv_task_env_rollout_policy_enqueues_rollout_tick() -> R<()> {
         let store = setup_store()?;
-        let manager = ManagerAgentService::new(store);
+        let manager = ManagerDaemonService::new(store);
 
         manager
             .put_kv(Request::new(PutKvRequest {
@@ -4524,7 +4524,7 @@ mod tests {
 
     // --- KV-driven task updates (reactive injections) ---
 
-    async fn put_kv_entry(manager: &ManagerAgentService, key: &str, value: &str) -> R<()> {
+    async fn put_kv_entry(manager: &ManagerDaemonService, key: &str, value: &str) -> R<()> {
         manager
             .put_kv(Request::new(PutKvRequest {
                 key: key.into(),
@@ -4537,7 +4537,7 @@ mod tests {
         Ok(())
     }
 
-    async fn delete_kv_entry(manager: &ManagerAgentService, key: &str) -> R<()> {
+    async fn delete_kv_entry(manager: &ManagerDaemonService, key: &str) -> R<()> {
         manager
             .delete_kv(Request::new(crate::structs::DeleteKvRequest {
                 key: key.into(),
@@ -4548,7 +4548,7 @@ mod tests {
         Ok(())
     }
 
-    async fn run_jobspec(manager: &ManagerAgentService, jobspec: Value) -> Result<(), Status> {
+    async fn run_jobspec(manager: &ManagerDaemonService, jobspec: Value) -> Result<(), Status> {
         manager
             .run_job(Request::new(RunJobRequest {
                 parsed_jobspec: jobspec.to_string(),
@@ -4601,7 +4601,7 @@ mod tests {
     #[tokio::test]
     async fn kv_delete_with_on_delete_none_takes_no_action() -> R<()> {
         let store = setup_store()?;
-        let manager = ManagerAgentService::new(store);
+        let manager = ManagerDaemonService::new(store);
 
         put_kv_entry(&manager, "del/none", "v1").await?;
         run_jobspec(
@@ -4632,7 +4632,7 @@ mod tests {
     #[tokio::test]
     async fn kv_delete_with_on_delete_restart_enqueues_job_update() -> R<()> {
         let store = setup_store()?;
-        let manager = ManagerAgentService::new(store);
+        let manager = ManagerDaemonService::new(store);
 
         put_kv_entry(&manager, "del/restart", "v1").await?;
         run_jobspec(
@@ -4654,7 +4654,7 @@ mod tests {
     #[tokio::test]
     async fn kv_delete_with_on_delete_rollout_creates_rollout() -> R<()> {
         let store = setup_store()?;
-        let manager = ManagerAgentService::new(store);
+        let manager = ManagerDaemonService::new(store);
 
         put_kv_entry(&manager, "del/rollout", "v1").await?;
         run_jobspec(
@@ -4686,7 +4686,7 @@ mod tests {
     #[tokio::test]
     async fn kv_delete_with_on_delete_fail_marks_job_failed_with_reason() -> R<()> {
         let store = setup_store()?;
-        let manager = ManagerAgentService::new(store.clone());
+        let manager = ManagerDaemonService::new(store.clone());
 
         put_kv_entry(&manager, "del/fail", "v1").await?;
         run_jobspec(
@@ -4729,7 +4729,7 @@ mod tests {
     #[tokio::test]
     async fn kv_put_after_fail_recovers_job_via_on_change() -> R<()> {
         let store = setup_store()?;
-        let manager = ManagerAgentService::new(store.clone());
+        let manager = ManagerDaemonService::new(store.clone());
 
         put_kv_entry(&manager, "recover/key", "v1").await?;
         run_jobspec(
@@ -4753,7 +4753,7 @@ mod tests {
     #[tokio::test]
     async fn kv_reconcile_skips_stopped_job() -> R<()> {
         let store = setup_store()?;
-        let manager = ManagerAgentService::new(store.clone());
+        let manager = ManagerDaemonService::new(store.clone());
 
         put_kv_entry(&manager, "stopped/key", "v1").await?;
         run_jobspec(
@@ -4816,7 +4816,7 @@ mod tests {
     #[tokio::test]
     async fn kv_fail_stamps_only_impacted_tasks_allocations() -> R<()> {
         let store = setup_store()?;
-        let manager = ManagerAgentService::new(store.clone());
+        let manager = ManagerDaemonService::new(store.clone());
 
         put_kv_entry(&manager, "scope/a", "a1").await?;
         put_kv_entry(&manager, "scope/b", "b1").await?;
@@ -4867,7 +4867,7 @@ mod tests {
     #[tokio::test]
     async fn kv_put_after_fail_with_restart_clears_stamps_and_replaces_allocations() -> R<()> {
         let store = setup_store()?;
-        let manager = ManagerAgentService::new(store.clone());
+        let manager = ManagerDaemonService::new(store.clone());
 
         put_kv_entry(&manager, "clr/key", "v1").await?;
         run_jobspec(
@@ -4905,7 +4905,7 @@ mod tests {
     #[tokio::test]
     async fn job_run_recovers_kv_failed_job_under_on_change_none() -> R<()> {
         let store = setup_store()?;
-        let manager = ManagerAgentService::new(store.clone());
+        let manager = ManagerDaemonService::new(store.clone());
 
         put_kv_entry(&manager, "none/key", "v1").await?;
         // onChange: none — a later put does NOT auto-recover.
@@ -4936,7 +4936,7 @@ mod tests {
     #[tokio::test]
     async fn kv_changes_ignored_when_watch_false() -> R<()> {
         let store = setup_store()?;
-        let manager = ManagerAgentService::new(store);
+        let manager = ManagerDaemonService::new(store);
 
         put_kv_entry(&manager, "unwatched/key", "v1").await?;
         let jobspec = json!({
@@ -4980,7 +4980,7 @@ mod tests {
     #[tokio::test]
     async fn kv_entry_policy_overrides_defaults_field_by_field() -> R<()> {
         let store = setup_store()?;
-        let manager = ManagerAgentService::new(store);
+        let manager = ManagerDaemonService::new(store);
 
         put_kv_entry(&manager, "prec/a", "a1").await?;
         put_kv_entry(&manager, "prec/b", "b1").await?;
@@ -5028,7 +5028,7 @@ mod tests {
     #[tokio::test]
     async fn kv_template_kv_source_tracks_template_and_transitive_keys() -> R<()> {
         let store = setup_store()?;
-        let manager = ManagerAgentService::new(store.clone());
+        let manager = ManagerDaemonService::new(store.clone());
 
         put_kv_entry(&manager, "ui/banner", "hello").await?;
         put_kv_entry(&manager, "templates/banner", "msg={{ kv \"ui/banner\" }}").await?;
@@ -5082,7 +5082,7 @@ mod tests {
     #[tokio::test]
     async fn kv_put_only_affects_tasks_watching_the_key() -> R<()> {
         let store = setup_store()?;
-        let manager = ManagerAgentService::new(store.clone());
+        let manager = ManagerDaemonService::new(store.clone());
 
         put_kv_entry(&manager, "iso/a", "v1").await?;
         let jobspec = json!({
@@ -5141,7 +5141,7 @@ mod tests {
     #[tokio::test]
     async fn kv_file_injection_rerender_replaces_existing_entry() -> R<()> {
         let store = setup_store()?;
-        let manager = ManagerAgentService::new(store.clone());
+        let manager = ManagerDaemonService::new(store.clone());
 
         put_kv_entry(&manager, "file/key", "v1").await?;
         let jobspec = json!({
@@ -5182,7 +5182,7 @@ mod tests {
         // Seed without opening a debounce window.
         store.put_kv("burst/key", "v0", KvValueType::String, None, None)?;
         let manager =
-            ManagerAgentService::new(store.clone()).with_kv_debounce(Duration::from_millis(100));
+            ManagerDaemonService::new(store.clone()).with_kv_debounce(Duration::from_millis(100));
 
         run_jobspec(
             &manager,
@@ -5211,7 +5211,7 @@ mod tests {
         let store = setup_store()?;
         store.put_kv("burst/del", "v0", KvValueType::String, None, None)?;
         let manager =
-            ManagerAgentService::new(store.clone()).with_kv_debounce(Duration::from_millis(100));
+            ManagerDaemonService::new(store.clone()).with_kv_debounce(Duration::from_millis(100));
 
         run_jobspec(
             &manager,
@@ -5234,7 +5234,7 @@ mod tests {
     #[tokio::test]
     async fn run_job_fails_when_required_kv_key_is_missing() -> R<()> {
         let store = setup_store()?;
-        let manager = ManagerAgentService::new(store);
+        let manager = ManagerDaemonService::new(store);
 
         let err = run_jobspec(
             &manager,
@@ -5255,7 +5255,7 @@ mod tests {
     #[tokio::test]
     async fn run_job_rejects_file_injection_for_container_tasks() -> R<()> {
         let store = setup_store()?;
-        let manager = ManagerAgentService::new(store);
+        let manager = ManagerDaemonService::new(store);
 
         let jobspec = json!({
             "name": "kv-container-files",
@@ -5286,7 +5286,7 @@ mod tests {
     #[tokio::test]
     async fn run_job_cancels_superseded_rollouts_and_cleans_stale_allocations() -> R<()> {
         let store = setup_store()?;
-        let manager = ManagerAgentService::new(store.clone());
+        let manager = ManagerDaemonService::new(store.clone());
         insert_node(&store, "node-a")?;
 
         let v1 = JobConfig {
@@ -5376,7 +5376,7 @@ mod tests {
     #[tokio::test]
     async fn stop_rollout_reverts_target_allocations() -> R<()> {
         let store = setup_store()?;
-        let manager = ManagerAgentService::new(store.clone());
+        let manager = ManagerDaemonService::new(store.clone());
         insert_node(&store, "node-a")?;
 
         let v1 = JobConfig {
@@ -5444,7 +5444,7 @@ mod tests {
     #[test]
     fn update_node_metadata_evicts_allocations_with_invalid_constraints() -> R<()> {
         let store = setup_store()?;
-        let manager = ManagerAgentService::new(store.clone());
+        let manager = ManagerDaemonService::new(store.clone());
 
         let node_a = Node {
             id: "node-a".into(),
@@ -5939,7 +5939,7 @@ mod tests {
     #[tokio::test]
     async fn list_rollout_events_returns_persisted_events() -> R<()> {
         let store = setup_store()?;
-        let manager = ManagerAgentService::new(store.clone());
+        let manager = ManagerDaemonService::new(store.clone());
         insert_node(&store, "node-a")?;
 
         let v1 = JobConfig {
@@ -6100,7 +6100,7 @@ mod tests {
 
         let store = setup_store()?;
         insert_node(&store, "node-a")?;
-        let manager = ManagerAgentService::new(store.clone());
+        let manager = ManagerDaemonService::new(store.clone());
         let job_id = "sandbox-rpc";
         submit_keyed_job(&store, job_id, vec![keyed_task("sandbox", "default", None)])?;
         // Keyed task with zero instances: the submit eval placed nothing.
@@ -6219,7 +6219,7 @@ mod tests {
     fn create_instance_validates_job_task_resolution_and_id_policy() -> R<()> {
         let store = setup_store()?;
         insert_node(&store, "node-a")?;
-        let manager = ManagerAgentService::new(store.clone());
+        let manager = ManagerDaemonService::new(store.clone());
         let runtime = tokio::runtime::Runtime::new()?;
         let create = |job: &str, group: Option<&str>, task: Option<&str>, id: Option<&str>| {
             runtime.block_on(manager.create_instance(Request::new(CreateInstanceRequest {
@@ -6309,7 +6309,7 @@ mod tests {
     fn instance_rpcs_replay_idempotency_keys() -> R<()> {
         let store = setup_store()?;
         insert_node(&store, "node-a")?;
-        let manager = ManagerAgentService::new(store.clone());
+        let manager = ManagerDaemonService::new(store.clone());
         let job_id = "sandbox-idem";
         submit_keyed_job(&store, job_id, vec![keyed_task("sandbox", "default", None)])?;
         let runtime = tokio::runtime::Runtime::new()?;
@@ -6369,7 +6369,7 @@ mod tests {
     fn list_and_get_instance_rpcs_filter_and_round_trip() -> R<()> {
         let store = setup_store()?;
         insert_node(&store, "node-a")?;
-        let manager = ManagerAgentService::new(store.clone());
+        let manager = ManagerDaemonService::new(store.clone());
         let job_id = "sandbox-list";
         submit_keyed_job(
             &store,

@@ -1,4 +1,4 @@
-use legion::manager::server::ManagerAgentService;
+use legion::manager::server::ManagerDaemonService;
 use legion::prelude::{json, Context, Value, R};
 use legion::storage::store::Store;
 use legion::structs::{
@@ -127,7 +127,7 @@ fn rollout_auto_progresses_through_percent_steps() -> R<()> {
     insert_node(&store, "node-a")?;
     insert_node(&store, "node-b")?;
     insert_node(&store, "node-c")?;
-    let manager = ManagerAgentService::new(store.clone());
+    let manager = ManagerDaemonService::new(store.clone());
     let runtime = Runtime::new()?;
 
     let v1 = json!({
@@ -204,7 +204,7 @@ fn rollout_manual_requires_explicit_stage_advances() -> R<()> {
     insert_node(&store, "node-a")?;
     insert_node(&store, "node-b")?;
     insert_node(&store, "node-c")?;
-    let manager = ManagerAgentService::new(store.clone());
+    let manager = ManagerDaemonService::new(store.clone());
     let runtime = Runtime::new()?;
 
     let v1 = json!({
@@ -381,7 +381,7 @@ fn allocs_by_instance(
 fn sequential_rollout_updates_one_slot_at_a_time_highest_first() -> R<()> {
     let store = setup_store()?;
     insert_node(&store, "node-a")?;
-    let manager = ManagerAgentService::new(store.clone());
+    let manager = ManagerDaemonService::new(store.clone());
     let runtime = Runtime::new()?;
     let job = "seq-rollout";
 
@@ -493,7 +493,7 @@ fn sequential_rollout_updates_one_slot_at_a_time_highest_first() -> R<()> {
 fn update_from_stages_rollout_and_lowering_it_promotes_remaining_slots() -> R<()> {
     let store = setup_store()?;
     insert_node(&store, "node-a")?;
-    let manager = ManagerAgentService::new(store.clone());
+    let manager = ManagerDaemonService::new(store.clone());
     let runtime = Runtime::new()?;
     let job = "staged-rollout";
 
@@ -591,7 +591,7 @@ fn default_parallel_rollout_on_slot_group_is_unchanged() -> R<()> {
     // reused by the replacements.
     let store = setup_store()?;
     insert_node(&store, "node-a")?;
-    let manager = ManagerAgentService::new(store.clone());
+    let manager = ManagerDaemonService::new(store.clone());
     let runtime = Runtime::new()?;
     let job = "parallel-stateful";
 
@@ -633,7 +633,7 @@ fn rollout_destroy_first_progresses_through_multiple_stages() -> R<()> {
     insert_node(&store, "node-a")?;
     insert_node(&store, "node-b")?;
     insert_node(&store, "node-c")?;
-    let manager = ManagerAgentService::new(store.clone());
+    let manager = ManagerDaemonService::new(store.clone());
     let runtime = Runtime::new()?;
 
     let v1 = json!({

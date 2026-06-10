@@ -1,4 +1,4 @@
-pub mod agent;
+pub mod daemon;
 pub mod dispatcher;
 pub mod join_server;
 pub mod oidc_http;

@@ -136,7 +136,7 @@ fn status_response(status: http::StatusCode) -> http::Response<BoxBody> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manager::server::ManagerAgentService;
+    use crate::manager::server::ManagerDaemonService;
     use crate::storage::store::Store;
     use crate::structs::manager_server::ManagerServer;
     use crate::structs::workload_identity::{WorkloadIdentity, WorkloadIdentityFile};
@@ -180,7 +180,7 @@ mod tests {
         drop(listener);
 
         let cors = CorsLayer::new().allow_origin(Any).allow_headers(Any);
-        let service = ManagerServer::new(ManagerAgentService::new(store));
+        let service = ManagerServer::new(ManagerDaemonService::new(store));
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         tokio::spawn(async move {
             Server::builder()
@@ -227,7 +227,7 @@ mod tests {
         let state = enabled_state(&store, &base)?;
 
         let cors = CorsLayer::new().allow_origin(Any).allow_headers(Any);
-        let service = ManagerServer::new(ManagerAgentService::new(store.clone()));
+        let service = ManagerServer::new(ManagerDaemonService::new(store.clone()));
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let state_for_server = state.clone();
         tokio::spawn(async move {
