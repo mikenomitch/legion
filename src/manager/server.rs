@@ -1724,7 +1724,17 @@ impl Manager for ManagerDaemonService {
                                 .map(|(id, task)| (id, task.name))
                                 .collect()
                         })
-                        .unwrap_or_default()
+                        .unwrap_or_else(|err| {
+                            // Task names are best-effort enrichment, so a lookup
+                            // failure must not fail the whole logs request — but
+                            // log it so a store outage isn't silently masked.
+                            warn!(
+                                job_config_id = %allocation.job_config_id,
+                                error = ?err,
+                                "Failed to load task configs for log task-name lookup; task names will be empty"
+                            );
+                            HashMap::new()
+                        })
                 })
                 .get(&allocation.task_config_id)
                 .cloned()

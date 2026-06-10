@@ -108,8 +108,11 @@ pub fn read_allocation_logs(
     max_bytes: i64,
     tail: bool,
 ) -> R<Vec<CapturedStream>> {
+    // Clamp the per-stream cap to a hard ceiling so an arbitrarily large
+    // `max_bytes` cannot drive a huge buffer allocation. The actual read is
+    // additionally bounded by the file size in `read_stream`.
     let cap = if max_bytes > 0 {
-        max_bytes as u64
+        (max_bytes as u64).min(MAX_TASK_LOG_READ_BYTES)
     } else {
         DEF_TASK_LOG_MAX_BYTES as u64
     };

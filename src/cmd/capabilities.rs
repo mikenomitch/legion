@@ -107,7 +107,7 @@ pub fn catalog() -> Vec<Capability> {
         },
         Capability {
             name: "job.logs",
-            cli: "legion job logs <NAME>",
+            cli: "legion job logs [<NAME>] [--allocation <ID>] [--follow]",
             grpc: Some("Manager/GetAllocationLogs"),
             summary: "Fetch captured stdout/stderr for a job's allocations.",
             mutates: false,

@@ -171,7 +171,8 @@ task logs tell it *why*. Workers capture each task's stdout and stderr to
 per-allocation files, and the manager proxies reads back to the agent:
 
 ```bash
-# All allocations of a job, both streams (tails the worker's default cap):
+# All allocations of a job, both streams (first 256 KiB per stream by default;
+# add --tail for the most recent output, or --follow to live-tail):
 legion job logs demo --json
 
 # A single allocation, stderr only, last 4 KiB:

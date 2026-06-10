@@ -514,10 +514,19 @@ mod tests {
         let allocation = alloc();
         manager.run_allocation(&allocation, &task)?;
 
-        // Give the short-lived process time to write and exit.
-        thread::sleep(Duration::from_millis(300));
-
-        let streams = manager.read_allocation_logs(allocation.id, "stdout", 0, 0, false)?;
+        // Poll for the captured output rather than sleeping a fixed duration,
+        // which races on slow/loaded CI and varying filesystems.
+        let mut streams = Vec::new();
+        for _ in 0..100 {
+            streams = manager.read_allocation_logs(allocation.id, "stdout", 0, 0, false)?;
+            if streams
+                .first()
+                .is_some_and(|s| s.content.contains("captured-stdout"))
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
         assert_eq!(streams.len(), 1);
         assert_eq!(streams[0].stream, "stdout");
         assert!(

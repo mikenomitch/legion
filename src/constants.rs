@@ -32,6 +32,11 @@ pub const DEF_WORKER_STATE_PATH: &str = ".legion/workers/default/worker_state.js
 // limit is requested. 256 KiB keeps replies small enough for an agent context.
 pub const DEF_TASK_LOG_MAX_BYTES: i64 = 256 * 1024;
 
+// Absolute per-stream ceiling for a single log read. An explicit `max_bytes`
+// larger than this is clamped so a buggy/hostile client cannot drive a huge
+// buffer allocation (OOM/DoS) even though the read API is otherwise unbounded.
+pub const MAX_TASK_LOG_READ_BYTES: u64 = 16 * 1024 * 1024;
+
 // Task log rotation/retention defaults (worker-side). These keep a chatty task
 // from filling a worker's disk while preserving a useful recent window. All are
 // overridable via env vars (LEGION_LOG_MAX_FILE_BYTES / LEGION_LOG_MAX_FILES /
