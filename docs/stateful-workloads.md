@@ -323,6 +323,108 @@ Stateful groups must use the default stop-then-start (`destroyFirst`)
 replacement, which guarantees the single-live-allocation invariant by
 construction. (This is a temporary restriction until instance fencing exists.)
 
+## Ordered rollouts for slot pools
+
+Slot pools are ordinal by nature, and quorum systems care about the order in
+which replicas restart. Two rollout options make config updates
+ordinal-aware (`rollout.slots`, also scopeable per group via
+`rolloutByGroup.<group>.slots` like every other rollout option):
+
+```jsonnet
+rollout: {
+  slots: {
+    order: 'sequential',   // 'parallel' (default, today's behavior) | 'sequential'
+    updateFrom: 2,         // optional staged floor; requires order: 'sequential'
+  },
+}
+```
+
+### `order: 'sequential'` — one slot at a time, highest first
+
+A sequential rollout replaces allocations **one slot per step, highest
+ordinal first** (`count-1 → 0`), and each step is gated on the previous
+slot's replacement passing the rollout's existing health criteria
+(allocation health snapshots plus `minHealthyTime`, exactly like any other
+rollout step). This is the update-order analog of a K8s StatefulSet's
+`OrderedReady` pod management: followers (high ordinals) restart before the
+conventional leader at slot 0.
+
+- **Replacement is stop-then-start per slot**: the slot's old allocation is
+  retired, its replacement is placed, **re-binds the same instance id and
+  storage handle**, and must become healthy before the next (lower) slot is
+  touched. (`createFirst` remains rejected for stateful groups, so the
+  at-most-one invariant holds at every step.)
+- **Halt on unhealthy**: if a replacement never passes the health gate, the
+  rollout stops at that slot — lower slots keep running the old config.
+  This inherits the standard rollout failure semantics: without a
+  `healthyDeadline` the rollout waits (status `running`, with a
+  `waiting for slot N replacement to become healthy` event); with one, the
+  configured `onHealthDeadline` action (`rollback` by default) fires.
+- **Legibility**: rollout events name each step's slot (`retired old
+  allocation for slot 2`, `slot 2 updated and healthy`), and
+  `GetRolloutStatus` reports `step_index`/`total_steps` where total steps =
+  the number of slots being updated.
+- Sequential defines its own one-slot-per-step progression, so it cannot be
+  combined with the step modes (`percentEachStep`, `countEachStep`,
+  `percentSteps`, `countSteps`) in the same scope. A per-group `slots`
+  override replaces a global step mode (and vice versa), mirroring how step
+  mode overrides already work. `progression: manual` composes fine: each
+  manual advance releases one slot.
+
+**Initial bring-up is not yet gated.** A fresh job's slots place in
+ascending order (0 → N-1) by construction, but in a single eval without
+per-slot health gating — the K8s `OrderedReady` *bring-up* analog is a
+follow-up. `order: 'sequential'` governs config updates (and staged
+promotions) today.
+
+### `updateFrom` — staged ("partitioned") rollouts
+
+`updateFrom: N` stages the rollout: **only slots `>= N` are updated to the
+new config; slots `0..N` keep running their current allocations untouched**
+— including across later reschedules (the scheduler knows staged slots are
+deliberately occupied by the older config and will not double-place them).
+This is the K8s StatefulSet `rollingUpdate.partition` analog and enables the
+canary-promote workflow:
+
+```text
+count: 4, v2 submitted with updateFrom: 2
+  step 1: slot 3 → v2 (health-gated)
+  step 2: slot 2 → v2 (health-gated)
+  rollout completes; slots 1 and 0 still run v1   ← canary state
+
+operator validates v2 on slots 3 and 2, then resubmits with updateFrom: 0
+  (or omits it): a new rollout updates the remaining slots in order
+  3 → 2 → 1 → 0 (slots already on the new task content are re-placed on the
+  new config version), each gated on health. Lowering the floor is all it
+  takes — the promote needs no other spec change.
+```
+
+Validation rules (all at `job validate`/submit time, with actionable
+errors):
+
+- `rollout.slots` (both `order` and `updateFrom`) is only valid for groups
+  whose stateful task is **slot mode** — stateless and keyed groups are
+  rejected, with a pointer at `rolloutByGroup` scoping for mixed jobs.
+- `updateFrom` requires `order: 'sequential'`. (K8s `partition` exists only
+  inside ordered rolling updates; "update slots >= N" has no coherent
+  meaning unless slots are replaced by ordinal.)
+- `updateFrom` must be `< count.num`. K8s permits `partition >= replicas`
+  to mean "update nothing", but a rollout that completes instantly while
+  silently pinning every slot to the old config is almost always a typo in
+  Legion — omit the field to update everything, or lower it to stage.
+- `updateFrom: 0` is valid and identical to omitting the field.
+- Negative or non-numeric values and unknown `order` values are rejected at
+  parse time.
+
+### K8s mapping
+
+| K8s StatefulSet | Legion |
+| --- | --- |
+| `podManagementPolicy: OrderedReady` (update order) | `rollout.slots.order: 'sequential'` |
+| `updateStrategy.rollingUpdate.partition` | `rollout.slots.updateFrom` |
+| `podManagementPolicy: Parallel` | `order: 'parallel'` (the default) |
+| OrderedReady bring-up gating | not yet (slots place 0→N-1 but ungated) |
+
 ## Keyed Mode: the Management API
 
 Keyed mode is the sandbox/dispatch primitive: 0..thousands of long-lived

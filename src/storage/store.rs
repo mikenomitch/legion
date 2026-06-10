@@ -3066,9 +3066,35 @@ impl Store {
         .map(|slot| slot as u32)
         .collect();
 
+        // Slots occupied by a live allocation of ANY config of this job
+        // (e.g. the outgoing config mid-rollout). Preferring slots outside
+        // this set makes the binder pick exactly the slot whose old
+        // allocation was just retired, which is what lets a sequential
+        // (`rollout.slots.order`) rollout replace highest-slot-first and what
+        // keeps a staged (`updateFrom`) rollout from double-binding a slot
+        // whose instance still runs the old config. The per-config `taken`
+        // set above remains the hard constraint; the job-wide set is only a
+        // preference so the fresh-plan-then-remove-previous submit flow
+        // (which deliberately places new-config allocations while the old
+        // config's are still live) keeps working.
+        let mut job_taken_stmt = tx.prepare(
+            "SELECT instance.slot_index FROM allocation \
+             INNER JOIN instance ON instance.instance_id = allocation.instance_id \
+             WHERE instance.job_id = ?1 AND instance.group_name = ?2 \
+             AND instance.mode = 'slot';",
+        )?;
+        let job_taken: HashSet<u32> = Self::collect_rows(
+            job_taken_stmt.query_map(params![job_id, group], |row| row.get::<_, Option<i64>>(0))?,
+        )?
+        .into_iter()
+        .flatten()
+        .map(|slot| slot as u32)
+        .collect();
+
         let desired = count.max(0) as u32;
         let slot = (0..desired)
-            .find(|slot| !taken.contains(slot))
+            .find(|slot| !taken.contains(slot) && !job_taken.contains(slot))
+            .or_else(|| (0..desired).find(|slot| !taken.contains(slot)))
             .with_context(|| {
                 format!(
                 "no free slot for stateful task {task_name} (group {group}); all {desired} slots \
@@ -4741,6 +4767,57 @@ impl Store {
              WHERE job_id = ?1 AND group_name = ?2 AND task_name = ?3 \
              AND mode = 'keyed' AND state NOT IN ('terminated', 'stopped');",
             params![job_id, group, task_name],
+            |row| row.get(0),
+        )?;
+        Ok(count.max(0) as u32)
+    }
+
+    /// Map of `instance_id -> slot ordinal` for the slot pool of a
+    /// (job, group). Used by sequential (`rollout.slots.order`) rollouts to
+    /// retire old allocations in descending slot order — an allocation's slot
+    /// identity is reachable only through its instance row
+    /// (`allocation.instance_id -> instance.slot_index`).
+    #[instrument(err, skip_all)]
+    pub fn slot_indices_for_job_group(&self, job_id: &str, group: &str) -> R<HashMap<String, u32>> {
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare(
+            "SELECT instance_id, slot_index FROM instance \
+             WHERE job_id = ?1 AND group_name = ?2 AND mode = 'slot' \
+             AND slot_index IS NOT NULL;",
+        )?;
+        let rows = stmt.query_map(params![job_id, group], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut indices = HashMap::new();
+        for row in rows {
+            let (instance_id, slot) = row?;
+            indices.insert(instance_id, slot.max(0) as u32);
+        }
+        Ok(indices)
+    }
+
+    /// Count live allocations bound to (job, group)'s slot instances that do
+    /// NOT belong to `exclude_job_config_id`.
+    ///
+    /// This is how a plain (non-rollout) reschedule learns that some slots
+    /// are deliberately still occupied by an older config — the staged
+    /// (`rollout.slots.updateFrom`) state — and must not be double-placed:
+    /// the latest config's effective desired count is `count.num` minus this
+    /// number, so a reschedule only replaces slots that are actually empty.
+    #[instrument(err, skip_all)]
+    pub fn count_slot_allocations_excluding_config(
+        &self,
+        job_id: &str,
+        group: &str,
+        exclude_job_config_id: &str,
+    ) -> R<u32> {
+        let conn = self.read_connection()?;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM allocation \
+             INNER JOIN instance ON instance.instance_id = allocation.instance_id \
+             WHERE instance.job_id = ?1 AND instance.group_name = ?2 \
+             AND instance.mode = 'slot' AND allocation.job_config_id != ?3;",
+            params![job_id, group, exclude_job_config_id],
             |row| row.get(0),
         )?;
         Ok(count.max(0) as u32)
@@ -8080,6 +8157,101 @@ mod tests {
             .context("slot 0 instance")?;
         assert_eq!(slot0_instance.state, InstanceState::Active);
         assert_eq!(slot0_instance.current_alloc_id, Some(slot0.id));
+        Ok(())
+    }
+
+    #[test]
+    fn slot_binding_prefers_slot_with_no_live_allocation_in_job() -> R<()> {
+        // Sequential-rollout shape: v1 holds slots 0..2; v2 must bind the
+        // slot whose old allocation was just retired (slot 2), not the
+        // lowest slot free in v2's own scope (slot 0, still live under v1).
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "active"))?;
+        let job_id = "slot-seq-bind";
+        submit_job(&store, job_id, vec![stateful_slot_task("db", 3, true)])?;
+        let v1_task = task_id_for(&store, "db", job_id)?;
+        let mut v1_allocs = Vec::new();
+        for _ in 0..3 {
+            v1_allocs.push(store.place_alloc("node-a", v1_task)?);
+        }
+        let slot2_handle = store
+            .get_instance(&format!("{job_id}-default-2"))?
+            .context("slot 2 instance")?
+            .storage_handle
+            .clone();
+
+        let v2_config_id = submit_job(
+            &store,
+            job_id,
+            vec![TaskConfig {
+                config: json!({ "version": 2 }),
+                ..stateful_slot_task("db", 3, true)
+            }],
+        )?;
+        let v2_task = task_id_for_config(&store, "db", &v2_config_id)?;
+
+        // Retire slot 2's old allocation, then place a v2 allocation: it
+        // must re-bind slot 2's instance (same id and storage handle).
+        store.remove_allocation_by_id(v1_allocs[2].id)?;
+        let replacement = store.place_alloc("node-a", v2_task)?;
+        assert_eq!(
+            replacement.instance_id.as_deref(),
+            Some(format!("{job_id}-default-2").as_str()),
+            "replacement must bind the freed slot, not slot 0"
+        );
+        let rebound = store
+            .get_instance(&format!("{job_id}-default-2"))?
+            .context("slot 2 instance after rebind")?;
+        assert_eq!(rebound.storage_handle, slot2_handle);
+
+        // Fallback parity with the fresh-plan-then-remove flow: with no
+        // job-wide-free slot left, per-config scoping still applies and the
+        // next v2 placement takes the lowest slot free in v2's scope.
+        let takeover = store.place_alloc("node-a", v2_task)?;
+        assert_eq!(
+            takeover.instance_id.as_deref(),
+            Some(format!("{job_id}-default-0").as_str())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn slot_indices_and_other_config_counts_round_trip() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "active"))?;
+        let job_id = "slot-helpers";
+        submit_job(&store, job_id, vec![stateful_slot_task("db", 2, false)])?;
+        let v1_task = task_id_for(&store, "db", job_id)?;
+        store.place_alloc("node-a", v1_task)?;
+        store.place_alloc("node-a", v1_task)?;
+
+        let indices = store.slot_indices_for_job_group(job_id, "default")?;
+        assert_eq!(indices.len(), 2);
+        assert_eq!(indices.get(&format!("{job_id}-default-0")), Some(&0));
+        assert_eq!(indices.get(&format!("{job_id}-default-1")), Some(&1));
+        assert!(store
+            .slot_indices_for_job_group(job_id, "other-group")?
+            .is_empty());
+
+        // Both v1 allocations count as "other config" from v2's viewpoint,
+        // and as zero from v1's own viewpoint.
+        let v1_config_id = format!("{job_id}-1");
+        let v2_config_id = submit_job(
+            &store,
+            job_id,
+            vec![TaskConfig {
+                config: json!({ "version": 2 }),
+                ..stateful_slot_task("db", 2, false)
+            }],
+        )?;
+        assert_eq!(
+            store.count_slot_allocations_excluding_config(job_id, "default", &v2_config_id)?,
+            2
+        );
+        assert_eq!(
+            store.count_slot_allocations_excluding_config(job_id, "default", &v1_config_id)?,
+            0
+        );
         Ok(())
     }
 

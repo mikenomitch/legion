@@ -590,6 +590,55 @@ pub enum RolloutDeadlineAction {
     Pause,
 }
 
+/// How a slot-mode stateful group's slots are replaced during a rollout
+/// (see `docs/stateful-workloads.md` "Ordered rollouts for slot pools").
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum RolloutSlotOrder {
+    /// Today's behavior (the default): slot replacements are driven by the
+    /// regular step machinery with no ordinal ordering.
+    Parallel,
+    /// One slot at a time, highest ordinal first (`count-1 .. 0`), each step
+    /// gated on the previous slot's replacement passing the rollout's health
+    /// criteria. The K8s StatefulSet `OrderedReady` analog for updates.
+    Sequential,
+}
+
+/// Ordinal-aware rollout options for groups with a slot-mode stateful task
+/// (`rollout.slots` / `rolloutByGroup.<group>.slots` in the jobspec).
+///
+/// Only valid for groups whose stateful task is slot mode; rejected at
+/// submit time otherwise. A group override replaces the global `slots`
+/// block as a unit (like the step-mode fields, the block is one coherent
+/// progression choice).
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RolloutSlotsConfig {
+    /// `'parallel'` (default) or `'sequential'` (one slot at a time, highest
+    /// first, health-gated). `sequential` defines its own one-slot-per-step
+    /// progression and therefore cannot be combined with the step-mode
+    /// fields (`percentEachStep`, `countEachStep`, `percentSteps`,
+    /// `countSteps`) in the same scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order: Option<RolloutSlotOrder>,
+    /// Staged ("partitioned") rollout floor: only slots `>= updateFrom` are
+    /// updated to the new config; slots `0..updateFrom` keep running their
+    /// current allocations untouched. Resubmitting with a lower value
+    /// extends the new config to more slots; `0` (or omitting the field)
+    /// updates everything. Requires `order: 'sequential'` and must be less
+    /// than the slot task's `count.num`. The K8s StatefulSet
+    /// `rollingUpdate.partition` analog.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_from: Option<u32>,
+}
+
+impl RolloutSlotsConfig {
+    /// Whether this block asks for ordered (one-slot-at-a-time) updates.
+    pub fn is_sequential(&self) -> bool {
+        self.order == Some(RolloutSlotOrder::Sequential)
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct RolloutConfig {
@@ -653,6 +702,11 @@ pub struct RolloutConfig {
         serialize_with = "serialize_optional_duration"
     )]
     pub batch_kill_after: Option<Duration>,
+    /// Ordinal-aware options for slot-mode stateful groups: ordered
+    /// (`order: 'sequential'`) and staged (`updateFrom`) slot replacement.
+    /// See [`RolloutSlotsConfig`] and docs/stateful-workloads.md.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slots: Option<RolloutSlotsConfig>,
 }
 
 impl RolloutConfig {
@@ -665,6 +719,15 @@ impl RolloutConfig {
 
     fn has_step_mode(&self) -> bool {
         self.step_mode_count() > 0
+    }
+
+    /// Whether the config asks for ordered one-slot-at-a-time updates
+    /// (`slots.order: 'sequential'`). Sequential is a progression mode of
+    /// its own and is mutually exclusive with the step-mode fields.
+    fn has_sequential_slots(&self) -> bool {
+        self.slots
+            .as_ref()
+            .is_some_and(RolloutSlotsConfig::is_sequential)
     }
 
     fn clear_step_modes(&mut self) {
@@ -687,8 +750,22 @@ impl RolloutConfig {
         if override_config.in_place.is_some() {
             self.in_place = override_config.in_place;
         }
+        // A group override that picks a progression mode replaces the global
+        // selection wholesale: step modes clear a global step mode AND a
+        // global sequential-slots choice; a sequential `slots` block clears
+        // the global step modes. This keeps the merged config from ever
+        // mixing two progression modes the group never asked for together.
         if override_config.has_step_mode() {
             self.clear_step_modes();
+            if self.has_sequential_slots() {
+                self.slots = None;
+            }
+        }
+        if override_config.has_sequential_slots() {
+            self.clear_step_modes();
+        }
+        if override_config.slots.is_some() {
+            self.slots = override_config.slots.clone();
         }
         if override_config.percent_each_step.is_some() {
             self.percent_each_step = override_config.percent_each_step;
@@ -806,6 +883,24 @@ impl RolloutConfig {
             .is_some_and(Duration::is_zero)
         {
             bail!("{scope}.healthyDeadline must be greater than 0 when set");
+        }
+
+        if self.has_sequential_slots() && self.has_step_mode() {
+            bail!(
+                "{scope} cannot combine slots.order: \"sequential\" with a step mode \
+                 (percentEachStep, countEachStep, percentSteps, countSteps); sequential slot \
+                 rollouts define their own one-slot-per-step progression"
+            );
+        }
+
+        if let Some(slots) = self.slots.as_ref() {
+            if slots.update_from.is_some() && !slots.is_sequential() {
+                bail!(
+                    "{scope}.slots.updateFrom requires slots.order: \"sequential\"; staged \
+                     rollouts only have defined semantics when slots are replaced in ordinal \
+                     order"
+                );
+            }
         }
 
         Ok(())
@@ -2065,6 +2160,152 @@ mod tests {
             err.to_string().contains("unknown group"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn rollout_slots_deserialize_and_round_trip() -> R<()> {
+        let spec = serde_json::json!({
+            "name": "demo",
+            "task": { "kind": "noop" },
+            "rollout": {
+                "slots": { "order": "sequential", "updateFrom": 2 }
+            }
+        });
+
+        let config: JobConfig = serde_json::from_value(spec)?;
+        let slots = config
+            .rollout
+            .as_ref()
+            .and_then(|rollout| rollout.slots.as_ref())
+            .expect("missing slots block");
+        assert_eq!(slots.order, Some(RolloutSlotOrder::Sequential));
+        assert_eq!(slots.update_from, Some(2));
+        assert!(slots.is_sequential());
+
+        // Round trip preserves the block (it is persisted in the rollout
+        // row's config_json and re-parsed every tick).
+        let raw = serde_json::to_string(config.rollout.as_ref().unwrap())?;
+        let parsed: RolloutConfig = serde_json::from_str(&raw)?;
+        assert_eq!(parsed.slots, config.rollout.as_ref().unwrap().slots);
+        Ok(())
+    }
+
+    #[test]
+    fn rollout_slots_reject_garbage_at_parse() {
+        // Unknown order value.
+        let err = serde_json::from_value::<RolloutConfig>(serde_json::json!({
+            "slots": { "order": "alphabetical" }
+        }))
+        .expect_err("garbage order should fail to parse");
+        assert!(err.to_string().contains("alphabetical"));
+
+        // Negative updateFrom.
+        assert!(serde_json::from_value::<RolloutConfig>(serde_json::json!({
+            "slots": { "updateFrom": -1 }
+        }))
+        .is_err());
+
+        // Non-numeric updateFrom.
+        assert!(serde_json::from_value::<RolloutConfig>(serde_json::json!({
+            "slots": { "updateFrom": "two" }
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn rollout_validation_rejects_update_from_without_sequential() {
+        for slots in [
+            serde_json::json!({ "updateFrom": 1 }),
+            serde_json::json!({ "order": "parallel", "updateFrom": 1 }),
+        ] {
+            let spec = serde_json::json!({
+                "name": "demo",
+                "task": { "kind": "noop" },
+                "rollout": { "slots": slots }
+            });
+            let config: JobConfig =
+                serde_json::from_value(spec).expect("config should deserialize");
+            let err = config
+                .validate_rollout()
+                .expect_err("updateFrom without sequential should fail");
+            assert!(
+                err.to_string().contains("requires slots.order"),
+                "unexpected error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn rollout_validation_rejects_sequential_with_step_mode() {
+        let spec = serde_json::json!({
+            "name": "demo",
+            "task": { "kind": "noop" },
+            "rollout": {
+                "percentSteps": [50, 100],
+                "slots": { "order": "sequential" }
+            }
+        });
+
+        let config: JobConfig = serde_json::from_value(spec).expect("config should deserialize");
+        let err = config
+            .validate_rollout()
+            .expect_err("sequential plus a step mode should fail");
+        assert!(
+            err.to_string().contains("cannot combine slots.order"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn group_sequential_slots_override_replaces_global_step_mode() -> R<()> {
+        let spec = serde_json::json!({
+            "name": "demo",
+            "tasks": {
+                "db": { "kind": "noop", "group": "data" },
+                "api": { "kind": "noop", "group": "backend" }
+            },
+            "rollout": { "percentSteps": [25, 100] },
+            "rolloutByGroup": {
+                "data": { "slots": { "order": "sequential", "updateFrom": 1 } }
+            }
+        });
+
+        let config: JobConfig = serde_json::from_value(spec)?;
+        // The sequential slots override is a progression mode of its own:
+        // it replaces the global percentSteps for this group (mirroring how
+        // a group step-mode override replaces the global step mode).
+        let data = config
+            .rollout_config_for_group("data")
+            .expect("missing data rollout");
+        assert!(data.percent_steps.is_none());
+        assert_eq!(
+            data.slots.as_ref().and_then(|slots| slots.update_from),
+            Some(1)
+        );
+        config.validate_rollout()?;
+
+        // Untouched group keeps the global step mode and gains no slots.
+        let backend = config
+            .rollout_config_for_group("backend")
+            .expect("missing backend rollout");
+        assert_eq!(backend.percent_steps, Some(vec![25, 100]));
+        assert!(backend.slots.is_none());
+
+        // The reverse: a group step-mode override clears a global
+        // sequential slots block instead of merging into a conflict.
+        let reverse: JobConfig = serde_json::from_value(serde_json::json!({
+            "name": "demo",
+            "tasks": { "db": { "kind": "noop", "group": "data" } },
+            "rollout": { "slots": { "order": "sequential" } },
+            "rolloutByGroup": { "data": { "countEachStep": 1 } }
+        }))?;
+        let data = reverse
+            .rollout_config_for_group("data")
+            .expect("missing data rollout");
+        assert_eq!(data.count_each_step, Some(1));
+        assert!(data.slots.is_none());
+        reverse.validate_rollout()?;
+        Ok(())
     }
 
     #[test]

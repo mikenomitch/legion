@@ -5,8 +5,8 @@ use crate::prelude::*;
 
 use crate::manager::dispatcher::build_task_allocation;
 use crate::manager::rollout::{
-    advance_rollout as advance_rollout_state, step_fractions_for_rollout,
-    stop_rollout as stop_rollout_state,
+    advance_rollout as advance_rollout_state, sequential_step_fractions,
+    step_fractions_for_rollout, stop_rollout as stop_rollout_state,
 };
 use crate::manager::rollout_strategy;
 use crate::manager::scheduler::{PlanConfigOutcome, PlanMode, Scheduler};
@@ -869,6 +869,15 @@ fn remove_stale_allocations_for_new_rollout(
 
     for allocation in allocations {
         if keep.contains(allocation.job_config_id.as_str()) {
+            continue;
+        }
+        // Stateful allocations (instance-bound) are never bulk-removed here:
+        // they may be the deliberate remainder of a staged rollout
+        // (`rollout.slots.updateFrom`), where low slots keep running an
+        // older config until a later resubmit lowers the floor. The new
+        // rollout sees them as old allocations and replaces them with the
+        // configured ordering and health gating instead of an abrupt stop.
+        if allocation.instance_id.is_some() {
             continue;
         }
         store
@@ -3676,7 +3685,26 @@ fn build_rollout_group_status(
             .unwrap_or_default();
         let effective_rollout =
             rollout_strategy::resolve_rollout_strategy(configured_rollout, &group, base_count)?;
-        let total_steps = step_fractions_for_rollout(&effective_rollout, base_count).len() as u32;
+        // Ordered slot groups (`rollout.slots.order: 'sequential'`) have one
+        // step per slot being updated; mirror the engine's step math so
+        // step_index/total_steps stay legible for sequential progress.
+        let slot_count = to_config
+            .tasks
+            .iter()
+            .find(|task| {
+                task.group == group
+                    && task
+                        .stateful
+                        .as_ref()
+                        .is_some_and(|stateful| stateful.mode == InstanceMode::Slot)
+            })
+            .map(|task| task.count.num);
+        let total_steps = match (effective_rollout.slots.as_ref(), slot_count) {
+            (Some(slots), Some(count)) if slots.is_sequential() => {
+                sequential_step_fractions(count, slots.update_from.unwrap_or(0)).len() as u32
+            }
+            _ => step_fractions_for_rollout(&effective_rollout, base_count).len() as u32,
+        };
 
         let mut allocations = allocations_by_group.remove(&group).unwrap_or_default();
         allocations.sort_by_key(|entry| entry.allocation_id);

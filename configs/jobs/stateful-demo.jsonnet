@@ -12,6 +12,20 @@
 //   LEGION_ALLOC_ID       the ephemeral placement id (changes each move)
 {
     name: "stateful-demo",
+    // Ordinal-aware rollouts for the slot pool (see docs/stateful-workloads.md
+    // "Ordered rollouts for slot pools"). Uncomment to make config updates
+    // replace ONE slot at a time, highest first (2 -> 1 -> 0), each step
+    // gated on the previous replacement becoming healthy (K8s OrderedReady
+    // analog). Add updateFrom to stage the update: e.g. updateFrom: 2
+    // updates only slot 2 and leaves slots 0-1 on the old config until a
+    // resubmit lowers the floor (K8s partition analog, the canary-promote
+    // workflow).
+    // rollout: {
+    //     slots: {
+    //         order: "sequential",
+    //         // updateFrom: 2,
+    //     },
+    // },
     tasks: [
         {
             name: "replica",

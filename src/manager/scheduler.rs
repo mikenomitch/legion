@@ -442,7 +442,12 @@ impl<'a> Scheduler<'a> {
         let all_tasks = self
             .store
             .cached_task_configs_for_job_config(job_config_id)?;
-        let tasks = self.tasks_for_plan_from_store(job_config_id)?;
+        let mut tasks = self.tasks_for_plan_from_store(job_config_id)?;
+        if matches!(mode, PlanMode::Reschedule) {
+            if let Some(job_id) = self.store.job_id_for_job_config(job_config_id)? {
+                Self::apply_slot_staged_counts(self.store, &job_id, job_config_id, &mut tasks)?;
+            }
+        }
 
         let mut allocations_by_node = self.store.cached_allocations_by_node()?;
         if matches!(mode, PlanMode::Fresh) {
@@ -600,6 +605,11 @@ impl<'a> Scheduler<'a> {
             .store
             .cached_task_configs_for_job_config(job_config_id)?;
         let mut tasks = self.tasks_for_plan_from_store(job_config_id)?;
+        if task_targets.is_none() && matches!(mode, PlanMode::Reschedule) {
+            if let Some(job_id) = self.store.job_id_for_job_config(job_config_id)? {
+                Self::apply_slot_staged_counts(self.store, &job_id, job_config_id, &mut tasks)?;
+            }
+        }
 
         let allocations_by_node = self.store.cached_allocations_by_node()?;
         let existing_counts =
@@ -1401,6 +1411,42 @@ impl<'a> Scheduler<'a> {
                 .is_some_and(|stateful| stateful.mode == crate::structs::InstanceMode::Keyed);
             if keyed {
                 *desired = store.count_live_keyed_instances(job_id, &task.group, &task.name)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Reduce a slot-mode stateful task's desired count by the number of
+    /// slots still deliberately occupied by live allocations of OTHER
+    /// configs of the same job.
+    ///
+    /// After (or during) a staged rollout (`rollout.slots.updateFrom`),
+    /// slots below the floor keep running the previous config's allocations
+    /// on purpose. A plain reschedule of the latest config would otherwise
+    /// converge that config to the full `count.num` and double-place those
+    /// slots (two live allocations on one instance — the at-most-one
+    /// invariant). Only applied to plain (no explicit per-task targets)
+    /// `Reschedule` plans: rollouts pass explicit targets and own this math
+    /// themselves, and `Fresh` plans deliberately ignore existing
+    /// allocations. Keyed and stateless tasks are untouched.
+    fn apply_slot_staged_counts(
+        store: &Store,
+        job_id: &str,
+        job_config_id: &str,
+        tasks: &mut [(i64, TaskConfig, u32)],
+    ) -> R<()> {
+        for (_task_id, task, desired) in tasks.iter_mut() {
+            let slot_mode = task
+                .stateful
+                .as_ref()
+                .is_some_and(|stateful| stateful.mode == crate::structs::InstanceMode::Slot);
+            if slot_mode {
+                let other_config_slots = store.count_slot_allocations_excluding_config(
+                    job_id,
+                    &task.group,
+                    job_config_id,
+                )?;
+                *desired = desired.saturating_sub(other_config_slots);
             }
         }
         Ok(())

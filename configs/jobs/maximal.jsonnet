@@ -25,7 +25,28 @@
     },
     rolloutByGroup: {
         frontend: {
-            countEachStep: 1,
+            // Ordinal-aware rollout for the group's slot-mode stateful task
+            // (see docs/stateful-workloads.md "Ordered rollouts for slot
+            // pools"). Only valid on groups with a slot-mode stateful task,
+            // which is why it is scoped here rather than globally.
+            slots: {
+                // "sequential" (K8s OrderedReady analog): replace ONE slot
+                // at a time, highest ordinal first (count-1 .. 0), each step
+                // gated on the previous slot's replacement passing the
+                // rollout health criteria. Defines its own one-slot-per-step
+                // progression, so it replaces the global step mode
+                // (percentSteps above) for this group and cannot be combined
+                // with step modes in the same block. Default: "parallel"
+                // (today's behavior).
+                order: "sequential",
+                // Staged/partitioned updates (K8s partition analog): only
+                // slots >= updateFrom are updated; lower slots keep running
+                // their current allocations. Resubmit with a lower value to
+                // promote the new config to more slots (0 = everything).
+                // Must be < the slot task's count. Requires order:
+                // "sequential". 0 is the same as omitting the field.
+                updateFrom: 0,
+            },
             inPlace: true,
         },
         // prep is stateless, so createFirst (replace-before-stop) is safe here
