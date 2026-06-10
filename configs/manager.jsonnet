@@ -36,4 +36,27 @@
       joinTokenTtlSeconds: 900,
     },
   },
+  // Auth & ACLs (off by default; see docs/auth-and-acls.md).
+  // When enabled, run `legion acl bootstrap` once to mint the initial
+  // management token, then create policies/tokens with `legion acl ...`.
+  acl: {
+    enabled: false,
+    // auditOnly: true,        // log denials without enforcing (migration mode)
+    // loginTtl: "24h",        // lifetime of tokens minted via `legion login`
+    // jwksRefreshInterval: "5m",
+    // authMethods: [
+    //   {
+    //     name: "corp-oidc",
+    //     type: "oidc",                       // discovery via issuer
+    //     issuer: "https://idp.example.com",
+    //     boundAudiences: ["legion"],
+    //     userClaim: "email",
+    //     bindingRules: [
+    //       { claim: "groups", value: "platform", policies: ["ops"] },
+    //       { policies: ["base-read"] },      // unconditional
+    //     ],
+    //     tokenTtl: "8h",
+    //   },
+    // ],
+  },
 }

@@ -1,3 +1,4 @@
+pub mod acl_store;
 pub mod errors;
 pub mod migrations;
 pub mod persistence;

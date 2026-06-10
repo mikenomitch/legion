@@ -37,6 +37,141 @@ pub struct ManagerConfig {
     pub persistence: Option<PersistenceConfig>,
     #[serde(default)]
     pub workload_identity: Option<WorkloadIdentityConfig>,
+    #[serde(default)]
+    pub acl: Option<AclConfig>,
+}
+
+/// Default TTL for tokens minted via Login (userpass or JWT exchange).
+pub const DEF_ACL_LOGIN_TTL: &str = "24h";
+/// Default refresh interval for auth-method JWKS documents.
+pub const DEF_ACL_JWKS_REFRESH: &str = "5m";
+
+/// ACL / auth configuration. Off by default: when `enabled` is false every
+/// caller has full access and the UI shows a dismissable warning.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AclConfig {
+    /// Master switch. Default: false (no enforcement).
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// When true (and `enabled` is true), denials are logged with the
+    /// `acl_audit` tracing target but requests are allowed. Use this to
+    /// stage policies before flipping to full enforcement.
+    #[serde(default)]
+    pub audit_only: Option<bool>,
+    /// TTL applied to tokens minted via Login when the request omits one.
+    pub login_ttl: Option<String>,
+    /// JWT/OIDC auth methods that convert external identities into policies.
+    #[serde(default)]
+    pub auth_methods: Option<Vec<AclAuthMethodConfig>>,
+    /// How often to re-fetch remote JWKS documents.
+    pub jwks_refresh_interval: Option<String>,
+}
+
+/// One JWT/OIDC auth method.
+///
+/// A method validates externally issued JWTs (signature via JWKS or a shared
+/// secret, plus issuer/audience bounds) and maps verified claims onto Legion
+/// ACL policies via binding rules.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AclAuthMethodConfig {
+    /// Unique method name, referenced by `legion login --method <name>`.
+    /// `userpass` is reserved for the built-in username/password method.
+    pub name: String,
+    /// `jwt` (keys provided explicitly) or `oidc` (keys discovered from the
+    /// issuer's /.well-known/openid-configuration document).
+    #[serde(default)]
+    pub r#type: Option<String>,
+    /// JWKS URL to fetch signing keys from (jwt type).
+    pub jwks_url: Option<String>,
+    /// Inline JWKS JSON document (jwt type; useful for air-gapped setups and tests).
+    pub jwks_json: Option<String>,
+    /// HMAC shared secret for HS256-signed tokens (dev/test setups).
+    pub hmac_secret: Option<String>,
+    /// OIDC issuer URL for discovery (oidc type) and `iss` validation.
+    pub issuer: Option<String>,
+    /// Accepted `aud` values. Strongly recommended; when empty, audience is
+    /// not validated.
+    #[serde(default)]
+    pub bound_audiences: Option<Vec<String>>,
+    /// Required `iss` value (defaults to `issuer` when set).
+    pub bound_issuer: Option<String>,
+    /// Claim used as the principal name. Default: `sub`.
+    pub user_claim: Option<String>,
+    /// Rules mapping verified claims to policy names.
+    #[serde(default)]
+    pub binding_rules: Option<Vec<AclBindingRule>>,
+    /// TTL for ACL tokens minted when exchanging a JWT via Login.
+    pub token_ttl: Option<String>,
+}
+
+/// Maps a verified JWT claim onto Legion policies.
+///
+/// When `claim` is omitted the rule is unconditional (every login through the
+/// method receives `policies`). When `claim` is set, the rule applies when the
+/// claim equals `value` (string compare) or, for array claims, contains
+/// `value`.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AclBindingRule {
+    /// JWT claim to inspect (for example "groups"). Omit for unconditional.
+    pub claim: Option<String>,
+    /// Value the claim must equal or contain.
+    pub value: Option<String>,
+    /// Policy names granted when the rule matches.
+    pub policies: Vec<String>,
+}
+
+/// AclConfig with defaults applied.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct AclConfigFull {
+    pub enabled: bool,
+    pub audit_only: bool,
+    pub login_ttl: String,
+    pub auth_methods: Vec<AclAuthMethodConfig>,
+    pub jwks_refresh_interval: String,
+}
+
+impl Default for AclConfigFull {
+    fn default() -> Self {
+        AclConfigFull {
+            enabled: false,
+            audit_only: false,
+            login_ttl: DEF_ACL_LOGIN_TTL.into(),
+            auth_methods: Vec::new(),
+            jwks_refresh_interval: DEF_ACL_JWKS_REFRESH.into(),
+        }
+    }
+}
+
+impl From<AclConfigFull> for AclConfig {
+    fn from(val: AclConfigFull) -> Self {
+        AclConfig {
+            enabled: Some(val.enabled),
+            audit_only: Some(val.audit_only),
+            login_ttl: Some(val.login_ttl),
+            auth_methods: Some(val.auth_methods),
+            jwks_refresh_interval: Some(val.jwks_refresh_interval),
+        }
+    }
+}
+
+impl AclConfig {
+    pub fn with_defaults(&self) -> AclConfigFull {
+        let d = AclConfigFull::default();
+        AclConfigFull {
+            enabled: self.enabled.unwrap_or(d.enabled),
+            audit_only: self.audit_only.unwrap_or(d.audit_only),
+            login_ttl: self.login_ttl.clone().unwrap_or(d.login_ttl),
+            auth_methods: self.auth_methods.clone().unwrap_or(d.auth_methods),
+            jwks_refresh_interval: self
+                .jwks_refresh_interval
+                .clone()
+                .unwrap_or(d.jwks_refresh_interval),
+        }
+    }
 }
 
 /// Default token TTL when an identity does not set its own.
@@ -219,6 +354,8 @@ pub struct ManagerConfigFull {
     pub persistence: PersistenceConfigFull,
     #[serde(default)]
     pub workload_identity: WorkloadIdentityConfigFull,
+    #[serde(default)]
+    pub acl: AclConfigFull,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -321,6 +458,7 @@ impl From<ManagerConfigFull> for ManagerConfig {
             custom_resources: val.custom_resources,
             persistence: Some(val.persistence.into()),
             workload_identity: Some(val.workload_identity.into()),
+            acl: Some(val.acl.into()),
         }
     }
 }
@@ -366,6 +504,11 @@ impl ManagerConfig {
                 .as_ref()
                 .map(WorkloadIdentityConfig::with_defaults)
                 .unwrap_or_default(),
+            acl: self
+                .acl
+                .as_ref()
+                .map(AclConfig::with_defaults)
+                .unwrap_or_default(),
         }
     }
 }
@@ -386,6 +529,7 @@ impl Default for ManagerConfigFull {
             eval_threads: default_eval_threads(),
             persistence: PersistenceConfigFull::default(),
             workload_identity: WorkloadIdentityConfigFull::default(),
+            acl: AclConfigFull::default(),
         }
     }
 }

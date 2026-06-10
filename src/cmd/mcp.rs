@@ -22,7 +22,6 @@
 use crate::cmd::helpers::connect_manager_client;
 use crate::cmd::output::CliError;
 use crate::prelude::*;
-use crate::structs::manager_client::ManagerClient;
 use crate::structs::{
     DestroyJobRequest, GetJobInfoRequest, GetJobSpecRequest, GetNodesRequest,
     GetRolloutStatusRequest, GetStateStoreSchemaRequest, JobConfig, ListJobsRequest,
@@ -31,7 +30,6 @@ use crate::structs::{
 use crate::task_plugins::validate_job_config;
 use serde::Serialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tonic::transport::Channel;
 
 /// MCP protocol revision this server implements.
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
@@ -157,6 +155,12 @@ fn tool_defs() -> Vec<ToolDef> {
         ToolDef {
             name: "legion_node_list",
             description: "List worker nodes and their health.",
+            input_schema: empty_schema,
+            mutates: false,
+        },
+        ToolDef {
+            name: "legion_acl_whoami",
+            description: "Show whether ACLs are enabled and what access the current credentials grant. Use this to diagnose PermissionDenied errors.",
             input_schema: empty_schema,
             mutates: false,
         },
@@ -386,6 +390,10 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             let mut client = connect().await?;
             grpc(client.get_nodes(GetNodesRequest::default())).await
         }
+        "legion_acl_whoami" => {
+            let mut client = connect().await?;
+            grpc(client.who_am_i(crate::structs::WhoAmIRequest {})).await
+        }
         "legion_state_query" => {
             let sql = str_arg(&args, "sql")?;
             let mut client = connect().await?;
@@ -457,7 +465,7 @@ fn validate_tool(args: Value) -> Result<Value, String> {
 }
 
 /// Connect to the manager, mapping connection failures to a tool error string.
-async fn connect() -> Result<ManagerClient<Channel>, String> {
+async fn connect() -> Result<crate::cmd::helpers::AuthedManagerClient, String> {
     connect_manager_client().await.map_err(|e| e.to_string())
 }
 

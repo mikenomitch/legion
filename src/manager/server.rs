@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use crate::prelude::*;
 
+use crate::manager::acl::{self, AclRuntime};
 use crate::manager::dispatcher::build_task_allocation;
 use crate::manager::rollout::{
     advance_rollout as advance_rollout_state, step_fractions_for_rollout,
@@ -12,6 +13,7 @@ use crate::manager::rollout_strategy;
 use crate::manager::scheduler::{PlanConfigOutcome, PlanMode, Scheduler};
 use crate::storage::errors::StorageError;
 use crate::storage::store::{JobKvReference, JobSubmitOutcome, Store};
+use crate::structs::acl::{AclAction, AclIdentity, AclResource, AclScope};
 use crate::structs::manager_server::Manager;
 use crate::structs::{
     worker_client::WorkerClient, AcquireKvLockReply, AcquireKvLockRequest, AdvanceRolloutReply,
@@ -39,6 +41,14 @@ use crate::structs::{
     TaskOnUnhealthyConfig, UpdateNodeDynamicReply, UpdateNodeDynamicRequest,
     UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest, WorkerConfig, WorkerPreRegisterReply,
     WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest,
+};
+use crate::structs::{
+    BootstrapAclReply, BootstrapAclRequest, CreateAclTokenReply, CreateAclTokenRequest,
+    DeleteAclPolicyReply, DeleteAclPolicyRequest, DeleteAclTokenReply, DeleteAclTokenRequest,
+    DeleteAclUserReply, DeleteAclUserRequest, GetAclPolicyReply, GetAclPolicyRequest,
+    ListAclPoliciesReply, ListAclPoliciesRequest, ListAclTokensReply, ListAclTokensRequest,
+    ListAclUsersReply, ListAclUsersRequest, LoginReply, LoginRequest, UpsertAclPolicyReply,
+    UpsertAclPolicyRequest, UpsertAclUserReply, UpsertAclUserRequest, WhoAmIReply, WhoAmIRequest,
 };
 use crate::task_plugins::validate_job_config;
 use crate::tracing_util::{o11y_enabled, read_recent_observability};
@@ -508,14 +518,72 @@ fn build_rollout_launch_config(config: &JobConfig) -> Result<RolloutLaunchConfig
 #[derive(Debug)]
 pub struct ManagerAgentService {
     pub store: Store,
+    pub acl: Arc<AclRuntime>,
     allocation_failures: Arc<Mutex<AllocationFailureTracker>>,
 }
 
 impl ManagerAgentService {
+    /// Service with ACLs disabled (tests, embedded use).
     pub fn new(store: Store) -> Self {
+        Self::with_acl(store, Arc::new(AclRuntime::disabled()))
+    }
+
+    pub fn with_acl(store: Store, acl: Arc<AclRuntime>) -> Self {
         Self {
             store,
+            acl,
             allocation_failures: Arc::new(Mutex::new(AllocationFailureTracker::default())),
+        }
+    }
+
+    /// Drop-in ACL gate for RPC handlers: authenticates the caller and
+    /// requires `action` on `resource` within `scope`.
+    ///
+    /// Every user-facing endpoint must call this (or `authenticate_acl` +
+    /// `acl::enforce` when the scope is only known after parsing the request
+    /// body) before doing any work. See AGENTS.md and
+    /// `tests/acl_endpoints.rs`, which fails when an endpoint is missing
+    /// coverage.
+    fn check_acl<T>(
+        &self,
+        request: &Request<T>,
+        resource: AclResource,
+        action: AclAction,
+        scope: AclScope,
+    ) -> Result<AclIdentity, Status> {
+        let identity = self.authenticate_acl(request)?;
+        acl::enforce(&identity, resource, action, &scope)?;
+        Ok(identity)
+    }
+
+    /// Resolves the caller's identity without enforcing anything. Pair with
+    /// `acl::enforce` once the request body has been parsed.
+    fn authenticate_acl<T>(&self, request: &Request<T>) -> Result<AclIdentity, Status> {
+        self.acl.authenticate(request.metadata(), &self.store)
+    }
+
+    /// Scope check against a rollout's job, used by rollout endpoints that
+    /// only carry a numeric rollout ID.
+    fn enforce_rollout_job(
+        &self,
+        identity: &AclIdentity,
+        action: AclAction,
+        rollout_id: i64,
+    ) -> Result<(), Status> {
+        let rollout = self
+            .store
+            .get_rollout(rollout_id)
+            .map_err(|e| map_store_error("Error loading rollout", e))?;
+        match rollout {
+            Some(rollout) => acl::enforce(
+                identity,
+                AclResource::Job,
+                action,
+                &AclScope::job(&rollout.job_id),
+            ),
+            // Unknown rollout: require coarse job access; handlers then
+            // produce their normal not-found/empty replies.
+            None => acl::enforce(identity, AclResource::Job, action, &AclScope::any()),
         }
     }
 
@@ -825,6 +893,14 @@ impl Manager for ManagerAgentService {
         &self,
         request: Request<RunJobRequest>,
     ) -> Result<Response<RunJobReply>, Status> {
+        // ACL: coarse gate here; exact job-name scope is enforced below once
+        // the jobspec has been parsed.
+        let identity = self.check_acl(
+            &request,
+            AclResource::Job,
+            AclAction::Write,
+            AclScope::any(),
+        )?;
         let inner = request.into_inner();
         let js = inner.parsed_jobspec;
         let mut subs = inner.submissions;
@@ -854,6 +930,12 @@ impl Manager for ManagerAgentService {
             error!("Error parsing jobspec: {:?}", e);
             Status::invalid_argument(format!("Error parsing jobspec: {e}"))
         })?;
+        acl::enforce(
+            &identity,
+            AclResource::Job,
+            AclAction::Write,
+            &AclScope::job(&config.name),
+        )?;
 
         let force_reschedule = inner.force_reschedule;
         validate_job_config(&config).map_err(|e| {
@@ -940,6 +1022,12 @@ impl Manager for ManagerAgentService {
         &self,
         request: Request<GetJobInfoRequest>,
     ) -> Result<Response<GetJobInfoReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Job,
+            AclAction::Read,
+            AclScope::job(&request.get_ref().name),
+        )?;
         let name = request.into_inner().name;
 
         let job = self
@@ -957,6 +1045,8 @@ impl Manager for ManagerAgentService {
         &self,
         request: Request<ListRolloutsRequest>,
     ) -> Result<Response<ListRolloutsReply>, Status> {
+        let identity =
+            self.check_acl(&request, AclResource::Job, AclAction::Read, AclScope::any())?;
         let request = request.into_inner();
         let job_id = request
             .job_id
@@ -975,6 +1065,13 @@ impl Manager for ManagerAgentService {
             .store
             .list_rollouts(job_id, request.active_only)
             .map_err(|e| map_store_error("Error listing rollouts", e))?;
+        rollouts.retain(|rollout| {
+            identity.allows(
+                AclResource::Job,
+                AclAction::Read,
+                &AclScope::job(&rollout.job_id),
+            )
+        });
 
         if let Some(query) = query {
             rollouts.retain(|rollout| {
@@ -1017,7 +1114,9 @@ impl Manager for ManagerAgentService {
         &self,
         request: Request<GetRolloutRequest>,
     ) -> Result<Response<GetRolloutReply>, Status> {
+        let identity = self.authenticate_acl(&request)?;
         let request = request.into_inner();
+        self.enforce_rollout_job(&identity, AclAction::Read, request.id)?;
         let rollout = self
             .store
             .get_rollout(request.id)
@@ -1030,7 +1129,9 @@ impl Manager for ManagerAgentService {
         &self,
         request: Request<GetRolloutStatusRequest>,
     ) -> Result<Response<GetRolloutStatusReply>, Status> {
+        let identity = self.authenticate_acl(&request)?;
         let request = request.into_inner();
+        self.enforce_rollout_job(&identity, AclAction::Read, request.id)?;
         let rollout = self
             .store
             .get_rollout(request.id)
@@ -1055,12 +1156,14 @@ impl Manager for ManagerAgentService {
         &self,
         request: Request<ListRolloutEventsRequest>,
     ) -> Result<Response<ListRolloutEventsReply>, Status> {
+        let identity = self.authenticate_acl(&request)?;
         let request = request.into_inner();
         if request.rollout_id <= 0 {
             return Err(Status::invalid_argument(
                 "rollout_id must be greater than 0",
             ));
         }
+        self.enforce_rollout_job(&identity, AclAction::Read, request.rollout_id)?;
         let events = self
             .store
             .list_rollout_events(request.rollout_id, request.limit)
@@ -1086,7 +1189,9 @@ impl Manager for ManagerAgentService {
         &self,
         request: Request<AdvanceRolloutRequest>,
     ) -> Result<Response<AdvanceRolloutReply>, Status> {
+        let identity = self.authenticate_acl(&request)?;
         let request = request.into_inner();
+        self.enforce_rollout_job(&identity, AclAction::Write, request.id)?;
         let priority = request.priority.unwrap_or(self.store.default_eval_priority);
         let rollout = advance_rollout_state(&self.store, request.id, &request.groups, priority)
             .map_err(|e| Status::invalid_argument(format!("Error advancing rollout: {e}")))?;
@@ -1102,7 +1207,9 @@ impl Manager for ManagerAgentService {
         &self,
         request: Request<StopRolloutRequest>,
     ) -> Result<Response<StopRolloutReply>, Status> {
+        let identity = self.authenticate_acl(&request)?;
         let request = request.into_inner();
+        self.enforce_rollout_job(&identity, AclAction::Write, request.id)?;
         let priority = request.priority.unwrap_or(self.store.default_eval_priority);
         let rollout = stop_rollout_state(&self.store, request.id, request.revert, priority)
             .map_err(|e| Status::invalid_argument(format!("Error stopping rollout: {e}")))?;
@@ -1122,6 +1229,10 @@ impl Manager for ManagerAgentService {
         &self,
         request: Request<PlanJobRequest>,
     ) -> Result<Response<PlanJobReply>, Status> {
+        // ACL: planning never mutates, so it requires job:read; the exact
+        // job-name scope is enforced after the jobspec parses.
+        let identity =
+            self.check_acl(&request, AclResource::Job, AclAction::Read, AclScope::any())?;
         let jobspec = request.into_inner().parsed_jobspec;
         if jobspec.trim().is_empty() {
             return Err(Status::invalid_argument("Plan request missing jobspec"));
@@ -1132,6 +1243,12 @@ impl Manager for ManagerAgentService {
                 error!("Error parsing jobspec for plan: {:?}", e);
                 Status::invalid_argument(format!("Error parsing jobspec: {e}"))
             })?;
+        acl::enforce(
+            &identity,
+            AclResource::Job,
+            AclAction::Read,
+            &AclScope::job(&config.name),
+        )?;
         let config = self
             .store
             .normalize_job_config(&config)
@@ -1240,6 +1357,12 @@ impl Manager for ManagerAgentService {
         &self,
         request: Request<GetJobSpecRequest>,
     ) -> Result<Response<GetJobSpecReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Job,
+            AclAction::Read,
+            AclScope::job(&request.get_ref().name),
+        )?;
         let name = request.into_inner().name;
 
         let config = match self
@@ -1267,7 +1390,18 @@ impl Manager for ManagerAgentService {
         &self,
         request: Request<GetJobSpecByConfigRequest>,
     ) -> Result<Response<GetJobSpecReply>, Status> {
+        let identity = self.authenticate_acl(&request)?;
         let config_id = request.into_inner().config_id;
+        // Resolve the config to its job so name-scoped policies apply.
+        let job_name = self
+            .store
+            .job_name_for_config(&config_id)
+            .map_err(|e| map_store_error("Error resolving job config", e))?;
+        let scope = match &job_name {
+            Some(name) => AclScope::job(name),
+            None => AclScope::any(),
+        };
+        acl::enforce(&identity, AclResource::Job, AclAction::Read, &scope)?;
 
         let submissions = self
             .store
@@ -1285,6 +1419,12 @@ impl Manager for ManagerAgentService {
         &self,
         request: Request<ListJobSpecHistoryRequest>,
     ) -> Result<Response<ListJobSpecHistoryReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Job,
+            AclAction::Read,
+            AclScope::job(&request.get_ref().name),
+        )?;
         let name = request.into_inner().name;
         let items = self
             .store
@@ -1306,6 +1446,8 @@ impl Manager for ManagerAgentService {
         &self,
         request: Request<ListJobsRequest>,
     ) -> Result<Response<ListJobsReply>, Status> {
+        let identity =
+            self.check_acl(&request, AclResource::Job, AclAction::Read, AclScope::any())?;
         let request = request.into_inner();
         let query = normalize_query(request.query);
         let sort_by = request.sort_by.unwrap_or_else(|| "created_at".to_string());
@@ -1320,6 +1462,9 @@ impl Manager for ManagerAgentService {
             .store
             .get_jobs()
             .map_err(|e| map_store_error("Error getting jobs", e))?;
+        jobs.retain(|job| {
+            identity.allows(AclResource::Job, AclAction::Read, &AclScope::job(&job.name))
+        });
 
         if let Some(query) = query {
             jobs.retain(|job| {
@@ -1357,6 +1502,12 @@ impl Manager for ManagerAgentService {
         &self,
         request: Request<StopJobRequest>,
     ) -> Result<Response<StopJobReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Job,
+            AclAction::Write,
+            AclScope::job(&request.get_ref().name),
+        )?;
         let inner = request.into_inner();
         let name = inner.name;
         let priority = inner.priority.unwrap_or(self.store.default_eval_priority);
@@ -1411,6 +1562,12 @@ impl Manager for ManagerAgentService {
         &self,
         request: Request<DestroyJobRequest>,
     ) -> Result<Response<DestroyJobReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Job,
+            AclAction::Write,
+            AclScope::job(&request.get_ref().name),
+        )?;
         let inner = request.into_inner();
         let name = inner.name;
         let idempotency_key = inner.idempotency_key.unwrap_or_default();
@@ -1449,6 +1606,9 @@ impl Manager for ManagerAgentService {
         &self,
         request: Request<HeartbeatRequest>,
     ) -> Result<Response<HeartbeatReply>, Status> {
+        // ACL: worker-plane endpoint, exempt from token checks so enabling
+        // ACLs never severs running workers. Worker-plane hardening (mTLS /
+        // per-node credentials) is tracked in docs/plans/auth-acl-plan.md.
         let req = request.into_inner();
         let id = req.id;
 
@@ -1490,6 +1650,7 @@ impl Manager for ManagerAgentService {
         &self,
         request: Request<HealthCheckRequest>,
     ) -> Result<Response<HealthCheckReply>, Status> {
+        // ACL: worker-plane endpoint, exempt (see `heartbeat`).
         let req = request.into_inner();
         let id = req.id;
 
@@ -1511,6 +1672,7 @@ impl Manager for ManagerAgentService {
         &self,
         request: Request<WorkerPreRegisterRequest>,
     ) -> Result<Response<WorkerPreRegisterReply>, Status> {
+        // ACL: worker-plane endpoint, exempt (see `heartbeat`).
         let request = request.into_inner();
         let worker_type = request.worker_type;
 
@@ -1542,6 +1704,7 @@ impl Manager for ManagerAgentService {
         &self,
         request: Request<WorkerRegisterRequest>,
     ) -> Result<Response<WorkerRegisterReply>, Status> {
+        // ACL: worker-plane endpoint, exempt (see `heartbeat`).
         let request = request.into_inner();
         let dynamic_attrs = json!({}).to_string();
 
@@ -1573,6 +1736,12 @@ impl Manager for ManagerAgentService {
         &self,
         request: Request<GetNodesRequest>,
     ) -> Result<Response<GetNodesReply>, Status> {
+        let identity = self.check_acl(
+            &request,
+            AclResource::Node,
+            AclAction::Read,
+            AclScope::any(),
+        )?;
         let request = request.into_inner();
         let query = normalize_query(request.query);
         let sort_by = request.sort_by.unwrap_or_else(|| "id".to_string());
@@ -1589,6 +1758,13 @@ impl Manager for ManagerAgentService {
             .map_err(|e| map_store_error("Error getting nodes", e))?;
 
         let mut node_messages: Vec<NodeMsg> = nodes.into_iter().map(Into::into).collect();
+        node_messages.retain(|node| {
+            identity.allows(
+                AclResource::Node,
+                AclAction::Read,
+                &AclScope::pool(&node.pool),
+            )
+        });
 
         if let Some(query) = query {
             node_messages.retain(|node| {
@@ -1628,11 +1804,18 @@ impl Manager for ManagerAgentService {
         &self,
         request: Request<GetNodeRequest>,
     ) -> Result<Response<GetNodeReply>, Status> {
+        let identity = self.authenticate_acl(&request)?;
         let id = request.into_inner().id;
         let node = self
             .store
             .get_node(&id)
             .map_err(|e| map_store_error("Error getting node", e))?;
+        acl::enforce(
+            &identity,
+            AclResource::Node,
+            AclAction::Read,
+            &AclScope::pool(&node.pool),
+        )?;
 
         let reply = GetNodeReply {
             node: Some(node.into()),
@@ -1645,11 +1828,18 @@ impl Manager for ManagerAgentService {
         &self,
         request: Request<RestartWorkerRequest>,
     ) -> Result<Response<RestartWorkerReply>, Status> {
+        let identity = self.authenticate_acl(&request)?;
         let node_id = request.into_inner().node_id;
         let node = self.store.get_node(&node_id).map_err(|e| {
             error!(error = ?e, node_id = %node_id, "Failed to get node for restart");
             Status::not_found("Node not found")
         })?;
+        acl::enforce(
+            &identity,
+            AclResource::Node,
+            AclAction::Write,
+            &AclScope::pool(&node.pool),
+        )?;
 
         let worker_address = worker_address_for_node(&node)
             .ok_or_else(|| Status::failed_precondition("Worker address missing"))?;
@@ -1676,8 +1866,20 @@ impl Manager for ManagerAgentService {
         &self,
         request: Request<UpdateNodeDynamicRequest>,
     ) -> Result<Response<UpdateNodeDynamicReply>, Status> {
+        let identity = self.authenticate_acl(&request)?;
         let r = request.into_inner();
         let id = r.id;
+        // Enforce against the node's pool before mutating it.
+        let existing = self
+            .store
+            .get_node(&id)
+            .map_err(|e| map_store_error("Error getting node", e))?;
+        acl::enforce(
+            &identity,
+            AclResource::Node,
+            AclAction::Write,
+            &AclScope::pool(&existing.pool),
+        )?;
         let dd_as_map: Map<String, Value> = serde_json::from_str(&r.dynamic_diff).map_err(|e| {
             error!("Error parsing dynamic diff: {:?}", e);
             Status::internal("Error parsing dynamic diff")
@@ -1720,6 +1922,12 @@ impl Manager for ManagerAgentService {
         &self,
         request: Request<GetManagerConfigsRequest>,
     ) -> Result<Response<GetManagerConfigsReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Operator,
+            AclAction::Read,
+            AclScope::none(),
+        )?;
         let request = request.into_inner();
         let query = normalize_query(request.query);
         let sort_by = request.sort_by.unwrap_or_else(|| "updated_at".to_string());
@@ -1766,6 +1974,12 @@ impl Manager for ManagerAgentService {
         &self,
         request: Request<GetObservabilityRequest>,
     ) -> Result<Response<GetObservabilityReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Operator,
+            AclAction::Read,
+            AclScope::none(),
+        )?;
         let max_lines = request.into_inner().max_lines.unwrap_or(300).min(1_000) as usize;
         let enabled = o11y_enabled();
         let (mut logs, mut traces) = if enabled {
@@ -1796,8 +2010,14 @@ impl Manager for ManagerAgentService {
     #[instrument(skip_all)]
     async fn get_raft_status(
         &self,
-        _request: Request<GetRaftStatusRequest>,
+        request: Request<GetRaftStatusRequest>,
     ) -> Result<Response<GetRaftStatusReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Operator,
+            AclAction::Read,
+            AclScope::none(),
+        )?;
         let status = self
             .store
             .raft_status()
@@ -1830,6 +2050,12 @@ impl Manager for ManagerAgentService {
         &self,
         request: Request<ListRaftHistoryRequest>,
     ) -> Result<Response<ListRaftHistoryReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Operator,
+            AclAction::Read,
+            AclScope::none(),
+        )?;
         let limit = request.into_inner().limit.unwrap_or(50).min(500) as usize;
         let events = self
             .store
@@ -1845,6 +2071,12 @@ impl Manager for ManagerAgentService {
         &self,
         request: Request<IssueRaftCommandRequest>,
     ) -> Result<Response<IssueRaftCommandReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Operator,
+            AclAction::Write,
+            AclScope::none(),
+        )?;
         let req = request.into_inner();
         let actor = req.actor.unwrap_or_else(|| "api".to_string());
         let event = self
@@ -1869,6 +2101,12 @@ impl Manager for ManagerAgentService {
         &self,
         request: Request<GetRaftJoinTokenRequest>,
     ) -> Result<Response<GetRaftJoinTokenReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Operator,
+            AclAction::Write,
+            AclScope::none(),
+        )?;
         let actor = request
             .into_inner()
             .actor
@@ -1892,14 +2130,28 @@ impl Manager for ManagerAgentService {
     #[instrument(skip_all)]
     async fn get_ledger(
         &self,
-        _request: Request<GetLedgerRequest>,
+        request: Request<GetLedgerRequest>,
     ) -> Result<Response<GetLedgerReply>, Status> {
+        let identity = self.check_acl(
+            &request,
+            AclResource::Node,
+            AclAction::Read,
+            AclScope::any(),
+        )?;
         let ledger = self
             .store
             .get_ledger()
             .map_err(|e| map_store_error("Error getting ledger", e))?;
 
-        let nodes: Vec<LedgerNode> = ledger.into_iter().map(Into::into).collect();
+        let mut nodes: Vec<LedgerNode> = ledger.into_iter().map(Into::into).collect();
+        nodes.retain(|entry| match &entry.node {
+            Some(node) => identity.allows(
+                AclResource::Node,
+                AclAction::Read,
+                &AclScope::pool(&node.pool),
+            ),
+            None => true,
+        });
 
         let reply: GetLedgerReply = GetLedgerReply { nodes };
 
@@ -1908,6 +2160,12 @@ impl Manager for ManagerAgentService {
 
     #[instrument(skip_all)]
     async fn put_kv(&self, request: Request<PutKvRequest>) -> Result<Response<PutKvReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Kv,
+            AclAction::Write,
+            AclScope::path(&request.get_ref().key),
+        )?;
         let req = request.into_inner();
         let value_type = KvValueType::try_from(req.value_type).unwrap_or(KvValueType::Unspecified);
         let entry = self
@@ -1928,6 +2186,12 @@ impl Manager for ManagerAgentService {
 
     #[instrument(skip_all)]
     async fn get_kv(&self, request: Request<GetKvRequest>) -> Result<Response<GetKvReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Kv,
+            AclAction::Read,
+            AclScope::path(&request.get_ref().key),
+        )?;
         let req = request.into_inner();
         let entry = self
             .store
@@ -1942,11 +2206,20 @@ impl Manager for ManagerAgentService {
         &self,
         request: Request<ListKvRequest>,
     ) -> Result<Response<ListKvReply>, Status> {
+        let identity =
+            self.check_acl(&request, AclResource::Kv, AclAction::Read, AclScope::any())?;
         let req = request.into_inner();
-        let entries = self
+        let mut entries = self
             .store
             .list_kv(&req.prefix)
             .map_err(|e| map_store_error("Error listing kv entries", e))?;
+        entries.retain(|entry| {
+            identity.allows(
+                AclResource::Kv,
+                AclAction::Read,
+                &AclScope::path(&entry.key),
+            )
+        });
 
         Ok(Response::new(ListKvReply { entries }))
     }
@@ -1956,6 +2229,12 @@ impl Manager for ManagerAgentService {
         &self,
         request: Request<DeleteKvRequest>,
     ) -> Result<Response<DeleteKvReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Kv,
+            AclAction::Write,
+            AclScope::path(&request.get_ref().key),
+        )?;
         let req = request.into_inner();
         self.store
             .delete_kv(&req.key, req.expected_version, req.lock_id.as_deref())
@@ -1972,6 +2251,12 @@ impl Manager for ManagerAgentService {
         &self,
         request: Request<PatchKvRequest>,
     ) -> Result<Response<PatchKvReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Kv,
+            AclAction::Write,
+            AclScope::path(&request.get_ref().key),
+        )?;
         let req = request.into_inner();
         let entry = self
             .store
@@ -1993,6 +2278,12 @@ impl Manager for ManagerAgentService {
         &self,
         request: Request<AcquireKvLockRequest>,
     ) -> Result<Response<AcquireKvLockReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Kv,
+            AclAction::Write,
+            AclScope::path(&request.get_ref().key),
+        )?;
         let req = request.into_inner();
         let lock = self
             .store
@@ -2013,6 +2304,12 @@ impl Manager for ManagerAgentService {
         &self,
         request: Request<RenewKvLockRequest>,
     ) -> Result<Response<RenewKvLockReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Kv,
+            AclAction::Write,
+            AclScope::path(&request.get_ref().key),
+        )?;
         let req = request.into_inner();
         let lock = self
             .store
@@ -2027,6 +2324,12 @@ impl Manager for ManagerAgentService {
         &self,
         request: Request<ReleaseKvLockRequest>,
     ) -> Result<Response<ReleaseKvLockReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Kv,
+            AclAction::Write,
+            AclScope::path(&request.get_ref().key),
+        )?;
         let req = request.into_inner();
         self.store
             .release_kv_lock(&req.key, &req.lock_id)
@@ -2042,6 +2345,12 @@ impl Manager for ManagerAgentService {
         &self,
         request: Request<GetKvLockRequest>,
     ) -> Result<Response<GetKvLockReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Kv,
+            AclAction::Read,
+            AclScope::path(&request.get_ref().key),
+        )?;
         let req = request.into_inner();
         let lock = self
             .store
@@ -2056,6 +2365,14 @@ impl Manager for ManagerAgentService {
         &self,
         request: Request<QueryStateStoreRequest>,
     ) -> Result<Response<QueryStateStoreReply>, Status> {
+        // ACL: raw state access is powerful (it can read every table,
+        // including ACL metadata); grant `state` capabilities sparingly.
+        let action = if request.get_ref().allow_write {
+            AclAction::Write
+        } else {
+            AclAction::Read
+        };
+        self.check_acl(&request, AclResource::State, action, AclScope::none())?;
         let req = request.into_inner();
         let result = self
             .store
@@ -2077,8 +2394,14 @@ impl Manager for ManagerAgentService {
     #[instrument(skip_all)]
     async fn get_state_store_schema(
         &self,
-        _request: Request<GetStateStoreSchemaRequest>,
+        request: Request<GetStateStoreSchemaRequest>,
     ) -> Result<Response<GetStateStoreSchemaReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::State,
+            AclAction::Read,
+            AclScope::none(),
+        )?;
         let objects = self
             .store
             .state_store_schema()
@@ -2109,8 +2432,14 @@ impl Manager for ManagerAgentService {
     #[instrument(skip_all)]
     async fn list_saved_state_queries(
         &self,
-        _request: Request<ListSavedStateQueriesRequest>,
+        request: Request<ListSavedStateQueriesRequest>,
     ) -> Result<Response<ListSavedStateQueriesReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::State,
+            AclAction::Read,
+            AclScope::none(),
+        )?;
         let queries = self
             .store
             .list_saved_state_queries()
@@ -2132,6 +2461,12 @@ impl Manager for ManagerAgentService {
         &self,
         request: Request<UpsertSavedStateQueryRequest>,
     ) -> Result<Response<UpsertSavedStateQueryReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::State,
+            AclAction::Write,
+            AclScope::none(),
+        )?;
         let req = request.into_inner();
         let query = self
             .store
@@ -2153,6 +2488,12 @@ impl Manager for ManagerAgentService {
         &self,
         request: Request<DeleteSavedStateQueryRequest>,
     ) -> Result<Response<DeleteSavedStateQueryReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::State,
+            AclAction::Write,
+            AclScope::none(),
+        )?;
         let req = request.into_inner();
         self.store
             .delete_saved_state_query(&req.name)
@@ -2160,6 +2501,348 @@ impl Manager for ManagerAgentService {
 
         Ok(Response::new(DeleteSavedStateQueryReply {
             message: "saved query deleted".to_string(),
+        }))
+    }
+
+    #[instrument(skip_all)]
+    async fn who_am_i(
+        &self,
+        request: Request<WhoAmIRequest>,
+    ) -> Result<Response<WhoAmIReply>, Status> {
+        // ACL: open endpoint. Identity introspection must work for anonymous
+        // callers so the UI/CLI can discover whether ACLs are enabled.
+        let identity = self.authenticate_acl(&request)?;
+        Ok(Response::new(WhoAmIReply {
+            acl_enabled: self.acl.enabled,
+            audit_only: self.acl.audit_only,
+            source: identity.source.as_str().to_string(),
+            principal: identity.principal.clone(),
+            token_type: if identity.is_management && self.acl.enabled {
+                "management".to_string()
+            } else if self.acl.enabled
+                && identity.source != crate::structs::acl::AclSource::Anonymous
+            {
+                "client".to_string()
+            } else {
+                "none".to_string()
+            },
+            policies: identity.policies.clone(),
+            expires_at: identity.expires_at.clone(),
+            accessor_id: identity.accessor_id.clone(),
+        }))
+    }
+
+    #[instrument(skip_all)]
+    async fn login(&self, request: Request<LoginRequest>) -> Result<Response<LoginReply>, Status> {
+        // ACL: open endpoint; this is how callers obtain credentials.
+        let req = request.into_inner();
+        let (token, secret) = self.acl.login(
+            &self.store,
+            &req.method,
+            req.username.as_deref(),
+            req.password.as_deref(),
+            req.jwt.as_deref(),
+            req.ttl.as_deref(),
+        )?;
+        info!(principal = %token.name, "ACL login succeeded");
+        Ok(Response::new(LoginReply {
+            token: Some(token),
+            secret,
+        }))
+    }
+
+    #[instrument(skip_all)]
+    async fn bootstrap_acl(
+        &self,
+        request: Request<BootstrapAclRequest>,
+    ) -> Result<Response<BootstrapAclReply>, Status> {
+        // ACL: open endpoint guarded by its one-shot semantics — it only
+        // succeeds while no management token exists.
+        let _ = request;
+        let (token, secret) = self.acl.bootstrap(&self.store)?;
+        info!(accessor_id = %token.accessor_id, "ACL bootstrap: initial management token created");
+        Ok(Response::new(BootstrapAclReply {
+            token: Some(token),
+            secret,
+        }))
+    }
+
+    #[instrument(skip_all)]
+    async fn upsert_acl_policy(
+        &self,
+        request: Request<UpsertAclPolicyRequest>,
+    ) -> Result<Response<UpsertAclPolicyReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Acl,
+            AclAction::Write,
+            AclScope::none(),
+        )?;
+        let req = request.into_inner();
+        let policy = self
+            .store
+            .upsert_acl_policy(&req.name, &req.description, &req.rules_json)
+            .map_err(|e| map_store_error("Error saving ACL policy", e))?;
+        Ok(Response::new(UpsertAclPolicyReply {
+            policy: Some(policy),
+        }))
+    }
+
+    #[instrument(skip_all)]
+    async fn get_acl_policy(
+        &self,
+        request: Request<GetAclPolicyRequest>,
+    ) -> Result<Response<GetAclPolicyReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Acl,
+            AclAction::Read,
+            AclScope::none(),
+        )?;
+        let req = request.into_inner();
+        let policy = self
+            .store
+            .get_acl_policy(&req.name)
+            .map_err(|e| map_store_error("Error getting ACL policy", e))?
+            .ok_or_else(|| Status::not_found(format!("ACL policy `{}` not found", req.name)))?;
+        Ok(Response::new(GetAclPolicyReply {
+            policy: Some(policy),
+        }))
+    }
+
+    #[instrument(skip_all)]
+    async fn list_acl_policies(
+        &self,
+        request: Request<ListAclPoliciesRequest>,
+    ) -> Result<Response<ListAclPoliciesReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Acl,
+            AclAction::Read,
+            AclScope::none(),
+        )?;
+        let policies = self
+            .store
+            .list_acl_policies()
+            .map_err(|e| map_store_error("Error listing ACL policies", e))?;
+        Ok(Response::new(ListAclPoliciesReply { policies }))
+    }
+
+    #[instrument(skip_all)]
+    async fn delete_acl_policy(
+        &self,
+        request: Request<DeleteAclPolicyRequest>,
+    ) -> Result<Response<DeleteAclPolicyReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Acl,
+            AclAction::Write,
+            AclScope::none(),
+        )?;
+        let req = request.into_inner();
+        self.store
+            .delete_acl_policy(&req.name)
+            .map_err(|e| map_store_error("Error deleting ACL policy", e))?;
+        Ok(Response::new(DeleteAclPolicyReply {
+            message: format!("ACL policy `{}` deleted", req.name),
+        }))
+    }
+
+    #[instrument(skip_all)]
+    async fn create_acl_token(
+        &self,
+        request: Request<CreateAclTokenRequest>,
+    ) -> Result<Response<CreateAclTokenReply>, Status> {
+        let identity = self.check_acl(
+            &request,
+            AclResource::Acl,
+            AclAction::Write,
+            AclScope::none(),
+        )?;
+        let req = request.into_inner();
+
+        let token_type = if req.token_type.is_empty() {
+            "client".to_string()
+        } else {
+            req.token_type
+        };
+        match token_type.as_str() {
+            // Escalation guard: only management tokens may mint management
+            // tokens, regardless of acl:write policy grants.
+            "management" => {
+                if !identity.is_management {
+                    return Err(Status::permission_denied(
+                        "creating a management token requires a management token",
+                    ));
+                }
+                if !req.policies.is_empty() {
+                    return Err(Status::invalid_argument(
+                        "management tokens must not list policies",
+                    ));
+                }
+            }
+            "client" => {
+                if req.policies.is_empty() {
+                    return Err(Status::invalid_argument(
+                        "client tokens must list at least one policy",
+                    ));
+                }
+                let missing = self
+                    .store
+                    .missing_acl_policies(&req.policies)
+                    .map_err(|e| map_store_error("Error validating policies", e))?;
+                if !missing.is_empty() {
+                    return Err(Status::invalid_argument(format!(
+                        "unknown ACL policies: {}",
+                        missing.join(", ")
+                    )));
+                }
+            }
+            other => {
+                return Err(Status::invalid_argument(format!(
+                    "unknown token type `{other}` (expected `management` or `client`)"
+                )));
+            }
+        }
+
+        let ttl = req
+            .ttl
+            .as_deref()
+            .map(|raw| {
+                raw.parse::<humantime::Duration>()
+                    .map(Into::into)
+                    .map_err(|e| Status::invalid_argument(format!("invalid ttl `{raw}`: {e}")))
+            })
+            .transpose()?;
+        let (token, secret) =
+            self.acl
+                .mint_token(&self.store, &req.name, &token_type, &req.policies, ttl)?;
+        info!(accessor_id = %token.accessor_id, name = %token.name, "ACL token created");
+        Ok(Response::new(CreateAclTokenReply {
+            token: Some(token),
+            secret,
+        }))
+    }
+
+    #[instrument(skip_all)]
+    async fn list_acl_tokens(
+        &self,
+        request: Request<ListAclTokensRequest>,
+    ) -> Result<Response<ListAclTokensReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Acl,
+            AclAction::Read,
+            AclScope::none(),
+        )?;
+        let tokens = self
+            .store
+            .list_acl_tokens()
+            .map_err(|e| map_store_error("Error listing ACL tokens", e))?
+            .iter()
+            .map(|record| record.to_info())
+            .collect();
+        Ok(Response::new(ListAclTokensReply { tokens }))
+    }
+
+    #[instrument(skip_all)]
+    async fn delete_acl_token(
+        &self,
+        request: Request<DeleteAclTokenRequest>,
+    ) -> Result<Response<DeleteAclTokenReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Acl,
+            AclAction::Write,
+            AclScope::none(),
+        )?;
+        let req = request.into_inner();
+        self.store
+            .delete_acl_token(&req.accessor_id)
+            .map_err(|e| map_store_error("Error deleting ACL token", e))?;
+        info!(accessor_id = %req.accessor_id, "ACL token deleted");
+        Ok(Response::new(DeleteAclTokenReply {
+            message: format!("ACL token `{}` deleted", req.accessor_id),
+        }))
+    }
+
+    #[instrument(skip_all)]
+    async fn upsert_acl_user(
+        &self,
+        request: Request<UpsertAclUserRequest>,
+    ) -> Result<Response<UpsertAclUserReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Acl,
+            AclAction::Write,
+            AclScope::none(),
+        )?;
+        let req = request.into_inner();
+        let missing = self
+            .store
+            .missing_acl_policies(&req.policies)
+            .map_err(|e| map_store_error("Error validating policies", e))?;
+        if !missing.is_empty() {
+            return Err(Status::invalid_argument(format!(
+                "unknown ACL policies: {}",
+                missing.join(", ")
+            )));
+        }
+        let password_hash = if req.password.is_empty() {
+            None
+        } else {
+            Some(
+                acl::hash_password(&req.password)
+                    .map_err(|e| Status::internal(format!("failed to hash password: {e:#}")))?,
+            )
+        };
+        let user = self
+            .store
+            .upsert_acl_user(&req.username, password_hash.as_deref(), &req.policies)
+            .map_err(|e| map_store_error("Error saving ACL user", e))?;
+        Ok(Response::new(UpsertAclUserReply {
+            user: Some(user.to_user()),
+        }))
+    }
+
+    #[instrument(skip_all)]
+    async fn list_acl_users(
+        &self,
+        request: Request<ListAclUsersRequest>,
+    ) -> Result<Response<ListAclUsersReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Acl,
+            AclAction::Read,
+            AclScope::none(),
+        )?;
+        let users = self
+            .store
+            .list_acl_users()
+            .map_err(|e| map_store_error("Error listing ACL users", e))?
+            .iter()
+            .map(|record| record.to_user())
+            .collect();
+        Ok(Response::new(ListAclUsersReply { users }))
+    }
+
+    #[instrument(skip_all)]
+    async fn delete_acl_user(
+        &self,
+        request: Request<DeleteAclUserRequest>,
+    ) -> Result<Response<DeleteAclUserReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Acl,
+            AclAction::Write,
+            AclScope::none(),
+        )?;
+        let req = request.into_inner();
+        self.store
+            .delete_acl_user(&req.username)
+            .map_err(|e| map_store_error("Error deleting ACL user", e))?;
+        Ok(Response::new(DeleteAclUserReply {
+            message: format!("ACL user `{}` deleted", req.username),
         }))
     }
 }

@@ -1,0 +1,1238 @@
+//! ACL coverage for every Manager RPC.
+//!
+//! Every endpoint on the Manager service must enforce ACLs (or be explicitly
+//! classified as worker-plane or open). This suite drives that as a hard
+//! gate:
+//!
+//! 1. `every_manager_rpc_is_classified` parses `proto/legion.proto` and fails
+//!    when an RPC is added without an entry in [`endpoint_table`] — so a new
+//!    endpoint cannot ship without deciding (and testing) its ACL behavior.
+//! 2. The deny/allow matrix calls every endpoint three ways: anonymous with
+//!    ACLs enabled (protected endpoints must return PermissionDenied), with a
+//!    management token (must never fail with an auth error), and with ACLs
+//!    disabled (must never fail with an auth error).
+//! 3. Scenario tests prove scoped policies behave correctly end-to-end
+//!    (job-name scoping, KV path scoping, node-pool filtering, audit mode).
+//!
+//! When you add an RPC: add it to `endpoint_table` with a request builder
+//! that references the seeded fixtures, and a one-line ACL check in the
+//! handler. See AGENTS.md ("Auth & ACL checks").
+
+use anyhow::{anyhow, Context};
+use legion::manager::acl::AclRuntime;
+use legion::manager::server::ManagerAgentService;
+use legion::storage::store::Store;
+use legion::structs::manager_server::Manager;
+use legion::structs::*;
+use std::collections::BTreeSet;
+use std::sync::Arc;
+use tonic::{Code, Request};
+
+type R<T> = anyhow::Result<T>;
+
+const NODE_ID: &str = "acl-node";
+const JOB_NAME: &str = "acl-job";
+const KV_KEY: &str = "team/config";
+const FIXTURE_POLICY: &str = "fixture-policy";
+const DELETABLE_POLICY: &str = "deletable-policy";
+const DELETABLE_USER: &str = "deletable-user";
+
+/// How an endpoint participates in the ACL system.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Plane {
+    /// Requires a policy granting the named capability; anonymous is denied.
+    Protected(&'static str),
+    /// Credential exchange / introspection; must work without a token.
+    Open,
+    /// Worker control plane; exempt from token checks so enabling ACLs never
+    /// severs running workers (hardening tracked in the auth/ACL plan).
+    Worker,
+}
+
+struct Fixtures {
+    job_config_id: String,
+    deletable_token_accessor: String,
+}
+
+/// One row per Manager RPC: proto method name, plane, request builder.
+fn endpoint_table() -> Vec<(&'static str, Plane)> {
+    vec![
+        ("WorkerPreRegister", Plane::Worker),
+        ("WorkerRegister", Plane::Worker),
+        ("Heartbeat", Plane::Worker),
+        ("HealthCheck", Plane::Worker),
+        ("RunJob", Plane::Protected("job:write")),
+        ("GetJobSpec", Plane::Protected("job:read")),
+        ("GetJobSpecByConfig", Plane::Protected("job:read")),
+        ("ListJobSpecHistory", Plane::Protected("job:read")),
+        ("GetJobInfo", Plane::Protected("job:read")),
+        ("ListRollouts", Plane::Protected("job:read")),
+        ("GetRollout", Plane::Protected("job:read")),
+        ("GetRolloutStatus", Plane::Protected("job:read")),
+        ("ListRolloutEvents", Plane::Protected("job:read")),
+        ("AdvanceRollout", Plane::Protected("job:write")),
+        ("StopRollout", Plane::Protected("job:write")),
+        ("PlanJob", Plane::Protected("job:read")),
+        ("StopJob", Plane::Protected("job:write")),
+        ("DestroyJob", Plane::Protected("job:write")),
+        ("ListJobs", Plane::Protected("job:read")),
+        ("GetNodes", Plane::Protected("node:read")),
+        ("GetNode", Plane::Protected("node:read")),
+        ("RestartWorker", Plane::Protected("node:write")),
+        ("GetLedger", Plane::Protected("node:read")),
+        ("UpdateNodeDynamic", Plane::Protected("node:write")),
+        ("GetManagerConfigs", Plane::Protected("operator:read")),
+        ("GetObservability", Plane::Protected("operator:read")),
+        ("GetRaftStatus", Plane::Protected("operator:read")),
+        ("ListRaftHistory", Plane::Protected("operator:read")),
+        ("IssueRaftCommand", Plane::Protected("operator:write")),
+        ("GetRaftJoinToken", Plane::Protected("operator:write")),
+        ("PutKv", Plane::Protected("kv:write")),
+        ("GetKv", Plane::Protected("kv:read")),
+        ("ListKv", Plane::Protected("kv:read")),
+        ("DeleteKv", Plane::Protected("kv:write")),
+        ("PatchKv", Plane::Protected("kv:write")),
+        ("AcquireKvLock", Plane::Protected("kv:write")),
+        ("RenewKvLock", Plane::Protected("kv:write")),
+        ("ReleaseKvLock", Plane::Protected("kv:write")),
+        ("GetKvLock", Plane::Protected("kv:read")),
+        ("QueryStateStore", Plane::Protected("state:read")),
+        ("GetStateStoreSchema", Plane::Protected("state:read")),
+        ("ListSavedStateQueries", Plane::Protected("state:read")),
+        ("UpsertSavedStateQuery", Plane::Protected("state:write")),
+        ("DeleteSavedStateQuery", Plane::Protected("state:write")),
+        ("WhoAmI", Plane::Open),
+        ("Login", Plane::Open),
+        ("BootstrapAcl", Plane::Open),
+        ("UpsertAclPolicy", Plane::Protected("acl:write")),
+        ("GetAclPolicy", Plane::Protected("acl:read")),
+        ("ListAclPolicies", Plane::Protected("acl:read")),
+        ("DeleteAclPolicy", Plane::Protected("acl:write")),
+        ("CreateAclToken", Plane::Protected("acl:write")),
+        ("ListAclTokens", Plane::Protected("acl:read")),
+        ("DeleteAclToken", Plane::Protected("acl:write")),
+        ("UpsertAclUser", Plane::Protected("acl:write")),
+        ("ListAclUsers", Plane::Protected("acl:read")),
+        ("DeleteAclUser", Plane::Protected("acl:write")),
+    ]
+}
+
+fn req<T>(inner: T, token: Option<&str>) -> Request<T> {
+    let mut request = Request::new(inner);
+    if let Some(token) = token {
+        request.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {token}").parse().expect("ascii token"),
+        );
+    }
+    request
+}
+
+fn jobspec(name: &str) -> String {
+    serde_json::json!({
+        "name": name,
+        "tasks": [{
+            "kind": "noop",
+            "count": 1,
+            "config": {},
+            "resources": {},
+            "constraints": {},
+        }],
+    })
+    .to_string()
+}
+
+/// Invokes one RPC by proto method name with fixture-backed arguments.
+///
+/// Requests reference existing fixtures wherever the handler fetches the
+/// resource before authorizing, so denials genuinely exercise the ACL check
+/// rather than a not-found path.
+async fn call_endpoint(
+    svc: &ManagerAgentService,
+    fx: &Fixtures,
+    method: &str,
+    token: Option<&str>,
+) -> Result<(), tonic::Status> {
+    match method {
+        "WorkerPreRegister" => svc
+            .worker_pre_register(req(
+                WorkerPreRegisterRequest {
+                    worker_type: "default".into(),
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "WorkerRegister" => svc
+            .worker_register(req(
+                WorkerRegisterRequest {
+                    name: "acl-node-registered".into(),
+                    pool: "default".into(),
+                    config_attrs: "{}".into(),
+                    fingerprint_attrs: "{}".into(),
+                    health_checks: "[]".into(),
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "Heartbeat" => svc
+            .heartbeat(req(
+                HeartbeatRequest {
+                    id: NODE_ID.into(),
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "HealthCheck" => svc
+            .health_check(req(
+                HealthCheckRequest {
+                    id: NODE_ID.into(),
+                    health_checks: "[]".into(),
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "RunJob" => svc
+            .run_job(req(
+                RunJobRequest {
+                    parsed_jobspec: jobspec("acl-job-2"),
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "GetJobSpec" => svc
+            .get_job_spec(req(
+                GetJobSpecRequest {
+                    name: JOB_NAME.into(),
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "GetJobSpecByConfig" => svc
+            .get_job_spec_by_config(req(
+                GetJobSpecByConfigRequest {
+                    config_id: fx.job_config_id.clone(),
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "ListJobSpecHistory" => svc
+            .list_job_spec_history(req(
+                ListJobSpecHistoryRequest {
+                    name: JOB_NAME.into(),
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "GetJobInfo" => svc
+            .get_job_info(req(
+                GetJobInfoRequest {
+                    name: JOB_NAME.into(),
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "ListRollouts" => svc
+            .list_rollouts(req(ListRolloutsRequest::default(), token))
+            .await
+            .map(|_| ()),
+        "GetRollout" => svc
+            .get_rollout(req(GetRolloutRequest { id: 1 }, token))
+            .await
+            .map(|_| ()),
+        "GetRolloutStatus" => svc
+            .get_rollout_status(req(GetRolloutStatusRequest { id: 1 }, token))
+            .await
+            .map(|_| ()),
+        "ListRolloutEvents" => svc
+            .list_rollout_events(req(
+                ListRolloutEventsRequest {
+                    rollout_id: 1,
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "AdvanceRollout" => svc
+            .advance_rollout(req(
+                AdvanceRolloutRequest {
+                    id: 1,
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "StopRollout" => svc
+            .stop_rollout(req(
+                StopRolloutRequest {
+                    id: 1,
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "PlanJob" => svc
+            .plan_job(req(
+                PlanJobRequest {
+                    parsed_jobspec: jobspec(JOB_NAME),
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "StopJob" => svc
+            .stop_job(req(
+                StopJobRequest {
+                    name: JOB_NAME.into(),
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "DestroyJob" => svc
+            .destroy_job(req(
+                DestroyJobRequest {
+                    name: JOB_NAME.into(),
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "ListJobs" => svc
+            .list_jobs(req(ListJobsRequest::default(), token))
+            .await
+            .map(|_| ()),
+        "GetNodes" => svc
+            .get_nodes(req(GetNodesRequest::default(), token))
+            .await
+            .map(|_| ()),
+        "GetNode" => svc
+            .get_node(req(GetNodeRequest { id: NODE_ID.into() }, token))
+            .await
+            .map(|_| ()),
+        "RestartWorker" => svc
+            .restart_worker(req(
+                RestartWorkerRequest {
+                    node_id: NODE_ID.into(),
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "GetLedger" => svc
+            .get_ledger(req(GetLedgerRequest::default(), token))
+            .await
+            .map(|_| ()),
+        "UpdateNodeDynamic" => svc
+            .update_node_dynamic(req(
+                UpdateNodeDynamicRequest {
+                    id: NODE_ID.into(),
+                    dynamic_diff: "{}".into(),
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "GetManagerConfigs" => svc
+            .get_manager_configs(req(GetManagerConfigsRequest::default(), token))
+            .await
+            .map(|_| ()),
+        "GetObservability" => svc
+            .get_observability(req(GetObservabilityRequest::default(), token))
+            .await
+            .map(|_| ()),
+        "GetRaftStatus" => svc
+            .get_raft_status(req(GetRaftStatusRequest::default(), token))
+            .await
+            .map(|_| ()),
+        "ListRaftHistory" => svc
+            .list_raft_history(req(ListRaftHistoryRequest::default(), token))
+            .await
+            .map(|_| ()),
+        "IssueRaftCommand" => svc
+            .issue_raft_command(req(
+                IssueRaftCommandRequest {
+                    command: "trigger_election".into(),
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "GetRaftJoinToken" => svc
+            .get_raft_join_token(req(GetRaftJoinTokenRequest::default(), token))
+            .await
+            .map(|_| ()),
+        "PutKv" => svc
+            .put_kv(req(
+                PutKvRequest {
+                    key: KV_KEY.into(),
+                    value: "updated".into(),
+                    value_type: KvValueType::String.into(),
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "GetKv" => svc
+            .get_kv(req(GetKvRequest { key: KV_KEY.into() }, token))
+            .await
+            .map(|_| ()),
+        "ListKv" => svc
+            .list_kv(req(
+                ListKvRequest {
+                    prefix: String::new(),
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "DeleteKv" => svc
+            .delete_kv(req(
+                DeleteKvRequest {
+                    key: "team/deletable".into(),
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "PatchKv" => svc
+            .patch_kv(req(
+                PatchKvRequest {
+                    key: KV_KEY.into(),
+                    patch_json: "[]".into(),
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "AcquireKvLock" => svc
+            .acquire_kv_lock(req(
+                AcquireKvLockRequest {
+                    key: KV_KEY.into(),
+                    ttl_seconds: 30,
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "RenewKvLock" => svc
+            .renew_kv_lock(req(
+                RenewKvLockRequest {
+                    key: KV_KEY.into(),
+                    lock_id: "missing-lock".into(),
+                    ttl_seconds: 30,
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "ReleaseKvLock" => svc
+            .release_kv_lock(req(
+                ReleaseKvLockRequest {
+                    key: KV_KEY.into(),
+                    lock_id: "missing-lock".into(),
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "GetKvLock" => svc
+            .get_kv_lock(req(GetKvLockRequest { key: KV_KEY.into() }, token))
+            .await
+            .map(|_| ()),
+        "QueryStateStore" => svc
+            .query_state_store(req(
+                QueryStateStoreRequest {
+                    sql: "SELECT 1;".into(),
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "GetStateStoreSchema" => svc
+            .get_state_store_schema(req(GetStateStoreSchemaRequest::default(), token))
+            .await
+            .map(|_| ()),
+        "ListSavedStateQueries" => svc
+            .list_saved_state_queries(req(ListSavedStateQueriesRequest::default(), token))
+            .await
+            .map(|_| ()),
+        "UpsertSavedStateQuery" => svc
+            .upsert_saved_state_query(req(
+                UpsertSavedStateQueryRequest {
+                    name: "acl-test-query".into(),
+                    sql: "SELECT 1;".into(),
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "DeleteSavedStateQuery" => svc
+            .delete_saved_state_query(req(
+                DeleteSavedStateQueryRequest {
+                    name: "acl-test-query".into(),
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "WhoAmI" => svc.who_am_i(req(WhoAmIRequest {}, token)).await.map(|_| ()),
+        "Login" => svc
+            .login(req(
+                LoginRequest {
+                    method: "userpass".into(),
+                    username: Some("nobody".into()),
+                    password: Some("nothing".into()),
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "BootstrapAcl" => svc
+            .bootstrap_acl(req(BootstrapAclRequest {}, token))
+            .await
+            .map(|_| ()),
+        "UpsertAclPolicy" => svc
+            .upsert_acl_policy(req(
+                UpsertAclPolicyRequest {
+                    name: "acl-test-policy".into(),
+                    description: String::new(),
+                    rules_json: r#"[{"resources": ["job"], "actions": ["read"]}]"#.into(),
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "GetAclPolicy" => svc
+            .get_acl_policy(req(
+                GetAclPolicyRequest {
+                    name: FIXTURE_POLICY.into(),
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "ListAclPolicies" => svc
+            .list_acl_policies(req(ListAclPoliciesRequest {}, token))
+            .await
+            .map(|_| ()),
+        "DeleteAclPolicy" => svc
+            .delete_acl_policy(req(
+                DeleteAclPolicyRequest {
+                    name: DELETABLE_POLICY.into(),
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "CreateAclToken" => svc
+            .create_acl_token(req(
+                CreateAclTokenRequest {
+                    name: "acl-test-token".into(),
+                    token_type: "client".into(),
+                    policies: vec![FIXTURE_POLICY.into()],
+                    ttl: None,
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "ListAclTokens" => svc
+            .list_acl_tokens(req(ListAclTokensRequest {}, token))
+            .await
+            .map(|_| ()),
+        "DeleteAclToken" => svc
+            .delete_acl_token(req(
+                DeleteAclTokenRequest {
+                    accessor_id: fx.deletable_token_accessor.clone(),
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "UpsertAclUser" => svc
+            .upsert_acl_user(req(
+                UpsertAclUserRequest {
+                    username: "acl-test-user".into(),
+                    password: "test-password".into(),
+                    policies: vec![FIXTURE_POLICY.into()],
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "ListAclUsers" => svc
+            .list_acl_users(req(ListAclUsersRequest {}, token))
+            .await
+            .map(|_| ()),
+        "DeleteAclUser" => svc
+            .delete_acl_user(req(
+                DeleteAclUserRequest {
+                    username: DELETABLE_USER.into(),
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        other => {
+            panic!("endpoint_table contains `{other}` but call_endpoint has no builder for it")
+        }
+    }
+}
+
+fn setup_store() -> R<Store> {
+    let store_dir = tempfile::Builder::new()
+        .prefix("legion-acl-endpoints-")
+        .tempdir()
+        .context("Error creating temp store directory")?
+        .keep();
+    let store_config = ManagerConfigFull {
+        store_path: store_dir
+            .to_str()
+            .context("Error parsing store path")?
+            .to_string(),
+        ..Default::default()
+    };
+    Store::start_storage(&store_config)
+}
+
+/// Seeds a node, job, KV entries, and ACL fixtures so fetch-then-authorize
+/// endpoints reach their ACL checks instead of returning NotFound.
+fn seed_fixtures(store: &Store) -> R<Fixtures> {
+    store.insert_node(NodeMsg {
+        id: NODE_ID.into(),
+        pool: "default".into(),
+        status: "active".into(),
+        availability: "available".into(),
+        config_attrs: "{}".into(),
+        fingerprint_attrs: "{}".into(),
+        dynamic_attrs: "{}".into(),
+        health_checks: "[]".into(),
+        last_heartbeat: "2026-01-01T00:00:00Z".into(),
+    })?;
+
+    let config: JobConfig = serde_json::from_str(&jobspec(JOB_NAME))?;
+    store.handle_job_submit(
+        &config,
+        &[Submission {
+            path: "acl-test.json".into(),
+            content: jobspec(JOB_NAME),
+            is_primary: true,
+        }],
+    )?;
+    let job_config_id = store.get_job_config(JOB_NAME)?.id();
+
+    store.put_kv(KV_KEY, "v1", KvValueType::String, None, None)?;
+    store.put_kv("team/deletable", "v1", KvValueType::String, None, None)?;
+    store.put_kv("secret/hidden", "v1", KvValueType::String, None, None)?;
+
+    store.upsert_acl_policy(
+        FIXTURE_POLICY,
+        "fixture",
+        r#"[{"resources": ["job"], "actions": ["read"]}]"#,
+    )?;
+    store.upsert_acl_policy(
+        DELETABLE_POLICY,
+        "fixture",
+        r#"[{"resources": ["job"], "actions": ["read"]}]"#,
+    )?;
+    store.upsert_acl_user(
+        DELETABLE_USER,
+        Some("$argon2id$fixture"),
+        &[FIXTURE_POLICY.to_string()],
+    )?;
+
+    Ok(Fixtures {
+        job_config_id,
+        deletable_token_accessor: String::new(),
+    })
+}
+
+fn enabled_runtime() -> Arc<AclRuntime> {
+    Arc::new(
+        AclRuntime::from_config(
+            &AclConfig {
+                enabled: Some(true),
+                ..Default::default()
+            }
+            .with_defaults(),
+        )
+        .expect("runtime should build"),
+    )
+}
+
+/// Service with ACLs enabled, plus a management token and a deletable client
+/// token for the DeleteAclToken builder.
+fn setup_enabled() -> R<(ManagerAgentService, Fixtures, String)> {
+    let store = setup_store()?;
+    let mut fixtures = seed_fixtures(&store)?;
+    let runtime = enabled_runtime();
+
+    let (_, management_secret) = runtime
+        .bootstrap(&store)
+        .map_err(|s| anyhow!(s.to_string()))?;
+    let (deletable, _) = runtime
+        .mint_token(
+            &store,
+            "deletable",
+            "client",
+            &[FIXTURE_POLICY.to_string()],
+            None,
+        )
+        .map_err(|s| anyhow!(s.to_string()))?;
+    fixtures.deletable_token_accessor = deletable.accessor_id;
+
+    Ok((
+        ManagerAgentService::with_acl(store, runtime),
+        fixtures,
+        management_secret,
+    ))
+}
+
+fn is_auth_error(code: Code) -> bool {
+    matches!(code, Code::PermissionDenied | Code::Unauthenticated)
+}
+
+/// Guard: every RPC in the Manager proto service must have a row in
+/// `endpoint_table`, and vice versa. Adding an endpoint without classifying
+/// its ACL behavior fails this test.
+#[test]
+fn every_manager_rpc_is_classified() -> R<()> {
+    let proto_path = concat!(env!("CARGO_MANIFEST_DIR"), "/proto/legion.proto");
+    let proto = std::fs::read_to_string(proto_path)?;
+    let service_start = proto
+        .find("service Manager {")
+        .context("service Manager not found in proto")?;
+    let service_body = &proto[service_start..];
+    let service_end = service_body
+        .find("\n}")
+        .context("end of service Manager not found")?;
+    let service_body = &service_body[..service_end];
+
+    let rpc_regex = regex::Regex::new(r"rpc\s+(\w+)\s*\(")?;
+    let proto_rpcs: BTreeSet<String> = rpc_regex
+        .captures_iter(service_body)
+        .map(|capture| capture[1].to_string())
+        .collect();
+    let table_rpcs: BTreeSet<String> = endpoint_table()
+        .iter()
+        .map(|(name, _)| name.to_string())
+        .collect();
+
+    let missing: Vec<_> = proto_rpcs.difference(&table_rpcs).collect();
+    let stale: Vec<_> = table_rpcs.difference(&proto_rpcs).collect();
+    assert!(
+        missing.is_empty(),
+        "Manager RPCs missing ACL test coverage (add them to endpoint_table \
+         in tests/acl_endpoints.rs and an ACL check in the handler): {missing:?}"
+    );
+    assert!(
+        stale.is_empty(),
+        "endpoint_table entries with no matching proto RPC: {stale:?}"
+    );
+    Ok(())
+}
+
+/// With ACLs enabled, anonymous callers are denied on every protected
+/// endpoint and never blocked on open or worker-plane endpoints.
+#[tokio::test]
+async fn anonymous_is_denied_on_every_protected_endpoint() -> R<()> {
+    let (svc, fixtures, _) = setup_enabled()?;
+
+    for (method, plane) in endpoint_table() {
+        let result = call_endpoint(&svc, &fixtures, method, None).await;
+        match plane {
+            Plane::Protected(capability) => {
+                let status = result.expect_err(&format!(
+                    "{method} must deny anonymous callers when ACLs are enabled"
+                ));
+                assert_eq!(
+                    status.code(),
+                    Code::PermissionDenied,
+                    "{method} (requires {capability}) returned `{}` instead of PermissionDenied: {}",
+                    status.code(),
+                    status.message(),
+                );
+            }
+            Plane::Open | Plane::Worker => {
+                if let Err(status) = result {
+                    // Login may return Unauthenticated for the bogus fixture
+                    // credentials — that is its job. Nothing here may return
+                    // PermissionDenied for lacking a token.
+                    assert_ne!(
+                        status.code(),
+                        Code::PermissionDenied,
+                        "{method} is {plane:?} and must not deny anonymous callers: {}",
+                        status.message(),
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A management token passes the ACL gate on every endpoint (other failures,
+/// like NotFound for absent fixtures, are fine — they prove the handler ran).
+#[tokio::test]
+async fn management_token_passes_every_endpoint() -> R<()> {
+    let (svc, fixtures, management_secret) = setup_enabled()?;
+
+    for (method, _) in endpoint_table() {
+        if method == "Login" {
+            continue; // Login validates the request-body credentials, not the bearer token.
+        }
+        if let Err(status) = call_endpoint(&svc, &fixtures, method, Some(&management_secret)).await
+        {
+            assert!(
+                !is_auth_error(status.code()),
+                "{method} must not fail auth with a management token, got {}: {}",
+                status.code(),
+                status.message(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// With ACLs disabled (the default), no endpoint ever fails with an auth
+/// error — except Login, whose job is credential validation.
+#[tokio::test]
+async fn acl_disabled_never_returns_auth_errors() -> R<()> {
+    let store = setup_store()?;
+    let fixtures = seed_fixtures(&store)?;
+    let svc = ManagerAgentService::new(store);
+
+    for (method, _) in endpoint_table() {
+        if method == "Login" {
+            continue; // Login validates the supplied credentials by design.
+        }
+        if let Err(status) = call_endpoint(&svc, &fixtures, method, None).await {
+            assert!(
+                !is_auth_error(status.code()),
+                "{method} must not fail auth when ACLs are disabled, got {}: {}",
+                status.code(),
+                status.message(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// An invalid or revoked token is rejected as Unauthenticated everywhere
+/// (distinct from PermissionDenied so clients can react differently).
+#[tokio::test]
+async fn unknown_token_is_unauthenticated() -> R<()> {
+    let (svc, fixtures, _) = setup_enabled()?;
+    let status = call_endpoint(&svc, &fixtures, "ListJobs", Some("lgn_not_a_real_token"))
+        .await
+        .expect_err("unknown token must be rejected");
+    assert_eq!(status.code(), Code::Unauthenticated);
+    Ok(())
+}
+
+/// Job-name-scoped policies allow matching jobs and deny others, and list
+/// endpoints filter rather than fail.
+#[tokio::test]
+async fn job_name_scoped_policy_limits_job_access() -> R<()> {
+    let (svc, fixtures, _) = setup_enabled()?;
+    let runtime = svc.acl.clone();
+
+    svc.store.upsert_acl_policy(
+        "acl-job-only",
+        "",
+        &format!(
+            r#"[{{"resources": ["job"], "actions": ["read", "write"], "names": ["{JOB_NAME}"]}}]"#
+        ),
+    )?;
+    let (_, secret) = runtime
+        .mint_token(
+            &svc.store,
+            "scoped",
+            "client",
+            &["acl-job-only".into()],
+            None,
+        )
+        .map_err(|s| anyhow!(s.to_string()))?;
+
+    // Allowed: reading and stopping the matching job.
+    call_endpoint(&svc, &fixtures, "GetJobInfo", Some(&secret))
+        .await
+        .expect("scoped token reads its job");
+    call_endpoint(&svc, &fixtures, "StopJob", Some(&secret))
+        .await
+        .expect("scoped token writes its job");
+
+    // Denied: submitting a different job (RunJob builder uses `acl-job-2`).
+    let status = call_endpoint(&svc, &fixtures, "RunJob", Some(&secret))
+        .await
+        .expect_err("scoped token must not write other jobs");
+    assert_eq!(status.code(), Code::PermissionDenied);
+
+    // List endpoints filter instead of failing.
+    let reply = svc
+        .list_jobs(req(ListJobsRequest::default(), Some(&secret)))
+        .await?
+        .into_inner();
+    assert!(
+        reply.jobs.iter().all(|job| job.name == JOB_NAME),
+        "list must only contain the scoped job, got {:?}",
+        reply.jobs.iter().map(|job| &job.name).collect::<Vec<_>>(),
+    );
+    Ok(())
+}
+
+/// KV path scoping: reads/writes under the granted prefix succeed, others are
+/// denied, deny rules carve out subtrees, and ListKv filters entries.
+#[tokio::test]
+async fn kv_path_scoped_policy_limits_kv_access() -> R<()> {
+    let (svc, fixtures, _) = setup_enabled()?;
+    let runtime = svc.acl.clone();
+
+    svc.store.upsert_acl_policy(
+        "kv-team",
+        "",
+        r#"[
+            {"resources": ["kv"], "actions": ["read", "write"], "paths": ["team/*"]},
+            {"resources": ["kv"], "actions": ["*"], "effect": "deny", "paths": ["secret/*"]}
+        ]"#,
+    )?;
+    let (_, secret) = runtime
+        .mint_token(&svc.store, "kv-scoped", "client", &["kv-team".into()], None)
+        .map_err(|s| anyhow!(s.to_string()))?;
+
+    call_endpoint(&svc, &fixtures, "GetKv", Some(&secret))
+        .await
+        .expect("scoped token reads team/ keys");
+    call_endpoint(&svc, &fixtures, "PutKv", Some(&secret))
+        .await
+        .expect("scoped token writes team/ keys");
+
+    // Outside the prefix: denied.
+    let status = svc
+        .get_kv(req(
+            GetKvRequest {
+                key: "secret/hidden".into(),
+            },
+            Some(&secret),
+        ))
+        .await
+        .expect_err("deny rule must block secret/ reads");
+    assert_eq!(status.code(), Code::PermissionDenied);
+
+    // ListKv filters to visible paths.
+    let reply = svc
+        .list_kv(req(
+            ListKvRequest {
+                prefix: String::new(),
+            },
+            Some(&secret),
+        ))
+        .await?
+        .into_inner();
+    assert!(
+        reply
+            .entries
+            .iter()
+            .all(|entry| entry.key.starts_with("team/")),
+        "list must only contain team/ keys, got {:?}",
+        reply
+            .entries
+            .iter()
+            .map(|entry| &entry.key)
+            .collect::<Vec<_>>(),
+    );
+    Ok(())
+}
+
+/// Node-pool scoping: a token limited to one pool cannot read or restart
+/// nodes in other pools, and GetNodes filters.
+#[tokio::test]
+async fn node_pool_scoped_policy_limits_node_access() -> R<()> {
+    let (svc, fixtures, _) = setup_enabled()?;
+    let runtime = svc.acl.clone();
+
+    svc.store.insert_node(NodeMsg {
+        id: "gpu-node".into(),
+        pool: "gpu".into(),
+        status: "active".into(),
+        availability: "available".into(),
+        config_attrs: "{}".into(),
+        fingerprint_attrs: "{}".into(),
+        dynamic_attrs: "{}".into(),
+        health_checks: "[]".into(),
+        last_heartbeat: "2026-01-01T00:00:00Z".into(),
+    })?;
+
+    svc.store.upsert_acl_policy(
+        "gpu-pool-only",
+        "",
+        r#"[{"resources": ["node"], "actions": ["read"], "pools": ["gpu"]}]"#,
+    )?;
+    let (_, secret) = runtime
+        .mint_token(
+            &svc.store,
+            "pool-scoped",
+            "client",
+            &["gpu-pool-only".into()],
+            None,
+        )
+        .map_err(|s| anyhow!(s.to_string()))?;
+
+    // The gpu node is visible; the default-pool node is not.
+    svc.get_node(req(
+        GetNodeRequest {
+            id: "gpu-node".into(),
+        },
+        Some(&secret),
+    ))
+    .await
+    .expect("pool-scoped token reads its pool");
+    let status = call_endpoint(&svc, &fixtures, "GetNode", Some(&secret))
+        .await
+        .expect_err("default pool must be denied");
+    assert_eq!(status.code(), Code::PermissionDenied);
+
+    let reply = svc
+        .get_nodes(req(GetNodesRequest::default(), Some(&secret)))
+        .await?
+        .into_inner();
+    assert!(
+        reply.nodes.iter().all(|node| node.pool == "gpu"),
+        "node list must be filtered to the gpu pool",
+    );
+
+    // Read-only pool access must not grant writes.
+    let status = call_endpoint(&svc, &fixtures, "RestartWorker", Some(&secret))
+        .await
+        .expect_err("read-only token must not restart workers");
+    assert_eq!(status.code(), Code::PermissionDenied);
+    Ok(())
+}
+
+/// The anonymous policy grants tokenless access during migrations.
+#[tokio::test]
+async fn anonymous_policy_grants_tokenless_access() -> R<()> {
+    let (svc, fixtures, _) = setup_enabled()?;
+
+    svc.store.upsert_acl_policy(
+        "anonymous",
+        "migration ramp",
+        r#"[{"resources": ["job"], "actions": ["read"]}]"#,
+    )?;
+
+    call_endpoint(&svc, &fixtures, "ListJobs", None)
+        .await
+        .expect("anonymous policy must allow job reads");
+    let status = call_endpoint(&svc, &fixtures, "StopJob", None)
+        .await
+        .expect_err("anonymous policy must not allow job writes");
+    assert_eq!(status.code(), Code::PermissionDenied);
+    Ok(())
+}
+
+/// Audit-only mode allows everything while ACL evaluation still runs.
+#[tokio::test]
+async fn audit_only_mode_allows_denied_requests() -> R<()> {
+    let store = setup_store()?;
+    let fixtures = seed_fixtures(&store)?;
+    let runtime = Arc::new(
+        AclRuntime::from_config(
+            &AclConfig {
+                enabled: Some(true),
+                audit_only: Some(true),
+                ..Default::default()
+            }
+            .with_defaults(),
+        )
+        .expect("runtime should build"),
+    );
+    let svc = ManagerAgentService::with_acl(store, runtime);
+
+    for (method, _) in endpoint_table() {
+        if method == "Login" {
+            continue; // Login still validates credentials in audit mode.
+        }
+        if let Err(status) = call_endpoint(&svc, &fixtures, method, None).await {
+            assert!(
+                !is_auth_error(status.code()),
+                "{method} must not be denied in audit-only mode, got {}: {}",
+                status.code(),
+                status.message(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// WhoAmI reports ACL state to anonymous, scoped, and management callers.
+#[tokio::test]
+async fn who_am_i_reports_identity() -> R<()> {
+    let (svc, _, management_secret) = setup_enabled()?;
+
+    let anonymous = svc
+        .who_am_i(req(WhoAmIRequest {}, None))
+        .await?
+        .into_inner();
+    assert!(anonymous.acl_enabled);
+    assert_eq!(anonymous.source, "anonymous");
+    assert_eq!(anonymous.token_type, "none");
+
+    let management = svc
+        .who_am_i(req(WhoAmIRequest {}, Some(&management_secret)))
+        .await?
+        .into_inner();
+    assert_eq!(management.source, "token");
+    assert_eq!(management.token_type, "management");
+    assert!(management.accessor_id.is_some());
+
+    let store = setup_store()?;
+    let disabled = ManagerAgentService::new(store);
+    let reply = disabled
+        .who_am_i(req(WhoAmIRequest {}, None))
+        .await?
+        .into_inner();
+    assert!(!reply.acl_enabled);
+    assert_eq!(reply.source, "disabled");
+    Ok(())
+}
+
+/// Login end-to-end: a userpass login mints a token that authenticates with
+/// the user's policies; bad credentials are rejected.
+#[tokio::test]
+async fn login_flow_mints_usable_token() -> R<()> {
+    let (svc, fixtures, management_secret) = setup_enabled()?;
+
+    svc.upsert_acl_user(req(
+        UpsertAclUserRequest {
+            username: "alice".into(),
+            password: "hunter2".into(),
+            policies: vec![FIXTURE_POLICY.into()],
+        },
+        Some(&management_secret),
+    ))
+    .await?;
+
+    let bad = svc
+        .login(req(
+            LoginRequest {
+                method: "userpass".into(),
+                username: Some("alice".into()),
+                password: Some("wrong".into()),
+                ..Default::default()
+            },
+            None,
+        ))
+        .await;
+    assert_eq!(bad.unwrap_err().code(), Code::Unauthenticated);
+
+    let reply = svc
+        .login(req(
+            LoginRequest {
+                method: "userpass".into(),
+                username: Some("alice".into()),
+                password: Some("hunter2".into()),
+                ..Default::default()
+            },
+            None,
+        ))
+        .await?
+        .into_inner();
+    let secret = reply.secret;
+
+    // fixture-policy grants job:read only.
+    call_endpoint(&svc, &fixtures, "ListJobs", Some(&secret))
+        .await
+        .expect("login token must grant the user's policies");
+    let status = call_endpoint(&svc, &fixtures, "PutKv", Some(&secret))
+        .await
+        .expect_err("login token must not exceed the user's policies");
+    assert_eq!(status.code(), Code::PermissionDenied);
+    Ok(())
+}
+
+/// Privilege escalation guard: acl:write alone cannot mint management tokens.
+#[tokio::test]
+async fn client_token_cannot_mint_management_tokens() -> R<()> {
+    let (svc, _, management_secret) = setup_enabled()?;
+
+    svc.store.upsert_acl_policy(
+        "acl-admin",
+        "",
+        r#"[{"resources": ["acl"], "actions": ["read", "write"]}]"#,
+    )?;
+    let (_, secret) = svc
+        .acl
+        .mint_token(
+            &svc.store,
+            "acl-admin-token",
+            "client",
+            &["acl-admin".into()],
+            None,
+        )
+        .map_err(|s| anyhow!(s.to_string()))?;
+
+    // The acl:write client token can mint client tokens...
+    svc.create_acl_token(req(
+        CreateAclTokenRequest {
+            name: "minted-client".into(),
+            token_type: "client".into(),
+            policies: vec![FIXTURE_POLICY.into()],
+            ttl: None,
+        },
+        Some(&secret),
+    ))
+    .await
+    .expect("acl:write must allow minting client tokens");
+
+    // ...but not management tokens.
+    let status = svc
+        .create_acl_token(req(
+            CreateAclTokenRequest {
+                name: "sneaky".into(),
+                token_type: "management".into(),
+                policies: vec![],
+                ttl: None,
+            },
+            Some(&secret),
+        ))
+        .await
+        .expect_err("client tokens must not mint management tokens");
+    assert_eq!(status.code(), Code::PermissionDenied);
+
+    // A management token can.
+    svc.create_acl_token(req(
+        CreateAclTokenRequest {
+            name: "second-mgmt".into(),
+            token_type: "management".into(),
+            policies: vec![],
+            ttl: None,
+        },
+        Some(&management_secret),
+    ))
+    .await
+    .expect("management tokens may mint management tokens");
+    Ok(())
+}

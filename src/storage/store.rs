@@ -358,11 +358,11 @@ impl Store {
         Ok(guard)
     }
 
-    fn write_connection(&self) -> R<MutexGuard<'_, Connection>> {
+    pub(crate) fn write_connection(&self) -> R<MutexGuard<'_, Connection>> {
         Self::lock_conn(&self.write_conn, "write")
     }
 
-    fn read_connection(&self) -> R<MutexGuard<'_, Connection>> {
+    pub(crate) fn read_connection(&self) -> R<MutexGuard<'_, Connection>> {
         let pool = self.read_conns.as_slice();
         let index = self.read_index.fetch_add(1, Ordering::Relaxed);
         let conn = pool.get(index % pool.len()).unwrap_or(&self.write_conn);
@@ -902,7 +902,7 @@ impl Store {
         Ok(PlanApplyOutcome::Applied(allocations))
     }
 
-    fn collect_rows<T, I>(iter: I) -> R<Vec<T>>
+    pub(crate) fn collect_rows<T, I>(iter: I) -> R<Vec<T>>
     where
         I: Iterator<Item = Result<T, rusqlite::Error>>,
     {

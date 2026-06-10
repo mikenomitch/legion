@@ -377,5 +377,44 @@ pub fn get_migrations() -> Migrations<'static> {
         // Workload identities declared on a task (workload-identity OIDC plan).
         // JSON-encoded Vec<WorkloadIdentity>; NULL/absent == no identities.
         M::up("ALTER TABLE task_config ADD COLUMN identities JSONB;").down(""),
+        // ACL policies: named rule documents (see docs/plans/auth-acl-plan.md).
+        M::up(
+            "CREATE TABLE IF NOT EXISTS acl_policy (
+            name STRING PRIMARY KEY,
+            description STRING NOT NULL DEFAULT '',
+            rules JSONB NOT NULL,
+            created_at TIMESTAMP NOT NULL,
+            updated_at TIMESTAMP NOT NULL
+        )",
+        )
+        .down("DROP TABLE IF EXISTS acl_policy;"),
+        // ACL tokens. Only a SHA-256 hash of the secret is stored; the
+        // accessor id is the public, log-safe handle.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS acl_token (
+            accessor_id STRING PRIMARY KEY,
+            secret_hash STRING NOT NULL UNIQUE,
+            name STRING NOT NULL,
+            token_type STRING NOT NULL,
+            policies JSONB NOT NULL,
+            expires_at TIMESTAMP,
+            created_at TIMESTAMP NOT NULL
+        )",
+        )
+        .down("DROP TABLE IF EXISTS acl_token;"),
+        M::up("CREATE INDEX IF NOT EXISTS idx_acl_token_secret_hash ON acl_token(secret_hash);")
+            .down("DROP INDEX IF EXISTS idx_acl_token_secret_hash;"),
+        // Username/password users for the built-in userpass auth method.
+        // password_hash is an argon2id PHC string.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS acl_user (
+            username STRING PRIMARY KEY,
+            password_hash STRING NOT NULL,
+            policies JSONB NOT NULL,
+            created_at TIMESTAMP NOT NULL,
+            updated_at TIMESTAMP NOT NULL
+        )",
+        )
+        .down("DROP TABLE IF EXISTS acl_user;"),
     ])
 }

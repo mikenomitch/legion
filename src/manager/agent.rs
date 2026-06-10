@@ -60,7 +60,30 @@ pub async fn run_manager(config: ManagerConfig, run_worker: bool) -> R<()> {
 
     let store_copy_b = store.clone();
 
-    let manager_node = ManagerAgentService::new(store);
+    let acl_runtime = Arc::new(
+        crate::manager::acl::AclRuntime::from_config(&full_config.acl)
+            .context("invalid acl configuration")?,
+    );
+    if acl_runtime.enabled {
+        info!(
+            audit_only = acl_runtime.audit_only,
+            auth_methods = acl_runtime.methods.len(),
+            "ACLs enabled; run `legion acl bootstrap` once to mint the initial management token"
+        );
+        // Prime remote JWKS documents, then keep them fresh in the background.
+        acl_runtime.refresh_jwks().await;
+        let refresh_runtime = acl_runtime.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(refresh_runtime.jwks_refresh_interval).await;
+                refresh_runtime.refresh_jwks().await;
+            }
+        });
+    } else {
+        warn!("ACLs are disabled; every API caller has full access (set acl.enabled to true to enforce)");
+    }
+
+    let manager_node = ManagerAgentService::with_acl(store, acl_runtime);
 
     let addr = format!("{}:{}", full_config.server.host, full_config.server.port).parse()?;
 

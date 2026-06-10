@@ -36,6 +36,26 @@
 - Default manager address `http://127.0.0.1:4747`; insecure listener `http://127.0.0.1:4748`.
 - Dev TLS certs live in `configs/tls/`; do not use in production.
 
+## Auth & ACL Checks (required on every endpoint)
+Every Manager gRPC endpoint must enforce ACLs. When you add an RPC:
+- **Drop in the check first.** Start the handler with one line:
+  `self.check_acl(&request, AclResource::X, AclAction::Read|Write, AclScope::...)?;`
+  When the scope comes from the parsed body, use the two-step form:
+  `let ident = self.authenticate_acl(&request)?;` then
+  `acl::enforce(&ident, resource, action, &scope)?` after parsing. Endpoints
+  that are worker-plane (called by workers) or open (login/introspection) must
+  say so with an explicit `// ACL:` comment.
+- **Pick the resource/action/scope** from the existing vocabulary: resources
+  `job|node|kv|state|operator|acl`, actions `read|write`, scopes by job name
+  (+namespace), node pool, or KV path. List endpoints gate with
+  `AclScope::any()` and then filter items with `ident.allows(...)`.
+- **Add the endpoint to `tests/acl_endpoints.rs`** (`endpoint_table` + a
+  request builder). The `every_manager_rpc_is_classified` test parses
+  `proto/legion.proto` and fails the build if a Manager RPC has no ACL
+  coverage entry, so this is not optional.
+- Never log token secrets; log accessor IDs. See `docs/auth-and-acls.md` and
+  `docs/plans/auth-acl-plan.md` for the model and roadmap.
+
 ## Tracing Guidance
 - Use `#[instrument]` on async or queue/loop boundaries (RPC handlers, scheduler entrypoints, eval worker loops).
 - Include stable IDs in span fields (`job_id`, `job_config_id`, `node_id`, `eval_id`, `worker_id`) and avoid logging giant JSON blobs.
@@ -94,6 +114,7 @@ the MCP server). Keep these surfaces agent-friendly when contributing. See
   - `docs/observability.md`
   - `docs/ui-architecture.md`
   - `docs/kv-store.md`
+  - `docs/auth-and-acls.md`
   - `docs/testing-and-benchmarks.md`
   - `docs/codebase-conventions.md`
   - `docs/agent-readiness.md`
