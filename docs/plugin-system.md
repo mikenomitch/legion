@@ -11,7 +11,7 @@ This approach was chosen because it is:
 - **Fast**: no RPC boundary between core scheduler/worker and plugin code.
 - **Simple to deploy**: plugins are shared libraries on disk under a predictable directory.
 - **Ergonomic for Rust extension authors**: plugin authors implement traits and export a `get` constructor.
-- **Flexible**: task kinds, scheduling policies, node checks, and rollout strategies can each be extended.
+- **Flexible**: task kinds, scheduling policies, node checks, rollout strategies, and artifact fetchers can each be extended.
 
 ## Downsides and Risks to Watch
 
@@ -174,7 +174,6 @@ Based on `docs/TASK-LIST.md`, `README.md`, and `docs/differentiators.md`, these 
 
 - Networking/CNI plugins.
 - Volume plugins.
-- Artifact acquisition plugins (image/file/etc lifecycle).
 - Command/API endpoint extension plugins.
 - Logging/observability pipeline plugins.
 - Eval hooks / scheduler reaction hooks.

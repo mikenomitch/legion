@@ -163,9 +163,11 @@ artifact-bearing or not:
 - `exec` tasks using landlock get the task directory appended to
   `read_write_paths` automatically — otherwise artifacts would stage
   somewhere the sandboxed task cannot read.
-- Artifacts stage into `dest` relative to this directory.
+- Artifacts stage into `dest` relative to this directory. Paths handed to
+  tasks (env vars, interpolation) are absolute.
 - The directory is removed when the allocation is stopped, destroyed, or
-  fails (best-effort, logged).
+  fails (best-effort, logged), and cleared before fresh staging begins — a
+  worker that died mid-staging leaves no stale content to collide with.
 
 ## Referencing staged artifacts
 
@@ -207,7 +209,7 @@ directories, OCI layouts).
 | `file://` | Copies a local file or directory tree. Dev workflows and node-local pre-provisioned artifacts. |
 | `git` | `git::https://github.com/acme/repo?ref=v1.2.0` (go-getter style) or `git://…`. Shallow clone (depth 1); `ref=` takes a branch, tag, or full 40-hex commit SHA (full SHAs are fetched as exact objects). The `.git` directory is stripped — tasks get a clean worktree. Credentials are injected via `GIT_CONFIG_*` environment variables (an `http.extraHeader` Authorization header), never argv. `resolve()` uses `git ls-remote` to pin refs to commit SHAs. |
 | `s3://` | `object_store`-backed; speaks any S3-compatible endpoint (AWS, MinIO, R2, GCS interop). Region/endpoint come from the credential object or query params (`s3://bucket/key?endpoint=https://minio.internal:9000&region=auto`) — query params win. Anonymous fetches skip request signing (public buckets). |
-| `oci://` | Built on the `oci-client` crate. Anonymous/basic/bearer registry auth; tags resolve to manifest digests for pinning. Without `mediaType`, the image is materialized as an on-disk **OCI layout** (what image-consuming kinds hand to their runtime). With `mediaType`, only matching ORAS layers are pulled, named by their `org.opencontainers.image.title` annotation (sanitized to a basename; digest hex as fallback). Blob sizes are checked against the size cap before any blob downloads. `?protocol=http` opts into plain-HTTP registries for dev/test. |
+| `oci://` | Built on the `oci-client` crate. Anonymous/basic/bearer registry auth; tags resolve to manifest digests for pinning. Without `mediaType`, the image is materialized as an on-disk **OCI layout** (what image-consuming kinds hand to their runtime; staged under `.oci/<name>/` unless `dest` is set). With `mediaType`, only matching ORAS layers are pulled, named by their `org.opencontainers.image.title` annotation (sanitized to a basename; digest hex as fallback). Blob sizes are checked against the size cap before any blob downloads. `?protocol=http` opts into plain-HTTP registries for dev/test. |
 
 Additional schemes can be served by [fetcher plugins](#fetcher-plugins).
 
@@ -339,11 +341,13 @@ Mutable references — OCI **tags** and git **branches/tags** — default to
   (`oci://…@sha256:…`, `git::…?ref=<sha>`) plus a `pinnedFrom` annotation
   recording the original reference. Every allocation of that job config —
   including reschedules days later — fetches identical bytes.
-- `job plan` and `job run` report what was pinned
-  (`task api: pinned oci://ghcr.io/acme/api:v42 -> sha256:def…`), and `job
-  plan` additionally diffs against the stored config
+- `job plan` reports what would be pinned
+  (`task api: pinned oci://ghcr.io/acme/api:v42 -> sha256:def…`) and diffs
+  against the stored config
   (`task api: artifact oci://ghcr.io/acme/api:v42 moved: sha256:abc… ->
-  sha256:def…`) so a moved tag is visible *before* you submit.
+  sha256:def…`) so a moved tag is visible *before* you submit. The UI's
+  declared-artifacts table shows each pinned digest with the tag it resolved
+  from.
 - **Re-submitting re-resolves.** That is the deliberate "roll forward"
   moment: push a new image to the tag, re-run `job run`, and the rollout
   ships the new digest.

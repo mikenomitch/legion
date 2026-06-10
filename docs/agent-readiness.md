@@ -158,7 +158,9 @@ tracked `rolloutId`. A non-converged wait exits non-zero.
 Other loop-closing signals available to agents today:
 
 - `legion job rollout events --id <ID> --json` — the rollout's event history.
-- `legion job rollout status --id <ID> --json` — per-allocation health.
+- `legion job rollout status --id <ID> --json` — per-allocation health, including
+  per-artifact staging states (`artifact_states`) for tasks that declare
+  [artifacts](artifacts.md).
 - `legion state query "<SQL>" --json` — inspect `task_status`, `allocation_health`,
   `eval`, etc. (read-only by default).
 
