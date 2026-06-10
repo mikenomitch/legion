@@ -324,6 +324,53 @@ missed. For most workloads this is negligible. If you need stricter delivery,
 raise `LEGION_LOG_MAX_FILE_BYTES` (rotate less often) and/or lower the
 collector's `poll_interval`, or ship from the application itself.
 
+### Run the shipper as a per-node Legion job (daemonset)
+
+You don't have to manage the collector out-of-band — you can run it **as a
+Legion job, one per node**, so the cluster schedules and supervises it for you.
+Two ready jobspecs ship in [`configs/jobs/`](../configs/jobs/):
+
+```bash
+legion job run configs/jobs/otel-log-shipper.jsonnet     # OpenTelemetry Collector
+# or
+legion job run configs/jobs/vector-log-shipper.jsonnet   # Vector
+```
+
+How they work:
+
+- **One per node** via `count: { num: 1, per: "id" }`. Legion's scheduler groups
+  eligible nodes by their unique node **id**, so `per: "id"` places exactly one
+  allocation on every node — the daemonset/system-job pattern. New nodes get a
+  shipper automatically.
+- **Reads every allocation's logs** because the shipper runs as an `exec` task: it
+  is a child of the worker and inherits the worker's working directory (the one
+  containing `.legion/`), so the relative `filelog`/`file` glob
+  `.legion/workers/*/logs/*/*.log` matches all of that node's task logs.
+- The collector config/Vector config is materialized on the node via the exec
+  task's `files:` field — no external config distribution needed.
+
+Edit the endpoint at the top of the jobspec (`otlpEndpoint` / `lokiEndpoint`)
+before running.
+
+**Requirements and limits (important):**
+
+- The `otelcol-contrib` (or `vector`) **binary must already be installed on every
+  node** and on `PATH`. The `exec` task runs a host binary; Legion does not
+  download it. (The OTel Collector **contrib** distro is required — core lacks
+  `filelog`.)
+- **Don't use the `debug`/`console` exporter in the job form.** The shipper's own
+  stdout is itself captured by Legion, so a console exporter would feed the
+  shipper its own output. The jobspecs use a real backend exporter and set the
+  shipper's self-logging to `warn`, which keeps self-ingestion negligible (a real
+  exporter doesn't echo to stdout, so there's no amplification loop).
+- If workers use an absolute `LEGION_WORKER_STATE_PATH`, set the task's `cwd` (or
+  make the glob absolute) so the relative path still resolves.
+- **The `container` task kind cannot do this.** Legion's container kind has no
+  host volume mounts (only image/command/env), so a containerized collector can't
+  read the node's log files. Use `exec` with a host-installed binary, as the
+  jobspecs do. (If host volume mounts are added to the container kind later, a
+  fully self-contained image-based shipper becomes possible.)
+
 ### Why a collector instead of built-in forwarding?
 
 Shipping is intentionally **not** in Legion's hot path: a task writes to a file
