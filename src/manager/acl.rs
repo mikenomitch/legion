@@ -1,16 +1,20 @@
-//! Authentication and ACL enforcement runtime.
+//! The authenticator: resolves request credentials to identities and mints
+//! ACL tokens.
 //!
 //! Every credential type converges on one [`AclIdentity`]:
 //!
 //! - **Legion ACL tokens** (opaque `lgn_...` secrets) are hashed and looked up
 //!   in the store; their attached policies become the identity's rules.
-//! - **External JWTs / OIDC tokens** are validated against a configured auth
-//!   method (JWKS, issuer/audience bounds) and mapped to policies via binding
-//!   rules — either per request (bearer) or once at `Login` (which mints a
-//!   short-lived ACL token).
-//! - **Username/password** logins verify an argon2id hash and mint a
-//!   short-lived ACL token carrying the user's policies.
+//! - **Auth methods** ([`crate::manager::auth_method::AuthMethod`]) handle
+//!   everything else: username/password, JWTs, and OIDC tokens — either per
+//!   request (bearer) or once at `Login`, which mints a short-lived ACL token
+//!   carrying the method's mapped policies.
 //! - **No credential** resolves to the `anonymous` policy when one exists.
+//!
+//! [`Authenticator`] is the long-lived object the manager holds: the ACL mode
+//! flags from config, the registered auth methods, and the token-minting
+//! logic. Policy evaluation lives in `crate::structs::acl`; per-endpoint
+//! enforcement is [`enforce`].
 //!
 //! Enforcement is default-deny once ACLs are enabled. In audit-only mode
 //! denials are logged under the `acl_audit` tracing target but allowed, so
@@ -20,20 +24,23 @@
 // gRPC surface and keeps handler call sites to a single `?`.
 #![allow(clippy::result_large_err)]
 
+use crate::manager::auth_method::{
+    parse_ttl, AuthMethod, JwtAuthMethod, LoginCredentials, UserpassMethod, VerifiedIdentity,
+};
 use crate::prelude::*;
 use crate::storage::acl_store::AclTokenRecord;
 use crate::storage::store::Store;
 use crate::structs::acl::{AclAction, AclIdentity, AclResource, AclScope, AclSource};
-use crate::structs::{AclAuthMethodConfig, AclBindingRule, AclConfigFull, AclTokenInfo};
+use crate::structs::{AclConfigFull, AclTokenInfo};
+
+pub use crate::manager::auth_method::USERPASS_METHOD;
 
 use argon2::password_hash::{
     rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString,
 };
 use argon2::Argon2;
-use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use rand::RngCore;
 use sha2::{Digest, Sha256};
-use std::sync::RwLock;
 use std::time::Duration;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
@@ -47,91 +54,7 @@ pub const TOKEN_PREFIX: &str = "lgn_";
 /// Policy name applied to requests that present no credential.
 pub const ANONYMOUS_POLICY: &str = "anonymous";
 
-/// Reserved auth-method name for built-in username/password login.
-pub const USERPASS_METHOD: &str = "userpass";
-
 const DEFAULT_LOGIN_TTL: Duration = Duration::from_secs(24 * 60 * 60);
-
-/// One configured JWT/OIDC auth method with defaults resolved.
-#[derive(Debug, Clone)]
-pub struct AuthMethod {
-    pub name: String,
-    pub is_oidc: bool,
-    pub jwks_url: Option<String>,
-    pub static_jwks: Option<Value>,
-    pub hmac_secret: Option<String>,
-    pub issuer: Option<String>,
-    pub bound_issuer: Option<String>,
-    pub bound_audiences: Vec<String>,
-    pub user_claim: String,
-    pub binding_rules: Vec<AclBindingRule>,
-    pub token_ttl: Duration,
-}
-
-impl AuthMethod {
-    fn from_config(config: &AclAuthMethodConfig, login_ttl: Duration) -> R<Self> {
-        let name = config.name.trim().to_string();
-        if name.is_empty() {
-            bail!("auth method name must not be empty");
-        }
-        if name == USERPASS_METHOD {
-            bail!("auth method name `{USERPASS_METHOD}` is reserved for the built-in method");
-        }
-        let method_type = config.r#type.clone().unwrap_or_else(|| "jwt".to_string());
-        let is_oidc = match method_type.as_str() {
-            "jwt" => false,
-            "oidc" => true,
-            other => {
-                bail!("auth method `{name}`: unknown type `{other}` (expected `jwt` or `oidc`)")
-            }
-        };
-        let static_jwks = config
-            .jwks_json
-            .as_ref()
-            .map(|raw| serde_json::from_str::<Value>(raw))
-            .transpose()
-            .with_context(|| format!("auth method `{name}`: jwksJson is not valid JSON"))?;
-        if is_oidc && config.issuer.is_none() {
-            bail!("auth method `{name}`: oidc methods require `issuer` for discovery");
-        }
-        if !is_oidc
-            && config.jwks_url.is_none()
-            && static_jwks.is_none()
-            && config.hmac_secret.is_none()
-        {
-            bail!("auth method `{name}`: jwt methods require one of `jwksUrl`, `jwksJson`, or `hmacSecret`");
-        }
-        let token_ttl = match &config.token_ttl {
-            Some(raw) => {
-                parse_ttl(raw).with_context(|| format!("auth method `{name}`: invalid tokenTtl"))?
-            }
-            None => login_ttl,
-        };
-        Ok(AuthMethod {
-            name,
-            is_oidc,
-            jwks_url: config.jwks_url.clone(),
-            static_jwks,
-            hmac_secret: config.hmac_secret.clone(),
-            issuer: config.issuer.clone(),
-            bound_issuer: config.bound_issuer.clone(),
-            bound_audiences: config.bound_audiences.clone().unwrap_or_default(),
-            user_claim: config
-                .user_claim
-                .clone()
-                .unwrap_or_else(|| "sub".to_string()),
-            binding_rules: config.binding_rules.clone().unwrap_or_default(),
-            token_ttl,
-        })
-    }
-}
-
-fn parse_ttl(raw: &str) -> R<Duration> {
-    let parsed: humantime::Duration = raw
-        .parse()
-        .map_err(|e| anyhow!("invalid duration `{raw}`: {e}"))?;
-    Ok(parsed.into())
-}
 
 /// Hashes a token secret for at-rest storage and lookup.
 pub fn hash_secret(secret: &str) -> String {
@@ -163,28 +86,36 @@ pub fn verify_password(password: &str, stored_hash: &str) -> bool {
         .is_ok()
 }
 
-/// The manager's ACL state: config plus the JWKS cache for auth methods.
-#[derive(Debug)]
-pub struct AclRuntime {
+/// The manager's authenticator: ACL mode flags, the registered auth methods,
+/// and token minting. One instance lives for the life of the manager and is
+/// shared by every RPC handler.
+pub struct Authenticator {
     pub enabled: bool,
     pub audit_only: bool,
     pub login_ttl: Duration,
     pub jwks_refresh_interval: Duration,
-    pub methods: Vec<AuthMethod>,
-    /// method name -> fetched JWKS document ({"keys": [...]}).
-    jwks_cache: RwLock<HashMap<String, Value>>,
+    methods: Vec<Box<dyn AuthMethod>>,
 }
 
-impl AclRuntime {
-    /// Runtime with ACLs off; every caller gets full access.
+impl std::fmt::Debug for Authenticator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Authenticator")
+            .field("enabled", &self.enabled)
+            .field("audit_only", &self.audit_only)
+            .field("methods", &self.method_names())
+            .finish()
+    }
+}
+
+impl Authenticator {
+    /// Authenticator with ACLs off; every caller gets full access.
     pub fn disabled() -> Self {
-        AclRuntime {
+        Authenticator {
             enabled: false,
             audit_only: false,
             login_ttl: DEFAULT_LOGIN_TTL,
             jwks_refresh_interval: Duration::from_secs(300),
-            methods: Vec::new(),
-            jwks_cache: RwLock::new(HashMap::new()),
+            methods: vec![Box::new(UserpassMethod::new(DEFAULT_LOGIN_TTL))],
         }
     }
 
@@ -192,98 +123,53 @@ impl AclRuntime {
         let login_ttl = parse_ttl(&config.login_ttl).context("invalid acl.loginTtl")?;
         let jwks_refresh_interval =
             parse_ttl(&config.jwks_refresh_interval).context("invalid acl.jwksRefreshInterval")?;
-        let mut methods = Vec::new();
-        for method_config in &config.auth_methods {
-            let method = AuthMethod::from_config(method_config, login_ttl)?;
-            if methods.iter().any(|m: &AuthMethod| m.name == method.name) {
-                bail!("duplicate auth method name `{}`", method.name);
-            }
-            methods.push(method);
-        }
-        let runtime = AclRuntime {
+        let mut authenticator = Authenticator {
             enabled: config.enabled,
             audit_only: config.audit_only,
             login_ttl,
             jwks_refresh_interval,
-            methods,
-            jwks_cache: RwLock::new(HashMap::new()),
+            methods: Vec::new(),
         };
-        runtime.load_static_jwks();
-        Ok(runtime)
-    }
-
-    /// Primes the cache with inline JWKS documents (no network needed).
-    fn load_static_jwks(&self) {
-        let mut cache = match self.jwks_cache.write() {
-            Ok(cache) => cache,
-            Err(_) => return,
-        };
-        for method in &self.methods {
-            if let Some(jwks) = &method.static_jwks {
-                cache.insert(method.name.clone(), jwks.clone());
-            }
+        // The built-in username/password method is always available.
+        authenticator.register_method(Box::new(UserpassMethod::new(login_ttl)))?;
+        for method_config in &config.auth_methods {
+            let method = JwtAuthMethod::from_config(method_config, login_ttl)?;
+            authenticator.register_method(Box::new(method))?;
         }
+        Ok(authenticator)
     }
 
-    /// Fetches remote JWKS documents for all methods that need them.
+    /// Registers an auth method. Names must be unique (`userpass` is taken by
+    /// the built-in method).
     ///
-    /// Called once at startup and then periodically (`jwksRefreshInterval`).
-    /// Failures are logged and leave any previously cached document in place,
-    /// so transient IdP outages do not lock out token validation.
-    pub async fn refresh_jwks(&self) {
-        for method in &self.methods {
-            if method.static_jwks.is_some() || method.hmac_secret.is_some() {
-                continue;
-            }
-            match self.fetch_jwks(method).await {
-                Ok(jwks) => {
-                    if let Ok(mut cache) = self.jwks_cache.write() {
-                        cache.insert(method.name.clone(), jwks);
-                    }
-                }
-                Err(e) => {
-                    warn!(method = %method.name, "Failed to refresh JWKS: {e:#}");
-                }
-            }
+    /// This is the extension seam for custom identity sources when embedding
+    /// Legion as a library; see `crate::manager::auth_method` for the planned
+    /// plugin story.
+    pub fn register_method(&mut self, method: Box<dyn AuthMethod>) -> R<()> {
+        if method.name().trim().is_empty() {
+            bail!("auth method name must not be empty");
         }
+        if self.methods.iter().any(|m| m.name() == method.name()) {
+            bail!("auth method `{}` is already registered", method.name());
+        }
+        self.methods.push(method);
+        Ok(())
     }
 
-    async fn fetch_jwks(&self, method: &AuthMethod) -> R<Value> {
-        let jwks_url = match &method.jwks_url {
-            Some(url) => url.clone(),
-            None => {
-                // OIDC discovery: issuer/.well-known/openid-configuration.
-                let issuer = method
-                    .issuer
-                    .as_ref()
-                    .context("oidc method missing issuer")?;
-                let discovery_url = format!(
-                    "{}/.well-known/openid-configuration",
-                    issuer.trim_end_matches('/')
-                );
-                let discovery: Value = reqwest::Client::new()
-                    .get(&discovery_url)
-                    .send()
-                    .await?
-                    .error_for_status()?
-                    .json()
-                    .await
-                    .with_context(|| format!("fetching {discovery_url}"))?;
-                discovery["jwks_uri"]
-                    .as_str()
-                    .context("discovery document missing jwks_uri")?
-                    .to_string()
-            }
-        };
-        let jwks: Value = reqwest::Client::new()
-            .get(&jwks_url)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await
-            .with_context(|| format!("fetching {jwks_url}"))?;
-        Ok(jwks)
+    /// Names of all registered auth methods (always includes `userpass`).
+    pub fn method_names(&self) -> Vec<&str> {
+        self.methods.iter().map(|m| m.name()).collect()
+    }
+
+    /// Refreshes remote validation material (JWKS, ...) for every method.
+    ///
+    /// Called once at startup and then every `jwksRefreshInterval`. Methods
+    /// swallow their own failures so a flaky identity provider cannot lock
+    /// out authentication.
+    pub async fn refresh_auth_methods(&self) {
+        for method in &self.methods {
+            method.refresh().await;
+        }
     }
 
     /// Resolves request metadata to an identity. This is the single
@@ -302,9 +188,9 @@ impl AclRuntime {
         };
 
         // Opaque Legion tokens take priority; anything JWT-shaped goes through
-        // the configured auth methods.
+        // the registered auth methods.
         if !credential.starts_with(TOKEN_PREFIX) && credential.matches('.').count() == 2 {
-            return self.jwt_identity(&credential, store);
+            return self.bearer_identity(&credential, store);
         }
         self.token_identity(&credential, store)
     }
@@ -359,83 +245,54 @@ impl AclRuntime {
         })
     }
 
-    fn jwt_identity(&self, token: &str, store: &Store) -> Result<AclIdentity, Status> {
-        if self.methods.is_empty() {
-            return Err(Status::unauthenticated(
-                "a JWT was presented but no auth methods are configured",
-            ));
-        }
+    /// Routes a JWT-shaped bearer credential through the auth methods; the
+    /// first method that validates it wins.
+    fn bearer_identity(&self, credential: &str, store: &Store) -> Result<AclIdentity, Status> {
+        let mut attempted = false;
         let mut last_error = String::new();
         for method in &self.methods {
-            match self.validate_jwt(method, token) {
-                Ok(claims) => {
-                    let principal = claims
-                        .get(&method.user_claim)
-                        .and_then(Value::as_str)
-                        .unwrap_or("jwt-user")
-                        .to_string();
-                    let policies = bound_policies(&method.binding_rules, &claims);
-                    let rules = store
-                        .resolve_acl_rules(&policies)
-                        .map_err(internal_acl_error)?;
-                    return Ok(AclIdentity {
-                        principal: format!("{}:{}", method.name, principal),
-                        accessor_id: None,
-                        is_management: false,
-                        policies,
-                        rules,
-                        source: AclSource::Jwt,
-                        expires_at: claims
-                            .get("exp")
-                            .and_then(Value::as_i64)
-                            .and_then(|exp| OffsetDateTime::from_unix_timestamp(exp).ok())
-                            .and_then(|dt| dt.format(&Rfc3339).ok()),
-                        audit_only: self.audit_only,
-                    });
-                }
+            let Some(result) = method.validate_bearer(credential) else {
+                continue;
+            };
+            attempted = true;
+            match result {
+                Ok(verified) => return self.method_identity(method.name(), verified, store),
                 Err(e) => {
-                    debug!(method = %method.name, "JWT validation failed: {e:#}");
-                    last_error = format!("{e:#}");
+                    let message = e.to_status().message().to_string();
+                    debug!(method = %method.name(), "bearer validation failed: {message}");
+                    last_error = message;
                 }
             }
+        }
+        if !attempted {
+            return Err(Status::unauthenticated(
+                "a JWT was presented but no JWT/OIDC auth methods are configured",
+            ));
         }
         Err(Status::unauthenticated(format!(
             "JWT was not accepted by any configured auth method (last error: {last_error})"
         )))
     }
 
-    /// Validates signature + bounds for one method and returns the claims.
-    fn validate_jwt(&self, method: &AuthMethod, token: &str) -> R<Value> {
-        let header = decode_header(token).context("invalid JWT header")?;
-
-        let (key, algorithm) = if let Some(secret) = &method.hmac_secret {
-            (
-                DecodingKey::from_secret(secret.as_bytes()),
-                Algorithm::HS256,
-            )
-        } else {
-            let jwks = self
-                .jwks_cache
-                .read()
-                .ok()
-                .and_then(|cache| cache.get(&method.name).cloned())
-                .ok_or_else(|| anyhow!("no JWKS available for method `{}` yet", method.name))?;
-            decoding_key_from_jwks(&jwks, header.kid.as_deref(), header.alg)?
-        };
-
-        let mut validation = Validation::new(algorithm);
-        if method.bound_audiences.is_empty() {
-            validation.validate_aud = false;
-        } else {
-            validation.set_audience(&method.bound_audiences);
-        }
-        let issuer = method.bound_issuer.as_ref().or(method.issuer.as_ref());
-        if let Some(issuer) = issuer {
-            validation.set_issuer(&[issuer]);
-        }
-
-        let data = decode::<Value>(token, &key, &validation).context("JWT validation failed")?;
-        Ok(data.claims)
+    fn method_identity(
+        &self,
+        method_name: &str,
+        verified: VerifiedIdentity,
+        store: &Store,
+    ) -> Result<AclIdentity, Status> {
+        let rules = store
+            .resolve_acl_rules(&verified.policies)
+            .map_err(internal_acl_error)?;
+        Ok(AclIdentity {
+            principal: format!("{method_name}:{}", verified.principal),
+            accessor_id: None,
+            is_management: false,
+            policies: verified.policies,
+            rules,
+            source: AclSource::Jwt,
+            expires_at: verified.expires_at,
+            audit_only: self.audit_only,
+        })
     }
 
     /// Mints a new opaque ACL token and persists its hash.
@@ -456,68 +313,43 @@ impl AclRuntime {
         Ok((record.to_info(), secret))
     }
 
-    /// Handles Login for both `userpass` and JWT/OIDC methods.
+    /// Handles Login: dispatches to the named auth method and mints an ACL
+    /// token carrying the verified identity's policies.
+    ///
+    /// Token names are `<method>:<principal>` (for example `userpass:alice`)
+    /// so audit logs show both the method and the external identity.
     pub fn login(
         &self,
         store: &Store,
-        method: &str,
+        method_name: &str,
         username: Option<&str>,
         password: Option<&str>,
         jwt: Option<&str>,
         requested_ttl: Option<&str>,
     ) -> Result<(AclTokenInfo, String), Status> {
-        if method == USERPASS_METHOD {
-            let username = username
-                .filter(|u| !u.trim().is_empty())
-                .ok_or_else(|| Status::invalid_argument("userpass login requires `username`"))?;
-            let password = password
-                .ok_or_else(|| Status::invalid_argument("userpass login requires `password`"))?;
-            let user = store
-                .get_acl_user(username)
-                .map_err(internal_acl_error)?
-                // Same error for unknown user and bad password (no user enumeration).
-                .ok_or_else(|| Status::unauthenticated("invalid username or password"))?;
-            if !verify_password(password, &user.password_hash) {
-                return Err(Status::unauthenticated("invalid username or password"));
-            }
-            let ttl = self.effective_login_ttl(requested_ttl, self.login_ttl)?;
-            return self.mint_token(
-                store,
-                &format!("login:{username}"),
-                "client",
-                &user.policies,
-                Some(ttl),
-            );
-        }
-
-        let method_config = self
+        let method = self
             .methods
             .iter()
-            .find(|m| m.name == method)
-            .ok_or_else(|| Status::invalid_argument(format!("unknown auth method `{method}`")))?;
-        let jwt = jwt.ok_or_else(|| {
-            Status::invalid_argument(format!("auth method `{method}` requires `jwt`"))
-        })?;
-        let claims = self
-            .validate_jwt(method_config, jwt)
-            .map_err(|e| Status::unauthenticated(format!("JWT validation failed: {e:#}")))?;
-        let principal = claims
-            .get(&method_config.user_claim)
-            .and_then(Value::as_str)
-            .unwrap_or("jwt-user")
-            .to_string();
-        let policies = bound_policies(&method_config.binding_rules, &claims);
-        if policies.is_empty() {
-            return Err(Status::permission_denied(format!(
-                "login via `{method}` succeeded but no binding rules matched any policies"
-            )));
-        }
-        let ttl = self.effective_login_ttl(requested_ttl, method_config.token_ttl)?;
+            .find(|m| m.name() == method_name)
+            .ok_or_else(|| {
+                Status::invalid_argument(format!("unknown auth method `{method_name}`"))
+            })?;
+        let verified = method
+            .login(
+                store,
+                LoginCredentials {
+                    username,
+                    password,
+                    jwt,
+                },
+            )
+            .map_err(|e| e.to_status())?;
+        let ttl = self.effective_login_ttl(requested_ttl, method.login_token_ttl())?;
         self.mint_token(
             store,
-            &format!("{method}:{principal}"),
+            &format!("{method_name}:{}", verified.principal),
             "client",
-            &policies,
+            &verified.policies,
             Some(ttl),
         )
     }
@@ -581,37 +413,6 @@ fn build_token_record(
     Ok((record, secret))
 }
 
-/// Evaluates binding rules against verified JWT claims.
-fn bound_policies(rules: &[AclBindingRule], claims: &Value) -> Vec<String> {
-    let mut policies: Vec<String> = Vec::new();
-    for rule in rules {
-        let matched = match (&rule.claim, &rule.value) {
-            (None, _) => true,
-            (Some(claim), None) => claims.get(claim).is_some(),
-            (Some(claim), Some(value)) => claim_contains(claims.get(claim), value),
-        };
-        if matched {
-            for policy in &rule.policies {
-                if !policies.contains(policy) {
-                    policies.push(policy.clone());
-                }
-            }
-        }
-    }
-    policies
-}
-
-fn claim_contains(claim: Option<&Value>, expected: &str) -> bool {
-    match claim {
-        None => false,
-        Some(Value::String(s)) => s == expected,
-        Some(Value::Array(items)) => items.iter().any(|item| item.as_str() == Some(expected)),
-        Some(Value::Number(n)) => n.to_string() == expected,
-        Some(Value::Bool(b)) => b.to_string() == expected,
-        _ => false,
-    }
-}
-
 /// Pulls a bearer credential from `authorization` or `x-legion-token`.
 fn extract_bearer(metadata: &MetadataMap) -> Option<String> {
     if let Some(value) = metadata.get("authorization").and_then(|v| v.to_str().ok()) {
@@ -634,56 +435,6 @@ fn extract_bearer(metadata: &MetadataMap) -> Option<String> {
         .and_then(|v| v.to_str().ok())
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
-}
-
-/// Builds a `DecodingKey` from a JWKS document, selecting by `kid` when the
-/// token names one and falling back to the first key of a compatible type.
-fn decoding_key_from_jwks(
-    jwks: &Value,
-    kid: Option<&str>,
-    alg: Algorithm,
-) -> R<(DecodingKey, Algorithm)> {
-    let keys = jwks["keys"]
-        .as_array()
-        .context("JWKS missing `keys` array")?;
-    let candidates: Vec<&Value> = match kid {
-        Some(kid) => keys
-            .iter()
-            .filter(|key| key["kid"].as_str() == Some(kid))
-            .collect(),
-        None => keys.iter().collect(),
-    };
-    if candidates.is_empty() {
-        bail!("no JWKS key matches kid {kid:?} (try refreshing JWKS)");
-    }
-    // Restrict to asymmetric algorithms; HS* via JWKS is not supported.
-    let algorithm = match alg {
-        Algorithm::RS256
-        | Algorithm::RS384
-        | Algorithm::RS512
-        | Algorithm::PS256
-        | Algorithm::PS384
-        | Algorithm::PS512
-        | Algorithm::ES256
-        | Algorithm::ES384 => alg,
-        other => bail!("unsupported JWT algorithm {other:?} for JWKS validation"),
-    };
-    for key in candidates {
-        match key["kty"].as_str() {
-            Some("RSA") => {
-                if let (Some(n), Some(e)) = (key["n"].as_str(), key["e"].as_str()) {
-                    return Ok((DecodingKey::from_rsa_components(n, e)?, algorithm));
-                }
-            }
-            Some("EC") => {
-                if let (Some(x), Some(y)) = (key["x"].as_str(), key["y"].as_str()) {
-                    return Ok((DecodingKey::from_ec_components(x, y)?, algorithm));
-                }
-            }
-            _ => continue,
-        }
-    }
-    bail!("no usable RSA/EC key found in JWKS for kid {kid:?}")
 }
 
 fn internal_acl_error(err: anyhow::Error) -> Status {
@@ -738,15 +489,16 @@ pub fn enforce(
 }
 
 #[cfg(test)]
-mod acl_runtime_test {
+mod authenticator_test {
     use super::*;
+    use crate::manager::auth_method::AuthError;
     use crate::structs::{AclConfig, ManagerConfigFull};
-    use jsonwebtoken::{encode, EncodingKey, Header};
+    use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
     use tempfile::Builder;
 
     fn setup_store() -> R<Store> {
         let store_dir = Builder::new()
-            .prefix("legion-acl-runtime-")
+            .prefix("legion-acl-auth-")
             .tempdir()
             .context("Error creating temp store directory")?
             .keep();
@@ -760,15 +512,15 @@ mod acl_runtime_test {
         Store::start_storage(&store_config)
     }
 
-    fn enabled_runtime() -> AclRuntime {
-        AclRuntime::from_config(
+    fn enabled_authenticator() -> Authenticator {
+        Authenticator::from_config(
             &AclConfig {
                 enabled: Some(true),
                 ..Default::default()
             }
             .with_defaults(),
         )
-        .expect("runtime should build")
+        .expect("authenticator should build")
     }
 
     fn metadata_with_token(token: &str) -> MetadataMap {
@@ -781,10 +533,10 @@ mod acl_runtime_test {
     }
 
     #[test]
-    fn disabled_runtime_grants_management_identity() -> R<()> {
+    fn disabled_authenticator_grants_management_identity() -> R<()> {
         let store = setup_store()?;
-        let runtime = AclRuntime::disabled();
-        let identity = runtime.authenticate(&MetadataMap::new(), &store)?;
+        let auth = Authenticator::disabled();
+        let identity = auth.authenticate(&MetadataMap::new(), &store)?;
         assert!(identity.is_management);
         assert_eq!(identity.source, AclSource::Disabled);
         Ok(())
@@ -793,9 +545,9 @@ mod acl_runtime_test {
     #[test]
     fn anonymous_uses_anonymous_policy_when_present() -> R<()> {
         let store = setup_store()?;
-        let runtime = enabled_runtime();
+        let auth = enabled_authenticator();
 
-        let identity = runtime.authenticate(&MetadataMap::new(), &store)?;
+        let identity = auth.authenticate(&MetadataMap::new(), &store)?;
         assert_eq!(identity.principal, "anonymous");
         assert!(!identity.allows(AclResource::Job, AclAction::Read, &AclScope::any()));
 
@@ -804,7 +556,7 @@ mod acl_runtime_test {
             "migration policy",
             r#"[{"resources": ["job"], "actions": ["read"]}]"#,
         )?;
-        let identity = runtime.authenticate(&MetadataMap::new(), &store)?;
+        let identity = auth.authenticate(&MetadataMap::new(), &store)?;
         assert!(identity.allows(AclResource::Job, AclAction::Read, &AclScope::any()));
         assert!(!identity.allows(AclResource::Job, AclAction::Write, &AclScope::any()));
         Ok(())
@@ -813,20 +565,20 @@ mod acl_runtime_test {
     #[test]
     fn token_roundtrip_authenticates_and_enforces_policies() -> R<()> {
         let store = setup_store()?;
-        let runtime = enabled_runtime();
+        let auth = enabled_authenticator();
 
         store.upsert_acl_policy(
             "kv-team",
             "",
             r#"[{"resources": ["kv"], "actions": ["read", "write"], "paths": ["team/*"]}]"#,
         )?;
-        let (info, secret) = runtime
+        let (info, secret) = auth
             .mint_token(&store, "ci", "client", &["kv-team".into()], None)
             .map_err(|s| anyhow!(s.to_string()))?;
         assert!(secret.starts_with(TOKEN_PREFIX));
         assert_eq!(info.token_type, "client");
 
-        let identity = runtime.authenticate(&metadata_with_token(&secret), &store)?;
+        let identity = auth.authenticate(&metadata_with_token(&secret), &store)?;
         assert_eq!(identity.principal, "ci");
         assert_eq!(
             identity.accessor_id.as_deref(),
@@ -841,7 +593,7 @@ mod acl_runtime_test {
         assert!(!identity.allows(AclResource::Job, AclAction::Read, &AclScope::any()));
 
         // Unknown token fails authentication entirely.
-        let result = runtime.authenticate(&metadata_with_token("lgn_bogus"), &store);
+        let result = auth.authenticate(&metadata_with_token("lgn_bogus"), &store);
         assert_eq!(result.unwrap_err().code(), tonic::Code::Unauthenticated);
         Ok(())
     }
@@ -849,8 +601,8 @@ mod acl_runtime_test {
     #[test]
     fn expired_tokens_are_rejected() -> R<()> {
         let store = setup_store()?;
-        let runtime = enabled_runtime();
-        let (_, secret) = runtime
+        let auth = enabled_authenticator();
+        let (_, secret) = auth
             .mint_token(
                 &store,
                 "fleeting",
@@ -860,7 +612,7 @@ mod acl_runtime_test {
             )
             .map_err(|s| anyhow!(s.to_string()))?;
         std::thread::sleep(Duration::from_millis(5));
-        let result = runtime.authenticate(&metadata_with_token(&secret), &store);
+        let result = auth.authenticate(&metadata_with_token(&secret), &store);
         assert_eq!(result.unwrap_err().code(), tonic::Code::Unauthenticated);
         Ok(())
     }
@@ -868,16 +620,14 @@ mod acl_runtime_test {
     #[test]
     fn management_tokens_bypass_policies() -> R<()> {
         let store = setup_store()?;
-        let runtime = enabled_runtime();
-        let (_, secret) = runtime
-            .bootstrap(&store)
-            .map_err(|s| anyhow!(s.to_string()))?;
-        let identity = runtime.authenticate(&metadata_with_token(&secret), &store)?;
+        let auth = enabled_authenticator();
+        let (_, secret) = auth.bootstrap(&store).map_err(|s| anyhow!(s.to_string()))?;
+        let identity = auth.authenticate(&metadata_with_token(&secret), &store)?;
         assert!(identity.is_management);
         assert!(identity.allows(AclResource::Acl, AclAction::Write, &AclScope::none()));
 
         // Second bootstrap is refused.
-        let again = runtime.bootstrap(&store);
+        let again = auth.bootstrap(&store);
         assert_eq!(again.unwrap_err().code(), tonic::Code::FailedPrecondition);
         Ok(())
     }
@@ -885,7 +635,7 @@ mod acl_runtime_test {
     #[test]
     fn userpass_login_mints_scoped_token() -> R<()> {
         let store = setup_store()?;
-        let runtime = enabled_runtime();
+        let auth = enabled_authenticator();
         store.upsert_acl_policy(
             "readers",
             "",
@@ -898,7 +648,7 @@ mod acl_runtime_test {
         )?;
 
         // Wrong password and unknown user produce the same error.
-        let bad = runtime.login(
+        let bad = auth.login(
             &store,
             USERPASS_METHOD,
             Some("alice"),
@@ -907,10 +657,10 @@ mod acl_runtime_test {
             None,
         );
         assert_eq!(bad.unwrap_err().code(), tonic::Code::Unauthenticated);
-        let unknown = runtime.login(&store, USERPASS_METHOD, Some("bob"), Some("x"), None, None);
+        let unknown = auth.login(&store, USERPASS_METHOD, Some("bob"), Some("x"), None, None);
         assert_eq!(unknown.unwrap_err().code(), tonic::Code::Unauthenticated);
 
-        let (info, secret) = runtime
+        let (info, secret) = auth
             .login(
                 &store,
                 USERPASS_METHOD,
@@ -920,16 +670,16 @@ mod acl_runtime_test {
                 None,
             )
             .map_err(|s| anyhow!(s.to_string()))?;
-        assert_eq!(info.name, "login:alice");
+        assert_eq!(info.name, "userpass:alice");
         assert!(info.expires_at.is_some(), "login tokens must expire");
 
-        let identity = runtime.authenticate(&metadata_with_token(&secret), &store)?;
+        let identity = auth.authenticate(&metadata_with_token(&secret), &store)?;
         assert!(identity.allows(AclResource::Job, AclAction::Read, &AclScope::any()));
         assert!(!identity.allows(AclResource::Job, AclAction::Write, &AclScope::any()));
         Ok(())
     }
 
-    fn hs256_runtime_and_jwt(claims: Value) -> R<(AclRuntime, String)> {
+    fn hs256_authenticator_and_jwt(claims: Value) -> R<(Authenticator, String)> {
         let config = AclConfig {
             enabled: Some(true),
             auth_methods: Some(vec![crate::structs::AclAuthMethodConfig {
@@ -955,13 +705,13 @@ mod acl_runtime_test {
             }]),
             ..Default::default()
         };
-        let runtime = AclRuntime::from_config(&config.with_defaults())?;
+        let auth = Authenticator::from_config(&config.with_defaults())?;
         let token = encode(
             &Header::new(Algorithm::HS256),
             &claims,
             &EncodingKey::from_secret(b"test-secret"),
         )?;
-        Ok((runtime, token))
+        Ok((auth, token))
     }
 
     fn future_exp() -> i64 {
@@ -978,7 +728,7 @@ mod acl_runtime_test {
             r#"[{"resources": ["job"], "actions": ["read"]}]"#,
         )?;
 
-        let (runtime, token) = hs256_runtime_and_jwt(json!({
+        let (auth, token) = hs256_authenticator_and_jwt(json!({
             "sub": "alice@corp",
             "iss": "https://idp.test",
             "aud": "legion",
@@ -986,7 +736,7 @@ mod acl_runtime_test {
             "exp": future_exp(),
         }))?;
 
-        let identity = runtime.authenticate(&metadata_with_token(&token), &store)?;
+        let identity = auth.authenticate(&metadata_with_token(&token), &store)?;
         assert_eq!(identity.principal, "ci:alice@corp");
         assert_eq!(identity.source, AclSource::Jwt);
         assert!(identity.policies.contains(&"ops".to_string()));
@@ -1002,7 +752,7 @@ mod acl_runtime_test {
     #[test]
     fn jwt_with_wrong_audience_or_issuer_is_rejected() -> R<()> {
         let store = setup_store()?;
-        let (runtime, _) = hs256_runtime_and_jwt(json!({}))?;
+        let (auth, _) = hs256_authenticator_and_jwt(json!({}))?;
 
         let bad_aud = encode(
             &Header::new(Algorithm::HS256),
@@ -1010,8 +760,7 @@ mod acl_runtime_test {
             &EncodingKey::from_secret(b"test-secret"),
         )?;
         assert_eq!(
-            runtime
-                .authenticate(&metadata_with_token(&bad_aud), &store)
+            auth.authenticate(&metadata_with_token(&bad_aud), &store)
                 .unwrap_err()
                 .code(),
             tonic::Code::Unauthenticated
@@ -1023,8 +772,7 @@ mod acl_runtime_test {
             &EncodingKey::from_secret(b"test-secret"),
         )?;
         assert_eq!(
-            runtime
-                .authenticate(&metadata_with_token(&bad_iss), &store)
+            auth.authenticate(&metadata_with_token(&bad_iss), &store)
                 .unwrap_err()
                 .code(),
             tonic::Code::Unauthenticated
@@ -1036,8 +784,7 @@ mod acl_runtime_test {
             &EncodingKey::from_secret(b"wrong-secret"),
         )?;
         assert_eq!(
-            runtime
-                .authenticate(&metadata_with_token(&bad_sig), &store)
+            auth.authenticate(&metadata_with_token(&bad_sig), &store)
                 .unwrap_err()
                 .code(),
             tonic::Code::Unauthenticated
@@ -1055,29 +802,93 @@ mod acl_runtime_test {
             r#"[{"resources": ["job"], "actions": ["read"]}]"#,
         )?;
 
-        let (runtime, token) = hs256_runtime_and_jwt(json!({
+        let (auth, token) = hs256_authenticator_and_jwt(json!({
             "sub": "ci-bot",
             "iss": "https://idp.test",
             "aud": "legion",
             "exp": future_exp(),
         }))?;
 
-        let (info, secret) = runtime
+        let (info, secret) = auth
             .login(&store, "ci", None, None, Some(&token), None)
             .map_err(|s| anyhow!(s.to_string()))?;
         assert_eq!(info.name, "ci:ci-bot");
         assert!(info.expires_at.is_some());
 
-        let identity = runtime.authenticate(&metadata_with_token(&secret), &store)?;
+        let identity = auth.authenticate(&metadata_with_token(&secret), &store)?;
         assert_eq!(identity.source, AclSource::Token);
         assert!(identity.allows(AclResource::Job, AclAction::Read, &AclScope::any()));
+        Ok(())
+    }
+
+    /// A minimal custom auth method, proving the registration seam works for
+    /// library users (and, later, plugins) without touching the core.
+    struct StaticTestMethod;
+
+    impl AuthMethod for StaticTestMethod {
+        fn name(&self) -> &str {
+            "static-test"
+        }
+
+        fn login(
+            &self,
+            _store: &Store,
+            credentials: LoginCredentials<'_>,
+        ) -> Result<VerifiedIdentity, AuthError> {
+            if credentials.password == Some("letmein") {
+                Ok(VerifiedIdentity {
+                    principal: "robot".into(),
+                    policies: vec!["readers".into()],
+                    expires_at: None,
+                })
+            } else {
+                Err(AuthError::InvalidCredentials("bad static secret".into()))
+            }
+        }
+
+        fn login_token_ttl(&self) -> Duration {
+            Duration::from_secs(60)
+        }
+    }
+
+    #[test]
+    fn custom_auth_methods_can_be_registered() -> R<()> {
+        let store = setup_store()?;
+        store.upsert_acl_policy(
+            "readers",
+            "",
+            r#"[{"resources": ["job"], "actions": ["read"]}]"#,
+        )?;
+
+        let mut auth = enabled_authenticator();
+        auth.register_method(Box::new(StaticTestMethod))?;
+        assert!(auth.method_names().contains(&"static-test"));
+
+        // Duplicate names are rejected (userpass is pre-registered).
+        assert!(auth.register_method(Box::new(StaticTestMethod)).is_err());
+        assert!(auth
+            .register_method(Box::new(UserpassMethod::new(Duration::from_secs(1))))
+            .is_err());
+
+        let bad = auth.login(&store, "static-test", None, Some("wrong"), None, None);
+        assert_eq!(bad.unwrap_err().code(), tonic::Code::Unauthenticated);
+
+        let (info, secret) = auth
+            .login(&store, "static-test", None, Some("letmein"), None, None)
+            .map_err(|s| anyhow!(s.to_string()))?;
+        assert_eq!(info.name, "static-test:robot");
+
+        let identity = auth.authenticate(&metadata_with_token(&secret), &store)?;
+        assert_eq!(identity.principal, "static-test:robot");
+        assert!(identity.allows(AclResource::Job, AclAction::Read, &AclScope::any()));
+        assert!(!identity.allows(AclResource::Job, AclAction::Write, &AclScope::any()));
         Ok(())
     }
 
     #[test]
     fn audit_only_mode_logs_but_allows() -> R<()> {
         let store = setup_store()?;
-        let runtime = AclRuntime::from_config(
+        let auth = Authenticator::from_config(
             &AclConfig {
                 enabled: Some(true),
                 audit_only: Some(true),
@@ -1085,7 +896,7 @@ mod acl_runtime_test {
             }
             .with_defaults(),
         )?;
-        let identity = runtime.authenticate(&MetadataMap::new(), &store)?;
+        let identity = auth.authenticate(&MetadataMap::new(), &store)?;
         assert!(enforce(
             &identity,
             AclResource::Job,
@@ -1100,8 +911,8 @@ mod acl_runtime_test {
     #[test]
     fn enforce_denies_with_helpful_message() -> R<()> {
         let store = setup_store()?;
-        let runtime = enabled_runtime();
-        let identity = runtime.authenticate(&MetadataMap::new(), &store)?;
+        let auth = enabled_authenticator();
+        let identity = auth.authenticate(&MetadataMap::new(), &store)?;
         let err = enforce(
             &identity,
             AclResource::Job,
@@ -1131,11 +942,12 @@ mod acl_runtime_test {
             enabled: Some(true),
             auth_methods: Some(vec![crate::structs::AclAuthMethodConfig {
                 name: USERPASS_METHOD.into(),
+                hmac_secret: Some("x".into()),
                 ..Default::default()
             }]),
             ..Default::default()
         };
-        assert!(AclRuntime::from_config(&reserved.with_defaults()).is_err());
+        assert!(Authenticator::from_config(&reserved.with_defaults()).is_err());
 
         let keyless = AclConfig {
             enabled: Some(true),
@@ -1146,7 +958,7 @@ mod acl_runtime_test {
             }]),
             ..Default::default()
         };
-        assert!(AclRuntime::from_config(&keyless.with_defaults()).is_err());
+        assert!(Authenticator::from_config(&keyless.with_defaults()).is_err());
 
         let duplicate = AclConfig {
             enabled: Some(true),
@@ -1164,6 +976,6 @@ mod acl_runtime_test {
             ]),
             ..Default::default()
         };
-        assert!(AclRuntime::from_config(&duplicate.with_defaults()).is_err());
+        assert!(Authenticator::from_config(&duplicate.with_defaults()).is_err());
     }
 }

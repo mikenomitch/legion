@@ -1,11 +1,10 @@
 //! ACL policy model and evaluation engine.
 //!
-//! Legion ACLs follow the token -> policies -> rules shape used by Nomad,
-//! Consul, and Vault: a request resolves to a set of named policies, each
-//! policy is a list of allow/deny rules over (resource, action) pairs, rules
-//! may be narrowed with glob scope selectors (namespaces, job names, node
-//! pools, KV paths), evaluation is default-deny, and a matching deny rule
-//! always overrides any allow.
+//! Legion ACLs are token -> policies -> rules: a request resolves to a set of
+//! named policies, each policy is a list of allow/deny rules over (resource,
+//! action) pairs, rules may be narrowed with glob scope selectors
+//! (namespaces, job names, node pools, KV paths), evaluation is default-deny,
+//! and a matching deny rule always overrides any allow.
 //!
 //! This module is pure logic (no storage, no transport) so it can be unit
 //! tested exhaustively. Credential resolution lives in `crate::manager::acl`.

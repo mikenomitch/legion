@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use crate::prelude::*;
 
-use crate::manager::acl::{self, AclRuntime};
+use crate::manager::acl::{self, Authenticator};
 use crate::manager::dispatcher::build_task_allocation;
 use crate::manager::rollout::{
     advance_rollout as advance_rollout_state, step_fractions_for_rollout,
@@ -518,20 +518,20 @@ fn build_rollout_launch_config(config: &JobConfig) -> Result<RolloutLaunchConfig
 #[derive(Debug)]
 pub struct ManagerAgentService {
     pub store: Store,
-    pub acl: Arc<AclRuntime>,
+    pub auth: Arc<Authenticator>,
     allocation_failures: Arc<Mutex<AllocationFailureTracker>>,
 }
 
 impl ManagerAgentService {
     /// Service with ACLs disabled (tests, embedded use).
     pub fn new(store: Store) -> Self {
-        Self::with_acl(store, Arc::new(AclRuntime::disabled()))
+        Self::with_acl(store, Arc::new(Authenticator::disabled()))
     }
 
-    pub fn with_acl(store: Store, acl: Arc<AclRuntime>) -> Self {
+    pub fn with_acl(store: Store, auth: Arc<Authenticator>) -> Self {
         Self {
             store,
-            acl,
+            auth,
             allocation_failures: Arc::new(Mutex::new(AllocationFailureTracker::default())),
         }
     }
@@ -559,7 +559,7 @@ impl ManagerAgentService {
     /// Resolves the caller's identity without enforcing anything. Pair with
     /// `acl::enforce` once the request body has been parsed.
     fn authenticate_acl<T>(&self, request: &Request<T>) -> Result<AclIdentity, Status> {
-        self.acl.authenticate(request.metadata(), &self.store)
+        self.auth.authenticate(request.metadata(), &self.store)
     }
 
     /// Scope check against a rollout's job, used by rollout endpoints that
@@ -2513,13 +2513,13 @@ impl Manager for ManagerAgentService {
         // callers so the UI/CLI can discover whether ACLs are enabled.
         let identity = self.authenticate_acl(&request)?;
         Ok(Response::new(WhoAmIReply {
-            acl_enabled: self.acl.enabled,
-            audit_only: self.acl.audit_only,
+            acl_enabled: self.auth.enabled,
+            audit_only: self.auth.audit_only,
             source: identity.source.as_str().to_string(),
             principal: identity.principal.clone(),
-            token_type: if identity.is_management && self.acl.enabled {
+            token_type: if identity.is_management && self.auth.enabled {
                 "management".to_string()
-            } else if self.acl.enabled
+            } else if self.auth.enabled
                 && identity.source != crate::structs::acl::AclSource::Anonymous
             {
                 "client".to_string()
@@ -2536,7 +2536,7 @@ impl Manager for ManagerAgentService {
     async fn login(&self, request: Request<LoginRequest>) -> Result<Response<LoginReply>, Status> {
         // ACL: open endpoint; this is how callers obtain credentials.
         let req = request.into_inner();
-        let (token, secret) = self.acl.login(
+        let (token, secret) = self.auth.login(
             &self.store,
             &req.method,
             req.username.as_deref(),
@@ -2559,7 +2559,7 @@ impl Manager for ManagerAgentService {
         // ACL: open endpoint guarded by its one-shot semantics — it only
         // succeeds while no management token exists.
         let _ = request;
-        let (token, secret) = self.acl.bootstrap(&self.store)?;
+        let (token, secret) = self.auth.bootstrap(&self.store)?;
         info!(accessor_id = %token.accessor_id, "ACL bootstrap: initial management token created");
         Ok(Response::new(BootstrapAclReply {
             token: Some(token),
@@ -2715,7 +2715,7 @@ impl Manager for ManagerAgentService {
             })
             .transpose()?;
         let (token, secret) =
-            self.acl
+            self.auth
                 .mint_token(&self.store, &req.name, &token_type, &req.policies, ttl)?;
         info!(accessor_id = %token.accessor_id, name = %token.name, "ACL token created");
         Ok(Response::new(CreateAclTokenReply {

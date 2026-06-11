@@ -2037,7 +2037,8 @@ message AclTokenInfo {
   // Public identifier for the token; safe to log and audit.
   string accessor_id = 1;
 
-  // Human-readable token name (for example "ci-deployer" or "login:alice").
+  // Human-readable token name. Tokens minted via Login are named
+  // `<method>:<principal>` (for example "userpass:alice").
   string name = 2;
 
   // Token type: `management` (full access) or `client` (policy-scoped).

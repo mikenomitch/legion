@@ -7194,7 +7194,8 @@ export class AclTokenInfo extends Message<AclTokenInfo> {
   accessorId = "";
 
   /**
-   * Human-readable token name (for example "ci-deployer" or "login:alice").
+   * Human-readable token name. Tokens minted via Login are named
+   * `<method>:<principal>` (for example "userpass:alice").
    *
    * @generated from field: string name = 2;
    */

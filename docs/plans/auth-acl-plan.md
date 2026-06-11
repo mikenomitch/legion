@@ -128,14 +128,29 @@ credential ──authenticate──▶ AclIdentity ──enforce──▶ allow 
   Public accessor IDs are the audit/revocation handle. Types: `management`
   (bypasses policy evaluation) and `client` (policy-scoped). Optional expiry;
   login-minted tokens always expire.
-- **Identity sources**, all converging on the same identity:
-  - ACL token in `authorization: Bearer …` (or `x-legion-token`).
-  - External **JWT/OIDC token** presented directly as the bearer credential:
-    validated against a configured auth method (JWKS by URL, inline JWKS,
-    OIDC discovery via issuer, or HMAC secret for dev), with bound
+- **Identity sources**, all converging on the same identity. Everything that
+  is not an opaque ACL token goes through one trait, `AuthMethod`
+  (`src/manager/auth_method.rs`): verify a credential, return a principal
+  plus policy names. The trait is deliberately shaped like Legion's other
+  plugin entry traits (`TaskPlugin`, `SchedulingPolicy`,
+  `RolloutStrategyPlugin`) — object-safe, `Send + Sync`, built-ins
+  dispatched by name — so identity sources stay a closed, auditable seam
+  today and a plugin category later:
+  - ACL token in `authorization: Bearer …` (or `x-legion-token`), resolved by
+    the `Authenticator` itself.
+  - `UserpassMethod` (built-in, always registered): argon2id-hashed users;
+    login-only.
+  - `JwtAuthMethod` (one instance per configured `acl.authMethods` entry):
+    external **JWT/OIDC tokens**, validated via JWKS by URL, inline JWKS,
+    OIDC discovery via issuer, or HMAC secret for dev, with bound
     issuer/audiences; **binding rules** map verified claims to policies.
-  - **Login exchange** (`legion login`): `userpass` (argon2id-hashed users)
-    or a JWT method — mints a TTL'd ACL token carrying the mapped policies.
+    Works per request (bearer) and at login.
+  - **Login exchange** (`legion login`): any method — mints a TTL'd ACL
+    token named `<method>:<principal>` carrying the mapped policies.
+    Minting, secret hashing, and policy evaluation never live inside a
+    method; methods can only yield policy names, never management access.
+  - Custom methods: `Authenticator::register_method(Box<dyn AuthMethod>)`
+    when embedding Legion as a library.
   - **Anonymous**: no credential ⇒ the `anonymous` policy if it exists
     (migration ramp), else no access.
 - **Modes**: `acl.enabled: false` (default — everything allowed, UI shows a
@@ -200,11 +215,15 @@ resolve the token, then pure rule matching). Three planes exist:
 - **Storage** `src/storage/acl_store.rs` + migrations: `acl_policy`,
   `acl_token` (hashed secrets, unique accessor), `acl_user` (argon2id PHC).
   One-shot transactional bootstrap.
-- **Runtime** `src/manager/acl.rs`: bearer extraction, token resolution,
-  JWT validation (RS256/384/512, PS*, ES256/384 via JWKS URL / inline JWKS /
-  OIDC discovery; HS256 via shared secret for dev), binding rules → policies,
-  userpass + JWT login minting TTL'd tokens, JWKS background refresh,
-  audit-only mode, structured denial audit.
+- **Authenticator** `src/manager/acl.rs`: bearer extraction, token
+  resolution, login dispatch, token minting, audit-only mode, structured
+  denial audit.
+- **Auth methods** `src/manager/auth_method.rs`: the `AuthMethod` trait plus
+  built-ins — `UserpassMethod` and `JwtAuthMethod` (RS256/384/512, PS*,
+  ES256/384 via JWKS URL / inline JWKS / OIDC discovery; HS256 via shared
+  secret for dev; binding rules → policies; per-method JWKS cache with
+  background refresh). Custom methods registrable via
+  `Authenticator::register_method`.
 - **API**: 13 new Manager RPCs (`WhoAmI`, `Login`, `BootstrapAcl`, policy
   CRUD, token create/list/delete, user CRUD), fully documented in
   `proto/legion.proto`. All 44 pre-existing RPCs carry checks or explicit
@@ -232,6 +251,21 @@ resolve the token, then pure rule matching). Three planes exist:
 ## 4. Roadmap
 
 ### Phase 2 — Interactive SSO & richer admin
+- **Auth method extensibility** (the plugin path; see also
+  docs/plugin-system.md):
+  1. A built-in `webhook` method type — POST the credential to an
+     operator-supplied endpoint, receive `{principal, policies}`. One more
+     `AuthMethod` implementation; keeps custom auth code behind a
+     process/network trust boundary and works in any language.
+  2. Only if demand emerges, a dynamic `plugins/auth/<name>/` category
+     exporting `get() -> Box<dyn AuthMethod>` like the other plugin kinds.
+     Deliberately last: auth plugins run in-process in the manager and
+     decide cluster admission, so the failure domain is total compromise —
+     unlike a task or scheduling plugin. Invariants that stay in core under
+     any mechanism: methods yield policy *names* only (never management
+     access), and token minting/secret hashing/policy evaluation never move
+     into a method. The trait is already transport-agnostic (`AuthError`
+     instead of gRPC types) to keep this door open.
 - `legion login --method <oidc>` browser flow: authorization-code + PKCE with
   a loopback callback (Nomad/Vault pattern), and a device-code fallback for
   headless hosts. (Today OIDC works by presenting/exchanging an IdP-issued

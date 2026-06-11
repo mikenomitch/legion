@@ -1,10 +1,10 @@
 # Auth & ACLs
 
-Legion ships a token-based ACL system in the spirit of Nomad/Consul/Vault:
-callers present a bearer credential, the manager resolves it to a set of
-named **policies**, and policies contain scoped allow/deny **rules** over a
-small set of resources and actions. Evaluation is default-deny once enabled,
-and a matching deny rule always overrides an allow.
+Legion ships a token-based ACL system: callers present a bearer credential,
+the manager resolves it to a set of named **policies**, and policies contain
+scoped allow/deny **rules** over a small set of resources and actions.
+Evaluation is default-deny once enabled, and a matching deny rule always
+overrides an allow.
 
 **ACLs are off by default.** With ACLs disabled every caller has full access
 and the UI shows a dismissable warning. Design rationale and roadmap live in
@@ -92,9 +92,15 @@ localStorage via the **Access** page.
 
 ### Logging in (userpass, JWT, OIDC / SSO)
 
-Every identity source converges on an ACL token:
+Every identity source is an **auth method** — one implementation of the same
+internal interface (`AuthMethod` in `src/manager/auth_method.rs`): verify a
+credential, return a principal plus policy names. The authenticator then
+mints an ACL token named `<method>:<principal>` (for example
+`userpass:alice`), so audit logs always show how an identity was established.
+Built-in methods:
 
-- **Username/password**: `legion acl user upsert alice --password ... --policy dev-team`
+- **Username/password** (`userpass`, always available):
+  `legion acl user upsert alice --password ... --policy dev-team`
   (argon2id-hashed), then `legion login -u alice -p ...` mints a token with
   the user's policies (TTL: `acl.loginTtl`, default 24h). The UI Access page
   has the same form.
@@ -107,6 +113,11 @@ Every identity source converges on an ACL token:
   map claims (for example `groups`) onto policies. The browser-redirect login
   flow is on the roadmap; today the UI/CLI accept the IdP-issued token
   directly.
+
+Custom identity sources can be registered through the same interface when
+embedding Legion as a library (`Authenticator::register_method`); a webhook
+method and a possible `plugins/auth/` category are planned — see
+[docs/plugin-system.md](plugin-system.md) and the roadmap in the plan.
 
 ```jsonnet
 acl: {

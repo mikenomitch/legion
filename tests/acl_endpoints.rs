@@ -19,7 +19,7 @@
 //! handler. See AGENTS.md ("Auth & ACL checks").
 
 use anyhow::{anyhow, Context};
-use legion::manager::acl::AclRuntime;
+use legion::manager::acl::Authenticator;
 use legion::manager::server::ManagerAgentService;
 use legion::storage::store::Store;
 use legion::structs::manager_server::Manager;
@@ -670,16 +670,16 @@ fn seed_fixtures(store: &Store) -> R<Fixtures> {
     })
 }
 
-fn enabled_runtime() -> Arc<AclRuntime> {
+fn enabled_authenticator() -> Arc<Authenticator> {
     Arc::new(
-        AclRuntime::from_config(
+        Authenticator::from_config(
             &AclConfig {
                 enabled: Some(true),
                 ..Default::default()
             }
             .with_defaults(),
         )
-        .expect("runtime should build"),
+        .expect("authenticator should build"),
     )
 }
 
@@ -688,12 +688,12 @@ fn enabled_runtime() -> Arc<AclRuntime> {
 fn setup_enabled() -> R<(ManagerAgentService, Fixtures, String)> {
     let store = setup_store()?;
     let mut fixtures = seed_fixtures(&store)?;
-    let runtime = enabled_runtime();
+    let authenticator = enabled_authenticator();
 
-    let (_, management_secret) = runtime
+    let (_, management_secret) = authenticator
         .bootstrap(&store)
         .map_err(|s| anyhow!(s.to_string()))?;
-    let (deletable, _) = runtime
+    let (deletable, _) = authenticator
         .mint_token(
             &store,
             "deletable",
@@ -705,7 +705,7 @@ fn setup_enabled() -> R<(ManagerAgentService, Fixtures, String)> {
     fixtures.deletable_token_accessor = deletable.accessor_id;
 
     Ok((
-        ManagerAgentService::with_acl(store, runtime),
+        ManagerAgentService::with_acl(store, authenticator),
         fixtures,
         management_secret,
     ))
@@ -858,7 +858,7 @@ async fn unknown_token_is_unauthenticated() -> R<()> {
 #[tokio::test]
 async fn job_name_scoped_policy_limits_job_access() -> R<()> {
     let (svc, fixtures, _) = setup_enabled()?;
-    let runtime = svc.acl.clone();
+    let authenticator = svc.auth.clone();
 
     svc.store.upsert_acl_policy(
         "acl-job-only",
@@ -867,7 +867,7 @@ async fn job_name_scoped_policy_limits_job_access() -> R<()> {
             r#"[{{"resources": ["job"], "actions": ["read", "write"], "names": ["{JOB_NAME}"]}}]"#
         ),
     )?;
-    let (_, secret) = runtime
+    let (_, secret) = authenticator
         .mint_token(
             &svc.store,
             "scoped",
@@ -909,7 +909,7 @@ async fn job_name_scoped_policy_limits_job_access() -> R<()> {
 #[tokio::test]
 async fn kv_path_scoped_policy_limits_kv_access() -> R<()> {
     let (svc, fixtures, _) = setup_enabled()?;
-    let runtime = svc.acl.clone();
+    let authenticator = svc.auth.clone();
 
     svc.store.upsert_acl_policy(
         "kv-team",
@@ -919,7 +919,7 @@ async fn kv_path_scoped_policy_limits_kv_access() -> R<()> {
             {"resources": ["kv"], "actions": ["*"], "effect": "deny", "paths": ["secret/*"]}
         ]"#,
     )?;
-    let (_, secret) = runtime
+    let (_, secret) = authenticator
         .mint_token(&svc.store, "kv-scoped", "client", &["kv-team".into()], None)
         .map_err(|s| anyhow!(s.to_string()))?;
 
@@ -972,7 +972,7 @@ async fn kv_path_scoped_policy_limits_kv_access() -> R<()> {
 #[tokio::test]
 async fn node_pool_scoped_policy_limits_node_access() -> R<()> {
     let (svc, fixtures, _) = setup_enabled()?;
-    let runtime = svc.acl.clone();
+    let authenticator = svc.auth.clone();
 
     svc.store.insert_node(NodeMsg {
         id: "gpu-node".into(),
@@ -991,7 +991,7 @@ async fn node_pool_scoped_policy_limits_node_access() -> R<()> {
         "",
         r#"[{"resources": ["node"], "actions": ["read"], "pools": ["gpu"]}]"#,
     )?;
-    let (_, secret) = runtime
+    let (_, secret) = authenticator
         .mint_token(
             &svc.store,
             "pool-scoped",
@@ -1058,8 +1058,8 @@ async fn anonymous_policy_grants_tokenless_access() -> R<()> {
 async fn audit_only_mode_allows_denied_requests() -> R<()> {
     let store = setup_store()?;
     let fixtures = seed_fixtures(&store)?;
-    let runtime = Arc::new(
-        AclRuntime::from_config(
+    let authenticator = Arc::new(
+        Authenticator::from_config(
             &AclConfig {
                 enabled: Some(true),
                 audit_only: Some(true),
@@ -1067,9 +1067,9 @@ async fn audit_only_mode_allows_denied_requests() -> R<()> {
             }
             .with_defaults(),
         )
-        .expect("runtime should build"),
+        .expect("authenticator should build"),
     );
-    let svc = ManagerAgentService::with_acl(store, runtime);
+    let svc = ManagerAgentService::with_acl(store, authenticator);
 
     for (method, _) in endpoint_table() {
         if method == "Login" {
@@ -1184,7 +1184,7 @@ async fn client_token_cannot_mint_management_tokens() -> R<()> {
         r#"[{"resources": ["acl"], "actions": ["read", "write"]}]"#,
     )?;
     let (_, secret) = svc
-        .acl
+        .auth
         .mint_token(
             &svc.store,
             "acl-admin-token",
