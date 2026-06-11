@@ -5,7 +5,7 @@
 This document proposes a **pluggable persistence layer** under the current SQLite-backed `Store` so operators can pick a reliability/complexity profile:
 
 1. **Local disk only** (today): simplest, zero clustering.
-2. **SQLite + asynchronous replication** (Litestream-like): low complexity, low-cost disaster recovery, optional warm standby.
+2. **SQLite + asynchronous replication** (streaming, via rustyriver): low complexity, low-cost disaster recovery, optional warm standby.
 3. **SQLite + consensus replication** (Raft): highest durability/availability, strongest write guarantees.
 
 Design intent:
@@ -58,7 +58,7 @@ Notes:
 
 - `StoreOpEnvelope` should be deterministic and small (operation name + normalized args + request id).
 - The default driver (`local_disk`) is effectively no-op hooks.
-- Litestream/Raft drivers extend behavior without rewriting store SQL.
+- Streaming/Raft drivers extend behavior without rewriting store SQL.
 
 ## 2) Manager Role Model
 
@@ -99,7 +99,7 @@ Current mode: manager writes to local SQLite only.
 
 ---
 
-## Option B: Litestream-like Asynchronous Replication
+## Option B: Streaming Asynchronous Replication (rustyriver)
 
 ### Description
 
@@ -127,7 +127,7 @@ This gives automatic recovery and split-brain resistance with minimal moving pie
 
 #### Why this is the simplest safe path
 
-- Litestream alone is backup/replication, not consensus/leader election.
+- Streaming replication alone is backup/replication, not consensus/leader election.
 - The lease provides fencing for writes.
 - Operationally still far simpler than full Raft.
 
@@ -283,7 +283,7 @@ Recommendation: keep this as a future fourth tier, not in initial rollout.
 - [x] Add `PersistenceStatus` plumbing and manager role exposure.
 - [x] Keep default config exactly as today.
 
-## Phase 1: Streaming backend (Litestream-like) with optional lease failover ✅ Completed (2026-03-20)
+## Phase 1: Streaming backend with optional lease failover ✅ Completed (2026-03-20)
 
 Delivered scope:
 
@@ -353,25 +353,18 @@ Suggested defaults:
 - `renew_jitter = 250ms`
 - `takeover_grace = 2 * max(sync_interval, renew_interval)`
 
-### Streaming replication implementation choice (Litestream vs custom)
+### Streaming replication implementation choice (rustyriver)
 
-After evaluating Rust ecosystem options for SQLite WAL shipping, the recommended Phase 1 implementation is to use **Litestream itself** as the replication engine rather than building a custom Rust WAL streamer.
-
-Reasoning:
-
-- There is no mature Rust crate that provides Litestream-equivalent SQLite WAL shipping, restore, retention, and operational hardening as a drop-in library.
-- Building a custom WAL shipper would add high correctness risk around SQLite/WAL edge cases, crash recovery, and object-store consistency behavior.
-- Litestream already solves the critical replication mechanics and has known operational behavior.
-- Legion should focus custom Rust logic on lease fencing, role transitions, and control-plane orchestration.
+The streaming backend embeds the [rustyriver](https://crates.io/crates/rustyriver) crate as the replication engine. Phase 1 originally shipped by shelling out to an external replication binary; it was ported to rustyriver (2026-06) so SQLite WAL→LTX shipping, point-in-time restore, and object-storage lease fencing all run in-process with no sidecar to install or supervise. See `docs/rustyriver-migration.md` for the port details.
 
 Implementation shape:
 
-- Run/coordinate Litestream process from manager runtime (or sidecar) with generated config.
-- Keep a narrow adapter boundary in Legion:
+- The manager opens the store through rustyriver's managed `Db` (WAL-mode checkpoint takeover) and drives the capture/upload sync loop on a dedicated thread.
+- Lease fencing uses rustyriver's `S3Leaser` (ETag compare-and-swap on the lock object).
+- A narrow adapter boundary remains in Legion (`StreamingPersistenceDriver`):
   - start/stop replication
-  - trigger restore/catch-up
-  - expose health/lag into `PersistenceStatus`
-- Revisit native Rust implementation only if operational constraints later require deeper embedding.
+  - restore via `rustyriver::restore`
+  - expose health into `PersistenceStatus`
 
 ## Phase 2: Raft tech preview
 

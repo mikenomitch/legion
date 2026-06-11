@@ -4,9 +4,8 @@ Legion supports a streaming persistence mode for manager state using:
 
 - SQLite as the local primary store.
 - [rustyriver](https://crates.io/crates/rustyriver) for WAL shipping to object
-  storage. rustyriver is an embeddable Rust reimplementation of Litestream v0.5,
-  so replication runs **in-process** — there is no `litestream` sidecar binary to
-  install or supervise.
+  storage. rustyriver is an embeddable replication engine, so replication runs
+  **in-process** — there is no sidecar binary to install or supervise.
 - An optional object-storage lease for single-primary failover fencing, provided
   by rustyriver's `S3Leaser`.
 
@@ -50,8 +49,7 @@ Legion supports a streaming persistence mode for manager state using:
 
 - `s3://<bucket>/<prefix>` — replicate to S3/R2/MinIO via rustyriver's
   `ObjectStoreClient`. Credentials for this destination are read from the ambient
-  environment (`AWS_*`, falling back to `LITESTREAM_*`), matching Litestream's URL
-  semantics.
+  environment (`AWS_*`, falling back to `LITESTREAM_*`).
 - `file://<path>` or a bare local path — replicate to a local directory via
   rustyriver's `FileReplicaClient` (useful for tests and single-host backups).
 - empty string — replication is disabled (local SQLite only).
@@ -79,8 +77,7 @@ The manager exposes persistence status through existing manager status APIs
 ## Operational Notes
 
 - **No external binary is required** — replication is embedded via the
-  `rustyriver` crate. (The former `litestreamBinary` config field has been
-  removed; it is ignored if still present in old configs.)
+  `rustyriver` crate.
 - For Cloudflare R2, use the S3-compatible endpoint + credentials.
 - Keep `ttlSeconds` comfortably above `renewIntervalSeconds` (default 15s / 5s).
 - For manual failover (`none`), operators must ensure only one writer is active.

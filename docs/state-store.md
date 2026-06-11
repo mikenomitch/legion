@@ -83,5 +83,5 @@ This store is local worker runtime state, not shared cluster state.
 
 ## What Is Not Implemented Yet
 
-For streaming persistence mode (Litestream + object-storage lease failover), see `docs/persistence-streaming.md`.
+For streaming persistence mode (rustyriver + object-storage lease failover), see `docs/persistence-streaming.md`.
 Legion now supports a Raft control-plane mode for leader election, failover operations, membership commands, and join-token workflows. Durable replicated manager state-machine writes are still planned; current manager data remains local SQLite until the Raft apply path is completed.

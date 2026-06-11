@@ -93,7 +93,7 @@
   - [ ] I can declare which other jobs have access to my service
   
 - [x] Persisting state
-  - [x] Saving the SQLite works (litestream-like)?
+  - [x] Saving the SQLite works (rustyriver streaming replication)?
   - [x] Raft Works (leader election/failover controls, observability, CLI/UI ops)
  
 - [ ] Stateful support

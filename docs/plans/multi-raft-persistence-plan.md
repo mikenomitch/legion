@@ -4,7 +4,7 @@
 > - [`docs/persistence-plan.md`](../persistence-plan.md) — the parent pluggable-persistence roadmap. This plan executes (and supersedes) its *“Remaining GA work (store replication path)”* section.
 > - [`docs/raft-operations.md`](../raft-operations.md) — current Raft control-plane operator workflows (election/failover/membership/join-token).
 > - [`docs/state-store.md`](../state-store.md) — the SQLite store, read-model cache, and allocation-epoch CAS this plan replicates.
-> - [`docs/persistence-streaming.md`](../persistence-streaming.md) — the Litestream tier this plan sits *above* on the durability gradient.
+> - [`docs/persistence-streaming.md`](../persistence-streaming.md) — the rustyriver streaming tier this plan sits *above* on the durability gradient.
 >
 > **Deliverable of this document:** a plan, not the implementation. The implementation is decomposed below into a Claude Dynamic Workflow so it can be executed (and re-executed) phase-by-phase with verification at every step.
 
@@ -66,7 +66,7 @@ We want Legion to be **faster and more scalable than Nomad/K8s** (per [`README.m
 - **Replacing SQLite** as the per-node state-machine store. We replicate *commands into* SQLite.
 - **Cross-region active/active.** Lanes are region-scoped; geo-replication is out of scope.
 - **Key-range sharding as the v1 default.** Horizontal sharding of the scheduler lane is specified as an *optional, later* axis (Phase 8), behind a flag, not the default.
-- **Replacing the Litestream/`streaming` tier.** It remains the low-complexity HA option for users who don't want consensus.
+- **Replacing the rustyriver/`streaming` tier.** It remains the low-complexity HA option for users who don't want consensus.
 - **Multi-writer SQLite** or distributed transactions *across* lanes. Cross-lane consistency is handled by an eventually-consistent read model + the existing allocation-epoch CAS (see Design §5), not 2PC.
 
 ---

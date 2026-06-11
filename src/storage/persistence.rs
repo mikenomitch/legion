@@ -132,10 +132,9 @@ impl PersistenceDriver for LocalDiskPersistenceDriver {
 
 /// Streaming persistence driver backed by [`rustyriver`].
 ///
-/// Replaces the former out-of-process `litestream` sidecar with rustyriver's
-/// in-process embedding API: a managed [`Db`] takes over SQLite checkpointing
-/// and ships each WAL segment to object storage through a [`Replica`], while an
-/// optional [`S3Leaser`] provides single-primary fencing.
+/// A managed [`Db`] takes over SQLite checkpointing and ships each WAL segment
+/// to object storage through a [`Replica`], while an optional [`S3Leaser`]
+/// provides single-primary fencing.
 #[derive(Debug)]
 pub struct StreamingPersistenceDriver {
     db_path: std::path::PathBuf,
@@ -161,8 +160,7 @@ impl StreamingPersistenceDriver {
     }
 
     /// Open the managed database and drive the rustyriver WAL→object-storage
-    /// sync loop on a dedicated thread (the in-process replacement for the old
-    /// `litestream replicate` subprocess).
+    /// sync loop on a dedicated thread.
     fn start_replication(&self) -> R<()> {
         if self.cfg.replica_url.trim().is_empty() {
             info!(

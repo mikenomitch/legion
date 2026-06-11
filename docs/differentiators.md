@@ -45,7 +45,7 @@
   * Makes for nicer nicer o11y and devex
 
 * Raft Optional
-  * Litestream?
+  * rustyriver (streaming replication)?
     * Both S3 + NFS?
   * At least initially this sounds pretty slick
   * You can have downtime on the leader and its NBD too…
