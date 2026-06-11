@@ -681,7 +681,7 @@ impl PersistenceDriver for RaftPersistenceDriver {
             .history
             .iter()
             .rev()
-            .take(limit.max(1).min(500))
+            .take(limit.clamp(1, 500))
             .cloned()
             .collect()
     }

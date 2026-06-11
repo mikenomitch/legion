@@ -1,6 +1,8 @@
 use crate::prelude::*;
 use crate::structs::{Allocation, TaskConfig};
-use crate::task_plugins::{derived_schema, spawn_task_process, TaskPlugin, TaskRuntime};
+use crate::task_plugins::{
+    configure_task_log_capture, derived_schema, spawn_task_process, TaskPlugin, TaskRuntime,
+};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::process::Command;
@@ -186,6 +188,7 @@ impl TaskPlugin for ContainerTaskPlugin {
 
         let mut cmd = Command::new(&launch.program);
         cmd.args(&launch.args);
+        configure_task_log_capture(&mut cmd, runtime)?;
 
         let child = spawn_task_process(&mut cmd).with_context(|| {
             format!(

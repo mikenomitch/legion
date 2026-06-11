@@ -1,3 +1,7 @@
+// Several rollout planning helpers thread a deliberately wide set of state
+// through by value; splitting them into structs would obscure more than it helps.
+#![allow(clippy::too_many_arguments)]
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Duration;
 
@@ -1637,7 +1641,7 @@ pub(crate) fn step_fractions_for_rollout(config: &RolloutConfig, base_count: u32
     let mut deduped = Vec::new();
     for step in steps {
         let clamped = step.clamp(0.0, 1.0);
-        if deduped.last().copied().map_or(true, |previous: f64| {
+        if deduped.last().copied().is_none_or(|previous: f64| {
             (previous - clamped).abs() > f64::EPSILON
         }) {
             deduped.push(clamped);
