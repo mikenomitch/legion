@@ -17,9 +17,7 @@ pub fn dispatch_allocations(store: &Store, allocations: &[Allocation]) -> R<()> 
     run_dispatch_future(async {
         let mut clients: HashMap<String, WorkerClient<Channel>> = HashMap::new();
         for allocation in allocations {
-            let tasks = task_cache
-                .entry(allocation.job_config_id.clone())
-                .or_insert_with(|| HashMap::new());
+            let tasks = task_cache.entry(allocation.job_config_id.clone()).or_default();
             if tasks.is_empty() {
                 let task_configs =
                     store.get_task_configs_for_job_config(&allocation.job_config_id)?;

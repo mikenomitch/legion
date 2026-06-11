@@ -1,3 +1,7 @@
+// Scheduler planning entry points pass many parameters (nodes, policy, caches,
+// epochs, …) by design; bundling them into structs would not improve clarity.
+#![allow(clippy::too_many_arguments)]
+
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use serde_json::Value;
@@ -809,7 +813,7 @@ impl<'a> Scheduler<'a> {
         allocations_by_node: &HashMap<String, Vec<Allocation>>,
         mode: PlanMode,
     ) -> R<Vec<PlannedAllocation>> {
-        tasks.sort_by(|a, b| a.0.cmp(&b.0));
+        tasks.sort_by_key(|a| a.0);
 
         let mut placements = Vec::new();
         let mut planned: HashMap<String, usize> = HashMap::new();
@@ -1260,9 +1264,9 @@ impl<'a> Scheduler<'a> {
         Ok(())
     }
 
-    fn select_node_id<'b>(
+    fn select_node_id(
         &self,
-        eligible: Vec<&'b Node>,
+        eligible: Vec<&Node>,
         reschedule_rng: &mut Option<StdRng>,
         nodes_considered_setting: Option<&NodesConsidered>,
         nodes_considered_rng: &mut StdRng,

@@ -27,6 +27,12 @@ pub struct WorkerTaskManager {
     log_sinks: Vec<Box<dyn LogSink>>,
 }
 
+impl Default for WorkerTaskManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl WorkerTaskManager {
     pub fn new() -> Self {
         Self::with_state_store(WorkerStateStore::new(WorkerStateStore::default_path()))
@@ -273,7 +279,7 @@ impl WorkerTaskManager {
         let runtime = self
             .runtimes
             .entry(allocation.id)
-            .or_insert_with(TaskRuntime::default);
+            .or_default();
         runtime.log_dir = Some(log_dir);
 
         info!(

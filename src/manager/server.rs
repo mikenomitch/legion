@@ -1,3 +1,7 @@
+// gRPC handler signatures are fixed by the generated `Manager` trait, so the
+// large `tonic::Status` error variant cannot be boxed away here.
+#![allow(clippy::result_large_err)]
+
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::Duration;
 
@@ -558,7 +562,7 @@ impl ManagerDaemonService {
         previous_job_config_id: Option<&str>,
     ) -> Result<(), Status> {
         let keep = std::iter::once(new_job_config_id)
-            .chain(previous_job_config_id.into_iter())
+            .chain(previous_job_config_id)
             .collect::<HashSet<_>>();
         let allocations = self
             .store
@@ -1276,10 +1280,7 @@ impl Manager for ManagerDaemonService {
             .get_submissions_for_config(&config_id)
             .map_err(|e| map_store_error("Error getting submissions", e))?;
 
-        Ok(Response::new(GetJobSpecReply {
-            submissions,
-            ..Default::default()
-        }))
+        Ok(Response::new(GetJobSpecReply { submissions }))
     }
 
     #[instrument(skip_all)]
@@ -2711,7 +2712,7 @@ fn build_desired_allocations(
     for allocation in desired {
         let tasks = task_cache
             .entry(allocation.job_config_id.clone())
-            .or_insert_with(HashMap::new);
+            .or_default();
         if tasks.is_empty() {
             let task_configs = store.get_task_configs_for_job_config(&allocation.job_config_id)?;
             for (id, config) in task_configs {
