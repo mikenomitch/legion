@@ -3,6 +3,14 @@ name: CI
 on:
   pull_request:
 
+# Grant the read scopes the workflow needs. `pull-requests: read` is required by
+# dorny/paths-filter, which calls the PR "list files" API on pull_request events;
+# without it the Scheduler Benchmark Gate fails with
+# "Resource not accessible by integration".
+permissions:
+  contents: read
+  pull-requests: read
+
 jobs:
   cargo-test:
     name: Cargo Test
