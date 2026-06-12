@@ -1,9 +1,9 @@
 use crate::prelude::*;
 
+use crate::structs::token::JoinToken;
 use crate::structs::{
     manager_client::ManagerClient, worker_server::WorkerServer, HealthCheckRequest,
-    HeartbeatRequest, JoinTokenClaims, WorkerPreRegisterReply, WorkerPreRegisterRequest,
-    WorkerRegisterRequest,
+    HeartbeatRequest, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterRequest,
 };
 use crate::util::random_string;
 use crate::worker::{
@@ -15,33 +15,50 @@ use crate::worker::{
 };
 
 use futures::join;
-use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::RwLock;
 use std::time::Duration;
 use tonic::{transport::Channel, transport::Server, Response};
 
-#[instrument(err, skip_all)]
-pub async fn run_worker(token: &str, name_override: Option<&str>) -> R<()> {
-    let mut val = Validation::new(Algorithm::HS512);
-    val.validate_exp = false;
+/// The worker's manager-issued credentials: the join secret it was started
+/// with (used to register and re-register) and the node token returned by
+/// registration (attached to heartbeats/health checks). Empty when the
+/// cluster runs without ACLs.
+#[derive(Debug, Default)]
+struct WorkerCredentials {
+    join_secret: Option<String>,
+    node_token: RwLock<Option<String>>,
+}
 
-    let token_data =
-        decode::<JoinTokenClaims>(token, &DecodingKey::from_secret(&TMP_SECRET_KEY[..]), &val)?;
-
-    // Reusing the validation code from above just to
-    // check for expiry. Not beautiful but it works.
-    if !token_data.claims.skip_expiry_validation {
-        info!("Validating expiry on join token");
-        val.validate_exp = true;
-        decode::<JoinTokenClaims>(token, &DecodingKey::from_secret(&TMP_SECRET_KEY[..]), &val)?;
-    } else {
-        info!("Skipping expiry validation check on join token");
+impl WorkerCredentials {
+    fn attach<T>(&self, mut request: tonic::Request<T>) -> tonic::Request<T> {
+        if let Some(token) = self.node_token.read().ok().and_then(|t| t.clone()) {
+            if let Ok(value) = format!("Bearer {token}").parse() {
+                request.metadata_mut().insert("authorization", value);
+            }
+        }
+        request
     }
 
-    let manager_addr = token_data.claims.address;
-    let worker_type = token_data.claims.worker_type;
-    run_worker_with_manager(manager_addr, worker_type, name_override).await
+    fn store_node_token(&self, token: Option<String>) {
+        if let Ok(mut current) = self.node_token.write() {
+            *current = token;
+        }
+    }
+}
+
+#[instrument(err, skip_all)]
+pub async fn run_worker(token: &str, name_override: Option<&str>) -> R<()> {
+    let join_token = JoinToken::decode(token)?;
+    info!(worker_type = %join_token.worker_type, "Decoded join token");
+    run_worker_with_manager(
+        join_token.addr,
+        join_token.worker_type,
+        name_override,
+        Some(join_token.secret),
+    )
+    .await
 }
 
 #[instrument(err, skip_all)]
@@ -49,8 +66,9 @@ pub async fn run_worker_local(
     manager_addr: String,
     worker_type: String,
     name_override: Option<&str>,
+    join_secret: Option<String>,
 ) -> R<()> {
-    run_worker_with_manager(manager_addr, worker_type, name_override).await
+    run_worker_with_manager(manager_addr, worker_type, name_override, join_secret).await
 }
 
 #[instrument(err, skip_all)]
@@ -58,15 +76,19 @@ async fn run_worker_with_manager(
     manager_addr: String,
     worker_type: String,
     name_override: Option<&str>,
+    join_secret: Option<String>,
 ) -> R<()> {
     let addr = format!("{DEF_MANAGER_HOSTNAME}:{DEF_WORKER_SERVER_PORT}").parse()?;
 
     info!(%manager_addr, %worker_type, "Worker connecting to manager");
 
     let client: ManagerClient<Channel> = connect_manager_with_retry(&manager_addr).await?;
+    let credentials = Arc::new(WorkerCredentials {
+        join_secret,
+        node_token: RwLock::new(None),
+    });
 
-    // TODO: Establish TLS connection properly
-    let pre_register_res = pre_register_self(client.clone(), worker_type).await?;
+    let pre_register_res = pre_register_self(client.clone(), worker_type, &credentials).await?;
     let config = pre_register_res
         .into_inner()
         .config
@@ -122,27 +144,43 @@ async fn run_worker_with_manager(
         )),
     );
 
-    register_self(
-        client.clone(),
-        name.clone(),
-        config.pool,
-        config_attrs,
-        fingerprint_data,
-        health_checks,
-    )
-    .await?;
+    let registration = RegistrationPayload {
+        name: name.clone(),
+        pool: config.pool.clone(),
+        config_attrs: serde_json::to_string(&config_attrs)?,
+        fingerprint_attrs: serde_json::to_string(&fingerprint_data)?,
+        health_checks: serde_json::to_string(&health_checks)?,
+    };
+    register_self(client.clone(), &registration, &credentials).await?;
     info!(worker_name = %name, "Worker registered with manager");
 
-    let heartbeat_fut = start_heartbeats(name.clone(), client.clone(), task_manager.clone());
+    let heartbeat_fut = start_heartbeats(
+        name.clone(),
+        client.clone(),
+        task_manager.clone(),
+        credentials.clone(),
+        registration,
+    );
     let checks_fut = start_node_checks(
         name.clone(),
         config.additional_node_checks.clone(),
         client,
         task_manager.clone(),
+        credentials,
     );
     let _res = join!(heartbeat_fut, checks_fut, worker_server_fut);
 
     Ok(())
+}
+
+/// Everything needed to (re-)register this worker with the manager.
+#[derive(Debug, Clone)]
+struct RegistrationPayload {
+    name: String,
+    pool: String,
+    config_attrs: String,
+    fingerprint_attrs: String,
+    health_checks: String,
 }
 
 #[instrument(err, skip_all)]
@@ -238,6 +276,8 @@ async fn start_heartbeats(
     name: String,
     client: ManagerClient<Channel>,
     task_manager: Arc<Mutex<WorkerTaskManager>>,
+    credentials: Arc<WorkerCredentials>,
+    registration: RegistrationPayload,
 ) -> R<()> {
     let mut client_clone = client.clone();
 
@@ -257,23 +297,38 @@ async fn start_heartbeats(
             (manager.allocations_snapshot(), failures, allocation_health)
         };
 
-        let req = tonic::Request::new(HeartbeatRequest {
+        let req = credentials.attach(tonic::Request::new(HeartbeatRequest {
             id: name.clone(),
             allocation_ids: allocations,
             failed_allocations: failures,
             allocation_health,
-        });
+        }));
 
-        let response = client_clone.heartbeat(req).await?;
-        debug!(worker = %name, elapsed_ms = start.elapsed().as_millis() as u64, "Heartbeat acknowledged by manager");
-        let reply = response.into_inner();
-        if !reply.desired_allocations.is_empty() {
-            let new_allocations = task_manager
-                .lock()
-                .expect("task manager")
-                .reconcile_allocations(&reply.desired_allocations);
-            for (allocation, task) in new_allocations {
-                spawn_health_monitor(task_manager.clone(), allocation, task);
+        match client_clone.heartbeat(req).await {
+            Ok(response) => {
+                debug!(worker = %name, elapsed_ms = start.elapsed().as_millis() as u64, "Heartbeat acknowledged by manager");
+                let reply = response.into_inner();
+                if !reply.desired_allocations.is_empty() {
+                    let new_allocations = task_manager
+                        .lock()
+                        .expect("task manager")
+                        .reconcile_allocations(&reply.desired_allocations);
+                    for (allocation, task) in new_allocations {
+                        spawn_health_monitor(task_manager.clone(), allocation, task);
+                    }
+                }
+            }
+            // The node token can be revoked/rotated (for example ACLs were
+            // just enabled, or the manager state was reset). Re-register with
+            // the join secret to obtain a fresh credential, then carry on.
+            Err(status) if status.code() == tonic::Code::Unauthenticated => {
+                warn!(worker = %name, "Heartbeat rejected as unauthenticated; re-registering");
+                if let Err(err) = register_self(client.clone(), &registration, &credentials).await {
+                    warn!(worker = %name, error = ?err, "Re-registration failed; will retry");
+                }
+            }
+            Err(status) => {
+                warn!(worker = %name, code = %status.code(), "Heartbeat failed: {}", status.message());
             }
         }
 
@@ -290,6 +345,7 @@ async fn start_node_checks(
     additional_node_checks: Vec<String>,
     client: ManagerClient<Channel>,
     task_manager: Arc<Mutex<WorkerTaskManager>>,
+    credentials: Arc<WorkerCredentials>,
 ) -> R<()> {
     let mut client_clone = client.clone();
 
@@ -302,13 +358,20 @@ async fn start_node_checks(
             run_health_checks(additional_node_checks.clone(), Some(readiness))
         };
         let serialized_health_check_data = serde_json::to_string(&checks_data)?;
-        let req = tonic::Request::new(HealthCheckRequest {
+        let req = credentials.attach(tonic::Request::new(HealthCheckRequest {
             id: name.clone(),
             health_checks: serialized_health_check_data.clone(),
-        });
+        }));
 
-        let response = client_clone.health_check(req).await?;
-        info!("RESPONSE={:?}", response);
+        match client_clone.health_check(req).await {
+            Ok(response) => {
+                debug!(worker = %name, "Health check acknowledged: {:?}", response.get_ref().message)
+            }
+            // The heartbeat loop owns re-registration; here just wait for it.
+            Err(status) => {
+                warn!(worker = %name, code = %status.code(), "Health check failed: {}", status.message())
+            }
+        }
 
         tokio::time::sleep(tokio::time::Duration::from_secs(
             WORKER_NODE_CHECK_DURATION_SEC,
@@ -320,27 +383,26 @@ async fn start_node_checks(
 #[instrument(err, skip_all)]
 async fn register_self(
     client: ManagerClient<Channel>,
-    name: String,
-    pool: String,
-    config_attrs: Map<String, Value>,
-    fingerprint_attrs: Map<String, Value>,
-    health_checks: Map<String, Value>,
+    registration: &RegistrationPayload,
+    credentials: &Arc<WorkerCredentials>,
 ) -> R<()> {
     let mut c2 = client.clone();
-    let serialized_config_data = serde_json::to_string(&config_attrs)?;
-    let serialized_fp_data = serde_json::to_string(&fingerprint_attrs)?;
-    let serialized_health_check_data = serde_json::to_string(&health_checks)?;
 
     let req = tonic::Request::new(WorkerRegisterRequest {
-        name,
-        config_attrs: serialized_config_data,
-        fingerprint_attrs: serialized_fp_data,
-        health_checks: serialized_health_check_data,
-        pool,
+        name: registration.name.clone(),
+        config_attrs: registration.config_attrs.clone(),
+        fingerprint_attrs: registration.fingerprint_attrs.clone(),
+        health_checks: registration.health_checks.clone(),
+        pool: registration.pool.clone(),
+        join_token: credentials.join_secret.clone(),
     });
 
     let response = c2.worker_register(req).await?;
-    info!("RESPONSE={:?}", response);
+    let reply = response.into_inner();
+    if reply.node_token.is_some() {
+        info!(worker = %registration.name, "Received node token from manager");
+    }
+    credentials.store_node_token(reply.node_token);
 
     Ok(())
 }
@@ -349,10 +411,14 @@ async fn register_self(
 async fn pre_register_self(
     client: ManagerClient<Channel>,
     worker_type: String,
+    credentials: &Arc<WorkerCredentials>,
 ) -> R<Response<WorkerPreRegisterReply>> {
     let mut c2 = client.clone();
 
-    let req = tonic::Request::new(WorkerPreRegisterRequest { worker_type });
+    let req = tonic::Request::new(WorkerPreRegisterRequest {
+        worker_type,
+        join_token: credentials.join_secret.clone(),
+    });
 
     let response = c2.worker_pre_register(req).await?;
 

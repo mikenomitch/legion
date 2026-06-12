@@ -12,6 +12,7 @@ pub mod ledger;
 pub mod login;
 pub mod mcp;
 pub mod node;
+pub mod oidc;
 pub mod output;
 pub mod raft;
 pub mod start;

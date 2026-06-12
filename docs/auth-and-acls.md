@@ -80,10 +80,19 @@ Jsonnet (either a bare rules array or `{description, rules}`).
 
 Opaque secrets (`lgn_…`); the manager stores only a SHA-256 hash. Each token
 has a public **accessor ID** (safe to log; used for revocation), a type
-(`management` = full access, `client` = policy-scoped), attached policy
-names, and an optional expiry. Create/inspect/revoke with
-`legion acl token create|list|delete`. Only a management token can create
-another management token.
+(`management` = full access, `client` = policy-scoped, `worker` = node
+credential), attached policy names, and an optional expiry. Create/inspect/
+revoke with `legion acl token create|list|delete`. Only a management token
+can create another management token.
+
+Lifetime bounds: set `acl: { tokenMaxTtl: "720h" }` to require every client
+token (created or login-minted) to expire within the bound; management
+tokens are exempt. Expired ACL and join tokens are rejected at
+authentication time and pruned hourly.
+
+For infrastructure-as-code, `legion acl bootstrap --secret <value>` (min 24
+chars) pre-seeds the initial management token instead of generating a random
+one.
 
 Clients send the secret as a bearer credential. Precedence for the CLI:
 `LEGION_TOKEN` env var, then `~/.legion/token` (written by `legion login`,
@@ -108,16 +117,25 @@ Built-in methods:
   either present the externally issued JWT directly as the bearer credential
   (validated on every request) or exchange it once:
   `legion login --method corp-oidc --jwt-file token.jwt`.
-- **General SSO**: any OIDC IdP works via the `oidc` method type — Legion
-  discovers the JWKS from the issuer and validates ID tokens; binding rules
-  map claims (for example `groups`) onto policies. The browser-redirect login
-  flow is on the roadmap; today the UI/CLI accept the IdP-issued token
-  directly.
+- **Single sign-on (browser flow)**: for `oidc` methods with an
+  `oidcClientId` configured, `legion login --method corp-oidc` opens the
+  browser for the standard authorization-code + PKCE flow (loopback callback
+  on `127.0.0.1:4749`, override with `--callback-port`; register
+  `http://127.0.0.1:4749/oidc/callback` as a redirect URI at the IdP). The UI
+  Access page offers the same as a "Continue with <method>" button (redirect
+  URI `<ui origin>/oidc/callback`). Binding rules map verified claims (for
+  example `groups`) onto policies.
+- **Webhook**: `type: "webhook"` delegates verification to your own HTTP
+  endpoint — the recommended way to integrate LDAP, SAML bridges, or bespoke
+  identity systems in any language. Legion POSTs
+  `{"method", "username", "password", "jwt"}` and expects
+  `{"principal": "...", "policies": ["..."]}` on HTTP 200 (401 = bad
+  credentials, 403 = verified but denied). Login-only; webhooks are never on
+  the per-request hot path.
 
-Custom identity sources can be registered through the same interface when
-embedding Legion as a library (`Authenticator::register_method`); a webhook
-method and a possible `plugins/auth/` category are planned — see
-[docs/plugin-system.md](plugin-system.md) and the roadmap in the plan.
+Custom identity sources can also be registered programmatically through the
+same `AuthMethod` interface when embedding Legion as a library
+(`Authenticator::register_method`) — see [docs/plugin-system.md](plugin-system.md).
 
 ```jsonnet
 acl: {
@@ -151,12 +169,56 @@ Two ramps for enabling ACLs on a live cluster without breaking anyone:
    requests with no credential. Grant it temporary read access while tokens
    are distributed, then delete it.
 
-### Worker nodes
+### Worker nodes: join tokens and node tokens
 
-Worker-plane endpoints (`WorkerPreRegister`, `WorkerRegister`, `Heartbeat`,
-`HealthCheck`) are exempt from token checks in v1, so enabling ACLs never
-severs running workers. Per-node credentials and mTLS are tracked in the
-plan's Phase 3.
+Introducing a worker is two commands:
+
+```bash
+# On the manager (or any host with node:write access):
+legion join-token create --type default --ttl 24h
+# On the worker host (paste the printed token):
+legion join lgnjoin_...
+```
+
+The join token is a self-describing composite — manager address, worker type,
+and a random secret — so the worker needs no other configuration. The manager
+stores only a hash of the secret; list and revoke with
+`legion join-token list|delete` or from the UI's Access → Worker Join tab.
+Set `server.advertiseAddr` when workers reach the manager at a different
+address than it binds.
+
+Workers declare their attributes through their worker type's template
+(pool, attributes, resources from `workerConfigPath`) plus worker-side
+fingerprinting; the join token pins which template applies.
+
+When ACLs are enforced:
+
+- `WorkerPreRegister`/`WorkerRegister` require a valid join secret.
+- Registration mints a per-node **worker token** (returned in the reply) that
+  the worker attaches to `Heartbeat`/`HealthCheck`. Node tokens grant nothing
+  on the user-facing API.
+- Re-registering rotates the node token; on an `Unauthenticated` heartbeat a
+  worker automatically re-registers using its join secret.
+- In `auditOnly` mode, workers without join tokens are admitted but logged —
+  the migration ramp for fleets that predate ACLs: enable audit mode, restart
+  workers onto join tokens at your own pace, then enforce.
+
+mTLS for the worker plane remains on the roadmap (the listener-level TLS
+below already covers transport encryption).
+
+### TLS
+
+The manager listener serves TLS when configured:
+
+```jsonnet
+server: {
+  tls: { enabled: true, certPath: "/etc/legion/server.pem", keyPath: "/etc/legion/server.key" },
+},
+```
+
+Clients use `https://` in `LEGION_ADDR` (CA configurable via
+`LEGION_TLS_CA_CERT`). Join tokens minted by a TLS-enabled manager advertise
+an `https://` address automatically.
 
 ### Introspection
 

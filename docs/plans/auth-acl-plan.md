@@ -1,6 +1,8 @@
 # Auth & ACL System Plan
 
-Status: **Phase 1 implemented** (this PR). Phases 2+ are roadmap.
+Status: **Phases 1–4 executed** (see §3 and the per-phase notes in §4 for the
+few deliberately deferred items: dynamic auth-method dylib plugins, worker
+mTLS, workload-identity API credentials, and the token-resolution cache).
 
 Legion needs a best-in-class auth and ACL system: simple enough to enable in
 two commands, flexible enough to scope teams to their own jobs, node pools,
@@ -186,8 +188,29 @@ resolve the token, then pure rule matching). Three planes exist:
 | Plane | Endpoints | Behavior |
 | --- | --- | --- |
 | Protected | everything user-facing | default deny once enabled |
-| Open | `WhoAmI`, `Login`, `BootstrapAcl` | work without credentials (bootstrap is one-shot) |
-| Worker | `WorkerPreRegister`, `WorkerRegister`, `Heartbeat`, `HealthCheck` | exempt in v1 so enabling ACLs never severs running workers (hardening: Phase 3) |
+| Open | `WhoAmI`, `Login`, `BootstrapAcl`, `GetAuthMethods` | work without credentials (bootstrap is one-shot) |
+| Worker | `WorkerPreRegister`, `WorkerRegister`, `Heartbeat`, `HealthCheck` | registration requires a join token; heartbeats/health require the node token minted at registration (audit-only mode admits and logs instead) |
+
+### Worker join (Phase 3 redesign)
+
+The original join tokens were HS512 JWTs signed with a compiled-in constant
+key, minted by an unauthenticated listener on `:4748` — forgeable by anyone
+with the binary, so they authenticated nothing. Both were removed and
+replaced:
+
+- **Join tokens** are now manager-minted stored secrets (`CreateJoinToken`,
+  requires `node:write`; hashed at rest; listable/revocable; default 24h
+  TTL). The printed token is a self-describing composite (advertised manager
+  address + worker type + secret) so `legion join <TOKEN>` stays
+  one-command. Worker attributes keep coming from the worker-type template
+  plus worker-side fingerprinting; the token pins the template.
+- **Node tokens** (`token_type: worker`) are minted per node at registration
+  and returned in `WorkerRegisterReply`; workers attach them to heartbeats
+  and health checks. Re-registering rotates the credential, and a worker
+  that gets `Unauthenticated` on a heartbeat re-registers automatically with
+  its join secret. Node tokens grant nothing on the user-facing API.
+- The in-process worker (`--run-worker`) self-issues a short-lived join
+  token, so single-binary dev clusters keep working with ACLs on.
 
 ### Error semantics
 
@@ -208,7 +231,7 @@ resolve the token, then pure rule matching). Three planes exist:
 
 ---
 
-## 3. What is implemented (Phase 1, this PR)
+## 3. What is implemented (Phase 1)
 
 - **Policy engine** `src/structs/acl.rs`: rules, globs, scopes, default-deny
   evaluation, deny-wins, list-gating semantics; exhaustively unit-tested.
@@ -248,60 +271,64 @@ resolve the token, then pure rule matching). Three planes exist:
   mode, login flow, escalation guard). Plus unit tests across the three new
   modules.
 
-## 4. Roadmap
+## 4. Phase status
 
-### Phase 2 — Interactive SSO & richer admin
-- **Auth method extensibility** (the plugin path; see also
-  docs/plugin-system.md):
-  1. A built-in `webhook` method type — POST the credential to an
-     operator-supplied endpoint, receive `{principal, policies}`. One more
-     `AuthMethod` implementation; keeps custom auth code behind a
-     process/network trust boundary and works in any language.
-  2. Only if demand emerges, a dynamic `plugins/auth/<name>/` category
-     exporting `get() -> Box<dyn AuthMethod>` like the other plugin kinds.
-     Deliberately last: auth plugins run in-process in the manager and
-     decide cluster admission, so the failure domain is total compromise —
-     unlike a task or scheduling plugin. Invariants that stay in core under
-     any mechanism: methods yield policy *names* only (never management
-     access), and token minting/secret hashing/policy evaluation never move
-     into a method. The trait is already transport-agnostic (`AuthError`
-     instead of gRPC types) to keep this door open.
-- `legion login --method <oidc>` browser flow: authorization-code + PKCE with
-  a loopback callback (Nomad/Vault pattern), and a device-code fallback for
-  headless hosts. (Today OIDC works by presenting/exchanging an IdP-issued
-  JWT; the UI can run its own PKCE flow against the IdP and paste/exchange
-  the ID token.)
-- UI: ACL admin pages (policies/tokens/users CRUD) and an optional login
-  redirect when anonymous access is denied.
-- Roles (named policy bundles) if policy lists on tokens get unwieldy;
-  Vault-style policy templating (`${identity.name}`) to avoid per-user
-  policies.
-- Token lifecycle: server-enforced min/max TTL bounds, expired-token pruning,
-  `legion acl token self`-style introspection of other tokens.
+### Phase 2 — Interactive SSO & richer admin: **executed**
+- **Webhook auth method** (`type: "webhook"`, `webhookUrl`,
+  `webhookBearer`): POSTs the login credentials to an operator-supplied
+  endpoint and maps `{principal, policies}` back. Login-only by design (a
+  per-request network call would put the webhook on every RPC's hot path).
+  The `AuthMethod::login` trait method became async (`BoxFuture`) to support
+  it.
+- **OIDC browser login**: `legion login --method <oidc>` runs
+  authorization-code + PKCE against the IdP's discovered endpoints with a
+  loopback callback (`127.0.0.1:4749`, `--callback-port` to change), then
+  exchanges the ID token via `Login`. The UI runs the same flow from the
+  Access page ("Continue with <method>", callback route `/oidc/callback`).
+  Public method metadata comes from the new open `GetAuthMethods` RPC
+  (`oidcClientId`/`oidcScopes` config). Device-code fallback for headless
+  hosts remains future work (use `--jwt-file` there today).
+- **UI admin**: the Access page grew tabs — Identity & Login, Policies,
+  Tokens, Users, Worker Join — full CRUD with one-time secret reveals, plus
+  a dismissable "you are browsing anonymously — log in" banner when ACLs are
+  enabled and no credential is present.
+- **Token lifecycle**: `acl.tokenMaxTtl` bounds client-token lifetimes
+  (CreateAclToken rejects, Login clamps; management exempt); expired ACL and
+  join tokens are pruned hourly.
+- *Deferred*: roles (policy bundles) and policy templating — policy lists on
+  tokens have not gotten unwieldy yet; dynamic `plugins/auth/` dylib loading
+  stays held back in favor of the webhook method (rationale in
+  docs/plugin-system.md; the trait is transport-agnostic so the door stays
+  open).
 
-### Phase 3 — Worker-plane hardening
-- Validate join tokens on `WorkerPreRegister`/`WorkerRegister`; mint a
-  per-node credential at registration that workers attach to heartbeats;
-  rotate via the existing workload-identity signing infrastructure.
-- Re-enable TLS/mTLS on the manager listener (certs.rs groundwork exists);
-  consider requiring `operator:write` for `GetJoinToken` on the insecure
-  listener when ACLs are enabled.
-- Per-allocation workload identity tokens as first-class API credentials
-  (bound to the `job` scope of their own job).
+### Phase 3 — Worker-plane hardening: **executed** (see §2 "Worker join")
+- Join-token validation on registration, per-node tokens with rotation on
+  re-register, automatic worker re-registration on auth failure, audit-mode
+  ramp, and removal of the forgeable JWT tokens plus the unauthenticated
+  `:4748` bootstrap listener (join tokens now require `node:write`).
+- Manager listener TLS is opt-in via `server.tls {enabled, certPath,
+  keyPath}` (never inferred from files on disk, so a stray dev cert cannot
+  flip the listener to https).
+- *Deferred*: worker-plane mTLS client certificates, and per-allocation
+  workload-identity tokens as API credentials — the latter belongs to the
+  workload-identity plan (its issuer is not yet wired to issue tokens to
+  allocations; once it is, a `JwtAuthMethod` against Legion's own JWKS plus
+  job-scoped binding rules is the intended shape).
 
-### Phase 4 — Operations at scale
-- Token→policy resolution cache with explicit TTL + push invalidation on
-  token/policy deletion (only needed if per-request SQLite lookups show up in
-  profiles; they are indexed point reads today).
-- Replicate ACL state through the Raft persistence layer alongside the rest
-  of the store (it already lives in the same SQLite file, so this falls out
-  of the multi-raft persistence plan).
-- Audit sink: ship `acl_audit` events through the observability pipeline;
-  optional bootstrap pre-seeding (`--bootstrap-token`) for IaC.
-- Namespaces: when jobs grow real namespaces, `AclScope::job` starts carrying
-  them; the `namespaces` rule selector already works (everything is
-  `default` today). Consider label-selector scoping (the most-requested
-  Nomad gap).
+### Phase 4 — Operations at scale: **executed where warranted**
+- Bootstrap pre-seeding for IaC: `BootstrapAcl.secret` /
+  `legion acl bootstrap --secret` (min 24 chars).
+- Expired-credential pruning loop (hourly) on the manager.
+- Audit sink: `acl_audit` denial events are tracing events, so they already
+  flow through the observability pipeline when `--o11y` is enabled.
+- ACL/join state lives in the same SQLite store as everything else, so Raft
+  replication falls out of the multi-raft persistence plan; nothing
+  ACL-specific to do.
+- *Deferred on evidence*: the token→policy resolution cache — per-request
+  lookups are indexed point reads; add the cache (with push invalidation on
+  token/policy deletion) only if profiles show it. Namespaces/label-selector
+  scoping still waits on jobs growing namespaces/labels; the `namespaces`
+  rule selector already works against the implicit `default`.
 
 ### Non-goals
 - External policy engines (OPA/SpiceDB/Cedar) in the authorization fast

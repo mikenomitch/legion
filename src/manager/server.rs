@@ -43,12 +43,15 @@ use crate::structs::{
     WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest,
 };
 use crate::structs::{
-    BootstrapAclReply, BootstrapAclRequest, CreateAclTokenReply, CreateAclTokenRequest,
-    DeleteAclPolicyReply, DeleteAclPolicyRequest, DeleteAclTokenReply, DeleteAclTokenRequest,
-    DeleteAclUserReply, DeleteAclUserRequest, GetAclPolicyReply, GetAclPolicyRequest,
-    ListAclPoliciesReply, ListAclPoliciesRequest, ListAclTokensReply, ListAclTokensRequest,
-    ListAclUsersReply, ListAclUsersRequest, LoginReply, LoginRequest, UpsertAclPolicyReply,
-    UpsertAclPolicyRequest, UpsertAclUserReply, UpsertAclUserRequest, WhoAmIReply, WhoAmIRequest,
+    AuthMethodInfo, BootstrapAclReply, BootstrapAclRequest, CreateAclTokenReply,
+    CreateAclTokenRequest, CreateJoinTokenReply, CreateJoinTokenRequest, DeleteAclPolicyReply,
+    DeleteAclPolicyRequest, DeleteAclTokenReply, DeleteAclTokenRequest, DeleteAclUserReply,
+    DeleteAclUserRequest, DeleteJoinTokenReply, DeleteJoinTokenRequest, GetAclPolicyReply,
+    GetAclPolicyRequest, GetAuthMethodsReply, GetAuthMethodsRequest, ListAclPoliciesReply,
+    ListAclPoliciesRequest, ListAclTokensReply, ListAclTokensRequest, ListAclUsersReply,
+    ListAclUsersRequest, ListJoinTokensReply, ListJoinTokensRequest, LoginReply, LoginRequest,
+    UpsertAclPolicyReply, UpsertAclPolicyRequest, UpsertAclUserReply, UpsertAclUserRequest,
+    WhoAmIReply, WhoAmIRequest,
 };
 use crate::task_plugins::validate_job_config;
 use crate::tracing_util::{o11y_enabled, read_recent_observability};
@@ -519,6 +522,8 @@ fn build_rollout_launch_config(config: &JobConfig) -> Result<RolloutLaunchConfig
 pub struct ManagerAgentService {
     pub store: Store,
     pub auth: Arc<Authenticator>,
+    /// Externally reachable manager address embedded in join tokens.
+    pub advertise_addr: String,
     allocation_failures: Arc<Mutex<AllocationFailureTracker>>,
 }
 
@@ -532,8 +537,15 @@ impl ManagerAgentService {
         Self {
             store,
             auth,
+            advertise_addr: DEF_MANAGER_ADDRESS.to_string(),
             allocation_failures: Arc::new(Mutex::new(AllocationFailureTracker::default())),
         }
+    }
+
+    /// Sets the address join tokens point workers at.
+    pub fn with_advertise_addr(mut self, advertise_addr: impl Into<String>) -> Self {
+        self.advertise_addr = advertise_addr.into();
+        self
     }
 
     /// Drop-in ACL gate for RPC handlers: authenticates the caller and
@@ -560,6 +572,35 @@ impl ManagerAgentService {
     /// `acl::enforce` once the request body has been parsed.
     fn authenticate_acl<T>(&self, request: &Request<T>) -> Result<AclIdentity, Status> {
         self.auth.authenticate(request.metadata(), &self.store)
+    }
+
+    /// Join gate for worker registration: when ACLs are enforced, callers
+    /// prove membership with a join token secret unless they already hold a
+    /// worker or management credential. Audit-only mode logs failures but
+    /// lets registration proceed (the migration ramp for existing fleets).
+    fn verify_join_for_registration(
+        &self,
+        identity: &AclIdentity,
+        join_token: Option<&str>,
+    ) -> Result<(), Status> {
+        if !self.auth.enabled || identity.is_management || identity.is_worker {
+            return Ok(());
+        }
+        match self.auth.verify_join_secret(&self.store, join_token) {
+            Ok(_) => Ok(()),
+            Err(status) if self.auth.audit_only => {
+                warn!(
+                    target: "acl_audit",
+                    resource = "worker-plane",
+                    action = "register",
+                    enforced = false,
+                    "join token verification failed (audit-only): {}",
+                    status.message()
+                );
+                Ok(())
+            }
+            Err(status) => Err(status),
+        }
     }
 
     /// Scope check against a rollout's job, used by rollout endpoints that
@@ -1408,10 +1449,7 @@ impl Manager for ManagerAgentService {
             .get_submissions_for_config(&config_id)
             .map_err(|e| map_store_error("Error getting submissions", e))?;
 
-        Ok(Response::new(GetJobSpecReply {
-            submissions,
-            ..Default::default()
-        }))
+        Ok(Response::new(GetJobSpecReply { submissions }))
     }
 
     #[instrument(skip_all)]
@@ -1606,9 +1644,10 @@ impl Manager for ManagerAgentService {
         &self,
         request: Request<HeartbeatRequest>,
     ) -> Result<Response<HeartbeatReply>, Status> {
-        // ACL: worker-plane endpoint, exempt from token checks so enabling
-        // ACLs never severs running workers. Worker-plane hardening (mTLS /
-        // per-node credentials) is tracked in docs/plans/auth-acl-plan.md.
+        // ACL: worker-plane endpoint. Requires the node token minted at
+        // registration (or a management token) when ACLs are enforced.
+        let identity = self.authenticate_acl(&request)?;
+        acl::enforce_worker_plane(&identity)?;
         let req = request.into_inner();
         let id = req.id;
 
@@ -1650,7 +1689,9 @@ impl Manager for ManagerAgentService {
         &self,
         request: Request<HealthCheckRequest>,
     ) -> Result<Response<HealthCheckReply>, Status> {
-        // ACL: worker-plane endpoint, exempt (see `heartbeat`).
+        // ACL: worker-plane endpoint (see `heartbeat`).
+        let identity = self.authenticate_acl(&request)?;
+        acl::enforce_worker_plane(&identity)?;
         let req = request.into_inner();
         let id = req.id;
 
@@ -1672,7 +1713,11 @@ impl Manager for ManagerAgentService {
         &self,
         request: Request<WorkerPreRegisterRequest>,
     ) -> Result<Response<WorkerPreRegisterReply>, Status> {
-        // ACL: worker-plane endpoint, exempt (see `heartbeat`).
+        // ACL: worker-plane endpoint. When ACLs are enforced, callers prove
+        // membership with a join token secret (or an already-issued worker /
+        // management bearer credential).
+        let identity = self.authenticate_acl(&request)?;
+        self.verify_join_for_registration(&identity, request.get_ref().join_token.as_deref())?;
         let request = request.into_inner();
         let worker_type = request.worker_type;
 
@@ -1704,9 +1749,13 @@ impl Manager for ManagerAgentService {
         &self,
         request: Request<WorkerRegisterRequest>,
     ) -> Result<Response<WorkerRegisterReply>, Status> {
-        // ACL: worker-plane endpoint, exempt (see `heartbeat`).
+        // ACL: worker-plane endpoint (see `worker_pre_register`). Successful
+        // registration mints (or rotates) the node token used for heartbeats.
+        let identity = self.authenticate_acl(&request)?;
+        self.verify_join_for_registration(&identity, request.get_ref().join_token.as_deref())?;
         let request = request.into_inner();
         let dynamic_attrs = json!({}).to_string();
+        let node_id = request.name.clone();
 
         let node_msg = NodeMsg {
             id: request.name,
@@ -1724,8 +1773,17 @@ impl Manager for ManagerAgentService {
             .insert_node(node_msg)
             .map_err(|e| map_store_error("Error registering worker", e))?;
 
+        let node_token = if self.auth.enabled {
+            let secret = self.auth.mint_node_token(&self.store, &node_id)?;
+            info!(node_id = %node_id, "Minted node token for registered worker");
+            Some(secret)
+        } else {
+            None
+        };
+
         let reply = WorkerRegisterReply {
             message: "Worker registered".into(),
+            node_token,
         };
 
         Ok(Response::new(reply))
@@ -2536,14 +2594,17 @@ impl Manager for ManagerAgentService {
     async fn login(&self, request: Request<LoginRequest>) -> Result<Response<LoginReply>, Status> {
         // ACL: open endpoint; this is how callers obtain credentials.
         let req = request.into_inner();
-        let (token, secret) = self.auth.login(
-            &self.store,
-            &req.method,
-            req.username.as_deref(),
-            req.password.as_deref(),
-            req.jwt.as_deref(),
-            req.ttl.as_deref(),
-        )?;
+        let (token, secret) = self
+            .auth
+            .login(
+                &self.store,
+                &req.method,
+                req.username.as_deref(),
+                req.password.as_deref(),
+                req.jwt.as_deref(),
+                req.ttl.as_deref(),
+            )
+            .await?;
         info!(principal = %token.name, "ACL login succeeded");
         Ok(Response::new(LoginReply {
             token: Some(token),
@@ -2558,8 +2619,8 @@ impl Manager for ManagerAgentService {
     ) -> Result<Response<BootstrapAclReply>, Status> {
         // ACL: open endpoint guarded by its one-shot semantics — it only
         // succeeds while no management token exists.
-        let _ = request;
-        let (token, secret) = self.auth.bootstrap(&self.store)?;
+        let req = request.into_inner();
+        let (token, secret) = self.auth.bootstrap(&self.store, req.secret.as_deref())?;
         info!(accessor_id = %token.accessor_id, "ACL bootstrap: initial management token created");
         Ok(Response::new(BootstrapAclReply {
             token: Some(token),
@@ -2705,7 +2766,7 @@ impl Manager for ManagerAgentService {
             }
         }
 
-        let ttl = req
+        let ttl: Option<Duration> = req
             .ttl
             .as_deref()
             .map(|raw| {
@@ -2714,6 +2775,27 @@ impl Manager for ManagerAgentService {
                     .map_err(|e| Status::invalid_argument(format!("invalid ttl `{raw}`: {e}")))
             })
             .transpose()?;
+        // Server-enforced lifetime bounds: when acl.tokenMaxTtl is set,
+        // client tokens must expire within it (management tokens are exempt).
+        if token_type == "client" {
+            if let Some(max) = self.auth.token_max_ttl {
+                match ttl {
+                    None => {
+                        return Err(Status::invalid_argument(format!(
+                            "client tokens must set a ttl of at most {} (acl.tokenMaxTtl)",
+                            humantime::format_duration(max)
+                        )))
+                    }
+                    Some(requested) if requested > max => {
+                        return Err(Status::invalid_argument(format!(
+                            "requested ttl exceeds acl.tokenMaxTtl ({})",
+                            humantime::format_duration(max)
+                        )))
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
         let (token, secret) =
             self.auth
                 .mint_token(&self.store, &req.name, &token_type, &req.policies, ttl)?;
@@ -2843,6 +2925,111 @@ impl Manager for ManagerAgentService {
             .map_err(|e| map_store_error("Error deleting ACL user", e))?;
         Ok(Response::new(DeleteAclUserReply {
             message: format!("ACL user `{}` deleted", req.username),
+        }))
+    }
+
+    #[instrument(skip_all)]
+    async fn get_auth_methods(
+        &self,
+        request: Request<GetAuthMethodsRequest>,
+    ) -> Result<Response<GetAuthMethodsReply>, Status> {
+        // ACL: open endpoint. Login UIs need the method list before any
+        // credential exists; only public metadata is returned.
+        let _ = request;
+        let methods = self
+            .auth
+            .method_infos()
+            .into_iter()
+            .map(|info| AuthMethodInfo {
+                name: info.name,
+                kind: info.kind,
+                oidc_issuer: info.oidc_issuer,
+                oidc_client_id: info.oidc_client_id,
+                oidc_scopes: info.oidc_scopes,
+            })
+            .collect();
+        Ok(Response::new(GetAuthMethodsReply { methods }))
+    }
+
+    #[instrument(skip_all)]
+    async fn create_join_token(
+        &self,
+        request: Request<CreateJoinTokenRequest>,
+    ) -> Result<Response<CreateJoinTokenReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Node,
+            AclAction::Write,
+            AclScope::none(),
+        )?;
+        let req = request.into_inner();
+        let worker_type = if req.worker_type.trim().is_empty() {
+            "default".to_string()
+        } else {
+            req.worker_type
+        };
+        let ttl = match req.ttl.as_deref() {
+            None => Some(Duration::from_secs(24 * 60 * 60)),
+            Some("none") | Some("0") => None,
+            Some(raw) => Some(
+                raw.parse::<humantime::Duration>()
+                    .map(Into::into)
+                    .map_err(|e| Status::invalid_argument(format!("invalid ttl `{raw}`: {e}")))?,
+            ),
+        };
+        let (info, token) = self.auth.mint_join_token(
+            &self.store,
+            &self.advertise_addr,
+            &worker_type,
+            ttl,
+            &req.description,
+        )?;
+        info!(id = %info.id, worker_type = %info.worker_type, "Join token created");
+        Ok(Response::new(CreateJoinTokenReply {
+            info: Some(info),
+            token,
+        }))
+    }
+
+    #[instrument(skip_all)]
+    async fn list_join_tokens(
+        &self,
+        request: Request<ListJoinTokensRequest>,
+    ) -> Result<Response<ListJoinTokensReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Node,
+            AclAction::Read,
+            AclScope::none(),
+        )?;
+        let tokens = self
+            .store
+            .list_join_tokens()
+            .map_err(|e| map_store_error("Error listing join tokens", e))?
+            .iter()
+            .map(|record| record.to_info())
+            .collect();
+        Ok(Response::new(ListJoinTokensReply { tokens }))
+    }
+
+    #[instrument(skip_all)]
+    async fn delete_join_token(
+        &self,
+        request: Request<DeleteJoinTokenRequest>,
+    ) -> Result<Response<DeleteJoinTokenReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Node,
+            AclAction::Write,
+            AclScope::none(),
+        )?;
+        let req = request.into_inner();
+        self.store
+            .delete_join_token(&req.id)
+            .map_err(|e| map_store_error("Error deleting join token", e))?;
+        info!(id = %req.id, "Join token deleted");
+        Ok(Response::new(DeleteJoinTokenReply {
+            message: format!("join token `{}` deleted", req.id),
         }))
     }
 }

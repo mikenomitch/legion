@@ -256,6 +256,29 @@ service Manager {
   // Tokens previously minted via Login remain valid until they expire or are
   // deleted; deleting the user only prevents future logins.
   rpc DeleteAclUser (DeleteAclUserRequest) returns (DeleteAclUserReply);
+
+  // Lists the auth methods clients may log in with.
+  //
+  // Open endpoint: login UIs need this before any credential exists. Only
+  // public metadata is returned (names, types, OIDC client settings) —
+  // never secrets or validation keys.
+  rpc GetAuthMethods (GetAuthMethodsRequest) returns (GetAuthMethodsReply);
+
+  // Creates a worker join token. Requires `node:write`.
+  //
+  // The reply contains a self-describing composite token (manager address +
+  // secret + worker type) that introduces a worker in one command:
+  // `legion join <TOKEN>`. The manager stores only a hash of the secret.
+  rpc CreateJoinToken (CreateJoinTokenRequest) returns (CreateJoinTokenReply);
+
+  // Lists worker join tokens (metadata only). Requires `node:read`.
+  rpc ListJoinTokens (ListJoinTokensRequest) returns (ListJoinTokensReply);
+
+  // Deletes (revokes) a worker join token by ID. Requires `node:write`.
+  //
+  // Workers already registered keep their node tokens; revocation only
+  // prevents future joins with this token.
+  rpc DeleteJoinToken (DeleteJoinTokenRequest) returns (DeleteJoinTokenReply);
 }
 
 // Request payload for WorkerPreRegister.
@@ -265,6 +288,13 @@ message WorkerPreRegisterRequest {
   // This selects the worker template stored on the manager.
   // No manager-side default is applied by this RPC.
   string worker_type = 1;
+
+  // Join token secret (the `secret` field of a decoded join token).
+  //
+  // Required when ACLs are enforced: the manager validates it against its
+  // stored join tokens before serving worker configuration. Ignored when
+  // ACLs are disabled.
+  optional string join_token = 2;
 }
 
 // Effective worker configuration returned by pre-registration.
@@ -336,6 +366,11 @@ message WorkerRegisterRequest {
   // - `availability = "available"`
   // - `dynamic_attrs = {}`
   // - `last_heartbeat = ""` until first heartbeat
+
+  // Join token secret (the `secret` field of a decoded join token).
+  //
+  // Required when ACLs are enforced. Ignored when ACLs are disabled.
+  optional string join_token = 6;
 }
 
 // Reply payload for WorkerRegister.
@@ -344,6 +379,12 @@ message WorkerRegisterReply {
   //
   // Current manager reply value: `"Worker registered"`.
   string message = 1;
+
+  // Per-node credential for subsequent worker-plane calls (Heartbeat,
+  // HealthCheck). Minted only when ACLs are enforced; re-registering
+  // rotates it (the previous node token is revoked). Workers attach it as
+  // a bearer credential exactly like an ACL token.
+  optional string node_token = 2;
 }
 
 // One submission unit that contributed to a rendered jobspec.
@@ -1818,37 +1859,6 @@ message UpdateNodeDynamicReply {
   optional NodeMsg node = 1;
 }
 
-// === INSECURE MANAGER ===
-
-// InsecureManager exposes bootstrap-only APIs on the insecure listener.
-//
-// This is typically used to issue join tokens before a worker has secure
-// cluster credentials.
-service InsecureManager {
-  // Generates a worker join token (JWT).
-  rpc GetJoinToken (GetJoinTokenRequest) returns (GetJoinTokenReply);
-}
-
-// Request payload for GetJoinToken.
-message GetJoinTokenRequest {
-  // Optional token TTL string (for example: "1h", "30m").
-  //
-  // Unset means no expiry in current manager implementation
-  // (`exp` claim is set to `0` and `skip_expiry_validation=true`).
-  optional string ttl = 1;
-
-  // Optional worker type to embed in token.
-  //
-  // Defaults to "default" when omitted.
-  optional string worker_type = 2;
-}
-
-// Reply payload for GetJoinToken.
-message GetJoinTokenReply {
-  // Signed JWT join token.
-  string token = 1;
-}
-
 // Internal eval queue item.
 message Eval {
   // Eval ID.
@@ -2021,6 +2031,11 @@ message LoginReply {
 
 // Request payload for BootstrapAcl.
 message BootstrapAclRequest {
+  // Optional operator-provided secret for the initial management token
+  // (infrastructure-as-code pre-seeding). Must be at least 24 characters.
+  //
+  // Default when omitted: the manager generates a random secret.
+  optional string secret = 1;
 }
 
 // Reply payload for BootstrapAcl.
@@ -2245,6 +2260,106 @@ message DeleteAclUserRequest {
 
 // Reply payload for DeleteAclUser.
 message DeleteAclUserReply {
+  // Human-readable status message.
+  string message = 1;
+}
+
+// === AUTH METHODS & JOIN TOKENS ===
+
+// Request payload for GetAuthMethods.
+message GetAuthMethodsRequest {
+}
+
+// Public metadata for one auth method (no secrets or keys).
+message AuthMethodInfo {
+  // Method name; pass to Login / `legion login --method <name>`.
+  string name = 1;
+
+  // Method kind: `userpass`, `jwt`, `oidc`, `webhook`, or `custom`.
+  string kind = 2;
+
+  // OIDC issuer URL (oidc kind only). Clients run discovery against it.
+  optional string oidc_issuer = 3;
+
+  // OAuth client ID registered for Legion at the identity provider
+  // (oidc kind only). Required for browser/CLI redirect login.
+  optional string oidc_client_id = 4;
+
+  // OAuth scopes to request (oidc kind only). Default: ["openid"].
+  repeated string oidc_scopes = 5;
+}
+
+// Reply payload for GetAuthMethods.
+message GetAuthMethodsReply {
+  // All registered auth methods, in registration order (userpass first).
+  repeated AuthMethodInfo methods = 1;
+}
+
+// Request payload for CreateJoinToken.
+message CreateJoinTokenRequest {
+  // Worker type the token introduces (selects the worker template).
+  //
+  // Default when empty: "default".
+  string worker_type = 1;
+
+  // Optional lifetime (humantime format, for example "24h").
+  //
+  // Default when omitted: 24h. Pass "none" for a non-expiring token
+  // (discouraged; prefer short-lived tokens).
+  optional string ttl = 2;
+
+  // Free-form description shown in ListJoinTokens (for example "rack 12").
+  string description = 3;
+}
+
+// Metadata describing a join token. Never contains the secret.
+message JoinTokenInfo {
+  // Public identifier; the handle used by DeleteJoinToken.
+  string id = 1;
+
+  // Worker type this token introduces.
+  string worker_type = 2;
+
+  // Free-form description.
+  string description = 3;
+
+  // RFC3339 expiry. Omitted when the token never expires.
+  optional string expires_at = 4;
+
+  // RFC3339 creation timestamp.
+  string created_at = 5;
+}
+
+// Reply payload for CreateJoinToken.
+message CreateJoinTokenReply {
+  // Token metadata.
+  JoinTokenInfo info = 1;
+
+  // The composite join token handed to the worker
+  // (`legion join <TOKEN>`). Base64url-encoded JSON carrying the manager
+  // address, the secret, and the worker type. Returned exactly once; the
+  // manager stores only a hash of the embedded secret.
+  string token = 2;
+}
+
+// Request payload for ListJoinTokens.
+message ListJoinTokensRequest {
+}
+
+// Reply payload for ListJoinTokens.
+message ListJoinTokensReply {
+  // All join tokens (metadata only), newest first.
+  repeated JoinTokenInfo tokens = 1;
+}
+
+// Request payload for DeleteJoinToken.
+message DeleteJoinTokenRequest {
+  // Join token ID to revoke.
+  string id = 1;
+}
+
+// Reply payload for DeleteJoinToken.
+message DeleteJoinTokenReply {
   // Human-readable status message.
   string message = 1;
 }

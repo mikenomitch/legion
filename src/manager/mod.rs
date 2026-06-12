@@ -2,7 +2,6 @@ pub mod acl;
 pub mod agent;
 pub mod auth_method;
 pub mod dispatcher;
-pub mod join_server;
 pub mod rollout;
 pub mod rollout_strategy;
 pub mod scheduler;

@@ -25,13 +25,15 @@
 #![allow(clippy::result_large_err)]
 
 use crate::manager::auth_method::{
-    parse_ttl, AuthMethod, JwtAuthMethod, LoginCredentials, UserpassMethod, VerifiedIdentity,
+    method_from_config, parse_ttl, AuthMethod, LoginCredentials, MethodPublicInfo, UserpassMethod,
+    VerifiedIdentity,
 };
 use crate::prelude::*;
-use crate::storage::acl_store::AclTokenRecord;
+use crate::storage::acl_store::{AclTokenRecord, JoinTokenRecord};
 use crate::storage::store::Store;
 use crate::structs::acl::{AclAction, AclIdentity, AclResource, AclScope, AclSource};
-use crate::structs::{AclConfigFull, AclTokenInfo};
+use crate::structs::token::{JoinToken, JOIN_SECRET_PREFIX};
+use crate::structs::{AclConfigFull, AclTokenInfo, JoinTokenInfo};
 
 pub use crate::manager::auth_method::USERPASS_METHOD;
 
@@ -86,6 +88,9 @@ pub fn verify_password(password: &str, stored_hash: &str) -> bool {
         .is_ok()
 }
 
+/// Token type for per-node worker credentials minted at registration.
+pub const WORKER_TOKEN_TYPE: &str = "worker";
+
 /// The manager's authenticator: ACL mode flags, the registered auth methods,
 /// and token minting. One instance lives for the life of the manager and is
 /// shared by every RPC handler.
@@ -93,6 +98,9 @@ pub struct Authenticator {
     pub enabled: bool,
     pub audit_only: bool,
     pub login_ttl: Duration,
+    /// Upper bound for client-token TTLs (CreateAclToken and Login).
+    /// `None` means unbounded; management tokens are always exempt.
+    pub token_max_ttl: Option<Duration>,
     pub jwks_refresh_interval: Duration,
     methods: Vec<Box<dyn AuthMethod>>,
 }
@@ -114,6 +122,7 @@ impl Authenticator {
             enabled: false,
             audit_only: false,
             login_ttl: DEFAULT_LOGIN_TTL,
+            token_max_ttl: None,
             jwks_refresh_interval: Duration::from_secs(300),
             methods: vec![Box::new(UserpassMethod::new(DEFAULT_LOGIN_TTL))],
         }
@@ -121,20 +130,27 @@ impl Authenticator {
 
     pub fn from_config(config: &AclConfigFull) -> R<Self> {
         let login_ttl = parse_ttl(&config.login_ttl).context("invalid acl.loginTtl")?;
+        let token_max_ttl = config
+            .token_max_ttl
+            .as_deref()
+            .map(parse_ttl)
+            .transpose()
+            .context("invalid acl.tokenMaxTtl")?;
         let jwks_refresh_interval =
             parse_ttl(&config.jwks_refresh_interval).context("invalid acl.jwksRefreshInterval")?;
         let mut authenticator = Authenticator {
             enabled: config.enabled,
             audit_only: config.audit_only,
             login_ttl,
+            token_max_ttl,
             jwks_refresh_interval,
             methods: Vec::new(),
         };
         // The built-in username/password method is always available.
         authenticator.register_method(Box::new(UserpassMethod::new(login_ttl)))?;
         for method_config in &config.auth_methods {
-            let method = JwtAuthMethod::from_config(method_config, login_ttl)?;
-            authenticator.register_method(Box::new(method))?;
+            let method = method_from_config(method_config, login_ttl)?;
+            authenticator.register_method(method)?;
         }
         Ok(authenticator)
     }
@@ -159,6 +175,12 @@ impl Authenticator {
     /// Names of all registered auth methods (always includes `userpass`).
     pub fn method_names(&self) -> Vec<&str> {
         self.methods.iter().map(|m| m.name()).collect()
+    }
+
+    /// Public, secret-free metadata for every registered method (served by
+    /// `GetAuthMethods` for login UIs).
+    pub fn method_infos(&self) -> Vec<MethodPublicInfo> {
+        self.methods.iter().map(|m| m.public_info()).collect()
     }
 
     /// Refreshes remote validation material (JWKS, ...) for every method.
@@ -204,6 +226,7 @@ impl Authenticator {
             principal: "anonymous".into(),
             accessor_id: None,
             is_management: false,
+            is_worker: false,
             policies,
             rules,
             source: AclSource::Anonymous,
@@ -237,6 +260,7 @@ impl Authenticator {
             principal: record.name.clone(),
             accessor_id: Some(record.accessor_id.clone()),
             is_management: record.is_management(),
+            is_worker: record.token_type == WORKER_TOKEN_TYPE,
             policies: record.policies.clone(),
             rules,
             source: AclSource::Token,
@@ -287,6 +311,7 @@ impl Authenticator {
             principal: format!("{method_name}:{}", verified.principal),
             accessor_id: None,
             is_management: false,
+            is_worker: false,
             policies: verified.policies,
             rules,
             source: AclSource::Jwt,
@@ -304,7 +329,7 @@ impl Authenticator {
         policies: &[String],
         ttl: Option<Duration>,
     ) -> Result<(AclTokenInfo, String), Status> {
-        let record = build_token_record(name, token_type, policies, ttl)
+        let record = build_token_record(name, token_type, policies, ttl, None)
             .map_err(|e| Status::internal(format!("failed to build token: {e:#}")))?;
         let (record, secret) = record;
         store
@@ -318,7 +343,7 @@ impl Authenticator {
     ///
     /// Token names are `<method>:<principal>` (for example `userpass:alice`)
     /// so audit logs show both the method and the external identity.
-    pub fn login(
+    pub async fn login(
         &self,
         store: &Store,
         method_name: &str,
@@ -343,6 +368,7 @@ impl Authenticator {
                     jwt,
                 },
             )
+            .await
             .map_err(|e| e.to_status())?;
         let ttl = self.effective_login_ttl(requested_ttl, method.login_token_ttl())?;
         self.mint_token(
@@ -354,26 +380,52 @@ impl Authenticator {
         )
     }
 
-    /// Requested TTLs are capped at the method's configured maximum.
+    /// Requested TTLs are capped at the method's configured maximum and the
+    /// global `acl.tokenMaxTtl` bound.
     fn effective_login_ttl(
         &self,
         requested: Option<&str>,
         cap: Duration,
     ) -> Result<Duration, Status> {
-        match requested {
-            None => Ok(cap),
+        let ttl = match requested {
+            None => cap,
             Some(raw) => {
                 let requested = parse_ttl(raw)
                     .map_err(|e| Status::invalid_argument(format!("invalid ttl: {e:#}")))?;
-                Ok(requested.min(cap))
+                requested.min(cap)
             }
-        }
+        };
+        Ok(match self.token_max_ttl {
+            Some(max) => ttl.min(max),
+            None => ttl,
+        })
     }
 
     /// One-shot creation of the initial management token.
-    pub fn bootstrap(&self, store: &Store) -> Result<(AclTokenInfo, String), Status> {
-        let (record, secret) = build_token_record("bootstrap", "management", &[], None)
-            .map_err(|e| Status::internal(format!("failed to build token: {e:#}")))?;
+    ///
+    /// `provided_secret` supports infrastructure-as-code pre-seeding: when
+    /// given (and at least 24 characters), it becomes the token secret
+    /// instead of a random one.
+    pub fn bootstrap(
+        &self,
+        store: &Store,
+        provided_secret: Option<&str>,
+    ) -> Result<(AclTokenInfo, String), Status> {
+        if let Some(secret) = provided_secret {
+            if secret.len() < 24 {
+                return Err(Status::invalid_argument(
+                    "provided bootstrap secret must be at least 24 characters",
+                ));
+            }
+        }
+        let (record, secret) = build_token_record(
+            "bootstrap",
+            "management",
+            &[],
+            None,
+            provided_secret.map(str::to_string),
+        )
+        .map_err(|e| Status::internal(format!("failed to build token: {e:#}")))?;
         let inserted = store
             .bootstrap_acl_token(&record)
             .map_err(internal_acl_error)?;
@@ -385,6 +437,90 @@ impl Authenticator {
         }
         Ok((record.to_info(), secret))
     }
+
+    /// Mints (or rotates) the per-node worker credential returned by
+    /// `WorkerRegister`. Any previous token for the node is revoked first, so
+    /// re-registering is also how a node credential gets rotated.
+    pub fn mint_node_token(&self, store: &Store, node_id: &str) -> Result<String, Status> {
+        store
+            .delete_node_tokens(node_id)
+            .map_err(internal_acl_error)?;
+        let (_, secret) = self.mint_token(
+            store,
+            &format!("node:{node_id}"),
+            WORKER_TOKEN_TYPE,
+            &[],
+            None,
+        )?;
+        Ok(secret)
+    }
+
+    /// Creates a worker join token: stores the secret hash and returns the
+    /// composite token (`lgnjoin_...`) that introduces a worker in one
+    /// command.
+    pub fn mint_join_token(
+        &self,
+        store: &Store,
+        advertise_addr: &str,
+        worker_type: &str,
+        ttl: Option<Duration>,
+        description: &str,
+    ) -> Result<(JoinTokenInfo, String), Status> {
+        let now = OffsetDateTime::now_utc();
+        let secret = format!("{JOIN_SECRET_PREFIX}{}", random_hex(24));
+        let expires_at = match ttl {
+            Some(ttl) => Some(
+                time::Duration::try_from(ttl)
+                    .ok()
+                    .map(|delta| now + delta)
+                    .and_then(|expiry| expiry.format(&Rfc3339).ok())
+                    .ok_or_else(|| Status::invalid_argument("join token ttl out of range"))?,
+            ),
+            None => None,
+        };
+        let record = JoinTokenRecord {
+            id: random_hex(8),
+            secret_hash: hash_secret(&secret),
+            worker_type: worker_type.to_string(),
+            description: description.to_string(),
+            expires_at,
+            created_at: now
+                .format(&Rfc3339)
+                .map_err(|e| Status::internal(format!("clock error: {e}")))?,
+        };
+        store
+            .insert_join_token(&record)
+            .map_err(internal_acl_error)?;
+        let composite = JoinToken::new(advertise_addr, secret, worker_type)
+            .encode()
+            .map_err(|e| Status::internal(format!("failed to encode join token: {e:#}")))?;
+        Ok((record.to_info(), composite))
+    }
+
+    /// Validates a join secret presented at worker registration. Only called
+    /// when ACLs are enforced.
+    pub fn verify_join_secret(
+        &self,
+        store: &Store,
+        secret: Option<&str>,
+    ) -> Result<JoinTokenRecord, Status> {
+        let secret = secret.filter(|s| !s.trim().is_empty()).ok_or_else(|| {
+            Status::unauthenticated(
+                "worker registration requires a join token when ACLs are enabled; \
+                 create one with `legion join-token create`",
+            )
+        })?;
+        let record = store
+            .get_join_token_by_hash(&hash_secret(secret))
+            .map_err(internal_acl_error)?
+            .ok_or_else(|| Status::unauthenticated("unknown or revoked join token"))?;
+        if record.is_expired(OffsetDateTime::now_utc()) {
+            return Err(Status::unauthenticated(
+                "join token has expired; create a new one with `legion join-token create`",
+            ));
+        }
+        Ok(record)
+    }
 }
 
 /// Builds a token record plus its secret. The secret is returned exactly once
@@ -394,9 +530,10 @@ fn build_token_record(
     token_type: &str,
     policies: &[String],
     ttl: Option<Duration>,
+    provided_secret: Option<String>,
 ) -> R<(AclTokenRecord, String)> {
     let now = OffsetDateTime::now_utc();
-    let secret = format!("{TOKEN_PREFIX}{}", random_hex(32));
+    let secret = provided_secret.unwrap_or_else(|| format!("{TOKEN_PREFIX}{}", random_hex(32)));
     let expires_at = match ttl {
         Some(ttl) => Some((now + time::Duration::try_from(ttl)?).format(&Rfc3339)?),
         None => None,
@@ -411,6 +548,35 @@ fn build_token_record(
         created_at: now.format(&Rfc3339)?,
     };
     Ok((record, secret))
+}
+
+/// Worker-plane gate for `Heartbeat` and `HealthCheck`: requires a node token
+/// (minted at registration) or a management token. Emits an `acl_audit`
+/// denial event like `enforce`.
+pub fn enforce_worker_plane(identity: &AclIdentity) -> Result<(), Status> {
+    if identity.is_management || identity.is_worker {
+        return Ok(());
+    }
+
+    warn!(
+        target: "acl_audit",
+        principal = %identity.principal,
+        accessor_id = identity.accessor_id.as_deref().unwrap_or("-"),
+        source = identity.source.as_str(),
+        resource = "worker-plane",
+        action = "call",
+        enforced = !identity.audit_only,
+        "ACL denial"
+    );
+
+    if identity.audit_only {
+        return Ok(());
+    }
+
+    Err(Status::unauthenticated(
+        "worker-plane endpoints require a node token (returned by WorkerRegister) \
+         or a management token",
+    ))
 }
 
 /// Pulls a bearer credential from `authorization` or `x-legion-token`.
@@ -621,19 +787,41 @@ mod authenticator_test {
     fn management_tokens_bypass_policies() -> R<()> {
         let store = setup_store()?;
         let auth = enabled_authenticator();
-        let (_, secret) = auth.bootstrap(&store).map_err(|s| anyhow!(s.to_string()))?;
+        let (_, secret) = auth
+            .bootstrap(&store, None)
+            .map_err(|s| anyhow!(s.to_string()))?;
         let identity = auth.authenticate(&metadata_with_token(&secret), &store)?;
         assert!(identity.is_management);
         assert!(identity.allows(AclResource::Acl, AclAction::Write, &AclScope::none()));
 
         // Second bootstrap is refused.
-        let again = auth.bootstrap(&store);
+        let again = auth.bootstrap(&store, None);
         assert_eq!(again.unwrap_err().code(), tonic::Code::FailedPrecondition);
         Ok(())
     }
 
     #[test]
-    fn userpass_login_mints_scoped_token() -> R<()> {
+    fn bootstrap_accepts_a_preseeded_secret() -> R<()> {
+        let store = setup_store()?;
+        let auth = enabled_authenticator();
+
+        // Too-short secrets are rejected before any state changes.
+        let short = auth.bootstrap(&store, Some("short"));
+        assert_eq!(short.unwrap_err().code(), tonic::Code::InvalidArgument);
+
+        let provided = "lgn_preseeded_for_iac_0123456789";
+        let (_, secret) = auth
+            .bootstrap(&store, Some(provided))
+            .map_err(|s| anyhow!(s.to_string()))?;
+        assert_eq!(secret, provided);
+
+        let identity = auth.authenticate(&metadata_with_token(provided), &store)?;
+        assert!(identity.is_management);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn userpass_login_mints_scoped_token() -> R<()> {
         let store = setup_store()?;
         let auth = enabled_authenticator();
         store.upsert_acl_policy(
@@ -648,16 +836,20 @@ mod authenticator_test {
         )?;
 
         // Wrong password and unknown user produce the same error.
-        let bad = auth.login(
-            &store,
-            USERPASS_METHOD,
-            Some("alice"),
-            Some("nope"),
-            None,
-            None,
-        );
+        let bad = auth
+            .login(
+                &store,
+                USERPASS_METHOD,
+                Some("alice"),
+                Some("nope"),
+                None,
+                None,
+            )
+            .await;
         assert_eq!(bad.unwrap_err().code(), tonic::Code::Unauthenticated);
-        let unknown = auth.login(&store, USERPASS_METHOD, Some("bob"), Some("x"), None, None);
+        let unknown = auth
+            .login(&store, USERPASS_METHOD, Some("bob"), Some("x"), None, None)
+            .await;
         assert_eq!(unknown.unwrap_err().code(), tonic::Code::Unauthenticated);
 
         let (info, secret) = auth
@@ -669,6 +861,7 @@ mod authenticator_test {
                 None,
                 None,
             )
+            .await
             .map_err(|s| anyhow!(s.to_string()))?;
         assert_eq!(info.name, "userpass:alice");
         assert!(info.expires_at.is_some(), "login tokens must expire");
@@ -676,6 +869,139 @@ mod authenticator_test {
         let identity = auth.authenticate(&metadata_with_token(&secret), &store)?;
         assert!(identity.allows(AclResource::Job, AclAction::Read, &AclScope::any()));
         assert!(!identity.allows(AclResource::Job, AclAction::Write, &AclScope::any()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn login_ttl_is_clamped_by_global_max() -> R<()> {
+        let store = setup_store()?;
+        store.upsert_acl_policy(
+            "readers",
+            "",
+            r#"[{"resources": ["job"], "actions": ["read"]}]"#,
+        )?;
+        store.upsert_acl_user("alice", Some(&hash_password("pw")?), &["readers".into()])?;
+
+        let auth = Authenticator::from_config(
+            &AclConfig {
+                enabled: Some(true),
+                token_max_ttl: Some("1h".into()),
+                ..Default::default()
+            }
+            .with_defaults(),
+        )?;
+
+        // Requesting 100h is clamped to the 1h global bound.
+        let (info, _) = auth
+            .login(
+                &store,
+                USERPASS_METHOD,
+                Some("alice"),
+                Some("pw"),
+                None,
+                Some("100h"),
+            )
+            .await
+            .map_err(|s| anyhow!(s.to_string()))?;
+        let expires =
+            OffsetDateTime::parse(&info.expires_at.expect("login tokens expire"), &Rfc3339)?;
+        let in_two_hours = OffsetDateTime::now_utc() + time::Duration::hours(2);
+        assert!(expires < in_two_hours, "expiry must respect tokenMaxTtl");
+        Ok(())
+    }
+
+    #[test]
+    fn node_tokens_authenticate_as_worker_identities_and_rotate() -> R<()> {
+        let store = setup_store()?;
+        let auth = enabled_authenticator();
+
+        let first = auth
+            .mint_node_token(&store, "worker-a")
+            .map_err(|s| anyhow!(s.to_string()))?;
+        let identity = auth.authenticate(&metadata_with_token(&first), &store)?;
+        assert!(identity.is_worker);
+        assert!(!identity.is_management);
+        assert_eq!(identity.principal, "node:worker-a");
+        // Worker tokens pass the worker plane but grant no API access.
+        assert!(enforce_worker_plane(&identity).is_ok());
+        assert!(!identity.allows(AclResource::Job, AclAction::Read, &AclScope::any()));
+
+        // Re-minting rotates: the old secret stops working.
+        let second = auth
+            .mint_node_token(&store, "worker-a")
+            .map_err(|s| anyhow!(s.to_string()))?;
+        assert!(auth
+            .authenticate(&metadata_with_token(&first), &store)
+            .is_err());
+        assert!(auth
+            .authenticate(&metadata_with_token(&second), &store)
+            .is_ok());
+
+        // Anonymous and plain client identities fail the worker plane.
+        let anonymous = auth.authenticate(&MetadataMap::new(), &store)?;
+        assert_eq!(
+            enforce_worker_plane(&anonymous).unwrap_err().code(),
+            tonic::Code::Unauthenticated
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn join_tokens_mint_and_verify() -> R<()> {
+        let store = setup_store()?;
+        let auth = enabled_authenticator();
+
+        let (info, composite) = auth
+            .mint_join_token(
+                &store,
+                "http://10.0.0.5:4747",
+                "gpu",
+                Some(Duration::from_secs(3600)),
+                "rack 12",
+            )
+            .map_err(|s| anyhow!(s.to_string()))?;
+        assert_eq!(info.worker_type, "gpu");
+        assert!(info.expires_at.is_some());
+
+        // The composite is decodable and carries the advertised address.
+        let decoded = JoinToken::decode(&composite)?;
+        assert_eq!(decoded.addr, "http://10.0.0.5:4747");
+        assert_eq!(decoded.worker_type, "gpu");
+
+        // The embedded secret verifies; garbage and missing secrets do not.
+        let record = auth
+            .verify_join_secret(&store, Some(&decoded.secret))
+            .map_err(|s| anyhow!(s.to_string()))?;
+        assert_eq!(record.id, info.id);
+        assert_eq!(
+            auth.verify_join_secret(&store, Some("ljt_bogus"))
+                .unwrap_err()
+                .code(),
+            tonic::Code::Unauthenticated
+        );
+        assert_eq!(
+            auth.verify_join_secret(&store, None).unwrap_err().code(),
+            tonic::Code::Unauthenticated
+        );
+
+        // Expired join tokens are rejected.
+        let (_, expired_composite) = auth
+            .mint_join_token(&store, "http://x:1", "default", Some(Duration::ZERO), "")
+            .map_err(|s| anyhow!(s.to_string()))?;
+        std::thread::sleep(Duration::from_millis(5));
+        let expired = JoinToken::decode(&expired_composite)?;
+        assert_eq!(
+            auth.verify_join_secret(&store, Some(&expired.secret))
+                .unwrap_err()
+                .code(),
+            tonic::Code::Unauthenticated
+        );
+
+        // Revocation by id.
+        store.delete_join_token(&info.id)?;
+        assert!(auth
+            .verify_join_secret(&store, Some(&decoded.secret))
+            .is_err());
         Ok(())
     }
 
@@ -792,8 +1118,8 @@ mod authenticator_test {
         Ok(())
     }
 
-    #[test]
-    fn jwt_login_exchanges_for_acl_token() -> R<()> {
+    #[tokio::test]
+    async fn jwt_login_exchanges_for_acl_token() -> R<()> {
         let store = setup_store()?;
         store.upsert_acl_policy("ops", "", r#"[{"resources": ["node"], "actions": ["*"]}]"#)?;
         store.upsert_acl_policy(
@@ -811,6 +1137,7 @@ mod authenticator_test {
 
         let (info, secret) = auth
             .login(&store, "ci", None, None, Some(&token), None)
+            .await
             .map_err(|s| anyhow!(s.to_string()))?;
         assert_eq!(info.name, "ci:ci-bot");
         assert!(info.expires_at.is_some());
@@ -830,20 +1157,22 @@ mod authenticator_test {
             "static-test"
         }
 
-        fn login(
-            &self,
-            _store: &Store,
-            credentials: LoginCredentials<'_>,
-        ) -> Result<VerifiedIdentity, AuthError> {
-            if credentials.password == Some("letmein") {
-                Ok(VerifiedIdentity {
-                    principal: "robot".into(),
-                    policies: vec!["readers".into()],
-                    expires_at: None,
-                })
-            } else {
-                Err(AuthError::InvalidCredentials("bad static secret".into()))
-            }
+        fn login<'a>(
+            &'a self,
+            _store: &'a Store,
+            credentials: LoginCredentials<'a>,
+        ) -> futures::future::BoxFuture<'a, Result<VerifiedIdentity, AuthError>> {
+            Box::pin(async move {
+                if credentials.password == Some("letmein") {
+                    Ok(VerifiedIdentity {
+                        principal: "robot".into(),
+                        policies: vec!["readers".into()],
+                        expires_at: None,
+                    })
+                } else {
+                    Err(AuthError::InvalidCredentials("bad static secret".into()))
+                }
+            })
         }
 
         fn login_token_ttl(&self) -> Duration {
@@ -851,8 +1180,8 @@ mod authenticator_test {
         }
     }
 
-    #[test]
-    fn custom_auth_methods_can_be_registered() -> R<()> {
+    #[tokio::test]
+    async fn custom_auth_methods_can_be_registered() -> R<()> {
         let store = setup_store()?;
         store.upsert_acl_policy(
             "readers",
@@ -863,6 +1192,11 @@ mod authenticator_test {
         let mut auth = enabled_authenticator();
         auth.register_method(Box::new(StaticTestMethod))?;
         assert!(auth.method_names().contains(&"static-test"));
+        // Unspecialized methods surface as `custom` in login UIs.
+        assert!(auth
+            .method_infos()
+            .iter()
+            .any(|info| info.name == "static-test" && info.kind == "custom"));
 
         // Duplicate names are rejected (userpass is pre-registered).
         assert!(auth.register_method(Box::new(StaticTestMethod)).is_err());
@@ -870,11 +1204,14 @@ mod authenticator_test {
             .register_method(Box::new(UserpassMethod::new(Duration::from_secs(1))))
             .is_err());
 
-        let bad = auth.login(&store, "static-test", None, Some("wrong"), None, None);
+        let bad = auth
+            .login(&store, "static-test", None, Some("wrong"), None, None)
+            .await;
         assert_eq!(bad.unwrap_err().code(), tonic::Code::Unauthenticated);
 
         let (info, secret) = auth
             .login(&store, "static-test", None, Some("letmein"), None, None)
+            .await
             .map_err(|s| anyhow!(s.to_string()))?;
         assert_eq!(info.name, "static-test:robot");
 

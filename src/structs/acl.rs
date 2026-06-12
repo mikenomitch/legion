@@ -356,6 +356,10 @@ pub struct AclIdentity {
     pub accessor_id: Option<String>,
     /// True for management tokens and when ACLs are disabled.
     pub is_management: bool,
+    /// True for per-node worker tokens minted at registration. Worker
+    /// identities may call worker-plane endpoints (heartbeats, health) but
+    /// carry no policies for the user-facing API.
+    pub is_worker: bool,
     /// Names of the policies attached to this identity.
     pub policies: Vec<String>,
     /// Flattened rules from all attached policies.
@@ -375,6 +379,7 @@ impl AclIdentity {
             principal: "acl-disabled".into(),
             accessor_id: None,
             is_management: true,
+            is_worker: false,
             policies: Vec::new(),
             rules: Vec::new(),
             source: AclSource::Disabled,
@@ -693,6 +698,7 @@ mod acl_rules_test {
             principal: "anonymous".into(),
             accessor_id: None,
             is_management: false,
+            is_worker: false,
             policies: Vec::new(),
             rules: Vec::new(),
             source: AclSource::Anonymous,

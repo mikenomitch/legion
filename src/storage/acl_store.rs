@@ -55,6 +55,41 @@ impl AclTokenRecord {
     }
 }
 
+/// Full join token row, including the secret hash. Never leaves the manager.
+#[derive(Debug, Clone)]
+pub struct JoinTokenRecord {
+    pub id: String,
+    pub secret_hash: String,
+    pub worker_type: String,
+    pub description: String,
+    pub expires_at: Option<String>,
+    pub created_at: String,
+}
+
+impl JoinTokenRecord {
+    pub fn to_info(&self) -> crate::structs::JoinTokenInfo {
+        crate::structs::JoinTokenInfo {
+            id: self.id.clone(),
+            worker_type: self.worker_type.clone(),
+            description: self.description.clone(),
+            expires_at: self.expires_at.clone(),
+            created_at: self.created_at.clone(),
+        }
+    }
+
+    /// True when the token has an expiry in the past.
+    pub fn is_expired(&self, now: OffsetDateTime) -> bool {
+        match &self.expires_at {
+            None => false,
+            Some(raw) => match OffsetDateTime::parse(raw, &Rfc3339) {
+                Ok(expiry) => expiry <= now,
+                // Unparseable expiry fails closed.
+                Err(_) => true,
+            },
+        }
+    }
+}
+
 /// Full ACL user row, including the password hash. Never leaves the manager.
 #[derive(Debug, Clone)]
 pub struct AclUserRecord {
@@ -318,6 +353,107 @@ impl Store {
         .map_err(Into::into)
     }
 
+    fn join_token_from_row(row: &Row<'_>) -> rusqlite::Result<JoinTokenRecord> {
+        Ok(JoinTokenRecord {
+            id: row.get(0)?,
+            secret_hash: row.get(1)?,
+            worker_type: row.get(2)?,
+            description: row.get(3)?,
+            expires_at: row.get(4)?,
+            created_at: row.get(5)?,
+        })
+    }
+
+    const JOIN_TOKEN_COLUMNS: &'static str =
+        "id, secret_hash, worker_type, description, expires_at, created_at";
+
+    #[instrument(err, skip_all, fields(id = record.id, worker_type = record.worker_type))]
+    pub fn insert_join_token(&self, record: &JoinTokenRecord) -> R<()> {
+        let conn = self.write_connection()?;
+        conn.execute(
+            "INSERT INTO join_token (id, secret_hash, worker_type, description, expires_at, created_at)
+             VALUES (:id, :secret_hash, :worker_type, :description, :expires_at, :created_at);",
+            named_params! {
+                ":id": record.id,
+                ":secret_hash": record.secret_hash,
+                ":worker_type": record.worker_type,
+                ":description": record.description,
+                ":expires_at": record.expires_at,
+                ":created_at": record.created_at,
+            },
+        )?;
+        Ok(())
+    }
+
+    /// Resolves a presented join secret to its record via SHA-256 hash.
+    pub fn get_join_token_by_hash(&self, secret_hash: &str) -> R<Option<JoinTokenRecord>> {
+        let conn = self.read_connection()?;
+        conn.query_row(
+            &format!(
+                "SELECT {} FROM join_token WHERE secret_hash = ?;",
+                Self::JOIN_TOKEN_COLUMNS
+            ),
+            [secret_hash],
+            Self::join_token_from_row,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn list_join_tokens(&self) -> R<Vec<JoinTokenRecord>> {
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM join_token ORDER BY created_at DESC, id ASC;",
+            Self::JOIN_TOKEN_COLUMNS
+        ))?;
+        let rows = stmt.query_map([], Self::join_token_from_row)?;
+        Self::collect_rows(rows)
+    }
+
+    #[instrument(err, skip_all, fields(id))]
+    pub fn delete_join_token(&self, id: &str) -> R<()> {
+        let conn = self.write_connection()?;
+        let deleted = conn.execute("DELETE FROM join_token WHERE id = ?;", [id])?;
+        if deleted == 0 {
+            return Err(anyhow::Error::new(StorageError::not_found(
+                "join_token",
+                id,
+            )));
+        }
+        Ok(())
+    }
+
+    /// Deletes expired ACL tokens and join tokens; returns counts removed.
+    ///
+    /// Expired credentials are already rejected at authentication time; this
+    /// keeps the tables (and `legion acl token list`) tidy.
+    #[instrument(err, skip_all)]
+    pub fn prune_expired_credentials(&self) -> R<(usize, usize)> {
+        let now = OffsetDateTime::now_utc().format(&Rfc3339)?;
+        let conn = self.write_connection()?;
+        let acl_tokens = conn.execute(
+            "DELETE FROM acl_token WHERE expires_at IS NOT NULL AND expires_at <= ?;",
+            [&now],
+        )?;
+        let join_tokens = conn.execute(
+            "DELETE FROM join_token WHERE expires_at IS NOT NULL AND expires_at <= ?;",
+            [&now],
+        )?;
+        Ok((acl_tokens, join_tokens))
+    }
+
+    /// Revokes any node tokens previously minted for `node_id` (used to
+    /// rotate the credential when a worker re-registers).
+    pub fn delete_node_tokens(&self, node_id: &str) -> R<usize> {
+        let conn = self.write_connection()?;
+        let deleted = conn.execute(
+            "DELETE FROM acl_token WHERE token_type = 'worker' AND name = ?;",
+            [&format!("node:{node_id}")],
+        )?;
+        Ok(deleted)
+    }
+
     fn acl_user_from_row(row: &Row<'_>) -> rusqlite::Result<AclUserRecord> {
         Ok(AclUserRecord {
             username: row.get(0)?,
@@ -563,6 +699,74 @@ mod acl_store_test {
         store.delete_acl_user("alice")?;
         assert!(store.get_acl_user("alice")?.is_none());
         assert!(store.delete_acl_user("alice").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn join_token_crud_and_pruning() -> R<()> {
+        let store = setup_store()?;
+        let record = JoinTokenRecord {
+            id: "jt-1".into(),
+            secret_hash: "hash-jt-1".into(),
+            worker_type: "gpu".into(),
+            description: "rack 12".into(),
+            expires_at: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+        };
+        store.insert_join_token(&record)?;
+
+        let found = store
+            .get_join_token_by_hash("hash-jt-1")?
+            .expect("join token resolves by hash");
+        assert_eq!(found.worker_type, "gpu");
+        assert!(!found.is_expired(OffsetDateTime::now_utc()));
+        assert_eq!(store.list_join_tokens()?.len(), 1);
+
+        // An expired token is pruned; unexpired ones survive.
+        store.insert_join_token(&JoinTokenRecord {
+            id: "jt-2".into(),
+            secret_hash: "hash-jt-2".into(),
+            worker_type: "default".into(),
+            description: String::new(),
+            expires_at: Some("2020-01-01T00:00:00Z".into()),
+            created_at: "2020-01-01T00:00:00Z".into(),
+        })?;
+        let (acl_pruned, join_pruned) = store.prune_expired_credentials()?;
+        assert_eq!((acl_pruned, join_pruned), (0, 1));
+        assert!(store.get_join_token_by_hash("hash-jt-2")?.is_none());
+
+        store.delete_join_token("jt-1")?;
+        assert!(store.delete_join_token("jt-1").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn prune_removes_expired_acl_tokens() -> R<()> {
+        let store = setup_store()?;
+        let mut expired = token_record("expired", "client");
+        expired.expires_at = Some("2020-01-01T00:00:00Z".into());
+        store.insert_acl_token(&expired)?;
+        store.insert_acl_token(&token_record("fresh", "client"))?;
+
+        let (acl_pruned, _) = store.prune_expired_credentials()?;
+        assert_eq!(acl_pruned, 1);
+        assert_eq!(store.list_acl_tokens()?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn node_token_rotation_deletes_by_node_name() -> R<()> {
+        let store = setup_store()?;
+        let mut node_token = token_record("nt-1", "worker");
+        node_token.name = "node:worker-a".into();
+        store.insert_acl_token(&node_token)?;
+        let mut other = token_record("nt-2", "worker");
+        other.name = "node:worker-b".into();
+        store.insert_acl_token(&other)?;
+
+        assert_eq!(store.delete_node_tokens("worker-a")?, 1);
+        assert_eq!(store.list_acl_tokens()?.len(), 1);
+        assert_eq!(store.delete_node_tokens("worker-a")?, 0);
         Ok(())
     }
 

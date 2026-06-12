@@ -4421,6 +4421,7 @@ mod tests {
                 host: "127.0.0.1".into(),
                 port: 1234,
                 insecure_port: 4321,
+                ..Default::default()
             },
             store_path: "tests/store".into(),
             worker_config_path: "configs/workers".into(),

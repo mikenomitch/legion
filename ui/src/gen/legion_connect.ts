@@ -3,7 +3,7 @@
 /* eslint-disable */
 // @ts-nocheck
 
-import { AcquireKvLockReply, AcquireKvLockRequest, AdvanceRolloutReply, AdvanceRolloutRequest, BootstrapAclReply, BootstrapAclRequest, CreateAclTokenReply, CreateAclTokenRequest, DeleteAclPolicyReply, DeleteAclPolicyRequest, DeleteAclTokenReply, DeleteAclTokenRequest, DeleteAclUserReply, DeleteAclUserRequest, DeleteKvReply, DeleteKvRequest, DeleteSavedStateQueryReply, DeleteSavedStateQueryRequest, DestroyJobReply, DestroyJobRequest, GetAclPolicyReply, GetAclPolicyRequest, GetJobInfoReply, GetJobInfoRequest, GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest, GetJoinTokenReply, GetJoinTokenRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest, GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest, GetObservabilityReply, GetObservabilityRequest, GetRaftJoinTokenReply, GetRaftJoinTokenRequest, GetRaftStatusReply, GetRaftStatusRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest, GetStateStoreSchemaReply, GetStateStoreSchemaRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, IssueRaftCommandReply, IssueRaftCommandRequest, ListAclPoliciesReply, ListAclPoliciesRequest, ListAclTokensReply, ListAclTokensRequest, ListAclUsersReply, ListAclUsersRequest, ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobsReply, ListJobsRequest, ListKvReply, ListKvRequest, ListRaftHistoryReply, ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply, ListRolloutsRequest, ListSavedStateQueriesReply, ListSavedStateQueriesRequest, LoginReply, LoginRequest, PatchKvReply, PatchKvRequest, PlanJobReply, PlanJobRequest, PostWorkReply, PostWorkRequest, PutKvReply, PutKvRequest, QueryStateStoreReply, QueryStateStoreRequest, ReleaseKvLockReply, ReleaseKvLockRequest, RenewKvLockReply, RenewKvLockRequest, RestartWorkerReply, RestartWorkerRequest, RunJobReply, RunJobRequest, StopJobReply, StopJobRequest, StopRolloutReply, StopRolloutRequest, UpdateNodeDynamicReply, UpdateNodeDynamicRequest, UpsertAclPolicyReply, UpsertAclPolicyRequest, UpsertAclUserReply, UpsertAclUserRequest, UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest, WhoAmIReply, WhoAmIRequest, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest } from "./legion_pb.js";
+import { AcquireKvLockReply, AcquireKvLockRequest, AdvanceRolloutReply, AdvanceRolloutRequest, BootstrapAclReply, BootstrapAclRequest, CreateAclTokenReply, CreateAclTokenRequest, CreateJoinTokenReply, CreateJoinTokenRequest, DeleteAclPolicyReply, DeleteAclPolicyRequest, DeleteAclTokenReply, DeleteAclTokenRequest, DeleteAclUserReply, DeleteAclUserRequest, DeleteJoinTokenReply, DeleteJoinTokenRequest, DeleteKvReply, DeleteKvRequest, DeleteSavedStateQueryReply, DeleteSavedStateQueryRequest, DestroyJobReply, DestroyJobRequest, GetAclPolicyReply, GetAclPolicyRequest, GetAuthMethodsReply, GetAuthMethodsRequest, GetJobInfoReply, GetJobInfoRequest, GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest, GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest, GetObservabilityReply, GetObservabilityRequest, GetRaftJoinTokenReply, GetRaftJoinTokenRequest, GetRaftStatusReply, GetRaftStatusRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest, GetStateStoreSchemaReply, GetStateStoreSchemaRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, IssueRaftCommandReply, IssueRaftCommandRequest, ListAclPoliciesReply, ListAclPoliciesRequest, ListAclTokensReply, ListAclTokensRequest, ListAclUsersReply, ListAclUsersRequest, ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobsReply, ListJobsRequest, ListJoinTokensReply, ListJoinTokensRequest, ListKvReply, ListKvRequest, ListRaftHistoryReply, ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply, ListRolloutsRequest, ListSavedStateQueriesReply, ListSavedStateQueriesRequest, LoginReply, LoginRequest, PatchKvReply, PatchKvRequest, PlanJobReply, PlanJobRequest, PostWorkReply, PostWorkRequest, PutKvReply, PutKvRequest, QueryStateStoreReply, QueryStateStoreRequest, ReleaseKvLockReply, ReleaseKvLockRequest, RenewKvLockReply, RenewKvLockRequest, RestartWorkerReply, RestartWorkerRequest, RunJobReply, RunJobRequest, StopJobReply, StopJobRequest, StopRolloutReply, StopRolloutRequest, UpdateNodeDynamicReply, UpdateNodeDynamicRequest, UpsertAclPolicyReply, UpsertAclPolicyRequest, UpsertAclUserReply, UpsertAclUserRequest, UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest, WhoAmIReply, WhoAmIRequest, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest } from "./legion_pb.js";
 import { MethodKind } from "@bufbuild/protobuf";
 
 /**
@@ -694,29 +694,59 @@ export const Manager = {
       O: DeleteAclUserReply,
       kind: MethodKind.Unary,
     },
-  }
-} as const;
-
-/**
- * InsecureManager exposes bootstrap-only APIs on the insecure listener.
- *
- * This is typically used to issue join tokens before a worker has secure
- * cluster credentials.
- *
- * @generated from service legion.InsecureManager
- */
-export const InsecureManager = {
-  typeName: "legion.InsecureManager",
-  methods: {
     /**
-     * Generates a worker join token (JWT).
+     * Lists the auth methods clients may log in with.
      *
-     * @generated from rpc legion.InsecureManager.GetJoinToken
+     * Open endpoint: login UIs need this before any credential exists. Only
+     * public metadata is returned (names, types, OIDC client settings) —
+     * never secrets or validation keys.
+     *
+     * @generated from rpc legion.Manager.GetAuthMethods
      */
-    getJoinToken: {
-      name: "GetJoinToken",
-      I: GetJoinTokenRequest,
-      O: GetJoinTokenReply,
+    getAuthMethods: {
+      name: "GetAuthMethods",
+      I: GetAuthMethodsRequest,
+      O: GetAuthMethodsReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Creates a worker join token. Requires `node:write`.
+     *
+     * The reply contains a self-describing composite token (manager address +
+     * secret + worker type) that introduces a worker in one command:
+     * `legion join <TOKEN>`. The manager stores only a hash of the secret.
+     *
+     * @generated from rpc legion.Manager.CreateJoinToken
+     */
+    createJoinToken: {
+      name: "CreateJoinToken",
+      I: CreateJoinTokenRequest,
+      O: CreateJoinTokenReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Lists worker join tokens (metadata only). Requires `node:read`.
+     *
+     * @generated from rpc legion.Manager.ListJoinTokens
+     */
+    listJoinTokens: {
+      name: "ListJoinTokens",
+      I: ListJoinTokensRequest,
+      O: ListJoinTokensReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Deletes (revokes) a worker join token by ID. Requires `node:write`.
+     *
+     * Workers already registered keep their node tokens; revocation only
+     * prevents future joins with this token.
+     *
+     * @generated from rpc legion.Manager.DeleteJoinToken
+     */
+    deleteJoinToken: {
+      name: "DeleteJoinToken",
+      I: DeleteJoinTokenRequest,
+      O: DeleteJoinTokenReply,
       kind: MethodKind.Unary,
     },
   }

@@ -44,14 +44,16 @@ enum Plane {
     Protected(&'static str),
     /// Credential exchange / introspection; must work without a token.
     Open,
-    /// Worker control plane; exempt from token checks so enabling ACLs never
-    /// severs running workers (hardening tracked in the auth/ACL plan).
+    /// Worker control plane: requires a join token (registration) or a node
+    /// token (heartbeats/health) when ACLs are enforced; anonymous callers
+    /// are rejected as Unauthenticated.
     Worker,
 }
 
 struct Fixtures {
     job_config_id: String,
     deletable_token_accessor: String,
+    join_token_id: String,
 }
 
 /// One row per Manager RPC: proto method name, plane, request builder.
@@ -104,6 +106,10 @@ fn endpoint_table() -> Vec<(&'static str, Plane)> {
         ("WhoAmI", Plane::Open),
         ("Login", Plane::Open),
         ("BootstrapAcl", Plane::Open),
+        ("GetAuthMethods", Plane::Open),
+        ("CreateJoinToken", Plane::Protected("node:write")),
+        ("ListJoinTokens", Plane::Protected("node:read")),
+        ("DeleteJoinToken", Plane::Protected("node:write")),
         ("UpsertAclPolicy", Plane::Protected("acl:write")),
         ("GetAclPolicy", Plane::Protected("acl:read")),
         ("ListAclPolicies", Plane::Protected("acl:read")),
@@ -158,6 +164,7 @@ async fn call_endpoint(
             .worker_pre_register(req(
                 WorkerPreRegisterRequest {
                     worker_type: "default".into(),
+                    join_token: None,
                 },
                 token,
             ))
@@ -171,6 +178,7 @@ async fn call_endpoint(
                     config_attrs: "{}".into(),
                     fingerprint_attrs: "{}".into(),
                     health_checks: "[]".into(),
+                    join_token: None,
                 },
                 token,
             ))
@@ -511,7 +519,35 @@ async fn call_endpoint(
             .await
             .map(|_| ()),
         "BootstrapAcl" => svc
-            .bootstrap_acl(req(BootstrapAclRequest {}, token))
+            .bootstrap_acl(req(BootstrapAclRequest { secret: None }, token))
+            .await
+            .map(|_| ()),
+        "GetAuthMethods" => svc
+            .get_auth_methods(req(GetAuthMethodsRequest {}, token))
+            .await
+            .map(|_| ()),
+        "CreateJoinToken" => svc
+            .create_join_token(req(
+                CreateJoinTokenRequest {
+                    worker_type: "default".into(),
+                    ttl: None,
+                    description: "test".into(),
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "ListJoinTokens" => svc
+            .list_join_tokens(req(ListJoinTokensRequest {}, token))
+            .await
+            .map(|_| ()),
+        "DeleteJoinToken" => svc
+            .delete_join_token(req(
+                DeleteJoinTokenRequest {
+                    id: fx.join_token_id.clone(),
+                },
+                token,
+            ))
             .await
             .map(|_| ()),
         "UpsertAclPolicy" => svc
@@ -664,9 +700,22 @@ fn seed_fixtures(store: &Store) -> R<Fixtures> {
         &[FIXTURE_POLICY.to_string()],
     )?;
 
+    // A join token for the DeleteJoinToken builder (inserted directly so the
+    // ACL-disabled setup has one too).
+    let join_token_id = "fixture-join-token".to_string();
+    store.insert_join_token(&legion::storage::acl_store::JoinTokenRecord {
+        id: join_token_id.clone(),
+        secret_hash: "fixture-join-hash".into(),
+        worker_type: "default".into(),
+        description: "fixture".into(),
+        expires_at: None,
+        created_at: "2026-01-01T00:00:00Z".into(),
+    })?;
+
     Ok(Fixtures {
         job_config_id,
         deletable_token_accessor: String::new(),
+        join_token_id,
     })
 }
 
@@ -691,7 +740,7 @@ fn setup_enabled() -> R<(ManagerAgentService, Fixtures, String)> {
     let authenticator = enabled_authenticator();
 
     let (_, management_secret) = authenticator
-        .bootstrap(&store)
+        .bootstrap(&store, None)
         .map_err(|s| anyhow!(s.to_string()))?;
     let (deletable, _) = authenticator
         .mint_token(
@@ -756,7 +805,8 @@ fn every_manager_rpc_is_classified() -> R<()> {
 }
 
 /// With ACLs enabled, anonymous callers are denied on every protected
-/// endpoint and never blocked on open or worker-plane endpoints.
+/// endpoint, rejected as unauthenticated on the worker plane, and never
+/// blocked on open endpoints.
 #[tokio::test]
 async fn anonymous_is_denied_on_every_protected_endpoint() -> R<()> {
     let (svc, fixtures, _) = setup_enabled()?;
@@ -776,7 +826,21 @@ async fn anonymous_is_denied_on_every_protected_endpoint() -> R<()> {
                     status.message(),
                 );
             }
-            Plane::Open | Plane::Worker => {
+            Plane::Worker => {
+                // Without a join token (registration) or node token
+                // (heartbeats), the worker plane rejects anonymous callers.
+                let status = result.expect_err(&format!(
+                    "{method} must reject credential-less workers when ACLs are enabled"
+                ));
+                assert_eq!(
+                    status.code(),
+                    Code::Unauthenticated,
+                    "{method} returned `{}` instead of Unauthenticated: {}",
+                    status.code(),
+                    status.message(),
+                );
+            }
+            Plane::Open => {
                 if let Err(status) = result {
                     // Login may return Unauthenticated for the bogus fixture
                     // credentials — that is its job. Nothing here may return
@@ -789,6 +853,213 @@ async fn anonymous_is_denied_on_every_protected_endpoint() -> R<()> {
                     );
                 }
             }
+        }
+    }
+    Ok(())
+}
+
+/// End-to-end worker join flow with ACLs enforced: a join token admits a
+/// worker, registration mints a node token for heartbeats, re-registration
+/// rotates it, and revoking the join token closes the door.
+#[tokio::test]
+async fn worker_join_flow_with_acls_enabled() -> R<()> {
+    let (svc, _, management_secret) = setup_enabled()?;
+
+    // Operator mints a join token (requires node:write).
+    let created = svc
+        .create_join_token(req(
+            CreateJoinTokenRequest {
+                worker_type: "default".into(),
+                ttl: Some("1h".into()),
+                description: "test rack".into(),
+            },
+            Some(&management_secret),
+        ))
+        .await?
+        .into_inner();
+    let join_token = legion::structs::token::JoinToken::decode(&created.token)?;
+    assert!(!join_token.secret.is_empty());
+
+    // Pre-register fails without the secret, succeeds with it. (The fixture
+    // store has no worker types, so success here is "passed the join gate"
+    // and failed later with NotFound rather than Unauthenticated.)
+    let denied = svc
+        .worker_pre_register(req(
+            WorkerPreRegisterRequest {
+                worker_type: "default".into(),
+                join_token: None,
+            },
+            None,
+        ))
+        .await
+        .expect_err("pre-register without join token must fail");
+    assert_eq!(denied.code(), Code::Unauthenticated);
+    let gated = svc
+        .worker_pre_register(req(
+            WorkerPreRegisterRequest {
+                worker_type: "default".into(),
+                join_token: Some(join_token.secret.clone()),
+            },
+            None,
+        ))
+        .await;
+    if let Err(status) = gated {
+        assert_ne!(status.code(), Code::Unauthenticated, "{}", status.message());
+    }
+
+    // Register with the join secret; the reply carries a node token.
+    let registered = svc
+        .worker_register(req(
+            WorkerRegisterRequest {
+                name: "joined-worker".into(),
+                pool: "default".into(),
+                config_attrs: "{}".into(),
+                fingerprint_attrs: "{}".into(),
+                health_checks: "[]".into(),
+                join_token: Some(join_token.secret.clone()),
+            },
+            None,
+        ))
+        .await?
+        .into_inner();
+    let node_token = registered
+        .node_token
+        .expect("registration mints a node token");
+
+    // Heartbeats require the node token.
+    let denied = svc
+        .heartbeat(req(
+            HeartbeatRequest {
+                id: "joined-worker".into(),
+                ..Default::default()
+            },
+            None,
+        ))
+        .await
+        .expect_err("heartbeat without node token must fail");
+    assert_eq!(denied.code(), Code::Unauthenticated);
+    svc.heartbeat(req(
+        HeartbeatRequest {
+            id: "joined-worker".into(),
+            ..Default::default()
+        },
+        Some(&node_token),
+    ))
+    .await
+    .expect("heartbeat with node token succeeds");
+    svc.health_check(req(
+        HealthCheckRequest {
+            id: "joined-worker".into(),
+            health_checks: "[]".into(),
+        },
+        Some(&node_token),
+    ))
+    .await
+    .expect("health check with node token succeeds");
+
+    // The node token is worker-plane only: no user-facing API access.
+    let status = svc
+        .list_jobs(req(ListJobsRequest::default(), Some(&node_token)))
+        .await
+        .expect_err("node tokens must not grant API access");
+    assert_eq!(status.code(), Code::PermissionDenied);
+
+    // Re-registering rotates the node token; the old one stops working.
+    let re_registered = svc
+        .worker_register(req(
+            WorkerRegisterRequest {
+                name: "joined-worker".into(),
+                pool: "default".into(),
+                config_attrs: "{}".into(),
+                fingerprint_attrs: "{}".into(),
+                health_checks: "[]".into(),
+                join_token: Some(join_token.secret.clone()),
+            },
+            None,
+        ))
+        .await?
+        .into_inner();
+    let rotated = re_registered
+        .node_token
+        .expect("re-registration mints a fresh token");
+    let stale = svc
+        .heartbeat(req(
+            HeartbeatRequest {
+                id: "joined-worker".into(),
+                ..Default::default()
+            },
+            Some(&node_token),
+        ))
+        .await
+        .expect_err("rotated-out node token must be rejected");
+    assert_eq!(stale.code(), Code::Unauthenticated);
+    svc.heartbeat(req(
+        HeartbeatRequest {
+            id: "joined-worker".into(),
+            ..Default::default()
+        },
+        Some(&rotated),
+    ))
+    .await
+    .expect("rotated node token works");
+
+    // Revoking the join token closes the door for future joins.
+    let info = created.info.expect("join token info");
+    svc.delete_join_token(req(
+        DeleteJoinTokenRequest { id: info.id },
+        Some(&management_secret),
+    ))
+    .await?;
+    let closed = svc
+        .worker_register(req(
+            WorkerRegisterRequest {
+                name: "late-worker".into(),
+                pool: "default".into(),
+                config_attrs: "{}".into(),
+                fingerprint_attrs: "{}".into(),
+                health_checks: "[]".into(),
+                join_token: Some(join_token.secret),
+            },
+            None,
+        ))
+        .await
+        .expect_err("revoked join token must be rejected");
+    assert_eq!(closed.code(), Code::Unauthenticated);
+    Ok(())
+}
+
+/// In audit-only mode the worker plane logs but admits credential-less
+/// workers (the migration ramp for fleets that predate ACLs).
+#[tokio::test]
+async fn audit_only_admits_workers_without_join_tokens() -> R<()> {
+    let store = setup_store()?;
+    let fixtures = seed_fixtures(&store)?;
+    let authenticator = Arc::new(
+        Authenticator::from_config(
+            &AclConfig {
+                enabled: Some(true),
+                audit_only: Some(true),
+                ..Default::default()
+            }
+            .with_defaults(),
+        )
+        .expect("authenticator should build"),
+    );
+    let svc = ManagerAgentService::with_acl(store, authenticator);
+
+    for method in [
+        "WorkerPreRegister",
+        "WorkerRegister",
+        "Heartbeat",
+        "HealthCheck",
+    ] {
+        if let Err(status) = call_endpoint(&svc, &fixtures, method, None).await {
+            assert_ne!(
+                status.code(),
+                Code::Unauthenticated,
+                "{method} must not reject workers in audit-only mode: {}",
+                status.message(),
+            );
         }
     }
     Ok(())

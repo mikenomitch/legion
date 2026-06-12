@@ -6,6 +6,7 @@ import { AclBanner } from './components/AclBanner'
 import { managerClient, managerEndpoint } from './grpcClient'
 import { commandPaletteIndexItems } from './utils/commandPalette'
 import Access from './pages/Access'
+import OidcCallback from './pages/OidcCallback'
 import Deployments from './pages/Deployments'
 import JobDetail from './pages/details/JobDetail'
 import JobSpecDetail from './pages/details/JobSpecDetail'
@@ -537,6 +538,7 @@ const AppRoutes = () => {
       <Route path="/rollouts/:id" component={RolloutDetail} />
       <Route path="/kv" component={KeyValue} />
       <Route path="/access" component={Access} />
+      <Route path="/oidc/callback" component={OidcCallback} />
       <Route path="/api" component={ApiExplorer} />
       <Route path="/observability" component={Observability} />
       <Route path="/state-explorer" component={StateExplorer} />

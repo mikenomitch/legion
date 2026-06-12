@@ -66,6 +66,17 @@ export class WorkerPreRegisterRequest extends Message<WorkerPreRegisterRequest> 
    */
   workerType = "";
 
+  /**
+   * Join token secret (the `secret` field of a decoded join token).
+   *
+   * Required when ACLs are enforced: the manager validates it against its
+   * stored join tokens before serving worker configuration. Ignored when
+   * ACLs are disabled.
+   *
+   * @generated from field: optional string join_token = 2;
+   */
+  joinToken?: string;
+
   constructor(data?: PartialMessage<WorkerPreRegisterRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -75,6 +86,7 @@ export class WorkerPreRegisterRequest extends Message<WorkerPreRegisterRequest> 
   static readonly typeName = "legion.WorkerPreRegisterRequest";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "worker_type", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "join_token", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): WorkerPreRegisterRequest {
@@ -287,6 +299,15 @@ export class WorkerRegisterRequest extends Message<WorkerRegisterRequest> {
    */
   healthChecks = "";
 
+  /**
+   * Join token secret (the `secret` field of a decoded join token).
+   *
+   * Required when ACLs are enforced. Ignored when ACLs are disabled.
+   *
+   * @generated from field: optional string join_token = 6;
+   */
+  joinToken?: string;
+
   constructor(data?: PartialMessage<WorkerRegisterRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -300,6 +321,7 @@ export class WorkerRegisterRequest extends Message<WorkerRegisterRequest> {
     { no: 3, name: "config_attrs", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 4, name: "fingerprint_attrs", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 5, name: "health_checks", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "join_token", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): WorkerRegisterRequest {
@@ -334,6 +356,16 @@ export class WorkerRegisterReply extends Message<WorkerRegisterReply> {
    */
   message = "";
 
+  /**
+   * Per-node credential for subsequent worker-plane calls (Heartbeat,
+   * HealthCheck). Minted only when ACLs are enforced; re-registering
+   * rotates it (the previous node token is revoked). Workers attach it as
+   * a bearer credential exactly like an ACL token.
+   *
+   * @generated from field: optional string node_token = 2;
+   */
+  nodeToken?: string;
+
   constructor(data?: PartialMessage<WorkerRegisterReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -343,6 +375,7 @@ export class WorkerRegisterReply extends Message<WorkerRegisterReply> {
   static readonly typeName = "legion.WorkerRegisterReply";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "node_token", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): WorkerRegisterReply {
@@ -6438,101 +6471,6 @@ export class UpdateNodeDynamicReply extends Message<UpdateNodeDynamicReply> {
 }
 
 /**
- * Request payload for GetJoinToken.
- *
- * @generated from message legion.GetJoinTokenRequest
- */
-export class GetJoinTokenRequest extends Message<GetJoinTokenRequest> {
-  /**
-   * Optional token TTL string (for example: "1h", "30m").
-   *
-   * Unset means no expiry in current manager implementation
-   * (`exp` claim is set to `0` and `skip_expiry_validation=true`).
-   *
-   * @generated from field: optional string ttl = 1;
-   */
-  ttl?: string;
-
-  /**
-   * Optional worker type to embed in token.
-   *
-   * Defaults to "default" when omitted.
-   *
-   * @generated from field: optional string worker_type = 2;
-   */
-  workerType?: string;
-
-  constructor(data?: PartialMessage<GetJoinTokenRequest>) {
-    super();
-    proto3.util.initPartial(data, this);
-  }
-
-  static readonly runtime: typeof proto3 = proto3;
-  static readonly typeName = "legion.GetJoinTokenRequest";
-  static readonly fields: FieldList = proto3.util.newFieldList(() => [
-    { no: 1, name: "ttl", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
-    { no: 2, name: "worker_type", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
-  ]);
-
-  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetJoinTokenRequest {
-    return new GetJoinTokenRequest().fromBinary(bytes, options);
-  }
-
-  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetJoinTokenRequest {
-    return new GetJoinTokenRequest().fromJson(jsonValue, options);
-  }
-
-  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetJoinTokenRequest {
-    return new GetJoinTokenRequest().fromJsonString(jsonString, options);
-  }
-
-  static equals(a: GetJoinTokenRequest | PlainMessage<GetJoinTokenRequest> | undefined, b: GetJoinTokenRequest | PlainMessage<GetJoinTokenRequest> | undefined): boolean {
-    return proto3.util.equals(GetJoinTokenRequest, a, b);
-  }
-}
-
-/**
- * Reply payload for GetJoinToken.
- *
- * @generated from message legion.GetJoinTokenReply
- */
-export class GetJoinTokenReply extends Message<GetJoinTokenReply> {
-  /**
-   * Signed JWT join token.
-   *
-   * @generated from field: string token = 1;
-   */
-  token = "";
-
-  constructor(data?: PartialMessage<GetJoinTokenReply>) {
-    super();
-    proto3.util.initPartial(data, this);
-  }
-
-  static readonly runtime: typeof proto3 = proto3;
-  static readonly typeName = "legion.GetJoinTokenReply";
-  static readonly fields: FieldList = proto3.util.newFieldList(() => [
-    { no: 1, name: "token", kind: "scalar", T: 9 /* ScalarType.STRING */ },
-  ]);
-
-  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetJoinTokenReply {
-    return new GetJoinTokenReply().fromBinary(bytes, options);
-  }
-
-  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetJoinTokenReply {
-    return new GetJoinTokenReply().fromJson(jsonValue, options);
-  }
-
-  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetJoinTokenReply {
-    return new GetJoinTokenReply().fromJsonString(jsonString, options);
-  }
-
-  static equals(a: GetJoinTokenReply | PlainMessage<GetJoinTokenReply> | undefined, b: GetJoinTokenReply | PlainMessage<GetJoinTokenReply> | undefined): boolean {
-    return proto3.util.equals(GetJoinTokenReply, a, b);
-  }
-}
-
-/**
  * Internal eval queue item.
  *
  * @generated from message legion.Eval
@@ -7104,6 +7042,16 @@ export class LoginReply extends Message<LoginReply> {
  * @generated from message legion.BootstrapAclRequest
  */
 export class BootstrapAclRequest extends Message<BootstrapAclRequest> {
+  /**
+   * Optional operator-provided secret for the initial management token
+   * (infrastructure-as-code pre-seeding). Must be at least 24 characters.
+   *
+   * Default when omitted: the manager generates a random secret.
+   *
+   * @generated from field: optional string secret = 1;
+   */
+  secret?: string;
+
   constructor(data?: PartialMessage<BootstrapAclRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -7112,6 +7060,7 @@ export class BootstrapAclRequest extends Message<BootstrapAclRequest> {
   static readonly runtime: typeof proto3 = proto3;
   static readonly typeName = "legion.BootstrapAclRequest";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "secret", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): BootstrapAclRequest {
@@ -8281,6 +8230,497 @@ export class DeleteAclUserReply extends Message<DeleteAclUserReply> {
 
   static equals(a: DeleteAclUserReply | PlainMessage<DeleteAclUserReply> | undefined, b: DeleteAclUserReply | PlainMessage<DeleteAclUserReply> | undefined): boolean {
     return proto3.util.equals(DeleteAclUserReply, a, b);
+  }
+}
+
+/**
+ * Request payload for GetAuthMethods.
+ *
+ * @generated from message legion.GetAuthMethodsRequest
+ */
+export class GetAuthMethodsRequest extends Message<GetAuthMethodsRequest> {
+  constructor(data?: PartialMessage<GetAuthMethodsRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetAuthMethodsRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetAuthMethodsRequest {
+    return new GetAuthMethodsRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetAuthMethodsRequest {
+    return new GetAuthMethodsRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetAuthMethodsRequest {
+    return new GetAuthMethodsRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetAuthMethodsRequest | PlainMessage<GetAuthMethodsRequest> | undefined, b: GetAuthMethodsRequest | PlainMessage<GetAuthMethodsRequest> | undefined): boolean {
+    return proto3.util.equals(GetAuthMethodsRequest, a, b);
+  }
+}
+
+/**
+ * Public metadata for one auth method (no secrets or keys).
+ *
+ * @generated from message legion.AuthMethodInfo
+ */
+export class AuthMethodInfo extends Message<AuthMethodInfo> {
+  /**
+   * Method name; pass to Login / `legion login --method <name>`.
+   *
+   * @generated from field: string name = 1;
+   */
+  name = "";
+
+  /**
+   * Method kind: `userpass`, `jwt`, `oidc`, `webhook`, or `custom`.
+   *
+   * @generated from field: string kind = 2;
+   */
+  kind = "";
+
+  /**
+   * OIDC issuer URL (oidc kind only). Clients run discovery against it.
+   *
+   * @generated from field: optional string oidc_issuer = 3;
+   */
+  oidcIssuer?: string;
+
+  /**
+   * OAuth client ID registered for Legion at the identity provider
+   * (oidc kind only). Required for browser/CLI redirect login.
+   *
+   * @generated from field: optional string oidc_client_id = 4;
+   */
+  oidcClientId?: string;
+
+  /**
+   * OAuth scopes to request (oidc kind only). Default: ["openid"].
+   *
+   * @generated from field: repeated string oidc_scopes = 5;
+   */
+  oidcScopes: string[] = [];
+
+  constructor(data?: PartialMessage<AuthMethodInfo>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.AuthMethodInfo";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "kind", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "oidc_issuer", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 4, name: "oidc_client_id", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 5, name: "oidc_scopes", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): AuthMethodInfo {
+    return new AuthMethodInfo().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): AuthMethodInfo {
+    return new AuthMethodInfo().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): AuthMethodInfo {
+    return new AuthMethodInfo().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: AuthMethodInfo | PlainMessage<AuthMethodInfo> | undefined, b: AuthMethodInfo | PlainMessage<AuthMethodInfo> | undefined): boolean {
+    return proto3.util.equals(AuthMethodInfo, a, b);
+  }
+}
+
+/**
+ * Reply payload for GetAuthMethods.
+ *
+ * @generated from message legion.GetAuthMethodsReply
+ */
+export class GetAuthMethodsReply extends Message<GetAuthMethodsReply> {
+  /**
+   * All registered auth methods, in registration order (userpass first).
+   *
+   * @generated from field: repeated legion.AuthMethodInfo methods = 1;
+   */
+  methods: AuthMethodInfo[] = [];
+
+  constructor(data?: PartialMessage<GetAuthMethodsReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetAuthMethodsReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "methods", kind: "message", T: AuthMethodInfo, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetAuthMethodsReply {
+    return new GetAuthMethodsReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetAuthMethodsReply {
+    return new GetAuthMethodsReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetAuthMethodsReply {
+    return new GetAuthMethodsReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetAuthMethodsReply | PlainMessage<GetAuthMethodsReply> | undefined, b: GetAuthMethodsReply | PlainMessage<GetAuthMethodsReply> | undefined): boolean {
+    return proto3.util.equals(GetAuthMethodsReply, a, b);
+  }
+}
+
+/**
+ * Request payload for CreateJoinToken.
+ *
+ * @generated from message legion.CreateJoinTokenRequest
+ */
+export class CreateJoinTokenRequest extends Message<CreateJoinTokenRequest> {
+  /**
+   * Worker type the token introduces (selects the worker template).
+   *
+   * Default when empty: "default".
+   *
+   * @generated from field: string worker_type = 1;
+   */
+  workerType = "";
+
+  /**
+   * Optional lifetime (humantime format, for example "24h").
+   *
+   * Default when omitted: 24h. Pass "none" for a non-expiring token
+   * (discouraged; prefer short-lived tokens).
+   *
+   * @generated from field: optional string ttl = 2;
+   */
+  ttl?: string;
+
+  /**
+   * Free-form description shown in ListJoinTokens (for example "rack 12").
+   *
+   * @generated from field: string description = 3;
+   */
+  description = "";
+
+  constructor(data?: PartialMessage<CreateJoinTokenRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.CreateJoinTokenRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "worker_type", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "ttl", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 3, name: "description", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): CreateJoinTokenRequest {
+    return new CreateJoinTokenRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): CreateJoinTokenRequest {
+    return new CreateJoinTokenRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): CreateJoinTokenRequest {
+    return new CreateJoinTokenRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: CreateJoinTokenRequest | PlainMessage<CreateJoinTokenRequest> | undefined, b: CreateJoinTokenRequest | PlainMessage<CreateJoinTokenRequest> | undefined): boolean {
+    return proto3.util.equals(CreateJoinTokenRequest, a, b);
+  }
+}
+
+/**
+ * Metadata describing a join token. Never contains the secret.
+ *
+ * @generated from message legion.JoinTokenInfo
+ */
+export class JoinTokenInfo extends Message<JoinTokenInfo> {
+  /**
+   * Public identifier; the handle used by DeleteJoinToken.
+   *
+   * @generated from field: string id = 1;
+   */
+  id = "";
+
+  /**
+   * Worker type this token introduces.
+   *
+   * @generated from field: string worker_type = 2;
+   */
+  workerType = "";
+
+  /**
+   * Free-form description.
+   *
+   * @generated from field: string description = 3;
+   */
+  description = "";
+
+  /**
+   * RFC3339 expiry. Omitted when the token never expires.
+   *
+   * @generated from field: optional string expires_at = 4;
+   */
+  expiresAt?: string;
+
+  /**
+   * RFC3339 creation timestamp.
+   *
+   * @generated from field: string created_at = 5;
+   */
+  createdAt = "";
+
+  constructor(data?: PartialMessage<JoinTokenInfo>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.JoinTokenInfo";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "worker_type", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "description", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "expires_at", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 5, name: "created_at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): JoinTokenInfo {
+    return new JoinTokenInfo().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): JoinTokenInfo {
+    return new JoinTokenInfo().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): JoinTokenInfo {
+    return new JoinTokenInfo().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: JoinTokenInfo | PlainMessage<JoinTokenInfo> | undefined, b: JoinTokenInfo | PlainMessage<JoinTokenInfo> | undefined): boolean {
+    return proto3.util.equals(JoinTokenInfo, a, b);
+  }
+}
+
+/**
+ * Reply payload for CreateJoinToken.
+ *
+ * @generated from message legion.CreateJoinTokenReply
+ */
+export class CreateJoinTokenReply extends Message<CreateJoinTokenReply> {
+  /**
+   * Token metadata.
+   *
+   * @generated from field: legion.JoinTokenInfo info = 1;
+   */
+  info?: JoinTokenInfo;
+
+  /**
+   * The composite join token handed to the worker
+   * (`legion join <TOKEN>`). Base64url-encoded JSON carrying the manager
+   * address, the secret, and the worker type. Returned exactly once; the
+   * manager stores only a hash of the embedded secret.
+   *
+   * @generated from field: string token = 2;
+   */
+  token = "";
+
+  constructor(data?: PartialMessage<CreateJoinTokenReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.CreateJoinTokenReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "info", kind: "message", T: JoinTokenInfo },
+    { no: 2, name: "token", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): CreateJoinTokenReply {
+    return new CreateJoinTokenReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): CreateJoinTokenReply {
+    return new CreateJoinTokenReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): CreateJoinTokenReply {
+    return new CreateJoinTokenReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: CreateJoinTokenReply | PlainMessage<CreateJoinTokenReply> | undefined, b: CreateJoinTokenReply | PlainMessage<CreateJoinTokenReply> | undefined): boolean {
+    return proto3.util.equals(CreateJoinTokenReply, a, b);
+  }
+}
+
+/**
+ * Request payload for ListJoinTokens.
+ *
+ * @generated from message legion.ListJoinTokensRequest
+ */
+export class ListJoinTokensRequest extends Message<ListJoinTokensRequest> {
+  constructor(data?: PartialMessage<ListJoinTokensRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListJoinTokensRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListJoinTokensRequest {
+    return new ListJoinTokensRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListJoinTokensRequest {
+    return new ListJoinTokensRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListJoinTokensRequest {
+    return new ListJoinTokensRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListJoinTokensRequest | PlainMessage<ListJoinTokensRequest> | undefined, b: ListJoinTokensRequest | PlainMessage<ListJoinTokensRequest> | undefined): boolean {
+    return proto3.util.equals(ListJoinTokensRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for ListJoinTokens.
+ *
+ * @generated from message legion.ListJoinTokensReply
+ */
+export class ListJoinTokensReply extends Message<ListJoinTokensReply> {
+  /**
+   * All join tokens (metadata only), newest first.
+   *
+   * @generated from field: repeated legion.JoinTokenInfo tokens = 1;
+   */
+  tokens: JoinTokenInfo[] = [];
+
+  constructor(data?: PartialMessage<ListJoinTokensReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListJoinTokensReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "tokens", kind: "message", T: JoinTokenInfo, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListJoinTokensReply {
+    return new ListJoinTokensReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListJoinTokensReply {
+    return new ListJoinTokensReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListJoinTokensReply {
+    return new ListJoinTokensReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListJoinTokensReply | PlainMessage<ListJoinTokensReply> | undefined, b: ListJoinTokensReply | PlainMessage<ListJoinTokensReply> | undefined): boolean {
+    return proto3.util.equals(ListJoinTokensReply, a, b);
+  }
+}
+
+/**
+ * Request payload for DeleteJoinToken.
+ *
+ * @generated from message legion.DeleteJoinTokenRequest
+ */
+export class DeleteJoinTokenRequest extends Message<DeleteJoinTokenRequest> {
+  /**
+   * Join token ID to revoke.
+   *
+   * @generated from field: string id = 1;
+   */
+  id = "";
+
+  constructor(data?: PartialMessage<DeleteJoinTokenRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.DeleteJoinTokenRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): DeleteJoinTokenRequest {
+    return new DeleteJoinTokenRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): DeleteJoinTokenRequest {
+    return new DeleteJoinTokenRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): DeleteJoinTokenRequest {
+    return new DeleteJoinTokenRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: DeleteJoinTokenRequest | PlainMessage<DeleteJoinTokenRequest> | undefined, b: DeleteJoinTokenRequest | PlainMessage<DeleteJoinTokenRequest> | undefined): boolean {
+    return proto3.util.equals(DeleteJoinTokenRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for DeleteJoinToken.
+ *
+ * @generated from message legion.DeleteJoinTokenReply
+ */
+export class DeleteJoinTokenReply extends Message<DeleteJoinTokenReply> {
+  /**
+   * Human-readable status message.
+   *
+   * @generated from field: string message = 1;
+   */
+  message = "";
+
+  constructor(data?: PartialMessage<DeleteJoinTokenReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.DeleteJoinTokenReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): DeleteJoinTokenReply {
+    return new DeleteJoinTokenReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): DeleteJoinTokenReply {
+    return new DeleteJoinTokenReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): DeleteJoinTokenReply {
+    return new DeleteJoinTokenReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: DeleteJoinTokenReply | PlainMessage<DeleteJoinTokenReply> | undefined, b: DeleteJoinTokenReply | PlainMessage<DeleteJoinTokenReply> | undefined): boolean {
+    return proto3.util.equals(DeleteJoinTokenReply, a, b);
   }
 }
 

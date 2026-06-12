@@ -12,29 +12,29 @@
 //!   secret, with bound issuer/audiences and binding rules mapping claims to
 //!   policies. Works both at login (exchange for an ACL token) and as a
 //!   per-request bearer credential. One instance per `acl.authMethods` entry.
+//! - [`WebhookMethod`] — delegates credential verification to an
+//!   operator-supplied HTTP endpoint, which returns the principal and policy
+//!   names. This is the recommended way to integrate custom identity systems
+//!   (LDAP, SAML bridges, bespoke SSO) in any language, behind a
+//!   process/network trust boundary. Login-only.
 //!
 //! Library users can register additional implementations with
 //! [`crate::manager::acl::Authenticator::register_method`].
 //!
-//! ## Future: auth method plugins
+//! ## Future: dynamic auth method plugins
 //!
 //! This trait is deliberately shaped like Legion's other plugin entry traits
 //! (`TaskPlugin`, `SchedulingPolicy`, `RolloutStrategyPlugin`): object-safe,
-//! `Send + Sync`, built-ins dispatched by name. Two extension mechanisms are
-//! planned (see docs/plans/auth-acl-plan.md and docs/plugin-system.md):
-//!
-//! 1. **Webhook method (preferred)**: an in-tree `type: "webhook"` method that
-//!    POSTs the credential to an operator-supplied endpoint and receives
-//!    `{principal, policies}` back. This keeps custom auth code behind a
-//!    process/network trust boundary and works in any language.
-//! 2. **Dynamic `cdylib` plugins**: a `plugins/auth/<name>/` kind exporting
-//!    `get() -> Box<dyn AuthMethod>` like the other plugin categories. Held
-//!    back deliberately: auth plugins run inside the manager and decide
-//!    cluster admission, so a buggy or malicious one is a full compromise —
-//!    a much worse failure domain than a task or scheduling plugin. If added,
-//!    it must reuse this exact trait, and the security-sensitive invariants
-//!    stay in core regardless: methods only ever yield policy *names* (never
-//!    management access), and token minting/hashing never moves into a method.
+//! `Send + Sync`, built-ins dispatched by name. A `plugins/auth/<name>/`
+//! `cdylib` kind exporting `get() -> Box<dyn AuthMethod>` could be added like
+//! the other plugin categories, but is held back deliberately: auth plugins
+//! run inside the manager and decide cluster admission, so a buggy or
+//! malicious one is a full compromise — a much worse failure domain than a
+//! task or scheduling plugin. Use the webhook method instead; if a dylib kind
+//! is ever added it must reuse this exact trait, and the security-sensitive
+//! invariants stay in core regardless: methods only ever yield policy *names*
+//! (never management access), and token minting/hashing never moves into a
+//! method.
 
 use crate::prelude::*;
 use crate::storage::store::Store;
@@ -104,6 +104,21 @@ pub struct VerifiedIdentity {
     pub expires_at: Option<String>,
 }
 
+/// Public, secret-free description of an auth method, served by
+/// `GetAuthMethods` so login UIs can present the available options.
+#[derive(Debug, Clone, Default)]
+pub struct MethodPublicInfo {
+    pub name: String,
+    /// `userpass`, `jwt`, `oidc`, `webhook`, or `custom`.
+    pub kind: String,
+    /// OIDC issuer URL (oidc kind), for client-side discovery.
+    pub oidc_issuer: Option<String>,
+    /// OAuth client ID for browser/CLI redirect login (oidc kind).
+    pub oidc_client_id: Option<String>,
+    /// OAuth scopes for redirect login (oidc kind).
+    pub oidc_scopes: Vec<String>,
+}
+
 /// A source of identity: verifies credentials and maps them to ACL policies.
 ///
 /// See the module docs for the built-in implementations and the planned
@@ -113,17 +128,21 @@ pub trait AuthMethod: Send + Sync {
     fn name(&self) -> &str;
 
     /// Exchange login credentials for an identity. The authenticator mints
-    /// the resulting ACL token; methods only verify and map.
-    fn login(
-        &self,
-        store: &Store,
-        credentials: LoginCredentials<'_>,
-    ) -> Result<VerifiedIdentity, AuthError>;
+    /// the resulting ACL token; methods only verify and map. Async because
+    /// some methods (webhook, future device flows) verify over the network.
+    fn login<'a>(
+        &'a self,
+        store: &'a Store,
+        credentials: LoginCredentials<'a>,
+    ) -> BoxFuture<'a, Result<VerifiedIdentity, AuthError>>;
 
     /// Validate a credential presented directly as a request bearer token.
     ///
     /// Return `None` when this method cannot interpret such credentials at
     /// all (for example userpass); `Some(Err(..))` when it tried and failed.
+    /// This runs on the hot path of every request, so it must stay local —
+    /// methods that would need a network call per request should be
+    /// login-only and return `None`.
     fn validate_bearer(&self, _credential: &str) -> Option<Result<VerifiedIdentity, AuthError>> {
         None
     }
@@ -132,6 +151,15 @@ pub trait AuthMethod: Send + Sync {
     /// method.
     fn login_token_ttl(&self) -> Duration;
 
+    /// Public metadata for login UIs. Never include secrets or key material.
+    fn public_info(&self) -> MethodPublicInfo {
+        MethodPublicInfo {
+            name: self.name().to_string(),
+            kind: "custom".to_string(),
+            ..Default::default()
+        }
+    }
+
     /// Refresh remote validation material (for example JWKS documents).
     ///
     /// Called at manager startup and then every `acl.jwksRefreshInterval`.
@@ -139,6 +167,28 @@ pub trait AuthMethod: Send + Sync {
     /// a flaky identity provider cannot lock out authentication.
     fn refresh(&self) -> BoxFuture<'_, ()> {
         Box::pin(async {})
+    }
+}
+
+/// Builds the configured method for one `acl.authMethods` entry.
+pub fn method_from_config(
+    config: &AclAuthMethodConfig,
+    default_login_ttl: Duration,
+) -> R<Box<dyn AuthMethod>> {
+    let method_type = config.r#type.clone().unwrap_or_else(|| "jwt".to_string());
+    match method_type.as_str() {
+        "jwt" | "oidc" => Ok(Box::new(JwtAuthMethod::from_config(
+            config,
+            default_login_ttl,
+        )?)),
+        "webhook" => Ok(Box::new(WebhookMethod::from_config(
+            config,
+            default_login_ttl,
+        )?)),
+        other => bail!(
+            "auth method `{}`: unknown type `{other}` (expected `jwt`, `oidc`, or `webhook`)",
+            config.name
+        ),
     }
 }
 
@@ -158,39 +208,51 @@ impl AuthMethod for UserpassMethod {
         USERPASS_METHOD
     }
 
-    fn login(
-        &self,
-        store: &Store,
-        credentials: LoginCredentials<'_>,
-    ) -> Result<VerifiedIdentity, AuthError> {
-        let username = credentials
-            .username
-            .filter(|u| !u.trim().is_empty())
-            .ok_or_else(|| {
-                AuthError::InvalidRequest("userpass login requires `username`".into())
+    fn login<'a>(
+        &'a self,
+        store: &'a Store,
+        credentials: LoginCredentials<'a>,
+    ) -> BoxFuture<'a, Result<VerifiedIdentity, AuthError>> {
+        Box::pin(async move {
+            let username = credentials
+                .username
+                .filter(|u| !u.trim().is_empty())
+                .ok_or_else(|| {
+                    AuthError::InvalidRequest("userpass login requires `username`".into())
+                })?;
+            let password = credentials.password.ok_or_else(|| {
+                AuthError::InvalidRequest("userpass login requires `password`".into())
             })?;
-        let password = credentials.password.ok_or_else(|| {
-            AuthError::InvalidRequest("userpass login requires `password`".into())
-        })?;
-        let user = store
-            .get_acl_user(username)
-            .map_err(|e| AuthError::Internal(format!("user lookup failed: {e:#}")))?
-            // Same error for unknown user and bad password (no user enumeration).
-            .ok_or_else(|| AuthError::InvalidCredentials("invalid username or password".into()))?;
-        if !crate::manager::acl::verify_password(password, &user.password_hash) {
-            return Err(AuthError::InvalidCredentials(
-                "invalid username or password".into(),
-            ));
-        }
-        Ok(VerifiedIdentity {
-            principal: username.to_string(),
-            policies: user.policies,
-            expires_at: None,
+            let user = store
+                .get_acl_user(username)
+                .map_err(|e| AuthError::Internal(format!("user lookup failed: {e:#}")))?
+                // Same error for unknown user and bad password (no user enumeration).
+                .ok_or_else(|| {
+                    AuthError::InvalidCredentials("invalid username or password".into())
+                })?;
+            if !crate::manager::acl::verify_password(password, &user.password_hash) {
+                return Err(AuthError::InvalidCredentials(
+                    "invalid username or password".into(),
+                ));
+            }
+            Ok(VerifiedIdentity {
+                principal: username.to_string(),
+                policies: user.policies,
+                expires_at: None,
+            })
         })
     }
 
     fn login_token_ttl(&self) -> Duration {
         self.login_ttl
+    }
+
+    fn public_info(&self) -> MethodPublicInfo {
+        MethodPublicInfo {
+            name: USERPASS_METHOD.to_string(),
+            kind: "userpass".to_string(),
+            ..Default::default()
+        }
     }
 }
 
@@ -207,6 +269,8 @@ pub struct JwtAuthMethod {
     user_claim: String,
     binding_rules: Vec<AclBindingRule>,
     token_ttl: Duration,
+    oidc_client_id: Option<String>,
+    oidc_scopes: Vec<String>,
     /// Cached JWKS document ({"keys": [...]}); primed from inline config and
     /// refreshed from the network by `refresh`.
     keys: RwLock<Option<Value>>,
@@ -222,9 +286,7 @@ impl JwtAuthMethod {
         let is_oidc = match method_type.as_str() {
             "jwt" => false,
             "oidc" => true,
-            other => {
-                bail!("auth method `{name}`: unknown type `{other}` (expected `jwt` or `oidc`)")
-            }
+            other => bail!("auth method `{name}`: JwtAuthMethod cannot handle type `{other}`"),
         };
         let static_jwks = config
             .jwks_json
@@ -262,6 +324,11 @@ impl JwtAuthMethod {
                 .unwrap_or_else(|| "sub".to_string()),
             binding_rules: config.binding_rules.clone().unwrap_or_default(),
             token_ttl,
+            oidc_client_id: config.oidc_client_id.clone(),
+            oidc_scopes: config
+                .oidc_scopes
+                .clone()
+                .unwrap_or_else(|| vec!["openid".to_string()]),
             keys: RwLock::new(static_jwks),
         })
     }
@@ -362,25 +429,27 @@ impl AuthMethod for JwtAuthMethod {
         &self.name
     }
 
-    fn login(
-        &self,
-        _store: &Store,
-        credentials: LoginCredentials<'_>,
-    ) -> Result<VerifiedIdentity, AuthError> {
-        let jwt = credentials.jwt.ok_or_else(|| {
-            AuthError::InvalidRequest(format!("auth method `{}` requires `jwt`", self.name))
-        })?;
-        let claims = self
-            .validate(jwt)
-            .map_err(|e| AuthError::InvalidCredentials(format!("JWT validation failed: {e:#}")))?;
-        let identity = self.identity_from_claims(&claims);
-        if identity.policies.is_empty() {
-            return Err(AuthError::Denied(format!(
-                "login via `{}` succeeded but no binding rules matched any policies",
-                self.name
-            )));
-        }
-        Ok(identity)
+    fn login<'a>(
+        &'a self,
+        _store: &'a Store,
+        credentials: LoginCredentials<'a>,
+    ) -> BoxFuture<'a, Result<VerifiedIdentity, AuthError>> {
+        Box::pin(async move {
+            let jwt = credentials.jwt.ok_or_else(|| {
+                AuthError::InvalidRequest(format!("auth method `{}` requires `jwt`", self.name))
+            })?;
+            let claims = self.validate(jwt).map_err(|e| {
+                AuthError::InvalidCredentials(format!("JWT validation failed: {e:#}"))
+            })?;
+            let identity = self.identity_from_claims(&claims);
+            if identity.policies.is_empty() {
+                return Err(AuthError::Denied(format!(
+                    "login via `{}` succeeded but no binding rules matched any policies",
+                    self.name
+                )));
+            }
+            Ok(identity)
+        })
     }
 
     fn validate_bearer(&self, credential: &str) -> Option<Result<VerifiedIdentity, AuthError>> {
@@ -392,6 +461,20 @@ impl AuthMethod for JwtAuthMethod {
 
     fn login_token_ttl(&self) -> Duration {
         self.token_ttl
+    }
+
+    fn public_info(&self) -> MethodPublicInfo {
+        MethodPublicInfo {
+            name: self.name.clone(),
+            kind: if self.is_oidc { "oidc" } else { "jwt" }.to_string(),
+            oidc_issuer: if self.is_oidc {
+                self.issuer.clone()
+            } else {
+                None
+            },
+            oidc_client_id: self.oidc_client_id.clone(),
+            oidc_scopes: self.oidc_scopes.clone(),
+        }
     }
 
     fn refresh(&self) -> BoxFuture<'_, ()> {
@@ -412,6 +495,147 @@ impl AuthMethod for JwtAuthMethod {
                 }
             }
         })
+    }
+}
+
+/// Built-in webhook method: delegates verification to an external endpoint.
+///
+/// Legion POSTs `{"method", "username"?, "password"?, "jwt"?}` to
+/// `webhookUrl` and expects HTTP 200 with
+/// `{"principal": "...", "policies": ["..."]}`. 401 rejects the credential,
+/// 403 means "verified but no access"; anything else is an internal error.
+/// Login-only by design: a per-request network call would put the webhook on
+/// the hot path of every RPC.
+pub struct WebhookMethod {
+    name: String,
+    url: String,
+    bearer: Option<String>,
+    token_ttl: Duration,
+}
+
+impl WebhookMethod {
+    pub fn from_config(config: &AclAuthMethodConfig, default_login_ttl: Duration) -> R<Self> {
+        let name = config.name.trim().to_string();
+        if name.is_empty() {
+            bail!("auth method name must not be empty");
+        }
+        let url = config.webhook_url.clone().with_context(|| {
+            format!("auth method `{name}`: webhook methods require `webhookUrl`")
+        })?;
+        let token_ttl = match &config.token_ttl {
+            Some(raw) => {
+                parse_ttl(raw).with_context(|| format!("auth method `{name}`: invalid tokenTtl"))?
+            }
+            None => default_login_ttl,
+        };
+        Ok(WebhookMethod {
+            name,
+            url,
+            bearer: config.webhook_bearer.clone(),
+            token_ttl,
+        })
+    }
+}
+
+impl AuthMethod for WebhookMethod {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn login<'a>(
+        &'a self,
+        _store: &'a Store,
+        credentials: LoginCredentials<'a>,
+    ) -> BoxFuture<'a, Result<VerifiedIdentity, AuthError>> {
+        Box::pin(async move {
+            let body = json!({
+                "method": self.name,
+                "username": credentials.username,
+                "password": credentials.password,
+                "jwt": credentials.jwt,
+            });
+            let mut request = reqwest::Client::new()
+                .post(&self.url)
+                .timeout(Duration::from_secs(10))
+                .json(&body);
+            if let Some(bearer) = &self.bearer {
+                request = request.bearer_auth(bearer);
+            }
+            let response = request.send().await.map_err(|e| {
+                AuthError::Internal(format!("auth webhook `{}` unreachable: {e}", self.name))
+            })?;
+
+            match response.status().as_u16() {
+                200 => {}
+                401 => {
+                    return Err(AuthError::InvalidCredentials(format!(
+                        "auth webhook `{}` rejected the credentials",
+                        self.name
+                    )))
+                }
+                403 => {
+                    return Err(AuthError::Denied(format!(
+                        "auth webhook `{}` verified the credentials but denied access",
+                        self.name
+                    )))
+                }
+                status => {
+                    return Err(AuthError::Internal(format!(
+                        "auth webhook `{}` returned unexpected status {status}",
+                        self.name
+                    )))
+                }
+            }
+
+            let payload: Value = response.json().await.map_err(|e| {
+                AuthError::Internal(format!(
+                    "auth webhook `{}` returned invalid JSON: {e}",
+                    self.name
+                ))
+            })?;
+            let principal = payload["principal"]
+                .as_str()
+                .filter(|p| !p.trim().is_empty())
+                .ok_or_else(|| {
+                    AuthError::Internal(format!(
+                        "auth webhook `{}` response is missing `principal`",
+                        self.name
+                    ))
+                })?
+                .to_string();
+            let policies: Vec<String> = payload["policies"]
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if policies.is_empty() {
+                return Err(AuthError::Denied(format!(
+                    "auth webhook `{}` granted no policies",
+                    self.name
+                )));
+            }
+            Ok(VerifiedIdentity {
+                principal,
+                policies,
+                expires_at: None,
+            })
+        })
+    }
+
+    fn login_token_ttl(&self) -> Duration {
+        self.token_ttl
+    }
+
+    fn public_info(&self) -> MethodPublicInfo {
+        MethodPublicInfo {
+            name: self.name.clone(),
+            kind: "webhook".to_string(),
+            ..Default::default()
+        }
     }
 }
 
@@ -570,15 +794,6 @@ mod auth_method_test {
         };
         assert!(JwtAuthMethod::from_config(&no_issuer, ttl).is_err());
 
-        // unknown type is rejected.
-        let bad_type = AclAuthMethodConfig {
-            name: "x".into(),
-            r#type: Some("saml".into()),
-            hmac_secret: Some("s".into()),
-            ..Default::default()
-        };
-        assert!(JwtAuthMethod::from_config(&bad_type, ttl).is_err());
-
         // hmac-secret jwt method is valid, login-only fields default sanely.
         let ok = AclAuthMethodConfig {
             name: "ci".into(),
@@ -589,6 +804,227 @@ mod auth_method_test {
         assert_eq!(method.name(), "ci");
         assert_eq!(method.login_token_ttl(), ttl);
         assert!(!method.needs_remote_keys());
+    }
+
+    #[test]
+    fn method_from_config_dispatches_by_type() {
+        let ttl = Duration::from_secs(60);
+
+        let jwt = AclAuthMethodConfig {
+            name: "ci".into(),
+            hmac_secret: Some("s".into()),
+            ..Default::default()
+        };
+        assert_eq!(method_from_config(&jwt, ttl).expect("jwt").name(), "ci");
+
+        let webhook = AclAuthMethodConfig {
+            name: "hook".into(),
+            r#type: Some("webhook".into()),
+            webhook_url: Some("http://127.0.0.1:1/auth".into()),
+            ..Default::default()
+        };
+        let method = method_from_config(&webhook, ttl).expect("webhook");
+        assert_eq!(method.public_info().kind, "webhook");
+        // Webhooks are login-only: never on the per-request bearer path.
+        assert!(method.validate_bearer("anything").is_none());
+
+        // Webhook without a url is rejected.
+        let no_url = AclAuthMethodConfig {
+            name: "hook".into(),
+            r#type: Some("webhook".into()),
+            ..Default::default()
+        };
+        assert!(method_from_config(&no_url, ttl).is_err());
+
+        // Unknown types are rejected.
+        let saml = AclAuthMethodConfig {
+            name: "x".into(),
+            r#type: Some("saml".into()),
+            ..Default::default()
+        };
+        assert!(method_from_config(&saml, ttl).is_err());
+    }
+
+    #[test]
+    fn public_info_exposes_oidc_metadata_without_secrets() {
+        let ttl = Duration::from_secs(60);
+        let oidc = AclAuthMethodConfig {
+            name: "corp".into(),
+            r#type: Some("oidc".into()),
+            issuer: Some("https://idp.test".into()),
+            oidc_client_id: Some("legion-ui".into()),
+            oidc_scopes: Some(vec!["openid".into(), "email".into()]),
+            hmac_secret: Some("never-exposed".into()),
+            ..Default::default()
+        };
+        let info = JwtAuthMethod::from_config(&oidc, ttl)
+            .expect("valid oidc method")
+            .public_info();
+        assert_eq!(info.kind, "oidc");
+        assert_eq!(info.oidc_issuer.as_deref(), Some("https://idp.test"));
+        assert_eq!(info.oidc_client_id.as_deref(), Some("legion-ui"));
+        assert_eq!(info.oidc_scopes, vec!["openid", "email"]);
+    }
+
+    /// Minimal one-shot HTTP server for webhook tests: answers every
+    /// connection with the given status and body.
+    async fn stub_http_server(status: u16, body: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stub server");
+        let addr = listener.local_addr().expect("stub addr");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    // Read until end of headers, then the Content-Length body.
+                    let mut request = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    let (mut header_end, mut content_length) = (None, 0usize);
+                    loop {
+                        let Ok(read) = socket.read(&mut buf).await else {
+                            return;
+                        };
+                        if read == 0 {
+                            break;
+                        }
+                        request.extend_from_slice(&buf[..read]);
+                        if header_end.is_none() {
+                            if let Some(idx) =
+                                request.windows(4).position(|window| window == b"\r\n\r\n")
+                            {
+                                header_end = Some(idx + 4);
+                                let headers = String::from_utf8_lossy(&request[..idx]);
+                                content_length = headers
+                                    .lines()
+                                    .find_map(|line| {
+                                        line.to_ascii_lowercase()
+                                            .strip_prefix("content-length:")
+                                            .map(|value| value.trim().parse().unwrap_or(0))
+                                    })
+                                    .unwrap_or(0);
+                            }
+                        }
+                        if let Some(end) = header_end {
+                            if request.len() >= end + content_length {
+                                break;
+                            }
+                        }
+                    }
+                    let reason = match status {
+                        200 => "OK",
+                        401 => "Unauthorized",
+                        403 => "Forbidden",
+                        _ => "Error",
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        format!("http://{addr}/auth")
+    }
+
+    fn webhook_method(url: String) -> WebhookMethod {
+        WebhookMethod::from_config(
+            &AclAuthMethodConfig {
+                name: "hook".into(),
+                r#type: Some("webhook".into()),
+                webhook_url: Some(url),
+                ..Default::default()
+            },
+            Duration::from_secs(60),
+        )
+        .expect("valid webhook method")
+    }
+
+    fn webhook_store() -> Store {
+        let dir = tempfile::Builder::new()
+            .prefix("legion-webhook-")
+            .tempdir()
+            .expect("tempdir")
+            .keep();
+        Store::start_storage(&crate::structs::ManagerConfigFull {
+            store_path: dir.to_str().expect("path").to_string(),
+            ..Default::default()
+        })
+        .expect("store")
+    }
+
+    #[tokio::test]
+    async fn webhook_login_maps_response_to_identity() -> R<()> {
+        let store = webhook_store();
+        let url = stub_http_server(200, r#"{"principal": "alice", "policies": ["readers"]}"#).await;
+        let method = webhook_method(url);
+
+        let identity = method
+            .login(
+                &store,
+                LoginCredentials {
+                    username: Some("alice"),
+                    password: Some("hunter2"),
+                    jwt: None,
+                },
+            )
+            .await
+            .expect("webhook login succeeds");
+        assert_eq!(identity.principal, "alice");
+        assert_eq!(identity.policies, vec!["readers"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn webhook_login_maps_failures_to_auth_errors() -> R<()> {
+        let store = webhook_store();
+
+        let rejected = webhook_method(stub_http_server(401, "{}").await);
+        assert!(matches!(
+            rejected.login(&store, LoginCredentials::default()).await,
+            Err(AuthError::InvalidCredentials(_))
+        ));
+
+        let denied = webhook_method(stub_http_server(403, "{}").await);
+        assert!(matches!(
+            denied.login(&store, LoginCredentials::default()).await,
+            Err(AuthError::Denied(_))
+        ));
+
+        let broken = webhook_method(stub_http_server(500, "{}").await);
+        assert!(matches!(
+            broken.login(&store, LoginCredentials::default()).await,
+            Err(AuthError::Internal(_))
+        ));
+
+        // 200 with no policies grants nothing.
+        let empty = webhook_method(
+            stub_http_server(200, r#"{"principal": "alice", "policies": []}"#).await,
+        );
+        assert!(matches!(
+            empty.login(&store, LoginCredentials::default()).await,
+            Err(AuthError::Denied(_))
+        ));
+
+        // 200 without a principal is a webhook contract error.
+        let nameless = webhook_method(stub_http_server(200, r#"{"policies": ["x"]}"#).await);
+        assert!(matches!(
+            nameless.login(&store, LoginCredentials::default()).await,
+            Err(AuthError::Internal(_))
+        ));
+
+        // Unreachable webhook is an internal error, not a credential error.
+        let unreachable = webhook_method("http://127.0.0.1:1/auth".into());
+        assert!(matches!(
+            unreachable.login(&store, LoginCredentials::default()).await,
+            Err(AuthError::Internal(_))
+        ));
+        Ok(())
     }
 
     #[test]

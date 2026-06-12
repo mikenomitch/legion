@@ -18,6 +18,12 @@ use tabled::Tabled;
 pub fn config() -> Command {
     let bootstrap_cmd = Command::new("bootstrap")
         .about("Create the one-time initial management token")
+        .arg(
+            Arg::new("secret")
+                .long("secret")
+                .value_name("SECRET")
+                .help("Pre-seed the management token secret (min 24 chars; for IaC)"),
+        )
         .arg(json_flag());
 
     let whoami_cmd = Command::new("whoami")
@@ -166,9 +172,7 @@ pub fn config() -> Command {
 #[instrument(err, skip_all)]
 pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
     match sub_matches.subcommand() {
-        Some(("bootstrap", arg_matches)) => {
-            bootstrap(OutputFormat::from_matches(arg_matches)).await
-        }
+        Some(("bootstrap", arg_matches)) => bootstrap(arg_matches).await,
         Some(("whoami", arg_matches)) => whoami(OutputFormat::from_matches(arg_matches)).await,
         Some(("policy", policy_matches)) => match policy_matches.subcommand() {
             Some(("apply", arg_matches)) => policy_apply(arg_matches).await,
@@ -217,13 +221,15 @@ pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
     }
 }
 
-async fn bootstrap(format: OutputFormat) -> R<()> {
+async fn bootstrap(arg_matches: &ArgMatches) -> R<()> {
+    let format = OutputFormat::from_matches(arg_matches);
+    let secret = arg_matches.get_one::<String>("secret").cloned();
     let mut client = connect_manager_client().await?;
     let response = output::resolve(
         format,
         "Failed to bootstrap ACLs",
         client
-            .bootstrap_acl(tonic::Request::new(BootstrapAclRequest {}))
+            .bootstrap_acl(tonic::Request::new(BootstrapAclRequest { secret }))
             .await,
     )?;
     let reply = response.into_inner();

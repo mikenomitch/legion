@@ -33,7 +33,10 @@
 
 ## Security & Configuration Tips
 - `protoc` must be available locally; CI installs `protobuf-compiler`.
-- Default manager address `http://127.0.0.1:4747`; insecure listener `http://127.0.0.1:4748`.
+- Default manager address `http://127.0.0.1:4747`. (The insecure `:4748`
+  bootstrap listener was removed; join tokens come from the authenticated
+  `CreateJoinToken` RPC / `legion join-token create`.)
+- Server TLS is opt-in via `server.tls { enabled, certPath, keyPath }`.
 - Dev TLS certs live in `configs/tls/`; do not use in production.
 
 ## Auth & ACL Checks (required on every endpoint)
@@ -49,6 +52,9 @@ Every Manager gRPC endpoint must enforce ACLs. When you add an RPC:
   `job|node|kv|state|operator|acl`, actions `read|write`, scopes by job name
   (+namespace), node pool, or KV path. List endpoints gate with
   `AclScope::any()` and then filter items with `ident.allows(...)`.
+  Worker-plane endpoints (registration, heartbeats) instead use
+  `verify_join_for_registration` / `acl::enforce_worker_plane` — see the
+  existing handlers.
 - **Add the endpoint to `tests/acl_endpoints.rs`** (`endpoint_table` + a
   request builder). The `every_manager_rpc_is_classified` test parses
   `proto/legion.proto` and fails the build if a Manager RPC has no ACL

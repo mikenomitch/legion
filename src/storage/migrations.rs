@@ -416,5 +416,18 @@ pub fn get_migrations() -> Migrations<'static> {
         )",
         )
         .down("DROP TABLE IF EXISTS acl_user;"),
+        // Worker join tokens. Only a SHA-256 hash of the secret is stored;
+        // the id is the public handle for listing/revocation.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS join_token (
+            id STRING PRIMARY KEY,
+            secret_hash STRING NOT NULL UNIQUE,
+            worker_type STRING NOT NULL,
+            description STRING NOT NULL DEFAULT '',
+            expires_at TIMESTAMP,
+            created_at TIMESTAMP NOT NULL
+        )",
+        )
+        .down("DROP TABLE IF EXISTS join_token;"),
     ])
 }
