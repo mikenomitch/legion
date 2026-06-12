@@ -319,6 +319,14 @@ impl WorkerTaskManager {
     }
 
     fn stop_allocation(&mut self, allocation_id: i64) -> R<()> {
+        self.stop_allocation_inner(allocation_id, true)
+    }
+
+    /// Stops an allocation's process and forgets it. `remove_dirs: false`
+    /// keeps the task directory in place so an immediate relaunch of the
+    /// same allocation (in-place re-dispatch) can reuse already-staged
+    /// artifacts via the staging manifest.
+    fn stop_allocation_inner(&mut self, allocation_id: i64, remove_dirs: bool) -> R<()> {
         if let Some(monitor) = self.health_monitors.remove(&allocation_id) {
             monitor.shutdown();
         }
@@ -353,7 +361,9 @@ impl WorkerTaskManager {
         self.task_configs.remove(&allocation_id);
         self.allocation_health.remove(&allocation_id);
         self.artifact_status.remove(allocation_id);
-        self.cleanup_alloc_dir(allocation_id);
+        if remove_dirs {
+            self.cleanup_alloc_dir(allocation_id);
+        }
         self.persist_state();
 
         Ok(())
@@ -444,15 +454,16 @@ impl WorkerTaskManager {
         let (alloc, task) = task_from_allocation(allocation)?;
         // A re-dispatch of an id we already run is an in-place update (for
         // example a config change reusing the allocation): stop the old
-        // instance first so dirs are fresh and the old process is gone —
-        // otherwise staging would collide with the previous content.
+        // process but keep the task directory — when the artifact list is
+        // unchanged, staging reuses the already-fetched content via the
+        // staging manifest instead of refetching.
         if self.runtimes.contains_key(&alloc.id) {
             info!(
                 allocation_id = alloc.id,
                 task_name = %task.name,
                 "Re-dispatched allocation; stopping previous instance before relaunch"
             );
-            if let Err(err) = self.stop_allocation(alloc.id) {
+            if let Err(err) = self.stop_allocation_inner(alloc.id, false) {
                 warn!(
                     allocation_id = alloc.id,
                     error = ?err,
@@ -487,10 +498,10 @@ impl WorkerTaskManager {
             );
         }
 
-        // Fresh staging must start from a clean slate: a worker that died
-        // mid-staging leaves partial content behind, which would otherwise
-        // collide with the re-staged artifacts.
-        self.cleanup_alloc_dir(alloc.id);
+        // Cleanliness is the stager's job now: it reuses the task dir when a
+        // valid staging manifest matches the artifact list, and clears it
+        // before any fresh fetch (covering partial content left by a worker
+        // that died mid-staging).
         let runtime = self.prepare_runtime(&alloc, &task)?;
         let task_dir = runtime
             .task_dir
@@ -995,12 +1006,13 @@ mod tests {
     }
 
     #[test]
-    fn begin_task_allocation_cleans_stale_dirs_from_interrupted_staging() -> R<()> {
+    fn staging_cleans_stale_dirs_from_interrupted_staging() -> R<()> {
         let temp_dir = TempDir::new()?;
         let mut manager = manager_in(&temp_dir);
 
-        // Simulate a worker that died mid-staging: leftover content exists
-        // but the allocation is not registered in this (restarted) manager.
+        // Simulate a worker that died mid-staging: leftover content (and no
+        // staging manifest) exists, but the allocation is not registered in
+        // this (restarted) manager.
         let stale = temp_dir
             .path()
             .join("allocs")
@@ -1010,7 +1022,12 @@ mod tests {
         std::fs::create_dir_all(stale.parent().unwrap())?;
         std::fs::write(&stale, "partial")?;
 
-        let artifacts = vec![ArtifactSpec::from_source("https://example.com/tool.tar.gz")];
+        let source_dir = TempDir::new()?;
+        let source = source_dir.path().join("tool.bin");
+        std::fs::write(&source, "fresh bytes")?;
+        let mut artifact = ArtifactSpec::from_source(format!("file://{}", source.display()));
+        artifact.name = Some("tool".into());
+        artifact.unpack = crate::structs::ArtifactUnpack::File;
         let ta = TaskAllocation {
             allocation_id: 11,
             job_id: "job".into(),
@@ -1022,11 +1039,24 @@ mod tests {
             task_config: json!({"command": ["true"]}).to_string(),
             task_checks: String::new(),
             task_on_unhealthy: String::new(),
-            task_artifacts: serde_json::to_string(&artifacts)?,
+            task_artifacts: serde_json::to_string(&[artifact])?,
         };
         let outcome = manager.begin_task_allocation(&ta)?;
-        assert!(matches!(outcome, BeginOutcome::Staging(_)));
+        let job = match outcome {
+            BeginOutcome::Staging(job) => job,
+            BeginOutcome::Started(..) => panic!("artifact task must stage"),
+        };
+
+        // Without a manifest, fresh staging clears the leftovers and fetches.
+        let staged = job.stager.stage_task_artifacts(
+            job.allocation.id,
+            &job.task_dir,
+            &job.task.artifacts,
+            &job.board,
+        )?;
         assert!(!stale.exists(), "stale staging leftovers must be removed");
+        assert_eq!(staged.len(), 1);
+        assert!(job.task_dir.join("tool.bin").is_file());
         Ok(())
     }
 

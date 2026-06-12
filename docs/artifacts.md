@@ -392,6 +392,30 @@ its per-artifact retries) fails the whole allocation. Per-artifact fetches
 retry with backoff and honor an overall per-artifact deadline and size cap,
 all configurable per worker type:
 
+### Restart reuse — no refetch when nothing changed
+
+A fully successful staging run writes a manifest (`.staged.json`) into the
+task directory recording the artifact list's fingerprint and every staged
+payload. When the **same allocation** stages again with an **unchanged
+artifact list** — a worker restart re-dispatching the allocation, or an
+in-place config update that didn't touch `artifacts` — the worker reuses the
+already-staged content instead of refetching from origin. Reuse is
+all-or-nothing and falls back to a full fresh fetch when:
+
+- the artifact list changed in any way (the fingerprint covers the
+  normalized, pinned specs — so a moved pinned digest refetches),
+- any recorded payload path is missing from the task directory,
+- any artifact sets `resolve: 'always'` (the explicit "re-resolve at every
+  staging" contract disables reuse for the whole task), or
+- the previous run never finished (no manifest is written until every
+  artifact staged successfully; partial content is cleared before the fresh
+  fetch).
+
+Reuse applies only on the same node, per allocation — allocations *moved* to
+another node always fetch fresh, and explicit stops/removals delete the task
+directory. Cross-allocation and cross-node caching remain the
+[cache plan's](plans/artifact-cache-and-prewarm-plan.md) territory.
+
 ```jsonnet
 // configs/workers/default.jsonnet — values shown are the defaults
 {

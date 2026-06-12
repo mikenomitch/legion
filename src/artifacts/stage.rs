@@ -404,6 +404,12 @@ impl ArtifactStager {
     /// through `board`. All-or-nothing: the first artifact that fails (after
     /// per-artifact retries) fails the whole staging, which the caller turns
     /// into an allocation failure through the existing `record_failure` path.
+    ///
+    /// When the task directory holds a [`StagedManifest`] from a previous
+    /// fully-successful run of the *same* artifact list (a worker restart or
+    /// an in-place re-dispatch), the staged content is reused instead of
+    /// refetched. Artifacts with an explicit `resolve: "always"` opt out of
+    /// reuse — that is the "re-resolve at every staging" contract.
     #[instrument(skip_all, fields(allocation_id, task_dir = %task_dir.display()))]
     pub fn stage_task_artifacts(
         &self,
@@ -412,6 +418,32 @@ impl ArtifactStager {
         artifacts: &[ArtifactSpec],
         board: &ArtifactStatusBoard,
     ) -> R<Vec<StagedArtifact>> {
+        let fingerprint = spec_fingerprint(artifacts)?;
+        if reuse_allowed(artifacts) {
+            if let Some(staged) = try_reuse_staged(task_dir, &fingerprint, artifacts) {
+                for (index, artifact) in staged.iter().enumerate() {
+                    board.update(allocation_id, index, |row| {
+                        row.state = ArtifactState::Staged;
+                        row.digest = artifact.digest.clone();
+                        row.bytes_fetched = Some(artifact.bytes);
+                        row.bytes_total = Some(artifact.bytes);
+                        row.error = None;
+                    });
+                }
+                info!(
+                    allocation_id,
+                    artifacts = staged.len(),
+                    "Reusing previously staged artifacts"
+                );
+                return Ok(staged);
+            }
+        }
+
+        // Fresh staging starts from a clean slate: leftovers from an
+        // interrupted or non-matching previous run would collide with the
+        // staged content.
+        clear_dir_contents(task_dir)?;
+
         let staging_root = task_dir.join(".staging");
         let mut staged = Vec::with_capacity(artifacts.len());
         let result = (|| {
@@ -436,7 +468,17 @@ impl ArtifactStager {
         })();
         // Always clear the temp area; staged content has been moved out.
         let _ = fs::remove_dir_all(&staging_root);
-        result.map(|()| staged)
+        let staged = result.map(|()| staged)?;
+        // Record the successful run so a restart can reuse it. Best-effort:
+        // a missing manifest only costs a refetch.
+        if let Err(err) = write_staged_manifest(task_dir, &fingerprint, &staged) {
+            warn!(
+                allocation_id,
+                error = ?err,
+                "Failed to write staged-artifact manifest; restart will refetch"
+            );
+        }
+        Ok(staged)
     }
 
     fn stage_one(
@@ -856,6 +898,244 @@ fn apply_mode(path: &Path, mode: Option<&str>) -> R<()> {
     Ok(())
 }
 
+/// Marker file recording a fully successful staging run, written into the
+/// task directory so a worker restart (or in-place re-dispatch with an
+/// unchanged artifact list) reuses the staged content instead of refetching.
+const STAGED_MANIFEST_FILE: &str = ".staged.json";
+const STAGED_MANIFEST_VERSION: u32 = 1;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StagedManifest {
+    version: u32,
+    /// sha256 of the normalized artifact list; reuse requires an exact match.
+    spec_fingerprint: String,
+    artifacts: Vec<StagedRecord>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StagedRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    digest: Option<String>,
+    bytes: u64,
+    payload: StagedRecordPayload,
+}
+
+/// Payloads recorded with task-dir-relative paths so the manifest stays
+/// valid wherever the worker state dir is mounted.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", tag = "kind")]
+enum StagedRecordPayload {
+    File {
+        path: String,
+    },
+    Tree {
+        dir: String,
+    },
+    Image {
+        oci_layout: String,
+        reference: String,
+    },
+    Layers {
+        dir: String,
+        files: Vec<String>,
+        media_type: String,
+    },
+}
+
+/// Identity of an artifact list for reuse purposes: the hash of its
+/// normalized JSON (post-admission, so pinned digests and baked auth are
+/// part of the identity).
+fn spec_fingerprint(artifacts: &[ArtifactSpec]) -> R<String> {
+    let serialized = serde_json::to_string(artifacts).context("serialize artifact specs")?;
+    Ok(format!(
+        "sha256:{:x}",
+        Sha256::digest(serialized.as_bytes())
+    ))
+}
+
+/// Reuse is disabled when any artifact explicitly opts into per-staging
+/// resolution (`resolve: "always"`); pinned/checksummed lists are
+/// deterministic and safe to reuse.
+fn reuse_allowed(artifacts: &[ArtifactSpec]) -> bool {
+    artifacts
+        .iter()
+        .all(|spec| spec.resolve != Some(crate::structs::ArtifactResolve::Always))
+}
+
+fn relative_to_task_dir(task_dir: &Path, path: &Path) -> R<String> {
+    if path == task_dir {
+        return Ok(".".to_string());
+    }
+    let relative = path.strip_prefix(task_dir).with_context(|| {
+        format!(
+            "staged path {} is outside the task directory",
+            path.display()
+        )
+    })?;
+    Ok(relative.to_string_lossy().into_owned())
+}
+
+fn join_task_dir(task_dir: &Path, relative: &str) -> PathBuf {
+    if relative == "." {
+        task_dir.to_path_buf()
+    } else {
+        task_dir.join(relative)
+    }
+}
+
+fn write_staged_manifest(task_dir: &Path, fingerprint: &str, staged: &[StagedArtifact]) -> R<()> {
+    let records = staged
+        .iter()
+        .map(|artifact| {
+            let payload = match &artifact.payload {
+                StagedPayload::File { path } => StagedRecordPayload::File {
+                    path: relative_to_task_dir(task_dir, path)?,
+                },
+                StagedPayload::Tree { dir } => StagedRecordPayload::Tree {
+                    dir: relative_to_task_dir(task_dir, dir)?,
+                },
+                StagedPayload::Image {
+                    oci_layout,
+                    reference,
+                } => StagedRecordPayload::Image {
+                    oci_layout: relative_to_task_dir(task_dir, oci_layout)?,
+                    reference: reference.clone(),
+                },
+                StagedPayload::Layers {
+                    dir,
+                    files,
+                    media_type,
+                } => StagedRecordPayload::Layers {
+                    dir: relative_to_task_dir(task_dir, dir)?,
+                    files: files
+                        .iter()
+                        .map(|file| relative_to_task_dir(task_dir, file))
+                        .collect::<R<Vec<_>>>()?,
+                    media_type: media_type.clone(),
+                },
+            };
+            Ok(StagedRecord {
+                name: artifact.name.clone(),
+                digest: artifact.digest.clone(),
+                bytes: artifact.bytes,
+                payload,
+            })
+        })
+        .collect::<R<Vec<_>>>()?;
+
+    let manifest = StagedManifest {
+        version: STAGED_MANIFEST_VERSION,
+        spec_fingerprint: fingerprint.to_string(),
+        artifacts: records,
+    };
+    // Write-then-rename so a crash mid-write never leaves a manifest that
+    // claims success.
+    let temp_path = task_dir.join(format!("{STAGED_MANIFEST_FILE}.tmp"));
+    fs::write(&temp_path, serde_json::to_vec_pretty(&manifest)?)?;
+    fs::rename(&temp_path, task_dir.join(STAGED_MANIFEST_FILE))?;
+    Ok(())
+}
+
+/// Rebuilds the staged artifacts from a previous run when the manifest
+/// matches the requested artifact list and every recorded payload still
+/// exists. Any mismatch returns `None` and the caller stages fresh.
+fn try_reuse_staged(
+    task_dir: &Path,
+    fingerprint: &str,
+    artifacts: &[ArtifactSpec],
+) -> Option<Vec<StagedArtifact>> {
+    let raw = fs::read(task_dir.join(STAGED_MANIFEST_FILE)).ok()?;
+    let manifest: StagedManifest = serde_json::from_slice(&raw).ok()?;
+    if manifest.version != STAGED_MANIFEST_VERSION
+        || manifest.spec_fingerprint != fingerprint
+        || manifest.artifacts.len() != artifacts.len()
+    {
+        return None;
+    }
+
+    let mut staged = Vec::with_capacity(manifest.artifacts.len());
+    for record in manifest.artifacts {
+        let payload = match record.payload {
+            StagedRecordPayload::File { path } => {
+                let path = join_task_dir(task_dir, &path);
+                if !path.is_file() {
+                    return None;
+                }
+                StagedPayload::File { path }
+            }
+            StagedRecordPayload::Tree { dir } => {
+                let dir = join_task_dir(task_dir, &dir);
+                if !dir.is_dir() {
+                    return None;
+                }
+                StagedPayload::Tree { dir }
+            }
+            StagedRecordPayload::Image {
+                oci_layout,
+                reference,
+            } => {
+                let oci_layout = join_task_dir(task_dir, &oci_layout);
+                if !oci_layout.is_dir() {
+                    return None;
+                }
+                StagedPayload::Image {
+                    oci_layout,
+                    reference,
+                }
+            }
+            StagedRecordPayload::Layers {
+                dir,
+                files,
+                media_type,
+            } => {
+                let dir = join_task_dir(task_dir, &dir);
+                let files: Vec<PathBuf> = files
+                    .iter()
+                    .map(|file| join_task_dir(task_dir, file))
+                    .collect();
+                if !dir.is_dir() || files.iter().any(|file| !file.is_file()) {
+                    return None;
+                }
+                StagedPayload::Layers {
+                    dir,
+                    files,
+                    media_type,
+                }
+            }
+        };
+        staged.push(StagedArtifact {
+            name: record.name,
+            digest: record.digest,
+            bytes: record.bytes,
+            payload,
+        });
+    }
+    Some(staged)
+}
+
+/// Removes everything inside `dir` (the dir itself stays, so paths handed to
+/// runtimes remain valid).
+fn clear_dir_contents(dir: &Path) -> R<()> {
+    if !dir.exists() {
+        fs::create_dir_all(dir)?;
+        return Ok(());
+    }
+    for entry in fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_dir() {
+            fs::remove_dir_all(&path).with_context(|| format!("remove {}", path.display()))?;
+        } else {
+            fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1248,25 +1528,30 @@ mod tests {
     }
 
     #[test]
-    fn collision_with_existing_task_file_fails() -> R<()> {
+    fn collision_between_artifacts_fails() -> R<()> {
+        // Fresh staging clears the task dir first, so pre-existing content
+        // never collides — but two artifacts in one task unpacking the same
+        // path still must error rather than silently overwrite.
         let src = tempdir()?;
-        let archive = write_archive(src.path(), "tool.tar.gz", &[("config.json", "new")]);
+        let first = write_archive(src.path(), "a.tar.gz", &[("config.json", "from-a")]);
+        let second = write_archive(src.path(), "b.tar.gz", &[("config.json", "from-b")]);
 
         let task_dir = tempdir()?;
-        fs::write(task_dir.path().join("config.json"), "existing")?;
-
         let board = ArtifactStatusBoard::new();
-        let artifact = spec(&format!("file://{}", archive.display()));
-        board.init(1, std::slice::from_ref(&artifact));
+        let artifacts = vec![
+            spec(&format!("file://{}", first.display())).named("a"),
+            spec(&format!("file://{}", second.display())).named("b"),
+        ];
+        board.init(1, &artifacts);
 
         let err = test_stager(1)
-            .stage_task_artifacts(1, task_dir.path(), &[artifact], &board)
+            .stage_task_artifacts(1, task_dir.path(), &artifacts, &board)
             .unwrap_err();
         assert!(format!("{err:#}").contains("collides"), "{err:#}");
-        // The pre-existing file is untouched.
+        // The first artifact's content is what landed.
         assert_eq!(
             fs::read_to_string(task_dir.path().join("config.json"))?,
-            "existing"
+            "from-a"
         );
         Ok(())
     }
@@ -1289,6 +1574,223 @@ mod tests {
             staged[0].payload,
             crate::artifacts::StagedPayload::File { .. }
         ));
+        Ok(())
+    }
+
+    // --- restart reuse via the staging manifest ---
+
+    #[test]
+    fn restaging_reuses_previous_fetch_without_touching_origin() -> R<()> {
+        let src = tempdir()?;
+        let archive = write_archive(src.path(), "tool.tar.gz", &[("tool/run.sh", "echo hi")]);
+
+        let task_dir = tempdir()?;
+        let board = ArtifactStatusBoard::new();
+        let mut artifact = spec(&format!("file://{}", archive.display()));
+        artifact.name = Some("tool".into());
+        board.init(1, std::slice::from_ref(&artifact));
+
+        let stager = test_stager(1);
+        let first = stager.stage_task_artifacts(
+            1,
+            task_dir.path(),
+            std::slice::from_ref(&artifact),
+            &board,
+        )?;
+        assert!(
+            task_dir.path().join(STAGED_MANIFEST_FILE).is_file(),
+            "manifest written after success"
+        );
+
+        // The origin is gone: any refetch would fail, so success proves reuse.
+        fs::remove_file(&archive)?;
+        board.init(1, std::slice::from_ref(&artifact));
+        let second = stager.stage_task_artifacts(
+            1,
+            task_dir.path(),
+            std::slice::from_ref(&artifact),
+            &board,
+        )?;
+
+        assert_eq!(first, second, "reused payloads match the original run");
+        assert_eq!(
+            fs::read_to_string(task_dir.path().join("tool/run.sh"))?,
+            "echo hi"
+        );
+        let rows = board.snapshot(1).expect("rows");
+        assert_eq!(rows[0].state, ArtifactState::Staged);
+        assert_eq!(rows[0].digest, first[0].digest);
+        Ok(())
+    }
+
+    #[test]
+    fn restaging_refetches_when_specs_changed() -> R<()> {
+        let src = tempdir()?;
+        let binary = src.path().join("tool.bin");
+        fs::write(&binary, "v1")?;
+
+        let task_dir = tempdir()?;
+        let board = ArtifactStatusBoard::new();
+        let mut artifact = spec(&format!("file://{}", binary.display()));
+        artifact.unpack = crate::structs::ArtifactUnpack::File;
+        board.init(1, std::slice::from_ref(&artifact));
+
+        let stager = test_stager(1);
+        stager.stage_task_artifacts(1, task_dir.path(), std::slice::from_ref(&artifact), &board)?;
+
+        // A different artifact list (changed dest) must not reuse the old run.
+        fs::write(&binary, "v2")?;
+        let mut changed = artifact.clone();
+        changed.dest = Some("bin/".into());
+        board.init(1, std::slice::from_ref(&changed));
+        let staged = stager.stage_task_artifacts(
+            1,
+            task_dir.path(),
+            std::slice::from_ref(&changed),
+            &board,
+        )?;
+        assert_eq!(
+            fs::read_to_string(staged[0].reference_path())?,
+            "v2",
+            "changed spec refetches from origin"
+        );
+        // The fresh run cleared the previous layout entirely.
+        assert!(!task_dir.path().join("tool.bin").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn restaging_refetches_when_staged_payload_is_missing() -> R<()> {
+        let src = tempdir()?;
+        let binary = src.path().join("tool.bin");
+        fs::write(&binary, "bytes")?;
+
+        let task_dir = tempdir()?;
+        let board = ArtifactStatusBoard::new();
+        let mut artifact = spec(&format!("file://{}", binary.display()));
+        artifact.unpack = crate::structs::ArtifactUnpack::File;
+        board.init(1, std::slice::from_ref(&artifact));
+
+        let stager = test_stager(1);
+        stager.stage_task_artifacts(1, task_dir.path(), std::slice::from_ref(&artifact), &board)?;
+
+        // Manifest intact but the payload vanished: reuse must not serve a
+        // dangling path.
+        fs::remove_file(task_dir.path().join("tool.bin"))?;
+        board.init(1, std::slice::from_ref(&artifact));
+        let staged = stager.stage_task_artifacts(
+            1,
+            task_dir.path(),
+            std::slice::from_ref(&artifact),
+            &board,
+        )?;
+        assert!(staged[0].reference_path().is_file());
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_always_disables_reuse() -> R<()> {
+        let src = tempdir()?;
+        let binary = src.path().join("tool.bin");
+        fs::write(&binary, "v1")?;
+
+        let task_dir = tempdir()?;
+        let board = ArtifactStatusBoard::new();
+        let mut artifact = spec(&format!("file://{}", binary.display()));
+        artifact.unpack = crate::structs::ArtifactUnpack::File;
+        artifact.resolve = Some(crate::structs::ArtifactResolve::Always);
+        board.init(1, std::slice::from_ref(&artifact));
+
+        let stager = test_stager(1);
+        let first = stager.stage_task_artifacts(
+            1,
+            task_dir.path(),
+            std::slice::from_ref(&artifact),
+            &board,
+        )?;
+
+        // resolve: "always" means every staging re-reads the source.
+        fs::write(&binary, "v2-different-content")?;
+        board.init(1, std::slice::from_ref(&artifact));
+        let second = stager.stage_task_artifacts(
+            1,
+            task_dir.path(),
+            std::slice::from_ref(&artifact),
+            &board,
+        )?;
+        assert_ne!(first[0].digest, second[0].digest, "refetched from origin");
+        assert_eq!(
+            fs::read_to_string(second[0].reference_path())?,
+            "v2-different-content"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn manifest_round_trip_covers_all_payload_kinds() -> R<()> {
+        let task_dir = tempdir()?;
+        let task_dir = task_dir.path();
+        fs::write(task_dir.join("tool"), "x")?;
+        fs::create_dir_all(task_dir.join("repo"))?;
+        fs::create_dir_all(task_dir.join(".oci/image"))?;
+        fs::create_dir_all(task_dir.join("models"))?;
+        fs::write(task_dir.join("models/w.bin"), "w")?;
+
+        let staged = vec![
+            StagedArtifact {
+                name: Some("tool".into()),
+                digest: Some(format!("sha256:{}", "a".repeat(64))),
+                bytes: 1,
+                payload: StagedPayload::File {
+                    path: task_dir.join("tool"),
+                },
+            },
+            StagedArtifact {
+                name: None,
+                digest: None,
+                bytes: 2,
+                payload: StagedPayload::Tree {
+                    // dest "." trees reference the task dir itself.
+                    dir: task_dir.to_path_buf(),
+                },
+            },
+            StagedArtifact {
+                name: Some("image".into()),
+                digest: Some(format!("sha256:{}", "b".repeat(64))),
+                bytes: 3,
+                payload: StagedPayload::Image {
+                    oci_layout: task_dir.join(".oci/image"),
+                    reference: "ghcr.io/acme/api:v1".into(),
+                },
+            },
+            StagedArtifact {
+                name: Some("model".into()),
+                digest: Some(format!("sha256:{}", "c".repeat(64))),
+                bytes: 4,
+                payload: StagedPayload::Layers {
+                    dir: task_dir.join("models"),
+                    files: vec![task_dir.join("models/w.bin")],
+                    media_type: "application/vnd.acme.weights".into(),
+                },
+            },
+        ];
+
+        let specs = vec![spec("https://example.com/a"), spec("https://example.com/b")];
+        let fingerprint_specs = [
+            specs[0].clone(),
+            specs[1].clone(),
+            specs[0].clone(),
+            specs[1].clone(),
+        ];
+        let fingerprint = spec_fingerprint(&fingerprint_specs)?;
+        write_staged_manifest(task_dir, &fingerprint, &staged)?;
+
+        let reused =
+            try_reuse_staged(task_dir, &fingerprint, &fingerprint_specs).expect("manifest matches");
+        assert_eq!(reused, staged);
+
+        // A different fingerprint is rejected outright.
+        assert!(try_reuse_staged(task_dir, "sha256:other", &fingerprint_specs).is_none());
         Ok(())
     }
 }

@@ -640,6 +640,107 @@ async fn resolve_always_passes_reference_through() -> R<()> {
     Ok(())
 }
 
+/// Worker restart: an allocation whose artifacts staged successfully is
+/// re-launched (same id, same task dir) without refetching. The HTTP fixture
+/// serves exactly one request, so any refetch attempt would fail the test.
+#[test]
+fn worker_restart_reuses_staged_artifacts() -> R<()> {
+    let (base_url, server) = serve_archive(tool_archive(), 1);
+    let temp_dir = TempDir::new()?;
+
+    let allocation = task_allocation(
+        66,
+        json!({"command": ["sh", "${artifact.tool}/tool/run.sh"]}),
+        json!([{"source": format!("{base_url}/tool.tar.gz"), "name": "tool"}]),
+    );
+
+    let task_dir = temp_dir.path().join("allocs").join("66").join("tool-task");
+    let marker = task_dir.join("marker");
+    {
+        let manager = worker_manager(&temp_dir);
+        launch_task_allocation(&manager, &allocation)?;
+        assert!(
+            wait_until(Duration::from_secs(15), || marker.is_file()),
+            "first launch failed: {:?}",
+            manager.lock().unwrap().allocation_health_snapshot()
+        );
+        // Worker "dies": the manager instance is dropped without stopping the
+        // allocation, leaving the staged task dir (and its manifest) behind.
+    }
+    server.join().ok();
+    assert!(
+        task_dir.join(".staged.json").is_file(),
+        "staging manifest persisted across restart"
+    );
+
+    // Fresh worker process over the same state dir. The script's process has
+    // exited, so restore skips it and the manager re-dispatches the same
+    // allocation. The fixture is gone — only reuse can succeed.
+    std::fs::remove_file(&marker)?;
+    let restarted = worker_manager(&temp_dir);
+    launch_task_allocation(&restarted, &allocation)?;
+    assert!(
+        wait_until(Duration::from_secs(15), || marker.is_file()),
+        "relaunch after restart failed (artifacts should be reused): {:?}",
+        restarted.lock().unwrap().allocation_health_snapshot()
+    );
+
+    let guard = restarted.lock().unwrap();
+    let health = guard.allocation_health_snapshot();
+    let entry = health
+        .iter()
+        .find(|h| h.allocation_id == 66)
+        .expect("health");
+    let states = entry.artifact_states.as_deref().expect("artifact states");
+    assert!(states.contains("\"state\":\"staged\""), "{states}");
+    Ok(())
+}
+
+/// In-place re-dispatch (same allocation id, changed task config but the
+/// same artifact list) stops the old process and reuses the staged
+/// artifacts instead of refetching.
+#[test]
+fn redispatch_with_unchanged_artifacts_reuses_staging() -> R<()> {
+    let (base_url, server) = serve_archive(tool_archive(), 1);
+    let temp_dir = TempDir::new()?;
+    let manager = worker_manager(&temp_dir);
+
+    let artifacts = json!([{"source": format!("{base_url}/tool.tar.gz"), "name": "tool"}]);
+    let allocation = task_allocation(
+        77,
+        json!({"command": ["sh", "${artifact.tool}/tool/run.sh"]}),
+        artifacts.clone(),
+    );
+    let task_dir = temp_dir.path().join("allocs").join("77").join("tool-task");
+    let marker = task_dir.join("marker");
+
+    launch_task_allocation(&manager, &allocation)?;
+    assert!(
+        wait_until(Duration::from_secs(15), || marker.is_file()),
+        "first launch failed"
+    );
+    server.join().ok();
+
+    // Re-dispatch with a changed env (config update) but identical artifacts;
+    // the single-shot fixture is gone, so success proves reuse.
+    std::fs::remove_file(&marker)?;
+    let updated = task_allocation(
+        77,
+        json!({
+            "command": ["sh", "${artifact.tool}/tool/run.sh"],
+            "env": {"V": "2"},
+        }),
+        artifacts,
+    );
+    launch_task_allocation(&manager, &updated)?;
+    assert!(
+        wait_until(Duration::from_secs(15), || marker.is_file()),
+        "re-dispatch failed (artifacts should be reused): {:?}",
+        manager.lock().unwrap().allocation_health_snapshot()
+    );
+    Ok(())
+}
+
 /// Worker-side parse guard: a `TaskAllocation` without `task_artifacts`
 /// behaves exactly as before the artifact system existed.
 #[test]
