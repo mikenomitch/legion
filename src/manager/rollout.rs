@@ -1,3 +1,7 @@
+// Several rollout planning helpers thread a deliberately wide set of state
+// through by value; splitting them into structs would obscure more than it helps.
+#![allow(clippy::too_many_arguments)]
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Duration;
 
@@ -422,7 +426,6 @@ pub fn stop_rollout(store: &Store, rollout_id: i64, revert: bool, priority: i64)
 }
 
 #[instrument(skip_all, fields(rollout_id = rollout.id, plans = plans.len()))]
-#[allow(clippy::too_many_arguments)]
 fn execute_tick(
     store: &Store,
     scheduler: &Scheduler<'_>,
@@ -577,7 +580,6 @@ fn execute_tick(
     skip_all,
     fields(rollout_id = rollout.id, group = %plan.name, step_index = state.step_index)
 )]
-#[allow(clippy::too_many_arguments)]
 fn execute_group_tick(
     store: &Store,
     scheduler: &Scheduler<'_>,
@@ -746,7 +748,6 @@ fn step_operation_order(replacement: &RolloutReplacement) -> [StepOperation; 3] 
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn execute_step_operation(
     operation: StepOperation,
     store: &Store,
@@ -862,7 +863,6 @@ fn execute_step_operation(
     skip_all,
     fields(rollout_id = rollout.id, group = %plan.name, in_place = plan.config.in_place.unwrap_or(false))
 )]
-#[allow(clippy::too_many_arguments)]
 fn try_place_for_group(
     store: &Store,
     scheduler: &Scheduler<'_>,
@@ -999,7 +999,6 @@ fn try_place_for_group(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn on_placement_wait(
     store: &Store,
     scheduler: &Scheduler<'_>,

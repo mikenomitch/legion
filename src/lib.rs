@@ -4,6 +4,7 @@ pub mod constants;
 pub mod constraints;
 pub mod getter_rs;
 pub mod manager;
+pub mod otel;
 pub mod plugin_runtime;
 pub mod prelude;
 pub mod resources;

@@ -1,6 +1,7 @@
 use crate::prelude::*;
 use crate::structs::{
-    worker_server::Worker, PostWorkReply, PostWorkRequest, RestartWorkerReply, RestartWorkerRequest,
+    worker_server::Worker, GetTaskLogsReply, GetTaskLogsRequest, PostWorkReply, PostWorkRequest,
+    RestartWorkerReply, RestartWorkerRequest, TaskLogStream,
 };
 use crate::worker::identity::WorkerIdentityManager;
 use crate::worker::task_health::spawn_health_monitor;
@@ -74,6 +75,43 @@ impl Worker for WorkerDaemonService {
         };
 
         Ok(Response::new(reply))
+    }
+
+    #[instrument(err, skip_all)]
+    async fn get_task_logs(
+        &self,
+        request: Request<GetTaskLogsRequest>,
+    ) -> Result<Response<GetTaskLogsReply>, Status> {
+        let req = request.into_inner();
+        let streams = {
+            let manager = self
+                .task_manager
+                .lock()
+                .map_err(|_| Status::internal("Task manager lock poisoned"))?;
+            manager
+                .read_allocation_logs(
+                    req.allocation_id,
+                    &req.stream,
+                    req.offset,
+                    req.max_bytes,
+                    req.tail,
+                )
+                .map_err(|err| Status::internal(format!("Failed to read task logs: {err}")))?
+        };
+
+        let streams = streams
+            .into_iter()
+            .map(|stream| TaskLogStream {
+                stream: stream.stream,
+                content: stream.content,
+                size_bytes: stream.size_bytes,
+                truncated: stream.truncated,
+                start_offset: stream.start_offset,
+                next_offset: stream.next_offset,
+            })
+            .collect();
+
+        Ok(Response::new(GetTaskLogsReply { streams }))
     }
 
     #[instrument(err, skip_all)]

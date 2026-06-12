@@ -13,6 +13,7 @@ A distributed scheduler similar to Kubernetes or Nomad.
 - [Task Kind: container](docs/task-kind-container.md)
 - [Task Kind: noop](docs/task-kind-noop.md)
 - [State Store](docs/state-store.md)
+- [Logging (task logs, tailing, rotation, shipping, OTLP traces)](docs/logging.md)
 - [Observability](docs/observability.md)
 - [UI Architecture](docs/ui-architecture.md)
 - [KV Store](docs/kv-store.md)

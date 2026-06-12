@@ -1,3 +1,7 @@
+// Scheduler planning entry points pass many parameters (nodes, policy, caches,
+// epochs, …) by design; bundling them into structs would not improve clarity.
+#![allow(clippy::too_many_arguments)]
+
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use serde_json::Value;
@@ -141,7 +145,6 @@ impl PlanScoringCache {
     const COMMON_CORES: u8 = 1 << 2;
     const COMMON_ALLOCATIONS: u8 = 1 << 3;
 
-    #[allow(clippy::too_many_arguments)]
     fn from_plan(
         candidates: &[&Node],
         task_id: i64,
@@ -813,7 +816,6 @@ impl<'a> Scheduler<'a> {
         Ok(nodes)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn build_plan(
         &self,
         job_config_id: &str,
@@ -824,7 +826,7 @@ impl<'a> Scheduler<'a> {
         allocations_by_node: &HashMap<String, Vec<Allocation>>,
         mode: PlanMode,
     ) -> R<Vec<PlannedAllocation>> {
-        tasks.sort_by_key(|task| task.0);
+        tasks.sort_by_key(|a| a.0);
 
         let mut placements = Vec::new();
         let mut planned: HashMap<String, usize> = HashMap::new();
@@ -1139,7 +1141,6 @@ impl<'a> Scheduler<'a> {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn place_task_allocations<'b>(
         &self,
         count: u32,
@@ -1276,7 +1277,6 @@ impl<'a> Scheduler<'a> {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn select_node_id(
         &self,
         eligible: Vec<&Node>,

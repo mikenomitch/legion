@@ -259,7 +259,6 @@ pub struct PersistenceConfigFull {
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct StreamingPersistenceConfig {
-    pub litestream_binary: Option<String>,
     pub replica_url: Option<String>,
     pub sync_interval: Option<String>,
     pub lease: Option<StreamingLeaseConfig>,
@@ -268,7 +267,6 @@ pub struct StreamingPersistenceConfig {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct StreamingPersistenceConfigFull {
-    pub litestream_binary: String,
     pub replica_url: String,
     pub sync_interval: String,
     pub lease: StreamingLeaseConfigFull,
@@ -451,7 +449,6 @@ impl PersistenceConfig {
 impl Default for StreamingPersistenceConfigFull {
     fn default() -> Self {
         Self {
-            litestream_binary: "litestream".to_string(),
             replica_url: String::new(),
             sync_interval: "1s".to_string(),
             lease: StreamingLeaseConfigFull::default(),
@@ -462,10 +459,6 @@ impl Default for StreamingPersistenceConfigFull {
 impl StreamingPersistenceConfig {
     pub fn with_defaults(&self) -> StreamingPersistenceConfigFull {
         StreamingPersistenceConfigFull {
-            litestream_binary: self
-                .litestream_binary
-                .clone()
-                .unwrap_or_else(|| "litestream".to_string()),
             replica_url: self.replica_url.clone().unwrap_or_default(),
             sync_interval: self
                 .sync_interval
@@ -563,7 +556,6 @@ impl From<PersistenceConfigFull> for PersistenceConfig {
 impl From<StreamingPersistenceConfigFull> for StreamingPersistenceConfig {
     fn from(value: StreamingPersistenceConfigFull) -> Self {
         Self {
-            litestream_binary: Some(value.litestream_binary),
             replica_url: Some(value.replica_url),
             sync_interval: Some(value.sync_interval),
             lease: Some(value.lease.into()),

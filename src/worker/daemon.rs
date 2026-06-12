@@ -174,7 +174,14 @@ async fn run_worker_with_manager(
         client,
         task_manager.clone(),
     );
-    let _res = join!(heartbeat_fut, self_fence_fut, checks_fut, worker_server_fut);
+    let log_maintenance_fut = start_log_maintenance(task_manager.clone());
+    let _res = join!(
+        heartbeat_fut,
+        self_fence_fut,
+        checks_fut,
+        log_maintenance_fut,
+        worker_server_fut
+    );
 
     Ok(())
 }
@@ -452,6 +459,20 @@ async fn start_self_fence_watchdog(
             );
         }
         tokio::time::sleep(SELF_FENCE_CHECK_INTERVAL).await;
+    }
+}
+
+/// Periodically rotate/prune captured task logs across all active allocations
+/// so a chatty task cannot fill the worker's disk. Runs for the lifetime of the
+/// worker; never returns on the happy path.
+#[instrument(skip_all)]
+async fn start_log_maintenance(task_manager: Arc<Mutex<WorkerTaskManager>>) -> R<()> {
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_secs(
+            DEF_TASK_LOG_MAINTENANCE_SEC,
+        ))
+        .await;
+        task_manager.lock().expect("task manager").maintain_logs();
     }
 }
 

@@ -1,3 +1,6 @@
+// A few low-level persistence helpers take many columns by parameter.
+#![allow(clippy::too_many_arguments)]
+
 use crate::constraints::{ConstraintSet, DistinctTracker, PermitSet};
 use crate::prelude::*;
 use crate::resources::ResourcePolicy;
@@ -2421,7 +2424,6 @@ impl Store {
     }
 
     #[instrument(err, skip_all)]
-    #[allow(clippy::too_many_arguments)]
     pub fn create_rollout(
         &self,
         job_id: &str,
