@@ -106,6 +106,12 @@ Two code paths exist:
 - Operational path (used in runtime):
   - Manager node checker marks stale-heartbeat nodes as lost.
   - Lost-node allocations are removed and reconciled immediately via store functions.
+  - Startup heartbeat grace: heartbeats can only refresh while the manager is
+    up, so after a manager restart every persisted heartbeat looks stale. The
+    checker therefore marks no node lost until the manager itself has been up
+    for a full lost-node window, giving reconnecting workers time to
+    re-heartbeat — a manager outage/restart never deschedules (and thus never
+    kills) tasks on healthy workers.
 - Eval path (used in tests/manual eval insertion):
   - `node_drop` / `node_join` eval kinds call equivalent store reconciliation logic.
 
