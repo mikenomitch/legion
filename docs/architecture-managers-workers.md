@@ -24,9 +24,17 @@ Important: Legion now includes a Raft control-plane mode for manager leader elec
 
 `run_manager` starts these loops/services:
 
-- Main manager gRPC server (`Manager` service) on `server.port`.
+- Main manager gRPC server (`Manager` service) on `server.port`. When
+  `workloadIdentity.enabled` is set, this same listener also answers two
+  plain HTTP/1.1 GET routes for the manager-as-OIDC-IdP role —
+  `/.well-known/openid-configuration` and the JWKS path — via a tower layer
+  mounted in front of the gRPC stack (`src/manager/oidc_http.rs`); external
+  relying parties (AWS/GCP/Vault) fetch these with generic HTTP clients.
 - Node status checker loop (`start_node_status_checker`).
 - Eval worker pool (`start_eval_loop`) with `eval_threads` workers.
+- Workload-identity signing-key rotation loop (only when
+  `workloadIdentity.enabled`; primary manager only in HA setups). See
+  [docs/workload-identity.md](workload-identity.md).
 - With ACLs enabled: JWKS refresh and expired-credential pruning loops.
 - Optional in-process worker (`--run-worker`; the manager self-issues its
   join token when ACLs are enforced).
@@ -74,6 +82,10 @@ Worker startup (`run_worker`) flow:
   - allocation health snapshots.
   Manager responds with desired allocations.
 - `HealthCheck`: worker sends node health check JSON.
+- `IssueWorkloadIdentityToken`: worker fetches short-lived OIDC tokens for
+  identities declared on its allocations' tasks (at launch and on refresh);
+  the manager derives all claims server-side and only serves allocations
+  placed on the calling node. See [docs/workload-identity.md](workload-identity.md).
 
 ### Worker APIs used by manager
 

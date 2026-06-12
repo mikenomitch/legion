@@ -106,6 +106,14 @@ pub fn catalog() -> Vec<Capability> {
             read_only_safe: true,
         },
         Capability {
+            name: "job.logs",
+            cli: "legion job logs [<NAME>] [--allocation <ID>] [--follow]",
+            grpc: Some("Manager/GetAllocationLogs"),
+            summary: "Fetch captured stdout/stderr for a job's allocations.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
             name: "job.stop",
             cli: "legion job stop <NAME>",
             grpc: Some("Manager/StopJob"),
@@ -118,6 +126,79 @@ pub fn catalog() -> Vec<Capability> {
             cli: "legion job destroy <NAME>",
             grpc: Some("Manager/DestroyJob"),
             summary: "Destroy a job and its allocations. Supports --idempotency-key.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        // --- Stateful instances (keyed mode; see docs/stateful-workloads.md) ---
+        Capability {
+            name: "instance.list",
+            cli: "legion instance list <JOB>",
+            grpc: Some("Manager/ListInstances"),
+            summary: "List a job's stateful instances (slot and keyed, incl. tombstones).",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "instance.get",
+            cli: "legion instance get <ID>",
+            grpc: Some("Manager/GetInstance"),
+            summary: "Inspect one stateful instance by id.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "instance.create",
+            cli: "legion instance create <JOB> [--id <KEY>]",
+            grpc: Some("Manager/CreateInstance"),
+            summary:
+                "Create a keyed-mode instance (never-recycled id). Supports --idempotency-key.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "instance.create-batch",
+            cli: "legion instance create <JOB> --id <KEY>... --count <N>",
+            grpc: Some("Manager/CreateInstances"),
+            summary:
+                "Create several keyed instances atomically (all-or-nothing: explicit ids plus N \
+                 server-minted). Supports --idempotency-key.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "instance.stop",
+            cli: "legion instance stop <ID>",
+            grpc: Some("Manager/StopInstance"),
+            summary: "Pause a keyed instance: stop its allocation, retain row + storage handle \
+                 (reversible via instance.start). Supports --idempotency-key.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "instance.start",
+            cli: "legion instance start <ID>",
+            grpc: Some("Manager/StartInstance"),
+            summary: "Resume a stopped keyed instance: re-place it with the same id and retained \
+                 storage handle. Supports --idempotency-key.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "instance.destroy",
+            cli: "legion instance destroy <ID>",
+            grpc: Some("Manager/DestroyInstance"),
+            summary:
+                "Destroy a keyed-mode instance and drop its storage. Supports --idempotency-key.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "instance.replace",
+            cli: "legion instance replace <ID>",
+            grpc: Some("Manager/ReplaceInstance"),
+            summary: "Operator override: force-replace an instance's allocation stuck on a LOST \
+                 node without waiting for onLost.replaceAfter (split-brain risk if the node is \
+                 only partitioned). Supports --idempotency-key.",
             mutates: true,
             read_only_safe: false,
         },
@@ -179,6 +260,15 @@ pub fn catalog() -> Vec<Capability> {
             mutates: false,
             read_only_safe: true,
         },
+        // --- Scheduler events ---
+        Capability {
+            name: "events.list",
+            cli: "legion events list",
+            grpc: Some("Manager/ListEvents"),
+            summary: "List recent scheduler events with filters and an after-id cursor.",
+            mutates: false,
+            read_only_safe: true,
+        },
         Capability {
             name: "node.join-token.delete",
             cli: "legion join-token delete <ID>",
@@ -186,6 +276,14 @@ pub fn catalog() -> Vec<Capability> {
             summary: "Revoke a worker join token.",
             mutates: true,
             read_only_safe: false,
+        },
+        Capability {
+            name: "events.follow",
+            cli: "legion events follow",
+            grpc: Some("Manager/StreamEvents"),
+            summary: "Stream scheduler events live (NDJSON envelopes in --json mode).",
+            mutates: false,
+            read_only_safe: true,
         },
         // --- State store (the agent's introspection workhorse) ---
         Capability {

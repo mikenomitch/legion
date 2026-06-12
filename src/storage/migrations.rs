@@ -377,6 +377,112 @@ pub fn get_migrations() -> Migrations<'static> {
         // Workload identities declared on a task (workload-identity OIDC plan).
         // JSON-encoded Vec<WorkloadIdentity>; NULL/absent == no identities.
         M::up("ALTER TABLE task_config ADD COLUMN identities JSONB;").down(""),
+        // Stateful block declared on a task (stateful-workloads plan).
+        // JSON-encoded StatefulConfig; NULL/absent == stateless task.
+        M::up("ALTER TABLE task_config ADD COLUMN stateful JSONB;").down(""),
+        // Stable instances for stateful workloads (stateful-workloads plan).
+        // One row per logical instance; allocations reference instance_id and
+        // churn underneath it. Terminated rows are retained: slot rows so a
+        // scale-out re-materializes the same id/storage, keyed rows forever so
+        // ids are never recycled.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS instance (
+            instance_id STRING PRIMARY KEY,
+            job_id STRING NOT NULL,
+            group_name STRING NOT NULL,
+            task_name STRING NOT NULL,
+            mode STRING NOT NULL,
+            state STRING NOT NULL,
+            slot_index INTEGER,
+            current_alloc_id INTEGER,
+            storage_handle STRING,
+            created_at TIMESTAMP NOT NULL,
+            updated_at TIMESTAMP NOT NULL,
+            FOREIGN KEY(job_id) REFERENCES job(id) ON DELETE CASCADE
+        )",
+        )
+        .down("DROP TABLE IF EXISTS instance;"),
+        M::up(
+            "CREATE INDEX IF NOT EXISTS idx_instance_job_group ON instance(job_id, group_name);",
+        )
+        .down("DROP INDEX IF EXISTS idx_instance_job_group;"),
+        // The stable instance an allocation currently fulfills (NULL for
+        // stateless tasks). No FK: instance rows outlive allocations and the
+        // column is assigned inside the allocation-insert transaction.
+        M::up("ALTER TABLE allocation ADD COLUMN instance_id STRING;").down(""),
+        M::up(
+            "CREATE INDEX IF NOT EXISTS idx_allocation_instance_id ON allocation(instance_id);",
+        )
+        .down("DROP INDEX IF EXISTS idx_allocation_instance_id;"),
+        // OIDC signing keys for workload identity (workload-identity plan).
+        // Persisting the keypair is what keeps externally-held tokens
+        // verifiable across manager restarts: the JWKS must keep publishing
+        // the same public keys, and the active private key must keep signing.
+        // The private key PEM lives here in the manager's SQLite — the same
+        // trust domain as the CA material; whoever can read the store can
+        // mint identities. state ∈ {active, retiring, expired}; expired rows
+        // are retained for audit and dropped from the JWKS.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS signing_key (
+            kid STRING PRIMARY KEY,
+            alg STRING NOT NULL,
+            private_key_pem TEXT NOT NULL,
+            public_jwk_x STRING NOT NULL,
+            public_jwk_y STRING NOT NULL,
+            created_at INTEGER NOT NULL,
+            not_after INTEGER,
+            state STRING NOT NULL
+        )",
+        )
+        .down("DROP TABLE IF EXISTS signing_key;"),
+        // When the node was marked lost (RFC3339); NULL while active/ready.
+        // Set once by mark_node_lost/mark_nodes_as_lost (not refreshed while
+        // the node stays lost) and cleared when the node heartbeats again or
+        // re-registers. Drives the stateful node-loss confirmation gate: a
+        // stateful allocation on a lost node is only freed for replacement
+        // once `now - lost_at > stateful.onLost.replaceAfter` (see
+        // docs/stateful-workloads.md "Node loss and fencing").
+        M::up("ALTER TABLE node ADD COLUMN lost_at TIMESTAMP;").down(""),
+        // Scheduler event journal backing ListEvents/StreamEvents.
+        //
+        // No foreign keys: events must outlive the jobs/nodes they describe
+        // (e.g. a job.destroyed event survives the job row's deletion).
+        //
+        // Deliberately no secondary indexes and no AUTOINCREMENT: events are
+        // inserted inside scheduler write transactions (the eval critical
+        // path), where every extra b-tree update lengthens the serialized
+        // critical section. The table is pruned to ~10k rows, so filtered
+        // list queries scan it in ~1ms, and cursor queries use the rowid PK.
+        // Plain INTEGER PRIMARY KEY stays monotonic because pruning only ever
+        // removes the oldest rows, never the newest.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS scheduler_event (
+            id INTEGER PRIMARY KEY,
+            kind TEXT NOT NULL,
+            level TEXT NOT NULL,
+            job_id TEXT,
+            node_id TEXT,
+            eval_id TEXT,
+            allocation_id INTEGER,
+            rollout_id INTEGER,
+            message TEXT NOT NULL,
+            metadata_json JSONB NOT NULL DEFAULT '{}',
+            created_at TIMESTAMP NOT NULL
+        )",
+        )
+        .down("DROP TABLE IF EXISTS scheduler_event;"),
+        // Artifacts declared on a task (artifact system plan). JSON-encoded
+        // Vec<ArtifactSpec> in normalized (post-admission) form; NULL/absent
+        // == no artifacts. Ordered after main's scheduler_event migration so
+        // databases migrated on main upgrade cleanly.
+        M::up("ALTER TABLE task_config ADD COLUMN artifacts JSONB;").down(""),
+        // Worker-type artifact fetch settings (JSON WorkerArtifactsConfig;
+        // empty string == worker built-in defaults).
+        M::up("ALTER TABLE worker_type ADD COLUMN artifacts TEXT NOT NULL DEFAULT '';")
+            .down(""),
+        // Per-artifact staging states from the latest worker heartbeat
+        // (JSON Vec<ArtifactStatus>); NULL == task declares no artifacts.
+        M::up("ALTER TABLE allocation_health ADD COLUMN artifact_states TEXT;").down(""),
         // ACL policies: named rule documents (see docs/plans/auth-acl-plan.md).
         M::up(
             "CREATE TABLE IF NOT EXISTS acl_policy (

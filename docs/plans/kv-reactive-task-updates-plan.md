@@ -1,5 +1,35 @@
 # Plan: KV-Driven Task Updates, Injection, and Capabilities
 
+## Status (2026-06-09)
+
+Implemented and shipped (see `docs/kv-store.md` "Reactive updates" for the
+user-facing semantics):
+
+- Spec API: `kv_injections` (defaults + `env[]` + `files[]`), per-reference
+  `watch`/`on_change`/`on_delete` policy with field-by-field defaults
+  inheritance, `template`/`template_kv` sources (transitive keys tracked),
+  validation of mutually exclusive sources.
+- Dependency graph (`job_kv_reference`), KV put/patch/delete eventing,
+  per-job action coalescing (`none < restart < rollout < fail`), and a
+  configurable debounce window (`kvDebounceMs`, default 500ms, 0 = sync).
+- Real `fail` semantics: job marked `failed`, allocations stamped
+  `failed:missing_kv_dependency`, no restart/rollout storm; recovery via a
+  later put resolving through `on_change` (or a manual job update).
+- Capability gating per task kind (exec: env+file; container: env only;
+  noop: neither) enforced at submit.
+- Integration tests across the delete matrix, watch=false, policy
+  precedence, template_kv transitivity, debounce coalescing, fail/recovery,
+  multi-task isolation, and capability rejection (`src/manager/server.rs`).
+
+Deliberate deviations from this plan:
+
+1. **No `kv_reactive_updates` feature flag.** The feature predates the flag
+   idea and is already default-on; gating it now would regress existing
+   jobs. Defaults are effectively opt-in per reference anyway, since `watch`
+   defaults to `false` (no surprise restarts).
+2. **No `kv_or()` optional-lookup helper in v1.** Open question 2 is
+   deferred; all references are required.
+
 ## Problem Statement
 
 Legion has a KV store and job/task specs, but there is no unified, user-facing way to:

@@ -55,10 +55,20 @@ Every Manager gRPC endpoint must enforce ACLs. When you add an RPC:
   Worker-plane endpoints (registration, heartbeats) instead use
   `verify_join_for_registration` / `acl::enforce_worker_plane` — see the
   existing handlers.
+- **Check before you fetch.** When the scope needs a lookup (instance ->
+  job, rollout -> job), gate with a coarse check (`AclScope::any()`) before
+  the lookup and enforce the precise scope after it — otherwise
+  credential-less callers can probe resource existence via NotFound vs
+  PermissionDenied.
 - **Add the endpoint to `tests/acl_endpoints.rs`** (`endpoint_table` + a
   request builder). The `every_manager_rpc_is_classified` test parses
   `proto/legion.proto` and fails the build if a Manager RPC has no ACL
   coverage entry, so this is not optional.
+- **After merging branches**, re-run `cargo test --test acl_endpoints`:
+  endpoints written on a branch that predates (or ran parallel to) the ACL
+  system arrive without checks, and this suite is what catches them. Add the
+  missing `check_acl` calls in the handlers; never silence the test by
+  classifying an unprotected endpoint as `Open`.
 - Never log token secrets; log accessor IDs. See `docs/auth-and-acls.md` and
   `docs/plans/auth-acl-plan.md` for the model and roadmap.
 

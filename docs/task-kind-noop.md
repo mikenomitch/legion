@@ -19,6 +19,13 @@ Provide a minimal task kind for testing scheduler/task-manager integration witho
 - `prepare/start/stop/destroy`: log actions.
 - `start`: copies task config JSON into runtime `state`.
 
+## Artifacts Support
+
+None. `noop` does not report `supports_artifacts()`, so a `noop` task that
+declares `artifacts` is rejected with an actionable error at
+`legion job validate` and at admission (see
+[docs/artifacts.md](artifacts.md)).
+
 ## Usage Notes
 
 - Useful in tests and lightweight demo jobs.

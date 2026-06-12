@@ -8,6 +8,7 @@ import { commandPaletteIndexItems } from './utils/commandPalette'
 import Access from './pages/Access'
 import OidcCallback from './pages/OidcCallback'
 import Deployments from './pages/Deployments'
+import Events from './pages/Events'
 import JobDetail from './pages/details/JobDetail'
 import JobSpecDetail from './pages/details/JobSpecDetail'
 import ManagerNodeDetail from './pages/details/ManagerNodeDetail'
@@ -102,6 +103,7 @@ const Layout = (props: RouteSectionProps) => {
         items: [
           { kind: 'item', label: 'Worker Nodes', path: '/nodes', title: 'Worker Nodes', copy: 'Inventory of worker nodes.' },
           { kind: 'item', label: 'Manager Nodes', path: '/manager', title: 'Manager Nodes', copy: 'Manager config snapshots.' },
+          { kind: 'item', label: 'Events', path: '/events', title: 'Events', copy: 'Live stream of scheduler activity.' },
           { kind: 'item', label: 'Raft', path: '/raft', title: 'Raft', copy: 'Raft elections, failover, and history.' },
           { kind: 'item', label: 'KV', path: '/kv', title: 'KV', copy: 'Browse and edit key/value entries.' },
           { kind: 'item', label: 'Access', path: '/access', title: 'Access', copy: 'ACL status, tokens, and login.' },
@@ -537,6 +539,7 @@ const AppRoutes = () => {
       <Route path="/rollouts" component={Rollouts} />
       <Route path="/rollouts/:id" component={RolloutDetail} />
       <Route path="/kv" component={KeyValue} />
+      <Route path="/events" component={Events} />
       <Route path="/access" component={Access} />
       <Route path="/oidc/callback" component={OidcCallback} />
       <Route path="/api" component={ApiExplorer} />

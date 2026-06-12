@@ -140,9 +140,14 @@ impl WorkloadIdentity {
     pub fn validate(&self, task_name: &str, stateful: bool) -> R<()> {
         let scope = format!("task {task_name} identity {:?}", self.name);
 
-        if self.name.trim().is_empty() {
-            bail!("task {task_name} declares an identity with an empty name");
-        }
+        // The name is used as the issuance-RPC selector, in env-file fallback
+        // paths (`.legion/identity/<alloc>/<name>/token`), and in delivery
+        // directories. A permissive name (`.`/`/`/`..`) would let a jobspec
+        // escape the task directory via path traversal, so enforce a strict
+        // charset at admission (the worker re-checks before any path join as
+        // defense in depth — see `validate_identity_name`).
+        validate_identity_name(&self.name)
+            .with_context(|| format!("task {task_name} declares an invalid identity name"))?;
 
         if self.audience.is_empty() {
             bail!("{scope} must declare at least one audience");
@@ -192,6 +197,45 @@ impl WorkloadIdentity {
 
         Ok(())
     }
+}
+
+/// Maximum length of an identity `name`.
+pub const MAX_IDENTITY_NAME_LEN: usize = 64;
+
+/// Validate an identity `name` against a strict charset: `[A-Za-z0-9_-]{1,64}`.
+///
+/// The name flows into a filesystem path (the env-delivery backing file at
+/// `.legion/identity/<alloc>/<name>/token` and per-identity delivery
+/// directories) and into the issuance-RPC selector. Allowing `.`, `/`, or `..`
+/// would permit path traversal out of the task directory, so reject anything
+/// outside the allow-list. Enforced at admission and re-checked on the worker
+/// before any path join (defense in depth).
+pub fn validate_identity_name(name: &str) -> R<()> {
+    if name.is_empty() {
+        bail!("identity name must not be empty");
+    }
+    if name.len() > MAX_IDENTITY_NAME_LEN {
+        bail!("identity name {name:?} is too long (max {MAX_IDENTITY_NAME_LEN} characters)");
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        bail!(
+            "identity name {name:?} is invalid; names must match [A-Za-z0-9_-] \
+             (no '.', '/', '..', whitespace, or other characters) to avoid \
+             filesystem path traversal"
+        );
+    }
+    Ok(())
+}
+
+/// Whether a claim key is one the signer must never let `extra_claims`
+/// override: a registered/reserved JWT claim or a key in the `legion.io/*`
+/// namespace. Admission already rejects these, but the signing sink re-checks
+/// so a derived claim can never be forged even if admission were bypassed.
+pub fn is_protected_claim_key(key: &str) -> bool {
+    RESERVED_CLAIMS.contains(&key) || key.starts_with(LEGION_CLAIM_PREFIX)
 }
 
 /// Reject `extra_claims` keys that would forge a trust-critical claim.
@@ -302,6 +346,34 @@ fn parse_placeholders(template: &str) -> R<Vec<String>> {
     Ok(fields)
 }
 
+/// Persisted form of an OIDC signing key (the `signing_key` table).
+///
+/// The private key PEM is stored in the manager's SQLite — the same trust
+/// domain as the CA material: whoever can read the store can mint identities.
+/// Persistence is what keeps externally-held tokens verifiable across manager
+/// restarts (same JWKS, same active signer). `state` is one of
+/// `active`/`retiring`/`expired`; expired rows are retained for audit but
+/// never loaded into the issuer or published in the JWKS.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SigningKeyRecord {
+    pub kid: String,
+    /// JWS algorithm name, e.g. "ES256".
+    pub alg: String,
+    /// PKCS#8 PEM of the private key. Never serialized into tokens or RPCs.
+    pub private_key_pem: String,
+    /// base64url(P-256 affine X coordinate) — the public JWK `x`.
+    pub public_jwk_x: String,
+    /// base64url(P-256 affine Y coordinate) — the public JWK `y`.
+    pub public_jwk_y: String,
+    /// Unix seconds the key was generated.
+    pub created_at: u64,
+    /// Last instant a token signed by this key can still be valid; `None`
+    /// while the key is active.
+    pub not_after: Option<u64>,
+    /// `active` | `retiring` | `expired`.
+    pub state: String,
+}
+
 /// Claims describing a workload's verifiable identity. The manager derives
 /// these from the scheduling record; it never trusts claims sent by a worker.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -398,6 +470,162 @@ impl WorkloadIdentityClaims {
         if let Some(slot) = self.slot {
             claims.insert(format!("{LEGION_CLAIM_PREFIX}slot"), slot.to_string());
         }
+        claims
+    }
+}
+
+/// Default `sub` template for node identities. Same stability rule as task
+/// identities: policy-friendly fields only — the churning node id is
+/// claims-only (`legion.io/node`), exactly like `{alloc}` for tasks.
+pub const DEFAULT_NODE_SUB_TEMPLATE: &str = "{region}:node:{pool}";
+
+/// Placeholders allowed in a node-identity `sub` template.
+const NODE_SUB_FIELDS: &[&str] = &["region", "pool"];
+
+/// One cluster-level identity issued to *worker nodes* rather than tasks
+/// (artifact system plan §6). Node identities let store policies say "any
+/// Legion worker node in region X, pool Y may read" — the cluster-grain
+/// credential that cluster artifact-auth matchers and pre-warming use.
+/// Declared under `workloadIdentity.nodeIdentities` in manager config.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeIdentityConfig {
+    /// Unique cluster-wide; the selector used in `auth.nodeIdentity` and in
+    /// cluster artifact-auth matchers.
+    pub name: String,
+    /// One or more audiences. Never empty, like task identities.
+    #[serde(default)]
+    pub audience: Vec<String>,
+    /// Token lifetime (humantime). Falls back to the cluster default TTL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<String>,
+    /// `sub` template override; defaults to [`DEFAULT_NODE_SUB_TEMPLATE`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sub_template: Option<String>,
+}
+
+impl NodeIdentityConfig {
+    pub fn parsed_ttl(&self) -> R<Option<Duration>> {
+        match self.ttl.as_deref() {
+            None => Ok(None),
+            Some(raw) => {
+                let parsed: Duration = raw
+                    .parse::<humantime::Duration>()
+                    .with_context(|| format!("invalid ttl {raw:?} (use e.g. \"15m\")"))?
+                    .into();
+                Ok(Some(parsed))
+            }
+        }
+    }
+
+    pub fn validate(&self) -> R<()> {
+        let scope = format!("nodeIdentity {:?}", self.name);
+        if self.name.trim().is_empty() {
+            bail!("nodeIdentities entries must have a non-empty name");
+        }
+        if self.audience.is_empty() {
+            bail!("{scope} must declare at least one audience");
+        }
+        if self.audience.iter().any(|a| a.trim().is_empty()) {
+            bail!("{scope} audience entries cannot be empty");
+        }
+        self.parsed_ttl()
+            .with_context(|| format!("{scope} ttl is invalid"))?;
+        if let Some(template) = self.sub_template.as_deref() {
+            validate_node_sub_template(template)
+                .with_context(|| format!("{scope} subTemplate is invalid"))?;
+        }
+        Ok(())
+    }
+}
+
+/// Validate the cluster's node-identity list: unique names plus per-entry
+/// rules.
+pub fn validate_node_identities(identities: &[NodeIdentityConfig]) -> R<()> {
+    let mut seen = std::collections::HashSet::new();
+    for identity in identities {
+        identity.validate()?;
+        if !seen.insert(identity.name.as_str()) {
+            bail!("duplicate nodeIdentity name {:?}", identity.name);
+        }
+    }
+    Ok(())
+}
+
+/// Validate a node-identity `sub` template: allow-list only (`{region}` and
+/// `{pool}`); `{node}` rejected explicitly because node ids churn — the node
+/// id rides along as a `legion.io/node` claim, never in `sub`.
+pub fn validate_node_sub_template(template: &str) -> R<()> {
+    let placeholders = parse_placeholders(template)?;
+    if placeholders.is_empty() {
+        bail!(
+            "node sub template {template:?} has no placeholders; it would render the same \
+             subject for every cluster"
+        );
+    }
+    for field in &placeholders {
+        if field == "node" {
+            bail!(
+                "node sub template {template:?} uses {{node}}, which churns as nodes are \
+                 replaced; it is available only as a legion.io/node claim"
+            );
+        }
+        if !NODE_SUB_FIELDS.contains(&field.as_str()) {
+            bail!("node sub template {template:?} uses unknown placeholder {{{field}}}");
+        }
+    }
+    Ok(())
+}
+
+/// Claims describing a worker node's verifiable identity. The manager derives
+/// these from the node's registration record at issuance time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeIdentityClaims {
+    pub region: String,
+    pub pool: String,
+    pub node_id: String,
+}
+
+impl NodeIdentityClaims {
+    /// Render the `sub` from a template, defaulting to
+    /// [`DEFAULT_NODE_SUB_TEMPLATE`].
+    pub fn subject_for(&self, template: Option<&str>) -> R<String> {
+        let template = template.unwrap_or(DEFAULT_NODE_SUB_TEMPLATE);
+        let mut out = String::with_capacity(template.len());
+        let mut rest = template;
+        while let Some(open) = rest.find('{') {
+            out.push_str(&rest[..open]);
+            let after = &rest[open + 1..];
+            let close = after
+                .find('}')
+                .with_context(|| format!("node sub template {template:?} has an unclosed '{{'"))?;
+            let value = match &after[..close] {
+                "region" => self.region.clone(),
+                "pool" => self.pool.clone(),
+                field => bail!(
+                    "node sub template {template:?} field {{{field}}} is not available for \
+                     node identities"
+                ),
+            };
+            out.push_str(&value);
+            rest = &after[close + 1..];
+        }
+        out.push_str(rest);
+        if out.is_empty() {
+            bail!("node sub template {template:?} rendered an empty subject");
+        }
+        Ok(out)
+    }
+
+    /// The discrete `legion.io/*` claims for a node token. `legion.io/scope`
+    /// is `"node"` so relying parties can distinguish node tokens from task
+    /// tokens issued by the same cluster; `legion.io/node` is audit-only.
+    pub fn legion_claims(&self) -> BTreeMap<String, String> {
+        let mut claims = BTreeMap::new();
+        claims.insert(format!("{LEGION_CLAIM_PREFIX}scope"), "node".to_string());
+        claims.insert(format!("{LEGION_CLAIM_PREFIX}region"), self.region.clone());
+        claims.insert(format!("{LEGION_CLAIM_PREFIX}pool"), self.pool.clone());
+        claims.insert(format!("{LEGION_CLAIM_PREFIX}node"), self.node_id.clone());
         claims
     }
 }
@@ -622,6 +850,48 @@ mod tests {
     }
 
     #[test]
+    fn identity_name_rejects_path_traversal_and_bad_charset() {
+        for bad in [
+            "../evil",
+            "a/b",
+            "..",
+            "",
+            &"x".repeat(65),
+            "has space",
+            "a.b",
+        ] {
+            assert!(
+                validate_identity_name(bad).is_err(),
+                "expected {bad:?} to be rejected"
+            );
+            let mut id = identity("aws");
+            id.name = bad.to_string();
+            assert!(
+                id.validate("api", false).is_err(),
+                "expected identity name {bad:?} to be rejected at admission"
+            );
+        }
+    }
+
+    #[test]
+    fn identity_name_accepts_valid_charset() {
+        for good in [
+            "aws",
+            "vault-prod",
+            "gcp_west",
+            "a",
+            &"x".repeat(64),
+            "legion",
+        ] {
+            validate_identity_name(good).unwrap_or_else(|e| panic!("{good:?}: {e}"));
+            let mut id = identity("aws");
+            id.name = good.to_string();
+            id.validate("api", false)
+                .unwrap_or_else(|e| panic!("{good:?}: {e}"));
+        }
+    }
+
+    #[test]
     fn duplicate_identity_names_rejected() {
         let ids = vec![identity("aws"), identity("aws")];
         let err = validate_identities("api", &ids, false).unwrap_err();
@@ -632,5 +902,83 @@ mod tests {
     fn distinct_identities_validate() {
         let ids = vec![identity("aws"), identity("gcp")];
         validate_identities("api", &ids, false).unwrap();
+    }
+
+    // --- node identities (artifact system plan §6) ---
+
+    fn node_identity(name: &str) -> NodeIdentityConfig {
+        NodeIdentityConfig {
+            name: name.into(),
+            audience: vec!["sts.amazonaws.com".into()],
+            ttl: Some("15m".into()),
+            sub_template: None,
+        }
+    }
+
+    #[test]
+    fn node_identity_validates_with_defaults() {
+        validate_node_identities(&[node_identity("artifact-pull")]).unwrap();
+    }
+
+    #[test]
+    fn node_identity_requires_audience() {
+        let mut id = node_identity("pull");
+        id.audience.clear();
+        let err = id.validate().unwrap_err();
+        assert!(err.to_string().contains("audience"), "{err}");
+    }
+
+    #[test]
+    fn duplicate_node_identity_names_rejected() {
+        let err =
+            validate_node_identities(&[node_identity("pull"), node_identity("pull")]).unwrap_err();
+        assert!(err.to_string().contains("duplicate"), "{err}");
+    }
+
+    #[test]
+    fn node_sub_template_allows_region_and_pool_only() {
+        validate_node_sub_template("{region}:node:{pool}").unwrap();
+        validate_node_sub_template("legion-{region}-{pool}").unwrap();
+
+        // {node} churns and is claims-only, exactly like {alloc} for tasks.
+        let err = validate_node_sub_template("{region}:{node}").unwrap_err();
+        assert!(err.to_string().contains("legion.io/node"), "{err}");
+
+        // Task placeholders are not valid in node scope.
+        let err = validate_node_sub_template("{region}:{job}").unwrap_err();
+        assert!(err.to_string().contains("unknown placeholder"), "{err}");
+
+        // Literal-only templates render the same subject everywhere.
+        let err = validate_node_sub_template("static").unwrap_err();
+        assert!(err.to_string().contains("no placeholders"), "{err}");
+    }
+
+    #[test]
+    fn node_claims_render_subject_and_scope() -> crate::prelude::R<()> {
+        let claims = NodeIdentityClaims {
+            region: "prod".into(),
+            pool: "default".into(),
+            node_id: "node-abc".into(),
+        };
+        assert_eq!(claims.subject_for(None)?, "prod:node:default");
+        assert_eq!(
+            claims.subject_for(Some("legion-{region}-{pool}"))?,
+            "legion-prod-default"
+        );
+
+        let legion_claims = claims.legion_claims();
+        assert_eq!(
+            legion_claims.get("legion.io/scope").map(String::as_str),
+            Some("node")
+        );
+        assert_eq!(
+            legion_claims.get("legion.io/node").map(String::as_str),
+            Some("node-abc")
+        );
+        assert_eq!(
+            legion_claims.get("legion.io/pool").map(String::as_str),
+            Some("default")
+        );
+        Ok(())
     }
 }

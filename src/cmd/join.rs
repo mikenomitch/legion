@@ -1,7 +1,7 @@
 use crate::cmd::helpers::{connect_manager_client, friendly_status};
 use crate::prelude::*;
 use crate::structs::CreateJoinTokenRequest;
-use crate::worker::agent::run_worker;
+use crate::worker::daemon::run_worker;
 
 pub fn config() -> Command {
     Command::new("join")

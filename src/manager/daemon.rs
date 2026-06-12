@@ -1,12 +1,16 @@
 use crate::prelude::*;
 
-use crate::manager::server::ManagerAgentService;
+use crate::manager::oidc_http::OidcHttpLayer;
+use crate::manager::server::ManagerDaemonService;
+use crate::manager::workload_identity::WorkloadIdentityState;
+use crate::storage::events::drafts;
+use crate::storage::persistence::PersistenceRole;
 use crate::storage::store::Store;
 use crate::structs::{
     manager_server::ManagerServer, Eval, JobConfig, KvValueType, ManagerConfig, Node, NodeMsg,
     Submission, TaskConfig, TlsConfigFull, WorkerConfig as WorkerConfigMsg, WorkerConfigAlt,
 };
-use crate::worker::agent::run_worker_local;
+use crate::worker::daemon::run_worker_local;
 
 use futures::join;
 use http::Method;
@@ -34,6 +38,22 @@ pub async fn run_manager(config: ManagerConfig, run_worker: bool) -> R<()> {
     info!("Starting manager node");
 
     let full_config = config.with_defaults();
+    // Fail fast on malformed artifact/auth/node-identity config: a bad
+    // matcher or unknown nodeIdentity reference should stop the manager at
+    // startup, not break job admission later.
+    crate::structs::workload_identity::validate_node_identities(
+        &full_config.workload_identity.node_identities,
+    )?;
+    let node_identity_names: Vec<String> = full_config
+        .workload_identity
+        .node_identities
+        .iter()
+        .map(|identity| identity.name.clone())
+        .collect();
+    crate::artifacts::auth::validate_cluster_artifacts_config(
+        &full_config.artifacts,
+        &node_identity_names,
+    )?;
     let manager_node_id = format!("{}:{}", full_config.server.host, full_config.server.port);
     let store = Store::start_storage(&full_config)?;
     if let Err(err) = store.prune_rollouts() {
@@ -102,7 +122,37 @@ pub async fn run_manager(config: ManagerConfig, run_worker: bool) -> R<()> {
         None
     };
 
-    let manager_node = ManagerAgentService::with_acl(store, authenticator)
+    let store_for_rotation = store.clone();
+
+    // Workload identity (OIDC issuer): only constructed when enabled. The
+    // signing keys are restored from (or first-boot persisted to) the store,
+    // so tokens held by third parties stay verifiable across restarts.
+    let workload_identity_state = if full_config.workload_identity.enabled {
+        let default_issuer = format!(
+            "http://{}:{}",
+            resolve_manager_host(&full_config.server.host),
+            full_config.server.port
+        );
+        let state = WorkloadIdentityState::initialize(
+            &store,
+            &full_config.workload_identity,
+            &default_issuer,
+            std::time::SystemTime::now(),
+        )?;
+        info!(
+            issuer = %state.issuer_url()?,
+            jwks_path = %state.jwks_path(),
+            "Workload identity enabled; serving OIDC discovery and JWKS"
+        );
+        Some(Arc::new(state))
+    } else {
+        None
+    };
+
+    let manager_node = ManagerDaemonService::with_manager_config(store, &full_config)
+        .with_workload_identity(workload_identity_state.clone())
+        .with_kv_debounce(Duration::from_millis(full_config.kv_debounce_ms))
+        .with_authenticator(authenticator)
         .with_advertise_addr(full_config.server.advertised_address());
 
     let addr = format!("{}:{}", full_config.server.host, full_config.server.port).parse()?;
@@ -130,8 +180,12 @@ pub async fn run_manager(config: ManagerConfig, run_worker: bool) -> R<()> {
             http::header::HeaderName::from_static("grpc-encoding"),
         ]);
 
+    // The OIDC layer sits outermost so generic HTTP clients (AWS/GCP/Vault)
+    // can GET the discovery document and JWKS on this listener; with workload
+    // identity disabled it is a pure passthrough and mounts no routes.
     let start_server_fut = server_builder
         .accept_http1(true)
+        .layer(OidcHttpLayer::new(workload_identity_state.clone()))
         .layer(cors)
         .layer(GrpcWebLayer::new())
         .add_service(manager_service)
@@ -157,14 +211,56 @@ pub async fn run_manager(config: ManagerConfig, run_worker: bool) -> R<()> {
         }
         Ok::<(), anyhow::Error>(())
     };
+    let rotation_fut = async move {
+        if let Some(state) = workload_identity_state {
+            start_workload_identity_rotation(store_for_rotation, state).await?;
+        }
+        Ok::<(), anyhow::Error>(())
+    };
     let _res = join!(
         start_server_fut,
         node_checker_fut,
         eval_loop_fut,
-        worker_fut
+        worker_fut,
+        rotation_fut
     );
 
     Ok(())
+}
+
+/// Background signing-key rotation for the workload-identity issuer: rotate
+/// the active key past `rotationAge`, expire retiring keys past their overlap
+/// window. Every transition is persisted, so a restart mid-overlap restores
+/// the exact same key set.
+///
+/// HA note: in a multi-manager deployment only the primary acts (same
+/// leader-only convention as other store-mutating loops); standbys share the
+/// replicated `signing_key` table and keep serving an identical JWKS.
+#[instrument(err, skip_all)]
+async fn start_workload_identity_rotation(
+    store: Store,
+    state: Arc<WorkloadIdentityState>,
+) -> R<()> {
+    let rotation_age = state.config().parsed_rotation_age();
+    // Check often enough to rotate promptly, but never more than once a minute.
+    let interval = Duration::from_secs((rotation_age.as_secs() / 10).max(60));
+    info!(
+        rotation_age_secs = rotation_age.as_secs(),
+        check_interval_secs = interval.as_secs(),
+        "Beginning workload identity key rotation loop"
+    );
+    loop {
+        if store.persistence_role() == PersistenceRole::Primary {
+            match state.rotation_tick(&store, std::time::SystemTime::now()) {
+                Ok(true) => info!("Workload identity signing key rotated"),
+                Ok(false) => debug!("Workload identity rotation not due"),
+                Err(err) => warn!(error = ?err, "Workload identity rotation tick failed"),
+            }
+        } else {
+            debug!("Skipping workload identity rotation on non-primary manager");
+        }
+        tokio::time::sleep(interval).await;
+    }
 }
 
 fn should_seed_ui_test_data() -> bool {
@@ -326,6 +422,13 @@ async fn start_node_status_checker(store: Store, check_seconds: u64) -> R<()> {
             .collect::<Vec<String>>();
 
         store.mark_nodes_as_lost(&node_ids_to_update)?;
+        // Stateful allocations on lost nodes are gated behind their
+        // onLost.replaceAfter loss-confirmation window (see
+        // docs/stateful-workloads.md "Node loss and fencing"). Re-run the
+        // reschedule path for still-lost nodes every tick so replacement
+        // proceeds automatically once a window elapses — no operator action
+        // needed.
+        store.recheck_lost_nodes();
         if let Err(err) = store.reconcile_incomplete_rollouts() {
             warn!(error = ?err, "Failed reconciling completed_incomplete rollouts");
         }
@@ -341,7 +444,9 @@ async fn start_eval_loop(store: Store, max_threads: usize) -> R<()> {
     let requeued = store.requeue_in_flight_evals()?;
     if requeued > 0 {
         warn!(requeued, "Recovered stale in-flight evals at startup");
+        store.events().scheduler_recovered(requeued);
     }
+    store.events().scheduler_started(max_threads);
 
     let mut join_set = JoinSet::new();
     for worker_id in 0..max_threads {
@@ -608,13 +713,15 @@ fn handle_claimed_eval(store: &Store, worker_id: usize, eval: &Eval) {
                 elapsed_ms = started.elapsed().as_millis() as u64,
                 "Eval {} handled successfully: {}", eval.id, message
             );
-            if let Err(e) = store.complete_eval(&eval.id, true) {
+            let completed = drafts::eval_completed(eval, &message, started.elapsed());
+            if let Err(e) = store.complete_eval_with_event(&eval.id, true, completed) {
                 error!(worker_id, "Error completing eval {}: {:?}", eval.id, e);
             }
         }
         Err(e) => {
             error!(worker_id, eval_id = %eval.id, elapsed_ms = started.elapsed().as_millis() as u64, "Error handling eval {}: {:?}", eval.id, e);
-            if let Err(complete_err) = store.complete_eval(&eval.id, false) {
+            let failed = drafts::eval_failed(eval, &e, started.elapsed());
+            if let Err(complete_err) = store.complete_eval_with_event(&eval.id, false, failed) {
                 error!(
                     worker_id,
                     "Error marking eval {} as failed after handling error: {:?}",
@@ -670,6 +777,18 @@ async fn load_initial_data(store: &Store, config: &ManagerConfig) -> R<()> {
             .transpose()?
             .unwrap_or_else(|| "{}".to_string());
 
+        let artifacts = match wcp.artifacts.as_ref() {
+            None => String::new(),
+            Some(config) => {
+                // Fail fast on malformed fetch settings (bad humantime /
+                // byte-size strings) at manager startup, not on the worker.
+                config.fetch_with_defaults().with_context(|| {
+                    format!("invalid artifacts config in worker config {path_str}")
+                })?;
+                serde_json::to_string(config)?
+            }
+        };
+
         let wc = WorkerConfigMsg {
             name: wcp.worker_type.clone(),
             pool: wcp.pool.unwrap_or("default".into()),
@@ -679,6 +798,7 @@ async fn load_initial_data(store: &Store, config: &ManagerConfig) -> R<()> {
             resources,
             reserved_resources,
             max_allocations: wcp.max_allocations,
+            artifacts,
         };
 
         store.insert_worker_type(&wc)?;

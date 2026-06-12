@@ -64,11 +64,25 @@
   - Everything has an easily accessible type and spec
   
 - [ ] Artifact system
-  - Plan: [docs/plans/artifact-system-plan.md](plans/artifact-system-plan.md)
-  - [ ] Able to grab docker images
-  - [ ] Able to do some auth for this
-  - [ ] Able to grab files and put them on disk
-  - [ ] Have plugin system for this
+  - Plan: [docs/plans/artifact-system-plan.md](plans/artifact-system-plan.md); user doc: [docs/artifacts.md](artifacts.md)
+  - [x] Able to grab docker images (oci:// fetcher + ORAS mediaType; container `image`
+    desugar ships behind `artifacts.containerImageDesugar`, default off until the cache lands;
+    youki bundle conversion still pending — see follow-ups)
+  - [x] Able to do some auth for this (KV credentials via `GetArtifactCredential` + cluster
+    `artifacts.auth` matchers; identity/nodeIdentity validated but blocked — see follow-ups)
+  - [x] Able to grab files and put them on disk (https/file/git/s3 fetchers, task dirs,
+    checksums, safe unpack, `${artifact.<name>}` referencing, per-artifact status in CLI/UI)
+  - [x] Have plugin system for this (`plugins/artifacts/<scheme>/` dylibs; sample at
+    `plugins/artifacts/demo`)
+  - Follow-ups:
+    - [ ] identity/nodeIdentity artifact auth end-to-end — blocked on workload-identity
+      phases 2 and 4 (`IssueWorkloadIdentityToken` RPC + worker delivery); fetch-time use
+      currently fails with an actionable error
+    - [ ] `onFetchFailure` policy distinct from `on_unhealthy` (today fetch flakiness
+      consumes restart/move budgets — documented in docs/artifacts.md)
+    - [ ] youki: OCI layout -> runtime bundle conversion so Legion-managed images work on
+      Linux container workloads
+    - [ ] Windows staging (tracked under the Windows support pass below)
   - [ ] Artifact cache + pre-warming/pre-pull + scheduler locality scoring
     - Plan: [docs/plans/artifact-cache-and-prewarm-plan.md](plans/artifact-cache-and-prewarm-plan.md)
 
@@ -165,13 +179,14 @@
   - Uses Libvirt? Uses cloud-hypervisor? QEMU?
 
 - [ ] ACL System
-  - [ ] !! KV ACLs: artifact auth (`auth.kv` in the artifact plan) lets any job read any
-    KV credential path today — accepted for now, but `GetArtifactCredential` must become
-    an early ACL enforcement point. See docs/plans/artifact-system-plan.md (Auth) and the
-    SECURITY BOUNDARY comment slated for src/artifacts/auth.rs.
+  - [ ] !! KV ACLs: artifact auth (`auth.kv`, now shipped) lets any job read any KV
+    credential path today — accepted for now, but the `GetArtifactCredential` handler must
+    become an early ACL enforcement point. The enforcement point exists and is marked: see
+    the SECURITY BOUNDARY comment on `get_artifact_credential` in src/manager/server.rs and
+    on the RPC in proto/legion.proto, plus the loud call-out in docs/artifacts.md (Auth).
 
 - [ ] Windows support pass
   - [ ] Artifact staging on Windows: hardlink/reflink fallbacks, path semantics, image
     consumption (see Follow-Ups in docs/plans/artifact-system-plan.md)
 
-- [ ] Workload identity tokens
+- [x] Workload identity tokens (OIDC; see docs/workload-identity.md)

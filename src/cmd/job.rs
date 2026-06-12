@@ -5,13 +5,12 @@ use clap::value_parser;
 
 use crate::cmd::helpers::{connect_manager_client, friendly_status, json_flag, print_table};
 use crate::cmd::output::{self, CliError, OutputFormat};
-use crate::getter_rs::Client as GetterClient;
 use crate::prelude::*;
 use crate::structs::{
-    AdvanceRolloutRequest, DestroyJobRequest, GetJobInfoRequest, GetJobSpecRequest, GetKvRequest,
-    GetRolloutStatusRequest, JobConfig, JobPlanPrint, JobPrint, KvEntry, KvValueType,
-    ListJobsRequest, ListRolloutEventsRequest, ListRolloutsRequest, PlanJobRequest, RunJobRequest,
-    StopJobRequest, Submission,
+    AdvanceRolloutRequest, DestroyJobRequest, GetAllocationLogsRequest, GetJobInfoRequest,
+    GetJobSpecRequest, GetKvRequest, GetRolloutStatusRequest, JobConfig, JobPlanPrint, JobPrint,
+    KvEntry, KvValueType, ListJobsRequest, ListRolloutEventsRequest, ListRolloutsRequest,
+    PlanJobRequest, RunJobRequest, StopJobRequest, Submission,
 };
 use crate::task_plugins::{builtin_task_plugin_schemas, validate_job_config};
 use jsonnet::JsonnetVm;
@@ -127,6 +126,50 @@ pub fn config() -> Command {
 
     let list_cmd = Command::new("list").about("List all jobs").arg(json_flag());
 
+    let logs_cmd = Command::new("logs")
+        .about("Fetch captured stdout/stderr for a job's allocations")
+        .arg(
+            Arg::new("name")
+                .value_name("NAME")
+                .help("Name of the job whose allocation logs to fetch"),
+        )
+        .arg(
+            Arg::new("allocation")
+                .long("allocation")
+                .value_name("ID")
+                .help("Fetch logs for a single allocation id instead of a whole job")
+                .value_parser(value_parser!(i64)),
+        )
+        .arg(
+            Arg::new("stream")
+                .long("stream")
+                .value_name("STREAM")
+                .help("Which stream to read: stdout, stderr, or all")
+                .value_parser(["stdout", "stderr", "all"])
+                .default_value("all"),
+        )
+        .arg(
+            Arg::new("max-bytes")
+                .long("max-bytes")
+                .value_name("N")
+                .help("Maximum bytes to return per stream (0 = worker default cap)")
+                .value_parser(value_parser!(i64)),
+        )
+        .arg(
+            Arg::new("tail")
+                .long("tail")
+                .help("Return the trailing bytes of each stream instead of the leading bytes")
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new("follow")
+                .long("follow")
+                .short('f')
+                .help("Stream new log output until interrupted (incompatible with --json)")
+                .action(ArgAction::SetTrue),
+        )
+        .arg(json_flag());
+
     let rollout_list_cmd = Command::new("list")
         .about("List rollouts")
         .arg(
@@ -218,6 +261,7 @@ pub fn config() -> Command {
         .subcommand(stop_cmd)
         .subcommand(spec_cmd)
         .subcommand(destroy_cmd)
+        .subcommand(logs_cmd)
         .subcommand(rollout_cmd)
 }
 
@@ -793,9 +837,7 @@ struct ResolvedJobspec {
 
 fn resolve_jobspec_source(source: &str) -> R<ResolvedJobspec> {
     let temp_dir = tempfile::tempdir().context("create temporary directory for jobspec")?;
-    let client = GetterClient::default();
-    let fetched_path = client
-        .get(source, temp_dir.path())
+    let fetched_path = crate::artifacts::fetch_source_to_dir(source, temp_dir.path())
         .with_context(|| format!("fetch jobspec from {source}"))?;
     let resolved_path = ensure_jobspec_file(source, &fetched_path)?;
 
@@ -904,6 +946,7 @@ pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
         Some(("validate", matches)) => validate_job(matches).await,
         Some(("schema", matches)) => job_schema(matches).await,
         Some(("wait", matches)) => wait_job(matches).await,
+        Some(("logs", matches)) => job_logs(matches).await,
         Some(("rollout", matches)) => handle_rollout(matches).await,
         _ => unreachable!(),
     }
@@ -919,6 +962,203 @@ struct RolloutPrint {
     pub from_job_config_id: String,
     pub created_at: String,
     pub incomplete: bool,
+}
+
+#[instrument(err, skip_all)]
+async fn job_logs(arg_matches: &ArgMatches) -> R<()> {
+    let format = OutputFormat::from_matches(arg_matches);
+    let name = arg_matches.get_one::<String>("name").cloned();
+    let allocation_id = arg_matches.get_one::<i64>("allocation").copied();
+    let stream = arg_matches
+        .get_one::<String>("stream")
+        .cloned()
+        .unwrap_or_else(|| "all".to_string());
+    let max_bytes = arg_matches
+        .get_one::<i64>("max-bytes")
+        .copied()
+        .unwrap_or(0);
+    let tail = arg_matches.get_flag("tail");
+    let follow = arg_matches.get_flag("follow");
+
+    if name.is_none() && allocation_id.is_none() {
+        return Err(output::fail_local(
+            format,
+            CliError::local(
+                "InvalidArgument",
+                "provide a job NAME or --allocation <ID>",
+                Some("usage: legion job logs <NAME> | legion job logs --allocation <ID>"),
+            ),
+        ));
+    }
+
+    let job = name.unwrap_or_default();
+    let mut client = connect_manager_client().await?;
+
+    if follow {
+        if format.is_json() {
+            return Err(output::fail_local(
+                format,
+                CliError::local(
+                    "InvalidArgument",
+                    "--follow cannot be combined with --json",
+                    Some("drop --json to stream logs, or drop --follow for a one-shot JSON read"),
+                ),
+            ));
+        }
+        return follow_logs(&mut client, &job, allocation_id, &stream).await;
+    }
+
+    let request = tonic::Request::new(GetAllocationLogsRequest {
+        job,
+        allocation_id,
+        stream,
+        max_bytes,
+        tail,
+        offset: 0,
+    });
+    let response = output::resolve(
+        format,
+        "failed to fetch allocation logs",
+        client.get_allocation_logs(request).await,
+    )?
+    .into_inner();
+
+    if format.is_json() {
+        print_json(&response.allocations);
+        return Ok(());
+    }
+
+    if response.allocations.is_empty() {
+        println!("No allocations found");
+        return Ok(());
+    }
+
+    for alloc in &response.allocations {
+        println!(
+            "== allocation {} (task {}) on {} ==",
+            alloc.allocation_id,
+            task_label(&alloc.task_name),
+            alloc.node_id
+        );
+        if !alloc.error.is_empty() {
+            println!("  error: {}", alloc.error);
+            continue;
+        }
+        if alloc.streams.is_empty() {
+            println!("  (no captured logs)");
+            continue;
+        }
+        for stream in &alloc.streams {
+            let suffix = if stream.truncated {
+                format!(" (truncated, {} bytes total)", stream.size_bytes)
+            } else {
+                String::new()
+            };
+            println!("--- {}{} ---", stream.stream, suffix);
+            print_stream_content(&stream.content);
+        }
+    }
+    Ok(())
+}
+
+fn task_label(task_name: &str) -> String {
+    if task_name.is_empty() {
+        "?".to_string()
+    } else {
+        task_name.to_string()
+    }
+}
+
+fn print_stream_content(content: &str) {
+    use std::io::Write;
+    let mut stdout = std::io::stdout();
+    let _ = stdout.write_all(content.as_bytes());
+    if !content.is_empty() && !content.ends_with('\n') {
+        let _ = stdout.write_all(b"\n");
+    }
+    let _ = stdout.flush();
+}
+
+/// Live-tail logs by polling `GetAllocationLogs` for each stream's trailing
+/// window and printing only the bytes beyond what was already shown, tracked by
+/// the per-(allocation, stream) `next_offset`. Runs until interrupted (Ctrl-C).
+async fn follow_logs(
+    client: &mut crate::cmd::helpers::AuthedManagerClient,
+    job: &str,
+    allocation_id: Option<i64>,
+    stream: &str,
+) -> R<()> {
+    use std::collections::{HashMap, HashSet};
+
+    // Last printed byte offset per (allocation, stream).
+    let mut printed_to: HashMap<(i64, String), i64> = HashMap::new();
+    let mut header_shown: HashSet<i64> = HashSet::new();
+    let mut error_shown: HashSet<i64> = HashSet::new();
+
+    loop {
+        let request = tonic::Request::new(GetAllocationLogsRequest {
+            job: job.to_string(),
+            allocation_id,
+            stream: stream.to_string(),
+            max_bytes: 0,
+            tail: true,
+            offset: 0,
+        });
+        let response = match client.get_allocation_logs(request).await {
+            Ok(resp) => resp.into_inner(),
+            Err(status) => {
+                return Err(crate::cmd::helpers::friendly_status(
+                    "failed to fetch allocation logs",
+                    status,
+                ))
+            }
+        };
+
+        for alloc in &response.allocations {
+            if !alloc.error.is_empty() {
+                if error_shown.insert(alloc.allocation_id) {
+                    eprintln!(
+                        "== allocation {} on {}: {} ==",
+                        alloc.allocation_id, alloc.node_id, alloc.error
+                    );
+                }
+                continue;
+            }
+            for s in &alloc.streams {
+                let key = (alloc.allocation_id, s.stream.clone());
+                let prev = printed_to.get(&key).copied();
+
+                // Determine which slice of the returned window is new.
+                let new_text = match prev {
+                    None => s.content.clone(),
+                    Some(prev) if s.next_offset <= prev => String::new(),
+                    Some(prev) if prev >= s.start_offset => {
+                        let skip = (prev - s.start_offset) as usize;
+                        s.content.get(skip..).unwrap_or("").to_string()
+                    }
+                    // Window slid past what we last printed (very chatty stream):
+                    // emit the whole window; a small gap may have been dropped.
+                    Some(_) => s.content.clone(),
+                };
+
+                if !new_text.is_empty() {
+                    if header_shown.insert(alloc.allocation_id) {
+                        println!(
+                            "== allocation {} (task {}) on {} ==",
+                            alloc.allocation_id,
+                            task_label(&alloc.task_name),
+                            alloc.node_id
+                        );
+                    }
+                    print!("[{}] ", s.stream);
+                    print_stream_content(&new_text);
+                }
+                printed_to.insert(key, s.next_offset.max(prev.unwrap_or(0)));
+            }
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+    }
 }
 
 async fn handle_rollout(arg_matches: &ArgMatches) -> R<()> {
@@ -941,6 +1181,34 @@ mod tests {
     fn priority_conflicts_with_asap() {
         let cmd = config();
         let result = cmd.try_get_matches_from(["job", "run", "--priority", "75", "--asap"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn logs_subcommand_parses_options() {
+        let matches = config()
+            .try_get_matches_from([
+                "job",
+                "logs",
+                "demo",
+                "--stream",
+                "stderr",
+                "--max-bytes",
+                "1024",
+                "--tail",
+            ])
+            .expect("logs args parse");
+        let (name, sub) = matches.subcommand().expect("logs subcommand");
+        assert_eq!(name, "logs");
+        assert_eq!(sub.get_one::<String>("name").unwrap(), "demo");
+        assert_eq!(sub.get_one::<String>("stream").unwrap(), "stderr");
+        assert_eq!(*sub.get_one::<i64>("max-bytes").unwrap(), 1024);
+        assert!(sub.get_flag("tail"));
+    }
+
+    #[test]
+    fn logs_subcommand_rejects_unknown_stream() {
+        let result = config().try_get_matches_from(["job", "logs", "demo", "--stream", "bogus"]);
         assert!(result.is_err());
     }
 

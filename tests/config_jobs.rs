@@ -104,7 +104,56 @@ fn maximal_job_spec_parse() {
 
     assert_eq!(config.name, "maximal-demo");
     assert_eq!(config.version, Some(1));
-    assert_eq!(config.tasks.len(), 4);
+    assert_eq!(config.tasks.len(), 5);
+
+    // The keyed-mode stateful task (sandbox group) round-trips and validates.
+    let sandbox = config
+        .tasks
+        .iter()
+        .find(|task| task.name == "sandbox")
+        .expect("maximal must declare the keyed sandbox task");
+    let stateful = sandbox.stateful.as_ref().expect("stateful block parsed");
+    assert_eq!(stateful.mode, legion::structs::InstanceMode::Keyed);
+    assert_eq!(stateful.id_source.as_deref(), Some("uuid"));
+    sandbox
+        .validate_stateful()
+        .expect("keyed sandbox task validates");
+
+    // No stateful task may sit under a createFirst (replace-before-stop)
+    // rollout: that would double-bind one instance id + storage handle (see
+    // docs/stateful-workloads.md). Verify the shipped spec honors this.
+    for task in &config.tasks {
+        if !task.is_stateful() {
+            continue;
+        }
+        let replacement = config
+            .rollout_config_for_group(&task.group)
+            .and_then(|rollout| rollout.replacement);
+        assert_ne!(
+            replacement,
+            Some(legion::structs::RolloutReplacement::CreateFirst),
+            "stateful task {} (group {}) must not use createFirst",
+            task.name,
+            task.group
+        );
+    }
+
+    // The KV injection policy keys are camelCase and actually parse (a
+    // snake_case `on_change` would be silently dropped by serde).
+    let injected = config
+        .tasks
+        .iter()
+        .find_map(|task| task.kv_injections.as_ref().and_then(|kv| kv.kv.as_ref()))
+        .expect("maximal must declare task-level kv injection defaults");
+    assert_eq!(injected.watch, Some(true));
+    assert_eq!(
+        injected.on_change,
+        Some(legion::structs::KvInjectionAction::Restart)
+    );
+    assert_eq!(
+        injected.on_delete,
+        Some(legion::structs::KvInjectionAction::Fail)
+    );
     for task in &config.tasks {
         assert!(!task.name.is_empty(), "task name should be set");
         assert!(

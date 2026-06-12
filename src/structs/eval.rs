@@ -177,6 +177,16 @@ impl Eval {
         }
 
         store.remove_allocs_for_job(&self.job_id)?;
+        // Stateful instance ROWS of a stopped job are always retained: slot
+        // rows are terminated so a later re-run re-materializes the same
+        // ordinal identities; keyed rows are merely stopped, so resubmitting
+        // the job + `legion instance start` revives them with their old
+        // handles (only DestroyInstance / job destroy is forever). Slot
+        // storage handles are retained too unless the task opts out with
+        // `stateful.storage.retainOnStop: false` (the K8s
+        // `whenDeleted: Delete` analog), in which case the handles are
+        // dropped and a re-run mints fresh ones. No-op for stateless jobs.
+        store.stop_instances_for_job(&self.job_id)?;
 
         Ok(format!("Job {} stopped", self.job_id))
     }
@@ -672,6 +682,199 @@ mod tests {
         let total_allocations: usize = ledger.iter().map(|entry| entry.allocations.len()).sum();
         assert_eq!(total_allocations, 0);
 
+        Ok(())
+    }
+
+    #[test]
+    fn job_stop_terminates_stateful_instances_but_retains_rows() -> R<()> {
+        use crate::structs::{InstanceMode, InstanceState, StatefulConfig, StatefulStorageConfig};
+
+        let store = setup_store()?;
+        store.insert_node(NodeMsg::from(make_node("node-a", "east")))?;
+
+        let job_name = "stateful-stop".to_string();
+        let task = TaskConfig {
+            count: TaskCount::new(2),
+            resources: json!({ "memory": 64 }),
+            stateful: Some(StatefulConfig {
+                mode: InstanceMode::Slot,
+                id_source: None,
+                initial_instances: None,
+                on_lost: None,
+                storage: Some(StatefulStorageConfig {
+                    path: "/var/lib/data".into(),
+                    retain_on_scale_in: None,
+                    retain_on_stop: None,
+                }),
+            }),
+            ..TaskConfig::new("db", "service")
+        };
+        let job_config = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: job_name.clone(),
+            tasks: vec![task],
+            version: None,
+        };
+        store.handle_job_submit(
+            &job_config,
+            &[Submission {
+                path: "job.jsonnet".into(),
+                content: "job".into(),
+                is_primary: true,
+            }],
+        )?;
+        let job_config_id = store.get_job_config(&job_name)?.id();
+
+        Eval {
+            id: "1".into(),
+            status: "pending".into(),
+            kind: "job_submit".into(),
+            job_id: job_name.clone(),
+            job_config_id: job_config_id.clone(),
+            node_name: String::new(),
+            priority: 50,
+        }
+        .handle(&store)?;
+
+        let instances = store.list_instances(&job_name)?;
+        assert_eq!(instances.len(), 2);
+        let handles: Vec<Option<String>> = instances
+            .iter()
+            .map(|instance| instance.storage_handle.clone())
+            .collect();
+        assert!(handles.iter().all(Option::is_some));
+
+        Eval {
+            id: "2".into(),
+            status: "pending".into(),
+            kind: "job_stop".into(),
+            job_id: job_name.clone(),
+            job_config_id,
+            node_name: String::new(),
+            priority: 50,
+        }
+        .handle(&store)?;
+
+        let stopped = store.list_instances(&job_name)?;
+        assert_eq!(stopped.len(), 2, "instance rows retained after stop");
+        for (instance, handle) in stopped.iter().zip(&handles) {
+            assert_eq!(instance.state, InstanceState::Terminated);
+            assert_eq!(instance.current_alloc_id, None);
+            assert_eq!(&instance.storage_handle, handle, "storage handles retained");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn job_stop_stops_keyed_instances_and_resubmit_does_not_resurrect_them() -> R<()> {
+        use crate::structs::{InstanceMode, InstanceState, StatefulConfig, StatefulStorageConfig};
+
+        let store = setup_store()?;
+        store.insert_node(NodeMsg::from(make_node("node-a", "east")))?;
+
+        let job_name = "keyed-stop-eval".to_string();
+        let task = TaskConfig {
+            resources: json!({ "memory": 64 }),
+            stateful: Some(StatefulConfig {
+                mode: InstanceMode::Keyed,
+                id_source: None,
+                initial_instances: None,
+                on_lost: None,
+                storage: Some(StatefulStorageConfig {
+                    path: "/workspace".into(),
+                    retain_on_scale_in: None,
+                    retain_on_stop: None,
+                }),
+            }),
+            ..TaskConfig::new("sandbox", "service")
+        };
+        let job_config = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: job_name.clone(),
+            tasks: vec![task],
+            version: None,
+        };
+        let subs = vec![Submission {
+            path: "job.jsonnet".into(),
+            content: "job".into(),
+            is_primary: true,
+        }];
+        store.handle_job_submit(&job_config, &subs)?;
+        let job_config_id = store.get_job_config(&job_name)?.id();
+
+        store.create_keyed_instance(&job_name, "default", "sandbox", Some("user-a"))?;
+        Eval {
+            id: "1".into(),
+            status: "pending".into(),
+            kind: "job_reschedule".into(),
+            job_id: job_name.clone(),
+            job_config_id: job_config_id.clone(),
+            node_name: String::new(),
+            priority: 50,
+        }
+        .handle(&store)?;
+        let handle = store
+            .get_instance("user-a")?
+            .context("placed instance")?
+            .storage_handle;
+        assert!(handle.is_some());
+
+        // Job stop: keyed instance STOPPED (not terminated), handle retained,
+        // allocation gone.
+        Eval {
+            id: "2".into(),
+            status: "pending".into(),
+            kind: "job_stop".into(),
+            job_id: job_name.clone(),
+            job_config_id: job_config_id.clone(),
+            node_name: String::new(),
+            priority: 50,
+        }
+        .handle(&store)?;
+        assert!(store.allocs_for_job(&job_name)?.is_empty());
+        let stopped = store.get_instance("user-a")?.context("row retained")?;
+        assert_eq!(stopped.state, InstanceState::Stopped);
+        assert_eq!(stopped.storage_handle, handle, "handle retained on stop");
+
+        // Resubmitting the job does NOT resurrect a stopped instance: the
+        // reconcile plans nothing for it until an explicit start.
+        store.handle_job_submit(&job_config, &subs)?;
+        Eval {
+            id: "3".into(),
+            status: "pending".into(),
+            kind: "job_reschedule".into(),
+            job_id: job_name.clone(),
+            job_config_id: job_config_id.clone(),
+            node_name: String::new(),
+            priority: 50,
+        }
+        .handle(&store)?;
+        assert!(store.allocs_for_job(&job_name)?.is_empty());
+        assert_eq!(
+            store.get_instance("user-a")?.context("still there")?.state,
+            InstanceState::Stopped
+        );
+
+        // Explicit start revives it with the SAME id and storage handle.
+        store.start_keyed_instance("user-a")?;
+        Eval {
+            id: "4".into(),
+            status: "pending".into(),
+            kind: "job_reschedule".into(),
+            job_id: job_name.clone(),
+            job_config_id,
+            node_name: String::new(),
+            priority: 50,
+        }
+        .handle(&store)?;
+        let allocations = store.allocs_for_job(&job_name)?;
+        assert_eq!(allocations.len(), 1);
+        assert_eq!(allocations[0].instance_id.as_deref(), Some("user-a"));
+        let revived = store.get_instance("user-a")?.context("revived")?;
+        assert_eq!(revived.state, InstanceState::Active);
+        assert_eq!(revived.storage_handle, handle, "old handle re-bound");
         Ok(())
     }
 

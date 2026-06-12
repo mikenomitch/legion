@@ -1,6 +1,8 @@
 use crate::prelude::*;
 use crate::structs::{Allocation, TaskConfig};
-use crate::task_plugins::{derived_schema, spawn_task_process, TaskPlugin, TaskRuntime};
+use crate::task_plugins::{
+    configure_task_log_capture, derived_schema, spawn_task_process, TaskPlugin, TaskRuntime,
+};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::process::Command;
@@ -122,6 +124,49 @@ fn build_launch(
     }
 }
 
+/// Imports a staged OCI layout into the local container runtime so the
+/// subsequent `run` finds the image without a registry pull.
+fn load_image(
+    runtime: ContainerRuntimeKind,
+    oci_layout: &std::path::Path,
+    reference: &str,
+) -> R<()> {
+    match runtime {
+        ContainerRuntimeKind::AppleContainer => {
+            // `container image load` consumes an OCI archive: tar the layout.
+            let archive_path = oci_layout.with_extension("oci.tar");
+            let archive = std::fs::File::create(&archive_path)
+                .with_context(|| format!("create image archive {}", archive_path.display()))?;
+            let mut builder = tar::Builder::new(archive);
+            builder
+                .append_dir_all(".", oci_layout)
+                .context("archive OCI layout")?;
+            builder.finish().context("finish OCI layout archive")?;
+
+            let output = Command::new("container")
+                .arg("image")
+                .arg("load")
+                .arg("--input")
+                .arg(&archive_path)
+                .output()
+                .context("spawn container image load")?;
+            let _ = std::fs::remove_file(&archive_path);
+            if !output.status.success() {
+                bail!(
+                    "container image load failed for {reference}: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+            Ok(())
+        }
+        ContainerRuntimeKind::Youki => bail!(
+            "Legion-managed image artifacts are not yet supported for the youki runtime \
+             (OCI layout -> runtime bundle conversion is pending); disable \
+             artifacts.containerImageDesugar for Linux container workloads"
+        ),
+    }
+}
+
 #[derive(Default)]
 pub struct ContainerTaskPlugin;
 
@@ -151,6 +196,59 @@ impl TaskPlugin for ContainerTaskPlugin {
     // therefore refresh via `changeMode: restart`.
     fn supports_identity_env(&self) -> bool {
         true
+    }
+
+    fn supports_artifacts(&self) -> bool {
+        true
+    }
+
+    /// Desugars `config.image` into an implicit `oci://` artifact (artifact
+    /// system plan §8). The manager calls this at admission only when the
+    /// cluster's `artifacts.containerImageDesugar` flag is on — without the
+    /// artifact cache, Legion-managed pulls would re-download per allocation.
+    fn implicit_artifacts(&self, task_config: &Value) -> R<Vec<crate::structs::ArtifactSpec>> {
+        let image = task_config
+            .get("image")
+            .and_then(Value::as_str)
+            .context("container task config requires image")?;
+        Ok(vec![crate::structs::ArtifactSpec::oci_image(image)])
+    }
+
+    /// Consumes the staged `Image` payload: hands the on-disk OCI layout to
+    /// the runtime. File/tree artifacts are deferred until the kind grows
+    /// volume plumbing (same limitation as its KV file injection).
+    fn consume_artifact(
+        &self,
+        staged: &crate::artifacts::StagedArtifact,
+        runtime: &mut TaskRuntime,
+    ) -> R<()> {
+        if let crate::artifacts::StagedPayload::Image {
+            oci_layout,
+            reference,
+        } = &staged.payload
+        {
+            let runtime_kind = ContainerRuntimeKind::detect()?;
+            load_image(runtime_kind, oci_layout, reference)?;
+            if let Some(state) = runtime.state.as_object_mut() {
+                state.insert(
+                    "artifactImage".into(),
+                    json!({
+                        "ociLayout": oci_layout.display().to_string(),
+                        "reference": reference,
+                        "digest": staged.digest,
+                    }),
+                );
+            } else {
+                runtime.state = json!({
+                    "artifactImage": {
+                        "ociLayout": oci_layout.display().to_string(),
+                        "reference": reference,
+                        "digest": staged.digest,
+                    }
+                });
+            }
+        }
+        Ok(())
     }
 
     fn prepare(
@@ -186,6 +284,7 @@ impl TaskPlugin for ContainerTaskPlugin {
 
         let mut cmd = Command::new(&launch.program);
         cmd.args(&launch.args);
+        configure_task_log_capture(&mut cmd, runtime)?;
 
         let child = spawn_task_process(&mut cmd).with_context(|| {
             format!(
@@ -253,6 +352,7 @@ mod tests {
             job_config_id: "job-1".into(),
             task_config_id: 1,
             job_id: "job".into(),
+            instance_id: None,
         }
     }
 

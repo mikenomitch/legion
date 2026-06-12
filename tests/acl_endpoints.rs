@@ -20,7 +20,7 @@
 
 use anyhow::{anyhow, Context};
 use legion::manager::acl::Authenticator;
-use legion::manager::server::ManagerAgentService;
+use legion::manager::server::ManagerDaemonService;
 use legion::storage::store::Store;
 use legion::structs::manager_server::Manager;
 use legion::structs::*;
@@ -103,6 +103,19 @@ fn endpoint_table() -> Vec<(&'static str, Plane)> {
         ("ListSavedStateQueries", Plane::Protected("state:read")),
         ("UpsertSavedStateQuery", Plane::Protected("state:write")),
         ("DeleteSavedStateQuery", Plane::Protected("state:write")),
+        ("CreateInstance", Plane::Protected("job:write")),
+        ("CreateInstances", Plane::Protected("job:write")),
+        ("DestroyInstance", Plane::Protected("job:write")),
+        ("StopInstance", Plane::Protected("job:write")),
+        ("StartInstance", Plane::Protected("job:write")),
+        ("ReplaceInstance", Plane::Protected("job:write")),
+        ("ListInstances", Plane::Protected("job:read")),
+        ("GetInstance", Plane::Protected("job:read")),
+        ("IssueWorkloadIdentityToken", Plane::Worker),
+        ("GetAllocationLogs", Plane::Protected("job:read")),
+        ("GetArtifactCredential", Plane::Worker),
+        ("ListEvents", Plane::Protected("operator:read")),
+        ("StreamEvents", Plane::Protected("operator:read")),
         ("WhoAmI", Plane::Open),
         ("Login", Plane::Open),
         ("BootstrapAcl", Plane::Open),
@@ -154,7 +167,7 @@ fn jobspec(name: &str) -> String {
 /// resource before authorizing, so denials genuinely exercise the ACL check
 /// rather than a not-found path.
 async fn call_endpoint(
-    svc: &ManagerAgentService,
+    svc: &ManagerDaemonService,
     fx: &Fixtures,
     method: &str,
     token: Option<&str>,
@@ -505,6 +518,125 @@ async fn call_endpoint(
             ))
             .await
             .map(|_| ()),
+        "CreateInstance" => svc
+            .create_instance(req(
+                CreateInstanceRequest {
+                    job_id: JOB_NAME.into(),
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "CreateInstances" => svc
+            .create_instances(req(
+                CreateInstancesRequest {
+                    job_id: JOB_NAME.into(),
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "DestroyInstance" => svc
+            .destroy_instance(req(
+                DestroyInstanceRequest {
+                    instance_id: "missing-instance".into(),
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "StopInstance" => svc
+            .stop_instance(req(
+                StopInstanceRequest {
+                    instance_id: "missing-instance".into(),
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "StartInstance" => svc
+            .start_instance(req(
+                StartInstanceRequest {
+                    instance_id: "missing-instance".into(),
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "ReplaceInstance" => svc
+            .replace_instance(req(
+                ReplaceInstanceRequest {
+                    instance_id: "missing-instance".into(),
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "ListInstances" => svc
+            .list_instances(req(
+                ListInstancesRequest {
+                    job_id: JOB_NAME.into(),
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "GetInstance" => svc
+            .get_instance(req(
+                GetInstanceRequest {
+                    instance_id: "missing-instance".into(),
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "IssueWorkloadIdentityToken" => svc
+            .issue_workload_identity_token(req(
+                IssueWorkloadIdentityTokenRequest {
+                    alloc_id: 1,
+                    identity_name: "default".into(),
+                    node_id: NODE_ID.into(),
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "GetAllocationLogs" => svc
+            .get_allocation_logs(req(
+                GetAllocationLogsRequest {
+                    job: JOB_NAME.into(),
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "GetArtifactCredential" => svc
+            .get_artifact_credential(req(
+                GetArtifactCredentialRequest {
+                    node_id: NODE_ID.into(),
+                    kv_path: KV_KEY.into(),
+                    source: "https://example.test/artifact".into(),
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "ListEvents" => svc
+            .list_events(req(ListEventsRequest::default(), token))
+            .await
+            .map(|_| ()),
+        "StreamEvents" => svc
+            .stream_events(req(StreamEventsRequest::default(), token))
+            .await
+            .map(|_| ()),
         "WhoAmI" => svc.who_am_i(req(WhoAmIRequest {}, token)).await.map(|_| ()),
         "Login" => svc
             .login(req(
@@ -734,7 +866,7 @@ fn enabled_authenticator() -> Arc<Authenticator> {
 
 /// Service with ACLs enabled, plus a management token and a deletable client
 /// token for the DeleteAclToken builder.
-fn setup_enabled() -> R<(ManagerAgentService, Fixtures, String)> {
+fn setup_enabled() -> R<(ManagerDaemonService, Fixtures, String)> {
     let store = setup_store()?;
     let mut fixtures = seed_fixtures(&store)?;
     let authenticator = enabled_authenticator();
@@ -754,7 +886,7 @@ fn setup_enabled() -> R<(ManagerAgentService, Fixtures, String)> {
     fixtures.deletable_token_accessor = deletable.accessor_id;
 
     Ok((
-        ManagerAgentService::with_acl(store, authenticator),
+        ManagerDaemonService::with_acl(store, authenticator),
         fixtures,
         management_secret,
     ))
@@ -1045,7 +1177,7 @@ async fn audit_only_admits_workers_without_join_tokens() -> R<()> {
         )
         .expect("authenticator should build"),
     );
-    let svc = ManagerAgentService::with_acl(store, authenticator);
+    let svc = ManagerDaemonService::with_acl(store, authenticator);
 
     for method in [
         "WorkerPreRegister",
@@ -1094,7 +1226,7 @@ async fn management_token_passes_every_endpoint() -> R<()> {
 async fn acl_disabled_never_returns_auth_errors() -> R<()> {
     let store = setup_store()?;
     let fixtures = seed_fixtures(&store)?;
-    let svc = ManagerAgentService::new(store);
+    let svc = ManagerDaemonService::new(store);
 
     for (method, _) in endpoint_table() {
         if method == "Login" {
@@ -1340,7 +1472,7 @@ async fn audit_only_mode_allows_denied_requests() -> R<()> {
         )
         .expect("authenticator should build"),
     );
-    let svc = ManagerAgentService::with_acl(store, authenticator);
+    let svc = ManagerDaemonService::with_acl(store, authenticator);
 
     for (method, _) in endpoint_table() {
         if method == "Login" {
@@ -1380,7 +1512,7 @@ async fn who_am_i_reports_identity() -> R<()> {
     assert!(management.accessor_id.is_some());
 
     let store = setup_store()?;
-    let disabled = ManagerAgentService::new(store);
+    let disabled = ManagerDaemonService::new(store);
     let reply = disabled
         .who_am_i(req(WhoAmIRequest {}, None))
         .await?
