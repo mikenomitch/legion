@@ -5,6 +5,7 @@ use crate::constraints::{ConstraintSet, DistinctTracker, PermitSet};
 use crate::prelude::*;
 use crate::resources::ResourcePolicy;
 use crate::storage::errors::StorageError;
+use crate::storage::events::{drafts, EventDraft, SchedulerEventFilter, SchedulerEventRecord};
 use crate::storage::migrations::get_migrations;
 use crate::storage::persistence::{
     build_persistence_driver, PersistenceDriver, PersistenceRole, PersistenceStatus,
@@ -48,7 +49,7 @@ use std::time::{Duration, Instant};
 use time::format_description::well_known::Rfc3339;
 use time::macros::format_description;
 use time::{Duration as TimeDuration, OffsetDateTime};
-use tokio::sync::Notify;
+use tokio::sync::{broadcast, Notify};
 
 // warning incorrectly
 #[allow(dead_code)]
@@ -113,6 +114,9 @@ pub struct Store {
     read_model: Arc<RwLock<SchedulingReadModel>>,
     // Cross-task wake signal for eval workers waiting on an empty queue.
     eval_notify: Arc<Notify>,
+    // Live fan-out of scheduler events to StreamEvents subscribers. Persisted
+    // history lives in the scheduler_event table; this only carries new events.
+    event_tx: broadcast::Sender<SchedulerEventRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -245,6 +249,13 @@ impl JobSubmitOutcome {
 pub const CONN_LOCK_ERROR: &str = "Error locking database connection";
 const READ_ONLY_CONN_POOL_SIZE: usize = 2;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+// Live subscribers that fall this many events behind must catch up from the
+// scheduler_event table (StreamEvents handles the Lagged case).
+const EVENT_BROADCAST_CAPACITY: usize = 1_024;
+// Retained journal size; older scheduler events are pruned opportunistically.
+const EVENT_RETAINED_ROWS: i64 = 10_000;
+// Prune once every N inserts to keep the hot emit path cheap.
+const EVENT_PRUNE_INTERVAL: i64 = 256;
 
 // NOTE: This will become a general interface for all storage backends
 impl Store {
@@ -273,6 +284,7 @@ impl Store {
             persistence_driver,
             read_model: Arc::new(RwLock::new(SchedulingReadModel::default())),
             eval_notify: Arc::new(Notify::new()),
+            event_tx: broadcast::channel(EVENT_BROADCAST_CAPACITY).0,
         };
 
         store.refresh_read_model()?;
@@ -811,7 +823,12 @@ impl Store {
                 "UPDATE plan_submission SET status = 'rejected', rejection_reason = ?1 WHERE id = ?2;",
                 params![reason, submission.id],
             )?;
+            let rejected_event = self.stage_event_locked(
+                &tx,
+                drafts::plan_rejected(&submission.job_config_id, &reason),
+            );
             tx.commit()?;
+            self.publish_staged(rejected_event);
             warn!(
                 submission_id = submission.id,
                 job_config_id = %submission.job_config_id,
@@ -888,7 +905,12 @@ impl Store {
                 )?;
                 let latest_versions =
                     self.scope_vector_epochs_tx(&tx, &submission.expected_versions)?;
+                let rejected_event = self.stage_event_locked(
+                    &tx,
+                    drafts::plan_rejected(&submission.job_config_id, &reason),
+                );
                 tx.commit()?;
+                self.publish_staged(rejected_event);
                 warn!(
                     submission_id = submission.id,
                     job_config_id = %submission.job_config_id,
@@ -927,7 +949,10 @@ impl Store {
             "UPDATE plan_submission SET status = 'applied', rejection_reason = NULL WHERE id = ?1;",
             [submission.id],
         )?;
+        let placed_event = drafts::allocations_placed(&submission.job_config_id, &allocations)
+            .and_then(|draft| self.stage_event_locked(&tx, draft));
         tx.commit()?;
+        self.publish_staged(placed_event);
         info!(
             submission_id = submission.id,
             job_config_id = %submission.job_config_id,
@@ -1522,6 +1547,8 @@ impl Store {
         let node = self.get_node(id)?;
         self.cache_node(node)?;
 
+        self.events().node_ready(id);
+
         Ok(())
     }
 
@@ -1551,6 +1578,8 @@ impl Store {
         let node = self.get_node(id)?;
         self.cache_node(node)?;
 
+        self.events().node_lost(id);
+
         Ok(())
     }
 
@@ -1568,8 +1597,12 @@ impl Store {
         self.release_instance_bindings_tx(&tx, &allocs)?;
         self.bump_epochs_for_allocations_tx(&tx, &allocs)?;
         tx.commit()?;
+        drop(conn);
 
         self.cache_clear_allocations_for_node(node_id)?;
+
+        self.events()
+            .allocations_removed_from_node(node_id, &allocs);
 
         Ok(allocs)
     }
@@ -1618,6 +1651,10 @@ impl Store {
         }
 
         self.cache_nodes_lost(ids)?;
+
+        for node_id in ids {
+            self.events().node_lost_after_missed_heartbeats(node_id);
+        }
 
         for node_id in ids {
             self.reschedule_allocations_for_lost_node(node_id)?;
@@ -1703,8 +1740,11 @@ impl Store {
             to_params_named(node)?.to_slice().as_slice(),
             |row| self.node_from_row(row),
         )?;
+        drop(conn);
 
         self.cache_node(node.clone())?;
+
+        self.events().node_registered(&node);
 
         Ok(node)
     }
@@ -1890,10 +1930,13 @@ impl Store {
         WHERE name = ?;
 "#;
         conn.execute(sql, [name])?;
+        drop(conn);
 
         // TODO: Create a job_update record
         // that kicks off the eval?
         // ... or maybe just this adds the eval straight up?
+
+        self.events().job_stopped(name);
 
         Ok(())
     }
@@ -1907,6 +1950,10 @@ impl Store {
         WHERE id = ?;
 "#;
         conn.execute(sql, [job_id])?;
+        drop(conn);
+
+        self.events().job_failed(job_id);
+
         Ok(())
     }
 
@@ -2060,7 +2107,12 @@ impl Store {
         }
 
         tx.commit()
-            .map_err(|_| anyhow!("Error committing transaction"))
+            .map_err(|_| anyhow!("Error committing transaction"))?;
+        drop(conn);
+
+        self.events().job_destroyed(name);
+
+        Ok(())
     }
 
     fn rollout_meta_from_value(
@@ -2378,17 +2430,23 @@ impl Store {
 
         Self::insert_task_statuses(&tx, &task_ids, &job.id, &job_config_id)?;
 
+        let outcome = if was_update {
+            JobSubmitOutcome::Updated { job_config_id }
+        } else {
+            JobSubmitOutcome::Created { job_config_id }
+        };
+        let submit_event =
+            drafts::job_submit_outcome(&job.id, &outcome, next_version, config.tasks.len())
+                .and_then(|draft| self.stage_event_locked(&tx, draft));
         tx.commit()
             .map_err(|_| anyhow!("Error committing transaction"))?;
+        self.publish_staged(submit_event);
+        drop(conn);
 
-        let cached_tasks = self.get_task_configs_for_job_config(&job_config_id)?;
-        self.cache_set_task_configs_for_job_config(&job_config_id, cached_tasks)?;
+        let cached_tasks = self.get_task_configs_for_job_config(outcome.job_config_id())?;
+        self.cache_set_task_configs_for_job_config(outcome.job_config_id(), cached_tasks)?;
 
-        if was_update {
-            Ok(JobSubmitOutcome::Updated { job_config_id })
-        } else {
-            Ok(JobSubmitOutcome::Created { job_config_id })
-        }
+        Ok(outcome)
     }
 
     pub fn normalize_job_config(&self, config: &JobConfig) -> R<JobConfig> {
@@ -2629,6 +2687,16 @@ impl Store {
             ],
             |row| self.rollout_event_from_row(row),
         )?;
+        drop(conn);
+
+        self.events().rollout_event(
+            rollout_id,
+            job_id,
+            level,
+            &event.message,
+            event.group_name.as_deref(),
+            &event.metadata_json,
+        );
 
         Ok(event)
     }
@@ -2656,6 +2724,229 @@ impl Store {
             self.rollout_event_from_row(row)
         })?;
         Self::collect_rows(rows)
+    }
+
+    /// Record a scheduler event: persist it to the journal and publish it to
+    /// live `StreamEvents` subscribers.
+    ///
+    /// Takes the write lock for the insert, so only use this from code that
+    /// is not already holding a write connection; code with an open write
+    /// transaction stages the event inside it via `stage_event_locked` +
+    /// `publish_staged` instead, which costs no extra lock acquisition or
+    /// WAL commit.
+    ///
+    /// Emission is strictly best-effort — scheduling work must never fail
+    /// because the event journal could not be written, so errors are logged
+    /// and swallowed here.
+    pub fn emit_event(&self, draft: EventDraft) {
+        let conn = match self.write_connection() {
+            Ok(conn) => conn,
+            Err(err) => {
+                warn!(kind = %draft.kind, error = ?err, "Failed locking store for scheduler event");
+                return;
+            }
+        };
+        let event = self.stage_event_locked(&conn, draft);
+        self.publish_staged(event);
+    }
+
+    /// Insert `draft` through an already-held write connection or open
+    /// transaction, returning the persisted record for later publication.
+    ///
+    /// Best-effort: failures are logged and `None` is returned. When called
+    /// with a transaction, the event commits or rolls back atomically with
+    /// the state change it describes.
+    fn stage_event_locked(
+        &self,
+        conn: &Connection,
+        draft: EventDraft,
+    ) -> Option<SchedulerEventRecord> {
+        // Operator escape hatch: silences event persistence and streaming
+        // entirely. Also how the benches A/B the cost of emission itself
+        // (see docs/event-stream.md).
+        if std::env::var_os("LEGION_EVENTS_OFF").is_some() {
+            return None;
+        }
+        match self.insert_event(conn, &draft) {
+            Ok(event) => Some(event),
+            Err(err) => {
+                warn!(
+                    kind = %draft.kind,
+                    error = ?err,
+                    "Failed recording scheduler event"
+                );
+                None
+            }
+        }
+    }
+
+    /// Publish a staged event to live subscribers once its transaction has
+    /// committed. Call while still holding the write guard the event was
+    /// staged under, so subscribers observe events in strict ID order.
+    fn publish_staged(&self, event: Option<SchedulerEventRecord>) {
+        if let Some(event) = event {
+            // send only fails when there are no live subscribers; fine.
+            let _ = self.event_tx.send(event);
+        }
+    }
+
+    fn insert_event(&self, conn: &Connection, draft: &EventDraft) -> R<SchedulerEventRecord> {
+        let created_at = Self::now_rfc3339()?;
+        let metadata_json = if draft.metadata.is_object() {
+            draft.metadata.to_string()
+        } else {
+            json!({ "value": draft.metadata }).to_string()
+        };
+
+        conn.execute(
+            "INSERT INTO scheduler_event (
+                kind, level, job_id, node_id, eval_id, allocation_id, rollout_id,
+                message, metadata_json, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10);",
+            params![
+                draft.kind,
+                draft.level,
+                draft.job_id,
+                draft.node_id,
+                draft.eval_id,
+                draft.allocation_id,
+                draft.rollout_id,
+                draft.message,
+                metadata_json,
+                created_at
+            ],
+        )?;
+        // Safe under the held write-connection guard: nothing can insert
+        // between the statement above and this read.
+        let id = conn.last_insert_rowid();
+
+        if id % EVENT_PRUNE_INTERVAL == 0 {
+            conn.execute(
+                "DELETE FROM scheduler_event WHERE id <= ?1;",
+                [id - EVENT_RETAINED_ROWS],
+            )?;
+        }
+
+        Ok(SchedulerEventRecord {
+            id,
+            kind: draft.kind.clone(),
+            level: draft.level.clone(),
+            job_id: draft.job_id.clone(),
+            node_id: draft.node_id.clone(),
+            eval_id: draft.eval_id.clone(),
+            allocation_id: draft.allocation_id,
+            rollout_id: draft.rollout_id,
+            message: draft.message.clone(),
+            metadata_json,
+            created_at,
+        })
+    }
+
+    /// Subscribe to live scheduler events. Receivers that lag behind the
+    /// broadcast buffer should resume from the journal via
+    /// `list_scheduler_events` using the last event ID they saw.
+    pub fn subscribe_events(&self) -> broadcast::Receiver<SchedulerEventRecord> {
+        self.event_tx.subscribe()
+    }
+
+    /// List journal events matching `filter`, ordered oldest-to-newest.
+    ///
+    /// Without an `after_id` cursor this returns the most recent
+    /// `filter.effective_limit()` events; with a cursor it pages forward from
+    /// `after_id` so pollers never skip events.
+    #[instrument(err, skip_all)]
+    pub fn list_scheduler_events(
+        &self,
+        filter: &SchedulerEventFilter,
+    ) -> R<Vec<SchedulerEventRecord>> {
+        let conn = self.read_connection()?;
+        let limit = filter.effective_limit() as i64;
+
+        let mut clauses: Vec<String> = Vec::new();
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        if let Some(after_id) = filter.after_id {
+            clauses.push(format!("id > ?{}", params.len() + 1));
+            params.push(Box::new(after_id));
+        }
+        if let Some(kind) = filter.kind.as_deref() {
+            clauses.push(format!(
+                "(kind = ?{} OR kind LIKE ?{} || '.%')",
+                params.len() + 1,
+                params.len() + 2
+            ));
+            params.push(Box::new(kind.to_string()));
+            params.push(Box::new(kind.to_string()));
+        }
+        if let Some(job_id) = filter.job_id.as_deref() {
+            clauses.push(format!("job_id = ?{}", params.len() + 1));
+            params.push(Box::new(job_id.to_string()));
+        }
+        if let Some(node_id) = filter.node_id.as_deref() {
+            clauses.push(format!("node_id = ?{}", params.len() + 1));
+            params.push(Box::new(node_id.to_string()));
+        }
+        if let Some(level) = filter.level.as_deref() {
+            clauses.push(format!("level = ?{}", params.len() + 1));
+            params.push(Box::new(level.to_string()));
+        }
+        let where_clause = if clauses.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", clauses.join(" AND "))
+        };
+        params.push(Box::new(limit));
+        let limit_param = params.len();
+
+        const EVENT_COLUMNS: &str = "id, kind, level, job_id, node_id, eval_id, allocation_id, rollout_id, message, metadata_json, created_at";
+        // With a cursor, page forward (oldest first). Without one, take the
+        // newest window and re-sort ascending, like list_rollout_events.
+        let sql = if filter.after_id.is_some() {
+            format!(
+                "SELECT {EVENT_COLUMNS} FROM scheduler_event {where_clause} ORDER BY id ASC LIMIT ?{limit_param};"
+            )
+        } else {
+            format!(
+                "SELECT {EVENT_COLUMNS} FROM (
+                    SELECT {EVENT_COLUMNS} FROM scheduler_event {where_clause} ORDER BY id DESC LIMIT ?{limit_param}
+                ) ORDER BY id ASC;"
+            )
+        };
+
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(
+            params_from_iter(params.iter().map(|param| param.as_ref())),
+            |row| self.scheduler_event_from_row(row),
+        )?;
+        Self::collect_rows(rows)
+    }
+
+    /// Highest event ID currently in the journal (0 when empty). Used by
+    /// clients to initialize a polling/streaming cursor.
+    #[instrument(err, skip_all)]
+    pub fn latest_scheduler_event_id(&self) -> R<i64> {
+        let conn = self.read_connection()?;
+        let latest: Option<i64> =
+            conn.query_row("SELECT MAX(id) FROM scheduler_event;", [], |row| row.get(0))?;
+        Ok(latest.unwrap_or(0))
+    }
+
+    fn scheduler_event_from_row(
+        &self,
+        row: &Row<'_>,
+    ) -> Result<SchedulerEventRecord, rusqlite::Error> {
+        Ok(SchedulerEventRecord {
+            id: row.get(0)?,
+            kind: row.get(1)?,
+            level: row.get(2)?,
+            job_id: row.get(3)?,
+            node_id: row.get(4)?,
+            eval_id: row.get(5)?,
+            allocation_id: row.get(6)?,
+            rollout_id: row.get(7)?,
+            message: row.get(8)?,
+            metadata_json: row.get(9)?,
+            created_at: row.get(10)?,
+        })
     }
 
     #[instrument(err, skip_all)]
@@ -3744,8 +4035,12 @@ impl Store {
         self.release_instance_bindings_tx(&tx, &allocations)?;
         self.bump_epochs_for_allocations_tx(&tx, &allocations)?;
         tx.commit()?;
+        drop(conn);
 
         self.cache_remove_allocations(&allocations)?;
+
+        self.events()
+            .allocations_removed_for_job(job_id, allocations.len());
 
         Ok(())
     }
@@ -3766,8 +4061,12 @@ impl Store {
         self.release_instance_bindings_tx(&tx, &allocations)?;
         self.bump_job_config_epoch_tx(&tx, job_config_id)?;
         tx.commit()?;
+        drop(conn);
 
         self.cache_remove_allocations(&allocations)?;
+
+        self.events()
+            .allocations_removed_for_job_config(job_config_id, &allocations);
 
         Ok(allocations)
     }
@@ -4991,6 +5290,28 @@ impl Store {
 
     #[instrument(err, skip_all)]
     pub fn complete_eval(&self, eval_id: &str, succeeded: bool) -> R<()> {
+        self.complete_eval_impl(eval_id, succeeded, None)
+    }
+
+    /// Complete an eval and record its lifecycle event (`eval.completed` /
+    /// `eval.failed`, built via `drafts`) in the same transaction, so the
+    /// event costs no extra lock acquisition on the eval critical path.
+    #[instrument(err, skip_all)]
+    pub fn complete_eval_with_event(
+        &self,
+        eval_id: &str,
+        succeeded: bool,
+        event: EventDraft,
+    ) -> R<()> {
+        self.complete_eval_impl(eval_id, succeeded, Some(event))
+    }
+
+    fn complete_eval_impl(
+        &self,
+        eval_id: &str,
+        succeeded: bool,
+        event: Option<EventDraft>,
+    ) -> R<()> {
         let tx_started = Instant::now();
         let mut conn: MutexGuard<'_, Connection> = self.write_connection()?;
         let tx = conn.transaction()?;
@@ -5000,7 +5321,9 @@ impl Store {
         } else {
             tx.execute("UPDATE eval SET status = 'failed' WHERE id = ?;", [eval_id])?;
         }
+        let staged = event.and_then(|draft| self.stage_event_locked(&tx, draft));
         tx.commit()?;
+        self.publish_staged(staged);
         debug!(
             eval_id,
             succeeded,
@@ -5078,7 +5401,10 @@ impl Store {
             priority: priority.unwrap_or(self.default_eval_priority),
         };
 
+        let enqueue_event = self.stage_event_locked(&tx, drafts::eval_enqueued(&eval, delay));
         tx.commit()?;
+        self.publish_staged(enqueue_event);
+        drop(conn);
 
         if delay.is_zero() {
             // Zero-delay evals are immediately claimable, so wake one sleeping worker.
@@ -7777,6 +8103,220 @@ mod tests {
         assert!(removed.is_some());
         let health = store.allocation_health_for_allocations(&[allocation.id])?;
         assert!(health.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn scheduler_events_emit_and_list_with_filters() -> R<()> {
+        let store = setup_store()?;
+        assert_eq!(store.latest_scheduler_event_id()?, 0);
+
+        store.emit_event(
+            EventDraft::info("eval.completed", "Eval 1 (job_submit) completed")
+                .job("demo")
+                .eval("1"),
+        );
+        store.emit_event(EventDraft::warn("node.lost", "Node node-a marked lost").node("node-a"));
+        store.emit_event(
+            EventDraft::info("allocation.placed", "Placed 2 allocation(s) for job demo")
+                .job("demo")
+                .meta(json!({ "count": 2 })),
+        );
+
+        let all = store.list_scheduler_events(&SchedulerEventFilter::default())?;
+        assert_eq!(all.len(), 3);
+        assert!(all.windows(2).all(|pair| pair[0].id < pair[1].id));
+        assert_eq!(store.latest_scheduler_event_id()?, all[2].id);
+
+        let demo_events = store.list_scheduler_events(&SchedulerEventFilter {
+            job_id: Some("demo".into()),
+            ..Default::default()
+        })?;
+        assert_eq!(demo_events.len(), 2);
+
+        let eval_events = store.list_scheduler_events(&SchedulerEventFilter {
+            kind: Some("eval".into()),
+            ..Default::default()
+        })?;
+        assert_eq!(eval_events.len(), 1);
+        assert_eq!(eval_events[0].kind, "eval.completed");
+        assert_eq!(eval_events[0].eval_id.as_deref(), Some("1"));
+
+        let warn_events = store.list_scheduler_events(&SchedulerEventFilter {
+            level: Some("warn".into()),
+            ..Default::default()
+        })?;
+        assert_eq!(warn_events.len(), 1);
+        assert_eq!(warn_events[0].node_id.as_deref(), Some("node-a"));
+
+        let after = store.list_scheduler_events(&SchedulerEventFilter {
+            after_id: Some(all[0].id),
+            ..Default::default()
+        })?;
+        assert_eq!(after.len(), 2);
+        assert_eq!(after[0].id, all[1].id);
+
+        let placed = &all[2];
+        assert_eq!(placed.metadata_json, json!({ "count": 2 }).to_string());
+
+        Ok(())
+    }
+
+    #[test]
+    fn event_recorder_emits_expected_kinds_and_skips_empty() -> R<()> {
+        let store = setup_store()?;
+
+        // Empty inputs are no-ops, so callers don't need their own guards.
+        store.events().allocations_removed_from_node("node-a", &[]);
+        store.events().allocations_removed_for_job("demo", 0);
+        assert!(drafts::allocations_placed("cfg-1", &[]).is_none());
+        assert!(drafts::job_submit_outcome(
+            "demo",
+            &JobSubmitOutcome::Unchanged {
+                job_config_id: "cfg-1".into(),
+            },
+            1,
+            1,
+        )
+        .is_none());
+        assert!(store
+            .list_scheduler_events(&SchedulerEventFilter::default())?
+            .is_empty());
+
+        let submitted = drafts::job_submit_outcome(
+            "demo",
+            &JobSubmitOutcome::Created {
+                job_config_id: "cfg-1".into(),
+            },
+            1,
+            2,
+        )
+        .context("created outcome should produce an event")?;
+        store.emit_event(submitted);
+        store
+            .events()
+            .allocation_failed(7, "node-a", "demo", "cfg-1", 3, "task crashed");
+        store.events().node_lost_after_missed_heartbeats("node-a");
+
+        let events = store.list_scheduler_events(&SchedulerEventFilter::default())?;
+        let kinds: Vec<&str> = events.iter().map(|event| event.kind.as_str()).collect();
+        assert_eq!(
+            kinds,
+            vec!["job.submitted", "allocation.failed", "node.lost"]
+        );
+
+        let failed = &events[1];
+        assert_eq!(failed.level, "warn");
+        assert_eq!(failed.job_id.as_deref(), Some("demo"));
+        assert_eq!(failed.node_id.as_deref(), Some("node-a"));
+        assert_eq!(failed.allocation_id, Some(7));
+        assert!(failed.message.contains("task crashed"));
+
+        let lost = &events[2];
+        assert_eq!(
+            lost.metadata_json,
+            json!({ "reason": "heartbeat" }).to_string()
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn complete_eval_with_event_records_event_atomically() -> R<()> {
+        let store = setup_store()?;
+        let eval = store.enqueue_eval("job_submit", None, None, None, None)?;
+        let claimed = store.claim_eval()?.context("eval should be claimable")?;
+        assert_eq!(claimed.id, eval.id);
+
+        store.complete_eval_with_event(
+            &eval.id,
+            true,
+            drafts::eval_completed(&claimed, "done", std::time::Duration::from_millis(5)),
+        )?;
+
+        assert!(store.get_evals()?.is_empty());
+        let events = store.list_scheduler_events(&SchedulerEventFilter {
+            kind: Some("eval.completed".into()),
+            ..Default::default()
+        })?;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].eval_id.as_deref(), Some(eval.id.as_str()));
+        assert!(events[0].message.contains("done"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn scheduler_events_list_without_cursor_returns_newest_window() -> R<()> {
+        let store = setup_store()?;
+        for index in 0..10 {
+            store.emit_event(EventDraft::info("eval.enqueued", format!("event {index}")));
+        }
+
+        let window = store.list_scheduler_events(&SchedulerEventFilter {
+            limit: Some(3),
+            ..Default::default()
+        })?;
+        assert_eq!(window.len(), 3);
+        // Newest three, still in ascending order.
+        assert_eq!(window[0].message, "event 7");
+        assert_eq!(window[2].message, "event 9");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scheduler_events_broadcast_to_subscribers() -> R<()> {
+        let store = setup_store()?;
+        let mut subscriber = store.subscribe_events();
+
+        store.emit_event(EventDraft::info("job.submitted", "Job demo submitted").job("demo"));
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), subscriber.recv())
+            .await
+            .context("timed out waiting for broadcast event")??;
+        assert_eq!(event.kind, "job.submitted");
+        assert_eq!(event.job_id.as_deref(), Some("demo"));
+        assert!(event.id > 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn store_mutations_emit_scheduler_events() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(NodeMsg::from(make_node("events-node")))?;
+
+        let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "events-job".into(),
+            tasks: vec![TaskConfig {
+                resources: json!({ "memory": 64 }),
+                ..TaskConfig::new("api", "noop")
+            }],
+            version: None,
+        };
+        store.handle_job_submit(&job, &[])?;
+        store.enqueue_eval("job_submit", Some(&job.name), None, None, None)?;
+        store.stop_job(&job.name)?;
+        store.mark_node_lost("events-node")?;
+
+        let events = store.list_scheduler_events(&SchedulerEventFilter::default())?;
+        let kinds: Vec<&str> = events.iter().map(|event| event.kind.as_str()).collect();
+        assert!(kinds.contains(&"node.registered"));
+        assert!(kinds.contains(&"job.submitted"));
+        assert!(kinds.contains(&"eval.enqueued"));
+        assert!(kinds.contains(&"job.stopped"));
+        assert!(kinds.contains(&"node.lost"));
+
+        let submit = events
+            .iter()
+            .find(|event| event.kind == "job.submitted")
+            .context("missing job.submitted event")?;
+        assert_eq!(submit.job_id.as_deref(), Some("events-job"));
+        assert_eq!(submit.level, "info");
 
         Ok(())
     }

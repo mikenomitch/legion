@@ -29,9 +29,9 @@ use crate::structs::{
     CreateInstanceRequest, CreateInstancesRequest, DestroyInstanceRequest, DestroyJobRequest,
     GetAllocationLogsRequest, GetInstanceRequest, GetJobInfoRequest, GetJobSpecRequest,
     GetNodesRequest, GetRolloutStatusRequest, GetStateStoreSchemaRequest, JobConfig,
-    ListInstancesRequest, ListJobsRequest, ListRolloutsRequest, QueryStateStoreRequest,
-    ReplaceInstanceRequest, RunJobRequest, StartInstanceRequest, StopInstanceRequest,
-    StopJobRequest,
+    ListEventsRequest, ListInstancesRequest, ListJobsRequest, ListRolloutsRequest,
+    QueryStateStoreRequest, ReplaceInstanceRequest, RunJobRequest, StartInstanceRequest,
+    StopInstanceRequest, StopJobRequest,
 };
 use crate::task_plugins::validate_job_config;
 use serde::Serialize;
@@ -188,6 +188,23 @@ fn tool_defs() -> Vec<ToolDef> {
             name: "legion_node_list",
             description: "List worker nodes and their health.",
             input_schema: empty_schema,
+            mutates: false,
+        },
+        ToolDef {
+            name: "legion_events",
+            description: "List recent scheduler events (evals, placements, node/job lifecycle, rollouts). Poll with after_id set to the returned latest_id to tail the stream incrementally.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "after_id": { "type": "integer", "description": "Only events with ID greater than this cursor." },
+                    "limit": { "type": "integer", "description": "Max events to return (default 100, max 1000)." },
+                    "kind": { "type": "string", "description": "Kind filter, exact or category prefix (e.g. 'eval' matches eval.*)." },
+                    "job_id": { "type": "string", "description": "Filter by exact job ID." },
+                    "node_id": { "type": "string", "description": "Filter by exact node ID." },
+                    "level": { "type": "string", "enum": ["info", "warn", "error"], "description": "Filter by severity." }
+                },
+                "additionalProperties": false
+            }),
             mutates: false,
         },
         ToolDef {
@@ -607,6 +624,21 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
                 idempotency_key,
             }))
             .await
+        }
+        "legion_events" => {
+            let request = ListEventsRequest {
+                after_id: args.get("after_id").and_then(Value::as_i64),
+                limit: args
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .map(|limit| limit.min(u32::MAX as u64) as u32),
+                kind: opt_str_arg(&args, "kind"),
+                job_id: opt_str_arg(&args, "job_id"),
+                node_id: opt_str_arg(&args, "node_id"),
+                level: opt_str_arg(&args, "level"),
+            };
+            let mut client = connect().await?;
+            grpc(client.list_events(request)).await
         }
         "legion_job_logs" => {
             let job = opt_str_arg(&args, "name").unwrap_or_default();

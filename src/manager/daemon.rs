@@ -4,6 +4,7 @@ use crate::manager::join_server::get_insecure_manager_service;
 use crate::manager::oidc_http::OidcHttpLayer;
 use crate::manager::server::ManagerDaemonService;
 use crate::manager::workload_identity::WorkloadIdentityState;
+use crate::storage::events::drafts;
 use crate::storage::persistence::PersistenceRole;
 use crate::storage::store::Store;
 use crate::structs::{
@@ -386,7 +387,9 @@ async fn start_eval_loop(store: Store, max_threads: usize) -> R<()> {
     let requeued = store.requeue_in_flight_evals()?;
     if requeued > 0 {
         warn!(requeued, "Recovered stale in-flight evals at startup");
+        store.events().scheduler_recovered(requeued);
     }
+    store.events().scheduler_started(max_threads);
 
     let mut join_set = JoinSet::new();
     for worker_id in 0..max_threads {
@@ -653,13 +656,15 @@ fn handle_claimed_eval(store: &Store, worker_id: usize, eval: &Eval) {
                 elapsed_ms = started.elapsed().as_millis() as u64,
                 "Eval {} handled successfully: {}", eval.id, message
             );
-            if let Err(e) = store.complete_eval(&eval.id, true) {
+            let completed = drafts::eval_completed(eval, &message, started.elapsed());
+            if let Err(e) = store.complete_eval_with_event(&eval.id, true, completed) {
                 error!(worker_id, "Error completing eval {}: {:?}", eval.id, e);
             }
         }
         Err(e) => {
             error!(worker_id, eval_id = %eval.id, elapsed_ms = started.elapsed().as_millis() as u64, "Error handling eval {}: {:?}", eval.id, e);
-            if let Err(complete_err) = store.complete_eval(&eval.id, false) {
+            let failed = drafts::eval_failed(eval, &e, started.elapsed());
+            if let Err(complete_err) = store.complete_eval_with_event(&eval.id, false, failed) {
                 error!(
                     worker_id,
                     "Error marking eval {} as failed after handling error: {:?}",

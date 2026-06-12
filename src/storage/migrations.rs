@@ -443,5 +443,33 @@ pub fn get_migrations() -> Migrations<'static> {
         // once `now - lost_at > stateful.onLost.replaceAfter` (see
         // docs/stateful-workloads.md "Node loss and fencing").
         M::up("ALTER TABLE node ADD COLUMN lost_at TIMESTAMP;").down(""),
+        // Scheduler event journal backing ListEvents/StreamEvents.
+        //
+        // No foreign keys: events must outlive the jobs/nodes they describe
+        // (e.g. a job.destroyed event survives the job row's deletion).
+        //
+        // Deliberately no secondary indexes and no AUTOINCREMENT: events are
+        // inserted inside scheduler write transactions (the eval critical
+        // path), where every extra b-tree update lengthens the serialized
+        // critical section. The table is pruned to ~10k rows, so filtered
+        // list queries scan it in ~1ms, and cursor queries use the rowid PK.
+        // Plain INTEGER PRIMARY KEY stays monotonic because pruning only ever
+        // removes the oldest rows, never the newest.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS scheduler_event (
+            id INTEGER PRIMARY KEY,
+            kind TEXT NOT NULL,
+            level TEXT NOT NULL,
+            job_id TEXT,
+            node_id TEXT,
+            eval_id TEXT,
+            allocation_id INTEGER,
+            rollout_id INTEGER,
+            message TEXT NOT NULL,
+            metadata_json JSONB NOT NULL DEFAULT '{}',
+            created_at TIMESTAMP NOT NULL
+        )",
+        )
+        .down("DROP TABLE IF EXISTS scheduler_event;"),
     ])
 }

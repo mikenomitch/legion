@@ -28,6 +28,7 @@ Routes in `App.tsx`:
 - `/nodes`
 - `/jobs`
 - `/rollouts`
+- `/events`
 - `/kv`
 - `/manager`
 - `/testing`
@@ -42,6 +43,11 @@ The app uses `createResource` + polling.
 - Route-scoped polling logic in `PollingController`
 - Mutation avoids unnecessary rerenders by equality checks before updating resource state
 
+Exception: the Events page (`Events.tsx`) consumes the `StreamEvents`
+server-streaming RPC over gRPC-Web (an async iterable from ConnectRPC) instead
+of polling. It seeds with `ListEvents`, tails the stream, and reconnects with
+an `afterId` cursor so no events are missed across disconnects.
+
 ## Page Responsibilities
 
 - `Homepage.tsx`: ledger cards and active rollout summary.
@@ -54,6 +60,7 @@ The app uses `createResource` + polling.
   storage handle, created). Keyed instance create/destroy is CLI-only
   (`legion instance ...`); the UI does not mutate instances.
 - `Rollouts.tsx`: rollout list, per-group status, event logs, manual advance action.
+- `Events.tsx`: live scheduler event feed with filtering and pause/resume.
 - `KeyValue.tsx`: key tree browser and CRUD/patch editor.
 - `Manager.tsx`: manager config snapshots.
 - `TestingUtils.tsx`: placeholder (not implemented yet).

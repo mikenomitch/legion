@@ -16,6 +16,7 @@ use crate::manager::rollout_strategy;
 use crate::manager::scheduler::{PlanConfigOutcome, PlanMode, Scheduler};
 use crate::manager::workload_identity::{claims_for_allocation, WorkloadIdentityState};
 use crate::storage::errors::StorageError;
+use crate::storage::events::{SchedulerEventFilter, SchedulerEventRecord};
 use crate::storage::store::{
     DestroyInstanceOutcome, JobKvReference, JobSubmitOutcome, StartInstanceOutcome,
     StopInstanceOutcome, Store,
@@ -39,27 +40,28 @@ use crate::structs::{
     HeartbeatReply, HeartbeatRequest, Instance, InstanceInfo, InstanceMode, InstanceState,
     IssueRaftCommandReply, IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply,
     IssueWorkloadIdentityTokenRequest, JobConfig, JobSpecHistoryItem, KvEntry, KvInjectionAction,
-    KvValueType, LedgerNode, ListInstancesReply, ListInstancesRequest, ListJobSpecHistoryReply,
-    ListJobSpecHistoryRequest, ListJobsReply, ListJobsRequest, ListKvReply, ListKvRequest,
-    ListRaftHistoryReply, ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest,
-    ListRolloutsReply, ListRolloutsRequest, ListSavedStateQueriesReply,
-    ListSavedStateQueriesRequest, Node, NodeMsg, PatchKvReply, PatchKvRequest, PlanJobReply,
-    PlanJobRequest, PlannedAllocation, PutKvReply, PutKvRequest, QueryStateStoreReply,
-    QueryStateStoreRequest, RaftHistoryEvent, RaftStatus, ReleaseKvLockReply, ReleaseKvLockRequest,
-    RenewKvLockReply, RenewKvLockRequest, ReplaceInstanceReply, ReplaceInstanceRequest,
-    RestartWorkerReply, RestartWorkerRequest, RolloutAllocationStatus, RolloutEvent,
-    RolloutGroupStatus, RolloutProgression, RolloutReplacement, RunJobReply, RunJobRequest,
-    SavedStateQuery, StartInstanceReply, StartInstanceRequest, StopInstanceReply,
-    StopInstanceRequest, StopJobReply, StopJobRequest, StopRolloutReply, StopRolloutRequest,
-    Submission, TaskConfig, TaskOnUnhealthyConfig, UpdateNodeDynamicReply,
-    UpdateNodeDynamicRequest, UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest,
-    WorkerConfig, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply,
-    WorkerRegisterRequest,
+    KvValueType, LedgerNode, ListEventsReply, ListEventsRequest, ListInstancesReply,
+    ListInstancesRequest, ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobsReply,
+    ListJobsRequest, ListKvReply, ListKvRequest, ListRaftHistoryReply, ListRaftHistoryRequest,
+    ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply, ListRolloutsRequest,
+    ListSavedStateQueriesReply, ListSavedStateQueriesRequest, Node, NodeMsg, PatchKvReply,
+    PatchKvRequest, PlanJobReply, PlanJobRequest, PlannedAllocation, PutKvReply, PutKvRequest,
+    QueryStateStoreReply, QueryStateStoreRequest, RaftHistoryEvent, RaftStatus, ReleaseKvLockReply,
+    ReleaseKvLockRequest, RenewKvLockReply, RenewKvLockRequest, ReplaceInstanceReply,
+    ReplaceInstanceRequest, RestartWorkerReply, RestartWorkerRequest, RolloutAllocationStatus,
+    RolloutEvent, RolloutGroupStatus, RolloutProgression, RolloutReplacement, RunJobReply,
+    RunJobRequest, SavedStateQuery, SchedulerEvent, StartInstanceReply, StartInstanceRequest,
+    StopInstanceReply, StopInstanceRequest, StopJobReply, StopJobRequest, StopRolloutReply,
+    StopRolloutRequest, StreamEventsRequest, Submission, TaskConfig, TaskOnUnhealthyConfig,
+    UpdateNodeDynamicReply, UpdateNodeDynamicRequest, UpsertSavedStateQueryReply,
+    UpsertSavedStateQueryRequest, WorkerConfig, WorkerPreRegisterReply, WorkerPreRegisterRequest,
+    WorkerRegisterReply, WorkerRegisterRequest,
 };
 use crate::task_plugins::validate_job_config;
 use crate::tracing_util::{o11y_enabled, read_recent_observability};
 
 use time::{Duration as TimeDuration, OffsetDateTime};
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Response, Status};
 
@@ -260,6 +262,54 @@ fn instance_loss_detail(store: &Store, instance: &Instance) -> Option<String> {
         node.id, instance.instance_id
     ))
 }
+
+fn map_scheduler_event(event: SchedulerEventRecord) -> SchedulerEvent {
+    SchedulerEvent {
+        id: event.id,
+        kind: event.kind,
+        level: event.level,
+        job_id: event.job_id,
+        node_id: event.node_id,
+        eval_id: event.eval_id,
+        allocation_id: event.allocation_id,
+        rollout_id: event.rollout_id,
+        message: event.message,
+        metadata_json: event.metadata_json,
+        created_at: event.created_at,
+    }
+}
+
+fn scheduler_event_filter(
+    after_id: Option<i64>,
+    limit: Option<u32>,
+    kind: Option<String>,
+    job_id: Option<String>,
+    node_id: Option<String>,
+    level: Option<String>,
+) -> SchedulerEventFilter {
+    let normalize = |value: Option<String>| {
+        value.and_then(|value| {
+            let trimmed = value.trim().to_string();
+            (!trimmed.is_empty()).then_some(trimmed)
+        })
+    };
+    SchedulerEventFilter {
+        // Explicit 0 means "from the very beginning"; only reject negatives.
+        after_id: after_id.filter(|id| *id >= 0),
+        limit,
+        kind: normalize(kind),
+        job_id: normalize(job_id),
+        node_id: normalize(node_id),
+        level: normalize(level),
+    }
+}
+
+// Outbound buffer for one StreamEvents subscriber. Slow consumers exert
+// backpressure here; if they fall further behind than the store's broadcast
+// buffer, the stream task backfills from the journal.
+const EVENT_STREAM_BUFFER: usize = 64;
+// Batch size used when replaying journal history into a stream.
+const EVENT_STREAM_REPLAY_BATCH: u32 = 500;
 
 #[derive(Debug, Clone)]
 struct KvReference {
@@ -1596,6 +1646,98 @@ impl Manager for ManagerDaemonService {
             .collect::<Vec<_>>();
 
         Ok(Response::new(ListRolloutEventsReply { events }))
+    }
+
+    #[instrument(skip_all)]
+    async fn list_events(
+        &self,
+        request: Request<ListEventsRequest>,
+    ) -> Result<Response<ListEventsReply>, Status> {
+        let request = request.into_inner();
+        let filter = scheduler_event_filter(
+            request.after_id,
+            request.limit,
+            request.kind,
+            request.job_id,
+            request.node_id,
+            request.level,
+        );
+
+        let events = self
+            .store
+            .list_scheduler_events(&filter)
+            .map_err(|e| map_store_error("Error listing scheduler events", e))?;
+        let latest_id = self
+            .store
+            .latest_scheduler_event_id()
+            .map_err(|e| map_store_error("Error reading latest scheduler event id", e))?;
+
+        Ok(Response::new(ListEventsReply {
+            events: events.into_iter().map(map_scheduler_event).collect(),
+            latest_id,
+        }))
+    }
+
+    type StreamEventsStream = ReceiverStream<Result<SchedulerEvent, Status>>;
+
+    #[instrument(skip_all)]
+    async fn stream_events(
+        &self,
+        request: Request<StreamEventsRequest>,
+    ) -> Result<Response<Self::StreamEventsStream>, Status> {
+        let request = request.into_inner();
+        let filter = scheduler_event_filter(
+            request.after_id,
+            None,
+            request.kind,
+            request.job_id,
+            request.node_id,
+            request.level,
+        );
+
+        let store = self.store.clone();
+        // Subscribe before replaying history so no event can fall between the
+        // journal snapshot and the live feed; overlap is deduped via event IDs.
+        let mut live = store.subscribe_events();
+        let (tx, rx) = tokio::sync::mpsc::channel(EVENT_STREAM_BUFFER);
+
+        tokio::spawn(async move {
+            let mut last_sent = match filter.after_id {
+                Some(after_id) => {
+                    match replay_journal_events(&store, &filter, after_id, &tx).await {
+                        Ok(cursor) => cursor,
+                        Err(StreamSendStopped) => return,
+                    }
+                }
+                // Pure tail: live subscription only sees events emitted after
+                // subscribe, so no replay and no cursor floor is needed.
+                None => 0,
+            };
+
+            loop {
+                match live.recv().await {
+                    Ok(event) => {
+                        if event.id <= last_sent || !filter.matches(&event) {
+                            continue;
+                        }
+                        last_sent = event.id;
+                        if tx.send(Ok(map_scheduler_event(event))).await.is_err() {
+                            return;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        debug!(skipped, "StreamEvents subscriber lagged; backfilling");
+                        match replay_journal_events(&store, &filter, last_sent, &tx).await {
+                            Ok(cursor) => last_sent = cursor.max(last_sent),
+                            Err(StreamSendStopped) => return,
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                }
+            }
+        });
+
+        Ok(Response::new(ReceiverStream::new(rx)))
     }
 
     #[instrument(skip_all)]
@@ -3436,6 +3578,51 @@ fn worker_address_for_node(node: &Node) -> Option<String> {
         .map(|value| value.to_string())
 }
 
+/// Marker error: the StreamEvents client went away, stop the stream task.
+struct StreamSendStopped;
+
+/// Send journal events with `id > after_id` (matching `filter`) into a stream
+/// channel in batches. Returns the new cursor (highest event ID sent, or
+/// `after_id` when nothing matched).
+async fn replay_journal_events(
+    store: &Store,
+    filter: &SchedulerEventFilter,
+    after_id: i64,
+    tx: &tokio::sync::mpsc::Sender<Result<SchedulerEvent, Status>>,
+) -> Result<i64, StreamSendStopped> {
+    let mut cursor = after_id;
+    loop {
+        let batch_filter = SchedulerEventFilter {
+            after_id: Some(cursor),
+            limit: Some(EVENT_STREAM_REPLAY_BATCH),
+            ..filter.clone()
+        };
+        let batch = match store.list_scheduler_events(&batch_filter) {
+            Ok(batch) => batch,
+            Err(err) => {
+                error!(error = ?err, "Error replaying scheduler events into stream");
+                let _ = tx
+                    .send(Err(Status::internal("Error replaying scheduler events")))
+                    .await;
+                return Err(StreamSendStopped);
+            }
+        };
+        if batch.is_empty() {
+            return Ok(cursor);
+        }
+        let batch_len = batch.len();
+        for event in batch {
+            cursor = cursor.max(event.id);
+            if tx.send(Ok(map_scheduler_event(event))).await.is_err() {
+                return Err(StreamSendStopped);
+            }
+        }
+        if (batch_len as u32) < EVENT_STREAM_REPLAY_BATCH {
+            return Ok(cursor);
+        }
+    }
+}
+
 /// Proxy a single allocation's log read to the worker hosting it.
 ///
 /// Returns the captured streams, or a human-readable error string suitable for
@@ -3510,6 +3697,15 @@ fn handle_failed_allocations(
         }
 
         store.remove_allocation_by_id(allocation_id)?;
+
+        store.events().allocation_failed(
+            allocation_id,
+            node_id,
+            &context.job_id,
+            &context.job_config_id,
+            context.task_config_id,
+            &failure.reason,
+        );
 
         let move_decision = {
             let mut tracker = failure_tracker.lock().expect("allocation failure tracker");
@@ -3936,6 +4132,7 @@ mod tests {
         NodeMsg, PostWorkReply, PostWorkRequest, PutKvRequest, RestartWorkerReply,
         RestartWorkerRequest, RunJobRequest, Submission, TaskConfig, UpdateNodeDynamicRequest,
     };
+    use futures::StreamExt;
     use serde_json::{json, Map, Value};
     use tempfile::Builder;
     use tokio::sync::oneshot;
@@ -6186,6 +6383,118 @@ mod tests {
         assert_eq!(response.events[0].rollout_id, rollout.id);
         assert_eq!(response.events[0].group_name.as_deref(), Some("web"));
         assert_eq!(response.events[0].message, "step advanced");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_events_returns_filtered_events_and_cursor() -> R<()> {
+        let store = setup_store()?;
+        let manager = ManagerDaemonService::new(store.clone());
+
+        store.emit_event(
+            crate::storage::events::EventDraft::info("eval.completed", "Eval 1 completed")
+                .job("demo"),
+        );
+        store.emit_event(
+            crate::storage::events::EventDraft::warn("node.lost", "Node node-a marked lost")
+                .node("node-a"),
+        );
+
+        let response = manager
+            .list_events(Request::new(ListEventsRequest::default()))
+            .await?
+            .into_inner();
+        assert_eq!(response.events.len(), 2);
+        assert_eq!(response.latest_id, response.events[1].id);
+
+        let filtered = manager
+            .list_events(Request::new(ListEventsRequest {
+                kind: Some("node".into()),
+                ..Default::default()
+            }))
+            .await?
+            .into_inner();
+        assert_eq!(filtered.events.len(), 1);
+        assert_eq!(filtered.events[0].kind, "node.lost");
+        assert_eq!(filtered.events[0].node_id.as_deref(), Some("node-a"));
+        // latest_id is unfiltered: the cursor always tracks the journal head.
+        assert_eq!(filtered.latest_id, response.latest_id);
+
+        let after = manager
+            .list_events(Request::new(ListEventsRequest {
+                after_id: Some(response.events[0].id),
+                ..Default::default()
+            }))
+            .await?
+            .into_inner();
+        assert_eq!(after.events.len(), 1);
+        assert_eq!(after.events[0].id, response.events[1].id);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stream_events_replays_backlog_then_delivers_live_events() -> R<()> {
+        let store = setup_store()?;
+        let manager = ManagerDaemonService::new(store.clone());
+
+        store.emit_event(crate::storage::events::EventDraft::info(
+            "job.submitted",
+            "Job demo submitted",
+        ));
+
+        let mut stream = manager
+            .stream_events(Request::new(StreamEventsRequest {
+                after_id: Some(0),
+                ..Default::default()
+            }))
+            .await?
+            .into_inner();
+
+        let replayed = tokio::time::timeout(Duration::from_secs(2), stream.next()).await?;
+        let replayed = replayed.context("stream closed before replaying backlog")??;
+        assert_eq!(replayed.kind, "job.submitted");
+
+        store.emit_event(crate::storage::events::EventDraft::warn(
+            "node.lost",
+            "Node node-a marked lost",
+        ));
+
+        let live = tokio::time::timeout(Duration::from_secs(2), stream.next()).await?;
+        let live = live.context("stream closed before delivering live event")??;
+        assert_eq!(live.kind, "node.lost");
+        assert!(live.id > replayed.id);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stream_events_applies_filters_to_live_events() -> R<()> {
+        let store = setup_store()?;
+        let manager = ManagerDaemonService::new(store.clone());
+
+        let mut stream = manager
+            .stream_events(Request::new(StreamEventsRequest {
+                level: Some("error".into()),
+                ..Default::default()
+            }))
+            .await?
+            .into_inner();
+
+        store.emit_event(crate::storage::events::EventDraft::info(
+            "eval.completed",
+            "Eval 1 completed",
+        ));
+        store.emit_event(crate::storage::events::EventDraft::error(
+            "eval.failed",
+            "Eval 2 failed",
+        ));
+
+        let event = tokio::time::timeout(Duration::from_secs(2), stream.next()).await?;
+        let event = event.context("stream closed before delivering error event")??;
+        assert_eq!(event.kind, "eval.failed");
+        assert_eq!(event.level, "error");
+
         Ok(())
     }
 
