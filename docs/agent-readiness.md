@@ -57,6 +57,7 @@ Even with `--allow-write`, `legion_state_query` is forced to read-only.
 | `legion_rollout_list` | no | List rollouts. |
 | `legion_rollout_status` | no | Rollout progress + allocation health. |
 | `legion_node_list` | no | List worker nodes. |
+| `legion_events` | no | List scheduler events; poll with `after_id` to tail. |
 | `legion_job_logs` | no | Fetch captured task stdout/stderr for a job. |
 | `legion_state_query` | no | Read-only SQL against the state store. |
 | `legion_state_schema` | no | Describe state store tables. |
@@ -158,6 +159,8 @@ tracked `rolloutId`. A non-converged wait exits non-zero.
 
 Other loop-closing signals available to agents today:
 
+- `legion events list --json` / `legion events follow --json` — the scheduler
+  event stream (see below).
 - `legion job rollout events --id <ID> --json` — the rollout's event history.
 - `legion job rollout status --id <ID> --json` — per-allocation health, including
   per-artifact staging states (`artifact_states`) for tasks that declare
@@ -165,6 +168,28 @@ Other loop-closing signals available to agents today:
 - `legion job logs <NAME> --json` — captured task stdout/stderr (see below).
 - `legion state query "<SQL>" --json` — inspect `task_status`, `allocation_health`,
   `eval`, etc. (read-only by default).
+
+### The scheduler event stream
+
+The manager journals an event for everything the scheduler does — evals
+enqueued/completed/failed, allocations placed/removed/failed, node and job
+lifecycle transitions, rollout activity — and exposes it three ways (see
+[Event Stream](event-stream.md)):
+
+```bash
+# A window of recent history (oldest first), with filters:
+legion events list --kind eval --job demo --level warn --json
+
+# Live tail over the StreamEvents gRPC stream; in JSON mode each line is a
+# complete { "ok": true, "data": <event> } envelope (NDJSON):
+legion events follow --job demo --json
+```
+
+Every event has a monotonically increasing `id`, so polling agents never miss
+or double-count: call `legion events list --json` once, remember `latestId`,
+then poll with `--after-id <latestId>` (the `legion_events` MCP tool takes the
+same `after_id` cursor). After a dropped `follow`, resume with
+`--after-id <last seen id>` and the manager replays the gap before tailing.
 
 ## 6a. Task log retrieval (`legion job logs`)
 
@@ -251,7 +276,9 @@ Prefer read-only operations; treat anything with `mutates: true` /
 
 Implemented: MCP server, structured envelope + typed errors, capabilities catalog,
 `job schema`/`job validate`, idempotency keys, `--wait`/`job wait`, saved-query
-library, and **task log retrieval** (`legion job logs` / `legion_job_logs`).
+library, the scheduler event stream (`events list`/`events follow`,
+`legion_events`), and **task log retrieval** (`legion job logs` /
+`legion_job_logs`).
 
 The task-log path captures task stdout/stderr to per-allocation files via the
 `TaskPlugin` runtime (`TaskRuntime.log_dir`), reads them on the node with

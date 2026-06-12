@@ -186,6 +186,21 @@ service Manager {
   rpc GetStateStoreSchema (GetStateStoreSchemaRequest)
     returns (GetStateStoreSchemaReply);
 
+  // Lists recent scheduler events from the manager's event journal.
+  //
+  // Events describe what the scheduler is doing: evals enqueued/completed,
+  // allocations placed/removed/failed, node lifecycle changes, job lifecycle
+  // changes, and rollout activity. Results are ordered oldest-to-newest and
+  // support cursor-based polling via `after_id`.
+  rpc ListEvents (ListEventsRequest) returns (ListEventsReply);
+
+  // Streams scheduler events as they happen (server-streaming).
+  //
+  // When `after_id` is set, persisted events with `id > after_id` are
+  // replayed first, then the live feed continues seamlessly. Clients that
+  // disconnect can resume without gaps by passing the last event ID they saw.
+  rpc StreamEvents (StreamEventsRequest) returns (stream SchedulerEvent);
+
   // Lists user-saved State Explorer query snippets.
   rpc ListSavedStateQueries (ListSavedStateQueriesRequest)
     returns (ListSavedStateQueriesReply);
@@ -1828,6 +1843,123 @@ message UpdateNodeDynamicReply {
   //
   // Includes merged dynamic attributes as persisted by manager.
   optional NodeMsg node = 1;
+}
+
+// One scheduler event from the manager's event journal.
+//
+// Events are emitted by the manager whenever the scheduler does something
+// observable: eval queue activity, allocation placement and removal, node
+// lifecycle transitions, job lifecycle transitions, and rollout activity.
+message SchedulerEvent {
+  // Monotonically increasing event ID.
+  //
+  // IDs are assigned by the manager's state store and are never reused, so
+  // they double as a resume cursor for `ListEvents`/`StreamEvents`.
+  int64 id = 1;
+
+  // Dotted event kind, namespaced by subsystem.
+  //
+  // Current kinds include:
+  // - `scheduler.started`, `scheduler.recovered`
+  // - `eval.enqueued`, `eval.completed`, `eval.failed`
+  // - `allocation.placed`, `allocation.removed`, `allocation.failed`, `allocation.plan_rejected`
+  // - `node.registered`, `node.ready`, `node.lost`
+  // - `job.submitted`, `job.updated`, `job.stopped`, `job.destroyed`, `job.failed`
+  // - `rollout.event`
+  string kind = 2;
+
+  // Event severity. Values: `info`, `warn`, `error`.
+  string level = 3;
+
+  // Job ID this event relates to, when applicable.
+  optional string job_id = 4;
+
+  // Node ID this event relates to, when applicable.
+  optional string node_id = 5;
+
+  // Eval ID this event relates to, when applicable.
+  optional string eval_id = 6;
+
+  // Allocation ID this event relates to, when applicable.
+  optional int64 allocation_id = 7;
+
+  // Rollout ID this event relates to, when applicable.
+  optional int64 rollout_id = 8;
+
+  // Human-readable event description.
+  string message = 9;
+
+  // JSON object string with kind-specific structured details.
+  //
+  // Always a valid JSON object; `{}` when the event has no extra detail.
+  string metadata_json = 10;
+
+  // RFC3339 timestamp when the event was recorded.
+  string created_at = 11;
+}
+
+// Request payload for ListEvents.
+message ListEventsRequest {
+  // Exclusive lower-bound event ID cursor.
+  //
+  // When set, only events with `id > after_id` are returned (oldest first),
+  // which makes repeated polling gap-free. When omitted, the most recent
+  // `limit` events are returned (still ordered oldest-to-newest).
+  optional int64 after_id = 1;
+
+  // Maximum number of events to return.
+  //
+  // Default when omitted: `100`. Manager bounds: clamped to `[1, 1000]`.
+  optional uint32 limit = 2;
+
+  // Optional kind filter.
+  //
+  // Matches events whose kind equals the value exactly, or whose kind starts
+  // with `<value>.` — so `eval` matches `eval.completed` and `eval.failed`.
+  optional string kind = 3;
+
+  // Optional exact job ID filter.
+  optional string job_id = 4;
+
+  // Optional exact node ID filter.
+  optional string node_id = 5;
+
+  // Optional severity filter. Values: `info`, `warn`, `error`.
+  optional string level = 6;
+}
+
+// Reply payload for ListEvents.
+message ListEventsReply {
+  // Matching events ordered oldest-to-newest.
+  repeated SchedulerEvent events = 1;
+
+  // Highest event ID currently stored by the manager (0 when no events).
+  //
+  // Clients can use this to initialize an `after_id` cursor for follow-up
+  // `ListEvents` polls or a `StreamEvents` call.
+  int64 latest_id = 2;
+}
+
+// Request payload for StreamEvents.
+message StreamEventsRequest {
+  // Exclusive lower-bound event ID to replay from.
+  //
+  // When set, persisted events with `id > after_id` are sent before the live
+  // feed. When omitted, the stream starts with events emitted after the
+  // stream is established (pure tail).
+  optional int64 after_id = 1;
+
+  // Optional kind filter. Same semantics as `ListEventsRequest.kind`.
+  optional string kind = 2;
+
+  // Optional exact job ID filter.
+  optional string job_id = 3;
+
+  // Optional exact node ID filter.
+  optional string node_id = 4;
+
+  // Optional severity filter. Values: `info`, `warn`, `error`.
+  optional string level = 5;
 }
 
 // === INSECURE MANAGER ===
