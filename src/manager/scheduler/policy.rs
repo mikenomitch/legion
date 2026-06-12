@@ -1,3 +1,6 @@
+// Scoring helpers take the full placement context by parameter on purpose.
+#![allow(clippy::too_many_arguments)]
+
 use crate::plugin_runtime::{plugin_paths, validate_manifest};
 use crate::util::plugin_root_dir;
 use std::collections::HashMap;

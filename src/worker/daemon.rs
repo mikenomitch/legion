@@ -9,7 +9,7 @@ use crate::util::random_string;
 use crate::worker::{
     artifact_credentials::ManagerCredentialSource,
     node_check::{fingerprint_node, run_health_checks},
-    server::WorkerAgentService,
+    server::WorkerDaemonService,
     state::WorkerStateStore,
     task_health::spawn_health_monitor,
     task_manager::{launch_task_allocation, WorkerTaskManager},
@@ -101,7 +101,7 @@ async fn run_worker_with_manager(
     for (allocation, task) in restored_allocations {
         spawn_health_monitor(task_manager.clone(), allocation, task);
     }
-    let worker_node = WorkerAgentService {
+    let worker_node = WorkerDaemonService {
         task_manager: task_manager.clone(),
     };
     let worker_server_fut = Server::builder()
@@ -153,7 +153,13 @@ async fn run_worker_with_manager(
         client,
         task_manager.clone(),
     );
-    let _res = join!(heartbeat_fut, checks_fut, worker_server_fut);
+    let log_maintenance_fut = start_log_maintenance(task_manager.clone());
+    let _res = join!(
+        heartbeat_fut,
+        checks_fut,
+        log_maintenance_fut,
+        worker_server_fut
+    );
 
     Ok(())
 }
@@ -313,6 +319,20 @@ async fn start_heartbeats(
             WORKER_HEARTBEAT_DURATION_SEC,
         ))
         .await;
+    }
+}
+
+/// Periodically rotate/prune captured task logs across all active allocations
+/// so a chatty task cannot fill the worker's disk. Runs for the lifetime of the
+/// worker; never returns on the happy path.
+#[instrument(skip_all)]
+async fn start_log_maintenance(task_manager: Arc<Mutex<WorkerTaskManager>>) -> R<()> {
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_secs(
+            DEF_TASK_LOG_MAINTENANCE_SEC,
+        ))
+        .await;
+        task_manager.lock().expect("task manager").maintain_logs();
     }
 }
 

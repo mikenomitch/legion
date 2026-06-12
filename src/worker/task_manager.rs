@@ -5,6 +5,8 @@ use crate::structs::{
     TaskOnUnhealthyConfig, WorkerArtifactFetchConfigFull,
 };
 use crate::task_plugins::{TaskPluginRegistry, TaskRuntime};
+use crate::worker::log_sink::{default_sinks, LogResource, LogSink};
+use crate::worker::logs::{read_allocation_logs, CapturedStream};
 use crate::worker::state::{pid_is_running, PersistedAllocation, WorkerStateStore};
 use crate::worker::task_health::{spawn_health_monitor, HealthMonitorHandle};
 use std::collections::HashMap;
@@ -49,6 +51,7 @@ pub struct WorkerTaskManager {
     alloc_root: PathBuf,
     artifact_status: ArtifactStatusBoard,
     stager: Arc<ArtifactStager>,
+    log_sinks: Vec<Box<dyn LogSink>>,
 }
 
 impl Default for WorkerTaskManager {
@@ -79,6 +82,56 @@ impl WorkerTaskManager {
                 WorkerArtifactFetchConfigFull::default(),
                 Box::new(crate::artifacts::AnonymousCredentials),
             )),
+            log_sinks: default_sinks(),
+        }
+    }
+
+    /// Build the [`LogResource`] describing an allocation's captured logs.
+    fn log_resource(&self, allocation: &Allocation, task: &TaskConfig) -> LogResource {
+        LogResource {
+            allocation_id: allocation.id,
+            job_id: allocation.job_id.clone(),
+            node_id: allocation.node_id.clone(),
+            task_name: task.name.clone(),
+            task_kind: task.kind.clone(),
+            log_dir: self.state_store.allocation_log_dir(allocation.id),
+        }
+    }
+
+    /// Notify every log sink that an allocation has started (writes manifests,
+    /// etc.). Failures are logged, never fatal to task startup.
+    fn notify_log_sinks_started(&self, allocation: &Allocation, task: &TaskConfig) {
+        let resource = self.log_resource(allocation, task);
+        for sink in &self.log_sinks {
+            if let Err(err) = sink.on_start(&resource) {
+                warn!(
+                    allocation_id = allocation.id,
+                    sink = sink.name(),
+                    error = ?err,
+                    "Log sink on_start failed"
+                );
+            }
+        }
+    }
+
+    /// Run rotation/retention (and any other sink upkeep) across all active
+    /// allocations. Invoked periodically by the worker maintenance loop.
+    pub fn maintain_logs(&self) {
+        for (allocation_id, allocation) in &self.allocations {
+            let Some(task) = self.task_configs.get(allocation_id) else {
+                continue;
+            };
+            let resource = self.log_resource(allocation, task);
+            for sink in &self.log_sinks {
+                if let Err(err) = sink.maintain(&resource) {
+                    warn!(
+                        allocation_id = *allocation_id,
+                        sink = sink.name(),
+                        error = ?err,
+                        "Log sink maintenance failed"
+                    );
+                }
+            }
         }
     }
 
@@ -339,10 +392,12 @@ impl WorkerTaskManager {
             .registry
             .plugin(&task.kind)
             .context("Task plugin not loaded")?;
+        let log_dir = self.state_store.allocation_log_dir(allocation.id);
         let runtime = self
             .runtimes
             .get_mut(&allocation.id)
             .context("Task runtime missing")?;
+        runtime.log_dir = Some(log_dir);
 
         let staged = runtime.staged_artifacts.clone();
         for artifact in &staged {
@@ -374,6 +429,7 @@ impl WorkerTaskManager {
         self.allocations.insert(allocation.id, allocation.clone());
         self.task_configs.insert(allocation.id, task.clone());
         self.set_allocation_health(allocation.id, false, "starting");
+        self.notify_log_sinks_started(allocation, task);
         self.persist_state();
 
         Ok(())
@@ -512,6 +568,19 @@ impl WorkerTaskManager {
         Ok(())
     }
 
+    /// Read captured stdout/stderr for an allocation hosted on this worker.
+    pub fn read_allocation_logs(
+        &self,
+        allocation_id: i64,
+        stream: &str,
+        offset: i64,
+        max_bytes: i64,
+        tail: bool,
+    ) -> R<Vec<CapturedStream>> {
+        let log_dir = self.state_store.allocation_log_dir(allocation_id);
+        read_allocation_logs(&log_dir, stream, offset, max_bytes, tail)
+    }
+
     pub fn register_health_monitor(&mut self, allocation_id: i64, handle: HealthMonitorHandle) {
         self.health_monitors.insert(allocation_id, handle);
     }
@@ -544,6 +613,7 @@ impl WorkerTaskManager {
             let task_dir = alloc_dir.join(&record.task.name);
             let mut runtime = TaskRuntime {
                 pid: Some(pid),
+                log_dir: Some(self.state_store.allocation_log_dir(record.allocation.id)),
                 ..TaskRuntime::default()
             };
             runtime
@@ -827,6 +897,43 @@ mod tests {
         assert!(alloc_dir.is_dir());
         let _ = manager.reconcile_allocations(&[]);
         assert!(!alloc_dir.exists(), "alloc dir must be cleaned on stop");
+        Ok(())
+    }
+
+    #[test]
+    fn captures_and_reads_exec_task_logs() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let state_store = WorkerStateStore::new(temp_dir.path().join("worker_state.json"));
+        let mut manager = WorkerTaskManager::with_state_store(state_store);
+        manager.load_builtin_plugins();
+
+        let task = TaskConfig {
+            config: json!({"command": ["sh", "-c", "echo captured-stdout"]}),
+            ..TaskConfig::new("exec-task", "exec")
+        };
+        let allocation = alloc();
+        manager.run_allocation(&allocation, &task)?;
+
+        // Poll for the captured output rather than sleeping a fixed duration,
+        // which races on slow/loaded CI and varying filesystems.
+        let mut streams = Vec::new();
+        for _ in 0..100 {
+            streams = manager.read_allocation_logs(allocation.id, "stdout", 0, 0, false)?;
+            if streams
+                .first()
+                .is_some_and(|s| s.content.contains("captured-stdout"))
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(streams.len(), 1);
+        assert_eq!(streams[0].stream, "stdout");
+        assert!(
+            streams[0].content.contains("captured-stdout"),
+            "unexpected stdout: {:?}",
+            streams[0].content
+        );
         Ok(())
     }
 

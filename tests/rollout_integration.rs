@@ -1,4 +1,4 @@
-use legion::manager::server::ManagerAgentService;
+use legion::manager::server::ManagerDaemonService;
 use legion::prelude::{json, Context, R};
 use legion::storage::store::Store;
 use legion::structs::{
@@ -128,7 +128,7 @@ fn rollout_auto_progresses_through_percent_steps() -> R<()> {
     insert_node(&store, "node-a")?;
     insert_node(&store, "node-b")?;
     insert_node(&store, "node-c")?;
-    let manager = ManagerAgentService::new(store.clone());
+    let manager = ManagerDaemonService::new(store.clone());
     let runtime = Runtime::new()?;
 
     let v1 = json!({
@@ -205,7 +205,7 @@ fn rollout_manual_requires_explicit_stage_advances() -> R<()> {
     insert_node(&store, "node-a")?;
     insert_node(&store, "node-b")?;
     insert_node(&store, "node-c")?;
-    let manager = ManagerAgentService::new(store.clone());
+    let manager = ManagerDaemonService::new(store.clone());
     let runtime = Runtime::new()?;
 
     let v1 = json!({
@@ -324,7 +324,7 @@ fn rollout_destroy_first_progresses_through_multiple_stages() -> R<()> {
     insert_node(&store, "node-a")?;
     insert_node(&store, "node-b")?;
     insert_node(&store, "node-c")?;
-    let manager = ManagerAgentService::new(store.clone());
+    let manager = ManagerDaemonService::new(store.clone());
     let runtime = Runtime::new()?;
 
     let v1 = json!({

@@ -6,6 +6,7 @@ use crate::util::plugin_root_dir;
 use jsonschema::JSONSchema;
 use libloading::{Library, Symbol};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::process::{Child, Command};
 
 mod container;
@@ -42,6 +43,40 @@ pub fn spawn_task_process(cmd: &mut Command) -> R<Child> {
     cmd.spawn().context("Failed to spawn task process")
 }
 
+/// File name for a captured stdout stream within an allocation log directory.
+pub const STDOUT_LOG_FILE: &str = "stdout.log";
+/// File name for a captured stderr stream within an allocation log directory.
+pub const STDERR_LOG_FILE: &str = "stderr.log";
+
+/// Redirect a task process's stdout/stderr to per-allocation capture files.
+///
+/// When `runtime.log_dir` is set (the worker threads an allocation log
+/// directory through the runtime), the directory is created and the command's
+/// stdout/stderr are pointed at append-mode `stdout.log` / `stderr.log` files.
+/// When no log directory is configured this is a no-op and the child inherits
+/// the worker's standard streams, preserving prior behaviour.
+pub fn configure_task_log_capture(cmd: &mut Command, runtime: &TaskRuntime) -> R<()> {
+    let Some(log_dir) = runtime.log_dir.as_ref() else {
+        return Ok(());
+    };
+    std::fs::create_dir_all(log_dir)
+        .with_context(|| format!("failed to create log dir {}", log_dir.display()))?;
+
+    let stdout = open_log_file(&log_dir.join(STDOUT_LOG_FILE))?;
+    let stderr = open_log_file(&log_dir.join(STDERR_LOG_FILE))?;
+    cmd.stdout(stdout);
+    cmd.stderr(stderr);
+    Ok(())
+}
+
+fn open_log_file(path: &std::path::Path) -> R<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("failed to open log file {}", path.display()))
+}
+
 pub(crate) fn derived_schema<T: schemars::JsonSchema>() -> Value {
     serde_json::to_value(schemars::schema_for!(T))
         .expect("derived task plugin schema should serialize")
@@ -66,6 +101,10 @@ pub struct TaskRuntime {
     /// Typed staged artifacts (artifact system plan §8), attached before
     /// `prepare()` so plugins consume payloads instead of guessing paths.
     pub staged_artifacts: Vec<crate::artifacts::StagedArtifact>,
+    /// Directory where the task's captured stdout/stderr are written, when log
+    /// capture is enabled by the worker. `None` leaves the child attached to
+    /// the worker's standard streams.
+    pub log_dir: Option<PathBuf>,
 }
 
 pub trait TaskPlugin: Send + Sync {

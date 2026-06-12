@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use legion::manager::dispatcher::build_task_allocation;
-use legion::manager::server::ManagerAgentService;
+use legion::manager::server::ManagerDaemonService;
 use legion::prelude::{json, Context, R};
 use legion::storage::store::Store;
 use legion::structs::{
@@ -327,7 +327,7 @@ fn checksum_mismatch_fails_staging() -> R<()> {
 fn artifact_states_flow_through_store_to_rollout_status() -> R<()> {
     let runtime = tokio::runtime::Runtime::new()?;
     let store = setup_store()?;
-    let manager = ManagerAgentService::new(store.clone());
+    let manager = ManagerDaemonService::new(store.clone());
     insert_node(&store, "node-a")?;
 
     let jobspec = json!({
@@ -425,7 +425,7 @@ async fn admission_normalizes_artifacts_and_preserves_plain_jobs() -> R<()> {
         },
         ..Default::default()
     };
-    let manager = ManagerAgentService::with_manager_config(store.clone(), &cluster);
+    let manager = ManagerDaemonService::with_manager_config(store.clone(), &cluster);
     insert_node(&store, "node-a")?;
 
     let jobspec = json!({
@@ -506,7 +506,7 @@ async fn admission_normalizes_artifacts_and_preserves_plain_jobs() -> R<()> {
 #[tokio::test]
 async fn plain_http_artifact_rejected_at_admission_by_default() -> R<()> {
     let store = setup_store()?;
-    let manager = ManagerAgentService::new(store.clone());
+    let manager = ManagerDaemonService::new(store.clone());
     insert_node(&store, "node-a")?;
 
     let jobspec = json!({
@@ -562,7 +562,7 @@ async fn git_ref_pins_to_commit_sha_at_submit() -> R<()> {
     git(&["commit", "--quiet", "-m", "init"])?;
 
     let store = setup_store()?;
-    let manager = ManagerAgentService::new(store.clone());
+    let manager = ManagerDaemonService::new(store.clone());
     insert_node(&store, "node-a")?;
 
     let source = format!("git::file://{}?ref=main", repo_dir.path().display());
@@ -609,7 +609,7 @@ async fn git_ref_pins_to_commit_sha_at_submit() -> R<()> {
 #[tokio::test]
 async fn resolve_always_passes_reference_through() -> R<()> {
     let store = setup_store()?;
-    let manager = ManagerAgentService::new(store.clone());
+    let manager = ManagerDaemonService::new(store.clone());
     insert_node(&store, "node-a")?;
 
     let jobspec = json!({

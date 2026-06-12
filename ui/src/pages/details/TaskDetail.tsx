@@ -1,6 +1,7 @@
 import { A, useParams } from '@solidjs/router'
 import { For, Show, createMemo, createResource } from 'solid-js'
 import { DetailBadge, DetailSection } from '../../components/DetailPrimitives'
+import LogViewer from '../../components/LogViewer'
 import { managerClient } from '../../grpcClient'
 import { formatDate } from '../../utils/format'
 import {
@@ -237,6 +238,18 @@ export default function TaskDetail() {
               </Show>
             </DetailSection>
           </Show>
+
+          <DetailSection title="Logs">
+            <Show
+              when={(data()!.taskRuntime?.allocations.length ?? 0) > 0}
+              fallback={<p class="text-sm text-neutral-500">No allocations are running for this task yet.</p>}
+            >
+              <LogViewer
+                job={jobName()}
+                allocationIds={data()!.taskRuntime!.allocations.map((allocation) => allocation.allocationId)}
+              />
+            </Show>
+          </DetailSection>
         </div>
       </Show>
     </Show>

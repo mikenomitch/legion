@@ -45,6 +45,22 @@ impl WorkerStateStore {
             })
     }
 
+    /// Base directory under which per-allocation log directories live.
+    ///
+    /// Logs sit beside the worker state file (`<state-dir>/logs`) so they share
+    /// the worker's data directory and survive worker restarts.
+    pub fn logs_base_dir(&self) -> PathBuf {
+        self.path
+            .parent()
+            .map(|parent| parent.join("logs"))
+            .unwrap_or_else(|| PathBuf::from("logs"))
+    }
+
+    /// Directory holding the captured stdout/stderr files for one allocation.
+    pub fn allocation_log_dir(&self, allocation_id: i64) -> PathBuf {
+        self.logs_base_dir().join(allocation_id.to_string())
+    }
+
     pub fn load(&self) -> R<Vec<PersistedAllocation>> {
         if !self.path.exists() {
             return Ok(Vec::new());

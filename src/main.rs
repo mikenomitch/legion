@@ -38,7 +38,16 @@ async fn main() -> R<()> {
     // The MCP server speaks JSON-RPC on stdout, so console logs must go to
     // stderr to avoid corrupting the protocol stream.
     let mcp_mode = matches!(matches.subcommand(), Some(("mcp", _)));
-    init_tracing_with_options(enable_o11y, mcp_mode)?;
+    // OTLP trace export is limited to long-running servers.
+    let server_mode = matches!(
+        matches.subcommand(),
+        Some(("start", sub_matches))
+            if matches!(
+                sub_matches.subcommand(),
+                Some(("manager", _)) | Some(("worker", _))
+            )
+    );
+    init_tracing_with_options(enable_o11y, mcp_mode, server_mode)?;
 
     match matches.subcommand() {
         Some(("capabilities", sub_matches)) => cmd::capabilities::handle(sub_matches).await?,

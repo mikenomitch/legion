@@ -20,7 +20,7 @@ pub fn o11y_enabled() -> bool {
 
 #[instrument(skip_all)]
 pub fn init_tracing(enable_o11y: bool) -> R<()> {
-    init_tracing_with_options(enable_o11y, false)
+    init_tracing_with_options(enable_o11y, false, false)
 }
 
 /// Initialize tracing, optionally routing the human-readable console layer to
@@ -29,8 +29,17 @@ pub fn init_tracing(enable_o11y: bool) -> R<()> {
 /// Routing to stderr is required for stdio protocol servers (for example
 /// `legion mcp serve`), where stdout is reserved for protocol messages and any
 /// stray log line would corrupt the stream.
+///
+/// When `server_mode` is set and OTLP export is configured via the standard
+/// OpenTelemetry environment variables (see [`crate::otel`]), Legion's own spans
+/// are also exported over OTLP/HTTP. OTLP export is limited to long-running
+/// servers so short-lived CLI invocations do not spin up an exporter.
 #[instrument(skip_all)]
-pub fn init_tracing_with_options(enable_o11y: bool, console_to_stderr: bool) -> R<()> {
+pub fn init_tracing_with_options(
+    enable_o11y: bool,
+    console_to_stderr: bool,
+    server_mode: bool,
+) -> R<()> {
     O11Y_ENABLED.store(enable_o11y, Ordering::Relaxed);
 
     let stdout_log = if console_to_stderr {
@@ -70,11 +79,31 @@ pub fn init_tracing_with_options(enable_o11y: bool, console_to_stderr: bool) -> 
         None
     };
 
+    // Optional OTLP export of Legion's own spans (servers only, opt-in by env).
+    let otlp_layer = if server_mode {
+        match crate::otel::resolved_traces_endpoint() {
+            Some(endpoint) => match crate::otel::build_tracing_layer(&endpoint) {
+                Ok(layer) => {
+                    eprintln!("legion: exporting OTLP traces to {endpoint}");
+                    Some(layer)
+                }
+                Err(err) => {
+                    eprintln!("legion: failed to initialize OTLP trace export: {err:#}");
+                    None
+                }
+            },
+            None => None,
+        }
+    } else {
+        None
+    };
+
     let subscriber = Registry::default()
         .with(stdout_log)
         .with(file_log_layer)
         .with(env_filter)
-        .with(trace_layer);
+        .with(trace_layer)
+        .with(otlp_layer);
 
     APPENDER_GUARDS
         .get_or_init(|| Mutex::new(Vec::new()))

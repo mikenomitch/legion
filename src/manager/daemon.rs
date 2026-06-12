@@ -1,13 +1,13 @@
 use crate::prelude::*;
 
 use crate::manager::join_server::get_insecure_manager_service;
-use crate::manager::server::ManagerAgentService;
+use crate::manager::server::ManagerDaemonService;
 use crate::storage::store::Store;
 use crate::structs::{
     manager_server::ManagerServer, Eval, JobConfig, KvValueType, ManagerConfig, Node, NodeMsg,
     Submission, TaskConfig, WorkerConfig as WorkerConfigMsg, WorkerConfigAlt,
 };
-use crate::worker::agent::run_worker_local;
+use crate::worker::daemon::run_worker_local;
 
 use futures::join;
 use http::Method;
@@ -76,7 +76,7 @@ pub async fn run_manager(config: ManagerConfig, run_worker: bool) -> R<()> {
 
     let store_copy_b = store.clone();
 
-    let manager_node = ManagerAgentService::with_manager_config(store, &full_config);
+    let manager_node = ManagerDaemonService::with_manager_config(store, &full_config);
 
     let addr = format!("{}:{}", full_config.server.host, full_config.server.port).parse()?;
 

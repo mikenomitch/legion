@@ -2,6 +2,7 @@ import { A, useNavigate, useParams } from '@solidjs/router'
 import { For, Show, createMemo, createResource, createSignal, onCleanup, onMount } from 'solid-js'
 import { DetailBadge, DetailSection, detailDangerButtonClass, detailTabButtonClass } from '../../components/DetailPrimitives'
 import DagVisualization from '../../components/DagVisualization'
+import LogViewer from '../../components/LogViewer'
 import { managerClient } from '../../grpcClient'
 import { formatDate } from '../../utils/format'
 import { buildTaskRuntimeByName, buildTaskRuntimeFromStatuses, extractJobSpecData, taskStatusTone, topoSortTaskNames, type TaskRuntimeSummary } from '../../utils/jobspec'
@@ -10,7 +11,7 @@ export default function JobDetail() {
   const params = useParams()
   const navigate = useNavigate()
   const jobName = createMemo(() => decodeURIComponent(params.id))
-  const [activeTab, setActiveTab] = createSignal<'overview' | 'spec'>('overview')
+  const [activeTab, setActiveTab] = createSignal<'overview' | 'spec' | 'logs'>('overview')
   const [actionMessage, setActionMessage] = createSignal('')
 
   const [jobData] = createResource(async () => {
@@ -132,6 +133,7 @@ export default function JobDetail() {
             <div class="mt-4 flex gap-2">
               <button type="button" onClick={() => setActiveTab('overview')} class={detailTabButtonClass(activeTab() === 'overview')}>Overview</button>
               <button type="button" onClick={() => setActiveTab('spec')} class={detailTabButtonClass(activeTab() === 'spec')}>Job Spec</button>
+              <button type="button" onClick={() => setActiveTab('logs')} class={detailTabButtonClass(activeTab() === 'logs')}>Logs</button>
             </div>
           </DetailSection>
 
@@ -270,6 +272,12 @@ export default function JobDetail() {
                   </A>
                 )}</For>
               </div>
+            </DetailSection>
+          </Show>
+
+          <Show when={activeTab() === 'logs'}>
+            <DetailSection title="Task logs" actions={<span class="text-xs text-neutral-500">live tail across this job's allocations</span>}>
+              <LogViewer job={jobName()} />
             </DetailSection>
           </Show>
         </div>
