@@ -3,7 +3,7 @@
 /* eslint-disable */
 // @ts-nocheck
 
-import { AcquireKvLockReply, AcquireKvLockRequest, AdvanceRolloutReply, AdvanceRolloutRequest, CreateInstanceReply, CreateInstanceRequest, CreateInstancesReply, CreateInstancesRequest, DeleteKvReply, DeleteKvRequest, DeleteSavedStateQueryReply, DeleteSavedStateQueryRequest, DestroyInstanceReply, DestroyInstanceRequest, DestroyJobReply, DestroyJobRequest, GetAllocationLogsReply, GetAllocationLogsRequest, GetArtifactCredentialReply, GetArtifactCredentialRequest, GetInstanceReply, GetInstanceRequest, GetJobInfoReply, GetJobInfoRequest, GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest, GetJoinTokenReply, GetJoinTokenRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest, GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest, GetObservabilityReply, GetObservabilityRequest, GetRaftJoinTokenReply, GetRaftJoinTokenRequest, GetRaftStatusReply, GetRaftStatusRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest, GetStateStoreSchemaReply, GetStateStoreSchemaRequest, GetTaskLogsReply, GetTaskLogsRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, IssueRaftCommandReply, IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply, IssueWorkloadIdentityTokenRequest, ListEventsReply, ListEventsRequest, ListInstancesReply, ListInstancesRequest, ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobsReply, ListJobsRequest, ListKvReply, ListKvRequest, ListRaftHistoryReply, ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply, ListRolloutsRequest, ListSavedStateQueriesReply, ListSavedStateQueriesRequest, PatchKvReply, PatchKvRequest, PlanJobReply, PlanJobRequest, PostWorkReply, PostWorkRequest, PutKvReply, PutKvRequest, QueryStateStoreReply, QueryStateStoreRequest, ReleaseKvLockReply, ReleaseKvLockRequest, RenewKvLockReply, RenewKvLockRequest, ReplaceInstanceReply, ReplaceInstanceRequest, RestartWorkerReply, RestartWorkerRequest, RunJobReply, RunJobRequest, SchedulerEvent, StartInstanceReply, StartInstanceRequest, StopInstanceReply, StopInstanceRequest, StopJobReply, StopJobRequest, StopRolloutReply, StopRolloutRequest, StreamEventsRequest, UpdateNodeDynamicReply, UpdateNodeDynamicRequest, UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest } from "./legion_pb.js";
+import { AcquireKvLockReply, AcquireKvLockRequest, AdvanceRolloutReply, AdvanceRolloutRequest, BootstrapAclReply, BootstrapAclRequest, CreateAclTokenReply, CreateAclTokenRequest, CreateInstanceReply, CreateInstanceRequest, CreateInstancesReply, CreateInstancesRequest, CreateJoinTokenReply, CreateJoinTokenRequest, DeleteAclPolicyReply, DeleteAclPolicyRequest, DeleteAclTokenReply, DeleteAclTokenRequest, DeleteAclUserReply, DeleteAclUserRequest, DeleteJoinTokenReply, DeleteJoinTokenRequest, DeleteKvReply, DeleteKvRequest, DeleteSavedStateQueryReply, DeleteSavedStateQueryRequest, DestroyInstanceReply, DestroyInstanceRequest, DestroyJobReply, DestroyJobRequest, GetAclPolicyReply, GetAclPolicyRequest, GetAllocationLogsReply, GetAllocationLogsRequest, GetArtifactCredentialReply, GetArtifactCredentialRequest, GetAuthMethodsReply, GetAuthMethodsRequest, GetInstanceReply, GetInstanceRequest, GetJobInfoReply, GetJobInfoRequest, GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest, GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest, GetObservabilityReply, GetObservabilityRequest, GetRaftJoinTokenReply, GetRaftJoinTokenRequest, GetRaftStatusReply, GetRaftStatusRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest, GetStateStoreSchemaReply, GetStateStoreSchemaRequest, GetTaskLogsReply, GetTaskLogsRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, IssueRaftCommandReply, IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply, IssueWorkloadIdentityTokenRequest, ListAclPoliciesReply, ListAclPoliciesRequest, ListAclTokensReply, ListAclTokensRequest, ListAclUsersReply, ListAclUsersRequest, ListEventsReply, ListEventsRequest, ListInstancesReply, ListInstancesRequest, ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobsReply, ListJobsRequest, ListJoinTokensReply, ListJoinTokensRequest, ListKvReply, ListKvRequest, ListRaftHistoryReply, ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply, ListRolloutsRequest, ListSavedStateQueriesReply, ListSavedStateQueriesRequest, LoginReply, LoginRequest, PatchKvReply, PatchKvRequest, PlanJobReply, PlanJobRequest, PostWorkReply, PostWorkRequest, PutKvReply, PutKvRequest, QueryStateStoreReply, QueryStateStoreRequest, ReleaseKvLockReply, ReleaseKvLockRequest, RenewKvLockReply, RenewKvLockRequest, ReplaceInstanceReply, ReplaceInstanceRequest, RestartWorkerReply, RestartWorkerRequest, RunJobReply, RunJobRequest, SchedulerEvent, StartInstanceReply, StartInstanceRequest, StopInstanceReply, StopInstanceRequest, StopJobReply, StopJobRequest, StopRolloutReply, StopRolloutRequest, StreamEventsRequest, UpdateNodeDynamicReply, UpdateNodeDynamicRequest, UpsertAclPolicyReply, UpsertAclPolicyRequest, UpsertAclUserReply, UpsertAclUserRequest, UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest, WhoAmIReply, WhoAmIRequest, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest } from "./legion_pb.js";
 import { MethodKind } from "@bufbuild/protobuf";
 
 /**
@@ -890,29 +890,229 @@ export const Manager = {
       O: DeleteSavedStateQueryReply,
       kind: MethodKind.Unary,
     },
-  }
-} as const;
-
-/**
- * InsecureManager exposes bootstrap-only APIs on the insecure listener.
- *
- * This is typically used to issue join tokens before a worker has secure
- * cluster credentials.
- *
- * @generated from service legion.InsecureManager
- */
-export const InsecureManager = {
-  typeName: "legion.InsecureManager",
-  methods: {
     /**
-     * Generates a worker join token (JWT).
+     * Reports how the manager authenticated the caller and what access applies.
      *
-     * @generated from rpc legion.InsecureManager.GetJoinToken
+     * This endpoint never requires a credential: anonymous callers receive the
+     * anonymous identity. UI and CLI clients use it to discover whether ACLs are
+     * enabled and to introspect the presented credential.
+     *
+     * @generated from rpc legion.Manager.WhoAmI
      */
-    getJoinToken: {
-      name: "GetJoinToken",
-      I: GetJoinTokenRequest,
-      O: GetJoinTokenReply,
+    whoAmI: {
+      name: "WhoAmI",
+      I: WhoAmIRequest,
+      O: WhoAmIReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Exchanges login credentials for a newly minted Legion ACL token.
+     *
+     * Supported methods: the built-in `userpass` method (username/password
+     * verified against stored ACL users) and any JWT/OIDC auth method configured
+     * on the manager (`method` = the configured method name, `jwt` = the
+     * externally issued token). The reply contains the token secret exactly
+     * once; the manager stores only a hash of it.
+     *
+     * @generated from rpc legion.Manager.Login
+     */
+    login: {
+      name: "Login",
+      I: LoginRequest,
+      O: LoginReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * One-time creation of the initial management token.
+     *
+     * Succeeds only while no management token exists; afterwards it returns
+     * FAILED_PRECONDITION. Run `legion acl bootstrap` right after enabling ACLs
+     * and store the returned secret safely.
+     *
+     * @generated from rpc legion.Manager.BootstrapAcl
+     */
+    bootstrapAcl: {
+      name: "BootstrapAcl",
+      I: BootstrapAclRequest,
+      O: BootstrapAclReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Creates or replaces a named ACL policy. Requires `acl:write`.
+     *
+     * @generated from rpc legion.Manager.UpsertAclPolicy
+     */
+    upsertAclPolicy: {
+      name: "UpsertAclPolicy",
+      I: UpsertAclPolicyRequest,
+      O: UpsertAclPolicyReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Returns one ACL policy by exact name. Requires `acl:read`.
+     *
+     * @generated from rpc legion.Manager.GetAclPolicy
+     */
+    getAclPolicy: {
+      name: "GetAclPolicy",
+      I: GetAclPolicyRequest,
+      O: GetAclPolicyReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Lists all ACL policies. Requires `acl:read`.
+     *
+     * @generated from rpc legion.Manager.ListAclPolicies
+     */
+    listAclPolicies: {
+      name: "ListAclPolicies",
+      I: ListAclPoliciesRequest,
+      O: ListAclPoliciesReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Deletes an ACL policy by exact name. Requires `acl:write`.
+     *
+     * Tokens referencing the deleted policy lose the access it granted.
+     *
+     * @generated from rpc legion.Manager.DeleteAclPolicy
+     */
+    deleteAclPolicy: {
+      name: "DeleteAclPolicy",
+      I: DeleteAclPolicyRequest,
+      O: DeleteAclPolicyReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Creates a new ACL token attached to existing policies.
+     *
+     * Requires `acl:write`. Creating a `management` token additionally requires
+     * the caller to hold a management token.
+     *
+     * @generated from rpc legion.Manager.CreateAclToken
+     */
+    createAclToken: {
+      name: "CreateAclToken",
+      I: CreateAclTokenRequest,
+      O: CreateAclTokenReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Lists ACL tokens. Requires `acl:read`.
+     *
+     * Only accessor IDs and metadata are returned; secrets are never stored or
+     * returned after creation.
+     *
+     * @generated from rpc legion.Manager.ListAclTokens
+     */
+    listAclTokens: {
+      name: "ListAclTokens",
+      I: ListAclTokensRequest,
+      O: ListAclTokensReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Deletes (revokes) an ACL token by accessor ID. Requires `acl:write`.
+     *
+     * @generated from rpc legion.Manager.DeleteAclToken
+     */
+    deleteAclToken: {
+      name: "DeleteAclToken",
+      I: DeleteAclTokenRequest,
+      O: DeleteAclTokenReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Creates or updates a username/password ACL user. Requires `acl:write`.
+     *
+     * Passwords are hashed with argon2id; plaintext is never stored.
+     *
+     * @generated from rpc legion.Manager.UpsertAclUser
+     */
+    upsertAclUser: {
+      name: "UpsertAclUser",
+      I: UpsertAclUserRequest,
+      O: UpsertAclUserReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Lists username/password ACL users. Requires `acl:read`.
+     *
+     * @generated from rpc legion.Manager.ListAclUsers
+     */
+    listAclUsers: {
+      name: "ListAclUsers",
+      I: ListAclUsersRequest,
+      O: ListAclUsersReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Deletes a username/password ACL user. Requires `acl:write`.
+     *
+     * Tokens previously minted via Login remain valid until they expire or are
+     * deleted; deleting the user only prevents future logins.
+     *
+     * @generated from rpc legion.Manager.DeleteAclUser
+     */
+    deleteAclUser: {
+      name: "DeleteAclUser",
+      I: DeleteAclUserRequest,
+      O: DeleteAclUserReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Lists the auth methods clients may log in with.
+     *
+     * Open endpoint: login UIs need this before any credential exists. Only
+     * public metadata is returned (names, types, OIDC client settings) —
+     * never secrets or validation keys.
+     *
+     * @generated from rpc legion.Manager.GetAuthMethods
+     */
+    getAuthMethods: {
+      name: "GetAuthMethods",
+      I: GetAuthMethodsRequest,
+      O: GetAuthMethodsReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Creates a worker join token. Requires `node:write`.
+     *
+     * The reply contains a self-describing composite token (manager address +
+     * secret + worker type) that introduces a worker in one command:
+     * `legion join <TOKEN>`. The manager stores only a hash of the secret.
+     *
+     * @generated from rpc legion.Manager.CreateJoinToken
+     */
+    createJoinToken: {
+      name: "CreateJoinToken",
+      I: CreateJoinTokenRequest,
+      O: CreateJoinTokenReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Lists worker join tokens (metadata only). Requires `node:read`.
+     *
+     * @generated from rpc legion.Manager.ListJoinTokens
+     */
+    listJoinTokens: {
+      name: "ListJoinTokens",
+      I: ListJoinTokensRequest,
+      O: ListJoinTokensReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Deletes (revokes) a worker join token by ID. Requires `node:write`.
+     *
+     * Workers already registered keep their node tokens; revocation only
+     * prevents future joins with this token.
+     *
+     * @generated from rpc legion.Manager.DeleteJoinToken
+     */
+    deleteJoinToken: {
+      name: "DeleteJoinToken",
+      I: DeleteJoinTokenRequest,
+      O: DeleteJoinTokenReply,
       kind: MethodKind.Unary,
     },
   }

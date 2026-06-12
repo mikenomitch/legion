@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use crate::prelude::*;
 
+use crate::manager::acl::{self, Authenticator};
 use crate::manager::dispatcher::build_task_allocation;
 use crate::manager::rollout::{
     advance_rollout as advance_rollout_state, sequential_step_fractions,
@@ -21,6 +22,7 @@ use crate::storage::store::{
     DestroyInstanceOutcome, JobKvReference, JobSubmitOutcome, StartInstanceOutcome,
     StopInstanceOutcome, Store,
 };
+use crate::structs::acl::{AclAction, AclIdentity, AclResource, AclScope};
 use crate::structs::manager_server::Manager;
 use crate::structs::{
     validate_keyed_instance_id, worker_client::WorkerClient, AcquireKvLockReply,
@@ -56,6 +58,17 @@ use crate::structs::{
     UpdateNodeDynamicReply, UpdateNodeDynamicRequest, UpsertSavedStateQueryReply,
     UpsertSavedStateQueryRequest, WorkerConfig, WorkerPreRegisterReply, WorkerPreRegisterRequest,
     WorkerRegisterReply, WorkerRegisterRequest,
+};
+use crate::structs::{
+    AuthMethodInfo, BootstrapAclReply, BootstrapAclRequest, CreateAclTokenReply,
+    CreateAclTokenRequest, CreateJoinTokenReply, CreateJoinTokenRequest, DeleteAclPolicyReply,
+    DeleteAclPolicyRequest, DeleteAclTokenReply, DeleteAclTokenRequest, DeleteAclUserReply,
+    DeleteAclUserRequest, DeleteJoinTokenReply, DeleteJoinTokenRequest, GetAclPolicyReply,
+    GetAclPolicyRequest, GetAuthMethodsReply, GetAuthMethodsRequest, ListAclPoliciesReply,
+    ListAclPoliciesRequest, ListAclTokensReply, ListAclTokensRequest, ListAclUsersReply,
+    ListAclUsersRequest, ListJoinTokensReply, ListJoinTokensRequest, LoginReply, LoginRequest,
+    UpsertAclPolicyReply, UpsertAclPolicyRequest, UpsertAclUserReply, UpsertAclUserRequest,
+    WhoAmIReply, WhoAmIRequest,
 };
 use crate::task_plugins::validate_job_config;
 use crate::tracing_util::{o11y_enabled, read_recent_observability};
@@ -796,6 +809,9 @@ struct KvDebounceState {
 #[derive(Debug)]
 pub struct ManagerDaemonService {
     pub store: Store,
+    pub auth: Arc<Authenticator>,
+    /// Externally reachable manager address embedded in join tokens.
+    pub advertise_addr: String,
     allocation_failures: Arc<Mutex<AllocationFailureTracker>>,
     /// OIDC issuer state; `None` when `workloadIdentity.enabled` is false
     /// (the default), in which case IssueWorkloadIdentityToken returns
@@ -817,9 +833,16 @@ pub struct ManagerDaemonService {
 }
 
 impl ManagerDaemonService {
+    /// Service with ACLs disabled (tests, embedded use).
     pub fn new(store: Store) -> Self {
+        Self::with_acl(store, Arc::new(Authenticator::disabled()))
+    }
+
+    pub fn with_acl(store: Store, auth: Arc<Authenticator>) -> Self {
         Self {
             store,
+            auth,
+            advertise_addr: DEF_MANAGER_ADDRESS.to_string(),
             allocation_failures: Arc::new(Mutex::new(AllocationFailureTracker::default())),
             workload_identity: None,
             // Constructor default is "no debounce" so direct service users
@@ -833,6 +856,116 @@ impl ManagerDaemonService {
                 crate::artifacts::FetcherRegistry::with_builtins(),
             )),
         }
+    }
+
+    /// Drop-in ACL gate for RPC handlers: authenticates the caller and
+    /// requires `action` on `resource` within `scope`.
+    ///
+    /// Every user-facing endpoint must call this (or `authenticate_acl` +
+    /// `acl::enforce` when the scope is only known after parsing the request
+    /// body) before doing any work. See AGENTS.md and
+    /// `tests/acl_endpoints.rs`, which fails when an endpoint is missing
+    /// coverage.
+    fn check_acl<T>(
+        &self,
+        request: &Request<T>,
+        resource: AclResource,
+        action: AclAction,
+        scope: AclScope,
+    ) -> Result<AclIdentity, Status> {
+        let identity = self.authenticate_acl(request)?;
+        acl::enforce(&identity, resource, action, &scope)?;
+        Ok(identity)
+    }
+
+    /// Resolves the caller's identity without enforcing anything. Pair with
+    /// `acl::enforce` once the request body has been parsed.
+    fn authenticate_acl<T>(&self, request: &Request<T>) -> Result<AclIdentity, Status> {
+        self.auth.authenticate(request.metadata(), &self.store)
+    }
+
+    /// Join gate for worker registration: when ACLs are enforced, callers
+    /// prove membership with a join token secret unless they already hold a
+    /// worker or management credential. Audit-only mode logs failures but
+    /// lets registration proceed (the migration ramp for existing fleets).
+    fn verify_join_for_registration(
+        &self,
+        identity: &AclIdentity,
+        join_token: Option<&str>,
+    ) -> Result<(), Status> {
+        if !self.auth.enabled || identity.is_management || identity.is_worker {
+            return Ok(());
+        }
+        match self.auth.verify_join_secret(&self.store, join_token) {
+            Ok(_) => Ok(()),
+            Err(status) if self.auth.audit_only => {
+                warn!(
+                    target: "acl_audit",
+                    resource = "worker-plane",
+                    action = "register",
+                    enforced = false,
+                    "join token verification failed (audit-only): {}",
+                    status.message()
+                );
+                Ok(())
+            }
+            Err(status) => Err(status),
+        }
+    }
+
+    /// Scope check against a rollout's job, used by rollout endpoints that
+    /// only carry a numeric rollout ID.
+    fn enforce_rollout_job(
+        &self,
+        identity: &AclIdentity,
+        action: AclAction,
+        rollout_id: i64,
+    ) -> Result<(), Status> {
+        let rollout = self
+            .store
+            .get_rollout(rollout_id)
+            .map_err(|e| map_store_error("Error loading rollout", e))?;
+        match rollout {
+            Some(rollout) => acl::enforce(
+                identity,
+                AclResource::Job,
+                action,
+                &AclScope::job(&rollout.job_id),
+            ),
+            // Unknown rollout: require coarse job access; handlers then
+            // produce their normal not-found/empty replies.
+            None => acl::enforce(identity, AclResource::Job, action, &AclScope::any()),
+        }
+    }
+
+    fn cancel_active_rollouts_for_job(&self, job_id: &str) -> Result<(), Status> {
+        let active_rollouts = self
+            .store
+            .list_rollouts(Some(job_id), true)
+            .map_err(|e| map_store_error("Error listing active rollouts", e))?;
+
+        for rollout in active_rollouts {
+            self.store
+                .update_rollout_status(
+                    rollout.id,
+                    "cancelled",
+                    false,
+                    Some("Rollout superseded by newer job update"),
+                )
+                .map_err(|e| map_store_error("Error cancelling superseded rollout", e))?;
+            self.store
+                .append_rollout_event(
+                    rollout.id,
+                    &rollout.job_id,
+                    None,
+                    "warn",
+                    "Rollout cancelled because a newer job config was submitted",
+                    Some(&json!({ "status": "cancelled", "reason": "superseded" }).to_string()),
+                )
+                .map_err(|e| map_store_error("Error writing rollout cancel event", e))?;
+        }
+
+        Ok(())
     }
 
     /// Service wired with cluster config (artifact admission settings + node
@@ -856,6 +989,19 @@ impl ManagerDaemonService {
     /// feature is enabled in the manager config).
     pub fn with_workload_identity(mut self, state: Option<Arc<WorkloadIdentityState>>) -> Self {
         self.workload_identity = state;
+        self
+    }
+
+    /// Attach the authenticator built from `acl` config (defaults to ACLs
+    /// disabled via `new`).
+    pub fn with_authenticator(mut self, auth: Arc<Authenticator>) -> Self {
+        self.auth = auth;
+        self
+    }
+
+    /// Sets the address join tokens point workers at.
+    pub fn with_advertise_addr(mut self, advertise_addr: impl Into<String>) -> Self {
+        self.advertise_addr = advertise_addr.into();
         self
     }
 
@@ -1503,6 +1649,14 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<RunJobRequest>,
     ) -> Result<Response<RunJobReply>, Status> {
+        // ACL: coarse gate here; exact job-name scope is enforced below once
+        // the jobspec has been parsed.
+        let identity = self.check_acl(
+            &request,
+            AclResource::Job,
+            AclAction::Write,
+            AclScope::any(),
+        )?;
         let inner = request.into_inner();
         let js = inner.parsed_jobspec;
         let mut subs = inner.submissions;
@@ -1533,6 +1687,12 @@ impl Manager for ManagerDaemonService {
                 error!("Error parsing jobspec: {:?}", e);
                 Status::invalid_argument(format!("Error parsing jobspec: {e}"))
             })?;
+        acl::enforce(
+            &identity,
+            AclResource::Job,
+            AclAction::Write,
+            &AclScope::job(&config.name),
+        )?;
 
         let force_reschedule = inner.force_reschedule;
         validate_job_config(&config).map_err(|e| {
@@ -1693,6 +1853,12 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<GetJobInfoRequest>,
     ) -> Result<Response<GetJobInfoReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Job,
+            AclAction::Read,
+            AclScope::job(&request.get_ref().name),
+        )?;
         let name = request.into_inner().name;
 
         let job = self
@@ -1710,6 +1876,8 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<ListRolloutsRequest>,
     ) -> Result<Response<ListRolloutsReply>, Status> {
+        let identity =
+            self.check_acl(&request, AclResource::Job, AclAction::Read, AclScope::any())?;
         let request = request.into_inner();
         let job_id = request
             .job_id
@@ -1728,6 +1896,13 @@ impl Manager for ManagerDaemonService {
             .store
             .list_rollouts(job_id, request.active_only)
             .map_err(|e| map_store_error("Error listing rollouts", e))?;
+        rollouts.retain(|rollout| {
+            identity.allows(
+                AclResource::Job,
+                AclAction::Read,
+                &AclScope::job(&rollout.job_id),
+            )
+        });
 
         if let Some(query) = query {
             rollouts.retain(|rollout| {
@@ -1770,7 +1945,9 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<GetRolloutRequest>,
     ) -> Result<Response<GetRolloutReply>, Status> {
+        let identity = self.authenticate_acl(&request)?;
         let request = request.into_inner();
+        self.enforce_rollout_job(&identity, AclAction::Read, request.id)?;
         let rollout = self
             .store
             .get_rollout(request.id)
@@ -1783,7 +1960,9 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<GetRolloutStatusRequest>,
     ) -> Result<Response<GetRolloutStatusReply>, Status> {
+        let identity = self.authenticate_acl(&request)?;
         let request = request.into_inner();
+        self.enforce_rollout_job(&identity, AclAction::Read, request.id)?;
         let rollout = self
             .store
             .get_rollout(request.id)
@@ -1808,12 +1987,14 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<ListRolloutEventsRequest>,
     ) -> Result<Response<ListRolloutEventsReply>, Status> {
+        let identity = self.authenticate_acl(&request)?;
         let request = request.into_inner();
         if request.rollout_id <= 0 {
             return Err(Status::invalid_argument(
                 "rollout_id must be greater than 0",
             ));
         }
+        self.enforce_rollout_job(&identity, AclAction::Read, request.rollout_id)?;
         let events = self
             .store
             .list_rollout_events(request.rollout_id, request.limit)
@@ -1839,6 +2020,12 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<ListEventsRequest>,
     ) -> Result<Response<ListEventsReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Operator,
+            AclAction::Read,
+            AclScope::none(),
+        )?;
         let request = request.into_inner();
         let filter = scheduler_event_filter(
             request.after_id,
@@ -1871,6 +2058,12 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<StreamEventsRequest>,
     ) -> Result<Response<Self::StreamEventsStream>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Operator,
+            AclAction::Read,
+            AclScope::none(),
+        )?;
         let request = request.into_inner();
         let filter = scheduler_event_filter(
             request.after_id,
@@ -1931,7 +2124,9 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<AdvanceRolloutRequest>,
     ) -> Result<Response<AdvanceRolloutReply>, Status> {
+        let identity = self.authenticate_acl(&request)?;
         let request = request.into_inner();
+        self.enforce_rollout_job(&identity, AclAction::Write, request.id)?;
         let priority = request.priority.unwrap_or(self.store.default_eval_priority);
         let rollout = advance_rollout_state(&self.store, request.id, &request.groups, priority)
             .map_err(|e| Status::invalid_argument(format!("Error advancing rollout: {e}")))?;
@@ -1947,7 +2142,9 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<StopRolloutRequest>,
     ) -> Result<Response<StopRolloutReply>, Status> {
+        let identity = self.authenticate_acl(&request)?;
         let request = request.into_inner();
+        self.enforce_rollout_job(&identity, AclAction::Write, request.id)?;
         let priority = request.priority.unwrap_or(self.store.default_eval_priority);
         let rollout = stop_rollout_state(&self.store, request.id, request.revert, priority)
             .map_err(|e| Status::invalid_argument(format!("Error stopping rollout: {e}")))?;
@@ -1967,6 +2164,10 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<PlanJobRequest>,
     ) -> Result<Response<PlanJobReply>, Status> {
+        // ACL: planning never mutates, so it requires job:read; the exact
+        // job-name scope is enforced after the jobspec parses.
+        let identity =
+            self.check_acl(&request, AclResource::Job, AclAction::Read, AclScope::any())?;
         let jobspec = request.into_inner().parsed_jobspec;
         if jobspec.trim().is_empty() {
             return Err(Status::invalid_argument("Plan request missing jobspec"));
@@ -1977,6 +2178,12 @@ impl Manager for ManagerDaemonService {
                 error!("Error parsing jobspec for plan: {:?}", e);
                 Status::invalid_argument(format!("Error parsing jobspec: {e}"))
             })?;
+        acl::enforce(
+            &identity,
+            AclResource::Job,
+            AclAction::Read,
+            &AclScope::job(&config.name),
+        )?;
         let mut config = self
             .store
             .normalize_job_config(&config)
@@ -2111,6 +2318,12 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<GetJobSpecRequest>,
     ) -> Result<Response<GetJobSpecReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Job,
+            AclAction::Read,
+            AclScope::job(&request.get_ref().name),
+        )?;
         let name = request.into_inner().name;
 
         let config = match self
@@ -2138,7 +2351,18 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<GetJobSpecByConfigRequest>,
     ) -> Result<Response<GetJobSpecReply>, Status> {
+        let identity = self.authenticate_acl(&request)?;
         let config_id = request.into_inner().config_id;
+        // Resolve the config to its job so name-scoped policies apply.
+        let job_name = self
+            .store
+            .job_name_for_config(&config_id)
+            .map_err(|e| map_store_error("Error resolving job config", e))?;
+        let scope = match &job_name {
+            Some(name) => AclScope::job(name),
+            None => AclScope::any(),
+        };
+        acl::enforce(&identity, AclResource::Job, AclAction::Read, &scope)?;
 
         let submissions = self
             .store
@@ -2153,6 +2377,12 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<ListJobSpecHistoryRequest>,
     ) -> Result<Response<ListJobSpecHistoryReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Job,
+            AclAction::Read,
+            AclScope::job(&request.get_ref().name),
+        )?;
         let name = request.into_inner().name;
         let items = self
             .store
@@ -2174,6 +2404,8 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<ListJobsRequest>,
     ) -> Result<Response<ListJobsReply>, Status> {
+        let identity =
+            self.check_acl(&request, AclResource::Job, AclAction::Read, AclScope::any())?;
         let request = request.into_inner();
         let query = normalize_query(request.query);
         let sort_by = request.sort_by.unwrap_or_else(|| "created_at".to_string());
@@ -2188,6 +2420,9 @@ impl Manager for ManagerDaemonService {
             .store
             .get_jobs()
             .map_err(|e| map_store_error("Error getting jobs", e))?;
+        jobs.retain(|job| {
+            identity.allows(AclResource::Job, AclAction::Read, &AclScope::job(&job.name))
+        });
 
         if let Some(query) = query {
             jobs.retain(|job| {
@@ -2225,6 +2460,12 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<StopJobRequest>,
     ) -> Result<Response<StopJobReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Job,
+            AclAction::Write,
+            AclScope::job(&request.get_ref().name),
+        )?;
         let inner = request.into_inner();
         let name = inner.name;
         let priority = inner.priority.unwrap_or(self.store.default_eval_priority);
@@ -2279,6 +2520,12 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<DestroyJobRequest>,
     ) -> Result<Response<DestroyJobReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Job,
+            AclAction::Write,
+            AclScope::job(&request.get_ref().name),
+        )?;
         let inner = request.into_inner();
         let name = inner.name;
         let idempotency_key = inner.idempotency_key.unwrap_or_default();
@@ -2320,6 +2567,12 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<CreateInstanceRequest>,
     ) -> Result<Response<CreateInstanceReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Job,
+            AclAction::Write,
+            AclScope::job(&request.get_ref().job_id),
+        )?;
         let inner = request.into_inner();
         let idempotency_key = inner.idempotency_key.unwrap_or_default();
 
@@ -2399,6 +2652,12 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<CreateInstancesRequest>,
     ) -> Result<Response<CreateInstancesReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Job,
+            AclAction::Write,
+            AclScope::job(&request.get_ref().job_id),
+        )?;
         let inner = request.into_inner();
         let idempotency_key = inner.idempotency_key.unwrap_or_default();
 
@@ -2495,6 +2754,12 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<StopInstanceRequest>,
     ) -> Result<Response<StopInstanceReply>, Status> {
+        let identity = self.check_acl(
+            &request,
+            AclResource::Job,
+            AclAction::Write,
+            AclScope::any(),
+        )?;
         let inner = request.into_inner();
         let idempotency_key = inner.idempotency_key.unwrap_or_default();
 
@@ -2516,6 +2781,12 @@ impl Manager for ManagerDaemonService {
             .ok_or_else(|| {
                 Status::not_found(format!("instance {} not found", inner.instance_id))
             })?;
+        acl::enforce(
+            &identity,
+            AclResource::Job,
+            AclAction::Write,
+            &AclScope::job(&instance.job_id),
+        )?;
         if instance.mode != InstanceMode::Keyed {
             return Err(Status::invalid_argument(format!(
                 "instance {} is slot-mode; slot lifecycles are owned by the scheduler via \
@@ -2577,6 +2848,12 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<StartInstanceRequest>,
     ) -> Result<Response<StartInstanceReply>, Status> {
+        let identity = self.check_acl(
+            &request,
+            AclResource::Job,
+            AclAction::Write,
+            AclScope::any(),
+        )?;
         let inner = request.into_inner();
         let idempotency_key = inner.idempotency_key.unwrap_or_default();
 
@@ -2598,6 +2875,12 @@ impl Manager for ManagerDaemonService {
             .ok_or_else(|| {
                 Status::not_found(format!("instance {} not found", inner.instance_id))
             })?;
+        acl::enforce(
+            &identity,
+            AclResource::Job,
+            AclAction::Write,
+            &AclScope::job(&instance.job_id),
+        )?;
         if instance.mode != InstanceMode::Keyed {
             return Err(Status::invalid_argument(format!(
                 "instance {} is slot-mode; slot lifecycles are owned by the scheduler via \
@@ -2674,6 +2957,12 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<DestroyInstanceRequest>,
     ) -> Result<Response<DestroyInstanceReply>, Status> {
+        let identity = self.check_acl(
+            &request,
+            AclResource::Job,
+            AclAction::Write,
+            AclScope::any(),
+        )?;
         let inner = request.into_inner();
         let idempotency_key = inner.idempotency_key.unwrap_or_default();
 
@@ -2695,6 +2984,12 @@ impl Manager for ManagerDaemonService {
             .ok_or_else(|| {
                 Status::not_found(format!("instance {} not found", inner.instance_id))
             })?;
+        acl::enforce(
+            &identity,
+            AclResource::Job,
+            AclAction::Write,
+            &AclScope::job(&instance.job_id),
+        )?;
 
         let outcome = self
             .store
@@ -2744,6 +3039,12 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<ReplaceInstanceRequest>,
     ) -> Result<Response<ReplaceInstanceReply>, Status> {
+        let identity = self.check_acl(
+            &request,
+            AclResource::Job,
+            AclAction::Write,
+            AclScope::any(),
+        )?;
         let inner = request.into_inner();
         let idempotency_key = inner.idempotency_key.unwrap_or_default();
 
@@ -2765,6 +3066,12 @@ impl Manager for ManagerDaemonService {
             .ok_or_else(|| {
                 Status::not_found(format!("instance {} not found", inner.instance_id))
             })?;
+        acl::enforce(
+            &identity,
+            AclResource::Job,
+            AclAction::Write,
+            &AclScope::job(&instance.job_id),
+        )?;
         let Some(alloc_id) = instance.current_alloc_id else {
             return Err(Status::failed_precondition(format!(
                 "instance {} has no current allocation; nothing is gated — a missing \
@@ -2843,6 +3150,12 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<ListInstancesRequest>,
     ) -> Result<Response<ListInstancesReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Job,
+            AclAction::Read,
+            AclScope::job(&request.get_ref().job_id),
+        )?;
         let inner = request.into_inner();
         let group = inner.group.filter(|group| !group.trim().is_empty());
 
@@ -2864,6 +3177,8 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<GetInstanceRequest>,
     ) -> Result<Response<GetInstanceReply>, Status> {
+        let identity =
+            self.check_acl(&request, AclResource::Job, AclAction::Read, AclScope::any())?;
         let inner = request.into_inner();
         let instance = self
             .store
@@ -2872,6 +3187,12 @@ impl Manager for ManagerDaemonService {
             .ok_or_else(|| {
                 Status::not_found(format!("instance {} not found", inner.instance_id))
             })?;
+        acl::enforce(
+            &identity,
+            AclResource::Job,
+            AclAction::Read,
+            &AclScope::job(&instance.job_id),
+        )?;
 
         Ok(Response::new(GetInstanceReply {
             instance: Some(map_instance_info(&self.store, instance)),
@@ -2883,6 +3204,10 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<IssueWorkloadIdentityTokenRequest>,
     ) -> Result<Response<IssueWorkloadIdentityTokenReply>, Status> {
+        // ACL: worker-plane endpoint (workers fetch tokens for allocations
+        // placed on them; the manager already checks node ownership below).
+        let identity = self.authenticate_acl(&request)?;
+        acl::enforce_worker_plane(&identity)?;
         let req = request.into_inner();
         tracing::Span::current().record("alloc_id", req.alloc_id);
         tracing::Span::current().record("identity_name", req.identity_name.as_str());
@@ -2975,6 +3300,10 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<HeartbeatRequest>,
     ) -> Result<Response<HeartbeatReply>, Status> {
+        // ACL: worker-plane endpoint. Requires the node token minted at
+        // registration (or a management token) when ACLs are enforced.
+        let identity = self.authenticate_acl(&request)?;
+        acl::enforce_worker_plane(&identity)?;
         let req = request.into_inner();
         let id = req.id;
 
@@ -3016,6 +3345,9 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<HealthCheckRequest>,
     ) -> Result<Response<HealthCheckReply>, Status> {
+        // ACL: worker-plane endpoint (see `heartbeat`).
+        let identity = self.authenticate_acl(&request)?;
+        acl::enforce_worker_plane(&identity)?;
         let req = request.into_inner();
         let id = req.id;
 
@@ -3037,6 +3369,11 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<WorkerPreRegisterRequest>,
     ) -> Result<Response<WorkerPreRegisterReply>, Status> {
+        // ACL: worker-plane endpoint. When ACLs are enforced, callers prove
+        // membership with a join token secret (or an already-issued worker /
+        // management bearer credential).
+        let identity = self.authenticate_acl(&request)?;
+        self.verify_join_for_registration(&identity, request.get_ref().join_token.as_deref())?;
         let request = request.into_inner();
         let worker_type = request.worker_type;
 
@@ -3069,8 +3406,13 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<WorkerRegisterRequest>,
     ) -> Result<Response<WorkerRegisterReply>, Status> {
+        // ACL: worker-plane endpoint (see `worker_pre_register`). Successful
+        // registration mints (or rotates) the node token used for heartbeats.
+        let identity = self.authenticate_acl(&request)?;
+        self.verify_join_for_registration(&identity, request.get_ref().join_token.as_deref())?;
         let request = request.into_inner();
         let dynamic_attrs = json!({}).to_string();
+        let node_id = request.name.clone();
 
         let node_msg = NodeMsg {
             id: request.name,
@@ -3088,8 +3430,17 @@ impl Manager for ManagerDaemonService {
             .insert_node(node_msg)
             .map_err(|e| map_store_error("Error registering worker", e))?;
 
+        let node_token = if self.auth.enabled {
+            let secret = self.auth.mint_node_token(&self.store, &node_id)?;
+            info!(node_id = %node_id, "Minted node token for registered worker");
+            Some(secret)
+        } else {
+            None
+        };
+
         let reply = WorkerRegisterReply {
             message: "Worker registered".into(),
+            node_token,
         };
 
         Ok(Response::new(reply))
@@ -3100,6 +3451,12 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<GetNodesRequest>,
     ) -> Result<Response<GetNodesReply>, Status> {
+        let identity = self.check_acl(
+            &request,
+            AclResource::Node,
+            AclAction::Read,
+            AclScope::any(),
+        )?;
         let request = request.into_inner();
         let query = normalize_query(request.query);
         let sort_by = request.sort_by.unwrap_or_else(|| "id".to_string());
@@ -3116,6 +3473,13 @@ impl Manager for ManagerDaemonService {
             .map_err(|e| map_store_error("Error getting nodes", e))?;
 
         let mut node_messages: Vec<NodeMsg> = nodes.into_iter().map(Into::into).collect();
+        node_messages.retain(|node| {
+            identity.allows(
+                AclResource::Node,
+                AclAction::Read,
+                &AclScope::pool(&node.pool),
+            )
+        });
 
         if let Some(query) = query {
             node_messages.retain(|node| {
@@ -3155,11 +3519,18 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<GetNodeRequest>,
     ) -> Result<Response<GetNodeReply>, Status> {
+        let identity = self.authenticate_acl(&request)?;
         let id = request.into_inner().id;
         let node = self
             .store
             .get_node(&id)
             .map_err(|e| map_store_error("Error getting node", e))?;
+        acl::enforce(
+            &identity,
+            AclResource::Node,
+            AclAction::Read,
+            &AclScope::pool(&node.pool),
+        )?;
 
         let reply = GetNodeReply {
             node: Some(node.into()),
@@ -3172,11 +3543,18 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<RestartWorkerRequest>,
     ) -> Result<Response<RestartWorkerReply>, Status> {
+        let identity = self.authenticate_acl(&request)?;
         let node_id = request.into_inner().node_id;
         let node = self.store.get_node(&node_id).map_err(|e| {
             error!(error = ?e, node_id = %node_id, "Failed to get node for restart");
             Status::not_found("Node not found")
         })?;
+        acl::enforce(
+            &identity,
+            AclResource::Node,
+            AclAction::Write,
+            &AclScope::pool(&node.pool),
+        )?;
 
         let worker_address = worker_address_for_node(&node)
             .ok_or_else(|| Status::failed_precondition("Worker address missing"))?;
@@ -3203,6 +3581,7 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<GetAllocationLogsRequest>,
     ) -> Result<Response<GetAllocationLogsReply>, Status> {
+        let identity = self.authenticate_acl(&request)?;
         let req = request.into_inner();
 
         // Resolve which allocations to read: a single allocation id when given,
@@ -3215,8 +3594,20 @@ impl Manager for ManagerDaemonService {
                 .ok_or_else(|| {
                     Status::not_found(format!("allocation {allocation_id} not found"))
                 })?;
+            acl::enforce(
+                &identity,
+                AclResource::Job,
+                AclAction::Read,
+                &AclScope::job(&alloc.job_id),
+            )?;
             vec![alloc]
         } else {
+            acl::enforce(
+                &identity,
+                AclResource::Job,
+                AclAction::Read,
+                &AclScope::job(&req.job),
+            )?;
             if req.job.trim().is_empty() {
                 return Err(Status::invalid_argument(
                     "either job or allocation_id is required",
@@ -3289,8 +3680,20 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<UpdateNodeDynamicRequest>,
     ) -> Result<Response<UpdateNodeDynamicReply>, Status> {
+        let identity = self.authenticate_acl(&request)?;
         let r = request.into_inner();
         let id = r.id;
+        // Enforce against the node's pool before mutating it.
+        let existing = self
+            .store
+            .get_node(&id)
+            .map_err(|e| map_store_error("Error getting node", e))?;
+        acl::enforce(
+            &identity,
+            AclResource::Node,
+            AclAction::Write,
+            &AclScope::pool(&existing.pool),
+        )?;
         let dd_as_map: Map<String, Value> = serde_json::from_str(&r.dynamic_diff).map_err(|e| {
             error!("Error parsing dynamic diff: {:?}", e);
             Status::internal("Error parsing dynamic diff")
@@ -3333,6 +3736,12 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<GetManagerConfigsRequest>,
     ) -> Result<Response<GetManagerConfigsReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Operator,
+            AclAction::Read,
+            AclScope::none(),
+        )?;
         let request = request.into_inner();
         let query = normalize_query(request.query);
         let sort_by = request.sort_by.unwrap_or_else(|| "updated_at".to_string());
@@ -3379,6 +3788,12 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<GetObservabilityRequest>,
     ) -> Result<Response<GetObservabilityReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Operator,
+            AclAction::Read,
+            AclScope::none(),
+        )?;
         let max_lines = request.into_inner().max_lines.unwrap_or(300).min(1_000) as usize;
         let enabled = o11y_enabled();
         let (mut logs, mut traces) = if enabled {
@@ -3409,8 +3824,14 @@ impl Manager for ManagerDaemonService {
     #[instrument(skip_all)]
     async fn get_raft_status(
         &self,
-        _request: Request<GetRaftStatusRequest>,
+        request: Request<GetRaftStatusRequest>,
     ) -> Result<Response<GetRaftStatusReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Operator,
+            AclAction::Read,
+            AclScope::none(),
+        )?;
         let status = self
             .store
             .raft_status()
@@ -3443,6 +3864,12 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<ListRaftHistoryRequest>,
     ) -> Result<Response<ListRaftHistoryReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Operator,
+            AclAction::Read,
+            AclScope::none(),
+        )?;
         let limit = request.into_inner().limit.unwrap_or(50).min(500) as usize;
         let events = self
             .store
@@ -3458,6 +3885,12 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<IssueRaftCommandRequest>,
     ) -> Result<Response<IssueRaftCommandReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Operator,
+            AclAction::Write,
+            AclScope::none(),
+        )?;
         let req = request.into_inner();
         let actor = req.actor.unwrap_or_else(|| "api".to_string());
         let event = self
@@ -3482,6 +3915,12 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<GetRaftJoinTokenRequest>,
     ) -> Result<Response<GetRaftJoinTokenReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Operator,
+            AclAction::Write,
+            AclScope::none(),
+        )?;
         let actor = request
             .into_inner()
             .actor
@@ -3505,8 +3944,14 @@ impl Manager for ManagerDaemonService {
     #[instrument(skip_all)]
     async fn get_ledger(
         &self,
-        _request: Request<GetLedgerRequest>,
+        request: Request<GetLedgerRequest>,
     ) -> Result<Response<GetLedgerReply>, Status> {
+        let identity = self.check_acl(
+            &request,
+            AclResource::Node,
+            AclAction::Read,
+            AclScope::any(),
+        )?;
         let ledger = self
             .store
             .get_ledger()
@@ -3531,6 +3976,14 @@ impl Manager for ManagerDaemonService {
                     .and_then(|snapshot| snapshot.artifact_states.clone());
             }
         }
+        nodes.retain(|entry| match &entry.node {
+            Some(node) => identity.allows(
+                AclResource::Node,
+                AclAction::Read,
+                &AclScope::pool(&node.pool),
+            ),
+            None => true,
+        });
 
         let reply: GetLedgerReply = GetLedgerReply { nodes };
 
@@ -3539,6 +3992,12 @@ impl Manager for ManagerDaemonService {
 
     #[instrument(skip_all)]
     async fn put_kv(&self, request: Request<PutKvRequest>) -> Result<Response<PutKvReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Kv,
+            AclAction::Write,
+            AclScope::path(&request.get_ref().key),
+        )?;
         let req = request.into_inner();
         let value_type = KvValueType::try_from(req.value_type).unwrap_or(KvValueType::Unspecified);
         let entry = self
@@ -3561,6 +4020,12 @@ impl Manager for ManagerDaemonService {
 
     #[instrument(skip_all)]
     async fn get_kv(&self, request: Request<GetKvRequest>) -> Result<Response<GetKvReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Kv,
+            AclAction::Read,
+            AclScope::path(&request.get_ref().key),
+        )?;
         let req = request.into_inner();
         let entry = self
             .store
@@ -3584,6 +4049,10 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<GetArtifactCredentialRequest>,
     ) -> Result<Response<GetArtifactCredentialReply>, Status> {
+        // ACL: worker-plane endpoint (workers fetch staged-artifact
+        // credentials referenced by their allocations).
+        let identity = self.authenticate_acl(&request)?;
+        acl::enforce_worker_plane(&identity)?;
         let req = request.into_inner();
         let entry = self
             .store
@@ -3616,11 +4085,20 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<ListKvRequest>,
     ) -> Result<Response<ListKvReply>, Status> {
+        let identity =
+            self.check_acl(&request, AclResource::Kv, AclAction::Read, AclScope::any())?;
         let req = request.into_inner();
-        let entries = self
+        let mut entries = self
             .store
             .list_kv(&req.prefix)
             .map_err(|e| map_store_error("Error listing kv entries", e))?;
+        entries.retain(|entry| {
+            identity.allows(
+                AclResource::Kv,
+                AclAction::Read,
+                &AclScope::path(&entry.key),
+            )
+        });
 
         Ok(Response::new(ListKvReply { entries }))
     }
@@ -3630,6 +4108,12 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<DeleteKvRequest>,
     ) -> Result<Response<DeleteKvReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Kv,
+            AclAction::Write,
+            AclScope::path(&request.get_ref().key),
+        )?;
         let req = request.into_inner();
         self.store
             .delete_kv(&req.key, req.expected_version, req.lock_id.as_deref())
@@ -3648,6 +4132,12 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<PatchKvRequest>,
     ) -> Result<Response<PatchKvReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Kv,
+            AclAction::Write,
+            AclScope::path(&request.get_ref().key),
+        )?;
         let req = request.into_inner();
         let entry = self
             .store
@@ -3671,6 +4161,12 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<AcquireKvLockRequest>,
     ) -> Result<Response<AcquireKvLockReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Kv,
+            AclAction::Write,
+            AclScope::path(&request.get_ref().key),
+        )?;
         let req = request.into_inner();
         let lock = self
             .store
@@ -3691,6 +4187,12 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<RenewKvLockRequest>,
     ) -> Result<Response<RenewKvLockReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Kv,
+            AclAction::Write,
+            AclScope::path(&request.get_ref().key),
+        )?;
         let req = request.into_inner();
         let lock = self
             .store
@@ -3705,6 +4207,12 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<ReleaseKvLockRequest>,
     ) -> Result<Response<ReleaseKvLockReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Kv,
+            AclAction::Write,
+            AclScope::path(&request.get_ref().key),
+        )?;
         let req = request.into_inner();
         self.store
             .release_kv_lock(&req.key, &req.lock_id)
@@ -3720,6 +4228,12 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<GetKvLockRequest>,
     ) -> Result<Response<GetKvLockReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Kv,
+            AclAction::Read,
+            AclScope::path(&request.get_ref().key),
+        )?;
         let req = request.into_inner();
         let lock = self
             .store
@@ -3734,6 +4248,14 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<QueryStateStoreRequest>,
     ) -> Result<Response<QueryStateStoreReply>, Status> {
+        // ACL: raw state access is powerful (it can read every table,
+        // including ACL metadata); grant `state` capabilities sparingly.
+        let action = if request.get_ref().allow_write {
+            AclAction::Write
+        } else {
+            AclAction::Read
+        };
+        self.check_acl(&request, AclResource::State, action, AclScope::none())?;
         let req = request.into_inner();
         let result = self
             .store
@@ -3755,8 +4277,14 @@ impl Manager for ManagerDaemonService {
     #[instrument(skip_all)]
     async fn get_state_store_schema(
         &self,
-        _request: Request<GetStateStoreSchemaRequest>,
+        request: Request<GetStateStoreSchemaRequest>,
     ) -> Result<Response<GetStateStoreSchemaReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::State,
+            AclAction::Read,
+            AclScope::none(),
+        )?;
         let objects = self
             .store
             .state_store_schema()
@@ -3787,8 +4315,14 @@ impl Manager for ManagerDaemonService {
     #[instrument(skip_all)]
     async fn list_saved_state_queries(
         &self,
-        _request: Request<ListSavedStateQueriesRequest>,
+        request: Request<ListSavedStateQueriesRequest>,
     ) -> Result<Response<ListSavedStateQueriesReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::State,
+            AclAction::Read,
+            AclScope::none(),
+        )?;
         let queries = self
             .store
             .list_saved_state_queries()
@@ -3810,6 +4344,12 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<UpsertSavedStateQueryRequest>,
     ) -> Result<Response<UpsertSavedStateQueryReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::State,
+            AclAction::Write,
+            AclScope::none(),
+        )?;
         let req = request.into_inner();
         let query = self
             .store
@@ -3831,6 +4371,12 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<DeleteSavedStateQueryRequest>,
     ) -> Result<Response<DeleteSavedStateQueryReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::State,
+            AclAction::Write,
+            AclScope::none(),
+        )?;
         let req = request.into_inner();
         self.store
             .delete_saved_state_query(&req.name)
@@ -3838,6 +4384,477 @@ impl Manager for ManagerDaemonService {
 
         Ok(Response::new(DeleteSavedStateQueryReply {
             message: "saved query deleted".to_string(),
+        }))
+    }
+
+    #[instrument(skip_all)]
+    async fn who_am_i(
+        &self,
+        request: Request<WhoAmIRequest>,
+    ) -> Result<Response<WhoAmIReply>, Status> {
+        // ACL: open endpoint. Identity introspection must work for anonymous
+        // callers so the UI/CLI can discover whether ACLs are enabled.
+        let identity = self.authenticate_acl(&request)?;
+        Ok(Response::new(WhoAmIReply {
+            acl_enabled: self.auth.enabled,
+            audit_only: self.auth.audit_only,
+            source: identity.source.as_str().to_string(),
+            principal: identity.principal.clone(),
+            token_type: if identity.is_management && self.auth.enabled {
+                "management".to_string()
+            } else if self.auth.enabled
+                && identity.source != crate::structs::acl::AclSource::Anonymous
+            {
+                "client".to_string()
+            } else {
+                "none".to_string()
+            },
+            policies: identity.policies.clone(),
+            expires_at: identity.expires_at.clone(),
+            accessor_id: identity.accessor_id.clone(),
+        }))
+    }
+
+    #[instrument(skip_all)]
+    async fn login(&self, request: Request<LoginRequest>) -> Result<Response<LoginReply>, Status> {
+        // ACL: open endpoint; this is how callers obtain credentials.
+        let req = request.into_inner();
+        let (token, secret) = self
+            .auth
+            .login(
+                &self.store,
+                &req.method,
+                req.username.as_deref(),
+                req.password.as_deref(),
+                req.jwt.as_deref(),
+                req.ttl.as_deref(),
+            )
+            .await?;
+        info!(principal = %token.name, "ACL login succeeded");
+        Ok(Response::new(LoginReply {
+            token: Some(token),
+            secret,
+        }))
+    }
+
+    #[instrument(skip_all)]
+    async fn bootstrap_acl(
+        &self,
+        request: Request<BootstrapAclRequest>,
+    ) -> Result<Response<BootstrapAclReply>, Status> {
+        // ACL: open endpoint guarded by its one-shot semantics — it only
+        // succeeds while no management token exists.
+        let req = request.into_inner();
+        let (token, secret) = self.auth.bootstrap(&self.store, req.secret.as_deref())?;
+        info!(accessor_id = %token.accessor_id, "ACL bootstrap: initial management token created");
+        Ok(Response::new(BootstrapAclReply {
+            token: Some(token),
+            secret,
+        }))
+    }
+
+    #[instrument(skip_all)]
+    async fn upsert_acl_policy(
+        &self,
+        request: Request<UpsertAclPolicyRequest>,
+    ) -> Result<Response<UpsertAclPolicyReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Acl,
+            AclAction::Write,
+            AclScope::none(),
+        )?;
+        let req = request.into_inner();
+        let policy = self
+            .store
+            .upsert_acl_policy(&req.name, &req.description, &req.rules_json)
+            .map_err(|e| map_store_error("Error saving ACL policy", e))?;
+        Ok(Response::new(UpsertAclPolicyReply {
+            policy: Some(policy),
+        }))
+    }
+
+    #[instrument(skip_all)]
+    async fn get_acl_policy(
+        &self,
+        request: Request<GetAclPolicyRequest>,
+    ) -> Result<Response<GetAclPolicyReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Acl,
+            AclAction::Read,
+            AclScope::none(),
+        )?;
+        let req = request.into_inner();
+        let policy = self
+            .store
+            .get_acl_policy(&req.name)
+            .map_err(|e| map_store_error("Error getting ACL policy", e))?
+            .ok_or_else(|| Status::not_found(format!("ACL policy `{}` not found", req.name)))?;
+        Ok(Response::new(GetAclPolicyReply {
+            policy: Some(policy),
+        }))
+    }
+
+    #[instrument(skip_all)]
+    async fn list_acl_policies(
+        &self,
+        request: Request<ListAclPoliciesRequest>,
+    ) -> Result<Response<ListAclPoliciesReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Acl,
+            AclAction::Read,
+            AclScope::none(),
+        )?;
+        let policies = self
+            .store
+            .list_acl_policies()
+            .map_err(|e| map_store_error("Error listing ACL policies", e))?;
+        Ok(Response::new(ListAclPoliciesReply { policies }))
+    }
+
+    #[instrument(skip_all)]
+    async fn delete_acl_policy(
+        &self,
+        request: Request<DeleteAclPolicyRequest>,
+    ) -> Result<Response<DeleteAclPolicyReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Acl,
+            AclAction::Write,
+            AclScope::none(),
+        )?;
+        let req = request.into_inner();
+        self.store
+            .delete_acl_policy(&req.name)
+            .map_err(|e| map_store_error("Error deleting ACL policy", e))?;
+        Ok(Response::new(DeleteAclPolicyReply {
+            message: format!("ACL policy `{}` deleted", req.name),
+        }))
+    }
+
+    #[instrument(skip_all)]
+    async fn create_acl_token(
+        &self,
+        request: Request<CreateAclTokenRequest>,
+    ) -> Result<Response<CreateAclTokenReply>, Status> {
+        let identity = self.check_acl(
+            &request,
+            AclResource::Acl,
+            AclAction::Write,
+            AclScope::none(),
+        )?;
+        let req = request.into_inner();
+
+        let token_type = if req.token_type.is_empty() {
+            "client".to_string()
+        } else {
+            req.token_type
+        };
+        match token_type.as_str() {
+            // Escalation guard: only management tokens may mint management
+            // tokens, regardless of acl:write policy grants.
+            "management" => {
+                if !identity.is_management {
+                    return Err(Status::permission_denied(
+                        "creating a management token requires a management token",
+                    ));
+                }
+                if !req.policies.is_empty() {
+                    return Err(Status::invalid_argument(
+                        "management tokens must not list policies",
+                    ));
+                }
+            }
+            "client" => {
+                if req.policies.is_empty() {
+                    return Err(Status::invalid_argument(
+                        "client tokens must list at least one policy",
+                    ));
+                }
+                let missing = self
+                    .store
+                    .missing_acl_policies(&req.policies)
+                    .map_err(|e| map_store_error("Error validating policies", e))?;
+                if !missing.is_empty() {
+                    return Err(Status::invalid_argument(format!(
+                        "unknown ACL policies: {}",
+                        missing.join(", ")
+                    )));
+                }
+            }
+            other => {
+                return Err(Status::invalid_argument(format!(
+                    "unknown token type `{other}` (expected `management` or `client`)"
+                )));
+            }
+        }
+
+        let ttl: Option<Duration> = req
+            .ttl
+            .as_deref()
+            .map(|raw| {
+                raw.parse::<humantime::Duration>()
+                    .map(Into::into)
+                    .map_err(|e| Status::invalid_argument(format!("invalid ttl `{raw}`: {e}")))
+            })
+            .transpose()?;
+        // Server-enforced lifetime bounds: when acl.tokenMaxTtl is set,
+        // client tokens must expire within it (management tokens are exempt).
+        if token_type == "client" {
+            if let Some(max) = self.auth.token_max_ttl {
+                match ttl {
+                    None => {
+                        return Err(Status::invalid_argument(format!(
+                            "client tokens must set a ttl of at most {} (acl.tokenMaxTtl)",
+                            humantime::format_duration(max)
+                        )))
+                    }
+                    Some(requested) if requested > max => {
+                        return Err(Status::invalid_argument(format!(
+                            "requested ttl exceeds acl.tokenMaxTtl ({})",
+                            humantime::format_duration(max)
+                        )))
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+        let (token, secret) =
+            self.auth
+                .mint_token(&self.store, &req.name, &token_type, &req.policies, ttl)?;
+        info!(accessor_id = %token.accessor_id, name = %token.name, "ACL token created");
+        Ok(Response::new(CreateAclTokenReply {
+            token: Some(token),
+            secret,
+        }))
+    }
+
+    #[instrument(skip_all)]
+    async fn list_acl_tokens(
+        &self,
+        request: Request<ListAclTokensRequest>,
+    ) -> Result<Response<ListAclTokensReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Acl,
+            AclAction::Read,
+            AclScope::none(),
+        )?;
+        let tokens = self
+            .store
+            .list_acl_tokens()
+            .map_err(|e| map_store_error("Error listing ACL tokens", e))?
+            .iter()
+            .map(|record| record.to_info())
+            .collect();
+        Ok(Response::new(ListAclTokensReply { tokens }))
+    }
+
+    #[instrument(skip_all)]
+    async fn delete_acl_token(
+        &self,
+        request: Request<DeleteAclTokenRequest>,
+    ) -> Result<Response<DeleteAclTokenReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Acl,
+            AclAction::Write,
+            AclScope::none(),
+        )?;
+        let req = request.into_inner();
+        self.store
+            .delete_acl_token(&req.accessor_id)
+            .map_err(|e| map_store_error("Error deleting ACL token", e))?;
+        info!(accessor_id = %req.accessor_id, "ACL token deleted");
+        Ok(Response::new(DeleteAclTokenReply {
+            message: format!("ACL token `{}` deleted", req.accessor_id),
+        }))
+    }
+
+    #[instrument(skip_all)]
+    async fn upsert_acl_user(
+        &self,
+        request: Request<UpsertAclUserRequest>,
+    ) -> Result<Response<UpsertAclUserReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Acl,
+            AclAction::Write,
+            AclScope::none(),
+        )?;
+        let req = request.into_inner();
+        let missing = self
+            .store
+            .missing_acl_policies(&req.policies)
+            .map_err(|e| map_store_error("Error validating policies", e))?;
+        if !missing.is_empty() {
+            return Err(Status::invalid_argument(format!(
+                "unknown ACL policies: {}",
+                missing.join(", ")
+            )));
+        }
+        let password_hash = if req.password.is_empty() {
+            None
+        } else {
+            Some(
+                acl::hash_password(&req.password)
+                    .map_err(|e| Status::internal(format!("failed to hash password: {e:#}")))?,
+            )
+        };
+        let user = self
+            .store
+            .upsert_acl_user(&req.username, password_hash.as_deref(), &req.policies)
+            .map_err(|e| map_store_error("Error saving ACL user", e))?;
+        Ok(Response::new(UpsertAclUserReply {
+            user: Some(user.to_user()),
+        }))
+    }
+
+    #[instrument(skip_all)]
+    async fn list_acl_users(
+        &self,
+        request: Request<ListAclUsersRequest>,
+    ) -> Result<Response<ListAclUsersReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Acl,
+            AclAction::Read,
+            AclScope::none(),
+        )?;
+        let users = self
+            .store
+            .list_acl_users()
+            .map_err(|e| map_store_error("Error listing ACL users", e))?
+            .iter()
+            .map(|record| record.to_user())
+            .collect();
+        Ok(Response::new(ListAclUsersReply { users }))
+    }
+
+    #[instrument(skip_all)]
+    async fn delete_acl_user(
+        &self,
+        request: Request<DeleteAclUserRequest>,
+    ) -> Result<Response<DeleteAclUserReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Acl,
+            AclAction::Write,
+            AclScope::none(),
+        )?;
+        let req = request.into_inner();
+        self.store
+            .delete_acl_user(&req.username)
+            .map_err(|e| map_store_error("Error deleting ACL user", e))?;
+        Ok(Response::new(DeleteAclUserReply {
+            message: format!("ACL user `{}` deleted", req.username),
+        }))
+    }
+
+    #[instrument(skip_all)]
+    async fn get_auth_methods(
+        &self,
+        request: Request<GetAuthMethodsRequest>,
+    ) -> Result<Response<GetAuthMethodsReply>, Status> {
+        // ACL: open endpoint. Login UIs need the method list before any
+        // credential exists; only public metadata is returned.
+        let _ = request;
+        let methods = self
+            .auth
+            .method_infos()
+            .into_iter()
+            .map(|info| AuthMethodInfo {
+                name: info.name,
+                kind: info.kind,
+                oidc_issuer: info.oidc_issuer,
+                oidc_client_id: info.oidc_client_id,
+                oidc_scopes: info.oidc_scopes,
+            })
+            .collect();
+        Ok(Response::new(GetAuthMethodsReply { methods }))
+    }
+
+    #[instrument(skip_all)]
+    async fn create_join_token(
+        &self,
+        request: Request<CreateJoinTokenRequest>,
+    ) -> Result<Response<CreateJoinTokenReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Node,
+            AclAction::Write,
+            AclScope::none(),
+        )?;
+        let req = request.into_inner();
+        let worker_type = if req.worker_type.trim().is_empty() {
+            "default".to_string()
+        } else {
+            req.worker_type
+        };
+        let ttl = match req.ttl.as_deref() {
+            None => Some(Duration::from_secs(24 * 60 * 60)),
+            Some("none") | Some("0") => None,
+            Some(raw) => Some(
+                raw.parse::<humantime::Duration>()
+                    .map(Into::into)
+                    .map_err(|e| Status::invalid_argument(format!("invalid ttl `{raw}`: {e}")))?,
+            ),
+        };
+        let (info, token) = self.auth.mint_join_token(
+            &self.store,
+            &self.advertise_addr,
+            &worker_type,
+            ttl,
+            &req.description,
+        )?;
+        info!(id = %info.id, worker_type = %info.worker_type, "Join token created");
+        Ok(Response::new(CreateJoinTokenReply {
+            info: Some(info),
+            token,
+        }))
+    }
+
+    #[instrument(skip_all)]
+    async fn list_join_tokens(
+        &self,
+        request: Request<ListJoinTokensRequest>,
+    ) -> Result<Response<ListJoinTokensReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Node,
+            AclAction::Read,
+            AclScope::none(),
+        )?;
+        let tokens = self
+            .store
+            .list_join_tokens()
+            .map_err(|e| map_store_error("Error listing join tokens", e))?
+            .iter()
+            .map(|record| record.to_info())
+            .collect();
+        Ok(Response::new(ListJoinTokensReply { tokens }))
+    }
+
+    #[instrument(skip_all)]
+    async fn delete_join_token(
+        &self,
+        request: Request<DeleteJoinTokenRequest>,
+    ) -> Result<Response<DeleteJoinTokenReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Node,
+            AclAction::Write,
+            AclScope::none(),
+        )?;
+        let req = request.into_inner();
+        self.store
+            .delete_join_token(&req.id)
+            .map_err(|e| map_store_error("Error deleting join token", e))?;
+        info!(id = %req.id, "Join token deleted");
+        Ok(Response::new(DeleteJoinTokenReply {
+            message: format!("join token `{}` deleted", req.id),
         }))
     }
 }

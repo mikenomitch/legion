@@ -1,6 +1,5 @@
 use crate::prelude::*;
 
-use crate::manager::join_server::get_insecure_manager_service;
 use crate::manager::oidc_http::OidcHttpLayer;
 use crate::manager::server::ManagerDaemonService;
 use crate::manager::workload_identity::WorkloadIdentityState;
@@ -9,7 +8,7 @@ use crate::storage::persistence::PersistenceRole;
 use crate::storage::store::Store;
 use crate::structs::{
     manager_server::ManagerServer, Eval, JobConfig, KvValueType, ManagerConfig, Node, NodeMsg,
-    Submission, TaskConfig, WorkerConfig as WorkerConfigMsg, WorkerConfigAlt,
+    Submission, TaskConfig, TlsConfigFull, WorkerConfig as WorkerConfigMsg, WorkerConfigAlt,
 };
 use crate::worker::daemon::run_worker_local;
 
@@ -64,21 +63,64 @@ pub async fn run_manager(config: ManagerConfig, run_worker: bool) -> R<()> {
     seed_ui_test_data(&store)?;
     store.upsert_manager_config(&manager_node_id, &full_config)?;
 
-    // Spawn a separate grpc server for non-TLS calls
-    let join_server_addr = format!(
-        "{}:{}",
-        full_config.server.host, full_config.server.insecure_port
-    )
-    .parse()?;
-
-    let insecure_manager_service = get_insecure_manager_service();
-    let join_server_fut = Server::builder()
-        .add_service(insecure_manager_service)
-        .serve(join_server_addr);
-
     let store_copy_a = store.clone();
 
     let store_copy_b = store.clone();
+
+    let authenticator = Arc::new(
+        crate::manager::acl::Authenticator::from_config(&full_config.acl)
+            .context("invalid acl configuration")?,
+    );
+    if authenticator.enabled {
+        info!(
+            audit_only = authenticator.audit_only,
+            auth_methods = ?authenticator.method_names(),
+            "ACLs enabled; run `legion acl bootstrap` once to mint the initial management token"
+        );
+        // Prime remote JWKS documents, then keep them fresh in the background.
+        authenticator.refresh_auth_methods().await;
+        let refresh_authenticator = authenticator.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(refresh_authenticator.jwks_refresh_interval).await;
+                refresh_authenticator.refresh_auth_methods().await;
+            }
+        });
+        // Keep credential tables tidy: expired tokens are already rejected at
+        // authentication time, pruning just removes the rows.
+        let prune_store = store.clone();
+        tokio::spawn(async move {
+            loop {
+                match prune_store.prune_expired_credentials() {
+                    Ok((acl_tokens, join_tokens)) if acl_tokens + join_tokens > 0 => {
+                        info!(acl_tokens, join_tokens, "Pruned expired credentials");
+                    }
+                    Ok(_) => {}
+                    Err(err) => warn!(error = ?err, "Failed pruning expired credentials"),
+                }
+                tokio::time::sleep(Duration::from_secs(60 * 60)).await;
+            }
+        });
+    } else {
+        warn!("ACLs are disabled; every API caller has full access (set acl.enabled to true to enforce)");
+    }
+
+    // The in-process worker (--run-worker) registers like any external
+    // worker; with ACLs enforced the manager self-issues its join token.
+    let local_worker_join_secret = if run_worker && authenticator.enabled {
+        let (_, composite) = authenticator
+            .mint_join_token(
+                &store,
+                &full_config.server.advertised_address(),
+                "default",
+                Some(Duration::from_secs(15 * 60)),
+                "in-process worker (--run-worker)",
+            )
+            .map_err(|e| anyhow!("failed to mint local worker join token: {e}"))?;
+        Some(crate::structs::token::JoinToken::decode(&composite)?.secret)
+    } else {
+        None
+    };
 
     let store_for_rotation = store.clone();
 
@@ -109,11 +151,13 @@ pub async fn run_manager(config: ManagerConfig, run_worker: bool) -> R<()> {
 
     let manager_node = ManagerDaemonService::with_manager_config(store, &full_config)
         .with_workload_identity(workload_identity_state.clone())
-        .with_kv_debounce(Duration::from_millis(full_config.kv_debounce_ms));
+        .with_kv_debounce(Duration::from_millis(full_config.kv_debounce_ms))
+        .with_authenticator(authenticator)
+        .with_advertise_addr(full_config.server.advertised_address());
 
     let addr = format!("{}:{}", full_config.server.host, full_config.server.port).parse()?;
 
-    let tls_identity = load_server_tls_identity()?;
+    let tls_identity = load_server_tls_identity(&full_config.server.tls)?;
     let server_builder = match tls_identity {
         Some(identity) => {
             info!("Starting manager with TLS enabled");
@@ -147,7 +191,6 @@ pub async fn run_manager(config: ManagerConfig, run_worker: bool) -> R<()> {
         .add_service(manager_service)
         .serve(addr);
 
-    println!("Join server starting on {join_server_addr}");
     println!("Manager node starting on {addr}");
 
     let node_checker_fut =
@@ -158,7 +201,13 @@ pub async fn run_manager(config: ManagerConfig, run_worker: bool) -> R<()> {
     let worker_fut = async move {
         if run_worker {
             info!(%manager_addr, "Starting in-process worker");
-            run_worker_local(manager_addr, "default".to_string(), None).await?;
+            run_worker_local(
+                manager_addr,
+                "default".to_string(),
+                None,
+                local_worker_join_secret,
+            )
+            .await?;
         }
         Ok::<(), anyhow::Error>(())
     };
@@ -169,7 +218,6 @@ pub async fn run_manager(config: ManagerConfig, run_worker: bool) -> R<()> {
         Ok::<(), anyhow::Error>(())
     };
     let _res = join!(
-        join_server_fut,
         start_server_fut,
         node_checker_fut,
         eval_loop_fut,
@@ -328,29 +376,22 @@ fn resolve_manager_host(host: &str) -> String {
     }
 }
 
-fn load_server_tls_identity() -> R<Option<Identity>> {
-    let tls_dir = std::env::var("LEGION_TLS_SERVER_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::PathBuf::from("configs/tls/server"));
-
-    let cert_path = tls_dir.join("server.pem");
-    let key_path = tls_dir.join("server.key");
-
-    if !(cert_path.exists() && key_path.exists()) {
-        info!(
-            ?tls_dir,
-            "TLS credentials not found; proceeding without TLS"
-        );
+/// Loads the manager's TLS identity when `server.tls.enabled` is set.
+///
+/// TLS is opt-in (never inferred from files on disk) so a stray dev cert
+/// cannot flip the listener to https and strand http clients.
+fn load_server_tls_identity(tls: &TlsConfigFull) -> R<Option<Identity>> {
+    if !tls.enabled {
         return Ok(None);
     }
-
-    // Temporarily don't do any TLS
-    Ok(None)
-
-    // let cert = std::fs::read_to_string(cert_path)?;
-    // let key = std::fs::read_to_string(key_path)?;
-
-    // Ok(Some(Identity::from_pem(cert, key)))
+    if tls.cert_path.is_empty() || tls.key_path.is_empty() {
+        bail!("server.tls.enabled requires certPath and keyPath");
+    }
+    let cert = std::fs::read_to_string(&tls.cert_path)
+        .with_context(|| format!("failed to read TLS certificate {}", tls.cert_path))?;
+    let key = std::fs::read_to_string(&tls.key_path)
+        .with_context(|| format!("failed to read TLS key {}", tls.key_path))?;
+    Ok(Some(Identity::from_pem(cert, key)))
 }
 
 #[instrument(err, skip_all)]

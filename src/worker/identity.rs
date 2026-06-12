@@ -81,17 +81,22 @@ pub struct ManagerTokenIssuer {
     /// This worker's node id (the same id used in heartbeats); the manager
     /// rejects requests for allocations placed on other nodes.
     pub node_id: String,
+    /// Worker-plane credentials; identity issuance requires the node token
+    /// when ACLs are enforced.
+    pub credentials: std::sync::Arc<crate::worker::daemon::WorkerCredentials>,
 }
 
 #[tonic::async_trait]
 impl TokenIssuer for ManagerTokenIssuer {
     async fn issue(&self, alloc_id: i64, identity_name: &str) -> R<Option<IssuedIdentityToken>> {
         let mut client = self.client.clone();
-        let request = tonic::Request::new(IssueWorkloadIdentityTokenRequest {
-            alloc_id,
-            identity_name: identity_name.to_string(),
-            node_id: self.node_id.clone(),
-        });
+        let request =
+            self.credentials
+                .attach(tonic::Request::new(IssueWorkloadIdentityTokenRequest {
+                    alloc_id,
+                    identity_name: identity_name.to_string(),
+                    node_id: self.node_id.clone(),
+                }));
         match client.issue_workload_identity_token(request).await {
             Ok(reply) => {
                 let reply = reply.into_inner();

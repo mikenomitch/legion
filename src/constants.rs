@@ -1,5 +1,3 @@
-pub const TMP_SECRET_KEY: [u8; 6] = *b"secret";
-
 // === Manager ===
 pub const DEF_CONFIG_PATH: &str = "./configs/manager.jsonnet";
 
@@ -10,7 +8,6 @@ pub const DEF_MANAGER_HOSTNAME: &str = "127.0.0.1";
 pub const DEF_MANAGER_SERVER_PORT: u64 = 4747;
 pub const DEF_MANAGER_INSECURE_PORT: u64 = 4748;
 pub const DEF_MANAGER_ADDRESS: &str = "http://127.0.0.1:4747";
-pub const DEF_INSECURE_ADDR: &str = "http://127.0.0.1:4748";
 // Loop time in manager rechecking nodes
 pub const DEF_WORKER_CHECK_SEC: u64 = 2;
 pub const DEF_SCHEDULING_POLICY: &str = "bin_pack";

@@ -17,8 +17,60 @@ use crate::structs::workload_identity::NodeIdentityConfig;
 #[serde(rename_all = "camelCase")]
 pub struct ServerConfig {
     pub port: Option<u64>,
+    /// Deprecated: the insecure bootstrap listener was removed (join tokens
+    /// are minted via the authenticated CreateJoinToken RPC). Parsed for
+    /// config compatibility; nothing binds this port.
     pub insecure_port: Option<u64>,
     pub host: Option<String>,
+    /// Externally reachable manager address embedded in join tokens
+    /// (for example `http://10.0.0.5:4747`). Default: derived from
+    /// host/port, with 0.0.0.0 mapped to 127.0.0.1.
+    pub advertise_addr: Option<String>,
+    /// TLS for the manager listener. Off unless `enabled` is true.
+    #[serde(default)]
+    pub tls: Option<TlsConfig>,
+}
+
+/// TLS settings for the manager's gRPC listener.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct TlsConfig {
+    /// Master switch; certPath/keyPath are required when true.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// PEM-encoded server certificate path.
+    pub cert_path: Option<String>,
+    /// PEM-encoded private key path.
+    pub key_path: Option<String>,
+}
+
+/// TlsConfig with defaults applied.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct TlsConfigFull {
+    pub enabled: bool,
+    pub cert_path: String,
+    pub key_path: String,
+}
+
+impl TlsConfig {
+    pub fn with_defaults(&self) -> TlsConfigFull {
+        TlsConfigFull {
+            enabled: self.enabled.unwrap_or(false),
+            cert_path: self.cert_path.clone().unwrap_or_default(),
+            key_path: self.key_path.clone().unwrap_or_default(),
+        }
+    }
+}
+
+impl From<TlsConfigFull> for TlsConfig {
+    fn from(val: TlsConfigFull) -> Self {
+        TlsConfig {
+            enabled: Some(val.enabled),
+            cert_path: Some(val.cert_path),
+            key_path: Some(val.key_path),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -44,7 +96,133 @@ pub struct ManagerConfig {
     #[serde(default)]
     pub workload_identity: Option<WorkloadIdentityConfig>,
     #[serde(default)]
+    pub acl: Option<AclConfig>,
     pub artifacts: Option<ArtifactsManagerConfig>,
+}
+
+/// Default TTL for tokens minted via Login (userpass or JWT exchange).
+pub const DEF_ACL_LOGIN_TTL: &str = "24h";
+/// Default refresh interval for auth-method JWKS documents.
+pub const DEF_ACL_JWKS_REFRESH: &str = "5m";
+
+/// ACL / auth configuration. Off by default: when `enabled` is false every
+/// caller has full access and the UI shows a dismissable warning.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AclConfig {
+    /// Master switch. Default: false (no enforcement).
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// When true (and `enabled` is true), denials are logged with the
+    /// `acl_audit` tracing target but requests are allowed. Use this to
+    /// stage policies before flipping to full enforcement.
+    #[serde(default)]
+    pub audit_only: Option<bool>,
+    /// TTL applied to tokens minted via Login when the request omits one.
+    pub login_ttl: Option<String>,
+    /// Upper bound on the TTL of client tokens minted via CreateAclToken and
+    /// Login. When set, client tokens must expire and may not outlive this
+    /// bound; management tokens are exempt. Default: unbounded.
+    pub token_max_ttl: Option<String>,
+    /// JWT/OIDC auth methods that convert external identities into policies.
+    #[serde(default)]
+    pub auth_methods: Option<Vec<AclAuthMethodConfig>>,
+    /// How often to re-fetch remote JWKS documents.
+    pub jwks_refresh_interval: Option<String>,
+}
+
+/// One JWT/OIDC auth method.
+///
+/// A method validates externally issued JWTs (signature via JWKS or a shared
+/// secret, plus issuer/audience bounds) and maps verified claims onto Legion
+/// ACL policies via binding rules.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AclAuthMethodConfig {
+    /// Unique method name, referenced by `legion login --method <name>`.
+    /// `userpass` is reserved for the built-in username/password method.
+    pub name: String,
+    /// `jwt` (keys provided explicitly), `oidc` (keys discovered from the
+    /// issuer's /.well-known/openid-configuration document), or `webhook`
+    /// (credentials verified by an external HTTP endpoint).
+    #[serde(default)]
+    pub r#type: Option<String>,
+    /// JWKS URL to fetch signing keys from (jwt type).
+    pub jwks_url: Option<String>,
+    /// Inline JWKS JSON document (jwt type; useful for air-gapped setups and tests).
+    pub jwks_json: Option<String>,
+    /// HMAC shared secret for HS256-signed tokens (dev/test setups).
+    pub hmac_secret: Option<String>,
+    /// OIDC issuer URL for discovery (oidc type) and `iss` validation.
+    pub issuer: Option<String>,
+    /// Accepted `aud` values. Strongly recommended; when empty, audience is
+    /// not validated.
+    #[serde(default)]
+    pub bound_audiences: Option<Vec<String>>,
+    /// Required `iss` value (defaults to `issuer` when set).
+    pub bound_issuer: Option<String>,
+    /// Claim used as the principal name. Default: `sub`.
+    pub user_claim: Option<String>,
+    /// Rules mapping verified claims to policy names.
+    #[serde(default)]
+    pub binding_rules: Option<Vec<AclBindingRule>>,
+    /// TTL for ACL tokens minted when exchanging a JWT via Login.
+    pub token_ttl: Option<String>,
+    /// OAuth client ID registered for Legion at the identity provider
+    /// (oidc type). Enables the browser/CLI redirect login flow.
+    pub oidc_client_id: Option<String>,
+    /// OAuth scopes requested during redirect login (oidc type).
+    /// Default: ["openid"].
+    #[serde(default)]
+    pub oidc_scopes: Option<Vec<String>>,
+    /// Verification endpoint for `webhook` methods. Legion POSTs the login
+    /// credentials as JSON and expects `{"principal": "...", "policies":
+    /// ["..."]}` on success (HTTP 200). 401/403 reject the credential.
+    pub webhook_url: Option<String>,
+    /// Optional bearer token Legion attaches when calling `webhookUrl`.
+    pub webhook_bearer: Option<String>,
+}
+
+/// Maps a verified JWT claim onto Legion policies.
+///
+/// When `claim` is omitted the rule is unconditional (every login through the
+/// method receives `policies`). When `claim` is set, the rule applies when the
+/// claim equals `value` (string compare) or, for array claims, contains
+/// `value`.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AclBindingRule {
+    /// JWT claim to inspect (for example "groups"). Omit for unconditional.
+    pub claim: Option<String>,
+    /// Value the claim must equal or contain.
+    pub value: Option<String>,
+    /// Policy names granted when the rule matches.
+    pub policies: Vec<String>,
+}
+
+/// AclConfig with defaults applied.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct AclConfigFull {
+    pub enabled: bool,
+    pub audit_only: bool,
+    pub login_ttl: String,
+    pub token_max_ttl: Option<String>,
+    pub auth_methods: Vec<AclAuthMethodConfig>,
+    pub jwks_refresh_interval: String,
+}
+
+impl Default for AclConfigFull {
+    fn default() -> Self {
+        AclConfigFull {
+            enabled: false,
+            audit_only: false,
+            login_ttl: DEF_ACL_LOGIN_TTL.into(),
+            token_max_ttl: None,
+            auth_methods: Vec::new(),
+            jwks_refresh_interval: DEF_ACL_JWKS_REFRESH.into(),
+        }
+    }
 }
 
 /// Default artifact scheme allowlist. Plain `http` requires explicit opt-in.
@@ -129,6 +307,19 @@ impl Default for ArtifactsManagerConfigFull {
     }
 }
 
+impl From<AclConfigFull> for AclConfig {
+    fn from(val: AclConfigFull) -> Self {
+        AclConfig {
+            enabled: Some(val.enabled),
+            audit_only: Some(val.audit_only),
+            login_ttl: Some(val.login_ttl),
+            token_max_ttl: val.token_max_ttl,
+            auth_methods: Some(val.auth_methods),
+            jwks_refresh_interval: Some(val.jwks_refresh_interval),
+        }
+    }
+}
+
 impl ArtifactsManagerConfig {
     pub fn with_defaults(&self) -> ArtifactsManagerConfigFull {
         let d = ArtifactsManagerConfigFull::default();
@@ -138,6 +329,23 @@ impl ArtifactsManagerConfig {
             container_image_desugar: self
                 .container_image_desugar
                 .unwrap_or(d.container_image_desugar),
+        }
+    }
+}
+
+impl AclConfig {
+    pub fn with_defaults(&self) -> AclConfigFull {
+        let d = AclConfigFull::default();
+        AclConfigFull {
+            enabled: self.enabled.unwrap_or(d.enabled),
+            audit_only: self.audit_only.unwrap_or(d.audit_only),
+            login_ttl: self.login_ttl.clone().unwrap_or(d.login_ttl),
+            token_max_ttl: self.token_max_ttl.clone(),
+            auth_methods: self.auth_methods.clone().unwrap_or(d.auth_methods),
+            jwks_refresh_interval: self
+                .jwks_refresh_interval
+                .clone()
+                .unwrap_or(d.jwks_refresh_interval),
         }
     }
 }
@@ -310,6 +518,25 @@ pub struct ServerConfigFull {
     pub port: u64,
     pub insecure_port: u64,
     pub host: String,
+    pub advertise_addr: Option<String>,
+    #[serde(default)]
+    pub tls: TlsConfigFull,
+}
+
+impl ServerConfigFull {
+    /// The address embedded in join tokens: `advertiseAddr` when set,
+    /// otherwise derived from scheme/host/port (0.0.0.0 -> 127.0.0.1).
+    pub fn advertised_address(&self) -> String {
+        if let Some(addr) = &self.advertise_addr {
+            return addr.clone();
+        }
+        let host = match self.host.as_str() {
+            "0.0.0.0" | "::" => "127.0.0.1",
+            other => other,
+        };
+        let scheme = if self.tls.enabled { "https" } else { "http" };
+        format!("{scheme}://{host}:{}", self.port)
+    }
 }
 
 impl From<ServerConfigFull> for ServerConfig {
@@ -318,6 +545,8 @@ impl From<ServerConfigFull> for ServerConfig {
             port: Some(val.port),
             insecure_port: Some(val.insecure_port),
             host: Some(val.host),
+            advertise_addr: val.advertise_addr,
+            tls: Some(val.tls.into()),
         }
     }
 }
@@ -331,6 +560,12 @@ impl ServerConfig {
                 .host
                 .clone()
                 .unwrap_or_else(|| DEF_MANAGER_HOSTNAME.to_string()),
+            advertise_addr: self.advertise_addr.clone(),
+            tls: self
+                .tls
+                .as_ref()
+                .map(TlsConfig::with_defaults)
+                .unwrap_or_default(),
         }
     }
 
@@ -339,6 +574,8 @@ impl ServerConfig {
             port: DEF_MANAGER_SERVER_PORT,
             insecure_port: DEF_MANAGER_INSECURE_PORT,
             host: DEF_MANAGER_HOSTNAME.to_string(),
+            advertise_addr: None,
+            tls: TlsConfigFull::default(),
         }
     }
 }
@@ -365,6 +602,7 @@ pub struct ManagerConfigFull {
     #[serde(default)]
     pub workload_identity: WorkloadIdentityConfigFull,
     #[serde(default)]
+    pub acl: AclConfigFull,
     pub artifacts: ArtifactsManagerConfigFull,
 }
 
@@ -467,6 +705,7 @@ impl From<ManagerConfigFull> for ManagerConfig {
             custom_resources: val.custom_resources,
             persistence: Some(val.persistence.into()),
             workload_identity: Some(val.workload_identity.into()),
+            acl: Some(val.acl.into()),
             artifacts: Some(val.artifacts.into()),
         }
     }
@@ -514,6 +753,11 @@ impl ManagerConfig {
                 .as_ref()
                 .map(WorkloadIdentityConfig::with_defaults)
                 .unwrap_or_default(),
+            acl: self
+                .acl
+                .as_ref()
+                .map(AclConfig::with_defaults)
+                .unwrap_or_default(),
             artifacts: self
                 .artifacts
                 .as_ref()
@@ -540,6 +784,7 @@ impl Default for ManagerConfigFull {
             eval_threads: default_eval_threads(),
             persistence: PersistenceConfigFull::default(),
             workload_identity: WorkloadIdentityConfigFull::default(),
+            acl: AclConfigFull::default(),
             artifacts: ArtifactsManagerConfigFull::default(),
         }
     }

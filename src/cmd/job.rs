@@ -352,7 +352,7 @@ fn is_settled_rollout_status(status: &str) -> bool {
 
 /// Poll the job's most recent rollout until it settles or the timeout elapses.
 async fn wait_for_convergence(
-    client: &mut crate::structs::manager_client::ManagerClient<tonic::transport::Channel>,
+    client: &mut crate::cmd::helpers::AuthedManagerClient,
     job_name: &str,
     timeout: std::time::Duration,
     format: OutputFormat,
@@ -795,7 +795,7 @@ fn kv_keys_from_vars(vars: &JsonnetVars) -> Vec<String> {
 }
 
 async fn fetch_kv_entry(
-    client: &mut crate::structs::manager_client::ManagerClient<tonic::transport::Channel>,
+    client: &mut crate::cmd::helpers::AuthedManagerClient,
     key: &str,
 ) -> R<KvEntry> {
     let request = tonic::Request::new(GetKvRequest {
@@ -809,7 +809,7 @@ async fn fetch_kv_entry(
 }
 
 async fn resolve_kv_jsonnet_vars_from_manager(
-    client: &mut crate::structs::manager_client::ManagerClient<tonic::transport::Channel>,
+    client: &mut crate::cmd::helpers::AuthedManagerClient,
     vars: JsonnetVars,
 ) -> R<JsonnetVars> {
     let mut cache = HashMap::new();
@@ -1083,7 +1083,7 @@ fn print_stream_content(content: &str) {
 /// window and printing only the bytes beyond what was already shown, tracked by
 /// the per-(allocation, stream) `next_offset`. Runs until interrupted (Ctrl-C).
 async fn follow_logs(
-    client: &mut crate::structs::manager_client::ManagerClient<tonic::transport::Channel>,
+    client: &mut crate::cmd::helpers::AuthedManagerClient,
     job: &str,
     allocation_id: Option<i64>,
     stream: &str,

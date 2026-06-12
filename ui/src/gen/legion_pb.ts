@@ -66,6 +66,17 @@ export class WorkerPreRegisterRequest extends Message<WorkerPreRegisterRequest> 
    */
   workerType = "";
 
+  /**
+   * Join token secret (the `secret` field of a decoded join token).
+   *
+   * Required when ACLs are enforced: the manager validates it against its
+   * stored join tokens before serving worker configuration. Ignored when
+   * ACLs are disabled.
+   *
+   * @generated from field: optional string join_token = 2;
+   */
+  joinToken?: string;
+
   constructor(data?: PartialMessage<WorkerPreRegisterRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -75,6 +86,7 @@ export class WorkerPreRegisterRequest extends Message<WorkerPreRegisterRequest> 
   static readonly typeName = "legion.WorkerPreRegisterRequest";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "worker_type", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "join_token", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): WorkerPreRegisterRequest {
@@ -301,6 +313,15 @@ export class WorkerRegisterRequest extends Message<WorkerRegisterRequest> {
    */
   healthChecks = "";
 
+  /**
+   * Join token secret (the `secret` field of a decoded join token).
+   *
+   * Required when ACLs are enforced. Ignored when ACLs are disabled.
+   *
+   * @generated from field: optional string join_token = 6;
+   */
+  joinToken?: string;
+
   constructor(data?: PartialMessage<WorkerRegisterRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -314,6 +335,7 @@ export class WorkerRegisterRequest extends Message<WorkerRegisterRequest> {
     { no: 3, name: "config_attrs", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 4, name: "fingerprint_attrs", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 5, name: "health_checks", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "join_token", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): WorkerRegisterRequest {
@@ -348,6 +370,16 @@ export class WorkerRegisterReply extends Message<WorkerRegisterReply> {
    */
   message = "";
 
+  /**
+   * Per-node credential for subsequent worker-plane calls (Heartbeat,
+   * HealthCheck). Minted only when ACLs are enforced; re-registering
+   * rotates it (the previous node token is revoked). Workers attach it as
+   * a bearer credential exactly like an ACL token.
+   *
+   * @generated from field: optional string node_token = 2;
+   */
+  nodeToken?: string;
+
   constructor(data?: PartialMessage<WorkerRegisterReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -357,6 +389,7 @@ export class WorkerRegisterReply extends Message<WorkerRegisterReply> {
   static readonly typeName = "legion.WorkerRegisterReply";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "node_token", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): WorkerRegisterReply {
@@ -8145,101 +8178,6 @@ export class StreamEventsRequest extends Message<StreamEventsRequest> {
 }
 
 /**
- * Request payload for GetJoinToken.
- *
- * @generated from message legion.GetJoinTokenRequest
- */
-export class GetJoinTokenRequest extends Message<GetJoinTokenRequest> {
-  /**
-   * Optional token TTL string (for example: "1h", "30m").
-   *
-   * Unset means no expiry in current manager implementation
-   * (`exp` claim is set to `0` and `skip_expiry_validation=true`).
-   *
-   * @generated from field: optional string ttl = 1;
-   */
-  ttl?: string;
-
-  /**
-   * Optional worker type to embed in token.
-   *
-   * Defaults to "default" when omitted.
-   *
-   * @generated from field: optional string worker_type = 2;
-   */
-  workerType?: string;
-
-  constructor(data?: PartialMessage<GetJoinTokenRequest>) {
-    super();
-    proto3.util.initPartial(data, this);
-  }
-
-  static readonly runtime: typeof proto3 = proto3;
-  static readonly typeName = "legion.GetJoinTokenRequest";
-  static readonly fields: FieldList = proto3.util.newFieldList(() => [
-    { no: 1, name: "ttl", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
-    { no: 2, name: "worker_type", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
-  ]);
-
-  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetJoinTokenRequest {
-    return new GetJoinTokenRequest().fromBinary(bytes, options);
-  }
-
-  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetJoinTokenRequest {
-    return new GetJoinTokenRequest().fromJson(jsonValue, options);
-  }
-
-  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetJoinTokenRequest {
-    return new GetJoinTokenRequest().fromJsonString(jsonString, options);
-  }
-
-  static equals(a: GetJoinTokenRequest | PlainMessage<GetJoinTokenRequest> | undefined, b: GetJoinTokenRequest | PlainMessage<GetJoinTokenRequest> | undefined): boolean {
-    return proto3.util.equals(GetJoinTokenRequest, a, b);
-  }
-}
-
-/**
- * Reply payload for GetJoinToken.
- *
- * @generated from message legion.GetJoinTokenReply
- */
-export class GetJoinTokenReply extends Message<GetJoinTokenReply> {
-  /**
-   * Signed JWT join token.
-   *
-   * @generated from field: string token = 1;
-   */
-  token = "";
-
-  constructor(data?: PartialMessage<GetJoinTokenReply>) {
-    super();
-    proto3.util.initPartial(data, this);
-  }
-
-  static readonly runtime: typeof proto3 = proto3;
-  static readonly typeName = "legion.GetJoinTokenReply";
-  static readonly fields: FieldList = proto3.util.newFieldList(() => [
-    { no: 1, name: "token", kind: "scalar", T: 9 /* ScalarType.STRING */ },
-  ]);
-
-  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetJoinTokenReply {
-    return new GetJoinTokenReply().fromBinary(bytes, options);
-  }
-
-  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetJoinTokenReply {
-    return new GetJoinTokenReply().fromJson(jsonValue, options);
-  }
-
-  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetJoinTokenReply {
-    return new GetJoinTokenReply().fromJsonString(jsonString, options);
-  }
-
-  static equals(a: GetJoinTokenReply | PlainMessage<GetJoinTokenReply> | undefined, b: GetJoinTokenReply | PlainMessage<GetJoinTokenReply> | undefined): boolean {
-    return proto3.util.equals(GetJoinTokenReply, a, b);
-  }
-}
-
-/**
  * Internal eval queue item.
  *
  * @generated from message legion.Eval
@@ -8991,6 +8929,1961 @@ export class PostWorkReply extends Message<PostWorkReply> {
 
   static equals(a: PostWorkReply | PlainMessage<PostWorkReply> | undefined, b: PostWorkReply | PlainMessage<PostWorkReply> | undefined): boolean {
     return proto3.util.equals(PostWorkReply, a, b);
+  }
+}
+
+/**
+ * Request payload for WhoAmI. Identity comes from request metadata, not the body.
+ *
+ * @generated from message legion.WhoAmIRequest
+ */
+export class WhoAmIRequest extends Message<WhoAmIRequest> {
+  constructor(data?: PartialMessage<WhoAmIRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.WhoAmIRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): WhoAmIRequest {
+    return new WhoAmIRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): WhoAmIRequest {
+    return new WhoAmIRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): WhoAmIRequest {
+    return new WhoAmIRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: WhoAmIRequest | PlainMessage<WhoAmIRequest> | undefined, b: WhoAmIRequest | PlainMessage<WhoAmIRequest> | undefined): boolean {
+    return proto3.util.equals(WhoAmIRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for WhoAmI.
+ *
+ * @generated from message legion.WhoAmIReply
+ */
+export class WhoAmIReply extends Message<WhoAmIReply> {
+  /**
+   * True when the manager enforces (or audits) ACLs.
+   *
+   * When false every caller has full access; clients should surface a
+   * warning so operators know the cluster is unprotected.
+   *
+   * @generated from field: bool acl_enabled = 1;
+   */
+  aclEnabled = false;
+
+  /**
+   * True when ACLs run in audit-only mode: denials are logged but allowed.
+   *
+   * @generated from field: bool audit_only = 2;
+   */
+  auditOnly = false;
+
+  /**
+   * How the caller was identified.
+   *
+   * One of: `disabled` (ACLs off), `token` (Legion ACL token), `jwt`
+   * (external JWT validated by an auth method), `anonymous` (no credential).
+   *
+   * @generated from field: string source = 3;
+   */
+  source = "";
+
+  /**
+   * Human-readable principal: token name, `user:<name>`, JWT subject, or
+   * `anonymous`.
+   *
+   * @generated from field: string principal = 4;
+   */
+  principal = "";
+
+  /**
+   * Token type resolved for the caller: `management`, `client`, or `none`.
+   *
+   * @generated from field: string token_type = 5;
+   */
+  tokenType = "";
+
+  /**
+   * Names of the policies attached to the caller's identity.
+   *
+   * @generated from field: repeated string policies = 6;
+   */
+  policies: string[] = [];
+
+  /**
+   * RFC3339 expiry of the presented credential, when it has one.
+   *
+   * @generated from field: optional string expires_at = 7;
+   */
+  expiresAt?: string;
+
+  /**
+   * Accessor ID of the presented ACL token, when one was presented.
+   *
+   * Accessor IDs are safe to log and are the handle used by DeleteAclToken.
+   *
+   * @generated from field: optional string accessor_id = 8;
+   */
+  accessorId?: string;
+
+  constructor(data?: PartialMessage<WhoAmIReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.WhoAmIReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "acl_enabled", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 2, name: "audit_only", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 3, name: "source", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "principal", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "token_type", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "policies", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 7, name: "expires_at", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 8, name: "accessor_id", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): WhoAmIReply {
+    return new WhoAmIReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): WhoAmIReply {
+    return new WhoAmIReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): WhoAmIReply {
+    return new WhoAmIReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: WhoAmIReply | PlainMessage<WhoAmIReply> | undefined, b: WhoAmIReply | PlainMessage<WhoAmIReply> | undefined): boolean {
+    return proto3.util.equals(WhoAmIReply, a, b);
+  }
+}
+
+/**
+ * Request payload for Login.
+ *
+ * @generated from message legion.LoginRequest
+ */
+export class LoginRequest extends Message<LoginRequest> {
+  /**
+   * Auth method name.
+   *
+   * `userpass` selects the built-in username/password method. Any other value
+   * must match the name of a JWT/OIDC auth method in the manager config.
+   *
+   * @generated from field: string method = 1;
+   */
+  method = "";
+
+  /**
+   * Username for the `userpass` method.
+   *
+   * @generated from field: optional string username = 2;
+   */
+  username?: string;
+
+  /**
+   * Password for the `userpass` method.
+   *
+   * @generated from field: optional string password = 3;
+   */
+  password?: string;
+
+  /**
+   * Externally issued JWT (for example an OIDC ID token) for JWT/OIDC methods.
+   *
+   * @generated from field: optional string jwt = 4;
+   */
+  jwt?: string;
+
+  /**
+   * Optional requested token lifetime (humantime format, for example "8h").
+   *
+   * Capped by the manager's configured maximum for the method. Default when
+   * omitted: the method's `tokenTtl` (built-in default `24h`).
+   *
+   * @generated from field: optional string ttl = 5;
+   */
+  ttl?: string;
+
+  constructor(data?: PartialMessage<LoginRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.LoginRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "method", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "username", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 3, name: "password", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 4, name: "jwt", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 5, name: "ttl", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): LoginRequest {
+    return new LoginRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): LoginRequest {
+    return new LoginRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): LoginRequest {
+    return new LoginRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: LoginRequest | PlainMessage<LoginRequest> | undefined, b: LoginRequest | PlainMessage<LoginRequest> | undefined): boolean {
+    return proto3.util.equals(LoginRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for Login.
+ *
+ * @generated from message legion.LoginReply
+ */
+export class LoginReply extends Message<LoginReply> {
+  /**
+   * Metadata for the newly minted token.
+   *
+   * @generated from field: legion.AclTokenInfo token = 1;
+   */
+  token?: AclTokenInfo;
+
+  /**
+   * The token secret. Returned exactly once; the manager stores only a hash.
+   *
+   * @generated from field: string secret = 2;
+   */
+  secret = "";
+
+  constructor(data?: PartialMessage<LoginReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.LoginReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "token", kind: "message", T: AclTokenInfo },
+    { no: 2, name: "secret", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): LoginReply {
+    return new LoginReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): LoginReply {
+    return new LoginReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): LoginReply {
+    return new LoginReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: LoginReply | PlainMessage<LoginReply> | undefined, b: LoginReply | PlainMessage<LoginReply> | undefined): boolean {
+    return proto3.util.equals(LoginReply, a, b);
+  }
+}
+
+/**
+ * Request payload for BootstrapAcl.
+ *
+ * @generated from message legion.BootstrapAclRequest
+ */
+export class BootstrapAclRequest extends Message<BootstrapAclRequest> {
+  /**
+   * Optional operator-provided secret for the initial management token
+   * (infrastructure-as-code pre-seeding). Must be at least 24 characters.
+   *
+   * Default when omitted: the manager generates a random secret.
+   *
+   * @generated from field: optional string secret = 1;
+   */
+  secret?: string;
+
+  constructor(data?: PartialMessage<BootstrapAclRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.BootstrapAclRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "secret", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): BootstrapAclRequest {
+    return new BootstrapAclRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): BootstrapAclRequest {
+    return new BootstrapAclRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): BootstrapAclRequest {
+    return new BootstrapAclRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: BootstrapAclRequest | PlainMessage<BootstrapAclRequest> | undefined, b: BootstrapAclRequest | PlainMessage<BootstrapAclRequest> | undefined): boolean {
+    return proto3.util.equals(BootstrapAclRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for BootstrapAcl.
+ *
+ * @generated from message legion.BootstrapAclReply
+ */
+export class BootstrapAclReply extends Message<BootstrapAclReply> {
+  /**
+   * Metadata for the initial management token.
+   *
+   * @generated from field: legion.AclTokenInfo token = 1;
+   */
+  token?: AclTokenInfo;
+
+  /**
+   * The management token secret. Returned exactly once.
+   *
+   * @generated from field: string secret = 2;
+   */
+  secret = "";
+
+  constructor(data?: PartialMessage<BootstrapAclReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.BootstrapAclReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "token", kind: "message", T: AclTokenInfo },
+    { no: 2, name: "secret", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): BootstrapAclReply {
+    return new BootstrapAclReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): BootstrapAclReply {
+    return new BootstrapAclReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): BootstrapAclReply {
+    return new BootstrapAclReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: BootstrapAclReply | PlainMessage<BootstrapAclReply> | undefined, b: BootstrapAclReply | PlainMessage<BootstrapAclReply> | undefined): boolean {
+    return proto3.util.equals(BootstrapAclReply, a, b);
+  }
+}
+
+/**
+ * Metadata describing an ACL token. Never contains the secret.
+ *
+ * @generated from message legion.AclTokenInfo
+ */
+export class AclTokenInfo extends Message<AclTokenInfo> {
+  /**
+   * Public identifier for the token; safe to log and audit.
+   *
+   * @generated from field: string accessor_id = 1;
+   */
+  accessorId = "";
+
+  /**
+   * Human-readable token name. Tokens minted via Login are named
+   * `<method>:<principal>` (for example "userpass:alice").
+   *
+   * @generated from field: string name = 2;
+   */
+  name = "";
+
+  /**
+   * Token type: `management` (full access) or `client` (policy-scoped).
+   *
+   * @generated from field: string token_type = 3;
+   */
+  tokenType = "";
+
+  /**
+   * Names of attached policies. Empty for management tokens.
+   *
+   * @generated from field: repeated string policies = 4;
+   */
+  policies: string[] = [];
+
+  /**
+   * RFC3339 creation timestamp.
+   *
+   * @generated from field: string created_at = 5;
+   */
+  createdAt = "";
+
+  /**
+   * RFC3339 expiry. Omitted when the token never expires.
+   *
+   * @generated from field: optional string expires_at = 6;
+   */
+  expiresAt?: string;
+
+  constructor(data?: PartialMessage<AclTokenInfo>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.AclTokenInfo";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "accessor_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "token_type", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "policies", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 5, name: "created_at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "expires_at", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): AclTokenInfo {
+    return new AclTokenInfo().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): AclTokenInfo {
+    return new AclTokenInfo().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): AclTokenInfo {
+    return new AclTokenInfo().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: AclTokenInfo | PlainMessage<AclTokenInfo> | undefined, b: AclTokenInfo | PlainMessage<AclTokenInfo> | undefined): boolean {
+    return proto3.util.equals(AclTokenInfo, a, b);
+  }
+}
+
+/**
+ * A named ACL policy.
+ *
+ * `rules_json` is a JSON array of rule objects:
+ *   [{"resources": ["job"], "actions": ["read", "write"],
+ *     "namespaces": ["default"], "names": ["web-*"]},
+ *    {"resources": ["kv"], "actions": ["read"], "paths": ["team/*"]},
+ *    {"resources": ["node"], "actions": ["read"], "pools": ["*"]},
+ *    {"resources": ["*"], "actions": ["*"], "effect": "deny",
+ *     "paths": ["secret/*"]}]
+ *
+ * Rule fields:
+ * - `resources`: resource types the rule covers (`job`, `node`, `kv`,
+ *   `state`, `operator`, `acl`, or `*`).
+ * - `actions`: `read`, `write`, or `*`.
+ * - `effect`: `allow` (default) or `deny`. A matching deny rule always
+ *   overrides any allow.
+ * - Optional scope selectors (glob lists matched against the request):
+ *   `namespaces` (job namespaces), `names` (job names), `pools` (node
+ *   pools), `paths` (KV keys). A rule with a selector only matches requests
+ *   that carry that attribute.
+ *
+ * @generated from message legion.AclPolicy
+ */
+export class AclPolicy extends Message<AclPolicy> {
+  /**
+   * Unique policy name. Tokens reference policies by exact name.
+   *
+   * @generated from field: string name = 1;
+   */
+  name = "";
+
+  /**
+   * Free-form description.
+   *
+   * @generated from field: string description = 2;
+   */
+  description = "";
+
+  /**
+   * JSON array of rules (see message comment for the schema).
+   *
+   * @generated from field: string rules_json = 3;
+   */
+  rulesJson = "";
+
+  /**
+   * RFC3339 creation timestamp.
+   *
+   * @generated from field: string created_at = 4;
+   */
+  createdAt = "";
+
+  /**
+   * RFC3339 last-update timestamp.
+   *
+   * @generated from field: string updated_at = 5;
+   */
+  updatedAt = "";
+
+  constructor(data?: PartialMessage<AclPolicy>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.AclPolicy";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "description", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "rules_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "created_at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "updated_at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): AclPolicy {
+    return new AclPolicy().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): AclPolicy {
+    return new AclPolicy().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): AclPolicy {
+    return new AclPolicy().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: AclPolicy | PlainMessage<AclPolicy> | undefined, b: AclPolicy | PlainMessage<AclPolicy> | undefined): boolean {
+    return proto3.util.equals(AclPolicy, a, b);
+  }
+}
+
+/**
+ * Request payload for UpsertAclPolicy.
+ *
+ * @generated from message legion.UpsertAclPolicyRequest
+ */
+export class UpsertAclPolicyRequest extends Message<UpsertAclPolicyRequest> {
+  /**
+   * Policy name to create or replace.
+   *
+   * @generated from field: string name = 1;
+   */
+  name = "";
+
+  /**
+   * Free-form description.
+   *
+   * @generated from field: string description = 2;
+   */
+  description = "";
+
+  /**
+   * JSON array of rules (see AclPolicy for the schema). Validated on write.
+   *
+   * @generated from field: string rules_json = 3;
+   */
+  rulesJson = "";
+
+  constructor(data?: PartialMessage<UpsertAclPolicyRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.UpsertAclPolicyRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "description", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "rules_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): UpsertAclPolicyRequest {
+    return new UpsertAclPolicyRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): UpsertAclPolicyRequest {
+    return new UpsertAclPolicyRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): UpsertAclPolicyRequest {
+    return new UpsertAclPolicyRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: UpsertAclPolicyRequest | PlainMessage<UpsertAclPolicyRequest> | undefined, b: UpsertAclPolicyRequest | PlainMessage<UpsertAclPolicyRequest> | undefined): boolean {
+    return proto3.util.equals(UpsertAclPolicyRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for UpsertAclPolicy.
+ *
+ * @generated from message legion.UpsertAclPolicyReply
+ */
+export class UpsertAclPolicyReply extends Message<UpsertAclPolicyReply> {
+  /**
+   * The stored policy.
+   *
+   * @generated from field: legion.AclPolicy policy = 1;
+   */
+  policy?: AclPolicy;
+
+  constructor(data?: PartialMessage<UpsertAclPolicyReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.UpsertAclPolicyReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "policy", kind: "message", T: AclPolicy },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): UpsertAclPolicyReply {
+    return new UpsertAclPolicyReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): UpsertAclPolicyReply {
+    return new UpsertAclPolicyReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): UpsertAclPolicyReply {
+    return new UpsertAclPolicyReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: UpsertAclPolicyReply | PlainMessage<UpsertAclPolicyReply> | undefined, b: UpsertAclPolicyReply | PlainMessage<UpsertAclPolicyReply> | undefined): boolean {
+    return proto3.util.equals(UpsertAclPolicyReply, a, b);
+  }
+}
+
+/**
+ * Request payload for GetAclPolicy.
+ *
+ * @generated from message legion.GetAclPolicyRequest
+ */
+export class GetAclPolicyRequest extends Message<GetAclPolicyRequest> {
+  /**
+   * Policy name (exact match).
+   *
+   * @generated from field: string name = 1;
+   */
+  name = "";
+
+  constructor(data?: PartialMessage<GetAclPolicyRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetAclPolicyRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetAclPolicyRequest {
+    return new GetAclPolicyRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetAclPolicyRequest {
+    return new GetAclPolicyRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetAclPolicyRequest {
+    return new GetAclPolicyRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetAclPolicyRequest | PlainMessage<GetAclPolicyRequest> | undefined, b: GetAclPolicyRequest | PlainMessage<GetAclPolicyRequest> | undefined): boolean {
+    return proto3.util.equals(GetAclPolicyRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for GetAclPolicy.
+ *
+ * @generated from message legion.GetAclPolicyReply
+ */
+export class GetAclPolicyReply extends Message<GetAclPolicyReply> {
+  /**
+   * The requested policy.
+   *
+   * @generated from field: legion.AclPolicy policy = 1;
+   */
+  policy?: AclPolicy;
+
+  constructor(data?: PartialMessage<GetAclPolicyReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetAclPolicyReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "policy", kind: "message", T: AclPolicy },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetAclPolicyReply {
+    return new GetAclPolicyReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetAclPolicyReply {
+    return new GetAclPolicyReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetAclPolicyReply {
+    return new GetAclPolicyReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetAclPolicyReply | PlainMessage<GetAclPolicyReply> | undefined, b: GetAclPolicyReply | PlainMessage<GetAclPolicyReply> | undefined): boolean {
+    return proto3.util.equals(GetAclPolicyReply, a, b);
+  }
+}
+
+/**
+ * Request payload for ListAclPolicies.
+ *
+ * @generated from message legion.ListAclPoliciesRequest
+ */
+export class ListAclPoliciesRequest extends Message<ListAclPoliciesRequest> {
+  constructor(data?: PartialMessage<ListAclPoliciesRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListAclPoliciesRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListAclPoliciesRequest {
+    return new ListAclPoliciesRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListAclPoliciesRequest {
+    return new ListAclPoliciesRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListAclPoliciesRequest {
+    return new ListAclPoliciesRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListAclPoliciesRequest | PlainMessage<ListAclPoliciesRequest> | undefined, b: ListAclPoliciesRequest | PlainMessage<ListAclPoliciesRequest> | undefined): boolean {
+    return proto3.util.equals(ListAclPoliciesRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for ListAclPolicies.
+ *
+ * @generated from message legion.ListAclPoliciesReply
+ */
+export class ListAclPoliciesReply extends Message<ListAclPoliciesReply> {
+  /**
+   * All policies, sorted by name.
+   *
+   * @generated from field: repeated legion.AclPolicy policies = 1;
+   */
+  policies: AclPolicy[] = [];
+
+  constructor(data?: PartialMessage<ListAclPoliciesReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListAclPoliciesReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "policies", kind: "message", T: AclPolicy, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListAclPoliciesReply {
+    return new ListAclPoliciesReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListAclPoliciesReply {
+    return new ListAclPoliciesReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListAclPoliciesReply {
+    return new ListAclPoliciesReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListAclPoliciesReply | PlainMessage<ListAclPoliciesReply> | undefined, b: ListAclPoliciesReply | PlainMessage<ListAclPoliciesReply> | undefined): boolean {
+    return proto3.util.equals(ListAclPoliciesReply, a, b);
+  }
+}
+
+/**
+ * Request payload for DeleteAclPolicy.
+ *
+ * @generated from message legion.DeleteAclPolicyRequest
+ */
+export class DeleteAclPolicyRequest extends Message<DeleteAclPolicyRequest> {
+  /**
+   * Policy name (exact match).
+   *
+   * @generated from field: string name = 1;
+   */
+  name = "";
+
+  constructor(data?: PartialMessage<DeleteAclPolicyRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.DeleteAclPolicyRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): DeleteAclPolicyRequest {
+    return new DeleteAclPolicyRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): DeleteAclPolicyRequest {
+    return new DeleteAclPolicyRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): DeleteAclPolicyRequest {
+    return new DeleteAclPolicyRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: DeleteAclPolicyRequest | PlainMessage<DeleteAclPolicyRequest> | undefined, b: DeleteAclPolicyRequest | PlainMessage<DeleteAclPolicyRequest> | undefined): boolean {
+    return proto3.util.equals(DeleteAclPolicyRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for DeleteAclPolicy.
+ *
+ * @generated from message legion.DeleteAclPolicyReply
+ */
+export class DeleteAclPolicyReply extends Message<DeleteAclPolicyReply> {
+  /**
+   * Human-readable status message.
+   *
+   * @generated from field: string message = 1;
+   */
+  message = "";
+
+  constructor(data?: PartialMessage<DeleteAclPolicyReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.DeleteAclPolicyReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): DeleteAclPolicyReply {
+    return new DeleteAclPolicyReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): DeleteAclPolicyReply {
+    return new DeleteAclPolicyReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): DeleteAclPolicyReply {
+    return new DeleteAclPolicyReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: DeleteAclPolicyReply | PlainMessage<DeleteAclPolicyReply> | undefined, b: DeleteAclPolicyReply | PlainMessage<DeleteAclPolicyReply> | undefined): boolean {
+    return proto3.util.equals(DeleteAclPolicyReply, a, b);
+  }
+}
+
+/**
+ * Request payload for CreateAclToken.
+ *
+ * @generated from message legion.CreateAclTokenRequest
+ */
+export class CreateAclTokenRequest extends Message<CreateAclTokenRequest> {
+  /**
+   * Human-readable token name.
+   *
+   * @generated from field: string name = 1;
+   */
+  name = "";
+
+  /**
+   * Token type: `management` or `client`. Default when empty: `client`.
+   *
+   * @generated from field: string token_type = 2;
+   */
+  tokenType = "";
+
+  /**
+   * Names of existing policies to attach. Required (non-empty) for client
+   * tokens; must be empty for management tokens.
+   *
+   * @generated from field: repeated string policies = 3;
+   */
+  policies: string[] = [];
+
+  /**
+   * Optional lifetime (humantime format, for example "720h").
+   *
+   * Default when omitted: the token never expires.
+   *
+   * @generated from field: optional string ttl = 4;
+   */
+  ttl?: string;
+
+  constructor(data?: PartialMessage<CreateAclTokenRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.CreateAclTokenRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "token_type", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "policies", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 4, name: "ttl", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): CreateAclTokenRequest {
+    return new CreateAclTokenRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): CreateAclTokenRequest {
+    return new CreateAclTokenRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): CreateAclTokenRequest {
+    return new CreateAclTokenRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: CreateAclTokenRequest | PlainMessage<CreateAclTokenRequest> | undefined, b: CreateAclTokenRequest | PlainMessage<CreateAclTokenRequest> | undefined): boolean {
+    return proto3.util.equals(CreateAclTokenRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for CreateAclToken.
+ *
+ * @generated from message legion.CreateAclTokenReply
+ */
+export class CreateAclTokenReply extends Message<CreateAclTokenReply> {
+  /**
+   * Metadata for the new token.
+   *
+   * @generated from field: legion.AclTokenInfo token = 1;
+   */
+  token?: AclTokenInfo;
+
+  /**
+   * The token secret. Returned exactly once; the manager stores only a hash.
+   *
+   * @generated from field: string secret = 2;
+   */
+  secret = "";
+
+  constructor(data?: PartialMessage<CreateAclTokenReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.CreateAclTokenReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "token", kind: "message", T: AclTokenInfo },
+    { no: 2, name: "secret", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): CreateAclTokenReply {
+    return new CreateAclTokenReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): CreateAclTokenReply {
+    return new CreateAclTokenReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): CreateAclTokenReply {
+    return new CreateAclTokenReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: CreateAclTokenReply | PlainMessage<CreateAclTokenReply> | undefined, b: CreateAclTokenReply | PlainMessage<CreateAclTokenReply> | undefined): boolean {
+    return proto3.util.equals(CreateAclTokenReply, a, b);
+  }
+}
+
+/**
+ * Request payload for ListAclTokens.
+ *
+ * @generated from message legion.ListAclTokensRequest
+ */
+export class ListAclTokensRequest extends Message<ListAclTokensRequest> {
+  constructor(data?: PartialMessage<ListAclTokensRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListAclTokensRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListAclTokensRequest {
+    return new ListAclTokensRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListAclTokensRequest {
+    return new ListAclTokensRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListAclTokensRequest {
+    return new ListAclTokensRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListAclTokensRequest | PlainMessage<ListAclTokensRequest> | undefined, b: ListAclTokensRequest | PlainMessage<ListAclTokensRequest> | undefined): boolean {
+    return proto3.util.equals(ListAclTokensRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for ListAclTokens.
+ *
+ * @generated from message legion.ListAclTokensReply
+ */
+export class ListAclTokensReply extends Message<ListAclTokensReply> {
+  /**
+   * All tokens (metadata only), newest first.
+   *
+   * @generated from field: repeated legion.AclTokenInfo tokens = 1;
+   */
+  tokens: AclTokenInfo[] = [];
+
+  constructor(data?: PartialMessage<ListAclTokensReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListAclTokensReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "tokens", kind: "message", T: AclTokenInfo, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListAclTokensReply {
+    return new ListAclTokensReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListAclTokensReply {
+    return new ListAclTokensReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListAclTokensReply {
+    return new ListAclTokensReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListAclTokensReply | PlainMessage<ListAclTokensReply> | undefined, b: ListAclTokensReply | PlainMessage<ListAclTokensReply> | undefined): boolean {
+    return proto3.util.equals(ListAclTokensReply, a, b);
+  }
+}
+
+/**
+ * Request payload for DeleteAclToken.
+ *
+ * @generated from message legion.DeleteAclTokenRequest
+ */
+export class DeleteAclTokenRequest extends Message<DeleteAclTokenRequest> {
+  /**
+   * Accessor ID of the token to revoke.
+   *
+   * @generated from field: string accessor_id = 1;
+   */
+  accessorId = "";
+
+  constructor(data?: PartialMessage<DeleteAclTokenRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.DeleteAclTokenRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "accessor_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): DeleteAclTokenRequest {
+    return new DeleteAclTokenRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): DeleteAclTokenRequest {
+    return new DeleteAclTokenRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): DeleteAclTokenRequest {
+    return new DeleteAclTokenRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: DeleteAclTokenRequest | PlainMessage<DeleteAclTokenRequest> | undefined, b: DeleteAclTokenRequest | PlainMessage<DeleteAclTokenRequest> | undefined): boolean {
+    return proto3.util.equals(DeleteAclTokenRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for DeleteAclToken.
+ *
+ * @generated from message legion.DeleteAclTokenReply
+ */
+export class DeleteAclTokenReply extends Message<DeleteAclTokenReply> {
+  /**
+   * Human-readable status message.
+   *
+   * @generated from field: string message = 1;
+   */
+  message = "";
+
+  constructor(data?: PartialMessage<DeleteAclTokenReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.DeleteAclTokenReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): DeleteAclTokenReply {
+    return new DeleteAclTokenReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): DeleteAclTokenReply {
+    return new DeleteAclTokenReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): DeleteAclTokenReply {
+    return new DeleteAclTokenReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: DeleteAclTokenReply | PlainMessage<DeleteAclTokenReply> | undefined, b: DeleteAclTokenReply | PlainMessage<DeleteAclTokenReply> | undefined): boolean {
+    return proto3.util.equals(DeleteAclTokenReply, a, b);
+  }
+}
+
+/**
+ * A username/password ACL user. Never contains password material.
+ *
+ * @generated from message legion.AclUser
+ */
+export class AclUser extends Message<AclUser> {
+  /**
+   * Unique username.
+   *
+   * @generated from field: string username = 1;
+   */
+  username = "";
+
+  /**
+   * Names of policies attached to tokens minted when this user logs in.
+   *
+   * @generated from field: repeated string policies = 2;
+   */
+  policies: string[] = [];
+
+  /**
+   * RFC3339 creation timestamp.
+   *
+   * @generated from field: string created_at = 3;
+   */
+  createdAt = "";
+
+  /**
+   * RFC3339 last-update timestamp.
+   *
+   * @generated from field: string updated_at = 4;
+   */
+  updatedAt = "";
+
+  constructor(data?: PartialMessage<AclUser>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.AclUser";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "username", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "policies", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 3, name: "created_at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "updated_at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): AclUser {
+    return new AclUser().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): AclUser {
+    return new AclUser().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): AclUser {
+    return new AclUser().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: AclUser | PlainMessage<AclUser> | undefined, b: AclUser | PlainMessage<AclUser> | undefined): boolean {
+    return proto3.util.equals(AclUser, a, b);
+  }
+}
+
+/**
+ * Request payload for UpsertAclUser.
+ *
+ * @generated from message legion.UpsertAclUserRequest
+ */
+export class UpsertAclUserRequest extends Message<UpsertAclUserRequest> {
+  /**
+   * Username to create or update.
+   *
+   * @generated from field: string username = 1;
+   */
+  username = "";
+
+  /**
+   * Plaintext password; hashed with argon2id before storage.
+   *
+   * When updating an existing user, an empty password keeps the current one.
+   *
+   * @generated from field: string password = 2;
+   */
+  password = "";
+
+  /**
+   * Names of existing policies granted on login.
+   *
+   * @generated from field: repeated string policies = 3;
+   */
+  policies: string[] = [];
+
+  constructor(data?: PartialMessage<UpsertAclUserRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.UpsertAclUserRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "username", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "password", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "policies", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): UpsertAclUserRequest {
+    return new UpsertAclUserRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): UpsertAclUserRequest {
+    return new UpsertAclUserRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): UpsertAclUserRequest {
+    return new UpsertAclUserRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: UpsertAclUserRequest | PlainMessage<UpsertAclUserRequest> | undefined, b: UpsertAclUserRequest | PlainMessage<UpsertAclUserRequest> | undefined): boolean {
+    return proto3.util.equals(UpsertAclUserRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for UpsertAclUser.
+ *
+ * @generated from message legion.UpsertAclUserReply
+ */
+export class UpsertAclUserReply extends Message<UpsertAclUserReply> {
+  /**
+   * The stored user.
+   *
+   * @generated from field: legion.AclUser user = 1;
+   */
+  user?: AclUser;
+
+  constructor(data?: PartialMessage<UpsertAclUserReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.UpsertAclUserReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "user", kind: "message", T: AclUser },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): UpsertAclUserReply {
+    return new UpsertAclUserReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): UpsertAclUserReply {
+    return new UpsertAclUserReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): UpsertAclUserReply {
+    return new UpsertAclUserReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: UpsertAclUserReply | PlainMessage<UpsertAclUserReply> | undefined, b: UpsertAclUserReply | PlainMessage<UpsertAclUserReply> | undefined): boolean {
+    return proto3.util.equals(UpsertAclUserReply, a, b);
+  }
+}
+
+/**
+ * Request payload for ListAclUsers.
+ *
+ * @generated from message legion.ListAclUsersRequest
+ */
+export class ListAclUsersRequest extends Message<ListAclUsersRequest> {
+  constructor(data?: PartialMessage<ListAclUsersRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListAclUsersRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListAclUsersRequest {
+    return new ListAclUsersRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListAclUsersRequest {
+    return new ListAclUsersRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListAclUsersRequest {
+    return new ListAclUsersRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListAclUsersRequest | PlainMessage<ListAclUsersRequest> | undefined, b: ListAclUsersRequest | PlainMessage<ListAclUsersRequest> | undefined): boolean {
+    return proto3.util.equals(ListAclUsersRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for ListAclUsers.
+ *
+ * @generated from message legion.ListAclUsersReply
+ */
+export class ListAclUsersReply extends Message<ListAclUsersReply> {
+  /**
+   * All users, sorted by username.
+   *
+   * @generated from field: repeated legion.AclUser users = 1;
+   */
+  users: AclUser[] = [];
+
+  constructor(data?: PartialMessage<ListAclUsersReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListAclUsersReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "users", kind: "message", T: AclUser, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListAclUsersReply {
+    return new ListAclUsersReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListAclUsersReply {
+    return new ListAclUsersReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListAclUsersReply {
+    return new ListAclUsersReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListAclUsersReply | PlainMessage<ListAclUsersReply> | undefined, b: ListAclUsersReply | PlainMessage<ListAclUsersReply> | undefined): boolean {
+    return proto3.util.equals(ListAclUsersReply, a, b);
+  }
+}
+
+/**
+ * Request payload for DeleteAclUser.
+ *
+ * @generated from message legion.DeleteAclUserRequest
+ */
+export class DeleteAclUserRequest extends Message<DeleteAclUserRequest> {
+  /**
+   * Username (exact match).
+   *
+   * @generated from field: string username = 1;
+   */
+  username = "";
+
+  constructor(data?: PartialMessage<DeleteAclUserRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.DeleteAclUserRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "username", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): DeleteAclUserRequest {
+    return new DeleteAclUserRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): DeleteAclUserRequest {
+    return new DeleteAclUserRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): DeleteAclUserRequest {
+    return new DeleteAclUserRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: DeleteAclUserRequest | PlainMessage<DeleteAclUserRequest> | undefined, b: DeleteAclUserRequest | PlainMessage<DeleteAclUserRequest> | undefined): boolean {
+    return proto3.util.equals(DeleteAclUserRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for DeleteAclUser.
+ *
+ * @generated from message legion.DeleteAclUserReply
+ */
+export class DeleteAclUserReply extends Message<DeleteAclUserReply> {
+  /**
+   * Human-readable status message.
+   *
+   * @generated from field: string message = 1;
+   */
+  message = "";
+
+  constructor(data?: PartialMessage<DeleteAclUserReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.DeleteAclUserReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): DeleteAclUserReply {
+    return new DeleteAclUserReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): DeleteAclUserReply {
+    return new DeleteAclUserReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): DeleteAclUserReply {
+    return new DeleteAclUserReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: DeleteAclUserReply | PlainMessage<DeleteAclUserReply> | undefined, b: DeleteAclUserReply | PlainMessage<DeleteAclUserReply> | undefined): boolean {
+    return proto3.util.equals(DeleteAclUserReply, a, b);
+  }
+}
+
+/**
+ * Request payload for GetAuthMethods.
+ *
+ * @generated from message legion.GetAuthMethodsRequest
+ */
+export class GetAuthMethodsRequest extends Message<GetAuthMethodsRequest> {
+  constructor(data?: PartialMessage<GetAuthMethodsRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetAuthMethodsRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetAuthMethodsRequest {
+    return new GetAuthMethodsRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetAuthMethodsRequest {
+    return new GetAuthMethodsRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetAuthMethodsRequest {
+    return new GetAuthMethodsRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetAuthMethodsRequest | PlainMessage<GetAuthMethodsRequest> | undefined, b: GetAuthMethodsRequest | PlainMessage<GetAuthMethodsRequest> | undefined): boolean {
+    return proto3.util.equals(GetAuthMethodsRequest, a, b);
+  }
+}
+
+/**
+ * Public metadata for one auth method (no secrets or keys).
+ *
+ * @generated from message legion.AuthMethodInfo
+ */
+export class AuthMethodInfo extends Message<AuthMethodInfo> {
+  /**
+   * Method name; pass to Login / `legion login --method <name>`.
+   *
+   * @generated from field: string name = 1;
+   */
+  name = "";
+
+  /**
+   * Method kind: `userpass`, `jwt`, `oidc`, `webhook`, or `custom`.
+   *
+   * @generated from field: string kind = 2;
+   */
+  kind = "";
+
+  /**
+   * OIDC issuer URL (oidc kind only). Clients run discovery against it.
+   *
+   * @generated from field: optional string oidc_issuer = 3;
+   */
+  oidcIssuer?: string;
+
+  /**
+   * OAuth client ID registered for Legion at the identity provider
+   * (oidc kind only). Required for browser/CLI redirect login.
+   *
+   * @generated from field: optional string oidc_client_id = 4;
+   */
+  oidcClientId?: string;
+
+  /**
+   * OAuth scopes to request (oidc kind only). Default: ["openid"].
+   *
+   * @generated from field: repeated string oidc_scopes = 5;
+   */
+  oidcScopes: string[] = [];
+
+  constructor(data?: PartialMessage<AuthMethodInfo>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.AuthMethodInfo";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "kind", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "oidc_issuer", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 4, name: "oidc_client_id", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 5, name: "oidc_scopes", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): AuthMethodInfo {
+    return new AuthMethodInfo().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): AuthMethodInfo {
+    return new AuthMethodInfo().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): AuthMethodInfo {
+    return new AuthMethodInfo().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: AuthMethodInfo | PlainMessage<AuthMethodInfo> | undefined, b: AuthMethodInfo | PlainMessage<AuthMethodInfo> | undefined): boolean {
+    return proto3.util.equals(AuthMethodInfo, a, b);
+  }
+}
+
+/**
+ * Reply payload for GetAuthMethods.
+ *
+ * @generated from message legion.GetAuthMethodsReply
+ */
+export class GetAuthMethodsReply extends Message<GetAuthMethodsReply> {
+  /**
+   * All registered auth methods, in registration order (userpass first).
+   *
+   * @generated from field: repeated legion.AuthMethodInfo methods = 1;
+   */
+  methods: AuthMethodInfo[] = [];
+
+  constructor(data?: PartialMessage<GetAuthMethodsReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetAuthMethodsReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "methods", kind: "message", T: AuthMethodInfo, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetAuthMethodsReply {
+    return new GetAuthMethodsReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetAuthMethodsReply {
+    return new GetAuthMethodsReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetAuthMethodsReply {
+    return new GetAuthMethodsReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetAuthMethodsReply | PlainMessage<GetAuthMethodsReply> | undefined, b: GetAuthMethodsReply | PlainMessage<GetAuthMethodsReply> | undefined): boolean {
+    return proto3.util.equals(GetAuthMethodsReply, a, b);
+  }
+}
+
+/**
+ * Request payload for CreateJoinToken.
+ *
+ * @generated from message legion.CreateJoinTokenRequest
+ */
+export class CreateJoinTokenRequest extends Message<CreateJoinTokenRequest> {
+  /**
+   * Worker type the token introduces (selects the worker template).
+   *
+   * Default when empty: "default".
+   *
+   * @generated from field: string worker_type = 1;
+   */
+  workerType = "";
+
+  /**
+   * Optional lifetime (humantime format, for example "24h").
+   *
+   * Default when omitted: 24h. Pass "none" for a non-expiring token
+   * (discouraged; prefer short-lived tokens).
+   *
+   * @generated from field: optional string ttl = 2;
+   */
+  ttl?: string;
+
+  /**
+   * Free-form description shown in ListJoinTokens (for example "rack 12").
+   *
+   * @generated from field: string description = 3;
+   */
+  description = "";
+
+  constructor(data?: PartialMessage<CreateJoinTokenRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.CreateJoinTokenRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "worker_type", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "ttl", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 3, name: "description", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): CreateJoinTokenRequest {
+    return new CreateJoinTokenRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): CreateJoinTokenRequest {
+    return new CreateJoinTokenRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): CreateJoinTokenRequest {
+    return new CreateJoinTokenRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: CreateJoinTokenRequest | PlainMessage<CreateJoinTokenRequest> | undefined, b: CreateJoinTokenRequest | PlainMessage<CreateJoinTokenRequest> | undefined): boolean {
+    return proto3.util.equals(CreateJoinTokenRequest, a, b);
+  }
+}
+
+/**
+ * Metadata describing a join token. Never contains the secret.
+ *
+ * @generated from message legion.JoinTokenInfo
+ */
+export class JoinTokenInfo extends Message<JoinTokenInfo> {
+  /**
+   * Public identifier; the handle used by DeleteJoinToken.
+   *
+   * @generated from field: string id = 1;
+   */
+  id = "";
+
+  /**
+   * Worker type this token introduces.
+   *
+   * @generated from field: string worker_type = 2;
+   */
+  workerType = "";
+
+  /**
+   * Free-form description.
+   *
+   * @generated from field: string description = 3;
+   */
+  description = "";
+
+  /**
+   * RFC3339 expiry. Omitted when the token never expires.
+   *
+   * @generated from field: optional string expires_at = 4;
+   */
+  expiresAt?: string;
+
+  /**
+   * RFC3339 creation timestamp.
+   *
+   * @generated from field: string created_at = 5;
+   */
+  createdAt = "";
+
+  constructor(data?: PartialMessage<JoinTokenInfo>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.JoinTokenInfo";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "worker_type", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "description", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "expires_at", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 5, name: "created_at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): JoinTokenInfo {
+    return new JoinTokenInfo().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): JoinTokenInfo {
+    return new JoinTokenInfo().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): JoinTokenInfo {
+    return new JoinTokenInfo().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: JoinTokenInfo | PlainMessage<JoinTokenInfo> | undefined, b: JoinTokenInfo | PlainMessage<JoinTokenInfo> | undefined): boolean {
+    return proto3.util.equals(JoinTokenInfo, a, b);
+  }
+}
+
+/**
+ * Reply payload for CreateJoinToken.
+ *
+ * @generated from message legion.CreateJoinTokenReply
+ */
+export class CreateJoinTokenReply extends Message<CreateJoinTokenReply> {
+  /**
+   * Token metadata.
+   *
+   * @generated from field: legion.JoinTokenInfo info = 1;
+   */
+  info?: JoinTokenInfo;
+
+  /**
+   * The composite join token handed to the worker
+   * (`legion join <TOKEN>`). Base64url-encoded JSON carrying the manager
+   * address, the secret, and the worker type. Returned exactly once; the
+   * manager stores only a hash of the embedded secret.
+   *
+   * @generated from field: string token = 2;
+   */
+  token = "";
+
+  constructor(data?: PartialMessage<CreateJoinTokenReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.CreateJoinTokenReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "info", kind: "message", T: JoinTokenInfo },
+    { no: 2, name: "token", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): CreateJoinTokenReply {
+    return new CreateJoinTokenReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): CreateJoinTokenReply {
+    return new CreateJoinTokenReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): CreateJoinTokenReply {
+    return new CreateJoinTokenReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: CreateJoinTokenReply | PlainMessage<CreateJoinTokenReply> | undefined, b: CreateJoinTokenReply | PlainMessage<CreateJoinTokenReply> | undefined): boolean {
+    return proto3.util.equals(CreateJoinTokenReply, a, b);
+  }
+}
+
+/**
+ * Request payload for ListJoinTokens.
+ *
+ * @generated from message legion.ListJoinTokensRequest
+ */
+export class ListJoinTokensRequest extends Message<ListJoinTokensRequest> {
+  constructor(data?: PartialMessage<ListJoinTokensRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListJoinTokensRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListJoinTokensRequest {
+    return new ListJoinTokensRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListJoinTokensRequest {
+    return new ListJoinTokensRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListJoinTokensRequest {
+    return new ListJoinTokensRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListJoinTokensRequest | PlainMessage<ListJoinTokensRequest> | undefined, b: ListJoinTokensRequest | PlainMessage<ListJoinTokensRequest> | undefined): boolean {
+    return proto3.util.equals(ListJoinTokensRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for ListJoinTokens.
+ *
+ * @generated from message legion.ListJoinTokensReply
+ */
+export class ListJoinTokensReply extends Message<ListJoinTokensReply> {
+  /**
+   * All join tokens (metadata only), newest first.
+   *
+   * @generated from field: repeated legion.JoinTokenInfo tokens = 1;
+   */
+  tokens: JoinTokenInfo[] = [];
+
+  constructor(data?: PartialMessage<ListJoinTokensReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListJoinTokensReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "tokens", kind: "message", T: JoinTokenInfo, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListJoinTokensReply {
+    return new ListJoinTokensReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListJoinTokensReply {
+    return new ListJoinTokensReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListJoinTokensReply {
+    return new ListJoinTokensReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListJoinTokensReply | PlainMessage<ListJoinTokensReply> | undefined, b: ListJoinTokensReply | PlainMessage<ListJoinTokensReply> | undefined): boolean {
+    return proto3.util.equals(ListJoinTokensReply, a, b);
+  }
+}
+
+/**
+ * Request payload for DeleteJoinToken.
+ *
+ * @generated from message legion.DeleteJoinTokenRequest
+ */
+export class DeleteJoinTokenRequest extends Message<DeleteJoinTokenRequest> {
+  /**
+   * Join token ID to revoke.
+   *
+   * @generated from field: string id = 1;
+   */
+  id = "";
+
+  constructor(data?: PartialMessage<DeleteJoinTokenRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.DeleteJoinTokenRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): DeleteJoinTokenRequest {
+    return new DeleteJoinTokenRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): DeleteJoinTokenRequest {
+    return new DeleteJoinTokenRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): DeleteJoinTokenRequest {
+    return new DeleteJoinTokenRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: DeleteJoinTokenRequest | PlainMessage<DeleteJoinTokenRequest> | undefined, b: DeleteJoinTokenRequest | PlainMessage<DeleteJoinTokenRequest> | undefined): boolean {
+    return proto3.util.equals(DeleteJoinTokenRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for DeleteJoinToken.
+ *
+ * @generated from message legion.DeleteJoinTokenReply
+ */
+export class DeleteJoinTokenReply extends Message<DeleteJoinTokenReply> {
+  /**
+   * Human-readable status message.
+   *
+   * @generated from field: string message = 1;
+   */
+  message = "";
+
+  constructor(data?: PartialMessage<DeleteJoinTokenReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.DeleteJoinTokenReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): DeleteJoinTokenReply {
+    return new DeleteJoinTokenReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): DeleteJoinTokenReply {
+    return new DeleteJoinTokenReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): DeleteJoinTokenReply {
+    return new DeleteJoinTokenReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: DeleteJoinTokenReply | PlainMessage<DeleteJoinTokenReply> | undefined, b: DeleteJoinTokenReply | PlainMessage<DeleteJoinTokenReply> | undefined): boolean {
+    return proto3.util.equals(DeleteJoinTokenReply, a, b);
   }
 }
 

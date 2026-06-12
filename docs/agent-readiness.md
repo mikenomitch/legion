@@ -59,6 +59,7 @@ Even with `--allow-write`, `legion_state_query` is forced to read-only.
 | `legion_instance_list` | no | List a job's stateful instances (slot + keyed). |
 | `legion_instance_get` | no | Inspect one stateful instance. |
 | `legion_node_list` | no | List worker nodes. |
+| `legion_acl_whoami` | no | ACL status + caller identity (diagnose PermissionDenied). |
 | `legion_events` | no | List scheduler events; poll with `after_id` to tail. |
 | `legion_job_logs` | no | Fetch captured task stdout/stderr for a job. |
 | `legion_state_query` | no | Read-only SQL against the state store. |
@@ -265,6 +266,11 @@ All client commands and the MCP server honour:
 
 - `LEGION_ADDR` — manager address (default `http://127.0.0.1:4747`).
 - `LEGION_TLS_CA_CERT` — CA certificate path for `https`/`grpcs` addresses.
+- `LEGION_TOKEN` — ACL token attached as a bearer credential when the cluster
+  has ACLs enabled (falls back to the `legion login` token file,
+  `~/.legion/token`). On a `PermissionDenied`, call `legion acl whoami`
+  (or the `legion_acl_whoami` MCP tool) to see the caller's policies. See
+  [Auth & ACLs](auth-and-acls.md).
 
 ## Recommended agent workflow
 

@@ -24,6 +24,9 @@ fn cli() -> Command {
         .subcommand(cmd::kv::config())
         .subcommand(cmd::state::config())
         .subcommand(cmd::raft::config())
+        .subcommand(cmd::acl::config())
+        .subcommand(cmd::login::login_config())
+        .subcommand(cmd::login::logout_config())
 }
 
 #[tokio::main]
@@ -66,6 +69,9 @@ async fn main() -> R<()> {
         Some(("kv", sub_matches)) => cmd::kv::handle(sub_matches).await?,
         Some(("state", sub_matches)) => cmd::state::handle(sub_matches).await?,
         Some(("raft", sub_matches)) => cmd::raft::handle(sub_matches).await?,
+        Some(("acl", sub_matches)) => cmd::acl::handle(sub_matches).await?,
+        Some(("login", sub_matches)) => cmd::login::handle_login(sub_matches).await?,
+        Some(("logout", sub_matches)) => cmd::login::handle_logout(sub_matches).await?,
         None => unreachable!(),
         Some((_, _)) => unreachable!(),
     };

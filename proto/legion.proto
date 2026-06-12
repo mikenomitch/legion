@@ -442,6 +442,108 @@ service Manager {
   // Deletes a saved State Explorer query by name.
   rpc DeleteSavedStateQuery (DeleteSavedStateQueryRequest)
     returns (DeleteSavedStateQueryReply);
+
+  // === AUTH & ACL ===
+  //
+  // Legion's ACL system is token-based: callers present a bearer credential in
+  // the `authorization` metadata header (`Bearer <secret>`). Credentials are
+  // either opaque Legion ACL tokens (minted by BootstrapAcl, CreateAclToken,
+  // or Login) or externally issued JWTs validated against a configured auth
+  // method. Each request resolves to a set of named policies; policies contain
+  // scoped allow/deny rules over resources (`job`, `node`, `kv`, `state`,
+  // `operator`, `acl`) and actions (`read`, `write`).
+  //
+  // When ACLs are disabled (the default) every endpoint behaves as if the
+  // caller held a management token.
+
+  // Reports how the manager authenticated the caller and what access applies.
+  //
+  // This endpoint never requires a credential: anonymous callers receive the
+  // anonymous identity. UI and CLI clients use it to discover whether ACLs are
+  // enabled and to introspect the presented credential.
+  rpc WhoAmI (WhoAmIRequest) returns (WhoAmIReply);
+
+  // Exchanges login credentials for a newly minted Legion ACL token.
+  //
+  // Supported methods: the built-in `userpass` method (username/password
+  // verified against stored ACL users) and any JWT/OIDC auth method configured
+  // on the manager (`method` = the configured method name, `jwt` = the
+  // externally issued token). The reply contains the token secret exactly
+  // once; the manager stores only a hash of it.
+  rpc Login (LoginRequest) returns (LoginReply);
+
+  // One-time creation of the initial management token.
+  //
+  // Succeeds only while no management token exists; afterwards it returns
+  // FAILED_PRECONDITION. Run `legion acl bootstrap` right after enabling ACLs
+  // and store the returned secret safely.
+  rpc BootstrapAcl (BootstrapAclRequest) returns (BootstrapAclReply);
+
+  // Creates or replaces a named ACL policy. Requires `acl:write`.
+  rpc UpsertAclPolicy (UpsertAclPolicyRequest) returns (UpsertAclPolicyReply);
+
+  // Returns one ACL policy by exact name. Requires `acl:read`.
+  rpc GetAclPolicy (GetAclPolicyRequest) returns (GetAclPolicyReply);
+
+  // Lists all ACL policies. Requires `acl:read`.
+  rpc ListAclPolicies (ListAclPoliciesRequest) returns (ListAclPoliciesReply);
+
+  // Deletes an ACL policy by exact name. Requires `acl:write`.
+  //
+  // Tokens referencing the deleted policy lose the access it granted.
+  rpc DeleteAclPolicy (DeleteAclPolicyRequest) returns (DeleteAclPolicyReply);
+
+  // Creates a new ACL token attached to existing policies.
+  //
+  // Requires `acl:write`. Creating a `management` token additionally requires
+  // the caller to hold a management token.
+  rpc CreateAclToken (CreateAclTokenRequest) returns (CreateAclTokenReply);
+
+  // Lists ACL tokens. Requires `acl:read`.
+  //
+  // Only accessor IDs and metadata are returned; secrets are never stored or
+  // returned after creation.
+  rpc ListAclTokens (ListAclTokensRequest) returns (ListAclTokensReply);
+
+  // Deletes (revokes) an ACL token by accessor ID. Requires `acl:write`.
+  rpc DeleteAclToken (DeleteAclTokenRequest) returns (DeleteAclTokenReply);
+
+  // Creates or updates a username/password ACL user. Requires `acl:write`.
+  //
+  // Passwords are hashed with argon2id; plaintext is never stored.
+  rpc UpsertAclUser (UpsertAclUserRequest) returns (UpsertAclUserReply);
+
+  // Lists username/password ACL users. Requires `acl:read`.
+  rpc ListAclUsers (ListAclUsersRequest) returns (ListAclUsersReply);
+
+  // Deletes a username/password ACL user. Requires `acl:write`.
+  //
+  // Tokens previously minted via Login remain valid until they expire or are
+  // deleted; deleting the user only prevents future logins.
+  rpc DeleteAclUser (DeleteAclUserRequest) returns (DeleteAclUserReply);
+
+  // Lists the auth methods clients may log in with.
+  //
+  // Open endpoint: login UIs need this before any credential exists. Only
+  // public metadata is returned (names, types, OIDC client settings) —
+  // never secrets or validation keys.
+  rpc GetAuthMethods (GetAuthMethodsRequest) returns (GetAuthMethodsReply);
+
+  // Creates a worker join token. Requires `node:write`.
+  //
+  // The reply contains a self-describing composite token (manager address +
+  // secret + worker type) that introduces a worker in one command:
+  // `legion join <TOKEN>`. The manager stores only a hash of the secret.
+  rpc CreateJoinToken (CreateJoinTokenRequest) returns (CreateJoinTokenReply);
+
+  // Lists worker join tokens (metadata only). Requires `node:read`.
+  rpc ListJoinTokens (ListJoinTokensRequest) returns (ListJoinTokensReply);
+
+  // Deletes (revokes) a worker join token by ID. Requires `node:write`.
+  //
+  // Workers already registered keep their node tokens; revocation only
+  // prevents future joins with this token.
+  rpc DeleteJoinToken (DeleteJoinTokenRequest) returns (DeleteJoinTokenReply);
 }
 
 // Request payload for WorkerPreRegister.
@@ -451,6 +553,13 @@ message WorkerPreRegisterRequest {
   // This selects the worker template stored on the manager.
   // No manager-side default is applied by this RPC.
   string worker_type = 1;
+
+  // Join token secret (the `secret` field of a decoded join token).
+  //
+  // Required when ACLs are enforced: the manager validates it against its
+  // stored join tokens before serving worker configuration. Ignored when
+  // ACLs are disabled.
+  optional string join_token = 2;
 }
 
 // Effective worker configuration returned by pre-registration.
@@ -531,6 +640,11 @@ message WorkerRegisterRequest {
   // - `availability = "available"`
   // - `dynamic_attrs = {}`
   // - `last_heartbeat = ""` until first heartbeat
+
+  // Join token secret (the `secret` field of a decoded join token).
+  //
+  // Required when ACLs are enforced. Ignored when ACLs are disabled.
+  optional string join_token = 6;
 }
 
 // Reply payload for WorkerRegister.
@@ -539,6 +653,12 @@ message WorkerRegisterReply {
   //
   // Current manager reply value: `"Worker registered"`.
   string message = 1;
+
+  // Per-node credential for subsequent worker-plane calls (Heartbeat,
+  // HealthCheck). Minted only when ACLs are enforced; re-registering
+  // rotates it (the previous node token is revoked). Workers attach it as
+  // a bearer credential exactly like an ACL token.
+  optional string node_token = 2;
 }
 
 // One submission unit that contributed to a rendered jobspec.
@@ -2521,37 +2641,6 @@ message StreamEventsRequest {
   optional string level = 5;
 }
 
-// === INSECURE MANAGER ===
-
-// InsecureManager exposes bootstrap-only APIs on the insecure listener.
-//
-// This is typically used to issue join tokens before a worker has secure
-// cluster credentials.
-service InsecureManager {
-  // Generates a worker join token (JWT).
-  rpc GetJoinToken (GetJoinTokenRequest) returns (GetJoinTokenReply);
-}
-
-// Request payload for GetJoinToken.
-message GetJoinTokenRequest {
-  // Optional token TTL string (for example: "1h", "30m").
-  //
-  // Unset means no expiry in current manager implementation
-  // (`exp` claim is set to `0` and `skip_expiry_validation=true`).
-  optional string ttl = 1;
-
-  // Optional worker type to embed in token.
-  //
-  // Defaults to "default" when omitted.
-  optional string worker_type = 2;
-}
-
-// Reply payload for GetJoinToken.
-message GetJoinTokenReply {
-  // Signed JWT join token.
-  string token = 1;
-}
-
 // Internal eval queue item.
 message Eval {
   // Eval ID.
@@ -2788,5 +2877,415 @@ message PostWorkReply {
   // Human-readable acknowledgement.
   //
   // Built-in worker reply value: `"Task accepted"`.
+  string message = 1;
+}
+
+// === AUTH & ACL MESSAGES ===
+
+// Request payload for WhoAmI. Identity comes from request metadata, not the body.
+message WhoAmIRequest {
+}
+
+// Reply payload for WhoAmI.
+message WhoAmIReply {
+  // True when the manager enforces (or audits) ACLs.
+  //
+  // When false every caller has full access; clients should surface a
+  // warning so operators know the cluster is unprotected.
+  bool acl_enabled = 1;
+
+  // True when ACLs run in audit-only mode: denials are logged but allowed.
+  bool audit_only = 2;
+
+  // How the caller was identified.
+  //
+  // One of: `disabled` (ACLs off), `token` (Legion ACL token), `jwt`
+  // (external JWT validated by an auth method), `anonymous` (no credential).
+  string source = 3;
+
+  // Human-readable principal: token name, `user:<name>`, JWT subject, or
+  // `anonymous`.
+  string principal = 4;
+
+  // Token type resolved for the caller: `management`, `client`, or `none`.
+  string token_type = 5;
+
+  // Names of the policies attached to the caller's identity.
+  repeated string policies = 6;
+
+  // RFC3339 expiry of the presented credential, when it has one.
+  optional string expires_at = 7;
+
+  // Accessor ID of the presented ACL token, when one was presented.
+  //
+  // Accessor IDs are safe to log and are the handle used by DeleteAclToken.
+  optional string accessor_id = 8;
+}
+
+// Request payload for Login.
+message LoginRequest {
+  // Auth method name.
+  //
+  // `userpass` selects the built-in username/password method. Any other value
+  // must match the name of a JWT/OIDC auth method in the manager config.
+  string method = 1;
+
+  // Username for the `userpass` method.
+  optional string username = 2;
+
+  // Password for the `userpass` method.
+  optional string password = 3;
+
+  // Externally issued JWT (for example an OIDC ID token) for JWT/OIDC methods.
+  optional string jwt = 4;
+
+  // Optional requested token lifetime (humantime format, for example "8h").
+  //
+  // Capped by the manager's configured maximum for the method. Default when
+  // omitted: the method's `tokenTtl` (built-in default `24h`).
+  optional string ttl = 5;
+}
+
+// Reply payload for Login.
+message LoginReply {
+  // Metadata for the newly minted token.
+  AclTokenInfo token = 1;
+
+  // The token secret. Returned exactly once; the manager stores only a hash.
+  string secret = 2;
+}
+
+// Request payload for BootstrapAcl.
+message BootstrapAclRequest {
+  // Optional operator-provided secret for the initial management token
+  // (infrastructure-as-code pre-seeding). Must be at least 24 characters.
+  //
+  // Default when omitted: the manager generates a random secret.
+  optional string secret = 1;
+}
+
+// Reply payload for BootstrapAcl.
+message BootstrapAclReply {
+  // Metadata for the initial management token.
+  AclTokenInfo token = 1;
+
+  // The management token secret. Returned exactly once.
+  string secret = 2;
+}
+
+// Metadata describing an ACL token. Never contains the secret.
+message AclTokenInfo {
+  // Public identifier for the token; safe to log and audit.
+  string accessor_id = 1;
+
+  // Human-readable token name. Tokens minted via Login are named
+  // `<method>:<principal>` (for example "userpass:alice").
+  string name = 2;
+
+  // Token type: `management` (full access) or `client` (policy-scoped).
+  string token_type = 3;
+
+  // Names of attached policies. Empty for management tokens.
+  repeated string policies = 4;
+
+  // RFC3339 creation timestamp.
+  string created_at = 5;
+
+  // RFC3339 expiry. Omitted when the token never expires.
+  optional string expires_at = 6;
+}
+
+// A named ACL policy.
+//
+// `rules_json` is a JSON array of rule objects:
+//   [{"resources": ["job"], "actions": ["read", "write"],
+//     "namespaces": ["default"], "names": ["web-*"]},
+//    {"resources": ["kv"], "actions": ["read"], "paths": ["team/*"]},
+//    {"resources": ["node"], "actions": ["read"], "pools": ["*"]},
+//    {"resources": ["*"], "actions": ["*"], "effect": "deny",
+//     "paths": ["secret/*"]}]
+//
+// Rule fields:
+// - `resources`: resource types the rule covers (`job`, `node`, `kv`,
+//   `state`, `operator`, `acl`, or `*`).
+// - `actions`: `read`, `write`, or `*`.
+// - `effect`: `allow` (default) or `deny`. A matching deny rule always
+//   overrides any allow.
+// - Optional scope selectors (glob lists matched against the request):
+//   `namespaces` (job namespaces), `names` (job names), `pools` (node
+//   pools), `paths` (KV keys). A rule with a selector only matches requests
+//   that carry that attribute.
+message AclPolicy {
+  // Unique policy name. Tokens reference policies by exact name.
+  string name = 1;
+
+  // Free-form description.
+  string description = 2;
+
+  // JSON array of rules (see message comment for the schema).
+  string rules_json = 3;
+
+  // RFC3339 creation timestamp.
+  string created_at = 4;
+
+  // RFC3339 last-update timestamp.
+  string updated_at = 5;
+}
+
+// Request payload for UpsertAclPolicy.
+message UpsertAclPolicyRequest {
+  // Policy name to create or replace.
+  string name = 1;
+
+  // Free-form description.
+  string description = 2;
+
+  // JSON array of rules (see AclPolicy for the schema). Validated on write.
+  string rules_json = 3;
+}
+
+// Reply payload for UpsertAclPolicy.
+message UpsertAclPolicyReply {
+  // The stored policy.
+  AclPolicy policy = 1;
+}
+
+// Request payload for GetAclPolicy.
+message GetAclPolicyRequest {
+  // Policy name (exact match).
+  string name = 1;
+}
+
+// Reply payload for GetAclPolicy.
+message GetAclPolicyReply {
+  // The requested policy.
+  AclPolicy policy = 1;
+}
+
+// Request payload for ListAclPolicies.
+message ListAclPoliciesRequest {
+}
+
+// Reply payload for ListAclPolicies.
+message ListAclPoliciesReply {
+  // All policies, sorted by name.
+  repeated AclPolicy policies = 1;
+}
+
+// Request payload for DeleteAclPolicy.
+message DeleteAclPolicyRequest {
+  // Policy name (exact match).
+  string name = 1;
+}
+
+// Reply payload for DeleteAclPolicy.
+message DeleteAclPolicyReply {
+  // Human-readable status message.
+  string message = 1;
+}
+
+// Request payload for CreateAclToken.
+message CreateAclTokenRequest {
+  // Human-readable token name.
+  string name = 1;
+
+  // Token type: `management` or `client`. Default when empty: `client`.
+  string token_type = 2;
+
+  // Names of existing policies to attach. Required (non-empty) for client
+  // tokens; must be empty for management tokens.
+  repeated string policies = 3;
+
+  // Optional lifetime (humantime format, for example "720h").
+  //
+  // Default when omitted: the token never expires.
+  optional string ttl = 4;
+}
+
+// Reply payload for CreateAclToken.
+message CreateAclTokenReply {
+  // Metadata for the new token.
+  AclTokenInfo token = 1;
+
+  // The token secret. Returned exactly once; the manager stores only a hash.
+  string secret = 2;
+}
+
+// Request payload for ListAclTokens.
+message ListAclTokensRequest {
+}
+
+// Reply payload for ListAclTokens.
+message ListAclTokensReply {
+  // All tokens (metadata only), newest first.
+  repeated AclTokenInfo tokens = 1;
+}
+
+// Request payload for DeleteAclToken.
+message DeleteAclTokenRequest {
+  // Accessor ID of the token to revoke.
+  string accessor_id = 1;
+}
+
+// Reply payload for DeleteAclToken.
+message DeleteAclTokenReply {
+  // Human-readable status message.
+  string message = 1;
+}
+
+// A username/password ACL user. Never contains password material.
+message AclUser {
+  // Unique username.
+  string username = 1;
+
+  // Names of policies attached to tokens minted when this user logs in.
+  repeated string policies = 2;
+
+  // RFC3339 creation timestamp.
+  string created_at = 3;
+
+  // RFC3339 last-update timestamp.
+  string updated_at = 4;
+}
+
+// Request payload for UpsertAclUser.
+message UpsertAclUserRequest {
+  // Username to create or update.
+  string username = 1;
+
+  // Plaintext password; hashed with argon2id before storage.
+  //
+  // When updating an existing user, an empty password keeps the current one.
+  string password = 2;
+
+  // Names of existing policies granted on login.
+  repeated string policies = 3;
+}
+
+// Reply payload for UpsertAclUser.
+message UpsertAclUserReply {
+  // The stored user.
+  AclUser user = 1;
+}
+
+// Request payload for ListAclUsers.
+message ListAclUsersRequest {
+}
+
+// Reply payload for ListAclUsers.
+message ListAclUsersReply {
+  // All users, sorted by username.
+  repeated AclUser users = 1;
+}
+
+// Request payload for DeleteAclUser.
+message DeleteAclUserRequest {
+  // Username (exact match).
+  string username = 1;
+}
+
+// Reply payload for DeleteAclUser.
+message DeleteAclUserReply {
+  // Human-readable status message.
+  string message = 1;
+}
+
+// === AUTH METHODS & JOIN TOKENS ===
+
+// Request payload for GetAuthMethods.
+message GetAuthMethodsRequest {
+}
+
+// Public metadata for one auth method (no secrets or keys).
+message AuthMethodInfo {
+  // Method name; pass to Login / `legion login --method <name>`.
+  string name = 1;
+
+  // Method kind: `userpass`, `jwt`, `oidc`, `webhook`, or `custom`.
+  string kind = 2;
+
+  // OIDC issuer URL (oidc kind only). Clients run discovery against it.
+  optional string oidc_issuer = 3;
+
+  // OAuth client ID registered for Legion at the identity provider
+  // (oidc kind only). Required for browser/CLI redirect login.
+  optional string oidc_client_id = 4;
+
+  // OAuth scopes to request (oidc kind only). Default: ["openid"].
+  repeated string oidc_scopes = 5;
+}
+
+// Reply payload for GetAuthMethods.
+message GetAuthMethodsReply {
+  // All registered auth methods, in registration order (userpass first).
+  repeated AuthMethodInfo methods = 1;
+}
+
+// Request payload for CreateJoinToken.
+message CreateJoinTokenRequest {
+  // Worker type the token introduces (selects the worker template).
+  //
+  // Default when empty: "default".
+  string worker_type = 1;
+
+  // Optional lifetime (humantime format, for example "24h").
+  //
+  // Default when omitted: 24h. Pass "none" for a non-expiring token
+  // (discouraged; prefer short-lived tokens).
+  optional string ttl = 2;
+
+  // Free-form description shown in ListJoinTokens (for example "rack 12").
+  string description = 3;
+}
+
+// Metadata describing a join token. Never contains the secret.
+message JoinTokenInfo {
+  // Public identifier; the handle used by DeleteJoinToken.
+  string id = 1;
+
+  // Worker type this token introduces.
+  string worker_type = 2;
+
+  // Free-form description.
+  string description = 3;
+
+  // RFC3339 expiry. Omitted when the token never expires.
+  optional string expires_at = 4;
+
+  // RFC3339 creation timestamp.
+  string created_at = 5;
+}
+
+// Reply payload for CreateJoinToken.
+message CreateJoinTokenReply {
+  // Token metadata.
+  JoinTokenInfo info = 1;
+
+  // The composite join token handed to the worker
+  // (`legion join <TOKEN>`). Base64url-encoded JSON carrying the manager
+  // address, the secret, and the worker type. Returned exactly once; the
+  // manager stores only a hash of the embedded secret.
+  string token = 2;
+}
+
+// Request payload for ListJoinTokens.
+message ListJoinTokensRequest {
+}
+
+// Reply payload for ListJoinTokens.
+message ListJoinTokensReply {
+  // All join tokens (metadata only), newest first.
+  repeated JoinTokenInfo tokens = 1;
+}
+
+// Request payload for DeleteJoinToken.
+message DeleteJoinTokenRequest {
+  // Join token ID to revoke.
+  string id = 1;
+}
+
+// Reply payload for DeleteJoinToken.
+message DeleteJoinTokenReply {
+  // Human-readable status message.
   string message = 1;
 }

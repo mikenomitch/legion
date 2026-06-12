@@ -168,6 +168,32 @@ Contract specifics (the rest follows the common pattern above):
 
 This allows normal core builds without paying plugin build cost.
 
+## Plugin-Shaped (Trait Exists, No Dynamic Loading)
+
+### Auth Methods
+
+Identity sources for the ACL system (username/password, JWT, OIDC) implement
+the `AuthMethod` trait in `src/manager/auth_method.rs` — the same
+trait-plus-built-ins shape as the categories above. Custom methods can be
+registered programmatically when embedding Legion as a library
+(`Authenticator::register_method`).
+
+Dynamic `cdylib` loading is deliberately **not** wired for this category.
+Auth methods run inside the manager and decide cluster admission, so a buggy
+or malicious plugin is a full cluster compromise — a much worse failure
+domain than a task or scheduling plugin. If external extensibility is needed,
+the plan is:
+
+1. First, an in-tree `webhook` method type that calls an operator-supplied
+   endpoint (`{credential} -> {principal, policies}`), keeping custom auth
+   code behind a process/network trust boundary.
+2. Only if real demand emerges, a `plugins/auth/<name>/` category exporting
+   `get() -> Box<dyn AuthMethod>` like the other kinds. Token minting,
+   secret hashing, and policy evaluation stay in core regardless; methods
+   can only ever yield policy names, never management access.
+
+See docs/plans/auth-acl-plan.md for the full reasoning.
+
 ## Planned Plugin Categories (Not Implemented Yet)
 
 Based on `docs/TASK-LIST.md`, `README.md`, and `docs/differentiators.md`, these are intended but not present as first-class plugin frameworks today:
@@ -179,5 +205,6 @@ Based on `docs/TASK-LIST.md`, `README.md`, and `docs/differentiators.md`, these 
 - Eval hooks / scheduler reaction hooks.
 - UI extension plugins.
 - Job submit hook plugins.
+- Auth method plugins (webhook-first; see above).
 
 Some similarly named functionality exists in non-plugin form today (for example, resource defaults/validation in `ResourcePolicy`).

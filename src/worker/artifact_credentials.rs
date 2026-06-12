@@ -16,13 +16,21 @@ use crate::structs::{manager_client::ManagerClient, GetArtifactCredentialRequest
 pub struct ManagerCredentialSource {
     manager_addr: String,
     node_id: String,
+    /// Worker-plane credentials; credential fetches require the node token
+    /// when ACLs are enforced.
+    credentials: std::sync::Arc<crate::worker::daemon::WorkerCredentials>,
 }
 
 impl ManagerCredentialSource {
-    pub fn new(manager_addr: String, node_id: String) -> Self {
+    pub fn new(
+        manager_addr: String,
+        node_id: String,
+        credentials: std::sync::Arc<crate::worker::daemon::WorkerCredentials>,
+    ) -> Self {
         Self {
             manager_addr,
             node_id,
+            credentials,
         }
     }
 }
@@ -35,11 +43,13 @@ impl CredentialSource for ManagerCredentialSource {
             .build()
             .context("build credential fetch runtime")?;
         let manager_addr = self.manager_addr.clone();
-        let request = GetArtifactCredentialRequest {
-            node_id: self.node_id.clone(),
-            kv_path: kv_path.to_string(),
-            source: redacted_source.to_string(),
-        };
+        let request = self
+            .credentials
+            .attach(tonic::Request::new(GetArtifactCredentialRequest {
+                node_id: self.node_id.clone(),
+                kv_path: kv_path.to_string(),
+                source: redacted_source.to_string(),
+            }));
         let credential_json = runtime.block_on(async move {
             let channel = tonic::transport::Channel::from_shared(manager_addr)
                 .context("manager address")?

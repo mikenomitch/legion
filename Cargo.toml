@@ -42,6 +42,8 @@ humantime = "2.1.0"
 serde_rusqlite = "0.36.0"
 jsonschema = "0.17.1"
 rand = "0.8.5"
+argon2 = "0.5.3"
+base64 = "0.22"
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["json", "env-filter"] }
 tracing-futures = "0.2.5"
@@ -68,7 +70,6 @@ libc = "0.2"
 object_store = { version = "0.11.2", features = ["aws"] }
 tar = "0.4"
 flate2 = "1.0"
-base64 = "0.22"
 oci-client = { version = "0.15", default-features = false, features = ["rustls-tls"] }
 openraft = "0.9.21"
 rustyriver = "0.1.0"
