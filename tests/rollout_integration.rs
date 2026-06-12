@@ -91,6 +91,7 @@ fn mark_active_rollout_replacements_healthy(store: &Store, job_id: &str) -> R<()
                     allocation_id: allocation.id,
                     healthy: true,
                     status: "integration healthy".into(),
+                    artifact_states: None,
                 }],
             )?;
         }

@@ -4,6 +4,7 @@ import { DetailBadge, DetailSection } from './DetailPrimitives'
 import type { LedgerAllocation, LedgerNode, NodeMsg } from '../gen/legion_pb'
 import { formatRelativeTime } from '../utils/format'
 import { summarizeHealthChecks } from '../utils/health'
+import { parseArtifactStates } from '../utils/jobspec'
 
 export interface NodeDeepViewProps {
   nodes: Resource<readonly NodeMsg[] | undefined>
@@ -554,28 +555,39 @@ export default function NodeDeepView(props: NodeDeepViewProps) {
                   <Show when={allocations().length > 0} fallback={<p class="text-sm text-neutral-500">No allocations assigned.</p>}>
                     <div class="space-y-2">
                       <For each={allocations()}>
-                        {(allocation) => (
-                          <div class="rounded border border-neutral-200 bg-white px-3 py-2 text-sm text-neutral-800 dark:border-neutral-700 dark:bg-neutral-950/60 dark:text-neutral-200">
-                            <div class="flex flex-wrap items-center justify-between gap-2">
-                              <span class="font-semibold">Allocation #{String(allocation.id)}</span>
-                              <DetailBadge tone="neutral">{allocation.status || 'Unknown'}</DetailBadge>
+                        {(allocation) => {
+                          const artifactRows = parseArtifactStates(allocation.artifactStates)
+                          const unstagedCount = artifactRows.filter((row) => row.state !== 'staged').length
+                          return (
+                            <div class="rounded border border-neutral-200 bg-white px-3 py-2 text-sm text-neutral-800 dark:border-neutral-700 dark:bg-neutral-950/60 dark:text-neutral-200">
+                              <div class="flex flex-wrap items-center justify-between gap-2">
+                                <span class="font-semibold">Allocation #{String(allocation.id)}</span>
+                                <span class="flex flex-wrap items-center gap-2">
+                                  <Show when={unstagedCount > 0}>
+                                    <DetailBadge tone={artifactRows.some((row) => row.state === 'failed') ? 'danger' : 'warning'}>
+                                      staging artifacts ({unstagedCount})
+                                    </DetailBadge>
+                                  </Show>
+                                  <DetailBadge tone="neutral">{allocation.status || 'Unknown'}</DetailBadge>
+                                </span>
+                              </div>
+                              <div class="mt-2 flex flex-wrap gap-2 text-xs text-neutral-600 dark:text-neutral-400">
+                                <span class="rounded border border-neutral-200 bg-neutral-50 px-2 py-1 dark:border-neutral-800 dark:bg-neutral-900">
+                                  Job <A class="underline" href={`/jobs/${encodeURIComponent(allocation.jobId || '')}`}>{allocation.jobId || '—'}</A>
+                                </span>
+                                <span class="rounded border border-neutral-200 bg-neutral-50 px-2 py-1 dark:border-neutral-800 dark:bg-neutral-900">
+                                  Spec{' '}
+                                  <A class="underline" href={`/jobs/${encodeURIComponent(allocation.jobId || '')}/specs/${encodeURIComponent(allocation.jobConfigId || '')}`}>
+                                    {allocation.jobConfigId || '—'}
+                                  </A>
+                                </span>
+                                <span class="rounded border border-neutral-200 bg-neutral-50 px-2 py-1 dark:border-neutral-800 dark:bg-neutral-900">
+                                  Task Config {allocation.taskConfigId ? String(allocation.taskConfigId) : '—'}
+                                </span>
+                              </div>
                             </div>
-                            <div class="mt-2 flex flex-wrap gap-2 text-xs text-neutral-600 dark:text-neutral-400">
-                              <span class="rounded border border-neutral-200 bg-neutral-50 px-2 py-1 dark:border-neutral-800 dark:bg-neutral-900">
-                                Job <A class="underline" href={`/jobs/${encodeURIComponent(allocation.jobId || '')}`}>{allocation.jobId || '—'}</A>
-                              </span>
-                              <span class="rounded border border-neutral-200 bg-neutral-50 px-2 py-1 dark:border-neutral-800 dark:bg-neutral-900">
-                                Spec{' '}
-                                <A class="underline" href={`/jobs/${encodeURIComponent(allocation.jobId || '')}/specs/${encodeURIComponent(allocation.jobConfigId || '')}`}>
-                                  {allocation.jobConfigId || '—'}
-                                </A>
-                              </span>
-                              <span class="rounded border border-neutral-200 bg-neutral-50 px-2 py-1 dark:border-neutral-800 dark:bg-neutral-900">
-                                Task Config {allocation.taskConfigId ? String(allocation.taskConfigId) : '—'}
-                              </span>
-                            </div>
-                          </div>
-                        )}
+                          )
+                        }}
                       </For>
                     </div>
                   </Show>

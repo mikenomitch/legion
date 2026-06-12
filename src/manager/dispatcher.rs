@@ -113,6 +113,13 @@ pub fn build_task_allocation(task: &TaskConfig, allocation: &Allocation) -> R<Ta
     let task_config = serde_json::to_string(&task.config)?;
     let task_checks = serde_json::to_string(&task.checks)?;
     let task_on_unhealthy = serde_json::to_string(&task.on_unhealthy)?;
+    // Empty string (not "[]") when no artifacts: jobs without artifacts stay
+    // byte-identical on the wire.
+    let task_artifacts = if task.artifacts.is_empty() {
+        String::new()
+    } else {
+        serde_json::to_string(&task.artifacts)?
+    };
     Ok(TaskAllocation {
         allocation_id: allocation.id,
         job_id: allocation.job_id.clone(),
@@ -124,6 +131,7 @@ pub fn build_task_allocation(task: &TaskConfig, allocation: &Allocation) -> R<Ta
         task_config,
         task_checks,
         task_on_unhealthy,
+        task_artifacts,
     })
 }
 

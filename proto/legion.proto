@@ -163,6 +163,19 @@ service Manager {
   // Returns current non-expired lock state for a KV key.
   rpc GetKvLock (GetKvLockRequest) returns (GetKvLockReply);
 
+  // Resolves an artifact credential stored in KV for a worker about to fetch.
+  //
+  // Called by workers over their existing authenticated manager channel
+  // immediately before fetching an artifact whose spec (or cluster default)
+  // names a KV credential path. The credential value is returned to the
+  // worker and is never persisted on allocations, logged, or traced.
+  //
+  // SECURITY: KV ACLs do not exist yet, so any task spec may reference any
+  // KV path via `auth.kv`. When the ACL system lands, this RPC is the
+  // enforcement point for artifact credential reads (see docs/artifacts.md).
+  rpc GetArtifactCredential (GetArtifactCredentialRequest)
+    returns (GetArtifactCredentialReply);
+
   // Executes a SQL statement directly against the manager state store.
   //
   // Read-only mode is the default safety behavior and rejects write statements
@@ -247,6 +260,15 @@ message WorkerConfig {
   //
   // Default: unset (no explicit max allocation cap).
   optional uint32 max_allocations = 8;
+
+  // JSON-encoded artifact fetch settings for this worker.
+  //
+  // Shape: `{"fetch":{"parallelism":4,"attempts":3,"timeout":"10m",
+  //          "maxArtifactSize":"50GiB","allowedSchemes":["https","s3",
+  //          "oci","git","file"]}}`.
+  //
+  // Default: empty string (worker applies conservative built-in defaults).
+  string artifacts = 9;
 }
 
 // Reply payload for WorkerPreRegister.
@@ -513,6 +535,15 @@ message RolloutAllocationStatus {
 
   // Optional allocation health status text from latest worker snapshot.
   optional string allocation_health = 11;
+
+  // Optional JSON-encoded per-artifact staging states from the latest worker
+  // snapshot. Same payload as `AllocationHealth.artifact_states`: an array of
+  // `{"name","source","state","bytesFetched","bytesTotal","digest",
+  //   "attempts","durationMs","error"}` objects.
+  //
+  // Unset when the allocation's task declares no artifacts or no snapshot
+  // has been received yet.
+  optional string artifact_states = 12;
 }
 
 // Group-level rollout status.
@@ -877,6 +908,15 @@ message FailedAllocation {
 
   // Failure reason text.
   string reason = 2;
+
+  // JSON-encoded final per-artifact staging states when the failure was an
+  // artifact staging failure (same payload as
+  // `AllocationHealth.artifact_states`). The manager turns failed rows into
+  // `artifact.failed` scheduler events with per-artifact detail (redacted
+  // source, error, attempts) instead of parsing the reason text.
+  //
+  // Unset for non-artifact failures.
+  optional string artifact_states = 3;
 }
 
 // Allocation health snapshot item from worker to manager.
@@ -889,6 +929,20 @@ message AllocationHealth {
 
   // Human-readable health status details.
   string status = 3;
+
+  // JSON-encoded per-artifact staging states for this allocation.
+  //
+  // Array of objects, one per declared artifact:
+  // `[{"name":"tool","source":"https://…","state":"fetching",
+  //    "bytesFetched":123,"bytesTotal":456,"digest":"sha256:…",
+  //    "attempts":1,"durationMs":412,"error":"…"}]`.
+  // States progress `pending` -> `fetching` -> `verifying` -> `staged`,
+  // or end in `failed`. Sources are redacted (no userinfo or query secrets)
+  // and errors reference auth *sources* (KV path or identity name), never
+  // credential values.
+  //
+  // Unset when the task declares no artifacts.
+  optional string artifact_states = 4;
 }
 
 // Request payload for HealthCheck.
@@ -1570,6 +1624,38 @@ message GetKvLockReply {
   optional KvLock lock = 1;
 }
 
+// Request payload for GetArtifactCredential.
+message GetArtifactCredentialRequest {
+  // Worker/node ID requesting the credential.
+  //
+  // Used for audit logging only; the credential value itself is never logged.
+  string node_id = 1;
+
+  // KV path holding the credential value (for example: "secrets/ghcr-pull").
+  //
+  // The KV value must be a JSON object with a `type` discriminator:
+  // `{"type":"basic","username":"…","password":"…"}`,
+  // `{"type":"bearer","token":"…"}`,
+  // `{"type":"aws","accessKeyId":"…","secretAccessKey":"…","sessionToken":"…",
+  //   "region":"…","endpoint":"…"}`, or
+  // `{"type":"headers","headers":{"X-Api-Key":"…"}}`.
+  string kv_path = 2;
+
+  // Redacted artifact source the credential will be used for.
+  //
+  // Audit context only (scheme://host/path with userinfo and query stripped).
+  string source = 3;
+}
+
+// Reply payload for GetArtifactCredential.
+message GetArtifactCredentialReply {
+  // JSON-encoded credential value read from KV at request time.
+  //
+  // Returned to the worker for immediate use; never persisted on allocation
+  // rows. Rotating the KV value affects the next fetch with no job changes.
+  string credential_json = 1;
+}
+
 // Request payload for QueryStateStore.
 message QueryStateStoreRequest {
   // SQL statement to execute.
@@ -1735,6 +1821,13 @@ message LedgerAllocation {
 
   // Job ID this allocation belongs to.
   string job_id = 7;
+
+  // Optional JSON-encoded per-artifact staging states from the latest worker
+  // health snapshot. Same payload as `AllocationHealth.artifact_states`.
+  //
+  // Unset when the allocation's task declares no artifacts or no snapshot
+  // has been received yet.
+  optional string artifact_states = 8;
 }
 
 // Request payload for UpdateNodeDynamic.
@@ -2092,6 +2185,18 @@ message TaskAllocation {
 
   // JSON-encoded task unhealthy handling policy.
   string task_on_unhealthy = 10;
+
+  // JSON-encoded list of normalized artifact specs for this task.
+  //
+  // This is the post-admission form: kind-implicit artifacts (for example a
+  // container `image`) are already desugared in, `resolve: "pin"` references
+  // are already pinned to digests, and cluster-level auth matchers are
+  // already applied. Workers stage exactly this list and never re-derive or
+  // re-resolve artifacts.
+  //
+  // Empty string when the task declares no artifacts (the staging step is
+  // skipped entirely).
+  string task_artifacts = 11;
 }
 
 // Request payload for PostWork.

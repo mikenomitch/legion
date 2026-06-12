@@ -8,7 +8,7 @@ const RECONNECT_DELAY_MS = 2000
 
 type ConnectionState = 'connecting' | 'live' | 'reconnecting'
 
-const KIND_CATEGORIES = ['scheduler', 'eval', 'allocation', 'node', 'job', 'rollout'] as const
+const KIND_CATEGORIES = ['scheduler', 'eval', 'allocation', 'artifact', 'node', 'job', 'rollout'] as const
 
 const levelClasses = (level: string): string => {
   if (level === 'error') {

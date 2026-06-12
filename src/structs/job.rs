@@ -10,6 +10,7 @@ use tabled::Tabled;
 
 use crate::prelude::{bail, R};
 
+use super::artifact::{validate_task_artifacts, ArtifactSpec};
 use super::workload_identity::{validate_identities, WorkloadIdentity};
 use super::{Job, PlannedAllocation, Submission};
 
@@ -849,6 +850,11 @@ pub struct TaskConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[tabled(skip)]
     pub identities: Vec<WorkloadIdentity>,
+    /// Artifacts fetched into the task directory before start (artifact
+    /// system plan). Empty = today's behavior; staging is skipped entirely.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[tabled(skip)]
+    pub artifacts: Vec<ArtifactSpec>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -984,6 +990,8 @@ struct TaskConfigInput {
     kv_injections: Option<TaskKvInjections>,
     #[serde(default)]
     identities: Vec<WorkloadIdentity>,
+    #[serde(default)]
+    artifacts: Vec<ArtifactSpec>,
 }
 
 #[derive(Deserialize)]
@@ -1049,6 +1057,7 @@ impl TaskConfigInput {
                 }
             }),
             identities: self.identities,
+            artifacts: self.artifacts,
         }
     }
 }
@@ -1203,6 +1212,7 @@ impl TaskConfig {
             on_unhealthy: TaskOnUnhealthyConfig::default(),
             kv_injections: None,
             identities: Vec::new(),
+            artifacts: Vec::new(),
         }
     }
 
@@ -1220,6 +1230,18 @@ impl TaskConfig {
     /// workload-identity OIDC plan). No identities = today's behavior.
     pub fn validate_identities(&self) -> R<()> {
         validate_identities(&self.name, &self.identities, self.is_stateful())
+    }
+
+    /// Validate artifacts declared on this task (artifact system plan):
+    /// spec shape, name uniqueness, `${artifact.<name>}` references in the
+    /// kind config, and `auth.identity` references. No artifacts = today's
+    /// behavior. Cluster-scoped rules (scheme allowlist, nodeIdentity names)
+    /// are enforced at admission where manager config is available.
+    pub fn validate_artifacts(&self) -> R<()> {
+        if self.artifacts.is_empty() {
+            return Ok(());
+        }
+        validate_task_artifacts(&self.name, &self.artifacts, &self.config, &self.identities)
     }
 
     pub fn validate_checks(&self) -> R<()> {
