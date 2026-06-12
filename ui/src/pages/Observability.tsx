@@ -130,6 +130,8 @@ function formatLogTimestamp(value: unknown): string {
   if (Number.isNaN(date.getTime())) {
     return toStringValue(value) ?? ''
   }
+  // `fractionalSecondDigits` is valid at runtime but missing from the ES2020
+  // DateTimeFormatOptions typings this project targets, hence the cast.
   return date.toLocaleString(undefined, {
     month: '2-digit',
     day: '2-digit',
@@ -137,7 +139,7 @@ function formatLogTimestamp(value: unknown): string {
     minute: '2-digit',
     second: '2-digit',
     fractionalSecondDigits: 3,
-  })
+  } as Intl.DateTimeFormatOptions)
 }
 
 function makeLogSignalUid(raw: string, timestampMs: number | undefined): string {

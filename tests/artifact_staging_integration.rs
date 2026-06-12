@@ -166,6 +166,8 @@ fn task_allocation(
         task_config: config.to_string(),
         task_checks: String::new(),
         task_on_unhealthy: String::new(),
+        task_identities: String::new(),
+        self_terminate_after_seconds: 0,
         task_artifacts: artifacts.to_string(),
     }
 }
@@ -497,8 +499,9 @@ async fn admission_normalizes_artifacts_and_preserves_plain_jobs() -> R<()> {
         job_config_id: job_config_id.clone(),
         task_config_id: 1,
         job_id: "artifact-admission-job".into(),
+        instance_id: None,
     };
-    let dispatched = build_task_allocation(with_artifacts, &allocation)?;
+    let dispatched = build_task_allocation(with_artifacts, &allocation, None)?;
     assert!(dispatched.task_artifacts.contains("secrets/private-pull"));
 
     let plain = tasks
@@ -507,7 +510,7 @@ async fn admission_normalizes_artifacts_and_preserves_plain_jobs() -> R<()> {
         .find(|task| task.name == "plain")
         .context("plain task")?;
     assert!(plain.artifacts.is_empty());
-    let dispatched_plain = build_task_allocation(plain, &allocation)?;
+    let dispatched_plain = build_task_allocation(plain, &allocation, None)?;
     assert_eq!(dispatched_plain.task_artifacts, "");
     Ok(())
 }

@@ -20,6 +20,8 @@ struct LedgerJsonAllocation {
     resources: Value,
     task_config_id: i64,
     job_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    instance_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -47,6 +49,7 @@ impl From<&Allocation> for LedgerJsonAllocation {
             resources: allocation.resources.clone(),
             task_config_id: allocation.task_config_id,
             job_id: allocation.job_id.clone(),
+            instance_id: allocation.instance_id.clone(),
         }
     }
 }

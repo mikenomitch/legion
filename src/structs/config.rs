@@ -7,9 +7,9 @@ use serde_json::Value;
 pub const DEF_SCHEDULER_AUTO_ANTI_AFFINITY_WEIGHT: f64 = 0.2;
 
 use crate::prelude::{
-    bail, Context, DEF_EVAL_PRIORITY, DEF_MANAGER_HOSTNAME, DEF_MANAGER_INSECURE_PORT,
-    DEF_MANAGER_SERVER_PORT, DEF_ROLLOUT_RETENTION_DAYS, DEF_SCHEDULING_POLICY, DEF_STORE_PATH,
-    DEF_WORKER_CHECK_SEC, DEF_WORKER_CONFIG_PATH, R,
+    bail, Context, DEF_EVAL_PRIORITY, DEF_KV_DEBOUNCE_MS, DEF_MANAGER_HOSTNAME,
+    DEF_MANAGER_INSECURE_PORT, DEF_MANAGER_SERVER_PORT, DEF_ROLLOUT_RETENTION_DAYS,
+    DEF_SCHEDULING_POLICY, DEF_STORE_PATH, DEF_WORKER_CHECK_SEC, DEF_WORKER_CONFIG_PATH, R,
 };
 use crate::structs::workload_identity::NodeIdentityConfig;
 
@@ -32,6 +32,11 @@ pub struct ManagerConfig {
     pub scheduling_policy: Option<String>,
     pub default_priority: Option<i64>,
     pub rollout_retention_days: Option<u64>,
+    /// Debounce window in milliseconds for KV-driven job reconciliation.
+    /// Rapid puts/deletes to watched keys within the window are coalesced
+    /// into a single update per job. `0` disables debouncing (every KV write
+    /// reconciles synchronously). Defaults to [`DEF_KV_DEBOUNCE_MS`].
+    pub kv_debounce_ms: Option<u64>,
     pub scheduler_settings: Option<Value>,
     pub task_resource_defaults: Option<Value>,
     pub custom_resources: Option<Value>,
@@ -192,6 +197,26 @@ pub struct WorkloadIdentityConfigFull {
     pub node_identities: Vec<NodeIdentityConfig>,
 }
 
+impl WorkloadIdentityConfigFull {
+    /// Default token lifetime when an identity does not set its own `ttl`.
+    pub fn parsed_default_ttl(&self) -> Duration {
+        parse_humantime_or(&self.default_ttl, DEF_WORKLOAD_IDENTITY_TTL)
+    }
+
+    /// How old the active signing key may get before the rotation loop
+    /// rotates it.
+    pub fn parsed_rotation_age(&self) -> Duration {
+        parse_humantime_or(&self.rotation_age, DEF_WORKLOAD_IDENTITY_ROTATION_AGE)
+    }
+}
+
+fn parse_humantime_or(raw: &str, fallback: &str) -> Duration {
+    raw.parse::<humantime::Duration>()
+        .or_else(|_| fallback.parse::<humantime::Duration>())
+        .map(Into::into)
+        .unwrap_or(Duration::from_secs(900))
+}
+
 impl Default for WorkloadIdentityConfigFull {
     fn default() -> Self {
         WorkloadIdentityConfigFull {
@@ -330,6 +355,8 @@ pub struct ManagerConfigFull {
     pub scheduling_policy: String,
     pub default_priority: i64,
     pub rollout_retention_days: u64,
+    #[serde(default = "default_kv_debounce_ms")]
+    pub kv_debounce_ms: u64,
     pub scheduler_settings: Option<Value>,
     pub task_resource_defaults: Option<Value>,
     pub custom_resources: Option<Value>,
@@ -434,6 +461,7 @@ impl From<ManagerConfigFull> for ManagerConfig {
             scheduling_policy: Some(val.scheduling_policy),
             default_priority: Some(val.default_priority),
             rollout_retention_days: Some(val.rollout_retention_days),
+            kv_debounce_ms: Some(val.kv_debounce_ms),
             scheduler_settings: val.scheduler_settings,
             task_resource_defaults: val.task_resource_defaults,
             custom_resources: val.custom_resources,
@@ -472,6 +500,7 @@ impl ManagerConfig {
             rollout_retention_days: self
                 .rollout_retention_days
                 .unwrap_or(DEF_ROLLOUT_RETENTION_DAYS),
+            kv_debounce_ms: self.kv_debounce_ms.unwrap_or(DEF_KV_DEBOUNCE_MS),
             scheduler_settings: self.scheduler_settings.clone(),
             task_resource_defaults: self.task_resource_defaults.clone(),
             custom_resources: self.custom_resources.clone(),
@@ -504,6 +533,7 @@ impl Default for ManagerConfigFull {
             scheduling_policy: DEF_SCHEDULING_POLICY.into(),
             default_priority: DEF_EVAL_PRIORITY,
             rollout_retention_days: DEF_ROLLOUT_RETENTION_DAYS,
+            kv_debounce_ms: DEF_KV_DEBOUNCE_MS,
             scheduler_settings: None,
             task_resource_defaults: None,
             custom_resources: None,
@@ -693,6 +723,10 @@ impl From<StreamingObjectStorageLeaseConfigFull> for StreamingObjectStorageLease
             secret_access_key: value.secret_access_key,
         }
     }
+}
+
+fn default_kv_debounce_ms() -> u64 {
+    DEF_KV_DEBOUNCE_MS
 }
 
 fn default_eval_threads() -> usize {

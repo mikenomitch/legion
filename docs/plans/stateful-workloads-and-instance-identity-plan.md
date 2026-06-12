@@ -144,7 +144,7 @@ Invariants:
   reattached on every subsequent allocation for that instance.
 - The task-launch pipeline mounts/links the handle before the process starts; on
   reschedule to a new node the same handle is reattached (semantics depend on the
-  future storage driver — e.g. local-dir handles are node-affine and constrain
+  future storage driver — e.g. local-dir handles are node-local and constrain
   placement, network handles are not).
 - This plan defines the *contract* (instance → handle, attach-before-start,
   detach-on-stop); concrete drivers are a follow-up (see Non-Goals).
@@ -247,7 +247,7 @@ plan's stateful `sub` variant can be implemented.
    `instances` table; add `instance_id` column to allocations.
 4. **Scheduler** ([src/manager/scheduler.rs](../../src/manager/scheduler.rs)) — slot
    assignment/reuse on placement; storage-handle reattachment; node constraints for
-   node-affine handles.
+   node-local handles.
 5. **Env injection** — emit the `LEGION_INSTANCE_*` vars in the task-launch pipeline.
 6. **Docs** — new `docs/stateful-workloads.md`; cross-link from README and the WI doc.
 

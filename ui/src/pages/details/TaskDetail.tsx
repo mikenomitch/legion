@@ -102,6 +102,15 @@ export default function TaskDetail() {
                   <p class="text-xs uppercase tracking-wide text-neutral-500">Task kind</p>
                   <p class="mt-1 font-semibold">{data()!.taskSpec!.kind}</p>
                 </div>
+                <Show when={data()!.taskSpec!.stateful}>
+                  <div class="rounded border border-neutral-200 p-3 dark:border-neutral-700">
+                    <p class="text-xs uppercase tracking-wide text-neutral-500">Stateful</p>
+                    <p class="mt-1"><DetailBadge tone="neutral">stateful · {data()!.taskSpec!.stateful!.mode}</DetailBadge></p>
+                    <Show when={data()!.taskSpec!.stateful!.storagePath}>
+                      <p class="mt-1 font-mono text-xs text-neutral-500" title="Persistent storage path">{data()!.taskSpec!.stateful!.storagePath}</p>
+                    </Show>
+                  </div>
+                </Show>
                 <div class="rounded border border-neutral-200 p-3 dark:border-neutral-700">
                   <p class="text-xs uppercase tracking-wide text-neutral-500">Dependencies</p>
                   <Show when={data()!.taskSpec!.dependsOn.length > 0} fallback={<p class="mt-1 text-sm text-neutral-500">No dependencies.</p>}>

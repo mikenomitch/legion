@@ -11,6 +11,12 @@ pub struct PersistedAllocation {
     pub allocation: Allocation,
     pub task: TaskConfig,
     pub pid: Option<u32>,
+    /// Self-fence window in seconds (`TaskAllocation.self_terminate_after_seconds`):
+    /// kill this allocation after losing manager contact for this long.
+    /// Persisted so the watchdog keeps protecting restored allocations after
+    /// a worker restart. `None`/absent = stateless allocation, no fencing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_terminate_after_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone)]

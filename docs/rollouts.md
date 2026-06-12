@@ -47,13 +47,16 @@ See a full example in `configs/jobs/maximal.jsonnet`.
 | `rollbackOnFailure` | `bool` | `false` | If true, `fail` actions trigger rollback. |
 | `onHealthDeadline` | `rollback \| fail \| pause` | `rollback` | Action when `healthyDeadline` expires. |
 | `batchKillAfter` | `duration` | unset | For batch tasks, maximum wait before active old allocations are force-retired during rollout. |
+| `slots.order` | `parallel \| sequential` | `parallel` | Slot-mode stateful groups only. `sequential` replaces one slot per step, highest ordinal first, each step health-gated. |
+| `slots.updateFrom` | `u32` | unset | Slot-mode stateful groups only. Staged rollout floor: only slots `>= updateFrom` are updated; lower slots keep their current allocations. Requires `slots.order: sequential` and must be `< count.num`. |
 
 ### Group override semantics
 
 - `rolloutByGroup` is keyed by task group name.
 - Unknown groups are rejected by validation.
 - Group overrides are merged onto global rollout config.
-- If a group override sets any step mode, it replaces the global step mode selection.
+- If a group override sets any step mode, it replaces the global step mode selection (and clears a global sequential `slots` block).
+- If a group override sets a sequential `slots` block, it replaces the global step mode selection; a `slots` override always replaces the global `slots` block as a unit.
 
 ## Validation rules
 
@@ -68,6 +71,8 @@ Rollout validation runs in `JobConfig::validate_rollout` and `validate_job_confi
 - `countSteps` must be non-empty and all values `>= 1`.
 - `capacityBlockTimeout` and `healthyDeadline` must be greater than zero when set.
 - `rollout.strategy` and each `rolloutByGroup.<group>.strategy` are validated at submit time.
+- `slots.order: sequential` cannot be combined with a step mode in the same scope.
+- `slots` is only valid for groups with a slot-mode stateful task; `slots.updateFrom` requires `slots.order: sequential` and must be less than the slot task's `count.num`.
 
 ## Step semantics
 
@@ -85,6 +90,26 @@ For each group, step fractions are applied to each task in that group:
 - Per-task target at each step is `ceil(task_desired * step_fraction)`.
 
 This keeps sidecars and primary tasks in the same group progressing together.
+
+## Ordered and staged slot rollouts (stateful groups)
+
+Groups with a slot-mode stateful task can opt into ordinal-aware rollouts:
+
+```jsonnet
+rollout: {
+  slots: {
+    order: 'sequential',  // one slot per step, highest ordinal first, health-gated
+    updateFrom: 2,        // optional: only slots >= 2 are updated (staged/canary)
+  },
+}
+```
+
+- `order: 'sequential'` is the K8s StatefulSet `OrderedReady` update analog: one slot per step, `count-1 → 0`, the next slot only after the previous replacement passes the health gate. An unhealthy replacement halts the rollout at that slot (standard failure semantics apply: wait, or `onHealthDeadline` when `healthyDeadline` is set).
+- `updateFrom` is the K8s `partition` analog: the rollout completes with slots below the floor still running their previous config; resubmitting with a lower floor updates the remaining slots (canary-promote).
+- Each slot's replacement re-binds the same instance id and storage handle; replacement is always stop-then-start (`createFirst` is rejected for stateful groups).
+- Rollout events name the slot per step; `GetRolloutStatus` `total_steps` equals the number of slots being updated.
+
+Full semantics, the canary-promote walkthrough, and validation rules: [stateful-workloads.md](stateful-workloads.md) "Ordered rollouts for slot pools".
 
 ## Replacement behavior
 

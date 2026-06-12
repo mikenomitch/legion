@@ -12,16 +12,20 @@
 //!   serves the JWKS, and emits the discovery document.
 //!
 //! The private key is never serialized into a token or RPC reply: only the
-//! public JWK leaves this module.
+//! public JWK leaves this module. Keys *are* persisted (private PEM included)
+//! in the manager's SQLite `signing_key` table — the same trust domain as the
+//! CA material — which is what keeps externally-held tokens verifiable across
+//! manager restarts. [`Issuer::load_or_generate`] restores the key set on
+//! boot; [`Issuer::rotate_persisted`] / [`Issuer::expire_keys_persisted`]
+//! write lifecycle transitions through to the store and are driven by the
+//! rotation loop in `crate::manager::agent`.
 //!
-//! What this module deliberately does *not* yet do (deferred phases, see the
-//! plan): mount the discovery/JWKS routes on the manager's TLS listener
-//! (Phase 1 wiring), the `IssueWorkloadIdentityToken` gRPC (Phase 2), worker
-//! delivery/refresh (Phase 4), SQLite key persistence, and the background
-//! rotation loop (Phase 5). The primitives here are built so those phases are
-//! wiring, not redesign — [`Issuer::rotate`] / [`Issuer::expire_keys`] already
-//! implement the rotation state machine a loop would drive.
+//! [`WorkloadIdentityState`] bundles the issuer with its config for the three
+//! consumers that share it: the `IssueWorkloadIdentityToken` RPC
+//! (`crate::manager::server`), the public discovery/JWKS HTTP routes
+//! (`crate::manager::oidc_http`), and the rotation loop.
 
+use std::sync::RwLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
@@ -30,9 +34,12 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
 use crate::prelude::*;
+use crate::storage::store::Store;
 use crate::structs::workload_identity::{
-    WorkloadIdentity, WorkloadIdentityClaims, CONTROL_PLANE_IDENTITY_NAME,
+    is_protected_claim_key, SigningKeyRecord, WorkloadIdentity, WorkloadIdentityClaims,
+    CONTROL_PLANE_IDENTITY_NAME,
 };
+use crate::structs::{Allocation, TaskConfig, WorkloadIdentityConfigFull};
 
 /// Standard OIDC discovery route.
 pub const DISCOVERY_PATH: &str = "/.well-known/openid-configuration";
@@ -47,6 +54,25 @@ pub enum KeyState {
     Active,
     Retiring,
     Expired,
+}
+
+impl KeyState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            KeyState::Active => "active",
+            KeyState::Retiring => "retiring",
+            KeyState::Expired => "expired",
+        }
+    }
+
+    pub fn parse(raw: &str) -> R<Self> {
+        match raw {
+            "active" => Ok(KeyState::Active),
+            "retiring" => Ok(KeyState::Retiring),
+            "expired" => Ok(KeyState::Expired),
+            other => bail!("unknown signing key state {other:?}"),
+        }
+    }
 }
 
 /// An ES256 signing key plus its public JWK material.
@@ -100,6 +126,42 @@ impl SigningKey {
         })
     }
 
+    /// The persisted form of this key (private PEM included; the store is the
+    /// manager's trust domain — see the `signing_key` migration comment).
+    pub fn to_record(&self) -> SigningKeyRecord {
+        SigningKeyRecord {
+            kid: self.kid.clone(),
+            alg: "ES256".into(),
+            private_key_pem: self.private_pem.clone(),
+            public_jwk_x: self.x.clone(),
+            public_jwk_y: self.y.clone(),
+            created_at: self.created_at,
+            not_after: self.not_after,
+            state: self.state.as_str().into(),
+        }
+    }
+
+    /// Restore a key from its persisted form.
+    pub fn from_record(record: &SigningKeyRecord) -> R<Self> {
+        if record.alg != "ES256" {
+            bail!(
+                "signing key {} has unsupported algorithm {:?} (only ES256 is implemented)",
+                record.kid,
+                record.alg
+            );
+        }
+        Ok(Self {
+            kid: record.kid.clone(),
+            alg: Algorithm::ES256,
+            private_pem: record.private_key_pem.clone(),
+            x: record.public_jwk_x.clone(),
+            y: record.public_jwk_y.clone(),
+            created_at: record.created_at,
+            not_after: record.not_after,
+            state: KeyState::parse(&record.state)?,
+        })
+    }
+
     fn encoding_key(&self) -> R<EncodingKey> {
         EncodingKey::from_ec_pem(self.private_pem.as_bytes())
             .context("failed to load signing key as ES256 encoding key")
@@ -149,6 +211,14 @@ pub struct Issuer {
     issuer_url: String,
     jwks_path: String,
     default_ttl: Duration,
+    /// The largest lifetime any single token may have, equal to the rotation
+    /// overlap window `max(rotationAge, defaultTtl)`. A token's `exp` is clamped
+    /// to at most `now + max_token_ttl` (P1): a long-TTL identity signed just
+    /// before rotation would otherwise outlive its signing key's `not_after`
+    /// (the key's overlap window is exactly this long) and become
+    /// valid-but-unverifiable once the key expires. Clamping `exp` at issuance
+    /// guarantees every token a key signs expires inside that key's overlap.
+    max_token_ttl: Duration,
     /// Cluster-default `sub` template; `None` means use the built-in default.
     sub_template: Option<String>,
     /// Active key first, then any retiring keys still inside their overlap window.
@@ -156,11 +226,36 @@ pub struct Issuer {
 }
 
 impl Issuer {
-    /// Create an issuer with a freshly generated active key.
+    /// Create an issuer with a freshly generated active key (in-memory only;
+    /// production paths use [`Issuer::load_or_generate`] so keys survive
+    /// manager restarts).
     pub fn new(
         issuer_url: impl Into<String>,
         jwks_path: impl Into<String>,
         default_ttl: Duration,
+        sub_template: Option<String>,
+        now: SystemTime,
+    ) -> R<Self> {
+        Self::new_with_max_ttl(
+            issuer_url,
+            jwks_path,
+            default_ttl,
+            default_ttl,
+            sub_template,
+            now,
+        )
+    }
+
+    /// Like [`Issuer::new`], but with an explicit `max_token_ttl` (the rotation
+    /// overlap window). Production paths derive `max_token_ttl` from the
+    /// manager config (`max(rotationAge, defaultTtl)`); the simple [`Issuer::new`]
+    /// uses `default_ttl` for both, which is correct for tests that never set a
+    /// per-identity TTL above the default.
+    pub fn new_with_max_ttl(
+        issuer_url: impl Into<String>,
+        jwks_path: impl Into<String>,
+        default_ttl: Duration,
+        max_token_ttl: Duration,
         sub_template: Option<String>,
         now: SystemTime,
     ) -> R<Self> {
@@ -169,8 +264,75 @@ impl Issuer {
             issuer_url: issuer_url.into(),
             jwks_path: jwks_path.into(),
             default_ttl,
+            max_token_ttl,
             sub_template,
             keys: vec![key],
+        })
+    }
+
+    /// Create an issuer backed by the store: restore all non-expired signing
+    /// keys, or generate **and persist** the first active key on first boot.
+    /// This is what keeps tokens held by third parties verifiable across
+    /// manager restarts — the JWKS keeps publishing the same public keys and
+    /// the same private key keeps signing.
+    pub fn load_or_generate(
+        store: &Store,
+        issuer_url: impl Into<String>,
+        jwks_path: impl Into<String>,
+        default_ttl: Duration,
+        sub_template: Option<String>,
+        now: SystemTime,
+    ) -> R<Self> {
+        Self::load_or_generate_with_max_ttl(
+            store,
+            issuer_url,
+            jwks_path,
+            default_ttl,
+            default_ttl,
+            sub_template,
+            now,
+        )
+    }
+
+    /// Like [`Issuer::load_or_generate`], but with an explicit `max_token_ttl`
+    /// (the rotation overlap window) used to clamp every token's `exp` (P1).
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_or_generate_with_max_ttl(
+        store: &Store,
+        issuer_url: impl Into<String>,
+        jwks_path: impl Into<String>,
+        default_ttl: Duration,
+        max_token_ttl: Duration,
+        sub_template: Option<String>,
+        now: SystemTime,
+    ) -> R<Self> {
+        let mut keys = Vec::new();
+        for record in store.list_signing_keys()? {
+            if record.state == KeyState::Expired.as_str() {
+                continue;
+            }
+            keys.push(SigningKey::from_record(&record)?);
+        }
+
+        if !keys.iter().any(|k| k.state == KeyState::Active) {
+            let key = SigningKey::generate(unix_secs(now)?)?;
+            store.insert_signing_key(&key.to_record())?;
+            info!(kid = %key.kid, "Generated and persisted initial workload-identity signing key");
+            keys.insert(0, key);
+        } else {
+            debug!(
+                keys = keys.len(),
+                "Restored workload-identity signing keys from store"
+            );
+        }
+
+        Ok(Self {
+            issuer_url: issuer_url.into(),
+            jwks_path: jwks_path.into(),
+            default_ttl,
+            max_token_ttl,
+            sub_template,
+            keys,
         })
     }
 
@@ -242,7 +404,21 @@ impl Issuer {
         let key = self.active_key()?;
         let iat = unix_secs(now)?;
         let ttl = identity.parsed_ttl()?.unwrap_or(self.default_ttl);
-        let exp = iat + ttl.as_secs();
+
+        // P1: clamp `exp` so no token outlives the overlap window its signing
+        // key gets when it retires. A per-identity `ttl` is unbounded at
+        // admission (rotationAge isn't reachable at spec-validation time), so a
+        // long-TTL token signed just before rotation could otherwise expire
+        // after its key's `not_after` and become valid-but-unverifiable. The
+        // bound is `now + max_token_ttl` where `max_token_ttl == overlap ==
+        // max(rotationAge, defaultTtl)`; we additionally clamp to the active
+        // key's `not_after` if one is ever set (a key should not sign once
+        // retiring, but be defensive). See docs/workload-identity.md.
+        let ttl = ttl.min(self.max_token_ttl);
+        let mut exp = iat + ttl.as_secs();
+        if let Some(not_after) = key.not_after {
+            exp = exp.min(not_after);
+        }
 
         let template = identity
             .sub_template
@@ -270,8 +446,20 @@ impl Issuer {
         for (claim, value) in claims.legion_claims() {
             body.insert(claim, json!(value));
         }
-        // Static, non-reserved extra claims (reserved keys rejected at admission).
+        // Static, non-reserved extra claims. Admission already rejects reserved
+        // and `legion.io/*` keys, but the signing sink re-checks (belt and
+        // suspenders): the signer must never let an extra claim overwrite a
+        // derived/trust-critical claim (iss/sub/aud/exp/iat/nbf/jti or
+        // legion.io/*), even if admission validation were somehow bypassed.
         for (claim, value) in &identity.extra_claims {
+            if is_protected_claim_key(claim) {
+                warn!(
+                    claim = %claim,
+                    identity = %identity.name,
+                    "Refusing to let extra_claims override a protected claim"
+                );
+                continue;
+            }
             body.insert(claim.clone(), json!(value));
         }
 
@@ -302,34 +490,281 @@ impl Issuer {
         Ok(data.claims)
     }
 
+    /// Unix-seconds creation time of the active key (drives the rotation loop).
+    pub fn active_key_created_at(&self) -> R<u64> {
+        Ok(self.active_key()?.created_at)
+    }
+
     /// Rotate the signing key: the current active key becomes `retiring` with a
     /// `not_after` covering the last token it could have signed, and a new
     /// active key is generated. `max_token_ttl` should be the largest TTL any
     /// identity can request so no signed token outlives the overlap window.
+    /// In-memory only; production paths use [`Issuer::rotate_persisted`].
     pub fn rotate(&mut self, now: SystemTime, max_token_ttl: Duration) -> R<()> {
-        let now_secs = unix_secs(now)?;
-        for key in &mut self.keys {
-            if key.state == KeyState::Active {
-                key.state = KeyState::Retiring;
-                key.not_after = Some(now_secs + max_token_ttl.as_secs());
-            }
-        }
-        let new_key = SigningKey::generate(now_secs)?;
-        self.keys.insert(0, new_key);
+        self.rotate_keys(now, max_token_ttl)?;
         Ok(())
     }
 
-    /// Drop retiring keys whose overlap window has closed. Returns how many keys
-    /// were expired. A driving loop calls this periodically.
-    pub fn expire_keys(&mut self, now: SystemTime) -> R<usize> {
+    /// Like [`Issuer::rotate`], but writes the lifecycle transitions through to
+    /// the store: retiring keys are updated in place and the new active key is
+    /// inserted, so a restart mid-overlap restores the exact same key set.
+    pub fn rotate_persisted(
+        &mut self,
+        store: &Store,
+        now: SystemTime,
+        max_token_ttl: Duration,
+    ) -> R<()> {
+        let (retired, new_record) = self.rotate_keys(now, max_token_ttl)?;
+        for (kid, not_after) in &retired {
+            store.update_signing_key_state(kid, KeyState::Retiring.as_str(), Some(*not_after))?;
+        }
+        store.insert_signing_key(&new_record)?;
+        info!(
+            new_kid = %new_record.kid,
+            retired = retired.len(),
+            "Rotated workload-identity signing key"
+        );
+        Ok(())
+    }
+
+    /// Shared rotation body: returns the (kid, not_after) pairs that started
+    /// retiring plus the persisted form of the new active key.
+    fn rotate_keys(
+        &mut self,
+        now: SystemTime,
+        max_token_ttl: Duration,
+    ) -> R<(Vec<(String, u64)>, SigningKeyRecord)> {
         let now_secs = unix_secs(now)?;
-        let before = self.keys.len();
+        let mut retired = Vec::new();
+        for key in &mut self.keys {
+            if key.state == KeyState::Active {
+                key.state = KeyState::Retiring;
+                let not_after = now_secs + max_token_ttl.as_secs();
+                key.not_after = Some(not_after);
+                retired.push((key.kid.clone(), not_after));
+            }
+        }
+        let new_key = SigningKey::generate(now_secs)?;
+        let record = new_key.to_record();
+        self.keys.insert(0, new_key);
+        Ok((retired, record))
+    }
+
+    /// Drop retiring keys whose overlap window has closed. Returns the kids of
+    /// the keys that were expired. In-memory only; production paths use
+    /// [`Issuer::expire_keys_persisted`].
+    pub fn expire_keys(&mut self, now: SystemTime) -> R<Vec<String>> {
+        let now_secs = unix_secs(now)?;
+        let mut expired = Vec::new();
         self.keys.retain(|k| match (k.state, k.not_after) {
-            (KeyState::Retiring, Some(not_after)) => now_secs <= not_after,
+            (KeyState::Retiring, Some(not_after)) if now_secs > not_after => {
+                expired.push(k.kid.clone());
+                false
+            }
             _ => true,
         });
-        Ok(before - self.keys.len())
+        Ok(expired)
     }
+
+    /// Like [`Issuer::expire_keys`], but marks the expired rows in the store
+    /// (rows are retained for audit; they are simply never loaded or
+    /// published again). Returns how many keys were expired.
+    pub fn expire_keys_persisted(&mut self, store: &Store, now: SystemTime) -> R<usize> {
+        let expired = self.expire_keys(now)?;
+        for kid in &expired {
+            store.update_signing_key_state(kid, KeyState::Expired.as_str(), None)?;
+            info!(%kid, "Expired workload-identity signing key past its overlap window");
+        }
+        Ok(expired.len())
+    }
+}
+
+/// Shared workload-identity state for the manager process: the effective
+/// config plus the store-backed [`Issuer`] behind a lock. Shared (via `Arc`)
+/// by the `IssueWorkloadIdentityToken` RPC handler, the public discovery/JWKS
+/// HTTP routes, and the background rotation loop. Only constructed when
+/// `workloadIdentity.enabled` is true — when disabled the manager carries no
+/// issuer at all and the HTTP routes are not mounted.
+pub struct WorkloadIdentityState {
+    config: WorkloadIdentityConfigFull,
+    issuer: RwLock<Issuer>,
+}
+
+impl std::fmt::Debug for WorkloadIdentityState {
+    // Manual impl: never expose issuer/key internals through Debug.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkloadIdentityState")
+            .field("enabled", &self.config.enabled)
+            .field("jwks_path", &self.config.jwks_path)
+            .finish_non_exhaustive()
+    }
+}
+
+impl WorkloadIdentityState {
+    /// Build the state from the effective manager config, restoring (or
+    /// first-boot generating + persisting) signing keys from the store.
+    ///
+    /// `default_issuer_url` is used when `workloadIdentity.issuer` is unset —
+    /// the manager's own listener address. For real third-party federation the
+    /// operator must configure the externally-reachable HTTPS issuer URL,
+    /// since it is baked into `iss` and the discovery document.
+    pub fn initialize(
+        store: &Store,
+        config: &WorkloadIdentityConfigFull,
+        default_issuer_url: &str,
+        now: SystemTime,
+    ) -> R<Self> {
+        let issuer_url = config
+            .issuer
+            .clone()
+            .unwrap_or_else(|| default_issuer_url.to_string());
+
+        // P2: validate the cluster-default `sub` template the same way a
+        // per-identity override is validated. Without this a cluster default
+        // like `"{job}"` (below the uniqueness floor, or using a churning
+        // `{alloc}`/`{node}` placeholder) would silently collapse distinct
+        // workloads into one shared identity, since `render_subject` only
+        // checks field availability, not the floor. Fail manager startup with
+        // a clear error instead. `stateful = false` here: the cluster default
+        // must render for every task, including stateless ones, so the
+        // stateful-only `{instance}`/`{slot}` placeholders are disallowed in a
+        // cluster default.
+        crate::structs::workload_identity::validate_sub_template(&config.sub_template, false)
+            .with_context(|| {
+                format!(
+                    "cluster-default workloadIdentity.subTemplate {:?} is invalid",
+                    config.sub_template
+                )
+            })?;
+
+        // Token `exp` is clamped to the rotation overlap window (P1).
+        let overlap = config
+            .parsed_rotation_age()
+            .max(config.parsed_default_ttl());
+        let issuer = Issuer::load_or_generate_with_max_ttl(
+            store,
+            issuer_url,
+            config.jwks_path.clone(),
+            config.parsed_default_ttl(),
+            overlap,
+            Some(config.sub_template.clone()),
+            now,
+        )?;
+        Ok(Self {
+            config: config.clone(),
+            issuer: RwLock::new(issuer),
+        })
+    }
+
+    pub fn config(&self) -> &WorkloadIdentityConfigFull {
+        &self.config
+    }
+
+    /// The route the JWKS is served at (path component only).
+    pub fn jwks_path(&self) -> &str {
+        &self.config.jwks_path
+    }
+
+    fn read_issuer(&self) -> R<std::sync::RwLockReadGuard<'_, Issuer>> {
+        self.issuer
+            .read()
+            .map_err(|_| anyhow!("workload identity issuer lock poisoned"))
+    }
+
+    fn write_issuer(&self) -> R<std::sync::RwLockWriteGuard<'_, Issuer>> {
+        self.issuer
+            .write()
+            .map_err(|_| anyhow!("workload identity issuer lock poisoned"))
+    }
+
+    pub fn issuer_url(&self) -> R<String> {
+        Ok(self.read_issuer()?.issuer_url().to_string())
+    }
+
+    pub fn discovery_document(&self) -> R<Value> {
+        Ok(self.read_issuer()?.discovery_document())
+    }
+
+    pub fn jwks(&self) -> R<Value> {
+        Ok(self.read_issuer()?.jwks())
+    }
+
+    /// Sign a token for `claims` under `identity` with the active key.
+    pub fn issue(
+        &self,
+        claims: &WorkloadIdentityClaims,
+        identity: &WorkloadIdentity,
+        now: SystemTime,
+    ) -> R<IssuedToken> {
+        self.read_issuer()?.issue(claims, identity, now)
+    }
+
+    /// Verify a token against the issuer's current key set (control-plane
+    /// verification path; external relying parties use the published JWKS).
+    pub fn verify(&self, token: &str, expected_audience: &str) -> R<Map<String, Value>> {
+        self.read_issuer()?.verify(token, expected_audience)
+    }
+
+    /// One pass of the rotation state machine, persisting every transition:
+    /// rotate when the active key is older than `rotationAge`, then expire
+    /// retiring keys past their overlap window. Returns true when a rotation
+    /// happened. Driven by the background loop in `crate::manager::agent`.
+    pub fn rotation_tick(&self, store: &Store, now: SystemTime) -> R<bool> {
+        let rotation_age = self.config.parsed_rotation_age();
+        // Overlap window: a retiring key stays published for one further
+        // rotation period (and at least the default TTL), so any token it
+        // signed verifies until expiry as long as identity TTLs stay at or
+        // below rotationAge (documented in docs/workload-identity.md).
+        let overlap = rotation_age.max(self.config.parsed_default_ttl());
+
+        let mut issuer = self.write_issuer()?;
+        let now_secs = now
+            .duration_since(UNIX_EPOCH)
+            .context("system clock before Unix epoch")?
+            .as_secs();
+        let age = now_secs.saturating_sub(issuer.active_key_created_at()?);
+        let rotated = if age > rotation_age.as_secs() {
+            issuer.rotate_persisted(store, now, overlap)?;
+            true
+        } else {
+            false
+        };
+        issuer.expire_keys_persisted(store, now)?;
+        Ok(rotated)
+    }
+}
+
+/// Derive workload-identity claims for an allocation from the scheduling
+/// record. This is the manager-side source of truth the issuance RPC
+/// stamps into tokens — claims are never trusted from a worker.
+///
+/// For stateful allocations the claims carry the stable `instance` key (and
+/// `slot` in slot mode) read from the allocation's instance record, which is
+/// what makes the token's identity stable across reschedules: every allocation
+/// for slot N of a group resolves to the same `legion.io/instance` and the
+/// same instance-keyed `sub` template rendering. Stateless allocations yield
+/// `instance: None` / `slot: None`, exactly today's behavior.
+pub fn claims_for_allocation(
+    store: &Store,
+    allocation: &Allocation,
+    task: &TaskConfig,
+    region: &str,
+) -> R<WorkloadIdentityClaims> {
+    let instance = match allocation.instance_id.as_deref() {
+        Some(instance_id) => store.get_instance(instance_id)?,
+        None => None,
+    };
+
+    Ok(WorkloadIdentityClaims {
+        region: region.to_string(),
+        job: allocation.job_id.clone(),
+        group: task.group.clone(),
+        task: task.name.clone(),
+        node_id: allocation.node_id.clone(),
+        alloc_id: allocation.id.to_string(),
+        instance: instance.as_ref().map(|i| i.instance_id.clone()),
+        slot: instance.as_ref().and_then(|i| i.slot_index),
+    })
 }
 
 /// Seconds since the Unix epoch.
@@ -545,6 +980,69 @@ mod tests {
     }
 
     #[test]
+    fn extra_claims_cannot_override_derived_or_legion_claims() {
+        // Belt-and-suspenders (P2): even with admission bypassed, the signing
+        // sink must never let extra_claims overwrite a derived/trust-critical
+        // claim. We inject `sub` and `legion.io/job` directly into the spec.
+        let iss = issuer();
+        let mut id = aws_identity();
+        id.extra_claims.insert("sub".into(), "attacker".into());
+        id.extra_claims
+            .insert("legion.io/job".into(), "spoofed".into());
+        id.extra_claims.insert("iss".into(), "evil-issuer".into());
+        let issued = iss.issue(&claims(), &id, now()).unwrap();
+        let decoded = iss.verify(&issued.token, "sts.amazonaws.com").unwrap();
+        // Derived values win; the forged extra claims are dropped.
+        assert_eq!(decoded["sub"], json!("auto:api:web:server"));
+        assert_eq!(decoded["legion.io/job"], json!("api"));
+        assert_eq!(decoded["iss"], json!(iss.issuer_url()));
+    }
+
+    #[test]
+    fn token_exp_is_clamped_to_the_overlap_window() {
+        // rotationAge/overlap is 900s here (Issuer::new uses default_ttl for
+        // both). A per-identity ttl far above that must be clamped so the token
+        // cannot outlive a retiring key's not_after.
+        let iss = issuer();
+        let long = WorkloadIdentity {
+            ttl: Some("48h".into()),
+            ..aws_identity()
+        };
+        let when = now();
+        let issued = iss.issue(&claims(), &long, when).unwrap();
+        let iat = when.duration_since(UNIX_EPOCH).unwrap().as_secs();
+        // exp clamped to iat + overlap (900s), not iat + 48h.
+        assert!(
+            issued.expires_at <= iat + 900,
+            "exp {} not clamped (iat {iat})",
+            issued.expires_at
+        );
+        assert!(issued.expires_at >= iat + 899);
+    }
+
+    #[test]
+    fn long_ttl_token_signed_before_rotation_still_verifies_after_rotation() {
+        // The whole point of P1: a token signed right before rotation must stay
+        // verifiable until it expires, because its (clamped) exp falls inside
+        // the retiring key's overlap window.
+        let mut iss = issuer();
+        let overlap = Duration::from_secs(900);
+        let long = WorkloadIdentity {
+            ttl: Some("24h".into()), // would outlive the key without clamping
+            ..aws_identity()
+        };
+        let issued = iss.issue(&claims(), &long, now()).unwrap();
+
+        // Rotate immediately after signing: the just-used key starts retiring
+        // with not_after = now + overlap.
+        iss.rotate(now(), overlap).unwrap();
+
+        // The pre-rotation token still verifies during the overlap window — its
+        // exp was clamped to <= the key's not_after.
+        iss.verify(&issued.token, "sts.amazonaws.com").unwrap();
+    }
+
+    #[test]
     fn control_plane_identity_audience_defaults_to_issuer() {
         let iss = issuer();
         let id = WorkloadIdentity {
@@ -619,7 +1117,7 @@ mod tests {
         let rotated_at = now() - Duration::from_secs(20 * 60);
         iss.rotate(rotated_at, max_ttl).unwrap();
         let expired = iss.expire_keys(now()).unwrap();
-        assert_eq!(expired, 1);
+        assert_eq!(expired.len(), 1);
 
         // Key is gone from the JWKS and verification can no longer find it.
         let kids: Vec<String> = iss.jwks()["keys"]
@@ -640,6 +1138,320 @@ mod tests {
         let second = iss.issue(&claims(), &aws_identity(), now()).unwrap();
         assert_ne!(first.kid, second.kid);
         assert_eq!(second.kid, iss.active_key().unwrap().kid);
+    }
+
+    // --- claims derivation from the scheduling record ---
+
+    fn claims_test_store() -> R<Store> {
+        let store_dir = tempfile::Builder::new()
+            .prefix("legion-wi-claims-")
+            .tempdir()
+            .context("error creating temp store directory")?
+            .keep();
+        let config = crate::structs::ManagerConfigFull {
+            store_path: store_dir
+                .to_str()
+                .context("error parsing store path")?
+                .to_string(),
+            ..Default::default()
+        };
+        let store = Store::start_storage(&config)?;
+        store.reset_all_tables()?;
+        Ok(store)
+    }
+
+    fn submit_and_place(store: &Store, task: crate::structs::TaskConfig) -> R<Allocation> {
+        use crate::structs::{JobConfig, NodeMsg, Submission};
+        store.insert_node(NodeMsg {
+            id: "node-1".into(),
+            pool: "default".into(),
+            status: "active".into(),
+            availability: "available".into(),
+            config_attrs: "{}".into(),
+            fingerprint_attrs: "{}".into(),
+            dynamic_attrs: "{}".into(),
+            health_checks: "{}".into(),
+            last_heartbeat: "2026-01-01 00:00:00 +00:00:00".into(),
+        })?;
+        let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "claims-job".into(),
+            tasks: vec![task],
+            version: None,
+        };
+        store.handle_job_submit(
+            &job,
+            &[Submission {
+                path: "job.jsonnet".into(),
+                content: "{}".into(),
+                is_primary: true,
+            }],
+        )?;
+        let job_config_id = store.get_job_config("claims-job")?.id();
+        let (task_id, _) = store
+            .get_task_configs_for_job_config(&job_config_id)?
+            .into_iter()
+            .next()
+            .context("missing task config")?;
+        store.place_alloc("node-1", task_id)
+    }
+
+    #[test]
+    fn claims_for_stateless_allocation_have_no_instance() -> R<()> {
+        let store = claims_test_store()?;
+        let task = crate::structs::TaskConfig::new("server", "noop");
+        let allocation = submit_and_place(&store, task.clone())?;
+
+        let derived = claims_for_allocation(&store, &allocation, &task, "auto")?;
+        assert_eq!(derived.job, "claims-job");
+        assert_eq!(derived.task, "server");
+        assert_eq!(derived.group, "default");
+        assert_eq!(derived.alloc_id, allocation.id.to_string());
+        assert_eq!(derived.node_id, "node-1");
+        assert_eq!(derived.instance, None);
+        assert_eq!(derived.slot, None);
+        assert!(!derived.is_stateful());
+        Ok(())
+    }
+
+    #[test]
+    fn claims_for_stateful_allocation_carry_instance_and_slot() -> R<()> {
+        use crate::structs::{InstanceMode, StatefulConfig, TaskConfig};
+
+        let store = claims_test_store()?;
+        let task = TaskConfig {
+            stateful: Some(StatefulConfig {
+                mode: InstanceMode::Slot,
+                id_source: None,
+                initial_instances: None,
+                on_lost: None,
+                storage: None,
+            }),
+            ..TaskConfig::new("db", "noop")
+        };
+        let allocation = submit_and_place(&store, task.clone())?;
+        assert!(allocation.instance_id.is_some());
+
+        let derived = claims_for_allocation(&store, &allocation, &task, "auto")?;
+        assert_eq!(derived.instance.as_deref(), Some("claims-job-default-0"));
+        assert_eq!(derived.slot, Some(0));
+        assert!(derived.is_stateful());
+
+        // The instance-keyed sub template now renders, and the legion claims
+        // carry the stable instance key.
+        let sub = derived.render_subject("{region}:{job}:{group}:{task}:{instance}")?;
+        assert_eq!(sub, "auto:claims-job:default:db:claims-job-default-0");
+        let legion = derived.legion_claims();
+        assert_eq!(
+            legion.get("legion.io/instance").map(String::as_str),
+            Some("claims-job-default-0")
+        );
+        assert_eq!(legion.get("legion.io/slot").map(String::as_str), Some("0"));
+        Ok(())
+    }
+
+    // --- signing-key persistence (restart semantics) ---
+
+    fn store_issuer(store: &Store) -> Issuer {
+        Issuer::load_or_generate(
+            store,
+            "https://manager.example.com:4747",
+            DEFAULT_JWKS_PATH,
+            Duration::from_secs(900),
+            None,
+            now(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn first_boot_generates_and_persists_the_active_key() -> R<()> {
+        let store = claims_test_store()?;
+        let iss = store_issuer(&store);
+
+        let records = store.list_signing_keys()?;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].state, "active");
+        assert_eq!(records[0].alg, "ES256");
+        assert_eq!(records[0].kid, iss.active_key().unwrap().kid);
+        Ok(())
+    }
+
+    #[test]
+    fn issuer_reload_verifies_token_issued_before_restart() -> R<()> {
+        let store = claims_test_store()?;
+
+        // "First boot": issue a token, then drop the issuer entirely.
+        let first = store_issuer(&store);
+        let issued = first.issue(&claims(), &aws_identity(), now())?;
+        let first_kid = issued.kid.clone();
+        drop(first);
+
+        // "Restart": a brand-new issuer over the same store must restore the
+        // same key — same kid in the JWKS, and the old token still verifies.
+        let second = store_issuer(&store);
+        assert_eq!(second.active_key().unwrap().kid, first_kid);
+        let decoded = second.verify(&issued.token, "sts.amazonaws.com")?;
+        assert_eq!(decoded["sub"], json!("auto:api:web:server"));
+
+        // No duplicate key was generated.
+        assert_eq!(store.list_signing_keys()?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn rotation_persists_and_survives_restart() -> R<()> {
+        let store = claims_test_store()?;
+        let mut first = store_issuer(&store);
+        let issued = first.issue(&claims(), &aws_identity(), now())?;
+        let original_kid = issued.kid.clone();
+
+        first.rotate_persisted(&store, now(), Duration::from_secs(900))?;
+        let new_kid = first.active_key().unwrap().kid.clone();
+        drop(first);
+
+        let records = store.list_signing_keys()?;
+        assert_eq!(records.len(), 2);
+        let by_kid = |kid: &str| records.iter().find(|r| r.kid == kid).unwrap();
+        assert_eq!(by_kid(&original_kid).state, "retiring");
+        assert!(by_kid(&original_kid).not_after.is_some());
+        assert_eq!(by_kid(&new_kid).state, "active");
+
+        // After a restart both keys are served and the pre-rotation token
+        // still verifies during the overlap window.
+        let second = store_issuer(&store);
+        assert_eq!(second.active_key().unwrap().kid, new_kid);
+        second.verify(&issued.token, "sts.amazonaws.com")?;
+        let kids: Vec<&str> = records.iter().map(|r| r.kid.as_str()).collect();
+        for key in second.jwks()["keys"].as_array().unwrap() {
+            assert!(kids.contains(&key["kid"].as_str().unwrap()));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn expired_keys_are_marked_in_store_and_not_reloaded() -> R<()> {
+        let store = claims_test_store()?;
+        let mut iss = store_issuer(&store);
+        let original_kid = iss.active_key().unwrap().kid.clone();
+
+        // Rotate in the past so the retiring key's window is already closed.
+        let rotated_at = now() - Duration::from_secs(20 * 60);
+        iss.rotate_persisted(&store, rotated_at, Duration::from_secs(900))?;
+        let expired = iss.expire_keys_persisted(&store, now())?;
+        assert_eq!(expired, 1);
+
+        let records = store.list_signing_keys()?;
+        let original = records.iter().find(|r| r.kid == original_kid).unwrap();
+        assert_eq!(original.state, "expired");
+        // The audit row keeps its recorded overlap window.
+        assert!(original.not_after.is_some());
+
+        // A restarted issuer loads only the non-expired key.
+        let reloaded = store_issuer(&store);
+        assert!(reloaded.key(&original_kid).is_none());
+        assert_eq!(reloaded.jwks()["keys"].as_array().unwrap().len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_cluster_default_sub_template_fails_initialize() -> R<()> {
+        let store = claims_test_store()?;
+        // Below the uniqueness floor: collapses distinct workloads into one.
+        let config = WorkloadIdentityConfigFull {
+            enabled: true,
+            issuer: Some("https://manager.example.com:4747".into()),
+            sub_template: "{job}".into(),
+            ..Default::default()
+        };
+        let err =
+            WorkloadIdentityState::initialize(&store, &config, "http://127.0.0.1:4747", now())
+                .unwrap_err();
+        assert!(err.to_string().contains("subTemplate"), "{err}");
+
+        // A churning placeholder in the cluster default is also rejected.
+        let config = WorkloadIdentityConfigFull {
+            enabled: true,
+            issuer: Some("https://manager.example.com:4747".into()),
+            sub_template: "{job}:{group}:{task}:{alloc}".into(),
+            ..Default::default()
+        };
+        let err =
+            WorkloadIdentityState::initialize(&store, &config, "http://127.0.0.1:4747", now())
+                .unwrap_err();
+        assert!(err.to_string().contains("subTemplate"), "{err}");
+        Ok(())
+    }
+
+    #[test]
+    fn valid_cluster_default_sub_template_passes_initialize() -> R<()> {
+        let store = claims_test_store()?;
+        let config = WorkloadIdentityConfigFull {
+            enabled: true,
+            issuer: Some("https://manager.example.com:4747".into()),
+            sub_template: "{region}/{job}/{group}/{task}".into(),
+            ..Default::default()
+        };
+        WorkloadIdentityState::initialize(&store, &config, "http://127.0.0.1:4747", now())?;
+        Ok(())
+    }
+
+    #[test]
+    fn rotation_tick_rotates_only_past_rotation_age() -> R<()> {
+        let store = claims_test_store()?;
+        let config = WorkloadIdentityConfigFull {
+            enabled: true,
+            issuer: Some("https://manager.example.com:4747".into()),
+            rotation_age: "24h".into(),
+            ..Default::default()
+        };
+        let state =
+            WorkloadIdentityState::initialize(&store, &config, "http://127.0.0.1:4747", now())?;
+
+        // Fresh key: not due.
+        assert!(!state.rotation_tick(&store, now())?);
+        assert_eq!(store.list_signing_keys()?.len(), 1);
+
+        // Pretend 25h elapsed: due.
+        let later = now() + Duration::from_secs(25 * 3600);
+        assert!(state.rotation_tick(&store, later)?);
+        let records = store.list_signing_keys()?;
+        assert_eq!(records.len(), 2);
+        assert_eq!(records.iter().filter(|r| r.state == "active").count(), 1);
+        assert_eq!(records.iter().filter(|r| r.state == "retiring").count(), 1);
+
+        // Far past the overlap window the retiring key is expired.
+        let much_later = now() + Duration::from_secs(80 * 3600);
+        state.rotation_tick(&store, much_later)?;
+        let records = store.list_signing_keys()?;
+        assert_eq!(records.iter().filter(|r| r.state == "expired").count(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn old_key_tokens_verify_until_not_after_and_new_tokens_use_new_kid() -> R<()> {
+        let store = claims_test_store()?;
+        let config = WorkloadIdentityConfigFull {
+            enabled: true,
+            issuer: Some("https://manager.example.com:4747".into()),
+            ..Default::default()
+        };
+        let state =
+            WorkloadIdentityState::initialize(&store, &config, "http://127.0.0.1:4747", now())?;
+
+        let old = state.issue(&claims(), &aws_identity(), now())?;
+        let later = now() + Duration::from_secs(25 * 3600);
+        assert!(state.rotation_tick(&store, later)?);
+
+        // Old-key token still verifies during the overlap (the token itself
+        // has expired by `later`, but key resolution must still succeed —
+        // verify against fresh wall-clock where the token is alive).
+        state.verify(&old.token, "sts.amazonaws.com")?;
+
+        let new = state.issue(&claims(), &aws_identity(), now())?;
+        assert_ne!(new.kid, old.kid);
+        Ok(())
     }
 
     #[test]

@@ -446,7 +446,12 @@ impl<'a> Scheduler<'a> {
         let all_tasks = self
             .store
             .cached_task_configs_for_job_config(job_config_id)?;
-        let tasks = self.tasks_for_plan_from_store(job_config_id)?;
+        let mut tasks = self.tasks_for_plan_from_store(job_config_id)?;
+        if matches!(mode, PlanMode::Reschedule) {
+            if let Some(job_id) = self.store.job_id_for_job_config(job_config_id)? {
+                Self::apply_slot_staged_counts(self.store, &job_id, job_config_id, &mut tasks)?;
+            }
+        }
 
         let mut allocations_by_node = self.store.cached_allocations_by_node()?;
         if matches!(mode, PlanMode::Fresh) {
@@ -496,7 +501,10 @@ impl<'a> Scheduler<'a> {
         }
 
         let status_map = HashMap::new();
-        let tasks = Self::tasks_for_plan(job_config, &status_map)?;
+        let mut tasks = Self::tasks_for_plan(job_config, &status_map)?;
+        // Keyed tasks plan against live instances, not count.num, even for
+        // not-yet-submitted configs (a fresh job simply has zero instances).
+        Self::apply_keyed_instance_counts(self.store, &job_config.name, &mut tasks)?;
         let all_tasks = job_config
             .tasks
             .iter()
@@ -601,6 +609,11 @@ impl<'a> Scheduler<'a> {
             .store
             .cached_task_configs_for_job_config(job_config_id)?;
         let mut tasks = self.tasks_for_plan_from_store(job_config_id)?;
+        if task_targets.is_none() && matches!(mode, PlanMode::Reschedule) {
+            if let Some(job_id) = self.store.job_id_for_job_config(job_config_id)? {
+                Self::apply_slot_staged_counts(self.store, &job_id, job_config_id, &mut tasks)?;
+            }
+        }
 
         let allocations_by_node = self.store.cached_allocations_by_node()?;
         let existing_counts =
@@ -1377,7 +1390,70 @@ impl<'a> Scheduler<'a> {
             })
             .collect::<HashMap<_, _>>();
 
-        Self::ready_tasks(tasks, &status_map)
+        let mut tasks = Self::ready_tasks(tasks, &status_map)?;
+        if let Some(job_id) = self.store.job_id_for_job_config(job_config_id)? {
+            Self::apply_keyed_instance_counts(self.store, &job_id, &mut tasks)?;
+        }
+        Ok(tasks)
+    }
+
+    /// Replace `count.num`-derived desired counts with live keyed-instance
+    /// counts for keyed-mode stateful tasks. `count.num` does not drive keyed
+    /// tasks: their desired allocation count is exactly the number of
+    /// instances in Pending/Active/Rescheduling state, created and destroyed
+    /// through the instance management API (zero instances = zero
+    /// allocations). Slot-mode and stateless tasks are untouched.
+    fn apply_keyed_instance_counts(
+        store: &Store,
+        job_id: &str,
+        tasks: &mut [(i64, TaskConfig, u32)],
+    ) -> R<()> {
+        for (_task_id, task, desired) in tasks.iter_mut() {
+            let keyed = task
+                .stateful
+                .as_ref()
+                .is_some_and(|stateful| stateful.mode == crate::structs::InstanceMode::Keyed);
+            if keyed {
+                *desired = store.count_live_keyed_instances(job_id, &task.group, &task.name)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Reduce a slot-mode stateful task's desired count by the number of
+    /// slots still deliberately occupied by live allocations of OTHER
+    /// configs of the same job.
+    ///
+    /// After (or during) a staged rollout (`rollout.slots.updateFrom`),
+    /// slots below the floor keep running the previous config's allocations
+    /// on purpose. A plain reschedule of the latest config would otherwise
+    /// converge that config to the full `count.num` and double-place those
+    /// slots (two live allocations on one instance — the at-most-one
+    /// invariant). Only applied to plain (no explicit per-task targets)
+    /// `Reschedule` plans: rollouts pass explicit targets and own this math
+    /// themselves, and `Fresh` plans deliberately ignore existing
+    /// allocations. Keyed and stateless tasks are untouched.
+    fn apply_slot_staged_counts(
+        store: &Store,
+        job_id: &str,
+        job_config_id: &str,
+        tasks: &mut [(i64, TaskConfig, u32)],
+    ) -> R<()> {
+        for (_task_id, task, desired) in tasks.iter_mut() {
+            let slot_mode = task
+                .stateful
+                .as_ref()
+                .is_some_and(|stateful| stateful.mode == crate::structs::InstanceMode::Slot);
+            if slot_mode {
+                let other_config_slots = store.count_slot_allocations_excluding_config(
+                    job_id,
+                    &task.group,
+                    job_config_id,
+                )?;
+                *desired = desired.saturating_sub(other_config_slots);
+            }
+        }
+        Ok(())
     }
 
     fn tasks_for_plan(
@@ -2538,6 +2614,340 @@ mod tests {
         Ok(())
     }
 
+    fn stateful_slot_task(name: &str, count: u32) -> TaskConfig {
+        TaskConfig {
+            count: TaskCount::new(count),
+            stateful: Some(crate::structs::StatefulConfig {
+                mode: crate::structs::InstanceMode::Slot,
+                id_source: None,
+                initial_instances: None,
+                on_lost: None,
+                storage: Some(crate::structs::StatefulStorageConfig {
+                    path: "/var/lib/data".into(),
+                    retain_on_scale_in: None,
+                    retain_on_stop: None,
+                }),
+            }),
+            ..TaskConfig::new(name, "noop")
+        }
+    }
+
+    fn submit_job(store: &Store, name: &str, tasks: Vec<TaskConfig>) -> R<String> {
+        let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: name.into(),
+            tasks,
+            version: None,
+        };
+        store.handle_job_submit(&job, &[dummy_submission()])?;
+        Ok(store.get_job_config(name)?.id())
+    }
+
+    #[test]
+    fn slot_mode_initial_plan_assigns_slots_zero_through_n_minus_one() -> R<()> {
+        use crate::structs::InstanceState;
+
+        let store = setup_store()?;
+        insert_test_nodes(&store)?;
+        let job_id = "stateful-initial";
+        let job_config_id = submit_job(&store, job_id, vec![stateful_slot_task("db", 3)])?;
+
+        let scheduler = Scheduler::new(&store)?;
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+        assert_eq!(outcome.allocations.len(), 3);
+
+        let mut instance_ids: Vec<String> = outcome
+            .allocations
+            .iter()
+            .map(|alloc| {
+                alloc
+                    .instance_id
+                    .clone()
+                    .expect("stateful alloc has instance")
+            })
+            .collect();
+        instance_ids.sort();
+        assert_eq!(
+            instance_ids,
+            vec![
+                "stateful-initial-default-0",
+                "stateful-initial-default-1",
+                "stateful-initial-default-2",
+            ]
+        );
+
+        let instances = store.list_instances(job_id)?;
+        assert_eq!(instances.len(), 3);
+        for (slot, instance) in instances.iter().enumerate() {
+            assert_eq!(instance.slot_index, Some(slot as u32));
+            assert_eq!(instance.state, InstanceState::Active);
+            assert!(instance
+                .storage_handle
+                .as_deref()
+                .is_some_and(|handle| handle.starts_with("local-dir/")));
+            let bound_alloc = outcome
+                .allocations
+                .iter()
+                .find(|alloc| alloc.instance_id.as_deref() == Some(instance.instance_id.as_str()))
+                .expect("instance bound to an allocation");
+            assert_eq!(instance.current_alloc_id, Some(bound_alloc.id));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn killed_slot_allocation_replacement_reuses_instance_and_storage() -> R<()> {
+        use crate::structs::InstanceState;
+
+        let store = setup_store()?;
+        insert_test_nodes(&store)?;
+        let job_id = "stateful-resched";
+        let job_config_id = submit_job(&store, job_id, vec![stateful_slot_task("db", 3)])?;
+
+        let scheduler = Scheduler::new(&store)?;
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+        let slot1_alloc = outcome
+            .allocations
+            .iter()
+            .find(|alloc| alloc.instance_id.as_deref() == Some("stateful-resched-default-1"))
+            .cloned()
+            .expect("slot 1 placed");
+        let slot1_instance = store
+            .get_instance("stateful-resched-default-1")?
+            .expect("slot 1 instance");
+        let original_handle = slot1_instance.storage_handle.clone();
+
+        // Kill slot 1's allocation: the instance survives in rescheduling.
+        store.remove_allocation_by_id(slot1_alloc.id)?;
+        let waiting = store
+            .get_instance("stateful-resched-default-1")?
+            .expect("instance retained");
+        assert_eq!(waiting.state, InstanceState::Rescheduling);
+
+        // The reschedule plan places exactly one replacement that reuses slot
+        // 1's instance id and reattaches the same storage handle.
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Reschedule)?;
+        assert_eq!(outcome.allocations.len(), 1);
+        let replacement = &outcome.allocations[0];
+        assert_eq!(
+            replacement.instance_id.as_deref(),
+            Some("stateful-resched-default-1")
+        );
+        assert_ne!(replacement.id, slot1_alloc.id);
+
+        let reactivated = store
+            .get_instance("stateful-resched-default-1")?
+            .expect("instance reactivated");
+        assert_eq!(reactivated.state, InstanceState::Active);
+        assert_eq!(reactivated.current_alloc_id, Some(replacement.id));
+        assert_eq!(reactivated.storage_handle, original_handle);
+        Ok(())
+    }
+
+    #[test]
+    fn slot_reuse_survives_lost_node_reschedule() -> R<()> {
+        let store = setup_store()?;
+        insert_test_nodes(&store)?;
+        let job_id = "stateful-lost-node";
+        let job_config_id = submit_job(&store, job_id, vec![stateful_slot_task("db", 2)])?;
+
+        let scheduler = Scheduler::new(&store)?;
+        scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+        let handles_before: HashMap<String, Option<String>> = store
+            .list_instances(job_id)?
+            .into_iter()
+            .map(|instance| (instance.instance_id.clone(), instance.storage_handle))
+            .collect();
+
+        store.mark_node_lost("node-a")?;
+        store.remove_allocs_for_node("node-a")?;
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Reschedule)?;
+
+        for alloc in &outcome.allocations {
+            assert_eq!(alloc.node_id, "node-b");
+            let instance_id = alloc.instance_id.as_deref().expect("instance id");
+            let instance = store.get_instance(instance_id)?.expect("instance");
+            assert_eq!(
+                &instance.storage_handle,
+                handles_before.get(instance_id).expect("known instance"),
+                "storage handle reattached on the new node"
+            );
+        }
+        Ok(())
+    }
+
+    fn stateful_keyed_task(name: &str) -> TaskConfig {
+        TaskConfig {
+            // count.num is deliberately non-zero to prove it is ignored for
+            // keyed tasks: live instances drive the desired count.
+            count: TaskCount::new(3),
+            stateful: Some(crate::structs::StatefulConfig {
+                mode: crate::structs::InstanceMode::Keyed,
+                id_source: None,
+                initial_instances: None,
+                on_lost: None,
+                storage: Some(crate::structs::StatefulStorageConfig {
+                    path: "/workspace".into(),
+                    retain_on_scale_in: None,
+                    retain_on_stop: None,
+                }),
+            }),
+            ..TaskConfig::new(name, "noop")
+        }
+    }
+
+    #[test]
+    fn keyed_task_with_zero_instances_plans_zero_allocations() -> R<()> {
+        let store = setup_store()?;
+        insert_test_nodes(&store)?;
+        let job_id = "keyed-zero";
+        let job_config_id = submit_job(&store, job_id, vec![stateful_keyed_task("sandbox")])?;
+
+        // count.num = 3, but no instances exist: nothing to place.
+        let scheduler = Scheduler::new(&store)?;
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+        assert!(outcome.allocations.is_empty(), "count.num must be ignored");
+        assert!(store.allocs_for_job(job_id)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn keyed_instances_drive_desired_count_and_each_binds_a_distinct_instance() -> R<()> {
+        use crate::structs::InstanceState;
+
+        let store = setup_store()?;
+        insert_test_nodes(&store)?;
+        let job_id = "keyed-drive";
+        let job_config_id = submit_job(&store, job_id, vec![stateful_keyed_task("sandbox")])?;
+        for key in ["user-a", "user-b"] {
+            store.create_keyed_instance(job_id, "default", "sandbox", Some(key))?;
+        }
+
+        let scheduler = Scheduler::new(&store)?;
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+        assert_eq!(outcome.allocations.len(), 2, "one allocation per instance");
+
+        let mut bound: Vec<String> = outcome
+            .allocations
+            .iter()
+            .map(|alloc| alloc.instance_id.clone().expect("keyed alloc bound"))
+            .collect();
+        bound.sort();
+        assert_eq!(bound, vec!["user-a", "user-b"]);
+
+        for instance in store.list_instances(job_id)? {
+            assert_eq!(instance.state, InstanceState::Active);
+            assert_eq!(instance.slot_index, None);
+            assert!(instance
+                .storage_handle
+                .as_deref()
+                .is_some_and(|handle| handle.starts_with("local-dir/")));
+        }
+
+        // Replanning when everything is placed adds nothing.
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Reschedule)?;
+        assert!(outcome.allocations.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn killed_keyed_allocation_replacement_reuses_id_and_storage() -> R<()> {
+        use crate::structs::InstanceState;
+
+        let store = setup_store()?;
+        insert_test_nodes(&store)?;
+        let job_id = "keyed-resched-plan";
+        let job_config_id = submit_job(&store, job_id, vec![stateful_keyed_task("sandbox")])?;
+        store.create_keyed_instance(job_id, "default", "sandbox", Some("user-a"))?;
+        store.create_keyed_instance(job_id, "default", "sandbox", Some("user-b"))?;
+
+        let scheduler = Scheduler::new(&store)?;
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+        let victim = outcome
+            .allocations
+            .iter()
+            .find(|alloc| alloc.instance_id.as_deref() == Some("user-a"))
+            .cloned()
+            .expect("user-a placed");
+        let original_handle = store
+            .get_instance("user-a")?
+            .expect("instance")
+            .storage_handle;
+
+        store.remove_allocation_by_id(victim.id)?;
+        assert_eq!(
+            store.get_instance("user-a")?.expect("retained").state,
+            InstanceState::Rescheduling
+        );
+
+        // Exactly one replacement, re-bound to the same identity + storage.
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Reschedule)?;
+        assert_eq!(outcome.allocations.len(), 1);
+        assert_eq!(
+            outcome.allocations[0].instance_id.as_deref(),
+            Some("user-a")
+        );
+        let reactivated = store.get_instance("user-a")?.expect("reactivated");
+        assert_eq!(reactivated.state, InstanceState::Active);
+        assert_eq!(reactivated.storage_handle, original_handle);
+        Ok(())
+    }
+
+    #[test]
+    fn destroyed_keyed_instance_is_not_replaced_by_reconciliation() -> R<()> {
+        let store = setup_store()?;
+        insert_test_nodes(&store)?;
+        let job_id = "keyed-destroyed";
+        let job_config_id = submit_job(&store, job_id, vec![stateful_keyed_task("sandbox")])?;
+        store.create_keyed_instance(job_id, "default", "sandbox", Some("user-a"))?;
+        store.create_keyed_instance(job_id, "default", "sandbox", Some("user-b"))?;
+
+        let scheduler = Scheduler::new(&store)?;
+        scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+        store.destroy_keyed_instance("user-b")?;
+
+        // The tombstone is not desired: nothing is re-placed for it.
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Reschedule)?;
+        assert!(outcome.allocations.is_empty());
+        let allocations = store.allocs_for_job(job_id)?;
+        assert_eq!(allocations.len(), 1);
+        assert_eq!(allocations[0].instance_id.as_deref(), Some("user-a"));
+        Ok(())
+    }
+
+    #[test]
+    fn stateless_job_plans_carry_no_instance_metadata() -> R<()> {
+        let store = setup_store()?;
+        insert_test_nodes(&store)?;
+        let job_id = "plain-job";
+        let job_config_id = submit_job(
+            &store,
+            job_id,
+            vec![TaskConfig {
+                count: TaskCount::new(2),
+                ..TaskConfig::new("web", "noop")
+            }],
+        )?;
+
+        let scheduler = Scheduler::new(&store)?;
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+        assert_eq!(outcome.allocations.len(), 2);
+        assert!(outcome
+            .allocations
+            .iter()
+            .all(|alloc| alloc.instance_id.is_none()));
+        assert!(store.list_instances(job_id)?.is_empty());
+
+        // Reschedule after losing an allocation behaves exactly as today.
+        store.remove_allocation_by_id(outcome.allocations[0].id)?;
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Reschedule)?;
+        assert_eq!(outcome.allocations.len(), 1);
+        assert!(outcome.allocations[0].instance_id.is_none());
+        assert!(store.list_instances(job_id)?.is_empty());
+        Ok(())
+    }
+
     #[test]
     fn count_per_attribute_places_allocations_per_group() -> R<()> {
         let store = setup_store_with_scheduler("spread", None)?;
@@ -3565,6 +3975,7 @@ mod tests {
                         node_id: "node-a".into(),
                         status: "running".into(),
                         resources: json!({}),
+                        instance_id: None,
                     },
                     Allocation {
                         id: 2,
@@ -3574,6 +3985,7 @@ mod tests {
                         node_id: "node-a".into(),
                         status: "running".into(),
                         resources: json!({}),
+                        instance_id: None,
                     },
                 ],
             ),
@@ -3587,6 +3999,7 @@ mod tests {
                     node_id: "node-b".into(),
                     status: "running".into(),
                     resources: json!({}),
+                    instance_id: None,
                 }],
             ),
         ]);
@@ -3616,6 +4029,7 @@ mod tests {
                         node_id: "node-a".into(),
                         status: "running".into(),
                         resources: json!({}),
+                        instance_id: None,
                     },
                     Allocation {
                         id: 2,
@@ -3625,6 +4039,7 @@ mod tests {
                         node_id: "node-a".into(),
                         status: "running".into(),
                         resources: json!({}),
+                        instance_id: None,
                     },
                     Allocation {
                         id: 3,
@@ -3634,6 +4049,7 @@ mod tests {
                         node_id: "node-a".into(),
                         status: "running".into(),
                         resources: json!({}),
+                        instance_id: None,
                     },
                 ],
             ),
@@ -3648,6 +4064,7 @@ mod tests {
                         node_id: "node-b".into(),
                         status: "running".into(),
                         resources: json!({}),
+                        instance_id: None,
                     },
                     Allocation {
                         id: 5,
@@ -3657,6 +4074,7 @@ mod tests {
                         node_id: "node-b".into(),
                         status: "running".into(),
                         resources: json!({}),
+                        instance_id: None,
                     },
                 ],
             ),

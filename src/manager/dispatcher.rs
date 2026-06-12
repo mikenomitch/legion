@@ -1,6 +1,8 @@
 use crate::prelude::*;
 use crate::storage::store::Store;
-use crate::structs::{worker_client::WorkerClient, Allocation, TaskAllocation, TaskConfig};
+use crate::structs::{
+    worker_client::WorkerClient, Allocation, Instance, TaskAllocation, TaskConfig,
+};
 use std::collections::HashMap;
 use tokio::runtime::RuntimeFlavor;
 use tonic::transport::{Channel, Endpoint};
@@ -46,7 +48,11 @@ pub fn dispatch_allocations(store: &Store, allocations: &[Allocation]) -> R<()> 
                 continue;
             };
 
-            let task_allocation = build_task_allocation(task, allocation)?;
+            let instance = match allocation.instance_id.as_deref() {
+                Some(instance_id) => store.get_instance(instance_id)?,
+                None => None,
+            };
+            let task_allocation = build_task_allocation(task, allocation, instance.as_ref())?;
             let request = crate::structs::PostWorkRequest {
                 allocation: Some(task_allocation),
             };
@@ -109,10 +115,29 @@ fn worker_address_for_node(node: &crate::structs::Node) -> Option<String> {
         .map(|value| value.to_string())
 }
 
-pub fn build_task_allocation(task: &TaskConfig, allocation: &Allocation) -> R<TaskAllocation> {
-    let task_config = serde_json::to_string(&task.config)?;
+pub fn build_task_allocation(
+    task: &TaskConfig,
+    allocation: &Allocation,
+    instance: Option<&Instance>,
+) -> R<TaskAllocation> {
+    let mut config = task.config.clone();
+    inject_runtime_env(&mut config, allocation, instance);
+    let task_config = serde_json::to_string(&config)?;
     let task_checks = serde_json::to_string(&task.checks)?;
     let task_on_unhealthy = serde_json::to_string(&task.on_unhealthy)?;
+    // Identity *specs* only (delivery/refresh instructions) — the tokens
+    // themselves are fetched by the worker via IssueWorkloadIdentityToken and
+    // never transit the desired-state payload.
+    let task_identities = serde_json::to_string(&task.identities)?;
+    // Worker self-fence window (the worker half of the at-most-one fencing
+    // guarantee, see docs/stateful-workloads.md "Node loss and fencing").
+    // Stateful tasks always carry a non-zero window — the 90s default applies
+    // even without an `onLost` block. Stateless tasks carry 0 (no fencing;
+    // the manager replaces them eagerly on node loss).
+    let self_terminate_after_seconds = match task.stateful.as_ref() {
+        Some(stateful) => stateful.resolved_on_lost()?.self_terminate_after.as_secs(),
+        None => 0,
+    };
     // Empty string (not "[]") when no artifacts: jobs without artifacts stay
     // byte-identical on the wire.
     let task_artifacts = if task.artifacts.is_empty() {
@@ -131,14 +156,258 @@ pub fn build_task_allocation(task: &TaskConfig, allocation: &Allocation) -> R<Ta
         task_config,
         task_checks,
         task_on_unhealthy,
+        task_identities,
+        self_terminate_after_seconds,
         task_artifacts,
     })
+}
+
+/// Inject Legion runtime environment variables into the task's kind config
+/// `env` map (the map exec/container plugins already read):
+///
+/// - `LEGION_ALLOC_ID` — always; the ephemeral placement id (churns each move).
+/// - `LEGION_INSTANCE_ID` / `LEGION_INSTANCE_MODE` — stateful tasks only; the
+///   stable instance id that survives reschedules and its mode (slot/keyed).
+/// - `LEGION_INSTANCE_SLOT` — slot-mode only; ordinal `0..count-1`.
+///
+/// Legion-injected values win over user-declared env keys with the same name:
+/// they are authoritative runtime facts, and letting a jobspec shadow them
+/// would let a workload misreport its own identity (mirrors Nomad, whose
+/// runtime variables always take precedence). Documented in
+/// `docs/stateful-workloads.md`.
+fn inject_runtime_env(config: &mut Value, allocation: &Allocation, instance: Option<&Instance>) {
+    let Some(config) = config.as_object_mut() else {
+        // Non-object kind configs cannot carry an env map; plugins that accept
+        // them do not read env either, so there is nothing to inject into.
+        return;
+    };
+
+    let env = config
+        .entry("env")
+        .or_insert_with(|| Value::Object(Default::default()));
+    let Some(env) = env.as_object_mut() else {
+        warn!(
+            allocation_id = allocation.id,
+            "Task config env is not an object; skipping runtime env injection"
+        );
+        return;
+    };
+
+    env.insert(
+        "LEGION_ALLOC_ID".to_string(),
+        Value::String(allocation.id.to_string()),
+    );
+    if let Some(instance) = instance {
+        env.insert(
+            "LEGION_INSTANCE_ID".to_string(),
+            Value::String(instance.instance_id.clone()),
+        );
+        env.insert(
+            "LEGION_INSTANCE_MODE".to_string(),
+            Value::String(instance.mode.to_string()),
+        );
+        if let Some(slot) = instance.slot_index {
+            env.insert(
+                "LEGION_INSTANCE_SLOT".to_string(),
+                Value::String(slot.to_string()),
+            );
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::structs::{InstanceMode, InstanceState};
     use serde_json::json;
+
+    fn allocation(instance_id: Option<&str>) -> Allocation {
+        Allocation {
+            id: 42,
+            status: "placed".into(),
+            resources: json!({}),
+            node_id: "node-1".into(),
+            job_config_id: "job-1".into(),
+            task_config_id: 1,
+            job_id: "job".into(),
+            instance_id: instance_id.map(String::from),
+        }
+    }
+
+    fn slot_instance() -> Instance {
+        Instance {
+            instance_id: "job-default-1".into(),
+            job_id: "job".into(),
+            group: "default".into(),
+            task_name: "db".into(),
+            mode: InstanceMode::Slot,
+            state: InstanceState::Active,
+            slot_index: Some(1),
+            current_alloc_id: Some(42),
+            storage_handle: Some("local-dir/abc".into()),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+        }
+    }
+
+    fn env_from(task_allocation: &TaskAllocation) -> serde_json::Map<String, Value> {
+        let config: Value =
+            serde_json::from_str(&task_allocation.task_config).expect("config parses");
+        config["env"].as_object().cloned().unwrap_or_default()
+    }
+
+    #[test]
+    fn injects_alloc_id_for_stateless_tasks_without_instance_vars() -> R<()> {
+        let task = TaskConfig {
+            config: json!({ "command": ["true"] }),
+            ..TaskConfig::new("web", "exec")
+        };
+        let built = build_task_allocation(&task, &allocation(None), None)?;
+        let env = env_from(&built);
+        assert_eq!(env["LEGION_ALLOC_ID"], json!("42"));
+        assert!(!env.contains_key("LEGION_INSTANCE_ID"));
+        assert!(!env.contains_key("LEGION_INSTANCE_MODE"));
+        assert!(!env.contains_key("LEGION_INSTANCE_SLOT"));
+        Ok(())
+    }
+
+    #[test]
+    fn injects_instance_env_for_slot_instances() -> R<()> {
+        let task = TaskConfig {
+            config: json!({ "command": ["true"] }),
+            ..TaskConfig::new("db", "exec")
+        };
+        let built = build_task_allocation(
+            &task,
+            &allocation(Some("job-default-1")),
+            Some(&slot_instance()),
+        )?;
+        let env = env_from(&built);
+        assert_eq!(env["LEGION_ALLOC_ID"], json!("42"));
+        assert_eq!(env["LEGION_INSTANCE_ID"], json!("job-default-1"));
+        assert_eq!(env["LEGION_INSTANCE_MODE"], json!("slot"));
+        assert_eq!(env["LEGION_INSTANCE_SLOT"], json!("1"));
+        Ok(())
+    }
+
+    #[test]
+    fn keyed_instances_omit_slot_env_var() -> R<()> {
+        let instance = Instance {
+            mode: InstanceMode::Keyed,
+            slot_index: None,
+            instance_id: "sandbox-7f3a".into(),
+            ..slot_instance()
+        };
+        let task = TaskConfig {
+            config: json!({ "command": ["true"] }),
+            ..TaskConfig::new("sandbox", "exec")
+        };
+        let built =
+            build_task_allocation(&task, &allocation(Some("sandbox-7f3a")), Some(&instance))?;
+        let env = env_from(&built);
+        assert_eq!(env["LEGION_INSTANCE_ID"], json!("sandbox-7f3a"));
+        assert_eq!(env["LEGION_INSTANCE_MODE"], json!("keyed"));
+        assert!(!env.contains_key("LEGION_INSTANCE_SLOT"));
+        Ok(())
+    }
+
+    #[test]
+    fn legion_env_wins_over_user_declared_keys() -> R<()> {
+        // Legion runtime vars are authoritative facts; a jobspec must not be
+        // able to make a workload misreport its own identity.
+        let task = TaskConfig {
+            config: json!({
+                "command": ["true"],
+                "env": {
+                    "LEGION_INSTANCE_ID": "forged",
+                    "LEGION_ALLOC_ID": "forged",
+                    "USER_VAR": "kept"
+                }
+            }),
+            ..TaskConfig::new("db", "exec")
+        };
+        let built = build_task_allocation(
+            &task,
+            &allocation(Some("job-default-1")),
+            Some(&slot_instance()),
+        )?;
+        let env = env_from(&built);
+        assert_eq!(env["LEGION_INSTANCE_ID"], json!("job-default-1"));
+        assert_eq!(env["LEGION_ALLOC_ID"], json!("42"));
+        assert_eq!(env["USER_VAR"], json!("kept"));
+        Ok(())
+    }
+
+    #[test]
+    fn stateless_tasks_carry_no_self_fence_window() -> R<()> {
+        let task = TaskConfig {
+            config: json!({ "command": ["true"] }),
+            ..TaskConfig::new("web", "exec")
+        };
+        let built = build_task_allocation(&task, &allocation(None), None)?;
+        assert_eq!(built.self_terminate_after_seconds, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn stateful_tasks_carry_the_default_self_fence_window_without_on_lost() -> R<()> {
+        // Even without an onLost block, stateful tasks get the 90s default —
+        // fencing is on by default.
+        let task = TaskConfig {
+            config: json!({ "command": ["true"] }),
+            stateful: Some(crate::structs::StatefulConfig {
+                mode: InstanceMode::Slot,
+                id_source: None,
+                initial_instances: None,
+                on_lost: None,
+                storage: None,
+            }),
+            ..TaskConfig::new("db", "exec")
+        };
+        let built = build_task_allocation(
+            &task,
+            &allocation(Some("job-default-1")),
+            Some(&slot_instance()),
+        )?;
+        assert_eq!(built.self_terminate_after_seconds, 90);
+        Ok(())
+    }
+
+    #[test]
+    fn stateful_tasks_carry_their_declared_self_fence_window() -> R<()> {
+        let task = TaskConfig {
+            config: json!({ "command": ["true"] }),
+            stateful: Some(crate::structs::StatefulConfig {
+                mode: InstanceMode::Slot,
+                id_source: None,
+                initial_instances: None,
+                on_lost: Some(crate::structs::StatefulOnLostConfig {
+                    self_terminate_after: Some("30s".into()),
+                    replace_after: Some("2m".into()),
+                }),
+                storage: None,
+            }),
+            ..TaskConfig::new("db", "exec")
+        };
+        let built = build_task_allocation(
+            &task,
+            &allocation(Some("job-default-1")),
+            Some(&slot_instance()),
+        )?;
+        assert_eq!(built.self_terminate_after_seconds, 30);
+        Ok(())
+    }
+
+    #[test]
+    fn injection_does_not_mutate_the_stored_task_config() -> R<()> {
+        let task = TaskConfig {
+            config: json!({ "command": ["true"] }),
+            ..TaskConfig::new("web", "exec")
+        };
+        build_task_allocation(&task, &allocation(None), None)?;
+        assert!(task.config.get("env").is_none());
+        Ok(())
+    }
 
     #[test]
     fn worker_address_from_node_config() {

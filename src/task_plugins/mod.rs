@@ -1,7 +1,10 @@
 use crate::manager::rollout_strategy::validate_rollout_strategy_name;
 use crate::plugin_runtime::{plugin_paths, validate_manifest};
 use crate::prelude::*;
-use crate::structs::{Allocation, JobConfig, TaskConfig, TaskDependencyCondition, TaskLifecycle};
+use crate::structs::{
+    Allocation, InstanceMode, JobConfig, RolloutReplacement, TaskConfig, TaskDependencyCondition,
+    TaskLifecycle,
+};
 use crate::util::plugin_root_dir;
 use jsonschema::JSONSchema;
 use libloading::{Library, Symbol};
@@ -286,6 +289,7 @@ pub fn validate_job_config(config: &JobConfig) -> R<()> {
         registry.validate_task_config(task)?;
         task.validate_checks()?;
         task.validate_kv_injections()?;
+        task.validate_stateful()?;
         task.validate_identities()?;
         task.validate_artifacts()?;
         if !task.artifacts.is_empty() {
@@ -359,6 +363,104 @@ pub fn validate_job_config(config: &JobConfig) -> R<()> {
                     "Task {} kind {} does not support kv file injection",
                     task.name,
                     task.kind
+                );
+            }
+        }
+    }
+    // Slot instance ids are derived from (job, group, slot), so two slot-mode
+    // stateful tasks in one group would collide on instance identity.
+    let mut slot_stateful_by_group: HashMap<&str, &str> = HashMap::new();
+    for task in &config.tasks {
+        if task
+            .stateful
+            .as_ref()
+            .is_some_and(|stateful| stateful.mode == InstanceMode::Slot)
+        {
+            if let Some(existing) =
+                slot_stateful_by_group.insert(task.group.as_str(), task.name.as_str())
+            {
+                bail!(
+                    "Group {} declares multiple slot-mode stateful tasks ({} and {}); slot \
+                     instance ids are derived from (job, group, slot) and would collide",
+                    task.group,
+                    existing,
+                    task.name
+                );
+            }
+        }
+    }
+    // A `createFirst` (replace-before-stop) rollout runs the incoming and
+    // outgoing allocations concurrently. For a stateful task that means two
+    // live allocations sharing one instance id, storage handle, and workload
+    // identity at once — violating the "at most one live allocation per
+    // instance" invariant (docs/stateful-workloads.md) with no fencing to make
+    // it safe (docs/stateful-vs-nomad-k8s.md). Reject the combo at admission:
+    // stateful groups must roll with the default stop-then-start strategy until
+    // fencing exists.
+    for task in &config.tasks {
+        if !task.is_stateful() {
+            continue;
+        }
+        let replacement = config
+            .rollout_config_for_group(&task.group)
+            .and_then(|rollout| rollout.replacement);
+        if replacement == Some(RolloutReplacement::CreateFirst) {
+            bail!(
+                "task {} (group {}) is stateful and cannot use a createFirst \
+                 (replace-before-stop) rollout: it would run two live allocations on the same \
+                 instance id and storage handle at once, breaking the at-most-one-live-allocation \
+                 invariant. Use the default stop-first replacement for stateful groups.",
+                task.name,
+                task.group
+            );
+        }
+    }
+    // Ordinal-aware rollout options (`rollout.slots`: `order: sequential`,
+    // `updateFrom`) only have meaning for a fixed pool of ordinal slots, i.e.
+    // a group whose stateful task is slot mode. Reject the block anywhere
+    // else (stateless groups, keyed groups) with a pointer at the per-group
+    // scoping so mixed jobs can still use it.
+    let job_groups = config
+        .tasks
+        .iter()
+        .map(|task| task.group.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    for group in job_groups {
+        let Some(slots) = config
+            .rollout_config_for_group(group)
+            .and_then(|rollout| rollout.slots)
+        else {
+            continue;
+        };
+        let slot_task = config.tasks.iter().find(|task| {
+            task.group == group
+                && task
+                    .stateful
+                    .as_ref()
+                    .is_some_and(|stateful| stateful.mode == InstanceMode::Slot)
+        });
+        let Some(slot_task) = slot_task else {
+            bail!(
+                "rollout slots options (order/updateFrom) are only valid for groups with a \
+                 slot-mode stateful task, and group {} has none. Scope them via \
+                 rolloutByGroup.{} on a slot-mode group instead.",
+                group,
+                group
+            );
+        };
+        if let Some(update_from) = slots.update_from {
+            // K8s allows partition >= replicas to mean "update nothing", but
+            // a Legion rollout that completes instantly while silently
+            // pinning every slot to the old config is almost always a typo.
+            // Reject it and point at the intent-revealing alternatives.
+            if update_from >= slot_task.count.num {
+                bail!(
+                    "rollout slots.updateFrom ({}) must be less than task {}'s count ({}): a \
+                     value >= count would update nothing. Omit updateFrom to update every slot, \
+                     or lower it to stage the update at a higher slot.",
+                    update_from,
+                    slot_task.name,
+                    slot_task.count.num
                 );
             }
         }
@@ -549,6 +651,7 @@ mod tests {
             job_config_id: "job-1".into(),
             task_config_id: 1,
             job_id: "job".into(),
+            instance_id: None,
         }
     }
 
@@ -756,6 +859,209 @@ mod tests {
 
         let err = validate_job_config(&config).expect_err("unknown strategy should fail");
         assert!(err.to_string().contains("invalid rollout.strategy"));
+    }
+
+    fn stateful_slot_task() -> TaskConfig {
+        TaskConfig {
+            count: crate::structs::TaskCount::new(2),
+            stateful: Some(crate::structs::StatefulConfig {
+                mode: InstanceMode::Slot,
+                id_source: None,
+                initial_instances: None,
+                on_lost: None,
+                storage: None,
+            }),
+            config: json!({"command": ["true"]}),
+            ..TaskConfig::new("db", "exec")
+        }
+    }
+
+    #[test]
+    fn rejects_create_first_rollout_on_stateful_task() {
+        let config = JobConfig {
+            rollout: Some(crate::structs::RolloutConfig {
+                replacement: Some(RolloutReplacement::CreateFirst),
+                ..Default::default()
+            }),
+            rollout_by_group: Default::default(),
+            name: "stateful-createfirst".into(),
+            tasks: vec![stateful_slot_task()],
+            version: None,
+        };
+
+        let err = validate_job_config(&config)
+            .expect_err("createFirst over a stateful task must be rejected");
+        assert!(
+            err.to_string().contains("createFirst"),
+            "error should name the createFirst combo: {err}"
+        );
+    }
+
+    #[test]
+    fn allows_stop_first_rollout_on_stateful_task() -> R<()> {
+        // Default (stop-first) replacement on a stateful task is fine.
+        let config = JobConfig {
+            rollout: Some(crate::structs::RolloutConfig {
+                replacement: Some(RolloutReplacement::DestroyFirst),
+                ..Default::default()
+            }),
+            rollout_by_group: Default::default(),
+            name: "stateful-stopfirst".into(),
+            tasks: vec![stateful_slot_task()],
+            version: None,
+        };
+        validate_job_config(&config)?;
+
+        // No rollout block at all is also fine.
+        let no_rollout = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "stateful-norollout".into(),
+            tasks: vec![stateful_slot_task()],
+            version: None,
+        };
+        validate_job_config(&no_rollout)?;
+        Ok(())
+    }
+
+    fn sequential_slots(update_from: Option<u32>) -> crate::structs::RolloutSlotsConfig {
+        crate::structs::RolloutSlotsConfig {
+            order: Some(crate::structs::RolloutSlotOrder::Sequential),
+            update_from,
+        }
+    }
+
+    #[test]
+    fn accepts_sequential_slots_rollout_on_slot_group() -> R<()> {
+        let config = JobConfig {
+            rollout: Some(crate::structs::RolloutConfig {
+                slots: Some(sequential_slots(Some(1))),
+                ..Default::default()
+            }),
+            rollout_by_group: Default::default(),
+            name: "stateful-sequential".into(),
+            tasks: vec![stateful_slot_task()],
+            version: None,
+        };
+        validate_job_config(&config)
+    }
+
+    #[test]
+    fn rejects_slots_rollout_on_group_without_slot_task() {
+        // Stateless group.
+        let config = JobConfig {
+            rollout: Some(crate::structs::RolloutConfig {
+                slots: Some(sequential_slots(None)),
+                ..Default::default()
+            }),
+            rollout_by_group: Default::default(),
+            name: "stateless-sequential".into(),
+            tasks: vec![TaskConfig {
+                config: json!({"command": ["true"]}),
+                ..TaskConfig::new("api", "exec")
+            }],
+            version: None,
+        };
+        let err = validate_job_config(&config).expect_err("slots on a stateless group");
+        assert!(
+            err.to_string().contains("slot-mode stateful task"),
+            "error should explain the slot-mode requirement: {err}"
+        );
+
+        // Keyed-mode stateful group is also not a slot pool.
+        let keyed = JobConfig {
+            rollout: Some(crate::structs::RolloutConfig {
+                slots: Some(sequential_slots(None)),
+                ..Default::default()
+            }),
+            rollout_by_group: Default::default(),
+            name: "keyed-sequential".into(),
+            tasks: vec![TaskConfig {
+                stateful: Some(crate::structs::StatefulConfig {
+                    mode: InstanceMode::Keyed,
+                    id_source: None,
+                    initial_instances: None,
+                    on_lost: None,
+                    storage: None,
+                }),
+                config: json!({"command": ["true"]}),
+                ..TaskConfig::new("sandbox", "exec")
+            }],
+            version: None,
+        };
+        let err = validate_job_config(&keyed).expect_err("slots on a keyed group");
+        assert!(err.to_string().contains("slot-mode stateful task"));
+    }
+
+    #[test]
+    fn rejects_update_from_at_or_above_slot_count() {
+        // stateful_slot_task() has count 2; updateFrom 2 would update nothing.
+        let config = JobConfig {
+            rollout: Some(crate::structs::RolloutConfig {
+                slots: Some(sequential_slots(Some(2))),
+                ..Default::default()
+            }),
+            rollout_by_group: Default::default(),
+            name: "updatefrom-too-high".into(),
+            tasks: vec![stateful_slot_task()],
+            version: None,
+        };
+        let err = validate_job_config(&config).expect_err("updateFrom >= count");
+        assert!(
+            err.to_string().contains("would update nothing"),
+            "error should explain the no-op and suggest omission: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_global_slots_when_any_group_lacks_slot_task() {
+        // Global slots apply to every group; the stateless `web` group makes
+        // the spec invalid, with a pointer at rolloutByGroup scoping.
+        let config = JobConfig {
+            rollout: Some(crate::structs::RolloutConfig {
+                slots: Some(sequential_slots(None)),
+                ..Default::default()
+            }),
+            rollout_by_group: Default::default(),
+            name: "mixed-groups".into(),
+            tasks: vec![
+                stateful_slot_task(),
+                TaskConfig {
+                    group: "web".into(),
+                    config: json!({"command": ["true"]}),
+                    ..TaskConfig::new("api", "exec")
+                },
+            ],
+            version: None,
+        };
+        let err = validate_job_config(&config).expect_err("global slots over a stateless group");
+        assert!(
+            err.to_string().contains("rolloutByGroup"),
+            "error should point at per-group scoping: {err}"
+        );
+
+        // Scoping the slots block to the slot group fixes it.
+        let scoped = JobConfig {
+            rollout: None,
+            rollout_by_group: std::collections::BTreeMap::from([(
+                "default".to_string(),
+                crate::structs::RolloutConfig {
+                    slots: Some(sequential_slots(None)),
+                    ..Default::default()
+                },
+            )]),
+            name: "mixed-groups-scoped".into(),
+            tasks: vec![
+                stateful_slot_task(),
+                TaskConfig {
+                    group: "web".into(),
+                    config: json!({"command": ["true"]}),
+                    ..TaskConfig::new("api", "exec")
+                },
+            ],
+            version: None,
+        };
+        validate_job_config(&scoped).expect("group-scoped slots block is valid");
     }
 
     #[test]

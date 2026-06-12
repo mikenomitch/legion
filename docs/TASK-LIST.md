@@ -189,4 +189,4 @@
   - [ ] Artifact staging on Windows: hardlink/reflink fallbacks, path semantics, image
     consumption (see Follow-Ups in docs/plans/artifact-system-plan.md)
 
-- [ ] Workload identity tokens
+- [x] Workload identity tokens (OIDC; see docs/workload-identity.md)

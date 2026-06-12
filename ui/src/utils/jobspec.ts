@@ -5,6 +5,13 @@ export type JobTaskDependency = {
   condition?: string
 }
 
+// Parsed `stateful` block from a task spec (see docs/stateful-workloads.md).
+export type JobTaskStateful = {
+  mode: string
+  idSource?: string
+  storagePath?: string
+}
+
 // A declared task artifact, normalized from either the string shorthand or
 // the full object form in the job spec.
 export type JobTaskArtifact = {
@@ -41,6 +48,7 @@ export type JobTask = {
   config?: Record<string, unknown>
   checks?: unknown
   dependsOn: JobTaskDependency[]
+  stateful?: JobTaskStateful
   artifacts: JobTaskArtifact[]
 }
 
@@ -69,6 +77,19 @@ const normalizeDependency = (value: unknown): JobTaskDependency | null => {
   return {
     task,
     condition: readTaskString(item.condition) || undefined,
+  }
+}
+
+const normalizeStateful = (value: unknown): JobTaskStateful | undefined => {
+  if (!value || typeof value !== 'object') return undefined
+  const raw = value as Record<string, unknown>
+  const mode = readTaskString(raw.mode)
+  if (!mode) return undefined
+  const storage = raw.storage && typeof raw.storage === 'object' ? (raw.storage as Record<string, unknown>) : undefined
+  return {
+    mode,
+    idSource: readTaskString(raw.idSource) || undefined,
+    storagePath: storage ? readTaskString(storage.path) || undefined : undefined,
   }
 }
 
@@ -194,6 +215,7 @@ const normalizeTask = (value: unknown): JobTask | null => {
     config: raw.config && typeof raw.config === 'object' ? (raw.config as Record<string, unknown>) : undefined,
     checks: raw.checks,
     dependsOn,
+    stateful: normalizeStateful(raw.stateful),
     artifacts,
   }
 }
@@ -334,5 +356,15 @@ export const taskStatusTone = (status: string): 'success' | 'warning' | 'danger'
   if (['running', 'healthy', 'completed', 'success'].some((item) => normalized.includes(item))) return 'success'
   if (['failed', 'error', 'stopped', 'lost'].some((item) => normalized.includes(item))) return 'danger'
   if (['pending', 'starting', 'queued'].some((item) => normalized.includes(item))) return 'warning'
+  return 'neutral'
+}
+
+// Tone for a stateful instance lifecycle state, consistent with the status
+// colors used elsewhere: active=green, pending/rescheduling=amber,
+// terminated=gray (tombstones are expected rows, not failures).
+export const instanceStateTone = (state: string): 'success' | 'warning' | 'neutral' => {
+  const normalized = state.toLowerCase()
+  if (normalized === 'active') return 'success'
+  if (normalized === 'pending' || normalized === 'rescheduling') return 'warning'
   return 'neutral'
 }

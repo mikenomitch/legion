@@ -1,5 +1,6 @@
 import { A } from '@solidjs/router'
 import { For, Show, type Resource } from 'solid-js'
+import { InstancePill } from '../components/DetailPrimitives'
 import type { LedgerNode, Rollout } from '../gen/legion_pb'
 import { asDisplay, formatRelativeTime } from '../utils/format'
 import { healthToneClasses, summarizeHealthChecks } from '../utils/health'
@@ -114,7 +115,12 @@ export default function Homepage(props: HomepageProps) {
                                 )
                               })()}
                               <div class="flex flex-wrap items-center justify-between gap-2 text-sm text-neutral-900 dark:text-neutral-100">
-                                <span class="font-semibold">Allocation #{asDisplay(allocation.id)} · <A href={`/jobs/${encodeURIComponent(allocation.jobId)}`} class="underline">{allocation.jobId}</A></span>
+                                <span class="flex flex-wrap items-center gap-2">
+                                  <span class="font-semibold">Allocation #{asDisplay(allocation.id)} · <A href={`/jobs/${encodeURIComponent(allocation.jobId)}`} class="underline">{allocation.jobId}</A></span>
+                                  <Show when={allocation.instanceId}>
+                                    <InstancePill id={allocation.instanceId!} />
+                                  </Show>
+                                </span>
                                 <span class="rounded border border-neutral-300 px-2 py-1 text-[11px] uppercase tracking-wide dark:border-neutral-700">
                                   {allocation.status}
                                 </span>

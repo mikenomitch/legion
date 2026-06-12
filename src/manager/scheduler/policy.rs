@@ -458,6 +458,7 @@ mod tests {
             job_config_id: job_config_id.into(),
             task_config_id,
             job_id: "job".into(),
+            instance_id: None,
         }
     }
 

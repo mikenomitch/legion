@@ -65,6 +65,34 @@ struct GroupPlan {
     replacement: RolloutReplacement,
     step_fractions: Vec<f64>,
     tasks: Vec<GroupTaskPlan>,
+    /// Present when the effective rollout config asks for ordered slot
+    /// replacement (`slots.order: 'sequential'`) and the group has a
+    /// slot-mode stateful task. One slot is replaced per step, highest
+    /// ordinal first, stopping above `update_from` (the staged floor).
+    sequential_slots: Option<SlotSequentialPlan>,
+}
+
+/// Ordered-slot parameters resolved for one group (see `GroupPlan`).
+#[derive(Debug, Clone)]
+struct SlotSequentialPlan {
+    /// Name of the group's slot-mode stateful task (at most one per group).
+    task_name: String,
+    /// The slot pool size (`count.num`) in the destination config.
+    count: u32,
+    /// Slots `0..update_from` are never touched (`slots.updateFrom`,
+    /// default 0 = update everything).
+    update_from: u32,
+}
+
+impl SlotSequentialPlan {
+    /// The slot being replaced at a given step: highest ordinal first,
+    /// `count-1` at step 0 down to `update_from` at the last step.
+    fn slot_for_step(&self, step_index: usize) -> u32 {
+        self.count
+            .saturating_sub(1)
+            .saturating_sub(step_index.min(u32::MAX as usize) as u32)
+            .max(self.update_from)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -116,6 +144,9 @@ struct TickOutcome {
 struct RetireOutcome {
     removed: usize,
     blocked: bool,
+    /// Slot ordinals retired this tick (sequential slot groups only), used
+    /// to make rollout events name the slot being replaced.
+    removed_slots: Vec<u32>,
 }
 
 #[derive(Debug, Default)]
@@ -611,7 +642,7 @@ fn execute_group_tick(
         .get(state.step_index)
         .copied()
         .unwrap_or(1.0);
-    let step_targets = build_step_targets(plan, step_fraction);
+    let step_targets = build_step_targets(plan, step_fraction, state.step_index);
     debug!(
         rollout_id = rollout.id,
         group = %plan.name,
@@ -639,24 +670,51 @@ fn execute_group_tick(
         }
     }
 
+    let completed_step = state.step_index;
     state.step_index += 1;
     state.active_step_started_at = None;
     state.reached_target_at = None;
     state.blocked_since = None;
     state.last_step_completed_at = Some(format_ts(now)?);
 
+    let message = match plan.sequential_slots.as_ref() {
+        // Make sequential progress legible in the event log: each completed
+        // step is exactly one slot becoming healthy on the new config.
+        Some(slots) => format!(
+            "Group {} advanced to step {} (slot {} updated and healthy)",
+            plan.name,
+            state.step_index,
+            slots.slot_for_step(completed_step)
+        ),
+        None => format!("Group {} advanced to step {}", plan.name, state.step_index),
+    };
     Ok(GroupAction::Mutated {
         delay: Some(Duration::from_millis(0)),
-        message: format!("Group {} advanced to step {}", plan.name, state.step_index),
+        message,
     })
 }
 
-fn build_step_targets(plan: &GroupPlan, step_fraction: f64) -> StepTargets {
+fn build_step_targets(plan: &GroupPlan, step_fraction: f64, step_index: usize) -> StepTargets {
     let mut targets = StepTargets::default();
     for task in &plan.tasks {
-        let target_new = ((task.desired_new as f64) * step_fraction)
-            .ceil()
-            .min(task.desired_new as f64) as u32;
+        let sequential = plan
+            .sequential_slots
+            .as_ref()
+            .filter(|slots| slots.task_name == task.name);
+        let target_new = if let Some(slots) = sequential {
+            // Exact integer math for the slot task: step i has replaced
+            // slots count-1 ..= count-1-i, i.e. i+1 slots, capped at the
+            // staged floor (slots below `update_from` are never updated).
+            let updatable = slots.count.saturating_sub(slots.update_from);
+            (step_index.min(u32::MAX as usize) as u32)
+                .saturating_add(1)
+                .min(updatable)
+                .min(task.desired_new)
+        } else {
+            ((task.desired_new as f64) * step_fraction)
+                .ceil()
+                .min(task.desired_new as f64) as u32
+        };
         let target_old = task.desired_new.saturating_sub(target_new);
         targets
             .per_task_target_new
@@ -731,9 +789,21 @@ fn execute_step_operation(
                 HealthState::Healthy => Ok(None),
                 HealthState::Waiting => {
                     let wait = health_wait_delay(plan, state, now)?;
+                    let message = match plan.sequential_slots.as_ref() {
+                        // Sequential groups halt here: the named slot's
+                        // replacement must pass the health gate before the
+                        // next (lower) slot is touched.
+                        Some(slots) => format!(
+                            "Group {} waiting for slot {} replacement to become healthy \
+                             before updating the next slot",
+                            plan.name,
+                            slots.slot_for_step(state.step_index)
+                        ),
+                        None => format!("Group {} waiting for healthy window", plan.name),
+                    };
                     Ok(Some(GroupAction::Wait {
                         delay: wait,
-                        message: format!("Group {} waiting for healthy window", plan.name),
+                        message,
                     }))
                 }
                 HealthState::Deadline(action) => Ok(Some(on_health_deadline(
@@ -753,12 +823,29 @@ fn execute_step_operation(
                 &step_targets.per_task_target_old,
             )?;
             if retire.removed > 0 {
-                return Ok(Some(GroupAction::Mutated {
-                    delay: plan.config.allocation_stagger,
-                    message: format!(
+                let message = if retire.removed_slots.is_empty() {
+                    format!(
                         "Group {} retired {} old allocations",
                         plan.name, retire.removed
-                    ),
+                    )
+                } else {
+                    // Sequential slot groups: name the slot(s) so the event
+                    // log shows the ordinal order of the update.
+                    format!(
+                        "Group {} retired old allocation for slot {} (sequential update, \
+                         highest slot first)",
+                        plan.name,
+                        retire
+                            .removed_slots
+                            .iter()
+                            .map(|slot| slot.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                };
+                return Ok(Some(GroupAction::Mutated {
+                    delay: plan.config.allocation_stagger,
+                    message,
                 }));
             }
             if retire.blocked {
@@ -1299,9 +1386,53 @@ fn retire_old_allocations_for_group(
         let mut old_allocs = task.current_old_allocs.clone();
         old_allocs.sort_by_key(|alloc| alloc.id);
 
+        let sequential = plan
+            .sequential_slots
+            .as_ref()
+            .filter(|slots| slots.task_name == task.name);
+        let slot_indices = match (sequential, old_allocs.first()) {
+            // Sequential slot groups retire in DESCENDING slot order (the
+            // K8s StatefulSet update order: highest ordinal first, so
+            // followers update before slot 0 by convention). The slot
+            // identity lives on the allocation's instance row.
+            (Some(slots), Some(first)) => {
+                let indices = store.slot_indices_for_job_group(&first.job_id, &plan.name)?;
+                // Never retire a slot below the staged floor: those keep
+                // running their current allocations untouched.
+                old_allocs.retain(|alloc| {
+                    alloc
+                        .instance_id
+                        .as_deref()
+                        .and_then(|id| indices.get(id))
+                        .is_none_or(|slot| *slot >= slots.update_from)
+                });
+                // Allocations without a resolvable slot (anomalies) sort
+                // first and are cleaned up before any real ordinal.
+                old_allocs.sort_by_key(|alloc| {
+                    std::cmp::Reverse(
+                        alloc
+                            .instance_id
+                            .as_deref()
+                            .and_then(|id| indices.get(id))
+                            .copied()
+                            .unwrap_or(u32::MAX),
+                    )
+                });
+                Some(indices)
+            }
+            _ => None,
+        };
+
         for allocation in old_allocs.into_iter().take(to_remove) {
             let _ = store.remove_allocation_by_id(allocation.id)?;
             outcome.removed += 1;
+            if let (Some(indices), Some(instance_id)) =
+                (slot_indices.as_ref(), allocation.instance_id.as_deref())
+            {
+                if let Some(slot) = indices.get(instance_id) {
+                    outcome.removed_slots.push(*slot);
+                }
+            }
         }
     }
 
@@ -1340,21 +1471,49 @@ fn build_group_plans(
     } else {
         Vec::new()
     };
-    let old_allocs = if let Some(from_id) = rollout.from_job_config_id.as_ref() {
-        store.allocs_for_job_config(from_id)?
+    // Old allocations to roll: EVERY live allocation of the job that is not
+    // on the destination config — not just the immediate from-config's. A
+    // staged rollout (`rollout.slots.updateFrom`) deliberately completes
+    // with low slots still running an older config; when a later resubmit
+    // lowers the floor (the canary-promote workflow), those older-config
+    // allocations must be visible to the new rollout so they are replaced
+    // with the same ordering and health gating as everything else.
+    let old_allocs = if rollout.from_job_config_id.is_some() {
+        store
+            .allocs_for_job(&rollout.job_id)?
+            .into_iter()
+            .filter(|allocation| allocation.job_config_id != rollout.to_job_config_id)
+            .collect::<Vec<_>>()
     } else {
         Vec::new()
     };
 
-    let old_allocs_by_task = old_allocs.into_iter().fold(
-        HashMap::<i64, Vec<Allocation>>::new(),
-        |mut acc, allocation| {
-            acc.entry(allocation.task_config_id)
-                .or_default()
-                .push(allocation);
-            acc
-        },
-    );
+    // Resolve each old allocation's (group, task name) through its own
+    // config version's task list (allocations from configs older than the
+    // from-config carry task ids the from-config does not know).
+    let mut tasks_by_config: HashMap<String, HashMap<i64, TaskConfig>> = HashMap::new();
+    if let Some(from_id) = rollout.from_job_config_id.as_ref() {
+        tasks_by_config.insert(from_id.clone(), from_tasks.iter().cloned().collect());
+    }
+    let mut old_allocs_by_group_task: HashMap<(String, String), Vec<Allocation>> = HashMap::new();
+    for allocation in old_allocs {
+        let config_tasks = match tasks_by_config.entry(allocation.job_config_id.clone()) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => entry.insert(
+                store
+                    .get_task_configs_for_job_config(&allocation.job_config_id)?
+                    .into_iter()
+                    .collect(),
+            ),
+        };
+        let Some(task) = config_tasks.get(&allocation.task_config_id) else {
+            continue;
+        };
+        old_allocs_by_group_task
+            .entry((task.group.clone(), task.name.clone()))
+            .or_default()
+            .push(allocation);
+    }
 
     let mut by_group_new: HashMap<String, HashMap<String, (i64, TaskConfig)>> = HashMap::new();
     for (task_id, task) in to_tasks {
@@ -1376,6 +1535,11 @@ fn build_group_plans(
         .keys()
         .chain(by_group_old.keys())
         .cloned()
+        .chain(
+            old_allocs_by_group_task
+                .keys()
+                .map(|(group, _)| group.clone()),
+        )
         .collect::<HashSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
@@ -1390,6 +1554,13 @@ fn build_group_plans(
             .keys()
             .chain(old_tasks.keys())
             .cloned()
+            .chain(old_allocs_by_group_task.keys().filter_map(|(g, name)| {
+                if *g == group {
+                    Some(name.clone())
+                } else {
+                    None
+                }
+            }))
             .collect::<HashSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
@@ -1398,14 +1569,27 @@ fn build_group_plans(
 
         let mut tasks = Vec::new();
         let mut base_count = 0;
+        let mut slot_task: Option<(String, u32)> = None;
         for name in task_names {
             let new_entry = new_tasks.get(&name).cloned();
             let old_entry = old_tasks.get(&name).cloned();
 
-            let desired_new = new_entry
-                .as_ref()
-                .map(|(_, task)| task.count.num)
-                .unwrap_or(0);
+            // Keyed-mode stateful tasks are not driven by count.num: their
+            // desired count is the number of live instances created via the
+            // instance management API, so a config rollout replaces every
+            // live keyed instance's allocation instead of converging to
+            // count.num.
+            let desired_new = match new_entry.as_ref() {
+                Some((_, task))
+                    if task.stateful.as_ref().is_some_and(|stateful| {
+                        stateful.mode == crate::structs::InstanceMode::Keyed
+                    }) =>
+                {
+                    store.count_live_keyed_instances(&rollout.job_id, &group, &name)?
+                }
+                Some((_, task)) => task.count.num,
+                None => 0,
+            };
             base_count = base_count.max(desired_new);
 
             let lifecycle = new_entry
@@ -1414,14 +1598,27 @@ fn build_group_plans(
                 .or_else(|| old_entry.as_ref().map(|(_, task)| task.lifecycle.clone()))
                 .unwrap_or(TaskLifecycle::Service);
 
+            if let Some((_, task)) = new_entry.as_ref() {
+                if task
+                    .stateful
+                    .as_ref()
+                    .is_some_and(|stateful| stateful.mode == crate::structs::InstanceMode::Slot)
+                {
+                    // At most one slot-mode stateful task per group
+                    // (enforced at job admission).
+                    slot_task = Some((task.name.clone(), task.count.num));
+                }
+            }
+
             let new_task_id = new_entry.as_ref().map(|(id, _)| *id);
             let old_task_id = old_entry.as_ref().map(|(id, _)| *id);
 
             let current_new = new_task_id
                 .and_then(|id| to_alloc_counts.get(&id).copied())
                 .unwrap_or_default();
-            let current_old_allocs = old_task_id
-                .and_then(|id| old_allocs_by_task.get(&id).cloned())
+            let current_old_allocs = old_allocs_by_group_task
+                .get(&(group.clone(), name.clone()))
+                .cloned()
                 .unwrap_or_default();
 
             tasks.push(GroupTaskPlan {
@@ -1448,7 +1645,26 @@ fn build_group_plans(
             .replacement
             .clone()
             .unwrap_or(RolloutReplacement::DestroyFirst);
-        let step_fractions = step_fractions_for_rollout(&effective_rollout, base_count.max(1));
+        // Ordered slot replacement only applies when the effective config
+        // asks for it AND the group actually has a slot pool (validation
+        // guarantees this for specs; strategy plugins could disagree, in
+        // which case the slots block is ignored for slot-less groups).
+        let sequential_slots = match (effective_rollout.slots.as_ref(), slot_task) {
+            (Some(slots), Some((task_name, count))) if slots.is_sequential() => {
+                Some(SlotSequentialPlan {
+                    task_name,
+                    count,
+                    update_from: slots.update_from.unwrap_or(0),
+                })
+            }
+            _ => None,
+        };
+        // Sequential groups define their own one-slot-per-step progression
+        // (taking precedence over any plugin-injected step mode).
+        let step_fractions = match sequential_slots.as_ref() {
+            Some(slots) => sequential_step_fractions(slots.count, slots.update_from),
+            None => step_fractions_for_rollout(&effective_rollout, base_count.max(1)),
+        };
         plans.push(GroupPlan {
             name: group,
             config: effective_rollout,
@@ -1456,6 +1672,7 @@ fn build_group_plans(
             replacement,
             step_fractions,
             tasks,
+            sequential_slots,
         });
     }
 
@@ -1481,6 +1698,7 @@ fn build_group_plans(
             replacement,
             step_fractions: step_fractions_for_rollout(&config, 1),
             tasks: Vec::new(),
+            sequential_slots: None,
         });
     }
 
@@ -1599,6 +1817,24 @@ fn build_tick_inputs(store: &Store, rollout: &Rollout, plans: &[GroupPlan]) -> R
         new_task_ids,
         allocation_health,
     })
+}
+
+/// Step fractions for an ordered slot rollout (`rollout.slots.order:
+/// 'sequential'`): one step per slot being updated, highest slot first,
+/// stopping at the staged floor (`update_from`). With `count = 4,
+/// update_from = 2` this yields `[0.25, 0.5]` — two steps (slots 3 then 2),
+/// deliberately NOT ending at 1.0 because slots 0..2 keep their current
+/// allocations. An out-of-range floor (`update_from >= count`, rejected at
+/// validation but reachable through strategy plugins) yields no steps: the
+/// group completes without touching anything.
+pub(crate) fn sequential_step_fractions(count: u32, update_from: u32) -> Vec<f64> {
+    if count == 0 {
+        return vec![1.0];
+    }
+    let updatable = count.saturating_sub(update_from);
+    (1..=updatable)
+        .map(|updated| (updated as f64) / (count as f64))
+        .collect()
 }
 
 pub(crate) fn step_fractions_for_rollout(config: &RolloutConfig, base_count: u32) -> Vec<f64> {
@@ -1796,6 +2032,67 @@ mod tests {
     }
 
     #[test]
+    fn sequential_step_fractions_one_step_per_slot() {
+        // count 4, no floor: four steps (slots 3, 2, 1, 0).
+        assert_eq!(sequential_step_fractions(4, 0), vec![0.25, 0.5, 0.75, 1.0]);
+        // count 4, updateFrom 2: two steps (slots 3, 2); deliberately does
+        // NOT end at 1.0 — slots 0..2 stay on their current allocations.
+        assert_eq!(sequential_step_fractions(4, 2), vec![0.25, 0.5]);
+        // Defensive: an out-of-range floor yields no steps (instant
+        // completion, nothing touched) rather than a panic.
+        assert!(sequential_step_fractions(3, 3).is_empty());
+        assert!(sequential_step_fractions(3, 7).is_empty());
+    }
+
+    #[test]
+    fn build_step_targets_sequential_replaces_one_slot_per_step() {
+        let task = GroupTaskPlan {
+            name: "db".to_string(),
+            lifecycle: TaskLifecycle::Service,
+            old_task_id: Some(1),
+            new_task_id: Some(2),
+            desired_new: 4,
+            current_new: 0,
+            current_old_allocs: Vec::new(),
+        };
+        let plan = GroupPlan {
+            name: "data".to_string(),
+            config: RolloutConfig::default(),
+            progression: RolloutProgression::Auto,
+            replacement: RolloutReplacement::DestroyFirst,
+            step_fractions: sequential_step_fractions(4, 2),
+            tasks: vec![task],
+            sequential_slots: Some(SlotSequentialPlan {
+                task_name: "db".to_string(),
+                count: 4,
+                update_from: 2,
+            }),
+        };
+
+        // Step 0 replaces slot 3 only; step 1 reaches the staged floor and
+        // keeps slots 0..2 as old allocations (target_old = update_from).
+        let step0 = build_step_targets(&plan, 0.25, 0);
+        assert_eq!(step0.per_task_target_new.get("db"), Some(&1));
+        assert_eq!(step0.per_task_target_old.get("db"), Some(&3));
+        let step1 = build_step_targets(&plan, 0.5, 1);
+        assert_eq!(step1.per_task_target_new.get("db"), Some(&2));
+        assert_eq!(step1.per_task_target_old.get("db"), Some(&2));
+    }
+
+    #[test]
+    fn slot_for_step_counts_down_from_highest() {
+        let slots = SlotSequentialPlan {
+            task_name: "db".to_string(),
+            count: 4,
+            update_from: 2,
+        };
+        assert_eq!(slots.slot_for_step(0), 3);
+        assert_eq!(slots.slot_for_step(1), 2);
+        // Clamped at the staged floor even for out-of-range steps.
+        assert_eq!(slots.slot_for_step(5), 2);
+    }
+
+    #[test]
     fn step_operation_order_matches_replacement_mode() {
         assert_eq!(
             step_operation_order(&RolloutReplacement::CreateFirst),
@@ -1839,6 +2136,7 @@ mod tests {
                         job_config_id: "job-1".to_string(),
                         task_config_id: 1,
                         job_id: "job".to_string(),
+                        instance_id: None,
                     },
                     Allocation {
                         id: 2,
@@ -1848,6 +2146,7 @@ mod tests {
                         job_config_id: "job-1".to_string(),
                         task_config_id: 1,
                         job_id: "job".to_string(),
+                        instance_id: None,
                     },
                     Allocation {
                         id: 3,
@@ -1857,12 +2156,14 @@ mod tests {
                         job_config_id: "job-1".to_string(),
                         task_config_id: 1,
                         job_id: "job".to_string(),
+                        instance_id: None,
                     },
                 ],
             }],
+            sequential_slots: None,
         };
 
-        let targets = build_step_targets(&plan, 0.5);
+        let targets = build_step_targets(&plan, 0.5, 0);
         assert_eq!(targets.per_task_target_new.get("api"), Some(&2));
         assert_eq!(targets.per_task_target_old.get("api"), Some(&2));
         assert!(targets.needs_new_placement);
@@ -2040,6 +2341,7 @@ mod tests {
                 current_new: 1,
                 current_old_allocs: Vec::new(),
             }],
+            sequential_slots: None,
         };
         let targets = HashMap::from([(String::from("api"), 1_u32)]);
         let allocations_by_task = HashMap::from([(task_id, vec![allocation.id])]);

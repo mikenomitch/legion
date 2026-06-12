@@ -12,19 +12,24 @@ use crate::storage::persistence::{
     RaftHistoryEvent, RaftStatus,
 };
 use crate::storage::queries::{
-    GET_ALLOCATION_BY_ID, GET_ALLOCS, GET_ALLOCS_FOR_JOB, GET_ALLOCS_FOR_JOB_CONFIG,
-    GET_ALLOCS_FOR_NODE, GET_EVALS, GET_JOB, GET_JOBS, GET_JOB_CONFIG, GET_JOB_CONFIG_BY_ID,
-    GET_JOB_UPDATE_FOR_CONFIG, GET_MANAGER_CONFIGS, GET_NEXT_EVAL, GET_NODE, GET_NODES,
+    DELETE_SIGNING_KEY, GET_ALLOCATION_BY_ID, GET_ALLOCS, GET_ALLOCS_FOR_JOB,
+    GET_ALLOCS_FOR_JOB_CONFIG, GET_ALLOCS_FOR_NODE, GET_EVALS, GET_INSTANCE, GET_INSTANCES_FOR_JOB,
+    GET_JOB, GET_JOBS, GET_JOB_CONFIG, GET_JOB_CONFIG_BY_ID, GET_JOB_UPDATE_FOR_CONFIG,
+    GET_MANAGER_CONFIGS, GET_NEXT_EVAL, GET_NODE, GET_NODES, GET_SIGNING_KEYS,
     GET_TASK_FOR_JOB_CONIFG, GET_WORKER_TYPE, INSERT_ALLOCATION, INSERT_EVAL, INSERT_JOB,
     INSERT_JOB_CONFIG, INSERT_JOB_CONFIG_SUBMISSION, INSERT_JOB_UPDATE, INSERT_NODE,
-    INSERT_SUBMISSION, INSERT_TASK, INSERT_WORKER_TYPE, NODE_ATTRS, UPSERT_MANAGER_CONFIG,
+    INSERT_SIGNING_KEY, INSERT_SUBMISSION, INSERT_TASK, INSERT_WORKER_TYPE, NODE_ATTRS,
+    UPDATE_SIGNING_KEY_STATE, UPSERT_INSTANCE, UPSERT_MANAGER_CONFIG,
 };
 use crate::structs::{
-    Allocation, AllocationHealth, Eval, Job, JobConfig, KvEntry, KvLock, KvValueType, LedgerEntry,
-    ManagerConfigFull, ManagerNodeConfig, Node, NodeMsg, Rollout, RolloutConfig, Submission,
-    TaskCheck, TaskConfig, TaskCount, TaskDependency, TaskLifecycle, TaskOnUnhealthyConfig,
-    TaskSchedule, TaskStatusState, WorkerConfig,
+    slot_instance_id, Allocation, AllocationHealth, Eval, Instance, InstanceMode, InstanceState,
+    Job, JobConfig, KvEntry, KvLock, KvValueType, LedgerEntry, ManagerConfigFull,
+    ManagerNodeConfig, Node, NodeMsg, ReplaceAfter, ResolvedOnLostPolicy, Rollout, RolloutConfig,
+    SigningKeyRecord, StatefulConfig, StatefulOnLostConfig, Submission, TaskCheck, TaskConfig,
+    TaskCount, TaskDependency, TaskLifecycle, TaskOnUnhealthyConfig, TaskSchedule, TaskStatusState,
+    WorkerConfig,
 };
+use crate::util::random_string;
 
 use rand::{seq::SliceRandom, thread_rng, Rng};
 use rusqlite::{
@@ -119,6 +124,38 @@ pub enum JobSubmitOutcome {
     Created { job_config_id: String },
     Updated { job_config_id: String },
     Unchanged { job_config_id: String },
+}
+
+/// Result of [`Store::destroy_keyed_instance`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DestroyInstanceOutcome {
+    /// The instance was live and is now terminated; `removed_allocations`
+    /// allocation rows were deleted (0 when it had no current placement).
+    Destroyed { removed_allocations: usize },
+    /// The instance was already a tombstone; nothing changed (idempotent
+    /// no-op).
+    AlreadyTerminated,
+}
+
+/// Result of [`Store::stop_keyed_instance`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopInstanceOutcome {
+    /// The instance was live and is now `stopped` (row and storage handle
+    /// retained); `removed_allocations` allocation rows were deleted (0 when
+    /// it had no current placement).
+    Stopped { removed_allocations: usize },
+    /// The instance was already stopped; nothing changed (idempotent no-op).
+    AlreadyStopped,
+}
+
+/// Result of [`Store::start_keyed_instance`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartInstanceOutcome {
+    /// The instance was `stopped` and is now `pending`, awaiting placement.
+    Started,
+    /// The instance was already live (pending/active/rescheduling); nothing
+    /// changed (idempotent no-op).
+    AlreadyRunning,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -406,7 +443,7 @@ impl Store {
 
         let mut task_stmt = conn.prepare(
             r#"
-            SELECT id, name, kind, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_config_id, identities, artifacts
+            SELECT id, name, kind, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_config_id, identities, stateful, artifacts
             FROM task_config;
             "#,
         )?;
@@ -438,7 +475,8 @@ impl Store {
                 on_unhealthy: self.parse_on_unhealthy_column(15, row.get(15)?)?,
                 kv_injections: self.parse_kv_injections_column(16, row.get(16)?)?,
                 identities: self.parse_identities_column(18, row.get(18)?)?,
-                artifacts: self.parse_artifacts_column(19, row.get(19)?)?,
+                stateful: self.parse_stateful_column(19, row.get(19)?)?,
+                artifacts: self.parse_artifacts_column(20, row.get(20)?)?,
             };
             let job_config_id: String = row.get(17)?;
             Ok((job_config_id, id, task))
@@ -1320,6 +1358,23 @@ impl Store {
         })
     }
 
+    fn parse_stateful_column(
+        &self,
+        idx: usize,
+        raw: Option<String>,
+    ) -> Result<Option<StatefulConfig>, rusqlite::Error> {
+        let Some(raw) = raw else {
+            return Ok(None);
+        };
+        serde_json::from_str(&raw).map(Some).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(
+                idx,
+                rusqlite::types::Type::Text,
+                Box::new(err),
+            )
+        })
+    }
+
     fn parse_task_lifecycle_column(
         &self,
         idx: usize,
@@ -1361,7 +1416,8 @@ impl Store {
             on_unhealthy: self.parse_on_unhealthy_column(15, row.get(15)?)?,
             kv_injections: self.parse_kv_injections_column(16, row.get(16)?)?,
             identities: self.parse_identities_column(19, row.get(19)?)?,
-            artifacts: self.parse_artifacts_column(20, row.get(20)?)?,
+            stateful: self.parse_stateful_column(20, row.get(20)?)?,
+            artifacts: self.parse_artifacts_column(21, row.get(21)?)?,
         };
 
         Ok(task_config)
@@ -1376,9 +1432,37 @@ impl Store {
             job_config_id: row.get(4)?,
             task_config_id: row.get(5)?,
             job_id: row.get(6)?,
+            instance_id: row.get(7)?,
         };
 
         Ok(allocation)
+    }
+
+    fn instance_from_row(&self, row: &Row<'_>) -> Result<Instance, rusqlite::Error> {
+        let mode: String = row.get(4)?;
+        let state: String = row.get(5)?;
+        let parse_err = |idx: usize, err: String| {
+            rusqlite::Error::FromSqlConversionFailure(
+                idx,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, err)),
+            )
+        };
+        let instance = Instance {
+            instance_id: row.get(0)?,
+            job_id: row.get(1)?,
+            group: row.get(2)?,
+            task_name: row.get(3)?,
+            mode: mode.parse().map_err(|err| parse_err(4, err))?,
+            state: state.parse().map_err(|err| parse_err(5, err))?,
+            slot_index: row.get::<_, Option<i64>>(6)?.map(|slot| slot as u32),
+            current_alloc_id: row.get(7)?,
+            storage_handle: row.get(8)?,
+            created_at: row.get(9)?,
+            updated_at: row.get(10)?,
+        };
+
+        Ok(instance)
     }
 
     fn manager_config_from_row(&self, row: &Row<'_>) -> Result<ManagerNodeConfig, rusqlite::Error> {
@@ -1465,9 +1549,13 @@ impl Store {
     #[instrument(err, skip_all)]
     pub fn mark_node_ready(&self, id: &str, last_heartbeat: &str) -> R<()> {
         let conn = self.write_connection()?;
+        // A ready node is by definition not lost: clear lost_at so the
+        // node-loss confirmation gate stops counting (its gated allocations
+        // keep running, bound to their instances).
         let sql = r#"
         UPDATE node
-        SET status = :status, availability = :availability, last_heartbeat = :last_heartbeat
+        SET status = :status, availability = :availability, last_heartbeat = :last_heartbeat,
+            lost_at = NULL
         WHERE id = :id;
         "#;
 
@@ -1492,9 +1580,13 @@ impl Store {
     #[instrument(err, skip_all)]
     pub fn mark_node_lost(&self, id: &str) -> R<()> {
         let conn = self.write_connection()?;
+        // lost_at is set once (COALESCE) so repeated marks never push the
+        // loss-confirmation clock back; it is cleared when the node
+        // heartbeats again or re-registers.
         let sql = r#"
         UPDATE node
-        SET status = :status, availability = :availability
+        SET status = :status, availability = :availability,
+            lost_at = COALESCE(lost_at, :lost_at)
         WHERE id = :id;
         "#;
 
@@ -1502,6 +1594,7 @@ impl Store {
             ":id": id,
             ":status": "lost",
             ":availability": "unavailable",
+            ":lost_at": Self::now_rfc3339()?,
         };
 
         conn.execute(sql, params)?;
@@ -1526,6 +1619,7 @@ impl Store {
         let mut conn = self.write_connection()?;
         let tx = conn.transaction()?;
         tx.execute("DELETE FROM allocation WHERE node_id = ?;", [node_id])?;
+        self.release_instance_bindings_tx(&tx, &allocs)?;
         self.bump_epochs_for_allocations_tx(&tx, &allocs)?;
         tx.commit()?;
         drop(conn);
@@ -1568,8 +1662,12 @@ impl Store {
         {
             let conn = self.write_connection()?;
             let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+            // See mark_node_lost: lost_at is set once and never refreshed
+            // while the node stays lost.
             let sql = format!(
-                "UPDATE node SET status = 'lost', availability = 'unavailable' WHERE id IN ({})",
+                "UPDATE node SET status = 'lost', availability = 'unavailable', \
+                 lost_at = COALESCE(lost_at, '{}') WHERE id IN ({})",
+                Self::now_rfc3339()?,
                 placeholders
             );
 
@@ -1588,6 +1686,69 @@ impl Store {
         }
 
         Ok(())
+    }
+
+    /// When the node was marked lost (RFC3339), or `None` while it is not
+    /// lost. Drives the stateful node-loss confirmation gate (see
+    /// [`Self::reschedule_allocations_for_lost_node`]).
+    #[instrument(err, skip_all)]
+    pub fn node_lost_at(&self, node_id: &str) -> R<Option<String>> {
+        let conn = self.read_connection()?;
+        let lost_at: Option<String> = conn
+            .query_row("SELECT lost_at FROM node WHERE id = ?;", [node_id], |row| {
+                row.get(0)
+            })
+            .optional()?
+            .flatten();
+        Ok(lost_at)
+    }
+
+    /// Overwrite a node's `lost_at` timestamp. Test/ops helper for the
+    /// node-loss confirmation gate: lets a loss be backdated so the
+    /// `replaceAfter` threshold can be exercised without real waiting.
+    #[instrument(err, skip_all)]
+    pub fn set_node_lost_at(&self, node_id: &str, lost_at: &str) -> R<()> {
+        let conn = self.write_connection()?;
+        conn.execute(
+            "UPDATE node SET lost_at = ? WHERE id = ?;",
+            params![lost_at, node_id],
+        )?;
+        Ok(())
+    }
+
+    /// Ids of all nodes currently marked lost.
+    #[instrument(err, skip_all)]
+    pub fn lost_node_ids(&self) -> R<Vec<String>> {
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare("SELECT id FROM node WHERE status = 'lost';")?;
+        let ids = Self::collect_rows(stmt.query_map([], |row| row.get(0))?)?;
+        Ok(ids)
+    }
+
+    /// Re-run the lost-node reschedule path for every node still marked
+    /// lost, so stateful allocations whose `onLost.replaceAfter` threshold
+    /// has since elapsed get replaced WITHOUT operator action. Called by the
+    /// manager's node-status monitor on every tick (the same loop that marks
+    /// nodes lost); errors are logged per node so one wedged job cannot
+    /// stall the sweep.
+    #[instrument(skip_all)]
+    pub fn recheck_lost_nodes(&self) {
+        let node_ids = match self.lost_node_ids() {
+            Ok(node_ids) => node_ids,
+            Err(err) => {
+                warn!(error = ?err, "Failed listing lost nodes for loss-confirmation recheck");
+                return;
+            }
+        };
+        for node_id in node_ids {
+            if let Err(err) = self.reschedule_allocations_for_lost_node(&node_id) {
+                warn!(
+                    %node_id,
+                    error = ?err,
+                    "Failed rechecking lost node for confirmed-loss replacements"
+                );
+            }
+        }
     }
 
     #[instrument(err, skip_all)]
@@ -1659,7 +1820,7 @@ impl Store {
         let conn = self.write_connection()?;
         let sql = r#"
         UPDATE node
-        SET last_heartbeat = :ts, status = 'active'
+        SET last_heartbeat = :ts, status = 'active', lost_at = NULL
         WHERE id = :id;
 "#;
         info!(
@@ -1820,6 +1981,108 @@ impl Store {
         self.events().job_failed(job_id);
 
         Ok(())
+    }
+
+    /// Mark a job failed because a required KV dependency vanished
+    /// (`onDelete: fail`). The job status becomes `failed` and the impacted
+    /// allocations' status is stamped `failed:<reason>` so the diagnostic is
+    /// visible in `job list`, the ledger, and state-store queries.
+    ///
+    /// Scope: when `impacted_tasks` is `Some`, only allocations whose task
+    /// config is one of those (by name, across all of the job's config
+    /// versions) are stamped — a missing injection key impacts just the tasks
+    /// that depend on it, leaving sibling tasks' allocations untouched. When
+    /// `None` (a legacy `$key` reference, which is not scoped to one task and
+    /// makes the whole config unrenderable), every allocation of the job is
+    /// stamped.
+    ///
+    /// The allocation rows are retained (the workload is not torn down and no
+    /// reschedule storm starts); a later KV put that triggers a restart or
+    /// rollout recovers the job (see `docs/kv-store.md`).
+    #[instrument(err, skip(self))]
+    pub fn mark_job_failed_for_kv(
+        &self,
+        job_id: &str,
+        reason: &str,
+        impacted_tasks: Option<&[String]>,
+    ) -> R<()> {
+        let mut conn = self.write_connection()?;
+        let tx = conn.transaction()?;
+        tx.execute("UPDATE job SET status = 'failed' WHERE id = ?;", [job_id])?;
+        let stamp = format!("failed:{reason}");
+        match impacted_tasks {
+            Some(tasks) if !tasks.is_empty() => {
+                // Build an IN (...) list of task-config ids for the named tasks
+                // across every config version of the job. rusqlite has no array
+                // binding, so bind the names positionally.
+                let placeholders = std::iter::repeat_n("?", tasks.len())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let sql = format!(
+                    "UPDATE allocation SET status = ?1 \
+                     WHERE task_config_id IN (\
+                         SELECT id FROM task_config WHERE job_id = ?2 AND name IN ({placeholders})\
+                     );"
+                );
+                let mut params: Vec<&dyn rusqlite::ToSql> = vec![&stamp, &job_id];
+                for task in tasks {
+                    params.push(task);
+                }
+                tx.execute(&sql, params.as_slice())?;
+            }
+            _ => {
+                tx.execute(
+                    "UPDATE allocation SET status = ?1 \
+                     WHERE job_config_id IN (SELECT id FROM job_config WHERE job_id = ?2);",
+                    (stamp.as_str(), job_id),
+                )?;
+            }
+        }
+        tx.commit()?;
+        self.refresh_read_model()?;
+        Ok(())
+    }
+
+    /// Look up a job's status by its job id (== name). Returns `None` when the
+    /// job row is absent.
+    pub fn job_status_by_id(&self, job_id: &str) -> R<Option<String>> {
+        let conn = self.read_connection()?;
+        let status: Option<String> = conn
+            .query_row("SELECT status FROM job WHERE id = ?;", [job_id], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        Ok(status)
+    }
+
+    /// Clear a `failed` job status (back to `done`) when a KV-triggered
+    /// restart or rollout actively recovers the job. No-op when the job is
+    /// not currently failed. Returns whether a row was updated.
+    #[instrument(err, skip(self))]
+    pub fn clear_job_failed_status(&self, job_id: &str) -> R<bool> {
+        let conn = self.write_connection()?;
+        let updated = conn.execute(
+            "UPDATE job SET status = 'done' WHERE id = ?1 AND status = 'failed';",
+            [job_id],
+        )?;
+        Ok(updated > 0)
+    }
+
+    /// Clear a `stopped` job status (back to `done`) when the job is
+    /// resubmitted via RunJob. A resubmit revives the job, so the
+    /// instance-management RPCs (CreateInstance/StartInstance), which reject
+    /// stopped jobs, must accept it again. Stopped keyed instances
+    /// deliberately stay `stopped` through this — reviving each one takes an
+    /// explicit StartInstance. No-op when the job is not currently stopped.
+    /// Returns whether a row was updated.
+    #[instrument(err, skip(self))]
+    pub fn clear_job_stopped_status(&self, job_id: &str) -> R<bool> {
+        let conn = self.write_connection()?;
+        let updated = conn.execute(
+            "UPDATE job SET status = 'done' WHERE id = ?1 AND status = 'stopped';",
+            [job_id],
+        )?;
+        Ok(updated > 0)
     }
 
     #[instrument(err, skip_all)]
@@ -1999,6 +2262,20 @@ impl Store {
             .ok_or_else(|| StorageError::not_found("job config", id).into())
     }
 
+    /// The owning job id for a job config id, if the config exists.
+    #[instrument(err, skip_all)]
+    pub fn job_id_for_job_config(&self, job_config_id: &str) -> R<Option<String>> {
+        let conn = self.read_connection()?;
+        let job_id = conn
+            .query_row(
+                "SELECT job_id FROM job_config WHERE id = ?;",
+                [job_config_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(job_id)
+    }
+
     pub fn list_job_spec_history(&self, name: &str) -> R<Vec<(String, String, Option<i64>)>> {
         let conn = self.read_connection()?;
         let mut stmt = conn.prepare(
@@ -2118,6 +2395,7 @@ impl Store {
             } else {
                 Some(serde_json::to_string(&t.identities)?)
             };
+            let stateful = t.stateful.as_ref().map(serde_json::to_string).transpose()?;
             let artifacts = if t.artifacts.is_empty() {
                 None
             } else {
@@ -2144,6 +2422,7 @@ impl Store {
                 ":job_id": job.id,
                 ":job_config_id": job_config_id,
                 ":identities": identities,
+                ":stateful": stateful,
                 ":artifacts": artifacts,
             };
 
@@ -3009,19 +3288,7 @@ impl Store {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
 
-        let params = named_params! {
-            ":status": "placed",
-            ":resources": resources,
-            ":node_id": node_id,
-            ":job_config_id": job_config_id,
-            ":task_config_id": task_id,
-        };
-
-        let allocation = tx.query_row(&INSERT_ALLOCATION, params, |row| {
-            self.allocation_from_row(row)
-        })?;
-
-        Ok(allocation)
+        self.insert_allocation_with_data(tx, node_id, task_id, &job_config_id, &resources)
     }
 
     fn insert_allocation_with_data(
@@ -3032,19 +3299,383 @@ impl Store {
         job_config_id: &str,
         resources: &Value,
     ) -> R<Allocation> {
+        // Stateful tasks: pick (or re-materialize) the instance this
+        // allocation will fulfill before writing the row, so the binding is
+        // atomic with the placement.
+        let instance_id = self.assign_stateful_instance_tx(tx, task_id)?;
+
         let params = named_params! {
             ":status": "placed",
             ":resources": resources,
             ":node_id": node_id,
             ":job_config_id": job_config_id,
             ":task_config_id": task_id,
+            ":instance_id": instance_id,
         };
 
         let allocation = tx.query_row(&INSERT_ALLOCATION, params, |row| {
             self.allocation_from_row(row)
         })?;
 
+        if let Some(instance_id) = allocation.instance_id.as_deref() {
+            let now = Self::now_rfc3339()?;
+            tx.execute(
+                "UPDATE instance SET state = 'active', current_alloc_id = ?1, updated_at = ?2 \
+                 WHERE instance_id = ?3;",
+                params![allocation.id, now, instance_id],
+            )?;
+        }
+
         Ok(allocation)
+    }
+
+    /// For a stateful task, pick the instance the new allocation will fulfill.
+    /// This is the single choke point all placement paths flow through, so the
+    /// instance binding is atomic with the allocation insert. Returns `None`
+    /// for stateless tasks. Must run inside the same transaction that inserts
+    /// the allocation.
+    ///
+    /// - Slot mode: the lowest slot `0..count.num-1` not currently fulfilled
+    ///   by an allocation of this task config; the instance row is created or
+    ///   re-activated as needed (slot ids are reused within the pool).
+    /// - Keyed mode: any live (non-terminated) keyed instance of this
+    ///   (job, group, task) not currently bound to an allocation of this task
+    ///   config. Instances only come into existence via CreateInstance; this
+    ///   never creates one. Keyed ids are not ordinals, so "any unbound" is
+    ///   correct — a rescheduling instance is simply the unbound one.
+    fn assign_stateful_instance_tx(&self, tx: &Transaction<'_>, task_id: i64) -> R<Option<String>> {
+        let (job_id, group, task_name, count, stateful): (
+            String,
+            String,
+            String,
+            i64,
+            Option<String>,
+        ) = tx.query_row(
+            "SELECT job_id, group_name, name, count, stateful FROM task_config WHERE id = ?;",
+            [task_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )?;
+
+        let Some(stateful) = stateful else {
+            return Ok(None);
+        };
+        let stateful: StatefulConfig = serde_json::from_str(&stateful)
+            .with_context(|| format!("invalid stateful config for task {task_name}"))?;
+        if stateful.mode == InstanceMode::Keyed {
+            return self
+                .assign_keyed_instance_tx(tx, task_id, &job_id, &group, &task_name, &stateful)
+                .map(Some);
+        }
+
+        // Slots already fulfilled by live allocations of this task config.
+        // Scoped per config so a create-first rollout's new allocations can
+        // take over instances still referenced by the outgoing config.
+        let mut taken_stmt = tx.prepare(
+            "SELECT instance.slot_index FROM allocation \
+             INNER JOIN instance ON instance.instance_id = allocation.instance_id \
+             WHERE allocation.task_config_id = ?1 AND allocation.instance_id IS NOT NULL;",
+        )?;
+        let taken: HashSet<u32> = Self::collect_rows(
+            taken_stmt.query_map([task_id], |row| row.get::<_, Option<i64>>(0))?,
+        )?
+        .into_iter()
+        .flatten()
+        .map(|slot| slot as u32)
+        .collect();
+
+        // Slots occupied by a live allocation of ANY config of this job
+        // (e.g. the outgoing config mid-rollout). Preferring slots outside
+        // this set makes the binder pick exactly the slot whose old
+        // allocation was just retired, which is what lets a sequential
+        // (`rollout.slots.order`) rollout replace highest-slot-first and what
+        // keeps a staged (`updateFrom`) rollout from double-binding a slot
+        // whose instance still runs the old config. The per-config `taken`
+        // set above remains the hard constraint; the job-wide set is only a
+        // preference so the fresh-plan-then-remove-previous submit flow
+        // (which deliberately places new-config allocations while the old
+        // config's are still live) keeps working.
+        let mut job_taken_stmt = tx.prepare(
+            "SELECT instance.slot_index FROM allocation \
+             INNER JOIN instance ON instance.instance_id = allocation.instance_id \
+             WHERE instance.job_id = ?1 AND instance.group_name = ?2 \
+             AND instance.mode = 'slot';",
+        )?;
+        let job_taken: HashSet<u32> = Self::collect_rows(
+            job_taken_stmt.query_map(params![job_id, group], |row| row.get::<_, Option<i64>>(0))?,
+        )?
+        .into_iter()
+        .flatten()
+        .map(|slot| slot as u32)
+        .collect();
+
+        let desired = count.max(0) as u32;
+        let slot = (0..desired)
+            .find(|slot| !taken.contains(slot) && !job_taken.contains(slot))
+            .or_else(|| (0..desired).find(|slot| !taken.contains(slot)))
+            .with_context(|| {
+                format!(
+                "no free slot for stateful task {task_name} (group {group}); all {desired} slots \
+                 already have allocations for this job config"
+            )
+            })?;
+
+        let instance_id = slot_instance_id(&job_id, &group, slot);
+        let now = Self::now_rfc3339()?;
+        let existing = tx
+            .query_row(&GET_INSTANCE, [instance_id.as_str()], |row| {
+                self.instance_from_row(row)
+            })
+            .optional()?;
+
+        match existing {
+            Some(existing) => {
+                // The slot id space is EXCLUSIVE: a row carrying this derived id
+                // must be this very (job, group, task, slot) slot. If a row with
+                // the same id exists but belongs to a different job/group/slot or
+                // a different mode (e.g. a keyed instance some caller created with
+                // `--id otherjob-default-0`), adopting it would let two jobs share
+                // one instance row, storage handle, and workload-identity subject.
+                // Refuse — never hijack. (Cross-job collisions are prevented at
+                // create time too, see `keyed_id_collides_with_slot_pattern`, so
+                // this is defence in depth.)
+                if existing.mode != InstanceMode::Slot
+                    || existing.job_id != job_id
+                    || existing.group != group
+                    || existing.slot_index != Some(slot)
+                {
+                    bail!(StorageError::Conflict {
+                        message: format!(
+                            "slot instance id {instance_id} is already owned by a different \
+                             instance (job {}, group {}, mode {:?}, slot {:?}); slot ids are \
+                             exclusive to their (job, group, slot) and cannot be adopted",
+                            existing.job_id, existing.group, existing.mode, existing.slot_index
+                        ),
+                    });
+                }
+                // Re-activation handles both reschedule (Rescheduling -> Active
+                // via the caller's binding update) and scale-out of a retained
+                // Terminated slot: the same id and storage handle come back.
+                // Mint a handle only if none was retained and the task (still)
+                // declares storage.
+                let storage_handle = existing
+                    .storage_handle
+                    .or_else(|| stateful.storage.as_ref().map(|_| mint_storage_handle()));
+                tx.execute(
+                    "UPDATE instance SET task_name = ?1, storage_handle = ?2, updated_at = ?3 \
+                     WHERE instance_id = ?4;",
+                    params![task_name, storage_handle, now, instance_id],
+                )?;
+            }
+            None => {
+                let storage_handle = stateful.storage.as_ref().map(|_| mint_storage_handle());
+                tx.execute(
+                    "INSERT INTO instance (instance_id, job_id, group_name, task_name, mode, \
+                     state, slot_index, current_alloc_id, storage_handle, created_at, updated_at) \
+                     VALUES (?1, ?2, ?3, ?4, 'slot', 'pending', ?5, NULL, ?6, ?7, ?7);",
+                    params![
+                        instance_id,
+                        job_id,
+                        group,
+                        task_name,
+                        slot,
+                        storage_handle,
+                        now
+                    ],
+                )?;
+            }
+        }
+
+        Ok(Some(instance_id))
+    }
+
+    /// Keyed-mode arm of [`Self::assign_stateful_instance_tx`]: bind the new
+    /// allocation to an unbound live keyed instance of (job, group, task).
+    ///
+    /// "Unbound" is scoped per task config (like slots) so a create-first
+    /// rollout's new allocations can take over instances still referenced by
+    /// the outgoing config. The oldest unbound instance is picked for
+    /// determinism; since keyed ids are not ordinals, any unbound instance is
+    /// a correct choice. Stopped instances are never bound (they are paused,
+    /// not awaiting placement), and terminated ones are tombstones. A storage
+    /// handle is minted on first placement when the task declares
+    /// `stateful.storage`, and the retained handle is reattached on every
+    /// re-bind — that is what makes a replacement allocation *the same
+    /// sandbox*.
+    fn assign_keyed_instance_tx(
+        &self,
+        tx: &Transaction<'_>,
+        task_id: i64,
+        job_id: &str,
+        group: &str,
+        task_name: &str,
+        stateful: &StatefulConfig,
+    ) -> R<String> {
+        let instance: Option<Instance> = tx
+            .query_row(
+                "SELECT instance_id, job_id, group_name, task_name, mode, state, slot_index, \
+                 current_alloc_id, storage_handle, created_at, updated_at FROM instance \
+                 WHERE job_id = ?1 AND group_name = ?2 AND task_name = ?3 \
+                 AND mode = 'keyed' AND state NOT IN ('terminated', 'stopped') \
+                 AND instance_id NOT IN (\
+                     SELECT instance_id FROM allocation \
+                     WHERE task_config_id = ?4 AND instance_id IS NOT NULL\
+                 ) \
+                 ORDER BY created_at ASC, instance_id ASC LIMIT 1;",
+                params![job_id, group, task_name, task_id],
+                |row| self.instance_from_row(row),
+            )
+            .optional()?;
+
+        let instance = instance.with_context(|| {
+            format!(
+                "no unbound keyed instance for task {task_name} (group {group}, job {job_id}); \
+                 keyed allocations are driven by CreateInstance, not count"
+            )
+        })?;
+
+        if instance.storage_handle.is_none() && stateful.storage.is_some() {
+            let now = Self::now_rfc3339()?;
+            tx.execute(
+                "UPDATE instance SET storage_handle = ?1, updated_at = ?2 WHERE instance_id = ?3;",
+                params![mint_storage_handle(), now, instance.instance_id],
+            )?;
+        }
+
+        Ok(instance.instance_id)
+    }
+
+    /// After allocation rows are deleted, transition the instances they
+    /// fulfilled. Instances still referenced by another live allocation (for
+    /// example the already-placed replacement during a config update) keep
+    /// running and just re-point `current_alloc_id`. Orphaned slot instances
+    /// become `rescheduling` while their slot is still desired, or
+    /// `terminated` when the latest job config no longer wants the slot
+    /// (scale-in) — retaining the row, and the storage handle unless
+    /// `retain_on_scale_in` is false. Orphaned keyed instances become
+    /// `rescheduling`: allocation churn never terminates or stops a keyed
+    /// instance, only DestroyInstance/StopInstance (or a job stop) does.
+    /// `Stopped` rows are skipped exactly like `Terminated` ones — the
+    /// stop/destroy paths set those states in the SAME transaction that
+    /// removes the allocations, so this hook can never flip a deliberately
+    /// stopped instance back to `rescheduling` (nor can a later, unrelated
+    /// allocation death resurrect it). Must run in the same transaction as
+    /// the deletion, before commit.
+    fn release_instance_bindings_tx(&self, tx: &Transaction<'_>, removed: &[Allocation]) -> R<()> {
+        let instance_ids: HashSet<&str> = removed
+            .iter()
+            .filter_map(|alloc| alloc.instance_id.as_deref())
+            .collect();
+        if instance_ids.is_empty() {
+            return Ok(());
+        }
+
+        let now = Self::now_rfc3339()?;
+        for instance_id in instance_ids {
+            let surviving_alloc: Option<i64> = tx
+                .query_row(
+                    "SELECT MAX(id) FROM allocation WHERE instance_id = ?;",
+                    [instance_id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .flatten();
+
+            if let Some(alloc_id) = surviving_alloc {
+                tx.execute(
+                    "UPDATE instance SET current_alloc_id = ?1, updated_at = ?2 \
+                     WHERE instance_id = ?3 AND current_alloc_id IS NOT ?1;",
+                    params![alloc_id, now, instance_id],
+                )?;
+                continue;
+            }
+
+            let instance = tx
+                .query_row(&GET_INSTANCE, [instance_id], |row| {
+                    self.instance_from_row(row)
+                })
+                .optional()?;
+            let Some(instance) = instance else {
+                continue;
+            };
+            if matches!(
+                instance.state,
+                InstanceState::Terminated | InstanceState::Stopped
+            ) {
+                continue;
+            }
+
+            let (still_desired, retain_storage) = self.slot_still_desired_tx(tx, &instance)?;
+            if still_desired {
+                tx.execute(
+                    "UPDATE instance SET state = 'rescheduling', current_alloc_id = NULL, \
+                     updated_at = ?1 WHERE instance_id = ?2;",
+                    params![now, instance_id],
+                )?;
+            } else {
+                let storage_handle = if retain_storage {
+                    instance.storage_handle.clone()
+                } else {
+                    None
+                };
+                info!(
+                    instance_id,
+                    job_id = %instance.job_id,
+                    retain_storage,
+                    "Terminating scaled-in instance"
+                );
+                tx.execute(
+                    "UPDATE instance SET state = 'terminated', current_alloc_id = NULL, \
+                     storage_handle = ?1, updated_at = ?2 WHERE instance_id = ?3;",
+                    params![storage_handle, now, instance_id],
+                )?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Whether the instance's slot is still inside the latest job config's
+    /// desired range, plus the effective storage retention policy. Keyed
+    /// instances are always "still desired" here — their lifecycle is owned by
+    /// the management API (DestroyInstance), never by allocation churn.
+    fn slot_still_desired_tx(&self, tx: &Transaction<'_>, instance: &Instance) -> R<(bool, bool)> {
+        let (InstanceMode::Slot, Some(slot)) = (instance.mode, instance.slot_index) else {
+            return Ok((true, true));
+        };
+
+        let latest_task: Option<(i64, Option<String>)> = tx
+            .query_row(
+                "SELECT task_config.count, task_config.stateful FROM task_config \
+                 INNER JOIN job_config ON job_config.id = task_config.job_config_id \
+                 WHERE task_config.job_id = ?1 AND task_config.group_name = ?2 \
+                 AND task_config.name = ?3 \
+                 ORDER BY job_config.version DESC LIMIT 1;",
+                params![instance.job_id, instance.group, instance.task_name],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+
+        let Some((count, stateful)) = latest_task else {
+            // Task disappeared from the job entirely: terminate, retain storage.
+            return Ok((false, true));
+        };
+
+        let retain = stateful
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<StatefulConfig>(raw).ok())
+            .and_then(|stateful| stateful.storage)
+            .map(|storage| storage.retains_on_scale_in())
+            .unwrap_or(true);
+
+        Ok(((slot as i64) < count, retain))
     }
 
     fn load_allocation_constraints(
@@ -3452,6 +4083,7 @@ impl Store {
         let mut conn = self.write_connection()?;
         let tx = conn.transaction()?;
         tx.execute("DELETE FROM allocation WHERE id = ?;", [allocation_id])?;
+        self.release_instance_bindings_tx(&tx, std::slice::from_ref(&allocation))?;
         self.bump_job_config_epoch_tx(&tx, &allocation.job_config_id)?;
         tx.commit()?;
 
@@ -3504,6 +4136,7 @@ impl Store {
         let params = named_params! { ":job_id": job_id };
 
         tx.execute(sql, params)?;
+        self.release_instance_bindings_tx(&tx, &allocations)?;
         self.bump_epochs_for_allocations_tx(&tx, &allocations)?;
         tx.commit()?;
         drop(conn);
@@ -3529,6 +4162,7 @@ impl Store {
             "DELETE FROM allocation WHERE job_config_id = ?;",
             [job_config_id],
         )?;
+        self.release_instance_bindings_tx(&tx, &allocations)?;
         self.bump_job_config_epoch_tx(&tx, job_config_id)?;
         tx.commit()?;
         drop(conn);
@@ -3615,24 +4249,159 @@ impl Store {
         Ok(())
     }
 
+    /// Free a lost node's allocations for replacement — gated for stateful
+    /// tasks (the at-most-one fencing guarantee, see
+    /// docs/stateful-workloads.md "Node loss and fencing"):
+    ///
+    /// - Stateless allocations are removed and replaced immediately (today's
+    ///   eager behavior).
+    /// - A stateful allocation is only removed once the node has been lost
+    ///   longer than its task's `onLost.replaceAfter` — i.e. provably past
+    ///   the worker's `selfTerminateAfter` self-fence window — so the
+    ///   replacement can never run concurrently with the original. With
+    ///   `replaceAfter: "never"` it is never removed here; only node
+    ///   recovery or an operator override (ReplaceInstance) frees it.
+    ///
+    /// Gated allocations keep their rows: the instance stays `active` and
+    /// bound (`current_alloc_id` intact), the scheduler keeps counting the
+    /// allocation as placed (so no plan path double-places the instance),
+    /// and instance get/list surfaces a `pending-loss-confirmation` detail.
+    /// The node-status monitor re-runs this method every tick (see
+    /// [`Self::recheck_lost_nodes`]), so replacement proceeds automatically
+    /// once the threshold elapses. Idempotent.
     #[instrument(err, skip_all)]
     pub fn reschedule_allocations_for_lost_node(&self, node_id: &str) -> R<()> {
-        let removed_allocs = self.remove_allocs_for_node(node_id)?;
-
-        if removed_allocs.is_empty() {
+        let allocs = self.allocs_for_node(node_id)?;
+        if allocs.is_empty() {
             return Ok(());
         }
 
-        let affected_job_configs: HashSet<String> = removed_allocs
-            .into_iter()
-            .map(|alloc| alloc.job_config_id)
-            .collect();
+        let lost_for = self.node_lost_for(node_id)?;
+        let mut removable = Vec::new();
+        for alloc in allocs {
+            if self.lost_allocation_replaceable(&alloc, lost_for)? {
+                removable.push(alloc);
+            } else {
+                info!(
+                    allocation_id = alloc.id,
+                    %node_id,
+                    instance_id = alloc.instance_id.as_deref().unwrap_or_default(),
+                    lost_for_secs = lost_for.map(TimeDuration::whole_seconds),
+                    "Holding stateful allocation on lost node pending loss confirmation"
+                );
+            }
+        }
+        if removable.is_empty() {
+            return Ok(());
+        }
 
+        let affected_job_configs = self.remove_allocations(&removable)?;
         for job_config_id in affected_job_configs {
             self.reconcile_job_config_allocations(&job_config_id)?;
         }
 
         Ok(())
+    }
+
+    /// How long the node has been lost, when known. `None` means the node is
+    /// not (or no longer) marked lost — callers treat that as "not
+    /// confirmable yet", never as "free to replace".
+    fn node_lost_for(&self, node_id: &str) -> R<Option<TimeDuration>> {
+        let Some(lost_at) = self.node_lost_at(node_id)? else {
+            return Ok(None);
+        };
+        let lost_at = OffsetDateTime::parse(&lost_at, &Rfc3339)
+            .with_context(|| format!("invalid lost_at timestamp {lost_at:?} for node {node_id}"))?;
+        Ok(Some(OffsetDateTime::now_utc() - lost_at))
+    }
+
+    /// Whether a lost node's allocation may be freed for replacement now.
+    /// Stateless tasks: always (eager). Stateful tasks: only once the loss
+    /// is confirmed per the task's `onLost` policy.
+    fn lost_allocation_replaceable(
+        &self,
+        alloc: &Allocation,
+        lost_for: Option<TimeDuration>,
+    ) -> R<bool> {
+        let Some(stateful) = self.task_stateful_config(alloc.task_config_id)? else {
+            return Ok(true);
+        };
+        let policy = Self::on_lost_policy_or_safe_default(&alloc.job_id, &stateful);
+        match policy.replace_after {
+            ReplaceAfter::Never => Ok(false),
+            ReplaceAfter::After(threshold) => {
+                // Unknown loss duration = unconfirmable = hold (safe side).
+                let Some(lost_for) = lost_for else {
+                    return Ok(false);
+                };
+                let threshold = TimeDuration::try_from(threshold)
+                    .context("onLost.replaceAfter overflows the comparable duration range")?;
+                Ok(lost_for > threshold)
+            }
+        }
+    }
+
+    /// Resolve a stored stateful block's `onLost` policy. Validation rejects
+    /// unresolvable policies at submit time, so a failure here means a row
+    /// predating validation or hand-edited state — fall back to the safe
+    /// defaults rather than wedging the whole lost-node sweep.
+    fn on_lost_policy_or_safe_default(
+        job_id: &str,
+        stateful: &StatefulConfig,
+    ) -> ResolvedOnLostPolicy {
+        stateful.resolved_on_lost().unwrap_or_else(|err| {
+            warn!(
+                %job_id,
+                error = ?err,
+                "Stored stateful onLost policy failed to resolve; using defaults"
+            );
+            StatefulOnLostConfig::default()
+                .resolve()
+                .expect("default onLost policy resolves")
+        })
+    }
+
+    /// The task's stored stateful block, if any (`None` = stateless task).
+    fn task_stateful_config(&self, task_config_id: i64) -> R<Option<StatefulConfig>> {
+        let conn = self.read_connection()?;
+        let raw: Option<String> = conn
+            .query_row(
+                "SELECT stateful FROM task_config WHERE id = ?;",
+                [task_config_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        raw.map(|raw| {
+            serde_json::from_str(&raw)
+                .with_context(|| format!("invalid stateful config for task {task_config_id}"))
+        })
+        .transpose()
+    }
+
+    /// Remove specific allocation rows (releasing instance bindings and
+    /// bumping epochs, like every other allocation-removal path) and return
+    /// the affected job config ids.
+    pub(crate) fn remove_allocations(&self, allocs: &[Allocation]) -> R<HashSet<String>> {
+        if allocs.is_empty() {
+            return Ok(HashSet::new());
+        }
+
+        let mut conn = self.write_connection()?;
+        let tx = conn.transaction()?;
+        for alloc in allocs {
+            tx.execute("DELETE FROM allocation WHERE id = ?;", [alloc.id])?;
+        }
+        self.release_instance_bindings_tx(&tx, allocs)?;
+        self.bump_epochs_for_allocations_tx(&tx, allocs)?;
+        tx.commit()?;
+
+        self.cache_remove_allocations(allocs)?;
+
+        Ok(allocs
+            .iter()
+            .map(|alloc| alloc.job_config_id.clone())
+            .collect())
     }
 
     #[instrument(err, skip_all)]
@@ -3665,6 +4434,797 @@ impl Store {
         }
 
         Ok(ledger)
+    }
+
+    //
+    // INSTANCES (stateful workloads; see docs/stateful-workloads.md)
+    //
+
+    #[instrument(err, skip_all)]
+    pub fn get_instance(&self, instance_id: &str) -> R<Option<Instance>> {
+        let conn = self.read_connection()?;
+        let instance = conn
+            .query_row(&GET_INSTANCE, [instance_id], |row| {
+                self.instance_from_row(row)
+            })
+            .optional()?;
+        Ok(instance)
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn list_instances(&self, job_id: &str) -> R<Vec<Instance>> {
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare(GET_INSTANCES_FOR_JOB.as_str())?;
+        let rows = stmt.query_map([job_id], |row| self.instance_from_row(row))?;
+        Self::collect_rows(rows)
+    }
+
+    //
+    // SIGNING KEYS (workload-identity OIDC issuer; see docs/workload-identity.md)
+    //
+    // The private key PEM is persisted in this SQLite store — the same trust
+    // domain as the CA material. Persistence is what keeps externally-held
+    // tokens verifiable across manager restarts.
+    //
+
+    fn signing_key_from_row(row: &Row<'_>) -> Result<SigningKeyRecord, rusqlite::Error> {
+        Ok(SigningKeyRecord {
+            kid: row.get(0)?,
+            alg: row.get(1)?,
+            private_key_pem: row.get(2)?,
+            public_jwk_x: row.get(3)?,
+            public_jwk_y: row.get(4)?,
+            created_at: row.get::<_, i64>(5)? as u64,
+            not_after: row.get::<_, Option<i64>>(6)?.map(|v| v as u64),
+            state: row.get(7)?,
+        })
+    }
+
+    /// Persist a freshly generated signing key.
+    #[instrument(err, skip_all, fields(kid = %record.kid, state = %record.state))]
+    pub fn insert_signing_key(&self, record: &SigningKeyRecord) -> R<()> {
+        let conn = self.write_connection()?;
+        conn.execute(
+            &INSERT_SIGNING_KEY,
+            named_params! {
+                ":kid": record.kid,
+                ":alg": record.alg,
+                ":private_key_pem": record.private_key_pem,
+                ":public_jwk_x": record.public_jwk_x,
+                ":public_jwk_y": record.public_jwk_y,
+                ":created_at": record.created_at as i64,
+                ":not_after": record.not_after.map(|v| v as i64),
+                ":state": record.state,
+            },
+        )?;
+        Ok(())
+    }
+
+    /// All persisted signing keys (including expired rows, newest first).
+    #[instrument(err, skip_all)]
+    pub fn list_signing_keys(&self) -> R<Vec<SigningKeyRecord>> {
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare(GET_SIGNING_KEYS.as_str())?;
+        let rows = stmt.query_map([], Self::signing_key_from_row)?;
+        Self::collect_rows(rows)
+    }
+
+    /// Persist a key lifecycle transition (`active` → `retiring` → `expired`).
+    #[instrument(err, skip_all, fields(kid = %kid, state = %state))]
+    pub fn update_signing_key_state(
+        &self,
+        kid: &str,
+        state: &str,
+        not_after: Option<u64>,
+    ) -> R<()> {
+        let conn = self.write_connection()?;
+        let updated = conn.execute(
+            &UPDATE_SIGNING_KEY_STATE,
+            named_params! {
+                ":kid": kid,
+                ":state": state,
+                ":not_after": not_after.map(|v| v as i64),
+            },
+        )?;
+        if updated == 0 {
+            bail!("signing key {kid} not found");
+        }
+        Ok(())
+    }
+
+    /// Remove a signing key row entirely. Normal rotation keeps expired rows
+    /// for audit; this exists for operator cleanup.
+    #[instrument(err, skip_all, fields(kid = %kid))]
+    pub fn delete_signing_key(&self, kid: &str) -> R<()> {
+        let conn = self.write_connection()?;
+        conn.execute(&DELETE_SIGNING_KEY, named_params! { ":kid": kid })?;
+        Ok(())
+    }
+
+    /// Insert or fully replace an instance row (terminated keyed rows are
+    /// never deleted — the never-recycle guarantee depends on them remaining).
+    #[instrument(err, skip_all)]
+    pub fn upsert_instance(&self, instance: &Instance) -> R<Instance> {
+        let now = Self::now_rfc3339()?;
+        let created_at = if instance.created_at.is_empty() {
+            now.clone()
+        } else {
+            instance.created_at.clone()
+        };
+        let conn = self.write_connection()?;
+        let params = named_params! {
+            ":instance_id": instance.instance_id,
+            ":job_id": instance.job_id,
+            ":group_name": instance.group,
+            ":task_name": instance.task_name,
+            ":mode": instance.mode.as_str(),
+            ":state": instance.state.as_str(),
+            ":slot_index": instance.slot_index,
+            ":current_alloc_id": instance.current_alloc_id,
+            ":storage_handle": instance.storage_handle,
+            ":created_at": created_at,
+            ":updated_at": now,
+        };
+        let instance =
+            conn.query_row(&UPSERT_INSTANCE, params, |row| self.instance_from_row(row))?;
+        Ok(instance)
+    }
+
+    /// Fetch the deterministic slot instance for (job, group, slot), creating
+    /// a Pending row (no storage handle) if it does not exist yet. The
+    /// allocation-insert path is what activates instances and mints storage
+    /// handles; this method exists for introspection and pre-materialization.
+    #[instrument(err, skip_all)]
+    pub fn get_or_create_slot_instance(
+        &self,
+        job_id: &str,
+        group: &str,
+        task_name: &str,
+        slot: u32,
+    ) -> R<Instance> {
+        let instance_id = slot_instance_id(job_id, group, slot);
+        if let Some(existing) = self.get_instance(&instance_id)? {
+            return Ok(existing);
+        }
+
+        let now = Self::now_rfc3339()?;
+        let conn = self.write_connection()?;
+        // INSERT OR IGNORE + re-read keeps this race-safe against the
+        // allocation-insert path creating the same slot concurrently.
+        conn.execute(
+            "INSERT OR IGNORE INTO instance (instance_id, job_id, group_name, task_name, mode, \
+             state, slot_index, current_alloc_id, storage_handle, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, 'slot', 'pending', ?5, NULL, NULL, ?6, ?6);",
+            params![instance_id, job_id, group, task_name, slot, now],
+        )?;
+        let instance = conn.query_row(&GET_INSTANCE, [instance_id.as_str()], |row| {
+            self.instance_from_row(row)
+        })?;
+        Ok(instance)
+    }
+
+    /// Point an instance at its (new) current allocation, or clear the binding.
+    #[instrument(err, skip_all)]
+    pub fn set_instance_current_alloc(
+        &self,
+        instance_id: &str,
+        current_alloc_id: Option<i64>,
+    ) -> R<()> {
+        let now = Self::now_rfc3339()?;
+        let conn = self.write_connection()?;
+        let updated = conn.execute(
+            "UPDATE instance SET current_alloc_id = ?1, updated_at = ?2 WHERE instance_id = ?3;",
+            params![current_alloc_id, now, instance_id],
+        )?;
+        if updated == 0 {
+            bail!("instance {instance_id} not found");
+        }
+        Ok(())
+    }
+
+    /// Transition an instance's lifecycle state.
+    #[instrument(err, skip_all)]
+    pub fn set_instance_state(&self, instance_id: &str, state: InstanceState) -> R<()> {
+        let now = Self::now_rfc3339()?;
+        let conn = self.write_connection()?;
+        let updated = conn.execute(
+            "UPDATE instance SET state = ?1, updated_at = ?2 WHERE instance_id = ?3;",
+            params![state.as_str(), now, instance_id],
+        )?;
+        if updated == 0 {
+            bail!("instance {instance_id} not found");
+        }
+        Ok(())
+    }
+
+    /// Settle every instance of a stopped job. Rows are always retained, but
+    /// the two modes land in different states:
+    ///
+    /// - slot rows become `terminated`, so a later `job run` re-materializes
+    ///   the same ordinal identities. Their storage handles are retained by
+    ///   default (the re-run reattaches the same data — exactly today's
+    ///   scale-out semantics), but a task with
+    ///   `stateful.storage.retainOnStop: false` (the K8s
+    ///   `whenDeleted: Delete` analog) has its slot handles DROPPED here, so
+    ///   the revived slots mint fresh handles;
+    /// - keyed rows become `stopped` (with handles retained, always — keyed
+    ///   stop semantics are fixed per instance), so resubmitting the job and
+    ///   running `legion instance start <id>` revives the same sandbox with
+    ///   its persisted state. A job stop is a pause, not a destroy: only
+    ///   DestroyInstance / job destroy is forever. Stopped keyed instances
+    ///   stay stopped when the job is resubmitted — they are not desired by
+    ///   the scheduler until explicitly started.
+    ///
+    /// `job destroy` never reaches this path — it unconditionally deletes
+    /// every instance row (and handle) via the job FK cascade, regardless of
+    /// `retainOnStop`.
+    ///
+    /// Called from the job_stop eval after its allocations are removed.
+    /// Idempotent: already-stopped/terminated rows are untouched.
+    #[instrument(err, skip_all)]
+    pub fn stop_instances_for_job(&self, job_id: &str) -> R<u64> {
+        let now = Self::now_rfc3339()?;
+        let mut conn = self.write_connection()?;
+        let tx = conn.transaction()?;
+
+        // Resolve the per-task job-stop retention policy from the LATEST job
+        // config version (mirroring how `slot_still_desired_tx` resolves the
+        // scale-in policy) and drop the handles of the slot rows this stop is
+        // about to terminate when `retainOnStop: false`. Already-settled
+        // (terminated/stopped) rows are untouched, keeping the stop
+        // idempotent; keyed rows are never targeted (their stop semantics are
+        // fixed, and validation rejects the knob in keyed mode anyway).
+        let mut stmt = tx.prepare(
+            "SELECT DISTINCT group_name, task_name FROM instance \
+             WHERE job_id = ?1 AND mode = 'slot' AND storage_handle IS NOT NULL \
+             AND state NOT IN ('terminated', 'stopped');",
+        )?;
+        let slot_tasks: Vec<(String, String)> =
+            Self::collect_rows(stmt.query_map([job_id], |row| Ok((row.get(0)?, row.get(1)?)))?)?;
+        drop(stmt);
+        for (group, task_name) in slot_tasks {
+            let stateful: Option<Option<String>> = tx
+                .query_row(
+                    "SELECT task_config.stateful FROM task_config \
+                     INNER JOIN job_config ON job_config.id = task_config.job_config_id \
+                     WHERE task_config.job_id = ?1 AND task_config.group_name = ?2 \
+                     AND task_config.name = ?3 \
+                     ORDER BY job_config.version DESC LIMIT 1;",
+                    params![job_id, group, task_name],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let retain = stateful
+                .flatten()
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<StatefulConfig>(raw).ok())
+                .and_then(|stateful| stateful.storage)
+                .map(|storage| storage.retains_on_stop())
+                .unwrap_or(true);
+            if !retain {
+                info!(
+                    job_id,
+                    group,
+                    task = %task_name,
+                    "Dropping slot storage handles on job stop (retainOnStop: false)"
+                );
+                tx.execute(
+                    "UPDATE instance SET storage_handle = NULL, updated_at = ?1 \
+                     WHERE job_id = ?2 AND group_name = ?3 AND task_name = ?4 \
+                     AND mode = 'slot' AND state NOT IN ('terminated', 'stopped');",
+                    params![now, job_id, group, task_name],
+                )?;
+            }
+        }
+
+        let updated = tx.execute(
+            "UPDATE instance SET \
+             state = CASE WHEN mode = 'keyed' THEN 'stopped' ELSE 'terminated' END, \
+             current_alloc_id = NULL, updated_at = ?1 \
+             WHERE job_id = ?2 AND state NOT IN ('terminated', 'stopped');",
+            params![now, job_id],
+        )?;
+        tx.commit()?;
+        Ok(updated as u64)
+    }
+
+    /// Whether ANY instance row (live, stopped, or tombstone) owns this id.
+    fn instance_id_exists_tx(tx: &Transaction<'_>, id: &str) -> R<bool> {
+        let found: Option<i64> = tx
+            .query_row(
+                "SELECT 1 FROM instance WHERE instance_id = ?;",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(found.is_some())
+    }
+
+    /// Whether a caller-supplied keyed id structurally aliases a slot id of a
+    /// slot-mode stateful task in the SAME job. Slot ids are the deterministic
+    /// `{job_id}-{group}-{slot}` pattern and the slot id space is exclusive, so
+    /// a keyed id that lands on `job-group-N` for some slot task with
+    /// `count.num > N` would, once that slot materializes, fight over one
+    /// instance row. We forbid it at create time so the two id spaces stay
+    /// disjoint within a job (cross-job aliasing is additionally caught when
+    /// the slot binds, see `assign_stateful_instance_tx`). Checks every job
+    /// config version's slot tasks so a not-yet-current (or future) slot can't
+    /// be aliased either.
+    fn keyed_id_collides_with_slot_pattern_tx(
+        tx: &Transaction<'_>,
+        job_id: &str,
+        id: &str,
+    ) -> R<bool> {
+        let mut stmt = tx.prepare(
+            "SELECT DISTINCT group_name, count FROM task_config \
+             WHERE job_id = ?1 AND stateful IS NOT NULL \
+             AND json_extract(stateful, '$.mode') = 'slot';",
+        )?;
+        let slot_tasks: Vec<(String, i64)> =
+            Self::collect_rows(stmt.query_map([job_id], |row| Ok((row.get(0)?, row.get(1)?)))?)?;
+        for (group, count) in slot_tasks {
+            for slot in 0..count.max(0) as u32 {
+                if slot_instance_id(job_id, &group, slot) == id {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// Insert one pending keyed instance row inside `tx`, enforcing the
+    /// never-recycle collision rule. `requested_id: None` mints
+    /// `{task}-{16 alphanumerics}`. Shared by the single and batch create
+    /// paths so both apply identical rules.
+    fn insert_keyed_instance_tx(
+        &self,
+        tx: &Transaction<'_>,
+        job_id: &str,
+        group: &str,
+        task_name: &str,
+        requested_id: Option<&str>,
+    ) -> R<String> {
+        let now = Self::now_rfc3339()?;
+        let instance_id = match requested_id {
+            Some(id) => {
+                if Self::instance_id_exists_tx(tx, id)? {
+                    bail!(StorageError::Conflict {
+                        message: format!(
+                            "instance id {id} already exists (keyed ids are never recycled, \
+                             including stopped and destroyed ones); choose a different id"
+                        ),
+                    });
+                }
+                if Self::keyed_id_collides_with_slot_pattern_tx(tx, job_id, id)? {
+                    bail!(StorageError::Conflict {
+                        message: format!(
+                            "instance id {id} collides with the reserved slot-id pattern \
+                             {{job}}-{{group}}-{{slot}} of a slot-mode stateful task in job \
+                             {job_id}; slot and keyed id spaces are disjoint within a job"
+                        ),
+                    });
+                }
+                id.to_string()
+            }
+            None => loop {
+                // Collisions on 16 random alphanumerics are practically
+                // impossible; the loop is belt-and-braces.
+                let candidate = format!("{task_name}-{}", random_string(16));
+                if !Self::instance_id_exists_tx(tx, &candidate)? {
+                    break candidate;
+                }
+            },
+        };
+
+        tx.execute(
+            "INSERT INTO instance (instance_id, job_id, group_name, task_name, mode, state, \
+             slot_index, current_alloc_id, storage_handle, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, 'keyed', 'pending', NULL, NULL, NULL, ?5, ?5);",
+            params![instance_id, job_id, group, task_name, now],
+        )?;
+        Ok(instance_id)
+    }
+
+    /// Register a new keyed-mode instance (the CreateInstance RPC's storage
+    /// half; task resolution and id policy live in the server handler).
+    ///
+    /// When `requested_id` is `Some` it must not collide with ANY existing
+    /// instance row — including Stopped rows and Terminated tombstones —
+    /// enforcing the never-recycle guarantee; collisions surface as
+    /// [`StorageError::Conflict`]. When `None`, a random id is minted
+    /// (`{task}-{16 alphanumerics}`). The row starts `pending` with no storage
+    /// handle; the first placement mints one if the task declares storage.
+    #[instrument(err, skip_all)]
+    pub fn create_keyed_instance(
+        &self,
+        job_id: &str,
+        group: &str,
+        task_name: &str,
+        requested_id: Option<&str>,
+    ) -> R<Instance> {
+        let mut conn = self.write_connection()?;
+        let tx = conn.transaction()?;
+        let instance_id =
+            self.insert_keyed_instance_tx(&tx, job_id, group, task_name, requested_id)?;
+        let instance = tx.query_row(&GET_INSTANCE, [instance_id.as_str()], |row| {
+            self.instance_from_row(row)
+        })?;
+        tx.commit()?;
+        Ok(instance)
+    }
+
+    /// Register a batch of keyed-mode instances ALL-OR-NOTHING (the
+    /// CreateInstances RPC's storage half): every id in `requested_ids` plus
+    /// `mint_count` server-minted ids, in one transaction. Any collision —
+    /// with an existing row (live/stopped/tombstone) or a duplicate within
+    /// `requested_ids` itself — aborts the whole batch with
+    /// [`StorageError::Conflict`] naming the offending id, creating nothing.
+    /// Returns the created ids in request order (explicit first, then
+    /// minted).
+    #[instrument(err, skip_all)]
+    pub fn create_keyed_instances(
+        &self,
+        job_id: &str,
+        group: &str,
+        task_name: &str,
+        requested_ids: &[String],
+        mint_count: u32,
+    ) -> R<Vec<String>> {
+        let mut conn = self.write_connection()?;
+        let tx = conn.transaction()?;
+        let mut created = Vec::with_capacity(requested_ids.len() + mint_count as usize);
+        for id in requested_ids {
+            created.push(self.insert_keyed_instance_tx(&tx, job_id, group, task_name, Some(id))?);
+        }
+        for _ in 0..mint_count {
+            created.push(self.insert_keyed_instance_tx(&tx, job_id, group, task_name, None)?);
+        }
+        tx.commit()?;
+        Ok(created)
+    }
+
+    /// Ensure each seed id from `stateful.initialInstances` exists (the
+    /// RunJob seeding half; see the field docs on
+    /// [`crate::structs::StatefulConfig::initial_instances`]).
+    ///
+    /// Ids that have never existed are created as `pending` keyed rows; ids
+    /// that already exist in ANY state — live, stopped, or a terminated
+    /// tombstone, even under another job — are skipped silently
+    /// (`INSERT OR IGNORE`), so resubmits are idempotent and a deliberately
+    /// destroyed id is never resurrected. Returns the ids actually created
+    /// by this call.
+    #[instrument(err, skip_all)]
+    pub fn seed_keyed_instances(
+        &self,
+        job_id: &str,
+        group: &str,
+        task_name: &str,
+        ids: &[String],
+    ) -> R<Vec<String>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let now = Self::now_rfc3339()?;
+        let mut conn = self.write_connection()?;
+        let tx = conn.transaction()?;
+        let mut created = Vec::new();
+        for id in ids {
+            let inserted = tx.execute(
+                "INSERT OR IGNORE INTO instance (instance_id, job_id, group_name, task_name, \
+                 mode, state, slot_index, current_alloc_id, storage_handle, created_at, \
+                 updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, 'keyed', 'pending', NULL, NULL, NULL, ?5, ?5);",
+                params![id, job_id, group, task_name, now],
+            )?;
+            if inserted > 0 {
+                created.push(id.clone());
+            }
+        }
+        tx.commit()?;
+        if !created.is_empty() {
+            info!(
+                job_id,
+                group,
+                task_name,
+                seeded = created.len(),
+                "Seeded keyed instances from initialInstances"
+            );
+        }
+        Ok(created)
+    }
+
+    /// Destroy a keyed-mode instance (the DestroyInstance RPC's storage half):
+    /// delete its allocations through the normal allocation-removal path,
+    /// transition the row to `terminated`, and drop its storage handle.
+    ///
+    /// The row is retained forever as a tombstone so the id can never be
+    /// created again. Destroying a `stopped` instance works the same way
+    /// (stopped -> terminated; the retained handle is dropped) — stop is the
+    /// reversible pause, destroy is forever. Destroying an
+    /// already-terminated instance is a no-op (returns
+    /// [`DestroyInstanceOutcome::AlreadyTerminated`]). Slot-mode instances
+    /// are rejected: their lifecycle is owned by the scheduler via
+    /// `count.num`.
+    #[instrument(err, skip_all)]
+    pub fn destroy_keyed_instance(&self, instance_id: &str) -> R<DestroyInstanceOutcome> {
+        let instance = self
+            .get_instance(instance_id)?
+            .ok_or_else(|| StorageError::not_found("instance", instance_id))?;
+        if instance.mode != InstanceMode::Keyed {
+            bail!(StorageError::InvalidInput {
+                message: format!(
+                    "instance {instance_id} is slot-mode; slot instances are managed by the \
+                     scheduler via count.num, not DestroyInstance"
+                ),
+            });
+        }
+        if instance.state == InstanceState::Terminated {
+            return Ok(DestroyInstanceOutcome::AlreadyTerminated);
+        }
+
+        let now = Self::now_rfc3339()?;
+        let mut conn = self.write_connection()?;
+        let tx = conn.transaction()?;
+
+        // Stop the instance's allocation(s) through the normal removal path
+        // (delete row + epoch bump + cache eviction); the worker stops the
+        // task on its next heartbeat reconcile. The instance is terminated in
+        // the same transaction, so the release hook semantics (which skip
+        // terminated instances) can never race this.
+        let mut stmt = tx.prepare(
+            "SELECT allocation.id, allocation.status, allocation.resources, allocation.node_id, \
+             allocation.job_config_id, allocation.task_config_id, job_config.job_id, \
+             allocation.instance_id \
+             FROM allocation \
+             INNER JOIN job_config ON job_config.id = allocation.job_config_id \
+             WHERE allocation.instance_id = ?;",
+        )?;
+        let allocations = Self::collect_rows(
+            stmt.query_map([instance_id], |row| self.allocation_from_row(row))?,
+        )?;
+        drop(stmt);
+
+        tx.execute(
+            "DELETE FROM allocation WHERE instance_id = ?;",
+            [instance_id],
+        )?;
+        tx.execute(
+            "UPDATE instance SET state = 'terminated', current_alloc_id = NULL, \
+             storage_handle = NULL, updated_at = ?1 WHERE instance_id = ?2;",
+            params![now, instance_id],
+        )?;
+        self.bump_epochs_for_allocations_tx(&tx, &allocations)?;
+        tx.commit()?;
+
+        self.cache_remove_allocations(&allocations)?;
+
+        info!(
+            instance_id,
+            job_id = %instance.job_id,
+            removed_allocations = allocations.len(),
+            "Destroyed keyed instance"
+        );
+        Ok(DestroyInstanceOutcome::Destroyed {
+            removed_allocations: allocations.len(),
+        })
+    }
+
+    /// Stop (pause) a keyed-mode instance (the StopInstance RPC's storage
+    /// half): delete its allocations through the normal allocation-removal
+    /// path and transition the row to `stopped`, RETAINING the row and its
+    /// storage handle. The id stays owned (creates still collide) and
+    /// [`Self::start_keyed_instance`] reverses the whole thing — unlike
+    /// destroy, stop is not forever.
+    ///
+    /// The state flips to `stopped` in the SAME transaction that removes the
+    /// allocations (mirroring [`Self::destroy_keyed_instance`]), so the
+    /// release hook — which skips `stopped` rows — can never race this and
+    /// flip the instance to `rescheduling`.
+    ///
+    /// Stopping an already-stopped instance is a no-op (returns
+    /// [`StopInstanceOutcome::AlreadyStopped`]). Slot-mode instances and
+    /// terminated tombstones are rejected with
+    /// [`StorageError::InvalidInput`]; the RPC layer pre-checks the
+    /// terminated case to surface FailedPrecondition.
+    #[instrument(err, skip_all)]
+    pub fn stop_keyed_instance(&self, instance_id: &str) -> R<StopInstanceOutcome> {
+        let instance = self
+            .get_instance(instance_id)?
+            .ok_or_else(|| StorageError::not_found("instance", instance_id))?;
+        if instance.mode != InstanceMode::Keyed {
+            bail!(StorageError::InvalidInput {
+                message: format!(
+                    "instance {instance_id} is slot-mode; slot instances are managed by the \
+                     scheduler via count.num, not StopInstance"
+                ),
+            });
+        }
+        match instance.state {
+            InstanceState::Stopped => return Ok(StopInstanceOutcome::AlreadyStopped),
+            InstanceState::Terminated => bail!(StorageError::InvalidInput {
+                message: format!(
+                    "instance {instance_id} is terminated; destroyed instances are tombstoned \
+                     forever and cannot be stopped"
+                ),
+            }),
+            InstanceState::Pending | InstanceState::Active | InstanceState::Rescheduling => {}
+        }
+
+        let now = Self::now_rfc3339()?;
+        let mut conn = self.write_connection()?;
+        let tx = conn.transaction()?;
+
+        // Stop the instance's allocation(s) through the normal removal path
+        // (delete row + epoch bump + cache eviction); the worker stops the
+        // task on its next heartbeat reconcile. The instance is marked
+        // stopped in the same transaction, so the release hook (which skips
+        // stopped instances) can never flip it to rescheduling.
+        let mut stmt = tx.prepare(
+            "SELECT allocation.id, allocation.status, allocation.resources, allocation.node_id, \
+             allocation.job_config_id, allocation.task_config_id, job_config.job_id, \
+             allocation.instance_id \
+             FROM allocation \
+             INNER JOIN job_config ON job_config.id = allocation.job_config_id \
+             WHERE allocation.instance_id = ?;",
+        )?;
+        let allocations = Self::collect_rows(
+            stmt.query_map([instance_id], |row| self.allocation_from_row(row))?,
+        )?;
+        drop(stmt);
+
+        tx.execute(
+            "DELETE FROM allocation WHERE instance_id = ?;",
+            [instance_id],
+        )?;
+        tx.execute(
+            "UPDATE instance SET state = 'stopped', current_alloc_id = NULL, updated_at = ?1 \
+             WHERE instance_id = ?2;",
+            params![now, instance_id],
+        )?;
+        self.bump_epochs_for_allocations_tx(&tx, &allocations)?;
+        tx.commit()?;
+
+        self.cache_remove_allocations(&allocations)?;
+
+        info!(
+            instance_id,
+            job_id = %instance.job_id,
+            removed_allocations = allocations.len(),
+            "Stopped keyed instance"
+        );
+        Ok(StopInstanceOutcome::Stopped {
+            removed_allocations: allocations.len(),
+        })
+    }
+
+    /// Start (resume) a stopped keyed-mode instance (the StartInstance RPC's
+    /// storage half): transition `stopped -> pending` so the next placement
+    /// eval binds a fresh allocation to the same instance id and its
+    /// RETAINED storage handle. Job-status gating (a stopped job schedules
+    /// nothing) lives in the RPC handler.
+    ///
+    /// Starting an already-live (pending/active/rescheduling) instance is a
+    /// no-op (returns [`StartInstanceOutcome::AlreadyRunning`]). Slot-mode
+    /// instances and terminated tombstones are rejected with
+    /// [`StorageError::InvalidInput`]; the RPC layer pre-checks the
+    /// terminated case to surface FailedPrecondition.
+    #[instrument(err, skip_all)]
+    pub fn start_keyed_instance(&self, instance_id: &str) -> R<StartInstanceOutcome> {
+        let instance = self
+            .get_instance(instance_id)?
+            .ok_or_else(|| StorageError::not_found("instance", instance_id))?;
+        if instance.mode != InstanceMode::Keyed {
+            bail!(StorageError::InvalidInput {
+                message: format!(
+                    "instance {instance_id} is slot-mode; slot instances are managed by the \
+                     scheduler via count.num, not StartInstance"
+                ),
+            });
+        }
+        match instance.state {
+            InstanceState::Pending | InstanceState::Active | InstanceState::Rescheduling => {
+                return Ok(StartInstanceOutcome::AlreadyRunning);
+            }
+            InstanceState::Terminated => bail!(StorageError::InvalidInput {
+                message: format!(
+                    "instance {instance_id} is terminated; destroyed ids are never recycled — \
+                     create a new instance instead"
+                ),
+            }),
+            InstanceState::Stopped => {}
+        }
+
+        let now = Self::now_rfc3339()?;
+        let conn = self.write_connection()?;
+        // Guard on the current state so a concurrent destroy/stop cannot be
+        // overwritten by this transition.
+        let updated = conn.execute(
+            "UPDATE instance SET state = 'pending', updated_at = ?1 \
+             WHERE instance_id = ?2 AND state = 'stopped';",
+            params![now, instance_id],
+        )?;
+        if updated == 0 {
+            bail!(StorageError::Conflict {
+                message: format!(
+                    "instance {instance_id} changed state concurrently; retry StartInstance"
+                ),
+            });
+        }
+        info!(
+            instance_id,
+            job_id = %instance.job_id,
+            "Started keyed instance (stopped -> pending)"
+        );
+        Ok(StartInstanceOutcome::Started)
+    }
+
+    /// Count the live (pending/active/rescheduling) keyed instances of a
+    /// (job, group, task). This is the desired allocation count for a
+    /// keyed-mode task — `count.num` is ignored for keyed tasks. `stopped`
+    /// instances are NOT live: they are paused and get no allocation until
+    /// StartInstance; `terminated` rows are tombstones.
+    #[instrument(err, skip_all)]
+    pub fn count_live_keyed_instances(&self, job_id: &str, group: &str, task_name: &str) -> R<u32> {
+        let conn = self.read_connection()?;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM instance \
+             WHERE job_id = ?1 AND group_name = ?2 AND task_name = ?3 \
+             AND mode = 'keyed' AND state NOT IN ('terminated', 'stopped');",
+            params![job_id, group, task_name],
+            |row| row.get(0),
+        )?;
+        Ok(count.max(0) as u32)
+    }
+
+    /// Map of `instance_id -> slot ordinal` for the slot pool of a
+    /// (job, group). Used by sequential (`rollout.slots.order`) rollouts to
+    /// retire old allocations in descending slot order — an allocation's slot
+    /// identity is reachable only through its instance row
+    /// (`allocation.instance_id -> instance.slot_index`).
+    #[instrument(err, skip_all)]
+    pub fn slot_indices_for_job_group(&self, job_id: &str, group: &str) -> R<HashMap<String, u32>> {
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare(
+            "SELECT instance_id, slot_index FROM instance \
+             WHERE job_id = ?1 AND group_name = ?2 AND mode = 'slot' \
+             AND slot_index IS NOT NULL;",
+        )?;
+        let rows = stmt.query_map(params![job_id, group], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut indices = HashMap::new();
+        for row in rows {
+            let (instance_id, slot) = row?;
+            indices.insert(instance_id, slot.max(0) as u32);
+        }
+        Ok(indices)
+    }
+
+    /// Count live allocations bound to (job, group)'s slot instances that do
+    /// NOT belong to `exclude_job_config_id`.
+    ///
+    /// This is how a plain (non-rollout) reschedule learns that some slots
+    /// are deliberately still occupied by an older config — the staged
+    /// (`rollout.slots.updateFrom`) state — and must not be double-placed:
+    /// the latest config's effective desired count is `count.num` minus this
+    /// number, so a reschedule only replaces slots that are actually empty.
+    #[instrument(err, skip_all)]
+    pub fn count_slot_allocations_excluding_config(
+        &self,
+        job_id: &str,
+        group: &str,
+        exclude_job_config_id: &str,
+    ) -> R<u32> {
+        let conn = self.read_connection()?;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM allocation \
+             INNER JOIN instance ON instance.instance_id = allocation.instance_id \
+             WHERE instance.job_id = ?1 AND instance.group_name = ?2 \
+             AND instance.mode = 'slot' AND allocation.job_config_id != ?3;",
+            params![job_id, group, exclude_job_config_id],
+            |row| row.get(0),
+        )?;
+        Ok(count.max(0) as u32)
     }
 
     //
@@ -4650,6 +6210,14 @@ impl Store {
     }
 }
 
+/// Mint an opaque storage handle for an instance. The `local-dir/` scheme is
+/// the placeholder contract for v1: attach/detach drivers are a follow-up (see
+/// `docs/plans/volume-plugin-system-plan.md`); today the handle only proves
+/// identity stability (same instance => same handle across reschedules).
+fn mint_storage_handle() -> String {
+    format!("local-dir/{}", random_string(32))
+}
+
 fn group_nodes_by_attr<'a>(nodes: &'a [&'a Node], key: &str) -> HashMap<String, Vec<&'a Node>> {
     let mut grouped: HashMap<String, Vec<&'a Node>> = HashMap::new();
     for node in nodes {
@@ -5214,6 +6782,229 @@ mod tests {
         assert!(node_one_allocs.is_empty());
         assert_eq!(node_two_allocs.len(), 1);
 
+        Ok(())
+    }
+
+    /// Slot-mode stateful task with an explicit onLost policy (None values =
+    /// the defaults).
+    fn fenced_slot_task(
+        name: &str,
+        self_terminate_after: Option<&str>,
+        replace_after: Option<&str>,
+    ) -> TaskConfig {
+        let mut task = stateful_slot_task(name, 1, true);
+        if self_terminate_after.is_some() || replace_after.is_some() {
+            if let Some(stateful) = task.stateful.as_mut() {
+                stateful.on_lost = Some(StatefulOnLostConfig {
+                    self_terminate_after: self_terminate_after.map(String::from),
+                    replace_after: replace_after.map(String::from),
+                });
+            }
+        }
+        task
+    }
+
+    fn backdated_rfc3339(minutes_ago: i64) -> R<String> {
+        Ok((OffsetDateTime::now_utc() - TimeDuration::minutes(minutes_ago)).format(&Rfc3339)?)
+    }
+
+    #[test]
+    fn mark_node_lost_sets_lost_at_once_and_heartbeat_clears_it() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-one", "active"))?;
+        assert_eq!(store.node_lost_at("node-one")?, None);
+
+        store.mark_node_lost("node-one")?;
+        let first = store.node_lost_at("node-one")?.context("lost_at set")?;
+
+        // A repeated mark never pushes the loss-confirmation clock back.
+        store.mark_node_lost("node-one")?;
+        assert_eq!(store.node_lost_at("node-one")?.as_deref(), Some(&*first));
+
+        // A heartbeat means the node is back: lost_at clears, status resets.
+        store.update_node_heartbeat("node-one".into())?;
+        assert_eq!(store.node_lost_at("node-one")?, None);
+        assert_eq!(store.get_node("node-one")?.status, "active");
+
+        // Re-registration (the upsert path) also clears a stale lost_at.
+        store.mark_node_lost("node-one")?;
+        assert!(store.node_lost_at("node-one")?.is_some());
+        store.insert_node(make_node_msg("node-one", "active"))?;
+        assert_eq!(store.node_lost_at("node-one")?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn stateful_alloc_on_lost_node_is_held_before_replace_threshold() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-one", "active"))?;
+        store.insert_node(make_node_msg("node-two", "active"))?;
+
+        let job_id = "fence-hold";
+        submit_job(&store, job_id, vec![fenced_slot_task("db", None, None)])?;
+        let task_id = task_id_for(&store, "db", job_id)?;
+        let alloc = store.place_alloc("node-one", task_id)?;
+        let instance_id = alloc.instance_id.clone().context("instance bound")?;
+
+        // Node just lost: well inside the default 180s replaceAfter window.
+        store.mark_nodes_as_lost(&["node-one".to_string()])?;
+
+        // NOT freed: the allocation row stays on the lost node, the instance
+        // stays active and bound, and nothing was placed elsewhere.
+        let held = store.allocs_for_node("node-one")?;
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].id, alloc.id);
+        assert!(store.allocs_for_node("node-two")?.is_empty());
+        let instance = store.get_instance(&instance_id)?.context("instance")?;
+        assert_eq!(instance.state, InstanceState::Active);
+        assert_eq!(instance.current_alloc_id, Some(alloc.id));
+
+        // Re-running the sweep (the monitor tick) is idempotent while the
+        // threshold has not elapsed.
+        store.recheck_lost_nodes();
+        assert_eq!(store.allocs_for_node("node-one")?.len(), 1);
+        assert!(store.allocs_for_node("node-two")?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn stateful_alloc_freed_after_threshold_rebinds_same_instance() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-one", "active"))?;
+        store.insert_node(make_node_msg("node-two", "active"))?;
+
+        let job_id = "fence-free";
+        submit_job(
+            &store,
+            job_id,
+            vec![fenced_slot_task("db", Some("30s"), Some("2m"))],
+        )?;
+        let task_id = task_id_for(&store, "db", job_id)?;
+        let alloc = store.place_alloc("node-one", task_id)?;
+        let instance_id = alloc.instance_id.clone().context("instance bound")?;
+        let original_handle = store
+            .get_instance(&instance_id)?
+            .context("instance")?
+            .storage_handle;
+        assert!(original_handle.is_some());
+
+        store.mark_nodes_as_lost(&["node-one".to_string()])?;
+        // Held while inside the window...
+        assert_eq!(store.allocs_for_node("node-one")?.len(), 1);
+
+        // ...then the loss is confirmed: backdate lost_at past replaceAfter
+        // and run the monitor sweep.
+        store.set_node_lost_at("node-one", &backdated_rfc3339(10)?)?;
+        store.recheck_lost_nodes();
+
+        assert!(store.allocs_for_node("node-one")?.is_empty());
+        let replacements = store.allocs_for_node("node-two")?;
+        assert_eq!(replacements.len(), 1);
+        // The replacement re-binds the SAME instance id and storage handle.
+        assert_eq!(replacements[0].instance_id.as_deref(), Some(&*instance_id));
+        let rebound = store.get_instance(&instance_id)?.context("instance")?;
+        assert_eq!(rebound.state, InstanceState::Active);
+        assert_eq!(rebound.current_alloc_id, Some(replacements[0].id));
+        assert_eq!(rebound.storage_handle, original_handle);
+        Ok(())
+    }
+
+    #[test]
+    fn stateful_alloc_with_replace_after_never_blocks_until_node_returns() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-one", "active"))?;
+        store.insert_node(make_node_msg("node-two", "active"))?;
+
+        let job_id = "fence-never";
+        submit_job(
+            &store,
+            job_id,
+            vec![fenced_slot_task("db", None, Some("never"))],
+        )?;
+        let task_id = task_id_for(&store, "db", job_id)?;
+        let alloc = store.place_alloc("node-one", task_id)?;
+        let instance_id = alloc.instance_id.clone().context("instance bound")?;
+
+        store.mark_nodes_as_lost(&["node-one".to_string()])?;
+        // Even an ancient loss never auto-replaces with "never".
+        store.set_node_lost_at("node-one", &backdated_rfc3339(60 * 24)?)?;
+        store.recheck_lost_nodes();
+        assert_eq!(store.allocs_for_node("node-one")?.len(), 1);
+        assert!(store.allocs_for_node("node-two")?.is_empty());
+
+        // The node returning is what frees it: binding intact, no churn.
+        store.update_node_heartbeat("node-one".into())?;
+        store.recheck_lost_nodes();
+        let kept = store.allocs_for_node("node-one")?;
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].id, alloc.id);
+        let instance = store.get_instance(&instance_id)?.context("instance")?;
+        assert_eq!(instance.state, InstanceState::Active);
+        assert_eq!(instance.current_alloc_id, Some(alloc.id));
+        Ok(())
+    }
+
+    #[test]
+    fn node_recovery_before_threshold_keeps_binding_and_clears_lost_at() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-one", "active"))?;
+        store.insert_node(make_node_msg("node-two", "active"))?;
+
+        let job_id = "fence-recover";
+        submit_job(&store, job_id, vec![fenced_slot_task("db", None, None)])?;
+        let task_id = task_id_for(&store, "db", job_id)?;
+        let alloc = store.place_alloc("node-one", task_id)?;
+        let instance_id = alloc.instance_id.clone().context("instance bound")?;
+
+        store.mark_nodes_as_lost(&["node-one".to_string()])?;
+        assert!(store.node_lost_at("node-one")?.is_some());
+
+        // Node heartbeats again BEFORE the threshold: lost_at clears and the
+        // allocation/instance binding is untouched — no replacement ever
+        // happened.
+        store.update_node_heartbeat("node-one".into())?;
+        assert_eq!(store.node_lost_at("node-one")?, None);
+        store.recheck_lost_nodes();
+
+        let kept = store.allocs_for_node("node-one")?;
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].id, alloc.id);
+        assert!(store.allocs_for_node("node-two")?.is_empty());
+        let instance = store.get_instance(&instance_id)?.context("instance")?;
+        assert_eq!(instance.state, InstanceState::Active);
+        assert_eq!(instance.current_alloc_id, Some(alloc.id));
+        Ok(())
+    }
+
+    #[test]
+    fn stateless_allocs_on_lost_node_replaced_immediately_while_stateful_held() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-one", "active"))?;
+        store.insert_node(make_node_msg("node-two", "active"))?;
+
+        let job_id = "fence-mixed";
+        submit_job(
+            &store,
+            job_id,
+            vec![task("web"), fenced_slot_task("db", None, None)],
+        )?;
+        let web_task = task_id_for(&store, "web", job_id)?;
+        let db_task = task_id_for(&store, "db", job_id)?;
+        store.place_alloc("node-one", web_task)?;
+        let db_alloc = store.place_alloc("node-one", db_task)?;
+
+        store.mark_nodes_as_lost(&["node-one".to_string()])?;
+
+        // Stateless web: replaced eagerly on node-two. Stateful db: held on
+        // the lost node pending loss confirmation.
+        let lost_node_allocs = store.allocs_for_node("node-one")?;
+        assert_eq!(lost_node_allocs.len(), 1);
+        assert_eq!(lost_node_allocs[0].id, db_alloc.id);
+        assert_eq!(lost_node_allocs[0].task_config_id, db_task);
+
+        let replaced = store.allocs_for_node("node-two")?;
+        assert_eq!(replaced.len(), 1);
+        assert_eq!(replaced[0].task_config_id, web_task);
         Ok(())
     }
 
@@ -6940,6 +8731,1340 @@ mod tests {
         assert_eq!(reconciled, 1);
         assert_eq!(store.allocs_for_job_config(&v2_id)?.len(), 1);
 
+        Ok(())
+    }
+
+    //
+    // INSTANCES (stateful workloads)
+    //
+
+    fn stateful_slot_task(name: &str, count: u32, with_storage: bool) -> TaskConfig {
+        TaskConfig {
+            count: TaskCount::new(count),
+            stateful: Some(crate::structs::StatefulConfig {
+                mode: InstanceMode::Slot,
+                id_source: None,
+                initial_instances: None,
+                on_lost: None,
+                storage: with_storage.then(|| crate::structs::StatefulStorageConfig {
+                    path: "/var/lib/data".into(),
+                    retain_on_scale_in: None,
+                    retain_on_stop: None,
+                }),
+            }),
+            ..TaskConfig::new(name, "noop")
+        }
+    }
+
+    fn submit_job(store: &Store, name: &str, tasks: Vec<TaskConfig>) -> R<String> {
+        let config = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: name.into(),
+            tasks,
+            version: None,
+        };
+        store.handle_job_submit(
+            &config,
+            &[Submission {
+                path: "job.jsonnet".into(),
+                content: "{}".into(),
+                is_primary: true,
+            }],
+        )?;
+        Ok(store.get_job_config(name)?.id())
+    }
+
+    #[test]
+    fn stateful_task_config_round_trips_through_persistence() -> R<()> {
+        let store = setup_store()?;
+        let job_config_id = submit_job(
+            &store,
+            "stateful-rt",
+            vec![stateful_slot_task("db", 2, true)],
+        )?;
+
+        let tasks = store.get_task_configs_for_job_config(&job_config_id)?;
+        let (_, task) = tasks.first().context("missing task")?;
+        let stateful = task.stateful.as_ref().context("stateful must persist")?;
+        assert_eq!(stateful.mode, InstanceMode::Slot);
+        assert_eq!(
+            stateful.storage.as_ref().map(|s| s.path.as_str()),
+            Some("/var/lib/data")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stateless_task_config_round_trips_without_stateful() -> R<()> {
+        let store = setup_store()?;
+        let job_config_id = submit_job(&store, "stateless-rt", vec![task("web")])?;
+        let tasks = store.get_task_configs_for_job_config(&job_config_id)?;
+        assert!(tasks[0].1.stateful.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn place_alloc_assigns_lowest_free_slot_and_activates_instance() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "active"))?;
+        let job_id = "slot-place";
+        submit_job(&store, job_id, vec![stateful_slot_task("db", 3, true)])?;
+        let task_id = task_id_for(&store, "db", job_id)?;
+
+        let first = store.place_alloc("node-a", task_id)?;
+        let second = store.place_alloc("node-a", task_id)?;
+        let third = store.place_alloc("node-a", task_id)?;
+
+        assert_eq!(first.instance_id.as_deref(), Some("slot-place-default-0"));
+        assert_eq!(second.instance_id.as_deref(), Some("slot-place-default-1"));
+        assert_eq!(third.instance_id.as_deref(), Some("slot-place-default-2"));
+
+        let instances = store.list_instances(job_id)?;
+        assert_eq!(instances.len(), 3);
+        for (slot, instance) in instances.iter().enumerate() {
+            assert_eq!(instance.mode, InstanceMode::Slot);
+            assert_eq!(instance.state, InstanceState::Active);
+            assert_eq!(instance.slot_index, Some(slot as u32));
+            assert!(
+                instance
+                    .storage_handle
+                    .as_deref()
+                    .is_some_and(|handle| handle.starts_with("local-dir/")),
+                "storage handle minted on first placement"
+            );
+        }
+        assert_eq!(instances[0].current_alloc_id, Some(first.id));
+        assert_eq!(instances[2].current_alloc_id, Some(third.id));
+
+        // A fourth placement would exceed the slot pool and must fail loudly.
+        assert!(store.place_alloc("node-a", task_id).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn removed_allocation_reuses_slot_instance_and_storage_handle() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "active"))?;
+        let job_id = "slot-reuse";
+        submit_job(&store, job_id, vec![stateful_slot_task("db", 2, true)])?;
+        let task_id = task_id_for(&store, "db", job_id)?;
+
+        let slot0 = store.place_alloc("node-a", task_id)?;
+        let slot1 = store.place_alloc("node-a", task_id)?;
+        let slot1_instance = store
+            .get_instance(slot1.instance_id.as_deref().context("instance id")?)?
+            .context("instance row")?;
+        let original_handle = slot1_instance.storage_handle.clone();
+        assert!(original_handle.is_some());
+
+        // Kill slot 1's allocation: instance transitions to rescheduling and
+        // keeps its handle.
+        store.remove_allocation_by_id(slot1.id)?;
+        let rescheduling = store
+            .get_instance(&slot1_instance.instance_id)?
+            .context("instance retained")?;
+        assert_eq!(rescheduling.state, InstanceState::Rescheduling);
+        assert_eq!(rescheduling.current_alloc_id, None);
+        assert_eq!(rescheduling.storage_handle, original_handle);
+
+        // The replacement reuses slot 1's instance id and storage handle.
+        let replacement = store.place_alloc("node-a", task_id)?;
+        assert_eq!(
+            replacement.instance_id.as_deref(),
+            Some(slot1_instance.instance_id.as_str())
+        );
+        let reactivated = store
+            .get_instance(&slot1_instance.instance_id)?
+            .context("instance reactivated")?;
+        assert_eq!(reactivated.state, InstanceState::Active);
+        assert_eq!(reactivated.current_alloc_id, Some(replacement.id));
+        assert_eq!(reactivated.storage_handle, original_handle);
+
+        // Slot 0 was never disturbed.
+        let slot0_instance = store
+            .get_instance(slot0.instance_id.as_deref().context("instance id")?)?
+            .context("slot 0 instance")?;
+        assert_eq!(slot0_instance.state, InstanceState::Active);
+        assert_eq!(slot0_instance.current_alloc_id, Some(slot0.id));
+        Ok(())
+    }
+
+    #[test]
+    fn slot_binding_prefers_slot_with_no_live_allocation_in_job() -> R<()> {
+        // Sequential-rollout shape: v1 holds slots 0..2; v2 must bind the
+        // slot whose old allocation was just retired (slot 2), not the
+        // lowest slot free in v2's own scope (slot 0, still live under v1).
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "active"))?;
+        let job_id = "slot-seq-bind";
+        submit_job(&store, job_id, vec![stateful_slot_task("db", 3, true)])?;
+        let v1_task = task_id_for(&store, "db", job_id)?;
+        let mut v1_allocs = Vec::new();
+        for _ in 0..3 {
+            v1_allocs.push(store.place_alloc("node-a", v1_task)?);
+        }
+        let slot2_handle = store
+            .get_instance(&format!("{job_id}-default-2"))?
+            .context("slot 2 instance")?
+            .storage_handle
+            .clone();
+
+        let v2_config_id = submit_job(
+            &store,
+            job_id,
+            vec![TaskConfig {
+                config: json!({ "version": 2 }),
+                ..stateful_slot_task("db", 3, true)
+            }],
+        )?;
+        let v2_task = task_id_for_config(&store, "db", &v2_config_id)?;
+
+        // Retire slot 2's old allocation, then place a v2 allocation: it
+        // must re-bind slot 2's instance (same id and storage handle).
+        store.remove_allocation_by_id(v1_allocs[2].id)?;
+        let replacement = store.place_alloc("node-a", v2_task)?;
+        assert_eq!(
+            replacement.instance_id.as_deref(),
+            Some(format!("{job_id}-default-2").as_str()),
+            "replacement must bind the freed slot, not slot 0"
+        );
+        let rebound = store
+            .get_instance(&format!("{job_id}-default-2"))?
+            .context("slot 2 instance after rebind")?;
+        assert_eq!(rebound.storage_handle, slot2_handle);
+
+        // Fallback parity with the fresh-plan-then-remove flow: with no
+        // job-wide-free slot left, per-config scoping still applies and the
+        // next v2 placement takes the lowest slot free in v2's scope.
+        let takeover = store.place_alloc("node-a", v2_task)?;
+        assert_eq!(
+            takeover.instance_id.as_deref(),
+            Some(format!("{job_id}-default-0").as_str())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn slot_indices_and_other_config_counts_round_trip() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "active"))?;
+        let job_id = "slot-helpers";
+        submit_job(&store, job_id, vec![stateful_slot_task("db", 2, false)])?;
+        let v1_task = task_id_for(&store, "db", job_id)?;
+        store.place_alloc("node-a", v1_task)?;
+        store.place_alloc("node-a", v1_task)?;
+
+        let indices = store.slot_indices_for_job_group(job_id, "default")?;
+        assert_eq!(indices.len(), 2);
+        assert_eq!(indices.get(&format!("{job_id}-default-0")), Some(&0));
+        assert_eq!(indices.get(&format!("{job_id}-default-1")), Some(&1));
+        assert!(store
+            .slot_indices_for_job_group(job_id, "other-group")?
+            .is_empty());
+
+        // Both v1 allocations count as "other config" from v2's viewpoint,
+        // and as zero from v1's own viewpoint.
+        let v1_config_id = format!("{job_id}-1");
+        let v2_config_id = submit_job(
+            &store,
+            job_id,
+            vec![TaskConfig {
+                config: json!({ "version": 2 }),
+                ..stateful_slot_task("db", 2, false)
+            }],
+        )?;
+        assert_eq!(
+            store.count_slot_allocations_excluding_config(job_id, "default", &v2_config_id)?,
+            2
+        );
+        assert_eq!(
+            store.count_slot_allocations_excluding_config(job_id, "default", &v1_config_id)?,
+            0
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn scale_in_terminates_high_slots_and_scale_out_reattaches_them() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "active"))?;
+        let job_id = "slot-scale";
+        submit_job(&store, job_id, vec![stateful_slot_task("db", 3, true)])?;
+        let v1_task = task_id_for(&store, "db", job_id)?;
+        for _ in 0..3 {
+            store.place_alloc("node-a", v1_task)?;
+        }
+        let handles_before: Vec<Option<String>> = store
+            .list_instances(job_id)?
+            .into_iter()
+            .map(|instance| instance.storage_handle)
+            .collect();
+
+        // Scale in to 2: submit v2, place its allocations, then drop v1's
+        // (mirrors the job_submit eval flow: plan fresh, then remove previous).
+        let v2_config_id = submit_job(&store, job_id, vec![stateful_slot_task("db", 2, true)])?;
+        let v1_config_id = format!("{job_id}-1");
+        let v2_task = task_id_for_config(&store, "db", &v2_config_id)?;
+        store.place_alloc("node-a", v2_task)?;
+        store.place_alloc("node-a", v2_task)?;
+        store.remove_allocs_for_job_config(&v1_config_id)?;
+
+        let instances = store.list_instances(job_id)?;
+        assert_eq!(instances.len(), 3, "terminated rows are retained");
+        assert_eq!(instances[0].state, InstanceState::Active);
+        assert_eq!(instances[1].state, InstanceState::Active);
+        assert_eq!(instances[2].state, InstanceState::Terminated);
+        assert_eq!(
+            instances[2].storage_handle, handles_before[2],
+            "scale-in retains the storage handle by default"
+        );
+        // Slots 0/1 kept their identity and storage across the config update.
+        assert_eq!(instances[0].storage_handle, handles_before[0]);
+        assert_eq!(instances[1].storage_handle, handles_before[1]);
+
+        // Scale back out to 3: the same slot id is re-materialized with the
+        // retained handle.
+        let v3_config_id = submit_job(&store, job_id, vec![stateful_slot_task("db", 3, true)])?;
+        let v3_task = task_id_for_config(&store, "db", &v3_config_id)?;
+        for _ in 0..3 {
+            store.place_alloc("node-a", v3_task)?;
+        }
+        store.remove_allocs_for_job_config(&v2_config_id)?;
+
+        let instances = store.list_instances(job_id)?;
+        assert_eq!(instances.len(), 3);
+        assert_eq!(instances[2].instance_id, "slot-scale-default-2");
+        assert_eq!(instances[2].state, InstanceState::Active);
+        assert_eq!(instances[2].storage_handle, handles_before[2]);
+        Ok(())
+    }
+
+    #[test]
+    fn scale_in_drops_storage_handle_when_retention_disabled() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "active"))?;
+        let job_id = "slot-noretain";
+        let no_retain_task = |count: u32| TaskConfig {
+            count: TaskCount::new(count),
+            stateful: Some(crate::structs::StatefulConfig {
+                mode: InstanceMode::Slot,
+                id_source: None,
+                initial_instances: None,
+                on_lost: None,
+                storage: Some(crate::structs::StatefulStorageConfig {
+                    path: "/var/lib/data".into(),
+                    retain_on_scale_in: Some(false),
+                    retain_on_stop: None,
+                }),
+            }),
+            ..TaskConfig::new("db", "noop")
+        };
+
+        submit_job(&store, job_id, vec![no_retain_task(2)])?;
+        let v1_task = task_id_for(&store, "db", job_id)?;
+        store.place_alloc("node-a", v1_task)?;
+        store.place_alloc("node-a", v1_task)?;
+
+        let v2_config_id = submit_job(&store, job_id, vec![no_retain_task(1)])?;
+        let v2_task = task_id_for_config(&store, "db", &v2_config_id)?;
+        store.place_alloc("node-a", v2_task)?;
+        store.remove_allocs_for_job_config(&format!("{job_id}-1"))?;
+
+        let instances = store.list_instances(job_id)?;
+        assert_eq!(instances[1].state, InstanceState::Terminated);
+        assert_eq!(instances[1].storage_handle, None);
+        Ok(())
+    }
+
+    #[test]
+    fn stateless_jobs_create_no_instance_rows() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "active"))?;
+        let job_id = "stateless-job";
+        submit_job(&store, job_id, vec![task("web")])?;
+        let task_id = task_id_for(&store, "web", job_id)?;
+
+        let allocation = store.place_alloc("node-a", task_id)?;
+        assert_eq!(allocation.instance_id, None);
+        assert!(store.list_instances(job_id)?.is_empty());
+
+        store.remove_allocation_by_id(allocation.id)?;
+        assert!(store.list_instances(job_id)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn instance_store_methods_round_trip() -> R<()> {
+        let store = setup_store()?;
+        let job_id = "inst-crud";
+        submit_job(&store, job_id, vec![stateful_slot_task("db", 2, false)])?;
+
+        assert!(store.get_instance("missing")?.is_none());
+
+        let created = store.get_or_create_slot_instance(job_id, "default", "db", 0)?;
+        assert_eq!(created.instance_id, "inst-crud-default-0");
+        assert_eq!(created.state, InstanceState::Pending);
+        assert_eq!(created.slot_index, Some(0));
+        assert_eq!(created.storage_handle, None);
+
+        // Idempotent: a second call returns the same row.
+        let again = store.get_or_create_slot_instance(job_id, "default", "db", 0)?;
+        assert_eq!(again.instance_id, created.instance_id);
+        assert_eq!(again.created_at, created.created_at);
+
+        store.set_instance_state(&created.instance_id, InstanceState::Active)?;
+        store.set_instance_current_alloc(&created.instance_id, Some(77))?;
+        let updated = store
+            .get_instance(&created.instance_id)?
+            .context("instance exists")?;
+        assert_eq!(updated.state, InstanceState::Active);
+        assert_eq!(updated.current_alloc_id, Some(77));
+
+        store.set_instance_current_alloc(&created.instance_id, None)?;
+        let cleared = store
+            .get_instance(&created.instance_id)?
+            .context("instance exists")?;
+        assert_eq!(cleared.current_alloc_id, None);
+
+        // Upsert overwrites mutable fields and keeps identity.
+        let upserted = store.upsert_instance(&Instance {
+            storage_handle: Some("local-dir/manual".into()),
+            state: InstanceState::Terminated,
+            ..cleared
+        })?;
+        assert_eq!(upserted.state, InstanceState::Terminated);
+        assert_eq!(upserted.storage_handle.as_deref(), Some("local-dir/manual"));
+
+        // Errors on unknown ids.
+        assert!(store
+            .set_instance_state("missing", InstanceState::Active)
+            .is_err());
+        assert!(store.set_instance_current_alloc("missing", None).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn stop_instances_for_job_terminates_slot_rows_and_retains_handles() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "active"))?;
+        let job_id = "inst-stop";
+        submit_job(&store, job_id, vec![stateful_slot_task("db", 2, true)])?;
+        let task_id = task_id_for(&store, "db", job_id)?;
+        store.place_alloc("node-a", task_id)?;
+        store.place_alloc("node-a", task_id)?;
+
+        let handles: Vec<Option<String>> = store
+            .list_instances(job_id)?
+            .into_iter()
+            .map(|instance| instance.storage_handle)
+            .collect();
+
+        // Mirror the job_stop eval: allocations are removed first, then the
+        // instances are settled. Default retainOnStop (absent = true) keeps
+        // every slot handle, like K8s `whenDeleted: Retain`.
+        store.remove_allocs_for_job(job_id)?;
+        assert_eq!(store.stop_instances_for_job(job_id)?, 2);
+        let instances = store.list_instances(job_id)?;
+        assert_eq!(instances.len(), 2);
+        for (instance, handle) in instances.iter().zip(&handles) {
+            assert_eq!(instance.state, InstanceState::Terminated);
+            assert_eq!(instance.current_alloc_id, None);
+            assert_eq!(&instance.storage_handle, handle);
+        }
+
+        // Idempotent.
+        assert_eq!(store.stop_instances_for_job(job_id)?, 0);
+
+        // Resubmitting the job re-materializes the SAME ordinal identities
+        // with the SAME retained handles.
+        let v2_config_id = submit_job(&store, job_id, vec![stateful_slot_task("db", 2, true)])?;
+        let v2_task = task_id_for_config(&store, "db", &v2_config_id)?;
+        store.place_alloc("node-a", v2_task)?;
+        store.place_alloc("node-a", v2_task)?;
+        let revived = store.list_instances(job_id)?;
+        assert_eq!(revived.len(), 2);
+        assert_eq!(revived[0].instance_id, "inst-stop-default-0");
+        assert_eq!(revived[1].instance_id, "inst-stop-default-1");
+        for (instance, handle) in revived.iter().zip(&handles) {
+            assert_eq!(instance.state, InstanceState::Active);
+            assert_eq!(
+                &instance.storage_handle, handle,
+                "re-run reattaches the retained handle"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn job_stop_drops_slot_handles_when_retain_on_stop_disabled() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "active"))?;
+        let job_id = "stop-noretain";
+        let no_stop_retain_task = || TaskConfig {
+            count: TaskCount::new(2),
+            stateful: Some(crate::structs::StatefulConfig {
+                mode: InstanceMode::Slot,
+                id_source: None,
+                initial_instances: None,
+                on_lost: None,
+                storage: Some(crate::structs::StatefulStorageConfig {
+                    path: "/var/lib/data".into(),
+                    retain_on_scale_in: None,
+                    retain_on_stop: Some(false),
+                }),
+            }),
+            ..TaskConfig::new("db", "noop")
+        };
+
+        submit_job(&store, job_id, vec![no_stop_retain_task()])?;
+        let task_id = task_id_for(&store, "db", job_id)?;
+        store.place_alloc("node-a", task_id)?;
+        store.place_alloc("node-a", task_id)?;
+        let original_handles: Vec<Option<String>> = store
+            .list_instances(job_id)?
+            .into_iter()
+            .map(|instance| instance.storage_handle)
+            .collect();
+        assert!(original_handles.iter().all(Option::is_some));
+
+        // Job stop (the K8s `whenDeleted: Delete` analog): rows are retained
+        // — identity comes back — but the data binding is dropped.
+        store.remove_allocs_for_job(job_id)?;
+        assert_eq!(store.stop_instances_for_job(job_id)?, 2);
+        let instances = store.list_instances(job_id)?;
+        assert_eq!(instances.len(), 2, "rows retained despite handle drop");
+        for instance in &instances {
+            assert_eq!(instance.state, InstanceState::Terminated);
+            assert_eq!(instance.current_alloc_id, None);
+            assert_eq!(
+                instance.storage_handle, None,
+                "retainOnStop: false drops the handle on job stop"
+            );
+        }
+
+        // Idempotent.
+        assert_eq!(store.stop_instances_for_job(job_id)?, 0);
+
+        // Resubmit: the same ordinal ids come back, but with FRESH handles —
+        // the identity survives the stop, the data binding does not.
+        let v2_config_id = submit_job(&store, job_id, vec![no_stop_retain_task()])?;
+        let v2_task = task_id_for_config(&store, "db", &v2_config_id)?;
+        store.place_alloc("node-a", v2_task)?;
+        store.place_alloc("node-a", v2_task)?;
+        let revived = store.list_instances(job_id)?;
+        assert_eq!(revived.len(), 2);
+        assert_eq!(revived[0].instance_id, "stop-noretain-default-0");
+        assert_eq!(revived[1].instance_id, "stop-noretain-default-1");
+        for (instance, original) in revived.iter().zip(&original_handles) {
+            assert_eq!(instance.state, InstanceState::Active);
+            assert!(instance.storage_handle.is_some(), "fresh handle minted");
+            assert_ne!(&instance.storage_handle, original);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn job_stop_drops_handles_only_for_tasks_with_retain_on_stop_disabled() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "active"))?;
+        let job_id = "stop-mixed";
+        // Three groups: a slot task that keeps the default (retain), a slot
+        // task that opts out, and a keyed task to prove the slot-only knob
+        // never touches keyed handles.
+        let keep_task = TaskConfig {
+            group: "keep".into(),
+            ..stateful_slot_task("keep-db", 1, true)
+        };
+        let drop_task = TaskConfig {
+            group: "drop".into(),
+            count: TaskCount::new(1),
+            stateful: Some(crate::structs::StatefulConfig {
+                mode: InstanceMode::Slot,
+                id_source: None,
+                initial_instances: None,
+                on_lost: None,
+                storage: Some(crate::structs::StatefulStorageConfig {
+                    path: "/var/lib/data".into(),
+                    retain_on_scale_in: None,
+                    retain_on_stop: Some(false),
+                }),
+            }),
+            ..TaskConfig::new("drop-db", "noop")
+        };
+        let keyed_task = TaskConfig {
+            group: "sandboxes".into(),
+            ..stateful_keyed_task("sandbox", true)
+        };
+        submit_job(&store, job_id, vec![keep_task, drop_task, keyed_task])?;
+        store.create_keyed_instance(job_id, "sandboxes", "sandbox", Some("user-a"))?;
+        store.place_alloc("node-a", task_id_for(&store, "keep-db", job_id)?)?;
+        store.place_alloc("node-a", task_id_for(&store, "drop-db", job_id)?)?;
+        store.place_alloc("node-a", task_id_for(&store, "sandbox", job_id)?)?;
+
+        let keep_id = slot_instance_id(job_id, "keep", 0);
+        let drop_id = slot_instance_id(job_id, "drop", 0);
+        let keep_handle = store
+            .get_instance(&keep_id)?
+            .context("keep")?
+            .storage_handle;
+        let keyed_handle = store
+            .get_instance("user-a")?
+            .context("keyed")?
+            .storage_handle;
+        assert!(keep_handle.is_some());
+        assert!(keyed_handle.is_some());
+
+        store.remove_allocs_for_job(job_id)?;
+        assert_eq!(store.stop_instances_for_job(job_id)?, 3);
+
+        // Only the opted-out task's slot handle is dropped.
+        let keep = store.get_instance(&keep_id)?.context("keep")?;
+        assert_eq!(keep.state, InstanceState::Terminated);
+        assert_eq!(keep.storage_handle, keep_handle, "default task retains");
+        let dropped = store.get_instance(&drop_id)?.context("drop")?;
+        assert_eq!(dropped.state, InstanceState::Terminated);
+        assert_eq!(dropped.storage_handle, None, "opted-out task drops");
+        // Keyed instances are paused with handles retained, regardless of any
+        // slot task's retainOnStop.
+        let keyed = store.get_instance("user-a")?.context("keyed")?;
+        assert_eq!(keyed.state, InstanceState::Stopped);
+        assert_eq!(keyed.storage_handle, keyed_handle, "keyed always retains");
+        Ok(())
+    }
+
+    fn task_id_for_config(store: &Store, task_name: &str, job_config_id: &str) -> R<i64> {
+        let conn = store.read_connection()?;
+        let id = conn.query_row(
+            "SELECT id FROM task_config WHERE name = ? AND job_config_id = ?;",
+            [task_name, job_config_id],
+            |row| row.get(0),
+        )?;
+        Ok(id)
+    }
+
+    //
+    // KEYED-MODE INSTANCES (sandbox style; see docs/stateful-workloads.md)
+    //
+
+    fn stateful_keyed_task(name: &str, with_storage: bool) -> TaskConfig {
+        TaskConfig {
+            stateful: Some(crate::structs::StatefulConfig {
+                mode: InstanceMode::Keyed,
+                id_source: None,
+                initial_instances: None,
+                on_lost: None,
+                storage: with_storage.then(|| crate::structs::StatefulStorageConfig {
+                    path: "/workspace".into(),
+                    retain_on_scale_in: None,
+                    retain_on_stop: None,
+                }),
+            }),
+            ..TaskConfig::new(name, "noop")
+        }
+    }
+
+    #[test]
+    fn keyed_placement_binds_each_live_instance_and_mints_handles() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "active"))?;
+        let job_id = "keyed-place";
+        submit_job(&store, job_id, vec![stateful_keyed_task("sandbox", true)])?;
+        let task_id = task_id_for(&store, "sandbox", job_id)?;
+
+        let first = store.create_keyed_instance(job_id, "default", "sandbox", Some("user-a"))?;
+        let second = store.create_keyed_instance(job_id, "default", "sandbox", Some("user-b"))?;
+        assert_eq!(first.state, InstanceState::Pending);
+        assert_eq!(first.slot_index, None);
+        assert_eq!(first.storage_handle, None, "handle minted at placement");
+        assert_eq!(second.instance_id, "user-b");
+
+        let alloc_one = store.place_alloc("node-a", task_id)?;
+        let alloc_two = store.place_alloc("node-a", task_id)?;
+        let mut bound: Vec<&str> = vec![
+            alloc_one.instance_id.as_deref().context("bound")?,
+            alloc_two.instance_id.as_deref().context("bound")?,
+        ];
+        bound.sort_unstable();
+        assert_eq!(bound, vec!["user-a", "user-b"]);
+
+        for id in ["user-a", "user-b"] {
+            let instance = store.get_instance(id)?.context("instance")?;
+            assert_eq!(instance.state, InstanceState::Active);
+            assert!(instance
+                .storage_handle
+                .as_deref()
+                .is_some_and(|handle| handle.starts_with("local-dir/")));
+            assert!(instance.current_alloc_id.is_some());
+        }
+
+        // No unbound live instance left: a third placement must fail loudly
+        // instead of inventing an instance.
+        let err = store.place_alloc("node-a", task_id).expect_err("no free");
+        assert!(
+            err.to_string().contains("CreateInstance"),
+            "error should point at the management API: {err}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn keyed_instance_cannot_hijack_another_jobs_slot_id() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "active"))?;
+
+        // Job A owns slot ids `job-a-default-{0,1,2}`.
+        let job_a = "job-a";
+        submit_job(&store, job_a, vec![stateful_slot_task("db", 3, true)])?;
+        let slot_task = task_id_for(&store, "db", job_a)?;
+
+        // Job B is a keyed sandbox job. A caller tries to create a keyed
+        // instance whose id is exactly job A's slot-0 id.
+        let job_b = "job-b";
+        submit_job(&store, job_b, vec![stateful_keyed_task("sandbox", true)])?;
+        let hijack_id = slot_instance_id(job_a, "default", 0); // "job-a-default-0"
+        let created = store.create_keyed_instance(job_b, "default", "sandbox", Some(&hijack_id))?;
+
+        // Job A's slot-0 placement must NOT adopt job B's row — it is a hard
+        // error, because the slot id space is exclusive.
+        let err = store
+            .place_alloc("node-a", slot_task)
+            .expect_err("slot placement must refuse to adopt a foreign row");
+        assert!(
+            err.to_string().contains("exclusive"),
+            "error should explain slot ids are exclusive: {err}"
+        );
+
+        // Job B's row is untouched: still keyed, still owned by job B.
+        let row = store.get_instance(&hijack_id)?.context("job B row")?;
+        assert_eq!(row.job_id, job_b);
+        assert_eq!(row.mode, InstanceMode::Keyed);
+        assert_eq!(row.created_at, created.created_at);
+
+        Ok(())
+    }
+
+    #[test]
+    fn keyed_create_rejects_id_aliasing_same_job_slot_pattern() -> R<()> {
+        let store = setup_store()?;
+        // One job with both a slot task (slots 0,1) and a keyed task.
+        let job_id = "mixed";
+        submit_job(
+            &store,
+            job_id,
+            vec![
+                stateful_slot_task("db", 2, true),
+                TaskConfig {
+                    group: "sandboxes".into(),
+                    ..stateful_keyed_task("sandbox", true)
+                },
+            ],
+        )?;
+
+        // A keyed id matching the slot pattern of the slot task is rejected.
+        let colliding = slot_instance_id(job_id, "default", 1); // "mixed-default-1"
+        let err = store
+            .create_keyed_instance(job_id, "sandboxes", "sandbox", Some(&colliding))
+            .expect_err("keyed id aliasing a slot id must be rejected");
+        assert!(
+            err.to_string().contains("slot-id pattern"),
+            "error should mention the reserved slot-id pattern: {err}"
+        );
+
+        // A slot index beyond the pool (slot 2) is NOT a slot id, so it's fine.
+        let ok_id = slot_instance_id(job_id, "default", 2); // "mixed-default-2"
+        store.create_keyed_instance(job_id, "sandboxes", "sandbox", Some(&ok_id))?;
+        Ok(())
+    }
+
+    #[test]
+    fn keyed_allocation_loss_sets_rescheduling_and_replacement_rebinds_identity() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "active"))?;
+        let job_id = "keyed-resched";
+        submit_job(&store, job_id, vec![stateful_keyed_task("sandbox", true)])?;
+        let task_id = task_id_for(&store, "sandbox", job_id)?;
+        store.create_keyed_instance(job_id, "default", "sandbox", Some("user-a"))?;
+
+        let alloc = store.place_alloc("node-a", task_id)?;
+        let handle = store
+            .get_instance("user-a")?
+            .context("instance")?
+            .storage_handle;
+        assert!(handle.is_some());
+
+        // The release hook must NOT terminate a keyed instance just because
+        // its allocation died — only DestroyInstance terminates keyed rows.
+        store.remove_allocation_by_id(alloc.id)?;
+        let waiting = store.get_instance("user-a")?.context("retained")?;
+        assert_eq!(waiting.state, InstanceState::Rescheduling);
+        assert_eq!(waiting.current_alloc_id, None);
+        assert_eq!(waiting.storage_handle, handle, "handle survives the loss");
+
+        // The replacement re-binds the same id + storage handle.
+        let replacement = store.place_alloc("node-a", task_id)?;
+        assert_eq!(replacement.instance_id.as_deref(), Some("user-a"));
+        let reactivated = store.get_instance("user-a")?.context("reactivated")?;
+        assert_eq!(reactivated.state, InstanceState::Active);
+        assert_eq!(reactivated.current_alloc_id, Some(replacement.id));
+        assert_eq!(reactivated.storage_handle, handle);
+        Ok(())
+    }
+
+    #[test]
+    fn create_keyed_instance_rejects_collisions_including_tombstones() -> R<()> {
+        let store = setup_store()?;
+        let job_id = "keyed-recycle";
+        submit_job(&store, job_id, vec![stateful_keyed_task("sandbox", true)])?;
+
+        store.create_keyed_instance(job_id, "default", "sandbox", Some("user-a"))?;
+
+        // Live collision.
+        let err = store
+            .create_keyed_instance(job_id, "default", "sandbox", Some("user-a"))
+            .expect_err("live collision");
+        assert!(matches!(
+            StorageError::from_anyhow(&err),
+            Some(StorageError::Conflict { .. })
+        ));
+
+        // Tombstone collision: a destroyed id can NEVER be created again.
+        store.destroy_keyed_instance("user-a")?;
+        let err = store
+            .create_keyed_instance(job_id, "default", "sandbox", Some("user-a"))
+            .expect_err("tombstoned ids are never recycled");
+        assert!(matches!(
+            StorageError::from_anyhow(&err),
+            Some(StorageError::Conflict { .. })
+        ));
+
+        // Server-minted ids are fresh and unique.
+        let minted = store.create_keyed_instance(job_id, "default", "sandbox", None)?;
+        assert_ne!(minted.instance_id, "user-a");
+        assert!(minted.instance_id.starts_with("sandbox-"));
+        assert!(crate::structs::validate_keyed_instance_id(&minted.instance_id).is_ok());
+        let minted_two = store.create_keyed_instance(job_id, "default", "sandbox", None)?;
+        assert_ne!(minted.instance_id, minted_two.instance_id);
+        Ok(())
+    }
+
+    #[test]
+    fn destroy_keyed_instance_stops_alloc_terminates_and_drops_handle() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "active"))?;
+        let job_id = "keyed-destroy";
+        submit_job(
+            &store,
+            job_id,
+            vec![
+                stateful_keyed_task("sandbox", true),
+                stateful_slot_task("db", 1, true),
+            ],
+        )?;
+        let keyed_task = task_id_for(&store, "sandbox", job_id)?;
+        let slot_task = task_id_for(&store, "db", job_id)?;
+        store.create_keyed_instance(job_id, "default", "sandbox", Some("user-a"))?;
+        let alloc = store.place_alloc("node-a", keyed_task)?;
+        let slot_alloc = store.place_alloc("node-a", slot_task)?;
+
+        let outcome = store.destroy_keyed_instance("user-a")?;
+        assert_eq!(
+            outcome,
+            DestroyInstanceOutcome::Destroyed {
+                removed_allocations: 1
+            }
+        );
+        assert!(
+            store.get_allocation_by_id(alloc.id)?.is_none(),
+            "the allocation is deleted through the normal stop path"
+        );
+        let tombstone = store.get_instance("user-a")?.context("row retained")?;
+        assert_eq!(tombstone.state, InstanceState::Terminated);
+        assert_eq!(tombstone.current_alloc_id, None);
+        assert_eq!(
+            tombstone.storage_handle, None,
+            "keyed destroy always drops storage (unlike slot scale-in retention)"
+        );
+
+        // Idempotent no-op on an already-terminated instance.
+        assert_eq!(
+            store.destroy_keyed_instance("user-a")?,
+            DestroyInstanceOutcome::AlreadyTerminated
+        );
+
+        // Slot instances are owned by the scheduler, not this API.
+        let slot_id = slot_alloc.instance_id.context("slot bound")?;
+        let err = store
+            .destroy_keyed_instance(&slot_id)
+            .expect_err("slot rejected");
+        assert!(matches!(
+            StorageError::from_anyhow(&err),
+            Some(StorageError::InvalidInput { .. })
+        ));
+
+        // Unknown ids surface NotFound.
+        let err = store
+            .destroy_keyed_instance("missing")
+            .expect_err("missing rejected");
+        assert!(matches!(
+            StorageError::from_anyhow(&err),
+            Some(StorageError::NotFound { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn job_stop_stops_keyed_instances_and_terminates_slot_instances() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "active"))?;
+        let job_id = "keyed-stop";
+        submit_job(
+            &store,
+            job_id,
+            vec![
+                stateful_keyed_task("sandbox", true),
+                stateful_slot_task("db", 1, true),
+            ],
+        )?;
+        store.create_keyed_instance(job_id, "default", "sandbox", Some("user-a"))?;
+        store.place_alloc("node-a", task_id_for(&store, "sandbox", job_id)?)?;
+        store.place_alloc("node-a", task_id_for(&store, "db", job_id)?)?;
+        let keyed_handle = store
+            .get_instance("user-a")?
+            .context("keyed row")?
+            .storage_handle;
+        assert!(keyed_handle.is_some());
+
+        // Keyed rows are merely STOPPED (handle retained — a job stop is a
+        // pause, revivable via start_keyed_instance); slot rows keep today's
+        // terminated-with-handle behavior so a re-run re-materializes them.
+        assert_eq!(store.stop_instances_for_job(job_id)?, 2);
+        let keyed = store.get_instance("user-a")?.context("keyed row")?;
+        assert_eq!(keyed.state, InstanceState::Stopped);
+        assert_eq!(keyed.current_alloc_id, None);
+        assert_eq!(
+            keyed.storage_handle, keyed_handle,
+            "keyed handles retained on job stop"
+        );
+        let slot = store
+            .get_instance(&slot_instance_id(job_id, "default", 0))?
+            .context("slot row")?;
+        assert_eq!(slot.state, InstanceState::Terminated);
+        assert!(slot.storage_handle.is_some(), "slot handles retained");
+
+        // Idempotent: stopped/terminated rows are not touched again.
+        assert_eq!(store.stop_instances_for_job(job_id)?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn count_live_keyed_instances_counts_only_live_rows_of_the_task() -> R<()> {
+        let store = setup_store()?;
+        let job_id = "keyed-count";
+        submit_job(&store, job_id, vec![stateful_keyed_task("sandbox", false)])?;
+
+        assert_eq!(
+            store.count_live_keyed_instances(job_id, "default", "sandbox")?,
+            0
+        );
+        store.create_keyed_instance(job_id, "default", "sandbox", Some("a"))?;
+        store.create_keyed_instance(job_id, "default", "sandbox", Some("b"))?;
+        assert_eq!(
+            store.count_live_keyed_instances(job_id, "default", "sandbox")?,
+            2
+        );
+
+        // Terminated tombstones do not count as desired.
+        store.destroy_keyed_instance("a")?;
+        assert_eq!(
+            store.count_live_keyed_instances(job_id, "default", "sandbox")?,
+            1
+        );
+
+        // Stopped instances do not count as desired either: a stopped
+        // instance gets no allocation until start_keyed_instance.
+        store.stop_keyed_instance("b")?;
+        assert_eq!(
+            store.count_live_keyed_instances(job_id, "default", "sandbox")?,
+            0
+        );
+        store.start_keyed_instance("b")?;
+        assert_eq!(
+            store.count_live_keyed_instances(job_id, "default", "sandbox")?,
+            1
+        );
+
+        // Other (job, group, task) scopes are not counted.
+        assert_eq!(
+            store.count_live_keyed_instances(job_id, "other", "sandbox")?,
+            0
+        );
+        assert_eq!(
+            store.count_live_keyed_instances("nope", "default", "sandbox")?,
+            0
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stop_keyed_instance_pauses_alloc_retains_row_and_handle() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "active"))?;
+        let job_id = "keyed-pause";
+        submit_job(&store, job_id, vec![stateful_keyed_task("sandbox", true)])?;
+        let task_id = task_id_for(&store, "sandbox", job_id)?;
+        store.create_keyed_instance(job_id, "default", "sandbox", Some("user-a"))?;
+        let alloc = store.place_alloc("node-a", task_id)?;
+        let handle = store
+            .get_instance("user-a")?
+            .context("instance")?
+            .storage_handle;
+        assert!(handle.is_some());
+
+        // Stop: allocation removed through the normal stop path, state
+        // stopped — NOT rescheduling (the release hook must not fire on a
+        // stop) — and the row + storage handle retained.
+        let outcome = store.stop_keyed_instance("user-a")?;
+        assert_eq!(
+            outcome,
+            StopInstanceOutcome::Stopped {
+                removed_allocations: 1
+            }
+        );
+        assert!(
+            store.get_allocation_by_id(alloc.id)?.is_none(),
+            "the allocation is deleted through the normal stop path"
+        );
+        let stopped = store.get_instance("user-a")?.context("row retained")?;
+        assert_eq!(stopped.state, InstanceState::Stopped);
+        assert_eq!(stopped.current_alloc_id, None);
+        assert_eq!(stopped.storage_handle, handle, "handle retained on stop");
+
+        // The id is still owned: creating it again collides (stopped is not
+        // destroyed).
+        let err = store
+            .create_keyed_instance(job_id, "default", "sandbox", Some("user-a"))
+            .expect_err("stopped ids still collide");
+        assert!(matches!(
+            StorageError::from_anyhow(&err),
+            Some(StorageError::Conflict { .. })
+        ));
+
+        // A stopped instance is never bound by placement: with only the
+        // stopped instance, there is nothing to place.
+        let err = store
+            .place_alloc("node-a", task_id)
+            .expect_err("stopped instances are not placement candidates");
+        assert!(err.to_string().contains("no unbound keyed instance"));
+
+        // Idempotent no-op on an already-stopped instance.
+        assert_eq!(
+            store.stop_keyed_instance("user-a")?,
+            StopInstanceOutcome::AlreadyStopped
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stop_keyed_instance_rejects_slot_terminated_and_missing() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "active"))?;
+        let job_id = "keyed-pause-reject";
+        submit_job(
+            &store,
+            job_id,
+            vec![
+                stateful_keyed_task("sandbox", true),
+                stateful_slot_task("db", 1, true),
+            ],
+        )?;
+        let slot_alloc = store.place_alloc("node-a", task_id_for(&store, "db", job_id)?)?;
+
+        // Slot instances are owned by the scheduler, not this API.
+        let slot_id = slot_alloc.instance_id.context("slot bound")?;
+        let err = store
+            .stop_keyed_instance(&slot_id)
+            .expect_err("slot rejected");
+        assert!(matches!(
+            StorageError::from_anyhow(&err),
+            Some(StorageError::InvalidInput { .. })
+        ));
+
+        // Terminated tombstones can never be stopped.
+        store.create_keyed_instance(job_id, "default", "sandbox", Some("user-gone"))?;
+        store.destroy_keyed_instance("user-gone")?;
+        let err = store
+            .stop_keyed_instance("user-gone")
+            .expect_err("terminated rejected");
+        assert!(matches!(
+            StorageError::from_anyhow(&err),
+            Some(StorageError::InvalidInput { .. })
+        ));
+
+        // Unknown ids surface NotFound.
+        let err = store
+            .stop_keyed_instance("missing")
+            .expect_err("missing rejected");
+        assert!(matches!(
+            StorageError::from_anyhow(&err),
+            Some(StorageError::NotFound { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn start_keyed_instance_revives_stopped_row_with_same_identity_and_handle() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "active"))?;
+        let job_id = "keyed-revive";
+        submit_job(&store, job_id, vec![stateful_keyed_task("sandbox", true)])?;
+        let task_id = task_id_for(&store, "sandbox", job_id)?;
+        store.create_keyed_instance(job_id, "default", "sandbox", Some("user-a"))?;
+        store.place_alloc("node-a", task_id)?;
+        let handle = store
+            .get_instance("user-a")?
+            .context("instance")?
+            .storage_handle;
+
+        store.stop_keyed_instance("user-a")?;
+        assert_eq!(
+            store.start_keyed_instance("user-a")?,
+            StartInstanceOutcome::Started
+        );
+        let pending = store.get_instance("user-a")?.context("instance")?;
+        assert_eq!(pending.state, InstanceState::Pending);
+        assert_eq!(pending.storage_handle, handle, "handle survives the cycle");
+
+        // The next placement re-binds the SAME id and storage handle: the
+        // revived workload is the same logical instance.
+        let replacement = store.place_alloc("node-a", task_id)?;
+        assert_eq!(replacement.instance_id.as_deref(), Some("user-a"));
+        let active = store.get_instance("user-a")?.context("instance")?;
+        assert_eq!(active.state, InstanceState::Active);
+        assert_eq!(active.storage_handle, handle);
+
+        // Idempotent no-op on a live instance, in every live state.
+        assert_eq!(
+            store.start_keyed_instance("user-a")?,
+            StartInstanceOutcome::AlreadyRunning
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn start_keyed_instance_rejects_slot_terminated_and_missing() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "active"))?;
+        let job_id = "keyed-revive-reject";
+        submit_job(
+            &store,
+            job_id,
+            vec![
+                stateful_keyed_task("sandbox", true),
+                stateful_slot_task("db", 1, true),
+            ],
+        )?;
+        let slot_alloc = store.place_alloc("node-a", task_id_for(&store, "db", job_id)?)?;
+
+        let slot_id = slot_alloc.instance_id.context("slot bound")?;
+        let err = store
+            .start_keyed_instance(&slot_id)
+            .expect_err("slot rejected");
+        assert!(matches!(
+            StorageError::from_anyhow(&err),
+            Some(StorageError::InvalidInput { .. })
+        ));
+
+        // Terminated is forever: a destroyed id can never be started again.
+        store.create_keyed_instance(job_id, "default", "sandbox", Some("user-gone"))?;
+        store.destroy_keyed_instance("user-gone")?;
+        let err = store
+            .start_keyed_instance("user-gone")
+            .expect_err("terminated rejected");
+        assert!(matches!(
+            StorageError::from_anyhow(&err),
+            Some(StorageError::InvalidInput { .. })
+        ));
+
+        let err = store
+            .start_keyed_instance("missing")
+            .expect_err("missing rejected");
+        assert!(matches!(
+            StorageError::from_anyhow(&err),
+            Some(StorageError::NotFound { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn destroy_after_stop_terminates_and_drops_retained_handle() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "active"))?;
+        let job_id = "keyed-stop-destroy";
+        submit_job(&store, job_id, vec![stateful_keyed_task("sandbox", true)])?;
+        let task_id = task_id_for(&store, "sandbox", job_id)?;
+        store.create_keyed_instance(job_id, "default", "sandbox", Some("user-a"))?;
+        store.place_alloc("node-a", task_id)?;
+
+        store.stop_keyed_instance("user-a")?;
+        assert!(store
+            .get_instance("user-a")?
+            .context("stopped row")?
+            .storage_handle
+            .is_some());
+
+        // Stop is a pause; destroy is forever — even from stopped, destroy
+        // drops the retained handle and tombstones the id.
+        let outcome = store.destroy_keyed_instance("user-a")?;
+        assert_eq!(
+            outcome,
+            DestroyInstanceOutcome::Destroyed {
+                removed_allocations: 0
+            }
+        );
+        let tombstone = store.get_instance("user-a")?.context("tombstone")?;
+        assert_eq!(tombstone.state, InstanceState::Terminated);
+        assert_eq!(tombstone.storage_handle, None, "handle dropped on destroy");
+        Ok(())
+    }
+
+    #[test]
+    fn release_hook_leaves_stopped_instances_stopped() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "active"))?;
+        let job_id = "keyed-release-stop";
+        submit_job(&store, job_id, vec![stateful_keyed_task("sandbox", true)])?;
+        let task_id = task_id_for(&store, "sandbox", job_id)?;
+        store.create_keyed_instance(job_id, "default", "sandbox", Some("user-a"))?;
+        let alloc = store.place_alloc("node-a", task_id)?;
+
+        // Simulate an allocation death racing a stop: the instance is
+        // already marked stopped when its (stale) allocation is removed. The
+        // release hook must NOT flip it back to rescheduling — that would
+        // resurrect a deliberately paused instance.
+        store.set_instance_state("user-a", InstanceState::Stopped)?;
+        store.remove_allocation_by_id(alloc.id)?;
+        let instance = store.get_instance("user-a")?.context("instance")?;
+        assert_eq!(instance.state, InstanceState::Stopped);
+        let handle = instance.storage_handle;
+        assert!(handle.is_some(), "handle untouched by the release hook");
+        Ok(())
+    }
+
+    #[test]
+    fn create_keyed_instances_batch_is_all_or_nothing() -> R<()> {
+        let store = setup_store()?;
+        let job_id = "keyed-batch";
+        submit_job(&store, job_id, vec![stateful_keyed_task("sandbox", true)])?;
+
+        // Explicit ids + minted extras, in request order.
+        let created = store.create_keyed_instances(
+            job_id,
+            "default",
+            "sandbox",
+            &["a".to_string(), "b".to_string()],
+            2,
+        )?;
+        assert_eq!(created.len(), 4);
+        assert_eq!(&created[..2], &["a".to_string(), "b".to_string()]);
+        assert!(created[2..].iter().all(|id| id.starts_with("sandbox-")));
+        for id in &created {
+            let instance = store.get_instance(id)?.context("created row")?;
+            assert_eq!(instance.state, InstanceState::Pending);
+            assert_eq!(instance.mode, InstanceMode::Keyed);
+        }
+
+        // Any collision — here "b", including with a tombstone — fails the
+        // whole batch and creates NOTHING.
+        store.destroy_keyed_instance("b")?;
+        let err = store
+            .create_keyed_instances(
+                job_id,
+                "default",
+                "sandbox",
+                &[
+                    "fresh-1".to_string(),
+                    "b".to_string(),
+                    "fresh-2".to_string(),
+                ],
+                1,
+            )
+            .expect_err("tombstone collision aborts the batch");
+        assert!(matches!(
+            StorageError::from_anyhow(&err),
+            Some(StorageError::Conflict { .. })
+        ));
+        assert!(err.to_string().contains("b"), "offending id named: {err}");
+        assert!(store.get_instance("fresh-1")?.is_none(), "nothing created");
+        assert!(store.get_instance("fresh-2")?.is_none(), "nothing created");
+        assert_eq!(store.list_instances(job_id)?.len(), 4);
+
+        // Duplicates WITHIN the request also abort atomically.
+        let err = store
+            .create_keyed_instances(
+                job_id,
+                "default",
+                "sandbox",
+                &["dupe".to_string(), "dupe".to_string()],
+                0,
+            )
+            .expect_err("in-request duplicate aborts the batch");
+        assert!(matches!(
+            StorageError::from_anyhow(&err),
+            Some(StorageError::Conflict { .. })
+        ));
+        assert!(store.get_instance("dupe")?.is_none(), "nothing created");
+
+        // Count-only mints N distinct ids.
+        let minted = store.create_keyed_instances(job_id, "default", "sandbox", &[], 3)?;
+        assert_eq!(minted.len(), 3);
+        let unique: HashSet<&String> = minted.iter().collect();
+        assert_eq!(unique.len(), 3, "minted ids are distinct");
+        Ok(())
+    }
+
+    #[test]
+    fn seed_keyed_instances_creates_new_and_skips_any_existing() -> R<()> {
+        let store = setup_store()?;
+        let job_id = "keyed-seed";
+        submit_job(&store, job_id, vec![stateful_keyed_task("sandbox", true)])?;
+
+        let ids = vec!["seed-a".to_string(), "seed-b".to_string()];
+        let created = store.seed_keyed_instances(job_id, "default", "sandbox", &ids)?;
+        assert_eq!(created, ids);
+        assert_eq!(
+            store.count_live_keyed_instances(job_id, "default", "sandbox")?,
+            2
+        );
+
+        // Re-seeding is a silent no-op (resubmits are idempotent).
+        let created = store.seed_keyed_instances(job_id, "default", "sandbox", &ids)?;
+        assert!(created.is_empty());
+
+        // A destroyed id is skipped, NOT resurrected: the seed list never
+        // overrides a deliberate destroy.
+        store.destroy_keyed_instance("seed-a")?;
+        let created = store.seed_keyed_instances(job_id, "default", "sandbox", &ids)?;
+        assert!(created.is_empty());
+        assert_eq!(
+            store
+                .get_instance("seed-a")?
+                .context("tombstone retained")?
+                .state,
+            InstanceState::Terminated
+        );
+
+        // A stopped id is skipped too: it stays stopped until StartInstance.
+        store.stop_keyed_instance("seed-b")?;
+        let created = store.seed_keyed_instances(job_id, "default", "sandbox", &ids)?;
+        assert!(created.is_empty());
+        assert_eq!(
+            store
+                .get_instance("seed-b")?
+                .context("stopped retained")?
+                .state,
+            InstanceState::Stopped
+        );
         Ok(())
     }
 

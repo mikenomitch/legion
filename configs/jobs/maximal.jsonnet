@@ -4,7 +4,12 @@
     rollout: {
         strategy: "default",
         progression: "auto",
-        replacement: "createFirst",
+        // Stateful groups (frontend's slot task, sandboxes' keyed task) cannot
+        // use createFirst — two live allocations would share one instance id +
+        // storage handle (see docs/stateful-workloads.md). Default to the safe
+        // stop-first replacement globally; exercise createFirst on the
+        // stateless `prep` group below.
+        replacement: "destroyFirst",
         inPlace: false,
         percentSteps: [10, 25, 50, 100],
         stepStagger: "15s",
@@ -20,8 +25,34 @@
     },
     rolloutByGroup: {
         frontend: {
-            countEachStep: 1,
+            // Ordinal-aware rollout for the group's slot-mode stateful task
+            // (see docs/stateful-workloads.md "Ordered rollouts for slot
+            // pools"). Only valid on groups with a slot-mode stateful task,
+            // which is why it is scoped here rather than globally.
+            slots: {
+                // "sequential" (K8s OrderedReady analog): replace ONE slot
+                // at a time, highest ordinal first (count-1 .. 0), each step
+                // gated on the previous slot's replacement passing the
+                // rollout health criteria. Defines its own one-slot-per-step
+                // progression, so it replaces the global step mode
+                // (percentSteps above) for this group and cannot be combined
+                // with step modes in the same block. Default: "parallel"
+                // (today's behavior).
+                order: "sequential",
+                // Staged/partitioned updates (K8s partition analog): only
+                // slots >= updateFrom are updated; lower slots keep running
+                // their current allocations. Resubmit with a lower value to
+                // promote the new config to more slots (0 = everything).
+                // Must be < the slot task's count. Requires order:
+                // "sequential". 0 is the same as omitting the field.
+                updateFrom: 0,
+            },
             inPlace: true,
+        },
+        // prep is stateless, so createFirst (replace-before-stop) is safe here
+        // and exercises the strategy that stateful groups forbid.
+        prep: {
+            replacement: "createFirst",
         },
     },
     tasks: [
@@ -31,13 +62,60 @@
             kind: "exec",
             group: "frontend",
             lifecycle: "service",
+            // Stable instance identity (see docs/stateful-workloads.md):
+            // slot mode gives each replica an ordinal slot 0..count-1 whose
+            // instance id and storage handle survive reschedules. The task
+            // sees LEGION_INSTANCE_ID / LEGION_INSTANCE_SLOT /
+            // LEGION_INSTANCE_MODE (and LEGION_ALLOC_ID) in its env.
+            stateful: {
+                mode: "slot",
+                // Node-loss fencing (at-most-one; see docs/stateful-workloads.md
+                // "Node loss and fencing"): the worker self-fences this task
+                // after losing manager contact for selfTerminateAfter; the
+                // manager only replaces an allocation on a lost node after
+                // replaceAfter (must be > selfTerminateAfter; "never" = wait
+                // for node recovery or `legion instance replace`). Optional:
+                // defaults are selfTerminateAfter 90s, replaceAfter 2x that.
+                onLost: {
+                    selfTerminateAfter: "90s",
+                    replaceAfter: "3m",
+                },
+                storage: {
+                    path: "/var/lib/web",
+                    // K8s persistentVolumeClaimRetentionPolicy analogs (both
+                    // default true = Retain). retainOnScaleIn ~ whenScaled;
+                    // retainOnStop ~ whenDeleted and governs `job stop` only
+                    // (`job destroy` always deletes every instance record).
+                    retainOnScaleIn: true,
+                    retainOnStop: true,
+                },
+            },
             config: {
                 command: ["sleep", "1"],
             },
+            // Workload identities (see docs/workload-identity.md): each named
+            // identity gets its own short-lived OIDC token, delivered as a
+            // file and/or env var and refreshed in place by the worker.
+            // Requires workloadIdentity.enabled on the manager; inert
+            // otherwise.
+            identities: [
+                {
+                    name: "aws",
+                    audience: ["sts.amazonaws.com"],
+                    ttl: "15m",
+                    file: {
+                        path: "/var/run/legion/identity/aws/token",
+                        mode: "0400",
+                    },
+                    changeMode: "noop",
+                },
+            ],
+            // Task-level KV policy defaults; entries override field-by-field
+            // (see docs/kv-store.md "Reactive updates"). Keys are camelCase.
             kv: {
                 watch: true,
-                on_change: "restart",
-                on_delete: "fail",
+                onChange: "restart",
+                onDelete: "fail",
             },
             env: [
                 {
@@ -45,9 +123,10 @@
                     value: {
                         template: '{{ kv "flags/global" }}',
                     },
+                    // watch is inherited from the task defaults above.
                     kv: {
-                        on_change: "rollout",
-                        on_delete: "none",
+                        onChange: "rollout",
+                        onDelete: "none",
                     },
                 },
             ],
@@ -234,6 +313,44 @@
             affinities: {
                 region: "us-west",
                 same_node_as: "web",
+            },
+        },
+        {
+            name: "sandbox",
+            kind: "exec",
+            group: "sandboxes",
+            lifecycle: "service",
+            // Keyed-mode stateful task (see docs/stateful-workloads.md):
+            // instances are created/destroyed on demand via
+            // `legion instance create maximal-demo --group sandboxes` /
+            // `legion instance destroy <id>`. count does NOT drive keyed
+            // tasks — zero instances means zero allocations — and each id is
+            // never recycled after destroy. The task sees
+            // LEGION_INSTANCE_ID / LEGION_INSTANCE_MODE ("keyed") and
+            // LEGION_ALLOC_ID in its env (no LEGION_INSTANCE_SLOT).
+            stateful: {
+                mode: "keyed",
+                // "uuid": server mints ids when --id is omitted;
+                // "caller": --id is required. Explicit ids always honored.
+                idSource: "uuid",
+                storage: {
+                    // Opaque per-instance handle, reattached across
+                    // reschedules and dropped on destroy.
+                    path: "/workspace",
+                },
+            },
+            config: {
+                command: ["sleep", "600"],
+            },
+            resources: {
+                cpus: 0.25,
+                memory: 128,
+            },
+            constraints: {
+                os: "linux",
+            },
+            affinities: {
+                node_class: "sandbox",
             },
         },
         {

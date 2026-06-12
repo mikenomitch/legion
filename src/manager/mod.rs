@@ -1,6 +1,7 @@
 pub mod daemon;
 pub mod dispatcher;
 pub mod join_server;
+pub mod oidc_http;
 pub mod rollout;
 pub mod rollout_strategy;
 pub mod scheduler;

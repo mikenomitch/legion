@@ -1,6 +1,6 @@
 import { A } from '@solidjs/router'
 import { For, Show, createMemo, createSignal, type JSX, type Resource } from 'solid-js'
-import { DetailBadge, DetailSection } from './DetailPrimitives'
+import { DetailBadge, DetailSection, InstancePill } from './DetailPrimitives'
 import type { LedgerAllocation, LedgerNode, NodeMsg } from '../gen/legion_pb'
 import { formatRelativeTime } from '../utils/format'
 import { summarizeHealthChecks } from '../utils/health'
@@ -561,7 +561,12 @@ export default function NodeDeepView(props: NodeDeepViewProps) {
                           return (
                             <div class="rounded border border-neutral-200 bg-white px-3 py-2 text-sm text-neutral-800 dark:border-neutral-700 dark:bg-neutral-950/60 dark:text-neutral-200">
                               <div class="flex flex-wrap items-center justify-between gap-2">
-                                <span class="font-semibold">Allocation #{String(allocation.id)}</span>
+                                <span class="flex flex-wrap items-center gap-2">
+                                  <span class="font-semibold">Allocation #{String(allocation.id)}</span>
+                                  <Show when={allocation.instanceId}>
+                                    <InstancePill id={allocation.instanceId!} />
+                                  </Show>
+                                </span>
                                 <span class="flex flex-wrap items-center gap-2">
                                   <Show when={unstagedCount > 0}>
                                     <DetailBadge tone={artifactRows.some((row) => row.state === 'failed') ? 'danger' : 'warning'}>

@@ -11,18 +11,20 @@ This document describes the feature, the job-spec API, and a provider
 integration cookbook. The design rationale lives in
 [docs/plans/workload-identity-oidc-plan.md](plans/workload-identity-oidc-plan.md).
 
-> **Implementation status.** This is delivered in phases. The current code
-> implements the *foundation*: the token/claims model and the security-critical
-> `sub` template (`src/structs/workload_identity.rs`), the ES256 signer + JWKS +
-> OIDC discovery document + key-rotation state machine
-> (`src/manager/workload_identity.rs`), the per-task `identities` spec API with
-> full admission validation, task-kind capability gating, persistence, manager
-> config, and the [node identities](#node-identities) config/claims model
-> consumed by the artifact system. Still to be wired (tracked as later phases
-> in the plan): serving discovery/JWKS over the manager's TLS HTTP listener,
-> the `IssueWorkloadIdentityToken` gRPC, worker-side delivery/refresh, and the
-> background rotation loop. See the plan's *Implementation Phases* for the full
-> breakdown.
+> **Implementation status.** Fully implemented end to end for *task*
+> identities: the token/claims model and the security-critical `sub` template
+> (`src/structs/workload_identity.rs`); the ES256 signer + JWKS + OIDC
+> discovery document + key-rotation state machine with **SQLite-persisted
+> signing keys** (`src/manager/workload_identity.rs`,
+> `signing_key` table); the public discovery/JWKS HTTP routes on the
+> manager's main listener (`src/manager/oidc_http.rs`); the
+> `IssueWorkloadIdentityToken` gRPC; worker-side delivery, refresh, and
+> change modes (`src/worker/identity.rs`); the background rotation loop
+> (`src/manager/agent.rs`); per-task `identities` spec validation and
+> task-kind capability gating; and manager config (off by default). The
+> [node identities](#node-identities) config/claims model consumed by the
+> artifact system is implemented; node-token *issuance* (a node mode on the
+> issuance RPC) is still pending — see the note in that section.
 
 ## The token
 
@@ -159,6 +161,185 @@ unsupported delivery are rejected at admission with an actionable error.
 The feature is off by default; existing jobs and the worker join-token flow are
 unaffected.
 
+### Public endpoints (discovery + JWKS)
+
+When enabled, the manager serves two unauthenticated, read-only HTTP/1.1
+routes **on its main listener** (`server.port`):
+
+- `GET /.well-known/openid-configuration` — the OIDC discovery document.
+- `GET <jwksPath>` (default `/.well-known/jwks.json`) — every non-expired
+  public signing key.
+
+These are plain JSON over HTTP because relying parties (AWS STS, GCP, Vault)
+fetch them with generic HTTP clients — they cannot speak gRPC. All other
+paths on the listener continue to serve gRPC/grpc-web untouched.
+
+The `issuer` config value is what gets published as `iss` in tokens and as
+`issuer`/`jwks_uri` in the discovery document — it is **not** derived from
+the bind address, so the published URLs stay correct behind proxies and load
+balancers. Rules of thumb:
+
+- **AWS / GCP** require the issuer to be reachable over **publicly-trusted
+  HTTPS**. The manager itself currently listens without TLS, so put a
+  TLS-terminating proxy (or LB) with a real certificate in front of the two
+  routes and set `issuer` to that public HTTPS URL.
+- **Vault / internal services** can point at the manager directly
+  (`oidc_discovery_url` + a CA bundle, or plain HTTP inside a trusted
+  network).
+- If `issuer` is unset, it defaults to the manager's own
+  `http://<host>:<port>` — fine for local development, not for federation.
+
+### Signing-key persistence and restart semantics
+
+Signing keys (including the private key PEM) are persisted in the manager's
+SQLite store (`signing_key` table) — the **same trust domain as the CA
+material**: anyone who can read the store can mint identities, so protect
+the store file accordingly. Persistence is what makes restarts safe:
+
+- On first boot with the feature enabled, the manager generates an ES256
+  keypair and persists it.
+- On every later boot it restores all non-expired keys, so the JWKS keeps
+  publishing the same `kid`s and tokens already held by third parties keep
+  verifying. No restart ever invalidates outstanding tokens.
+- Rotation transitions (`active` → `retiring` → `expired`) are written
+  through to the store; expired rows are retained for audit but never served.
+
+### Key rotation
+
+A background loop on the manager (started only when the feature is enabled)
+checks roughly every `rotationAge / 10` (minimum 1 minute):
+
+- When the active key is older than `rotationAge` (default 24h), it rotates:
+  the old key becomes `retiring` with a `not_after` overlap window and stays
+  in the JWKS; a new active key is generated and persisted. New tokens sign
+  with the new `kid` immediately.
+- Retiring keys past `not_after` are marked `expired` and dropped from the
+  JWKS.
+
+The overlap window is `max(rotationAge, defaultTtl)`, so any token signed by
+the retiring key stays verifiable until it expires — provided identity TTLs
+stay at or below `rotationAge` (keep token TTLs in minutes; that is the
+point of workload identity).
+
+**HA note:** with raft/streaming persistence, only the **primary** manager
+runs the rotation loop (the same leader-only convention as other
+store-mutating loops); all managers share the replicated `signing_key` table
+and therefore serve an identical JWKS. With the default local-disk
+persistence there is a single manager and it is always primary.
+
+## How tokens reach the task
+
+1. The manager's heartbeat/dispatch payload carries each task's identity
+   *specs* (names, audiences, delivery, change mode) — never token bytes.
+2. Before starting the task, the **worker** calls
+   `IssueWorkloadIdentityToken` on the manager for each identity
+   (`{ alloc_id, identity_name, node_id }`). The manager derives **all**
+   claims from the allocation's scheduling record and the named identity in
+   the stored spec; nothing security-relevant is read from the request, and
+   the request is rejected unless the allocation is placed on the calling
+   node. (Worker RPCs are identified by claimed node id today — the same
+   trust model as heartbeats; binding them to a per-node credential is
+   tracked as a TODO alongside worker mTLS.)
+3. Delivery:
+   - **file**: written to `file.path` with `file.mode` (default `0400`),
+     atomically (temp file + rename, so readers never see a partial token).
+     For `exec` tasks the path is used as given — absolute, or relative to
+     the worker's working directory (same rooting as `exec` injected files).
+   - **env**: injected into the task's env map before start (worker-side, so
+     tokens never transit the scheduler). Because a live process's env can
+     never change, every env-delivered identity is **also mirrored to a
+     backing file** at `.legion/identity/<alloc-id>/<name>/token` (mode
+     `0400`), and a companion `<ENV>_FILE` variable points at it.
+4. A per-identity refresh loop on the worker re-issues the token at roughly
+   half its remaining TTL (with jitter, and retry/backoff if the manager is
+   unreachable), rewrites the file(s) atomically, then applies the
+   identity's `changeMode`. Loops stop when the allocation stops.
+5. If the manager has the feature disabled, issuance returns
+   `FailedPrecondition`; the worker logs one warning and the task starts
+   with its identities inert (no tokens delivered). Job specs still
+   validate — declaring identities is allowed before the cluster enables
+   the feature.
+
+### What each change mode does on refresh
+
+- `noop`: the file is atomically rewritten; nothing else happens. Cloud SDKs
+  re-read web-identity token files on each call, so this is the recommended
+  default for file delivery.
+- `signal`: file(s) rewritten, then `changeSignal` (e.g. `SIGHUP`) is sent
+  to the task's process. For env delivery the *live* env still holds the old
+  token — the handler must re-read the backing file (see `<ENV>_FILE`
+  above). An env-only identity with `signal` therefore can't refresh unless
+  the app reads that file; this is exactly why the backing file exists.
+- `restart`: the stored task config's env is updated with the fresh token,
+  then the allocation is restarted in place — the relaunched process sees
+  the new value directly.
+
+Tokens at rest on the worker host: the delivered token files (mode `0400`),
+the env-delivery backing files under `.legion/identity/`, and — for
+env-delivered identities — the worker's persisted allocation state (which
+records the task env so restarts survive worker restarts). All are local to
+the worker host and readable by whoever can read the worker's state, the
+same trust boundary as the task itself. Token bytes are never logged.
+
+## Testing this locally in a basic way
+
+1. Enable workload identity in `configs/manager.jsonnet` (the block is there,
+   commented):
+
+   ```jsonnet
+   workloadIdentity: {
+     enabled: true,
+     // optional; defaults to http://127.0.0.1:4747 for local testing
+     // issuer: 'https://manager.example.com:4747',
+   },
+   ```
+
+2. Start a manager (with an in-process worker for a one-machine demo):
+
+   ```sh
+   cargo run -- start manager -c configs/manager.jsonnet --run-worker
+   ```
+
+   The log line `Workload identity enabled; serving OIDC discovery and JWKS`
+   confirms the issuer is up (and the `signing_key` table now holds the key).
+
+3. Curl the public endpoints:
+
+   ```sh
+   curl -s http://127.0.0.1:4747/.well-known/openid-configuration | jq
+   curl -s http://127.0.0.1:4747/.well-known/jwks.json | jq
+   ```
+
+4. Run the example job and find the delivered token:
+
+   ```sh
+   cargo run -- job run configs/jobs/workload-identity.jsonnet
+   sudo cat /var/run/legion/identity/aws/token   # the 'aws' file identity
+   ```
+
+5. Decode the token (any JWT tool works; here with plain shell):
+
+   ```sh
+   TOKEN=$(sudo cat /var/run/legion/identity/aws/token)
+   echo "$TOKEN" | cut -d. -f2 | tr '_-' '/+' | base64 -d 2>/dev/null | jq
+   # → iss, sub ("auto:workload-identity-demo:default:api"), aud, exp,
+   #   legion.io/job, legion.io/alloc, ...
+   ```
+
+   (`jwt decode "$TOKEN"` from mike-engel/jwt-cli gives the same view.)
+
+6. Watch a refresh happen: the `aws` identity uses `ttl: '15m'`, so the
+   worker rewrites the file after ~7–8 minutes. For a faster demo set
+   `ttl: '1m'` in the jobspec and watch:
+
+   ```sh
+   watch -n5 'sudo stat -c "%y" /var/run/legion/identity/aws/token;      sudo cat /var/run/legion/identity/aws/token | cut -d. -f2 | tr "_-" "/+" | base64 -d 2>/dev/null | jq .exp'
+   ```
+
+   Each refresh bumps the mtime and `exp`, with no task restart
+   (`changeMode: noop`). The `vault` env identity refreshes its backing file
+   (`.legion/identity/<alloc>/vault/token`) and SIGHUPs the task instead.
+
 ## Node identities
 
 Task identities prove *which workload* is fetching or calling out. Some
@@ -225,12 +406,12 @@ blur the per-task `sub` security boundary, so matchers accept `kv` and
 warm fetches the same way (a warm pull happens before any task exists).
 
 > **Issuance status.** The config shape, validation, `sub`/claims model, and
-> the artifact-spec surface are implemented. Actual token *issuance* to
-> workers is pending the same later phases as task tokens — the
-> `IssueWorkloadIdentityToken` RPC (which gains a node mode, gated on node
-> registration) and worker-side delivery/refresh. Until those land, an
-> artifact fetch authenticating with `nodeIdentity` fails with an actionable
-> error suggesting `auth.kv` or anonymous access.
+> the artifact-spec surface are implemented. Actual *node* token issuance to
+> workers is still pending: the `IssueWorkloadIdentityToken` RPC (fully wired
+> for task identities) gains a node mode, gated on node registration, plus
+> worker-side node-token delivery/refresh. Until those land, an artifact
+> fetch authenticating with `nodeIdentity` fails with an actionable error
+> suggesting `auth.kv` or anonymous access.
 
 ## Provider integration cookbook
 

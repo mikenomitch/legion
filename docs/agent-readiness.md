@@ -56,6 +56,8 @@ Even with `--allow-write`, `legion_state_query` is forced to read-only.
 | `legion_job_validate` | no | Validate a rendered jobspec (JSON). |
 | `legion_rollout_list` | no | List rollouts. |
 | `legion_rollout_status` | no | Rollout progress + allocation health. |
+| `legion_instance_list` | no | List a job's stateful instances (slot + keyed). |
+| `legion_instance_get` | no | Inspect one stateful instance. |
 | `legion_node_list` | no | List worker nodes. |
 | `legion_events` | no | List scheduler events; poll with `after_id` to tail. |
 | `legion_job_logs` | no | Fetch captured task stdout/stderr for a job. |
@@ -64,6 +66,9 @@ Even with `--allow-write`, `legion_state_query` is forced to read-only.
 | `legion_job_run` | **yes** | Submit/update a job from rendered JSON. |
 | `legion_job_stop` | **yes** | Stop a job. |
 | `legion_job_destroy` | **yes** | Destroy a job. |
+| `legion_instance_create` | **yes** | Create a keyed-mode stateful instance (never-recycled id; supports `idempotency_key`). |
+| `legion_instance_destroy` | **yes** | Destroy a keyed instance, stop its allocation, drop its storage (supports `idempotency_key`). |
+| `legion_instance_replace` | **yes** | Force-replace an instance's allocation stuck on a LOST node (skips the `onLost.replaceAfter` loss-confirmation gate; split-brain risk if the node is only partitioned; supports `idempotency_key`). |
 
 Tool errors are returned in-band (`result.isError = true` with a text payload),
 following MCP convention; transport/protocol errors use JSON-RPC `error`.
@@ -73,7 +78,8 @@ all console logs to **stderr** so stdout stays a clean protocol stream.
 
 ## 2. Structured output envelope
 
-The agent-facing commands (`job`, `state`, `node`, `kv`, `capabilities`) accept
+The agent-facing commands (`job`, `instance`, `state`, `node`, `kv`,
+`capabilities`) accept
 `--json` / `-j` and emit exactly one of two shapes (bootstrap/cluster-admin
 commands such as `start`, `join`, and `raft` are operator-oriented and are not
 part of the agent surface):
@@ -128,6 +134,8 @@ after a timeout without risking a double-apply:
 legion job run demo.jsonnet --idempotency-key deploy-2026-05-29-001
 legion job stop demo        --idempotency-key stop-demo-001
 legion job destroy demo     --idempotency-key destroy-demo-001
+legion instance create sandbox-demo --id user-42 --idempotency-key sbx-user-42
+legion instance destroy user-42     --idempotency-key destroy-user-42
 ```
 
 The manager records the first outcome for a key and replays it for any later

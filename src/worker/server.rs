@@ -3,12 +3,16 @@ use crate::structs::{
     worker_server::Worker, GetTaskLogsReply, GetTaskLogsRequest, PostWorkReply, PostWorkRequest,
     RestartWorkerReply, RestartWorkerRequest, TaskLogStream,
 };
+use crate::worker::identity::WorkerIdentityManager;
 use crate::worker::task_manager::{launch_task_allocation, WorkerTaskManager};
 use std::sync::{Arc, Mutex};
 use tonic::{Request, Response, Status};
 
 pub struct WorkerDaemonService {
     pub task_manager: Arc<Mutex<WorkerTaskManager>>,
+    /// Workload-identity delivery/refresh; `None` when this worker runs
+    /// without a manager identity client (tests).
+    pub identity: Option<Arc<WorkerIdentityManager>>,
 }
 #[tonic::async_trait]
 impl Worker for WorkerDaemonService {
@@ -18,10 +22,30 @@ impl Worker for WorkerDaemonService {
         request: Request<PostWorkRequest>,
     ) -> Result<Response<PostWorkReply>, Status> {
         info!("Got a request from {:?}", request.remote_addr());
-        let allocation = request
+        let mut allocation = request
             .into_inner()
             .allocation
             .ok_or_else(|| Status::invalid_argument("Missing allocation"))?;
+
+        // Fetch + deliver identity tokens before the task starts (env tokens
+        // must be in the env map at exec time). A task must not start without
+        // an identity it declared.
+        let prepared = match self.identity.as_ref() {
+            Some(identity) => match identity.prepare_task_allocation(&mut allocation).await {
+                Ok(prepared) => prepared,
+                Err(err) => {
+                    let reason = format!("Failed to deliver workload identities: {err}");
+                    self.task_manager
+                        .lock()
+                        .map_err(|_| Status::internal("Task manager lock poisoned"))?
+                        .record_failure(allocation.allocation_id, reason.clone());
+                    return Err(Status::internal(reason));
+                }
+            },
+            None => Vec::new(),
+        };
+
+        let allocation_id = allocation.allocation_id;
 
         // Synchronous failures (bad config, unknown kind) surface here;
         // artifact-bearing tasks stage on a background thread and report
@@ -33,6 +57,12 @@ impl Worker for WorkerDaemonService {
                 .map_err(|err| Status::internal(format!("launch task panicked: {err}")))?;
         if let Err(err) = launched {
             return Err(Status::internal(format!("Failed to start task: {err}")));
+        }
+
+        // Refresh loops are keyed by allocation id; identity_manager.retain
+        // (run each heartbeat) prunes them if the allocation goes away.
+        if let Some(identity) = self.identity.as_ref() {
+            identity.spawn_refreshers(allocation_id, prepared, self.task_manager.clone());
         }
 
         let reply = PostWorkReply {
