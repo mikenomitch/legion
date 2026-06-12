@@ -14,7 +14,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 use std::path::Path;
 use std::process::Command;
 
@@ -322,6 +322,19 @@ impl TaskPlugin for ExecTaskPlugin {
         if let Some(user) = config.user_spec()? {
             cmd.uid(user.uid);
             cmd.gid(user.gid);
+            // The worker creates alloc/task dirs owner-only (its own user) as
+            // the isolation boundary between allocations on a node. Hand this
+            // allocation's tree to the task user, or the dropped-privilege
+            // process could not enter its own cwd or read staged artifacts —
+            // while every other allocation stays unreachable to it.
+            if let Some(alloc_dir) = runtime.alloc_dir.as_ref() {
+                chown_tree(alloc_dir, user.uid, user.gid).with_context(|| {
+                    format!(
+                        "failed to hand allocation dir {} to exec task user",
+                        alloc_dir.display()
+                    )
+                })?;
+            }
         }
 
         // Worker-injected env (LEGION_TASK_DIR, LEGION_ARTIFACT_*) first, so
@@ -493,6 +506,26 @@ fn apply_landlock(options: &LandlockOptions) -> R<()> {
     Ok(())
 }
 
+/// Chown a directory tree without following symlinks: a symlink staged into
+/// the task dir (e.g. inside a tree artifact) must not hand ownership of a
+/// path outside the allocation tree to the task user.
+#[cfg(unix)]
+fn chown_tree(path: &Path, uid: u32, gid: u32) -> R<()> {
+    std::os::unix::fs::lchown(path, Some(uid), Some(gid))
+        .with_context(|| format!("failed to chown {}", path.display()))?;
+    let metadata = path
+        .symlink_metadata()
+        .with_context(|| format!("failed to stat {}", path.display()))?;
+    if metadata.is_dir() {
+        for entry in std::fs::read_dir(path)
+            .with_context(|| format!("failed to read dir {}", path.display()))?
+        {
+            chown_tree(&entry?.path(), uid, gid)?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 fn lookup_user(value: &str) -> R<UserSpec> {
     let cstr = CString::new(value).context("exec task user must not contain null bytes")?;
@@ -536,6 +569,25 @@ mod tests {
         assert_eq!(options.oom_score_adj, Some(250));
         assert_eq!(options.cgroup.as_deref(), Some("workloads/demo"));
         assert!(options.landlock.is_some());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn chown_tree_walks_dirs_without_following_symlinks() -> R<()> {
+        let temp_dir = tempfile::TempDir::new()?;
+        let root = temp_dir.path().join("alloc");
+        std::fs::create_dir_all(root.join("task/nested"))?;
+        std::fs::write(root.join("task/nested/artifact"), b"data")?;
+        // A dangling symlink errors when followed (chown) but not when
+        // operated on directly (lchown) — success proves no-follow.
+        std::os::unix::fs::symlink("/nonexistent-target", root.join("task/dangling"))?;
+
+        // Chown to our own uid/gid: a no-op ownership-wise, but exercises the
+        // full walk without requiring root.
+        // SAFETY: trivial libc getters with no preconditions.
+        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        chown_tree(&root, uid, gid)?;
         Ok(())
     }
 

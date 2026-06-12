@@ -155,6 +155,13 @@ artifact-bearing or not:
 (beside the worker's `worker_state.json`, i.e.
 `.legion/workers/<id>/allocs/…`).
 
+- Created owner-only (`0700` on Unix). The allocation directory is the
+  on-disk isolation boundary between workloads sharing a node: no other
+  task or local user can reach this allocation's staged artifacts, injected
+  secrets, or files. When an `exec` task sets `user`, the allocation tree is
+  chowned to that user at start (symlinks are not followed), so the
+  dropped-privilege process keeps access to its own directory — and only
+  its own.
 - Exposed to the task as `LEGION_ALLOC_DIR` and `LEGION_TASK_DIR` env vars
   (for kinds that apply worker-injected env — see the
   [capability matrix](#task-kind-support)).
