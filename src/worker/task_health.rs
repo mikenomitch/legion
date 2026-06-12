@@ -1,3 +1,6 @@
+// handle_unhealthy threads the full task/health context by parameter.
+#![allow(clippy::too_many_arguments)]
+
 use crate::prelude::*;
 use crate::structs::{Allocation, TaskCheck, TaskCheckKind, TaskCheckType, TaskConfig};
 use crate::worker::task_manager::WorkerTaskManager;

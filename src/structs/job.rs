@@ -381,16 +381,12 @@ pub struct TaskDependency {
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+#[derive(Default)]
 pub enum TaskLifecycle {
+    #[default]
     Service,
     Batch,
     Sidecar,
-}
-
-impl Default for TaskLifecycle {
-    fn default() -> Self {
-        TaskLifecycle::Service
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -778,7 +774,7 @@ impl RolloutConfig {
             if count_steps.is_empty() {
                 bail!("{scope}.countSteps must not be empty");
             }
-            if count_steps.iter().any(|step| *step == 0) {
+            if count_steps.contains(&0) {
                 bail!("{scope}.countSteps values must be at least 1");
             }
         }

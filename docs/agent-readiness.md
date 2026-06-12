@@ -21,7 +21,7 @@ below map directly onto those pillars.
 | Discoverability | `legion capabilities`, MCP `tools/list`, `legion job schema`, `GetStateStoreSchema` |
 | Structured I/O | Universal `--json` envelope, typed errors with `code`/`hint`/`retryable` |
 | Safety under retries | Idempotency keys, read-only-by-default SQL, `job plan`, `job validate` |
-| Closing the loop | `job run --wait` / `job wait`, rollout events, `legion state query` |
+| Closing the loop | `job run --wait` / `job wait`, rollout events, `legion state query`, `job logs` |
 
 ## 1. MCP server (`legion mcp serve`)
 
@@ -58,6 +58,7 @@ Even with `--allow-write`, `legion_state_query` is forced to read-only.
 | `legion_rollout_status` | no | Rollout progress + allocation health. |
 | `legion_node_list` | no | List worker nodes. |
 | `legion_events` | no | List scheduler events; poll with `after_id` to tail. |
+| `legion_job_logs` | no | Fetch captured task stdout/stderr for a job. |
 | `legion_state_query` | no | Read-only SQL against the state store. |
 | `legion_state_schema` | no | Describe state store tables. |
 | `legion_job_run` | **yes** | Submit/update a job from rendered JSON. |
@@ -162,6 +163,7 @@ Other loop-closing signals available to agents today:
   event stream (see below).
 - `legion job rollout events --id <ID> --json` — the rollout's event history.
 - `legion job rollout status --id <ID> --json` — per-allocation health.
+- `legion job logs <NAME> --json` — captured task stdout/stderr (see below).
 - `legion state query "<SQL>" --json` — inspect `task_status`, `allocation_health`,
   `eval`, etc. (read-only by default).
 
@@ -186,6 +188,50 @@ or double-count: call `legion events list --json` once, remember `latestId`,
 then poll with `--after-id <latestId>` (the `legion_events` MCP tool takes the
 same `after_id` cursor). After a dropped `follow`, resume with
 `--after-id <last seen id>` and the manager replays the gap before tailing.
+
+## 6a. Task log retrieval (`legion job logs`)
+
+Rollout events and the state store tell an agent *that* a task is unhealthy;
+task logs tell it *why*. Workers capture each task's stdout and stderr to
+per-allocation files, and the manager proxies reads back to the agent:
+
+```bash
+# All allocations of a job, both streams (first 256 KiB per stream by default;
+# add --tail for the most recent output, or --follow to live-tail):
+legion job logs demo --json
+
+# A single allocation, stderr only, last 4 KiB:
+legion job logs demo --allocation 42 --stream stderr --max-bytes 4096 --tail
+```
+
+Flags: `--allocation <ID>` targets one allocation instead of the whole job;
+`--stream stdout|stderr|all` (default `all`); `--max-bytes <N>` caps each stream
+(`0` uses the worker's built-in 256 KiB cap); `--tail` returns the trailing
+bytes rather than the leading bytes; `--follow`/`-f` live-tails until interrupted.
+The MCP tool is `legion_job_logs`, and the web UI exposes a live-tailing **Logs**
+tab on jobs and tasks.
+
+Workers rotate and prune these files (size cap + retention) so a chatty task
+cannot fill a node's disk, and the files are ready to ship to an external
+collector. See **[Logging](logging.md)** for the full picture: capture, the
+`LogSink` seam, rotation config, tailing, external shipping, and exporting
+Legion's own traces over OpenTelemetry.
+
+Each returned allocation carries its `allocationId`, `nodeId`, `taskName`, the
+captured `streams` (with `sizeBytes` and a `truncated` flag), and a per-allocation
+`error` string — so one unreachable node degrades gracefully instead of failing
+the whole request.
+
+How it is wired (read-only, agent-safe):
+
+1. Workers redirect task stdout/stderr into `stdout.log` / `stderr.log` under a
+   per-allocation log directory threaded through the `TaskPlugin` runtime
+   (`TaskRuntime.log_dir`); built-in `exec` and `container` tasks capture
+   automatically.
+2. `Worker.GetTaskLogs` reads those files on the node (with the byte cap / tail).
+3. `Manager.GetAllocationLogs` resolves a job (or allocation id) to its
+   allocations, locates each host node, and proxies the read to that worker.
+4. `legion job logs <name>` and the `legion_job_logs` MCP tool surface it.
 
 ## 7. State store introspection + saved query library
 
@@ -228,19 +274,11 @@ Prefer read-only operations; treat anything with `mutates: true` /
 
 Implemented: MCP server, structured envelope + typed errors, capabilities catalog,
 `job schema`/`job validate`, idempotency keys, `--wait`/`job wait`, saved-query
-library, scheduler event stream (`events list`/`events follow`, `legion_events`).
+library, the scheduler event stream (`events list`/`events follow`,
+`legion_events`), and **task log retrieval** (`legion job logs` /
+`legion_job_logs`).
 
-Recommended next step — **task log retrieval**. Today an agent diagnoses failures
-via rollout events and the state store. Direct stdout/stderr retrieval would
-tighten the loop further. The intended design:
-
-1. Workers capture task stdout/stderr to per-allocation files (requires threading
-   an allocation log directory through the `TaskPlugin` runtime, which affects the
-   plugin ABI — hence staged separately).
-2. A `Worker.GetTaskLogs` RPC reads those files on the node.
-3. A `Manager.GetAllocationLogs` RPC locates the node and proxies the request.
-4. `legion job logs <name>` and a `legion_job_logs` MCP tool surface it.
-
-This was deliberately not bundled with the changes above to keep the plugin ABI
-stable and avoid shipping cluster-coupled code that cannot be verified without a
-live multi-node cluster.
+The task-log path captures task stdout/stderr to per-allocation files via the
+`TaskPlugin` runtime (`TaskRuntime.log_dir`), reads them on the node with
+`Worker.GetTaskLogs`, and proxies through `Manager.GetAllocationLogs`. See
+[§6a](#6a-task-log-retrieval-legion-job-logs).

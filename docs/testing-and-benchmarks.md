@@ -85,7 +85,7 @@ Scenario files encode:
 
 CI behavior:
 
-- `.github/workflows/ci.yml` runs the SLO benchmark gate only when scheduler-impacting files are changed (`src/manager/scheduler.rs`, `src/storage/store.rs`, `src/manager/agent.rs`, benchmark scenarios, or the gate test itself).
+- `.github/workflows/ci.yml` runs the SLO benchmark gate only when scheduler-impacting files are changed (`src/manager/scheduler.rs`, `src/storage/store.rs`, `src/manager/daemon.rs`, benchmark scenarios, or the gate test itself).
 
 ## Plugin-Related Test Notes
 

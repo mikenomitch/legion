@@ -19,7 +19,7 @@ pub fn dispatch_allocations(store: &Store, allocations: &[Allocation]) -> R<()> 
         for allocation in allocations {
             let tasks = task_cache
                 .entry(allocation.job_config_id.clone())
-                .or_insert_with(|| HashMap::new());
+                .or_default();
             if tasks.is_empty() {
                 let task_configs =
                     store.get_task_configs_for_job_config(&allocation.job_config_id)?;
