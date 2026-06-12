@@ -477,6 +477,16 @@ Sources are redacted; errors name auth sources, never values.
   and node views show live staging rows — state badge, progress percentage,
   failure reason — and rollout cards summarize `staging artifacts: 1/3
   staged` while a deploy is mid-fetch.
+- **Event stream:** artifact lifecycle transitions join the
+  [scheduler event stream](event-stream.md) (`legion events list --kind
+  artifact`, `legion events tail`, the UI Events page). `artifact.staging`
+  fires when an allocation enters staging, `artifact.staged` once when every
+  artifact landed (digests/bytes/durations in metadata), `artifact.failed`
+  per failed artifact with the redacted source, error, and attempt count
+  (riding the failure report, so it survives the allocation's removal), and
+  `artifact.pinned` records submit-time digest pinning. The staging/staged
+  events are derived manager-side from heartbeat snapshot *transitions*, so
+  steady-state heartbeats add nothing to the journal.
 
 ## Task-kind support
 

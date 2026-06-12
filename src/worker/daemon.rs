@@ -280,6 +280,7 @@ async fn start_heartbeats(
                 .map(|failure| crate::structs::FailedAllocation {
                     allocation_id: failure.allocation_id,
                     reason: failure.reason,
+                    artifact_states: failure.artifact_states,
                 })
                 .collect::<Vec<_>>();
             let allocation_health = manager.allocation_health_snapshot();

@@ -908,6 +908,15 @@ message FailedAllocation {
 
   // Failure reason text.
   string reason = 2;
+
+  // JSON-encoded final per-artifact staging states when the failure was an
+  // artifact staging failure (same payload as
+  // `AllocationHealth.artifact_states`). The manager turns failed rows into
+  // `artifact.failed` scheduler events with per-artifact detail (redacted
+  // source, error, attempts) instead of parsing the reason text.
+  //
+  // Unset for non-artifact failures.
+  optional string artifact_states = 3;
 }
 
 // Allocation health snapshot item from worker to manager.

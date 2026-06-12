@@ -2786,6 +2786,19 @@ export class FailedAllocation extends Message<FailedAllocation> {
    */
   reason = "";
 
+  /**
+   * JSON-encoded final per-artifact staging states when the failure was an
+   * artifact staging failure (same payload as
+   * `AllocationHealth.artifact_states`). The manager turns failed rows into
+   * `artifact.failed` scheduler events with per-artifact detail (redacted
+   * source, error, attempts) instead of parsing the reason text.
+   *
+   * Unset for non-artifact failures.
+   *
+   * @generated from field: optional string artifact_states = 3;
+   */
+  artifactStates?: string;
+
   constructor(data?: PartialMessage<FailedAllocation>) {
     super();
     proto3.util.initPartial(data, this);
@@ -2796,6 +2809,7 @@ export class FailedAllocation extends Message<FailedAllocation> {
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "allocation_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
     { no: 2, name: "reason", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "artifact_states", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): FailedAllocation {

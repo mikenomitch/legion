@@ -18,6 +18,10 @@ from the CLI, the MCP server, the UI, and raw gRPC.
 | `allocation.removed` | info/warn | Allocations were removed (job stop/update: info; node loss: warn). |
 | `allocation.failed` | warn | A worker reported an allocation failure (includes the reason). |
 | `allocation.plan_rejected` | warn | A placement plan was rejected by optimistic concurrency (will be retried). |
+| `artifact.staging` | info | An allocation began staging its [artifacts](artifacts.md) (artifact list in metadata). |
+| `artifact.staged` | info | Every artifact for an allocation staged successfully (digests, bytes, durations in metadata). |
+| `artifact.failed` | warn | One artifact's fetch failed — per-artifact detail (redacted source, error, attempts) alongside the allocation-level `allocation.failed`. |
+| `artifact.pinned` | info | Mutable artifact references were pinned to digests at submit (one event per changing submit; pins in metadata). |
 | `node.registered` | info | A worker registered (or re-registered). |
 | `node.ready` | info | A known node rejoined and was marked ready. |
 | `node.lost` | warn | A node was marked lost (explicitly or via missed heartbeats). |

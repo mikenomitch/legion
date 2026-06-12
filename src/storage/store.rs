@@ -3270,8 +3270,26 @@ impl Store {
         let mut conn = self.write_connection()?;
         let tx = conn.transaction()?;
         let now = Self::now_rfc3339()?;
+        let mut staged_events = Vec::new();
         for snapshot in snapshots {
-            tx.execute(
+            // Artifact staging transitions are derived by diffing against
+            // the previously persisted snapshot, inside this transaction so
+            // events commit atomically with the state they describe. The
+            // extra read only happens for snapshots carrying artifact rows;
+            // plain tasks stay on the single-statement path.
+            let previous_states: Option<String> = if snapshot.artifact_states.is_some() {
+                tx.query_row(
+                    "SELECT artifact_states FROM allocation_health WHERE allocation_id = ?1;",
+                    [snapshot.allocation_id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .flatten()
+            } else {
+                None
+            };
+
+            let inserted = tx.execute(
                 "INSERT INTO allocation_health (
                     allocation_id,
                     node_id,
@@ -3297,9 +3315,59 @@ impl Store {
                     snapshot.artifact_states.as_deref()
                 ],
             )?;
+
+            let Some(new_states) = snapshot.artifact_states.as_deref() else {
+                continue;
+            };
+            // The guarded insert writes nothing for unknown allocations;
+            // skip events for those too.
+            if inserted == 0 {
+                continue;
+            }
+            let (transitions, rows) = crate::storage::events::artifact_transitions(
+                previous_states.as_deref(),
+                new_states,
+            );
+            if !transitions.staging_started && !transitions.all_staged {
+                continue;
+            }
+            let job_id = self
+                .job_id_for_allocation_tx(&tx, snapshot.allocation_id)?
+                .unwrap_or_default();
+            if transitions.staging_started {
+                staged_events.push(self.stage_event_locked(
+                    &tx,
+                    drafts::artifact_staging(snapshot.allocation_id, node_id, &job_id, &rows),
+                ));
+            }
+            if transitions.all_staged {
+                staged_events.push(self.stage_event_locked(
+                    &tx,
+                    drafts::artifact_staged(snapshot.allocation_id, node_id, &job_id, &rows),
+                ));
+            }
         }
         tx.commit()?;
+        for event in staged_events {
+            self.publish_staged(event);
+        }
         Ok(())
+    }
+
+    /// Job ID owning an allocation, resolved inside an open transaction (the
+    /// allocation table stores job_config_id; the job comes via join). Only
+    /// consulted when an artifact staging transition actually fires.
+    fn job_id_for_allocation_tx(&self, tx: &Connection, allocation_id: i64) -> R<Option<String>> {
+        let job_id = tx
+            .query_row(
+                "SELECT job_config.job_id FROM allocation
+                 INNER JOIN job_config ON job_config.id = allocation.job_config_id
+                 WHERE allocation.id = ?1;",
+                [allocation_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(job_id)
     }
 
     #[instrument(err, skip_all)]
@@ -6279,6 +6347,87 @@ mod tests {
         assert_eq!(statuses.get(&prep_id), Some(&TaskStatusState::Success));
         assert_eq!(statuses.get(&api_id), Some(&TaskStatusState::Running));
 
+        Ok(())
+    }
+
+    #[test]
+    fn artifact_staging_transitions_emit_events_once() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "ready"))?;
+
+        let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "artifact-events".into(),
+            tasks: vec![TaskConfig::new("web", "noop")],
+            version: None,
+        };
+        store.handle_job_submit(
+            &job,
+            &[Submission {
+                path: "job.jsonnet".into(),
+                content: "{}".into(),
+                is_primary: true,
+            }],
+        )?;
+        let task_id = task_id_for(&store, "web", &job.name)?;
+        let allocation = store.place_alloc("node-a", task_id)?;
+
+        let artifact_events = |store: &Store| -> R<Vec<SchedulerEventRecord>> {
+            store.list_scheduler_events(&SchedulerEventFilter {
+                kind: Some("artifact".into()),
+                ..Default::default()
+            })
+        };
+
+        let snapshot = |states: &str, status: &str| AllocationHealth {
+            allocation_id: allocation.id,
+            healthy: false,
+            status: status.into(),
+            artifact_states: Some(states.into()),
+        };
+        let staging =
+            r#"[{"name":"tool","source":"https://example.com/t.tar.gz","state":"fetching"}]"#;
+        let staged = r#"[{"name":"tool","source":"https://example.com/t.tar.gz","state":"staged","digest":"sha256:abc","bytesFetched":10}]"#;
+
+        // First staging snapshot announces the run.
+        store.upsert_allocation_health_snapshots(
+            "node-a",
+            &[snapshot(staging, "staging artifacts")],
+        )?;
+        let events = artifact_events(&store)?;
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0].kind, "artifact.staging");
+        assert_eq!(events[0].allocation_id, Some(allocation.id));
+        assert_eq!(events[0].job_id.as_deref(), Some("artifact-events"));
+        assert_eq!(events[0].node_id.as_deref(), Some("node-a"));
+
+        // Repeated identical heartbeats emit nothing new.
+        store.upsert_allocation_health_snapshots(
+            "node-a",
+            &[snapshot(staging, "staging artifacts")],
+        )?;
+        assert_eq!(artifact_events(&store)?.len(), 1);
+
+        // Completion emits artifact.staged exactly once.
+        store.upsert_allocation_health_snapshots("node-a", &[snapshot(staged, "starting")])?;
+        store.upsert_allocation_health_snapshots("node-a", &[snapshot(staged, "healthy")])?;
+        let events = artifact_events(&store)?;
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(events[1].kind, "artifact.staged");
+        assert!(events[1].metadata_json.contains("sha256:abc"));
+
+        // Snapshots without artifact rows never touch the artifact kinds.
+        store.upsert_allocation_health_snapshots(
+            "node-a",
+            &[AllocationHealth {
+                allocation_id: allocation.id,
+                healthy: true,
+                status: "healthy".into(),
+                artifact_states: None,
+            }],
+        )?;
+        assert_eq!(artifact_events(&store)?.len(), 2);
         Ok(())
     }
 

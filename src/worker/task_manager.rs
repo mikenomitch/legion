@@ -16,6 +16,10 @@ use std::path::PathBuf;
 pub struct FailedAllocationReport {
     pub allocation_id: i64,
     pub reason: String,
+    /// Final per-artifact staging states (JSON) when the failure was an
+    /// artifact staging failure; rides the heartbeat failure report so the
+    /// manager can emit per-artifact `artifact.failed` events.
+    pub artifact_states: Option<String>,
 }
 
 /// A staging job handed to a dedicated thread: everything needed to fetch a
@@ -263,11 +267,16 @@ impl WorkerTaskManager {
         self.allocations.remove(&allocation_id);
         self.task_configs.remove(&allocation_id);
         self.allocation_health.remove(&allocation_id);
+        // Capture the final board snapshot before clearing it: the failure
+        // report is the last (and race-free) carrier of per-artifact failure
+        // detail to the manager's event stream.
+        let artifact_states = self.artifact_status.snapshot_json(allocation_id);
         self.artifact_status.remove(allocation_id);
         self.cleanup_alloc_dir(allocation_id);
         self.failed.push(FailedAllocationReport {
             allocation_id,
             reason: reason.into(),
+            artifact_states,
         });
         self.persist_state();
     }

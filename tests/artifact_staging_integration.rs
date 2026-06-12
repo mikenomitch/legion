@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use legion::manager::dispatcher::build_task_allocation;
 use legion::manager::server::ManagerDaemonService;
 use legion::prelude::{json, Context, R};
+use legion::storage::events::SchedulerEventFilter;
 use legion::storage::store::Store;
 use legion::structs::{
     config::ManagerConfigFull, manager_server::Manager, Allocation, AllocationHealth,
@@ -272,6 +273,15 @@ fn fetch_failure_after_retries_fails_allocation() -> R<()> {
         "failure reasons must carry redacted sources: {}",
         failures[0].reason
     );
+    // The failure report carries the final per-artifact states so the
+    // manager can emit artifact.failed events with structured detail.
+    let states = failures[0]
+        .artifact_states
+        .as_deref()
+        .expect("failure report carries artifact states");
+    assert!(states.contains("\"state\":\"failed\""), "{states}");
+    assert!(states.contains("\"name\":\"gone\""), "{states}");
+    assert!(!states.contains("token=secret"), "{states}");
     drop(guard);
 
     assert!(
@@ -571,7 +581,7 @@ async fn git_ref_pins_to_commit_sha_at_submit() -> R<()> {
         "tasks": [{
             "name": "repo",
             "kind": "exec",
-            "artifacts": [{"source": source, "name": "repo"}],
+            "artifacts": [{"source": source.clone(), "name": "repo"}],
             "config": {"command": ["true"]},
         }],
     })
@@ -601,6 +611,41 @@ async fn git_ref_pins_to_commit_sha_at_submit() -> R<()> {
         .context("pinned ref missing")?;
     assert_eq!(pinned_ref.len(), 40, "{}", artifact.source);
     assert!(pinned_ref.chars().all(|c| c.is_ascii_hexdigit()));
+
+    // Pinning joins the event stream: one artifact.pinned event for the
+    // submit, with the resolution in metadata.
+    let pin_events = store.list_scheduler_events(&SchedulerEventFilter {
+        kind: Some("artifact.pinned".into()),
+        ..Default::default()
+    })?;
+    assert_eq!(pin_events.len(), 1, "{pin_events:?}");
+    assert_eq!(pin_events[0].job_id.as_deref(), Some("git-pin-job"));
+    assert!(
+        pin_events[0].metadata_json.contains(pinned_ref),
+        "{}",
+        pin_events[0].metadata_json
+    );
+
+    // An unchanged re-submit resolves the same digest and stays quiet.
+    let jobspec = json!({
+        "name": "git-pin-job",
+        "tasks": [{
+            "name": "repo",
+            "kind": "exec",
+            "artifacts": [{"source": source, "name": "repo"}],
+            "config": {"command": ["true"]},
+        }],
+    })
+    .to_string();
+    manager
+        .run_job(Request::new(run_request(jobspec, "git-pin-job")))
+        .await
+        .map_err(|status| anyhow::anyhow!("re-run_job failed: {status}"))?;
+    let pin_events = store.list_scheduler_events(&SchedulerEventFilter {
+        kind: Some("artifact.pinned".into()),
+        ..Default::default()
+    })?;
+    assert_eq!(pin_events.len(), 1, "unchanged re-submit must not re-emit");
     Ok(())
 }
 

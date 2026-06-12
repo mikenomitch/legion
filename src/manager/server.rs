@@ -15,7 +15,7 @@ use crate::manager::rollout::{
 use crate::manager::rollout_strategy;
 use crate::manager::scheduler::{PlanConfigOutcome, PlanMode, Scheduler};
 use crate::storage::errors::StorageError;
-use crate::storage::events::{SchedulerEventFilter, SchedulerEventRecord};
+use crate::storage::events::{ArtifactPin, SchedulerEventFilter, SchedulerEventRecord};
 use crate::storage::store::{JobKvReference, JobSubmitOutcome, Store};
 use crate::structs::manager_server::Manager;
 use crate::structs::{
@@ -617,8 +617,8 @@ impl ManagerDaemonService {
     /// desugars kind-implicit artifacts (behind `containerImageDesugar`),
     /// enforces cluster-scoped rules (scheme allowlist, nodeIdentity refs),
     /// bakes the effective auth from cluster matchers, and pins mutable
-    /// references at submit. Returns human-readable pin notes
-    /// (`task api: pinned oci://… -> sha256:…`) for plan/run messages.
+    /// references at submit. Returns the pins performed (rendered into plan
+    /// messages and emitted as `artifact.pinned` events on submit).
     ///
     /// Workers receive exactly this normalized list and never re-derive
     /// implicit artifacts or re-resolve pinned tags.
@@ -626,7 +626,7 @@ impl ManagerDaemonService {
         &self,
         config: &mut JobConfig,
         resolve_pins: bool,
-    ) -> R<Vec<String>> {
+    ) -> R<Vec<ArtifactPin>> {
         use crate::structs::ArtifactResolve;
 
         let mut notes = Vec::new();
@@ -681,12 +681,11 @@ impl ManagerDaemonService {
                         spec.redacted_source()
                     )
                 })?;
-                notes.push(format!(
-                    "task {}: pinned {} -> {}",
-                    task.name,
-                    spec.redacted_source(),
-                    resolved.digest
-                ));
+                notes.push(ArtifactPin {
+                    task: task.name.clone(),
+                    from: spec.redacted_source(),
+                    to: resolved.digest,
+                });
                 spec.pinned_from = Some(spec.source.clone());
                 spec.source = resolved.pinned_source;
             }
@@ -1088,17 +1087,27 @@ impl Manager for ManagerDaemonService {
         })?;
         // Artifact admission: desugar/auth/pin. Pin resolution can reach
         // registries, so it runs as blocking work.
-        run_blocking_admission(|| self.normalize_job_artifacts(&mut config, true)).map_err(
-            |e| {
-                error!("Error normalizing artifacts: {:?}", e);
-                Status::invalid_argument(format!("Error normalizing artifacts: {e:#}"))
-            },
-        )?;
+        let artifact_pins =
+            run_blocking_admission(|| self.normalize_job_artifacts(&mut config, true)).map_err(
+                |e| {
+                    error!("Error normalizing artifacts: {:?}", e);
+                    Status::invalid_argument(format!("Error normalizing artifacts: {e:#}"))
+                },
+            )?;
         let config = config;
         let submit_outcome = self
             .store
             .handle_job_submit(&config, &subs)
             .map_err(|e| map_store_error("Error running job", e))?;
+
+        // Pin provenance joins the event stream only when the submit changed
+        // something — unchanged re-submits resolve the same digests and would
+        // spam the stream otherwise.
+        if !matches!(submit_outcome, JobSubmitOutcome::Unchanged { .. }) {
+            self.store
+                .events()
+                .artifact_pinned(&config.name, &artifact_pins);
+        }
 
         let job_config_id = submit_outcome.job_config_id().to_string();
         let stored_refs: Vec<JobKvReference> = kv_refs
@@ -1570,9 +1579,13 @@ impl Manager for ManagerDaemonService {
             .collect();
 
         let mut message = message;
-        for note in pin_notes.iter().chain(artifact_diffs.iter()) {
+        for note in pin_notes
+            .iter()
+            .map(ArtifactPin::describe)
+            .chain(artifact_diffs.iter().cloned())
+        {
             message.push('\n');
-            message.push_str(note);
+            message.push_str(&note);
         }
 
         let reply = PlanJobReply {
@@ -2792,6 +2805,17 @@ fn handle_failed_allocations(
             context.task_config_id,
             &failure.reason,
         );
+        // Artifact staging failures additionally carry the final per-artifact
+        // states; surface each failed artifact as its own event with the
+        // redacted source, error, and attempt count.
+        if let Some(artifact_states) = failure.artifact_states.as_deref() {
+            store.events().artifact_failed_rows(
+                allocation_id,
+                node_id,
+                &context.job_id,
+                artifact_states,
+            );
+        }
 
         let move_decision = {
             let mut tracker = failure_tracker.lock().expect("allocation failure tracker");
@@ -3985,6 +4009,7 @@ mod tests {
             &[FailedAllocation {
                 allocation_id: allocation.id,
                 reason: "boom".into(),
+                artifact_states: None,
             }],
         )?;
         std::thread::sleep(Duration::from_millis(10));
@@ -3996,6 +4021,73 @@ mod tests {
         assert_eq!(eval.job_config_id, job_config_id);
         assert_eq!(eval.node_name, "node-a");
 
+        Ok(())
+    }
+
+    #[test]
+    fn artifact_staging_failures_emit_per_artifact_events() -> R<()> {
+        let store = setup_store()?;
+        insert_node(&store, "node-a")?;
+
+        let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "artifact-fail-job".into(),
+            tasks: vec![TaskConfig::new("task", "noop")],
+            version: None,
+        };
+        store.handle_job_submit(&job, &[submission()])?;
+        let job_config_id = store.get_job_config(&job.name)?.id();
+        let task_id = store.get_task_configs_for_job_config(&job_config_id)?[0].0;
+        let allocation = store.place_alloc("node-a", task_id)?;
+
+        let artifact_states = serde_json::json!([
+            {
+                "name": "tool",
+                "source": "https://example.com/tool.tar.gz",
+                "state": "failed",
+                "attempts": 3,
+                "error": "404 after retries",
+            },
+            // Non-failed rows in the final snapshot produce no events.
+            {
+                "name": "ok",
+                "source": "https://example.com/ok.tar.gz",
+                "state": "staged",
+            },
+        ])
+        .to_string();
+
+        let tracker = Arc::new(Mutex::new(AllocationFailureTracker::default()));
+        handle_failed_allocations(
+            &store,
+            &tracker,
+            "node-a",
+            &[FailedAllocation {
+                allocation_id: allocation.id,
+                reason: "artifact staging failed: 404".into(),
+                artifact_states: Some(artifact_states),
+            }],
+        )?;
+
+        let events = store.list_scheduler_events(&SchedulerEventFilter {
+            kind: Some("artifact.failed".into()),
+            ..Default::default()
+        })?;
+        assert_eq!(events.len(), 1, "{events:?}");
+        let event = &events[0];
+        assert_eq!(event.allocation_id, Some(allocation.id));
+        assert_eq!(event.job_id.as_deref(), Some("artifact-fail-job"));
+        assert_eq!(event.node_id.as_deref(), Some("node-a"));
+        assert!(event.message.contains("tool"), "{}", event.message);
+        assert!(event.metadata_json.contains("404 after retries"));
+
+        // The allocation-level failure event is still emitted alongside.
+        let allocation_events = store.list_scheduler_events(&SchedulerEventFilter {
+            kind: Some("allocation.failed".into()),
+            ..Default::default()
+        })?;
+        assert_eq!(allocation_events.len(), 1);
         Ok(())
     }
 
@@ -4025,6 +4117,7 @@ mod tests {
             &[FailedAllocation {
                 allocation_id: allocation.id,
                 reason: "spoofed".into(),
+                artifact_states: None,
             }],
         )?;
         std::thread::sleep(Duration::from_millis(10));
