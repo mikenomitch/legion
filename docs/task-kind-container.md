@@ -8,9 +8,30 @@ Run containerized workloads via host container runtime binaries.
 
 ## Runtime Selection
 
-- macOS: uses `container` binary (Apple container toolchain).
-- Linux: uses `youki` binary.
-- Other OS: kind is rejected as unsupported.
+The worker auto-detects the container runtime, so the kind "just works" on a
+Mac (Docker Desktop) and on Linux without per-job configuration. Resolution
+order:
+
+1. **`LEGION_CONTAINER_RUNTIME` env override** (`docker` | `container` |
+   `youki`) — pins a node's runtime regardless of detection.
+2. **First installed runtime on `PATH`**, in a per-OS preference order:
+   - macOS: Apple `container`, then `docker`.
+   - Linux: `docker`, then `youki`.
+3. **OS default** when nothing is installed, so the eventual spawn failure
+   still names the expected binary.
+
+Supported runtimes:
+
+- **Docker** (`docker`): the portable default for local dev and Kamal-style
+  workflows; available on macOS (Docker Desktop) and Linux.
+- **Apple `container`** (`container`): the Apple container toolchain on macOS.
+- **`youki`** (`youki`): low-level OCI runtime on Linux.
+
+Other operating systems reject the kind as unsupported.
+
+Docker and Apple `container` share a docker-compatible `run` surface; `youki`
+takes `--image`. Only Apple `container` and `youki` need a `--` terminator
+before the command (Docker rejects a literal `--`).
 
 ## Config Schema
 
@@ -30,9 +51,15 @@ Optional:
   - parse `ContainerTaskConfig`,
   - detect runtime,
   - build runtime-specific launch args,
-  - spawn child,
+  - spawn child (stdout/stderr captured per allocation when the worker sets a
+    log dir),
   - track child and PID.
 - `stop`:
+  - for daemon-backed runtimes (Docker, Apple `container`), tear the container
+    down by name first (`docker rm -f legion-<alloc>` / `container stop
+    legion-<alloc>`) — killing the foreground `run` CLI only detaches it,
+    leaving the container running; `youki` runs the container init as a direct
+    child so no by-name teardown is needed,
   - kill child handle if present,
   - else kill by PID lookup.
 - `destroy` delegates to `stop`.
@@ -50,10 +77,11 @@ images (see [docs/artifacts.md](artifacts.md)):
   shared artifact pipeline — cluster auth matchers, digest pinning, status
   rows — and the plugin's `consume_artifact` imports the staged OCI layout
   into the runtime.
-  - macOS: the layout is tarred and imported via `container image load`.
-  - Linux (youki): not yet supported — consuming a Legion-managed image fails
+  - Docker (with the containerd image store) and Apple `container`: the layout
+    is tarred and imported via `docker load` / `container image load`.
+  - youki: not yet supported — consuming a Legion-managed image fails
     with an explicit error (OCI layout -> runtime bundle conversion pending).
-    Keep the flag off for Linux container workloads.
+    Keep the flag off for youki container workloads.
   - The flag defaults to **off** until the artifact cache lands; with it off,
     container behavior is unchanged (the runtime pulls images itself).
 - **File/tree artifacts and env referencing are deferred:** explicitly

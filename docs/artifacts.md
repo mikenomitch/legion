@@ -512,11 +512,12 @@ the shared pipeline — same auth matchers, same pinning, same status rows as
 every other artifact. The plugin then loads the staged OCI layout into the
 local runtime:
 
-- **macOS (Apple `container`):** the layout is tarred and imported with
-  `container image load`, so the subsequent run needs no registry pull.
-- **Linux (youki):** not yet supported — consuming a Legion-managed image
+- **Docker (containerd image store) / Apple `container`:** the layout is
+  tarred and imported with `docker load` / `container image load`, so the
+  subsequent run needs no registry pull.
+- **youki:** not yet supported — consuming a Legion-managed image
   fails with an honest error (OCI layout → runtime bundle conversion is
-  pending). Keep the flag off for Linux container workloads.
+  pending). Keep the flag off for youki container workloads.
 
 The flag defaults to **off** until the artifact cache lands: without a
 cache, Legion-managed pulls re-download the image for every allocation,

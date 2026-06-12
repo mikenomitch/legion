@@ -53,10 +53,12 @@
     - [x] It uses landlock appropriately
     - [ ] It handles network namespaces well? (use netavark lib?)
   - [x] A "container" kind works
-    - Does it just user docker? Apple's container' runtime if on MacOS?
-    - MUST work on a Mac easily (and on linux)
-        1. Think about Kamal
-        2. Think about local dev
+    - Runtime auto-detected per node: `docker` (portable default, works on a
+      Mac via Docker Desktop and on Linux), Apple `container` on macOS, `youki`
+      on Linux. Override with `LEGION_CONTAINER_RUNTIME`. macOS prefers Apple
+      `container` then Docker; Linux prefers Docker then youki.
+    - MUST work on a Mac easily (and on linux) — Docker covers the easy local
+      path (Kamal / local dev); Apple `container` and youki remain available.
   - [ ] A "WASM" kind works
  
 - [ ] Make something for the AIs to use this
