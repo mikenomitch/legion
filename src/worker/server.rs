@@ -4,8 +4,7 @@ use crate::structs::{
     RestartWorkerReply, RestartWorkerRequest, TaskLogStream,
 };
 use crate::worker::identity::WorkerIdentityManager;
-use crate::worker::task_health::spawn_health_monitor;
-use crate::worker::task_manager::WorkerTaskManager;
+use crate::worker::task_manager::{launch_task_allocation, WorkerTaskManager};
 use std::sync::{Arc, Mutex};
 use tonic::{Request, Response, Status};
 
@@ -46,29 +45,25 @@ impl Worker for WorkerDaemonService {
             None => Vec::new(),
         };
 
-        let started = {
-            let mut manager = self
-                .task_manager
-                .lock()
-                .map_err(|_| Status::internal("Task manager lock poisoned"))?;
-            match manager.run_task_allocation(&allocation) {
-                Ok(started) => started,
-                Err(err) => {
-                    manager.record_failure(allocation.allocation_id, err.to_string());
-                    return Err(Status::internal(format!("Failed to start task: {err}")));
-                }
-            }
-        };
+        let allocation_id = allocation.allocation_id;
 
-        if let Some(identity) = self.identity.as_ref() {
-            identity.spawn_refreshers(
-                allocation.allocation_id,
-                prepared,
-                self.task_manager.clone(),
-            );
+        // Synchronous failures (bad config, unknown kind) surface here;
+        // artifact-bearing tasks stage on a background thread and report
+        // staging failures through the heartbeat failure path.
+        let task_manager = self.task_manager.clone();
+        let launched =
+            tokio::task::spawn_blocking(move || launch_task_allocation(&task_manager, &allocation))
+                .await
+                .map_err(|err| Status::internal(format!("launch task panicked: {err}")))?;
+        if let Err(err) = launched {
+            return Err(Status::internal(format!("Failed to start task: {err}")));
         }
 
-        spawn_health_monitor(self.task_manager.clone(), started.0, started.1);
+        // Refresh loops are keyed by allocation id; identity_manager.retain
+        // (run each heartbeat) prunes them if the allocation goes away.
+        if let Some(identity) = self.identity.as_ref() {
+            identity.spawn_refreshers(allocation_id, prepared, self.task_manager.clone());
+        }
 
         let reply = PostWorkReply {
             message: "Task accepted".into(),

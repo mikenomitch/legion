@@ -7,12 +7,13 @@ use crate::structs::{
 };
 use crate::util::random_string;
 use crate::worker::{
+    artifact_credentials::ManagerCredentialSource,
     identity::{ManagerTokenIssuer, PreparedIdentity, WorkerIdentityManager},
     node_check::{fingerprint_node, run_health_checks},
     server::WorkerDaemonService,
     state::WorkerStateStore,
     task_health::spawn_health_monitor,
-    task_manager::WorkerTaskManager,
+    task_manager::{launch_task_allocation, WorkerTaskManager},
 };
 
 use futures::join;
@@ -78,9 +79,21 @@ async fn run_worker_with_manager(
     let task_manager = Arc::new(Mutex::new(WorkerTaskManager::with_state_store(
         WorkerStateStore::new(state_path),
     )));
+    let artifact_fetch_config =
+        parse_artifact_fetch_config(&config.artifacts).unwrap_or_else(|err| {
+            warn!(error = ?err, "Invalid worker artifacts config; using defaults");
+            crate::structs::WorkerArtifactFetchConfigFull::default()
+        });
     let restored_allocations = {
         let mut manager = task_manager.lock().expect("task manager");
         manager.load_builtin_plugins();
+        manager.configure_artifacts(
+            artifact_fetch_config,
+            Box::new(ManagerCredentialSource::new(
+                manager_addr.clone(),
+                name.clone(),
+            )),
+        );
         manager.restore_allocations().unwrap_or_else(|err| {
             warn!(error = ?err, "Failed to restore persisted allocations");
             Vec::new()
@@ -205,6 +218,16 @@ async fn connect_manager_with_retry(manager_addr: &str) -> R<ManagerClient<Chann
             }
         }
     }
+}
+
+/// Parses the worker config's `artifacts` JSON payload (empty = defaults).
+fn parse_artifact_fetch_config(raw: &str) -> R<crate::structs::WorkerArtifactFetchConfigFull> {
+    if raw.trim().is_empty() {
+        return Ok(crate::structs::WorkerArtifactFetchConfigFull::default());
+    }
+    let config: crate::structs::WorkerArtifactsConfig =
+        serde_json::from_str(raw).context("parse worker artifacts config")?;
+    config.fetch_with_defaults()
 }
 
 fn resolve_worker_name(name_override: Option<&str>, name_prefix: Option<String>) -> R<String> {
@@ -344,6 +367,7 @@ async fn heartbeat_tick(
                 .map(|failure| crate::structs::FailedAllocation {
                     allocation_id: failure.allocation_id,
                     reason: failure.reason,
+                    artifact_states: failure.artifact_states,
                 })
                 .collect::<Vec<_>>();
             let allocation_health = manager.allocation_health_snapshot();
@@ -406,15 +430,30 @@ async fn heartbeat_tick(
                 .lock()
                 .expect("task manager")
                 .reconcile_allocations(&desired);
-            for (allocation, task) in new_allocations {
-                if let Some(prepared) = prepared_by_alloc.remove(&allocation.id) {
-                    identity_manager.spawn_refreshers(
-                        allocation.id,
-                        prepared,
-                        task_manager.clone(),
-                    );
+            if !new_allocations.is_empty() {
+                // Refresh loops are keyed by allocation id and may start
+                // slightly before the task process does (artifact staging);
+                // identity_manager.retain below prunes them if the launch
+                // fails and the allocation goes away.
+                for allocation in &new_allocations {
+                    if let Some(prepared) = prepared_by_alloc.remove(&allocation.allocation_id) {
+                        identity_manager.spawn_refreshers(
+                            allocation.allocation_id,
+                            prepared,
+                            task_manager.clone(),
+                        );
+                    }
                 }
-                spawn_health_monitor(task_manager.clone(), allocation, task);
+                // Launch off the heartbeat task: artifact-less tasks spawn
+                // processes synchronously, artifact tasks kick off staging
+                // threads; neither should stall the heartbeat loop.
+                let task_manager = task_manager.clone();
+                tokio::task::spawn_blocking(move || {
+                    for allocation in &new_allocations {
+                        // Failures are recorded inside (heartbeat failure path).
+                        let _ = launch_task_allocation(&task_manager, allocation);
+                    }
+                });
             }
         }
 

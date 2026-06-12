@@ -173,6 +173,9 @@ pub struct AllocationHealthSnapshot {
     pub healthy: bool,
     pub status: String,
     pub updated_at: String,
+    /// JSON-encoded per-artifact staging states from the worker heartbeat
+    /// (`Vec<ArtifactStatus>`); `None` when the task declares no artifacts.
+    pub artifact_states: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -440,7 +443,7 @@ impl Store {
 
         let mut task_stmt = conn.prepare(
             r#"
-            SELECT id, name, kind, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_config_id, identities, stateful
+            SELECT id, name, kind, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_config_id, identities, stateful, artifacts
             FROM task_config;
             "#,
         )?;
@@ -473,6 +476,7 @@ impl Store {
                 kv_injections: self.parse_kv_injections_column(16, row.get(16)?)?,
                 identities: self.parse_identities_column(18, row.get(18)?)?,
                 stateful: self.parse_stateful_column(19, row.get(19)?)?,
+                artifacts: self.parse_artifacts_column(20, row.get(20)?)?,
             };
             let job_config_id: String = row.get(17)?;
             Ok((job_config_id, id, task))
@@ -1191,6 +1195,7 @@ impl Store {
             healthy: row.get::<_, i64>(2)? != 0,
             status: row.get(3)?,
             updated_at: row.get(4)?,
+            artifact_states: row.get(5)?,
         })
     }
 
@@ -1224,6 +1229,7 @@ impl Store {
         let resources = row.get(5)?;
         let reserved_resources = row.get(6)?;
         let max_allocations = row.get(7)?;
+        let artifacts = row.get(8)?;
 
         Ok(WorkerConfig {
             name: row.get(0)?,
@@ -1238,6 +1244,7 @@ impl Store {
             resources,
             reserved_resources,
             max_allocations,
+            artifacts,
         })
     }
 
@@ -1309,6 +1316,23 @@ impl Store {
             return Ok(None);
         };
         serde_json::from_str(&raw).map(Some).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(
+                idx,
+                rusqlite::types::Type::Text,
+                Box::new(err),
+            )
+        })
+    }
+
+    fn parse_artifacts_column(
+        &self,
+        idx: usize,
+        raw: Option<String>,
+    ) -> Result<Vec<crate::structs::ArtifactSpec>, rusqlite::Error> {
+        let Some(raw) = raw else {
+            return Ok(Vec::new());
+        };
+        serde_json::from_str(&raw).map_err(|err| {
             rusqlite::Error::FromSqlConversionFailure(
                 idx,
                 rusqlite::types::Type::Text,
@@ -1393,6 +1417,7 @@ impl Store {
             kv_injections: self.parse_kv_injections_column(16, row.get(16)?)?,
             identities: self.parse_identities_column(19, row.get(19)?)?,
             stateful: self.parse_stateful_column(20, row.get(20)?)?,
+            artifacts: self.parse_artifacts_column(21, row.get(21)?)?,
         };
 
         Ok(task_config)
@@ -1886,6 +1911,7 @@ impl Store {
             ":resources": resources_to_save,
             ":reserved_resources": reserved_resources_to_save,
             ":max_allocations": config.max_allocations,
+            ":artifacts": config.artifacts,
         };
 
         let config = conn.query_row(&INSERT_WORKER_TYPE, params, |row| {
@@ -2370,6 +2396,11 @@ impl Store {
                 Some(serde_json::to_string(&t.identities)?)
             };
             let stateful = t.stateful.as_ref().map(serde_json::to_string).transpose()?;
+            let artifacts = if t.artifacts.is_empty() {
+                None
+            } else {
+                Some(serde_json::to_string(&t.artifacts)?)
+            };
             let schedule = t.schedule.as_ref().map(ToString::to_string);
             let task_params = named_params! {
                 ":name": t.name,
@@ -2392,6 +2423,7 @@ impl Store {
                 ":job_config_id": job_config_id,
                 ":identities": identities,
                 ":stateful": stateful,
+                ":artifacts": artifacts,
             };
 
             let task_id: i64 = tx.query_row(&INSERT_TASK, task_params, |row| row.get(0))?;
@@ -3869,33 +3901,104 @@ impl Store {
         let mut conn = self.write_connection()?;
         let tx = conn.transaction()?;
         let now = Self::now_rfc3339()?;
+        let mut staged_events = Vec::new();
         for snapshot in snapshots {
-            tx.execute(
+            // Artifact staging transitions are derived by diffing against
+            // the previously persisted snapshot, inside this transaction so
+            // events commit atomically with the state they describe. The
+            // extra read only happens for snapshots carrying artifact rows;
+            // plain tasks stay on the single-statement path.
+            let previous_states: Option<String> = if snapshot.artifact_states.is_some() {
+                tx.query_row(
+                    "SELECT artifact_states FROM allocation_health WHERE allocation_id = ?1;",
+                    [snapshot.allocation_id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .flatten()
+            } else {
+                None
+            };
+
+            let inserted = tx.execute(
                 "INSERT INTO allocation_health (
                     allocation_id,
                     node_id,
                     healthy,
                     status,
-                    updated_at
+                    updated_at,
+                    artifact_states
                 )
-                SELECT ?1, ?2, ?3, ?4, ?5
+                SELECT ?1, ?2, ?3, ?4, ?5, ?6
                 WHERE EXISTS (SELECT 1 FROM allocation WHERE id = ?1 AND node_id = ?2)
                 ON CONFLICT(allocation_id) DO UPDATE
                 SET node_id = excluded.node_id,
                     healthy = excluded.healthy,
                     status = excluded.status,
-                    updated_at = excluded.updated_at;",
+                    updated_at = excluded.updated_at,
+                    artifact_states = excluded.artifact_states;",
                 params![
                     snapshot.allocation_id,
                     node_id,
                     i64::from(snapshot.healthy),
                     snapshot.status.as_str(),
-                    now.as_str()
+                    now.as_str(),
+                    snapshot.artifact_states.as_deref()
                 ],
             )?;
+
+            let Some(new_states) = snapshot.artifact_states.as_deref() else {
+                continue;
+            };
+            // The guarded insert writes nothing for unknown allocations;
+            // skip events for those too.
+            if inserted == 0 {
+                continue;
+            }
+            let (transitions, rows) = crate::storage::events::artifact_transitions(
+                previous_states.as_deref(),
+                new_states,
+            );
+            if !transitions.staging_started && !transitions.all_staged {
+                continue;
+            }
+            let job_id = self
+                .job_id_for_allocation_tx(&tx, snapshot.allocation_id)?
+                .unwrap_or_default();
+            if transitions.staging_started {
+                staged_events.push(self.stage_event_locked(
+                    &tx,
+                    drafts::artifact_staging(snapshot.allocation_id, node_id, &job_id, &rows),
+                ));
+            }
+            if transitions.all_staged {
+                staged_events.push(self.stage_event_locked(
+                    &tx,
+                    drafts::artifact_staged(snapshot.allocation_id, node_id, &job_id, &rows),
+                ));
+            }
         }
         tx.commit()?;
+        for event in staged_events {
+            self.publish_staged(event);
+        }
         Ok(())
+    }
+
+    /// Job ID owning an allocation, resolved inside an open transaction (the
+    /// allocation table stores job_config_id; the job comes via join). Only
+    /// consulted when an artifact staging transition actually fires.
+    fn job_id_for_allocation_tx(&self, tx: &Connection, allocation_id: i64) -> R<Option<String>> {
+        let job_id = tx
+            .query_row(
+                "SELECT job_config.job_id FROM allocation
+                 INNER JOIN job_config ON job_config.id = allocation.job_config_id
+                 WHERE allocation.id = ?1;",
+                [allocation_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(job_id)
     }
 
     #[instrument(err, skip_all)]
@@ -3931,7 +4034,7 @@ impl Store {
             .collect::<Vec<_>>()
             .join(",");
         let sql = format!(
-            "SELECT allocation_id, node_id, healthy, status, updated_at
+            "SELECT allocation_id, node_id, healthy, status, updated_at, artifact_states
              FROM allocation_health
              WHERE allocation_id IN ({placeholders});"
         );
@@ -3954,7 +4057,8 @@ impl Store {
     ) -> R<HashMap<i64, AllocationHealthSnapshot>> {
         let conn = self.read_connection()?;
         let mut stmt = conn.prepare(
-            "SELECT ah.allocation_id, ah.node_id, ah.healthy, ah.status, ah.updated_at
+            "SELECT ah.allocation_id, ah.node_id, ah.healthy, ah.status, ah.updated_at, \
+                    ah.artifact_states
              FROM allocation_health ah
              INNER JOIN allocation a ON a.id = ah.allocation_id
              WHERE a.job_config_id = ?1;",
@@ -6565,6 +6669,7 @@ mod tests {
             resources: "{}".into(),
             reserved_resources: "{}".into(),
             max_allocations: None,
+            artifacts: String::new(),
         };
 
         let returned_config = store.insert_worker_type(&worker_config)?;
@@ -6596,6 +6701,7 @@ mod tests {
             resources: "{}".into(),
             reserved_resources: "{}".into(),
             max_allocations: None,
+            artifacts: String::new(),
         };
 
         store.insert_worker_type(&worker_config)?;
@@ -8036,6 +8142,87 @@ mod tests {
     }
 
     #[test]
+    fn artifact_staging_transitions_emit_events_once() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "ready"))?;
+
+        let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "artifact-events".into(),
+            tasks: vec![TaskConfig::new("web", "noop")],
+            version: None,
+        };
+        store.handle_job_submit(
+            &job,
+            &[Submission {
+                path: "job.jsonnet".into(),
+                content: "{}".into(),
+                is_primary: true,
+            }],
+        )?;
+        let task_id = task_id_for(&store, "web", &job.name)?;
+        let allocation = store.place_alloc("node-a", task_id)?;
+
+        let artifact_events = |store: &Store| -> R<Vec<SchedulerEventRecord>> {
+            store.list_scheduler_events(&SchedulerEventFilter {
+                kind: Some("artifact".into()),
+                ..Default::default()
+            })
+        };
+
+        let snapshot = |states: &str, status: &str| AllocationHealth {
+            allocation_id: allocation.id,
+            healthy: false,
+            status: status.into(),
+            artifact_states: Some(states.into()),
+        };
+        let staging =
+            r#"[{"name":"tool","source":"https://example.com/t.tar.gz","state":"fetching"}]"#;
+        let staged = r#"[{"name":"tool","source":"https://example.com/t.tar.gz","state":"staged","digest":"sha256:abc","bytesFetched":10}]"#;
+
+        // First staging snapshot announces the run.
+        store.upsert_allocation_health_snapshots(
+            "node-a",
+            &[snapshot(staging, "staging artifacts")],
+        )?;
+        let events = artifact_events(&store)?;
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0].kind, "artifact.staging");
+        assert_eq!(events[0].allocation_id, Some(allocation.id));
+        assert_eq!(events[0].job_id.as_deref(), Some("artifact-events"));
+        assert_eq!(events[0].node_id.as_deref(), Some("node-a"));
+
+        // Repeated identical heartbeats emit nothing new.
+        store.upsert_allocation_health_snapshots(
+            "node-a",
+            &[snapshot(staging, "staging artifacts")],
+        )?;
+        assert_eq!(artifact_events(&store)?.len(), 1);
+
+        // Completion emits artifact.staged exactly once.
+        store.upsert_allocation_health_snapshots("node-a", &[snapshot(staged, "starting")])?;
+        store.upsert_allocation_health_snapshots("node-a", &[snapshot(staged, "healthy")])?;
+        let events = artifact_events(&store)?;
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(events[1].kind, "artifact.staged");
+        assert!(events[1].metadata_json.contains("sha256:abc"));
+
+        // Snapshots without artifact rows never touch the artifact kinds.
+        store.upsert_allocation_health_snapshots(
+            "node-a",
+            &[AllocationHealth {
+                allocation_id: allocation.id,
+                healthy: true,
+                status: "healthy".into(),
+                artifact_states: None,
+            }],
+        )?;
+        assert_eq!(artifact_events(&store)?.len(), 2);
+        Ok(())
+    }
+
+    #[test]
     fn allocation_health_snapshots_upsert_and_cleanup() -> R<()> {
         let store = setup_store()?;
         store.insert_node(make_node_msg("node-a", "ready"))?;
@@ -8065,6 +8252,7 @@ mod tests {
                 allocation_id: allocation.id,
                 healthy: false,
                 status: "starting".into(),
+                artifact_states: None,
             }],
         )?;
         store.upsert_allocation_health_snapshots(
@@ -8073,6 +8261,7 @@ mod tests {
                 allocation_id: allocation.id,
                 healthy: true,
                 status: "healthy".into(),
+                artifact_states: None,
             }],
         )?;
 
@@ -8089,6 +8278,7 @@ mod tests {
                 allocation_id: allocation.id,
                 healthy: false,
                 status: "spoofed".into(),
+                artifact_states: None,
             }],
         )?;
         let health = store.allocation_health_for_allocations(&[allocation.id])?;

@@ -170,7 +170,9 @@ Other loop-closing signals available to agents today:
 - `legion events list --json` / `legion events follow --json` — the scheduler
   event stream (see below).
 - `legion job rollout events --id <ID> --json` — the rollout's event history.
-- `legion job rollout status --id <ID> --json` — per-allocation health.
+- `legion job rollout status --id <ID> --json` — per-allocation health, including
+  per-artifact staging states (`artifact_states`) for tasks that declare
+  [artifacts](artifacts.md).
 - `legion job logs <NAME> --json` — captured task stdout/stderr (see below).
 - `legion state query "<SQL>" --json` — inspect `task_status`, `allocation_health`,
   `eval`, etc. (read-only by default).

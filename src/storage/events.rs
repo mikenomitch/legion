@@ -12,6 +12,7 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use crate::artifacts::status::{ArtifactState, ArtifactStatus};
 use crate::storage::store::{JobSubmitOutcome, Store};
 use crate::structs::{Allocation, Eval, Node};
 
@@ -454,6 +455,201 @@ pub mod drafts {
                 "details": details,
             }))
     }
+
+    /// `artifact.staging` — an allocation began staging its artifacts
+    /// (derived from the first heartbeat snapshot reporting artifact rows).
+    pub fn artifact_staging(
+        allocation_id: i64,
+        node_id: &str,
+        job_id: &str,
+        rows: &[ArtifactStatus],
+    ) -> EventDraft {
+        EventDraft::info(
+            "artifact.staging",
+            format!(
+                "Allocation {allocation_id} staging {} artifact(s)",
+                rows.len()
+            ),
+        )
+        .job(job_id)
+        .node(node_id)
+        .allocation(allocation_id)
+        .meta(json!({
+            "count": rows.len(),
+            "artifacts": artifact_rows_meta(rows),
+        }))
+    }
+
+    /// `artifact.staged` — every artifact for an allocation staged
+    /// successfully (digests/bytes/durations in metadata).
+    pub fn artifact_staged(
+        allocation_id: i64,
+        node_id: &str,
+        job_id: &str,
+        rows: &[ArtifactStatus],
+    ) -> EventDraft {
+        let bytes: u64 = rows.iter().filter_map(|row| row.bytes_fetched).sum();
+        EventDraft::info(
+            "artifact.staged",
+            format!(
+                "Allocation {allocation_id} staged {} artifact(s)",
+                rows.len()
+            ),
+        )
+        .job(job_id)
+        .node(node_id)
+        .allocation(allocation_id)
+        .meta(json!({
+            "count": rows.len(),
+            "bytes": bytes,
+            "artifacts": artifact_rows_meta(rows),
+        }))
+    }
+
+    /// `artifact.failed` — one artifact's fetch failed (the allocation-level
+    /// `allocation.failed` event follows separately through the failure
+    /// path). Sources are redacted by the worker; errors name auth sources,
+    /// never credential values.
+    pub fn artifact_failed(
+        allocation_id: i64,
+        node_id: &str,
+        job_id: &str,
+        row: &ArtifactStatus,
+    ) -> EventDraft {
+        let label = row.name.as_deref().unwrap_or(&row.source);
+        EventDraft::warn(
+            "artifact.failed",
+            format!(
+                "Allocation {allocation_id} artifact {label} failed: {}",
+                row.error.as_deref().unwrap_or("unknown error")
+            ),
+        )
+        .job(job_id)
+        .node(node_id)
+        .allocation(allocation_id)
+        .meta(json!({
+            "name": row.name,
+            "source": row.source,
+            "error": row.error,
+            "attempts": row.attempts,
+        }))
+    }
+
+    /// `artifact.pinned` — mutable references were pinned to digests at
+    /// submit (artifact system plan §7). One event per submit, all pins in
+    /// metadata. `None` when nothing was pinned.
+    pub fn artifact_pinned(job_id: &str, pins: &[ArtifactPin]) -> Option<EventDraft> {
+        if pins.is_empty() {
+            return None;
+        }
+        let entries: Vec<Value> = pins
+            .iter()
+            .take(20)
+            .map(|pin| {
+                json!({
+                    "task": pin.task,
+                    "from": pin.from,
+                    "to": pin.to,
+                })
+            })
+            .collect();
+        Some(
+            EventDraft::info(
+                "artifact.pinned",
+                format!("Job {job_id} pinned {} artifact reference(s)", pins.len()),
+            )
+            .job(job_id)
+            .meta(json!({
+                "count": pins.len(),
+                "pins": entries,
+            })),
+        )
+    }
+
+    /// Per-artifact metadata rows shared by the staging/staged drafts
+    /// (capped like `allocation.placed` placements).
+    fn artifact_rows_meta(rows: &[ArtifactStatus]) -> Vec<Value> {
+        rows.iter()
+            .take(20)
+            .map(|row| {
+                json!({
+                    "name": row.name,
+                    "source": row.source,
+                    "state": row.state,
+                    "digest": row.digest,
+                    "bytes": row.bytes_fetched,
+                    "durationMs": row.duration_ms,
+                })
+            })
+            .collect()
+    }
+}
+
+/// One submit-time pin resolution (mutable reference -> digest), surfaced in
+/// `job plan` output and the `artifact.pinned` event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactPin {
+    pub task: String,
+    /// The original mutable reference (redacted form).
+    pub from: String,
+    /// The digest/SHA it resolved to.
+    pub to: String,
+}
+
+impl ArtifactPin {
+    /// Human-readable rendering used in `job plan` messages.
+    pub fn describe(&self) -> String {
+        format!("task {}: pinned {} -> {}", self.task, self.from, self.to)
+    }
+}
+
+/// Artifact staging transitions derived from two consecutive heartbeat
+/// `artifact_states` snapshots for one allocation. The heartbeat repeats the
+/// same snapshot every beat, so events fire only on *changes*; the pure
+/// derivation lives here so the store's hot path stays one call.
+#[derive(Debug, Default, PartialEq)]
+pub struct ArtifactTransitions {
+    /// The allocation entered staging (no previous rows, or a fresh staging
+    /// run after a previously completed one — e.g. an in-place relaunch).
+    pub staging_started: bool,
+    /// Every artifact reached `staged` (fires once per staging run).
+    pub all_staged: bool,
+}
+
+/// Aggregate state of one snapshot's rows.
+fn artifact_summary(rows: &[ArtifactStatus]) -> &'static str {
+    if rows.is_empty() {
+        return "none";
+    }
+    if rows.iter().any(|row| row.state == ArtifactState::Failed) {
+        return "failed";
+    }
+    if rows.iter().all(|row| row.state == ArtifactState::Staged) {
+        return "staged";
+    }
+    "staging"
+}
+
+/// Computes transitions between the previously persisted `artifact_states`
+/// JSON (if any) and the incoming one. Returns the parsed new rows alongside
+/// so emission sites don't parse twice.
+pub fn artifact_transitions(
+    previous: Option<&str>,
+    new: &str,
+) -> (ArtifactTransitions, Vec<ArtifactStatus>) {
+    let new_rows: Vec<ArtifactStatus> = serde_json::from_str(new).unwrap_or_default();
+    let previous_rows: Vec<ArtifactStatus> = previous
+        .map(|raw| serde_json::from_str(raw).unwrap_or_default())
+        .unwrap_or_default();
+
+    let new_summary = artifact_summary(&new_rows);
+    let previous_summary = artifact_summary(&previous_rows);
+
+    let transitions = ArtifactTransitions {
+        staging_started: new_summary == "staging" && previous_summary != "staging",
+        all_staged: new_summary == "staged" && previous_summary != "staged",
+    };
+    (transitions, new_rows)
 }
 
 /// Immediate-emit sugar over [`drafts`] for call sites that are not already
@@ -561,6 +757,27 @@ impl EventRecorder<'_> {
             group_name,
             metadata_json,
         ));
+    }
+
+    /// Emits one `artifact.failed` per failed row in a failure report's
+    /// `artifact_states` JSON. The worker attaches the final board snapshot
+    /// to artifact-staging failures, so this is the reliable (race-free)
+    /// source of per-artifact failure detail.
+    pub fn artifact_failed_rows(
+        self,
+        allocation_id: i64,
+        node_id: &str,
+        job_id: &str,
+        artifact_states: &str,
+    ) {
+        let rows: Vec<ArtifactStatus> = serde_json::from_str(artifact_states).unwrap_or_default();
+        for row in rows.iter().filter(|row| row.state == ArtifactState::Failed) {
+            self.emit(drafts::artifact_failed(allocation_id, node_id, job_id, row));
+        }
+    }
+
+    pub fn artifact_pinned(self, job_id: &str, pins: &[ArtifactPin]) {
+        self.emit_opt(drafts::artifact_pinned(job_id, pins));
     }
 }
 
@@ -695,5 +912,118 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(zero.effective_limit(), 1);
+    }
+
+    // --- artifact staging transitions (artifact <-> event stream wiring) ---
+
+    fn rows_json(states: &[&str]) -> String {
+        let rows: Vec<Value> = states
+            .iter()
+            .enumerate()
+            .map(|(index, state)| {
+                json!({
+                    "name": format!("a{index}"),
+                    "source": "https://example.com/a.tar.gz",
+                    "state": state,
+                })
+            })
+            .collect();
+        serde_json::to_string(&rows).expect("rows json")
+    }
+
+    #[test]
+    fn transitions_fire_once_per_staging_run() {
+        // First snapshot: staging begins.
+        let staging = rows_json(&["pending", "fetching"]);
+        let (transitions, rows) = artifact_transitions(None, &staging);
+        assert!(transitions.staging_started);
+        assert!(!transitions.all_staged);
+        assert_eq!(rows.len(), 2);
+
+        // Heartbeats repeat the same snapshot: nothing new.
+        let (transitions, _) = artifact_transitions(Some(&staging), &staging);
+        assert_eq!(transitions, ArtifactTransitions::default());
+
+        // Progress within staging is still staging: no event.
+        let progressing = rows_json(&["staged", "fetching"]);
+        let (transitions, _) = artifact_transitions(Some(&staging), &progressing);
+        assert_eq!(transitions, ArtifactTransitions::default());
+
+        // Everything staged: the staged event fires once…
+        let staged = rows_json(&["staged", "staged"]);
+        let (transitions, _) = artifact_transitions(Some(&progressing), &staged);
+        assert!(!transitions.staging_started);
+        assert!(transitions.all_staged);
+
+        // …and repeated staged snapshots stay quiet.
+        let (transitions, _) = artifact_transitions(Some(&staged), &staged);
+        assert_eq!(transitions, ArtifactTransitions::default());
+    }
+
+    #[test]
+    fn relaunch_after_staged_restarts_the_cycle() {
+        // An in-place relaunch resets the board to pending: that is a new
+        // staging run and should announce itself again.
+        let staged = rows_json(&["staged"]);
+        let pending = rows_json(&["pending"]);
+        let (transitions, _) = artifact_transitions(Some(&staged), &pending);
+        assert!(transitions.staging_started);
+        assert!(!transitions.all_staged);
+    }
+
+    #[test]
+    fn failed_rows_do_not_count_as_staged() {
+        let staging = rows_json(&["fetching", "fetching"]);
+        let failed = rows_json(&["staged", "failed"]);
+        let (transitions, _) = artifact_transitions(Some(&staging), &failed);
+        assert!(!transitions.all_staged);
+        assert!(!transitions.staging_started);
+    }
+
+    #[test]
+    fn unparseable_or_empty_snapshots_stay_quiet() {
+        let (transitions, rows) = artifact_transitions(None, "not json");
+        assert_eq!(transitions, ArtifactTransitions::default());
+        assert!(rows.is_empty());
+
+        let (transitions, _) = artifact_transitions(None, "[]");
+        assert_eq!(transitions, ArtifactTransitions::default());
+    }
+
+    #[test]
+    fn artifact_drafts_carry_scopes_and_metadata() {
+        let rows: Vec<crate::artifacts::status::ArtifactStatus> =
+            serde_json::from_str(&rows_json(&["fetching"])).expect("rows");
+        let draft = drafts::artifact_staging(7, "node-1", "demo", &rows);
+        assert_eq!(draft.kind, "artifact.staging");
+        assert_eq!(draft.allocation_id, Some(7));
+        assert_eq!(draft.job_id.as_deref(), Some("demo"));
+        assert_eq!(draft.metadata["count"], 1);
+
+        let mut failed_row = rows[0].clone();
+        failed_row.state = crate::artifacts::status::ArtifactState::Failed;
+        failed_row.error = Some("403 from endpoint (credentials from kv secrets/pull)".into());
+        failed_row.attempts = Some(3);
+        let draft = drafts::artifact_failed(7, "node-1", "demo", &failed_row);
+        assert_eq!(draft.kind, "artifact.failed");
+        assert_eq!(draft.level, EVENT_LEVEL_WARN);
+        assert!(draft.message.contains("a0"), "{}", draft.message);
+        assert_eq!(draft.metadata["attempts"], 3);
+    }
+
+    #[test]
+    fn artifact_pinned_draft_skips_empty_and_lists_pins() {
+        assert!(drafts::artifact_pinned("demo", &[]).is_none());
+
+        let pins = vec![ArtifactPin {
+            task: "api".into(),
+            from: "oci://ghcr.io/acme/api:v42".into(),
+            to: format!("sha256:{}", "a".repeat(64)),
+        }];
+        let draft = drafts::artifact_pinned("demo", &pins).expect("pin draft");
+        assert_eq!(draft.kind, "artifact.pinned");
+        assert_eq!(draft.job_id.as_deref(), Some("demo"));
+        assert_eq!(draft.metadata["pins"][0]["task"], "api");
+        assert!(pins[0].describe().contains("pinned oci://"));
     }
 }

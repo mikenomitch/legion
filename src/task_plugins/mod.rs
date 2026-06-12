@@ -90,6 +90,20 @@ pub struct TaskRuntime {
     pub state: Value,
     pub child: Option<Child>,
     pub pid: Option<u32>,
+    /// Private per-allocation directory (`allocs/<alloc_id>/`), created by
+    /// the worker before `prepare()` and removed on destroy.
+    pub alloc_dir: Option<std::path::PathBuf>,
+    /// Private task directory (`allocs/<alloc_id>/<task_name>/`). Artifacts
+    /// stage here; the exec kind's `cwd` defaults here.
+    pub task_dir: Option<std::path::PathBuf>,
+    /// Env vars injected by the worker core (`LEGION_ALLOC_DIR`,
+    /// `LEGION_TASK_DIR`, `LEGION_ARTIFACT_<NAME>`). Kinds that run host
+    /// processes apply these at start; kinds with isolated filesystems
+    /// (container) skip them until they grow volume plumbing.
+    pub extra_env: std::collections::BTreeMap<String, String>,
+    /// Typed staged artifacts (artifact system plan §8), attached before
+    /// `prepare()` so plugins consume payloads instead of guessing paths.
+    pub staged_artifacts: Vec<crate::artifacts::StagedArtifact>,
     /// Directory where the task's captured stdout/stderr are written, when log
     /// capture is enabled by the worker. `None` leaves the child attached to
     /// the worker's standard streams.
@@ -142,6 +156,35 @@ pub trait TaskPlugin: Send + Sync {
     /// for an identity with `changeMode: signal`).
     fn supports_signal(&self) -> bool {
         false
+    }
+
+    /// Capability gate for the `artifacts` task field, mirroring
+    /// `supports_kv_env_injection` and friends. Admission rejects
+    /// artifact-bearing specs for kinds that return false. Kinds that return
+    /// true get File/Tree payloads with zero further code: the worker core
+    /// stages them into the task dir and exposes `${artifact.<name>}` /
+    /// `LEGION_ARTIFACT_<NAME>`.
+    fn supports_artifacts(&self) -> bool {
+        false
+    }
+
+    /// Desugars kind-config fields into artifacts (artifact system plan §8).
+    /// The manager calls this at admission; this is how `container.image`
+    /// joins the shared pipeline without changing its user-facing spec.
+    fn implicit_artifacts(&self, task_config: &Value) -> R<Vec<crate::structs::ArtifactSpec>> {
+        let _ = task_config;
+        Ok(Vec::new())
+    }
+
+    /// Consumes non-file payloads during prepare (OCI images, ORAS layers).
+    /// The default handles nothing because File/Tree need no consumption.
+    fn consume_artifact(
+        &self,
+        staged: &crate::artifacts::StagedArtifact,
+        runtime: &mut TaskRuntime,
+    ) -> R<()> {
+        let _ = (staged, runtime);
+        Ok(())
     }
 
     fn prepare(
@@ -248,6 +291,20 @@ pub fn validate_job_config(config: &JobConfig) -> R<()> {
         task.validate_kv_injections()?;
         task.validate_stateful()?;
         task.validate_identities()?;
+        task.validate_artifacts()?;
+        if !task.artifacts.is_empty() {
+            registry.load_plugin(&task.kind, false)?;
+            let plugin = registry
+                .plugin(&task.kind)
+                .context("task plugin loaded but missing")?;
+            if !plugin.supports_artifacts() {
+                bail!(
+                    "Task {} kind {} does not support artifacts",
+                    task.name,
+                    task.kind
+                );
+            }
+        }
         if !task.identities.is_empty() {
             registry.load_plugin(&task.kind, false)?;
             let plugin = registry
@@ -1105,5 +1162,83 @@ mod tests {
         };
         let err = validate_job_config(&job_with(task)).expect_err("duplicate identity name");
         assert!(err.to_string().contains("duplicate identity"), "{err}");
+    }
+
+    // --- artifact capability gating (artifact system plan §8) ---
+
+    use crate::structs::ArtifactSpec;
+
+    #[test]
+    fn exec_task_accepts_artifacts_with_valid_references() -> R<()> {
+        let task = TaskConfig {
+            artifacts: vec![
+                ArtifactSpec::from_source("https://releases.example.com/tool.tar.gz").named("tool"),
+            ],
+            config: json!({"command": ["${artifact.tool}/run", "--once"]}),
+            ..TaskConfig::new("batch", "exec")
+        };
+        validate_job_config(&job_with(task))
+    }
+
+    #[test]
+    fn container_task_accepts_artifacts() -> R<()> {
+        let task = TaskConfig {
+            artifacts: vec![ArtifactSpec::from_source("oci://ghcr.io/acme/extra:v1")],
+            config: json!({"image": "alpine", "command": ["echo", "hi"]}),
+            ..TaskConfig::new("api", "container")
+        };
+        validate_job_config(&job_with(task))
+    }
+
+    #[test]
+    fn unknown_artifact_interpolation_fails_validation() {
+        let task = TaskConfig {
+            artifacts: vec![
+                ArtifactSpec::from_source("https://releases.example.com/tool.tar.gz").named("tool"),
+            ],
+            config: json!({"command": ["${artifact.tool}/run", "--w", "${artifact.modle}/w"]}),
+            ..TaskConfig::new("batch", "exec")
+        };
+        let err = validate_job_config(&job_with(task)).expect_err("typo'd reference");
+        assert!(err.to_string().contains("artifact.modle"), "{err}");
+    }
+
+    #[test]
+    fn noop_kind_rejects_artifacts_when_plugin_available() {
+        // The noop plugin is a dylib; gate the assertion on its presence like
+        // the other noop tests.
+        if std::env::var("LEGION_SKIP_PLUGIN_BUILD").is_ok() {
+            return;
+        }
+        let path = task_plugin_name_to_path("noop");
+        if !Path::new(&path).exists() {
+            return;
+        }
+        let task = TaskConfig {
+            artifacts: vec![ArtifactSpec::from_source("https://example.com/x.tar.gz")],
+            config: json!({}),
+            ..TaskConfig::new("noop-task", "noop")
+        };
+        let err = validate_job_config(&job_with(task)).expect_err("noop has no artifacts");
+        assert!(
+            err.to_string().contains("does not support artifacts"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn container_implicit_artifacts_desugar_image() -> R<()> {
+        let plugin = ContainerTaskPlugin;
+        assert!(plugin.supports_artifacts());
+        let implicit = plugin
+            .implicit_artifacts(&json!({"image": "ghcr.io/acme/api:v42", "command": ["x"]}))?;
+        assert_eq!(implicit.len(), 1);
+        assert_eq!(implicit[0].source, "oci://ghcr.io/acme/api:v42");
+        assert_eq!(implicit[0].name.as_deref(), Some("image"));
+
+        // Docker Hub shorthand expands to a fully-qualified reference.
+        let implicit = plugin.implicit_artifacts(&json!({"image": "alpine:latest"}))?;
+        assert_eq!(implicit[0].source, "oci://docker.io/library/alpine:latest");
+        Ok(())
     }
 }

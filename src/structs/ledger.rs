@@ -117,6 +117,9 @@ impl From<Allocation> for LedgerAllocation {
             task_config_id,
             job_id,
             instance_id,
+            // Enriched from allocation_health snapshots by the manager's
+            // GetLedger handler; the core Allocation carries no health data.
+            artifact_states: None,
         }
     }
 }
@@ -167,6 +170,7 @@ impl LedgerAllocation {
             task_config_id,
             job_id,
             instance_id,
+            artifact_states: _,
         } = self;
 
         let resources: Value =

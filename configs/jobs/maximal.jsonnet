@@ -209,8 +209,55 @@
             group: "prep",
             lifecycle: "batch",
             schedule: "every 15m",
+            // Artifacts fetched into the task directory before start
+            // (docs/artifacts.md). A bare string is the minimal form; the
+            // object form adds naming, verification, unpack, pinning, and
+            // auth controls.
+            artifacts: [
+                // Minimal: fetch + auto-unpack into the task directory.
+                "https://github.com/acme/tool/releases/download/v1.4/tool-linux-amd64.tar.gz",
+                {
+                    source: "s3://acme-builds/api/v42.tar.gz",
+                    // Handle for ${artifact.build} / LEGION_ARTIFACT_BUILD.
+                    name: "build",
+                    // Relative to the task directory.
+                    dest: "build/",
+                    checksum: "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+                    // auto (default) | archive | file
+                    unpack: "auto",
+                    // Credential JSON read from Legion KV at fetch time.
+                    auth: { kv: "secrets/build-store" },
+                },
+                {
+                    source: "git::https://github.com/acme/repo?ref=v1.2.0",
+                    name: "repo",
+                    dest: "src/",
+                    // pin (default) resolves the ref to a commit SHA at
+                    // submit; always re-resolves at every staging.
+                    resolve: "always",
+                },
+                {
+                    source: "oci://registry.acme.io/models/embedder@sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                    name: "model",
+                    // ORAS layer selection by media type.
+                    mediaType: "application/vnd.acme.model.weights.v1",
+                    dest: "models/",
+                },
+                {
+                    source: "https://releases.acme.io/bin/runner",
+                    name: "runner",
+                    unpack: "file",
+                    // chmod for single-file artifacts.
+                    mode: "0755",
+                },
+            ],
             config: {
                 command: ["sleep", "1"],
+                env: {
+                    // Worker-side interpolation of staged artifact paths.
+                    MODEL_DIR: "${artifact.model}",
+                    BUILD_DIR: "${artifact.build}",
+                },
             },
             resources: {
                 cpus: 0.5,

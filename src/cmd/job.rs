@@ -5,7 +5,6 @@ use clap::value_parser;
 
 use crate::cmd::helpers::{connect_manager_client, friendly_status, json_flag, print_table};
 use crate::cmd::output::{self, CliError, OutputFormat};
-use crate::getter_rs::Client as GetterClient;
 use crate::prelude::*;
 use crate::structs::{
     AdvanceRolloutRequest, DestroyJobRequest, GetAllocationLogsRequest, GetJobInfoRequest,
@@ -838,9 +837,7 @@ struct ResolvedJobspec {
 
 fn resolve_jobspec_source(source: &str) -> R<ResolvedJobspec> {
     let temp_dir = tempfile::tempdir().context("create temporary directory for jobspec")?;
-    let client = GetterClient::default();
-    let fetched_path = client
-        .get(source, temp_dir.path())
+    let fetched_path = crate::artifacts::fetch_source_to_dir(source, temp_dir.path())
         .with_context(|| format!("fetch jobspec from {source}"))?;
     let resolved_path = ensure_jobspec_file(source, &fetched_path)?;
 

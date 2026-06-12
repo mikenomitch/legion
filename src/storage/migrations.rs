@@ -471,5 +471,17 @@ pub fn get_migrations() -> Migrations<'static> {
         )",
         )
         .down("DROP TABLE IF EXISTS scheduler_event;"),
+        // Artifacts declared on a task (artifact system plan). JSON-encoded
+        // Vec<ArtifactSpec> in normalized (post-admission) form; NULL/absent
+        // == no artifacts. Ordered after main's scheduler_event migration so
+        // databases migrated on main upgrade cleanly.
+        M::up("ALTER TABLE task_config ADD COLUMN artifacts JSONB;").down(""),
+        // Worker-type artifact fetch settings (JSON WorkerArtifactsConfig;
+        // empty string == worker built-in defaults).
+        M::up("ALTER TABLE worker_type ADD COLUMN artifacts TEXT NOT NULL DEFAULT '';")
+            .down(""),
+        // Per-artifact staging states from the latest worker heartbeat
+        // (JSON Vec<ArtifactStatus>); NULL == task declares no artifacts.
+        M::up("ALTER TABLE allocation_health ADD COLUMN artifact_states TEXT;").down(""),
     ])
 }

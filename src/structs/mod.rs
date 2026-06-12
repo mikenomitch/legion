@@ -1,5 +1,6 @@
 tonic::include_proto!("legion");
 
+pub mod artifact;
 pub mod config;
 pub mod eval;
 pub mod instance;
@@ -9,6 +10,7 @@ pub mod node;
 pub mod token;
 pub mod workload_identity;
 
+pub use artifact::*;
 pub use config::*;
 pub use instance::*;
 pub use job::*;

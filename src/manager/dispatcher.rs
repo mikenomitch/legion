@@ -138,6 +138,13 @@ pub fn build_task_allocation(
         Some(stateful) => stateful.resolved_on_lost()?.self_terminate_after.as_secs(),
         None => 0,
     };
+    // Empty string (not "[]") when no artifacts: jobs without artifacts stay
+    // byte-identical on the wire.
+    let task_artifacts = if task.artifacts.is_empty() {
+        String::new()
+    } else {
+        serde_json::to_string(&task.artifacts)?
+    };
     Ok(TaskAllocation {
         allocation_id: allocation.id,
         job_id: allocation.job_id.clone(),
@@ -151,6 +158,7 @@ pub fn build_task_allocation(
         task_on_unhealthy,
         task_identities,
         self_terminate_after_seconds,
+        task_artifacts,
     })
 }
 

@@ -29,6 +29,12 @@ impl WorkerStateStore {
         Self { path }
     }
 
+    /// Location of the worker state file; per-allocation directories live
+    /// beside it (`<parent>/allocs/`).
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     pub fn default_path() -> PathBuf {
         std::env::var("LEGION_WORKER_STATE_PATH")
             .map(PathBuf::from)

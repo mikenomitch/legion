@@ -11,8 +11,8 @@ This document describes the feature, the job-spec API, and a provider
 integration cookbook. The design rationale lives in
 [docs/plans/workload-identity-oidc-plan.md](plans/workload-identity-oidc-plan.md).
 
-> **Implementation status.** Fully implemented end to end: the token/claims
-> model and the security-critical `sub` template
+> **Implementation status.** Fully implemented end to end for *task*
+> identities: the token/claims model and the security-critical `sub` template
 > (`src/structs/workload_identity.rs`); the ES256 signer + JWKS + OIDC
 > discovery document + key-rotation state machine with **SQLite-persisted
 > signing keys** (`src/manager/workload_identity.rs`,
@@ -21,7 +21,10 @@ integration cookbook. The design rationale lives in
 > `IssueWorkloadIdentityToken` gRPC; worker-side delivery, refresh, and
 > change modes (`src/worker/identity.rs`); the background rotation loop
 > (`src/manager/agent.rs`); per-task `identities` spec validation and
-> task-kind capability gating; and manager config (off by default).
+> task-kind capability gating; and manager config (off by default). The
+> [node identities](#node-identities) config/claims model consumed by the
+> artifact system is implemented; node-token *issuance* (a node mode on the
+> issuance RPC) is still pending — see the note in that section.
 
 ## The token
 
@@ -336,6 +339,79 @@ same trust boundary as the task itself. Token bytes are never logged.
    Each refresh bumps the mtime and `exp`, with no task restart
    (`changeMode: noop`). The `vault` env identity refreshes its backing file
    (`.legion/identity/<alloc>/vault/token`) and SIGHUPs the task instead.
+
+## Node identities
+
+Task identities prove *which workload* is fetching or calling out. Some
+policies want the inverse grain: not "task X may read" but "**the cluster's
+worker nodes** may read" — an ops bucket of tooling every workload needs, or
+a pre-warm fetch that happens before any task exists. **Node identities** are
+identities issued to worker nodes rather than tasks, declared once at the
+cluster level:
+
+```jsonnet
+// manager.jsonnet
+{
+  workloadIdentity: {
+    enabled: true,
+    issuer: 'https://manager.example.com:4747',
+    // ... existing fields ...
+
+    nodeIdentities: [
+      {
+        name: 'artifact-pull',            // unique cluster-wide
+        audience: ['sts.amazonaws.com'],  // non-empty, like task identities
+        ttl: '15m',                       // optional; cluster default TTL otherwise
+        subTemplate: '{region}:node:{pool}',  // optional; this is the default
+      },
+    ],
+  },
+}
+```
+
+Node tokens use the same issuer, signer, JWKS, and rotation as task tokens.
+Claims:
+
+| Claim | Value |
+| --- | --- |
+| `sub` | `prod:node:default` (default template `{region}:node:{pool}`) |
+| `legion.io/scope` | `"node"` — distinguishes node tokens from task tokens |
+| `legion.io/region`, `legion.io/pool` | discrete facts |
+| `legion.io/node` | the node id — audit only, never in `sub` |
+
+### Sub template rules
+
+Node `subTemplate`s follow the same philosophy as task templates — dumb
+`{field}` substitution with admission-validated guardrails:
+
+- **Allow-list only:** `{region}` and `{pool}`. Unknown placeholders are
+  rejected.
+- **`{node}` is explicitly forbidden** — node ids churn as nodes are
+  replaced, so no stable policy could be written against them. The node id
+  is claims-only (`legion.io/node`), exactly like `{alloc}` for tasks.
+- The template must contain at least one placeholder and render non-empty
+  (a literal-only template would mint the same subject for every cluster).
+- Names must be unique across `nodeIdentities`; `audience` must be
+  non-empty.
+
+### Who consumes node identities
+
+The **artifact system** ([docs/artifacts.md](artifacts.md)) is the first
+consumer: a task artifact may set `auth: { nodeIdentity: 'artifact-pull' }`,
+and cluster-level `artifacts.auth` matchers may route source prefixes to a
+node identity. Cluster matchers may use node identities precisely *because*
+they are cluster-scoped — attaching a per-task identity cluster-wide would
+blur the per-task `sub` security boundary, so matchers accept `kv` and
+`nodeIdentity` only. The planned artifact pre-warm layer authenticates its
+warm fetches the same way (a warm pull happens before any task exists).
+
+> **Issuance status.** The config shape, validation, `sub`/claims model, and
+> the artifact-spec surface are implemented. Actual *node* token issuance to
+> workers is still pending: the `IssueWorkloadIdentityToken` RPC (fully wired
+> for task identities) gains a node mode, gated on node registration, plus
+> worker-side node-token delivery/refresh. Until those land, an artifact
+> fetch authenticating with `nodeIdentity` fails with an actionable error
+> suggesting `auth.kv` or anonymous access.
 
 ## Provider integration cookbook
 
