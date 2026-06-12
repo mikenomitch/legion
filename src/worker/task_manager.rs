@@ -276,10 +276,7 @@ impl WorkerTaskManager {
             .plugin(&task.kind)
             .context("Task plugin not loaded")?;
         let log_dir = self.state_store.allocation_log_dir(allocation.id);
-        let runtime = self
-            .runtimes
-            .entry(allocation.id)
-            .or_default();
+        let runtime = self.runtimes.entry(allocation.id).or_default();
         runtime.log_dir = Some(log_dir);
 
         info!(

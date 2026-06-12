@@ -389,7 +389,6 @@ pub enum TaskLifecycle {
     Sidecar,
 }
 
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskStatusState {
     Pending,

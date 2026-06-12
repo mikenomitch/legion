@@ -1,4 +1,5 @@
 import { For, Show, createMemo, createSignal } from "solid-js";
+import { MethodKind } from "@bufbuild/protobuf";
 import HoverInfo from "../components/HoverInfo";
 import { managerClient } from "../grpcClient";
 import { Manager } from "../gen/legion_connect";
@@ -153,6 +154,19 @@ const defaultScalarValue = (scalar: unknown): unknown => {
 
 const toCamelCase = (value: string) => value.replace(/_([a-z])/g, (_, c: string) => c.toUpperCase());
 
+// Cap on messages collected when invoking a server-streaming method so the
+// explorer renders a snapshot instead of tailing forever.
+const STREAM_PREVIEW_LIMIT = 20;
+const STREAM_PREVIEW_TIMEOUT_MS = 5000;
+
+const methodKindLabel = (kind: MethodKind): string =>
+  kind === MethodKind.ServerStreaming ? "Server streaming" : "Unary";
+
+const toPlainJson = (message: unknown): unknown =>
+  typeof message === "object" && message && "toJson" in message
+    ? (message as { toJson: () => unknown }).toJson()
+    : message;
+
 export default function ApiExplorer() {
   const [selectedMethodName, setSelectedMethodName] =
     createSignal<ManagerMethodName>(methodEntries[0][0]);
@@ -207,16 +221,35 @@ export default function ApiExplorer() {
     setIsCalling(true);
     try {
       const methodName = selectedMethodName();
-      const client = managerClient as unknown as Record<
-        ManagerMethodName,
-        (request: unknown) => Promise<unknown>
-      >;
-      const response = await client[methodName](requestMessage);
-      const responseAsJson =
-        typeof response === "object" && response && "toJson" in response
-          ? (response as { toJson: () => unknown }).toJson()
-          : response;
-      setResponseJson(JSON.stringify(responseAsJson, null, 2));
+      if (selectedMethod().kind === MethodKind.ServerStreaming) {
+        const client = managerClient as unknown as Record<
+          ManagerMethodName,
+          (request: unknown, options?: { signal?: AbortSignal }) => AsyncIterable<unknown>
+        >;
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), STREAM_PREVIEW_TIMEOUT_MS);
+        const collected: unknown[] = [];
+        try {
+          for await (const message of client[methodName](requestMessage, { signal: controller.signal })) {
+            collected.push(toPlainJson(message));
+            if (collected.length >= STREAM_PREVIEW_LIMIT) break;
+          }
+        } catch (error) {
+          // An abort just ends the preview window; surface anything else.
+          if (!controller.signal.aborted) throw error;
+        } finally {
+          clearTimeout(timeout);
+          controller.abort();
+        }
+        setResponseJson(JSON.stringify(collected, null, 2));
+      } else {
+        const client = managerClient as unknown as Record<
+          ManagerMethodName,
+          (request: unknown) => Promise<unknown>
+        >;
+        const response = await client[methodName](requestMessage);
+        setResponseJson(JSON.stringify(toPlainJson(response), null, 2));
+      }
     } catch (error) {
       setCallError(error instanceof Error ? error.message : "RPC failed");
     } finally {
@@ -262,7 +295,7 @@ export default function ApiExplorer() {
                   }}
                 >
                   <p class="font-semibold">{method.name}</p>
-                  <p class="mt-1 text-xs opacity-80">Unary</p>
+                  <p class="mt-1 text-xs opacity-80">{methodKindLabel(method.kind)}</p>
                 </button>
               )}
             </For>

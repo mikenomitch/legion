@@ -31,25 +31,40 @@ Repo convention also expects running tests for Rust changes (docs/frontend-only 
 
 ## Benchmark Coverage
 
-Benchmark target:
+Benchmark targets:
 
 - `benches/scheduler_bench.rs` (Criterion)
+- `benches/eval_critical_path_bench.rs` (Criterion)
 - `tests/scheduler_benchmark_slo.rs` (repeatable scenario + SLO gate)
 - Scenario definitions in `benchmarks/scheduler/scenarios/*.json`
 - SLO thresholds in `benchmarks/scheduler/slo.json`
 
-What it measures:
+What they measure:
 
-- Scheduler planning/apply throughput across scale matrix.
-- Policies tested: `bin_pack`, `spread`.
-- Scale dimensions:
-  - node counts: 10 -> 100,000
-  - allocation counts: 10 -> 100,000
+- `scheduler_bench`: scheduler planning/apply throughput across a scale matrix.
+  - Policies tested: `bin_pack`, `spread`.
+  - Scale dimensions: node counts 10 -> 100,000; allocation counts 10 -> 100,000.
+- `eval_critical_path_bench`: end-to-end enqueue -> claim -> apply -> complete
+  latency under 1/4/8 concurrent eval workers (write-lock contention).
 
-Run command:
+Run commands:
 
 - `cargo bench --bench scheduler_bench`
+- `cargo bench --bench eval_critical_path_bench`
 - `cargo test --test scheduler_benchmark_slo -- --ignored --nocapture`
+
+### Measuring scheduler event-stream overhead
+
+`LEGION_EVENTS_OFF=1` disables scheduler event emission, which allows an
+A/B comparison of emission cost in the same binary:
+
+```bash
+LEGION_EVENTS_OFF=1 cargo bench --bench eval_critical_path_bench -- --save-baseline events-off
+cargo bench --bench eval_critical_path_bench -- --baseline events-off
+```
+
+See `docs/event-stream.md` for the current numbers and the design constraints
+that keep this overhead at the noise floor.
 
 ### Scheduler Benchmark SLOs
 

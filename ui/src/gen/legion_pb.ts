@@ -6438,6 +6438,363 @@ export class UpdateNodeDynamicReply extends Message<UpdateNodeDynamicReply> {
 }
 
 /**
+ * One scheduler event from the manager's event journal.
+ *
+ * Events are emitted by the manager whenever the scheduler does something
+ * observable: eval queue activity, allocation placement and removal, node
+ * lifecycle transitions, job lifecycle transitions, and rollout activity.
+ *
+ * @generated from message legion.SchedulerEvent
+ */
+export class SchedulerEvent extends Message<SchedulerEvent> {
+  /**
+   * Monotonically increasing event ID.
+   *
+   * IDs are assigned by the manager's state store and are never reused, so
+   * they double as a resume cursor for `ListEvents`/`StreamEvents`.
+   *
+   * @generated from field: int64 id = 1;
+   */
+  id = protoInt64.zero;
+
+  /**
+   * Dotted event kind, namespaced by subsystem.
+   *
+   * Current kinds include:
+   * - `scheduler.started`, `scheduler.recovered`
+   * - `eval.enqueued`, `eval.completed`, `eval.failed`
+   * - `allocation.placed`, `allocation.removed`, `allocation.failed`, `allocation.plan_rejected`
+   * - `node.registered`, `node.ready`, `node.lost`
+   * - `job.submitted`, `job.updated`, `job.stopped`, `job.destroyed`, `job.failed`
+   * - `rollout.event`
+   *
+   * @generated from field: string kind = 2;
+   */
+  kind = "";
+
+  /**
+   * Event severity. Values: `info`, `warn`, `error`.
+   *
+   * @generated from field: string level = 3;
+   */
+  level = "";
+
+  /**
+   * Job ID this event relates to, when applicable.
+   *
+   * @generated from field: optional string job_id = 4;
+   */
+  jobId?: string;
+
+  /**
+   * Node ID this event relates to, when applicable.
+   *
+   * @generated from field: optional string node_id = 5;
+   */
+  nodeId?: string;
+
+  /**
+   * Eval ID this event relates to, when applicable.
+   *
+   * @generated from field: optional string eval_id = 6;
+   */
+  evalId?: string;
+
+  /**
+   * Allocation ID this event relates to, when applicable.
+   *
+   * @generated from field: optional int64 allocation_id = 7;
+   */
+  allocationId?: bigint;
+
+  /**
+   * Rollout ID this event relates to, when applicable.
+   *
+   * @generated from field: optional int64 rollout_id = 8;
+   */
+  rolloutId?: bigint;
+
+  /**
+   * Human-readable event description.
+   *
+   * @generated from field: string message = 9;
+   */
+  message = "";
+
+  /**
+   * JSON object string with kind-specific structured details.
+   *
+   * Always a valid JSON object; `{}` when the event has no extra detail.
+   *
+   * @generated from field: string metadata_json = 10;
+   */
+  metadataJson = "";
+
+  /**
+   * RFC3339 timestamp when the event was recorded.
+   *
+   * @generated from field: string created_at = 11;
+   */
+  createdAt = "";
+
+  constructor(data?: PartialMessage<SchedulerEvent>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.SchedulerEvent";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 2, name: "kind", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "level", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "job_id", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 5, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 6, name: "eval_id", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 7, name: "allocation_id", kind: "scalar", T: 3 /* ScalarType.INT64 */, opt: true },
+    { no: 8, name: "rollout_id", kind: "scalar", T: 3 /* ScalarType.INT64 */, opt: true },
+    { no: 9, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 10, name: "metadata_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 11, name: "created_at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): SchedulerEvent {
+    return new SchedulerEvent().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): SchedulerEvent {
+    return new SchedulerEvent().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): SchedulerEvent {
+    return new SchedulerEvent().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: SchedulerEvent | PlainMessage<SchedulerEvent> | undefined, b: SchedulerEvent | PlainMessage<SchedulerEvent> | undefined): boolean {
+    return proto3.util.equals(SchedulerEvent, a, b);
+  }
+}
+
+/**
+ * Request payload for ListEvents.
+ *
+ * @generated from message legion.ListEventsRequest
+ */
+export class ListEventsRequest extends Message<ListEventsRequest> {
+  /**
+   * Exclusive lower-bound event ID cursor.
+   *
+   * When set, only events with `id > after_id` are returned (oldest first),
+   * which makes repeated polling gap-free. When omitted, the most recent
+   * `limit` events are returned (still ordered oldest-to-newest).
+   *
+   * @generated from field: optional int64 after_id = 1;
+   */
+  afterId?: bigint;
+
+  /**
+   * Maximum number of events to return.
+   *
+   * Default when omitted: `100`. Manager bounds: clamped to `[1, 1000]`.
+   *
+   * @generated from field: optional uint32 limit = 2;
+   */
+  limit?: number;
+
+  /**
+   * Optional kind filter.
+   *
+   * Matches events whose kind equals the value exactly, or whose kind starts
+   * with `<value>.` — so `eval` matches `eval.completed` and `eval.failed`.
+   *
+   * @generated from field: optional string kind = 3;
+   */
+  kind?: string;
+
+  /**
+   * Optional exact job ID filter.
+   *
+   * @generated from field: optional string job_id = 4;
+   */
+  jobId?: string;
+
+  /**
+   * Optional exact node ID filter.
+   *
+   * @generated from field: optional string node_id = 5;
+   */
+  nodeId?: string;
+
+  /**
+   * Optional severity filter. Values: `info`, `warn`, `error`.
+   *
+   * @generated from field: optional string level = 6;
+   */
+  level?: string;
+
+  constructor(data?: PartialMessage<ListEventsRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListEventsRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "after_id", kind: "scalar", T: 3 /* ScalarType.INT64 */, opt: true },
+    { no: 2, name: "limit", kind: "scalar", T: 13 /* ScalarType.UINT32 */, opt: true },
+    { no: 3, name: "kind", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 4, name: "job_id", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 5, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 6, name: "level", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListEventsRequest {
+    return new ListEventsRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListEventsRequest {
+    return new ListEventsRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListEventsRequest {
+    return new ListEventsRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListEventsRequest | PlainMessage<ListEventsRequest> | undefined, b: ListEventsRequest | PlainMessage<ListEventsRequest> | undefined): boolean {
+    return proto3.util.equals(ListEventsRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for ListEvents.
+ *
+ * @generated from message legion.ListEventsReply
+ */
+export class ListEventsReply extends Message<ListEventsReply> {
+  /**
+   * Matching events ordered oldest-to-newest.
+   *
+   * @generated from field: repeated legion.SchedulerEvent events = 1;
+   */
+  events: SchedulerEvent[] = [];
+
+  /**
+   * Highest event ID currently stored by the manager (0 when no events).
+   *
+   * Clients can use this to initialize an `after_id` cursor for follow-up
+   * `ListEvents` polls or a `StreamEvents` call.
+   *
+   * @generated from field: int64 latest_id = 2;
+   */
+  latestId = protoInt64.zero;
+
+  constructor(data?: PartialMessage<ListEventsReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListEventsReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "events", kind: "message", T: SchedulerEvent, repeated: true },
+    { no: 2, name: "latest_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListEventsReply {
+    return new ListEventsReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListEventsReply {
+    return new ListEventsReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListEventsReply {
+    return new ListEventsReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListEventsReply | PlainMessage<ListEventsReply> | undefined, b: ListEventsReply | PlainMessage<ListEventsReply> | undefined): boolean {
+    return proto3.util.equals(ListEventsReply, a, b);
+  }
+}
+
+/**
+ * Request payload for StreamEvents.
+ *
+ * @generated from message legion.StreamEventsRequest
+ */
+export class StreamEventsRequest extends Message<StreamEventsRequest> {
+  /**
+   * Exclusive lower-bound event ID to replay from.
+   *
+   * When set, persisted events with `id > after_id` are sent before the live
+   * feed. When omitted, the stream starts with events emitted after the
+   * stream is established (pure tail).
+   *
+   * @generated from field: optional int64 after_id = 1;
+   */
+  afterId?: bigint;
+
+  /**
+   * Optional kind filter. Same semantics as `ListEventsRequest.kind`.
+   *
+   * @generated from field: optional string kind = 2;
+   */
+  kind?: string;
+
+  /**
+   * Optional exact job ID filter.
+   *
+   * @generated from field: optional string job_id = 3;
+   */
+  jobId?: string;
+
+  /**
+   * Optional exact node ID filter.
+   *
+   * @generated from field: optional string node_id = 4;
+   */
+  nodeId?: string;
+
+  /**
+   * Optional severity filter. Values: `info`, `warn`, `error`.
+   *
+   * @generated from field: optional string level = 5;
+   */
+  level?: string;
+
+  constructor(data?: PartialMessage<StreamEventsRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.StreamEventsRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "after_id", kind: "scalar", T: 3 /* ScalarType.INT64 */, opt: true },
+    { no: 2, name: "kind", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 3, name: "job_id", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 4, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 5, name: "level", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): StreamEventsRequest {
+    return new StreamEventsRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): StreamEventsRequest {
+    return new StreamEventsRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): StreamEventsRequest {
+    return new StreamEventsRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: StreamEventsRequest | PlainMessage<StreamEventsRequest> | undefined, b: StreamEventsRequest | PlainMessage<StreamEventsRequest> | undefined): boolean {
+    return proto3.util.equals(StreamEventsRequest, a, b);
+  }
+}
+
+/**
  * Request payload for GetJoinToken.
  *
  * @generated from message legion.GetJoinTokenRequest

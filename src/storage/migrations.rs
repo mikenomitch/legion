@@ -377,5 +377,33 @@ pub fn get_migrations() -> Migrations<'static> {
         // Workload identities declared on a task (workload-identity OIDC plan).
         // JSON-encoded Vec<WorkloadIdentity>; NULL/absent == no identities.
         M::up("ALTER TABLE task_config ADD COLUMN identities JSONB;").down(""),
+        // Scheduler event journal backing ListEvents/StreamEvents.
+        //
+        // No foreign keys: events must outlive the jobs/nodes they describe
+        // (e.g. a job.destroyed event survives the job row's deletion).
+        //
+        // Deliberately no secondary indexes and no AUTOINCREMENT: events are
+        // inserted inside scheduler write transactions (the eval critical
+        // path), where every extra b-tree update lengthens the serialized
+        // critical section. The table is pruned to ~10k rows, so filtered
+        // list queries scan it in ~1ms, and cursor queries use the rowid PK.
+        // Plain INTEGER PRIMARY KEY stays monotonic because pruning only ever
+        // removes the oldest rows, never the newest.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS scheduler_event (
+            id INTEGER PRIMARY KEY,
+            kind TEXT NOT NULL,
+            level TEXT NOT NULL,
+            job_id TEXT,
+            node_id TEXT,
+            eval_id TEXT,
+            allocation_id INTEGER,
+            rollout_id INTEGER,
+            message TEXT NOT NULL,
+            metadata_json JSONB NOT NULL DEFAULT '{}',
+            created_at TIMESTAMP NOT NULL
+        )",
+        )
+        .down("DROP TABLE IF EXISTS scheduler_event;"),
     ])
 }

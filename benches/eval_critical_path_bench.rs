@@ -1,5 +1,6 @@
 use criterion::{criterion_group, criterion_main, Criterion};
 use serde_json::json;
+use std::collections::HashSet;
 use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -70,13 +71,16 @@ fn eval_critical_path_latency_benchmark(c: &mut Criterion) {
                             store
                                 .enqueue_eval("bench", None, None, None, Some(10))
                                 .expect("enqueue eval");
-                            let epoch = store.allocation_epoch().expect("epoch");
+                            let job_config_id = format!("bench-job-{}", worker_idx);
+                            let expected_versions = store
+                                .allocation_version_vector(&job_config_id, &HashSet::new())
+                                .expect("version vector");
                             let submission = store
                                 .insert_plan_submission(
-                                    &format!("bench-job-{}", worker_idx),
+                                    &job_config_id,
                                     "fresh",
                                     &[],
-                                    epoch,
+                                    &expected_versions,
                                 )
                                 .expect("insert plan submission");
 

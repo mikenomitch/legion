@@ -1641,9 +1641,11 @@ pub(crate) fn step_fractions_for_rollout(config: &RolloutConfig, base_count: u32
     let mut deduped = Vec::new();
     for step in steps {
         let clamped = step.clamp(0.0, 1.0);
-        if deduped.last().copied().is_none_or(|previous: f64| {
-            (previous - clamped).abs() > f64::EPSILON
-        }) {
+        if deduped
+            .last()
+            .copied()
+            .is_none_or(|previous: f64| (previous - clamped).abs() > f64::EPSILON)
+        {
             deduped.push(clamped);
         }
     }
