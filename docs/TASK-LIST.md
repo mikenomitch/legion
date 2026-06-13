@@ -53,12 +53,14 @@
     - [x] It uses landlock appropriately
     - [ ] It handles network namespaces well? (use netavark lib?)
   - [x] A "container" kind works
-    - Runtime auto-detected per node: `docker` (portable default, works on a
-      Mac via Docker Desktop and on Linux), Apple `container` on macOS, `youki`
-      on Linux. Override with `LEGION_CONTAINER_RUNTIME`. macOS prefers Apple
-      `container` then Docker; Linux prefers Docker then youki.
-    - MUST work on a Mac easily (and on linux) — Docker covers the easy local
-      path (Kamal / local dev); Apple `container` and youki remain available.
+    - No Docker dependency. macOS uses Apple `container` (runs images by
+      reference); Linux uses a low-level OCI runtime — `youki` by default, or
+      any OCI-spec runtime (`runc`/`crun`) via `LEGION_OCI_RUNTIME`.
+    - On Linux the runtime can't pull/run images, so the kind builds an OCI
+      runtime bundle from the image's OCI layout (rootfs + generated
+      config.json) and runs `<runtime> run --bundle`. The layout comes from the
+      artifact pipeline (`containerImageDesugar`) or an anonymous `oci://` pull.
+    - MUST work on a Mac easily (and on linux) — done via the native runtimes.
   - [ ] A "WASM" kind works
  
 - [ ] Make something for the AIs to use this
@@ -69,7 +71,7 @@
   - Plan: [docs/plans/artifact-system-plan.md](plans/artifact-system-plan.md); user doc: [docs/artifacts.md](artifacts.md)
   - [x] Able to grab docker images (oci:// fetcher + ORAS mediaType; container `image`
     desugar ships behind `artifacts.containerImageDesugar`, default off until the cache lands;
-    youki bundle conversion still pending — see follow-ups)
+    Linux OCI-runtime bundle conversion now implemented in `src/task_plugins/oci_bundle.rs`)
   - [x] Able to do some auth for this (KV credentials via `GetArtifactCredential` + cluster
     `artifacts.auth` matchers; identity/nodeIdentity validated but blocked — see follow-ups)
   - [x] Able to grab files and put them on disk (https/file/git/s3 fetchers, task dirs,
@@ -82,8 +84,8 @@
       currently fails with an actionable error
     - [ ] `onFetchFailure` policy distinct from `on_unhealthy` (today fetch flakiness
       consumes restart/move budgets — documented in docs/artifacts.md)
-    - [ ] youki: OCI layout -> runtime bundle conversion so Legion-managed images work on
-      Linux container workloads
+    - [x] youki: OCI layout -> runtime bundle conversion so Legion-managed images work on
+      Linux container workloads (`src/task_plugins/oci_bundle.rs`; runs on youki/runc/crun)
     - [ ] Windows staging (tracked under the Windows support pass below)
   - [ ] Artifact cache + pre-warming/pre-pull + scheduler locality scoring
     - Plan: [docs/plans/artifact-cache-and-prewarm-plan.md](plans/artifact-cache-and-prewarm-plan.md)
