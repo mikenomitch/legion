@@ -397,29 +397,10 @@ fn load_server_tls_identity(tls: &TlsConfigFull) -> R<Option<Identity>> {
 #[instrument(err, skip_all)]
 async fn start_node_status_checker(store: Store, check_seconds: u64) -> R<()> {
     info!("Beginning node status checker loop");
+    let started_at = std::time::Instant::now();
     loop {
-        let node_ids_to_update = store
-            .get_node_ids_and_heartbeats()?
-            .into_iter()
-            .filter(
-                |(id, heartbeat)| match Node::last_heartbeat_too_slow(heartbeat) {
-                    Ok(too_slow) => {
-                        if too_slow {
-                            warn!("Node {} heartbeat too slow - marking as lost", id);
-                        }
-                        too_slow
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Error checking heartbeat - marking node {} lost: {:?}",
-                            id, e
-                        );
-                        true
-                    }
-                },
-            )
-            .map(|(id, _heartbeat)| id)
-            .collect::<Vec<String>>();
+        let node_ids_to_update =
+            nodes_to_mark_lost(store.get_node_ids_and_heartbeats()?, started_at.elapsed());
 
         store.mark_nodes_as_lost(&node_ids_to_update)?;
         // Stateful allocations on lost nodes are gated behind their
@@ -434,6 +415,47 @@ async fn start_node_status_checker(store: Store, check_seconds: u64) -> R<()> {
         }
         tokio::time::sleep(tokio::time::Duration::from_secs(check_seconds)).await;
     }
+}
+
+/// Which active nodes to mark lost, given their last heartbeats and how long
+/// this manager process has been up.
+///
+/// Heartbeats only refresh while the manager is up, so time the manager spent
+/// down must not count as missed heartbeats: right after a manager restart
+/// every persisted heartbeat looks stale, and marking those nodes lost would
+/// deschedule — and therefore kill — every healthy task in the cluster before
+/// its worker had a chance to reconnect. No node is marked lost until the
+/// manager has been up for a full lost-node window; live workers heartbeat
+/// every `WORKER_HEARTBEAT_DURATION_SEC` and retry with a capped backoff, so
+/// they re-establish contact well within it.
+fn nodes_to_mark_lost(
+    nodes_with_heartbeats: Vec<(String, String)>,
+    manager_uptime: Duration,
+) -> Vec<String> {
+    if manager_uptime < Duration::from_secs(DEF_LOST_NODE_AT_SEC as u64) {
+        return Vec::new();
+    }
+    nodes_with_heartbeats
+        .into_iter()
+        .filter(
+            |(id, heartbeat)| match Node::last_heartbeat_too_slow(heartbeat) {
+                Ok(too_slow) => {
+                    if too_slow {
+                        warn!("Node {} heartbeat too slow - marking as lost", id);
+                    }
+                    too_slow
+                }
+                Err(e) => {
+                    warn!(
+                        "Error checking heartbeat - marking node {} lost: {:?}",
+                        id, e
+                    );
+                    true
+                }
+            },
+        )
+        .map(|(id, _heartbeat)| id)
+        .collect()
 }
 
 #[instrument(err, skip_all)]
@@ -594,6 +616,123 @@ mod tests {
         let store = Store::start_storage(&store_config)?;
         store.reset_all_tables()?;
         Ok(store)
+    }
+
+    fn rfc3339_seconds_ago(seconds: i64) -> R<String> {
+        Ok(
+            (OffsetDateTime::now_utc() - time::Duration::seconds(seconds))
+                .format(&time::format_description::well_known::Rfc3339)?,
+        )
+    }
+
+    fn node_msg(id: &str, last_heartbeat: String) -> NodeMsg {
+        NodeMsg {
+            id: id.to_string(),
+            pool: "default".into(),
+            status: "active".into(),
+            availability: "available".into(),
+            config_attrs: "{}".into(),
+            fingerprint_attrs: "{}".into(),
+            dynamic_attrs: "{}".into(),
+            health_checks: "{}".into(),
+            last_heartbeat,
+        }
+    }
+
+    #[test]
+    fn nodes_to_mark_lost_waits_for_startup_heartbeat_grace() -> R<()> {
+        let lost_window = DEF_LOST_NODE_AT_SEC as u64;
+        let nodes = vec![
+            ("stale-node".to_string(), rfc3339_seconds_ago(120)?),
+            ("fresh-node".to_string(), rfc3339_seconds_ago(0)?),
+        ];
+
+        // Right after a manager restart every persisted heartbeat looks
+        // stale; nothing may be marked lost until workers have had a full
+        // window to reconnect.
+        assert!(nodes_to_mark_lost(nodes.clone(), Duration::ZERO).is_empty());
+        assert!(nodes_to_mark_lost(nodes.clone(), Duration::from_secs(lost_window - 1)).is_empty());
+
+        // Once the manager has been up a full window, silence means real loss
+        // — and only for the silent node.
+        assert_eq!(
+            nodes_to_mark_lost(nodes, Duration::from_secs(lost_window)),
+            vec!["stale-node".to_string()]
+        );
+        Ok(())
+    }
+
+    /// Regression: a manager outage longer than the lost-node window used to
+    /// mark every node lost on the status checker's first tick after restart,
+    /// descheduling (and therefore killing) all healthy running tasks before
+    /// their workers had a chance to re-heartbeat.
+    #[test]
+    fn manager_restart_does_not_deschedule_allocations_before_heartbeat_grace() -> R<()> {
+        let store = setup_store()?;
+
+        // Cluster state as persisted before the manager went down: an active
+        // node running one allocation, whose last heartbeat is now older than
+        // the lost-node window only because the manager was unreachable.
+        store.insert_node(node_msg(
+            "node-1",
+            rfc3339_seconds_ago(DEF_LOST_NODE_AT_SEC + 50)?,
+        ))?;
+        // A second node that reconnected promptly after the manager restart;
+        // it must never be marked lost and later receives the rescheduled
+        // allocation once node-1's loss is confirmed.
+        store.insert_node(node_msg("node-2", rfc3339_seconds_ago(0)?))?;
+        let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "restart-survivor".into(),
+            tasks: vec![TaskConfig::new("svc", "noop")],
+            version: None,
+        };
+        store.handle_job_submit(
+            &job,
+            &[Submission {
+                path: "job.jsonnet".into(),
+                content: "{}".into(),
+                is_primary: true,
+            }],
+        )?;
+        let task_id: i64 = store.read_connection()?.query_row(
+            "SELECT id FROM task_config WHERE name = ? AND job_id = ?;",
+            ["svc", &job.name],
+            |row| row.get(0),
+        )?;
+        store.place_alloc("node-1", task_id)?;
+
+        // First status-checker tick of the freshly restarted manager: the
+        // node must stay active and keep its allocation.
+        let to_mark = nodes_to_mark_lost(store.get_node_ids_and_heartbeats()?, Duration::ZERO);
+        store.mark_nodes_as_lost(&to_mark)?;
+        assert_eq!(store.get_node("node-1")?.status, "active");
+        assert_eq!(
+            store.allocs_for_node("node-1")?.len(),
+            1,
+            "allocation must survive a manager restart"
+        );
+
+        // The grace elapsed and the node still never heartbeated: now it is
+        // genuinely lost and its allocations reschedule off it.
+        let to_mark = nodes_to_mark_lost(
+            store.get_node_ids_and_heartbeats()?,
+            Duration::from_secs(DEF_LOST_NODE_AT_SEC as u64),
+        );
+        assert_eq!(to_mark, vec!["node-1".to_string()]);
+        store.mark_nodes_as_lost(&to_mark)?;
+        assert_eq!(store.get_node("node-1")?.status, "lost");
+        assert!(
+            store.allocs_for_node("node-1")?.is_empty(),
+            "allocations must reschedule once the loss is real"
+        );
+        assert_eq!(
+            store.allocs_for_node("node-2")?.len(),
+            1,
+            "the surviving node receives the rescheduled allocation"
+        );
+        Ok(())
     }
 
     #[tokio::test]
