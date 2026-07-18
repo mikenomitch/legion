@@ -1,0 +1,320 @@
+//! Live exec sessions: a process spawned inside (or alongside) a running
+//! allocation that the worker pumps stdin/stdout/stderr/resize frames through.
+//!
+//! Two concrete backends, both object-safe behind [`ExecSession`]:
+//!
+//! - [`PtyExecSession`] (interactive, `tty: true`) runs the command on a
+//!   pseudo-terminal via `portable-pty` (openpty on Unix, ConPTY on Windows).
+//!   Output is a single combined stream; window resize is supported.
+//! - [`PipeExecSession`] (non-interactive) runs the command with piped
+//!   stdio via `std::process::Command`, keeping stdout and stderr separate.
+//!
+//! Task kinds build a command + env and call [`spawn_pty`] / [`spawn_pipe`];
+//! they do not depend on the backend types directly.
+
+use std::collections::BTreeMap;
+use std::io::{Read, Write};
+use std::process::Stdio;
+
+use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
+
+use crate::prelude::*;
+
+/// What to run for an exec session.
+#[derive(Debug, Clone)]
+pub struct ExecOptions {
+    /// Argv; first element is the program.
+    pub command: Vec<String>,
+    /// Allocate a PTY (interactive).
+    pub tty: bool,
+    /// Initial terminal size (cols, rows). Ignored for pipe sessions.
+    pub winsize: (u16, u16),
+    /// Working directory, when the kind wants to set one.
+    pub cwd: Option<std::path::PathBuf>,
+    /// Extra environment for the exec'd process.
+    pub env: BTreeMap<String, String>,
+}
+
+impl ExecOptions {
+    pub fn new(command: Vec<String>, tty: bool) -> Self {
+        Self {
+            command,
+            tty,
+            winsize: (80, 24),
+            cwd: None,
+            env: BTreeMap::new(),
+        }
+    }
+}
+
+/// The output streams of a session. `stderr` is `None` for PTY sessions,
+/// where the terminal merges both onto the master.
+pub struct ExecOutputStreams {
+    pub stdout: Box<dyn Read + Send>,
+    pub stderr: Option<Box<dyn Read + Send>>,
+}
+
+/// A live exec session. The worker owns one of these and drives it: writing
+/// client stdin, forwarding resize, reading output, and waiting for exit.
+///
+/// Methods are blocking; the worker runs them off the async runtime.
+pub trait ExecSession: Send {
+    /// Take the output reader(s). Called exactly once.
+    fn take_output(&mut self) -> R<ExecOutputStreams>;
+    /// Write bytes to the process stdin.
+    fn write_stdin(&mut self, data: &[u8]) -> std::io::Result<()>;
+    /// Half-close stdin (send EOF) without killing the session.
+    fn close_stdin(&mut self);
+    /// Resize the terminal (no-op for pipe sessions).
+    fn resize(&mut self, cols: u16, rows: u16) -> std::io::Result<()>;
+    /// Block until the process exits and return its exit code.
+    fn wait(&mut self) -> R<i32>;
+    /// Non-blocking exit check; `Ok(Some(code))` once the process has exited.
+    fn try_wait(&mut self) -> R<Option<i32>>;
+    /// Force-terminate the process.
+    fn kill(&mut self);
+}
+
+fn apply_common(builder: &mut CommandBuilder, opts: &ExecOptions) {
+    for (k, v) in &opts.env {
+        builder.env(k, v);
+    }
+    if let Some(cwd) = &opts.cwd {
+        builder.cwd(cwd);
+    }
+}
+
+/// Spawn an interactive PTY-backed session.
+pub fn spawn_pty(opts: &ExecOptions) -> R<Box<dyn ExecSession>> {
+    let (program, args) = opts
+        .command
+        .split_first()
+        .context("exec command must include at least one entry")?;
+
+    let pty = NativePtySystem::default();
+    let pair = pty
+        .openpty(PtySize {
+            rows: opts.winsize.1.max(1),
+            cols: opts.winsize.0.max(1),
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .context("failed to open pty")?;
+
+    let mut builder = CommandBuilder::new(program);
+    builder.args(args);
+    apply_common(&mut builder, opts);
+
+    let child = pair
+        .slave
+        .spawn_command(builder)
+        .context("failed to spawn pty command")?;
+    // Slave handle is held by the child; drop ours so EOF propagates on exit.
+    drop(pair.slave);
+
+    let writer = pair
+        .master
+        .take_writer()
+        .context("failed to take pty writer")?;
+    let reader = pair
+        .master
+        .try_clone_reader()
+        .context("failed to clone pty reader")?;
+
+    Ok(Box::new(PtyExecSession {
+        master: pair.master,
+        child,
+        writer: Some(writer),
+        reader: Some(reader),
+    }))
+}
+
+/// Spawn a non-interactive pipe-backed session (stdout/stderr separate).
+pub fn spawn_pipe(opts: &ExecOptions) -> R<Box<dyn ExecSession>> {
+    let (program, args) = opts
+        .command
+        .split_first()
+        .context("exec command must include at least one entry")?;
+
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(args);
+    for (k, v) in &opts.env {
+        cmd.env(k, v);
+    }
+    if let Some(cwd) = &opts.cwd {
+        cmd.current_dir(cwd);
+    }
+    cmd.stdin(Stdio::piped());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().context("failed to spawn exec command")?;
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let stdin = child.stdin.take();
+
+    Ok(Box::new(PipeExecSession {
+        child,
+        stdin,
+        stdout: stdout.map(|s| Box::new(s) as Box<dyn Read + Send>),
+        stderr: stderr.map(|s| Box::new(s) as Box<dyn Read + Send>),
+    }))
+}
+
+struct PtyExecSession {
+    master: Box<dyn portable_pty::MasterPty + Send>,
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    writer: Option<Box<dyn Write + Send>>,
+    reader: Option<Box<dyn Read + Send>>,
+}
+
+impl ExecSession for PtyExecSession {
+    fn take_output(&mut self) -> R<ExecOutputStreams> {
+        let stdout = self.reader.take().context("pty reader already taken")?;
+        Ok(ExecOutputStreams {
+            stdout,
+            stderr: None,
+        })
+    }
+
+    fn write_stdin(&mut self, data: &[u8]) -> std::io::Result<()> {
+        match self.writer.as_mut() {
+            Some(w) => {
+                w.write_all(data)?;
+                w.flush()
+            }
+            None => Ok(()),
+        }
+    }
+
+    fn close_stdin(&mut self) {
+        // Dropping the writer closes the master write side -> EOF to the pty.
+        self.writer = None;
+    }
+
+    fn resize(&mut self, cols: u16, rows: u16) -> std::io::Result<()> {
+        self.master
+            .resize(PtySize {
+                rows: rows.max(1),
+                cols: cols.max(1),
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(std::io::Error::other)
+    }
+
+    fn wait(&mut self) -> R<i32> {
+        let status = self.child.wait().context("pty child wait failed")?;
+        Ok(status.exit_code() as i32)
+    }
+
+    fn try_wait(&mut self) -> R<Option<i32>> {
+        match self.child.try_wait().context("pty child try_wait failed")? {
+            Some(status) => Ok(Some(status.exit_code() as i32)),
+            None => Ok(None),
+        }
+    }
+
+    fn kill(&mut self) {
+        let _ = self.child.kill();
+    }
+}
+
+struct PipeExecSession {
+    child: std::process::Child,
+    stdin: Option<std::process::ChildStdin>,
+    stdout: Option<Box<dyn Read + Send>>,
+    stderr: Option<Box<dyn Read + Send>>,
+}
+
+impl ExecSession for PipeExecSession {
+    fn take_output(&mut self) -> R<ExecOutputStreams> {
+        let stdout = self.stdout.take().context("pipe stdout already taken")?;
+        Ok(ExecOutputStreams {
+            stdout,
+            stderr: self.stderr.take(),
+        })
+    }
+
+    fn write_stdin(&mut self, data: &[u8]) -> std::io::Result<()> {
+        match self.stdin.as_mut() {
+            Some(w) => {
+                w.write_all(data)?;
+                w.flush()
+            }
+            None => Ok(()),
+        }
+    }
+
+    fn close_stdin(&mut self) {
+        self.stdin = None;
+    }
+
+    fn resize(&mut self, _cols: u16, _rows: u16) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn wait(&mut self) -> R<i32> {
+        let status = self.child.wait().context("exec child wait failed")?;
+        Ok(status.code().unwrap_or(-1))
+    }
+
+    fn try_wait(&mut self) -> R<Option<i32>> {
+        match self.child.try_wait().context("exec child try_wait failed")? {
+            Some(status) => Ok(Some(status.code().unwrap_or(-1))),
+            None => Ok(None),
+        }
+    }
+
+    fn kill(&mut self) {
+        let _ = self.child.kill();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+
+    #[test]
+    fn pipe_session_runs_command_and_captures_stdout() -> R<()> {
+        let mut session = spawn_pipe(&ExecOptions::new(
+            vec!["/bin/echo".into(), "hello-exec".into()],
+            false,
+        ))?;
+        let mut out = session.take_output()?;
+        let mut buf = String::new();
+        out.stdout.read_to_string(&mut buf)?;
+        let code = session.wait()?;
+        assert_eq!(code, 0);
+        assert!(buf.contains("hello-exec"), "got: {buf:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn pipe_session_propagates_nonzero_exit() -> R<()> {
+        let mut session = spawn_pipe(&ExecOptions::new(
+            vec!["/bin/sh".into(), "-c".into(), "exit 7".into()],
+            false,
+        ))?;
+        let _ = session.take_output()?;
+        assert_eq!(session.wait()?, 7);
+        Ok(())
+    }
+
+    #[test]
+    fn pty_session_runs_interactively() -> R<()> {
+        let mut session = spawn_pty(&ExecOptions::new(
+            vec!["/bin/echo".into(), "pty-hello".into()],
+            true,
+        ))?;
+        let mut out = session.take_output()?;
+        let mut buf = Vec::new();
+        // PTY read returns EIO on some platforms at EOF; tolerate a short read.
+        let _ = out.stdout.read_to_end(&mut buf);
+        let code = session.wait()?;
+        assert_eq!(code, 0);
+        assert!(String::from_utf8_lossy(&buf).contains("pty-hello"));
+        Ok(())
+    }
+}

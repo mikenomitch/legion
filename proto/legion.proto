@@ -315,6 +315,20 @@ service Manager {
   rpc GetAllocationLogs (GetAllocationLogsRequest)
     returns (GetAllocationLogsReply);
 
+  // Opens an interactive or one-shot exec session inside a running
+  // allocation, streaming stdin/stdout/stderr/resize frames both ways. The
+  // manager authorizes the request, resolves the allocation to its node, and
+  // proxies the stream to that worker's `Worker.ExecTask`.
+  //
+  // The first client frame must be an `ExecStart`. Raw commands require
+  // `exec:write` (with `host: true` for host-level kinds); action runs
+  // require `action:write` (or `exec:write`) and are rendered server-side
+  // from the stored job spec.
+  rpc ExecAllocation (stream ExecClientFrame) returns (stream ExecServerFrame);
+
+  // Lists the actions declared on a job's tasks (for CLI + UI discovery).
+  rpc ListJobActions (ListJobActionsRequest) returns (ListJobActionsReply);
+
   // Returns node + allocation view of cluster state (the "ledger").
   rpc GetLedger (GetLedgerRequest) returns (GetLedgerReply);
 
@@ -2799,6 +2813,142 @@ service Worker {
 
   // Reads captured stdout/stderr files for one allocation on this node.
   rpc GetTaskLogs (GetTaskLogsRequest) returns (GetTaskLogsReply);
+
+  // Runs an exec session against a local allocation. Called only by the
+  // manager (worker plane); the manager has already authorized the caller and
+  // rendered any action command into a raw argv on the `ExecStart` frame.
+  rpc ExecTask (stream ExecClientFrame) returns (stream ExecServerFrame);
+}
+
+// === EXEC / ACTIONS ===
+
+// Frames sent from the initiator (CLI, UI, or manager proxy) toward the
+// process. The first frame on a stream must carry `start`.
+message ExecClientFrame {
+  oneof frame {
+    ExecStart start   = 1;
+    ExecInput stdin   = 2;
+    ExecResize resize = 3;
+    ExecPing ping     = 4;
+  }
+}
+
+// Opens a session. Exactly one of `command` (raw exec) or `action` (named,
+// server-rendered) selects what runs.
+message ExecStart {
+  // Target allocation (must be `active`).
+  int64 allocation_id = 1;
+
+  // Task within the allocation. Optional when the allocation runs one task.
+  string task_name = 2;
+
+  // Raw command argv (requires exec:write). Empty when running an action.
+  repeated string command = 3;
+
+  // Action name (requires action:write). Empty for raw exec.
+  string action = 4;
+
+  // Action parameter values, validated + substituted server-side.
+  map<string, string> action_params = 5;
+
+  // Allocate a PTY (interactive). When false, stdout/stderr stay separate.
+  bool tty = 6;
+
+  // Initial terminal size (tty sessions only).
+  ExecWinsize winsize = 7;
+
+  // Bearer token carried in-frame for the browser WebSocket bridge, which
+  // cannot set request headers. Ignored on native gRPC legs, where the
+  // `authorization` metadata is used instead.
+  string bearer_token = 8;
+}
+
+// Standard-input chunk. `eof` half-closes stdin (the k8s v5 lesson) so piped
+// input reaches EOF without tearing down the whole session.
+message ExecInput {
+  bytes data = 1;
+  bool eof   = 2;
+}
+
+// Terminal dimensions in character cells.
+message ExecWinsize {
+  uint32 cols = 1;
+  uint32 rows = 2;
+}
+
+// Window-resize event (tty sessions).
+message ExecResize {
+  ExecWinsize winsize = 1;
+}
+
+// Keepalive; the peer echoes it back as `pong`.
+message ExecPing {}
+
+// Frames sent from the process back toward the initiator.
+message ExecServerFrame {
+  oneof frame {
+    ExecOutput stdout   = 1;
+    ExecOutput stderr   = 2;
+    ExecExit exit       = 3;
+    ExecPing pong       = 4;
+    ExecStarted started = 5;
+  }
+}
+
+// A chunk of captured output.
+message ExecOutput {
+  bytes data = 1;
+}
+
+// Terminal frame: the process exited. The stream closes after this.
+message ExecExit {
+  int32 code      = 1;
+  string message  = 2;
+}
+
+// Acknowledges that the session is live; the UI switches to the terminal on
+// receipt. `session_id` identifies the session in audit events.
+message ExecStarted {
+  string session_id = 1;
+}
+
+// Request payload for ListJobActions.
+message ListJobActionsRequest {
+  // Job whose declared actions to list.
+  string job = 1;
+}
+
+// One declared action, flattened with its owning task for discovery.
+message JobAction {
+  string task_name          = 1;
+  string name               = 2;
+  string description        = 3;
+  bool tty                  = 4;
+  repeated JobActionParam params = 5;
+}
+
+// One declared parameter of an action.
+message JobActionParam {
+  string name        = 1;
+  string description  = 2;
+  // One of: string | int | bool | enum.
+  string type        = 3;
+  bool required      = 4;
+  string default     = 5;
+  // Allowed values for `enum` params.
+  repeated string values = 6;
+  // Anchored regex for `string` params (empty = unconstrained).
+  string pattern     = 7;
+  // Inclusive bounds for `int` params (empty = unbounded).
+  string min         = 8;
+  string max         = 9;
+  // Redact the value in audit events + UI history.
+  bool sensitive     = 10;
+}
+
+// Reply payload for ListJobActions.
+message ListJobActionsReply {
+  repeated JobAction actions = 1;
 }
 
 // Selects which captured stream(s) to read for a task.

@@ -1,8 +1,8 @@
 use crate::prelude::*;
 use crate::structs::{Allocation, TaskConfig};
 use crate::task_plugins::{
-    configure_task_log_capture, derived_schema, oci_bundle, spawn_task_process, TaskPlugin,
-    TaskRuntime,
+    configure_task_log_capture, derived_schema, oci_bundle, spawn_pipe, spawn_pty,
+    spawn_task_process, ExecOptions, ExecSession, ExecSupport, TaskPlugin, TaskRuntime,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -82,6 +82,13 @@ impl ContainerRuntime {
         } else {
             bail!("container tasks are not supported on this OS");
         }
+    }
+
+    /// Whether this runtime can exec into a running container. Apple's
+    /// `container exec` works; the low-level OCI runtimes need different flag
+    /// handling and are deferred (Q1 in the plan), so they report unsupported.
+    fn supports_exec(&self) -> bool {
+        matches!(self, Self::AppleContainer)
     }
 }
 
@@ -187,6 +194,28 @@ fn pull_image_layout(image: &str, dest_root: &Path) -> R<PathBuf> {
     }
 }
 
+/// Builds the argv that execs `command` inside the allocation's container.
+fn build_exec_command(
+    runtime: &ContainerRuntime,
+    allocation_id: i64,
+    tty: bool,
+    command: &[String],
+) -> Vec<String> {
+    let program = match runtime {
+        ContainerRuntime::AppleContainer => "container".to_string(),
+        ContainerRuntime::Oci { binary } => binary.clone(),
+    };
+    let name = format!("legion-{allocation_id}");
+    let mut argv = vec![program, "exec".to_string()];
+    if tty {
+        argv.push("--tty".to_string());
+        argv.push("--interactive".to_string());
+    }
+    argv.push(name);
+    argv.extend(command.iter().cloned());
+    argv
+}
+
 /// The OCI layout recorded on `runtime.state` by `consume_artifact` when the
 /// image was staged through the artifact pipeline.
 fn staged_image_layout(runtime: &TaskRuntime) -> Option<PathBuf> {
@@ -231,6 +260,49 @@ impl TaskPlugin for ContainerTaskPlugin {
 
     fn supports_artifacts(&self) -> bool {
         true
+    }
+
+    fn exec_support(&self) -> ExecSupport {
+        // Exec is sandboxed inside the container (host_level = false). Whether
+        // it is available at all depends on the detected runtime.
+        let supported = ContainerRuntime::detect()
+            .map(|rt| rt.supports_exec())
+            .unwrap_or(false);
+        ExecSupport {
+            exec: supported,
+            pty: supported,
+            host_level: false,
+        }
+    }
+
+    fn exec(
+        &self,
+        allocation: &Allocation,
+        task: &TaskConfig,
+        _runtime: &mut TaskRuntime,
+        mut opts: ExecOptions,
+    ) -> R<Box<dyn ExecSession>> {
+        let runtime_kind = ContainerRuntime::detect()?;
+        if !runtime_kind.supports_exec() {
+            bail!("this container runtime does not support exec yet");
+        }
+        // Delegate to the runtime's `exec` subcommand against the running
+        // container. The command runs inside the container's namespaces, so
+        // it is genuinely sandboxed exec (unlike the exec kind).
+        opts.command = build_exec_command(&runtime_kind, allocation.id, opts.tty, &opts.command);
+
+        info!(
+            allocation_id = allocation.id,
+            task_name = %task.name,
+            tty = opts.tty,
+            "Opening exec session for container task"
+        );
+
+        if opts.tty {
+            spawn_pty(&opts)
+        } else {
+            spawn_pipe(&opts)
+        }
     }
 
     /// Desugars `config.image` into an implicit `oci://` artifact (artifact
