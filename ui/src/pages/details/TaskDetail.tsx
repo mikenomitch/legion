@@ -3,6 +3,7 @@ import { For, Show, createMemo, createResource } from 'solid-js'
 import { DetailBadge, DetailSection } from '../../components/DetailPrimitives'
 import LogViewer from '../../components/LogViewer'
 import { managerClient } from '../../grpcClient'
+import AllocationExecPanel from '../../components/AllocationExecPanel'
 import { formatDate } from '../../utils/format'
 import {
   artifactProgressPercent,
@@ -240,6 +241,11 @@ export default function TaskDetail() {
                             )}</For>
                           </div>
                         </Show>
+                        <AllocationExecPanel
+                          allocationId={allocation.allocationId}
+                          jobName={jobName()}
+                          taskName={taskName()}
+                        />
                       </div>
                     )
                   }}</For>
