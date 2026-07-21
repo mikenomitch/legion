@@ -77,10 +77,12 @@ fn resolve_exec_start(
         .map_err(|e| Status::internal(format!("failed to load allocation: {e}")))?
         .ok_or_else(|| Status::not_found(format!("allocation {} not found", start.allocation_id)))?;
 
-    // Q8: exec targets active allocations only.
-    if allocation.status != "active" && allocation.status != "running" {
+    // Q8: exec targets running allocations only. A dispatched allocation is
+    // `placed`; terminal/failed allocations are removed from the ledger, so
+    // anything still present and not explicitly dead is a valid target.
+    if !is_runnable_status(&allocation.status) {
         return Err(Status::failed_precondition(format!(
-            "allocation {} is {}, not active",
+            "allocation {} is {}, not running",
             allocation.id, allocation.status
         )));
     }
@@ -198,6 +200,12 @@ fn resolve_exec_start(
         audit_subject,
         audit_params,
     })
+}
+
+/// Whether an allocation status is a live target for exec. `placed` is the
+/// dispatched/running state; the rest are the running aliases used elsewhere.
+fn is_runnable_status(status: &str) -> bool {
+    matches!(status, "placed" | "active" | "running")
 }
 
 fn worker_address_for_node(node: &Node) -> Option<String> {

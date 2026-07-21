@@ -163,7 +163,7 @@ async fn newest_alloc_for_job(
     let mut best: Option<i64> = None;
     for node in ledger.nodes {
         for alloc in node.allocations {
-            if alloc.job_id == job && (alloc.status == "active" || alloc.status == "running") {
+            if alloc.job_id == job && (alloc.status == "placed" || alloc.status == "active" || alloc.status == "running") {
                 best = Some(best.map_or(alloc.id, |b| b.max(alloc.id)));
             }
         }

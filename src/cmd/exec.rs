@@ -54,8 +54,7 @@ pub fn config() -> Command {
                 .help("Command to run (after --)")
                 .num_args(1..)
                 .last(true)
-                .required(true)
-                .trailing_var_arg(true),
+                .required(true),
         )
 }
 
@@ -116,7 +115,7 @@ async fn resolve_allocation(
     let mut best: Option<i64> = None;
     for node in ledger.nodes {
         for alloc in node.allocations {
-            if &alloc.job_id == job && (alloc.status == "active" || alloc.status == "running") {
+            if &alloc.job_id == job && (alloc.status == "placed" || alloc.status == "active" || alloc.status == "running") {
                 best = Some(best.map_or(alloc.id, |b| b.max(alloc.id)));
             }
         }
