@@ -2065,6 +2065,20 @@ impl Manager for ManagerDaemonService {
         // which lifts the in-frame token into metadata before dialing). ACL
         // enforcement + action rendering happen on the parsed ExecStart.
         let identity = self.authenticate_acl(&request)?;
+        // Coarse gate before touching the stream, so a credential-less caller
+        // is denied immediately (and cannot probe by holding the connection).
+        // Either exec:write or action:write anywhere clears it; the precise
+        // job/host/action scope is enforced once the ExecStart is parsed.
+        if !identity.would_allow(AclResource::Exec, AclAction::Write, &AclScope::any())
+            && !identity.would_allow(AclResource::Action, AclAction::Write, &AclScope::any())
+        {
+            acl::enforce(
+                &identity,
+                AclResource::Exec,
+                AclAction::Write,
+                &AclScope::any(),
+            )?;
+        }
         let mut inbound = request.into_inner();
         let first = inbound
             .message()

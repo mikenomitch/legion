@@ -115,6 +115,8 @@ fn endpoint_table() -> Vec<(&'static str, Plane)> {
         ("GetInstance", Plane::Protected("job:read")),
         ("IssueWorkloadIdentityToken", Plane::Worker),
         ("GetAllocationLogs", Plane::Protected("job:read")),
+        ("ExecAllocation", Plane::Protected("exec:write")),
+        ("ListJobActions", Plane::Protected("job:read")),
         ("GetArtifactCredential", Plane::Worker),
         ("ListEvents", Plane::Protected("operator:read")),
         ("StreamEvents", Plane::Protected("operator:read")),
@@ -136,6 +138,14 @@ fn endpoint_table() -> Vec<(&'static str, Plane)> {
         ("ListAclUsers", Plane::Protected("acl:read")),
         ("DeleteAclUser", Plane::Protected("acl:write")),
     ]
+}
+
+/// An empty client-streaming request body, for exercising the ACL gate of
+/// `ExecAllocation` (which authorizes before reading any frame).
+fn empty_exec_stream() -> tonic::Streaming<ExecClientFrame> {
+    use tonic::codec::{Codec, ProstCodec};
+    let mut codec: ProstCodec<ExecClientFrame, ExecClientFrame> = ProstCodec::default();
+    tonic::Streaming::new_empty(codec.decoder(), tonic::body::empty_body())
 }
 
 fn req<T>(inner: T, token: Option<&str>) -> Request<T> {
@@ -623,6 +633,19 @@ async fn call_endpoint(
                 GetAllocationLogsRequest {
                     job: JOB_NAME.into(),
                     ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "ExecAllocation" => svc
+            .exec_allocation(req(empty_exec_stream(), token))
+            .await
+            .map(|_| ()),
+        "ListJobActions" => svc
+            .list_job_actions(req(
+                ListJobActionsRequest {
+                    job: JOB_NAME.into(),
                 },
                 token,
             ))
