@@ -362,6 +362,7 @@ pub fn validate_job_config(config: &JobConfig) -> R<()> {
         task.validate_stateful()?;
         task.validate_identities()?;
         task.validate_artifacts()?;
+        task.validate_actions()?;
         if !task.artifacts.is_empty() {
             registry.load_plugin(&task.kind, false)?;
             let plugin = registry

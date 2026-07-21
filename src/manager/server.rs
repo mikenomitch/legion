@@ -30,7 +30,8 @@ use crate::structs::{
     AllocationLog, CreateInstanceReply, CreateInstanceRequest, CreateInstancesReply,
     CreateInstancesRequest, DeleteKvReply, DeleteKvRequest, DeleteSavedStateQueryReply,
     DeleteSavedStateQueryRequest, DestroyInstanceReply, DestroyInstanceRequest, DestroyJobReply,
-    DestroyJobRequest, FailedAllocation, GetAllocationLogsReply, GetAllocationLogsRequest,
+    DestroyJobRequest, ExecClientFrame, FailedAllocation, GetAllocationLogsReply,
+    GetAllocationLogsRequest,
     GetArtifactCredentialReply, GetArtifactCredentialRequest, GetInstanceReply, GetInstanceRequest,
     GetJobInfoReply, GetJobInfoRequest, GetJobSpecByConfigRequest, GetJobSpecReply,
     GetJobSpecRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply,
@@ -46,12 +47,13 @@ use crate::structs::{
     ListInstancesRequest, ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobsReply,
     ListJobsRequest, ListKvReply, ListKvRequest, ListRaftHistoryReply, ListRaftHistoryRequest,
     ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply, ListRolloutsRequest,
-    ListSavedStateQueriesReply, ListSavedStateQueriesRequest, ListServicesReply,
-    ListServicesRequest, Node, NodeMsg, PatchKvReply, PatchKvRequest, PlanJobReply, PlanJobRequest,
-    PlannedAllocation, PutKvReply, PutKvRequest, QueryStateStoreReply, QueryStateStoreRequest,
-    RaftHistoryEvent, RaftStatus, ReleaseKvLockReply, ReleaseKvLockRequest, RenewKvLockReply,
-    RenewKvLockRequest, ReplaceInstanceReply, ReplaceInstanceRequest, ResolveServiceReply,
-    ResolveServiceRequest, RestartWorkerReply, RestartWorkerRequest, RolloutAllocationStatus,
+    ListJobActionsReply, ListJobActionsRequest, ListSavedStateQueriesReply,
+    ListSavedStateQueriesRequest, ListServicesReply, ListServicesRequest, Node, NodeMsg,
+    PatchKvReply, PatchKvRequest, PlanJobReply, PlanJobRequest, PlannedAllocation, PutKvReply,
+    PutKvRequest, QueryStateStoreReply, QueryStateStoreRequest, RaftHistoryEvent, RaftStatus,
+    ReleaseKvLockReply, ReleaseKvLockRequest, RenewKvLockReply, RenewKvLockRequest,
+    ReplaceInstanceReply, ReplaceInstanceRequest, ResolveServiceReply, ResolveServiceRequest,
+    RestartWorkerReply, RestartWorkerRequest, RolloutAllocationStatus,
     RolloutEvent, RolloutGroupStatus, RolloutProgression, RolloutReplacement, RunJobReply,
     RunJobRequest, SavedStateQuery, SchedulerEvent, ServiceEndpoint, ServiceSummary,
     StartInstanceReply, StartInstanceRequest, StopInstanceReply, StopInstanceRequest, StopJobReply,
@@ -77,7 +79,7 @@ use crate::tracing_util::{o11y_enabled, read_recent_observability};
 use time::{Duration as TimeDuration, OffsetDateTime};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{Channel, Endpoint};
-use tonic::{Request, Response, Status};
+use tonic::{Request, Response, Status, Streaming};
 
 fn map_store_error(action: &str, err: anyhow::Error) -> Status {
     error!("{action}: {:?}", err);
@@ -2050,6 +2052,52 @@ impl Manager for ManagerDaemonService {
             events: events.into_iter().map(map_scheduler_event).collect(),
             latest_id,
         }))
+    }
+
+    type ExecAllocationStream = crate::manager::exec::ExecAllocationStream;
+
+    #[instrument(skip_all)]
+    async fn exec_allocation(
+        &self,
+        request: Request<Streaming<ExecClientFrame>>,
+    ) -> Result<Response<Self::ExecAllocationStream>, Status> {
+        // Authenticate from request metadata (native gRPC and the WS bridge,
+        // which lifts the in-frame token into metadata before dialing). ACL
+        // enforcement + action rendering happen on the parsed ExecStart.
+        let identity = self.authenticate_acl(&request)?;
+        let mut inbound = request.into_inner();
+        let first = inbound
+            .message()
+            .await
+            .map_err(|e| Status::internal(format!("exec stream error: {e}")))?
+            .ok_or_else(|| Status::invalid_argument("exec stream closed before start frame"))?;
+        let start = match first.frame {
+            Some(crate::structs::exec_client_frame::Frame::Start(start)) => start,
+            _ => {
+                return Err(Status::invalid_argument(
+                    "first exec frame must be ExecStart",
+                ))
+            }
+        };
+        let stream =
+            crate::manager::exec::run_exec_session(&self.store, &identity, start, inbound).await?;
+        Ok(Response::new(stream))
+    }
+
+    #[instrument(skip_all)]
+    async fn list_job_actions(
+        &self,
+        request: Request<ListJobActionsRequest>,
+    ) -> Result<Response<ListJobActionsReply>, Status> {
+        let req = request.get_ref();
+        self.check_acl(
+            &request,
+            AclResource::Job,
+            AclAction::Read,
+            AclScope::job(&req.job),
+        )?;
+        let actions = crate::manager::exec::list_job_actions(&self.store, &req.job)?;
+        Ok(Response::new(ListJobActionsReply { actions }))
     }
 
     type StreamEventsStream = ReceiverStream<Result<SchedulerEvent, Status>>;
@@ -6071,6 +6119,16 @@ mod tests {
                     next_offset: 0,
                 }],
             }))
+        }
+
+        type ExecTaskStream =
+            tokio_stream::wrappers::ReceiverStream<Result<crate::structs::ExecServerFrame, Status>>;
+
+        async fn exec_task(
+            &self,
+            _request: Request<Streaming<ExecClientFrame>>,
+        ) -> Result<Response<Self::ExecTaskStream>, Status> {
+            Err(Status::unimplemented("not used in test"))
         }
     }
 

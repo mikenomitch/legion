@@ -8,7 +8,8 @@ use std::str::FromStr;
 use std::time::Duration;
 use tabled::Tabled;
 
-use crate::prelude::{bail, R};
+use crate::prelude::{anyhow, bail, R};
+use tracing::warn;
 
 use super::artifact::{validate_task_artifacts, ArtifactSpec};
 use super::instance::InstanceMode;
@@ -1600,6 +1601,8 @@ struct TaskConfigInput {
     on_lost: Option<Value>,
     #[serde(default)]
     artifacts: Vec<ArtifactSpec>,
+    #[serde(default)]
+    actions: Vec<ActionSpec>,
 }
 
 #[derive(Deserialize)]
@@ -1700,6 +1703,7 @@ impl TaskConfigInput {
             identities: self.identities,
             stateful: self.stateful,
             artifacts: self.artifacts,
+            actions: self.actions,
         })
     }
 }
@@ -1871,6 +1875,7 @@ impl TaskConfig {
             identities: Vec::new(),
             stateful: None,
             artifacts: Vec::new(),
+            actions: Vec::new(),
         }
     }
 
@@ -2055,6 +2060,68 @@ impl TaskConfig {
             return Ok(());
         }
         validate_task_artifacts(&self.name, &self.artifacts, &self.config, &self.identities)
+    }
+
+    /// Validate declared actions: unique names, well-formed params, and that
+    /// every `${param.<name>}` placeholder in a command refers to a declared
+    /// param. Also warns (does not reject) when a param is interpolated into a
+    /// `sh -c`-style command element.
+    pub fn validate_actions(&self) -> R<()> {
+        let mut seen = std::collections::HashSet::new();
+        for action in &self.actions {
+            action
+                .validate()
+                .map_err(|e| anyhow!("task {} action invalid: {e}", self.name))?;
+            if !seen.insert(action.name.as_str()) {
+                bail!(
+                    "task {} declares duplicate action `{}`",
+                    self.name,
+                    action.name
+                );
+            }
+            // Every placeholder must reference a declared param.
+            for element in &action.command {
+                let mut rest = element.as_str();
+                while let Some(idx) = rest.find("${param.") {
+                    let after = &rest[idx + "${param.".len()..];
+                    let Some(end) = after.find('}') else {
+                        bail!(
+                            "task {} action `{}` has an unterminated ${{param.}} placeholder",
+                            self.name,
+                            action.name
+                        );
+                    };
+                    let param_name = &after[..end];
+                    if !action.params.iter().any(|p| p.name == param_name) {
+                        bail!(
+                            "task {} action `{}` references undeclared param `{}`",
+                            self.name,
+                            action.name,
+                            param_name
+                        );
+                    }
+                    rest = &after[end + 1..];
+                }
+            }
+            // Warn on shell-interpolation footgun (param inside `sh -c`).
+            let is_shell = matches!(action.command.first().map(String::as_str), Some(cmd)
+                if cmd.ends_with("sh") || cmd == "bash" || cmd == "zsh")
+                && action.command.iter().any(|a| a == "-c");
+            if is_shell
+                && action
+                    .command
+                    .iter()
+                    .any(|a| a.contains("${param."))
+            {
+                warn!(
+                    task = %self.name,
+                    action = %action.name,
+                    "action interpolates a param inside a shell command; \
+                     values are validated but shell quoting is the author's responsibility"
+                );
+            }
+        }
+        Ok(())
     }
 
     pub fn validate_checks(&self) -> R<()> {
