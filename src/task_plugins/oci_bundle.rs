@@ -56,7 +56,11 @@ pub(crate) fn build_bundle(
             .with_context(|| format!("extract layer {}", layer.display()))?;
     }
 
-    let spec = build_spec(command, env, &image, hostname);
+    // Resolve the image user against the *extracted* rootfs so named users
+    // (`postgres`, `nobody:nogroup`) map to their real uid/gid instead of
+    // silently running as root.
+    let user = resolve_user(&rootfs, image.user.as_deref());
+    let spec = build_spec(command, env, &image, &user, hostname);
     let config_path = bundle_dir.join("config.json");
     std::fs::write(&config_path, serde_json::to_vec_pretty(&spec)?)
         .with_context(|| format!("write {}", config_path.display()))?;
@@ -154,10 +158,13 @@ fn safe_relative(path: &Path) -> Option<PathBuf> {
 /// existing contents (an opaque directory) before later entries land.
 fn extract_layer(blob: &Path, rootfs: &Path) -> R<()> {
     let mut file = std::fs::File::open(blob)?;
-    let mut magic = [0u8; 2];
+    let mut magic = [0u8; 4];
     let read = file.read(&mut magic)?;
     file.rewind()?;
-    let gzipped = read == 2 && magic == [0x1f, 0x8b];
+    if read == 4 && magic == [0x28, 0xb5, 0x2f, 0xfd] {
+        bail!("zstd-compressed image layers are not yet supported");
+    }
+    let gzipped = read >= 2 && magic[..2] == [0x1f, 0x8b];
 
     let reader: Box<dyn Read> = if gzipped {
         Box::new(flate2::read::GzDecoder::new(file))
@@ -246,40 +253,161 @@ fn merge_env(
         .collect()
 }
 
-/// Best-effort numeric user parse (`uid`, `uid:gid`). Non-numeric users
-/// (names needing `/etc/passwd` resolution) fall back to root.
-fn parse_user(user: Option<&str>) -> (u32, u32) {
-    let Some(user) = user else {
-        return (0, 0);
+/// The image `User` resolved to concrete ids, plus the home directory when it
+/// came from a passwd entry (images expect `HOME` set, as Docker does).
+#[derive(Debug, PartialEq, Eq)]
+struct ResolvedUser {
+    uid: u32,
+    gid: u32,
+    home: Option<String>,
+}
+
+/// Resolves the image config's `User` (`uid`, `uid:gid`, `name`, `name:group`)
+/// against the extracted rootfs. Names look up `etc/passwd` / `etc/group`
+/// inside the rootfs; a name that resolves nowhere falls back to root with a
+/// warning (matching the previous behavior, but no longer silently).
+fn resolve_user(rootfs: &Path, user: Option<&str>) -> ResolvedUser {
+    let root = ResolvedUser {
+        uid: 0,
+        gid: 0,
+        home: None,
     };
-    let (uid_str, gid_str) = match user.split_once(':') {
+    let Some(user) = user else {
+        return root;
+    };
+    let (user_part, group_part) = match user.split_once(':') {
         Some((u, g)) => (u, Some(g)),
         None => (user, None),
     };
-    let uid = uid_str.parse().unwrap_or(0);
-    let gid = gid_str.and_then(|g| g.parse().ok()).unwrap_or(uid);
-    (uid, gid)
+
+    let passwd_entry = match user_part.parse::<u32>() {
+        Ok(uid) => lookup_passwd(rootfs, |entry| entry.uid == uid),
+        Err(_) => lookup_passwd(rootfs, |entry| entry.name == user_part),
+    };
+    let (uid, passwd_gid, home) = match (&passwd_entry, user_part.parse::<u32>()) {
+        (Some(entry), _) => (entry.uid, Some(entry.gid), Some(entry.home.clone())),
+        // Numeric uid without a passwd entry is fine — kernels don't need one.
+        (None, Ok(uid)) => (uid, None, None),
+        (None, Err(_)) => {
+            warn!(
+                user,
+                "image user not found in rootfs /etc/passwd; running as root"
+            );
+            return root;
+        }
+    };
+
+    let gid = match group_part {
+        Some(group) => match group.parse::<u32>() {
+            Ok(gid) => gid,
+            Err(_) => match lookup_group(rootfs, group) {
+                Some(gid) => gid,
+                None => {
+                    warn!(
+                        group,
+                        "image group not found in rootfs /etc/group; using uid as gid"
+                    );
+                    uid
+                }
+            },
+        },
+        None => passwd_gid.unwrap_or(uid),
+    };
+
+    ResolvedUser { uid, gid, home }
+}
+
+struct PasswdEntry {
+    name: String,
+    uid: u32,
+    gid: u32,
+    home: String,
+}
+
+/// Finds the first `etc/passwd` entry matching `predicate`
+/// (`name:pw:uid:gid:gecos:home:shell`). Malformed lines are skipped.
+fn lookup_passwd(rootfs: &Path, predicate: impl Fn(&PasswdEntry) -> bool) -> Option<PasswdEntry> {
+    let content = std::fs::read_to_string(rootfs.join("etc/passwd")).ok()?;
+    content.lines().find_map(|line| {
+        let fields: Vec<&str> = line.split(':').collect();
+        let entry = PasswdEntry {
+            name: (*fields.first()?).to_string(),
+            uid: fields.get(2)?.parse().ok()?,
+            gid: fields.get(3)?.parse().ok()?,
+            home: (*fields.get(5)?).to_string(),
+        };
+        predicate(&entry).then_some(entry)
+    })
+}
+
+/// Resolves a group name to its gid via `etc/group` (`name:pw:gid:members`).
+fn lookup_group(rootfs: &Path, group: &str) -> Option<u32> {
+    let content = std::fs::read_to_string(rootfs.join("etc/group")).ok()?;
+    content.lines().find_map(|line| {
+        let fields: Vec<&str> = line.split(':').collect();
+        (*fields.first()? == group).then(|| fields.get(2)?.parse().ok())?
+    })
+}
+
+/// Read-only bind mounts of the host's DNS/hosts files, when they exist. The
+/// container shares host networking, so without these the rootfs has no
+/// resolver config and every name lookup fails.
+fn dns_mounts() -> Vec<Value> {
+    ["/etc/resolv.conf", "/etc/hosts"]
+        .iter()
+        .filter(|path| Path::new(path).is_file())
+        .map(|path| {
+            json!({
+                "destination": path,
+                "type": "bind",
+                "source": path,
+                "options": ["bind", "ro"],
+            })
+        })
+        .collect()
 }
 
 /// Builds an OCI runtime spec. Based on the standard `runc spec` default, with:
-/// the task command as `process.args`, merged env, the image's working dir and
-/// user, no private network namespace (the container shares host networking
-/// until network orchestration lands), and a writable root.
+/// the task command as `process.args`, merged env (plus `HOME` from the
+/// resolved user's passwd entry when unset), the image's working dir and user,
+/// no private network namespace (the container shares host networking until
+/// network orchestration lands; host DNS files are bind-mounted in), and a
+/// writable root.
 fn build_spec(
     command: &[String],
     task_env: &std::collections::HashMap<String, String>,
     image: &ImageConfig,
+    user: &ResolvedUser,
     hostname: &str,
 ) -> Value {
-    let (uid, gid) = parse_user(image.user.as_deref());
-    let env = merge_env(&image.env, task_env);
+    let mut env = merge_env(&image.env, task_env);
+    if let Some(home) = &user.home {
+        if !env.iter().any(|entry| entry.starts_with("HOME=")) {
+            env.push(format!("HOME={home}"));
+        }
+    }
     let cwd = image.working_dir.clone().unwrap_or_else(|| "/".to_string());
+
+    let mut mounts = vec![
+        json!({ "destination": "/proc", "type": "proc", "source": "proc" }),
+        json!({ "destination": "/dev", "type": "tmpfs", "source": "tmpfs",
+              "options": ["nosuid", "strictatime", "mode=755", "size=65536k"] }),
+        json!({ "destination": "/dev/pts", "type": "devpts", "source": "devpts",
+              "options": ["nosuid", "noexec", "newinstance", "ptmxmode=0666", "mode=0620", "gid=5"] }),
+        json!({ "destination": "/dev/shm", "type": "tmpfs", "source": "shm",
+              "options": ["nosuid", "noexec", "nodev", "mode=1777", "size=65536k"] }),
+        json!({ "destination": "/dev/mqueue", "type": "mqueue", "source": "mqueue",
+              "options": ["nosuid", "noexec", "nodev"] }),
+        json!({ "destination": "/sys", "type": "sysfs", "source": "sysfs",
+              "options": ["nosuid", "noexec", "nodev", "ro"] }),
+    ];
+    mounts.extend(dns_mounts());
 
     json!({
         "ociVersion": "1.0.2",
         "process": {
             "terminal": false,
-            "user": { "uid": uid, "gid": gid },
+            "user": { "uid": user.uid, "gid": user.gid },
             "args": command,
             "env": env,
             "cwd": cwd,
@@ -293,19 +421,7 @@ fn build_spec(
         },
         "root": { "path": "rootfs", "readonly": false },
         "hostname": hostname,
-        "mounts": [
-            { "destination": "/proc", "type": "proc", "source": "proc" },
-            { "destination": "/dev", "type": "tmpfs", "source": "tmpfs",
-              "options": ["nosuid", "strictatime", "mode=755", "size=65536k"] },
-            { "destination": "/dev/pts", "type": "devpts", "source": "devpts",
-              "options": ["nosuid", "noexec", "newinstance", "ptmxmode=0666", "mode=0620", "gid=5"] },
-            { "destination": "/dev/shm", "type": "tmpfs", "source": "shm",
-              "options": ["nosuid", "noexec", "nodev", "mode=1777", "size=65536k"] },
-            { "destination": "/dev/mqueue", "type": "mqueue", "source": "mqueue",
-              "options": ["nosuid", "noexec", "nodev"] },
-            { "destination": "/sys", "type": "sysfs", "source": "sysfs",
-              "options": ["nosuid", "noexec", "nodev", "ro"] }
-        ],
+        "mounts": mounts,
         "linux": {
             "resources": { "devices": [{ "allow": false, "access": "rwm" }] },
             "namespaces": [
@@ -363,22 +479,107 @@ mod tests {
         assert!(merged.iter().any(|e| e.starts_with("PATH=/usr/local/sbin")));
     }
 
-    #[test]
-    fn parse_user_handles_numeric_and_names() {
-        assert_eq!(parse_user(None), (0, 0));
-        assert_eq!(parse_user(Some("1000")), (1000, 1000));
-        assert_eq!(parse_user(Some("1000:2000")), (1000, 2000));
-        // Names need passwd resolution we don't do; fall back to root.
-        assert_eq!(parse_user(Some("nobody")), (0, 0));
+    /// A synthetic rootfs with passwd/group files for user resolution tests.
+    fn fake_rootfs() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("etc")).expect("etc");
+        std::fs::write(
+            dir.path().join("etc/passwd"),
+            "root:x:0:0:root:/root:/bin/sh\n\
+             postgres:x:70:70:PostgreSQL:/var/lib/postgresql:/bin/sh\n\
+             malformed-line\n",
+        )
+        .expect("passwd");
+        std::fs::write(
+            dir.path().join("etc/group"),
+            "root:x:0:\npostgres:x:70:\nstaff:x:50:\n",
+        )
+        .expect("group");
+        dir
     }
 
     #[test]
-    fn build_spec_sets_command_env_and_host_networking() {
+    fn resolve_user_handles_numeric_named_and_missing() {
+        let rootfs = fake_rootfs();
+        let root = rootfs.path();
+
+        // No user -> root.
+        assert_eq!(
+            resolve_user(root, None),
+            ResolvedUser {
+                uid: 0,
+                gid: 0,
+                home: None
+            }
+        );
+        // Named user resolves uid/gid/home from passwd.
+        assert_eq!(
+            resolve_user(root, Some("postgres")),
+            ResolvedUser {
+                uid: 70,
+                gid: 70,
+                home: Some("/var/lib/postgresql".into())
+            }
+        );
+        // Numeric uid with a passwd entry picks up its gid and home.
+        assert_eq!(
+            resolve_user(root, Some("70")),
+            ResolvedUser {
+                uid: 70,
+                gid: 70,
+                home: Some("/var/lib/postgresql".into())
+            }
+        );
+        // Numeric uid without a passwd entry is used as-is.
+        assert_eq!(
+            resolve_user(root, Some("1234")),
+            ResolvedUser {
+                uid: 1234,
+                gid: 1234,
+                home: None
+            }
+        );
+        // user:group with a named group resolves via /etc/group.
+        assert_eq!(
+            resolve_user(root, Some("postgres:staff")),
+            ResolvedUser {
+                uid: 70,
+                gid: 50,
+                home: Some("/var/lib/postgresql".into())
+            }
+        );
+        // uid:gid stays numeric.
+        assert_eq!(
+            resolve_user(root, Some("1000:2000")),
+            ResolvedUser {
+                uid: 1000,
+                gid: 2000,
+                home: None
+            }
+        );
+        // Unknown name falls back to root.
+        assert_eq!(
+            resolve_user(root, Some("ghost")),
+            ResolvedUser {
+                uid: 0,
+                gid: 0,
+                home: None
+            }
+        );
+    }
+
+    #[test]
+    fn build_spec_sets_command_env_user_and_host_networking() {
         let image = ImageConfig {
             env: vec!["FROM_IMAGE=1".to_string()],
             working_dir: Some("/app".to_string()),
             user: Some("1000:1000".to_string()),
             layers: vec![],
+        };
+        let user = ResolvedUser {
+            uid: 1000,
+            gid: 1000,
+            home: Some("/home/app".to_string()),
         };
         let mut task_env = HashMap::new();
         task_env.insert("MODE".to_string(), "test".to_string());
@@ -386,6 +587,7 @@ mod tests {
             &["/bin/echo".to_string(), "hi".to_string()],
             &task_env,
             &image,
+            &user,
             "legion-7",
         );
 
@@ -398,9 +600,39 @@ mod tests {
         let env = spec["process"]["env"].as_array().unwrap();
         assert!(env.iter().any(|e| e == "MODE=test"));
         assert!(env.iter().any(|e| e == "FROM_IMAGE=1"));
+        // HOME comes from the resolved user when the env doesn't set it.
+        assert!(env.iter().any(|e| e == "HOME=/home/app"));
         // No private network namespace: container uses host networking.
         let namespaces = spec["linux"]["namespaces"].as_array().unwrap();
         assert!(!namespaces.iter().any(|n| n["type"] == "network"));
         assert!(namespaces.iter().any(|n| n["type"] == "pid"));
+        // Host DNS files are bind-mounted in when they exist on this host.
+        let mounts = spec["mounts"].as_array().unwrap();
+        for path in ["/etc/resolv.conf", "/etc/hosts"] {
+            assert_eq!(
+                mounts.iter().any(|m| m["destination"] == path),
+                Path::new(path).is_file(),
+                "mount presence for {path} should match host file presence"
+            );
+        }
+    }
+
+    #[test]
+    fn env_home_not_overridden_when_set() {
+        let image = ImageConfig {
+            env: vec!["HOME=/from-image".to_string()],
+            working_dir: None,
+            user: None,
+            layers: vec![],
+        };
+        let user = ResolvedUser {
+            uid: 70,
+            gid: 70,
+            home: Some("/var/lib/postgresql".to_string()),
+        };
+        let spec = build_spec(&["true".to_string()], &HashMap::new(), &image, &user, "h");
+        let env = spec["process"]["env"].as_array().unwrap();
+        assert!(env.iter().any(|e| e == "HOME=/from-image"));
+        assert!(!env.iter().any(|e| e == "HOME=/var/lib/postgresql"));
     }
 }

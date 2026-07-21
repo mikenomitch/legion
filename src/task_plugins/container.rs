@@ -312,8 +312,14 @@ impl TaskPlugin for ContainerTaskPlugin {
                 // layout (from the artifact pipeline if staged, else pull it),
                 // convert it to a bundle, then `run` it.
                 let scratch = work_root(allocation, runtime);
+                let pulled_layout = scratch.join("image").join("layout");
                 let layout = match staged_image_layout(runtime) {
                     Some(layout) => layout,
+                    // A previous start of this allocation already pulled the
+                    // layout; reuse it so in-place restarts don't refetch.
+                    // `index.json` is written last by the fetcher, so its
+                    // presence marks a complete pull.
+                    None if pulled_layout.join("index.json").is_file() => pulled_layout,
                     None => pull_image_layout(&config.image, &scratch.join("image"))?,
                 };
                 let bundle = scratch.join("bundle");
@@ -416,7 +422,22 @@ impl TaskPlugin for ContainerTaskPlugin {
             task_name = %task.name,
             "Destroying container task"
         );
-        self.stop(allocation, task, runtime)
+        self.stop(allocation, task, runtime)?;
+        // Drop the image/bundle scratch. Best-effort: when it lives under the
+        // worker's alloc dir the worker removes that tree anyway, but the
+        // temp-dir fallback (no alloc dir threaded through) would leak a
+        // multi-hundred-MB rootfs without this.
+        let scratch = work_root(allocation, runtime);
+        if scratch.exists() {
+            if let Err(err) = std::fs::remove_dir_all(&scratch) {
+                warn!(
+                    allocation_id = allocation.id,
+                    error = %err,
+                    "Failed to remove container scratch dir"
+                );
+            }
+        }
+        Ok(())
     }
 }
 
@@ -567,9 +588,17 @@ mod tests {
     fn oci_runtime_runs_container_and_captures_logs() -> R<()> {
         let plugin = ContainerTaskPlugin::default();
         let allocation = alloc();
+        // Also proves the host's DNS files are bind-mounted in (host networking
+        // is useless without resolver config) and that env reaches the task.
         let task = container_task(
             "logtest",
-            json!(["/bin/sh", "-c", "echo stdout-line; echo stderr-line 1>&2"]),
+            json!([
+                "/bin/sh",
+                "-c",
+                "echo stdout-line; echo stderr-line 1>&2; \
+                 test -s /etc/resolv.conf || { echo missing-resolv-conf 1>&2; exit 1; }; \
+                 test -e /etc/hosts || { echo missing-hosts 1>&2; exit 1; }"
+            ]),
         );
 
         let tmp = tempfile::tempdir()?;

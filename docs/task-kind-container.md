@@ -30,12 +30,24 @@ it (`src/task_plugins/oci_bundle.rs`):
 1. **Obtain the image's OCI layout.** If the image was staged through the
    artifact pipeline (`artifacts.containerImageDesugar`), that layout is used;
    otherwise the kind pulls it anonymously through the shared `oci://` fetcher.
+   A layout pulled by an earlier start of the same allocation is reused, so
+   in-place restarts don't refetch from the registry.
 2. **Build a bundle.** Extract each image layer into `rootfs/` (honoring
-   overlayfs whiteouts), and synthesize an OCI runtime `config.json` that merges
-   the image config (env, working dir, user) with the task `command`/`env`. The
-   container shares host networking until network orchestration lands; the root
-   filesystem is writable.
+   overlayfs whiteouts; gzip or uncompressed layers — zstd is rejected with an
+   explicit error), and synthesize an OCI runtime `config.json`:
+   - the task `command`/`env` merged over the image config's env (task wins;
+     `PATH` is defaulted if absent),
+   - the image's working dir and user — named users/groups resolve against the
+     extracted rootfs's `/etc/passwd` / `/etc/group` (with `HOME` set from the
+     passwd entry when the env doesn't set it); unresolvable names fall back to
+     root with a warning,
+   - host networking (no private network namespace) with the host's
+     `/etc/resolv.conf` and `/etc/hosts` bind-mounted read-only so DNS works,
+   - a writable root filesystem.
 3. **Run it:** `<runtime> run --bundle <dir> legion-<alloc>`.
+
+The image/bundle scratch lives under the allocation's private directory and is
+removed on destroy.
 
 ## Config Schema
 
@@ -109,11 +121,12 @@ images (see [docs/artifacts.md](artifacts.md)):
 
 - Runtime integration is intentionally simple (shelling out to runtime binaries).
 - No advanced network/volume orchestration yet: Linux containers share host
-  networking, and the root filesystem is writable (no volume mounts).
+  networking (with host DNS files bind-mounted read-only), and the root
+  filesystem is writable (no volume mounts).
 - Private-registry image auth and digest pinning require the artifact pipeline
   (`containerImageDesugar`); the kind's own fallback pull is anonymous.
-- The Linux image→bundle path resolves numeric image users only; named users
-  (needing `/etc/passwd` resolution) fall back to root.
-- No artifact cache yet, so an off-pipeline Linux pull re-fetches per allocation.
+- zstd-compressed image layers are rejected (gzip and uncompressed supported).
+- No artifact cache yet, so an off-pipeline Linux pull fetches once per
+  allocation (in-place restarts reuse the pulled layout; moves refetch).
 - Health checks still run through worker health monitor.
 
