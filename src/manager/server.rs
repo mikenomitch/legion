@@ -2093,9 +2093,20 @@ impl Manager for ManagerDaemonService {
                 ))
             }
         };
-        let stream =
-            crate::manager::exec::run_exec_session(&self.store, &identity, start, inbound).await?;
-        Ok(Response::new(stream))
+
+        // Adapt the tonic client stream into the channel the shared core reads.
+        let (in_tx, in_rx) = tokio::sync::mpsc::channel::<ExecClientFrame>(128);
+        tokio::spawn(async move {
+            while let Ok(Some(frame)) = inbound.message().await {
+                if in_tx.send(frame).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let out_rx =
+            crate::manager::exec::run_exec_session(&self.store, &identity, start, in_rx).await?;
+        Ok(Response::new(ReceiverStream::new(out_rx)))
     }
 
     #[instrument(skip_all)]

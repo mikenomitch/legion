@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, HashMap};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Endpoint;
-use tonic::{Status, Streaming};
+use tonic::Status;
 
 use crate::manager::acl;
 use crate::prelude::*;
@@ -216,14 +216,16 @@ fn worker_address_for_node(node: &Node) -> Option<String> {
         .map(|value| value.to_string())
 }
 
-/// Authorize, resolve, and proxy an exec session. Returns the server-frame
-/// stream to hand back to the caller.
+/// Authorize, resolve, and proxy an exec session. `inbound` is a channel of
+/// client frames *after* the opening `ExecStart` (which is passed separately),
+/// so this core is shared by the gRPC handler and the WebSocket bridge. Returns
+/// a receiver of server frames to write back to the caller.
 pub async fn run_exec_session(
     store: &Store,
     identity: &AclIdentity,
     start: ExecStart,
-    mut inbound: Streaming<ExecClientFrame>,
-) -> Result<ExecAllocationStream, Status> {
+    mut inbound: mpsc::Receiver<ExecClientFrame>,
+) -> Result<mpsc::Receiver<Result<ExecServerFrame, Status>>, Status> {
     let resolved = resolve_exec_start(store, identity, &start)?;
 
     info!(
@@ -269,18 +271,13 @@ pub async fn run_exec_session(
 
     // Splice remaining client frames to the worker (stdin, resize, ping).
     tokio::spawn(async move {
-        loop {
-            match inbound.message().await {
-                Ok(Some(frame)) => {
-                    // Never forward a second Start frame.
-                    if matches!(frame.frame, Some(exec_client_frame::Frame::Start(_))) {
-                        continue;
-                    }
-                    if fwd_tx.send(frame).await.is_err() {
-                        break;
-                    }
-                }
-                _ => break,
+        while let Some(frame) = inbound.recv().await {
+            // Never forward a second Start frame.
+            if matches!(frame.frame, Some(exec_client_frame::Frame::Start(_))) {
+                continue;
+            }
+            if fwd_tx.send(frame).await.is_err() {
+                break;
             }
         }
     });
@@ -325,7 +322,7 @@ pub async fn run_exec_session(
         }
     });
 
-    Ok(ReceiverStream::new(out_rx))
+    Ok(out_rx)
 }
 
 /// List the actions declared across a job's tasks (for CLI + UI discovery).
