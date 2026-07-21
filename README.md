@@ -12,6 +12,7 @@ A distributed scheduler similar to Kubernetes or Nomad.
 - [Task Kind: exec](docs/task-kind-exec.md)
 - [Task Kind: container](docs/task-kind-container.md)
 - [Task Kind: noop](docs/task-kind-noop.md)
+- [Service Discovery](docs/service-discovery.md)
 - [State Store](docs/state-store.md)
 - [Observability](docs/observability.md)
 - [UI Architecture](docs/ui-architecture.md)

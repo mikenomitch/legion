@@ -79,9 +79,24 @@ fn build_launch(
     runtime: ContainerRuntimeKind,
     allocation: &Allocation,
     config: &ContainerTaskConfig,
+    legion_env: &[(String, String)],
 ) -> ContainerLaunch {
     let name = format!("legion-{}", allocation.id);
     let mut args = Vec::new();
+
+    // Legion-provided env first so user-declared env wins on key conflicts.
+    let mut env_args = Vec::new();
+    for (key, value) in legion_env {
+        if config.env.contains_key(key) {
+            continue;
+        }
+        env_args.push("--env".to_string());
+        env_args.push(format!("{key}={value}"));
+    }
+    for (key, value) in &config.env {
+        env_args.push("--env".to_string());
+        env_args.push(format!("{key}={value}"));
+    }
 
     match runtime {
         ContainerRuntimeKind::AppleContainer => {
@@ -91,10 +106,7 @@ fn build_launch(
                 "--name".to_string(),
                 name,
             ]);
-            for (key, value) in &config.env {
-                args.push("--env".to_string());
-                args.push(format!("{key}={value}"));
-            }
+            args.extend(env_args);
             args.push(config.image.clone());
             args.push("--".to_string());
             args.extend(config.command.clone());
@@ -107,10 +119,7 @@ fn build_launch(
                 "--image".to_string(),
                 config.image.clone(),
             ]);
-            for (key, value) in &config.env {
-                args.push("--env".to_string());
-                args.push(format!("{key}={value}"));
-            }
+            args.extend(env_args);
             args.push("--".to_string());
             args.extend(config.command.clone());
         }
@@ -166,7 +175,8 @@ impl TaskPlugin for ContainerTaskPlugin {
     ) -> R<()> {
         let config = ContainerTaskConfig::from_value(&task.config)?;
         let runtime_kind = ContainerRuntimeKind::detect()?;
-        let launch = build_launch(runtime_kind, allocation, &config);
+        let legion_env = crate::task_plugins::allocation_env(allocation, task);
+        let launch = build_launch(runtime_kind, allocation, &config, &legion_env);
 
         info!(
             allocation_id = allocation.id,
@@ -244,6 +254,7 @@ mod tests {
             job_config_id: "job-1".into(),
             task_config_id: 1,
             job_id: "job".into(),
+            network: None,
         }
     }
 
@@ -319,9 +330,21 @@ mod tests {
             "image": "alpine",
             "command": ["echo", "ok"]
         }))?;
-        let launch = build_launch(ContainerRuntimeKind::Youki, &alloc(), &config);
+        let launch = build_launch(ContainerRuntimeKind::Youki, &alloc(), &config, &[]);
         assert_eq!(launch.program, "youki");
         assert!(launch.args.contains(&"--image".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn launch_command_includes_legion_env() -> R<()> {
+        let config = ContainerTaskConfig::from_value(&json!({
+            "image": "alpine",
+            "command": ["echo", "ok"]
+        }))?;
+        let legion_env = vec![("LEGION_PORT_HTTP".to_string(), "20000".to_string())];
+        let launch = build_launch(ContainerRuntimeKind::Youki, &alloc(), &config, &legion_env);
+        assert!(launch.args.contains(&"LEGION_PORT_HTTP=20000".to_string()));
         Ok(())
     }
 }

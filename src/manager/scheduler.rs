@@ -3561,6 +3561,7 @@ mod tests {
                         node_id: "node-a".into(),
                         status: "running".into(),
                         resources: json!({}),
+                        network: None,
                     },
                     Allocation {
                         id: 2,
@@ -3570,6 +3571,7 @@ mod tests {
                         node_id: "node-a".into(),
                         status: "running".into(),
                         resources: json!({}),
+                        network: None,
                     },
                 ],
             ),
@@ -3583,6 +3585,7 @@ mod tests {
                     node_id: "node-b".into(),
                     status: "running".into(),
                     resources: json!({}),
+                    network: None,
                 }],
             ),
         ]);
@@ -3612,6 +3615,7 @@ mod tests {
                         node_id: "node-a".into(),
                         status: "running".into(),
                         resources: json!({}),
+                        network: None,
                     },
                     Allocation {
                         id: 2,
@@ -3621,6 +3625,7 @@ mod tests {
                         node_id: "node-a".into(),
                         status: "running".into(),
                         resources: json!({}),
+                        network: None,
                     },
                     Allocation {
                         id: 3,
@@ -3630,6 +3635,7 @@ mod tests {
                         node_id: "node-a".into(),
                         status: "running".into(),
                         resources: json!({}),
+                        network: None,
                     },
                 ],
             ),
@@ -3644,6 +3650,7 @@ mod tests {
                         node_id: "node-b".into(),
                         status: "running".into(),
                         resources: json!({}),
+                        network: None,
                     },
                     Allocation {
                         id: 5,
@@ -3653,6 +3660,7 @@ mod tests {
                         node_id: "node-b".into(),
                         status: "running".into(),
                         resources: json!({}),
+                        network: None,
                     },
                 ],
             ),

@@ -42,6 +42,21 @@ pub fn spawn_task_process(cmd: &mut Command) -> R<Child> {
     cmd.spawn().context("Failed to spawn task process")
 }
 
+/// Legion-provided environment for a task: allocation identity plus any
+/// assigned ports (`LEGION_PORT_*`, `LEGION_ADDR_*`, ...). Task plugins apply
+/// these before user-declared env so user values win on key conflicts.
+pub fn allocation_env(allocation: &Allocation, task: &TaskConfig) -> Vec<(String, String)> {
+    let mut pairs = vec![
+        ("LEGION_ALLOC_ID".to_string(), allocation.id.to_string()),
+        ("LEGION_JOB_ID".to_string(), allocation.job_id.clone()),
+        ("LEGION_TASK_NAME".to_string(), task.name.clone()),
+    ];
+    if let Some(network) = allocation.network.as_ref() {
+        pairs.extend(network.env_pairs());
+    }
+    pairs
+}
+
 pub(crate) fn derived_schema<T: schemars::JsonSchema>() -> Value {
     serde_json::to_value(schemars::schema_for!(T))
         .expect("derived task plugin schema should serialize")
@@ -188,6 +203,7 @@ pub fn validate_job_config(config: &JobConfig) -> R<()> {
         registry.validate_task_config(task)?;
         task.validate_checks()?;
         task.validate_kv_injections()?;
+        task.validate_network()?;
         if task.schedule.is_some() && task.lifecycle != TaskLifecycle::Batch {
             bail!(
                 "Task {} can only set schedule when lifecycle is batch",
@@ -401,6 +417,7 @@ mod tests {
             job_config_id: "job-1".into(),
             task_config_id: 1,
             job_id: "job".into(),
+            network: None,
         }
     }
 

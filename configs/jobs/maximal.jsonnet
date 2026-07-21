@@ -34,6 +34,19 @@
             config: {
                 command: ["sleep", "1"],
             },
+            network: {
+                mode: "auto",  // auto | host (datapath plugins add more)
+                ports: [
+                    { name: "http", to: 8080 },      // dynamic host port -> task 8080
+                    { name: "metrics", static: 9090 },  // fixed host port
+                ],
+            },
+            service: {
+                name: "web",       // defaults to task name
+                port: "http",      // label from network.ports; or a number/'dynamic' to declare inline
+                tags: ["v1", "public"],
+                meta: { protocol: "http" },
+            },
             kv: {
                 watch: true,
                 on_change: "restart",
@@ -82,7 +95,7 @@
                     name: "HTTP Boot /health",
                     kind: "http",
                     path: "/health",
-                    port: 8080,
+                    port: "http",  // port label -> resolved to the assigned host port
                     every: "5s",
                     timeout: "2s",
                     unhealthy_after_count: 1,
@@ -91,7 +104,7 @@
                     type: "health",
                     kind: "http",
                     path: "/health",
-                    port: 8080,
+                    port: "http",  // port label -> resolved to the assigned host port
                     every: "10s",
                     timeout: "2s",
                     unhealthy_after_count: 1,

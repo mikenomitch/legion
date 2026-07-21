@@ -18,6 +18,7 @@ fn cli() -> Command {
         .subcommand(cmd::join::config())
         .subcommand(cmd::ledger::config())
         .subcommand(cmd::kv::config())
+        .subcommand(cmd::service::config())
         .subcommand(cmd::state::config())
         .subcommand(cmd::raft::config())
 }
@@ -44,6 +45,7 @@ async fn main() -> R<()> {
         Some(("join", sub_matches)) => cmd::join::handle(sub_matches).await?,
         Some(("ledger", sub_matches)) => cmd::ledger::handle(sub_matches).await?,
         Some(("kv", sub_matches)) => cmd::kv::handle(sub_matches).await?,
+        Some(("service", sub_matches)) => cmd::service::handle(sub_matches).await?,
         Some(("state", sub_matches)) => cmd::state::handle(sub_matches).await?,
         Some(("raft", sub_matches)) => cmd::raft::handle(sub_matches).await?,
         None => unreachable!(),

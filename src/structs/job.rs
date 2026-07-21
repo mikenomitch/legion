@@ -480,8 +480,10 @@ pub struct TaskCheck {
     pub kind: TaskCheckKind,
     #[serde(default)]
     pub path: Option<String>,
+    /// Port number, or the name of a `network.ports` entry to resolve at
+    /// runtime (supports dynamic ports).
     #[serde(default)]
-    pub port: Option<u16>,
+    pub port: Option<crate::structs::network::CheckPort>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<Vec<String>>,
     #[serde(
@@ -847,6 +849,12 @@ pub struct TaskConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[tabled(skip)]
     pub kv_injections: Option<TaskKvInjections>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[tabled(skip)]
+    pub network: Option<crate::structs::network::NetworkConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[tabled(skip)]
+    pub service: Option<crate::structs::network::ServiceConfig>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -980,6 +988,10 @@ struct TaskConfigInput {
     files: Vec<TaskKvFileInjection>,
     #[serde(default)]
     kv_injections: Option<TaskKvInjections>,
+    #[serde(default)]
+    network: Option<crate::structs::network::NetworkConfig>,
+    #[serde(default)]
+    service: Option<crate::structs::network::ServiceConfig>,
 }
 
 #[derive(Deserialize)]
@@ -1044,6 +1056,8 @@ impl TaskConfigInput {
                     files: self.files,
                 }
             }),
+            network: self.network,
+            service: self.service,
         }
     }
 }
@@ -1090,6 +1104,16 @@ impl<'de> Deserialize<'de> for JobConfig {
 }
 
 impl JobConfig {
+    /// Normalize spec shorthands (currently the `service.port` inline port
+    /// sugar) so stored configs are always in explicit form. Must run before
+    /// validation and storage on every submit path.
+    pub fn normalize(&mut self) -> R<()> {
+        for task in &mut self.tasks {
+            task.normalize_network()?;
+        }
+        Ok(())
+    }
+
     pub fn is_same_as(&self, other: &JobConfig) -> bool {
         self.name == other.name
             && self.tasks == other.tasks
@@ -1162,7 +1186,8 @@ impl TaskCheck {
             TaskCheckKind::Tcp => {
                 let port = self
                     .port
-                    .map(|value| value.to_string())
+                    .as_ref()
+                    .map(ToString::to_string)
                     .unwrap_or_else(|| "unknown".into());
                 format!("TCP Check {port}")
             }
@@ -1197,7 +1222,46 @@ impl TaskConfig {
             checks: Vec::new(),
             on_unhealthy: TaskOnUnhealthyConfig::default(),
             kv_injections: None,
+            network: None,
+            service: None,
         }
+    }
+
+    /// Apply the `service.port` number/`dynamic` shorthand, materializing the
+    /// implied `network.ports` entry so stored configs are always explicit.
+    pub fn normalize_network(&mut self) -> R<()> {
+        let name = self.name.clone();
+        crate::structs::network::normalize_task_network(&name, &mut self.network, &mut self.service)
+    }
+
+    pub fn validate_network(&self) -> R<()> {
+        // Validate the desugared form so this is correct whether or not the
+        // submit path has normalized yet.
+        let mut network = self.network.clone();
+        let mut service = self.service.clone();
+        crate::structs::network::normalize_task_network(&self.name, &mut network, &mut service)?;
+        crate::structs::network::validate_task_network(
+            &self.name,
+            network.as_ref(),
+            service.as_ref(),
+        )?;
+
+        // Check port labels must reference a declared network port.
+        for check in &self.checks {
+            if let Some(crate::structs::network::CheckPort::Label(label)) = check.port.as_ref() {
+                let declared = network
+                    .as_ref()
+                    .is_some_and(|network| network.ports.iter().any(|port| &port.name == label));
+                if !declared {
+                    bail!(
+                        "task {} check {} references port '{label}' which is not declared in network.ports",
+                        self.name,
+                        check.default_name()
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn validate_checks(&self) -> R<()> {
@@ -1255,16 +1319,9 @@ impl TaskConfig {
                             check.default_name()
                         );
                     }
-                    if check.path.is_none() {
-                        bail!(
-                            "{} check {} requires a path",
-                            match check.kind {
-                                TaskCheckKind::Http => "http",
-                                TaskCheckKind::Tcp => "tcp",
-                                TaskCheckKind::Exec => "exec",
-                            },
-                            check.default_name()
-                        );
+                    // TCP checks only dial the port; a path is meaningless for them.
+                    if check.path.is_none() && matches!(check.kind, TaskCheckKind::Http) {
+                        bail!("http check {} requires a path", check.default_name());
                     }
                     if check.command.is_some() {
                         bail!(

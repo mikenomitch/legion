@@ -374,6 +374,12 @@ fn task_from_allocation(allocation: &TaskAllocation) -> R<(Allocation, TaskConfi
             .context("Invalid task on_unhealthy JSON")?
     };
 
+    let network = if allocation.network.trim().is_empty() {
+        None
+    } else {
+        Some(serde_json::from_str(&allocation.network).context("Invalid allocation network JSON")?)
+    };
+
     let task = TaskConfig {
         config: task_config,
         checks,
@@ -388,6 +394,7 @@ fn task_from_allocation(allocation: &TaskAllocation) -> R<(Allocation, TaskConfi
         job_config_id: allocation.job_config_id.clone(),
         task_config_id: allocation.task_config_id,
         job_id: allocation.job_id.clone(),
+        network,
     };
 
     Ok((alloc, task))
@@ -412,6 +419,7 @@ mod tests {
             job_config_id: "job-1".into(),
             task_config_id: 1,
             job_id: "job".into(),
+            network: None,
         }
     }
 

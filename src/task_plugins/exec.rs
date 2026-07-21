@@ -289,6 +289,7 @@ impl TaskPlugin for ExecTaskPlugin {
             cmd.gid(user.gid);
         }
 
+        cmd.envs(crate::task_plugins::allocation_env(allocation, task));
         if !config.env.is_empty() {
             cmd.envs(&config.env);
         }

@@ -4,6 +4,7 @@ use tabled::Tabled;
 
 use crate::prelude::{Context, R};
 
+use super::network::AllocNetwork;
 use super::node::Node;
 use super::{LedgerAllocation, LedgerNode};
 
@@ -17,6 +18,10 @@ pub struct Allocation {
     pub job_config_id: String,
     pub task_config_id: i64,
     pub job_id: String,
+    /// Assigned ports + node address, set at placement. None when the task
+    /// declares no network block.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<AllocNetwork>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -100,9 +105,14 @@ impl From<Allocation> for LedgerAllocation {
             job_config_id,
             task_config_id,
             job_id,
+            network,
         } = allocation;
 
         let resources = to_string(&resources).unwrap_or_else(|_| "{}".into());
+        let network = network
+            .as_ref()
+            .and_then(|network| to_string(network).ok())
+            .unwrap_or_default();
 
         LedgerAllocation {
             id,
@@ -112,6 +122,7 @@ impl From<Allocation> for LedgerAllocation {
             job_config_id,
             task_config_id,
             job_id,
+            network,
         }
     }
 }
@@ -126,10 +137,16 @@ impl LedgerAllocation {
             job_config_id,
             task_config_id,
             job_id,
+            network,
         } = self;
 
         let resources: Value =
             serde_json::from_str(&resources).context("failed to parse allocation resources")?;
+        let network = if network.trim().is_empty() {
+            None
+        } else {
+            Some(serde_json::from_str(&network).context("failed to parse allocation network")?)
+        };
 
         Ok(Allocation {
             id,
@@ -139,6 +156,7 @@ impl LedgerAllocation {
             job_config_id,
             task_config_id,
             job_id,
+            network,
         })
     }
 }

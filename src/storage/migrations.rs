@@ -356,6 +356,11 @@ pub fn get_migrations() -> Migrations<'static> {
             "CREATE INDEX IF NOT EXISTS idx_rollout_event_job_created ON rollout_event(job_id, created_at DESC, id DESC);",
         )
         .down("DROP INDEX IF EXISTS idx_rollout_event_job_created;"),
+        M::up("ALTER TABLE task_config ADD COLUMN network JSONB;").down(""),
+        M::up("ALTER TABLE task_config ADD COLUMN service JSONB;").down(""),
+        M::up("ALTER TABLE allocation ADD COLUMN network JSONB;").down(""),
+        M::up("CREATE INDEX IF NOT EXISTS idx_allocation_node_id ON allocation(node_id);")
+            .down("DROP INDEX IF EXISTS idx_allocation_node_id;"),
         M::up(
             "CREATE TABLE IF NOT EXISTS saved_state_query (
             name STRING PRIMARY KEY,

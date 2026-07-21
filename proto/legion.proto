@@ -156,6 +156,22 @@ service Manager {
   // Returns current non-expired lock state for a KV key.
   rpc GetKvLock (GetKvLockRequest) returns (GetKvLockReply);
 
+  // Lists all declared services with aggregate endpoint health.
+  //
+  // A service exists when a stored task config declares a `service` block.
+  // The reply is derived (a projection) from task configs, allocations, and
+  // allocation health snapshots; there is no separate registration mechanism
+  // and no way for the catalog to drift from scheduler state.
+  rpc ListServices (ListServicesRequest) returns (ListServicesReply);
+
+  // Resolves one service name to its endpoint addresses and ports.
+  //
+  // By default only healthy endpoints are returned: an endpoint is healthy
+  // when its allocation's latest health snapshot reports healthy AND its node
+  // is not lost/down. Endpoints without any health snapshot yet (still
+  // booting) are excluded unless `include_unhealthy` is set.
+  rpc ResolveService (ResolveServiceRequest) returns (ResolveServiceReply);
+
   // Executes a SQL statement directly against the manager state store.
   //
   // Read-only mode is the default safety behavior and rejects write statements
@@ -1520,6 +1536,96 @@ message GetKvLockReply {
   optional KvLock lock = 1;
 }
 
+// Request payload for ListServices. Currently no filters; all declared
+// services are returned.
+message ListServicesRequest {
+}
+
+// Aggregate view of one declared service.
+message ServiceSummary {
+  // Service name (from `service.name`, defaulting to the task name).
+  string service = 1;
+
+  // Job ID whose task declares this service.
+  string job_id = 2;
+
+  // Task name declaring this service.
+  string task_name = 3;
+
+  // Count of endpoints currently passing health (see ResolveService for the
+  // healthy definition).
+  uint32 healthy_count = 4;
+
+  // Total endpoint (allocation) count for this service, healthy or not.
+  uint32 total_count = 5;
+
+  // Service tags declared in the task's `service.tags`.
+  repeated string tags = 6;
+}
+
+// Reply payload for ListServices.
+message ListServicesReply {
+  // All declared services. Empty when no stored task config declares a
+  // `service` block.
+  repeated ServiceSummary services = 1;
+}
+
+// Request payload for ResolveService.
+message ResolveServiceRequest {
+  // Service name to resolve. Matches `service.name` (defaulting to the task
+  // name) on stored task configs.
+  string service = 1;
+
+  // When true, endpoints failing (or missing) health are also returned, with
+  // `healthy` set accordingly. Default false: only healthy endpoints.
+  bool include_unhealthy = 2;
+}
+
+// One resolvable endpoint of a service.
+message ServiceEndpoint {
+  // Service name this endpoint belongs to.
+  string service = 1;
+
+  // Job ID whose task declares the service.
+  string job_id = 2;
+
+  // Task name declaring the service.
+  string task_name = 3;
+
+  // Allocation ID backing this endpoint.
+  int64 allocation_id = 4;
+
+  // Node ID currently hosting the endpoint.
+  string node_id = 5;
+
+  // Routable address (host/IP) of the endpoint's node. Derived from the
+  // node's advertised worker address. Empty when the node has no advertised
+  // address.
+  string address = 6;
+
+  // Host port assigned to the service's advertised port label.
+  uint32 port = 7;
+
+  // True when the endpoint's latest allocation health snapshot is healthy and
+  // its node is alive.
+  bool healthy = 8;
+
+  // Human-readable health status detail from the latest snapshot (for
+  // example `healthy`, `starting`, or a check failure description). Empty
+  // when no snapshot has been reported yet.
+  string health_status = 9;
+
+  // Service tags declared in the task's `service.tags`.
+  repeated string tags = 10;
+}
+
+// Reply payload for ResolveService.
+message ResolveServiceReply {
+  // Matching endpoints. Empty when the service is unknown or (by default) has
+  // no healthy endpoints — callers can distinguish the two via ListServices.
+  repeated ServiceEndpoint endpoints = 1;
+}
+
 // Request payload for QueryStateStore.
 message QueryStateStoreRequest {
   // SQL statement to execute.
@@ -1685,6 +1791,11 @@ message LedgerAllocation {
 
   // Job ID this allocation belongs to.
   string job_id = 7;
+
+  // JSON-encoded assigned network payload (address + ports) for this
+  // allocation, matching the `AllocNetwork` shape. Empty string when the
+  // task declares no network block.
+  string network = 8;
 }
 
 // Request payload for UpdateNodeDynamic.
@@ -1819,6 +1930,12 @@ message TaskAllocation {
 
   // JSON-encoded task unhealthy handling policy.
   string task_on_unhealthy = 10;
+
+  // JSON-encoded assigned network payload (address + ports) for this
+  // allocation, matching the `AllocNetwork` shape. Workers use it to inject
+  // `LEGION_PORT_*` / `LEGION_ADDR_*` environment variables into the task.
+  // Empty string when the task declares no network block.
+  string network = 11;
 }
 
 // Request payload for PostWork.
