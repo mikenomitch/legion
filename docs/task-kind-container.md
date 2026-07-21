@@ -116,6 +116,10 @@ images (see [docs/artifacts.md](artifacts.md)):
 | Identity env / file delivery | ✅ / ❌ |
 | Signal delivery | ❌ |
 | Artifacts | ✅ image (staged via `containerImageDesugar`, or pulled by the kind); file/tree + env deferred |
+| Exec / interactive PTY | ✅ / ✅ on Apple `container` (sandboxed); ❌ on the Linux OCI runtimes (deferred) — see [docs/exec-and-actions.md](exec-and-actions.md) |
+
+Container exec runs inside the container's namespaces, so it is sandboxed
+(`host: false`): an `exec:write` rule without `host` suffices.
 
 ## Current Scope and Limitations
 

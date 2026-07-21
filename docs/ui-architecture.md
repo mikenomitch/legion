@@ -90,3 +90,22 @@ Proto compilation command is documented in `ui/README.md` and writes generated f
 ## Raft page
 
 The UI includes a dedicated **Raft** page under Cluster navigation for manager raft status, recent raft history, and operator commands (election/failover/membership/join-token flows).
+
+## Exec & Actions (interactive terminal)
+
+The task detail page (`pages/details/JobDetail.tsx` → `TaskDetail.tsx`) has an
+**Exec & Actions** section listing the job's running allocations (from
+`GetLedger`). Each allocation gets an `AllocationExecPanel` with a command
+launcher (interactive-tty toggle) and, for tasks that declare them, action
+forms generated from the parameter schema (`ListJobActions`).
+
+Unlike the rest of the UI, exec does **not** use gRPC-Web — browsers cannot do
+bidirectional streaming over it. `src/lib/execSocket.ts` opens a **WebSocket**
+to the manager's exec bridge (`ws://<host>:<port+1>/v1/exec/ws`), exchanging
+protobuf `ExecClientFrame`/`ExecServerFrame` messages (the same frames the CLI
+uses) one per binary WS frame; the bearer token rides in the first frame.
+`components/ExecTerminal.tsx` binds those frames to an **xterm.js** terminal
+(`@xterm/xterm` + `@xterm/addon-fit`), driving resize frames on container
+resize. The `<Terminal>` contract (open/write/onData/resize) is kept to the
+xterm.js surface so the renderer can later be swapped for a libghostty-vt
+wrapper without touching the transport (see the plan's Q5).

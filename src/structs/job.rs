@@ -2261,6 +2261,100 @@ impl Submission {
 mod tests {
     use super::*;
 
+    fn sample_action() -> ActionSpec {
+        ActionSpec {
+            name: "flush-cache".into(),
+            description: String::new(),
+            command: vec![
+                "/srv/api".into(),
+                "flush".into(),
+                "--scope".into(),
+                "${param.scope}".into(),
+            ],
+            params: vec![ActionParam {
+                name: "scope".into(),
+                description: String::new(),
+                param_type: ActionParamType::Enum,
+                default: Some("sessions".into()),
+                required: None,
+                values: vec!["all".into(), "sessions".into()],
+                pattern: None,
+                min: None,
+                max: None,
+                sensitive: false,
+            }],
+            tty: false,
+            timeout: None,
+        }
+    }
+
+    #[test]
+    fn action_render_substitutes_validated_params() {
+        let action = sample_action();
+        let mut supplied = std::collections::HashMap::new();
+        supplied.insert("scope".to_string(), "all".to_string());
+        let (argv, resolved) = action.render_command(&supplied).unwrap();
+        assert_eq!(argv, vec!["/srv/api", "flush", "--scope", "all"]);
+        assert_eq!(resolved.get("scope").unwrap(), "all");
+    }
+
+    #[test]
+    fn action_render_uses_default_when_param_omitted() {
+        let action = sample_action();
+        let (argv, _) = action.render_command(&std::collections::HashMap::new()).unwrap();
+        assert_eq!(argv.last().unwrap(), "sessions");
+    }
+
+    #[test]
+    fn action_render_rejects_invalid_enum_and_unknown_params() {
+        let action = sample_action();
+        let mut bad = std::collections::HashMap::new();
+        bad.insert("scope".to_string(), "nope".to_string());
+        assert!(action.render_command(&bad).unwrap_err().contains("one of"));
+
+        let mut unknown = std::collections::HashMap::new();
+        unknown.insert("bogus".to_string(), "x".to_string());
+        assert!(action
+            .render_command(&unknown)
+            .unwrap_err()
+            .contains("unknown parameter"));
+    }
+
+    #[test]
+    fn action_int_bounds_enforced() {
+        let param = ActionParam {
+            name: "lines".into(),
+            description: String::new(),
+            param_type: ActionParamType::Int,
+            default: None,
+            required: None,
+            values: vec![],
+            pattern: None,
+            min: Some(1),
+            max: Some(10),
+            sensitive: false,
+        };
+        assert!(param.validate_value("5").is_ok());
+        assert!(param.validate_value("0").unwrap_err().contains(">= 1"));
+        assert!(param.validate_value("11").unwrap_err().contains("<= 10"));
+        assert!(param.validate_value("x").unwrap_err().contains("integer"));
+    }
+
+    #[test]
+    fn action_validate_rejects_undeclared_placeholder() {
+        let mut task = TaskConfig::new("t", "exec");
+        task.actions = vec![ActionSpec {
+            name: "bad".into(),
+            description: String::new(),
+            command: vec!["/bin/echo".into(), "${param.missing}".into()],
+            params: vec![],
+            tty: false,
+            timeout: None,
+        }];
+        let err = task.validate_actions().unwrap_err().to_string();
+        assert!(err.contains("undeclared param"), "got: {err}");
+    }
+
     #[test]
     fn deserializes_task_list_jobspec() {
         let spec = serde_json::json!({

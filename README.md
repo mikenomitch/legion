@@ -20,6 +20,7 @@ A distributed scheduler similar to Kubernetes or Nomad.
 - [UI Architecture](docs/ui-architecture.md)
 - [KV Store](docs/kv-store.md)
 - [Auth & ACLs](docs/auth-and-acls.md)
+- [Exec & Actions (run commands in a workload, interactive PTY, actions)](docs/exec-and-actions.md)
 - [Workload Identity (OIDC)](docs/workload-identity.md)
 - [Testing and Benchmarks](docs/testing-and-benchmarks.md)
 - [Codebase Conventions](docs/codebase-conventions.md)
