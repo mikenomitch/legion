@@ -459,6 +459,7 @@ mod tests {
             task_config_id,
             job_id: "job".into(),
             instance_id: None,
+            network: None,
         }
     }
 

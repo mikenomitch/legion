@@ -616,6 +616,7 @@ mod tests {
             task_config_id: 1,
             job_id: "job".into(),
             instance_id: None,
+            network: None,
         }
     }
 
@@ -832,6 +833,8 @@ mod tests {
             task_identities: serde_json::to_string(&identities)?,
             self_terminate_after_seconds: 0,
             task_artifacts: String::new(),
+
+            network: String::new(),
         };
 
         let prepared = manager.prepare_task_allocation(&mut allocation).await?;
@@ -889,6 +892,8 @@ mod tests {
             task_identities: serde_json::to_string(&identities)?,
             self_terminate_after_seconds: 0,
             task_artifacts: String::new(),
+
+            network: String::new(),
         };
 
         let prepared = manager.prepare_task_allocation(&mut allocation).await?;

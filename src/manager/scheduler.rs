@@ -3976,6 +3976,7 @@ mod tests {
                         status: "running".into(),
                         resources: json!({}),
                         instance_id: None,
+                        network: None,
                     },
                     Allocation {
                         id: 2,
@@ -3986,6 +3987,7 @@ mod tests {
                         status: "running".into(),
                         resources: json!({}),
                         instance_id: None,
+                        network: None,
                     },
                 ],
             ),
@@ -4000,6 +4002,7 @@ mod tests {
                     status: "running".into(),
                     resources: json!({}),
                     instance_id: None,
+                    network: None,
                 }],
             ),
         ]);
@@ -4030,6 +4033,7 @@ mod tests {
                         status: "running".into(),
                         resources: json!({}),
                         instance_id: None,
+                        network: None,
                     },
                     Allocation {
                         id: 2,
@@ -4040,6 +4044,7 @@ mod tests {
                         status: "running".into(),
                         resources: json!({}),
                         instance_id: None,
+                        network: None,
                     },
                     Allocation {
                         id: 3,
@@ -4050,6 +4055,7 @@ mod tests {
                         status: "running".into(),
                         resources: json!({}),
                         instance_id: None,
+                        network: None,
                     },
                 ],
             ),
@@ -4065,6 +4071,7 @@ mod tests {
                         status: "running".into(),
                         resources: json!({}),
                         instance_id: None,
+                        network: None,
                     },
                     Allocation {
                         id: 5,
@@ -4075,6 +4082,7 @@ mod tests {
                         status: "running".into(),
                         resources: json!({}),
                         instance_id: None,
+                        network: None,
                     },
                 ],
             ),

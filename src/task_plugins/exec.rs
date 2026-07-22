@@ -337,8 +337,10 @@ impl TaskPlugin for ExecTaskPlugin {
             }
         }
 
-        // Worker-injected env (LEGION_TASK_DIR, LEGION_ARTIFACT_*) first, so
-        // explicit task env can override on collision.
+        // Legion-provided env first (allocation identity/ports, then
+        // worker-injected LEGION_TASK_DIR/LEGION_ARTIFACT_*), so explicit
+        // task env can override on collision.
+        cmd.envs(crate::task_plugins::allocation_env(allocation, task));
         if !runtime.extra_env.is_empty() {
             cmd.envs(&runtime.extra_env);
         }

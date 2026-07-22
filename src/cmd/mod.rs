@@ -17,5 +17,6 @@ pub mod node;
 pub mod oidc;
 pub mod output;
 pub mod raft;
+pub mod service;
 pub mod start;
 pub mod state;

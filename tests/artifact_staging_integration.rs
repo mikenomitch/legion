@@ -169,6 +169,7 @@ fn task_allocation(
         task_identities: String::new(),
         self_terminate_after_seconds: 0,
         task_artifacts: artifacts.to_string(),
+        network: String::new(),
     }
 }
 
@@ -500,6 +501,7 @@ async fn admission_normalizes_artifacts_and_preserves_plain_jobs() -> R<()> {
         task_config_id: 1,
         job_id: "artifact-admission-job".into(),
         instance_id: None,
+        network: None,
     };
     let dispatched = build_task_allocation(with_artifacts, &allocation, None)?;
     assert!(dispatched.task_artifacts.contains("secrets/private-pull"));

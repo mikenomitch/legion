@@ -4,6 +4,7 @@ use tabled::Tabled;
 
 use crate::prelude::{Context, R};
 
+use super::network::AllocNetwork;
 use super::node::Node;
 use super::{LedgerAllocation, LedgerNode};
 
@@ -20,6 +21,10 @@ pub struct Allocation {
     /// Stable instance this allocation fulfills, when the task is stateful
     /// (see `docs/stateful-workloads.md`). None for stateless tasks.
     pub instance_id: Option<String>,
+    /// Assigned ports + node address, set at placement. None when the task
+    /// declares no network block.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<AllocNetwork>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -104,9 +109,14 @@ impl From<Allocation> for LedgerAllocation {
             task_config_id,
             job_id,
             instance_id,
+            network,
         } = allocation;
 
         let resources = to_string(&resources).unwrap_or_else(|_| "{}".into());
+        let network = network
+            .as_ref()
+            .and_then(|network| to_string(network).ok())
+            .unwrap_or_default();
 
         LedgerAllocation {
             id,
@@ -117,6 +127,7 @@ impl From<Allocation> for LedgerAllocation {
             task_config_id,
             job_id,
             instance_id,
+            network,
             // Enriched from allocation_health snapshots by the manager's
             // GetLedger handler; the core Allocation carries no health data.
             artifact_states: None,
@@ -139,6 +150,7 @@ mod ledger_tests {
             task_config_id: 3,
             job_id: "db".into(),
             instance_id: instance_id.map(Into::into),
+            network: None,
         }
     }
 
@@ -170,11 +182,17 @@ impl LedgerAllocation {
             task_config_id,
             job_id,
             instance_id,
+            network,
             artifact_states: _,
         } = self;
 
         let resources: Value =
             serde_json::from_str(&resources).context("failed to parse allocation resources")?;
+        let network = if network.trim().is_empty() {
+            None
+        } else {
+            Some(serde_json::from_str(&network).context("failed to parse allocation network")?)
+        };
 
         Ok(Allocation {
             id,
@@ -185,6 +203,7 @@ impl LedgerAllocation {
             task_config_id,
             job_id,
             instance_id,
+            network,
         })
     }
 }

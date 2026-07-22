@@ -46,18 +46,19 @@ use crate::structs::{
     ListInstancesRequest, ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobsReply,
     ListJobsRequest, ListKvReply, ListKvRequest, ListRaftHistoryReply, ListRaftHistoryRequest,
     ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply, ListRolloutsRequest,
-    ListSavedStateQueriesReply, ListSavedStateQueriesRequest, Node, NodeMsg, PatchKvReply,
-    PatchKvRequest, PlanJobReply, PlanJobRequest, PlannedAllocation, PutKvReply, PutKvRequest,
-    QueryStateStoreReply, QueryStateStoreRequest, RaftHistoryEvent, RaftStatus, ReleaseKvLockReply,
-    ReleaseKvLockRequest, RenewKvLockReply, RenewKvLockRequest, ReplaceInstanceReply,
-    ReplaceInstanceRequest, RestartWorkerReply, RestartWorkerRequest, RolloutAllocationStatus,
+    ListSavedStateQueriesReply, ListSavedStateQueriesRequest, ListServicesReply,
+    ListServicesRequest, Node, NodeMsg, PatchKvReply, PatchKvRequest, PlanJobReply, PlanJobRequest,
+    PlannedAllocation, PutKvReply, PutKvRequest, QueryStateStoreReply, QueryStateStoreRequest,
+    RaftHistoryEvent, RaftStatus, ReleaseKvLockReply, ReleaseKvLockRequest, RenewKvLockReply,
+    RenewKvLockRequest, ReplaceInstanceReply, ReplaceInstanceRequest, ResolveServiceReply,
+    ResolveServiceRequest, RestartWorkerReply, RestartWorkerRequest, RolloutAllocationStatus,
     RolloutEvent, RolloutGroupStatus, RolloutProgression, RolloutReplacement, RunJobReply,
-    RunJobRequest, SavedStateQuery, SchedulerEvent, StartInstanceReply, StartInstanceRequest,
-    StopInstanceReply, StopInstanceRequest, StopJobReply, StopJobRequest, StopRolloutReply,
-    StopRolloutRequest, StreamEventsRequest, Submission, TaskConfig, TaskOnUnhealthyConfig,
-    UpdateNodeDynamicReply, UpdateNodeDynamicRequest, UpsertSavedStateQueryReply,
-    UpsertSavedStateQueryRequest, WorkerConfig, WorkerPreRegisterReply, WorkerPreRegisterRequest,
-    WorkerRegisterReply, WorkerRegisterRequest,
+    RunJobRequest, SavedStateQuery, SchedulerEvent, ServiceEndpoint, ServiceSummary,
+    StartInstanceReply, StartInstanceRequest, StopInstanceReply, StopInstanceRequest, StopJobReply,
+    StopJobRequest, StopRolloutReply, StopRolloutRequest, StreamEventsRequest, Submission,
+    TaskConfig, TaskOnUnhealthyConfig, UpdateNodeDynamicReply, UpdateNodeDynamicRequest,
+    UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest, WorkerConfig, WorkerPreRegisterReply,
+    WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest,
 };
 use crate::structs::{
     AuthMethodInfo, BootstrapAclReply, BootstrapAclRequest, CreateAclTokenReply,
@@ -3988,6 +3989,89 @@ impl Manager for ManagerDaemonService {
         let reply: GetLedgerReply = GetLedgerReply { nodes };
 
         Ok(Response::new(reply))
+    }
+
+    #[instrument(skip_all)]
+    async fn list_services(
+        &self,
+        request: Request<ListServicesRequest>,
+    ) -> Result<Response<ListServicesReply>, Status> {
+        // Services are a projection over jobs/allocations, so job:read governs.
+        self.check_acl(&request, AclResource::Job, AclAction::Read, AclScope::any())?;
+        let endpoints = self
+            .store
+            .service_endpoints(None)
+            .map_err(|e| map_store_error("Error listing service endpoints", e))?;
+        let declared = self
+            .store
+            .declared_services()
+            .map_err(|e| map_store_error("Error listing declared services", e))?;
+
+        let mut summaries: std::collections::BTreeMap<String, ServiceSummary> =
+            std::collections::BTreeMap::new();
+        for (service, job_id, task_name, tags) in declared {
+            summaries.entry(service.clone()).or_insert(ServiceSummary {
+                service,
+                job_id,
+                task_name,
+                healthy_count: 0,
+                total_count: 0,
+                tags,
+            });
+        }
+        for endpoint in endpoints {
+            let summary = summaries
+                .entry(endpoint.service.clone())
+                .or_insert(ServiceSummary {
+                    service: endpoint.service.clone(),
+                    job_id: endpoint.job_id.clone(),
+                    task_name: endpoint.task_name.clone(),
+                    healthy_count: 0,
+                    total_count: 0,
+                    tags: endpoint.tags.clone(),
+                });
+            summary.total_count += 1;
+            if endpoint.healthy {
+                summary.healthy_count += 1;
+            }
+        }
+
+        Ok(Response::new(ListServicesReply {
+            services: summaries.into_values().collect(),
+        }))
+    }
+
+    #[instrument(skip_all)]
+    async fn resolve_service(
+        &self,
+        request: Request<ResolveServiceRequest>,
+    ) -> Result<Response<ResolveServiceReply>, Status> {
+        // Services are a projection over jobs/allocations, so job:read governs.
+        self.check_acl(&request, AclResource::Job, AclAction::Read, AclScope::any())?;
+        let req = request.into_inner();
+        let endpoints = self
+            .store
+            .service_endpoints(Some(&req.service))
+            .map_err(|e| map_store_error("Error resolving service", e))?;
+
+        let endpoints = endpoints
+            .into_iter()
+            .filter(|endpoint| req.include_unhealthy || endpoint.healthy)
+            .map(|endpoint| ServiceEndpoint {
+                service: endpoint.service,
+                job_id: endpoint.job_id,
+                task_name: endpoint.task_name,
+                allocation_id: endpoint.allocation_id,
+                node_id: endpoint.node_id,
+                address: endpoint.address.unwrap_or_default(),
+                port: u32::from(endpoint.port.unwrap_or(0)),
+                healthy: endpoint.healthy,
+                health_status: endpoint.health_status,
+                tags: endpoint.tags,
+            })
+            .collect();
+
+        Ok(Response::new(ResolveServiceReply { endpoints }))
     }
 
     #[instrument(skip_all)]

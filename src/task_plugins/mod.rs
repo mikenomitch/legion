@@ -47,6 +47,21 @@ pub fn spawn_task_process(cmd: &mut Command) -> R<Child> {
     cmd.spawn().context("Failed to spawn task process")
 }
 
+/// Legion-provided environment for a task: allocation identity plus any
+/// assigned ports (`LEGION_PORT_*`, `LEGION_ADDR_*`, ...). Task plugins apply
+/// these before user-declared env so user values win on key conflicts.
+pub fn allocation_env(allocation: &Allocation, task: &TaskConfig) -> Vec<(String, String)> {
+    let mut pairs = vec![
+        ("LEGION_ALLOC_ID".to_string(), allocation.id.to_string()),
+        ("LEGION_JOB_ID".to_string(), allocation.job_id.clone()),
+        ("LEGION_TASK_NAME".to_string(), task.name.clone()),
+    ];
+    if let Some(network) = allocation.network.as_ref() {
+        pairs.extend(network.env_pairs());
+    }
+    pairs
+}
+
 /// File name for a captured stdout stream within an allocation log directory.
 pub const STDOUT_LOG_FILE: &str = "stdout.log";
 /// File name for a captured stderr stream within an allocation log directory.
@@ -295,6 +310,7 @@ pub fn validate_job_config(config: &JobConfig) -> R<()> {
         registry.validate_task_config(task)?;
         task.validate_checks()?;
         task.validate_kv_injections()?;
+        task.validate_network()?;
         task.validate_stateful()?;
         task.validate_identities()?;
         task.validate_artifacts()?;
@@ -658,6 +674,7 @@ mod tests {
             task_config_id: 1,
             job_id: "job".into(),
             instance_id: None,
+            network: None,
         }
     }
 

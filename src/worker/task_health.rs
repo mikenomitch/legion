@@ -28,6 +28,9 @@ struct CheckRuntime {
     check: TaskCheck,
     name: String,
     boot_grace_time: Duration,
+    /// Concrete port for http/tcp checks, with label references already
+    /// resolved against the allocation's assigned ports.
+    resolved_port: Option<u16>,
 }
 
 #[derive(Debug)]
@@ -92,10 +95,15 @@ async fn run_health_monitor(
     for check in task.checks.iter().cloned() {
         let name = check.default_name();
         let boot_grace_time = check.boot_grace_time.unwrap_or(default_boot_grace);
+        let resolved_port = check
+            .port
+            .as_ref()
+            .and_then(|port| port.resolve(allocation.network.as_ref()));
         checks.push(CheckRuntime {
             check,
             name,
             boot_grace_time,
+            resolved_port,
         });
     }
 
@@ -349,9 +357,8 @@ async fn run_check(runtime: &CheckRuntime) -> CheckResult {
 
 fn run_http_check(runtime: &CheckRuntime) -> Result<(), String> {
     let port = runtime
-        .check
-        .port
-        .ok_or_else(|| "http check requires a port".to_string())?;
+        .resolved_port
+        .ok_or_else(|| "http check requires a port (or an assigned port label)".to_string())?;
     let path = runtime
         .check
         .path
@@ -375,9 +382,8 @@ fn run_http_check(runtime: &CheckRuntime) -> Result<(), String> {
 
 fn run_tcp_check(runtime: &CheckRuntime) -> Result<(), String> {
     let port = runtime
-        .check
-        .port
-        .ok_or_else(|| "tcp check requires a port".to_string())?;
+        .resolved_port
+        .ok_or_else(|| "tcp check requires a port (or an assigned port label)".to_string())?;
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
     TcpStream::connect_timeout(&addr, runtime.check.timeout)
         .map(|_| ())

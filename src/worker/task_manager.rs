@@ -1018,6 +1018,12 @@ fn task_from_allocation(allocation: &TaskAllocation) -> R<(Allocation, TaskConfi
         serde_json::from_str(&allocation.task_artifacts).context("Invalid task artifacts JSON")?
     };
 
+    let network = if allocation.network.trim().is_empty() {
+        None
+    } else {
+        Some(serde_json::from_str(&allocation.network).context("Invalid allocation network JSON")?)
+    };
+
     let task = TaskConfig {
         config: task_config,
         checks,
@@ -1034,6 +1040,7 @@ fn task_from_allocation(allocation: &TaskAllocation) -> R<(Allocation, TaskConfi
         job_config_id: allocation.job_config_id.clone(),
         task_config_id: allocation.task_config_id,
         job_id: allocation.job_id.clone(),
+        network,
         // The worker never needs the instance binding: instance env vars are
         // already injected into task_config by the manager at dispatch time.
         instance_id: None,
@@ -1062,6 +1069,7 @@ mod tests {
             task_config_id: 1,
             job_id: "job".into(),
             instance_id: None,
+            network: None,
         }
     }
 
@@ -1249,6 +1257,8 @@ mod tests {
             task_identities: String::new(),
             self_terminate_after_seconds: 0,
             task_artifacts: String::new(),
+
+            network: String::new(),
         };
         let new = manager.reconcile_allocations(std::slice::from_ref(&ta));
         assert_eq!(new.len(), 1);
@@ -1298,6 +1308,8 @@ mod tests {
             task_identities: String::new(),
             self_terminate_after_seconds: 0,
             task_artifacts: serde_json::to_string(&[artifact])?,
+
+            network: String::new(),
         };
         let outcome = manager.begin_task_allocation(&ta)?;
         let job = match outcome {
@@ -1338,6 +1350,8 @@ mod tests {
             task_identities: String::new(),
             self_terminate_after_seconds: 0,
             task_artifacts: serde_json::to_string(&artifacts)?,
+
+            network: String::new(),
         };
 
         let outcome = manager.begin_task_allocation(&ta)?;

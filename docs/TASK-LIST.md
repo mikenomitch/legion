@@ -104,11 +104,11 @@
   - [x] When I update one of these, the task restarts (if configured to do so)
   - [x] I can use one of these in the defintion
 
-- [ ] Service Discovery
-  - [ ] I can declare a named service on a task
-  - [ ] I can declare health checks on that task
-  - [ ] Can query address and port from other services
-  - [ ] I can declare which other jobs have access to my service
+- [ ] Service Discovery ([plan](plans/service-discovery-final-plan.md), [docs](service-discovery.md))
+  - [x] I can declare a named service on a task
+  - [x] I can declare health checks on that task
+  - [x] Can query address and port from other services
+  - [ ] I can declare which other jobs have access to my service (intentions; needs workload identity + L4 forwarder)
   
 - [x] Persisting state
   - [x] Saving the SQLite works (litestream-like)?

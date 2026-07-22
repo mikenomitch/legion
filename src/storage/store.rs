@@ -60,6 +60,42 @@ pub enum Msg {
 pub type MemSafeConn = Arc<Mutex<Connection>>;
 const READ_MODEL_LOCK_ERROR: &str = "Error locking read model";
 
+/// Parse a nullable JSONB text column into an optional typed value, mapping
+/// parse failures onto rusqlite conversion errors.
+fn parse_json_column<T: serde::de::DeserializeOwned>(
+    idx: usize,
+    raw: Option<String>,
+) -> Result<Option<T>, rusqlite::Error> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    serde_json::from_str(&raw).map(Some).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(idx, rusqlite::types::Type::Text, Box::new(err))
+    })
+}
+
+/// Extract the host portion of a node's advertised `workerAddress` config
+/// attribute (for example `http://10.0.0.5:4848` -> `10.0.0.5`).
+fn worker_address_host(config_attrs: &Value) -> Option<String> {
+    let address = config_attrs.as_object()?.get("workerAddress")?.as_str()?;
+    let without_scheme = address
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(address);
+    let host = without_scheme
+        .split('/')
+        .next()
+        .unwrap_or(without_scheme)
+        .rsplit_once(':')
+        .map(|(host, _)| host)
+        .unwrap_or(without_scheme);
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_string())
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SchedulingReadModel {
     pub nodes: HashMap<String, Node>,
@@ -82,7 +118,12 @@ struct AllocationTaskState {
     job_config_id: String,
     resources: Value,
     lifecycle: TaskLifecycle,
+    network_raw: Option<String>,
 }
+
+/// A service declared in a job's latest config: (service, job_id, task_name,
+/// tags). Endpoint counts come from `service_endpoints`.
+pub type DeclaredService = (String, String, String, Vec<String>);
 
 #[derive(Debug, Clone)]
 pub struct PlanSubmission {
@@ -443,7 +484,7 @@ impl Store {
 
         let mut task_stmt = conn.prepare(
             r#"
-            SELECT id, name, kind, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_config_id, identities, stateful, artifacts
+            SELECT id, name, kind, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_config_id, identities, stateful, artifacts, network, service
             FROM task_config;
             "#,
         )?;
@@ -477,6 +518,8 @@ impl Store {
                 identities: self.parse_identities_column(18, row.get(18)?)?,
                 stateful: self.parse_stateful_column(19, row.get(19)?)?,
                 artifacts: self.parse_artifacts_column(20, row.get(20)?)?,
+                network: parse_json_column(21, row.get(21)?)?,
+                service: parse_json_column(22, row.get(22)?)?,
             };
             let job_config_id: String = row.get(17)?;
             Ok((job_config_id, id, task))
@@ -931,12 +974,15 @@ impl Store {
                 tracker.insert_from_node(node);
             }
 
+            let network =
+                self.assign_allocation_network(&tx, node_id, *task_id, state.network_raw.clone())?;
             let allocation = self.insert_allocation_with_data(
                 &tx,
                 node_id,
                 *task_id,
                 &state.job_config_id,
                 &state.resources,
+                network.as_ref(),
             )?;
             task_status_updates
                 .entry(*task_id)
@@ -1418,6 +1464,8 @@ impl Store {
             identities: self.parse_identities_column(19, row.get(19)?)?,
             stateful: self.parse_stateful_column(20, row.get(20)?)?,
             artifacts: self.parse_artifacts_column(21, row.get(21)?)?,
+            network: parse_json_column(22, row.get(22)?)?,
+            service: parse_json_column(23, row.get(23)?)?,
         };
 
         Ok(task_config)
@@ -1433,6 +1481,7 @@ impl Store {
             task_config_id: row.get(5)?,
             job_id: row.get(6)?,
             instance_id: row.get(7)?,
+            network: parse_json_column(8, row.get(8)?)?,
         };
 
         Ok(allocation)
@@ -2390,6 +2439,8 @@ impl Store {
                 .as_ref()
                 .map(serde_json::to_string)
                 .transpose()?;
+            let network = t.network.as_ref().map(serde_json::to_string).transpose()?;
+            let service = t.service.as_ref().map(serde_json::to_string).transpose()?;
             let identities = if t.identities.is_empty() {
                 None
             } else {
@@ -2424,6 +2475,8 @@ impl Store {
                 ":identities": identities,
                 ":stateful": stateful,
                 ":artifacts": artifacts,
+                ":network": network,
+                ":service": service,
             };
 
             let task_id: i64 = tx.query_row(&INSERT_TASK, task_params, |row| row.get(0))?;
@@ -2489,10 +2542,12 @@ impl Store {
                 let resources = self
                     .resource_policy
                     .normalize_task_resources(&task.resources, true)?;
-                Ok(TaskConfig {
+                let mut task = TaskConfig {
                     resources,
                     ..task.clone()
-                })
+                };
+                task.normalize_network()?;
+                Ok(task)
             })
             .collect::<R<Vec<_>>>()?;
 
@@ -3282,13 +3337,67 @@ impl Store {
         // This helper writes a single allocation row. Callers mutating allocation state
         // must call bump_epochs_for_allocations_tx (or bump_job_config_epoch_tx)
         // in the same transaction before commit.
-        let (job_config_id, resources): (String, Value) = tx.query_row(
-            "SELECT job_config_id, resources FROM task_config WHERE id = ?;",
-            [task_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
+        let (job_config_id, resources, network_raw): (String, Value, Option<String>) = tx
+            .query_row(
+                "SELECT job_config_id, resources, network FROM task_config WHERE id = ?;",
+                [task_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
 
-        self.insert_allocation_with_data(tx, node_id, task_id, &job_config_id, &resources)
+        let network = self.assign_allocation_network(tx, node_id, task_id, network_raw)?;
+        self.insert_allocation_with_data(
+            tx,
+            node_id,
+            task_id,
+            &job_config_id,
+            &resources,
+            network.as_ref(),
+        )
+    }
+
+    /// Assign host ports for a new allocation of `task_id` on `node_id` inside
+    /// the current transaction. Reads ports already assigned on the node so
+    /// concurrent placements in the same tx or committed earlier cannot
+    /// collide. Static port conflicts fail placement with a node-scoped error.
+    fn assign_allocation_network(
+        &self,
+        tx: &Transaction<'_>,
+        node_id: &str,
+        task_id: i64,
+        network_raw: Option<String>,
+    ) -> R<Option<crate::structs::AllocNetwork>> {
+        let Some(raw) = network_raw else {
+            return Ok(None);
+        };
+        let network: crate::structs::NetworkConfig = from_str(&raw)
+            .with_context(|| format!("invalid stored network config for task {task_id}"))?;
+        if network.ports.is_empty() {
+            return Ok(None);
+        }
+
+        let mut used: HashSet<u16> = HashSet::new();
+        let mut stmt = tx
+            .prepare("SELECT network FROM allocation WHERE node_id = ? AND network IS NOT NULL;")?;
+        let rows = stmt.query_map([node_id], |row| row.get::<_, Option<String>>(0))?;
+        for row in rows {
+            let Some(raw) = row? else { continue };
+            let existing: crate::structs::AllocNetwork = from_str(&raw)
+                .with_context(|| format!("invalid stored allocation network on node {node_id}"))?;
+            used.extend(existing.ports.iter().map(|port| port.host_port));
+        }
+
+        let ports = crate::structs::assign_ports(&network, &used)
+            .with_context(|| format!("failed to assign ports on node {node_id}"))?;
+        let address = tx
+            .query_row(
+                "SELECT config_attrs FROM node WHERE id = ?;",
+                [node_id],
+                |row| row.get::<_, Value>(0),
+            )
+            .ok()
+            .and_then(|attrs| worker_address_host(&attrs));
+
+        Ok(Some(crate::structs::AllocNetwork { address, ports }))
     }
 
     fn insert_allocation_with_data(
@@ -3298,7 +3407,9 @@ impl Store {
         task_id: i64,
         job_config_id: &str,
         resources: &Value,
+        network: Option<&crate::structs::AllocNetwork>,
     ) -> R<Allocation> {
+        let network_json = network.map(to_string).transpose()?;
         // Stateful tasks: pick (or re-materialize) the instance this
         // allocation will fulfill before writing the row, so the binding is
         // atomic with the placement.
@@ -3311,6 +3422,7 @@ impl Store {
             ":job_config_id": job_config_id,
             ":task_config_id": task_id,
             ":instance_id": instance_id,
+            ":network": network_json,
         };
 
         let allocation = tx.query_row(&INSERT_ALLOCATION, params, |row| {
@@ -3722,14 +3834,15 @@ impl Store {
         tx: &Transaction<'_>,
         task_id: i64,
     ) -> R<AllocationTaskState> {
-        let (job_config_id, resources, constraints, permit, lifecycle): (
+        let (job_config_id, resources, constraints, permit, lifecycle, network_raw): (
             String,
             Value,
             Value,
             Value,
             String,
+            Option<String>,
         ) = tx.query_row(
-            "SELECT job_config_id, resources, constraints, permit, lifecycle FROM task_config WHERE id = ?;",
+            "SELECT job_config_id, resources, constraints, permit, lifecycle, network FROM task_config WHERE id = ?;",
             [task_id],
             |row| {
                 Ok((
@@ -3738,6 +3851,7 @@ impl Store {
                     row.get(2)?,
                     row.get(3)?,
                     row.get(4)?,
+                    row.get(5)?,
                 ))
             },
         )?;
@@ -3771,6 +3885,7 @@ impl Store {
             job_config_id,
             resources,
             lifecycle: lifecycle.parse().map_err(|err: String| anyhow!(err))?,
+            network_raw,
         })
     }
 
@@ -4051,6 +4166,147 @@ impl Store {
     }
 
     #[instrument(err, skip_all)]
+    /// One resolvable endpoint of a declared service, derived (never
+    /// registered) from task config + allocation + health + node state.
+    pub fn service_endpoints(
+        &self,
+        service_filter: Option<&str>,
+    ) -> R<Vec<crate::structs::ServiceEndpointRow>> {
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare(
+            "SELECT tc.name, tc.service, tc.job_id,
+                    a.id, a.node_id, a.network,
+                    ah.healthy, ah.status,
+                    n.status, n.config_attrs
+             FROM task_config tc
+             INNER JOIN allocation a ON a.task_config_id = tc.id
+             LEFT JOIN allocation_health ah ON ah.allocation_id = a.id
+             LEFT JOIN node n ON n.id = a.node_id
+             WHERE tc.service IS NOT NULL;",
+        )?;
+
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<bool>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<Value>>(9)?,
+            ))
+        })?;
+
+        let mut endpoints = Vec::new();
+        for row in rows {
+            let (
+                task_name,
+                service_raw,
+                job_id,
+                allocation_id,
+                node_id,
+                network_raw,
+                alloc_healthy,
+                health_status,
+                node_status,
+                node_config_attrs,
+            ) = row?;
+
+            let service: crate::structs::ServiceConfig = from_str(&service_raw)
+                .with_context(|| format!("invalid stored service config for task {task_name}"))?;
+            let service_name = service.service_name(&task_name).to_string();
+            if let Some(filter) = service_filter {
+                if service_name != filter {
+                    continue;
+                }
+            }
+
+            let network: Option<crate::structs::AllocNetwork> = network_raw
+                .as_deref()
+                .map(from_str)
+                .transpose()
+                .with_context(|| {
+                    format!("invalid stored network for allocation {allocation_id}")
+                })?;
+            let port = service
+                .port_label()
+                .and_then(|label| network.as_ref().and_then(|network| network.port(label)))
+                .map(|port| port.host_port);
+            let address = network
+                .as_ref()
+                .and_then(|network| network.address.clone())
+                .or_else(|| node_config_attrs.as_ref().and_then(worker_address_host));
+
+            // Nodes report `active`/`ready` while alive; `lost` (or a missing
+            // row) is the dead state. Endpoint liveness is leased on this.
+            let node_alive = matches!(node_status.as_deref(), Some(status) if status != "lost");
+            let healthy = alloc_healthy.unwrap_or(false) && node_alive;
+            let health_status = if node_alive {
+                health_status.unwrap_or_default()
+            } else {
+                format!(
+                    "node {} is {}",
+                    node_id,
+                    node_status.as_deref().unwrap_or("unknown")
+                )
+            };
+
+            endpoints.push(crate::structs::ServiceEndpointRow {
+                service: service_name,
+                job_id,
+                task_name,
+                allocation_id,
+                node_id,
+                address,
+                port,
+                healthy,
+                health_status,
+                tags: service.tags.clone(),
+            });
+        }
+
+        Ok(endpoints)
+    }
+
+    /// Services declared by the latest job config of each job, including ones
+    /// with no allocations yet. Returns (service, job_id, task_name, tags).
+    pub fn declared_services(&self) -> R<Vec<DeclaredService>> {
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare(
+            "SELECT tc.name, tc.service, tc.job_id
+             FROM task_config tc
+             INNER JOIN job_config jc ON jc.id = tc.job_config_id
+             INNER JOIN (
+                 SELECT job_id, MAX(version) AS version FROM job_config GROUP BY job_id
+             ) latest ON latest.job_id = jc.job_id AND latest.version = jc.version
+             WHERE tc.service IS NOT NULL;",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+
+        let mut declared = Vec::new();
+        for row in rows {
+            let (task_name, service_raw, job_id) = row?;
+            let service: crate::structs::ServiceConfig = from_str(&service_raw)
+                .with_context(|| format!("invalid stored service config for task {task_name}"))?;
+            declared.push((
+                service.service_name(&task_name).to_string(),
+                job_id,
+                task_name,
+                service.tags.clone(),
+            ));
+        }
+        Ok(declared)
+    }
+
     pub fn allocation_health_for_job_config(
         &self,
         job_config_id: &str,
@@ -4974,7 +5230,7 @@ impl Store {
         let mut stmt = tx.prepare(
             "SELECT allocation.id, allocation.status, allocation.resources, allocation.node_id, \
              allocation.job_config_id, allocation.task_config_id, job_config.job_id, \
-             allocation.instance_id \
+             allocation.instance_id, allocation.network \
              FROM allocation \
              INNER JOIN job_config ON job_config.id = allocation.job_config_id \
              WHERE allocation.instance_id = ?;",
@@ -5062,7 +5318,7 @@ impl Store {
         let mut stmt = tx.prepare(
             "SELECT allocation.id, allocation.status, allocation.resources, allocation.node_id, \
              allocation.job_config_id, allocation.task_config_id, job_config.job_id, \
-             allocation.instance_id \
+             allocation.instance_id, allocation.network \
              FROM allocation \
              INNER JOIN job_config ON job_config.id = allocation.job_config_id \
              WHERE allocation.instance_id = ?;",
@@ -10089,4 +10345,176 @@ mod tests {
     //     let _store = setup_store()?;
     //     Ok(())
     // }
+
+    fn service_task(name: &str) -> TaskConfig {
+        let mut task = TaskConfig::new(name, "noop");
+        task.network = Some(crate::structs::NetworkConfig {
+            ports: vec![crate::structs::PortConfig {
+                name: "http".into(),
+                static_port: None,
+                to: Some(8080),
+            }],
+            ..Default::default()
+        });
+        task.service = Some(
+            serde_json::from_value(json!({ "port": "http", "tags": ["v1"] }))
+                .expect("service config"),
+        );
+        task
+    }
+
+    fn submit_service_job(store: &Store, name: &str, tasks: Vec<TaskConfig>) -> R<()> {
+        let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: name.into(),
+            tasks,
+            version: None,
+        };
+        store.handle_job_submit(
+            &job,
+            &[Submission {
+                path: "job.jsonnet".into(),
+                content: "{}".into(),
+                is_primary: true,
+            }],
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn port_assignment_gives_distinct_dynamic_ports() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "ready"))?;
+        submit_service_job(&store, "svc-ports", vec![service_task("web")])?;
+        let task_id = task_id_for(&store, "web", "svc-ports")?;
+
+        let first = store.place_alloc("node-a", task_id)?;
+        let second = store.place_alloc("node-a", task_id)?;
+
+        let first_port = first
+            .network
+            .as_ref()
+            .and_then(|network| network.port("http"))
+            .map(|port| port.host_port)
+            .context("first alloc missing http port")?;
+        let second_port = second
+            .network
+            .as_ref()
+            .and_then(|network| network.port("http"))
+            .map(|port| port.host_port)
+            .context("second alloc missing http port")?;
+
+        assert_ne!(first_port, second_port);
+        assert!(first_port >= crate::structs::DYNAMIC_PORT_MIN);
+        assert!(second_port <= crate::structs::DYNAMIC_PORT_MAX);
+        Ok(())
+    }
+
+    #[test]
+    fn static_port_conflict_fails_placement_with_clear_error() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "ready"))?;
+
+        let mut task = TaskConfig::new("redis", "noop");
+        task.service =
+            Some(serde_json::from_value(json!({ "port": 6379 })).expect("service config"));
+        submit_service_job(&store, "svc-conflict", vec![task])?;
+        let task_id = task_id_for(&store, "redis", "svc-conflict")?;
+
+        store.place_alloc("node-a", task_id)?;
+        let err = store.place_alloc("node-a", task_id).unwrap_err();
+        let details = format!("{err:#}");
+        assert!(details.contains("static port 6379"), "got: {details}");
+        assert!(details.contains("node-a"), "got: {details}");
+        Ok(())
+    }
+
+    #[test]
+    fn service_endpoints_projection_gates_on_health_and_node() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "ready"))?;
+        submit_service_job(&store, "svc-proj", vec![service_task("web")])?;
+        let task_id = task_id_for(&store, "web", "svc-proj")?;
+        let alloc = store.place_alloc("node-a", task_id)?;
+
+        // No health snapshot yet: endpoint exists but is not healthy.
+        let endpoints = store.service_endpoints(Some("web"))?;
+        assert_eq!(endpoints.len(), 1);
+        assert!(!endpoints[0].healthy);
+        assert!(endpoints[0].port.is_some());
+
+        // Healthy snapshot: endpoint becomes healthy.
+        store.upsert_allocation_health_snapshots(
+            "node-a",
+            &[AllocationHealth {
+                allocation_id: alloc.id,
+                healthy: true,
+                status: "healthy".into(),
+                artifact_states: None,
+            }],
+        )?;
+        let endpoints = store.service_endpoints(Some("web"))?;
+        assert!(endpoints[0].healthy);
+
+        // Unhealthy snapshot: gated out again.
+        store.upsert_allocation_health_snapshots(
+            "node-a",
+            &[AllocationHealth {
+                allocation_id: alloc.id,
+                healthy: false,
+                status: "tcp connect refused".into(),
+                artifact_states: None,
+            }],
+        )?;
+        let endpoints = store.service_endpoints(Some("web"))?;
+        assert!(!endpoints[0].healthy);
+        assert_eq!(endpoints[0].health_status, "tcp connect refused");
+
+        // Healthy again but node lost: still not healthy (liveness lease).
+        store.upsert_allocation_health_snapshots(
+            "node-a",
+            &[AllocationHealth {
+                allocation_id: alloc.id,
+                healthy: true,
+                status: "healthy".into(),
+                artifact_states: None,
+            }],
+        )?;
+        store.mark_node_lost("node-a")?;
+        let endpoints = store.service_endpoints(Some("web"))?;
+        assert!(!endpoints[0].healthy);
+        assert!(endpoints[0].health_status.contains("node node-a is lost"));
+
+        // Removing the allocation removes the endpoint entirely.
+        store.remove_allocation_by_id(alloc.id)?;
+        let endpoints = store.service_endpoints(Some("web"))?;
+        assert!(endpoints.is_empty());
+
+        // But the declared service is still listed (0 endpoints).
+        let declared = store.declared_services()?;
+        assert!(declared.iter().any(|(service, ..)| service == "web"));
+        Ok(())
+    }
+
+    #[test]
+    fn service_port_sugar_persists_explicit_network() -> R<()> {
+        let store = setup_store()?;
+        let mut task = TaskConfig::new("redis", "noop");
+        task.service =
+            Some(serde_json::from_value(json!({ "port": 6379 })).expect("service config"));
+        submit_service_job(&store, "svc-sugar", vec![task])?;
+
+        let job_config_id = store.get_job_config("svc-sugar")?.id();
+        let tasks = store.get_task_configs_for_job_config(&job_config_id)?;
+        let (_, stored) = tasks.first().context("missing stored task")?;
+        let network = stored
+            .network
+            .as_ref()
+            .context("network not materialized")?;
+        assert_eq!(network.ports.len(), 1);
+        assert_eq!(network.ports[0].name, "redis");
+        assert_eq!(network.ports[0].static_port, Some(6379));
+        Ok(())
+    }
 }

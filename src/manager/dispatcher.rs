@@ -125,6 +125,12 @@ pub fn build_task_allocation(
     let task_config = serde_json::to_string(&config)?;
     let task_checks = serde_json::to_string(&task.checks)?;
     let task_on_unhealthy = serde_json::to_string(&task.on_unhealthy)?;
+    let network = allocation
+        .network
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()?
+        .unwrap_or_default();
     // Identity *specs* only (delivery/refresh instructions) — the tokens
     // themselves are fetched by the worker via IssueWorkloadIdentityToken and
     // never transit the desired-state payload.
@@ -156,6 +162,7 @@ pub fn build_task_allocation(
         task_config,
         task_checks,
         task_on_unhealthy,
+        network,
         task_identities,
         self_terminate_after_seconds,
         task_artifacts,
@@ -231,6 +238,7 @@ mod tests {
             task_config_id: 1,
             job_id: "job".into(),
             instance_id: instance_id.map(String::from),
+            network: None,
         }
     }
 

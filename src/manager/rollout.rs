@@ -2137,6 +2137,7 @@ mod tests {
                         task_config_id: 1,
                         job_id: "job".to_string(),
                         instance_id: None,
+                        network: None,
                     },
                     Allocation {
                         id: 2,
@@ -2147,6 +2148,7 @@ mod tests {
                         task_config_id: 1,
                         job_id: "job".to_string(),
                         instance_id: None,
+                        network: None,
                     },
                     Allocation {
                         id: 3,
@@ -2157,6 +2159,7 @@ mod tests {
                         task_config_id: 1,
                         job_id: "job".to_string(),
                         instance_id: None,
+                        network: None,
                     },
                 ],
             }],

@@ -760,6 +760,7 @@ mod tests {
                 task_config_id: 1,
                 job_id: "job".into(),
                 instance_id: None,
+                network: None,
             };
             manager.run_allocation(&allocation, &task)?;
             manager.set_self_fence_window(1, Duration::from_millis(50));

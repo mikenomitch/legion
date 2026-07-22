@@ -103,15 +103,20 @@ fn work_root(allocation: &Allocation, runtime: &TaskRuntime) -> PathBuf {
 }
 
 /// Apple `container run` launch (docker-compatible). The `--` terminator lets a
-/// flag-bearing command pass through swift-argument-parser.
-fn build_apple_launch(allocation: &Allocation, config: &ContainerTaskConfig) -> Vec<String> {
+/// flag-bearing command pass through swift-argument-parser. `env` is the
+/// merged Legion + task env (task values already win on conflicts).
+fn build_apple_launch(
+    allocation: &Allocation,
+    config: &ContainerTaskConfig,
+    env: &HashMap<String, String>,
+) -> Vec<String> {
     let mut args = vec![
         "run".to_string(),
         "--rm".to_string(),
         "--name".to_string(),
         container_name(allocation),
     ];
-    for (key, value) in &config.env {
+    for (key, value) in env {
         args.push("--env".to_string());
         args.push(format!("{key}={value}"));
     }
@@ -295,6 +300,14 @@ impl TaskPlugin for ContainerTaskPlugin {
         let config = ContainerTaskConfig::from_value(&task.config)?;
         let runtime_kind = ContainerRuntime::detect()?;
 
+        // Legion-provided env (allocation identity + assigned ports) first;
+        // user-declared env overrides on key conflicts.
+        let mut merged_env: HashMap<String, String> =
+            crate::task_plugins::allocation_env(allocation, task)
+                .into_iter()
+                .collect();
+        merged_env.extend(config.env.clone());
+
         let mut cmd = match &runtime_kind {
             ContainerRuntime::AppleContainer => {
                 info!(
@@ -304,7 +317,7 @@ impl TaskPlugin for ContainerTaskPlugin {
                     "Starting container task"
                 );
                 let mut cmd = Command::new("container");
-                cmd.args(build_apple_launch(allocation, &config));
+                cmd.args(build_apple_launch(allocation, &config, &merged_env));
                 cmd
             }
             ContainerRuntime::Oci { binary } => {
@@ -327,7 +340,7 @@ impl TaskPlugin for ContainerTaskPlugin {
                     &layout,
                     &bundle,
                     &config.command,
-                    &config.env,
+                    &merged_env,
                     &container_name(allocation),
                 )?;
 
@@ -456,6 +469,7 @@ mod tests {
             task_config_id: 1,
             job_id: "job".into(),
             instance_id: None,
+            network: None,
         }
     }
 
@@ -530,7 +544,7 @@ mod tests {
             "command": ["ls", "-l"],
             "env": { "MODE": "test" }
         }))?;
-        let args = build_apple_launch(&alloc(), &config);
+        let args = build_apple_launch(&alloc(), &config, &config.env.clone());
         assert_eq!(args[0], "run");
         assert!(args.contains(&"--rm".to_string()));
         assert!(args.contains(&"--env".to_string()));
@@ -660,6 +674,19 @@ mod tests {
             !after.status.success(),
             "container should be gone after stop"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn launch_command_includes_legion_env() -> R<()> {
+        let config = ContainerTaskConfig::from_value(&json!({
+            "image": "alpine",
+            "command": ["echo", "ok"]
+        }))?;
+        let mut env: HashMap<String, String> = config.env.clone();
+        env.insert("LEGION_PORT_HTTP".to_string(), "20000".to_string());
+        let args = build_apple_launch(&alloc(), &config, &env);
+        assert!(args.contains(&"LEGION_PORT_HTTP=20000".to_string()));
         Ok(())
     }
 }

@@ -78,6 +78,8 @@ fn endpoint_table() -> Vec<(&'static str, Plane)> {
         ("StopJob", Plane::Protected("job:write")),
         ("DestroyJob", Plane::Protected("job:write")),
         ("ListJobs", Plane::Protected("job:read")),
+        ("ListServices", Plane::Protected("job:read")),
+        ("ResolveService", Plane::Protected("job:read")),
         ("GetNodes", Plane::Protected("node:read")),
         ("GetNode", Plane::Protected("node:read")),
         ("RestartWorker", Plane::Protected("node:write")),
@@ -336,6 +338,14 @@ async fn call_endpoint(
             .map(|_| ()),
         "ListJobs" => svc
             .list_jobs(req(ListJobsRequest::default(), token))
+            .await
+            .map(|_| ()),
+        "ListServices" => svc
+            .list_services(req(ListServicesRequest::default(), token))
+            .await
+            .map(|_| ()),
+        "ResolveService" => svc
+            .resolve_service(req(ResolveServiceRequest::default(), token))
             .await
             .map(|_| ()),
         "GetNodes" => svc

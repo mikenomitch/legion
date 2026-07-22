@@ -59,25 +59,26 @@ id, status, resources, node_id, job_config_id, task_config_id, instance_id
 "#;
 
 pub const ALLOCATION_WITH_JOB_ATTRS: &str = r#"
-allocation.id, allocation.status, allocation.resources, allocation.node_id, allocation.job_config_id, allocation.task_config_id, job_config.job_id, allocation.instance_id
+allocation.id, allocation.status, allocation.resources, allocation.node_id, allocation.job_config_id, allocation.task_config_id, job_config.job_id, allocation.instance_id, allocation.network
 "#;
 
 pub const ALLOCATION_SELECT_ATTRS: &str = r#"
-allocation.id, allocation.status, allocation.resources, allocation.node_id, allocation.job_config_id, allocation.task_config_id, task_config.job_id, allocation.instance_id
+allocation.id, allocation.status, allocation.resources, allocation.node_id, allocation.job_config_id, allocation.task_config_id, task_config.job_id, allocation.instance_id, allocation.network
 "#;
 
 pub const ALLOCATION_RETURNING_ATTRS: &str = r#"
 id, status, resources, node_id, job_config_id, task_config_id,
     (SELECT job_id FROM job_config WHERE job_config.id = allocation.job_config_id) as job_id,
-    instance_id
+    instance_id,
+    network
 "#;
 
 pub const ALLOCATION_INSERT_ATTRS: &str = r#"
-status, resources, node_id, job_config_id, task_config_id, instance_id
+status, resources, node_id, job_config_id, task_config_id, instance_id, network
 "#;
 
 pub const ALLOCATION_ATTRS_VALS: &str = r#"
-:status, :resources, :node_id, :job_config_id, :task_config_id, :instance_id
+:status, :resources, :node_id, :job_config_id, :task_config_id, :instance_id, :network
 "#;
 
 lazy_static! {
@@ -305,11 +306,11 @@ lazy_static! {
 //
 
 pub const TASK_CONFIG_ATTRS: &str = r#"
-id, name, kind, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_id, job_config_id, identities, stateful, artifacts
+id, name, kind, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_id, job_config_id, identities, stateful, artifacts, network, service
 "#;
 
 pub const TASK_CONFIG_INSERT_ATTRS: &str = r#"
-name, kind, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_id, job_config_id, identities, stateful, artifacts
+name, kind, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_id, job_config_id, identities, stateful, artifacts, network, service
 "#;
 
 // pub const TASK_CONFIG_PARAM_SET: &str = r#"
@@ -317,7 +318,7 @@ name, kind, count, count_per, group_name, lifecycle, schedule, depends_on, confi
 // "#;
 
 pub const TASK_CONFIG_ATTRS_VALS: &str = r#"
-:name, :kind, :count, :count_per, :group_name, :lifecycle, :schedule, :depends_on, :config, :resources, :constraints, :permit, :affinities, :checks, :on_unhealthy, :kv_injections, :job_id, :job_config_id, :identities, :stateful, :artifacts
+:name, :kind, :count, :count_per, :group_name, :lifecycle, :schedule, :depends_on, :config, :resources, :constraints, :permit, :affinities, :checks, :on_unhealthy, :kv_injections, :job_id, :job_config_id, :identities, :stateful, :artifacts, :network, :service
 "#;
 
 lazy_static! {
