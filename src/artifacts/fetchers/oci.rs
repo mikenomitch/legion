@@ -437,4 +437,43 @@ mod tests {
         assert!(blob_path(root, "sha256:../escape").is_err());
         Ok(())
     }
+
+    /// End-to-end pull of a public image into a valid on-disk OCI layout.
+    /// Ignored by default (needs network + registry access). Override the
+    /// reference with `LEGION_OCI_TEST_IMAGE` (e.g. to a Docker Hub mirror when
+    /// docker.io anonymous pulls are rate-limited).
+    ///
+    /// Run with: `cargo test --lib fetch_public_image -- --ignored --nocapture`
+    #[test]
+    #[ignore = "network: pulls a public image from a registry"]
+    fn fetch_public_image_produces_oci_layout() -> R<()> {
+        let source = std::env::var("LEGION_OCI_TEST_IMAGE")
+            .unwrap_or_else(|_| "oci://docker.io/library/hello-world:latest".to_string());
+        let parsed = parse_artifact_source(&source)?;
+        let limits = FetchLimits::default();
+        let req = request(&parsed, &limits, &source);
+
+        let staging = tempfile::tempdir()?;
+        let mut sink = ArtifactSink::new(staging.path().to_path_buf(), limits.max_bytes)?;
+        let fetched = OciFetcher::new().fetch(&req, &mut sink)?;
+
+        match &fetched.payload {
+            FetchedPayload::Image {
+                oci_layout, digest, ..
+            } => {
+                assert!(oci_layout.join("oci-layout").is_file(), "oci-layout marker");
+                assert!(oci_layout.join("index.json").is_file(), "index.json");
+                assert!(oci_layout.join("blobs").is_dir(), "blobs/ dir");
+                assert!(digest.starts_with("sha256:"), "digest {digest}");
+                let (_, hex) = digest.split_once(':').expect("digest has algo");
+                assert!(
+                    oci_layout.join("blobs").join("sha256").join(hex).is_file(),
+                    "manifest blob present at its digest"
+                );
+            }
+            other => panic!("expected an Image payload, got {other:?}"),
+        }
+        assert!(fetched.bytes > 0, "fetched non-zero bytes");
+        Ok(())
+    }
 }

@@ -14,6 +14,7 @@ use std::process::{Child, Command};
 
 mod container;
 mod exec;
+mod oci_bundle;
 mod schema_docs;
 
 pub use container::ContainerTaskPlugin;

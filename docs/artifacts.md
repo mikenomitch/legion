@@ -514,9 +514,10 @@ local runtime:
 
 - **macOS (Apple `container`):** the layout is tarred and imported with
   `container image load`, so the subsequent run needs no registry pull.
-- **Linux (youki):** not yet supported — consuming a Legion-managed image
-  fails with an honest error (OCI layout → runtime bundle conversion is
-  pending). Keep the flag off for Linux container workloads.
+- **Linux (youki / any OCI runtime):** the layout is converted to an OCI
+  runtime bundle (rootfs extraction + generated `config.json`) and run with
+  `<runtime> run --bundle` — see
+  [task-kind-container.md](task-kind-container.md#linux-image--bundle).
 
 The flag defaults to **off** until the artifact cache lands: without a
 cache, Legion-managed pulls re-download the image for every allocation,
@@ -598,9 +599,10 @@ Remember the allowlists: a custom scheme must be added to the cluster's
 - **Cluster auth matcher changes apply at the next submit**, not to
   in-flight jobs (the effective auth is baked into the normalized spec at
   admission). KV credential *value* rotation applies immediately.
-- **Container kinds consume only the `Image` payload**, image desugaring is
-  off by default, and youki image loading is pending; file/tree artifacts
-  and env referencing inside containers wait on volume plumbing.
+- **Container kinds consume only the `Image` payload** (macOS imports it into
+  Apple `container`; Linux converts it to an OCI runtime bundle), and image
+  desugaring is off by default; file/tree artifacts and env referencing inside
+  containers wait on volume plumbing.
 - **Archive formats** are `.tar.gz`/`.tgz`/`.tar`/`.gz`; `zip`/`zstd` are
   not yet recognized (use `unpack: 'file'` to stage such files as-is).
 - **Fetch failures consume `on_unhealthy` budgets** (see
