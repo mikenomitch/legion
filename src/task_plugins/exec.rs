@@ -1,6 +1,8 @@
 use crate::prelude::*;
 use crate::structs::{Allocation, TaskConfig};
-use crate::task_plugins::{derived_schema, spawn_task_process, TaskPlugin, TaskRuntime};
+use crate::task_plugins::{
+    configure_task_log_capture, derived_schema, spawn_task_process, TaskPlugin, TaskRuntime,
+};
 #[cfg(target_os = "linux")]
 use landlock::{AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr, ABI};
 use schemars::JsonSchema;
@@ -230,6 +232,22 @@ impl TaskPlugin for ExecTaskPlugin {
         true
     }
 
+    fn supports_identity_env(&self) -> bool {
+        true
+    }
+
+    fn supports_identity_file(&self) -> bool {
+        true
+    }
+
+    fn supports_signal(&self) -> bool {
+        true
+    }
+
+    fn supports_artifacts(&self) -> bool {
+        true
+    }
+
     fn prepare(
         &self,
         allocation: &Allocation,
@@ -256,7 +274,16 @@ impl TaskPlugin for ExecTaskPlugin {
             .split_first()
             .context("exec task command must include at least one entry")?;
 
-        let linux_options = config.linux_options()?;
+        let mut linux_options = config.linux_options()?;
+        // Artifacts stage into the task directory; a landlocked task must be
+        // able to read them, so the task dir rides along automatically.
+        if let (Some(landlock), Some(task_dir)) =
+            (linux_options.landlock.as_mut(), runtime.task_dir.as_ref())
+        {
+            landlock
+                .read_write_paths
+                .push(task_dir.display().to_string());
+        }
         for file in &config.files {
             let path = std::path::PathBuf::from(&file.path);
             if let Some(parent) = path.parent() {
@@ -280,8 +307,16 @@ impl TaskPlugin for ExecTaskPlugin {
 
         let mut cmd = Command::new(program);
         cmd.args(args);
-        if let Some(cwd) = config.cwd.as_deref() {
-            cmd.current_dir(cwd);
+        // cwd defaults to the private task directory when the spec sets none.
+        match config.cwd.as_deref() {
+            Some(cwd) => {
+                cmd.current_dir(cwd);
+            }
+            None => {
+                if let Some(task_dir) = runtime.task_dir.as_ref() {
+                    cmd.current_dir(task_dir);
+                }
+            }
         }
         #[cfg(unix)]
         if let Some(user) = config.user_spec()? {
@@ -289,12 +324,19 @@ impl TaskPlugin for ExecTaskPlugin {
             cmd.gid(user.gid);
         }
 
+        // Legion-provided env first (allocation identity/ports, then
+        // worker-injected LEGION_TASK_DIR/LEGION_ARTIFACT_*), so explicit
+        // task env can override on collision.
         cmd.envs(crate::task_plugins::allocation_env(allocation, task));
+        if !runtime.extra_env.is_empty() {
+            cmd.envs(&runtime.extra_env);
+        }
         if !config.env.is_empty() {
             cmd.envs(&config.env);
         }
 
         configure_linux_process_options(&mut cmd, &linux_options, &allocation.id, &task.name)?;
+        configure_task_log_capture(&mut cmd, runtime)?;
 
         let child = spawn_task_process(&mut cmd).with_context(|| {
             format!(

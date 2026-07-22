@@ -80,6 +80,8 @@ fn make_jobs(total_allocations: usize) -> Vec<JobConfig> {
         jobs.push(JobConfig {
             name: format!("bench-job-{job_idx}"),
             tasks: vec![task],
+            rollout: None,
+            rollout_by_group: Default::default(),
             version: None,
         });
     }

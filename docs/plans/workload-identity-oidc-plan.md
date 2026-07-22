@@ -279,11 +279,11 @@ injection surface).
   - `GET /<jwks_path>` → all non-expired public keys as a JWKS.
 
   **Where to host it — and why not the join server.** The join server
-  ([src/manager/agent.rs:48-57](../../src/manager/agent.rs)) is the manager's
+  ([src/manager/daemon.rs:48-57](../../src/manager/daemon.rs)) is the manager's
   existing *unauthenticated* surface, which is conceptually the right kind of place.
   But it is a **non-TLS `tonic` gRPC** listener, and AWS/GCP require the `iss` to be
   reachable over **publicly-trusted HTTPS**. The main manager listener
-  ([src/manager/agent.rs:90-95](../../src/manager/agent.rs)) already has TLS *and*
+  ([src/manager/daemon.rs:90-95](../../src/manager/daemon.rs)) already has TLS *and*
   `accept_http1(true)` + CORS, so it is the better home: mount the axum routes there
   as an HTTP fallback alongside the gRPC `Manager` service. (Dev / Vault-with-CA-bundle
   setups can tolerate the non-TLS join port behind a proxy, but the default should be

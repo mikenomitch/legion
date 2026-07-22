@@ -12,6 +12,7 @@ use rcgen::{
 use std::fs;
 use std::fs::File;
 use std::io::{BufReader, Read};
+use std::path::Path;
 use std::sync::Mutex;
 
 lazy_static! {
@@ -50,7 +51,7 @@ pub fn read_root_cert(pem_path: String, key_path: String) -> R<CertifiedKey> {
 }
 
 #[allow(dead_code)]
-pub fn create_ca_cert() -> R<CertifiedKey> {
+pub fn create_ca_cert(out_dir: &Path) -> R<CertifiedKey> {
     let _guard = CERT_IO_LOCK.lock().expect("cert IO lock poisoned");
 
     let key_pair = KeyPair::generate()?;
@@ -71,16 +72,18 @@ pub fn create_ca_cert() -> R<CertifiedKey> {
 
     let cert_pem = cert.pem();
 
-    std::fs::create_dir_all("configs/tls/")?;
+    std::fs::create_dir_all(out_dir)?;
 
-    let cert_tmp = "configs/tls/rootca.pem.tmp";
-    let key_tmp = "configs/tls/rootca.key.tmp";
+    let cert_path = out_dir.join("rootca.pem");
+    let key_path = out_dir.join("rootca.key");
+    let cert_tmp = out_dir.join("rootca.pem.tmp");
+    let key_tmp = out_dir.join("rootca.key.tmp");
 
-    fs::write(cert_tmp, cert_pem.as_bytes())?;
-    fs::write(key_tmp, key_pair.serialize_pem().as_bytes())?;
+    fs::write(&cert_tmp, cert_pem.as_bytes())?;
+    fs::write(&key_tmp, key_pair.serialize_pem().as_bytes())?;
 
-    fs::rename(cert_tmp, "configs/tls/rootca.pem")?;
-    fs::rename(key_tmp, "configs/tls/rootca.key")?;
+    fs::rename(&cert_tmp, &cert_path)?;
+    fs::rename(&key_tmp, &key_path)?;
 
     Ok(CertifiedKey { cert, key_pair })
 }
@@ -117,14 +120,18 @@ pub fn signed_cert_with_ca(
 }
 
 #[allow(dead_code)]
-pub fn write_signed_cert_with_ca(ca_cert: &CertifiedKey, dn_name: &str) -> R<CertifiedKey> {
+pub fn write_signed_cert_with_ca(
+    ca_cert: &CertifiedKey,
+    dn_name: &str,
+    out_dir: &Path,
+) -> R<CertifiedKey> {
     let (cert_signed, key, ca_cert_again) = signed_cert_with_ca(ca_cert, dn_name)?;
 
-    let path = format!("configs/tls/{dn_name}/");
-    let cert_path = format!("configs/tls/{dn_name}/{dn_name}.pem");
-    let key_path = format!("configs/tls/{dn_name}/{dn_name}.key");
+    let path = out_dir.join(dn_name);
+    let cert_path = path.join(format!("{dn_name}.pem"));
+    let key_path = path.join(format!("{dn_name}.key"));
 
-    std::fs::create_dir_all(path)?;
+    std::fs::create_dir_all(&path)?;
     fs::write(cert_path, cert_signed)?;
     fs::write(key_path, key)?;
 
@@ -135,21 +142,56 @@ pub fn write_signed_cert_with_ca(ca_cert: &CertifiedKey, dn_name: &str) -> R<Cer
 mod tests {
     use super::*;
 
+    /// Creates a unique, ephemeral directory for cert IO in tests so we never
+    /// clobber the checked-in fixtures under `configs/tls/`. Cleaned up on drop.
+    struct TmpCertDir(std::path::PathBuf);
+
+    impl TmpCertDir {
+        fn new() -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock before unix epoch")
+                .as_nanos();
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!(
+                "legion-certs-test-{}-{nanos}-{n}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).expect("failed to create temp cert dir");
+            TmpCertDir(dir)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TmpCertDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     #[test]
     fn create_ca_cert_runs() -> R<()> {
-        let _cert = create_ca_cert()?;
-        assert!(true);
+        let tmp = TmpCertDir::new();
+        let _cert = create_ca_cert(tmp.path())?;
+        assert!(tmp.path().join("rootca.pem").exists());
+        assert!(tmp.path().join("rootca.key").exists());
 
         Ok(())
     }
 
     #[test]
     fn read_root_cert_works() -> R<()> {
-        let _generated = create_ca_cert()?;
+        let tmp = TmpCertDir::new();
+        let _generated = create_ca_cert(tmp.path())?;
 
-        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let ca_pem_path = manifest_dir.join("configs/tls/rootca.pem");
-        let ca_key_path = manifest_dir.join("configs/tls/rootca.key");
+        let ca_pem_path = tmp.path().join("rootca.pem");
+        let ca_key_path = tmp.path().join("rootca.key");
 
         let cert = read_root_cert(
             ca_pem_path.to_string_lossy().into_owned(),
@@ -164,7 +206,8 @@ mod tests {
 
     #[test]
     fn signed_cert_with_ca_works() -> R<()> {
-        let cert = create_ca_cert()?;
+        let tmp = TmpCertDir::new();
+        let cert = create_ca_cert(tmp.path())?;
         let (cert_signed, key, _) = signed_cert_with_ca(&cert, "test")?;
         assert!(cert_signed.len() > 0);
         assert!(key.len() > 0);
@@ -174,8 +217,11 @@ mod tests {
 
     #[test]
     fn write_signed_cert_with_ca_works() -> R<()> {
-        let cert = create_ca_cert()?;
-        write_signed_cert_with_ca(&cert, "server")?;
+        let tmp = TmpCertDir::new();
+        let cert = create_ca_cert(tmp.path())?;
+        write_signed_cert_with_ca(&cert, "server", tmp.path())?;
+        assert!(tmp.path().join("server/server.pem").exists());
+        assert!(tmp.path().join("server/server.key").exists());
         Ok(())
     }
 }

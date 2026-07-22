@@ -7,17 +7,70 @@ use serde_json::Value;
 pub const DEF_SCHEDULER_AUTO_ANTI_AFFINITY_WEIGHT: f64 = 0.2;
 
 use crate::prelude::{
-    DEF_EVAL_PRIORITY, DEF_MANAGER_HOSTNAME, DEF_MANAGER_INSECURE_PORT, DEF_MANAGER_SERVER_PORT,
-    DEF_ROLLOUT_RETENTION_DAYS, DEF_SCHEDULING_POLICY, DEF_STORE_PATH, DEF_WORKER_CHECK_SEC,
-    DEF_WORKER_CONFIG_PATH,
+    bail, Context, DEF_EVAL_PRIORITY, DEF_KV_DEBOUNCE_MS, DEF_MANAGER_HOSTNAME,
+    DEF_MANAGER_INSECURE_PORT, DEF_MANAGER_SERVER_PORT, DEF_ROLLOUT_RETENTION_DAYS,
+    DEF_SCHEDULING_POLICY, DEF_STORE_PATH, DEF_WORKER_CHECK_SEC, DEF_WORKER_CONFIG_PATH, R,
 };
+use crate::structs::workload_identity::NodeIdentityConfig;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ServerConfig {
     pub port: Option<u64>,
+    /// Deprecated: the insecure bootstrap listener was removed (join tokens
+    /// are minted via the authenticated CreateJoinToken RPC). Parsed for
+    /// config compatibility; nothing binds this port.
     pub insecure_port: Option<u64>,
     pub host: Option<String>,
+    /// Externally reachable manager address embedded in join tokens
+    /// (for example `http://10.0.0.5:4747`). Default: derived from
+    /// host/port, with 0.0.0.0 mapped to 127.0.0.1.
+    pub advertise_addr: Option<String>,
+    /// TLS for the manager listener. Off unless `enabled` is true.
+    #[serde(default)]
+    pub tls: Option<TlsConfig>,
+}
+
+/// TLS settings for the manager's gRPC listener.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct TlsConfig {
+    /// Master switch; certPath/keyPath are required when true.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// PEM-encoded server certificate path.
+    pub cert_path: Option<String>,
+    /// PEM-encoded private key path.
+    pub key_path: Option<String>,
+}
+
+/// TlsConfig with defaults applied.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct TlsConfigFull {
+    pub enabled: bool,
+    pub cert_path: String,
+    pub key_path: String,
+}
+
+impl TlsConfig {
+    pub fn with_defaults(&self) -> TlsConfigFull {
+        TlsConfigFull {
+            enabled: self.enabled.unwrap_or(false),
+            cert_path: self.cert_path.clone().unwrap_or_default(),
+            key_path: self.key_path.clone().unwrap_or_default(),
+        }
+    }
+}
+
+impl From<TlsConfigFull> for TlsConfig {
+    fn from(val: TlsConfigFull) -> Self {
+        TlsConfig {
+            enabled: Some(val.enabled),
+            cert_path: Some(val.cert_path),
+            key_path: Some(val.key_path),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -31,10 +84,394 @@ pub struct ManagerConfig {
     pub scheduling_policy: Option<String>,
     pub default_priority: Option<i64>,
     pub rollout_retention_days: Option<u64>,
+    /// Debounce window in milliseconds for KV-driven job reconciliation.
+    /// Rapid puts/deletes to watched keys within the window are coalesced
+    /// into a single update per job. `0` disables debouncing (every KV write
+    /// reconciles synchronously). Defaults to [`DEF_KV_DEBOUNCE_MS`].
+    pub kv_debounce_ms: Option<u64>,
     pub scheduler_settings: Option<Value>,
     pub task_resource_defaults: Option<Value>,
     pub custom_resources: Option<Value>,
     pub persistence: Option<PersistenceConfig>,
+    #[serde(default)]
+    pub workload_identity: Option<WorkloadIdentityConfig>,
+    #[serde(default)]
+    pub acl: Option<AclConfig>,
+    pub artifacts: Option<ArtifactsManagerConfig>,
+}
+
+/// Default TTL for tokens minted via Login (userpass or JWT exchange).
+pub const DEF_ACL_LOGIN_TTL: &str = "24h";
+/// Default refresh interval for auth-method JWKS documents.
+pub const DEF_ACL_JWKS_REFRESH: &str = "5m";
+
+/// ACL / auth configuration. Off by default: when `enabled` is false every
+/// caller has full access and the UI shows a dismissable warning.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AclConfig {
+    /// Master switch. Default: false (no enforcement).
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// When true (and `enabled` is true), denials are logged with the
+    /// `acl_audit` tracing target but requests are allowed. Use this to
+    /// stage policies before flipping to full enforcement.
+    #[serde(default)]
+    pub audit_only: Option<bool>,
+    /// TTL applied to tokens minted via Login when the request omits one.
+    pub login_ttl: Option<String>,
+    /// Upper bound on the TTL of client tokens minted via CreateAclToken and
+    /// Login. When set, client tokens must expire and may not outlive this
+    /// bound; management tokens are exempt. Default: unbounded.
+    pub token_max_ttl: Option<String>,
+    /// JWT/OIDC auth methods that convert external identities into policies.
+    #[serde(default)]
+    pub auth_methods: Option<Vec<AclAuthMethodConfig>>,
+    /// How often to re-fetch remote JWKS documents.
+    pub jwks_refresh_interval: Option<String>,
+}
+
+/// One JWT/OIDC auth method.
+///
+/// A method validates externally issued JWTs (signature via JWKS or a shared
+/// secret, plus issuer/audience bounds) and maps verified claims onto Legion
+/// ACL policies via binding rules.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AclAuthMethodConfig {
+    /// Unique method name, referenced by `legion login --method <name>`.
+    /// `userpass` is reserved for the built-in username/password method.
+    pub name: String,
+    /// `jwt` (keys provided explicitly), `oidc` (keys discovered from the
+    /// issuer's /.well-known/openid-configuration document), or `webhook`
+    /// (credentials verified by an external HTTP endpoint).
+    #[serde(default)]
+    pub r#type: Option<String>,
+    /// JWKS URL to fetch signing keys from (jwt type).
+    pub jwks_url: Option<String>,
+    /// Inline JWKS JSON document (jwt type; useful for air-gapped setups and tests).
+    pub jwks_json: Option<String>,
+    /// HMAC shared secret for HS256-signed tokens (dev/test setups).
+    pub hmac_secret: Option<String>,
+    /// OIDC issuer URL for discovery (oidc type) and `iss` validation.
+    pub issuer: Option<String>,
+    /// Accepted `aud` values. Strongly recommended; when empty, audience is
+    /// not validated.
+    #[serde(default)]
+    pub bound_audiences: Option<Vec<String>>,
+    /// Required `iss` value (defaults to `issuer` when set).
+    pub bound_issuer: Option<String>,
+    /// Claim used as the principal name. Default: `sub`.
+    pub user_claim: Option<String>,
+    /// Rules mapping verified claims to policy names.
+    #[serde(default)]
+    pub binding_rules: Option<Vec<AclBindingRule>>,
+    /// TTL for ACL tokens minted when exchanging a JWT via Login.
+    pub token_ttl: Option<String>,
+    /// OAuth client ID registered for Legion at the identity provider
+    /// (oidc type). Enables the browser/CLI redirect login flow.
+    pub oidc_client_id: Option<String>,
+    /// OAuth scopes requested during redirect login (oidc type).
+    /// Default: ["openid"].
+    #[serde(default)]
+    pub oidc_scopes: Option<Vec<String>>,
+    /// Verification endpoint for `webhook` methods. Legion POSTs the login
+    /// credentials as JSON and expects `{"principal": "...", "policies":
+    /// ["..."]}` on success (HTTP 200). 401/403 reject the credential.
+    pub webhook_url: Option<String>,
+    /// Optional bearer token Legion attaches when calling `webhookUrl`.
+    pub webhook_bearer: Option<String>,
+}
+
+/// Maps a verified JWT claim onto Legion policies.
+///
+/// When `claim` is omitted the rule is unconditional (every login through the
+/// method receives `policies`). When `claim` is set, the rule applies when the
+/// claim equals `value` (string compare) or, for array claims, contains
+/// `value`.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AclBindingRule {
+    /// JWT claim to inspect (for example "groups"). Omit for unconditional.
+    pub claim: Option<String>,
+    /// Value the claim must equal or contain.
+    pub value: Option<String>,
+    /// Policy names granted when the rule matches.
+    pub policies: Vec<String>,
+}
+
+/// AclConfig with defaults applied.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct AclConfigFull {
+    pub enabled: bool,
+    pub audit_only: bool,
+    pub login_ttl: String,
+    pub token_max_ttl: Option<String>,
+    pub auth_methods: Vec<AclAuthMethodConfig>,
+    pub jwks_refresh_interval: String,
+}
+
+impl Default for AclConfigFull {
+    fn default() -> Self {
+        AclConfigFull {
+            enabled: false,
+            audit_only: false,
+            login_ttl: DEF_ACL_LOGIN_TTL.into(),
+            token_max_ttl: None,
+            auth_methods: Vec::new(),
+            jwks_refresh_interval: DEF_ACL_JWKS_REFRESH.into(),
+        }
+    }
+}
+
+/// Default artifact scheme allowlist. Plain `http` requires explicit opt-in.
+pub const DEF_ARTIFACT_ALLOWED_SCHEMES: &[&str] = &["https", "s3", "oci", "git", "file"];
+
+/// One cluster-level artifact auth matcher: routes sources matching a glob to
+/// a KV credential or a node identity. First match wins. Cluster entries may
+/// never attach a *task* identity — task identities are a per-task security
+/// boundary (artifact plan judgement call 6); node identity exists precisely
+/// to be the cluster-grain credential.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtifactAuthMatcher {
+    /// Source glob: `scheme://host/path` segments where `*` matches within a
+    /// path segment and `**` crosses segments (for example
+    /// `oci://ghcr.io/acme/**`).
+    pub r#match: String,
+    /// KV path holding the credential JSON for matching sources.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv: Option<String>,
+    /// Node identity name (from `workloadIdentity.nodeIdentities`) used for
+    /// matching sources.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_identity: Option<String>,
+}
+
+impl ArtifactAuthMatcher {
+    pub fn validate(&self) -> R<()> {
+        if self.r#match.trim().is_empty() {
+            bail!("artifacts.auth matcher requires a non-empty match pattern");
+        }
+        match (self.kv.as_deref(), self.node_identity.as_deref()) {
+            (Some(kv), None) if !kv.trim().is_empty() => Ok(()),
+            (None, Some(node_identity)) if !node_identity.trim().is_empty() => Ok(()),
+            (Some(_), Some(_)) => bail!(
+                "artifacts.auth matcher {:?} must set exactly one of kv or nodeIdentity",
+                self.r#match
+            ),
+            _ => bail!(
+                "artifacts.auth matcher {:?} must set one of kv or nodeIdentity (task \
+                 identities are per-task and cannot be attached cluster-wide)",
+                self.r#match
+            ),
+        }
+    }
+}
+
+/// Cluster-level artifact settings (manager config `artifacts` block).
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtifactsManagerConfig {
+    /// Source schemes jobs may use. Defaults to
+    /// [`DEF_ARTIFACT_ALLOWED_SCHEMES`] (everything except plain `http`).
+    pub allowed_schemes: Option<Vec<String>>,
+    /// Cluster auth matchers applied when a task artifact carries no `auth`.
+    pub auth: Option<Vec<ArtifactAuthMatcher>>,
+    /// Whether container `image` fields desugar into Legion-managed `oci://`
+    /// artifacts. Off by default until the artifact cache lands (without a
+    /// cache this would re-download images per allocation and regress
+    /// runtimes that cache images themselves).
+    pub container_image_desugar: Option<bool>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtifactsManagerConfigFull {
+    pub allowed_schemes: Vec<String>,
+    pub auth: Vec<ArtifactAuthMatcher>,
+    pub container_image_desugar: bool,
+}
+
+impl Default for ArtifactsManagerConfigFull {
+    fn default() -> Self {
+        ArtifactsManagerConfigFull {
+            allowed_schemes: DEF_ARTIFACT_ALLOWED_SCHEMES
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            auth: Vec::new(),
+            container_image_desugar: false,
+        }
+    }
+}
+
+impl From<AclConfigFull> for AclConfig {
+    fn from(val: AclConfigFull) -> Self {
+        AclConfig {
+            enabled: Some(val.enabled),
+            audit_only: Some(val.audit_only),
+            login_ttl: Some(val.login_ttl),
+            token_max_ttl: val.token_max_ttl,
+            auth_methods: Some(val.auth_methods),
+            jwks_refresh_interval: Some(val.jwks_refresh_interval),
+        }
+    }
+}
+
+impl ArtifactsManagerConfig {
+    pub fn with_defaults(&self) -> ArtifactsManagerConfigFull {
+        let d = ArtifactsManagerConfigFull::default();
+        ArtifactsManagerConfigFull {
+            allowed_schemes: self.allowed_schemes.clone().unwrap_or(d.allowed_schemes),
+            auth: self.auth.clone().unwrap_or(d.auth),
+            container_image_desugar: self
+                .container_image_desugar
+                .unwrap_or(d.container_image_desugar),
+        }
+    }
+}
+
+impl AclConfig {
+    pub fn with_defaults(&self) -> AclConfigFull {
+        let d = AclConfigFull::default();
+        AclConfigFull {
+            enabled: self.enabled.unwrap_or(d.enabled),
+            audit_only: self.audit_only.unwrap_or(d.audit_only),
+            login_ttl: self.login_ttl.clone().unwrap_or(d.login_ttl),
+            token_max_ttl: self.token_max_ttl.clone(),
+            auth_methods: self.auth_methods.clone().unwrap_or(d.auth_methods),
+            jwks_refresh_interval: self
+                .jwks_refresh_interval
+                .clone()
+                .unwrap_or(d.jwks_refresh_interval),
+        }
+    }
+}
+
+impl From<ArtifactsManagerConfigFull> for ArtifactsManagerConfig {
+    fn from(val: ArtifactsManagerConfigFull) -> Self {
+        ArtifactsManagerConfig {
+            allowed_schemes: Some(val.allowed_schemes),
+            auth: Some(val.auth),
+            container_image_desugar: Some(val.container_image_desugar),
+        }
+    }
+}
+
+/// Default token TTL when an identity does not set its own.
+pub const DEF_WORKLOAD_IDENTITY_TTL: &str = "15m";
+/// Default signing-key rotation age.
+pub const DEF_WORKLOAD_IDENTITY_ROTATION_AGE: &str = "24h";
+/// Default JWKS route relative to the issuer URL.
+pub const DEF_WORKLOAD_IDENTITY_JWKS_PATH: &str = "/.well-known/jwks.json";
+
+/// Manager OIDC issuer / workload-identity configuration. Off by default; the
+/// OIDC HTTP listener only binds when `enabled` is true (see the plan rollout).
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkloadIdentityConfig {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// Public HTTPS issuer URL relying parties trust (must match discovery doc).
+    pub issuer: Option<String>,
+    pub jwks_path: Option<String>,
+    pub signing_alg: Option<String>,
+    pub default_ttl: Option<String>,
+    pub rotation_age: Option<String>,
+    pub default_audience: Option<Vec<String>>,
+    /// Cluster-default `sub` template; per-identity `subTemplate` overrides it.
+    pub sub_template: Option<String>,
+    /// Identities issued to worker nodes rather than tasks (artifact system
+    /// plan §6). Referenced by `auth.nodeIdentity` and cluster artifact-auth
+    /// matchers.
+    #[serde(default)]
+    pub node_identities: Option<Vec<NodeIdentityConfig>>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkloadIdentityConfigFull {
+    pub enabled: bool,
+    pub issuer: Option<String>,
+    pub jwks_path: String,
+    pub signing_alg: String,
+    pub default_ttl: String,
+    pub rotation_age: String,
+    pub default_audience: Vec<String>,
+    pub sub_template: String,
+    #[serde(default)]
+    pub node_identities: Vec<NodeIdentityConfig>,
+}
+
+impl WorkloadIdentityConfigFull {
+    /// Default token lifetime when an identity does not set its own `ttl`.
+    pub fn parsed_default_ttl(&self) -> Duration {
+        parse_humantime_or(&self.default_ttl, DEF_WORKLOAD_IDENTITY_TTL)
+    }
+
+    /// How old the active signing key may get before the rotation loop
+    /// rotates it.
+    pub fn parsed_rotation_age(&self) -> Duration {
+        parse_humantime_or(&self.rotation_age, DEF_WORKLOAD_IDENTITY_ROTATION_AGE)
+    }
+}
+
+fn parse_humantime_or(raw: &str, fallback: &str) -> Duration {
+    raw.parse::<humantime::Duration>()
+        .or_else(|_| fallback.parse::<humantime::Duration>())
+        .map(Into::into)
+        .unwrap_or(Duration::from_secs(900))
+}
+
+impl Default for WorkloadIdentityConfigFull {
+    fn default() -> Self {
+        WorkloadIdentityConfigFull {
+            enabled: false,
+            issuer: None,
+            jwks_path: DEF_WORKLOAD_IDENTITY_JWKS_PATH.into(),
+            signing_alg: "ES256".into(),
+            default_ttl: DEF_WORKLOAD_IDENTITY_TTL.into(),
+            rotation_age: DEF_WORKLOAD_IDENTITY_ROTATION_AGE.into(),
+            default_audience: Vec::new(),
+            sub_template: crate::structs::workload_identity::DEFAULT_SUB_TEMPLATE.into(),
+            node_identities: Vec::new(),
+        }
+    }
+}
+
+impl From<WorkloadIdentityConfigFull> for WorkloadIdentityConfig {
+    fn from(val: WorkloadIdentityConfigFull) -> Self {
+        WorkloadIdentityConfig {
+            enabled: Some(val.enabled),
+            issuer: val.issuer,
+            jwks_path: Some(val.jwks_path),
+            signing_alg: Some(val.signing_alg),
+            default_ttl: Some(val.default_ttl),
+            rotation_age: Some(val.rotation_age),
+            default_audience: Some(val.default_audience),
+            sub_template: Some(val.sub_template),
+            node_identities: Some(val.node_identities),
+        }
+    }
+}
+
+impl WorkloadIdentityConfig {
+    pub fn with_defaults(&self) -> WorkloadIdentityConfigFull {
+        let d = WorkloadIdentityConfigFull::default();
+        WorkloadIdentityConfigFull {
+            enabled: self.enabled.unwrap_or(d.enabled),
+            issuer: self.issuer.clone(),
+            jwks_path: self.jwks_path.clone().unwrap_or(d.jwks_path),
+            signing_alg: self.signing_alg.clone().unwrap_or(d.signing_alg),
+            default_ttl: self.default_ttl.clone().unwrap_or(d.default_ttl),
+            rotation_age: self.rotation_age.clone().unwrap_or(d.rotation_age),
+            default_audience: self.default_audience.clone().unwrap_or(d.default_audience),
+            sub_template: self.sub_template.clone().unwrap_or(d.sub_template),
+            node_identities: self.node_identities.clone().unwrap_or(d.node_identities),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -81,6 +518,25 @@ pub struct ServerConfigFull {
     pub port: u64,
     pub insecure_port: u64,
     pub host: String,
+    pub advertise_addr: Option<String>,
+    #[serde(default)]
+    pub tls: TlsConfigFull,
+}
+
+impl ServerConfigFull {
+    /// The address embedded in join tokens: `advertiseAddr` when set,
+    /// otherwise derived from scheme/host/port (0.0.0.0 -> 127.0.0.1).
+    pub fn advertised_address(&self) -> String {
+        if let Some(addr) = &self.advertise_addr {
+            return addr.clone();
+        }
+        let host = match self.host.as_str() {
+            "0.0.0.0" | "::" => "127.0.0.1",
+            other => other,
+        };
+        let scheme = if self.tls.enabled { "https" } else { "http" };
+        format!("{scheme}://{host}:{}", self.port)
+    }
 }
 
 impl From<ServerConfigFull> for ServerConfig {
@@ -89,6 +545,8 @@ impl From<ServerConfigFull> for ServerConfig {
             port: Some(val.port),
             insecure_port: Some(val.insecure_port),
             host: Some(val.host),
+            advertise_addr: val.advertise_addr,
+            tls: Some(val.tls.into()),
         }
     }
 }
@@ -102,6 +560,12 @@ impl ServerConfig {
                 .host
                 .clone()
                 .unwrap_or_else(|| DEF_MANAGER_HOSTNAME.to_string()),
+            advertise_addr: self.advertise_addr.clone(),
+            tls: self
+                .tls
+                .as_ref()
+                .map(TlsConfig::with_defaults)
+                .unwrap_or_default(),
         }
     }
 
@@ -110,6 +574,8 @@ impl ServerConfig {
             port: DEF_MANAGER_SERVER_PORT,
             insecure_port: DEF_MANAGER_INSECURE_PORT,
             host: DEF_MANAGER_HOSTNAME.to_string(),
+            advertise_addr: None,
+            tls: TlsConfigFull::default(),
         }
     }
 }
@@ -126,11 +592,18 @@ pub struct ManagerConfigFull {
     pub scheduling_policy: String,
     pub default_priority: i64,
     pub rollout_retention_days: u64,
+    #[serde(default = "default_kv_debounce_ms")]
+    pub kv_debounce_ms: u64,
     pub scheduler_settings: Option<Value>,
     pub task_resource_defaults: Option<Value>,
     pub custom_resources: Option<Value>,
     #[serde(default)]
     pub persistence: PersistenceConfigFull,
+    #[serde(default)]
+    pub workload_identity: WorkloadIdentityConfigFull,
+    #[serde(default)]
+    pub acl: AclConfigFull,
+    pub artifacts: ArtifactsManagerConfigFull,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -144,7 +617,6 @@ pub struct PersistenceConfigFull {
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct StreamingPersistenceConfig {
-    pub litestream_binary: Option<String>,
     pub replica_url: Option<String>,
     pub sync_interval: Option<String>,
     pub lease: Option<StreamingLeaseConfig>,
@@ -153,7 +625,6 @@ pub struct StreamingPersistenceConfig {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct StreamingPersistenceConfigFull {
-    pub litestream_binary: String,
     pub replica_url: String,
     pub sync_interval: String,
     pub lease: StreamingLeaseConfigFull,
@@ -228,10 +699,14 @@ impl From<ManagerConfigFull> for ManagerConfig {
             scheduling_policy: Some(val.scheduling_policy),
             default_priority: Some(val.default_priority),
             rollout_retention_days: Some(val.rollout_retention_days),
+            kv_debounce_ms: Some(val.kv_debounce_ms),
             scheduler_settings: val.scheduler_settings,
             task_resource_defaults: val.task_resource_defaults,
             custom_resources: val.custom_resources,
             persistence: Some(val.persistence.into()),
+            workload_identity: Some(val.workload_identity.into()),
+            acl: Some(val.acl.into()),
+            artifacts: Some(val.artifacts.into()),
         }
     }
 }
@@ -264,6 +739,7 @@ impl ManagerConfig {
             rollout_retention_days: self
                 .rollout_retention_days
                 .unwrap_or(DEF_ROLLOUT_RETENTION_DAYS),
+            kv_debounce_ms: self.kv_debounce_ms.unwrap_or(DEF_KV_DEBOUNCE_MS),
             scheduler_settings: self.scheduler_settings.clone(),
             task_resource_defaults: self.task_resource_defaults.clone(),
             custom_resources: self.custom_resources.clone(),
@@ -271,6 +747,21 @@ impl ManagerConfig {
                 .persistence
                 .as_ref()
                 .map(PersistenceConfig::with_defaults)
+                .unwrap_or_default(),
+            workload_identity: self
+                .workload_identity
+                .as_ref()
+                .map(WorkloadIdentityConfig::with_defaults)
+                .unwrap_or_default(),
+            acl: self
+                .acl
+                .as_ref()
+                .map(AclConfig::with_defaults)
+                .unwrap_or_default(),
+            artifacts: self
+                .artifacts
+                .as_ref()
+                .map(ArtifactsManagerConfig::with_defaults)
                 .unwrap_or_default(),
         }
     }
@@ -286,11 +777,15 @@ impl Default for ManagerConfigFull {
             scheduling_policy: DEF_SCHEDULING_POLICY.into(),
             default_priority: DEF_EVAL_PRIORITY,
             rollout_retention_days: DEF_ROLLOUT_RETENTION_DAYS,
+            kv_debounce_ms: DEF_KV_DEBOUNCE_MS,
             scheduler_settings: None,
             task_resource_defaults: None,
             custom_resources: None,
             eval_threads: default_eval_threads(),
             persistence: PersistenceConfigFull::default(),
+            workload_identity: WorkloadIdentityConfigFull::default(),
+            acl: AclConfigFull::default(),
+            artifacts: ArtifactsManagerConfigFull::default(),
         }
     }
 }
@@ -326,7 +821,6 @@ impl PersistenceConfig {
 impl Default for StreamingPersistenceConfigFull {
     fn default() -> Self {
         Self {
-            litestream_binary: "litestream".to_string(),
             replica_url: String::new(),
             sync_interval: "1s".to_string(),
             lease: StreamingLeaseConfigFull::default(),
@@ -337,10 +831,6 @@ impl Default for StreamingPersistenceConfigFull {
 impl StreamingPersistenceConfig {
     pub fn with_defaults(&self) -> StreamingPersistenceConfigFull {
         StreamingPersistenceConfigFull {
-            litestream_binary: self
-                .litestream_binary
-                .clone()
-                .unwrap_or_else(|| "litestream".to_string()),
             replica_url: self.replica_url.clone().unwrap_or_default(),
             sync_interval: self
                 .sync_interval
@@ -438,7 +928,6 @@ impl From<PersistenceConfigFull> for PersistenceConfig {
 impl From<StreamingPersistenceConfigFull> for StreamingPersistenceConfig {
     fn from(value: StreamingPersistenceConfigFull) -> Self {
         Self {
-            litestream_binary: Some(value.litestream_binary),
             replica_url: Some(value.replica_url),
             sync_interval: Some(value.sync_interval),
             lease: Some(value.lease.into()),
@@ -481,6 +970,10 @@ impl From<StreamingObjectStorageLeaseConfigFull> for StreamingObjectStorageLease
     }
 }
 
+fn default_kv_debounce_ms() -> u64 {
+    DEF_KV_DEBOUNCE_MS
+}
+
 fn default_eval_threads() -> usize {
     std::thread::available_parallelism()
         .map(|p| p.get())
@@ -498,4 +991,214 @@ pub struct WorkerConfigAlt {
     pub resources: Option<Value>,
     pub reserved_resources: Option<Value>,
     pub max_allocations: Option<u32>,
+    #[serde(default)]
+    pub artifacts: Option<WorkerArtifactsConfig>,
+}
+
+/// Default concurrent artifact fetches per worker.
+pub const DEF_ARTIFACT_FETCH_PARALLELISM: usize = 4;
+/// Default per-artifact fetch attempts before the allocation fails.
+pub const DEF_ARTIFACT_FETCH_ATTEMPTS: u32 = 3;
+/// Default overall fetch deadline per artifact.
+pub const DEF_ARTIFACT_FETCH_TIMEOUT: &str = "10m";
+/// Default per-artifact size cap (also bounds decompression).
+pub const DEF_ARTIFACT_MAX_SIZE: &str = "50GiB";
+
+/// Worker-level artifact settings (worker config `artifacts` block). The
+/// cache plan later adds a sibling `cache` block under the same key.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerArtifactsConfig {
+    pub fetch: Option<WorkerArtifactFetchConfig>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerArtifactFetchConfig {
+    /// Concurrent fetches per worker.
+    pub parallelism: Option<usize>,
+    /// Per-artifact retries before the allocation fails.
+    pub attempts: Option<u32>,
+    /// Overall fetch deadline per artifact (humantime, e.g. "10m").
+    pub timeout: Option<String>,
+    /// Per-artifact size cap (e.g. "50GiB"); also bounds decompression.
+    pub max_artifact_size: Option<String>,
+    /// Worker-side scheme allowlist (defense in depth alongside admission).
+    pub allowed_schemes: Option<Vec<String>>,
+}
+
+/// Resolved worker fetch settings with defaults applied.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerArtifactFetchConfigFull {
+    pub parallelism: usize,
+    pub attempts: u32,
+    pub timeout_secs: u64,
+    pub max_artifact_size_bytes: u64,
+    pub allowed_schemes: Vec<String>,
+}
+
+impl Default for WorkerArtifactFetchConfigFull {
+    fn default() -> Self {
+        WorkerArtifactFetchConfigFull {
+            parallelism: DEF_ARTIFACT_FETCH_PARALLELISM,
+            attempts: DEF_ARTIFACT_FETCH_ATTEMPTS,
+            timeout_secs: 600,
+            max_artifact_size_bytes: 50 * 1024 * 1024 * 1024,
+            allowed_schemes: DEF_ARTIFACT_ALLOWED_SCHEMES
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        }
+    }
+}
+
+impl WorkerArtifactsConfig {
+    pub fn fetch_with_defaults(&self) -> R<WorkerArtifactFetchConfigFull> {
+        let d = WorkerArtifactFetchConfigFull::default();
+        let Some(fetch) = self.fetch.as_ref() else {
+            return Ok(d);
+        };
+        let timeout_secs = match fetch.timeout.as_deref() {
+            None => d.timeout_secs,
+            Some(raw) => raw
+                .parse::<humantime::Duration>()
+                .with_context(|| format!("invalid artifacts.fetch.timeout {raw:?}"))?
+                .as_secs(),
+        };
+        let max_artifact_size_bytes = match fetch.max_artifact_size.as_deref() {
+            None => d.max_artifact_size_bytes,
+            Some(raw) => parse_byte_size(raw)
+                .with_context(|| format!("invalid artifacts.fetch.maxArtifactSize {raw:?}"))?,
+        };
+        if fetch.parallelism == Some(0) {
+            bail!("artifacts.fetch.parallelism must be at least 1");
+        }
+        if fetch.attempts == Some(0) {
+            bail!("artifacts.fetch.attempts must be at least 1");
+        }
+        Ok(WorkerArtifactFetchConfigFull {
+            parallelism: fetch.parallelism.unwrap_or(d.parallelism),
+            attempts: fetch.attempts.unwrap_or(d.attempts),
+            timeout_secs,
+            max_artifact_size_bytes,
+            allowed_schemes: fetch.allowed_schemes.clone().unwrap_or(d.allowed_schemes),
+        })
+    }
+}
+
+/// Parses human byte sizes like "512MiB", "50GiB", "10MB", or plain bytes.
+/// Decimal (KB/MB/GB/TB) and binary (KiB/MiB/GiB/TiB) suffixes supported.
+pub fn parse_byte_size(raw: &str) -> R<u64> {
+    let trimmed = raw.trim();
+    let split = trimmed
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(trimmed.len());
+    let (number, suffix) = trimmed.split_at(split);
+    let value: f64 = number
+        .parse()
+        .with_context(|| format!("invalid byte size {raw:?}"))?;
+    let multiplier: u64 = match suffix.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 1,
+        "kb" => 1000,
+        "mb" => 1000 * 1000,
+        "gb" => 1000 * 1000 * 1000,
+        "tb" => 1000 * 1000 * 1000 * 1000,
+        "kib" | "k" => 1 << 10,
+        "mib" | "m" => 1 << 20,
+        "gib" | "g" => 1 << 30,
+        "tib" | "t" => 1 << 40,
+        other => bail!("invalid byte size suffix {other:?} in {raw:?}"),
+    };
+    if value < 0.0 {
+        bail!("byte size {raw:?} cannot be negative");
+    }
+    Ok((value * multiplier as f64) as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn byte_sizes_parse_decimal_and_binary_suffixes() -> R<()> {
+        assert_eq!(parse_byte_size("1024")?, 1024);
+        assert_eq!(parse_byte_size("10MB")?, 10_000_000);
+        assert_eq!(parse_byte_size("512MiB")?, 512 * 1024 * 1024);
+        assert_eq!(parse_byte_size("50GiB")?, 50 * 1024 * 1024 * 1024);
+        assert_eq!(parse_byte_size("1.5KiB")?, 1536);
+        assert!(parse_byte_size("10XB").is_err());
+        assert!(parse_byte_size("abc").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn worker_artifact_fetch_defaults_and_overrides() -> R<()> {
+        let defaults = WorkerArtifactsConfig::default().fetch_with_defaults()?;
+        assert_eq!(defaults.parallelism, DEF_ARTIFACT_FETCH_PARALLELISM);
+        assert_eq!(defaults.attempts, DEF_ARTIFACT_FETCH_ATTEMPTS);
+        assert_eq!(defaults.timeout_secs, 600);
+        assert!(!defaults.allowed_schemes.contains(&"http".to_string()));
+
+        let config: WorkerArtifactsConfig = serde_json::from_value(serde_json::json!({
+            "fetch": {
+                "parallelism": 8,
+                "attempts": 5,
+                "timeout": "2m",
+                "maxArtifactSize": "1GiB",
+                "allowedSchemes": ["https", "http"],
+            }
+        }))?;
+        let full = config.fetch_with_defaults()?;
+        assert_eq!(full.parallelism, 8);
+        assert_eq!(full.attempts, 5);
+        assert_eq!(full.timeout_secs, 120);
+        assert_eq!(full.max_artifact_size_bytes, 1024 * 1024 * 1024);
+        assert!(full.allowed_schemes.contains(&"http".to_string()));
+
+        let zero: WorkerArtifactsConfig =
+            serde_json::from_value(serde_json::json!({"fetch": {"parallelism": 0}}))?;
+        assert!(zero.fetch_with_defaults().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn artifact_auth_matcher_one_of_enforced() {
+        let both = ArtifactAuthMatcher {
+            r#match: "oci://x/**".into(),
+            kv: Some("secrets/x".into()),
+            node_identity: Some("pull".into()),
+        };
+        assert!(both.validate().is_err());
+
+        let neither = ArtifactAuthMatcher {
+            r#match: "oci://x/**".into(),
+            kv: None,
+            node_identity: None,
+        };
+        assert!(neither.validate().is_err());
+
+        let kv_only = ArtifactAuthMatcher {
+            r#match: "oci://x/**".into(),
+            kv: Some("secrets/x".into()),
+            node_identity: None,
+        };
+        kv_only.validate().expect("kv matcher valid");
+    }
+
+    #[test]
+    fn manager_artifacts_defaults_exclude_plain_http() {
+        let full = ArtifactsManagerConfigFull::default();
+        assert!(!full.allowed_schemes.contains(&"http".to_string()));
+        for scheme in ["https", "s3", "oci", "git", "file"] {
+            assert!(
+                full.allowed_schemes.contains(&scheme.to_string()),
+                "{scheme}"
+            );
+        }
+        assert!(
+            !full.container_image_desugar,
+            "desugar off until cache plan"
+        );
+    }
 }

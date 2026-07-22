@@ -11,6 +11,12 @@ pub struct PersistedAllocation {
     pub allocation: Allocation,
     pub task: TaskConfig,
     pub pid: Option<u32>,
+    /// Self-fence window in seconds (`TaskAllocation.self_terminate_after_seconds`):
+    /// kill this allocation after losing manager contact for this long.
+    /// Persisted so the watchdog keeps protecting restored allocations after
+    /// a worker restart. `None`/absent = stateless allocation, no fencing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_terminate_after_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -21,6 +27,12 @@ pub struct WorkerStateStore {
 impl WorkerStateStore {
     pub fn new(path: PathBuf) -> Self {
         Self { path }
+    }
+
+    /// Location of the worker state file; per-allocation directories live
+    /// beside it (`<parent>/allocs/`).
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     pub fn default_path() -> PathBuf {
@@ -37,6 +49,22 @@ impl WorkerStateStore {
                     .join(worker_id)
                     .join("worker_state.json")
             })
+    }
+
+    /// Base directory under which per-allocation log directories live.
+    ///
+    /// Logs sit beside the worker state file (`<state-dir>/logs`) so they share
+    /// the worker's data directory and survive worker restarts.
+    pub fn logs_base_dir(&self) -> PathBuf {
+        self.path
+            .parent()
+            .map(|parent| parent.join("logs"))
+            .unwrap_or_else(|| PathBuf::from("logs"))
+    }
+
+    /// Directory holding the captured stdout/stderr files for one allocation.
+    pub fn allocation_log_dir(&self, allocation_id: i64) -> PathBuf {
+        self.logs_base_dir().join(allocation_id.to_string())
     }
 
     pub fn load(&self) -> R<Vec<PersistedAllocation>> {

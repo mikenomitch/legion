@@ -5,6 +5,41 @@ export type JobTaskDependency = {
   condition?: string
 }
 
+// Parsed `stateful` block from a task spec (see docs/stateful-workloads.md).
+export type JobTaskStateful = {
+  mode: string
+  idSource?: string
+  storagePath?: string
+}
+
+// A declared task artifact, normalized from either the string shorthand or
+// the full object form in the job spec.
+export type JobTaskArtifact = {
+  source: string
+  name?: string
+  dest?: string
+  checksum?: string
+  unpack?: string
+  resolve?: string
+  authLabel?: string
+  mediaType?: string
+  pinnedFrom?: string
+}
+
+// One per-artifact staging state row, decoded from the JSON-encoded
+// `artifact_states` payload reported by workers via heartbeat.
+export type ArtifactStateRow = {
+  name?: string
+  source: string
+  state: string
+  digest?: string
+  bytesFetched?: number
+  bytesTotal?: number
+  attempts?: number
+  durationMs?: number
+  error?: string
+}
+
 export type JobTask = {
   name: string
   kind: string
@@ -13,6 +48,8 @@ export type JobTask = {
   config?: Record<string, unknown>
   checks?: unknown
   dependsOn: JobTaskDependency[]
+  stateful?: JobTaskStateful
+  artifacts: JobTaskArtifact[]
 }
 
 export type JobSpecData = {
@@ -24,6 +61,8 @@ export type TaskRuntimeSummary = {
   statuses: string[]
   health: string[]
   healthy?: boolean
+  // Full allocation statuses, including each allocation's optional
+  // `artifactStates` JSON payload (decode with parseArtifactStates).
   allocations: RolloutAllocationStatus[]
 }
 
@@ -41,6 +80,117 @@ const normalizeDependency = (value: unknown): JobTaskDependency | null => {
   }
 }
 
+const normalizeStateful = (value: unknown): JobTaskStateful | undefined => {
+  if (!value || typeof value !== 'object') return undefined
+  const raw = value as Record<string, unknown>
+  const mode = readTaskString(raw.mode)
+  if (!mode) return undefined
+  const storage = raw.storage && typeof raw.storage === 'object' ? (raw.storage as Record<string, unknown>) : undefined
+  return {
+    mode,
+    idSource: readTaskString(raw.idSource) || undefined,
+    storagePath: storage ? readTaskString(storage.path) || undefined : undefined,
+  }
+}
+
+// Derives a display label for an artifact's auth: the KV path or identity
+// name (never values), suffixed when the auth came from a cluster default.
+const deriveArtifactAuthLabel = (auth: unknown, authOrigin: string): string => {
+  if (auth && typeof auth === 'object') {
+    const item = auth as Record<string, unknown>
+    const suffix = authOrigin === 'cluster' ? ' (cluster default)' : ''
+    const kv = readTaskString(item.kv)
+    if (kv) return `kv: ${kv}${suffix}`
+    const identity = readTaskString(item.identity)
+    if (identity) return `identity: ${identity}${suffix}`
+    const nodeIdentity = readTaskString(item.nodeIdentity)
+    if (nodeIdentity) return `nodeIdentity: ${nodeIdentity}${suffix}`
+  }
+  return 'anonymous'
+}
+
+// Artifacts may be declared as a bare source string or a full object.
+const normalizeArtifact = (value: unknown): JobTaskArtifact | null => {
+  if (typeof value === 'string') {
+    return value ? { source: value, authLabel: 'anonymous' } : null
+  }
+  if (!value || typeof value !== 'object') return null
+  const raw = value as Record<string, unknown>
+  const source = readTaskString(raw.source)
+  if (!source) return null
+  return {
+    source,
+    name: readTaskString(raw.name) || undefined,
+    dest: readTaskString(raw.dest) || undefined,
+    checksum: readTaskString(raw.checksum) || undefined,
+    unpack: readTaskString(raw.unpack) || undefined,
+    resolve: readTaskString(raw.resolve) || undefined,
+    authLabel: deriveArtifactAuthLabel(raw.auth, readTaskString(raw.authOrigin)),
+    mediaType: readTaskString(raw.mediaType) || undefined,
+    pinnedFrom: readTaskString(raw.pinnedFrom) || undefined,
+  }
+}
+
+const readStateNumber = (value: unknown): number | undefined =>
+  typeof value === 'number' && Number.isFinite(value) ? value : undefined
+
+const normalizeArtifactStateRow = (value: unknown): ArtifactStateRow | null => {
+  if (!value || typeof value !== 'object') return null
+  const raw = value as Record<string, unknown>
+  const source = readTaskString(raw.source)
+  const state = readTaskString(raw.state)
+  if (!source && !state) return null
+  return {
+    name: readTaskString(raw.name) || undefined,
+    source,
+    state,
+    digest: readTaskString(raw.digest) || undefined,
+    bytesFetched: readStateNumber(raw.bytesFetched),
+    bytesTotal: readStateNumber(raw.bytesTotal),
+    attempts: readStateNumber(raw.attempts),
+    durationMs: readStateNumber(raw.durationMs),
+    error: readTaskString(raw.error) || undefined,
+  }
+}
+
+// Safely decodes the JSON-encoded `artifact_states` payload carried on
+// allocation statuses (heartbeat -> manager -> rollout status/ledger RPCs).
+export const parseArtifactStates = (raw: string | undefined): ArtifactStateRow[] => {
+  if (!raw) return []
+  try {
+    const parsed = JSON.parse(raw) as unknown
+    if (!Array.isArray(parsed)) return []
+    return parsed
+      .map((row) => normalizeArtifactStateRow(row))
+      .filter((row): row is ArtifactStateRow => Boolean(row))
+  } catch {
+    return []
+  }
+}
+
+export const artifactStateTone = (state: string): 'success' | 'warning' | 'danger' | 'neutral' => {
+  const normalized = state.toLowerCase()
+  if (normalized === 'staged') return 'success'
+  if (normalized === 'failed') return 'danger'
+  if (normalized === 'fetching' || normalized === 'verifying') return 'warning'
+  return 'neutral'
+}
+
+// Percent complete for an artifact fetch, when both byte counters are known.
+export const artifactProgressPercent = (row: ArtifactStateRow): number | undefined => {
+  if (row.bytesFetched === undefined || row.bytesTotal === undefined || row.bytesTotal <= 0) return undefined
+  return Math.min(100, Math.round((row.bytesFetched / row.bytesTotal) * 100))
+}
+
+// Shortens "sha256:<64 hex>" digests to "sha256:abcdef12…" for display.
+export const shortenArtifactDigest = (digest: string): string => {
+  const separator = digest.indexOf(':')
+  const prefix = separator >= 0 ? digest.slice(0, separator + 1) : ''
+  const hex = separator >= 0 ? digest.slice(separator + 1) : digest
+  if (hex.length <= 12) return digest
+  return `${prefix}${hex.slice(0, 8)}…`
+}
+
 const normalizeTask = (value: unknown): JobTask | null => {
   if (!value || typeof value !== 'object') return null
   const raw = value as Record<string, unknown>
@@ -52,6 +202,11 @@ const normalizeTask = (value: unknown): JobTask | null => {
     .map((dependency) => normalizeDependency(dependency))
     .filter((dependency): dependency is JobTaskDependency => Boolean(dependency))
 
+  const artifactsInput = Array.isArray(raw.artifacts) ? raw.artifacts : []
+  const artifacts = artifactsInput
+    .map((artifact) => normalizeArtifact(artifact))
+    .filter((artifact): artifact is JobTaskArtifact => Boolean(artifact))
+
   return {
     name,
     kind: readTaskString(raw.kind, 'unknown'),
@@ -60,6 +215,8 @@ const normalizeTask = (value: unknown): JobTask | null => {
     config: raw.config && typeof raw.config === 'object' ? (raw.config as Record<string, unknown>) : undefined,
     checks: raw.checks,
     dependsOn,
+    stateful: normalizeStateful(raw.stateful),
+    artifacts,
   }
 }
 
@@ -199,5 +356,15 @@ export const taskStatusTone = (status: string): 'success' | 'warning' | 'danger'
   if (['running', 'healthy', 'completed', 'success'].some((item) => normalized.includes(item))) return 'success'
   if (['failed', 'error', 'stopped', 'lost'].some((item) => normalized.includes(item))) return 'danger'
   if (['pending', 'starting', 'queued'].some((item) => normalized.includes(item))) return 'warning'
+  return 'neutral'
+}
+
+// Tone for a stateful instance lifecycle state, consistent with the status
+// colors used elsewhere: active=green, pending/rescheduling=amber,
+// terminated=gray (tombstones are expected rows, not failures).
+export const instanceStateTone = (state: string): 'success' | 'warning' | 'neutral' => {
+  const normalized = state.toLowerCase()
+  if (normalized === 'active') return 'success'
+  if (normalized === 'pending' || normalized === 'rescheduling') return 'warning'
   return 'neutral'
 }

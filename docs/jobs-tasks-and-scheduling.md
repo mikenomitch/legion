@@ -32,6 +32,18 @@ Important `TaskConfig` fields:
 - `lifecycle`: `service`, `batch`, `sidecar`
 - `schedule`: only valid for `batch`
 - `checks` and `on_unhealthy`: health and restart/reschedule policy
+- `stateful`: opt-in stable instance identity for the task's replicas. In
+  `slot` mode each replica gets an ordinal slot `0..count-1` whose instance id
+  and storage handle survive reschedules; replacements reuse the same slot.
+  See [Stateful Workloads](stateful-workloads.md) for the full job-spec
+  reference, env vars, and scale-in/out semantics. Tasks without a `stateful`
+  block behave exactly as before.
+- `kv` / `env` / `files` (KV injections): KV-backed env vars and rendered
+  files with per-reference `watch`/`onChange`/`onDelete` policies that can
+  restart, roll out, or fail the job when watched keys change or are
+  deleted. Full semantics (policy precedence, debounce, fail/recovery,
+  per-kind capability matrix) live in the
+  ["Reactive updates" section of the KV store doc](kv-store.md#reactive-updates-kv-driven-task-updates).
 
 ## Task Lists and Dependency Readiness
 

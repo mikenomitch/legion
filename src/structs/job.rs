@@ -10,6 +10,9 @@ use tabled::Tabled;
 
 use crate::prelude::{bail, R};
 
+use super::artifact::{validate_task_artifacts, ArtifactSpec};
+use super::instance::InstanceMode;
+use super::workload_identity::{validate_identities, WorkloadIdentity};
 use super::{Job, PlannedAllocation, Submission};
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Tabled)]
@@ -380,16 +383,12 @@ pub struct TaskDependency {
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+#[derive(Default)]
 pub enum TaskLifecycle {
+    #[default]
     Service,
     Batch,
     Sidecar,
-}
-
-impl Default for TaskLifecycle {
-    fn default() -> Self {
-        TaskLifecycle::Service
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -590,6 +589,55 @@ pub enum RolloutDeadlineAction {
     Pause,
 }
 
+/// How a slot-mode stateful group's slots are replaced during a rollout
+/// (see `docs/stateful-workloads.md` "Ordered rollouts for slot pools").
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum RolloutSlotOrder {
+    /// Today's behavior (the default): slot replacements are driven by the
+    /// regular step machinery with no ordinal ordering.
+    Parallel,
+    /// One slot at a time, highest ordinal first (`count-1 .. 0`), each step
+    /// gated on the previous slot's replacement passing the rollout's health
+    /// criteria. The K8s StatefulSet `OrderedReady` analog for updates.
+    Sequential,
+}
+
+/// Ordinal-aware rollout options for groups with a slot-mode stateful task
+/// (`rollout.slots` / `rolloutByGroup.<group>.slots` in the jobspec).
+///
+/// Only valid for groups whose stateful task is slot mode; rejected at
+/// submit time otherwise. A group override replaces the global `slots`
+/// block as a unit (like the step-mode fields, the block is one coherent
+/// progression choice).
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RolloutSlotsConfig {
+    /// `'parallel'` (default) or `'sequential'` (one slot at a time, highest
+    /// first, health-gated). `sequential` defines its own one-slot-per-step
+    /// progression and therefore cannot be combined with the step-mode
+    /// fields (`percentEachStep`, `countEachStep`, `percentSteps`,
+    /// `countSteps`) in the same scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order: Option<RolloutSlotOrder>,
+    /// Staged ("partitioned") rollout floor: only slots `>= updateFrom` are
+    /// updated to the new config; slots `0..updateFrom` keep running their
+    /// current allocations untouched. Resubmitting with a lower value
+    /// extends the new config to more slots; `0` (or omitting the field)
+    /// updates everything. Requires `order: 'sequential'` and must be less
+    /// than the slot task's `count.num`. The K8s StatefulSet
+    /// `rollingUpdate.partition` analog.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_from: Option<u32>,
+}
+
+impl RolloutSlotsConfig {
+    /// Whether this block asks for ordered (one-slot-at-a-time) updates.
+    pub fn is_sequential(&self) -> bool {
+        self.order == Some(RolloutSlotOrder::Sequential)
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct RolloutConfig {
@@ -653,6 +701,11 @@ pub struct RolloutConfig {
         serialize_with = "serialize_optional_duration"
     )]
     pub batch_kill_after: Option<Duration>,
+    /// Ordinal-aware options for slot-mode stateful groups: ordered
+    /// (`order: 'sequential'`) and staged (`updateFrom`) slot replacement.
+    /// See [`RolloutSlotsConfig`] and docs/stateful-workloads.md.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slots: Option<RolloutSlotsConfig>,
 }
 
 impl RolloutConfig {
@@ -665,6 +718,15 @@ impl RolloutConfig {
 
     fn has_step_mode(&self) -> bool {
         self.step_mode_count() > 0
+    }
+
+    /// Whether the config asks for ordered one-slot-at-a-time updates
+    /// (`slots.order: 'sequential'`). Sequential is a progression mode of
+    /// its own and is mutually exclusive with the step-mode fields.
+    fn has_sequential_slots(&self) -> bool {
+        self.slots
+            .as_ref()
+            .is_some_and(RolloutSlotsConfig::is_sequential)
     }
 
     fn clear_step_modes(&mut self) {
@@ -687,8 +749,22 @@ impl RolloutConfig {
         if override_config.in_place.is_some() {
             self.in_place = override_config.in_place;
         }
+        // A group override that picks a progression mode replaces the global
+        // selection wholesale: step modes clear a global step mode AND a
+        // global sequential-slots choice; a sequential `slots` block clears
+        // the global step modes. This keeps the merged config from ever
+        // mixing two progression modes the group never asked for together.
         if override_config.has_step_mode() {
             self.clear_step_modes();
+            if self.has_sequential_slots() {
+                self.slots = None;
+            }
+        }
+        if override_config.has_sequential_slots() {
+            self.clear_step_modes();
+        }
+        if override_config.slots.is_some() {
+            self.slots = override_config.slots.clone();
         }
         if override_config.percent_each_step.is_some() {
             self.percent_each_step = override_config.percent_each_step;
@@ -779,7 +855,7 @@ impl RolloutConfig {
             if count_steps.is_empty() {
                 bail!("{scope}.countSteps must not be empty");
             }
-            if count_steps.iter().any(|step| *step == 0) {
+            if count_steps.contains(&0) {
                 bail!("{scope}.countSteps values must be at least 1");
             }
         }
@@ -808,7 +884,229 @@ impl RolloutConfig {
             bail!("{scope}.healthyDeadline must be greater than 0 when set");
         }
 
+        if self.has_sequential_slots() && self.has_step_mode() {
+            bail!(
+                "{scope} cannot combine slots.order: \"sequential\" with a step mode \
+                 (percentEachStep, countEachStep, percentSteps, countSteps); sequential slot \
+                 rollouts define their own one-slot-per-step progression"
+            );
+        }
+
+        if let Some(slots) = self.slots.as_ref() {
+            if slots.update_from.is_some() && !slots.is_sequential() {
+                bail!(
+                    "{scope}.slots.updateFrom requires slots.order: \"sequential\"; staged \
+                     rollouts only have defined semantics when slots are replaced in ordinal \
+                     order"
+                );
+            }
+        }
+
         Ok(())
+    }
+}
+
+/// Declares a task stateful: its replicas become stable *instances* that
+/// survive reschedules (see `docs/stateful-workloads.md`). Absent = today's
+/// stateless behavior; the feature is opt-in per task.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct StatefulConfig {
+    /// Instance id assignment mode: `slot` (fixed ordinal pool `0..count-1`,
+    /// ids reused within the pool) or `keyed` (created on demand via the
+    /// CreateInstance/DestroyInstance RPCs, ids never recycled). In keyed
+    /// mode `count.num` is ignored: the set of live instances created via
+    /// the API is the desired allocation count.
+    pub mode: InstanceMode,
+    /// Where keyed instance ids come from by default: `caller` (the
+    /// CreateInstance request must supply one) or `uuid` (server-minted when
+    /// the request omits one). A valid caller-supplied id is always honored
+    /// regardless of this setting. Only valid in keyed mode; slot ids are
+    /// always derived from the ordinal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id_source: Option<String>,
+    /// Keyed mode only: instance ids to SEED on job submit
+    /// (`initialInstances` in the jobspec).
+    ///
+    /// On every submit, after the config is persisted and before placement
+    /// is evaluated, the manager ensures each listed id exists: ids that
+    /// have NEVER existed are created (`pending`) and flow into the submit's
+    /// normal placement eval; ids that already exist in ANY state — live,
+    /// stopped, or a terminated tombstone — are skipped silently. Resubmits
+    /// are therefore idempotent, and a deliberately destroyed id is never
+    /// resurrected by a resubmit.
+    ///
+    /// This is a SEED list, not a reconciled desired set: removing an id
+    /// from the list on resubmit does not stop or destroy that instance —
+    /// only `legion instance stop/destroy` (or a job stop/destroy) does.
+    ///
+    /// Each id must match `[A-Za-z0-9._-]{1,128}` and the list must not
+    /// contain duplicates (both enforced at validation time). Invalid in
+    /// slot mode (slot ids are derived from ordinals).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_instances: Option<Vec<String>>,
+    /// Optional persistent storage bound to each instance (contract only in
+    /// v1; drivers are a follow-up, see
+    /// `docs/plans/volume-plugin-system-plan.md`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage: Option<StatefulStorageConfig>,
+    /// Node-loss fencing policy (`onLost`): worker self-fence window plus
+    /// the manager's loss-confirmation gate. Absent = the safe defaults
+    /// (`selfTerminateAfter: 90s`, `replaceAfter: 2 x selfTerminateAfter`)
+    /// — see [`StatefulOnLostConfig`] and docs/stateful-workloads.md
+    /// "Node loss and fencing".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_lost: Option<StatefulOnLostConfig>,
+}
+
+/// Default worker self-fence window for stateful tasks (see
+/// [`StatefulOnLostConfig::self_terminate_after`]). Applies whenever a
+/// stateful task declares no `onLost` block — fencing is on by default.
+pub const DEFAULT_SELF_TERMINATE_AFTER: Duration = Duration::from_secs(90);
+
+/// Fencing policy for manager<->worker partitions (the at-most-one
+/// guarantee; see docs/stateful-workloads.md "Node loss and fencing").
+///
+/// Two cooperating timers make a node loss *confirmable*: the worker kills
+/// its stateful allocations after losing manager contact for
+/// `selfTerminateAfter`, and the manager refuses to plan a replacement until
+/// the node has been lost for `replaceAfter` (> `selfTerminateAfter`). By
+/// the time the replacement binds the instance id and storage handle, the
+/// original allocation has provably self-fenced or its node is truly dead.
+///
+/// Every stateful task gets this policy — an absent block means the defaults
+/// below (safe by default; tune `selfTerminateAfter` down for faster
+/// failover).
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct StatefulOnLostConfig {
+    /// How long the worker tolerates failed heartbeats before killing this
+    /// task's allocations locally (humantime string, e.g. `"90s"`). Default
+    /// `"90s"`. Must be greater than zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_terminate_after: Option<String>,
+    /// How long a node must have been lost before the manager replaces this
+    /// task's allocations on it (humantime string, e.g. `"3m"`), or the
+    /// special value `"never"` (K8s StatefulSet-style: the allocation is
+    /// only freed when the node returns or an operator forces it via
+    /// ReplaceInstance). Default: `2 x selfTerminateAfter`. Must be greater
+    /// than `selfTerminateAfter` — otherwise a replacement could start
+    /// before the worker has provably self-fenced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replace_after: Option<String>,
+}
+
+/// Resolved manager-side replacement gate for allocations on a lost node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplaceAfter {
+    /// Replace once the node has been lost longer than this.
+    After(Duration),
+    /// Never auto-replace; node recovery or operator override required.
+    Never,
+}
+
+/// [`StatefulOnLostConfig`] with defaults applied and durations parsed — the
+/// only shape the manager gate and the dispatcher reason about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedOnLostPolicy {
+    pub self_terminate_after: Duration,
+    pub replace_after: ReplaceAfter,
+}
+
+impl StatefulOnLostConfig {
+    /// Parse and default the policy. Errors carry actionable messages and
+    /// surface at `job validate`/submit time via
+    /// [`TaskConfig::validate_stateful`].
+    pub fn resolve(&self) -> R<ResolvedOnLostPolicy> {
+        let self_terminate_after = match self.self_terminate_after.as_deref() {
+            None => DEFAULT_SELF_TERMINATE_AFTER,
+            Some(raw) => humantime::parse_duration(raw).map_err(|err| {
+                anyhow::anyhow!(
+                    "stateful.onLost.selfTerminateAfter {raw:?} is not a valid duration \
+                     (use e.g. \"90s\"): {err}"
+                )
+            })?,
+        };
+        if self_terminate_after.is_zero() {
+            bail!("stateful.onLost.selfTerminateAfter must be greater than 0");
+        }
+
+        let replace_after = match self.replace_after.as_deref() {
+            None => ReplaceAfter::After(self_terminate_after * 2),
+            Some("never") => ReplaceAfter::Never,
+            Some(raw) => {
+                let parsed = humantime::parse_duration(raw).map_err(|err| {
+                    anyhow::anyhow!(
+                        "stateful.onLost.replaceAfter {raw:?} is not a valid duration \
+                         (use e.g. \"3m\", or the special value \"never\"): {err}"
+                    )
+                })?;
+                if parsed <= self_terminate_after {
+                    bail!(
+                        "stateful.onLost.replaceAfter ({raw}) must be greater than \
+                         selfTerminateAfter ({}): the manager must wait until the worker has \
+                         provably self-fenced before re-binding the instance, otherwise the \
+                         workload can run twice. Raise replaceAfter, lower selfTerminateAfter, \
+                         or use replaceAfter: \"never\"",
+                        humantime::format_duration(self_terminate_after)
+                    );
+                }
+                ReplaceAfter::After(parsed)
+            }
+        };
+
+        Ok(ResolvedOnLostPolicy {
+            self_terminate_after,
+            replace_after,
+        })
+    }
+}
+
+impl StatefulConfig {
+    /// The effective node-loss fencing policy: the declared `onLost` block,
+    /// or the safe defaults when absent. Stateful tasks ALWAYS have one —
+    /// only stateless tasks are replaced eagerly.
+    pub fn resolved_on_lost(&self) -> R<ResolvedOnLostPolicy> {
+        self.on_lost.clone().unwrap_or_default().resolve()
+    }
+}
+
+/// Persistent storage contract for a stateful task. Each instance gets an
+/// opaque `storage_handle` minted on first placement and reattached on every
+/// subsequent allocation for that instance.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct StatefulStorageConfig {
+    /// Absolute path inside the task where the instance's storage is exposed.
+    pub path: String,
+    /// Whether to keep an instance's storage handle when its slot is scaled
+    /// in (so a later scale-out reattaches the same data). Defaults to true,
+    /// mirroring K8s PVC retention (`whenScaled: Retain`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retain_on_scale_in: Option<bool>,
+    /// Whether to keep slot instances' storage handles when the JOB is
+    /// stopped (`legion job stop` — Legion's analog of deleting a
+    /// StatefulSet, i.e. K8s `whenDeleted`). Defaults to true (K8s Retain).
+    /// With `false`, a job stop still terminates the slot instances and
+    /// retains their rows (a later `job run` re-materializes the same
+    /// ordinal identities), but their storage handles are DROPPED, so the
+    /// revived slots mint fresh handles. Slot mode only: keyed stop/destroy
+    /// semantics are fixed per instance (stop retains, destroy drops).
+    /// `job destroy` is unaffected — it always purges every instance row
+    /// (and handle) with the job, regardless of this flag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retain_on_stop: Option<bool>,
+}
+
+impl StatefulStorageConfig {
+    /// Effective scale-in retention policy (defaults to retain).
+    pub fn retains_on_scale_in(&self) -> bool {
+        self.retain_on_scale_in.unwrap_or(true)
+    }
+
+    /// Effective job-stop retention policy (defaults to retain).
+    pub fn retains_on_stop(&self) -> bool {
+        self.retain_on_stop.unwrap_or(true)
     }
 }
 
@@ -855,9 +1153,24 @@ pub struct TaskConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[tabled(skip)]
     pub service: Option<crate::structs::network::ServiceConfig>,
+    /// Workload identities issued to this task (workload-identity OIDC plan).
+    /// Empty = today's behavior; the feature is opt-in per task.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[tabled(skip)]
+    pub identities: Vec<WorkloadIdentity>,
+    /// Stable instance identity for stateful workloads (see
+    /// `docs/stateful-workloads.md`). None = stateless, today's behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[tabled(skip)]
+    pub stateful: Option<StatefulConfig>,
+    /// Artifacts fetched into the task directory before start (artifact
+    /// system plan). Empty = today's behavior; staging is skipped entirely.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[tabled(skip)]
+    pub artifacts: Vec<ArtifactSpec>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum KvInjectionAction {
     None,
@@ -866,15 +1179,48 @@ pub enum KvInjectionAction {
     Fail,
 }
 
+/// Per-reference KV reactivity policy. Every field is optional so an entry
+/// can override the task-level defaults field-by-field: a field left unset
+/// on the entry inherits the defaults block, and a field unset in both
+/// places falls back to the documented hard defaults (`watch=false`,
+/// `onChange=none`, `onDelete=fail`). See `docs/kv-store.md`.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct KvInjectionPolicy {
-    #[serde(default)]
-    pub watch: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watch: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_change: Option<KvInjectionAction>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_delete: Option<KvInjectionAction>,
+}
+
+/// Fully-resolved KV policy for one injection edge after defaults and hard
+/// fallbacks are applied (the only shape reconciliation reasons about).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedKvInjectionPolicy {
+    pub watch: bool,
+    pub on_change: KvInjectionAction,
+    pub on_delete: KvInjectionAction,
+}
+
+impl KvInjectionPolicy {
+    /// Resolve this entry-level policy against the task-level defaults
+    /// block. Precedence per field: entry value, then defaults value, then
+    /// the hard default (`watch=false`, `onChange=none`, `onDelete=fail`).
+    pub fn resolve_with_defaults(&self, defaults: &KvInjectionPolicy) -> ResolvedKvInjectionPolicy {
+        ResolvedKvInjectionPolicy {
+            watch: self.watch.or(defaults.watch).unwrap_or(false),
+            on_change: self
+                .on_change
+                .or(defaults.on_change)
+                .unwrap_or(KvInjectionAction::None),
+            on_delete: self
+                .on_delete
+                .or(defaults.on_delete)
+                .unwrap_or(KvInjectionAction::Fail),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
@@ -955,8 +1301,10 @@ enum TaskConfigList {
 struct TaskConfigInput {
     #[serde(default)]
     name: Option<String>,
-    #[serde(default = "default_task_count")]
-    count: TaskCount,
+    // Optional so keyed-mode validation can tell an explicit `count` apart
+    // from the default; resolved via `unwrap_or_default()` in conversion.
+    #[serde(default)]
+    count: Option<TaskCount>,
     kind: String,
     #[serde(default = "default_task_group")]
     group: String,
@@ -992,6 +1340,18 @@ struct TaskConfigInput {
     network: Option<crate::structs::network::NetworkConfig>,
     #[serde(default)]
     service: Option<crate::structs::network::ServiceConfig>,
+    #[serde(default)]
+    identities: Vec<WorkloadIdentity>,
+    #[serde(default)]
+    stateful: Option<StatefulConfig>,
+    // `onLost` is only valid INSIDE the stateful block. Without this field
+    // serde would silently ignore a task-level `onLost`, which is exactly
+    // the misplacement users will type (and on a stateless task there is
+    // nothing to fence) — so catch it and reject loudly at parse time.
+    #[serde(default)]
+    on_lost: Option<Value>,
+    #[serde(default)]
+    artifacts: Vec<ArtifactSpec>,
 }
 
 #[derive(Deserialize)]
@@ -1006,7 +1366,38 @@ enum TaskDependencyInput {
 }
 
 impl TaskConfigInput {
-    fn into_task_config(self, name: String) -> TaskConfig {
+    fn into_task_config(self, name: String) -> Result<TaskConfig, String> {
+        let name = self.name.unwrap_or(name);
+        // Keyed-mode cardinality is owned by the instance management API
+        // (CreateInstance/DestroyInstance), never by the job spec. An explicit
+        // `count` on a keyed task would be silently meaningless, so reject it
+        // loudly at parse time (only here do we still know it was explicit).
+        if let Some(stateful) = self.stateful.as_ref() {
+            if stateful.mode == InstanceMode::Keyed && self.count.is_some() {
+                return Err(format!(
+                    "task {name} is stateful keyed mode and cannot define count: keyed \
+                     instance cardinality is driven by the instance management API \
+                     (legion instance create/destroy), not the job spec; remove the \
+                     count field (see docs/stateful-workloads.md)"
+                ));
+            }
+        }
+        if self.on_lost.is_some() {
+            return Err(if self.stateful.is_some() {
+                format!(
+                    "task {name} declares onLost at the task level; the node-loss fencing \
+                     policy belongs inside the stateful block — move it to \
+                     stateful.onLost (see docs/stateful-workloads.md)"
+                )
+            } else {
+                format!(
+                    "task {name} declares onLost but is not stateful; onLost is the \
+                     node-loss fencing policy for stateful instances and is only valid \
+                     inside a stateful block. Stateless tasks are always replaced eagerly \
+                     on node loss (see docs/stateful-workloads.md)"
+                )
+            });
+        }
         let depends_on = self
             .depends_on
             .into_iter()
@@ -1020,9 +1411,9 @@ impl TaskConfigInput {
                 }
             })
             .collect();
-        TaskConfig {
-            name: self.name.unwrap_or(name),
-            count: self.count,
+        Ok(TaskConfig {
+            name,
+            count: self.count.unwrap_or_default(),
             kind: self.kind,
             group: self.group,
             depends_on,
@@ -1058,11 +1449,14 @@ impl TaskConfigInput {
             }),
             network: self.network,
             service: self.service,
-        }
+            identities: self.identities,
+            stateful: self.stateful,
+            artifacts: self.artifacts,
+        })
     }
 }
 
-fn task_list_to_vec(configs: TaskConfigList) -> Vec<TaskConfig> {
+fn task_list_to_vec(configs: TaskConfigList) -> Result<Vec<TaskConfig>, String> {
     match configs {
         TaskConfigList::List(tasks) => tasks
             .into_iter()
@@ -1088,8 +1482,10 @@ impl<'de> Deserialize<'de> for JobConfig {
                     "jobspec must define only one of task or tasks",
                 ))
             }
-            (Some(tasks), None) => task_list_to_vec(tasks),
-            (None, Some(task)) => vec![task.into_task_config(String::from("task"))],
+            (Some(tasks), None) => task_list_to_vec(tasks).map_err(D::Error::custom)?,
+            (None, Some(task)) => vec![task
+                .into_task_config(String::from("task"))
+                .map_err(D::Error::custom)?],
             (None, None) => return Err(D::Error::custom("jobspec must define at least one task")),
         };
 
@@ -1224,6 +1620,9 @@ impl TaskConfig {
             kv_injections: None,
             network: None,
             service: None,
+            identities: Vec::new(),
+            stateful: None,
+            artifacts: Vec::new(),
         }
     }
 
@@ -1262,6 +1661,152 @@ impl TaskConfig {
             }
         }
         Ok(())
+    }
+
+    /// Whether this task declares a stateful block. Gates the stateful-only
+    /// `{instance}`/`{slot}` placeholders in a `sub` template and the
+    /// instance-assignment path in the scheduler/store.
+    pub fn is_stateful(&self) -> bool {
+        self.stateful.is_some()
+    }
+
+    /// Validate the task's stateful block (see `docs/stateful-workloads.md`).
+    /// No stateful block = today's stateless behavior, always valid.
+    pub fn validate_stateful(&self) -> R<()> {
+        let Some(stateful) = self.stateful.as_ref() else {
+            return Ok(());
+        };
+
+        match stateful.mode {
+            InstanceMode::Slot => {
+                if stateful.id_source.is_some() {
+                    bail!(
+                        "task {} stateful.idSource is only valid in keyed mode; slot ids are \
+                         always derived from the ordinal",
+                        self.name
+                    );
+                }
+                if self.count.num < 1 {
+                    bail!(
+                        "task {} stateful slot mode requires count.num >= 1 (slots are 0..count-1)",
+                        self.name
+                    );
+                }
+                if self.count.per.is_some() {
+                    bail!(
+                        "task {} stateful slot mode cannot be combined with count.per; per-attribute \
+                         pools would produce colliding slot instance ids",
+                        self.name
+                    );
+                }
+                if stateful.initial_instances.is_some() {
+                    bail!(
+                        "task {} stateful.initialInstances is only valid in keyed mode; slot ids \
+                         are always derived from the ordinal",
+                        self.name
+                    );
+                }
+            }
+            InstanceMode::Keyed => {
+                if stateful
+                    .storage
+                    .as_ref()
+                    .is_some_and(|storage| storage.retain_on_stop.is_some())
+                {
+                    bail!(
+                        "task {} stateful.storage.retainOnStop is only valid in slot mode; keyed \
+                         stop/destroy semantics are fixed per instance (instance stop / job stop \
+                         always retains the storage handle, instance destroy always drops it)",
+                        self.name
+                    );
+                }
+                if let Some(id_source) = stateful.id_source.as_deref() {
+                    if !matches!(id_source, "caller" | "uuid") {
+                        bail!(
+                            "task {} stateful.idSource must be \"caller\" or \"uuid\", got {:?}",
+                            self.name,
+                            id_source
+                        );
+                    }
+                }
+                // Keyed cardinality is driven entirely by the management API
+                // (CreateInstance/DestroyInstance). An explicit `count` in the
+                // job spec is rejected at parse time (see TaskConfigInput);
+                // this guard re-checks `count.per` for directly-constructed
+                // configs, which would otherwise be silently meaningless.
+                if self.count.per.is_some() {
+                    bail!(
+                        "task {} stateful keyed mode cannot be combined with count.per; keyed \
+                         instance cardinality is driven by the instance management API, not count",
+                        self.name
+                    );
+                }
+                // The seed list is validated here (not at seeding time) so a
+                // bad jobspec fails `job validate`/submit before any state
+                // changes. Duplicates are rejected because the list is a set
+                // of identities — a duplicate is always a spec mistake.
+                if let Some(initial) = stateful.initial_instances.as_ref() {
+                    let mut seen = std::collections::BTreeSet::new();
+                    for id in initial {
+                        crate::structs::validate_keyed_instance_id(id).map_err(|err| {
+                            anyhow::anyhow!(
+                                "task {} stateful.initialInstances entry {:?}: {err}",
+                                self.name,
+                                id
+                            )
+                        })?;
+                        if !seen.insert(id.as_str()) {
+                            bail!(
+                                "task {} stateful.initialInstances contains duplicate id {:?}",
+                                self.name,
+                                id
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(storage) = stateful.storage.as_ref() {
+            if storage.path.trim().is_empty() {
+                bail!("task {} stateful.storage.path cannot be empty", self.name);
+            }
+            if !storage.path.starts_with('/') {
+                bail!(
+                    "task {} stateful.storage.path must be an absolute path, got {:?}",
+                    self.name,
+                    storage.path
+                );
+            }
+        }
+
+        // Node-loss fencing: durations must parse and replaceAfter must
+        // exceed selfTerminateAfter (or be "never"). Resolving here also
+        // covers the defaulted case, so a stateful task can never reach the
+        // scheduler with an unresolvable policy.
+        stateful
+            .resolved_on_lost()
+            .map_err(|err| anyhow::anyhow!("task {}: {err}", self.name))?;
+
+        Ok(())
+    }
+
+    /// Validate workload identities declared on this task (see the
+    /// workload-identity OIDC plan). No identities = today's behavior.
+    pub fn validate_identities(&self) -> R<()> {
+        validate_identities(&self.name, &self.identities, self.is_stateful())
+    }
+
+    /// Validate artifacts declared on this task (artifact system plan):
+    /// spec shape, name uniqueness, `${artifact.<name>}` references in the
+    /// kind config, and `auth.identity` references. No artifacts = today's
+    /// behavior. Cluster-scoped rules (scheme allowlist, nodeIdentity names)
+    /// are enforced at admission where manager config is available.
+    pub fn validate_artifacts(&self) -> R<()> {
+        if self.artifacts.is_empty() {
+            return Ok(());
+        }
+        validate_task_artifacts(&self.name, &self.artifacts, &self.config, &self.identities)
     }
 
     pub fn validate_checks(&self) -> R<()> {
@@ -1693,6 +2238,152 @@ mod tests {
     }
 
     #[test]
+    fn rollout_slots_deserialize_and_round_trip() -> R<()> {
+        let spec = serde_json::json!({
+            "name": "demo",
+            "task": { "kind": "noop" },
+            "rollout": {
+                "slots": { "order": "sequential", "updateFrom": 2 }
+            }
+        });
+
+        let config: JobConfig = serde_json::from_value(spec)?;
+        let slots = config
+            .rollout
+            .as_ref()
+            .and_then(|rollout| rollout.slots.as_ref())
+            .expect("missing slots block");
+        assert_eq!(slots.order, Some(RolloutSlotOrder::Sequential));
+        assert_eq!(slots.update_from, Some(2));
+        assert!(slots.is_sequential());
+
+        // Round trip preserves the block (it is persisted in the rollout
+        // row's config_json and re-parsed every tick).
+        let raw = serde_json::to_string(config.rollout.as_ref().unwrap())?;
+        let parsed: RolloutConfig = serde_json::from_str(&raw)?;
+        assert_eq!(parsed.slots, config.rollout.as_ref().unwrap().slots);
+        Ok(())
+    }
+
+    #[test]
+    fn rollout_slots_reject_garbage_at_parse() {
+        // Unknown order value.
+        let err = serde_json::from_value::<RolloutConfig>(serde_json::json!({
+            "slots": { "order": "alphabetical" }
+        }))
+        .expect_err("garbage order should fail to parse");
+        assert!(err.to_string().contains("alphabetical"));
+
+        // Negative updateFrom.
+        assert!(serde_json::from_value::<RolloutConfig>(serde_json::json!({
+            "slots": { "updateFrom": -1 }
+        }))
+        .is_err());
+
+        // Non-numeric updateFrom.
+        assert!(serde_json::from_value::<RolloutConfig>(serde_json::json!({
+            "slots": { "updateFrom": "two" }
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn rollout_validation_rejects_update_from_without_sequential() {
+        for slots in [
+            serde_json::json!({ "updateFrom": 1 }),
+            serde_json::json!({ "order": "parallel", "updateFrom": 1 }),
+        ] {
+            let spec = serde_json::json!({
+                "name": "demo",
+                "task": { "kind": "noop" },
+                "rollout": { "slots": slots }
+            });
+            let config: JobConfig =
+                serde_json::from_value(spec).expect("config should deserialize");
+            let err = config
+                .validate_rollout()
+                .expect_err("updateFrom without sequential should fail");
+            assert!(
+                err.to_string().contains("requires slots.order"),
+                "unexpected error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn rollout_validation_rejects_sequential_with_step_mode() {
+        let spec = serde_json::json!({
+            "name": "demo",
+            "task": { "kind": "noop" },
+            "rollout": {
+                "percentSteps": [50, 100],
+                "slots": { "order": "sequential" }
+            }
+        });
+
+        let config: JobConfig = serde_json::from_value(spec).expect("config should deserialize");
+        let err = config
+            .validate_rollout()
+            .expect_err("sequential plus a step mode should fail");
+        assert!(
+            err.to_string().contains("cannot combine slots.order"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn group_sequential_slots_override_replaces_global_step_mode() -> R<()> {
+        let spec = serde_json::json!({
+            "name": "demo",
+            "tasks": {
+                "db": { "kind": "noop", "group": "data" },
+                "api": { "kind": "noop", "group": "backend" }
+            },
+            "rollout": { "percentSteps": [25, 100] },
+            "rolloutByGroup": {
+                "data": { "slots": { "order": "sequential", "updateFrom": 1 } }
+            }
+        });
+
+        let config: JobConfig = serde_json::from_value(spec)?;
+        // The sequential slots override is a progression mode of its own:
+        // it replaces the global percentSteps for this group (mirroring how
+        // a group step-mode override replaces the global step mode).
+        let data = config
+            .rollout_config_for_group("data")
+            .expect("missing data rollout");
+        assert!(data.percent_steps.is_none());
+        assert_eq!(
+            data.slots.as_ref().and_then(|slots| slots.update_from),
+            Some(1)
+        );
+        config.validate_rollout()?;
+
+        // Untouched group keeps the global step mode and gains no slots.
+        let backend = config
+            .rollout_config_for_group("backend")
+            .expect("missing backend rollout");
+        assert_eq!(backend.percent_steps, Some(vec![25, 100]));
+        assert!(backend.slots.is_none());
+
+        // The reverse: a group step-mode override clears a global
+        // sequential slots block instead of merging into a conflict.
+        let reverse: JobConfig = serde_json::from_value(serde_json::json!({
+            "name": "demo",
+            "tasks": { "db": { "kind": "noop", "group": "data" } },
+            "rollout": { "slots": { "order": "sequential" } },
+            "rolloutByGroup": { "data": { "countEachStep": 1 } }
+        }))?;
+        let data = reverse
+            .rollout_config_for_group("data")
+            .expect("missing data rollout");
+        assert_eq!(data.count_each_step, Some(1));
+        assert!(data.slots.is_none());
+        reverse.validate_rollout()?;
+        Ok(())
+    }
+
+    #[test]
     fn kv_injection_validation_rejects_both_template_sources() {
         let spec = serde_json::json!({
             "name": "demo",
@@ -1714,6 +2405,474 @@ mod tests {
     }
 
     #[test]
+    fn kv_policy_resolution_uses_hard_defaults_when_everything_is_silent() {
+        let resolved =
+            KvInjectionPolicy::default().resolve_with_defaults(&KvInjectionPolicy::default());
+        assert!(!resolved.watch);
+        assert_eq!(resolved.on_change, KvInjectionAction::None);
+        assert_eq!(resolved.on_delete, KvInjectionAction::Fail);
+    }
+
+    #[test]
+    fn kv_policy_resolution_inherits_defaults_for_silent_entry_fields() {
+        let defaults = KvInjectionPolicy {
+            watch: Some(true),
+            on_change: Some(KvInjectionAction::Restart),
+            on_delete: Some(KvInjectionAction::None),
+        };
+        // Entry only overrides on_change; watch and on_delete inherit.
+        let entry = KvInjectionPolicy {
+            watch: None,
+            on_change: Some(KvInjectionAction::Rollout),
+            on_delete: None,
+        };
+        let resolved = entry.resolve_with_defaults(&defaults);
+        assert!(resolved.watch);
+        assert_eq!(resolved.on_change, KvInjectionAction::Rollout);
+        assert_eq!(resolved.on_delete, KvInjectionAction::None);
+    }
+
+    #[test]
+    fn kv_policy_resolution_lets_entry_disable_watch_explicitly() {
+        let defaults = KvInjectionPolicy {
+            watch: Some(true),
+            on_change: Some(KvInjectionAction::Rollout),
+            on_delete: Some(KvInjectionAction::Fail),
+        };
+        let entry = KvInjectionPolicy {
+            watch: Some(false),
+            on_change: None,
+            on_delete: None,
+        };
+        let resolved = entry.resolve_with_defaults(&defaults);
+        assert!(!resolved.watch);
+        assert_eq!(resolved.on_change, KvInjectionAction::Rollout);
+    }
+
+    #[test]
+    fn identities_deserialize_from_camel_case_spec() -> R<()> {
+        let spec = serde_json::json!({
+            "name": "demo",
+            "task": {
+                "kind": "exec",
+                "identities": [
+                    {
+                        "name": "aws",
+                        "audience": ["sts.amazonaws.com"],
+                        "ttl": "15m",
+                        "file": { "path": "/var/run/legion/identity/aws/token", "mode": "0400" },
+                        "changeMode": "noop"
+                    },
+                    {
+                        "name": "vault",
+                        "audience": ["vault.internal"],
+                        "ttl": "5m",
+                        "env": "VAULT_WORKLOAD_TOKEN",
+                        "changeMode": "signal",
+                        "changeSignal": "SIGHUP",
+                        "extraClaims": { "app.example.com/tier": "backend" }
+                    }
+                ]
+            }
+        });
+        let config: JobConfig = serde_json::from_value(spec)?;
+        let task = &config.tasks[0];
+        assert_eq!(task.identities.len(), 2);
+        assert_eq!(task.identities[0].name, "aws");
+        assert!(task.identities[0].delivers_file());
+        assert_eq!(task.identities[1].change_signal.as_deref(), Some("SIGHUP"));
+        assert_eq!(
+            task.identities[1].extra_claims["app.example.com/tier"],
+            "backend"
+        );
+        task.validate_identities()?;
+        Ok(())
+    }
+
+    #[test]
+    fn identity_with_empty_audience_fails_validation() {
+        let spec = serde_json::json!({
+            "name": "demo",
+            "task": {
+                "kind": "exec",
+                "identities": [
+                    { "name": "aws", "audience": [], "env": "TOKEN", "changeMode": "restart" }
+                ]
+            }
+        });
+        let config: JobConfig = serde_json::from_value(spec).expect("should deserialize");
+        let err = config.tasks[0]
+            .validate_identities()
+            .expect_err("empty audience must be rejected");
+        assert!(err.to_string().contains("audience"), "{err}");
+    }
+
+    #[test]
+    fn stateful_block_deserializes_and_round_trips() -> R<()> {
+        let spec = serde_json::json!({
+            "name": "demo",
+            "task": {
+                "kind": "exec",
+                "count": 3,
+                "stateful": {
+                    "mode": "slot",
+                    "storage": { "path": "/var/lib/db", "retainOnScaleIn": true }
+                }
+            }
+        });
+        let config: JobConfig = serde_json::from_value(spec)?;
+        let task = &config.tasks[0];
+        let stateful = task.stateful.as_ref().expect("stateful block parsed");
+        assert_eq!(stateful.mode, InstanceMode::Slot);
+        assert!(stateful.id_source.is_none());
+        let storage = stateful.storage.as_ref().expect("storage parsed");
+        assert_eq!(storage.path, "/var/lib/db");
+        assert!(storage.retains_on_scale_in());
+        task.validate_stateful()?;
+        assert!(task.is_stateful());
+
+        // Round trip: serialize the task config and re-parse.
+        let serialized = serde_json::to_value(task)?;
+        assert_eq!(serialized["stateful"]["mode"], "slot");
+        let reparsed: TaskConfig = serde_json::from_value(serialized)?;
+        assert_eq!(reparsed.stateful, task.stateful);
+        Ok(())
+    }
+
+    #[test]
+    fn stateful_keyed_block_accepts_id_source() -> R<()> {
+        let spec = serde_json::json!({
+            "name": "demo",
+            "task": {
+                "kind": "container",
+                "stateful": {
+                    "mode": "keyed",
+                    "idSource": "caller",
+                    "storage": { "path": "/workspace" }
+                }
+            }
+        });
+        let config: JobConfig = serde_json::from_value(spec)?;
+        let stateful = config.tasks[0].stateful.as_ref().expect("stateful parsed");
+        assert_eq!(stateful.mode, InstanceMode::Keyed);
+        assert_eq!(stateful.id_source.as_deref(), Some("caller"));
+        config.tasks[0].validate_stateful()?;
+        Ok(())
+    }
+
+    #[test]
+    fn stateful_keyed_mode_rejects_explicit_count_at_parse_time() {
+        for count in [
+            serde_json::json!(3),
+            serde_json::json!({ "num": 2, "per": "arch" }),
+        ] {
+            let spec = serde_json::json!({
+                "name": "demo",
+                "task": {
+                    "kind": "exec",
+                    "count": count,
+                    "stateful": { "mode": "keyed" }
+                }
+            });
+            let err = serde_json::from_value::<JobConfig>(spec)
+                .expect_err("keyed task with explicit count must fail to parse");
+            let message = err.to_string();
+            assert!(
+                message.contains("cannot define count")
+                    && message.contains("instance management API"),
+                "unexpected error message: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn stateful_keyed_mode_rejects_explicit_count_in_task_list() {
+        let spec = serde_json::json!({
+            "name": "demo",
+            "tasks": {
+                "sandbox": {
+                    "kind": "exec",
+                    "count": 1,
+                    "stateful": { "mode": "keyed" }
+                }
+            }
+        });
+        let err = serde_json::from_value::<JobConfig>(spec)
+            .expect_err("keyed task with explicit count must fail to parse");
+        assert!(err.to_string().contains("task sandbox"));
+    }
+
+    #[test]
+    fn stateful_keyed_mode_parses_without_count_and_slot_mode_keeps_count() -> R<()> {
+        let spec = serde_json::json!({
+            "name": "demo",
+            "tasks": [
+                { "kind": "exec", "stateful": { "mode": "keyed" } },
+                { "kind": "exec", "count": 3, "stateful": { "mode": "slot" } },
+                { "kind": "exec", "group": "plain" }
+            ]
+        });
+        let config: JobConfig = serde_json::from_value(spec)?;
+        assert_eq!(config.tasks[0].count, TaskCount::new(1));
+        assert_eq!(config.tasks[1].count, TaskCount::new(3));
+        assert_eq!(config.tasks[2].count, TaskCount::new(1));
+        Ok(())
+    }
+
+    #[test]
+    fn stateful_storage_retain_defaults_to_true() -> R<()> {
+        let spec = serde_json::json!({
+            "name": "demo",
+            "task": {
+                "kind": "exec",
+                "stateful": { "mode": "slot", "storage": { "path": "/data" } }
+            }
+        });
+        let config: JobConfig = serde_json::from_value(spec)?;
+        let storage = config.tasks[0]
+            .stateful
+            .as_ref()
+            .and_then(|stateful| stateful.storage.as_ref())
+            .expect("storage parsed");
+        assert!(storage.retain_on_scale_in.is_none());
+        assert!(storage.retains_on_scale_in());
+        // Both retention knobs default to Retain, like K8s
+        // persistentVolumeClaimRetentionPolicy.
+        assert!(storage.retain_on_stop.is_none());
+        assert!(storage.retains_on_stop());
+        Ok(())
+    }
+
+    #[test]
+    fn stateful_storage_retain_on_stop_parses_in_slot_mode() -> R<()> {
+        let spec = serde_json::json!({
+            "name": "demo",
+            "task": {
+                "kind": "exec",
+                "count": 2,
+                "stateful": {
+                    "mode": "slot",
+                    "storage": {
+                        "path": "/data",
+                        "retainOnScaleIn": true,
+                        "retainOnStop": false
+                    }
+                }
+            }
+        });
+        let config: JobConfig = serde_json::from_value(spec)?;
+        let task = &config.tasks[0];
+        let storage = task
+            .stateful
+            .as_ref()
+            .and_then(|stateful| stateful.storage.as_ref())
+            .expect("storage parsed");
+        assert_eq!(storage.retain_on_stop, Some(false));
+        assert!(!storage.retains_on_stop());
+        assert!(storage.retains_on_scale_in(), "the knobs are independent");
+        task.validate_stateful()?;
+
+        // Round trip: the camelCase key survives serialization.
+        let serialized = serde_json::to_value(task)?;
+        assert_eq!(serialized["stateful"]["storage"]["retainOnStop"], false);
+        let reparsed: TaskConfig = serde_json::from_value(serialized)?;
+        assert_eq!(reparsed.stateful, task.stateful);
+        Ok(())
+    }
+
+    #[test]
+    fn stateful_validation_rejects_retain_on_stop_in_keyed_mode() {
+        for value in [true, false] {
+            let task = TaskConfig {
+                stateful: Some(StatefulConfig {
+                    mode: InstanceMode::Keyed,
+                    id_source: None,
+                    initial_instances: None,
+                    on_lost: None,
+                    storage: Some(StatefulStorageConfig {
+                        path: "/workspace".into(),
+                        retain_on_scale_in: None,
+                        retain_on_stop: Some(value),
+                    }),
+                }),
+                ..TaskConfig::new("sandbox", "container")
+            };
+            let err = task
+                .validate_stateful()
+                .expect_err("retainOnStop must be rejected in keyed mode");
+            assert!(
+                err.to_string().contains("retainOnStop")
+                    && err.to_string().contains("slot mode")
+                    && err.to_string().contains("fixed per instance"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn stateful_validation_rejects_id_source_in_slot_mode() {
+        let task = TaskConfig {
+            stateful: Some(StatefulConfig {
+                mode: InstanceMode::Slot,
+                id_source: Some("uuid".into()),
+                initial_instances: None,
+                on_lost: None,
+                storage: None,
+            }),
+            ..TaskConfig::new("db", "exec")
+        };
+        let err = task
+            .validate_stateful()
+            .expect_err("idSource must be rejected in slot mode");
+        assert!(err.to_string().contains("idSource"), "{err}");
+    }
+
+    #[test]
+    fn stateful_validation_rejects_zero_count_in_slot_mode() {
+        let task = TaskConfig {
+            count: TaskCount::new(0),
+            stateful: Some(StatefulConfig {
+                mode: InstanceMode::Slot,
+                id_source: None,
+                initial_instances: None,
+                on_lost: None,
+                storage: None,
+            }),
+            ..TaskConfig::new("db", "exec")
+        };
+        let err = task
+            .validate_stateful()
+            .expect_err("slot mode requires count >= 1");
+        assert!(err.to_string().contains("count.num >= 1"), "{err}");
+    }
+
+    #[test]
+    fn stateful_validation_rejects_count_per_in_slot_mode() {
+        let task = TaskConfig {
+            count: TaskCount::per(2, "region"),
+            stateful: Some(StatefulConfig {
+                mode: InstanceMode::Slot,
+                id_source: None,
+                initial_instances: None,
+                on_lost: None,
+                storage: None,
+            }),
+            ..TaskConfig::new("db", "exec")
+        };
+        let err = task
+            .validate_stateful()
+            .expect_err("slot mode cannot combine with count.per");
+        assert!(err.to_string().contains("count.per"), "{err}");
+    }
+
+    #[test]
+    fn stateful_validation_rejects_bad_storage_paths() {
+        for bad_path in ["", "   ", "relative/path"] {
+            let task = TaskConfig {
+                stateful: Some(StatefulConfig {
+                    mode: InstanceMode::Slot,
+                    id_source: None,
+                    initial_instances: None,
+                    on_lost: None,
+                    storage: Some(StatefulStorageConfig {
+                        path: bad_path.into(),
+                        retain_on_scale_in: None,
+                        retain_on_stop: None,
+                    }),
+                }),
+                ..TaskConfig::new("db", "exec")
+            };
+            let err = task
+                .validate_stateful()
+                .expect_err("storage path must be rejected");
+            assert!(
+                err.to_string().contains("path"),
+                "{err} (path {bad_path:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn stateful_validation_rejects_unknown_keyed_id_source() {
+        let task = TaskConfig {
+            stateful: Some(StatefulConfig {
+                mode: InstanceMode::Keyed,
+                id_source: Some("dice-roll".into()),
+                initial_instances: None,
+                on_lost: None,
+                storage: None,
+            }),
+            ..TaskConfig::new("sandbox", "container")
+        };
+        let err = task
+            .validate_stateful()
+            .expect_err("unknown idSource must be rejected");
+        assert!(err.to_string().contains("idSource"), "{err}");
+    }
+
+    #[test]
+    fn stateful_validation_rejects_count_per_in_keyed_mode() {
+        let task = TaskConfig {
+            count: TaskCount::per(2, "region"),
+            stateful: Some(StatefulConfig {
+                mode: InstanceMode::Keyed,
+                id_source: None,
+                initial_instances: None,
+                on_lost: None,
+                storage: None,
+            }),
+            ..TaskConfig::new("sandbox", "container")
+        };
+        let err = task
+            .validate_stateful()
+            .expect_err("keyed mode cannot combine with count.per");
+        assert!(err.to_string().contains("count.per"), "{err}");
+    }
+
+    #[test]
+    fn stateful_keyed_mode_does_not_require_count() {
+        // count.num is ignored for keyed tasks (the management API drives
+        // cardinality), so any count.num — including 0 — validates.
+        for count in [0, 1, 7] {
+            let task = TaskConfig {
+                count: TaskCount::new(count),
+                stateful: Some(StatefulConfig {
+                    mode: InstanceMode::Keyed,
+                    id_source: Some("uuid".into()),
+                    initial_instances: None,
+                    on_lost: None,
+                    storage: None,
+                }),
+                ..TaskConfig::new("sandbox", "container")
+            };
+            task.validate_stateful()
+                .expect("keyed tasks must not require count.num");
+        }
+    }
+
+    #[test]
+    fn stateless_task_passes_stateful_validation_and_is_not_stateful() -> R<()> {
+        let task = TaskConfig::new("web", "exec");
+        assert!(!task.is_stateful());
+        task.validate_stateful()?;
+        Ok(())
+    }
+
+    #[test]
+    fn stateful_validation_rejects_unknown_mode_at_parse_time() {
+        let spec = serde_json::json!({
+            "name": "demo",
+            "task": {
+                "kind": "exec",
+                "stateful": { "mode": "ordinal" }
+            }
+        });
+        let err = serde_json::from_value::<JobConfig>(spec)
+            .expect_err("unknown stateful mode must fail to parse");
+        assert!(err.to_string().contains("ordinal") || err.to_string().contains("variant"));
+    }
+
+    #[test]
     fn kv_injection_validation_accepts_single_template_source() -> R<()> {
         let spec = serde_json::json!({
             "name": "demo",
@@ -1727,6 +2886,202 @@ mod tests {
         });
         let config: JobConfig = serde_json::from_value(spec)?;
         config.tasks[0].validate_kv_injections()?;
+        Ok(())
+    }
+
+    fn slot_task_with_on_lost(on_lost: StatefulOnLostConfig) -> TaskConfig {
+        TaskConfig {
+            stateful: Some(StatefulConfig {
+                mode: InstanceMode::Slot,
+                id_source: None,
+                initial_instances: None,
+                on_lost: Some(on_lost),
+                storage: None,
+            }),
+            ..TaskConfig::new("db", "exec")
+        }
+    }
+
+    #[test]
+    fn on_lost_defaults_apply_to_every_stateful_task() -> R<()> {
+        // No onLost block: the safe defaults still apply (90s self-fence,
+        // 2x that for the manager gate) — fencing is on by default.
+        let task = TaskConfig {
+            stateful: Some(StatefulConfig {
+                mode: InstanceMode::Slot,
+                id_source: None,
+                initial_instances: None,
+                on_lost: None,
+                storage: None,
+            }),
+            ..TaskConfig::new("db", "exec")
+        };
+        let policy = task.stateful.as_ref().unwrap().resolved_on_lost()?;
+        assert_eq!(policy.self_terminate_after, Duration::from_secs(90));
+        assert_eq!(
+            policy.replace_after,
+            ReplaceAfter::After(Duration::from_secs(180))
+        );
+        task.validate_stateful()?;
+        Ok(())
+    }
+
+    #[test]
+    fn on_lost_replace_after_defaults_to_twice_self_terminate_after() -> R<()> {
+        let policy = StatefulOnLostConfig {
+            self_terminate_after: Some("45s".into()),
+            replace_after: None,
+        }
+        .resolve()?;
+        assert_eq!(policy.self_terminate_after, Duration::from_secs(45));
+        assert_eq!(
+            policy.replace_after,
+            ReplaceAfter::After(Duration::from_secs(90))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn on_lost_parses_explicit_durations_and_never() -> R<()> {
+        let task = slot_task_with_on_lost(StatefulOnLostConfig {
+            self_terminate_after: Some("30s".into()),
+            replace_after: Some("3m".into()),
+        });
+        task.validate_stateful()?;
+        let policy = task.stateful.as_ref().unwrap().resolved_on_lost()?;
+        assert_eq!(policy.self_terminate_after, Duration::from_secs(30));
+        assert_eq!(
+            policy.replace_after,
+            ReplaceAfter::After(Duration::from_secs(180))
+        );
+
+        // The special value "never" is accepted: K8s StatefulSet-style
+        // manual recovery (node return or operator override).
+        let never = slot_task_with_on_lost(StatefulOnLostConfig {
+            self_terminate_after: None,
+            replace_after: Some("never".into()),
+        });
+        never.validate_stateful()?;
+        let policy = never.stateful.as_ref().unwrap().resolved_on_lost()?;
+        assert_eq!(policy.replace_after, ReplaceAfter::Never);
+        Ok(())
+    }
+
+    #[test]
+    fn on_lost_rejects_replace_after_not_exceeding_self_terminate_after() {
+        for replace_after in ["90s", "60s"] {
+            let task = slot_task_with_on_lost(StatefulOnLostConfig {
+                self_terminate_after: Some("90s".into()),
+                replace_after: Some(replace_after.into()),
+            });
+            let err = task
+                .validate_stateful()
+                .expect_err("replaceAfter <= selfTerminateAfter must be rejected");
+            let message = err.to_string();
+            assert!(
+                message.contains("must be greater than")
+                    && message.contains("self-fenced")
+                    && message.contains("task db"),
+                "unexpected error: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn on_lost_rejects_bad_duration_strings() {
+        // selfTerminateAfter: not a duration / missing unit / zero.
+        for bad in ["soon", "90", "0s"] {
+            let task = slot_task_with_on_lost(StatefulOnLostConfig {
+                self_terminate_after: Some(bad.into()),
+                replace_after: None,
+            });
+            let err = task
+                .validate_stateful()
+                .expect_err("bad selfTerminateAfter must be rejected");
+            assert!(err.to_string().contains("selfTerminateAfter"), "{err}");
+        }
+
+        // replaceAfter: anything unparsable that is not the literal "never".
+        for bad in ["later", "180", "Never"] {
+            let task = slot_task_with_on_lost(StatefulOnLostConfig {
+                self_terminate_after: None,
+                replace_after: Some(bad.into()),
+            });
+            let err = task
+                .validate_stateful()
+                .expect_err("bad replaceAfter must be rejected");
+            assert!(err.to_string().contains("replaceAfter"), "{err}");
+        }
+    }
+
+    #[test]
+    fn on_lost_at_task_level_is_rejected_at_parse_time() {
+        // Stateless task: there is nothing to fence.
+        let spec = serde_json::json!({
+            "name": "demo",
+            "task": {
+                "kind": "exec",
+                "onLost": { "selfTerminateAfter": "90s" }
+            }
+        });
+        let err = serde_json::from_value::<JobConfig>(spec)
+            .expect_err("onLost on a stateless task must be rejected");
+        let message = err.to_string();
+        assert!(
+            message.contains("not stateful") && message.contains("onLost"),
+            "unexpected error: {message}"
+        );
+
+        // Stateful task with onLost misplaced at the task level: point the
+        // user at the right nesting instead of silently ignoring it.
+        let spec = serde_json::json!({
+            "name": "demo",
+            "task": {
+                "kind": "exec",
+                "count": 2,
+                "stateful": { "mode": "slot" },
+                "onLost": { "selfTerminateAfter": "90s" }
+            }
+        });
+        let err = serde_json::from_value::<JobConfig>(spec)
+            .expect_err("task-level onLost must be rejected");
+        assert!(err.to_string().contains("stateful.onLost"), "{err}");
+    }
+
+    #[test]
+    fn on_lost_deserializes_inside_stateful_and_round_trips() -> R<()> {
+        let spec = serde_json::json!({
+            "name": "demo",
+            "task": {
+                "kind": "exec",
+                "count": 2,
+                "stateful": {
+                    "mode": "slot",
+                    "onLost": {
+                        "selfTerminateAfter": "30s",
+                        "replaceAfter": "2m"
+                    }
+                }
+            }
+        });
+        let config: JobConfig = serde_json::from_value(spec)?;
+        let task = &config.tasks[0];
+        task.validate_stateful()?;
+        let on_lost = task
+            .stateful
+            .as_ref()
+            .and_then(|stateful| stateful.on_lost.as_ref())
+            .expect("onLost parsed");
+        assert_eq!(on_lost.self_terminate_after.as_deref(), Some("30s"));
+        assert_eq!(on_lost.replace_after.as_deref(), Some("2m"));
+
+        let serialized = serde_json::to_value(task)?;
+        assert_eq!(
+            serialized["stateful"]["onLost"]["selfTerminateAfter"],
+            "30s"
+        );
+        let reparsed: TaskConfig = serde_json::from_value(serialized)?;
+        assert_eq!(reparsed.stateful, task.stateful);
         Ok(())
     }
 }

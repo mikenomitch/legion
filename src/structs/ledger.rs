@@ -18,6 +18,9 @@ pub struct Allocation {
     pub job_config_id: String,
     pub task_config_id: i64,
     pub job_id: String,
+    /// Stable instance this allocation fulfills, when the task is stateful
+    /// (see `docs/stateful-workloads.md`). None for stateless tasks.
+    pub instance_id: Option<String>,
     /// Assigned ports + node address, set at placement. None when the task
     /// declares no network block.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -105,6 +108,7 @@ impl From<Allocation> for LedgerAllocation {
             job_config_id,
             task_config_id,
             job_id,
+            instance_id,
             network,
         } = allocation;
 
@@ -122,8 +126,48 @@ impl From<Allocation> for LedgerAllocation {
             job_config_id,
             task_config_id,
             job_id,
+            instance_id,
             network,
+            // Enriched from allocation_health snapshots by the manager's
+            // GetLedger handler; the core Allocation carries no health data.
+            artifact_states: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod ledger_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn allocation(instance_id: Option<&str>) -> Allocation {
+        Allocation {
+            id: 7,
+            status: "running".into(),
+            resources: json!({"cpu": 100}),
+            node_id: "node-a".into(),
+            job_config_id: "jc-1".into(),
+            task_config_id: 3,
+            job_id: "db".into(),
+            instance_id: instance_id.map(Into::into),
+            network: None,
+        }
+    }
+
+    #[test]
+    fn ledger_allocation_round_trips_instance_id() {
+        let msg = LedgerAllocation::from(allocation(Some("db-default-2")));
+        assert_eq!(msg.instance_id.as_deref(), Some("db-default-2"));
+        let back = msg.into_allocation().unwrap();
+        assert_eq!(back.instance_id.as_deref(), Some("db-default-2"));
+    }
+
+    #[test]
+    fn ledger_allocation_omits_instance_id_for_stateless() {
+        let msg = LedgerAllocation::from(allocation(None));
+        assert_eq!(msg.instance_id, None);
+        let back = msg.into_allocation().unwrap();
+        assert_eq!(back.instance_id, None);
     }
 }
 
@@ -137,7 +181,9 @@ impl LedgerAllocation {
             job_config_id,
             task_config_id,
             job_id,
+            instance_id,
             network,
+            artifact_states: _,
         } = self;
 
         let resources: Value =
@@ -156,6 +202,7 @@ impl LedgerAllocation {
             job_config_id,
             task_config_id,
             job_id,
+            instance_id,
             network,
         })
     }

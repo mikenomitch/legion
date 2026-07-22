@@ -75,6 +75,219 @@ service Manager {
   // Lists jobs known by the manager.
   rpc ListJobs (ListJobsRequest) returns (ListJobsReply);
 
+  // Creates a keyed-mode stateful instance for a job's keyed task and
+  // enqueues placement.
+  //
+  // Keyed instances (see docs/stateful-workloads.md) are the sandbox/dispatch
+  // primitive: each instance is a long-lived logical entity with a unique,
+  // **never-recycled** id that persists across allocations. Unlike slot mode,
+  // Keyed tasks cannot define `count` (rejected at job parse time) — the
+  // number of live instances
+  // created through this RPC is the task's desired allocation count (zero
+  // instances = zero allocations).
+  //
+  // Id assignment: the target task's `stateful.idSource` declares the default
+  // source. With `idSource: "caller"` the request must supply `instance_id`;
+  // with `idSource: "uuid"` (or unset) the server mints an id when
+  // `instance_id` is absent. A caller-supplied `instance_id` is always
+  // accepted when valid, regardless of `idSource` — the setting picks the
+  // default, it does not forbid explicit keys.
+  //
+  // Errors:
+  // - NotFound: the job does not exist.
+  // - InvalidArgument: no keyed task matches `group`/`task`, the match is
+  //   ambiguous, the id has an invalid charset (must match
+  //   `[A-Za-z0-9._-]{1,128}`), or `idSource: "caller"` and no id was given.
+  // - AlreadyExists: the id collides with ANY existing instance row of the
+  //   job — including Stopped instances and Terminated tombstones — or
+  //   structurally aliases the reserved slot-id pattern
+  //   `{job}-{group}-{slot}` of a slot-mode stateful task in the same job
+  //   (the slot and keyed id spaces are kept disjoint so a keyed id can never
+  //   adopt, or be adopted by, a slot placement). A stopped instance still
+  //   owns its id, and a destroyed id can never be created again for the
+  //   lifetime of the job (the never-recycle guarantee; destroying the whole
+  //   job clears its instance history — see DestroyJob).
+  rpc CreateInstance (CreateInstanceRequest) returns (CreateInstanceReply);
+
+  // Creates several keyed-mode stateful instances in one atomic call and
+  // enqueues a single placement evaluation for the batch.
+  //
+  // The request may carry explicit `instance_ids`, a `count` of server-minted
+  // ids, or both; the call creates every explicit id PLUS `count` freshly
+  // minted ids. Creation is ALL-OR-NOTHING inside one storage transaction:
+  // if any explicit id is invalid or collides with ANY existing instance row
+  // (live, Stopped, or a Terminated tombstone — ids are never recycled), the
+  // whole call fails and NO instance is created. The reply lists every id
+  // that was created, in request order (explicit ids first, then minted ids).
+  //
+  // Task resolution (`group`/`task`) follows the same disambiguation rules as
+  // `CreateInstance`: filters may be omitted when the job has exactly one
+  // keyed task; ambiguity is rejected, never guessed.
+  //
+  // Interaction with `stateful.idSource`:
+  // - `idSource: "caller"` requires every id to be caller-supplied, so
+  //   `count > 0` (server minting) contradicts the policy and is rejected
+  //   with InvalidArgument.
+  // - `idSource: "uuid"` (or unset) accepts any mix of explicit ids and
+  //   minted ids.
+  //
+  // Errors:
+  // - NotFound: the job does not exist.
+  // - FailedPrecondition: the job is stopped (run it before creating
+  //   instances).
+  // - InvalidArgument: no keyed task matches `group`/`task` or the match is
+  //   ambiguous; `instance_ids` is empty AND `count` is 0 (nothing to
+  //   create); an id has an invalid charset (must match
+  //   `[A-Za-z0-9._-]{1,128}`, the offending id is named); or the task
+  //   declares `idSource: "caller"` and `count > 0`.
+  // - AlreadyExists: an id (named in the message) collides with an existing
+  //   instance row — including duplicates within the request itself, Stopped
+  //   instances, and Terminated tombstones. Nothing is created.
+  rpc CreateInstances (CreateInstancesRequest) returns (CreateInstancesReply);
+
+  // Destroys a keyed-mode instance: stops its current allocation, drops its
+  // storage handle, and marks the instance Terminated.
+  //
+  // The instance row is retained as a tombstone so its id can never be
+  // re-created — and its workload identity `sub` never re-minted for a
+  // different workload — for the lifetime of the job (the never-recycle
+  // guarantee). Destroying the whole job (DestroyJob) cascades and clears its
+  // instance history, after which the id is free again; a live job never
+  // recycles a destroyed id. The storage handle is always dropped on destroy
+  // — a destroyed sandbox's state must not be reattachable. (This is
+  // intentionally stricter than slot-mode scale-in, which retains storage by
+  // default for a later scale-out.)
+  //
+  // Destroying an already-Terminated instance succeeds as a no-op, so the
+  // call is safe to retry even without an idempotency key.
+  //
+  // Destroy also applies to Stopped instances: the row transitions
+  // stopped -> terminated and its retained storage handle is dropped.
+  //
+  // Errors:
+  // - NotFound: no instance row with this id exists.
+  // - InvalidArgument: the instance is slot-mode (slot lifecycles are owned
+  //   by the scheduler via `count.num`, not this API).
+  rpc DestroyInstance (DestroyInstanceRequest) returns (DestroyInstanceReply);
+
+  // Stops (pauses) a keyed-mode instance WITHOUT tombstoning it.
+  //
+  // The instance's current allocation is stopped through the normal
+  // allocation-stop path (the hosting worker stops the task on its next
+  // heartbeat reconcile), and the instance transitions to `stopped`. Unlike
+  // `DestroyInstance` this is fully reversible:
+  // - the row is RETAINED and the id stays owned — `CreateInstance` with the
+  //   same id still fails with AlreadyExists (stopped is not destroyed);
+  // - the storage handle is RETAINED, so a later `StartInstance` revives the
+  //   instance with its persisted state;
+  // - `StartInstance` moves it back to `pending` and re-places it.
+  //
+  // While stopped, the instance is NOT part of the keyed task's desired
+  // allocation count: the scheduler plans no allocation for it, and job
+  // resubmits / config updates / reschedules will not resurrect it. Only an
+  // explicit `StartInstance` does.
+  //
+  // Stopping an already-stopped instance succeeds as a no-op, so the call is
+  // safe to retry even without an idempotency key.
+  //
+  // Errors:
+  // - NotFound: no instance row with this id exists.
+  // - InvalidArgument: the instance is slot-mode (slot lifecycles are owned
+  //   by the scheduler via `count.num`; stop the job or scale in instead).
+  // - FailedPrecondition: the instance is Terminated. Destroyed instances
+  //   are tombstoned forever (never-recycle) and can never be stopped,
+  //   started, or re-created.
+  rpc StopInstance (StopInstanceRequest) returns (StopInstanceReply);
+
+  // Starts (resumes) a stopped keyed-mode instance.
+  //
+  // The instance transitions `stopped -> pending` and a placement evaluation
+  // is enqueued (exactly like `CreateInstance` does), so the scheduler
+  // places a new allocation bound to the same instance id and its RETAINED
+  // storage handle — the revived workload is *the same* logical instance.
+  //
+  // Starting an instance that is already live (pending, active, or
+  // rescheduling) succeeds as a no-op, so the call is safe to retry even
+  // without an idempotency key.
+  //
+  // Errors:
+  // - NotFound: no instance row with this id exists.
+  // - InvalidArgument: the instance is slot-mode (slot lifecycles are owned
+  //   by the scheduler via `count.num`, not this API).
+  // - FailedPrecondition: the instance is Terminated (destroyed ids are
+  //   tombstoned forever — create a NEW id instead), or the owning job is
+  //   stopped (run the job first; a stopped job schedules nothing).
+  rpc StartInstance (StartInstanceRequest) returns (StartInstanceReply);
+
+  // Operator override for the node-loss confirmation gate (the K8s analog is
+  // force-deleting a pod stuck on a lost node): immediately frees a stateful
+  // instance's allocation on a LOST node for replacement, without waiting for
+  // `stateful.onLost.replaceAfter` to elapse (and despite `replaceAfter:
+  // "never"`). See docs/stateful-workloads.md "Node loss and fencing".
+  //
+  // The gated allocation row is removed (the instance transitions to
+  // `rescheduling`, keeping its id and storage handle) and a reschedule
+  // evaluation is enqueued that excludes the lost node, so the replacement
+  // re-binds the same instance elsewhere.
+  //
+  // DANGER: this asserts the lost node's workload is dead. If the node is
+  // merely partitioned and its worker has not yet self-fenced
+  // (`onLost.selfTerminateAfter`), forcing a replacement can run the
+  // instance twice (split-brain on its storage handle and workload-identity
+  // subject). Only force when the node is confirmed dead/isolated.
+  //
+  // Works for slot and keyed instances alike.
+  //
+  // Errors:
+  // - NotFound: no instance row with this id exists.
+  // - FailedPrecondition: the instance has no current allocation, or its
+  //   allocation's node is not `lost` (the gate only ever holds allocations
+  //   on lost nodes; everything else reschedules through the normal paths).
+  rpc ReplaceInstance (ReplaceInstanceRequest) returns (ReplaceInstanceReply);
+
+  // Lists stateful instances (slot and keyed) for a job, optionally filtered
+  // by group. Includes Terminated rows (slot rows retained for scale-out
+  // re-materialization; keyed rows retained forever as never-recycle
+  // tombstones).
+  rpc ListInstances (ListInstancesRequest) returns (ListInstancesReply);
+
+  // Returns one stateful instance by id.
+  //
+  // Errors:
+  // - NotFound: no instance row with this id exists.
+  rpc GetInstance (GetInstanceRequest) returns (GetInstanceReply);
+
+  // Issues a short-lived, asymmetrically-signed OIDC workload-identity token
+  // for one named identity declared on the task of a placed allocation
+  // (see docs/workload-identity.md).
+  //
+  // Called by the worker that hosts the allocation — never by the task
+  // itself — at task launch and again before each token expiry (the refresh
+  // loop). The manager derives **all** claims server-side from the
+  // scheduling record (region, job, group, task, node, alloc, and the stable
+  // instance/slot for stateful tasks) and applies the audience, TTL, subject
+  // template, and extra claims of the *named identity in the stored task
+  // spec*. Nothing security-relevant is read from the request, so a
+  // compromised worker can only obtain tokens for allocations placed on it,
+  // scoped to audiences the spec already declared.
+  //
+  // Authorization: the request's `node_id` must match the node the
+  // allocation is placed on. This is the same trust model as Heartbeat —
+  // workers are admitted via join token and identified by their claimed
+  // node id; there is no per-request worker credential yet (TODO: bind
+  // worker RPCs to a per-node credential once worker mTLS lands).
+  //
+  // Errors:
+  // - FailedPrecondition: workload identity is not enabled on this manager
+  //   (`workloadIdentity.enabled: false`, the default).
+  // - NotFound: no allocation with `alloc_id` exists, or the allocation's
+  //   task does not declare an identity named `identity_name`.
+  // - PermissionDenied: the allocation exists but is not placed on
+  //   `node_id` (a worker may only request tokens for its own allocations).
+  // - Internal: signing failed.
+  rpc IssueWorkloadIdentityToken (IssueWorkloadIdentityTokenRequest)
+      returns (IssueWorkloadIdentityTokenReply);
+
   // Worker heartbeat endpoint.
   //
   // Workers send runtime state, failures, and allocation health snapshots.
@@ -94,6 +307,13 @@ service Manager {
 
   // Proxies a restart request to a worker node.
   rpc RestartWorker (RestartWorkerRequest) returns (RestartWorkerReply);
+
+  // Retrieves captured task stdout/stderr for a job's allocations.
+  //
+  // The manager locates the node hosting each allocation and proxies the read
+  // to that worker's `Worker.GetTaskLogs` RPC.
+  rpc GetAllocationLogs (GetAllocationLogsRequest)
+    returns (GetAllocationLogsReply);
 
   // Returns node + allocation view of cluster state (the "ledger").
   rpc GetLedger (GetLedgerRequest) returns (GetLedgerReply);
@@ -130,6 +350,14 @@ service Manager {
     returns (UpdateNodeDynamicReply);
 
   // Creates or updates a KV entry.
+  //
+  // Jobs that reference the key (legacy `$key` jobspec references or
+  // watched task kv injections) are reconciled: their configs are
+  // re-rendered from the new value and the per-reference `onChange` policy
+  // (none/restart/rollout/fail) is applied. Rapid writes are coalesced per
+  // the manager's `kvDebounceMs` window (default 500ms; with a non-zero
+  // window reconciliation errors are logged on the manager instead of
+  // failing this RPC). See docs/kv-store.md "Reactive updates".
   rpc PutKv (PutKvRequest) returns (PutKvReply);
 
   // Gets one KV entry by key.
@@ -139,9 +367,18 @@ service Manager {
   rpc ListKv (ListKvRequest) returns (ListKvReply);
 
   // Deletes one KV entry by key.
+  //
+  // Deletion is a first-class reconciliation event: jobs watching the key
+  // resolve their per-reference `onDelete` policy (default `fail`, which
+  // marks the job and its allocations failed with reason
+  // `missing_kv_dependency`; a later PutKv to the key recovers the job via
+  // `onChange`). Legacy `$key` references treat deletion as `fail`. Events
+  // are debounced like PutKv. See docs/kv-store.md "Reactive updates".
   rpc DeleteKv (DeleteKvRequest) returns (DeleteKvReply);
 
   // Applies an RFC6902 JSON patch to a JSON-typed KV entry.
+  //
+  // Triggers the same KV-change reconciliation (and debouncing) as PutKv.
   rpc PatchKv (PatchKvRequest) returns (PatchKvReply);
 
   // Acquires (or force-acquires) a lock for a KV key.
@@ -172,6 +409,19 @@ service Manager {
   // booting) are excluded unless `include_unhealthy` is set.
   rpc ResolveService (ResolveServiceRequest) returns (ResolveServiceReply);
 
+  // Resolves an artifact credential stored in KV for a worker about to fetch.
+  //
+  // Called by workers over their existing authenticated manager channel
+  // immediately before fetching an artifact whose spec (or cluster default)
+  // names a KV credential path. The credential value is returned to the
+  // worker and is never persisted on allocations, logged, or traced.
+  //
+  // SECURITY: KV ACLs do not exist yet, so any task spec may reference any
+  // KV path via `auth.kv`. When the ACL system lands, this RPC is the
+  // enforcement point for artifact credential reads (see docs/artifacts.md).
+  rpc GetArtifactCredential (GetArtifactCredentialRequest)
+    returns (GetArtifactCredentialReply);
+
   // Executes a SQL statement directly against the manager state store.
   //
   // Read-only mode is the default safety behavior and rejects write statements
@@ -181,6 +431,21 @@ service Manager {
   // Returns a structured schema snapshot for the manager SQLite state store.
   rpc GetStateStoreSchema (GetStateStoreSchemaRequest)
     returns (GetStateStoreSchemaReply);
+
+  // Lists recent scheduler events from the manager's event journal.
+  //
+  // Events describe what the scheduler is doing: evals enqueued/completed,
+  // allocations placed/removed/failed, node lifecycle changes, job lifecycle
+  // changes, and rollout activity. Results are ordered oldest-to-newest and
+  // support cursor-based polling via `after_id`.
+  rpc ListEvents (ListEventsRequest) returns (ListEventsReply);
+
+  // Streams scheduler events as they happen (server-streaming).
+  //
+  // When `after_id` is set, persisted events with `id > after_id` are
+  // replayed first, then the live feed continues seamlessly. Clients that
+  // disconnect can resume without gaps by passing the last event ID they saw.
+  rpc StreamEvents (StreamEventsRequest) returns (stream SchedulerEvent);
 
   // Lists user-saved State Explorer query snippets.
   rpc ListSavedStateQueries (ListSavedStateQueriesRequest)
@@ -193,6 +458,108 @@ service Manager {
   // Deletes a saved State Explorer query by name.
   rpc DeleteSavedStateQuery (DeleteSavedStateQueryRequest)
     returns (DeleteSavedStateQueryReply);
+
+  // === AUTH & ACL ===
+  //
+  // Legion's ACL system is token-based: callers present a bearer credential in
+  // the `authorization` metadata header (`Bearer <secret>`). Credentials are
+  // either opaque Legion ACL tokens (minted by BootstrapAcl, CreateAclToken,
+  // or Login) or externally issued JWTs validated against a configured auth
+  // method. Each request resolves to a set of named policies; policies contain
+  // scoped allow/deny rules over resources (`job`, `node`, `kv`, `state`,
+  // `operator`, `acl`) and actions (`read`, `write`).
+  //
+  // When ACLs are disabled (the default) every endpoint behaves as if the
+  // caller held a management token.
+
+  // Reports how the manager authenticated the caller and what access applies.
+  //
+  // This endpoint never requires a credential: anonymous callers receive the
+  // anonymous identity. UI and CLI clients use it to discover whether ACLs are
+  // enabled and to introspect the presented credential.
+  rpc WhoAmI (WhoAmIRequest) returns (WhoAmIReply);
+
+  // Exchanges login credentials for a newly minted Legion ACL token.
+  //
+  // Supported methods: the built-in `userpass` method (username/password
+  // verified against stored ACL users) and any JWT/OIDC auth method configured
+  // on the manager (`method` = the configured method name, `jwt` = the
+  // externally issued token). The reply contains the token secret exactly
+  // once; the manager stores only a hash of it.
+  rpc Login (LoginRequest) returns (LoginReply);
+
+  // One-time creation of the initial management token.
+  //
+  // Succeeds only while no management token exists; afterwards it returns
+  // FAILED_PRECONDITION. Run `legion acl bootstrap` right after enabling ACLs
+  // and store the returned secret safely.
+  rpc BootstrapAcl (BootstrapAclRequest) returns (BootstrapAclReply);
+
+  // Creates or replaces a named ACL policy. Requires `acl:write`.
+  rpc UpsertAclPolicy (UpsertAclPolicyRequest) returns (UpsertAclPolicyReply);
+
+  // Returns one ACL policy by exact name. Requires `acl:read`.
+  rpc GetAclPolicy (GetAclPolicyRequest) returns (GetAclPolicyReply);
+
+  // Lists all ACL policies. Requires `acl:read`.
+  rpc ListAclPolicies (ListAclPoliciesRequest) returns (ListAclPoliciesReply);
+
+  // Deletes an ACL policy by exact name. Requires `acl:write`.
+  //
+  // Tokens referencing the deleted policy lose the access it granted.
+  rpc DeleteAclPolicy (DeleteAclPolicyRequest) returns (DeleteAclPolicyReply);
+
+  // Creates a new ACL token attached to existing policies.
+  //
+  // Requires `acl:write`. Creating a `management` token additionally requires
+  // the caller to hold a management token.
+  rpc CreateAclToken (CreateAclTokenRequest) returns (CreateAclTokenReply);
+
+  // Lists ACL tokens. Requires `acl:read`.
+  //
+  // Only accessor IDs and metadata are returned; secrets are never stored or
+  // returned after creation.
+  rpc ListAclTokens (ListAclTokensRequest) returns (ListAclTokensReply);
+
+  // Deletes (revokes) an ACL token by accessor ID. Requires `acl:write`.
+  rpc DeleteAclToken (DeleteAclTokenRequest) returns (DeleteAclTokenReply);
+
+  // Creates or updates a username/password ACL user. Requires `acl:write`.
+  //
+  // Passwords are hashed with argon2id; plaintext is never stored.
+  rpc UpsertAclUser (UpsertAclUserRequest) returns (UpsertAclUserReply);
+
+  // Lists username/password ACL users. Requires `acl:read`.
+  rpc ListAclUsers (ListAclUsersRequest) returns (ListAclUsersReply);
+
+  // Deletes a username/password ACL user. Requires `acl:write`.
+  //
+  // Tokens previously minted via Login remain valid until they expire or are
+  // deleted; deleting the user only prevents future logins.
+  rpc DeleteAclUser (DeleteAclUserRequest) returns (DeleteAclUserReply);
+
+  // Lists the auth methods clients may log in with.
+  //
+  // Open endpoint: login UIs need this before any credential exists. Only
+  // public metadata is returned (names, types, OIDC client settings) —
+  // never secrets or validation keys.
+  rpc GetAuthMethods (GetAuthMethodsRequest) returns (GetAuthMethodsReply);
+
+  // Creates a worker join token. Requires `node:write`.
+  //
+  // The reply contains a self-describing composite token (manager address +
+  // secret + worker type) that introduces a worker in one command:
+  // `legion join <TOKEN>`. The manager stores only a hash of the secret.
+  rpc CreateJoinToken (CreateJoinTokenRequest) returns (CreateJoinTokenReply);
+
+  // Lists worker join tokens (metadata only). Requires `node:read`.
+  rpc ListJoinTokens (ListJoinTokensRequest) returns (ListJoinTokensReply);
+
+  // Deletes (revokes) a worker join token by ID. Requires `node:write`.
+  //
+  // Workers already registered keep their node tokens; revocation only
+  // prevents future joins with this token.
+  rpc DeleteJoinToken (DeleteJoinTokenRequest) returns (DeleteJoinTokenReply);
 }
 
 // Request payload for WorkerPreRegister.
@@ -202,6 +569,13 @@ message WorkerPreRegisterRequest {
   // This selects the worker template stored on the manager.
   // No manager-side default is applied by this RPC.
   string worker_type = 1;
+
+  // Join token secret (the `secret` field of a decoded join token).
+  //
+  // Required when ACLs are enforced: the manager validates it against its
+  // stored join tokens before serving worker configuration. Ignored when
+  // ACLs are disabled.
+  optional string join_token = 2;
 }
 
 // Effective worker configuration returned by pre-registration.
@@ -241,6 +615,15 @@ message WorkerConfig {
   //
   // Default: unset (no explicit max allocation cap).
   optional uint32 max_allocations = 8;
+
+  // JSON-encoded artifact fetch settings for this worker.
+  //
+  // Shape: `{"fetch":{"parallelism":4,"attempts":3,"timeout":"10m",
+  //          "maxArtifactSize":"50GiB","allowedSchemes":["https","s3",
+  //          "oci","git","file"]}}`.
+  //
+  // Default: empty string (worker applies conservative built-in defaults).
+  string artifacts = 9;
 }
 
 // Reply payload for WorkerPreRegister.
@@ -273,6 +656,11 @@ message WorkerRegisterRequest {
   // - `availability = "available"`
   // - `dynamic_attrs = {}`
   // - `last_heartbeat = ""` until first heartbeat
+
+  // Join token secret (the `secret` field of a decoded join token).
+  //
+  // Required when ACLs are enforced. Ignored when ACLs are disabled.
+  optional string join_token = 6;
 }
 
 // Reply payload for WorkerRegister.
@@ -281,6 +669,12 @@ message WorkerRegisterReply {
   //
   // Current manager reply value: `"Worker registered"`.
   string message = 1;
+
+  // Per-node credential for subsequent worker-plane calls (Heartbeat,
+  // HealthCheck). Minted only when ACLs are enforced; re-registering
+  // rotates it (the previous node token is revoked). Workers attach it as
+  // a bearer credential exactly like an ACL token.
+  optional string node_token = 2;
 }
 
 // One submission unit that contributed to a rendered jobspec.
@@ -316,6 +710,16 @@ message RunJobRequest {
   //
   // Default: `false`.
   bool force_reschedule = 4;
+
+  // Optional idempotency key.
+  //
+  // When set and non-empty, the manager deduplicates retried requests carrying
+  // the same key: the first request is applied and its outcome recorded; any
+  // later request with the same key returns the recorded reply without
+  // re-applying. This lets clients (especially automated agents) safely retry
+  // after a timeout without risking a double submission. Unset disables
+  // deduplication.
+  optional string idempotency_key = 5;
 }
 
 // Reply payload for RunJob.
@@ -329,6 +733,10 @@ message RunJobReply {
   // - `"Job config unchanged; no update needed"`
   // - `"Job config unchanged; forced reschedule queued"`
   string message = 1;
+
+  // True when this reply was replayed from a previously recorded result for the
+  // request's `idempotency_key` rather than applied fresh.
+  bool deduplicated = 2;
 }
 
 // Request payload for GetJobInfo.
@@ -493,6 +901,15 @@ message RolloutAllocationStatus {
 
   // Optional allocation health status text from latest worker snapshot.
   optional string allocation_health = 11;
+
+  // Optional JSON-encoded per-artifact staging states from the latest worker
+  // snapshot. Same payload as `AllocationHealth.artifact_states`: an array of
+  // `{"name","source","state","bytesFetched","bytesTotal","digest",
+  //   "attempts","durationMs","error"}` objects.
+  //
+  // Unset when the allocation's task declares no artifacts or no snapshot
+  // has been received yet.
+  optional string artifact_states = 12;
 }
 
 // Group-level rollout status.
@@ -715,6 +1132,9 @@ message StopJobRequest {
   // Default when omitted: manager `default_priority`
   // (`50` in built-in config defaults).
   optional int64 priority = 2;
+
+  // Optional idempotency key. See `RunJobRequest.idempotency_key`.
+  optional string idempotency_key = 3;
 }
 
 // Reply payload for StopJob.
@@ -723,6 +1143,10 @@ message StopJobReply {
   //
   // Current manager reply format: `"Stopped <job-name>"`.
   string message = 1;
+
+  // True when replayed from a recorded result for the request's
+  // `idempotency_key` rather than applied fresh.
+  bool deduplicated = 2;
 }
 
 // Request payload for DestroyJob.
@@ -734,6 +1158,9 @@ message DestroyJobRequest {
   //
   // Current manager implementation ignores this field.
   optional int64 priority = 2;
+
+  // Optional idempotency key. See `RunJobRequest.idempotency_key`.
+  optional string idempotency_key = 3;
 }
 
 // Reply payload for DestroyJob.
@@ -742,6 +1169,288 @@ message DestroyJobReply {
   //
   // Current manager reply format: `"Destroyed <job-name>"`.
   string message = 1;
+
+  // True when replayed from a recorded result for the request's
+  // `idempotency_key` rather than applied fresh.
+  bool deduplicated = 2;
+}
+
+// Request payload for CreateInstance.
+message CreateInstanceRequest {
+  // Job name (also used as job ID in current manager implementation). The
+  // job's latest config must declare at least one keyed-mode stateful task.
+  string job_id = 1;
+
+  // Optional task-group filter used to resolve the target task.
+  //
+  // May be omitted when the job has exactly one keyed task. Required (along
+  // with `task` when a group holds several keyed tasks) whenever the keyed
+  // task would otherwise be ambiguous; ambiguity is rejected with
+  // InvalidArgument rather than guessed.
+  optional string group = 2;
+
+  // Optional task-name filter used to resolve the target task. Same
+  // disambiguation rules as `group`.
+  optional string task = 3;
+
+  // Optional caller-supplied instance key.
+  //
+  // Must match `[A-Za-z0-9._-]{1,128}` and must not collide with any
+  // existing instance id of any job — including Terminated tombstones
+  // (destroyed ids are never reusable). Required when the task declares
+  // `stateful.idSource: "caller"`; optional otherwise (the server mints an
+  // id when absent). A valid explicit key is always honored regardless of
+  // `idSource`.
+  optional string instance_id = 4;
+
+  // Optional idempotency key. See `RunJobRequest.idempotency_key`. The
+  // recorded replay carries the originally created instance id.
+  optional string idempotency_key = 5;
+}
+
+// Reply payload for CreateInstance.
+message CreateInstanceReply {
+  // The created instance's stable id (caller-supplied or server-minted).
+  // This is the value the task sees as `LEGION_INSTANCE_ID` and the key its
+  // storage handle and workload identity bind to.
+  string instance_id = 1;
+
+  // True when replayed from a recorded result for the request's
+  // `idempotency_key` rather than applied fresh.
+  bool deduplicated = 2;
+}
+
+// Request payload for CreateInstances (atomic batch create).
+message CreateInstancesRequest {
+  // Job name (also used as job ID in current manager implementation). The
+  // job's latest config must declare at least one keyed-mode stateful task.
+  string job_id = 1;
+
+  // Optional task-group filter used to resolve the target task. Same
+  // disambiguation rules as `CreateInstanceRequest.group`.
+  optional string group = 2;
+
+  // Optional task-name filter used to resolve the target task. Same
+  // disambiguation rules as `CreateInstanceRequest.task`.
+  optional string task = 3;
+
+  // Explicit instance keys to create. Each must match
+  // `[A-Za-z0-9._-]{1,128}` and must not collide with any existing instance
+  // id (including Stopped instances and Terminated tombstones) nor repeat
+  // within this list. Any violation fails the WHOLE call (nothing is
+  // created), naming the offending id. May be empty when `count > 0`.
+  repeated string instance_ids = 4;
+
+  // Number of additional server-minted instances to create on top of
+  // `instance_ids`. Rejected (InvalidArgument) when the task declares
+  // `stateful.idSource: "caller"`, which requires caller-supplied ids. At
+  // least one of `instance_ids` / `count` must be non-empty/non-zero.
+  uint32 count = 5;
+
+  // Optional idempotency key. See `RunJobRequest.idempotency_key`. The
+  // recorded replay carries the originally created instance ids.
+  optional string idempotency_key = 6;
+}
+
+// Reply payload for CreateInstances.
+message CreateInstancesReply {
+  // Every instance id created by this call, in request order: the explicit
+  // `instance_ids` first, then the `count` server-minted ids. On failure
+  // nothing is created and this RPC returns an error status instead.
+  repeated string instance_ids = 1;
+
+  // True when replayed from a recorded result for the request's
+  // `idempotency_key` rather than applied fresh.
+  bool deduplicated = 2;
+}
+
+// Request payload for DestroyInstance.
+message DestroyInstanceRequest {
+  // Stable instance id to destroy. Must reference a keyed-mode instance.
+  string instance_id = 1;
+
+  // Optional idempotency key. See `RunJobRequest.idempotency_key`.
+  optional string idempotency_key = 2;
+}
+
+// Reply payload for DestroyInstance.
+message DestroyInstanceReply {
+  // Human-readable status message.
+  //
+  // Current manager reply values:
+  // - `"Destroyed instance <id>"` — terminated by this request.
+  // - `"Instance <id> already terminated"` — no-op on a tombstone.
+  string message = 1;
+
+  // True when replayed from a recorded result for the request's
+  // `idempotency_key` rather than applied fresh.
+  bool deduplicated = 2;
+}
+
+// Request payload for StopInstance.
+message StopInstanceRequest {
+  // Stable instance id to stop. Must reference a keyed-mode instance that is
+  // not Terminated (tombstones can never be stopped or restarted).
+  string instance_id = 1;
+
+  // Optional idempotency key. See `RunJobRequest.idempotency_key`.
+  optional string idempotency_key = 2;
+}
+
+// Reply payload for StopInstance.
+message StopInstanceReply {
+  // Human-readable status message.
+  //
+  // Current manager reply values:
+  // - `"Stopped instance <id>"` — stopped by this request.
+  // - `"Instance <id> already stopped"` — no-op on a stopped instance.
+  string message = 1;
+
+  // True when replayed from a recorded result for the request's
+  // `idempotency_key` rather than applied fresh.
+  bool deduplicated = 2;
+}
+
+// Request payload for StartInstance.
+message StartInstanceRequest {
+  // Stable instance id to start. Must reference a keyed-mode instance that
+  // is not Terminated, on a job that is not stopped.
+  string instance_id = 1;
+
+  // Optional idempotency key. See `RunJobRequest.idempotency_key`.
+  optional string idempotency_key = 2;
+}
+
+// Reply payload for StartInstance.
+message StartInstanceReply {
+  // Human-readable status message.
+  //
+  // Current manager reply values:
+  // - `"Started instance <id>"` — moved stopped -> pending and queued for
+  //  placement by this request.
+  // - `"Instance <id> already running"` — no-op on a live
+  //  (pending/active/rescheduling) instance.
+  string message = 1;
+
+  // True when replayed from a recorded result for the request's
+  // `idempotency_key` rather than applied fresh.
+  bool deduplicated = 2;
+}
+
+// Request payload for ReplaceInstance.
+message ReplaceInstanceRequest {
+  // Stable instance id whose lost-node allocation to force-replace. Must
+  // reference an instance whose current allocation sits on a `lost` node.
+  string instance_id = 1;
+
+  // Optional idempotency key. See `RunJobRequest.idempotency_key`.
+  optional string idempotency_key = 2;
+}
+
+// Reply payload for ReplaceInstance.
+message ReplaceInstanceReply {
+  // Human-readable status message.
+  //
+  // Current manager reply value:
+  // - `"Replacing instance <id>: freed allocation <alloc> on lost node
+  //   <node>"` — the gate was overridden and a reschedule eval enqueued.
+  string message = 1;
+
+  // True when replayed from a recorded result for the request's
+  // `idempotency_key` rather than applied fresh.
+  bool deduplicated = 2;
+}
+
+// One stateful instance (see docs/stateful-workloads.md). An instance is the
+// stable identity one level above an allocation: it survives reschedules,
+// owns the storage binding, and feeds the workload-identity subject.
+message InstanceInfo {
+  // Stable id, unique within the cluster. Slot mode: the deterministic
+  // `{job}-{group}-{slot}` ordinal id. Keyed mode: the caller-supplied or
+  // server-minted key, never recycled after destroy.
+  string instance_id = 1;
+
+  // Owning job name.
+  string job_id = 2;
+
+  // Task group the instance belongs to.
+  string group = 3;
+
+  // Task name the instance currently belongs to (informational; identity is
+  // keyed by `instance_id`).
+  string task = 4;
+
+  // Id-assignment mode: `slot` or `keyed`.
+  string mode = 5;
+
+  // Lifecycle state: `pending` (never placed, or queued for re-placement
+  // after StartInstance), `active` (live allocation), `rescheduling` (lost
+  // its allocation; a replacement will re-bind the same id and storage),
+  // `stopped` (keyed only: paused via StopInstance or a job stop; row and
+  // storage handle retained, id still owned, revivable via StartInstance),
+  // or `terminated` (slot scale-in / keyed destroy / job destroy; rows
+  // retained — keyed tombstones forever).
+  string state = 6;
+
+  // Ordinal slot index `0..count.num-1`; present only in slot mode.
+  optional uint32 slot_index = 7;
+
+  // The allocation currently fulfilling this instance, if any.
+  optional int64 current_alloc_id = 8;
+
+  // Opaque persistent-storage handle bound to the instance, when the task
+  // declares `stateful.storage`. Stable across reschedules and retained
+  // while `stopped` (StopInstance / job stop). Dropped on keyed destroy;
+  // retained on slot scale-in unless `retainOnScaleIn: false`, and retained
+  // on job stop unless `retainOnStop: false` (slot mode only; the K8s
+  // `whenDeleted` analog — job destroy always deletes every instance row).
+  optional string storage_handle = 9;
+
+  // RFC3339 creation timestamp.
+  string created_at = 10;
+
+  // RFC3339 timestamp of the last state/binding change.
+  string updated_at = 11;
+
+  // Diagnostic detail explaining a non-obvious lifecycle situation; unset in
+  // the common case. Currently the only producer is the node-loss
+  // confirmation gate (see docs/stateful-workloads.md "Node loss and
+  // fencing"): when the instance's current allocation sits on a `lost` node,
+  // this carries `pending-loss-confirmation: ...` describing why the
+  // instance has not been replaced yet (the manager is waiting out
+  // `stateful.onLost.replaceAfter`, or `replaceAfter: "never"` requires node
+  // recovery / ReplaceInstance). The instance stays `active` while gated —
+  // its workload may well still be running on the partitioned node.
+  optional string detail = 12;
+}
+
+// Request payload for ListInstances.
+message ListInstancesRequest {
+  // Job name whose instances to list.
+  string job_id = 1;
+
+  // Optional exact-match group filter.
+  optional string group = 2;
+}
+
+// Reply payload for ListInstances.
+message ListInstancesReply {
+  // Instances ordered by group, slot index, then instance id. Includes
+  // Terminated rows (tombstones).
+  repeated InstanceInfo instances = 1;
+}
+
+// Request payload for GetInstance.
+message GetInstanceRequest {
+  // Stable instance id to fetch.
+  string instance_id = 1;
+}
+
+// Reply payload for GetInstance.
+message GetInstanceReply {
+  // The requested instance. Manager returns NotFound instead of returning
+  // this field unset.
+  InstanceInfo instance = 1;
 }
 
 // Request payload for ListJobs.
@@ -802,6 +1511,39 @@ message ListJobsReply {
   uint32 page_size = 4;
 }
 
+// Request payload for IssueWorkloadIdentityToken.
+message IssueWorkloadIdentityTokenRequest {
+  // Allocation the token is requested for. Must exist and be placed on
+  // `node_id`. All token claims are derived from this allocation's
+  // scheduling record on the manager — never from the request.
+  int64 alloc_id = 1;
+
+  // Name of the identity declared in the allocation's task spec
+  // (`identities[].name`). Selects the audience, TTL, subject template,
+  // delivery, and extra claims. Unknown names are rejected with NotFound.
+  string identity_name = 2;
+
+  // Node id of the calling worker (the same id used in Heartbeat). The
+  // manager rejects the request with PermissionDenied unless the allocation
+  // is placed on this node. See the RPC comment for the trust model.
+  string node_id = 3;
+}
+
+// Reply payload for IssueWorkloadIdentityToken.
+message IssueWorkloadIdentityTokenReply {
+  // The signed JWT (ES256, `kid` header references a key in the published
+  // JWKS). Treat as a secret: never log it; deliver it only to the task it
+  // was issued for.
+  string token = 1;
+
+  // Token expiry (`exp`) as Unix seconds. Workers schedule the refresh loop
+  // from this (re-issue at roughly half the remaining TTL).
+  int64 expires_at = 2;
+
+  // Echo of the identity name the token was issued for.
+  string name = 3;
+}
+
 // Request payload for Heartbeat.
 message HeartbeatRequest {
   // Worker/node ID sending heartbeat.
@@ -843,6 +1585,15 @@ message FailedAllocation {
 
   // Failure reason text.
   string reason = 2;
+
+  // JSON-encoded final per-artifact staging states when the failure was an
+  // artifact staging failure (same payload as
+  // `AllocationHealth.artifact_states`). The manager turns failed rows into
+  // `artifact.failed` scheduler events with per-artifact detail (redacted
+  // source, error, attempts) instead of parsing the reason text.
+  //
+  // Unset for non-artifact failures.
+  optional string artifact_states = 3;
 }
 
 // Allocation health snapshot item from worker to manager.
@@ -855,6 +1606,20 @@ message AllocationHealth {
 
   // Human-readable health status details.
   string status = 3;
+
+  // JSON-encoded per-artifact staging states for this allocation.
+  //
+  // Array of objects, one per declared artifact:
+  // `[{"name":"tool","source":"https://…","state":"fetching",
+  //    "bytesFetched":123,"bytesTotal":456,"digest":"sha256:…",
+  //    "attempts":1,"durationMs":412,"error":"…"}]`.
+  // States progress `pending` -> `fetching` -> `verifying` -> `staged`,
+  // or end in `failed`. Sources are redacted (no userinfo or query secrets)
+  // and errors reference auth *sources* (KV path or identity name), never
+  // credential values.
+  //
+  // Unset when the task declares no artifacts.
+  optional string artifact_states = 4;
 }
 
 // Request payload for HealthCheck.
@@ -1626,6 +2391,38 @@ message ResolveServiceReply {
   repeated ServiceEndpoint endpoints = 1;
 }
 
+// Request payload for GetArtifactCredential.
+message GetArtifactCredentialRequest {
+  // Worker/node ID requesting the credential.
+  //
+  // Used for audit logging only; the credential value itself is never logged.
+  string node_id = 1;
+
+  // KV path holding the credential value (for example: "secrets/ghcr-pull").
+  //
+  // The KV value must be a JSON object with a `type` discriminator:
+  // `{"type":"basic","username":"…","password":"…"}`,
+  // `{"type":"bearer","token":"…"}`,
+  // `{"type":"aws","accessKeyId":"…","secretAccessKey":"…","sessionToken":"…",
+  //   "region":"…","endpoint":"…"}`, or
+  // `{"type":"headers","headers":{"X-Api-Key":"…"}}`.
+  string kv_path = 2;
+
+  // Redacted artifact source the credential will be used for.
+  //
+  // Audit context only (scheme://host/path with userinfo and query stripped).
+  string source = 3;
+}
+
+// Reply payload for GetArtifactCredential.
+message GetArtifactCredentialReply {
+  // JSON-encoded credential value read from KV at request time.
+  //
+  // Returned to the worker for immediate use; never persisted on allocation
+  // rows. Rotating the KV value affects the next fetch with no job changes.
+  string credential_json = 1;
+}
+
 // Request payload for QueryStateStore.
 message QueryStateStoreRequest {
   // SQL statement to execute.
@@ -1795,7 +2592,23 @@ message LedgerAllocation {
   // JSON-encoded assigned network payload (address + ports) for this
   // allocation, matching the `AllocNetwork` shape. Empty string when the
   // task declares no network block.
-  string network = 8;
+  string network = 10;
+
+  // Optional JSON-encoded per-artifact staging states from the latest worker
+  // health snapshot. Same payload as `AllocationHealth.artifact_states`.
+  //
+  // Unset when the allocation's task declares no artifacts or no snapshot
+  // has been received yet.
+  optional string artifact_states = 8;
+
+  // Stable instance id this allocation fulfills, set only when the backing
+  // task is stateful (slot or keyed mode; see `docs/stateful-workloads.md`).
+  //
+  // The instance id survives reschedules: a replacement allocation for the
+  // same slot/keyed instance reports the same value here. Unset for
+  // stateless tasks. Full instance metadata (mode, state, slot index,
+  // storage handle) is available via `GetInstance` / `ListInstances`.
+  optional string instance_id = 9;
 }
 
 // Request payload for UpdateNodeDynamic.
@@ -1822,35 +2635,121 @@ message UpdateNodeDynamicReply {
   optional NodeMsg node = 1;
 }
 
-// === INSECURE MANAGER ===
-
-// InsecureManager exposes bootstrap-only APIs on the insecure listener.
+// One scheduler event from the manager's event journal.
 //
-// This is typically used to issue join tokens before a worker has secure
-// cluster credentials.
-service InsecureManager {
-  // Generates a worker join token (JWT).
-  rpc GetJoinToken (GetJoinTokenRequest) returns (GetJoinTokenReply);
+// Events are emitted by the manager whenever the scheduler does something
+// observable: eval queue activity, allocation placement and removal, node
+// lifecycle transitions, job lifecycle transitions, and rollout activity.
+message SchedulerEvent {
+  // Monotonically increasing event ID.
+  //
+  // IDs are assigned by the manager's state store and are never reused, so
+  // they double as a resume cursor for `ListEvents`/`StreamEvents`.
+  int64 id = 1;
+
+  // Dotted event kind, namespaced by subsystem.
+  //
+  // Current kinds include:
+  // - `scheduler.started`, `scheduler.recovered`
+  // - `eval.enqueued`, `eval.completed`, `eval.failed`
+  // - `allocation.placed`, `allocation.removed`, `allocation.failed`, `allocation.plan_rejected`
+  // - `node.registered`, `node.ready`, `node.lost`
+  // - `job.submitted`, `job.updated`, `job.stopped`, `job.destroyed`, `job.failed`
+  // - `rollout.event`
+  string kind = 2;
+
+  // Event severity. Values: `info`, `warn`, `error`.
+  string level = 3;
+
+  // Job ID this event relates to, when applicable.
+  optional string job_id = 4;
+
+  // Node ID this event relates to, when applicable.
+  optional string node_id = 5;
+
+  // Eval ID this event relates to, when applicable.
+  optional string eval_id = 6;
+
+  // Allocation ID this event relates to, when applicable.
+  optional int64 allocation_id = 7;
+
+  // Rollout ID this event relates to, when applicable.
+  optional int64 rollout_id = 8;
+
+  // Human-readable event description.
+  string message = 9;
+
+  // JSON object string with kind-specific structured details.
+  //
+  // Always a valid JSON object; `{}` when the event has no extra detail.
+  string metadata_json = 10;
+
+  // RFC3339 timestamp when the event was recorded.
+  string created_at = 11;
 }
 
-// Request payload for GetJoinToken.
-message GetJoinTokenRequest {
-  // Optional token TTL string (for example: "1h", "30m").
+// Request payload for ListEvents.
+message ListEventsRequest {
+  // Exclusive lower-bound event ID cursor.
   //
-  // Unset means no expiry in current manager implementation
-  // (`exp` claim is set to `0` and `skip_expiry_validation=true`).
-  optional string ttl = 1;
+  // When set, only events with `id > after_id` are returned (oldest first),
+  // which makes repeated polling gap-free. When omitted, the most recent
+  // `limit` events are returned (still ordered oldest-to-newest).
+  optional int64 after_id = 1;
 
-  // Optional worker type to embed in token.
+  // Maximum number of events to return.
   //
-  // Defaults to "default" when omitted.
-  optional string worker_type = 2;
+  // Default when omitted: `100`. Manager bounds: clamped to `[1, 1000]`.
+  optional uint32 limit = 2;
+
+  // Optional kind filter.
+  //
+  // Matches events whose kind equals the value exactly, or whose kind starts
+  // with `<value>.` — so `eval` matches `eval.completed` and `eval.failed`.
+  optional string kind = 3;
+
+  // Optional exact job ID filter.
+  optional string job_id = 4;
+
+  // Optional exact node ID filter.
+  optional string node_id = 5;
+
+  // Optional severity filter. Values: `info`, `warn`, `error`.
+  optional string level = 6;
 }
 
-// Reply payload for GetJoinToken.
-message GetJoinTokenReply {
-  // Signed JWT join token.
-  string token = 1;
+// Reply payload for ListEvents.
+message ListEventsReply {
+  // Matching events ordered oldest-to-newest.
+  repeated SchedulerEvent events = 1;
+
+  // Highest event ID currently stored by the manager (0 when no events).
+  //
+  // Clients can use this to initialize an `after_id` cursor for follow-up
+  // `ListEvents` polls or a `StreamEvents` call.
+  int64 latest_id = 2;
+}
+
+// Request payload for StreamEvents.
+message StreamEventsRequest {
+  // Exclusive lower-bound event ID to replay from.
+  //
+  // When set, persisted events with `id > after_id` are sent before the live
+  // feed. When omitted, the stream starts with events emitted after the
+  // stream is established (pure tail).
+  optional int64 after_id = 1;
+
+  // Optional kind filter. Same semantics as `ListEventsRequest.kind`.
+  optional string kind = 2;
+
+  // Optional exact job ID filter.
+  optional string job_id = 3;
+
+  // Optional exact node ID filter.
+  optional string node_id = 4;
+
+  // Optional severity filter. Values: `info`, `warn`, `error`.
+  optional string level = 5;
 }
 
 // Internal eval queue item.
@@ -1897,6 +2796,112 @@ service Worker {
 
   // Requests the worker process to restart itself.
   rpc RestartWorker (RestartWorkerRequest) returns (RestartWorkerReply);
+
+  // Reads captured stdout/stderr files for one allocation on this node.
+  rpc GetTaskLogs (GetTaskLogsRequest) returns (GetTaskLogsReply);
+}
+
+// Selects which captured stream(s) to read for a task.
+//
+// Used by both `Worker.GetTaskLogs` and `Manager.GetAllocationLogs`.
+message GetTaskLogsRequest {
+  // Allocation whose logs are requested.
+  int64 allocation_id = 1;
+
+  // Stream filter: "stdout", "stderr", or "all" (default when empty).
+  string stream = 2;
+
+  // Maximum number of bytes to return per stream.
+  //
+  // `0` selects the worker's built-in default cap. When a stream's file is
+  // larger than the cap the returned content is truncated.
+  int64 max_bytes = 3;
+
+  // When true, return the trailing bytes of each stream (tail) rather than the
+  // leading bytes. Defaults to false (head).
+  bool tail = 4;
+
+  // Byte offset to read forward from (incremental tail / follow). When > 0 the
+  // worker returns bytes from this position to EOF and ignores `tail`. When the
+  // offset is past EOF (the file was rotated) the read restarts from the front.
+  int64 offset = 5;
+}
+
+// One captured stream's content for a single allocation.
+message TaskLogStream {
+  // Stream name ("stdout" or "stderr").
+  string stream = 1;
+
+  // UTF-8 (lossy) content of the (possibly truncated) stream.
+  string content = 2;
+
+  // Total size of the underlying active log file in bytes.
+  int64 size_bytes = 3;
+
+  // Whether `content` was truncated to satisfy `max_bytes`.
+  bool truncated = 4;
+
+  // Byte offset within the file where `content` begins.
+  int64 start_offset = 5;
+
+  // Byte offset to resume from on the next incremental read
+  // (`start_offset` + bytes returned). Clients following a stream pass this
+  // back as the request `offset`.
+  int64 next_offset = 6;
+}
+
+// Reply payload for Worker.GetTaskLogs.
+message GetTaskLogsReply {
+  // Captured streams for the allocation. Streams with no log file are omitted.
+  repeated TaskLogStream streams = 1;
+}
+
+// Request payload for Manager.GetAllocationLogs.
+message GetAllocationLogsRequest {
+  // Job name to gather allocation logs for. Required unless `allocation_id` is
+  // set.
+  string job = 1;
+
+  // Optional: restrict the read to a single allocation id. When set, `job` is
+  // ignored.
+  optional int64 allocation_id = 2;
+
+  // Stream filter: "stdout", "stderr", or "all" (default when empty).
+  string stream = 3;
+
+  // Maximum number of bytes to return per stream (`0` = worker default).
+  int64 max_bytes = 4;
+
+  // When true, return the trailing bytes of each stream rather than the leading.
+  bool tail = 5;
+
+  // Byte offset to read forward from (incremental tail / follow). Applied per
+  // stream; see `GetTaskLogsRequest.offset`.
+  int64 offset = 6;
+}
+
+// Captured logs for a single allocation, annotated with where they came from.
+message AllocationLog {
+  // Allocation id.
+  int64 allocation_id = 1;
+
+  // Node hosting the allocation.
+  string node_id = 2;
+
+  // Task name for the allocation, when resolvable.
+  string task_name = 3;
+
+  // Captured streams for the allocation.
+  repeated TaskLogStream streams = 4;
+
+  // Per-allocation error (for example: node unreachable). Empty on success.
+  string error = 5;
+}
+
+// Reply payload for Manager.GetAllocationLogs.
+message GetAllocationLogsReply {
+  // One entry per matched allocation.
+  repeated AllocationLog allocations = 1;
 }
 
 // Allocation payload sent to workers.
@@ -1935,7 +2940,45 @@ message TaskAllocation {
   // allocation, matching the `AllocNetwork` shape. Workers use it to inject
   // `LEGION_PORT_*` / `LEGION_ADDR_*` environment variables into the task.
   // Empty string when the task declares no network block.
-  string network = 11;
+  string network = 14;
+
+  // JSON-encoded list of normalized artifact specs for this task.
+  //
+  // This is the post-admission form: kind-implicit artifacts (for example a
+  // container `image`) are already desugared in, `resolve: "pin"` references
+  // are already pinned to digests, and cluster-level auth matchers are
+  // already applied. Workers stage exactly this list and never re-derive or
+  // re-resolve artifacts.
+  //
+  // Empty string when the task declares no artifacts (the staging step is
+  // skipped entirely).
+  string task_artifacts = 11;
+
+  // JSON-encoded list of workload identities declared on the task
+  // (`identities[]`, see docs/workload-identity.md). Empty string or `[]`
+  // when the task declares none. The worker uses this to know which tokens
+  // to request via IssueWorkloadIdentityToken, how to deliver them
+  // (env/file), and what to do on refresh (changeMode). The identity specs
+  // carry no secrets — tokens themselves are fetched separately by the
+  // worker and never transit the desired-state payload.
+  string task_identities = 12;
+
+  // Worker self-fence window, in seconds (`stateful.onLost.selfTerminateAfter`,
+  // see docs/stateful-workloads.md "Node loss and fencing"). When non-zero,
+  // the worker MUST locally kill this allocation once it has been unable to
+  // complete a heartbeat against the manager for this long, and report it as
+  // failed on the next successful heartbeat. This is the worker half of the
+  // at-most-one guarantee: the manager will not plan a replacement for a
+  // stateful allocation on a lost node until the node has been lost for
+  // longer than this window plus a safety margin (`onLost.replaceAfter`), so
+  // by the time a replacement binds the same instance id and storage handle,
+  // the original is provably dead or fenced.
+  //
+  // 0 = no self-fencing (stateless tasks, which the manager replaces
+  // eagerly). Stateful tasks always carry a non-zero value — the manager
+  // applies the 90s default even when the jobspec declares no `onLost`
+  // block.
+  uint64 self_terminate_after_seconds = 13;
 }
 
 // Request payload for PostWork.
@@ -1951,5 +2994,415 @@ message PostWorkReply {
   // Human-readable acknowledgement.
   //
   // Built-in worker reply value: `"Task accepted"`.
+  string message = 1;
+}
+
+// === AUTH & ACL MESSAGES ===
+
+// Request payload for WhoAmI. Identity comes from request metadata, not the body.
+message WhoAmIRequest {
+}
+
+// Reply payload for WhoAmI.
+message WhoAmIReply {
+  // True when the manager enforces (or audits) ACLs.
+  //
+  // When false every caller has full access; clients should surface a
+  // warning so operators know the cluster is unprotected.
+  bool acl_enabled = 1;
+
+  // True when ACLs run in audit-only mode: denials are logged but allowed.
+  bool audit_only = 2;
+
+  // How the caller was identified.
+  //
+  // One of: `disabled` (ACLs off), `token` (Legion ACL token), `jwt`
+  // (external JWT validated by an auth method), `anonymous` (no credential).
+  string source = 3;
+
+  // Human-readable principal: token name, `user:<name>`, JWT subject, or
+  // `anonymous`.
+  string principal = 4;
+
+  // Token type resolved for the caller: `management`, `client`, or `none`.
+  string token_type = 5;
+
+  // Names of the policies attached to the caller's identity.
+  repeated string policies = 6;
+
+  // RFC3339 expiry of the presented credential, when it has one.
+  optional string expires_at = 7;
+
+  // Accessor ID of the presented ACL token, when one was presented.
+  //
+  // Accessor IDs are safe to log and are the handle used by DeleteAclToken.
+  optional string accessor_id = 8;
+}
+
+// Request payload for Login.
+message LoginRequest {
+  // Auth method name.
+  //
+  // `userpass` selects the built-in username/password method. Any other value
+  // must match the name of a JWT/OIDC auth method in the manager config.
+  string method = 1;
+
+  // Username for the `userpass` method.
+  optional string username = 2;
+
+  // Password for the `userpass` method.
+  optional string password = 3;
+
+  // Externally issued JWT (for example an OIDC ID token) for JWT/OIDC methods.
+  optional string jwt = 4;
+
+  // Optional requested token lifetime (humantime format, for example "8h").
+  //
+  // Capped by the manager's configured maximum for the method. Default when
+  // omitted: the method's `tokenTtl` (built-in default `24h`).
+  optional string ttl = 5;
+}
+
+// Reply payload for Login.
+message LoginReply {
+  // Metadata for the newly minted token.
+  AclTokenInfo token = 1;
+
+  // The token secret. Returned exactly once; the manager stores only a hash.
+  string secret = 2;
+}
+
+// Request payload for BootstrapAcl.
+message BootstrapAclRequest {
+  // Optional operator-provided secret for the initial management token
+  // (infrastructure-as-code pre-seeding). Must be at least 24 characters.
+  //
+  // Default when omitted: the manager generates a random secret.
+  optional string secret = 1;
+}
+
+// Reply payload for BootstrapAcl.
+message BootstrapAclReply {
+  // Metadata for the initial management token.
+  AclTokenInfo token = 1;
+
+  // The management token secret. Returned exactly once.
+  string secret = 2;
+}
+
+// Metadata describing an ACL token. Never contains the secret.
+message AclTokenInfo {
+  // Public identifier for the token; safe to log and audit.
+  string accessor_id = 1;
+
+  // Human-readable token name. Tokens minted via Login are named
+  // `<method>:<principal>` (for example "userpass:alice").
+  string name = 2;
+
+  // Token type: `management` (full access) or `client` (policy-scoped).
+  string token_type = 3;
+
+  // Names of attached policies. Empty for management tokens.
+  repeated string policies = 4;
+
+  // RFC3339 creation timestamp.
+  string created_at = 5;
+
+  // RFC3339 expiry. Omitted when the token never expires.
+  optional string expires_at = 6;
+}
+
+// A named ACL policy.
+//
+// `rules_json` is a JSON array of rule objects:
+//   [{"resources": ["job"], "actions": ["read", "write"],
+//     "namespaces": ["default"], "names": ["web-*"]},
+//    {"resources": ["kv"], "actions": ["read"], "paths": ["team/*"]},
+//    {"resources": ["node"], "actions": ["read"], "pools": ["*"]},
+//    {"resources": ["*"], "actions": ["*"], "effect": "deny",
+//     "paths": ["secret/*"]}]
+//
+// Rule fields:
+// - `resources`: resource types the rule covers (`job`, `node`, `kv`,
+//   `state`, `operator`, `acl`, or `*`).
+// - `actions`: `read`, `write`, or `*`.
+// - `effect`: `allow` (default) or `deny`. A matching deny rule always
+//   overrides any allow.
+// - Optional scope selectors (glob lists matched against the request):
+//   `namespaces` (job namespaces), `names` (job names), `pools` (node
+//   pools), `paths` (KV keys). A rule with a selector only matches requests
+//   that carry that attribute.
+message AclPolicy {
+  // Unique policy name. Tokens reference policies by exact name.
+  string name = 1;
+
+  // Free-form description.
+  string description = 2;
+
+  // JSON array of rules (see message comment for the schema).
+  string rules_json = 3;
+
+  // RFC3339 creation timestamp.
+  string created_at = 4;
+
+  // RFC3339 last-update timestamp.
+  string updated_at = 5;
+}
+
+// Request payload for UpsertAclPolicy.
+message UpsertAclPolicyRequest {
+  // Policy name to create or replace.
+  string name = 1;
+
+  // Free-form description.
+  string description = 2;
+
+  // JSON array of rules (see AclPolicy for the schema). Validated on write.
+  string rules_json = 3;
+}
+
+// Reply payload for UpsertAclPolicy.
+message UpsertAclPolicyReply {
+  // The stored policy.
+  AclPolicy policy = 1;
+}
+
+// Request payload for GetAclPolicy.
+message GetAclPolicyRequest {
+  // Policy name (exact match).
+  string name = 1;
+}
+
+// Reply payload for GetAclPolicy.
+message GetAclPolicyReply {
+  // The requested policy.
+  AclPolicy policy = 1;
+}
+
+// Request payload for ListAclPolicies.
+message ListAclPoliciesRequest {
+}
+
+// Reply payload for ListAclPolicies.
+message ListAclPoliciesReply {
+  // All policies, sorted by name.
+  repeated AclPolicy policies = 1;
+}
+
+// Request payload for DeleteAclPolicy.
+message DeleteAclPolicyRequest {
+  // Policy name (exact match).
+  string name = 1;
+}
+
+// Reply payload for DeleteAclPolicy.
+message DeleteAclPolicyReply {
+  // Human-readable status message.
+  string message = 1;
+}
+
+// Request payload for CreateAclToken.
+message CreateAclTokenRequest {
+  // Human-readable token name.
+  string name = 1;
+
+  // Token type: `management` or `client`. Default when empty: `client`.
+  string token_type = 2;
+
+  // Names of existing policies to attach. Required (non-empty) for client
+  // tokens; must be empty for management tokens.
+  repeated string policies = 3;
+
+  // Optional lifetime (humantime format, for example "720h").
+  //
+  // Default when omitted: the token never expires.
+  optional string ttl = 4;
+}
+
+// Reply payload for CreateAclToken.
+message CreateAclTokenReply {
+  // Metadata for the new token.
+  AclTokenInfo token = 1;
+
+  // The token secret. Returned exactly once; the manager stores only a hash.
+  string secret = 2;
+}
+
+// Request payload for ListAclTokens.
+message ListAclTokensRequest {
+}
+
+// Reply payload for ListAclTokens.
+message ListAclTokensReply {
+  // All tokens (metadata only), newest first.
+  repeated AclTokenInfo tokens = 1;
+}
+
+// Request payload for DeleteAclToken.
+message DeleteAclTokenRequest {
+  // Accessor ID of the token to revoke.
+  string accessor_id = 1;
+}
+
+// Reply payload for DeleteAclToken.
+message DeleteAclTokenReply {
+  // Human-readable status message.
+  string message = 1;
+}
+
+// A username/password ACL user. Never contains password material.
+message AclUser {
+  // Unique username.
+  string username = 1;
+
+  // Names of policies attached to tokens minted when this user logs in.
+  repeated string policies = 2;
+
+  // RFC3339 creation timestamp.
+  string created_at = 3;
+
+  // RFC3339 last-update timestamp.
+  string updated_at = 4;
+}
+
+// Request payload for UpsertAclUser.
+message UpsertAclUserRequest {
+  // Username to create or update.
+  string username = 1;
+
+  // Plaintext password; hashed with argon2id before storage.
+  //
+  // When updating an existing user, an empty password keeps the current one.
+  string password = 2;
+
+  // Names of existing policies granted on login.
+  repeated string policies = 3;
+}
+
+// Reply payload for UpsertAclUser.
+message UpsertAclUserReply {
+  // The stored user.
+  AclUser user = 1;
+}
+
+// Request payload for ListAclUsers.
+message ListAclUsersRequest {
+}
+
+// Reply payload for ListAclUsers.
+message ListAclUsersReply {
+  // All users, sorted by username.
+  repeated AclUser users = 1;
+}
+
+// Request payload for DeleteAclUser.
+message DeleteAclUserRequest {
+  // Username (exact match).
+  string username = 1;
+}
+
+// Reply payload for DeleteAclUser.
+message DeleteAclUserReply {
+  // Human-readable status message.
+  string message = 1;
+}
+
+// === AUTH METHODS & JOIN TOKENS ===
+
+// Request payload for GetAuthMethods.
+message GetAuthMethodsRequest {
+}
+
+// Public metadata for one auth method (no secrets or keys).
+message AuthMethodInfo {
+  // Method name; pass to Login / `legion login --method <name>`.
+  string name = 1;
+
+  // Method kind: `userpass`, `jwt`, `oidc`, `webhook`, or `custom`.
+  string kind = 2;
+
+  // OIDC issuer URL (oidc kind only). Clients run discovery against it.
+  optional string oidc_issuer = 3;
+
+  // OAuth client ID registered for Legion at the identity provider
+  // (oidc kind only). Required for browser/CLI redirect login.
+  optional string oidc_client_id = 4;
+
+  // OAuth scopes to request (oidc kind only). Default: ["openid"].
+  repeated string oidc_scopes = 5;
+}
+
+// Reply payload for GetAuthMethods.
+message GetAuthMethodsReply {
+  // All registered auth methods, in registration order (userpass first).
+  repeated AuthMethodInfo methods = 1;
+}
+
+// Request payload for CreateJoinToken.
+message CreateJoinTokenRequest {
+  // Worker type the token introduces (selects the worker template).
+  //
+  // Default when empty: "default".
+  string worker_type = 1;
+
+  // Optional lifetime (humantime format, for example "24h").
+  //
+  // Default when omitted: 24h. Pass "none" for a non-expiring token
+  // (discouraged; prefer short-lived tokens).
+  optional string ttl = 2;
+
+  // Free-form description shown in ListJoinTokens (for example "rack 12").
+  string description = 3;
+}
+
+// Metadata describing a join token. Never contains the secret.
+message JoinTokenInfo {
+  // Public identifier; the handle used by DeleteJoinToken.
+  string id = 1;
+
+  // Worker type this token introduces.
+  string worker_type = 2;
+
+  // Free-form description.
+  string description = 3;
+
+  // RFC3339 expiry. Omitted when the token never expires.
+  optional string expires_at = 4;
+
+  // RFC3339 creation timestamp.
+  string created_at = 5;
+}
+
+// Reply payload for CreateJoinToken.
+message CreateJoinTokenReply {
+  // Token metadata.
+  JoinTokenInfo info = 1;
+
+  // The composite join token handed to the worker
+  // (`legion join <TOKEN>`). Base64url-encoded JSON carrying the manager
+  // address, the secret, and the worker type. Returned exactly once; the
+  // manager stores only a hash of the embedded secret.
+  string token = 2;
+}
+
+// Request payload for ListJoinTokens.
+message ListJoinTokensRequest {
+}
+
+// Reply payload for ListJoinTokens.
+message ListJoinTokensReply {
+  // All join tokens (metadata only), newest first.
+  repeated JoinTokenInfo tokens = 1;
+}
+
+// Request payload for DeleteJoinToken.
+message DeleteJoinTokenRequest {
+  // Join token ID to revoke.
+  string id = 1;
+}
+
+// Reply payload for DeleteJoinToken.
+message DeleteJoinTokenReply {
+  // Human-readable status message.
   string message = 1;
 }

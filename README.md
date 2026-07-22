@@ -7,6 +7,7 @@ A distributed scheduler similar to Kubernetes or Nomad.
 - [Managers and Workers](docs/architecture-managers-workers.md)
 - [Plugin System](docs/plugin-system.md)
 - [Scheduler and Eval Loop](docs/scheduler-and-eval-loop.md)
+- [Event Stream](docs/event-stream.md)
 - [Jobs, Tasks, and Scheduling](docs/jobs-tasks-and-scheduling.md)
 - [Task Kind Plugins](docs/task-kind-plugins.md)
 - [Task Kind: exec](docs/task-kind-exec.md)
@@ -14,11 +15,15 @@ A distributed scheduler similar to Kubernetes or Nomad.
 - [Task Kind: noop](docs/task-kind-noop.md)
 - [Service Discovery](docs/service-discovery.md)
 - [State Store](docs/state-store.md)
+- [Logging (task logs, tailing, rotation, shipping, OTLP traces)](docs/logging.md)
 - [Observability](docs/observability.md)
 - [UI Architecture](docs/ui-architecture.md)
 - [KV Store](docs/kv-store.md)
+- [Auth & ACLs](docs/auth-and-acls.md)
+- [Workload Identity (OIDC)](docs/workload-identity.md)
 - [Testing and Benchmarks](docs/testing-and-benchmarks.md)
 - [Codebase Conventions](docs/codebase-conventions.md)
+- [Agent Readiness (MCP, structured output, agent workflow)](docs/agent-readiness.md)
 
 It aims to be differentiated from the above based on the following:
 - Ease:

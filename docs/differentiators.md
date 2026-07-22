@@ -10,8 +10,11 @@
     * Networking fingerprinters (for different configs for Service Disco)
   * CNI (or custom networking plugin that can do CNI)
   * Allocation Setup Plugins (IE - download image or snapshot or cache data/files)
-  * Artifacts (docker images, VM snapshots, etc)
-    * Type, auth, how to get them, how to cache them
+  * Artifacts (docker images, files, git, S3, OCI/ORAS) — shipped, see docs/artifacts.md
+    * Type, auth, how to get them: one `artifacts` task field shared by every kind,
+      pluggable fetchers (`plugins/artifacts/<scheme>/`), KV-backed auth with cluster
+      matchers, digest pinning at submit
+    * How to cache them: still planned (docs/plans/artifact-cache-and-prewarm-plan.md)
   * Task Group Setup plugins
   * Configuration language??
   * Pluggable Node Statuses for degradation (Disk Pressure, Network Pressure, ect)

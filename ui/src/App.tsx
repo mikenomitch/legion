@@ -2,9 +2,13 @@ import { A, Route, Router, useLocation, useNavigate, type RouteSectionProps } fr
 import { For, Show, createEffect, createMemo, createResource, createSignal, onCleanup, onMount } from 'solid-js'
 import type { LedgerNode, Rollout } from './gen/legion_pb'
 import Breadcrumbs from './components/Breadcrumbs'
+import { AclBanner } from './components/AclBanner'
 import { managerClient, managerEndpoint } from './grpcClient'
 import { commandPaletteIndexItems } from './utils/commandPalette'
+import Access from './pages/Access'
+import OidcCallback from './pages/OidcCallback'
 import Deployments from './pages/Deployments'
+import Events from './pages/Events'
 import JobDetail from './pages/details/JobDetail'
 import JobSpecDetail from './pages/details/JobSpecDetail'
 import ManagerNodeDetail from './pages/details/ManagerNodeDetail'
@@ -99,8 +103,10 @@ const Layout = (props: RouteSectionProps) => {
         items: [
           { kind: 'item', label: 'Worker Nodes', path: '/nodes', title: 'Worker Nodes', copy: 'Inventory of worker nodes.' },
           { kind: 'item', label: 'Manager Nodes', path: '/manager', title: 'Manager Nodes', copy: 'Manager config snapshots.' },
+          { kind: 'item', label: 'Events', path: '/events', title: 'Events', copy: 'Live stream of scheduler activity.' },
           { kind: 'item', label: 'Raft', path: '/raft', title: 'Raft', copy: 'Raft elections, failover, and history.' },
           { kind: 'item', label: 'KV', path: '/kv', title: 'KV', copy: 'Browse and edit key/value entries.' },
+          { kind: 'item', label: 'Access', path: '/access', title: 'Access', copy: 'ACL status, tokens, and login.' },
         ],
       },
       {
@@ -424,6 +430,7 @@ const Layout = (props: RouteSectionProps) => {
           />
         </Show>
           <div class="relative flex min-h-screen min-w-0 flex-1 flex-col md:ml-0">
+            <AclBanner />
             <button
               type="button"
               class="absolute right-4 top-4 z-20 flex h-9 w-9 items-center justify-center rounded border bg-white/90 text-base dark:border-neutral-700 dark:bg-neutral-900/80"
@@ -532,6 +539,9 @@ const AppRoutes = () => {
       <Route path="/rollouts" component={Rollouts} />
       <Route path="/rollouts/:id" component={RolloutDetail} />
       <Route path="/kv" component={KeyValue} />
+      <Route path="/events" component={Events} />
+      <Route path="/access" component={Access} />
+      <Route path="/oidc/callback" component={OidcCallback} />
       <Route path="/api" component={ApiExplorer} />
       <Route path="/observability" component={Observability} />
       <Route path="/state-explorer" component={StateExplorer} />

@@ -157,6 +157,17 @@ Typical triggers:
 - Dynamic node updates -> enqueue `job_update` for affected jobs.
 - Rollout engine -> enqueue delayed `rollout_tick` while active.
 
+## Observability: the Scheduler Event Stream
+
+Every observable scheduler action — evals enqueued/completed/failed, plan
+applies, allocation removals/failures, node and job lifecycle transitions, and
+rollout activity — is recorded as a scheduler event and exposed via
+`legion events list` / `legion events follow`, the `legion_events` MCP tool,
+the UI Events page, and the `ListEvents`/`StreamEvents` gRPC methods.
+
+See [Event Stream](event-stream.md) for the kind catalog and consumption
+patterns.
+
 ## Known Boundaries
 
 - Queue dedupe is scoped to job/node IDs, not full payload equivalence.

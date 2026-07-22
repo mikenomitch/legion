@@ -1,10 +1,7 @@
-use crate::cmd::helpers::friendly_status;
+use crate::cmd::helpers::{connect_manager_client, friendly_status};
 use crate::prelude::*;
-use crate::structs::insecure_manager_client::InsecureManagerClient;
-use crate::structs::GetJoinTokenRequest;
-use crate::worker::agent::run_worker;
-
-use crate::constants::DEF_INSECURE_ADDR;
+use crate::structs::CreateJoinTokenRequest;
+use crate::worker::daemon::run_worker;
 
 pub fn config() -> Command {
     Command::new("join")
@@ -68,27 +65,20 @@ pub async fn handle(arg_matches: &ArgMatches) -> R<()> {
     run_worker(&token, name).await
 }
 
+/// `--auto` convenience: mint a join token through the normal authenticated
+/// API and immediately join with it (requires `node:write` when ACLs are on).
 #[instrument(err, skip_all)]
 async fn request_join_token(ttl: &str, worker_type: &str) -> R<String> {
-    let address = std::env::var("LEGION_ADDR").unwrap_or(DEF_INSECURE_ADDR.to_owned());
+    let mut client = connect_manager_client().await?;
 
-    let mut client = InsecureManagerClient::connect(address.clone())
-        .await
-        .with_context(|| format!("failed to connect to manager at {address}"))?;
-
-    let req_ttl: Option<String> = if ttl == "0" || ttl == "none" || ttl == "skip" {
-        None
-    } else {
-        Some(ttl.to_owned())
-    };
-
-    let request = tonic::Request::new(GetJoinTokenRequest {
-        ttl: req_ttl,
-        worker_type: Some(worker_type.into()),
+    let request = tonic::Request::new(CreateJoinTokenRequest {
+        worker_type: worker_type.to_string(),
+        ttl: Some(ttl.to_string()),
+        description: "created by `legion join --auto`".to_string(),
     });
 
     let response = client
-        .get_join_token(request)
+        .create_join_token(request)
         .await
         .map_err(|status| friendly_status("failed to request join token", status))?;
 
