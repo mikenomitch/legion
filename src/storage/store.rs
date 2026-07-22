@@ -6800,6 +6800,51 @@ mod tests {
     }
 
     #[test]
+    fn tasks_with_actions_round_trip() -> R<()> {
+        use crate::structs::{ActionParam, ActionParamType, ActionSpec};
+        let store = setup_store()?;
+        let mut t = task("worker");
+        t.actions = vec![ActionSpec {
+            name: "flush-cache".into(),
+            description: "Flush it".into(),
+            command: vec!["/bin/echo".into(), "${param.scope}".into()],
+            params: vec![ActionParam {
+                name: "scope".into(),
+                description: String::new(),
+                param_type: ActionParamType::Enum,
+                default: Some("all".into()),
+                required: None,
+                values: vec!["all".into(), "sessions".into()],
+                pattern: None,
+                min: None,
+                max: None,
+                sensitive: false,
+            }],
+            tty: false,
+            timeout: None,
+        }];
+        let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "actions-persist".into(),
+            tasks: vec![t.clone()],
+            version: None,
+        };
+        store.handle_job_submit(
+            &job,
+            &[Submission {
+                path: "job.jsonnet".into(),
+                content: "{}".into(),
+                is_primary: true,
+            }],
+        )?;
+        // Read back through both parsers: get_job_config and the read-model.
+        let loaded = store.get_job_config(&job.name)?;
+        assert_eq!(loaded.tasks[0].actions, t.actions);
+        Ok(())
+    }
+
+    #[test]
     fn tasks_without_identities_round_trip_empty() -> R<()> {
         let store = setup_store()?;
         let job = JobConfig {
