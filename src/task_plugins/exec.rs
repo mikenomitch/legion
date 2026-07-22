@@ -1,7 +1,8 @@
 use crate::prelude::*;
 use crate::structs::{Allocation, TaskConfig};
 use crate::task_plugins::{
-    configure_task_log_capture, derived_schema, spawn_task_process, TaskPlugin, TaskRuntime,
+    configure_task_log_capture, derived_schema, spawn_pipe, spawn_pty, spawn_task_process,
+    ExecOptions, ExecSession, ExecSupport, TaskPlugin, TaskRuntime,
 };
 #[cfg(target_os = "linux")]
 use landlock::{AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr, ABI};
@@ -246,6 +247,61 @@ impl TaskPlugin for ExecTaskPlugin {
 
     fn supports_artifacts(&self) -> bool {
         true
+    }
+
+    fn exec_support(&self) -> ExecSupport {
+        // A sibling host process, even with landlock: still host-level, so it
+        // carries the `host` ACL flag (Nomad's alloc-node-exec lesson).
+        ExecSupport {
+            exec: true,
+            pty: true,
+            host_level: true,
+        }
+    }
+
+    fn exec(
+        &self,
+        allocation: &Allocation,
+        task: &TaskConfig,
+        runtime: &mut TaskRuntime,
+        mut opts: ExecOptions,
+    ) -> R<Box<dyn ExecSession>> {
+        // Run the exec command in the same *context* the task got: its env
+        // (worker-injected first, then task env), and its working directory.
+        // It is a sibling host process — the running task has no namespace to
+        // join — which is the honest semantic for the `exec` kind.
+        let config = self.parse_config(&task.config)?;
+
+        let mut env = runtime.extra_env.clone();
+        for (k, v) in &config.env {
+            env.insert(k.clone(), v.clone());
+        }
+        // Preserve any env the caller set (e.g. TERM) without clobbering task env.
+        for (k, v) in std::mem::take(&mut opts.env) {
+            env.entry(k).or_insert(v);
+        }
+        opts.env = env;
+
+        if opts.cwd.is_none() {
+            opts.cwd = config
+                .cwd
+                .as_deref()
+                .map(std::path::PathBuf::from)
+                .or_else(|| runtime.task_dir.clone());
+        }
+
+        info!(
+            allocation_id = allocation.id,
+            task_name = %task.name,
+            tty = opts.tty,
+            "Opening exec session for exec task"
+        );
+
+        if opts.tty {
+            spawn_pty(&opts)
+        } else {
+            spawn_pipe(&opts)
+        }
     }
 
     fn prepare(

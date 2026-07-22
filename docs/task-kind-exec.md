@@ -71,6 +71,12 @@ Spawn helper sets a new session (`setsid`) on Unix so task processes survive wor
 | Identity env / file delivery | ✅ / ✅ |
 | Signal delivery | ✅ |
 | Artifacts | ✅ (File/Tree + interpolation + env) |
+| Exec / interactive PTY | ✅ / ✅ — **host-level** (see [docs/exec-and-actions.md](exec-and-actions.md)) |
+
+Exec runs a sibling host process with the task's env and working directory.
+Because it is a process on the host (even under landlock), it carries the
+`host` ACL flag: exec into an `exec` task requires an `exec:write` rule with
+`host: true`.
 
 ## Notes
 

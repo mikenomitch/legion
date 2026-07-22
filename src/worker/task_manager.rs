@@ -515,6 +515,56 @@ impl WorkerTaskManager {
         self.runtimes.contains_key(&allocation_id)
     }
 
+    /// Open a live exec session against a local allocation. Resolves the task
+    /// kind's plugin, checks its declared exec support, and spawns the
+    /// session. The caller (worker exec RPC) drives the returned session.
+    pub fn open_exec_session(
+        &mut self,
+        allocation_id: i64,
+        task_name: Option<&str>,
+        opts: crate::task_plugins::ExecOptions,
+    ) -> R<Box<dyn crate::task_plugins::ExecSession>> {
+        let allocation = self
+            .allocations
+            .get(&allocation_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("allocation {allocation_id} is not active on this worker"))?;
+        let task = self
+            .task_configs
+            .get(&allocation_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("no task config for allocation {allocation_id}"))?;
+        if let Some(name) = task_name {
+            if !name.is_empty() && name != task.name {
+                bail!(
+                    "allocation {allocation_id} runs task `{}`, not `{name}`",
+                    task.name
+                );
+            }
+        }
+
+        let plugin = self
+            .registry
+            .plugin(&task.kind)
+            .ok_or_else(|| anyhow!("no task plugin loaded for kind `{}`", task.kind))?;
+        let support = plugin.exec_support();
+        if !support.exec {
+            bail!("task kind `{}` does not support exec", task.kind);
+        }
+        if opts.tty && !support.pty {
+            bail!(
+                "task kind `{}` does not support interactive (tty) exec",
+                task.kind
+            );
+        }
+
+        let runtime = self
+            .runtimes
+            .get_mut(&allocation_id)
+            .ok_or_else(|| anyhow!("no runtime for allocation {allocation_id}"))?;
+        plugin.exec(&allocation, &task, runtime, opts)
+    }
+
     /// Synchronous run for tasks without artifacts (and the post-staging
     /// path). Creates dirs, runs `prepare` + `start`, registers the
     /// allocation.

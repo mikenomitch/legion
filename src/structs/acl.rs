@@ -29,6 +29,12 @@ pub enum AclResource {
     Operator,
     /// ACL administration: tokens, policies, users.
     Acl,
+    /// Interactive/one-shot exec into a running allocation. `write` opens a
+    /// session; the `host` selector gates host-level (unsandboxed) kinds.
+    Exec,
+    /// Running a declared action against an allocation. `write` runs it;
+    /// narrower than `exec` (the command is fixed and server-rendered).
+    Action,
 }
 
 impl AclResource {
@@ -40,11 +46,15 @@ impl AclResource {
             AclResource::State => "state",
             AclResource::Operator => "operator",
             AclResource::Acl => "acl",
+            AclResource::Exec => "exec",
+            AclResource::Action => "action",
         }
     }
 
     pub fn all() -> &'static [&'static str] {
-        &["job", "node", "kv", "state", "operator", "acl"]
+        &[
+            "job", "node", "kv", "state", "operator", "acl", "exec", "action",
+        ]
     }
 }
 
@@ -90,6 +100,16 @@ pub struct AclRule {
     /// Glob selectors over KV keys.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paths: Option<Vec<String>>,
+    /// Glob selectors over action names (on `action` rules). Named
+    /// `action_names` rather than `actions` to avoid colliding with the
+    /// read/write `actions` field above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_names: Option<Vec<String>>,
+    /// On `exec` rules: when true, the rule also grants exec into host-level
+    /// (unsandboxed) kinds. When absent/false, it matches only sandboxed
+    /// kinds. Mirrors Nomad's `alloc-exec` vs `alloc-node-exec` split.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<bool>,
 }
 
 impl AclRule {
@@ -102,6 +122,7 @@ impl AclRule {
             || self.names.is_some()
             || self.pools.is_some()
             || self.paths.is_some()
+            || self.action_names.is_some()
     }
 }
 
@@ -118,6 +139,11 @@ pub struct AclScope {
     pub name: Option<String>,
     pub pool: Option<String>,
     pub path: Option<String>,
+    /// Action name, for `action`-resource scopes.
+    pub action_name: Option<String>,
+    /// True when the exec target is a host-level (unsandboxed) kind. Only an
+    /// `exec` rule with `host: true` matches such a scope.
+    pub host: bool,
 }
 
 /// Namespace assigned to all jobs until Legion grows real namespaces.
@@ -158,6 +184,26 @@ impl AclScope {
     pub fn path(path: &str) -> Self {
         AclScope {
             path: Some(path.to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// Scope for an exec session into a job. `host` marks host-level kinds.
+    pub fn exec(job: &str, host: bool) -> Self {
+        AclScope {
+            namespace: Some(DEFAULT_NAMESPACE.to_string()),
+            name: Some(job.to_string()),
+            host,
+            ..Default::default()
+        }
+    }
+
+    /// Scope for running an action on a job.
+    pub fn action(job: &str, action_name: &str) -> Self {
+        AclScope {
+            namespace: Some(DEFAULT_NAMESPACE.to_string()),
+            name: Some(job.to_string()),
+            action_name: Some(action_name.to_string()),
             ..Default::default()
         }
     }
@@ -241,10 +287,16 @@ fn rule_matches(
         // individually); blanket deny rules are handled by the caller.
         return true;
     }
+    // A host-level exec target requires an exec rule that opts into `host`.
+    // Sandboxed targets (scope.host == false) are unaffected by the flag.
+    if resource == AclResource::Exec && scope.host && rule.host != Some(true) {
+        return false;
+    }
     selector_matches(&rule.namespaces, &scope.namespace)
         && selector_matches(&rule.names, &scope.name)
         && selector_matches(&rule.pools, &scope.pool)
         && selector_matches(&rule.paths, &scope.path)
+        && selector_matches(&rule.action_names, &scope.action_name)
 }
 
 /// Default-deny evaluation over a flattened rule set.

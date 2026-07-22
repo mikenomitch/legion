@@ -8,7 +8,8 @@ use std::str::FromStr;
 use std::time::Duration;
 use tabled::Tabled;
 
-use crate::prelude::{bail, R};
+use crate::prelude::{anyhow, bail, R};
+use tracing::warn;
 
 use super::artifact::{validate_task_artifacts, ArtifactSpec};
 use super::instance::InstanceMode;
@@ -1168,6 +1169,254 @@ pub struct TaskConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[tabled(skip)]
     pub artifacts: Vec<ArtifactSpec>,
+    /// Pre-baked, parameterized command templates runnable against a running
+    /// allocation of this task (see `docs/plans/exec-and-actions-plan.md`).
+    /// Empty = no actions. Guarded by the `action` ACL resource, separate
+    /// from raw `exec`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[tabled(skip)]
+    pub actions: Vec<ActionSpec>,
+}
+
+/// A declared action: a named command template with typed parameters.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ActionSpec {
+    /// Action name, `[a-z0-9-]{1,128}`, unique within its task.
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    /// Command argv. `${param.<name>}` placeholders are substituted at
+    /// invocation, element-by-element, with no shell evaluation.
+    pub command: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub params: Vec<ActionParam>,
+    /// Allocate a PTY when run (default false).
+    #[serde(default)]
+    pub tty: bool,
+    /// Optional wall-clock cap, e.g. `"60s"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<String>,
+}
+
+/// Parameter type for an action parameter.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum ActionParamType {
+    #[default]
+    String,
+    Int,
+    Bool,
+    Enum,
+}
+
+impl ActionParamType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ActionParamType::String => "string",
+            ActionParamType::Int => "int",
+            ActionParamType::Bool => "bool",
+            ActionParamType::Enum => "enum",
+        }
+    }
+}
+
+/// A typed, validated parameter of an action.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ActionParam {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    #[serde(default, rename = "type")]
+    pub param_type: ActionParamType,
+    /// When set, the param is optional and this value is used if omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
+    /// Explicit required flag; defaults to `true` unless a `default` is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required: Option<bool>,
+    /// Allowed values for `enum` params.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub values: Vec<String>,
+    /// Anchored regex constraint for `string` params.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<String>,
+    /// Inclusive bounds for `int` params.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max: Option<i64>,
+    /// Redact the value in audit events and UI history.
+    #[serde(default)]
+    pub sensitive: bool,
+}
+
+impl ActionParam {
+    /// Whether this parameter must be supplied at invocation.
+    pub fn is_required(&self) -> bool {
+        self.required.unwrap_or_else(|| self.default.is_none())
+    }
+
+    /// Validates one supplied value against this parameter's constraints.
+    pub fn validate_value(&self, value: &str) -> Result<(), String> {
+        match self.param_type {
+            ActionParamType::String => {
+                if let Some(pattern) = &self.pattern {
+                    let re = regex::Regex::new(pattern)
+                        .map_err(|e| format!("param `{}` bad pattern: {e}", self.name))?;
+                    if !re.is_match(value) {
+                        return Err(format!(
+                            "param `{}` value does not match pattern",
+                            self.name
+                        ));
+                    }
+                }
+            }
+            ActionParamType::Int => {
+                let n: i64 = value
+                    .parse()
+                    .map_err(|_| format!("param `{}` must be an integer", self.name))?;
+                if let Some(min) = self.min {
+                    if n < min {
+                        return Err(format!("param `{}` must be >= {min}", self.name));
+                    }
+                }
+                if let Some(max) = self.max {
+                    if n > max {
+                        return Err(format!("param `{}` must be <= {max}", self.name));
+                    }
+                }
+            }
+            ActionParamType::Bool => {
+                if value != "true" && value != "false" {
+                    return Err(format!("param `{}` must be `true` or `false`", self.name));
+                }
+            }
+            ActionParamType::Enum => {
+                if !self.values.iter().any(|v| v == value) {
+                    return Err(format!(
+                        "param `{}` must be one of: {}",
+                        self.name,
+                        self.values.join(", ")
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl ActionSpec {
+    /// Validates the action's static shape at job submission. Runtime param
+    /// validation happens separately at invocation via [`render_command`].
+    pub fn validate(&self) -> Result<(), String> {
+        if self.name.is_empty() || self.name.len() > 128 {
+            return Err(format!("action name `{}` must be 1..=128 chars", self.name));
+        }
+        if !self
+            .name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        {
+            return Err(format!("action name `{}` must match [a-z0-9-]", self.name));
+        }
+        if self.command.is_empty() {
+            return Err(format!("action `{}` command must not be empty", self.name));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for param in &self.params {
+            if !seen.insert(param.name.as_str()) {
+                return Err(format!(
+                    "action `{}` has duplicate param `{}`",
+                    self.name, param.name
+                ));
+            }
+            if matches!(param.param_type, ActionParamType::Enum) && param.values.is_empty() {
+                return Err(format!(
+                    "action `{}` enum param `{}` must list `values`",
+                    self.name, param.name
+                ));
+            }
+            if let Some(pattern) = &param.pattern {
+                regex::Regex::new(pattern).map_err(|e| {
+                    format!(
+                        "action `{}` param `{}` has invalid pattern: {e}",
+                        self.name, param.name
+                    )
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Validates supplied params and renders the final argv. Every argv
+    /// element has its `${param.<name>}` placeholders replaced with the
+    /// validated value; there is no shell evaluation and no word-splitting.
+    ///
+    /// Returns the rendered argv plus the effective (defaulted) parameter
+    /// values for audit logging.
+    pub fn render_command(
+        &self,
+        supplied: &std::collections::HashMap<String, String>,
+    ) -> Result<(Vec<String>, std::collections::BTreeMap<String, String>), String> {
+        // Reject params that were not declared (strict allowlist).
+        for key in supplied.keys() {
+            if !self.params.iter().any(|p| &p.name == key) {
+                return Err(format!("unknown parameter `{key}`"));
+            }
+        }
+
+        let mut resolved: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        for param in &self.params {
+            let value = match supplied.get(&param.name) {
+                Some(v) => v.clone(),
+                None => match &param.default {
+                    Some(d) => d.clone(),
+                    None => {
+                        if param.is_required() {
+                            return Err(format!("missing required parameter `{}`", param.name));
+                        }
+                        String::new()
+                    }
+                },
+            };
+            param.validate_value(&value)?;
+            resolved.insert(param.name.clone(), value);
+        }
+
+        let mut argv = Vec::with_capacity(self.command.len());
+        for element in &self.command {
+            argv.push(substitute_params(element, &resolved)?);
+        }
+        Ok((argv, resolved))
+    }
+}
+
+/// Replaces `${param.<name>}` placeholders inside a single argv element.
+/// Unknown placeholders are an error; the replacement is literal (no shell).
+fn substitute_params(
+    element: &str,
+    resolved: &std::collections::BTreeMap<String, String>,
+) -> Result<String, String> {
+    let mut out = String::with_capacity(element.len());
+    let mut rest = element;
+    while let Some(start) = rest.find("${param.") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + "${param.".len()..];
+        let end = after
+            .find('}')
+            .ok_or_else(|| format!("unterminated `${{param.` in `{element}`"))?;
+        let name = &after[..end];
+        let value = resolved
+            .get(name)
+            .ok_or_else(|| format!("unknown parameter `{name}` in command template"))?;
+        out.push_str(value);
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -1352,6 +1601,8 @@ struct TaskConfigInput {
     on_lost: Option<Value>,
     #[serde(default)]
     artifacts: Vec<ArtifactSpec>,
+    #[serde(default)]
+    actions: Vec<ActionSpec>,
 }
 
 #[derive(Deserialize)]
@@ -1452,6 +1703,7 @@ impl TaskConfigInput {
             identities: self.identities,
             stateful: self.stateful,
             artifacts: self.artifacts,
+            actions: self.actions,
         })
     }
 }
@@ -1623,6 +1875,7 @@ impl TaskConfig {
             identities: Vec::new(),
             stateful: None,
             artifacts: Vec::new(),
+            actions: Vec::new(),
         }
     }
 
@@ -1809,6 +2062,68 @@ impl TaskConfig {
         validate_task_artifacts(&self.name, &self.artifacts, &self.config, &self.identities)
     }
 
+    /// Validate declared actions: unique names, well-formed params, and that
+    /// every `${param.<name>}` placeholder in a command refers to a declared
+    /// param. Also warns (does not reject) when a param is interpolated into a
+    /// `sh -c`-style command element.
+    pub fn validate_actions(&self) -> R<()> {
+        let mut seen = std::collections::HashSet::new();
+        for action in &self.actions {
+            action
+                .validate()
+                .map_err(|e| anyhow!("task {} action invalid: {e}", self.name))?;
+            if !seen.insert(action.name.as_str()) {
+                bail!(
+                    "task {} declares duplicate action `{}`",
+                    self.name,
+                    action.name
+                );
+            }
+            // Every placeholder must reference a declared param.
+            for element in &action.command {
+                let mut rest = element.as_str();
+                while let Some(idx) = rest.find("${param.") {
+                    let after = &rest[idx + "${param.".len()..];
+                    let Some(end) = after.find('}') else {
+                        bail!(
+                            "task {} action `{}` has an unterminated ${{param.}} placeholder",
+                            self.name,
+                            action.name
+                        );
+                    };
+                    let param_name = &after[..end];
+                    if !action.params.iter().any(|p| p.name == param_name) {
+                        bail!(
+                            "task {} action `{}` references undeclared param `{}`",
+                            self.name,
+                            action.name,
+                            param_name
+                        );
+                    }
+                    rest = &after[end + 1..];
+                }
+            }
+            // Warn on shell-interpolation footgun (param inside `sh -c`).
+            let is_shell = matches!(action.command.first().map(String::as_str), Some(cmd)
+                if cmd.ends_with("sh") || cmd == "bash" || cmd == "zsh")
+                && action.command.iter().any(|a| a == "-c");
+            if is_shell
+                && action
+                    .command
+                    .iter()
+                    .any(|a| a.contains("${param."))
+            {
+                warn!(
+                    task = %self.name,
+                    action = %action.name,
+                    "action interpolates a param inside a shell command; \
+                     values are validated but shell quoting is the author's responsibility"
+                );
+            }
+        }
+        Ok(())
+    }
+
     pub fn validate_checks(&self) -> R<()> {
         let has_boot_checks = self
             .checks
@@ -1945,6 +2260,100 @@ impl Submission {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_action() -> ActionSpec {
+        ActionSpec {
+            name: "flush-cache".into(),
+            description: String::new(),
+            command: vec![
+                "/srv/api".into(),
+                "flush".into(),
+                "--scope".into(),
+                "${param.scope}".into(),
+            ],
+            params: vec![ActionParam {
+                name: "scope".into(),
+                description: String::new(),
+                param_type: ActionParamType::Enum,
+                default: Some("sessions".into()),
+                required: None,
+                values: vec!["all".into(), "sessions".into()],
+                pattern: None,
+                min: None,
+                max: None,
+                sensitive: false,
+            }],
+            tty: false,
+            timeout: None,
+        }
+    }
+
+    #[test]
+    fn action_render_substitutes_validated_params() {
+        let action = sample_action();
+        let mut supplied = std::collections::HashMap::new();
+        supplied.insert("scope".to_string(), "all".to_string());
+        let (argv, resolved) = action.render_command(&supplied).unwrap();
+        assert_eq!(argv, vec!["/srv/api", "flush", "--scope", "all"]);
+        assert_eq!(resolved.get("scope").unwrap(), "all");
+    }
+
+    #[test]
+    fn action_render_uses_default_when_param_omitted() {
+        let action = sample_action();
+        let (argv, _) = action.render_command(&std::collections::HashMap::new()).unwrap();
+        assert_eq!(argv.last().unwrap(), "sessions");
+    }
+
+    #[test]
+    fn action_render_rejects_invalid_enum_and_unknown_params() {
+        let action = sample_action();
+        let mut bad = std::collections::HashMap::new();
+        bad.insert("scope".to_string(), "nope".to_string());
+        assert!(action.render_command(&bad).unwrap_err().contains("one of"));
+
+        let mut unknown = std::collections::HashMap::new();
+        unknown.insert("bogus".to_string(), "x".to_string());
+        assert!(action
+            .render_command(&unknown)
+            .unwrap_err()
+            .contains("unknown parameter"));
+    }
+
+    #[test]
+    fn action_int_bounds_enforced() {
+        let param = ActionParam {
+            name: "lines".into(),
+            description: String::new(),
+            param_type: ActionParamType::Int,
+            default: None,
+            required: None,
+            values: vec![],
+            pattern: None,
+            min: Some(1),
+            max: Some(10),
+            sensitive: false,
+        };
+        assert!(param.validate_value("5").is_ok());
+        assert!(param.validate_value("0").unwrap_err().contains(">= 1"));
+        assert!(param.validate_value("11").unwrap_err().contains("<= 10"));
+        assert!(param.validate_value("x").unwrap_err().contains("integer"));
+    }
+
+    #[test]
+    fn action_validate_rejects_undeclared_placeholder() {
+        let mut task = TaskConfig::new("t", "exec");
+        task.actions = vec![ActionSpec {
+            name: "bad".into(),
+            description: String::new(),
+            command: vec!["/bin/echo".into(), "${param.missing}".into()],
+            params: vec![],
+            tty: false,
+            timeout: None,
+        }];
+        let err = task.validate_actions().unwrap_err().to_string();
+        assert!(err.contains("undeclared param"), "got: {err}");
+    }
 
     #[test]
     fn deserializes_task_list_jobspec() {

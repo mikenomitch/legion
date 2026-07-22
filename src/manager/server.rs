@@ -30,7 +30,8 @@ use crate::structs::{
     AllocationLog, CreateInstanceReply, CreateInstanceRequest, CreateInstancesReply,
     CreateInstancesRequest, DeleteKvReply, DeleteKvRequest, DeleteSavedStateQueryReply,
     DeleteSavedStateQueryRequest, DestroyInstanceReply, DestroyInstanceRequest, DestroyJobReply,
-    DestroyJobRequest, FailedAllocation, GetAllocationLogsReply, GetAllocationLogsRequest,
+    DestroyJobRequest, ExecClientFrame, FailedAllocation, GetAllocationLogsReply,
+    GetAllocationLogsRequest,
     GetArtifactCredentialReply, GetArtifactCredentialRequest, GetInstanceReply, GetInstanceRequest,
     GetJobInfoReply, GetJobInfoRequest, GetJobSpecByConfigRequest, GetJobSpecReply,
     GetJobSpecRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply,
@@ -46,12 +47,13 @@ use crate::structs::{
     ListInstancesRequest, ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobsReply,
     ListJobsRequest, ListKvReply, ListKvRequest, ListRaftHistoryReply, ListRaftHistoryRequest,
     ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply, ListRolloutsRequest,
-    ListSavedStateQueriesReply, ListSavedStateQueriesRequest, ListServicesReply,
-    ListServicesRequest, Node, NodeMsg, PatchKvReply, PatchKvRequest, PlanJobReply, PlanJobRequest,
-    PlannedAllocation, PutKvReply, PutKvRequest, QueryStateStoreReply, QueryStateStoreRequest,
-    RaftHistoryEvent, RaftStatus, ReleaseKvLockReply, ReleaseKvLockRequest, RenewKvLockReply,
-    RenewKvLockRequest, ReplaceInstanceReply, ReplaceInstanceRequest, ResolveServiceReply,
-    ResolveServiceRequest, RestartWorkerReply, RestartWorkerRequest, RolloutAllocationStatus,
+    ListJobActionsReply, ListJobActionsRequest, ListSavedStateQueriesReply,
+    ListSavedStateQueriesRequest, ListServicesReply, ListServicesRequest, Node, NodeMsg,
+    PatchKvReply, PatchKvRequest, PlanJobReply, PlanJobRequest, PlannedAllocation, PutKvReply,
+    PutKvRequest, QueryStateStoreReply, QueryStateStoreRequest, RaftHistoryEvent, RaftStatus,
+    ReleaseKvLockReply, ReleaseKvLockRequest, RenewKvLockReply, RenewKvLockRequest,
+    ReplaceInstanceReply, ReplaceInstanceRequest, ResolveServiceReply, ResolveServiceRequest,
+    RestartWorkerReply, RestartWorkerRequest, RolloutAllocationStatus,
     RolloutEvent, RolloutGroupStatus, RolloutProgression, RolloutReplacement, RunJobReply,
     RunJobRequest, SavedStateQuery, SchedulerEvent, ServiceEndpoint, ServiceSummary,
     StartInstanceReply, StartInstanceRequest, StopInstanceReply, StopInstanceRequest, StopJobReply,
@@ -77,7 +79,7 @@ use crate::tracing_util::{o11y_enabled, read_recent_observability};
 use time::{Duration as TimeDuration, OffsetDateTime};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{Channel, Endpoint};
-use tonic::{Request, Response, Status};
+use tonic::{Request, Response, Status, Streaming};
 
 fn map_store_error(action: &str, err: anyhow::Error) -> Status {
     error!("{action}: {:?}", err);
@@ -831,6 +833,9 @@ pub struct ManagerDaemonService {
     /// Fetcher registry used to resolve `resolve: "pin"` references at
     /// submit (blocking; callers wrap in block_in_place).
     fetcher_registry: Arc<Mutex<crate::artifacts::FetcherRegistry>>,
+    /// Whether `ExecAllocation` is enabled (config `exec.enabled`, default
+    /// true). When false the endpoint rejects with FailedPrecondition.
+    exec_enabled: bool,
 }
 
 impl ManagerDaemonService {
@@ -856,6 +861,7 @@ impl ManagerDaemonService {
             fetcher_registry: Arc::new(Mutex::new(
                 crate::artifacts::FetcherRegistry::with_builtins(),
             )),
+            exec_enabled: true,
         }
     }
 
@@ -983,6 +989,7 @@ impl ManagerDaemonService {
             .iter()
             .map(|identity| identity.name.clone())
             .collect();
+        service.exec_enabled = config.exec.enabled;
         service
     }
 
@@ -2050,6 +2057,82 @@ impl Manager for ManagerDaemonService {
             events: events.into_iter().map(map_scheduler_event).collect(),
             latest_id,
         }))
+    }
+
+    type ExecAllocationStream = crate::manager::exec::ExecAllocationStream;
+
+    #[instrument(skip_all)]
+    async fn exec_allocation(
+        &self,
+        request: Request<Streaming<ExecClientFrame>>,
+    ) -> Result<Response<Self::ExecAllocationStream>, Status> {
+        if !self.exec_enabled {
+            return Err(Status::failed_precondition(
+                "exec is disabled on this manager (exec.enabled=false)",
+            ));
+        }
+        // Authenticate from request metadata (native gRPC and the WS bridge,
+        // which lifts the in-frame token into metadata before dialing). ACL
+        // enforcement + action rendering happen on the parsed ExecStart.
+        let identity = self.authenticate_acl(&request)?;
+        // Coarse gate before touching the stream, so a credential-less caller
+        // is denied immediately (and cannot probe by holding the connection).
+        // Either exec:write or action:write anywhere clears it; the precise
+        // job/host/action scope is enforced once the ExecStart is parsed.
+        if !identity.would_allow(AclResource::Exec, AclAction::Write, &AclScope::any())
+            && !identity.would_allow(AclResource::Action, AclAction::Write, &AclScope::any())
+        {
+            acl::enforce(
+                &identity,
+                AclResource::Exec,
+                AclAction::Write,
+                &AclScope::any(),
+            )?;
+        }
+        let mut inbound = request.into_inner();
+        let first = inbound
+            .message()
+            .await
+            .map_err(|e| Status::internal(format!("exec stream error: {e}")))?
+            .ok_or_else(|| Status::invalid_argument("exec stream closed before start frame"))?;
+        let start = match first.frame {
+            Some(crate::structs::exec_client_frame::Frame::Start(start)) => start,
+            _ => {
+                return Err(Status::invalid_argument(
+                    "first exec frame must be ExecStart",
+                ))
+            }
+        };
+
+        // Adapt the tonic client stream into the channel the shared core reads.
+        let (in_tx, in_rx) = tokio::sync::mpsc::channel::<ExecClientFrame>(128);
+        tokio::spawn(async move {
+            while let Ok(Some(frame)) = inbound.message().await {
+                if in_tx.send(frame).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let out_rx =
+            crate::manager::exec::run_exec_session(&self.store, &identity, start, in_rx).await?;
+        Ok(Response::new(ReceiverStream::new(out_rx)))
+    }
+
+    #[instrument(skip_all)]
+    async fn list_job_actions(
+        &self,
+        request: Request<ListJobActionsRequest>,
+    ) -> Result<Response<ListJobActionsReply>, Status> {
+        let req = request.get_ref();
+        self.check_acl(
+            &request,
+            AclResource::Job,
+            AclAction::Read,
+            AclScope::job(&req.job),
+        )?;
+        let actions = crate::manager::exec::list_job_actions(&self.store, &req.job)?;
+        Ok(Response::new(ListJobActionsReply { actions }))
     }
 
     type StreamEventsStream = ReceiverStream<Result<SchedulerEvent, Status>>;
@@ -6071,6 +6154,16 @@ mod tests {
                     next_offset: 0,
                 }],
             }))
+        }
+
+        type ExecTaskStream =
+            tokio_stream::wrappers::ReceiverStream<Result<crate::structs::ExecServerFrame, Status>>;
+
+        async fn exec_task(
+            &self,
+            _request: Request<Streaming<ExecClientFrame>>,
+        ) -> Result<Response<Self::ExecTaskStream>, Status> {
+            Err(Status::unimplemented("not used in test"))
         }
     }
 

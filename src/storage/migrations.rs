@@ -540,5 +540,9 @@ pub fn get_migrations() -> Migrations<'static> {
         )",
         )
         .down("DROP TABLE IF EXISTS join_token;"),
+        // Declared actions on a task (exec & actions plan). JSON-encoded
+        // Vec<ActionSpec>; NULL/absent == no actions. Appended last so
+        // databases created before this feature migrate cleanly.
+        M::up("ALTER TABLE task_config ADD COLUMN actions JSONB;").down(""),
     ])
 }

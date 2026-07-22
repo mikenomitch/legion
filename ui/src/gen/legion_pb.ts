@@ -8278,6 +8278,779 @@ export class Eval extends Message<Eval> {
 }
 
 /**
+ * Frames sent from the initiator (CLI, UI, or manager proxy) toward the
+ * process. The first frame on a stream must carry `start`.
+ *
+ * @generated from message legion.ExecClientFrame
+ */
+export class ExecClientFrame extends Message<ExecClientFrame> {
+  /**
+   * @generated from oneof legion.ExecClientFrame.frame
+   */
+  frame: {
+    /**
+     * @generated from field: legion.ExecStart start = 1;
+     */
+    value: ExecStart;
+    case: "start";
+  } | {
+    /**
+     * @generated from field: legion.ExecInput stdin = 2;
+     */
+    value: ExecInput;
+    case: "stdin";
+  } | {
+    /**
+     * @generated from field: legion.ExecResize resize = 3;
+     */
+    value: ExecResize;
+    case: "resize";
+  } | {
+    /**
+     * @generated from field: legion.ExecPing ping = 4;
+     */
+    value: ExecPing;
+    case: "ping";
+  } | { case: undefined; value?: undefined } = { case: undefined };
+
+  constructor(data?: PartialMessage<ExecClientFrame>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ExecClientFrame";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "start", kind: "message", T: ExecStart, oneof: "frame" },
+    { no: 2, name: "stdin", kind: "message", T: ExecInput, oneof: "frame" },
+    { no: 3, name: "resize", kind: "message", T: ExecResize, oneof: "frame" },
+    { no: 4, name: "ping", kind: "message", T: ExecPing, oneof: "frame" },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ExecClientFrame {
+    return new ExecClientFrame().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ExecClientFrame {
+    return new ExecClientFrame().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ExecClientFrame {
+    return new ExecClientFrame().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ExecClientFrame | PlainMessage<ExecClientFrame> | undefined, b: ExecClientFrame | PlainMessage<ExecClientFrame> | undefined): boolean {
+    return proto3.util.equals(ExecClientFrame, a, b);
+  }
+}
+
+/**
+ * Opens a session. Exactly one of `command` (raw exec) or `action` (named,
+ * server-rendered) selects what runs.
+ *
+ * @generated from message legion.ExecStart
+ */
+export class ExecStart extends Message<ExecStart> {
+  /**
+   * Target allocation (must be `active`).
+   *
+   * @generated from field: int64 allocation_id = 1;
+   */
+  allocationId = protoInt64.zero;
+
+  /**
+   * Task within the allocation. Optional when the allocation runs one task.
+   *
+   * @generated from field: string task_name = 2;
+   */
+  taskName = "";
+
+  /**
+   * Raw command argv (requires exec:write). Empty when running an action.
+   *
+   * @generated from field: repeated string command = 3;
+   */
+  command: string[] = [];
+
+  /**
+   * Action name (requires action:write). Empty for raw exec.
+   *
+   * @generated from field: string action = 4;
+   */
+  action = "";
+
+  /**
+   * Action parameter values, validated + substituted server-side.
+   *
+   * @generated from field: map<string, string> action_params = 5;
+   */
+  actionParams: { [key: string]: string } = {};
+
+  /**
+   * Allocate a PTY (interactive). When false, stdout/stderr stay separate.
+   *
+   * @generated from field: bool tty = 6;
+   */
+  tty = false;
+
+  /**
+   * Initial terminal size (tty sessions only).
+   *
+   * @generated from field: legion.ExecWinsize winsize = 7;
+   */
+  winsize?: ExecWinsize;
+
+  /**
+   * Bearer token carried in-frame for the browser WebSocket bridge, which
+   * cannot set request headers. Ignored on native gRPC legs, where the
+   * `authorization` metadata is used instead.
+   *
+   * @generated from field: string bearer_token = 8;
+   */
+  bearerToken = "";
+
+  constructor(data?: PartialMessage<ExecStart>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ExecStart";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "allocation_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 2, name: "task_name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "command", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 4, name: "action", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "action_params", kind: "map", K: 9 /* ScalarType.STRING */, V: {kind: "scalar", T: 9 /* ScalarType.STRING */} },
+    { no: 6, name: "tty", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 7, name: "winsize", kind: "message", T: ExecWinsize },
+    { no: 8, name: "bearer_token", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ExecStart {
+    return new ExecStart().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ExecStart {
+    return new ExecStart().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ExecStart {
+    return new ExecStart().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ExecStart | PlainMessage<ExecStart> | undefined, b: ExecStart | PlainMessage<ExecStart> | undefined): boolean {
+    return proto3.util.equals(ExecStart, a, b);
+  }
+}
+
+/**
+ * Standard-input chunk. `eof` half-closes stdin (the k8s v5 lesson) so piped
+ * input reaches EOF without tearing down the whole session.
+ *
+ * @generated from message legion.ExecInput
+ */
+export class ExecInput extends Message<ExecInput> {
+  /**
+   * @generated from field: bytes data = 1;
+   */
+  data = new Uint8Array(0);
+
+  /**
+   * @generated from field: bool eof = 2;
+   */
+  eof = false;
+
+  constructor(data?: PartialMessage<ExecInput>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ExecInput";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "data", kind: "scalar", T: 12 /* ScalarType.BYTES */ },
+    { no: 2, name: "eof", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ExecInput {
+    return new ExecInput().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ExecInput {
+    return new ExecInput().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ExecInput {
+    return new ExecInput().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ExecInput | PlainMessage<ExecInput> | undefined, b: ExecInput | PlainMessage<ExecInput> | undefined): boolean {
+    return proto3.util.equals(ExecInput, a, b);
+  }
+}
+
+/**
+ * Terminal dimensions in character cells.
+ *
+ * @generated from message legion.ExecWinsize
+ */
+export class ExecWinsize extends Message<ExecWinsize> {
+  /**
+   * @generated from field: uint32 cols = 1;
+   */
+  cols = 0;
+
+  /**
+   * @generated from field: uint32 rows = 2;
+   */
+  rows = 0;
+
+  constructor(data?: PartialMessage<ExecWinsize>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ExecWinsize";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "cols", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 2, name: "rows", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ExecWinsize {
+    return new ExecWinsize().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ExecWinsize {
+    return new ExecWinsize().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ExecWinsize {
+    return new ExecWinsize().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ExecWinsize | PlainMessage<ExecWinsize> | undefined, b: ExecWinsize | PlainMessage<ExecWinsize> | undefined): boolean {
+    return proto3.util.equals(ExecWinsize, a, b);
+  }
+}
+
+/**
+ * Window-resize event (tty sessions).
+ *
+ * @generated from message legion.ExecResize
+ */
+export class ExecResize extends Message<ExecResize> {
+  /**
+   * @generated from field: legion.ExecWinsize winsize = 1;
+   */
+  winsize?: ExecWinsize;
+
+  constructor(data?: PartialMessage<ExecResize>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ExecResize";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "winsize", kind: "message", T: ExecWinsize },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ExecResize {
+    return new ExecResize().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ExecResize {
+    return new ExecResize().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ExecResize {
+    return new ExecResize().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ExecResize | PlainMessage<ExecResize> | undefined, b: ExecResize | PlainMessage<ExecResize> | undefined): boolean {
+    return proto3.util.equals(ExecResize, a, b);
+  }
+}
+
+/**
+ * Keepalive; the peer echoes it back as `pong`.
+ *
+ * @generated from message legion.ExecPing
+ */
+export class ExecPing extends Message<ExecPing> {
+  constructor(data?: PartialMessage<ExecPing>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ExecPing";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ExecPing {
+    return new ExecPing().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ExecPing {
+    return new ExecPing().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ExecPing {
+    return new ExecPing().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ExecPing | PlainMessage<ExecPing> | undefined, b: ExecPing | PlainMessage<ExecPing> | undefined): boolean {
+    return proto3.util.equals(ExecPing, a, b);
+  }
+}
+
+/**
+ * Frames sent from the process back toward the initiator.
+ *
+ * @generated from message legion.ExecServerFrame
+ */
+export class ExecServerFrame extends Message<ExecServerFrame> {
+  /**
+   * @generated from oneof legion.ExecServerFrame.frame
+   */
+  frame: {
+    /**
+     * @generated from field: legion.ExecOutput stdout = 1;
+     */
+    value: ExecOutput;
+    case: "stdout";
+  } | {
+    /**
+     * @generated from field: legion.ExecOutput stderr = 2;
+     */
+    value: ExecOutput;
+    case: "stderr";
+  } | {
+    /**
+     * @generated from field: legion.ExecExit exit = 3;
+     */
+    value: ExecExit;
+    case: "exit";
+  } | {
+    /**
+     * @generated from field: legion.ExecPing pong = 4;
+     */
+    value: ExecPing;
+    case: "pong";
+  } | {
+    /**
+     * @generated from field: legion.ExecStarted started = 5;
+     */
+    value: ExecStarted;
+    case: "started";
+  } | { case: undefined; value?: undefined } = { case: undefined };
+
+  constructor(data?: PartialMessage<ExecServerFrame>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ExecServerFrame";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "stdout", kind: "message", T: ExecOutput, oneof: "frame" },
+    { no: 2, name: "stderr", kind: "message", T: ExecOutput, oneof: "frame" },
+    { no: 3, name: "exit", kind: "message", T: ExecExit, oneof: "frame" },
+    { no: 4, name: "pong", kind: "message", T: ExecPing, oneof: "frame" },
+    { no: 5, name: "started", kind: "message", T: ExecStarted, oneof: "frame" },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ExecServerFrame {
+    return new ExecServerFrame().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ExecServerFrame {
+    return new ExecServerFrame().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ExecServerFrame {
+    return new ExecServerFrame().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ExecServerFrame | PlainMessage<ExecServerFrame> | undefined, b: ExecServerFrame | PlainMessage<ExecServerFrame> | undefined): boolean {
+    return proto3.util.equals(ExecServerFrame, a, b);
+  }
+}
+
+/**
+ * A chunk of captured output.
+ *
+ * @generated from message legion.ExecOutput
+ */
+export class ExecOutput extends Message<ExecOutput> {
+  /**
+   * @generated from field: bytes data = 1;
+   */
+  data = new Uint8Array(0);
+
+  constructor(data?: PartialMessage<ExecOutput>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ExecOutput";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "data", kind: "scalar", T: 12 /* ScalarType.BYTES */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ExecOutput {
+    return new ExecOutput().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ExecOutput {
+    return new ExecOutput().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ExecOutput {
+    return new ExecOutput().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ExecOutput | PlainMessage<ExecOutput> | undefined, b: ExecOutput | PlainMessage<ExecOutput> | undefined): boolean {
+    return proto3.util.equals(ExecOutput, a, b);
+  }
+}
+
+/**
+ * Terminal frame: the process exited. The stream closes after this.
+ *
+ * @generated from message legion.ExecExit
+ */
+export class ExecExit extends Message<ExecExit> {
+  /**
+   * @generated from field: int32 code = 1;
+   */
+  code = 0;
+
+  /**
+   * @generated from field: string message = 2;
+   */
+  message = "";
+
+  constructor(data?: PartialMessage<ExecExit>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ExecExit";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "code", kind: "scalar", T: 5 /* ScalarType.INT32 */ },
+    { no: 2, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ExecExit {
+    return new ExecExit().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ExecExit {
+    return new ExecExit().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ExecExit {
+    return new ExecExit().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ExecExit | PlainMessage<ExecExit> | undefined, b: ExecExit | PlainMessage<ExecExit> | undefined): boolean {
+    return proto3.util.equals(ExecExit, a, b);
+  }
+}
+
+/**
+ * Acknowledges that the session is live; the UI switches to the terminal on
+ * receipt. `session_id` identifies the session in audit events.
+ *
+ * @generated from message legion.ExecStarted
+ */
+export class ExecStarted extends Message<ExecStarted> {
+  /**
+   * @generated from field: string session_id = 1;
+   */
+  sessionId = "";
+
+  constructor(data?: PartialMessage<ExecStarted>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ExecStarted";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "session_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ExecStarted {
+    return new ExecStarted().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ExecStarted {
+    return new ExecStarted().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ExecStarted {
+    return new ExecStarted().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ExecStarted | PlainMessage<ExecStarted> | undefined, b: ExecStarted | PlainMessage<ExecStarted> | undefined): boolean {
+    return proto3.util.equals(ExecStarted, a, b);
+  }
+}
+
+/**
+ * Request payload for ListJobActions.
+ *
+ * @generated from message legion.ListJobActionsRequest
+ */
+export class ListJobActionsRequest extends Message<ListJobActionsRequest> {
+  /**
+   * Job whose declared actions to list.
+   *
+   * @generated from field: string job = 1;
+   */
+  job = "";
+
+  constructor(data?: PartialMessage<ListJobActionsRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListJobActionsRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "job", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListJobActionsRequest {
+    return new ListJobActionsRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListJobActionsRequest {
+    return new ListJobActionsRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListJobActionsRequest {
+    return new ListJobActionsRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListJobActionsRequest | PlainMessage<ListJobActionsRequest> | undefined, b: ListJobActionsRequest | PlainMessage<ListJobActionsRequest> | undefined): boolean {
+    return proto3.util.equals(ListJobActionsRequest, a, b);
+  }
+}
+
+/**
+ * One declared action, flattened with its owning task for discovery.
+ *
+ * @generated from message legion.JobAction
+ */
+export class JobAction extends Message<JobAction> {
+  /**
+   * @generated from field: string task_name = 1;
+   */
+  taskName = "";
+
+  /**
+   * @generated from field: string name = 2;
+   */
+  name = "";
+
+  /**
+   * @generated from field: string description = 3;
+   */
+  description = "";
+
+  /**
+   * @generated from field: bool tty = 4;
+   */
+  tty = false;
+
+  /**
+   * @generated from field: repeated legion.JobActionParam params = 5;
+   */
+  params: JobActionParam[] = [];
+
+  constructor(data?: PartialMessage<JobAction>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.JobAction";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "task_name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "description", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "tty", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 5, name: "params", kind: "message", T: JobActionParam, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): JobAction {
+    return new JobAction().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): JobAction {
+    return new JobAction().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): JobAction {
+    return new JobAction().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: JobAction | PlainMessage<JobAction> | undefined, b: JobAction | PlainMessage<JobAction> | undefined): boolean {
+    return proto3.util.equals(JobAction, a, b);
+  }
+}
+
+/**
+ * One declared parameter of an action.
+ *
+ * @generated from message legion.JobActionParam
+ */
+export class JobActionParam extends Message<JobActionParam> {
+  /**
+   * @generated from field: string name = 1;
+   */
+  name = "";
+
+  /**
+   * @generated from field: string description = 2;
+   */
+  description = "";
+
+  /**
+   * One of: string | int | bool | enum.
+   *
+   * @generated from field: string type = 3;
+   */
+  type = "";
+
+  /**
+   * @generated from field: bool required = 4;
+   */
+  required = false;
+
+  /**
+   * @generated from field: string default = 5;
+   */
+  default = "";
+
+  /**
+   * Allowed values for `enum` params.
+   *
+   * @generated from field: repeated string values = 6;
+   */
+  values: string[] = [];
+
+  /**
+   * Anchored regex for `string` params (empty = unconstrained).
+   *
+   * @generated from field: string pattern = 7;
+   */
+  pattern = "";
+
+  /**
+   * Inclusive bounds for `int` params (empty = unbounded).
+   *
+   * @generated from field: string min = 8;
+   */
+  min = "";
+
+  /**
+   * @generated from field: string max = 9;
+   */
+  max = "";
+
+  /**
+   * Redact the value in audit events + UI history.
+   *
+   * @generated from field: bool sensitive = 10;
+   */
+  sensitive = false;
+
+  constructor(data?: PartialMessage<JobActionParam>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.JobActionParam";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "description", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "type", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "required", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 5, name: "default", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "values", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 7, name: "pattern", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 8, name: "min", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 9, name: "max", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 10, name: "sensitive", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): JobActionParam {
+    return new JobActionParam().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): JobActionParam {
+    return new JobActionParam().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): JobActionParam {
+    return new JobActionParam().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: JobActionParam | PlainMessage<JobActionParam> | undefined, b: JobActionParam | PlainMessage<JobActionParam> | undefined): boolean {
+    return proto3.util.equals(JobActionParam, a, b);
+  }
+}
+
+/**
+ * Reply payload for ListJobActions.
+ *
+ * @generated from message legion.ListJobActionsReply
+ */
+export class ListJobActionsReply extends Message<ListJobActionsReply> {
+  /**
+   * @generated from field: repeated legion.JobAction actions = 1;
+   */
+  actions: JobAction[] = [];
+
+  constructor(data?: PartialMessage<ListJobActionsReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListJobActionsReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "actions", kind: "message", T: JobAction, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListJobActionsReply {
+    return new ListJobActionsReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListJobActionsReply {
+    return new ListJobActionsReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListJobActionsReply {
+    return new ListJobActionsReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListJobActionsReply | PlainMessage<ListJobActionsReply> | undefined, b: ListJobActionsReply | PlainMessage<ListJobActionsReply> | undefined): boolean {
+    return proto3.util.equals(ListJobActionsReply, a, b);
+  }
+}
+
+/**
  * Selects which captured stream(s) to read for a task.
  *
  * Used by both `Worker.GetTaskLogs` and `Manager.GetAllocationLogs`.

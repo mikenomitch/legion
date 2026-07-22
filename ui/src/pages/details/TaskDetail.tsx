@@ -3,6 +3,7 @@ import { For, Show, createMemo, createResource } from 'solid-js'
 import { DetailBadge, DetailSection } from '../../components/DetailPrimitives'
 import LogViewer from '../../components/LogViewer'
 import { managerClient } from '../../grpcClient'
+import AllocationExecPanel from '../../components/AllocationExecPanel'
 import { formatDate } from '../../utils/format'
 import {
   artifactProgressPercent,
@@ -43,10 +44,11 @@ export default function TaskDetail() {
   const taskName = createMemo(() => decodeURIComponent(params.taskName))
 
   const [data] = createResource(async () => {
-    const [jobInfo, rollouts, spec] = await Promise.all([
+    const [jobInfo, rollouts, spec, ledger] = await Promise.all([
       managerClient.getJobInfo({ name: jobName() }),
       managerClient.listRollouts({ jobId: jobName(), activeOnly: false, page: 1, pageSize: 200 }),
       managerClient.getJobSpec({ name: jobName() }),
+      managerClient.getLedger({}),
     ])
 
     const latestRollout = rollouts.rollouts[0]
@@ -56,10 +58,19 @@ export default function TaskDetail() {
     const runtimeByTask = buildTaskRuntimeByName(rolloutStatus?.groups ?? [])
     const taskRuntime = runtimeByTask.get(taskName())
 
+    // All running allocations for this job (from the ledger), regardless of
+    // whether a rollout produced them. The exec panel targets these; the
+    // manager rejects exec into an allocation whose task != this page's task.
+    const runnable = new Set(['placed', 'active', 'running'])
+    const jobAllocations = ledger.nodes
+      .flatMap((node) => node.allocations)
+      .filter((alloc) => alloc.jobId === jobName() && runnable.has(alloc.status))
+
     return {
       job: jobInfo.job,
       taskSpec,
       taskRuntime,
+      jobAllocations,
       latestRollout,
       groups: rolloutStatus?.groups ?? [],
     }
@@ -247,6 +258,30 @@ export default function TaskDetail() {
               </Show>
             </DetailSection>
           </Show>
+
+          <DetailSection title="Exec & Actions">
+            <Show
+              when={data()!.jobAllocations.length > 0}
+              fallback={<p class="text-sm text-neutral-500">No running allocations to exec into.</p>}
+            >
+              <div class="space-y-2">
+                <For each={data()!.jobAllocations}>{(alloc) => (
+                  <div class="rounded border border-neutral-200 p-3 dark:border-neutral-700">
+                    <div class="flex flex-wrap items-center justify-between gap-2">
+                      <p class="text-sm font-semibold">Allocation #{String(alloc.id)}</p>
+                      <DetailBadge tone={taskStatusTone(alloc.status)}>{alloc.status}</DetailBadge>
+                    </div>
+                    <p class="mt-1 text-xs text-neutral-500">Node {alloc.nodeId}</p>
+                    <AllocationExecPanel
+                      allocationId={alloc.id}
+                      jobName={jobName()}
+                      taskName={taskName()}
+                    />
+                  </div>
+                )}</For>
+              </div>
+            </Show>
+          </DetailSection>
 
           <DetailSection title="Logs">
             <Show

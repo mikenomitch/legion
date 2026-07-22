@@ -73,6 +73,16 @@ flate2 = "1.0"
 oci-client = { version = "0.15", default-features = false, features = ["rustls-tls"] }
 openraft = "0.9.21"
 rustyriver = "0.1.0"
+# Exec/PTY: cross-platform pty (openpty + ConPTY) for interactive exec.
+portable-pty = "0.8.1"
+# Browser exec transport: a dedicated WebSocket listener (tonic's gRPC server
+# does not enable HTTP upgrades, so exec-over-WS needs its own hyper listener).
+tokio-tungstenite = "0.24"
+hyper-tungstenite = "0.15"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "server"] }
+# CLI interactive terminal: raw mode + window size for `legion exec -it`.
+crossterm = "0.28"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4.1"

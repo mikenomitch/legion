@@ -1,3 +1,7 @@
+// The generated protobuf code (included below) carries doc comments whose
+// list formatting newer clippy flags; we don't hand-maintain generated output.
+#![allow(clippy::doc_overindented_list_items)]
+
 tonic::include_proto!("legion");
 
 pub mod acl;

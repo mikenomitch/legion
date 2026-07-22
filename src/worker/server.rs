@@ -1,12 +1,13 @@
 use crate::prelude::*;
 use crate::structs::{
-    worker_server::Worker, GetTaskLogsReply, GetTaskLogsRequest, PostWorkReply, PostWorkRequest,
-    RestartWorkerReply, RestartWorkerRequest, TaskLogStream,
+    worker_server::Worker, ExecClientFrame, GetTaskLogsReply, GetTaskLogsRequest, PostWorkReply,
+    PostWorkRequest, RestartWorkerReply, RestartWorkerRequest, TaskLogStream,
 };
+use crate::worker::exec::{handle_exec_task, ExecTaskStream};
 use crate::worker::identity::WorkerIdentityManager;
 use crate::worker::task_manager::{launch_task_allocation, WorkerTaskManager};
 use std::sync::{Arc, Mutex};
-use tonic::{Request, Response, Status};
+use tonic::{Request, Response, Status, Streaming};
 
 pub struct WorkerDaemonService {
     pub task_manager: Arc<Mutex<WorkerTaskManager>>,
@@ -107,6 +108,17 @@ impl Worker for WorkerDaemonService {
             .collect();
 
         Ok(Response::new(GetTaskLogsReply { streams }))
+    }
+
+    type ExecTaskStream = ExecTaskStream;
+
+    #[instrument(skip_all)]
+    async fn exec_task(
+        &self,
+        request: Request<Streaming<ExecClientFrame>>,
+    ) -> Result<Response<Self::ExecTaskStream>, Status> {
+        let stream = handle_exec_task(self.task_manager.clone(), request.into_inner()).await?;
+        Ok(Response::new(stream))
     }
 
     #[instrument(err, skip_all)]

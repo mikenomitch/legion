@@ -10,6 +10,10 @@
   evalThreads: 4,
   schedulingPolicy: "bin_pack",
   defaultPriority: 50,
+  // Exec & actions (docs/exec-and-actions.md). Enabled by default; exec is
+  // still per-caller default-deny once ACLs are on. Set enabled:false to turn
+  // off ExecAllocation and the exec WebSocket bridge entirely.
+  // exec: { enabled: true },
   schedulerSettings: {
     plan_conflict_max_retries: 3,
   },

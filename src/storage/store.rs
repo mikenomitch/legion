@@ -484,7 +484,7 @@ impl Store {
 
         let mut task_stmt = conn.prepare(
             r#"
-            SELECT id, name, kind, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_config_id, identities, stateful, artifacts, network, service
+            SELECT id, name, kind, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_config_id, identities, stateful, artifacts, network, service, actions
             FROM task_config;
             "#,
         )?;
@@ -520,6 +520,7 @@ impl Store {
                 artifacts: self.parse_artifacts_column(20, row.get(20)?)?,
                 network: parse_json_column(21, row.get(21)?)?,
                 service: parse_json_column(22, row.get(22)?)?,
+                actions: self.parse_actions_column(23, row.get(23)?)?,
             };
             let job_config_id: String = row.get(17)?;
             Ok((job_config_id, id, task))
@@ -1387,6 +1388,23 @@ impl Store {
         })
     }
 
+    fn parse_actions_column(
+        &self,
+        idx: usize,
+        raw: Option<String>,
+    ) -> Result<Vec<crate::structs::ActionSpec>, rusqlite::Error> {
+        let Some(raw) = raw else {
+            return Ok(Vec::new());
+        };
+        serde_json::from_str(&raw).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(
+                idx,
+                rusqlite::types::Type::Text,
+                Box::new(err),
+            )
+        })
+    }
+
     fn parse_identities_column(
         &self,
         idx: usize,
@@ -1466,6 +1484,7 @@ impl Store {
             artifacts: self.parse_artifacts_column(21, row.get(21)?)?,
             network: parse_json_column(22, row.get(22)?)?,
             service: parse_json_column(23, row.get(23)?)?,
+            actions: self.parse_actions_column(24, row.get(24)?)?,
         };
 
         Ok(task_config)
@@ -2452,6 +2471,11 @@ impl Store {
             } else {
                 Some(serde_json::to_string(&t.artifacts)?)
             };
+            let actions = if t.actions.is_empty() {
+                None
+            } else {
+                Some(serde_json::to_string(&t.actions)?)
+            };
             let schedule = t.schedule.as_ref().map(ToString::to_string);
             let task_params = named_params! {
                 ":name": t.name,
@@ -2477,6 +2501,7 @@ impl Store {
                 ":artifacts": artifacts,
                 ":network": network,
                 ":service": service,
+                ":actions": actions,
             };
 
             let task_id: i64 = tx.query_row(&INSERT_TASK, task_params, |row| row.get(0))?;
@@ -6771,6 +6796,51 @@ mod tests {
         let loaded = store.get_job_config(&job.name)?;
         assert_eq!(loaded.tasks.len(), 1);
         assert_eq!(loaded.tasks[0].identities, vec![identity]);
+        Ok(())
+    }
+
+    #[test]
+    fn tasks_with_actions_round_trip() -> R<()> {
+        use crate::structs::{ActionParam, ActionParamType, ActionSpec};
+        let store = setup_store()?;
+        let mut t = task("worker");
+        t.actions = vec![ActionSpec {
+            name: "flush-cache".into(),
+            description: "Flush it".into(),
+            command: vec!["/bin/echo".into(), "${param.scope}".into()],
+            params: vec![ActionParam {
+                name: "scope".into(),
+                description: String::new(),
+                param_type: ActionParamType::Enum,
+                default: Some("all".into()),
+                required: None,
+                values: vec!["all".into(), "sessions".into()],
+                pattern: None,
+                min: None,
+                max: None,
+                sensitive: false,
+            }],
+            tty: false,
+            timeout: None,
+        }];
+        let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "actions-persist".into(),
+            tasks: vec![t.clone()],
+            version: None,
+        };
+        store.handle_job_submit(
+            &job,
+            &[Submission {
+                path: "job.jsonnet".into(),
+                content: "{}".into(),
+                is_primary: true,
+            }],
+        )?;
+        // Read back through both parsers: get_job_config and the read-model.
+        let loaded = store.get_job_config(&job.name)?;
+        assert_eq!(loaded.tasks[0].actions, t.actions);
         Ok(())
     }
 

@@ -14,11 +14,13 @@ use std::process::{Child, Command};
 
 mod container;
 mod exec;
+mod exec_session;
 mod oci_bundle;
 mod schema_docs;
 
 pub use container::ContainerTaskPlugin;
 pub use exec::ExecTaskPlugin;
+pub use exec_session::{spawn_pipe, spawn_pty, ExecOptions, ExecOutputStreams, ExecSession};
 pub use schema_docs::{
     builtin_task_plugin_schemas, render_builtin_task_plugin_schemas_markdown,
     validate_builtin_task_plugin_schemas,
@@ -131,6 +133,34 @@ pub struct TaskRuntime {
     pub log_dir: Option<PathBuf>,
 }
 
+/// Whether exec into a kind means host-level (unsandboxed) access, used by
+/// the manager to pick the `host` ACL flag *before* it proxies to the worker.
+///
+/// This is a static classification (it must not depend on the worker's OS or
+/// runtime detection, which the manager cannot see). The worker still checks
+/// real availability via [`TaskPlugin::exec_support`] and errors if a kind
+/// cannot actually exec. Unknown/dynamic kinds are treated as host-level so
+/// they require the stronger `exec:write` + `host` grant by default.
+pub fn kind_is_host_level(kind: &str) -> bool {
+    match kind {
+        "container" => false,
+        "exec" => true,
+        _ => true,
+    }
+}
+
+/// What a task kind can do for `legion exec` / actions.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ExecSupport {
+    /// One-shot + streamed exec (piped stdio).
+    pub exec: bool,
+    /// Interactive PTY sessions (`--tty`).
+    pub pty: bool,
+    /// True when exec'ing means unsandboxed host access (drives the ACL
+    /// `host` distinction, like Nomad's `alloc-node-exec`).
+    pub host_level: bool,
+}
+
 pub trait TaskPlugin: Send + Sync {
     fn name(&self) -> &'static str;
 
@@ -206,6 +236,24 @@ pub trait TaskPlugin: Send + Sync {
     ) -> R<()> {
         let _ = (staged, runtime);
         Ok(())
+    }
+
+    /// What this kind supports for exec / actions. Defaults to none, so a
+    /// kind that has not opted in fails fast and honestly (S4 in the plan).
+    fn exec_support(&self) -> ExecSupport {
+        ExecSupport::default()
+    }
+
+    /// Open a live exec session inside (or alongside) the running allocation.
+    /// The default rejects; kinds that report `exec_support().exec` override.
+    fn exec(
+        &self,
+        _allocation: &Allocation,
+        _task: &TaskConfig,
+        _runtime: &mut TaskRuntime,
+        _opts: ExecOptions,
+    ) -> R<Box<dyn ExecSession>> {
+        bail!("task kind `{}` does not support exec", self.name())
     }
 
     fn prepare(
@@ -314,6 +362,7 @@ pub fn validate_job_config(config: &JobConfig) -> R<()> {
         task.validate_stateful()?;
         task.validate_identities()?;
         task.validate_artifacts()?;
+        task.validate_actions()?;
         if !task.artifacts.is_empty() {
             registry.load_plugin(&task.kind, false)?;
             let plugin = registry

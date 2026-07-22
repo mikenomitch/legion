@@ -149,6 +149,13 @@ pub async fn run_manager(config: ManagerConfig, run_worker: bool) -> R<()> {
         None
     };
 
+    // Clone store + authenticator for the exec WebSocket listener before the
+    // service takes ownership of them.
+    let exec_ws_state = crate::manager::exec_ws::ExecWsState {
+        store: store.clone(),
+        auth: authenticator.clone(),
+    };
+
     let manager_node = ManagerDaemonService::with_manager_config(store, &full_config)
         .with_workload_identity(workload_identity_state.clone())
         .with_kv_debounce(Duration::from_millis(full_config.kv_debounce_ms))
@@ -156,6 +163,27 @@ pub async fn run_manager(config: ManagerConfig, run_worker: bool) -> R<()> {
         .with_advertise_addr(full_config.server.advertised_address());
 
     let addr = format!("{}:{}", full_config.server.host, full_config.server.port).parse()?;
+
+    // Exec WebSocket listener on the next port (browsers cannot do bidi
+    // streaming over gRPC-Web; tonic's listener does not do HTTP upgrades).
+    // Skipped entirely when exec is disabled.
+    if full_config.exec.enabled {
+        let exec_ws_addr: std::net::SocketAddr = format!(
+            "{}:{}",
+            full_config.server.host,
+            full_config.server.port + 1
+        )
+        .parse()?;
+        tokio::spawn(async move {
+            if let Err(err) =
+                crate::manager::exec_ws::serve_exec_ws(exec_ws_addr, exec_ws_state).await
+            {
+                tracing::error!(error = ?err, "exec ws listener exited");
+            }
+        });
+    } else {
+        info!("Exec is disabled (exec.enabled=false); ExecAllocation and the exec WebSocket are off");
+    }
 
     let tls_identity = load_server_tls_identity(&full_config.server.tls)?;
     let server_builder = match tls_identity {

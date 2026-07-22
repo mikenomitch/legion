@@ -98,6 +98,41 @@ pub struct ManagerConfig {
     #[serde(default)]
     pub acl: Option<AclConfig>,
     pub artifacts: Option<ArtifactsManagerConfig>,
+    /// Exec/actions settings (see docs/exec-and-actions.md).
+    #[serde(default)]
+    pub exec: Option<ExecConfig>,
+}
+
+/// Exec/actions configuration. Enabled by default (exec is still per-caller
+/// default-deny once ACLs are on); a hardened site can disable it entirely.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecConfig {
+    /// Master switch for `ExecAllocation` + the exec WebSocket bridge.
+    /// Default: true.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+}
+
+/// Resolved exec configuration.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecConfigFull {
+    pub enabled: bool,
+}
+
+impl Default for ExecConfigFull {
+    fn default() -> Self {
+        ExecConfigFull { enabled: true }
+    }
+}
+
+impl ExecConfig {
+    pub fn with_defaults(&self) -> ExecConfigFull {
+        ExecConfigFull {
+            enabled: self.enabled.unwrap_or(true),
+        }
+    }
 }
 
 /// Default TTL for tokens minted via Login (userpass or JWT exchange).
@@ -604,6 +639,8 @@ pub struct ManagerConfigFull {
     #[serde(default)]
     pub acl: AclConfigFull,
     pub artifacts: ArtifactsManagerConfigFull,
+    #[serde(default)]
+    pub exec: ExecConfigFull,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -707,6 +744,9 @@ impl From<ManagerConfigFull> for ManagerConfig {
             workload_identity: Some(val.workload_identity.into()),
             acl: Some(val.acl.into()),
             artifacts: Some(val.artifacts.into()),
+            exec: Some(ExecConfig {
+                enabled: Some(val.exec.enabled),
+            }),
         }
     }
 }
@@ -763,6 +803,11 @@ impl ManagerConfig {
                 .as_ref()
                 .map(ArtifactsManagerConfig::with_defaults)
                 .unwrap_or_default(),
+            exec: self
+                .exec
+                .as_ref()
+                .map(ExecConfig::with_defaults)
+                .unwrap_or_default(),
         }
     }
 }
@@ -786,6 +831,7 @@ impl Default for ManagerConfigFull {
             workload_identity: WorkloadIdentityConfigFull::default(),
             acl: AclConfigFull::default(),
             artifacts: ArtifactsManagerConfigFull::default(),
+            exec: ExecConfigFull::default(),
         }
     }
 }

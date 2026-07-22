@@ -2,6 +2,8 @@ pub mod acl;
 pub mod auth_method;
 pub mod daemon;
 pub mod dispatcher;
+pub mod exec;
+pub mod exec_ws;
 pub mod oidc_http;
 pub mod rollout;
 pub mod rollout_strategy;
