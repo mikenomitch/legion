@@ -86,6 +86,9 @@ impl FileLogSink {
     fn write_manifest(&self, resource: &LogResource) -> R<()> {
         std::fs::create_dir_all(&resource.log_dir)
             .with_context(|| format!("failed to create log dir {}", resource.log_dir.display()))?;
+        // Either this sink or log capture may create the directory first;
+        // both enforce the owner-only isolation boundary.
+        crate::util::restrict_dir_to_owner(&resource.log_dir)?;
         let manifest = json!({
             "schema": "legion.task-logs/v1",
             "resource": resource.otel_attributes(),

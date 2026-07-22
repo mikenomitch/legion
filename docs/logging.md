@@ -35,6 +35,11 @@ two append-mode files in a per-allocation directory:
 The state dir defaults to `.legion/workers/<worker-id>/` (override the worker
 state path with `LEGION_WORKER_STATE_PATH`).
 
+The per-allocation log directory is created owner-only (`0700` on Unix):
+captured output can carry secrets, so other tasks and local users on the node
+cannot read it. Tasks never need to enter the directory themselves — the
+worker opens the capture file descriptors before spawning the task.
+
 Capture is wired through the task plugin runtime: the worker sets a log
 directory on `TaskRuntime`, and the built-in `exec` and `container` task kinds
 redirect their child process to those files

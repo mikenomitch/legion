@@ -298,6 +298,11 @@ impl WorkerTaskManager {
         let task_dir = alloc_dir.join(&task.name);
         std::fs::create_dir_all(&task_dir)
             .with_context(|| format!("create task directory {}", task_dir.display()))?;
+        // Owner-only: the alloc dir is the isolation boundary between
+        // allocations sharing a node — other tasks must not be able to reach
+        // this allocation's artifacts, injected secrets, or output.
+        crate::util::restrict_dir_to_owner(&alloc_dir)?;
+        crate::util::restrict_dir_to_owner(&task_dir)?;
         let mut runtime = TaskRuntime::default();
         runtime
             .extra_env
@@ -1101,6 +1106,36 @@ mod tests {
             Some(task_dir.to_str().unwrap())
         );
         assert!(runtime.extra_env.contains_key("LEGION_ALLOC_DIR"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn alloc_and_task_dirs_are_owner_only() -> R<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        let task = TaskConfig {
+            config: json!({"command": ["true"]}),
+            ..TaskConfig::new("exec-task", "exec")
+        };
+
+        manager.run_allocation(&alloc(), &task)?;
+
+        // The alloc dir is the isolation boundary between tasks on the node:
+        // anything looser than 0700 exposes artifacts/secrets/output to
+        // every other local process.
+        let alloc_dir = temp_dir.path().join("allocs").join("5");
+        for dir in [alloc_dir.clone(), alloc_dir.join("exec-task")] {
+            let mode = std::fs::metadata(&dir)?.permissions().mode() & 0o777;
+            assert_eq!(
+                mode,
+                0o700,
+                "{} must be owner-only, got {mode:o}",
+                dir.display()
+            );
+        }
         Ok(())
     }
 

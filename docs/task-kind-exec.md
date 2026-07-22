@@ -17,7 +17,13 @@ Optional:
 - `env`: map of string env vars.
 - `cwd`: working directory. Defaults to the allocation's private task
   directory when unset (see Artifacts Support below).
-- `user` (unix): run as given user (resolved to uid/gid).
+- `user` (unix): run as given user (resolved to uid/gid). At start the
+  allocation directory tree is chowned to this user (without following
+  symlinks): the worker creates alloc/task dirs owner-only as the isolation
+  boundary between allocations on a node, so the tree must be handed over
+  for the dropped-privilege process to use its own cwd and artifacts.
+  Chowning to a different user requires the worker to run with the
+  privileges to do so (as does setting uid/gid at all).
 - `oom_adj` / `oom_score_adj` (linux): one of these, range `-1000..1000`.
 - `cgroup` (linux): cgroup path.
 - `landlock` (linux):

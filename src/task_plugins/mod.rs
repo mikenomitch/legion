@@ -65,6 +65,11 @@ pub fn configure_task_log_capture(cmd: &mut Command, runtime: &TaskRuntime) -> R
     };
     std::fs::create_dir_all(log_dir)
         .with_context(|| format!("failed to create log dir {}", log_dir.display()))?;
+    // Captured stdout/stderr can carry secrets; keep the allocation's log
+    // directory unreadable to other tasks on the node. The capture files are
+    // opened by the worker before spawn, so the task itself never needs to
+    // enter this directory.
+    crate::util::restrict_dir_to_owner(log_dir)?;
 
     let stdout = open_log_file(&log_dir.join(STDOUT_LOG_FILE))?;
     let stderr = open_log_file(&log_dir.join(STDERR_LOG_FILE))?;
@@ -672,6 +677,25 @@ mod tests {
             }),
             ..TaskConfig::new("container-task", "container")
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn log_capture_dir_is_owner_only() -> R<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::TempDir::new()?;
+        let log_dir = temp_dir.path().join("logs").join("1");
+        let runtime = TaskRuntime {
+            log_dir: Some(log_dir.clone()),
+            ..TaskRuntime::default()
+        };
+
+        configure_task_log_capture(&mut Command::new("true"), &runtime)?;
+
+        let mode = std::fs::metadata(&log_dir)?.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "log dir must be owner-only, got {mode:o}");
+        Ok(())
     }
 
     #[test]
