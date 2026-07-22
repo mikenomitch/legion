@@ -25,12 +25,13 @@ use crate::cmd::helpers::connect_manager_client;
 use crate::cmd::output::CliError;
 use crate::prelude::*;
 use crate::structs::{
-    CreateInstanceRequest, CreateInstancesRequest, DestroyInstanceRequest, DestroyJobRequest,
+    exec_client_frame, exec_server_frame, CreateInstanceRequest, CreateInstancesRequest,
+    DestroyInstanceRequest, DestroyJobRequest, ExecClientFrame, ExecInput, ExecStart,
     GetAllocationLogsRequest, GetInstanceRequest, GetJobInfoRequest, GetJobSpecRequest,
-    GetNodesRequest, GetRolloutStatusRequest, GetStateStoreSchemaRequest, JobConfig,
-    ListEventsRequest, ListInstancesRequest, ListJobsRequest, ListRolloutsRequest,
-    QueryStateStoreRequest, ReplaceInstanceRequest, RunJobRequest, StartInstanceRequest,
-    StopInstanceRequest, StopJobRequest,
+    GetLedgerRequest, GetNodesRequest, GetRolloutStatusRequest, GetStateStoreSchemaRequest,
+    JobConfig, ListEventsRequest, ListInstancesRequest, ListJobActionsRequest, ListJobsRequest,
+    ListRolloutsRequest, QueryStateStoreRequest, ReplaceInstanceRequest, RunJobRequest,
+    StartInstanceRequest, StopInstanceRequest, StopJobRequest,
 };
 use crate::task_plugins::validate_job_config;
 use serde::Serialize;
@@ -362,6 +363,48 @@ fn tool_defs() -> Vec<ToolDef> {
             }),
             mutates: true,
         },
+        ToolDef {
+            name: "legion_action_list",
+            description: "List the declared actions (pre-baked, parameterized commands) on a job's tasks, including each action's parameters.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": { "job": { "type": "string", "description": "Job name." } },
+                "required": ["job"],
+                "additionalProperties": false
+            }),
+            mutates: false,
+        },
+        ToolDef {
+            name: "legion_action_run",
+            description: "Run a declared action against a running allocation and return its combined output and exit code. One-shot (no interactive tty). Mutating.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "job": { "type": "string", "description": "Job name (used to pick the newest running allocation when allocation_id is omitted)." },
+                    "action": { "type": "string", "description": "Action name." },
+                    "allocation_id": { "type": "integer", "description": "Target allocation id; defaults to the newest running allocation of the job." },
+                    "params": { "type": "object", "description": "Action parameters as a string->string map.", "additionalProperties": { "type": "string" } }
+                },
+                "required": ["job", "action"],
+                "additionalProperties": false
+            }),
+            mutates: true,
+        },
+        ToolDef {
+            name: "legion_exec_run",
+            description: "Run a one-shot command inside a running allocation and return its stdout, stderr, and exit code. No interactive tty. Mutating; requires exec:write.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "allocation_id": { "type": "integer", "description": "Target allocation id." },
+                    "command": { "type": "array", "items": { "type": "string" }, "description": "Command argv; first element is the program." },
+                    "task": { "type": "string", "description": "Task name, for multi-task allocations." }
+                },
+                "required": ["allocation_id", "command"],
+                "additionalProperties": false
+            }),
+            mutates: true,
+        },
     ]
 }
 
@@ -531,6 +574,66 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
         "legion_acl_whoami" => {
             let mut client = connect().await?;
             grpc(client.who_am_i(crate::structs::WhoAmIRequest {})).await
+        }
+        "legion_action_list" => {
+            let job = str_arg(&args, "job")?;
+            let mut client = connect().await?;
+            grpc(client.list_job_actions(ListJobActionsRequest { job })).await
+        }
+        "legion_action_run" => {
+            let job = str_arg(&args, "job")?;
+            let action = str_arg(&args, "action")?;
+            let params: std::collections::HashMap<String, String> = args
+                .get("params")
+                .and_then(Value::as_object)
+                .map(|m| {
+                    m.iter()
+                        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut client = connect().await?;
+            let allocation_id = match args.get("allocation_id").and_then(Value::as_i64) {
+                Some(id) => id,
+                None => newest_alloc_for_job(&mut client, &job).await?,
+            };
+            let start = ExecStart {
+                allocation_id,
+                task_name: String::new(),
+                command: Vec::new(),
+                action,
+                action_params: params,
+                tty: false,
+                winsize: None,
+                bearer_token: String::new(),
+            };
+            run_exec_oneshot(&mut client, start).await
+        }
+        "legion_exec_run" => {
+            let allocation_id = args
+                .get("allocation_id")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| "missing integer argument: allocation_id".to_string())?;
+            let command: Vec<String> = args
+                .get("command")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+            if command.is_empty() {
+                return Err("command must be a non-empty array".to_string());
+            }
+            let start = ExecStart {
+                allocation_id,
+                task_name: opt_str_arg(&args, "task").unwrap_or_default(),
+                command,
+                action: String::new(),
+                action_params: std::collections::HashMap::new(),
+                tty: false,
+                winsize: None,
+                bearer_token: String::new(),
+            };
+            let mut client = connect().await?;
+            run_exec_oneshot(&mut client, start).await
         }
         "legion_instance_list" => {
             let job_id = str_arg(&args, "job_id")?;
@@ -741,6 +844,84 @@ fn validate_tool(args: Value) -> Result<Value, String> {
 /// Connect to the manager, mapping connection failures to a tool error string.
 async fn connect() -> Result<crate::cmd::helpers::AuthedManagerClient, String> {
     connect_manager_client().await.map_err(|e| e.to_string())
+}
+
+/// Pick the newest running allocation for a job (for exec/action tools that
+/// default the target).
+async fn newest_alloc_for_job(
+    client: &mut crate::cmd::helpers::AuthedManagerClient,
+    job: &str,
+) -> Result<i64, String> {
+    let ledger = client
+        .get_ledger(GetLedgerRequest {})
+        .await
+        .map_err(|s| s.message().to_string())?
+        .into_inner();
+    let mut best: Option<i64> = None;
+    for node in ledger.nodes {
+        for alloc in node.allocations {
+            if alloc.job_id == job
+                && matches!(alloc.status.as_str(), "placed" | "active" | "running")
+            {
+                best = Some(best.map_or(alloc.id, |b| b.max(alloc.id)));
+            }
+        }
+    }
+    best.ok_or_else(|| format!("no running allocation found for job `{job}`"))
+}
+
+/// Drive a one-shot exec/action session over `ExecAllocation`, collecting
+/// stdout/stderr and the exit code. Interactive PTY is not supported here.
+async fn run_exec_oneshot(
+    client: &mut crate::cmd::helpers::AuthedManagerClient,
+    start: ExecStart,
+) -> Result<Value, String> {
+    let (tx, rx) = tokio::sync::mpsc::channel::<ExecClientFrame>(8);
+    tx.send(ExecClientFrame {
+        frame: Some(exec_client_frame::Frame::Start(start)),
+    })
+    .await
+    .ok();
+    // No stdin; signal EOF immediately.
+    tx.send(ExecClientFrame {
+        frame: Some(exec_client_frame::Frame::Stdin(ExecInput {
+            data: Vec::new(),
+            eof: true,
+        })),
+    })
+    .await
+    .ok();
+    drop(tx);
+
+    let mut inbound = client
+        .exec_allocation(tokio_stream::wrappers::ReceiverStream::new(rx))
+        .await
+        .map_err(|s| s.message().to_string())?
+        .into_inner();
+
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let mut exit_code = -1i32;
+    let mut exit_message = String::new();
+    while let Some(frame) = inbound.message().await.map_err(|s| s.message().to_string())? {
+        match frame.frame {
+            Some(exec_server_frame::Frame::Stdout(o)) => stdout.extend_from_slice(&o.data),
+            Some(exec_server_frame::Frame::Stderr(o)) => stderr.extend_from_slice(&o.data),
+            Some(exec_server_frame::Frame::Exit(e)) => {
+                exit_code = e.code;
+                exit_message = e.message;
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    Ok(json!({
+        "exit_code": exit_code,
+        "stdout": String::from_utf8_lossy(&stdout),
+        "stderr": String::from_utf8_lossy(&stderr),
+        "message": exit_message,
+    }))
 }
 
 /// Execute a gRPC call and serialize the reply to JSON, mapping a gRPC

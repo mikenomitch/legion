@@ -13,6 +13,8 @@ Design rationale and the alternatives considered live in
 - [Actions](#actions)
 - [Which task kinds support exec](#which-task-kinds-support-exec)
 - [ACLs](#acls)
+- [Agents (MCP)](#agents-mcp)
+- [Disabling exec](#disabling-exec)
 - [How it works](#how-it-works)
 
 ---
@@ -172,6 +174,30 @@ is the entire point of actions.
 Every session and action run is audited (tracing target `exec_audit`) with the
 principal, accessor id, allocation, task, command or action + parameters
 (sensitive values redacted), tty flag, and exit code.
+
+## Agents (MCP)
+
+The MCP server (`legion mcp serve`) exposes exec/actions to agents:
+
+- `legion_action_list` (read-only) — list a job's declared actions and params.
+- `legion_action_run` (mutating, needs `--allow-write`) — run an action
+  one-shot and return combined output + exit code.
+- `legion_exec_run` (mutating, needs `--allow-write`) — run a one-shot command
+  and return stdout, stderr, and exit code.
+
+There is no interactive PTY over MCP — these tools are one-shot only.
+
+## Disabling exec
+
+Exec is on by default (it is still per-caller default-deny once ACLs are
+enabled). A hardened deployment can turn it off entirely in the manager config:
+
+```jsonnet
+// configs/manager.jsonnet
+{
+  exec: { enabled: false },   // ExecAllocation rejects; the WS bridge is not started
+}
+```
 
 ## How it works
 

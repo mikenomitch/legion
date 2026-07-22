@@ -833,6 +833,9 @@ pub struct ManagerDaemonService {
     /// Fetcher registry used to resolve `resolve: "pin"` references at
     /// submit (blocking; callers wrap in block_in_place).
     fetcher_registry: Arc<Mutex<crate::artifacts::FetcherRegistry>>,
+    /// Whether `ExecAllocation` is enabled (config `exec.enabled`, default
+    /// true). When false the endpoint rejects with FailedPrecondition.
+    exec_enabled: bool,
 }
 
 impl ManagerDaemonService {
@@ -858,6 +861,7 @@ impl ManagerDaemonService {
             fetcher_registry: Arc::new(Mutex::new(
                 crate::artifacts::FetcherRegistry::with_builtins(),
             )),
+            exec_enabled: true,
         }
     }
 
@@ -985,6 +989,7 @@ impl ManagerDaemonService {
             .iter()
             .map(|identity| identity.name.clone())
             .collect();
+        service.exec_enabled = config.exec.enabled;
         service
     }
 
@@ -2061,6 +2066,11 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<Streaming<ExecClientFrame>>,
     ) -> Result<Response<Self::ExecAllocationStream>, Status> {
+        if !self.exec_enabled {
+            return Err(Status::failed_precondition(
+                "exec is disabled on this manager (exec.enabled=false)",
+            ));
+        }
         // Authenticate from request metadata (native gRPC and the WS bridge,
         // which lifts the in-frame token into metadata before dialing). ACL
         // enforcement + action rendering happen on the parsed ExecStart.
