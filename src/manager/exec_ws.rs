@@ -203,7 +203,7 @@ async fn bridge(websocket: hyper_tungstenite::HyperWebsocket, state: ExecWsState
                 let is_exit =
                     matches!(frame.frame, Some(crate::structs::exec_server_frame::Frame::Exit(_)));
                 let bytes = frame.encode_to_vec();
-                if ws_out.send(Message::Binary(bytes.into())).await.is_err() {
+                if ws_out.send(Message::Binary(bytes)).await.is_err() {
                     break;
                 }
                 if is_exit {
@@ -235,6 +235,6 @@ where
             },
         )),
     };
-    let _ = ws_out.send(Message::Binary(frame.encode_to_vec().into())).await;
+    let _ = ws_out.send(Message::Binary(frame.encode_to_vec())).await;
     let _ = ws_out.send(Message::Close(None)).await;
 }

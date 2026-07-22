@@ -1,3 +1,7 @@
+// `tonic::Status` is large; like `server.rs` we accept a large Err variant
+// rather than boxing every `Result`.
+#![allow(clippy::result_large_err)]
+
 //! Manager-side exec/action proxy.
 //!
 //! `Manager.ExecAllocation` authorizes an exec request, resolves the target
@@ -196,7 +200,7 @@ fn resolve_exec_start(
         task_name: task.name.clone(),
         command,
         tty,
-        winsize: start.winsize.clone(),
+        winsize: start.winsize,
         audit_subject,
         audit_params,
     })
@@ -257,7 +261,7 @@ pub async fn run_exec_session(
         action: String::new(),
         action_params: Default::default(),
         tty: resolved.tty,
-        winsize: resolved.winsize.clone(),
+        winsize: resolved.winsize,
         bearer_token: String::new(),
     };
 

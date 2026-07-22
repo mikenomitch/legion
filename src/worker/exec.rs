@@ -136,34 +136,29 @@ pub async fn handle_exec_task(
 
     // Async reader: pull client frames, forward to the driver / answer pings.
     tokio::spawn(async move {
-        loop {
-            match inbound.message().await {
-                Ok(Some(frame)) => match frame.frame {
-                    Some(exec_client_frame::Frame::Stdin(input)) => {
-                        if !input.data.is_empty() {
-                            let _ = in_tx.send(InputCmd::Stdin(input.data));
-                        }
-                        if input.eof {
-                            let _ = in_tx.send(InputCmd::CloseStdin);
-                        }
+        while let Ok(Some(frame)) = inbound.message().await {
+            match frame.frame {
+                Some(exec_client_frame::Frame::Stdin(input)) => {
+                    if !input.data.is_empty() {
+                        let _ = in_tx.send(InputCmd::Stdin(input.data));
                     }
-                    Some(exec_client_frame::Frame::Resize(resize)) => {
-                        if let Some(ws) = resize.winsize {
-                            let _ = in_tx
-                                .send(InputCmd::Resize(ws.cols as u16, ws.rows as u16));
-                        }
+                    if input.eof {
+                        let _ = in_tx.send(InputCmd::CloseStdin);
                     }
-                    Some(exec_client_frame::Frame::Ping(_)) => {
-                        let _ = out_tx.send(Ok(pong_frame())).await;
+                }
+                Some(exec_client_frame::Frame::Resize(resize)) => {
+                    if let Some(ws) = resize.winsize {
+                        let _ = in_tx.send(InputCmd::Resize(ws.cols as u16, ws.rows as u16));
                     }
-                    // A second Start frame is a protocol error; ignore it.
-                    _ => {}
-                },
-                // Client closed or errored: dropping `in_tx` tells the driver
-                // to tear the session down.
-                _ => break,
+                }
+                Some(exec_client_frame::Frame::Ping(_)) => {
+                    let _ = out_tx.send(Ok(pong_frame())).await;
+                }
+                // A second Start frame is a protocol error; ignore it.
+                _ => {}
             }
         }
+        // On stream end/error, dropping `in_tx` tears the session down.
     });
 
     Ok(ReceiverStream::new(out_rx))

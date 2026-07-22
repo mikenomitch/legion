@@ -83,7 +83,7 @@ pub async fn handle(matches: &ArgMatches) -> R<()> {
         action: String::new(),
         action_params: Default::default(),
         tty,
-        winsize: winsize.clone(),
+        winsize,
         bearer_token: String::new(),
     };
 
