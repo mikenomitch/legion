@@ -8,6 +8,32 @@ The UI is a SolidJS single-page app in `ui/` and talks directly to manager gRPC 
 - ConnectRPC (`@connectrpc/connect-web`) generated from `proto/legion.proto`
 - TailwindCSS
 - Vite build
+- Self-hosted fonts via `@fontsource-variable` (Space Grotesk for display,
+  Inter for text, JetBrains Mono for data) — no CDN requests
+
+## Design System
+
+The visual language ("Legion command post": warm stone neutrals, brass
+accent, dark-first with a full light theme) is centralized:
+
+- **Tokens**: theme colors are CSS variables in `ui/src/index.css`
+  (`--c-canvas`, `--c-surface`, `--c-line`, `--c-ink`, `--c-muted`,
+  `--c-brass`, …) mapped into Tailwind color names in
+  `ui/tailwind.config.js` (`bg-surface`, `text-muted`, `border-line`,
+  `text-brass`, …). Light/dark switch by swapping variables on `.dark`;
+  pages never write `dark:` variants for theme colors.
+- **Primitives**: `ui/src/components/ui.tsx` exports the shared components
+  every page composes — `Icon`, `Badge`/`StatusBadge`/`MonoBadge`,
+  `Card`/`SectionCard`/`PageHeader`/`StatCard`, `Tabs`, `Note`,
+  `EmptyState`, `Spinner`/`LoadingRows`, `Button`/`ConfirmButton` (two-step
+  destructive confirm)/`CopyButton`, `CodeBlock`, `DefList`, form classes
+  (`inputClass`, `selectClass`, …) and table classes (`tableClass`,
+  `thClass`, `tdClass`, …). Add new UI here first.
+- **Status vocabulary**: `ui/src/utils/status.ts` maps every status string
+  the manager emits to one of six tones (`ok`/`warn`/`danger`/`info`/
+  `neutral`/`accent`) and exposes the badge/dot/text classes for each, so
+  the same word gets the same color everywhere. `StatusBadge` uses it
+  automatically.
 
 ## Entry Points
 
@@ -24,16 +50,19 @@ Manager endpoint:
 
 Routes in `App.tsx`:
 
-- `/` overview dashboard (ledger + active rollouts)
-- `/nodes`
-- `/jobs`
-- `/rollouts`
-- `/events`
-- `/kv`
-- `/manager`
-- `/testing`
+- `/` overview dashboard (KPI stat cards, active rollouts, workers and
+  allocations tables)
+- `/jobs` (+ `/jobs/:id`, `/jobs/:id/tasks/:taskName`, `/jobs/:id/specs/:configId`)
+- `/rollouts` (+ `/rollouts/:id`); `/deployments` redirects here
+- `/nodes` (+ `/nodes/:id`)
+- `/manager` (+ `/manager/:id`)
+- `/raft`, `/events`, `/kv`, `/access`, `/api`, `/state-explorer`,
+  `/observability` (shown only when the manager reports o11y enabled),
+  `/testing`
 
-A shared layout provides nav, theme toggle, and page headers.
+A shared layout provides the grouped sidebar nav, a slim topbar
+(breadcrumbs, ⌘K search, theme toggle), and page headers for top-level
+routes; detail pages render their own `PageHeader`.
 
 ## Data Fetch Pattern
 
