@@ -193,7 +193,7 @@ export default function DagVisualization(props: DagVisualizationProps) {
     const runtime = props.taskRuntime.get(taskName)
     const fallback = props.statusLoading ? 'loading…' : 'not allocated'
     const status = runtime?.statuses[0] ?? fallback
-    return { status, tone: taskStatusTone(status) as Tone }
+    return { status, tone: taskStatusTone(status) }
   }
 
   // ── Pan & zoom state ──────────────────────────────────────────────

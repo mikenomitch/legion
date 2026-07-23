@@ -9,18 +9,22 @@
 export type Tone = 'ok' | 'warn' | 'danger' | 'info' | 'neutral' | 'accent'
 
 const DANGER = ['fail', 'error', 'unhealthy', 'critical', 'down', 'dead', 'lost', 'cancel', 'reject', 'denied', 'fatal', 'destroy']
-const OK = ['running', 'complete', 'done', 'healthy', 'ready', 'active', 'up', 'pass', 'ok', 'success', 'live', 'leader', 'placed', 'bound', 'staged']
 const WARN = ['pend', 'warn', 'degrad', 'drain', 'pause', 'stop', 'incomplete', 'expir', 'stale', 'reconnect', 'queue', 'reschedul', 'unknown', 'staging']
 const INFO = ['deploy', 'roll', 'updat', 'schedul', 'assign', 'start', 'creat', 'connect', 'follower', 'learner', 'candidate', 'submit', 'loading', 'fetch']
+const OK = ['running', 'complete', 'done', 'healthy', 'ready', 'active', 'pass', 'success', 'live', 'leader', 'placed', 'bound', 'staged']
+// Whole words only — substrings would swallow "updating", "broken", "disabled", …
+const OK_WORDS = /\b(up|ok|enabled)\b/
 
 export const statusTone = (status?: string | null): Tone => {
   const normalized = (status ?? '').toLowerCase().trim()
   if (!normalized) return 'neutral'
   const match = (keywords: string[]) => keywords.some((keyword) => normalized.includes(keyword))
+  // Order matters: danger > warn > info > ok, so "update failed" is red and
+  // "updating" is blue rather than accidentally green.
   if (match(DANGER)) return 'danger'
   if (match(WARN)) return 'warn'
-  if (match(OK)) return 'ok'
   if (match(INFO)) return 'info'
+  if (match(OK) || OK_WORDS.test(normalized)) return 'ok'
   return 'neutral'
 }
 

@@ -3,7 +3,7 @@ import type { SchedulerEvent } from '../gen/legion_pb'
 import { managerClient } from '../grpcClient'
 import { formatRelativeTime } from '../utils/format'
 import { Badge, Button, Dot, EmptyState, Icon, SectionCard, cx, inputClass, selectClass } from '../components/ui'
-import type { Tone } from '../utils/status'
+import { statusTone, type Tone } from '../utils/status'
 
 const MAX_BUFFERED_EVENTS = 750
 const RECONNECT_DELAY_MS = 2000
@@ -12,11 +12,7 @@ type ConnectionState = 'connecting' | 'live' | 'reconnecting'
 
 const KIND_CATEGORIES = ['scheduler', 'eval', 'allocation', 'artifact', 'node', 'job', 'rollout'] as const
 
-const levelTone = (level: string): Tone => {
-  if (level === 'error') return 'danger'
-  if (level === 'warn') return 'warn'
-  return 'neutral'
-}
+const levelTone = (level: string): Tone => statusTone(level) === 'info' ? 'neutral' : statusTone(level)
 
 const connectionTone = (state: ConnectionState): Tone => {
   if (state === 'live') return 'ok'

@@ -1,6 +1,6 @@
 import { For, Show, createMemo, createResource, createSignal } from 'solid-js'
 import { managerClient } from '../grpcClient'
-import { Badge, Button, CodeBlock, ConfirmButton, DefList, EmptyState, Field, Note, SectionCard, StatusBadge, cx, inputClass } from '../components/ui'
+import { Badge, Button, CodeBlock, ConfirmButton, DefList, EmptyState, Field, Note, SectionCard, Spinner, StatusBadge, cx, inputClass } from '../components/ui'
 
 const raftCommands = [
   { label: 'Trigger Election', command: 'trigger-election', destructive: false },
@@ -64,7 +64,7 @@ export default function Raft() {
 
       <div class="grid items-start gap-4 lg:grid-cols-2">
         <SectionCard title="Consensus status">
-          <Show when={status()?.status} fallback={<p class="text-sm text-muted">Loading status…</p>}>
+          <Show when={status()?.status} fallback={<Spinner label="Loading status…" />}>
             {(raft) => (
               <DefList
                 items={[

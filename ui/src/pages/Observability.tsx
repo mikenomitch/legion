@@ -1,6 +1,7 @@
 import { For, Show, createEffect, createMemo, createResource, createSignal, onCleanup } from 'solid-js'
 import { managerClient } from '../grpcClient'
 import { EmptyState, Icon, Note, SectionCard, checkboxClass, cx, inputClass } from '../components/ui'
+import { badgeToneClasses, statusTone } from '../utils/status'
 
 type LogSignal = {
   raw: string
@@ -182,19 +183,9 @@ function normalizeSignal(line: string): LogSignal {
   }
 }
 
-function logLevelClass(level: string | undefined): string {
-  const normalized = (level ?? '').toLowerCase()
-  if (normalized.includes('error') || normalized.includes('fatal') || normalized.includes('critical')) {
-    return 'bg-red-500/10 text-red-700 dark:text-red-300'
-  }
-  if (normalized.includes('warn')) {
-    return 'bg-amber-500/10 text-amber-700 dark:text-amber-300'
-  }
-  if (normalized.includes('info')) {
-    return 'bg-sky-500/10 text-sky-700 dark:text-sky-300'
-  }
-  return 'bg-surface2 text-muted'
-}
+// Log levels share the central status vocabulary (error→danger, warn→warn…).
+const logLevelClass = (level: string | undefined): string =>
+  badgeToneClasses[level?.toLowerCase().includes('info') ? 'info' : statusTone(level)]
 
 function LogSignalRow(props: {
   signal: LogSignal

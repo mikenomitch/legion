@@ -1,6 +1,6 @@
 import { A } from '@solidjs/router'
-import { Show, createSignal, splitProps, type JSX } from 'solid-js'
-import { badgeToneClasses, dotToneClasses, noteToneClasses, statusTone, type Tone } from '../utils/status'
+import { Show, createSignal, onCleanup, splitProps, type JSX } from 'solid-js'
+import { badgeToneClasses, dotToneClasses, noteToneClasses, statusTone, textToneClasses, type Tone } from '../utils/status'
 
 /*
  * Legion UI primitives. Every page composes these so spacing, color, type and
@@ -20,22 +20,18 @@ const ICON_PATHS: Record<string, string> = {
   server: 'M5 2h14a2 2 0 0 1 2 2v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2z M5 14h14a2 2 0 0 1 2 2v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4a2 2 0 0 1 2-2z M6 6h.01 M6 18h.01',
   shieldCheck: 'M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z m-11 -1 2 2 4-4',
   radio: 'M4.9 19.1C1 15.2 1 8.8 4.9 4.9 M7.8 16.2c-2.3-2.3-2.3-6.1 0-8.5 M16.2 7.8c2.3 2.3 2.3 6.1 0 8.5 M19.1 4.9C23 8.8 23 15.2 19.1 19.1 M12 12h.01',
-  vote: 'm9 12 2 2 4-4 M5 7c0-1.1.9-2 2-2h10a2 2 0 0 1 2 2v12H5V7z M22 19H2',
   keySquare: 'M12.4 2.7a2.5 2.5 0 0 1 3.4 0l5.5 5.5a2.5 2.5 0 0 1 0 3.4l-3.7 3.7a2.5 2.5 0 0 1-3.4 0L8.7 9.8a2.5 2.5 0 0 1 0-3.4z M14 7l3 3 M9.4 10.6 2 18v4h4l7.4-7.4',
   terminal: 'm4 17 6-6-6-6 M12 19h8',
   database: 'M12 2C8 2 4 3 4 5v14c0 2 4 3 8 3s8-1 8-3V5c0-2-4-3-8-3z M4 5c0 2 4 3 8 3s8-1 8-3 M4 12c0 2 4 3 8 3s8-1 8-3',
-  scrollText: 'M15 12h-5 M15 8h-5 M19 17V5a2 2 0 0 0-2-2H4 M8 21h12a2 2 0 0 0 2-2v-1a1 1 0 0 0-1-1H11a1 1 0 0 0-1 1v1a2 2 0 1 1-4 0V5a2 2 0 1 0-4 0v2a1 1 0 0 0 1 1h3',
   search: 'M11 19a8 8 0 1 0 0-16 8 8 0 0 0 0 16z m10 2 -4.3-4.3',
   sun: 'M12 17a5 5 0 1 0 0-10 5 5 0 0 0 0 10z M12 1v2 M12 21v2 M4.22 4.22l1.42 1.42 M18.36 18.36l1.42 1.42 M1 12h2 M21 12h2 M4.22 19.78l1.42-1.42 M18.36 5.64l1.42-1.42',
   moon: 'M21 12.8A9 9 0 1 1 11.2 3 7 7 0 0 0 21 12.8z',
   menu: 'M4 6h16 M4 12h16 M4 18h16',
   x: 'M18 6 6 18 M6 6l12 12',
   chevronRight: 'm9 18 6-6-6-6',
-  chevronDown: 'm6 9 6 6 6-6',
   chevronLeft: 'm15 18-6-6 6-6',
   copy: 'M8 8h12v12H8z M16 8V6a2 2 0 0 0-2-2H4a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h2',
   check: 'M20 6 9 17l-5-5',
-  externalLink: 'M15 3h6v6 M10 14 21 3 M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6',
   play: 'm6 3 14 9-14 9V3z',
   pause: 'M6 4h4v16H6z M14 4h4v16h-4z',
   trash: 'M3 6h18 M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6 M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2 M10 11v6 M14 11v6',
@@ -45,16 +41,10 @@ const ICON_PATHS: Record<string, string> = {
   file: 'M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7z M14 2v4a2 2 0 0 0 2 2h4',
   alertTriangle: 'm21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3z M12 9v4 M12 17h.01',
   info: 'M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20z M12 16v-4 M12 8h.01',
-  command: 'M15 6v12a3 3 0 1 0 3-3H6a3 3 0 1 0 3 3V6a3 3 0 1 0-3 3h12a3 3 0 1 0-3-3',
-  arrowRight: 'M5 12h14 m-7 -7 7 7-7 7',
-  arrowUpRight: 'M7 17 17 7 M7 7h10v10',
   logOut: 'M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4 M16 17l5-5-5-5 M21 12H9',
   boxes: 'M2.97 12.92A2 2 0 0 0 2 14.63v3.24a2 2 0 0 0 .97 1.71l3 1.8a2 2 0 0 0 2.06 0L12 19v-5.5l-5-3-4.03 2.42z M7 16.5l-4.74-2.85 M7 16.5l5-3 M7 16.5v5.17 M12 13.5V19l3.97 2.38a2 2 0 0 0 2.06 0l3-1.8a2 2 0 0 0 .97-1.71v-3.24a2 2 0 0 0-.97-1.71L17 10.5l-5 3z M17 16.5l-5-3 M17 16.5l4.74-2.85 M17 16.5v5.17 M7.97 4.42A2 2 0 0 0 7 6.13v4.37l5 3 5-3V6.13a2 2 0 0 0-.97-1.71l-3-1.8a2 2 0 0 0-2.06 0l-3 1.8z M12 8 7.26 5.15 M12 8l4.74-2.85 M12 13.5V8',
-  hardDrive: 'M22 12H2 M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z M6 16h.01 M10 16h.01',
   network: 'M9 2h6v6H9z M16 16h6v6h-6z M2 16h6v6H2z M5 16v-3a1 1 0 0 1 1-1h12a1 1 0 0 1 1 1v3 M12 12V8',
-  fileCode: 'M10 12.5 8 15l2 2.5 M14 12.5l2 2.5-2 2.5 M14 2v4a2 2 0 0 0 2 2h4 M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7z',
   eye: 'M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6z',
-  clock: 'M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20z M12 6v6l4 2',
   zap: 'M13 2 3 14h9l-1 8 10-12h-9l1-8z',
   users: 'M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2 M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8z M22 21v-2a4 4 0 0 0-3-3.87 M16 3.13a4 4 0 0 1 0 7.75',
   gitBranch: 'M6 3v12 M18 9a3 3 0 1 0 0-6 3 3 0 0 0 0 6z M6 21a3 3 0 1 0 0-6 3 3 0 0 0 0 6z M15 6a9 9 0 0 0-9 9',
@@ -120,10 +110,10 @@ export function Badge(props: BadgeProps) {
   )
 }
 
-// Status text in a badge with an auto-derived tone and a status dot.
-export function StatusBadge(props: { status?: string | null; loading?: boolean; class?: string; title?: string }) {
+// Status text in a badge with an auto-derived tone (overridable) and a dot.
+export function StatusBadge(props: { status?: string | null; tone?: Tone; loading?: boolean; class?: string; title?: string }) {
   const label = () => (props.loading ? 'loading' : (props.status ?? '').trim() || 'unknown')
-  const tone = () => (props.loading ? 'neutral' : statusTone(props.status))
+  const tone = () => (props.loading ? 'neutral' : props.tone ?? statusTone(props.status))
   return (
     <Badge tone={tone()} dot title={props.title} class={cx('uppercase tracking-wide', props.loading && 'animate-pulse', props.class)}>
       {label()}
@@ -225,7 +215,7 @@ export function StatCard(props: { label: string; value: JSX.Element; hint?: JSX.
           <Icon name={props.icon!} size={15} class="text-faint" />
         </Show>
       </div>
-      <p class={cx('mt-1.5 font-display text-2xl font-semibold tabular-nums tracking-tight', props.tone ? { ok: 'text-emerald-600 dark:text-emerald-400', warn: 'text-amber-600 dark:text-amber-400', danger: 'text-red-600 dark:text-red-400', info: 'text-sky-600 dark:text-sky-400', neutral: 'text-ink', accent: 'text-brass' }[props.tone] : 'text-ink')}>
+      <p class={cx('mt-1.5 font-display text-2xl font-semibold tabular-nums tracking-tight', props.tone && props.tone !== 'neutral' ? textToneClasses[props.tone] : 'text-ink')}>
         {props.value}
       </p>
       <Show when={props.hint}>
@@ -409,6 +399,9 @@ export function ConfirmButton(props: { label: string; confirmLabel?: string; onC
   const [armed, setArmed] = createSignal(false)
   let timer: ReturnType<typeof setTimeout> | undefined
   let armedAt = 0
+  onCleanup(() => {
+    if (timer) clearTimeout(timer)
+  })
   const disarm = () => {
     setArmed(false)
     if (timer) clearTimeout(timer)

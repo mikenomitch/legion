@@ -1,6 +1,6 @@
 import { A, useParams } from '@solidjs/router'
 import { For, Show, createMemo, createResource, createSignal } from 'solid-js'
-import { Badge, Button, ConfirmButton, Icon, Note, PageHeader, SectionCard, StatusBadge, cx, inputClass } from '../../components/ui'
+import { Badge, Button, ConfirmButton, Icon, Note, PageHeader, SectionCard, Spinner, StatusBadge, cx, inputClass, linkClass } from '../../components/ui'
 import { managerClient } from '../../grpcClient'
 import { formatDate } from '../../utils/format'
 import { artifactProgressPercent, parseArtifactStates } from '../../utils/jobspec'
@@ -68,7 +68,7 @@ export default function RolloutDetail() {
   }
 
   return (
-    <Show when={!data.loading} fallback={<div class="py-6 text-sm text-muted">Loading rollout…</div>}>
+    <Show when={!data.loading} fallback={<div class="py-6"><Spinner label="Loading rollout…" /></div>}>
       <Show when={!data.error && data()?.rollout} fallback={<Note tone="danger">Failed to load rollout.</Note>}>
         {(() => {
           const rollout = data()!.rollout!
@@ -89,7 +89,7 @@ export default function RolloutDetail() {
                 subtitle={
                   <>
                     Job{' '}
-                    <A href={`/jobs/${encodeURIComponent(rollout.jobId)}`} class="font-medium text-brass-strong underline-offset-2 hover:underline">
+                    <A href={`/jobs/${encodeURIComponent(rollout.jobId)}`} class={linkClass}>
                       {rollout.jobId}
                     </A>
                     <span class="mx-2 text-faint">·</span>

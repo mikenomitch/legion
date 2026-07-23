@@ -1,6 +1,6 @@
 import { A, useNavigate, useParams } from '@solidjs/router'
 import { For, Show, createMemo, createResource, createSignal, onCleanup, onMount } from 'solid-js'
-import { Badge, CodeBlock, ConfirmButton, EmptyState, MonoBadge, Note, PageHeader, SectionCard, Spinner, StatusBadge, TableShell, Tabs, tableClass, tdClass, thClass, theadClass, trHoverClass } from '../../components/ui'
+import { Badge, CodeBlock, ConfirmButton, EmptyState, MonoBadge, Note, PageHeader, SectionCard, Spinner, StatusBadge, TableShell, Tabs, linkClass, tableClass, tdClass, thClass, theadClass, trHoverClass } from '../../components/ui'
 import DagVisualization from '../../components/DagVisualization'
 import { InstanceInfo } from '../../gen/legion_pb'
 import LogViewer from '../../components/LogViewer'
@@ -204,7 +204,7 @@ export default function JobDetail() {
                     <span class="text-xs opacity-80">
                       {jobData()!.allocations.filter((allocation) => allocation.jobConfigId === jobData()!.activeRollout!.toJobConfigId).length} allocation(s) on target config
                     </span>
-                    <A href={`/rollouts/${jobData()!.activeRollout!.id}`} class="font-medium underline underline-offset-2">Open rollout</A>
+                    <A href={`/rollouts/${jobData()!.activeRollout!.id}`} class={linkClass}>Open rollout</A>
                   </div>
                 </Note>
               </Show>

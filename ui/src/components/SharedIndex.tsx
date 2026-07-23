@@ -229,7 +229,7 @@ export default function SharedIndex(props: SharedIndexProps) {
                           <Show when={!props.hideStatus}>
                             <td class={tdClass}>
                               <Show when={item.status !== undefined} fallback={<span class="text-faint">—</span>}>
-                                <StatusBadge status={item.status} />
+                                <StatusBadge status={item.status} tone={item.statusTone} />
                               </Show>
                             </td>
                           </Show>

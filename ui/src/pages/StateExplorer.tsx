@@ -1,7 +1,7 @@
 import { For, Show, createEffect, createMemo, createSignal } from 'solid-js'
 import { managerClient } from '../grpcClient'
 import type { SavedStateQuery, StateStoreSchemaObject } from '../gen/legion_pb'
-import { Badge, Button, ConfirmButton, Icon, Note, SectionCard, Tabs, checkboxClass, cx, inputClass, textareaClass } from '../components/ui'
+import { Badge, Button, ConfirmButton, Icon, Note, SectionCard, Spinner, Tabs, checkboxClass, cx, inputClass, textareaClass } from '../components/ui'
 
 type QueryResult = {
   statementType: string
@@ -91,7 +91,7 @@ function HighlightedText(props: { text: string; term: string; class?: string }) 
             when={segment.matched}
             fallback={<>{segment.text}</>}
           >
-            <mark class="rounded bg-amber-200 px-0.5 text-neutral-900 dark:bg-amber-300 dark:text-neutral-900">{segment.text}</mark>
+            <mark class="rounded bg-amber-500/30 px-0.5 text-ink">{segment.text}</mark>
           </Show>
         )}
       </For>
@@ -462,7 +462,7 @@ export default function StateExplorer() {
                   />
                 </div>
                 <div class="max-h-[360px] space-y-2.5 overflow-auto">
-                  <Show when={!isLoadingSchema()} fallback={<p class="text-sm text-muted">Loading schema…</p>}>
+                  <Show when={!isLoadingSchema()} fallback={<Spinner label="Loading schema…" />}>
                     <For each={filteredSchema()}>
                       {(object) => (
                         <article class="rounded-md border border-line bg-surface2/40 p-3">

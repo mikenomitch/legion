@@ -2,7 +2,7 @@ import { useNavigate } from '@solidjs/router'
 import { Show, createResource } from 'solid-js'
 import { managerClient, setStoredToken } from '../grpcClient'
 import { completeOidcLogin, pendingClientId } from '../utils/oidc'
-import { Spinner } from '../components/ui'
+import { Spinner, linkClass } from '../components/ui'
 
 // Lands here after the identity provider redirect: completes the PKCE code
 // exchange, trades the ID token for a Legion ACL token, and returns to the
@@ -28,7 +28,7 @@ export default function OidcCallback() {
         <div>
           <p class="font-semibold text-red-600 dark:text-red-400">Single sign-on failed</p>
           <p class="mt-1 text-muted">{String(result.error)}</p>
-          <a class="mt-3 inline-block font-medium text-brass-strong underline-offset-2 hover:underline" href="/access">
+          <a class={`mt-3 inline-block ${linkClass}`} href="/access">
             Back to Access
           </a>
         </div>

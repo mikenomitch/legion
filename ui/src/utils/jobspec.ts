@@ -1,3 +1,4 @@
+import { statusTone } from './status'
 import type { RolloutAllocationStatus, RolloutGroupStatus, Submission } from '../gen/legion_pb'
 
 export type JobTaskDependency = {
@@ -168,14 +169,6 @@ export const parseArtifactStates = (raw: string | undefined): ArtifactStateRow[]
   }
 }
 
-export const artifactStateTone = (state: string): 'success' | 'warning' | 'danger' | 'neutral' => {
-  const normalized = state.toLowerCase()
-  if (normalized === 'staged') return 'success'
-  if (normalized === 'failed') return 'danger'
-  if (normalized === 'fetching' || normalized === 'verifying') return 'warning'
-  return 'neutral'
-}
-
 // Percent complete for an artifact fetch, when both byte counters are known.
 export const artifactProgressPercent = (row: ArtifactStateRow): number | undefined => {
   if (row.bytesFetched === undefined || row.bytesTotal === undefined || row.bytesTotal <= 0) return undefined
@@ -246,9 +239,6 @@ export const extractJobSpecData = (submissions: readonly Submission[]): JobSpecD
   }
   return null
 }
-
-export const groupTasksByName = (tasks: readonly JobTask[]): Map<string, JobTask> =>
-  new Map(tasks.map((task) => [task.name, task]))
 
 export const buildTaskRuntimeByName = (
   groups: readonly RolloutGroupStatus[],
@@ -351,20 +341,13 @@ export const topoSortTaskNames = (tasks: readonly JobTask[]): string[][] => {
   return layers
 }
 
+// DAG node tone, derived from the central status vocabulary so the graph
+// always agrees with the status badges elsewhere on the page. The DAG only
+// distinguishes four states, so warn and info both render as "in progress".
 export const taskStatusTone = (status: string): 'success' | 'warning' | 'danger' | 'neutral' => {
-  const normalized = status.toLowerCase()
-  if (['running', 'healthy', 'completed', 'success'].some((item) => normalized.includes(item))) return 'success'
-  if (['failed', 'error', 'stopped', 'lost'].some((item) => normalized.includes(item))) return 'danger'
-  if (['pending', 'starting', 'queued'].some((item) => normalized.includes(item))) return 'warning'
-  return 'neutral'
-}
-
-// Tone for a stateful instance lifecycle state, consistent with the status
-// colors used elsewhere: active=green, pending/rescheduling=amber,
-// terminated=gray (tombstones are expected rows, not failures).
-export const instanceStateTone = (state: string): 'success' | 'warning' | 'neutral' => {
-  const normalized = state.toLowerCase()
-  if (normalized === 'active') return 'success'
-  if (normalized === 'pending' || normalized === 'rescheduling') return 'warning'
+  const tone = statusTone(status)
+  if (tone === 'ok') return 'success'
+  if (tone === 'danger') return 'danger'
+  if (tone === 'warn' || tone === 'info') return 'warning'
   return 'neutral'
 }

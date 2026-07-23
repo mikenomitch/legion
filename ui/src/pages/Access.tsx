@@ -1,7 +1,7 @@
 import { For, Show, createMemo, createResource, createSignal } from 'solid-js'
 import { getStoredToken, managerClient, setStoredToken } from '../grpcClient'
 import { beginOidcLogin, rememberClientId } from '../utils/oidc'
-import { Badge, Button, DefList, Field, Note, SectionCard, StatusBadge, Tabs, cx, inputClass, selectClass } from '../components/ui'
+import { Badge, Button, DefList, Field, Note, SectionCard, Spinner, StatusBadge, Tabs, cx, inputClass, selectClass } from '../components/ui'
 import {
   JoinTokensPanel,
   PoliciesPanel,
@@ -122,7 +122,7 @@ export default function Access() {
               </Show>
             }
           >
-            <Show when={whoami()} fallback={<p class="text-sm text-muted">Loading…</p>}>
+            <Show when={whoami()} fallback={<Spinner label="Loading identity…" />}>
               {(identity) => (
                 <DefList
                   cols={3}
