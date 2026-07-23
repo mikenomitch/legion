@@ -2,14 +2,6 @@ import { createEffect, createMemo, createResource, createSignal } from 'solid-js
 import SharedIndex from '../components/SharedIndex'
 import { managerClient } from '../grpcClient'
 import { formatRelativeTime } from '../utils/format'
-import { healthToneClasses } from '../utils/health'
-
-const toneForStatus = (status: string) => {
-  const normalized = status.toLowerCase()
-  if (normalized.includes('fail')) return healthToneClasses('unhealthy')
-  if (normalized.includes('running') || normalized.includes('done')) return healthToneClasses('healthy')
-  return healthToneClasses('unknown')
-}
 
 export default function Jobs() {
   const [search, setSearch] = createSignal('')
@@ -54,16 +46,18 @@ export default function Jobs() {
         { label: 'Created (oldest)', value: 'created_at:asc' },
         { label: 'Name (A-Z)', value: 'name:asc' },
       ]}
+      columns={[{ key: 'allocations', header: 'Allocations', class: 'text-right' }]}
       loading={data.loading || ledger.loading}
       error={data.error ? 'Failed to load jobs.' : undefined}
       items={(data()?.jobs ?? []).map((job) => ({
         id: job.id,
         title: job.name || job.id,
-        subtitle: `Status: ${job.status || 'unknown'} · Allocations: ${jobAllocationCounts().get(job.id) ?? 0}`,
-        health: job.status || 'unknown',
-        healthClass: toneForStatus(job.status),
+        status: job.status || 'unknown',
         updatedAt: formatRelativeTime(job.createdAt),
         href: `/jobs/${encodeURIComponent(job.name || job.id)}`,
+        cells: {
+          allocations: <span class="tabular-nums">{jobAllocationCounts().get(job.id) ?? 0}</span>,
+        },
       }))}
       page={Number(data()?.page ?? page())}
       pageSize={Number(data()?.pageSize ?? pageSize())}
@@ -73,7 +67,8 @@ export default function Jobs() {
         setPageSize(size)
         setPage(1)
       }}
-      emptyLabel="No jobs found."
+      emptyLabel="No jobs yet"
+      emptyHint="Submit a job with `legion job submit <spec>` and it will appear here."
     />
   )
 }

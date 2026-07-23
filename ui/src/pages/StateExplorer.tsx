@@ -1,6 +1,7 @@
 import { For, Show, createEffect, createMemo, createSignal } from 'solid-js'
 import { managerClient } from '../grpcClient'
 import type { SavedStateQuery, StateStoreSchemaObject } from '../gen/legion_pb'
+import { Badge, Button, ConfirmButton, Icon, Note, SectionCard, Tabs, checkboxClass, cx, inputClass, textareaClass } from '../components/ui'
 
 type QueryResult = {
   statementType: string
@@ -283,19 +284,14 @@ export default function StateExplorer() {
   }
 
   return (
-    <div class="space-y-6">
-      <section class="rounded border border-neutral-200 bg-white/90 p-5 shadow-[4px_4px_0_#d4d4d8] dark:border-neutral-800 dark:bg-neutral-900/70 dark:shadow-[4px_4px_0_#0b0d12]">
-        <div class="flex flex-wrap items-center justify-between gap-3">
-          <div>
-            <p class="text-xs uppercase tracking-[0.18em] text-neutral-500 dark:text-neutral-400">Stare Explorer</p>
-            <h2 class="text-2xl font-semibold text-neutral-900 dark:text-neutral-100">SQLite State Explorer</h2>
-            <p class="text-sm text-neutral-600 dark:text-neutral-300">Run read queries safely by default, and opt into writes only when needed.</p>
-          </div>
-        </div>
-
-        <div class="mt-4 grid gap-3">
+    <div class="space-y-4">
+      <SectionCard
+        title="Query"
+        description="Read queries run safely by default; opt into writes only when needed."
+      >
+        <div class="grid gap-3">
           <textarea
-            class="min-h-[180px] w-full rounded border border-neutral-300 bg-white px-3 py-2 font-mono text-sm shadow-sm focus:border-neutral-900 focus:outline-none dark:border-neutral-700 dark:bg-neutral-950"
+            class={cx(textareaClass, 'min-h-[160px] text-sm')}
             value={query()}
             onInput={(event) => setQuery(event.currentTarget.value)}
             onKeyDown={(event) => {
@@ -305,13 +301,18 @@ export default function StateExplorer() {
               }
             }}
             placeholder="SELECT * FROM job LIMIT 25;"
+            spellcheck={false}
           />
-          <div class="space-y-2">
-            <p class="text-xs uppercase tracking-[0.12em] text-neutral-500 dark:text-neutral-400">Suggestions: {smartSuggestions().label}</p>
-            <div class="flex flex-wrap gap-2">
+          <div class="space-y-1.5">
+            <p class="eyebrow">Suggestions · {smartSuggestions().label}</p>
+            <div class="flex flex-wrap gap-1.5">
               <For each={smartSuggestions().items}>
                 {(token) => (
-                  <button type="button" class="rounded-full border border-neutral-300 px-2 py-0.5 text-xs dark:border-neutral-700" onClick={() => applySuggestion(token)}>
+                  <button
+                    type="button"
+                    class="rounded-full border border-line bg-surface px-2 py-0.5 font-mono text-2xs text-muted transition-colors hover:border-brass/50 hover:text-ink"
+                    onClick={() => applySuggestion(token)}
+                  >
                     {token}
                   </button>
                 )}
@@ -320,36 +321,31 @@ export default function StateExplorer() {
           </div>
 
           <div class="flex flex-wrap items-center justify-end gap-3">
-            <label class="inline-flex items-center gap-2 text-sm font-medium text-amber-600 dark:text-amber-300">
-              <input type="checkbox" checked={allowWrite()} onChange={(event) => setAllowWrite(event.currentTarget.checked)} />
+            <label class={cx(
+              'inline-flex cursor-pointer items-center gap-2 rounded-md border px-2.5 py-1.5 text-xs font-medium transition-colors',
+              allowWrite() ? 'border-amber-500/50 bg-amber-500/10 text-amber-700 dark:text-amber-300' : 'border-line text-muted',
+            )}>
+              <input type="checkbox" class={checkboxClass} checked={allowWrite()} onChange={(event) => setAllowWrite(event.currentTarget.checked)} />
               Allow write queries
             </label>
-            <button
-              type="button"
-              class="rounded border border-neutral-900 bg-neutral-900 px-3 py-2 text-xs font-semibold uppercase tracking-[0.08em] text-white dark:border-neutral-200 dark:bg-neutral-100 dark:text-neutral-900"
-              onClick={() => void runQuery()}
-              disabled={isRunning()}
-            >
-              {isRunning() ? 'Running…' : 'Run Query'}
-            </button>
+            <Button variant="primary" size="md" icon="play" onClick={() => void runQuery()} disabled={isRunning()} title="⌘Enter">
+              {isRunning() ? 'Running…' : 'Run query'}
+            </Button>
           </div>
         </div>
-      </section>
+      </SectionCard>
 
-      <section class="grid gap-6 xl:grid-cols-[340px_1fr]">
-        <div class="space-y-4 rounded border border-neutral-200 bg-white/90 p-4 shadow-[4px_4px_0_#d4d4d8] dark:border-neutral-800 dark:bg-neutral-900/70 dark:shadow-[4px_4px_0_#0b0d12]">
-          <h3 class="text-sm font-semibold uppercase tracking-[0.12em] text-neutral-600 dark:text-neutral-300">Saved Queries</h3>
-          <div class="space-y-2">
-            <input class="w-full rounded border border-neutral-300 bg-white px-3 py-2 text-sm dark:border-neutral-700 dark:bg-neutral-950" value={saveName()} onInput={(event) => setSaveName(event.currentTarget.value)} placeholder="weekly rollout report" />
-            <button type="button" class="w-full rounded border border-neutral-300 px-3 py-2 text-xs font-semibold uppercase tracking-[0.08em] dark:border-neutral-700" onClick={() => void saveQuery()}>
-              Save / Overwrite
-            </button>
+      <div class="grid items-start gap-4 xl:grid-cols-[320px_1fr]">
+        <SectionCard title="Saved queries" flush>
+          <div class="space-y-2 border-b border-line p-3">
+            <input class={inputClass} value={saveName()} onInput={(event) => setSaveName(event.currentTarget.value)} placeholder="weekly rollout report" />
+            <Button class="w-full" onClick={() => void saveQuery()}>Save / overwrite</Button>
           </div>
-          <div class="max-h-[360px] space-y-2 overflow-auto pr-1">
+          <div class="max-h-[360px] space-y-1.5 overflow-auto p-2">
             <For each={savedQueries()}>
               {(saved) => (
                 <article
-                  class="cursor-pointer rounded border border-neutral-200 p-2 text-sm transition-colors hover:bg-neutral-50 dark:border-neutral-800 dark:hover:bg-neutral-800/50"
+                  class="cursor-pointer rounded-md border border-line p-2 text-sm transition-colors hover:border-brass/40 hover:bg-surface2/50"
                   role="button"
                   tabindex={0}
                   onClick={() => {
@@ -365,125 +361,141 @@ export default function StateExplorer() {
                   }}
                 >
                   <div class="flex items-center justify-between gap-2">
-                    <p class="text-left font-semibold text-neutral-800 dark:text-neutral-100">{saved.name}</p>
-                    <button
-                      type="button"
-                      class="text-xs text-red-600 dark:text-red-300"
-                      onClick={(event) => {
-                        event.stopPropagation()
-                        void deleteQuery(saved.name)
-                      }}
-                    >
-                      Delete
-                    </button>
+                    <p class="text-left text-xs font-semibold text-ink">{saved.name}</p>
+                    <ConfirmButton
+                      label="Delete"
+                      size="xs"
+                      onConfirm={() => void deleteQuery(saved.name)}
+                    />
                   </div>
-                  <p class="mt-1 line-clamp-2 font-mono text-xs text-neutral-500 dark:text-neutral-400">{saved.sql}</p>
+                  <p class="mt-1 line-clamp-2 font-mono text-2xs text-faint">{saved.sql}</p>
                 </article>
               )}
             </For>
             <Show when={savedQueries().length === 0}>
-              <p class="text-sm text-neutral-500">No saved queries yet.</p>
+              <p class="p-2 text-sm text-muted">No saved queries yet.</p>
             </Show>
           </div>
-        </div>
+        </SectionCard>
 
-        <div class="space-y-4 rounded border border-neutral-200 bg-white/90 p-4 shadow-[4px_4px_0_#d4d4d8] dark:border-neutral-800 dark:bg-neutral-900/70 dark:shadow-[4px_4px_0_#0b0d12]">
-          <div class="flex items-center justify-between">
-            <h3 class="text-sm font-semibold uppercase tracking-[0.12em] text-neutral-600 dark:text-neutral-300">Results & Schema</h3>
-            <div class="inline-flex rounded border border-neutral-300 p-0.5 text-xs dark:border-neutral-700">
-              <button
-                type="button"
-                class={`rounded px-2 py-1 ${activeTab() === 'results' ? 'bg-neutral-900 text-white dark:bg-neutral-100 dark:text-neutral-900' : 'text-neutral-600 dark:text-neutral-300'}`}
-                onClick={() => setActiveTab('results')}
+        <SectionCard flush>
+          <Tabs
+            tabs={[
+              { id: 'results', label: 'Results' },
+              { id: 'schema', label: 'Schema', count: schema().length },
+            ]}
+            active={activeTab()}
+            onChange={(id) => setActiveTab(id as ExplorerTab)}
+          />
+          <div class="space-y-3 p-3.5">
+            <Show when={status()}><Note tone="ok" onDismiss={() => setStatus(null)}>{status()}</Note></Show>
+            <Show when={error()}><Note tone="danger" onDismiss={() => setError(null)}>{error()}</Note></Show>
+
+            <Show when={activeTab() === 'results'}>
+              <Show
+                when={result()}
+                fallback={<p class="text-sm text-muted">Run a query to see results.</p>}
               >
-                Results
-              </button>
-              <button
-                type="button"
-                class={`rounded px-2 py-1 ${activeTab() === 'schema' ? 'bg-neutral-900 text-white dark:bg-neutral-100 dark:text-neutral-900' : 'text-neutral-600 dark:text-neutral-300'}`}
-                onClick={() => setActiveTab('schema')}
-              >
-                Schema
-              </button>
-            </div>
-          </div>
-
-          <Show when={status()}><p class="rounded border border-green-500/60 bg-green-50 px-3 py-2 text-sm text-green-700 dark:bg-green-900/30 dark:text-green-200">{status()}</p></Show>
-          <Show when={error()}><p class="rounded border border-red-500/60 bg-red-50 px-3 py-2 text-sm text-red-700 dark:bg-red-900/30 dark:text-red-200">{error()}</p></Show>
-
-          <Show when={activeTab() === 'results'}>
-            <Show
-              when={result()}
-              fallback={<p class="text-sm text-neutral-500">Run a query to see results.</p>}
-            >
-              {(queryResult) => (
-                <div class="space-y-2">
-                  <p class="text-xs uppercase tracking-[0.12em] text-neutral-500">{queryResult().statementType} · affected {queryResult().affectedRows.toString()}</p>
-                  <div class="max-h-[260px] overflow-auto rounded border border-neutral-200 dark:border-neutral-800">
-                    <table class="min-w-full divide-y divide-neutral-200 text-sm dark:divide-neutral-800">
-                      <thead class="bg-neutral-100/80 dark:bg-neutral-900/80">
-                        <tr>
-                          <For each={queryResult().columns}>{(column) => <th class="px-3 py-2 text-left font-semibold">{column}</th>}</For>
-                        </tr>
-                      </thead>
-                      <tbody class="divide-y divide-neutral-200 dark:divide-neutral-800">
-                        <For each={queryResult().rows}>
-                          {(row) => (
-                            <tr>
-                              <td colspan={Math.max(1, queryResult().columns.length)} class="px-3 py-2 font-mono text-xs text-neutral-600 dark:text-neutral-300">{row}</td>
-                            </tr>
-                          )}
-                        </For>
-                      </tbody>
-                    </table>
+                {(queryResult) => (
+                  <div class="space-y-2">
+                    <p class="flex items-center gap-2">
+                      <Badge tone="accent" mono>{queryResult().statementType}</Badge>
+                      <span class="text-xs text-faint">{queryResult().rows.length} row{queryResult().rows.length === 1 ? '' : 's'} · {queryResult().affectedRows.toString()} affected</span>
+                    </p>
+                    <div class="max-h-[320px] overflow-auto rounded-md border border-line">
+                      <table class="min-w-full divide-y divide-line text-sm">
+                        <thead class="sticky top-0 bg-surface2">
+                          <tr>
+                            <For each={queryResult().columns}>{(column) => <th class="px-3 py-2 text-left text-2xs font-semibold uppercase tracking-wider text-faint">{column}</th>}</For>
+                          </tr>
+                        </thead>
+                        <tbody class="divide-y divide-line">
+                          <For each={queryResult().rows}>
+                            {(row) => {
+                              // Rows arrive as JSON strings; render per-column cells when parseable.
+                              let parsed: Record<string, unknown> | null = null
+                              try {
+                                const value = JSON.parse(row)
+                                if (value && typeof value === 'object' && !Array.isArray(value)) parsed = value as Record<string, unknown>
+                              } catch {
+                                parsed = null
+                              }
+                              return (
+                                <Show
+                                  when={parsed && queryResult().columns.length > 0}
+                                  fallback={
+                                    <tr>
+                                      <td colspan={Math.max(1, queryResult().columns.length)} class="px-3 py-2 font-mono text-xs text-muted">{row}</td>
+                                    </tr>
+                                  }
+                                >
+                                  <tr class="transition-colors hover:bg-surface2/50">
+                                    <For each={queryResult().columns}>
+                                      {(column) => {
+                                        const cell = parsed![column]
+                                        const text = cell === null || cell === undefined ? '' : typeof cell === 'object' ? JSON.stringify(cell) : String(cell)
+                                        return <td class="max-w-[24rem] truncate px-3 py-1.5 font-mono text-xs text-muted" title={text}>{text || <span class="text-faint">—</span>}</td>
+                                      }}
+                                    </For>
+                                  </tr>
+                                </Show>
+                              )
+                            }}
+                          </For>
+                        </tbody>
+                      </table>
+                    </div>
                   </div>
-                </div>
-              )}
-            </Show>
-          </Show>
-
-          <Show when={activeTab() === 'schema'}>
-            <div class="space-y-3">
-              <input
-                class="w-full rounded border border-neutral-300 bg-white px-3 py-2 text-sm dark:border-neutral-700 dark:bg-neutral-950"
-                value={schemaSearch()}
-                onInput={(event) => setSchemaSearch(event.currentTarget.value)}
-                placeholder="Search schema (tables, columns, types, SQL)"
-              />
-              <div class="max-h-[360px] space-y-3 overflow-auto rounded border border-neutral-200 p-3 dark:border-neutral-800">
-              <Show when={!isLoadingSchema()} fallback={<p class="text-sm text-neutral-500">Loading schema…</p>}>
-                <For each={filteredSchema()}>
-                  {(object) => (
-                    <article class="rounded border border-neutral-200 p-3 dark:border-neutral-800">
-                      <h4 class="text-sm font-semibold">
-                        <HighlightedText text={`${object.kind}: ${object.name}`} term={schemaSearch()} />
-                      </h4>
-                      <p class="mt-1 text-xs text-neutral-500">
-                        <HighlightedText text={object.createSql} term={schemaSearch()} />
-                      </p>
-                      <ul class="mt-2 space-y-1 text-xs text-neutral-600 dark:text-neutral-300">
-                        <For each={object.columns}>
-                          {(column) => (
-                            <li>
-                              <HighlightedText text={column.name} term={schemaSearch()} /> <span class="text-neutral-400"><HighlightedText text={column.dataType} term={schemaSearch()} /></span>
-                              <Show when={column.primaryKey}><span class="ml-1 rounded bg-neutral-200 px-1 dark:bg-neutral-700"><HighlightedText text="PK" term={schemaSearch()} /></span></Show>
-                              <Show when={column.notNull}><span class="ml-1 rounded bg-neutral-200 px-1 dark:bg-neutral-700"><HighlightedText text="NOT NULL" term={schemaSearch()} /></span></Show>
-                            </li>
-                          )}
-                        </For>
-                      </ul>
-                    </article>
-                  )}
-                </For>
-                <Show when={!isLoadingSchema() && filteredSchema().length === 0}>
-                  <p class="text-sm text-neutral-500">No schema entries matched your search.</p>
-                </Show>
+                )}
               </Show>
+            </Show>
+
+            <Show when={activeTab() === 'schema'}>
+              <div class="space-y-3">
+                <div class="relative">
+                  <Icon name="search" size={14} class="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-faint" />
+                  <input
+                    class={cx(inputClass, 'pl-8')}
+                    value={schemaSearch()}
+                    onInput={(event) => setSchemaSearch(event.currentTarget.value)}
+                    placeholder="Search schema (tables, columns, types, SQL)"
+                  />
+                </div>
+                <div class="max-h-[360px] space-y-2.5 overflow-auto">
+                  <Show when={!isLoadingSchema()} fallback={<p class="text-sm text-muted">Loading schema…</p>}>
+                    <For each={filteredSchema()}>
+                      {(object) => (
+                        <article class="rounded-md border border-line bg-surface2/40 p-3">
+                          <h4 class="font-mono text-xs font-semibold text-ink">
+                            <HighlightedText text={`${object.kind}: ${object.name}`} term={schemaSearch()} />
+                          </h4>
+                          <p class="mt-1 font-mono text-2xs text-faint">
+                            <HighlightedText text={object.createSql} term={schemaSearch()} />
+                          </p>
+                          <ul class="mt-2 space-y-1 font-mono text-xs text-muted">
+                            <For each={object.columns}>
+                              {(column) => (
+                                <li>
+                                  <HighlightedText text={column.name} term={schemaSearch()} /> <span class="text-faint"><HighlightedText text={column.dataType} term={schemaSearch()} /></span>
+                                  <Show when={column.primaryKey}><span class="ml-1 rounded bg-brass/10 px-1 text-brass-strong"><HighlightedText text="PK" term={schemaSearch()} /></span></Show>
+                                  <Show when={column.notNull}><span class="ml-1 rounded bg-surface2 px-1"><HighlightedText text="NOT NULL" term={schemaSearch()} /></span></Show>
+                                </li>
+                              )}
+                            </For>
+                          </ul>
+                        </article>
+                      )}
+                    </For>
+                    <Show when={!isLoadingSchema() && filteredSchema().length === 0}>
+                      <p class="text-sm text-muted">No schema entries matched your search.</p>
+                    </Show>
+                  </Show>
+                </div>
               </div>
-            </div>
-          </Show>
-        </div>
-      </section>
+            </Show>
+          </div>
+        </SectionCard>
+      </div>
     </div>
   )
 }

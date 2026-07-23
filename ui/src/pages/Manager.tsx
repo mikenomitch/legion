@@ -2,7 +2,6 @@ import { createEffect, createResource, createSignal } from 'solid-js'
 import SharedIndex from '../components/SharedIndex'
 import { managerClient } from '../grpcClient'
 import { formatRelativeTime } from '../utils/format'
-import { healthToneClasses } from '../utils/health'
 
 export default function Manager() {
   const [search, setSearch] = createSignal('')
@@ -47,8 +46,7 @@ export default function Manager() {
       items={(data()?.configs ?? []).map((config) => ({
         id: config.nodeId,
         title: config.nodeId,
-        health: 'config',
-        healthClass: healthToneClasses('healthy'),
+        subtitle: 'Configuration snapshot',
         updatedAt: formatRelativeTime(config.updatedAt),
         href: `/manager/${encodeURIComponent(config.nodeId)}`,
       }))}
@@ -60,7 +58,8 @@ export default function Manager() {
         setPageSize(size)
         setPage(1)
       }}
-      emptyLabel="No managers found."
+      emptyLabel="No manager configs recorded"
+      emptyHint="Manager nodes publish a config snapshot when they start."
     />
   )
 }

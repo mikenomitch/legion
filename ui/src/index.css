@@ -1,25 +1,99 @@
+@import '@fontsource-variable/inter';
+@import '@fontsource-variable/space-grotesk';
+@import '@fontsource-variable/jetbrains-mono';
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
+/*
+ * Legion theme tokens. Every theme-aware color in tailwind.config.js reads one
+ * of these RGB triplets, so light/dark stay consistent across the whole app.
+ *
+ * The palette is "command post": warm stone neutrals, a brass accent for the
+ * standard, and restrained semantic colors for status.
+ */
 :root {
-  font-family: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --c-canvas: 247 246 243;
+  --c-surface: 255 255 255;
+  --c-surface2: 244 242 237;
+  --c-line: 228 225 216;
+  --c-line-strong: 203 198 185;
+  --c-ink: 30 28 23;
+  --c-muted: 106 101 90;
+  --c-faint: 154 148 135;
+  --c-brass: 143 106 21;
+  --c-brass-strong: 110 81 16;
+  color-scheme: light;
+}
+
+.dark {
+  --c-canvas: 12 11 9;
+  --c-surface: 23 21 17;
+  --c-surface2: 31 28 22;
+  --c-line: 45 41 32;
+  --c-line-strong: 68 61 46;
+  --c-ink: 235 230 219;
+  --c-muted: 162 154 138;
+  --c-faint: 112 105 90;
+  --c-brass: 214 180 90;
+  --c-brass-strong: 231 201 122;
+  color-scheme: dark;
+}
+
+html {
+  font-family: 'Inter Variable', Inter, system-ui, -apple-system, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
 }
 
 body {
   margin: 0;
   min-height: 100vh;
-  background: #f8fafc;
-  color: #0b0c0f;
+  @apply bg-canvas text-ink;
 }
 
 .dark body {
-  background: radial-gradient(circle at 20% 20%, rgba(255, 255, 255, 0.02), transparent 25%),
-    radial-gradient(circle at 80% 0%, rgba(255, 255, 255, 0.02), transparent 30%),
-    #0f1115;
-  color: #e5e7eb;
+  background-image:
+    radial-gradient(ellipse 80% 50% at 50% -10%, rgb(var(--c-brass) / 0.045), transparent),
+    none;
+  background-attachment: fixed;
 }
 
 a {
   color: inherit;
+}
+
+::selection {
+  background: rgb(var(--c-brass) / 0.25);
+}
+
+/* Focus visibility: one consistent brass ring everywhere. */
+:focus-visible {
+  outline: 2px solid rgb(var(--c-brass) / 0.7);
+  outline-offset: 1px;
+}
+
+/* Slim scrollbars for dense panels (logs, tables, palettes). */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgb(var(--c-line-strong)) transparent;
+}
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-thumb {
+  background: rgb(var(--c-line-strong));
+  border-radius: 8px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+@layer components {
+  /* Small-caps section label — the recurring Legion "inscription" motif. */
+  .eyebrow {
+    @apply font-display text-2xs font-semibold uppercase tracking-[0.16em] text-faint;
+  }
 }

@@ -1,6 +1,8 @@
 import { useParams } from '@solidjs/router'
 import { Show, createResource } from 'solid-js'
+import { CodeBlock, Note, PageHeader, SectionCard, Spinner } from '../../components/ui'
 import { managerClient } from '../../grpcClient'
+import { formatRelativeTime } from '../../utils/format'
 
 function prettyJsonLine(line: string): string {
   try {
@@ -19,24 +21,30 @@ export default function ManagerNodeDetail() {
   const [o11y] = createResource(async () => managerClient.getObservability({ maxLines: 200 }))
 
   return (
-    <Show when={!data.loading} fallback={<p>Loading manager…</p>}>
-      <Show when={!data.error && data()} fallback={<p class="text-rose-500">Failed to load manager.</p>}>
-        <article class="space-y-3 rounded border border-neutral-200 bg-white/90 p-4 dark:border-neutral-800 dark:bg-neutral-900/60">
-          <h2 class="text-2xl font-semibold">{data()!.nodeId}</h2>
-          <pre class="max-h-[520px] overflow-auto rounded bg-neutral-100 p-3 text-xs dark:bg-neutral-950">{JSON.stringify(data(), null, 2)}</pre>
+    <Show when={!data.loading} fallback={<div class="py-6"><Spinner label="Loading manager…" /></div>}>
+      <Show when={!data.error && data()} fallback={<Note tone="danger">Failed to load manager.</Note>}>
+        <div>
+          <PageHeader
+            eyebrow="Manager"
+            title={data()!.nodeId}
+            subtitle={<>Configuration snapshot · updated {formatRelativeTime(data()!.updatedAt)}</>}
+          />
+          <div class="space-y-4">
+            <SectionCard title="Config snapshot">
+              <CodeBlock code={JSON.stringify(data(), null, 2)} maxHClass="max-h-[520px]" />
+            </SectionCard>
 
-          <Show when={o11y()?.o11yEnabled}>
-            <section class="space-y-2">
-              <h3 class="text-lg font-semibold">Logs</h3>
-              <p class="text-xs text-neutral-500">Recent OTEL log lines captured by manager.</p>
-              <div class="max-h-[280px] overflow-auto rounded bg-neutral-100 p-3 text-xs dark:bg-neutral-950">
-                {(o11y()?.logs ?? []).map((line) => (
-                  <pre>{prettyJsonLine(line)}</pre>
-                ))}
-              </div>
-            </section>
-          </Show>
-        </article>
+            <Show when={o11y()?.o11yEnabled}>
+              <SectionCard title="Recent logs" description="Recent OTEL log lines captured by the manager.">
+                <div class="max-h-[280px] overflow-auto rounded-md border border-line bg-surface2/70 p-3 font-mono text-xs leading-relaxed">
+                  {(o11y()?.logs ?? []).map((line) => (
+                    <pre class="whitespace-pre-wrap">{prettyJsonLine(line)}</pre>
+                  ))}
+                </div>
+              </SectionCard>
+            </Show>
+          </div>
+        </div>
       </Show>
     </Show>
   )

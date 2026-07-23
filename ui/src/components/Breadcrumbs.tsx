@@ -1,5 +1,6 @@
 import { A, useLocation } from '@solidjs/router'
 import { For, Show, createMemo } from 'solid-js'
+import { Icon } from './ui'
 
 export type Breadcrumb = {
   label: string
@@ -7,13 +8,17 @@ export type Breadcrumb = {
 }
 
 const sectionLabels: Record<string, string> = {
-  nodes: 'Worker Nodes',
-  manager: 'Manager Nodes',
+  nodes: 'Workers',
+  manager: 'Managers',
   jobs: 'Jobs',
-  deployments: 'Deployments',
   rollouts: 'Rollouts',
-  kv: 'Key/Value',
-  api: 'API',
+  raft: 'Raft',
+  events: 'Events',
+  kv: 'KV Store',
+  access: 'Access',
+  api: 'API Explorer',
+  'state-explorer': 'State Explorer',
+  observability: 'Observability',
   testing: 'Testing',
 }
 
@@ -41,10 +46,11 @@ const labelForSegment = (segments: readonly string[], index: number): string => 
   if (previous === 'nodes') return decoded
   if (previous === 'manager') return decoded
   if (previous === 'rollouts') return decoded
-  if (previous === 'deployments') return decoded
   if (previous === 'specs') return decoded
+  if (previous === 'tasks') return decoded
 
   if (current === 'specs') return 'Specs'
+  if (current === 'tasks') return 'Tasks'
   if (sectionLabels[current]) return sectionLabels[current]
 
   return titleCase(decoded)
@@ -75,23 +81,25 @@ export default function Breadcrumbs() {
 
   return (
     <Show when={crumbs().length > 0}>
-      <nav aria-label="Breadcrumb" class="mb-4">
-        <ol class="flex flex-wrap items-center gap-2 text-xs text-neutral-500 dark:text-neutral-400">
+      <nav aria-label="Breadcrumb" class="min-w-0">
+        <ol class="flex items-center gap-1 overflow-hidden text-xs text-faint">
           <For each={crumbs()}>
             {(crumb, index) => (
               <>
                 <Show when={index() > 0}>
-                  <li aria-hidden="true" class="text-neutral-400 dark:text-neutral-600">/</li>
+                  <li aria-hidden="true" class="shrink-0">
+                    <Icon name="chevronRight" size={12} class="text-faint/70" />
+                  </li>
                 </Show>
-                <li>
+                <li class="min-w-0">
                   <Show
                     when={crumb.href}
-                    fallback={<span class="font-medium text-neutral-700 dark:text-neutral-200">{crumb.label}</span>}
+                    fallback={<span class="block max-w-[16rem] truncate font-medium text-ink">{crumb.label}</span>}
                   >
                     {(href) => (
                       <A
                         href={href()}
-                        class="rounded px-1 py-0.5 text-neutral-600 underline decoration-dotted underline-offset-4 hover:text-neutral-900 dark:text-neutral-300 dark:hover:text-neutral-100"
+                        class="block max-w-[12rem] truncate rounded px-0.5 py-0.5 text-muted transition-colors hover:text-ink"
                       >
                         {crumb.label}
                       </A>

@@ -1,6 +1,7 @@
 import { For, Show, createMemo, createSignal } from "solid-js";
 import { MethodKind } from "@bufbuild/protobuf";
 import HoverInfo from "../components/HoverInfo";
+import { Badge, Button, Icon, Note, SectionCard, cx, inputClass, textareaClass } from "../components/ui";
 import { managerClient } from "../grpcClient";
 import { Manager } from "../gen/legion_connect";
 import {
@@ -258,127 +259,105 @@ export default function ApiExplorer() {
   };
 
   return (
-    <section class="space-y-4">
-      <div class="grid gap-4 lg:grid-cols-[20rem,1fr]">
-        <aside class="max-h-[70vh] overflow-auto rounded border border-neutral-200 bg-white/90 p-4 shadow-[4px_4px_0_#d4d4d8] dark:border-neutral-800 dark:bg-neutral-900/60 dark:shadow-[4px_4px_0_#0b0d12]">
-          <p class="mb-3 text-xs uppercase tracking-[0.12em] text-neutral-500 dark:text-neutral-400">
-            Methods
-          </p>
-          <input
-            type="search"
-            placeholder="Search RPC methods"
-            class="mb-3 w-full rounded border border-neutral-300 bg-white px-3 py-2 text-sm text-neutral-900 placeholder:text-neutral-500 dark:border-neutral-700 dark:bg-neutral-950 dark:text-neutral-100 dark:placeholder:text-neutral-400"
-            value={methodSearch()}
-            onInput={(event) => setMethodSearch(event.currentTarget.value)}
-          />
-          <Show
-            when={filteredMethods().length > 0}
-            fallback={
-              <p class="text-sm text-neutral-500 dark:text-neutral-400">
-                No methods match your search.
-              </p>
-            }
-          >
-          <div class="space-y-2">
+    <div class="grid items-start gap-4 lg:grid-cols-[19rem,1fr]">
+      <SectionCard title="Methods" flush class="lg:sticky lg:top-16">
+        <div class="border-b border-line p-2.5">
+          <div class="relative">
+            <Icon name="search" size={14} class="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-faint" />
+            <input
+              type="search"
+              placeholder="Search RPC methods…"
+              class={cx(inputClass, "pl-8")}
+              value={methodSearch()}
+              onInput={(event) => setMethodSearch(event.currentTarget.value)}
+            />
+          </div>
+        </div>
+        <Show
+          when={filteredMethods().length > 0}
+          fallback={<p class="p-4 text-sm text-muted">No methods match your search.</p>}
+        >
+          <div class="max-h-[65vh] space-y-0.5 overflow-auto p-1.5">
             <For each={filteredMethods()}>
               {([name, method]) => (
                 <button
                   type="button"
-                  class={`w-full rounded border px-3 py-2 text-left text-sm transition ${
+                  class={cx(
+                    "flex w-full items-center justify-between gap-2 rounded-md px-2.5 py-1.5 text-left text-sm transition-colors",
                     selectedMethodName() === name
-                      ? "border-neutral-900 bg-neutral-900 text-white dark:border-neutral-200 dark:bg-neutral-100 dark:text-neutral-900"
-                      : "border-neutral-300 text-neutral-700 hover:border-neutral-500 dark:border-neutral-700 dark:text-neutral-300"
-                  }`}
+                      ? "bg-brass/10 font-medium text-ink"
+                      : "text-muted hover:bg-surface2 hover:text-ink",
+                  )}
                   onClick={() => {
                     setSelectedMethodName(name);
                     resetRequestTemplate();
                   }}
                 >
-                  <p class="font-semibold">{method.name}</p>
-                  <p class="mt-1 text-xs opacity-80">{methodKindLabel(method.kind)}</p>
+                  <span class="truncate font-mono text-xs">{method.name}</span>
+                  <Show when={method.kind === MethodKind.ServerStreaming}>
+                    <Badge tone="info">stream</Badge>
+                  </Show>
                 </button>
               )}
             </For>
           </div>
+        </Show>
+      </SectionCard>
+
+      <div class="min-w-0 space-y-4">
+        <SectionCard
+          title={<span class="font-mono normal-case tracking-normal">{selectedMethod().name}</span>}
+          description={methodKindLabel(selectedMethod().kind)}
+        >
+          <Show when={selectedMethodComment()}>
+            <p class="mb-4 whitespace-pre-wrap text-sm text-muted">{selectedMethodComment()}</p>
           </Show>
-        </aside>
-
-        <div class="space-y-4">
-          <div class="rounded border border-neutral-200 bg-white/90 p-4 shadow-[4px_4px_0_#d4d4d8] dark:border-neutral-800 dark:bg-neutral-900/60 dark:shadow-[4px_4px_0_#0b0d12]">
-            <p class="text-xs uppercase tracking-[0.12em] text-neutral-500 dark:text-neutral-400">
-              Type information
-            </p>
-            <h3 class="text-lg font-semibold text-neutral-900 dark:text-neutral-100">
-              {selectedMethod().name}
-            </h3>
-            <Show when={selectedMethodComment()}>
-              <p class="mt-1 whitespace-pre-wrap text-sm text-neutral-600 dark:text-neutral-300">
-                {selectedMethodComment()}
-              </p>
-            </Show>
-            <div class="mt-4 grid gap-4 md:grid-cols-2">
-              <TypeTable
-                title={`Request: ${requestType().typeName}`}
-                typeName={requestType().typeName}
-                fields={requestType().fields.list()}
-              />
-              <TypeTable
-                title={`Response: ${responseType().typeName}`}
-                typeName={responseType().typeName}
-                fields={responseType().fields.list()}
-              />
-            </div>
-          </div>
-
           <div class="grid gap-4 md:grid-cols-2">
-            <div class="rounded border border-neutral-200 bg-white/90 p-4 shadow-[4px_4px_0_#d4d4d8] dark:border-neutral-800 dark:bg-neutral-900/60 dark:shadow-[4px_4px_0_#0b0d12]">
-              <div class="mb-2 flex items-center justify-between">
-                <p class="text-sm font-semibold text-neutral-900 dark:text-neutral-100">
-                  Request JSON
-                </p>
-                <button
-                  type="button"
-                  class="rounded border border-neutral-300 px-2 py-1 text-xs text-neutral-700 hover:border-neutral-500 dark:border-neutral-700 dark:text-neutral-200"
-                  onClick={resetRequestTemplate}
-                >
-                  Reset template
-                </button>
-              </div>
-              <textarea
-                class="h-80 w-full rounded border border-neutral-300 bg-white p-3 font-mono text-xs text-neutral-900 dark:border-neutral-700 dark:bg-neutral-950 dark:text-neutral-100"
-                value={requestJson()}
-                onInput={(event) => setRequestJson(event.currentTarget.value)}
-              />
-              <Show when={requestError()}>
-                <p class="mt-2 text-xs text-red-500">{requestError()}</p>
-              </Show>
-              <Show when={callError()}>
-                <p class="mt-2 text-xs text-red-500">RPC error: {callError()}</p>
-              </Show>
-              <div class="mt-3 flex justify-end">
-                <button
-                  type="button"
-                  class="rounded border border-neutral-900 bg-neutral-900 px-4 py-2 text-sm font-semibold text-white disabled:opacity-50 dark:border-neutral-200 dark:bg-neutral-100 dark:text-neutral-900"
-                  onClick={() => void runCall()}
-                  disabled={isCalling()}
-                >
-                  {isCalling() ? "Calling…" : `Invoke ${selectedMethod().name}`}
-                </button>
-              </div>
-            </div>
-
-            <div class="rounded border border-neutral-200 bg-white/90 p-4 shadow-[4px_4px_0_#d4d4d8] dark:border-neutral-800 dark:bg-neutral-900/60 dark:shadow-[4px_4px_0_#0b0d12]">
-              <p class="mb-2 text-sm font-semibold text-neutral-900 dark:text-neutral-100">
-                Response JSON
-              </p>
-              <pre class="h-80 overflow-auto rounded border border-neutral-300 bg-white p-3 font-mono text-xs text-neutral-900 dark:border-neutral-700 dark:bg-neutral-950 dark:text-neutral-100">
-                {responseJson()}
-              </pre>
-            </div>
+            <TypeTable
+              title={`Request: ${requestType().typeName}`}
+              typeName={requestType().typeName}
+              fields={requestType().fields.list()}
+            />
+            <TypeTable
+              title={`Response: ${responseType().typeName}`}
+              typeName={responseType().typeName}
+              fields={responseType().fields.list()}
+            />
           </div>
+        </SectionCard>
+
+        <div class="grid gap-4 xl:grid-cols-2">
+          <SectionCard
+            title="Request JSON"
+            actions={<Button size="xs" icon="refresh" onClick={resetRequestTemplate}>Reset template</Button>}
+          >
+            <textarea
+              class={cx(textareaClass, "h-80")}
+              value={requestJson()}
+              onInput={(event) => setRequestJson(event.currentTarget.value)}
+              spellcheck={false}
+            />
+            <Show when={requestError()}>
+              <Note tone="danger" class="mt-2 text-xs">{requestError()}</Note>
+            </Show>
+            <Show when={callError()}>
+              <Note tone="danger" class="mt-2 text-xs">RPC error: {callError()}</Note>
+            </Show>
+            <div class="mt-3 flex justify-end">
+              <Button variant="primary" size="md" icon="zap" onClick={() => void runCall()} disabled={isCalling()}>
+                {isCalling() ? "Calling…" : `Invoke ${selectedMethod().name}`}
+              </Button>
+            </div>
+          </SectionCard>
+
+          <SectionCard title="Response JSON">
+            <pre class="h-80 overflow-auto rounded-md border border-line bg-surface2/70 p-3 font-mono text-xs leading-relaxed text-ink">
+              {responseJson()}
+            </pre>
+          </SectionCard>
         </div>
       </div>
-    </section>
+    </div>
   );
 }
 
@@ -392,10 +371,10 @@ function TypeTable(props: TypeTableProps) {
   const messageComment = createMemo(() => getMessageProtoComment(props.typeName));
 
   return (
-    <div class="rounded border border-neutral-200 p-3 dark:border-neutral-700">
+    <div class="min-w-0 rounded-md border border-line bg-surface2/40 p-3">
       <HoverInfo content={messageComment()}>
         <p
-          class={`text-sm font-semibold text-neutral-900 dark:text-neutral-100 ${
+          class={`font-mono text-xs font-semibold text-ink ${
             messageComment()
               ? "cursor-help decoration-dotted underline-offset-4 hover:underline"
               : ""
@@ -406,15 +385,15 @@ function TypeTable(props: TypeTableProps) {
       </HoverInfo>
       <Show
         when={props.fields.length > 0}
-        fallback={<p class="mt-2 text-xs text-neutral-500">No fields.</p>}
+        fallback={<p class="mt-2 text-xs text-faint">No fields.</p>}
       >
         <div class="mt-3 overflow-visible">
           <table class="min-w-full text-left text-xs">
             <thead>
-              <tr class="text-neutral-500 dark:text-neutral-400">
-                <th class="pb-2 pr-4">Field</th>
-                <th class="pb-2 pr-4">#</th>
-                <th class="pb-2">Type</th>
+              <tr class="text-2xs uppercase tracking-wider text-faint">
+                <th class="pb-2 pr-4 font-semibold">Field</th>
+                <th class="pb-2 pr-4 font-semibold">#</th>
+                <th class="pb-2 font-semibold">Type</th>
               </tr>
             </thead>
             <tbody>
@@ -422,8 +401,8 @@ function TypeTable(props: TypeTableProps) {
                 {(field) => {
                   const fieldComment = getFieldProtoComment(props.typeName, field.no);
                   return (
-                    <tr class="border-t border-neutral-200 align-top dark:border-neutral-800">
-                      <td class="py-2 pr-4 font-mono text-neutral-900 dark:text-neutral-100">
+                    <tr class="border-t border-line align-top">
+                      <td class="py-1.5 pr-4 font-mono text-ink">
                         <HoverInfo content={fieldComment}>
                           <span
                             class={
@@ -436,8 +415,8 @@ function TypeTable(props: TypeTableProps) {
                           </span>
                         </HoverInfo>
                       </td>
-                      <td class="py-2 pr-4 text-neutral-600 dark:text-neutral-300">{field.no}</td>
-                      <td class="py-2 text-neutral-700 dark:text-neutral-200">{describeFieldType(field)}</td>
+                      <td class="py-1.5 pr-4 tabular-nums text-faint">{field.no}</td>
+                      <td class="py-1.5 font-mono text-muted">{describeFieldType(field)}</td>
                     </tr>
                   );
                 }}

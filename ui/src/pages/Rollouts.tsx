@@ -1,15 +1,8 @@
 import { createEffect, createMemo, createResource, createSignal } from 'solid-js'
 import SharedIndex from '../components/SharedIndex'
+import { checkboxClass } from '../components/ui'
 import { managerClient } from '../grpcClient'
 import { formatRelativeTime } from '../utils/format'
-import { healthToneClasses } from '../utils/health'
-
-const toneForStatus = (status: string) => {
-  const normalized = status.toLowerCase()
-  if (normalized.includes('failed') || normalized.includes('cancel')) return healthToneClasses('unhealthy')
-  if (normalized.includes('completed') || normalized.includes('running')) return healthToneClasses('healthy')
-  return healthToneClasses('unknown')
-}
 
 const isActiveStatus = (status: string) => !['completed', 'failed', 'cancelled', 'completed_incomplete'].includes(status.toLowerCase())
 
@@ -60,24 +53,37 @@ export default function Rollouts() {
         { label: 'Updated (oldest)', value: 'updated_at:asc' },
         { label: 'Status', value: 'status:asc' },
       ]}
-      extraFilters={<label class="flex items-center gap-2 text-sm"><input type="checkbox" checked={activeOnly()} onChange={(event) => setActiveOnly(event.currentTarget.checked)} />Active only</label>}
+      extraFilters={
+        <label class="flex cursor-pointer items-center gap-2 rounded-md border border-line bg-surface px-2.5 py-1.5 text-xs font-medium text-muted">
+          <input type="checkbox" class={checkboxClass} checked={activeOnly()} onChange={(event) => setActiveOnly(event.currentTarget.checked)} />
+          Active only
+        </label>
+      }
+      columns={[
+        { key: 'target', header: 'Target config' },
+        { key: 'placed', header: 'Placed', class: 'text-right' },
+      ]}
       loading={data.loading || ledger.loading}
       error={data.error ? 'Failed to load rollouts.' : undefined}
       items={prioritized().map((rollout) => ({
         id: String(rollout.id),
         title: rollout.jobId,
-        subtitle: `Placed allocations: ${placementCounts().get(rollout.toJobConfigId) ?? 0}`,
-        health: rollout.status,
-        healthClass: toneForStatus(rollout.status),
+        subtitle: `Rollout #${rollout.id}`,
+        status: rollout.status,
         updatedAt: formatRelativeTime(rollout.updatedAt),
         href: `/rollouts/${rollout.id}`,
+        cells: {
+          target: <span class="font-mono text-xs">{rollout.toJobConfigId}</span>,
+          placed: <span class="tabular-nums">{placementCounts().get(rollout.toJobConfigId) ?? 0}</span>,
+        },
       }))}
       page={Number(data()?.page ?? page())}
       pageSize={Number(data()?.pageSize ?? pageSize())}
       totalCount={Number(data()?.totalCount ?? 0)}
       onPageChange={setPage}
       onPageSizeChange={(size) => { setPageSize(size); setPage(1) }}
-      emptyLabel="No rollouts found."
+      emptyLabel="No rollouts yet"
+      emptyHint="Rollouts are created automatically when you submit a new version of a running job."
     />
   )
 }

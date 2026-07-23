@@ -1,5 +1,6 @@
 import { For, Show, createEffect, createMemo, createResource, createSignal, onCleanup } from 'solid-js'
 import { managerClient } from '../grpcClient'
+import { EmptyState, Icon, Note, SectionCard, checkboxClass, cx, inputClass } from '../components/ui'
 
 type LogSignal = {
   raw: string
@@ -184,18 +185,15 @@ function normalizeSignal(line: string): LogSignal {
 function logLevelClass(level: string | undefined): string {
   const normalized = (level ?? '').toLowerCase()
   if (normalized.includes('error') || normalized.includes('fatal') || normalized.includes('critical')) {
-    return 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-300'
+    return 'bg-red-500/10 text-red-700 dark:text-red-300'
   }
   if (normalized.includes('warn')) {
-    return 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300'
+    return 'bg-amber-500/10 text-amber-700 dark:text-amber-300'
   }
   if (normalized.includes('info')) {
-    return 'bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-300'
+    return 'bg-sky-500/10 text-sky-700 dark:text-sky-300'
   }
-  if (normalized.includes('debug')) {
-    return 'bg-neutral-100 text-neutral-700 dark:bg-neutral-900/70 dark:text-neutral-200'
-  }
-  return 'bg-neutral-100 text-neutral-700 dark:bg-neutral-900/70 dark:text-neutral-200'
+  return 'bg-surface2 text-muted'
 }
 
 function LogSignalRow(props: {
@@ -206,35 +204,35 @@ function LogSignalRow(props: {
   const [level, source] = props.signal.subtitle.split(' · ')
 
   return (
-    <article class="overflow-hidden border-b border-neutral-200 bg-white dark:border-neutral-800 dark:bg-neutral-950">
+    <article>
       <button
         type="button"
-        class="grid w-full cursor-pointer grid-cols-[8.5rem_1fr_auto] items-start gap-3 px-3 py-2 text-left"
+        class="grid w-full cursor-pointer grid-cols-[8.5rem_1fr_auto] items-start gap-3 px-3 py-2 text-left transition-colors hover:bg-surface2/50"
         onClick={() => props.onToggle(props.signal.uid)}
         aria-expanded={props.expanded}
       >
-        <span class="shrink-0 text-[11px] leading-5 font-mono text-neutral-500 tabular-nums">
+        <span class="shrink-0 font-mono text-2xs leading-5 tabular-nums text-faint">
           {props.signal.timestampText || '—'}
         </span>
-        <span class="min-w-0 text-sm break-words font-mono text-neutral-900 dark:text-neutral-100">
+        <span class="min-w-0 break-words font-mono text-xs leading-5 text-ink">
           {props.signal.title}
         </span>
-        <span class="inline-flex items-center justify-center gap-1 text-[11px] font-medium text-neutral-500">
+        <span class="inline-flex items-center justify-center gap-1.5 text-2xs font-medium text-faint">
           <Show when={level}>
-            <span class={`rounded px-2 py-0.5 font-mono ${logLevelClass(level)}`}>{level}</span>
+            <span class={`rounded-full px-2 py-0.5 font-mono ${logLevelClass(level)}`}>{level}</span>
           </Show>
           <Show when={source}>
-            <span class="hidden text-[10px] uppercase text-neutral-400 md:inline">{source}</span>
+            <span class="hidden text-[10px] uppercase md:inline">{source}</span>
           </Show>
-          <span>{props.expanded ? '▾' : '▸'}</span>
+          <Icon name="chevronRight" size={12} class={cx('transition-transform', props.expanded && 'rotate-90')} />
         </span>
       </button>
       <Show when={props.expanded}>
-        <section class="border-t border-neutral-200 bg-neutral-50 px-3 py-2 dark:border-neutral-800 dark:bg-neutral-900/70">
-          <p class="mb-2 text-[11px] font-mono text-neutral-500">{props.signal.subtitle || 'Log entry attributes'}</p>
-          <pre class="max-h-56 overflow-auto rounded bg-neutral-100 p-2 text-[11px] font-mono leading-5 dark:bg-neutral-900">{props.signal.pretty}</pre>
+        <section class="border-y border-line bg-surface2/40 px-3 py-2">
+          <p class="mb-2 font-mono text-2xs text-faint">{props.signal.subtitle || 'Log entry attributes'}</p>
+          <pre class="max-h-56 overflow-auto rounded-md border border-line bg-surface p-2 font-mono text-2xs leading-5 text-muted">{props.signal.pretty}</pre>
           <Show when={props.signal.timestampMs !== undefined}>
-            <p class="mt-2 text-[10px] text-neutral-500">epoch_ms: {props.signal.timestampMs}</p>
+            <p class="mt-2 text-[10px] text-faint">epoch_ms: {props.signal.timestampMs}</p>
           </Show>
         </section>
       </Show>
@@ -307,51 +305,58 @@ export default function Observability() {
   }
 
   return (
-    <section class="space-y-4 rounded border border-neutral-200 bg-white/90 p-4 dark:border-neutral-800 dark:bg-neutral-900/60">
-      <article class="space-y-1">
-        <p class="text-sm text-neutral-600 dark:text-neutral-300">Live manager logs are pulled from the observability endpoint.</p>
-      </article>
-
-      <Show
-        when={o11y()?.o11yEnabled}
-        fallback={<p class="text-sm text-neutral-500">Enable manager observability with <code>--o11y</code> to populate logs.</p>}
-      >
-        <div class="flex flex-wrap items-end justify-between gap-3">
-          <p class="text-sm font-semibold text-neutral-900 dark:text-neutral-100">Logs</p>
-          <div class="flex flex-wrap items-center justify-end gap-3">
-            <label class="inline-flex items-center gap-2 text-xs text-neutral-500">
-              <input
-                type="checkbox"
-                class="h-3.5 w-3.5 rounded border-neutral-300 text-neutral-900 dark:border-neutral-600 dark:text-neutral-100 dark:bg-neutral-950"
-                checked={liveUpdating()}
-                onInput={(event) => setLiveUpdating((event.currentTarget as HTMLInputElement).checked)}
-              />
-              <span>Live update</span>
-            </label>
-            <label class="text-xs text-neutral-500">
-              <span class="sr-only">Search logs</span>
-              <input
-                type="search"
-                class="w-72 rounded border border-neutral-200 bg-white px-3 py-2 text-sm outline-none ring-0 focus:border-neutral-900 dark:border-neutral-700 dark:bg-neutral-950"
-                placeholder="Search message, level, source..."
-                value={searchTerm()}
-                onInput={(event) => setSearchTerm((event.target as HTMLInputElement).value)}
-              />
-            </label>
+    <Show
+      when={o11y()?.o11yEnabled || o11y() === undefined}
+      fallback={
+        <Note tone="info">
+          Enable manager observability with <code class="rounded bg-surface2 px-1 font-mono text-xs">--o11y</code> to populate logs.
+        </Note>
+      }
+    >
+      <div class="space-y-3">
+        <div class="flex flex-wrap items-center gap-2">
+          <div class="relative min-w-[14rem] flex-1">
+            <Icon name="search" size={14} class="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-faint" />
+            <input
+              type="search"
+              class={cx(inputClass, 'pl-8')}
+              placeholder="Search message, level, source…"
+              value={searchTerm()}
+              onInput={(event) => setSearchTerm((event.target as HTMLInputElement).value)}
+              aria-label="Search logs"
+            />
           </div>
+          <label class="inline-flex cursor-pointer items-center gap-2 rounded-md border border-line bg-surface px-2.5 py-1.5 text-xs font-medium text-muted">
+            <input
+              type="checkbox"
+              class={checkboxClass}
+              checked={liveUpdating()}
+              onInput={(event) => setLiveUpdating((event.currentTarget as HTMLInputElement).checked)}
+            />
+            <span>Live update</span>
+          </label>
         </div>
 
-        <p class="text-xs text-neutral-500">
-          Showing {filteredLogs().length} logs
-          <Show when={query().length > 0}> matching "{query()}"</Show>
-        </p>
-
-        <Show when={filteredLogs().length > 0} fallback={<p class="text-sm text-neutral-500">No logs matched your search.</p>}>
-          <section class="max-h-[540px] overflow-auto rounded border border-neutral-200 bg-white text-sm dark:border-neutral-800 dark:bg-neutral-950">
-            <For each={filteredLogs()}>{(signal) => <SignalCard signal={signal} expanded={isLogExpanded(signal.uid)} onToggle={toggleLogExpanded} />}</For>
-          </section>
-        </Show>
-      </Show>
-    </section>
+        <SectionCard
+          title="Manager logs"
+          description={
+            <>
+              {filteredLogs().length} log{filteredLogs().length === 1 ? '' : 's'}
+              <Show when={query().length > 0}> matching "{query()}"</Show>
+            </>
+          }
+          flush
+        >
+          <Show
+            when={filteredLogs().length > 0}
+            fallback={<EmptyState icon="eye" title="No logs matched" body="Waiting for manager log output." />}
+          >
+            <section class="max-h-[560px] divide-y divide-line overflow-auto text-sm">
+              <For each={filteredLogs()}>{(signal) => <SignalCard signal={signal} expanded={isLogExpanded(signal.uid)} onToggle={toggleLogExpanded} />}</For>
+            </section>
+          </Show>
+        </SectionCard>
+      </div>
+    </Show>
   )
 }

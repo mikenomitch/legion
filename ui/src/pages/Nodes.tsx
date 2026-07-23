@@ -2,7 +2,7 @@ import { createEffect, createMemo, createResource, createSignal } from 'solid-js
 import SharedIndex from '../components/SharedIndex'
 import { managerClient } from '../grpcClient'
 import { formatRelativeTime } from '../utils/format'
-import { healthToneClasses, summarizeHealthChecks } from '../utils/health'
+import { summarizeHealthChecks } from '../utils/health'
 
 export default function Nodes() {
   const [search, setSearch] = createSignal('')
@@ -54,6 +54,11 @@ export default function Nodes() {
         { label: 'ID (Z-A)', value: 'id:desc' },
         { label: 'Last heartbeat (newest)', value: 'last_heartbeat:desc' },
       ]}
+      columns={[
+        { key: 'pool', header: 'Pool' },
+        { key: 'availability', header: 'Availability' },
+        { key: 'allocations', header: 'Allocations', class: 'text-right' },
+      ]}
       loading={data.loading || ledger.loading}
       error={data.error ? 'Failed to load workers.' : undefined}
       items={(data()?.nodes ?? []).map((node) => {
@@ -61,11 +66,15 @@ export default function Nodes() {
         return {
           id: node.id,
           title: node.id,
-          subtitle: `Pool: ${node.pool || 'default'} · Availability: ${node.availability || '—'} · Last heartbeat: ${formatRelativeTime(node.lastHeartbeat)} · Allocations: ${allocationCounts().get(node.id) ?? 0}`,
-          health: health.label,
-          healthClass: healthToneClasses(health.tone),
+          status: health.label,
+          statusTone: health.tone,
           updatedAt: formatRelativeTime(node.lastHeartbeat),
           href: `/nodes/${encodeURIComponent(node.id)}`,
+          cells: {
+            pool: node.pool || 'default',
+            availability: node.availability || '—',
+            allocations: <span class="tabular-nums">{allocationCounts().get(node.id) ?? 0}</span>,
+          },
         }
       })}
       page={Number(data()?.page ?? page())}
@@ -76,7 +85,8 @@ export default function Nodes() {
         setPageSize(size)
         setPage(1)
       }}
-      emptyLabel="No workers found."
+      emptyLabel="No workers connected"
+      emptyHint="Join a worker with `legion agent --join <manager>` and it will appear here."
     />
   )
 }

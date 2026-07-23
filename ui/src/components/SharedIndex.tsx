@@ -1,17 +1,23 @@
 import { A, useNavigate } from '@solidjs/router'
 import { createEffect, For, onCleanup, onMount, Show, createSignal, type JSX } from 'solid-js'
 import { clearCommandPaletteIndexItems, setCommandPaletteIndexItems } from '../utils/commandPalette'
+import { Button, EmptyState, Icon, LoadingRows, Note, SectionCard, StatusBadge, cx, inputClass, selectClass, tableClass, tdClass, thClass, theadClass, trHoverClass } from './ui'
+import type { Tone } from '../utils/status'
 
 export type IndexSortOption = { label: string; value: string }
+
+// Extra, entity-specific columns rendered between Status and Updated.
+export type IndexColumn = { key: string; header: string; class?: string }
 
 export type IndexItem = {
   id: string
   title: string
-  health: string
-  healthClass: string
+  subtitle?: string
+  status?: string
+  statusTone?: Tone
   updatedAt: string
   href: string
-  subtitle?: string
+  cells?: Record<string, JSX.Element>
 }
 
 type SharedIndexProps = {
@@ -21,6 +27,7 @@ type SharedIndexProps = {
   sort: string
   onSort: (value: string) => void
   sortOptions: readonly IndexSortOption[]
+  columns?: readonly IndexColumn[]
   items: readonly IndexItem[]
   loading: boolean
   error?: string
@@ -30,6 +37,7 @@ type SharedIndexProps = {
   onPageChange: (page: number) => void
   onPageSizeChange: (size: number) => void
   emptyLabel: string
+  emptyHint?: string
   extraFilters?: JSX.Element
 }
 
@@ -37,7 +45,7 @@ export default function SharedIndex(props: SharedIndexProps) {
   const totalPages = () => Math.max(1, Math.ceil(props.totalCount / props.pageSize))
   const [selectedIndex, setSelectedIndex] = createSignal(-1)
   const navigate = useNavigate()
-  let indexListRef: HTMLDivElement | undefined
+  let indexListRef: HTMLTableSectionElement | undefined
 
   createEffect(() => {
     setCommandPaletteIndexItems(
@@ -72,7 +80,7 @@ export default function SharedIndex(props: SharedIndexProps) {
   const scrollSelectedItemIntoView = () => {
     const index = selectedIndex()
     if (index < 0) return
-    const item = indexListRef?.querySelector(`[data-index-item="${index}"]`) as HTMLAnchorElement | null
+    const item = indexListRef?.querySelector(`[data-index-item="${index}"]`) as HTMLElement | null
     item?.scrollIntoView({ block: 'nearest' })
   }
 
@@ -138,90 +146,110 @@ export default function SharedIndex(props: SharedIndexProps) {
   })
 
   return (
-    <section class="space-y-4 rounded border border-neutral-200 bg-white/90 p-4 shadow-[5px_5px_0_#d4d4d8] dark:border-neutral-800 dark:bg-neutral-900/60 dark:shadow-[5px_5px_0_#0b0d12]">
-      <header class="grid gap-2 md:grid-cols-[1fr_180px_130px]">
-        <input
-          value={props.search}
-          onInput={(event) => props.onSearch(event.currentTarget.value)}
-          placeholder={`Search ${props.entityLabel.toLowerCase()}...`}
-          class="w-full rounded border border-neutral-300 bg-white px-3 py-2 text-sm dark:border-neutral-700 dark:bg-neutral-900"
-        />
+    <div class="space-y-3">
+      <div class="flex flex-wrap items-center gap-2">
+        <div class="relative min-w-[14rem] flex-1">
+          <Icon name="search" size={14} class="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-faint" />
+          <input
+            value={props.search}
+            onInput={(event) => props.onSearch(event.currentTarget.value)}
+            placeholder={`Search ${props.entityLabel.toLowerCase()}…`}
+            class={cx(inputClass, 'pl-8')}
+            aria-label={`Search ${props.entityLabel.toLowerCase()}`}
+          />
+        </div>
+        {props.extraFilters}
         <select
           value={props.sort}
           onChange={(event) => props.onSort(event.currentTarget.value)}
-          class="rounded border border-neutral-300 bg-white px-3 py-2 text-sm dark:border-neutral-700 dark:bg-neutral-900"
+          class={cx(selectClass, 'w-auto')}
+          aria-label="Sort"
         >
           <For each={props.sortOptions}>{(option) => <option value={option.value}>{option.label}</option>}</For>
         </select>
-        <select
-          value={String(props.pageSize)}
-          onChange={(event) => props.onPageSizeChange(Number.parseInt(event.currentTarget.value, 10))}
-          class="rounded border border-neutral-300 bg-white px-3 py-2 text-sm dark:border-neutral-700 dark:bg-neutral-900"
-        >
-          <option value="10">10 / page</option>
-          <option value="20">20 / page</option>
-          <option value="50">50 / page</option>
-        </select>
-      </header>
+      </div>
 
-      <Show when={props.extraFilters}>{props.extraFilters}</Show>
-
-      <Show when={!props.loading} fallback={<p class="text-sm text-neutral-500">Loading {props.entityLabel.toLowerCase()}…</p>}>
-        <Show when={!props.error} fallback={<p class="text-sm text-rose-500">{props.error}</p>}>
-          <Show when={props.items.length > 0} fallback={<p class="text-sm text-neutral-500">{props.emptyLabel}</p>}>
-            <div class="space-y-2" ref={indexListRef} data-index-list>
-              <For each={props.items}>
-                {(item, index) => (
-                  <A
-                    href={item.href}
-                    data-index-item={index()}
-                    class={`block rounded border p-3 transition ${selectedIndex() === index() ? 'border-neutral-900 bg-neutral-900 text-white dark:border-neutral-200 dark:bg-neutral-100 dark:text-neutral-900' : 'border-neutral-200 bg-white hover:border-neutral-400 dark:border-neutral-700 dark:bg-neutral-950'}`}
-                    onMouseEnter={() => setSelectedIndex(index())}
-                  >
-                    <div class="flex items-center justify-between gap-2">
-                      <div>
-                        <div class="font-semibold">{item.title}</div>
-                        <Show when={item.subtitle}>
-                          <p class="text-xs text-neutral-500 dark:text-neutral-400">{item.subtitle}</p>
-                        </Show>
-                      </div>
-                      <span class={`rounded border px-2 py-0.5 text-[11px] uppercase tracking-wide ${item.healthClass}`}>
-                        {item.health}
-                      </span>
-                    </div>
-                    <p class="mt-1 text-xs text-neutral-500 dark:text-neutral-400">Updated {item.updatedAt}</p>
-                  </A>
-                )}
-              </For>
-            </div>
+      <SectionCard flush>
+        <Show when={!props.loading} fallback={<LoadingRows rows={5} />}>
+          <Show when={!props.error} fallback={<Note tone="danger" class="m-4">{props.error}</Note>}>
+            <Show
+              when={props.items.length > 0}
+              fallback={<EmptyState icon="search" title={props.emptyLabel} body={props.emptyHint} />}
+            >
+              <div class="overflow-x-auto">
+                <table class={tableClass}>
+                  <thead class={theadClass}>
+                    <tr>
+                      <th class={thClass}>{props.entityLabel.replace(/s$/, '')}</th>
+                      <th class={thClass}>Status</th>
+                      <For each={props.columns ?? []}>{(column) => <th class={cx(thClass, column.class)}>{column.header}</th>}</For>
+                      <th class={cx(thClass, 'text-right')}>Updated</th>
+                    </tr>
+                  </thead>
+                  <tbody class="divide-y divide-line" ref={indexListRef} data-index-list>
+                    <For each={props.items}>
+                      {(item, index) => (
+                        <tr
+                          data-index-item={index()}
+                          class={cx(trHoverClass, 'cursor-pointer', selectedIndex() === index() && 'bg-brass/[0.07]')}
+                          onMouseEnter={() => setSelectedIndex(index())}
+                          onClick={(event) => {
+                            if ((event.target as HTMLElement).closest('a')) return
+                            navigate(item.href)
+                          }}
+                        >
+                          <td class={cx(tdClass, 'py-2.5')}>
+                            <A href={item.href} class="font-medium text-ink hover:text-brass-strong">
+                              {item.title}
+                            </A>
+                            <Show when={item.subtitle}>
+                              <p class="mt-0.5 text-xs text-faint">{item.subtitle}</p>
+                            </Show>
+                          </td>
+                          <td class={tdClass}>
+                            <Show when={item.status !== undefined} fallback={<span class="text-faint">—</span>}>
+                              <StatusBadge status={item.status} />
+                            </Show>
+                          </td>
+                          <For each={props.columns ?? []}>
+                            {(column) => <td class={cx(tdClass, 'text-muted', column.class)}>{item.cells?.[column.key] ?? '—'}</td>}
+                          </For>
+                          <td class={cx(tdClass, 'whitespace-nowrap text-right text-xs text-faint')}>{item.updatedAt}</td>
+                        </tr>
+                      )}
+                    </For>
+                  </tbody>
+                </table>
+              </div>
+            </Show>
           </Show>
         </Show>
-      </Show>
 
-      <footer class="flex items-center justify-between text-xs text-neutral-600 dark:text-neutral-300">
-        <span>{props.totalCount} total</span>
-        <div class="flex items-center gap-2">
-          <button
-            type="button"
-            disabled={props.page <= 1}
-            onClick={() => props.onPageChange(props.page - 1)}
-            class="rounded border border-neutral-300 px-2 py-1 disabled:opacity-50 dark:border-neutral-700"
-          >
-            Prev
-          </button>
-          <span>
-            Page {props.page} / {totalPages()}
+        <footer class="flex flex-wrap items-center justify-between gap-2 border-t border-line px-4 py-2 text-xs text-muted">
+          <span class="tabular-nums">
+            {props.totalCount} total · page {props.page} of {totalPages()}
           </span>
-          <button
-            type="button"
-            disabled={props.page >= totalPages()}
-            onClick={() => props.onPageChange(props.page + 1)}
-            class="rounded border border-neutral-300 px-2 py-1 disabled:opacity-50 dark:border-neutral-700"
-          >
-            Next
-          </button>
-        </div>
-      </footer>
-    </section>
+          <div class="flex items-center gap-1.5">
+            <select
+              value={String(props.pageSize)}
+              onChange={(event) => props.onPageSizeChange(Number.parseInt(event.currentTarget.value, 10))}
+              class={cx(selectClass, 'w-auto py-1 text-xs')}
+              aria-label="Rows per page"
+            >
+              <option value="10">10 / page</option>
+              <option value="20">20 / page</option>
+              <option value="50">50 / page</option>
+            </select>
+            <Button size="xs" icon="chevronLeft" disabled={props.page <= 1} onClick={() => props.onPageChange(props.page - 1)} aria-label="Previous page" />
+            <Button size="xs" icon="chevronRight" disabled={props.page >= totalPages()} onClick={() => props.onPageChange(props.page + 1)} aria-label="Next page" />
+          </div>
+        </footer>
+      </SectionCard>
+
+      <p class="text-2xs text-faint">
+        <kbd class="rounded border border-line bg-surface2 px-1 font-mono">j</kbd>/<kbd class="rounded border border-line bg-surface2 px-1 font-mono">k</kbd> to move ·{' '}
+        <kbd class="rounded border border-line bg-surface2 px-1 font-mono">o</kbd> to open · <kbd class="rounded border border-line bg-surface2 px-1 font-mono">⌘K</kbd> to search everything
+      </p>
+    </div>
   )
 }

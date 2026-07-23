@@ -1,9 +1,10 @@
 import { A } from '@solidjs/router'
-import { For, Show, type Resource } from 'solid-js'
-import { InstancePill } from '../components/DetailPrimitives'
+import { For, Show, createMemo, type Resource } from 'solid-js'
+import { EmptyState, LoadingRows, MonoBadge, Note, SectionCard, StatCard, StatusBadge, TableShell, linkClass, tableClass, tdClass, thClass, theadClass, trHoverClass } from '../components/ui'
 import type { LedgerNode, Rollout } from '../gen/legion_pb'
 import { asDisplay, formatRelativeTime } from '../utils/format'
-import { healthToneClasses, summarizeHealthChecks } from '../utils/health'
+import { summarizeHealthChecks } from '../utils/health'
+import { statusTone } from '../utils/status'
 
 interface HomepageProps {
   ledger: Resource<readonly LedgerNode[] | undefined>
@@ -11,144 +12,201 @@ interface HomepageProps {
 }
 
 export default function Homepage(props: HomepageProps) {
+  const workers = createMemo(() => props.ledger() ?? [])
+  const allocations = createMemo(() =>
+    workers().flatMap((entry) =>
+      entry.allocations.map((allocation) => ({ allocation, nodeId: entry.node?.id ?? '' })),
+    ),
+  )
+  // "Healthy" here means the status maps to the ok tone (ready/active/running/placed/…),
+  // reusing the central status vocabulary instead of matching one exact word.
+  const readyWorkers = createMemo(
+    () => workers().filter((entry) => statusTone(entry.node?.status) === 'ok').length,
+  )
+  const runningAllocations = createMemo(
+    () => allocations().filter(({ allocation }) => statusTone(allocation.status) === 'ok').length,
+  )
+  const jobCount = createMemo(() => new Set(allocations().map(({ allocation }) => allocation.jobId)).size)
+  const activeRollouts = createMemo(() => props.rollouts() ?? [])
+
   return (
-    <Show when={!props.ledger.loading} fallback={<p class="text-neutral-500">Loading ledger…</p>}>
-      <Show when={!props.ledger.error} fallback={<p class="text-red-500">Failed to load ledger.</p>}>
-        {props.ledger() && props.ledger()!.length > 0 ? (
-          <div class="space-y-4">
-            <article class="rounded border border-neutral-200 bg-white/90 p-4 shadow-[6px_6px_0_#d4d4d8] transition dark:border-neutral-800 dark:bg-neutral-900/60 dark:shadow-[6px_6px_0_#0b0d12]">
-              <header class="flex items-center justify-between gap-4">
-                <div>
-                  <p class="text-xs uppercase tracking-[0.12em] text-neutral-500 dark:text-neutral-400">Rollouts</p>
-                  <A href="/rollouts" class="font-semibold text-neutral-900 underline-offset-2 hover:underline dark:text-neutral-100">Active Rollouts</A>
-                </div>
-                <span class="rounded border border-neutral-300 px-3 py-1 text-xs uppercase tracking-wide text-neutral-800 dark:border-neutral-700 dark:text-neutral-200">
-                  {props.rollouts()?.length ?? 0}
-                </span>
-              </header>
-              <div class="mt-3 space-y-2">
-                <Show
-                  when={!props.rollouts.loading}
-                  fallback={<p class="rounded border border-dashed border-neutral-200 px-3 py-2 text-sm text-neutral-500 dark:border-neutral-700 dark:text-neutral-500">Loading rollouts…</p>}
-                >
-                  <Show
-                    when={!props.rollouts.error}
-                    fallback={<p class="rounded border border-dashed border-neutral-200 px-3 py-2 text-sm text-red-500 dark:border-neutral-700">Failed to load rollouts.</p>}
-                  >
-                    <Show
-                      when={(props.rollouts()?.length ?? 0) > 0}
-                      fallback={<p class="rounded border border-dashed border-neutral-200 px-3 py-2 text-sm text-neutral-500 dark:border-neutral-700 dark:text-neutral-500">No active rollouts</p>}
-                    >
-                      <For each={props.rollouts() ?? []}>
-                        {(rollout) => (
-                          <div class="rounded border border-neutral-200 bg-neutral-50 p-3 dark:border-neutral-800 dark:bg-neutral-950/60">
-                            <div class="flex flex-wrap items-center justify-between gap-2 text-sm text-neutral-900 dark:text-neutral-100">
-                              <span class="font-semibold">#{asDisplay(rollout.id)} {asDisplay(rollout.jobId)}</span>
-                              <span class="rounded border border-neutral-300 px-2 py-1 text-[11px] uppercase tracking-wide dark:border-neutral-700">
-                                {asDisplay(rollout.status)}
-                              </span>
-                            </div>
-                            <div class="mt-2 grid gap-2 text-xs text-neutral-600 dark:text-neutral-400 md:grid-cols-3">
-                              <span class="rounded border border-neutral-200 bg-white px-2 py-1 dark:border-neutral-800 dark:bg-neutral-900">
-                                To Config: {asDisplay(rollout.toJobConfigId)}
-                              </span>
-                              <span class="rounded border border-neutral-200 bg-white px-2 py-1 dark:border-neutral-800 dark:bg-neutral-900">
-                                Updated: {formatRelativeTime(rollout.updatedAt)}
-                              </span>
-                              <span class="rounded border border-neutral-200 bg-white px-2 py-1 dark:border-neutral-800 dark:bg-neutral-900">
-                                Incomplete: {rollout.incomplete ? 'Yes' : 'No'}
-                              </span>
-                            </div>
-                          </div>
-                        )}
-                      </For>
-                    </Show>
-                  </Show>
-                </Show>
-              </div>
-            </article>
-            <For each={props.ledger()!}>
-              {(item) => (
-                <article class="rounded border border-neutral-200 bg-white/90 p-4 shadow-[6px_6px_0_#d4d4d8] transition dark:border-neutral-800 dark:bg-neutral-900/60 dark:shadow-[6px_6px_0_#0b0d12]">
-                  <header class="flex items-center justify-between gap-4">
-                    <div>
-                      <p class="text-xs uppercase tracking-[0.12em] text-neutral-500 dark:text-neutral-400">Worker</p>
-                      <A href={`/nodes/${encodeURIComponent(item.node?.id ?? '')}`} class="font-semibold text-neutral-900 underline-offset-2 hover:underline dark:text-neutral-100">{item.node?.id ?? 'Unknown worker'}</A>
-                    </div>
-                    <span class="rounded border border-neutral-300 px-3 py-1 text-xs uppercase tracking-wide text-neutral-800 dark:border-neutral-700 dark:text-neutral-200">
-                      {item.node?.status ?? 'N/A'}
-                    </span>
-                  </header>
-                  <div class="mt-3 grid grid-cols-2 gap-2 text-sm text-neutral-700 dark:text-neutral-300 md:grid-cols-3">
-                    <span class="rounded border border-neutral-200 bg-neutral-50 px-3 py-2 dark:border-neutral-800 dark:bg-neutral-900">
-                      Pool: {item.node?.pool ?? '—'}
-                    </span>
-                    <span class="rounded border border-neutral-200 bg-neutral-50 px-3 py-2 dark:border-neutral-800 dark:bg-neutral-900">
-                      Availability: {item.node?.availability ?? '—'}
-                    </span>
-                      <span class="rounded border border-neutral-200 bg-neutral-50 px-3 py-2 dark:border-neutral-800 dark:bg-neutral-900">
-                        Last heartbeat: {formatRelativeTime(item.node?.lastHeartbeat)}
-                      </span>
-                  </div>
-                  <div class="mt-4">
-                    <p class="text-xs uppercase tracking-[0.12em] text-neutral-500 dark:text-neutral-400">Allocations</p>
-                    <div class="mt-2 space-y-2">
-                      <Show
-                        when={item.allocations.length}
-                        fallback={
-                            <p class="rounded border border-dashed border-neutral-200 px-3 py-2 text-sm text-neutral-500 dark:border-neutral-700 dark:text-neutral-500">
-                              No current allocations
-                            </p>
-                        }
-                      >
-                        <For each={item.allocations}>
-                          {(allocation) => (
-                            <div class="rounded border border-neutral-200 bg-neutral-50 p-3 dark:border-neutral-800 dark:bg-neutral-950/60">
-                              {(() => {
-                                const healthSummary = summarizeHealthChecks(item.node?.healthChecks)
-                                return (
-                                  <div class="mb-2 flex flex-wrap items-center gap-2 text-[11px] uppercase tracking-wide">
-                                    <span class={`rounded border px-2 py-1 ${healthToneClasses(healthSummary.tone)}`}>
-                                      {healthSummary.label}
-                                    </span>
-                                  </div>
-                                )
-                              })()}
-                              <div class="flex flex-wrap items-center justify-between gap-2 text-sm text-neutral-900 dark:text-neutral-100">
-                                <span class="flex flex-wrap items-center gap-2">
-                                  <span class="font-semibold">Allocation #{asDisplay(allocation.id)} · <A href={`/jobs/${encodeURIComponent(allocation.jobId)}`} class="underline">{allocation.jobId}</A></span>
-                                  <Show when={allocation.instanceId}>
-                                    <InstancePill id={allocation.instanceId!} />
-                                  </Show>
-                                </span>
-                                <span class="rounded border border-neutral-300 px-2 py-1 text-[11px] uppercase tracking-wide dark:border-neutral-700">
-                                  {allocation.status}
-                                </span>
-                              </div>
-                              <div class="mt-2 grid gap-2 text-xs text-neutral-600 dark:text-neutral-400 md:grid-cols-3">
-                                <span class="rounded border border-neutral-200 bg-white px-2 py-1 dark:border-neutral-800 dark:bg-neutral-900">
-                                  Resources: {asDisplay(allocation.resources)}
-                                </span>
-                                <span class="rounded border border-neutral-200 bg-white px-2 py-1 dark:border-neutral-800 dark:bg-neutral-900">
-                                  Job Config: {asDisplay(allocation.jobConfigId)}
-                                </span>
-                                <span class="rounded border border-neutral-200 bg-white px-2 py-1 dark:border-neutral-800 dark:bg-neutral-900">
-                                  Task Config: {asDisplay(allocation.taskConfigId)}
-                                </span>
-                              </div>
-                            </div>
-                          )}
-                        </For>
-                      </Show>
-                    </div>
-                  </div>
-                </article>
-              )}
-            </For>
+    <Show when={!props.ledger.loading} fallback={<LoadingRows rows={6} class="p-0" />}>
+      <Show when={!props.ledger.error} fallback={<Note tone="danger">Failed to reach the manager. Check that it is running and that the UI can reach its gRPC-Web endpoint.</Note>}>
+        <div class="space-y-5">
+          <div class="grid grid-cols-2 gap-3 lg:grid-cols-4">
+            <StatCard
+              label="Workers"
+              icon="server"
+              href="/nodes"
+              value={
+                <>
+                  {readyWorkers()}
+                  <span class="text-base font-normal text-faint"> / {workers().length} up</span>
+                </>
+              }
+              tone={workers().length > 0 && readyWorkers() < workers().length ? 'warn' : 'neutral'}
+            />
+            <StatCard
+              label="Jobs placed"
+              icon="layers"
+              href="/jobs"
+              value={jobCount()}
+              hint="jobs with allocations"
+            />
+            <StatCard
+              label="Allocations"
+              icon="boxes"
+              value={
+                <>
+                  {runningAllocations()}
+                  <span class="text-base font-normal text-faint"> / {allocations().length} healthy</span>
+                </>
+              }
+              tone={allocations().length > 0 && runningAllocations() < allocations().length ? 'warn' : 'neutral'}
+            />
+            <StatCard
+              label="Active rollouts"
+              icon="rocket"
+              href="/rollouts"
+              value={activeRollouts().length}
+              tone={activeRollouts().length > 0 ? 'info' : 'neutral'}
+            />
           </div>
-        ) : (
-          <p class="text-neutral-500">No ledger entries available.</p>
-        )}
+
+          <Show when={activeRollouts().length > 0}>
+            <SectionCard title="Active rollouts" flush actions={<A href="/rollouts" class={linkClass}>View all</A>}>
+              <TableShell>
+                <table class={tableClass}>
+                  <thead class={theadClass}>
+                    <tr>
+                      <th class={thClass}>Rollout</th>
+                      <th class={thClass}>Status</th>
+                      <th class={thClass}>Target config</th>
+                      <th class={thClass + ' text-right'}>Updated</th>
+                    </tr>
+                  </thead>
+                  <tbody class="divide-y divide-line">
+                    <For each={activeRollouts()}>
+                      {(rollout) => (
+                        <tr class={trHoverClass}>
+                          <td class={tdClass}>
+                            <A href={`/rollouts/${rollout.id}`} class="font-medium hover:text-brass-strong">
+                              {asDisplay(rollout.jobId)}
+                            </A>
+                            <span class="ml-2 text-xs text-faint">#{asDisplay(rollout.id)}</span>
+                          </td>
+                          <td class={tdClass}><StatusBadge status={rollout.status} /></td>
+                          <td class={tdClass}><span class="font-mono text-xs text-muted">{asDisplay(rollout.toJobConfigId)}</span></td>
+                          <td class={tdClass + ' whitespace-nowrap text-right text-xs text-faint'}>{formatRelativeTime(rollout.updatedAt)}</td>
+                        </tr>
+                      )}
+                    </For>
+                  </tbody>
+                </table>
+              </TableShell>
+            </SectionCard>
+          </Show>
+
+          <SectionCard title="Workers" flush actions={<A href="/nodes" class={linkClass}>View all</A>}>
+            <Show
+              when={workers().length > 0}
+              fallback={
+                <EmptyState
+                  icon="server"
+                  title="No workers connected"
+                  body="Join a worker with `legion agent --join <manager>` and it will appear here."
+                />
+              }
+            >
+              <TableShell>
+                <table class={tableClass}>
+                  <thead class={theadClass}>
+                    <tr>
+                      <th class={thClass}>Worker</th>
+                      <th class={thClass}>Status</th>
+                      <th class={thClass}>Health</th>
+                      <th class={thClass}>Pool</th>
+                      <th class={thClass + ' text-right'}>Allocations</th>
+                      <th class={thClass + ' text-right'}>Heartbeat</th>
+                    </tr>
+                  </thead>
+                  <tbody class="divide-y divide-line">
+                    <For each={workers()}>
+                      {(entry) => {
+                        const health = summarizeHealthChecks(entry.node?.healthChecks)
+                        return (
+                          <tr class={trHoverClass}>
+                            <td class={tdClass}>
+                              <A href={`/nodes/${encodeURIComponent(entry.node?.id ?? '')}`} class="font-medium hover:text-brass-strong">
+                                {entry.node?.id ?? 'unknown'}
+                              </A>
+                            </td>
+                            <td class={tdClass}><StatusBadge status={entry.node?.status} /></td>
+                            <td class={tdClass}><StatusBadge status={health.label} /></td>
+                            <td class={tdClass + ' text-muted'}>{entry.node?.pool || 'default'}</td>
+                            <td class={tdClass + ' text-right tabular-nums text-muted'}>{entry.allocations.length}</td>
+                            <td class={tdClass + ' whitespace-nowrap text-right text-xs text-faint'}>{formatRelativeTime(entry.node?.lastHeartbeat)}</td>
+                          </tr>
+                        )
+                      }}
+                    </For>
+                  </tbody>
+                </table>
+              </TableShell>
+            </Show>
+          </SectionCard>
+
+          <SectionCard title="Allocations" flush>
+            <Show
+              when={allocations().length > 0}
+              fallback={
+                <EmptyState
+                  icon="boxes"
+                  title="No allocations placed"
+                  body="Submit a job and the scheduler will place its allocations on workers."
+                />
+              }
+            >
+              <TableShell>
+                <table class={tableClass}>
+                  <thead class={theadClass}>
+                    <tr>
+                      <th class={thClass}>Allocation</th>
+                      <th class={thClass}>Job</th>
+                      <th class={thClass}>Status</th>
+                      <th class={thClass}>Worker</th>
+                      <th class={thClass}>Config</th>
+                    </tr>
+                  </thead>
+                  <tbody class="divide-y divide-line">
+                    <For each={allocations()}>
+                      {({ allocation, nodeId }) => (
+                        <tr class={trHoverClass}>
+                          <td class={tdClass}>
+                            <span class="font-mono text-xs">#{asDisplay(allocation.id)}</span>
+                            <Show when={allocation.instanceId}>
+                              <MonoBadge title={`Stateful instance ${allocation.instanceId}`} class="ml-2">{allocation.instanceId}</MonoBadge>
+                            </Show>
+                          </td>
+                          <td class={tdClass}>
+                            <A href={`/jobs/${encodeURIComponent(allocation.jobId)}`} class="font-medium hover:text-brass-strong">
+                              {allocation.jobId}
+                            </A>
+                          </td>
+                          <td class={tdClass}><StatusBadge status={allocation.status} /></td>
+                          <td class={tdClass}>
+                            <A href={`/nodes/${encodeURIComponent(nodeId)}`} class="text-muted hover:text-brass-strong">{nodeId}</A>
+                          </td>
+                          <td class={tdClass}><span class="font-mono text-xs text-muted">{asDisplay(allocation.jobConfigId)}</span></td>
+                        </tr>
+                      )}
+                    </For>
+                  </tbody>
+                </table>
+              </TableShell>
+            </Show>
+          </SectionCard>
+        </div>
       </Show>
     </Show>
   )
