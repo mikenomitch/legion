@@ -415,7 +415,6 @@ pub struct WorkloadIdentityConfig {
     pub signing_alg: Option<String>,
     pub default_ttl: Option<String>,
     pub rotation_age: Option<String>,
-    pub default_audience: Option<Vec<String>>,
     /// Cluster-default `sub` template; per-identity `subTemplate` overrides it.
     pub sub_template: Option<String>,
     /// Identities issued to worker nodes rather than tasks (artifact system
@@ -434,7 +433,6 @@ pub struct WorkloadIdentityConfigFull {
     pub signing_alg: String,
     pub default_ttl: String,
     pub rotation_age: String,
-    pub default_audience: Vec<String>,
     pub sub_template: String,
     #[serde(default)]
     pub node_identities: Vec<NodeIdentityConfig>,
@@ -469,7 +467,6 @@ impl Default for WorkloadIdentityConfigFull {
             signing_alg: "ES256".into(),
             default_ttl: DEF_WORKLOAD_IDENTITY_TTL.into(),
             rotation_age: DEF_WORKLOAD_IDENTITY_ROTATION_AGE.into(),
-            default_audience: Vec::new(),
             sub_template: crate::structs::workload_identity::DEFAULT_SUB_TEMPLATE.into(),
             node_identities: Vec::new(),
         }
@@ -485,7 +482,6 @@ impl From<WorkloadIdentityConfigFull> for WorkloadIdentityConfig {
             signing_alg: Some(val.signing_alg),
             default_ttl: Some(val.default_ttl),
             rotation_age: Some(val.rotation_age),
-            default_audience: Some(val.default_audience),
             sub_template: Some(val.sub_template),
             node_identities: Some(val.node_identities),
         }
@@ -502,7 +498,6 @@ impl WorkloadIdentityConfig {
             signing_alg: self.signing_alg.clone().unwrap_or(d.signing_alg),
             default_ttl: self.default_ttl.clone().unwrap_or(d.default_ttl),
             rotation_age: self.rotation_age.clone().unwrap_or(d.rotation_age),
-            default_audience: self.default_audience.clone().unwrap_or(d.default_audience),
             sub_template: self.sub_template.clone().unwrap_or(d.sub_template),
             node_identities: self.node_identities.clone().unwrap_or(d.node_identities),
         }

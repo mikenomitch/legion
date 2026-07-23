@@ -375,6 +375,13 @@ impl Store {
         // logs via raft before committing to an in-memory sqlite db
 
         std::fs::create_dir_all(store_path)?;
+        // The store holds secret material — ACL/join-token hashes and the OIDC
+        // private signing key (a leak of which lets anyone mint workload
+        // identities trusted by AWS/GCP/Vault). SQLite creates store.sqlite and
+        // its WAL/-shm siblings at the process umask (commonly 0644), so lock
+        // the containing directory to owner-only; the 0700 dir denies traversal
+        // to those files regardless of their own modes.
+        crate::util::restrict_dir_to_owner(std::path::Path::new(store_path))?;
         let tmp = std::path::Path::new(store_path).join("store.sqlite");
         Ok(tmp)
     }

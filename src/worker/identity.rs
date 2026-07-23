@@ -126,6 +126,10 @@ pub struct PreparedIdentity {
 pub struct WorkerIdentityManager {
     issuer: Arc<dyn TokenIssuer>,
     refreshers: Mutex<HashMap<i64, Vec<JoinHandle<()>>>>,
+    /// Backing token file(s) delivered per allocation, so they can be removed
+    /// when the allocation stops (short-TTL hygiene: live token material must
+    /// not linger on disk past the workload's life).
+    delivered_files: Mutex<HashMap<i64, Vec<PathBuf>>>,
     warned_disabled: AtomicBool,
 }
 
@@ -134,6 +138,7 @@ impl WorkerIdentityManager {
         Self {
             issuer,
             refreshers: Mutex::new(HashMap::new()),
+            delivered_files: Mutex::new(HashMap::new()),
             warned_disabled: AtomicBool::new(false),
         }
     }
@@ -174,16 +179,30 @@ impl WorkerIdentityManager {
             };
 
             write_identity_files(&identity, alloc_id, &issued.token)?;
+            if let Some(backing) = backing_file_path(&identity, alloc_id) {
+                self.delivered_files
+                    .lock()
+                    .expect("identity delivered-files lock")
+                    .entry(alloc_id)
+                    .or_default()
+                    .push(backing);
+            }
 
             if let Some(env_key) = identity.env.as_deref().filter(|e| !e.trim().is_empty()) {
                 env_injections.push((env_key.to_string(), issued.token.clone()));
-                // Companion var so signal handlers can re-read the refreshed
-                // token from the backing file (env itself cannot change).
-                if let Some(backing) = backing_file_path(&identity, alloc_id) {
-                    env_injections.push((
-                        format!("{env_key}_FILE"),
-                        backing.to_string_lossy().to_string(),
-                    ));
+                // Companion var so a `changeMode: signal` handler can re-read
+                // the refreshed token from the backing file (env itself cannot
+                // change). Pointless for `restart` (the relaunch re-injects the
+                // fresh token directly into env) and for kinds whose filesystem
+                // the host path doesn't reach — so only emit it when a signal
+                // handler would actually use it.
+                if identity.change_mode == ChangeMode::Signal {
+                    if let Some(backing) = backing_file_path(&identity, alloc_id) {
+                        env_injections.push((
+                            format!("{env_key}_FILE"),
+                            backing.to_string_lossy().to_string(),
+                        ));
+                    }
                 }
             }
 
@@ -243,25 +262,69 @@ impl WorkerIdentityManager {
     /// each reconcile so loops never outlive their allocation).
     pub fn retain(&self, live: &[i64]) {
         let live: std::collections::HashSet<i64> = live.iter().copied().collect();
-        let mut refreshers = self.refreshers.lock().expect("identity refreshers lock");
-        refreshers.retain(|alloc_id, handles| {
-            if live.contains(alloc_id) {
-                return true;
-            }
-            for handle in handles.iter() {
-                handle.abort();
-            }
-            debug!(allocation_id = alloc_id, "Stopped identity refresh loops");
-            false
-        });
+        let mut pruned = Vec::new();
+        {
+            let mut refreshers = self.refreshers.lock().expect("identity refreshers lock");
+            refreshers.retain(|alloc_id, handles| {
+                if live.contains(alloc_id) {
+                    return true;
+                }
+                for handle in handles.iter() {
+                    handle.abort();
+                }
+                debug!(allocation_id = alloc_id, "Stopped identity refresh loops");
+                pruned.push(*alloc_id);
+                false
+            });
+        }
+        for alloc_id in pruned {
+            self.cleanup_files(alloc_id);
+        }
     }
 
     /// Stop refresh loops for one allocation.
     pub fn stop(&self, alloc_id: i64) {
-        let mut refreshers = self.refreshers.lock().expect("identity refreshers lock");
-        if let Some(handles) = refreshers.remove(&alloc_id) {
-            for handle in handles {
-                handle.abort();
+        {
+            let mut refreshers = self.refreshers.lock().expect("identity refreshers lock");
+            if let Some(handles) = refreshers.remove(&alloc_id) {
+                for handle in handles {
+                    handle.abort();
+                }
+            }
+        }
+        self.cleanup_files(alloc_id);
+    }
+
+    /// Remove the token material delivered for `alloc_id`: each declared
+    /// `file.path` target plus the env-fallback directory
+    /// `.legion/identity/<alloc>`. Never logs token bytes; best-effort (a
+    /// failure to unlink is warned, not fatal).
+    fn cleanup_files(&self, alloc_id: i64) {
+        let paths = self
+            .delivered_files
+            .lock()
+            .expect("identity delivered-files lock")
+            .remove(&alloc_id);
+        for path in paths.into_iter().flatten() {
+            if let Err(err) = fs::remove_file(&path) {
+                if err.kind() != std::io::ErrorKind::NotFound {
+                    warn!(allocation_id = alloc_id, error = ?err, "Failed to remove identity token file");
+                }
+            }
+        }
+        // Drop the per-allocation env-fallback tree, if any.
+        let fallback_dir = {
+            let mut root = PathBuf::from(IDENTITY_TOKEN_DIR);
+            if !root.is_absolute() {
+                if let Ok(cwd) = std::env::current_dir() {
+                    root = cwd.join(root);
+                }
+            }
+            root.join(alloc_id.to_string())
+        };
+        if let Err(err) = fs::remove_dir_all(&fallback_dir) {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                debug!(allocation_id = alloc_id, error = ?err, "Failed to remove identity fallback dir");
             }
         }
     }
@@ -289,8 +352,14 @@ fn backing_file_path(identity: &WorkloadIdentity, alloc_id: i64) -> Option<PathB
 }
 
 /// Well-known per-identity token path backing env-delivered identities:
-/// `.legion/identity/<alloc>/<name>/token`, relative to the worker's working
-/// directory.
+/// `<cwd>/.legion/identity/<alloc>/<name>/token`, **absolute** (rooted at the
+/// worker's working directory at startup).
+///
+/// It must be absolute because the same value is injected as the `<ENV>_FILE`
+/// companion for a `changeMode: signal` handler to re-read, and a task's own
+/// cwd is its private task dir (see `exec`), not the worker's — a relative
+/// path would resolve against the wrong directory and the handler would not
+/// find the file.
 ///
 /// Defense in depth: the manager already rejects identity names that aren't
 /// `[A-Za-z0-9_-]{1,64}` at admission (`validate_identity_name`), but the
@@ -301,8 +370,13 @@ fn backing_file_path(identity: &WorkloadIdentity, alloc_id: i64) -> Option<PathB
 /// instead of writing outside the task dir.
 pub fn fallback_token_path(alloc_id: i64, identity_name: &str) -> PathBuf {
     let safe_name = sanitize_identity_name_component(identity_name);
-    PathBuf::from(IDENTITY_TOKEN_DIR)
-        .join(alloc_id.to_string())
+    let mut root = PathBuf::from(IDENTITY_TOKEN_DIR);
+    if !root.is_absolute() {
+        if let Ok(cwd) = std::env::current_dir() {
+            root = cwd.join(root);
+        }
+    }
+    root.join(alloc_id.to_string())
         .join(safe_name)
         .join("token")
 }
@@ -340,7 +414,7 @@ fn write_identity_files(identity: &WorkloadIdentity, alloc_id: i64, token: &str)
         .file
         .as_ref()
         .and_then(|f| f.mode.as_deref())
-        .map(parse_file_mode)
+        .map(crate::structs::workload_identity::parse_file_mode)
         .transpose()?
         .unwrap_or(DEFAULT_TOKEN_FILE_MODE);
     write_token_file(&path, token, mode)
@@ -409,12 +483,6 @@ fn write_token_tmp(tmp: &Path, token: &str, mode: u32) -> R<()> {
     file.sync_all()
         .with_context(|| format!("failed to fsync token file {tmp:?}"))?;
     Ok(())
-}
-
-/// Parse an octal file mode string like "0400".
-fn parse_file_mode(raw: &str) -> R<u32> {
-    let trimmed = raw.trim().trim_start_matches("0o");
-    u32::from_str_radix(trimmed, 8).with_context(|| format!("invalid file mode {raw:?}"))
 }
 
 /// Inject env vars into a JSON-encoded task kind config (the same `env` map
@@ -777,7 +845,8 @@ mod tests {
         let p = fallback_token_path(7, "../../tmp/evil");
         let s = p.to_string_lossy();
         assert!(!s.contains(".."), "path still contains traversal: {s}");
-        assert!(s.starts_with(IDENTITY_TOKEN_DIR), "{s}");
+        // Absolute (rooted at cwd) but still under the identity token dir.
+        assert!(s.contains(IDENTITY_TOKEN_DIR), "{s}");
         assert!(s.ends_with("token"), "{s}");
         // A valid name is preserved verbatim.
         let ok = fallback_token_path(7, "vault");

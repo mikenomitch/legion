@@ -34,6 +34,40 @@ pub const LEGION_CLAIM_PREFIX: &str = "legion.io/";
 /// or a `sub` template — overriding them would forge the trust-critical fields.
 pub const RESERVED_CLAIMS: &[&str] = &["iss", "sub", "aud", "exp", "iat", "nbf", "jti", "kid"];
 
+/// Signal names the worker can actually deliver for `changeMode: signal`. Kept
+/// in sync with `parse_signal` in `crate::worker::task_manager`; admission
+/// validates `changeSignal` against this set so a typo fails `job validate`
+/// rather than silently going stale in the refresh loop hours later.
+pub const SUPPORTED_CHANGE_SIGNALS: &[&str] = &[
+    "HUP", "INT", "QUIT", "TERM", "USR1", "USR2", "CONT", "WINCH",
+];
+
+/// Normalize a `changeSignal` to its canonical short name (uppercased, optional
+/// `SIG` prefix stripped), erroring if it is not one the worker can deliver.
+pub fn normalize_change_signal(raw: &str) -> R<&'static str> {
+    let trimmed = raw.trim().to_ascii_uppercase();
+    let bare = trimmed.strip_prefix("SIG").unwrap_or(&trimmed);
+    SUPPORTED_CHANGE_SIGNALS
+        .iter()
+        .find(|s| **s == bare)
+        .copied()
+        .with_context(|| {
+            format!(
+                "unsupported changeSignal {raw:?}; supported signals are {}",
+                SUPPORTED_CHANGE_SIGNALS.join(", ")
+            )
+        })
+}
+
+/// Parse an octal file mode string like "0400" (accepts an optional `0o`
+/// prefix). Shared by admission validation and worker-side delivery so a bad
+/// mode fails `job validate`, not first launch on a node.
+pub fn parse_file_mode(raw: &str) -> R<u32> {
+    let trimmed = raw.trim().trim_start_matches("0o");
+    u32::from_str_radix(trimmed, 8)
+        .with_context(|| format!("invalid file mode {raw:?} (octal, e.g. \"0400\")"))
+}
+
 /// Placeholders allowed in a `sub` template that are present on every workload.
 const STABLE_SUB_FIELDS: &[&str] = &["region", "job", "group", "task"];
 
@@ -164,6 +198,12 @@ impl WorkloadIdentity {
         self.parsed_ttl()
             .with_context(|| format!("{scope} ttl is invalid"))?;
 
+        // Parse the file mode eagerly too, so a bad value fails admission
+        // rather than task launch on the node.
+        if let Some(mode) = self.file.as_ref().and_then(|f| f.mode.as_deref()) {
+            parse_file_mode(mode).with_context(|| format!("{scope} file mode is invalid"))?;
+        }
+
         match self.change_mode {
             ChangeMode::Noop => {
                 // env can never refresh in place — fixed at exec time.
@@ -175,12 +215,17 @@ impl WorkloadIdentity {
                 }
             }
             ChangeMode::Signal => {
-                if self
-                    .change_signal
-                    .as_deref()
-                    .is_none_or(|s| s.trim().is_empty())
-                {
-                    bail!("{scope} changeMode signal requires a non-empty changeSignal");
+                match self.change_signal.as_deref() {
+                    None => bail!("{scope} changeMode signal requires a non-empty changeSignal"),
+                    Some(s) if s.trim().is_empty() => {
+                        bail!("{scope} changeMode signal requires a non-empty changeSignal")
+                    }
+                    // Reject a signal the worker can't deliver at admission,
+                    // not silently in the refresh loop.
+                    Some(s) => {
+                        normalize_change_signal(s)
+                            .with_context(|| format!("{scope} changeSignal is invalid"))?;
+                    }
                 }
             }
             ChangeMode::Restart => {}
@@ -230,6 +275,28 @@ pub fn validate_identity_name(name: &str) -> R<()> {
     Ok(())
 }
 
+/// Reject a `sub`-component value (job, group, or task name) that contains a
+/// character which could act as a template separator, collapsing two distinct
+/// workloads onto one identity. Enforced at admission only for tasks that
+/// declare identities, so jobs that never mint tokens keep their existing
+/// naming freedom. Mirrors the keyed-instance-id charset (`[A-Za-z0-9._-]`).
+pub fn validate_subject_field(label: &str, value: &str) -> R<()> {
+    if value.is_empty() {
+        bail!("{label} must not be empty for a task that declares identities");
+    }
+    if let Some(bad) = value
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')))
+    {
+        bail!(
+            "{label} {value:?} contains {bad:?}, which is not allowed for a task that declares \
+             workload identities (allowed: [A-Za-z0-9._-]); the value becomes part of the OIDC \
+             `sub`, and a separator character there could collide with another workload's subject"
+        );
+    }
+    Ok(())
+}
+
 /// Whether a claim key is one the signer must never let `extra_claims`
 /// override: a registered/reserved JWT claim or a key in the `legion.io/*`
 /// namespace. Admission already rejects these, but the signing sink re-checks
@@ -257,6 +324,15 @@ pub fn validate_identities(
     stateful: bool,
 ) -> R<()> {
     let mut seen = std::collections::HashSet::new();
+    // Delivery targets must be unique across the task's identities: two
+    // identities writing the same file path (each on its own refresh schedule)
+    // would clobber each other with tokens of different audiences, and two
+    // sharing an env key is silent last-write-wins. Map target → first
+    // identity name so the error can name both sides.
+    let mut env_targets: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let mut file_targets: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     for identity in identities {
         identity.validate(task_name, stateful)?;
         if !seen.insert(identity.name.as_str()) {
@@ -264,6 +340,44 @@ pub fn validate_identities(
                 "task {task_name} declares duplicate identity name {:?}",
                 identity.name
             );
+        }
+        if identity.delivers_env() {
+            let key = identity
+                .env
+                .as_deref()
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            // The `<ENV>_FILE` companion this identity injects must not collide
+            // with another identity's env var either.
+            let companion = format!("{key}_FILE");
+            if let Some(other) = env_targets.insert(key.clone(), identity.name.clone()) {
+                bail!(
+                    "task {task_name} identities {other:?} and {:?} both deliver env var {key:?}",
+                    identity.name
+                );
+            }
+            if let Some(other) = env_targets.insert(companion.clone(), identity.name.clone()) {
+                bail!(
+                    "task {task_name} env var {companion:?} (the refresh companion of \
+                     identity {:?}) collides with identity {other:?}",
+                    identity.name
+                );
+            }
+        }
+        if identity.delivers_file() {
+            let path = identity
+                .file
+                .as_ref()
+                .map(|f| f.path.trim().to_string())
+                .unwrap_or_default();
+            if let Some(other) = file_targets.insert(path.clone(), identity.name.clone()) {
+                bail!(
+                    "task {task_name} identities {other:?} and {:?} both deliver to file \
+                     path {path:?}",
+                    identity.name
+                );
+            }
         }
     }
     Ok(())
@@ -324,6 +438,39 @@ pub fn validate_sub_template(template: &str, stateful: bool) -> R<()> {
     }
 
     Ok(())
+}
+
+/// The set of characters that act as *separators between two adjacent
+/// placeholders* in a template. For the default `{region}:{job}:{group}:{task}`
+/// this is `{':'}`; for `legion/{job}/{task}` it is `{'/'}`. A prefix/suffix
+/// literal (a placeholder on only one side) is a fixed constant and cannot
+/// cause a collision, so its characters are excluded.
+///
+/// This is the charset a rendered field value must not contain: if `task`
+/// could contain `:`, then `(job=a, group=b, task="c:d")` and
+/// `(job=a, group="b:c", task=d)` would both render `a:b:c:d`, silently merging
+/// two distinct workloads' identities — and `sub` is the only fine-grained key
+/// AWS IAM can match, so that collision is a real privilege boundary.
+fn separator_chars(template: &str) -> R<std::collections::HashSet<char>> {
+    let mut seps = std::collections::HashSet::new();
+    let mut rest = template;
+    let mut prev_was_field = false;
+    while let Some(open) = rest.find('{') {
+        let literal = &rest[..open];
+        // A literal sits *between* two placeholders only if a field preceded it
+        // and one follows it (the `{` we just found).
+        if prev_was_field {
+            seps.extend(literal.chars());
+        }
+        let after = &rest[open + 1..];
+        let close = after
+            .find('}')
+            .with_context(|| format!("sub template {template:?} has an unclosed '{{'"))?;
+        prev_was_field = true;
+        rest = &after[close + 1..];
+    }
+    // Trailing literal after the last field is a suffix constant — ignored.
+    Ok(seps)
 }
 
 /// Extract the `{field}` placeholder names from a template, in order. Errors on
@@ -423,6 +570,7 @@ impl WorkloadIdentityClaims {
     /// with [`validate_sub_template`] first; this still rejects unknown fields
     /// and an empty render as a defense-in-depth check.
     pub fn render_subject(&self, template: &str) -> R<String> {
+        let separators = separator_chars(template)?;
         let mut out = String::with_capacity(template.len());
         let mut rest = template;
         while let Some(open) = rest.find('{') {
@@ -435,6 +583,17 @@ impl WorkloadIdentityClaims {
             let value = self
                 .field(field)
                 .with_context(|| format!("sub template {template:?} field {{{field}}} is not available for this workload"))?;
+            // A field value must not contain a template separator, or two
+            // distinct workloads could render an identical `sub` (see
+            // `separator_chars`). Admission also rejects such values, but the
+            // signer refuses to mint an ambiguous identity even if that were
+            // bypassed.
+            if let Some(bad) = value.chars().find(|c| separators.contains(c)) {
+                bail!(
+                    "sub template {template:?} field {{{field}}} value {value:?} contains the \
+                     separator {bad:?}, which would let it collide with another workload's subject"
+                );
+            }
             out.push_str(&value);
             rest = &after[close + 1..];
         }
@@ -446,12 +605,11 @@ impl WorkloadIdentityClaims {
         Ok(out)
     }
 
-    /// Render the `sub` using `template` if provided, else the built-in default.
+    /// Render the `sub` using `template` if provided, else the built-in
+    /// default. Both paths go through [`Self::render_subject`], so the
+    /// separator-collision guard applies to the default template too.
     pub fn subject_for(&self, template: Option<&str>) -> R<String> {
-        match template {
-            Some(t) => self.render_subject(t),
-            None => Ok(self.subject()),
-        }
+        self.render_subject(template.unwrap_or(DEFAULT_SUB_TEMPLATE))
     }
 
     /// The discrete `legion.io/*` claims, so providers that can match arbitrary
@@ -652,7 +810,9 @@ mod tests {
             name: name.into(),
             audience: vec!["sts.amazonaws.com".into()],
             file: Some(WorkloadIdentityFile {
-                path: "/var/run/legion/identity/token".into(),
+                // Per-identity path so distinct identities don't collide on a
+                // shared delivery target (validate_identities rejects that).
+                path: format!("/var/run/legion/identity/{name}/token"),
                 mode: Some("0400".into()),
             }),
             ..Default::default()
@@ -902,6 +1062,143 @@ mod tests {
     fn distinct_identities_validate() {
         let ids = vec![identity("aws"), identity("gcp")];
         validate_identities("api", &ids, false).unwrap();
+    }
+
+    #[test]
+    fn duplicate_file_delivery_target_rejected() {
+        let mut a = identity("aws");
+        let mut b = identity("gcp");
+        a.file.as_mut().unwrap().path = "/run/legion/token".into();
+        b.file.as_mut().unwrap().path = "/run/legion/token".into();
+        let err = validate_identities("api", &[a, b], false).unwrap_err();
+        assert!(err.to_string().contains("file path"), "{err}");
+    }
+
+    #[test]
+    fn duplicate_env_delivery_target_rejected() {
+        let env_id = |name: &str| WorkloadIdentity {
+            name: name.into(),
+            audience: vec!["a".into()],
+            env: Some("TOKEN".into()),
+            change_mode: ChangeMode::Restart,
+            ..Default::default()
+        };
+        let err = validate_identities("api", &[env_id("aws"), env_id("gcp")], false).unwrap_err();
+        assert!(err.to_string().contains("env var"), "{err}");
+    }
+
+    #[test]
+    fn env_target_colliding_with_companion_rejected() {
+        // Identity A injects TOKEN + TOKEN_FILE; identity B uses TOKEN_FILE.
+        let a = WorkloadIdentity {
+            name: "a".into(),
+            audience: vec!["x".into()],
+            env: Some("TOKEN".into()),
+            change_mode: ChangeMode::Signal,
+            change_signal: Some("SIGHUP".into()),
+            ..Default::default()
+        };
+        let b = WorkloadIdentity {
+            name: "b".into(),
+            audience: vec!["x".into()],
+            env: Some("TOKEN_FILE".into()),
+            change_mode: ChangeMode::Restart,
+            ..Default::default()
+        };
+        // B's env key collides with A's `<ENV>_FILE` refresh companion, so the
+        // pair is rejected (the companion would otherwise clobber B's token).
+        let err = validate_identities("api", &[a, b], false).unwrap_err();
+        assert!(err.to_string().contains("TOKEN_FILE"), "{err}");
+    }
+
+    #[test]
+    fn invalid_change_signal_rejected_at_admission() {
+        for bad in ["SIGUSR3", "SIGHUPP", "not-a-signal"] {
+            let id = WorkloadIdentity {
+                name: "vault".into(),
+                audience: vec!["vault.internal".into()],
+                env: Some("VAULT_TOKEN".into()),
+                change_mode: ChangeMode::Signal,
+                change_signal: Some(bad.into()),
+                ..Default::default()
+            };
+            let err = id.validate("api", false).unwrap_err();
+            assert!(err.to_string().contains("changeSignal"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn supported_change_signals_accepted() {
+        for good in ["SIGHUP", "hup", "sigterm", "USR1"] {
+            let id = WorkloadIdentity {
+                name: "vault".into(),
+                audience: vec!["vault.internal".into()],
+                env: Some("VAULT_TOKEN".into()),
+                change_mode: ChangeMode::Signal,
+                change_signal: Some(good.into()),
+                ..Default::default()
+            };
+            id.validate("api", false)
+                .unwrap_or_else(|e| panic!("{good}: {e}"));
+        }
+    }
+
+    #[test]
+    fn bad_file_mode_rejected_at_validation() {
+        let mut id = identity("aws");
+        id.file.as_mut().unwrap().mode = Some("rw-".into());
+        let err = id.validate("api", false).unwrap_err();
+        assert!(err.to_string().contains("file mode"), "{err}");
+        // Valid octal modes still pass (with and without the 0o prefix).
+        for good in ["0400", "0o600", "640"] {
+            let mut ok = identity("aws");
+            ok.file.as_mut().unwrap().mode = Some(good.into());
+            ok.validate("api", false)
+                .unwrap_or_else(|e| panic!("{good}: {e}"));
+        }
+    }
+
+    // --- sub delimiter-injection defense (C20) ---
+
+    #[test]
+    fn render_rejects_value_containing_separator() {
+        // task value carrying the ':' separator would collide with another
+        // (job, group, task) tuple.
+        let c = WorkloadIdentityClaims {
+            task: "server:extra".into(),
+            ..claims()
+        };
+        let err = c.subject_for(None).unwrap_err();
+        assert!(err.to_string().contains("separator"), "{err}");
+    }
+
+    #[test]
+    fn render_allows_prefix_literal_chars_in_values() {
+        // "legion/" is a prefix constant; a value containing its letters is
+        // fine — only true between-placeholder separators ('/') are rejected.
+        let s = claims()
+            .render_subject("legion/{job}/{group}/{task}")
+            .unwrap();
+        assert_eq!(s, "legion/api/web/server");
+        let c = WorkloadIdentityClaims {
+            job: "a/b".into(),
+            ..claims()
+        };
+        let err = c.render_subject("legion/{job}/{group}/{task}").unwrap_err();
+        assert!(err.to_string().contains("separator"), "{err}");
+    }
+
+    #[test]
+    fn subject_field_charset_rejects_delimiters() {
+        for bad in ["a:b", "a/b", "a b"] {
+            assert!(
+                validate_subject_field("job name", bad).is_err(),
+                "expected {bad:?} rejected"
+            );
+        }
+        for good in ["api", "web-1", "team.svc", "a_b"] {
+            validate_subject_field("job name", good).unwrap_or_else(|e| panic!("{good}: {e}"));
+        }
     }
 
     // --- node identities (artifact system plan §6) ---

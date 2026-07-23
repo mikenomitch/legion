@@ -466,6 +466,12 @@ async fn heartbeat_tick(
         };
         debug!(worker = %name, elapsed_ms = start.elapsed().as_millis() as u64, "Heartbeat acknowledged by manager");
         let reply = response.into_inner();
+        // Allocations whose launch was dispatched this tick. Their refresh
+        // loops are spawned before the (async, unawaited) launch registers
+        // them in the task manager, so they must be treated as live by the
+        // retain() below or the reconcile-time snapshot could abort the loops
+        // we just started and never respawn them.
+        let mut launched_this_tick: Vec<i64> = Vec::new();
         if !reply.desired_allocations.is_empty() {
             // Deliver identity tokens for not-yet-running allocations BEFORE
             // reconcile starts them: env tokens must be present at exec time.
@@ -499,10 +505,13 @@ async fn heartbeat_tick(
                 .expect("task manager")
                 .reconcile_allocations(&desired);
             if !new_allocations.is_empty() {
-                // Refresh loops are keyed by allocation id and may start
-                // slightly before the task process does (artifact staging);
-                // identity_manager.retain below prunes them if the launch
-                // fails and the allocation goes away.
+                // Refresh loops are keyed by allocation id and start slightly
+                // before the task process registers (the launch below is
+                // dispatched but not awaited); record the ids as live-this-tick
+                // so retain() doesn't abort the loops before registration. If a
+                // launch actually fails, the allocation is absent from the next
+                // tick's snapshot and that tick's retain prunes its loops.
+                launched_this_tick.extend(new_allocations.iter().map(|a| a.allocation_id));
                 for allocation in &new_allocations {
                     if let Some(prepared) = prepared_by_alloc.remove(&allocation.allocation_id) {
                         identity_manager.spawn_refreshers(
@@ -525,11 +534,14 @@ async fn heartbeat_tick(
             }
         }
 
-        // Refresh loops must never outlive their allocation.
-        let live = task_manager
+        // Refresh loops must never outlive their allocation — but treat
+        // allocations launched this tick as live even if their async launch
+        // hasn't registered them in the snapshot yet.
+        let mut live = task_manager
             .lock()
             .expect("task manager")
             .allocations_snapshot();
+        live.extend(launched_this_tick);
         identity_manager.retain(&live);
     }
 

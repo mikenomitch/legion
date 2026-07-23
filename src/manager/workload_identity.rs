@@ -18,7 +18,7 @@
 //! manager restarts. [`Issuer::load_or_generate`] restores the key set on
 //! boot; [`Issuer::rotate_persisted`] / [`Issuer::expire_keys_persisted`]
 //! write lifecycle transitions through to the store and are driven by the
-//! rotation loop in `crate::manager::agent`.
+//! rotation loop in `crate::manager::daemon`.
 //!
 //! [`WorkloadIdentityState`] bundles the issuer with its config for the three
 //! consumers that share it: the `IssueWorkloadIdentityToken` RPC
@@ -577,6 +577,34 @@ impl Issuer {
         }
         Ok(expired.len())
     }
+
+    /// Replace the in-memory key set from the (replicated) store. This is how a
+    /// **standby** manager keeps its JWKS and signer in step with the primary:
+    /// keys are read once at boot, so without this a follower would serve a
+    /// boot-frozen JWKS and miss keys the primary rotated in. Never generates a
+    /// key — minting the first/rotated key is the primary's job — so a follower
+    /// simply adopts whatever the primary persisted. Returns true if the set
+    /// changed.
+    pub fn reload_keys(&mut self, store: &Store) -> R<bool> {
+        let mut keys = Vec::new();
+        for record in store.list_signing_keys()? {
+            if record.state == KeyState::Expired.as_str() {
+                continue;
+            }
+            keys.push(SigningKey::from_record(&record)?);
+        }
+        if keys.is_empty() {
+            // Nothing (non-expired) persisted yet; keep the current set rather
+            // than blanking a live JWKS.
+            return Ok(false);
+        }
+        let before: std::collections::BTreeSet<&str> =
+            self.keys.iter().map(|k| k.kid.as_str()).collect();
+        let after: std::collections::BTreeSet<&str> = keys.iter().map(|k| k.kid.as_str()).collect();
+        let changed = before != after;
+        self.keys = keys;
+        Ok(changed)
+    }
 }
 
 /// Shared workload-identity state for the manager process: the effective
@@ -614,10 +642,57 @@ impl WorkloadIdentityState {
         default_issuer_url: &str,
         now: SystemTime,
     ) -> R<Self> {
+        // Trim a trailing slash so `jwks_uri = issuer + jwks_path` (which
+        // requires a leading slash on jwks_path, checked below) never produces
+        // a double slash or a malformed URL.
         let issuer_url = config
             .issuer
             .clone()
-            .unwrap_or_else(|| default_issuer_url.to_string());
+            .unwrap_or_else(|| default_issuer_url.to_string())
+            .trim_end_matches('/')
+            .to_string();
+
+        // Only ES256 is implemented; fail fast rather than silently signing
+        // ES256 when an operator asked for something else (e.g. RS256).
+        if config.signing_alg != "ES256" {
+            bail!(
+                "workloadIdentity.signingAlg {:?} is not supported (only ES256 is implemented)",
+                config.signing_alg
+            );
+        }
+
+        // The JWKS route matches the request path by exact string equality and
+        // request paths always start with '/', so a jwks_path without a leading
+        // slash yields an unreachable route and a malformed jwks_uri. Reject it
+        // at startup instead of serving an unreachable JWKS.
+        if !config.jwks_path.starts_with('/') {
+            bail!(
+                "workloadIdentity.jwksPath {:?} must start with '/'",
+                config.jwks_path
+            );
+        }
+
+        // Fail fast on a malformed TTL/rotation duration rather than silently
+        // falling back to a default (these two govern token lifetime and the
+        // rotation overlap window — a typo must not pass quietly).
+        config
+            .default_ttl
+            .parse::<humantime::Duration>()
+            .with_context(|| {
+                format!(
+                    "invalid workloadIdentity.defaultTtl {:?} (use e.g. \"15m\")",
+                    config.default_ttl
+                )
+            })?;
+        config
+            .rotation_age
+            .parse::<humantime::Duration>()
+            .with_context(|| {
+                format!(
+                    "invalid workloadIdentity.rotationAge {:?} (use e.g. \"24h\")",
+                    config.rotation_age
+                )
+            })?;
 
         // P2: validate the cluster-default `sub` template the same way a
         // per-identity override is validated. Without this a cluster default
@@ -708,7 +783,7 @@ impl WorkloadIdentityState {
     /// One pass of the rotation state machine, persisting every transition:
     /// rotate when the active key is older than `rotationAge`, then expire
     /// retiring keys past their overlap window. Returns true when a rotation
-    /// happened. Driven by the background loop in `crate::manager::agent`.
+    /// happened. Driven by the background loop in `crate::manager::daemon`.
     pub fn rotation_tick(&self, store: &Store, now: SystemTime) -> R<bool> {
         let rotation_age = self.config.parsed_rotation_age();
         // Overlap window: a retiring key stays published for one further
@@ -731,6 +806,14 @@ impl WorkloadIdentityState {
         };
         issuer.expire_keys_persisted(store, now)?;
         Ok(rotated)
+    }
+
+    /// Refresh the in-memory key set from the replicated store. Called on each
+    /// rotation-check tick by **non-primary** managers so a follower's JWKS and
+    /// signer pick up keys the primary rotated in (staleness bounded by the
+    /// check interval). Returns true if the key set changed.
+    pub fn reload_from_store(&self, store: &Store) -> R<bool> {
+        self.write_issuer()?.reload_keys(store)
     }
 }
 
@@ -1451,6 +1534,113 @@ mod tests {
 
         let new = state.issue(&claims(), &aws_identity(), now())?;
         assert_ne!(new.kid, old.kid);
+        Ok(())
+    }
+
+    #[test]
+    fn initialize_rejects_unsupported_signing_alg() -> R<()> {
+        let store = claims_test_store()?;
+        let config = WorkloadIdentityConfigFull {
+            enabled: true,
+            signing_alg: "RS256".into(),
+            ..Default::default()
+        };
+        let err = WorkloadIdentityState::initialize(&store, &config, "https://m:4747", now())
+            .unwrap_err();
+        assert!(err.to_string().contains("signingAlg"), "{err}");
+        Ok(())
+    }
+
+    #[test]
+    fn initialize_rejects_jwks_path_without_leading_slash() -> R<()> {
+        let store = claims_test_store()?;
+        let config = WorkloadIdentityConfigFull {
+            enabled: true,
+            jwks_path: "jwks.json".into(),
+            ..Default::default()
+        };
+        let err = WorkloadIdentityState::initialize(&store, &config, "https://m:4747", now())
+            .unwrap_err();
+        assert!(err.to_string().contains("jwksPath"), "{err}");
+        Ok(())
+    }
+
+    #[test]
+    fn initialize_rejects_malformed_durations() -> R<()> {
+        for (ttl, rot) in [("nonsense", "24h"), ("15m", "24hours!")] {
+            let store = claims_test_store()?;
+            let config = WorkloadIdentityConfigFull {
+                enabled: true,
+                default_ttl: ttl.into(),
+                rotation_age: rot.into(),
+                ..Default::default()
+            };
+            let err = WorkloadIdentityState::initialize(&store, &config, "https://m:4747", now())
+                .unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("defaultTtl") || msg.contains("rotationAge"),
+                "{msg}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn initialize_trims_trailing_slash_from_issuer() -> R<()> {
+        let store = claims_test_store()?;
+        let config = WorkloadIdentityConfigFull {
+            enabled: true,
+            issuer: Some("https://manager.example.com:4747/".into()),
+            ..Default::default()
+        };
+        let state = WorkloadIdentityState::initialize(&store, &config, "https://m:4747", now())?;
+        // No double slash in the advertised jwks_uri.
+        let discovery = state.discovery_document()?;
+        assert_eq!(
+            discovery["jwks_uri"],
+            json!("https://manager.example.com:4747/.well-known/jwks.json")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn standby_reload_picks_up_primary_rotated_key() -> R<()> {
+        // Two issuers over one store model a primary + a standby manager
+        // sharing the replicated signing_key table (the plan's HA case).
+        let store = claims_test_store()?;
+        let mut primary = store_issuer(&store);
+        let standby = store_issuer(&store);
+
+        // Same starting key on both.
+        let start_kid = primary.active_key().unwrap().kid.clone();
+        assert_eq!(standby.active_key().unwrap().kid, start_kid);
+
+        // Primary rotates; the new key lands in the store.
+        primary.rotate_persisted(&store, now(), Duration::from_secs(900))?;
+        let new_kid = primary.active_key().unwrap().kid.clone();
+        assert_ne!(new_kid, start_kid);
+
+        // Before reload the standby's JWKS lacks the new kid...
+        let jwks_before = standby.jwks();
+        let has = |jwks: &Value, kid: &str| {
+            jwks["keys"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|k| k["kid"] == json!(kid))
+        };
+        assert!(!has(&jwks_before, &new_kid));
+
+        // ...after reloading from the store it serves the new key and can
+        // verify a token the primary signed with it.
+        let mut standby = standby;
+        assert!(standby.reload_keys(&store)?);
+        assert!(has(&standby.jwks(), &new_kid));
+        assert_eq!(standby.active_key().unwrap().kid, new_kid);
+        let token = primary.issue(&claims(), &aws_identity(), now())?;
+        assert_eq!(token.kid, new_kid);
+        standby.verify(&token.token, "sts.amazonaws.com")?;
         Ok(())
     }
 

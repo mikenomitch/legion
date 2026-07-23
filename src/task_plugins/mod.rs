@@ -377,6 +377,15 @@ pub fn validate_job_config(config: &JobConfig) -> R<()> {
             }
         }
         if !task.identities.is_empty() {
+            // The job/group/task names become the OIDC `sub` components, so
+            // constrain their charset to keep distinct workloads distinct (see
+            // validate_subject_field). Only enforced for identity-declaring
+            // tasks so other jobs keep their naming freedom.
+            use crate::structs::workload_identity::validate_subject_field;
+            validate_subject_field("job name", &config.name)?;
+            validate_subject_field(&format!("task {} group", task.name), &task.group)?;
+            validate_subject_field(&format!("task {} name", task.name), &task.name)?;
+
             registry.load_plugin(&task.kind, false)?;
             let plugin = registry
                 .plugin(&task.kind)

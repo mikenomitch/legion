@@ -271,11 +271,13 @@ service Manager {
   // compromised worker can only obtain tokens for allocations placed on it,
   // scoped to audiences the spec already declared.
   //
-  // Authorization: the request's `node_id` must match the node the
-  // allocation is placed on. This is the same trust model as Heartbeat —
-  // workers are admitted via join token and identified by their claimed
-  // node id; there is no per-request worker credential yet (TODO: bind
-  // worker RPCs to a per-node credential once worker mTLS lands).
+  // Authorization: the caller must present the per-node worker token minted
+  // at WorkerRegister (attached to every worker-plane RPC), whose principal
+  // is `node:<node_id>`. The manager requires that principal to match the
+  // request's `node_id`, which in turn must be the node the allocation is
+  // placed on — so a worker can only obtain tokens for allocations on its own
+  // node, and cannot forge a peer's node id to steal that peer's federation
+  // credentials. Management tokens (and ACL-disabled deployments) are exempt.
   //
   // Errors:
   // - FailedPrecondition: workload identity is not enabled on this manager

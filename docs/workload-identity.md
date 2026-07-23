@@ -20,7 +20,7 @@ integration cookbook. The design rationale lives in
 > manager's main listener (`src/manager/oidc_http.rs`); the
 > `IssueWorkloadIdentityToken` gRPC; worker-side delivery, refresh, and
 > change modes (`src/worker/identity.rs`); the background rotation loop
-> (`src/manager/agent.rs`); per-task `identities` spec validation and
+> (`src/manager/daemon.rs`); per-task `identities` spec validation and
 > task-kind capability gating; and manager config (off by default). The
 > [node identities](#node-identities) config/claims model consumed by the
 > artifact system is implemented; node-token *issuance* (a node mode on the
@@ -149,14 +149,20 @@ unsupported delivery are rejected at admission with an actionable error.
   workloadIdentity: {
     enabled: true,                              // default false
     issuer: 'https://manager.example.com:4747', // public HTTPS issuer URL
-    jwksPath: '/.well-known/jwks.json',
-    signingAlg: 'ES256',
+    jwksPath: '/.well-known/jwks.json',            // must start with '/'
+    signingAlg: 'ES256',                           // only ES256 is supported
     defaultTtl: '15m',
     rotationAge: '24h',
     subTemplate: '{region}:{job}:{group}:{task}',
   },
 }
 ```
+
+`signingAlg` is validated at startup and only `ES256` is accepted today —
+setting anything else fails manager boot rather than silently signing ES256.
+Malformed `defaultTtl`/`rotationAge`/`jwksPath` values also fail boot instead
+of falling back to a default. Only `enabled` and `issuer` are required for
+real federation; the rest have sensible defaults.
 
 The feature is off by default; existing jobs and the worker join-token flow are
 unaffected.
@@ -219,13 +225,21 @@ checks roughly every `rotationAge / 10` (minimum 1 minute):
 The overlap window is `max(rotationAge, defaultTtl)`, so any token signed by
 the retiring key stays verifiable until it expires — provided identity TTLs
 stay at or below `rotationAge` (keep token TTLs in minutes; that is the
-point of workload identity).
+point of workload identity). Note that a retiring key's `not_after` is
+computed from the `rotationAge`/`defaultTtl` in effect **at rotation time**;
+if you drastically *shrink* those values and restart, tokens already issued
+under the older, larger TTL can expire after the key is dropped. Shrink token
+lifetimes gradually (or accept that in-flight long-TTL tokens may need a
+re-issue) rather than in one large step across a restart.
 
 **HA note:** with raft/streaming persistence, only the **primary** manager
-runs the rotation loop (the same leader-only convention as other
-store-mutating loops); all managers share the replicated `signing_key` table
-and therefore serve an identical JWKS. With the default local-disk
-persistence there is a single manager and it is always primary.
+*rotates* keys (the same leader-only convention as other store-mutating
+loops). Standby managers do not rotate, but on each rotation-check tick they
+**reload** the key set from the replicated `signing_key` table, so a
+follower's JWKS and signer pick up keys the primary rotated in — staleness is
+bounded by the check interval (`max(rotationAge / 10, 1m)`), not frozen at
+boot. With the default local-disk persistence there is a single manager and
+it is always primary.
 
 ## How tokens reach the task
 
@@ -237,9 +251,9 @@ persistence there is a single manager and it is always primary.
    claims from the allocation's scheduling record and the named identity in
    the stored spec; nothing security-relevant is read from the request, and
    the request is rejected unless the allocation is placed on the calling
-   node. (Worker RPCs are identified by claimed node id today — the same
-   trust model as heartbeats; binding them to a per-node credential is
-   tracked as a TODO alongside worker mTLS.)
+   node. The `node_id` is bound to the caller's **authenticated** per-node
+   worker token (principal `node:<node_id>`, minted at registration), so a
+   worker cannot forge a peer's node id to mint that peer's tokens.
 3. Delivery:
    - **file**: written to `file.path` with `file.mode` (default `0400`),
      atomically (temp file + rename, so readers never see a partial token).
@@ -277,9 +291,30 @@ persistence there is a single manager and it is always primary.
 Tokens at rest on the worker host: the delivered token files (mode `0400`),
 the env-delivery backing files under `.legion/identity/`, and — for
 env-delivered identities — the worker's persisted allocation state (which
-records the task env so restarts survive worker restarts). All are local to
-the worker host and readable by whoever can read the worker's state, the
-same trust boundary as the task itself. Token bytes are never logged.
+records the task env so restarts survive worker restarts). All are written
+owner-only: token files and their directories are created at a restrictive
+mode from the start (never briefly world-readable), and the worker state file
+and its directory are locked to the worker's own user. They are readable by
+whoever can read the worker's state, the same trust boundary as the task
+itself. Token bytes are never logged. When an allocation stops, the worker
+removes its delivered token files and per-allocation backing directory.
+
+**Known limitations.**
+
+- *`exec` tasks that drop to a different `user`.* Token files are written
+  owner-only by the worker's user. An `exec` task configured with a `user`
+  runs de-privileged and hands over only its allocation directory tree, so a
+  file-delivered token written outside that tree (an absolute `file.path`, or
+  the `.legion/identity/` backing dir) is not readable by the task user. Until
+  per-user token ownership lands, point `file.path` inside the allocation
+  directory, or run the task as the worker's user, when using file delivery
+  with a dropped-privilege `user`.
+- *Apple `container` runtime (macOS).* The Apple container runtime passes env
+  vars to `container run` on the command line, so an env-delivered identity
+  token is visible to other local users via `ps` for the life of the launch
+  process. Prefer file delivery, or the Linux/OCI runtime, for secret env on
+  that runtime. (The Linux path writes env into the OCI bundle under the
+  owner-only allocation directory and is not exposed this way.)
 
 ## Testing this locally in a basic way
 

@@ -128,8 +128,18 @@ pub async fn run_manager(config: ManagerConfig, run_worker: bool) -> R<()> {
     // signing keys are restored from (or first-boot persisted to) the store,
     // so tokens held by third parties stay verifiable across restarts.
     let workload_identity_state = if full_config.workload_identity.enabled {
+        // When the issuer URL is unset, fall back to this manager's own
+        // listener. Match the scheme to the listener: with server TLS on it
+        // speaks only HTTPS, so an http:// issuer would make `iss`/`jwks_uri`
+        // point at an endpoint the manager won't answer. Operators should still
+        // set an externally-reachable HTTPS issuer for real federation.
+        let scheme = if full_config.server.tls.enabled {
+            "https"
+        } else {
+            "http"
+        };
         let default_issuer = format!(
-            "http://{}:{}",
+            "{scheme}://{}:{}",
             resolve_manager_host(&full_config.server.host),
             full_config.server.port
         );
@@ -182,7 +192,9 @@ pub async fn run_manager(config: ManagerConfig, run_worker: bool) -> R<()> {
             }
         });
     } else {
-        info!("Exec is disabled (exec.enabled=false); ExecAllocation and the exec WebSocket are off");
+        info!(
+            "Exec is disabled (exec.enabled=false); ExecAllocation and the exec WebSocket are off"
+        );
     }
 
     let tls_identity = load_server_tls_identity(&full_config.server.tls)?;
@@ -261,9 +273,11 @@ pub async fn run_manager(config: ManagerConfig, run_worker: bool) -> R<()> {
 /// window. Every transition is persisted, so a restart mid-overlap restores
 /// the exact same key set.
 ///
-/// HA note: in a multi-manager deployment only the primary acts (same
-/// leader-only convention as other store-mutating loops); standbys share the
-/// replicated `signing_key` table and keep serving an identical JWKS.
+/// HA note: only the primary *rotates* (same leader-only convention as other
+/// store-mutating loops). Standbys don't rotate, but they must not serve a
+/// boot-frozen JWKS — keys are read once at startup — so on each tick a standby
+/// reloads the key set from the replicated `signing_key` table, picking up
+/// keys the primary rotated in (staleness bounded by the check interval).
 #[instrument(err, skip_all)]
 async fn start_workload_identity_rotation(
     store: Store,
@@ -285,7 +299,13 @@ async fn start_workload_identity_rotation(
                 Err(err) => warn!(error = ?err, "Workload identity rotation tick failed"),
             }
         } else {
-            debug!("Skipping workload identity rotation on non-primary manager");
+            // Standby: don't rotate, but refresh the key set so this manager's
+            // JWKS/signer track keys the primary rotated in.
+            match state.reload_from_store(&store) {
+                Ok(true) => info!("Refreshed workload identity signing keys from store (standby)"),
+                Ok(false) => debug!("Workload identity signing keys unchanged (standby)"),
+                Err(err) => warn!(error = ?err, "Failed to refresh signing keys on standby"),
+            }
         }
         tokio::time::sleep(interval).await;
     }

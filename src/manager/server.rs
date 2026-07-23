@@ -31,34 +31,34 @@ use crate::structs::{
     CreateInstancesRequest, DeleteKvReply, DeleteKvRequest, DeleteSavedStateQueryReply,
     DeleteSavedStateQueryRequest, DestroyInstanceReply, DestroyInstanceRequest, DestroyJobReply,
     DestroyJobRequest, ExecClientFrame, FailedAllocation, GetAllocationLogsReply,
-    GetAllocationLogsRequest,
-    GetArtifactCredentialReply, GetArtifactCredentialRequest, GetInstanceReply, GetInstanceRequest,
-    GetJobInfoReply, GetJobInfoRequest, GetJobSpecByConfigRequest, GetJobSpecReply,
-    GetJobSpecRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply,
-    GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest, GetNodeReply,
-    GetNodeRequest, GetNodesReply, GetNodesRequest, GetObservabilityReply, GetObservabilityRequest,
-    GetRaftJoinTokenReply, GetRaftJoinTokenRequest, GetRaftStatusReply, GetRaftStatusRequest,
-    GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest,
-    GetStateStoreSchemaReply, GetStateStoreSchemaRequest, GetTaskLogsRequest, HealthCheckReply,
-    HealthCheckRequest, HeartbeatReply, HeartbeatRequest, Instance, InstanceInfo, InstanceMode,
-    InstanceState, IssueRaftCommandReply, IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply,
+    GetAllocationLogsRequest, GetArtifactCredentialReply, GetArtifactCredentialRequest,
+    GetInstanceReply, GetInstanceRequest, GetJobInfoReply, GetJobInfoRequest,
+    GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest, GetKvLockReply,
+    GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest,
+    GetManagerConfigsReply, GetManagerConfigsRequest, GetNodeReply, GetNodeRequest, GetNodesReply,
+    GetNodesRequest, GetObservabilityReply, GetObservabilityRequest, GetRaftJoinTokenReply,
+    GetRaftJoinTokenRequest, GetRaftStatusReply, GetRaftStatusRequest, GetRolloutReply,
+    GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest, GetStateStoreSchemaReply,
+    GetStateStoreSchemaRequest, GetTaskLogsRequest, HealthCheckReply, HealthCheckRequest,
+    HeartbeatReply, HeartbeatRequest, Instance, InstanceInfo, InstanceMode, InstanceState,
+    IssueRaftCommandReply, IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply,
     IssueWorkloadIdentityTokenRequest, JobConfig, JobSpecHistoryItem, KvEntry, KvInjectionAction,
     KvValueType, LedgerNode, ListEventsReply, ListEventsRequest, ListInstancesReply,
-    ListInstancesRequest, ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobsReply,
-    ListJobsRequest, ListKvReply, ListKvRequest, ListRaftHistoryReply, ListRaftHistoryRequest,
-    ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply, ListRolloutsRequest,
-    ListJobActionsReply, ListJobActionsRequest, ListSavedStateQueriesReply,
+    ListInstancesRequest, ListJobActionsReply, ListJobActionsRequest, ListJobSpecHistoryReply,
+    ListJobSpecHistoryRequest, ListJobsReply, ListJobsRequest, ListKvReply, ListKvRequest,
+    ListRaftHistoryReply, ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest,
+    ListRolloutsReply, ListRolloutsRequest, ListSavedStateQueriesReply,
     ListSavedStateQueriesRequest, ListServicesReply, ListServicesRequest, Node, NodeMsg,
     PatchKvReply, PatchKvRequest, PlanJobReply, PlanJobRequest, PlannedAllocation, PutKvReply,
     PutKvRequest, QueryStateStoreReply, QueryStateStoreRequest, RaftHistoryEvent, RaftStatus,
     ReleaseKvLockReply, ReleaseKvLockRequest, RenewKvLockReply, RenewKvLockRequest,
     ReplaceInstanceReply, ReplaceInstanceRequest, ResolveServiceReply, ResolveServiceRequest,
-    RestartWorkerReply, RestartWorkerRequest, RolloutAllocationStatus,
-    RolloutEvent, RolloutGroupStatus, RolloutProgression, RolloutReplacement, RunJobReply,
-    RunJobRequest, SavedStateQuery, SchedulerEvent, ServiceEndpoint, ServiceSummary,
-    StartInstanceReply, StartInstanceRequest, StopInstanceReply, StopInstanceRequest, StopJobReply,
-    StopJobRequest, StopRolloutReply, StopRolloutRequest, StreamEventsRequest, Submission,
-    TaskConfig, TaskOnUnhealthyConfig, UpdateNodeDynamicReply, UpdateNodeDynamicRequest,
+    RestartWorkerReply, RestartWorkerRequest, RolloutAllocationStatus, RolloutEvent,
+    RolloutGroupStatus, RolloutProgression, RolloutReplacement, RunJobReply, RunJobRequest,
+    SavedStateQuery, SchedulerEvent, ServiceEndpoint, ServiceSummary, StartInstanceReply,
+    StartInstanceRequest, StopInstanceReply, StopInstanceRequest, StopJobReply, StopJobRequest,
+    StopRolloutReply, StopRolloutRequest, StreamEventsRequest, Submission, TaskConfig,
+    TaskOnUnhealthyConfig, UpdateNodeDynamicReply, UpdateNodeDynamicRequest,
     UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest, WorkerConfig, WorkerPreRegisterReply,
     WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest,
 };
@@ -3289,9 +3289,14 @@ impl Manager for ManagerDaemonService {
         request: Request<IssueWorkloadIdentityTokenRequest>,
     ) -> Result<Response<IssueWorkloadIdentityTokenReply>, Status> {
         // ACL: worker-plane endpoint (workers fetch tokens for allocations
-        // placed on them; the manager already checks node ownership below).
+        // placed on them; node ownership is enforced against the authenticated
+        // principal below).
         let identity = self.authenticate_acl(&request)?;
         acl::enforce_worker_plane(&identity)?;
+        // Capture the caller's authenticated identity before `identity` is
+        // shadowed by the spec-identity lookup further down.
+        let caller_is_management = identity.is_management;
+        let caller_principal = identity.principal.clone();
         let req = request.into_inner();
         tracing::Span::current().record("alloc_id", req.alloc_id);
         tracing::Span::current().record("identity_name", req.identity_name.as_str());
@@ -3310,13 +3315,21 @@ impl Manager for ManagerDaemonService {
             .map_err(|e| map_store_error("Error loading allocation", e))?
             .ok_or_else(|| Status::not_found(format!("allocation {} not found", req.alloc_id)))?;
 
-        // AuthZ: a worker may only request tokens for allocations placed on
-        // it. This is the same trust model as Heartbeat — workers are
-        // admitted via join token and identified by their claimed node id;
-        // there is no per-request worker credential today.
-        // TODO(worker-authn): bind worker RPCs to a per-node credential
-        // (mTLS or a join-token-derived bearer) so node_id is proven rather
-        // than claimed; see the join-token trust model in src/structs/token.rs.
+        // AuthZ: a worker may only request tokens for allocations placed on it.
+        // Bind the request to the *authenticated* principal: a node worker
+        // token has principal `node:<node_id>` (minted at WorkerRegister and
+        // attached to every worker-plane RPC), so require it to match the
+        // node_id in the request. This closes cross-node identity theft — a
+        // compromised worker cannot set `node_id` to a peer's and mint that
+        // peer's federation credentials. Management/ACL-disabled callers
+        // (is_management) are exempt. This mints AWS/GCP/Vault-scoped tokens,
+        // so unlike Heartbeat the node id must be proven, not merely claimed.
+        if !caller_is_management && caller_principal != format!("node:{}", req.node_id) {
+            return Err(Status::permission_denied(format!(
+                "worker {caller_principal:?} may not request tokens for node {:?}",
+                req.node_id
+            )));
+        }
         if allocation.node_id != req.node_id {
             return Err(Status::permission_denied(format!(
                 "allocation {} is not placed on node {:?}",
@@ -5865,6 +5878,64 @@ mod tests {
 
         let err = manager
             .issue_workload_identity_token(issue_request(allocation.id, "aws", "node-evil"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn issue_token_binds_node_id_to_authenticated_worker() -> R<()> {
+        use crate::manager::acl::Authenticator;
+        use crate::structs::AclConfigFull;
+
+        let store = setup_store()?;
+        insert_node(&store, "node-2")?;
+        // Allocation is placed on node-1 by submit_and_place_identity_task.
+        let allocation =
+            submit_and_place_identity_task(&store, "wi-job", aws_identity_task("api"))?;
+        let state = wi_state(&store)?;
+
+        // ACLs on: the caller's worker token principal is `node:<id>`.
+        let auth = Arc::new(Authenticator::from_config(&AclConfigFull {
+            enabled: true,
+            ..Default::default()
+        })?);
+        let node1_token = auth.mint_node_token(&store, "node-1")?;
+        let node2_token = auth.mint_node_token(&store, "node-2")?;
+        let manager = ManagerDaemonService::new(store)
+            .with_workload_identity(Some(state))
+            .with_authenticator(auth);
+
+        let authed = |token: &str, node_id: &str| {
+            let mut request = issue_request(allocation.id, "aws", node_id);
+            request.metadata_mut().insert(
+                "authorization",
+                format!("Bearer {token}").parse().expect("ascii token"),
+            );
+            request
+        };
+
+        // node-1's own token issues for its own allocation.
+        let reply = manager
+            .issue_workload_identity_token(authed(&node1_token, "node-1"))
+            .await?
+            .into_inner();
+        assert_eq!(reply.name, "aws");
+
+        // node-2's token forging node-1 in the request is denied: the request
+        // node_id must match the authenticated principal, not just the
+        // allocation's node.
+        let err = manager
+            .issue_workload_identity_token(authed(&node2_token, "node-1"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+
+        // And node-2 asking for node-2 (matching principal) is still rejected
+        // because the allocation is not on node-2 — defense in depth.
+        let err = manager
+            .issue_workload_identity_token(authed(&node2_token, "node-2"))
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
