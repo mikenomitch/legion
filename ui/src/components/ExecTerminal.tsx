@@ -30,8 +30,8 @@ export default function ExecTerminal(props: ExecTerminalProps) {
       convertEol: !props.interactive,
       cursorBlink: props.interactive,
       fontSize: 13,
-      fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
-      theme: { background: '#0b0f19' },
+      fontFamily: '"JetBrains Mono Variable", "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
+      theme: { background: '#0d0c0a', cursor: '#d6b45a' },
     })
     fit = new FitAddon()
     term.loadAddon(fit)
@@ -76,5 +76,5 @@ export default function ExecTerminal(props: ExecTerminalProps) {
     term?.dispose()
   })
 
-  return <div ref={container} class="h-72 w-full overflow-hidden rounded-md bg-[#0b0f19] p-2" />
+  return <div ref={container} class="h-72 w-full overflow-hidden rounded-md border border-line bg-[#0d0c0a] p-2" />
 }

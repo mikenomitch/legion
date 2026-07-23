@@ -1,5 +1,6 @@
 import { For, Show, createEffect, createSignal, onCleanup, onMount } from 'solid-js'
 import { managerClient } from '../grpcClient'
+import { Button, Dot, Note, cx, selectClass } from './ui'
 
 // Live-tailing task log viewer.
 //
@@ -186,11 +187,12 @@ export default function LogViewer(props: LogViewerProps) {
     <button
       type="button"
       onClick={() => setStreamFilter(value)}
-      class={`rounded border px-2 py-1 text-xs ${
+      class={cx(
+        'px-2.5 py-1 text-xs font-medium transition-colors first:rounded-l-md last:rounded-r-md',
         streamFilter() === value
-          ? 'border-neutral-900 bg-neutral-900 text-white dark:border-neutral-100 dark:bg-neutral-100 dark:text-neutral-900'
-          : 'border-neutral-300 dark:border-neutral-700'
-      }`}
+          ? 'bg-ink text-canvas'
+          : 'bg-surface text-muted hover:bg-surface2 hover:text-ink',
+      )}
     >
       {label}
     </button>
@@ -199,7 +201,7 @@ export default function LogViewer(props: LogViewerProps) {
   return (
     <div class="space-y-2">
       <div class="flex flex-wrap items-center gap-2">
-        <div class="flex gap-1">
+        <div class="inline-flex divide-x divide-line overflow-hidden rounded-md border border-line">
           {filterBtn('all', 'All')}
           {filterBtn('stdout', 'stdout')}
           {filterBtn('stderr', 'stderr')}
@@ -207,70 +209,45 @@ export default function LogViewer(props: LogViewerProps) {
 
         <Show when={!props.allocationIds && knownAllocs().length > 1}>
           <select
-            class="rounded border border-neutral-300 bg-transparent px-2 py-1 text-xs dark:border-neutral-700"
+            class={cx(selectClass, 'w-auto py-1 text-xs')}
             value={allocFilter()}
             onChange={(e) => setAllocFilter(e.currentTarget.value)}
+            aria-label="Filter by allocation"
           >
             <option value="all">All allocations</option>
             <For each={knownAllocs()}>{(id) => <option value={id}>alloc #{id}</option>}</For>
           </select>
         </Show>
 
-        <div class="ml-auto flex items-center gap-2">
+        <div class="ml-auto flex items-center gap-1.5">
           <button
             type="button"
             onClick={() => setFollow((v) => !v)}
-            class={`flex items-center gap-1.5 rounded border px-2 py-1 text-xs ${
+            class={cx(
+              'flex items-center gap-1.5 rounded-md border px-2.5 py-1 text-xs font-medium transition-colors',
               follow()
-                ? 'border-emerald-400 text-emerald-700 dark:border-emerald-700 dark:text-emerald-300'
-                : 'border-neutral-300 dark:border-neutral-700'
-            }`}
+                ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'
+                : 'border-line text-muted hover:bg-surface2',
+            )}
             title="Auto-scroll to the newest log line"
           >
-            <span
-              class={`h-2 w-2 rounded-full ${follow() ? 'animate-pulse bg-emerald-500' : 'bg-neutral-400'}`}
-            />
+            <Dot tone={follow() ? 'ok' : 'neutral'} pulse={follow()} />
             {follow() ? 'Following' : 'Follow'}
           </button>
-          <button
-            type="button"
-            onClick={() => setPaused((v) => !v)}
-            class="rounded border border-neutral-300 px-2 py-1 text-xs dark:border-neutral-700"
-            title="Pause/resume polling"
-          >
+          <Button size="xs" icon={paused() ? 'play' : 'pause'} onClick={() => setPaused((v) => !v)} title="Pause/resume polling">
             {paused() ? 'Resume' : 'Pause'}
-          </button>
-          <button
-            type="button"
-            onClick={() => setWrap((v) => !v)}
-            class="rounded border border-neutral-300 px-2 py-1 text-xs dark:border-neutral-700"
-          >
-            {wrap() ? 'No wrap' : 'Wrap'}
-          </button>
-          <button
-            type="button"
-            onClick={clear}
-            class="rounded border border-neutral-300 px-2 py-1 text-xs dark:border-neutral-700"
-          >
-            Clear
-          </button>
-          <button
-            type="button"
-            onClick={download}
-            class="rounded border border-neutral-300 px-2 py-1 text-xs dark:border-neutral-700"
-          >
-            Download
-          </button>
+          </Button>
+          <Button size="xs" onClick={() => setWrap((v) => !v)}>{wrap() ? 'No wrap' : 'Wrap'}</Button>
+          <Button size="xs" onClick={clear}>Clear</Button>
+          <Button size="xs" onClick={download}>Download</Button>
         </div>
       </div>
 
       <Show when={error()}>
-        <p class="rounded border border-rose-300 bg-rose-50 px-2 py-1 text-xs text-rose-700 dark:border-rose-800 dark:bg-rose-950/40 dark:text-rose-300">
-          {error()}
-        </p>
+        <Note tone="danger" class="text-xs">{error()}</Note>
       </Show>
       <Show when={truncated()}>
-        <p class="text-[11px] text-amber-600 dark:text-amber-400">
+        <p class="text-2xs text-amber-600 dark:text-amber-400">
           Showing the most recent {Math.round(WINDOW_BYTES / 1024)} KiB per stream; older lines were
           rotated out. Use external log shipping for full history.
         </p>
@@ -279,7 +256,7 @@ export default function LogViewer(props: LogViewerProps) {
       <div
         ref={container}
         onScroll={onScroll}
-        class="h-[28rem] overflow-auto rounded-md border border-neutral-800 bg-neutral-950 p-3 font-mono text-xs leading-relaxed text-neutral-200"
+        class="h-[28rem] overflow-auto rounded-md border border-line bg-[#0d0c0a] p-3 font-mono text-xs leading-relaxed text-neutral-200"
       >
         <Show
           when={visibleLines().length > 0}
@@ -293,13 +270,13 @@ export default function LogViewer(props: LogViewerProps) {
                 </Show>
                 <span
                   class={`shrink-0 select-none ${
-                    line.stream === 'stderr' ? 'text-rose-400' : 'text-sky-500'
+                    line.stream === 'stderr' ? 'text-red-400' : 'text-sky-500'
                   }`}
                 >
                   {line.stream === 'stderr' ? 'E' : 'O'}
                 </span>
-                <span class={line.stream === 'stderr' ? 'text-rose-300' : 'text-neutral-200'}>
-                  {line.text || ' '}
+                <span class={line.stream === 'stderr' ? 'text-red-300' : 'text-neutral-200'}>
+                  {line.text || ' '}
                 </span>
               </div>
             )}
@@ -307,8 +284,8 @@ export default function LogViewer(props: LogViewerProps) {
         </Show>
       </div>
 
-      <div class="flex items-center justify-between text-[11px] text-neutral-500">
-        <span>
+      <div class="flex items-center justify-between text-2xs text-faint">
+        <span class="tabular-nums">
           {visibleLines().length} line{visibleLines().length === 1 ? '' : 's'} buffered
           <Show when={visibleLines().length >= MAX_LINES}> (capped at {MAX_LINES})</Show>
         </span>

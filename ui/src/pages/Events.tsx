@@ -2,6 +2,8 @@ import { For, Show, createMemo, createSignal, onCleanup, onMount } from 'solid-j
 import type { SchedulerEvent } from '../gen/legion_pb'
 import { managerClient } from '../grpcClient'
 import { formatRelativeTime } from '../utils/format'
+import { Badge, Button, Dot, EmptyState, Icon, SectionCard, cx, inputClass, selectClass } from '../components/ui'
+import { statusTone, type Tone } from '../utils/status'
 
 const MAX_BUFFERED_EVENTS = 750
 const RECONNECT_DELAY_MS = 2000
@@ -10,20 +12,12 @@ type ConnectionState = 'connecting' | 'live' | 'reconnecting'
 
 const KIND_CATEGORIES = ['scheduler', 'eval', 'allocation', 'artifact', 'node', 'job', 'rollout'] as const
 
-const levelClasses = (level: string): string => {
-  if (level === 'error') {
-    return 'border-rose-300 bg-rose-50 text-rose-700 dark:border-rose-600 dark:bg-rose-950 dark:text-rose-100'
-  }
-  if (level === 'warn') {
-    return 'border-amber-300 bg-amber-50 text-amber-700 dark:border-amber-600 dark:bg-amber-950 dark:text-amber-100'
-  }
-  return 'border-neutral-300 bg-neutral-50 text-neutral-600 dark:border-neutral-700 dark:bg-neutral-900 dark:text-neutral-300'
-}
+const levelTone = (level: string): Tone => statusTone(level) === 'info' ? 'neutral' : statusTone(level)
 
-const connectionClasses = (state: ConnectionState): string => {
-  if (state === 'live') return 'bg-emerald-500'
-  if (state === 'reconnecting') return 'bg-rose-500'
-  return 'bg-amber-500'
+const connectionTone = (state: ConnectionState): Tone => {
+  if (state === 'live') return 'ok'
+  if (state === 'reconnecting') return 'danger'
+  return 'warn'
 }
 
 const eventCategory = (kind: string): string => kind.split('.')[0] ?? kind
@@ -76,12 +70,16 @@ export default function Events() {
     }
 
     while (!abortController.signal.aborted) {
+      // gRPC-Web streams have no "open" signal, so treat a stream that
+      // survives its first moments without erroring as live even while quiet.
+      let liveTimer: ReturnType<typeof setTimeout> | undefined
       try {
         setConnection((state) => (state === 'connecting' ? 'connecting' : 'reconnecting'))
         const stream = managerClient.streamEvents(
           { afterId: cursor },
           { signal: abortController.signal },
         )
+        liveTimer = setTimeout(() => setConnection('live'), 1500)
         for await (const event of stream) {
           setConnection('live')
           cursor = event.id > cursor ? event.id : cursor
@@ -90,6 +88,8 @@ export default function Events() {
       } catch (error) {
         if (abortController.signal.aborted) return
         console.error('Scheduler event stream interrupted; reconnecting', error)
+      } finally {
+        if (liveTimer) clearTimeout(liveTimer)
       }
       setConnection('reconnecting')
       await new Promise((resolve) => setTimeout(resolve, RECONNECT_DELAY_MS))
@@ -135,14 +135,14 @@ export default function Events() {
   })
 
   return (
-    <section class="space-y-4">
-      <div class="flex flex-wrap items-center gap-3 rounded border border-neutral-200 bg-white/90 px-4 py-3 dark:border-neutral-800 dark:bg-neutral-900/60">
-        <span class="flex items-center gap-2 text-sm">
-          <span class={`h-2.5 w-2.5 rounded-full ${connectionClasses(connection())}`} />
+    <div class="space-y-3">
+      <div class="flex flex-wrap items-center gap-2">
+        <span class="flex items-center gap-2 px-1 text-xs font-medium text-muted" role="status">
+          <Dot tone={connectionTone(connection())} pulse={connection() === 'live'} />
           {connectionLabel()}
         </span>
         <select
-          class="rounded border border-neutral-300 bg-white px-2 py-1.5 text-sm dark:border-neutral-700 dark:bg-neutral-950"
+          class={cx(selectClass, 'w-auto')}
           value={categoryFilter()}
           onChange={(event) => setCategoryFilter(event.currentTarget.value)}
           aria-label="Filter by event category"
@@ -153,7 +153,7 @@ export default function Events() {
           </For>
         </select>
         <select
-          class="rounded border border-neutral-300 bg-white px-2 py-1.5 text-sm dark:border-neutral-700 dark:bg-neutral-950"
+          class={cx(selectClass, 'w-auto')}
           value={levelFilter()}
           onChange={(event) => setLevelFilter(event.currentTarget.value)}
           aria-label="Filter by level"
@@ -163,86 +163,84 @@ export default function Events() {
           <option value="warn">warn</option>
           <option value="error">error</option>
         </select>
-        <input
-          type="search"
-          placeholder="Search message, job, node…"
-          class="min-w-[14rem] flex-1 rounded border border-neutral-300 bg-white px-3 py-1.5 text-sm placeholder:text-neutral-500 dark:border-neutral-700 dark:bg-neutral-950 dark:placeholder:text-neutral-400"
-          value={search()}
-          onInput={(event) => setSearch(event.currentTarget.value)}
-        />
-        <button
-          type="button"
-          class="rounded border border-neutral-300 px-3 py-1.5 text-sm font-semibold text-neutral-700 hover:border-neutral-500 dark:border-neutral-700 dark:text-neutral-200"
-          onClick={togglePaused}
-        >
+        <div class="relative min-w-[14rem] flex-1">
+          <Icon name="search" size={14} class="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-faint" />
+          <input
+            type="search"
+            placeholder="Search message, job, node…"
+            class={cx(inputClass, 'pl-8')}
+            value={search()}
+            onInput={(event) => setSearch(event.currentTarget.value)}
+          />
+        </div>
+        <Button icon={paused() ? 'play' : 'pause'} onClick={togglePaused}>
           {paused()
             ? `Resume${pendingWhilePaused().length > 0 ? ` (${pendingWhilePaused().length} new)` : ''}`
             : 'Pause'}
-        </button>
+        </Button>
       </div>
 
-      <Show
-        when={visibleEvents().length > 0}
-        fallback={
-          <p class="rounded border border-neutral-200 bg-white/90 px-4 py-6 text-sm text-neutral-500 dark:border-neutral-800 dark:bg-neutral-900/60 dark:text-neutral-400">
-            No scheduler events yet. Submit a job or join a worker and activity will appear here live.
-          </p>
-        }
-      >
-        <ul class="space-y-1.5">
-          <For each={visibleEvents()}>
-            {(event) => (
-              <li class="rounded border border-neutral-200 bg-white/90 px-3 py-2 text-sm dark:border-neutral-800 dark:bg-neutral-900/60">
-                <button
-                  type="button"
-                  class="flex w-full flex-wrap items-center gap-2 text-left"
-                  onClick={() => setExpandedId((current) => (current === event.id ? null : event.id))}
-                >
-                  <span class={`rounded border px-1.5 py-0.5 text-[11px] font-semibold uppercase ${levelClasses(event.level)}`}>
-                    {event.level}
-                  </span>
-                  <span class="font-mono text-xs text-neutral-500 dark:text-neutral-400">{event.kind}</span>
-                  <span class="min-w-0 flex-1 truncate text-neutral-900 dark:text-neutral-100">{event.message}</span>
-                  <Show when={event.jobId}>
-                    <span class="rounded bg-neutral-100 px-1.5 py-0.5 font-mono text-[11px] text-neutral-600 dark:bg-neutral-800 dark:text-neutral-300">
-                      job={event.jobId}
+      <SectionCard flush>
+        <Show
+          when={visibleEvents().length > 0}
+          fallback={
+            <EmptyState
+              icon="radio"
+              title="No scheduler events yet"
+              body="Submit a job or join a worker and activity will appear here live."
+            />
+          }
+        >
+          <ul class="divide-y divide-line">
+            <For each={visibleEvents()}>
+              {(event) => (
+                <li>
+                  <button
+                    type="button"
+                    class="flex w-full flex-wrap items-center gap-2 px-3.5 py-2 text-left text-sm transition-colors hover:bg-surface2/50"
+                    onClick={() => setExpandedId((current) => (current === event.id ? null : event.id))}
+                    aria-expanded={expandedId() === event.id}
+                  >
+                    <Badge tone={levelTone(event.level)} class="uppercase">{event.level}</Badge>
+                    <span class="font-mono text-xs text-faint">{event.kind}</span>
+                    <span class="min-w-0 flex-1 truncate text-ink">{event.message}</span>
+                    <Show when={event.jobId}>
+                      <span class="rounded bg-surface2 px-1.5 py-0.5 font-mono text-2xs text-muted">job={event.jobId}</span>
+                    </Show>
+                    <Show when={event.nodeId}>
+                      <span class="rounded bg-surface2 px-1.5 py-0.5 font-mono text-2xs text-muted">node={event.nodeId}</span>
+                    </Show>
+                    <span class="whitespace-nowrap text-xs text-faint" title={event.createdAt}>
+                      {formatRelativeTime(event.createdAt)}
                     </span>
+                  </button>
+                  <Show when={expandedId() === event.id}>
+                    <div class="space-y-2 border-t border-line bg-surface2/40 px-3.5 py-2.5 text-xs">
+                      <p class="flex flex-wrap gap-x-4 gap-y-1 text-muted">
+                        <span><span class="font-semibold text-faint">id</span> {String(event.id)}</span>
+                        <Show when={event.evalId}>
+                          <span><span class="font-semibold text-faint">eval</span> {event.evalId}</span>
+                        </Show>
+                        <Show when={event.allocationId !== undefined}>
+                          <span><span class="font-semibold text-faint">allocation</span> {String(event.allocationId)}</span>
+                        </Show>
+                        <Show when={event.rolloutId !== undefined}>
+                          <span><span class="font-semibold text-faint">rollout</span> {String(event.rolloutId)}</span>
+                        </Show>
+                        <span><span class="font-semibold text-faint">at</span> {event.createdAt}</span>
+                      </p>
+                      <pre class="overflow-auto rounded-md border border-line bg-surface p-2 font-mono text-2xs leading-relaxed text-muted">
+                        {formatMetadata(event.metadataJson)}
+                      </pre>
+                    </div>
                   </Show>
-                  <Show when={event.nodeId}>
-                    <span class="rounded bg-neutral-100 px-1.5 py-0.5 font-mono text-[11px] text-neutral-600 dark:bg-neutral-800 dark:text-neutral-300">
-                      node={event.nodeId}
-                    </span>
-                  </Show>
-                  <span class="text-xs text-neutral-500 dark:text-neutral-400" title={event.createdAt}>
-                    {formatRelativeTime(event.createdAt)}
-                  </span>
-                </button>
-                <Show when={expandedId() === event.id}>
-                  <div class="mt-2 space-y-1 border-t border-neutral-200 pt-2 text-xs dark:border-neutral-800">
-                    <p class="text-neutral-600 dark:text-neutral-300">
-                      <span class="font-semibold">id</span> {String(event.id)}
-                      <Show when={event.evalId}>
-                        <span class="ml-3 font-semibold">eval</span> {event.evalId}
-                      </Show>
-                      <Show when={event.allocationId !== undefined}>
-                        <span class="ml-3 font-semibold">allocation</span> {String(event.allocationId)}
-                      </Show>
-                      <Show when={event.rolloutId !== undefined}>
-                        <span class="ml-3 font-semibold">rollout</span> {String(event.rolloutId)}
-                      </Show>
-                      <span class="ml-3 font-semibold">at</span> {event.createdAt}
-                    </p>
-                    <pre class="overflow-auto rounded bg-neutral-100 p-2 font-mono text-[11px] text-neutral-700 dark:bg-neutral-950 dark:text-neutral-300">
-                      {formatMetadata(event.metadataJson)}
-                    </pre>
-                  </div>
-                </Show>
-              </li>
-            )}
-          </For>
-        </ul>
-      </Show>
-    </section>
+                </li>
+              )}
+            </For>
+          </ul>
+        </Show>
+      </SectionCard>
+    </div>
   )
 }
 

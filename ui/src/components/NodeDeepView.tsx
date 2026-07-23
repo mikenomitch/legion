@@ -1,10 +1,11 @@
 import { A } from '@solidjs/router'
 import { For, Show, createMemo, createSignal, type JSX, type Resource } from 'solid-js'
-import { DetailBadge, DetailSection, InstancePill } from './DetailPrimitives'
+import { Badge, Icon, MonoBadge, Note, PageHeader, SectionCard, Spinner, StatusBadge, TableShell, cx, tableClass, tdClass, thClass, theadClass, trHoverClass } from './ui'
 import type { LedgerAllocation, LedgerNode, NodeMsg } from '../gen/legion_pb'
 import { formatRelativeTime } from '../utils/format'
 import { summarizeHealthChecks } from '../utils/health'
 import { parseArtifactStates } from '../utils/jobspec'
+import type { Tone } from '../utils/status'
 
 export interface NodeDeepViewProps {
   nodes: Resource<readonly NodeMsg[] | undefined>
@@ -24,28 +25,6 @@ const parseAttributes = (value?: string): unknown => {
   }
 }
 
-const prettifyData = (value: unknown): string => {
-  if (value === undefined || value === null) return ''
-
-  if (typeof value === 'string') {
-    try {
-      return JSON.stringify(JSON.parse(value), null, 2)
-    } catch {
-      return value
-    }
-  }
-
-  if (isPlainObject(value) || Array.isArray(value)) {
-    try {
-      return JSON.stringify(value, null, 2)
-    } catch {
-      return String(value)
-    }
-  }
-
-  return String(value)
-}
-
 const extractField = (value: unknown, key: string): unknown =>
   isPlainObject(value) && key in value ? (value as Record<string, unknown>)[key] : undefined
 
@@ -59,13 +38,11 @@ type ResourceUsageEntry = {
   kind: 'amount' | 'items'
 }
 
-type NodeHealthTone = 'healthy' | 'unhealthy' | 'unknown'
-
 type NodeHealthEntry = {
   key: string
   label: string
   status: string
-  tone: NodeHealthTone
+  tone: Tone
   details?: unknown
 }
 
@@ -117,6 +94,12 @@ const formatUsage = (entry: ResourceUsageEntry): string => {
 const resourcePercent = (entry: ResourceUsageEntry): number => {
   if (entry.total <= 0) return 0
   return Math.min(100, Math.round((entry.used / entry.total) * 100))
+}
+
+const resourceBarClass = (percent: number): string => {
+  if (percent >= 90) return 'bg-red-500'
+  if (percent >= 70) return 'bg-amber-500'
+  return 'bg-emerald-500'
 }
 
 const accumulateUsage = (
@@ -262,17 +245,17 @@ const collectHealthStrings = (value: unknown, bucket: string[]) => {
   }
 }
 
-const inferHealthTone = (value: unknown): NodeHealthTone => {
+const inferHealthTone = (value: unknown): Tone => {
   const bucket: string[] = []
   collectHealthStrings(value, bucket)
   const normalized = bucket.map((entry) => entry.trim().toLowerCase())
   if (normalized.some((entry) => HEALTH_FAIL_KEYWORDS.some((keyword) => entry.includes(keyword)))) {
-    return 'unhealthy'
+    return 'danger'
   }
   if (normalized.some((entry) => HEALTH_PASS_KEYWORDS.some((keyword) => entry.includes(keyword)))) {
-    return 'healthy'
+    return 'ok'
   }
-  return 'unknown'
+  return 'neutral'
 }
 
 const firstStatusValue = (value: unknown): string | undefined => {
@@ -322,10 +305,10 @@ const buildHealthEntries = (value: unknown): NodeHealthEntry[] => {
 }
 
 const renderValue = (value: unknown): JSX.Element => {
-  if (value === null || value === undefined) return <span class="text-neutral-500">—</span>
+  if (value === null || value === undefined) return <span class="text-faint">—</span>
   if (Array.isArray(value)) {
     return (
-      <ul class="list-disc space-y-1 pl-4 text-sm text-neutral-800 dark:text-neutral-200">
+      <ul class="list-disc space-y-1 pl-4 text-sm">
         <For each={value}>{(item) => <li>{renderValue(item)}</li>}</For>
       </ul>
     )
@@ -333,14 +316,14 @@ const renderValue = (value: unknown): JSX.Element => {
 
   if (isPlainObject(value)) {
     const entries = Object.entries(value)
-    if (!entries.length) return <span class="text-neutral-500">—</span>
+    if (!entries.length) return <span class="text-faint">—</span>
     return (
-      <div class="space-y-2">
+      <div class="space-y-1.5">
         <For each={entries}>
           {([key, val]) => (
-            <div class="rounded border border-neutral-200 bg-white px-2 py-1 dark:border-neutral-800 dark:bg-neutral-900">
-              <div class="text-[11px] uppercase tracking-wide text-neutral-500 dark:text-neutral-400">{key}</div>
-              <div class="break-words text-sm text-neutral-800 dark:text-neutral-200">{renderValue(val)}</div>
+            <div class="rounded-md border border-line bg-surface px-2 py-1">
+              <div class="text-2xs uppercase tracking-wide text-faint">{key}</div>
+              <div class="break-words text-sm">{renderValue(val)}</div>
             </div>
           )}
         </For>
@@ -348,48 +331,39 @@ const renderValue = (value: unknown): JSX.Element => {
     )
   }
 
-  return <span class="break-words font-mono text-sm text-neutral-800 dark:text-neutral-200">{String(value)}</span>
+  return <span class="break-words font-mono text-xs">{String(value)}</span>
 }
 
 interface KeyValueGridProps {
-  title: string
   data: unknown
   emptyLabel: string
-  showTitle?: boolean
 }
 
 const KeyValueGrid = (props: KeyValueGridProps) => (
-  <div class="space-y-2">
-    <Show when={props.showTitle ?? true}>
-      <h4 class="text-sm font-semibold text-neutral-900 dark:text-neutral-100">{props.title}</h4>
-    </Show>
-    <div class="rounded border border-neutral-200 bg-neutral-50 p-3 dark:border-neutral-800 dark:bg-neutral-900/60">
-      <Show
-        when={(() => {
-          if (props.data === undefined || props.data === null) return false
-          if (typeof props.data === 'string' && props.data.trim() === '') return false
-          if (isPlainObject(props.data)) return Object.keys(props.data).length > 0
-          return true
-        })()}
-        fallback={<p class="text-sm text-neutral-500">{props.emptyLabel}</p>}
-      >
-        {isPlainObject(props.data) ? (
-          <div class="grid gap-2 sm:grid-cols-2">
-            <For each={Object.entries(props.data)}>
-              {([key, value]) => (
-                <div class="rounded border border-neutral-200 bg-white px-2 py-1 text-sm dark:border-neutral-800 dark:bg-neutral-950/60">
-                  <div class="text-[11px] uppercase tracking-wide text-neutral-500 dark:text-neutral-400">{key}</div>
-                  <div class="mt-1 break-words text-neutral-800 dark:text-neutral-200">{renderValue(value)}</div>
-                </div>
-              )}
-            </For>
-          </div>
-        ) : (
-          <div class="break-words text-sm text-neutral-800 dark:text-neutral-200">{renderValue(props.data)}</div>
-        )}
-      </Show>
-    </div>
-  </div>
+  <Show
+    when={(() => {
+      if (props.data === undefined || props.data === null) return false
+      if (typeof props.data === 'string' && props.data.trim() === '') return false
+      if (isPlainObject(props.data)) return Object.keys(props.data).length > 0
+      return true
+    })()}
+    fallback={<p class="text-sm text-muted">{props.emptyLabel}</p>}
+  >
+    {isPlainObject(props.data) ? (
+      <div class="grid gap-2 sm:grid-cols-2">
+        <For each={Object.entries(props.data)}>
+          {([key, value]) => (
+            <div class="min-w-0 rounded-md border border-line bg-surface2/40 px-2.5 py-1.5 text-sm">
+              <div class="text-2xs uppercase tracking-wide text-faint">{key}</div>
+              <div class="mt-0.5 break-words">{renderValue(value)}</div>
+            </div>
+          )}
+        </For>
+      </div>
+    ) : (
+      <div class="break-words text-sm">{renderValue(props.data)}</div>
+    )}
+  </Show>
 )
 
 interface CollapsibleSectionProps {
@@ -412,28 +386,21 @@ const CollapsibleSection = (props: CollapsibleSectionProps) => {
   }
 
   return (
-    <div class="rounded border border-neutral-200 bg-white/90 px-3 py-2 shadow-sm dark:border-neutral-800 dark:bg-neutral-900/50">
+    <div class="overflow-hidden rounded-lg border border-line bg-surface">
       <button
         type="button"
-        class="flex w-full items-center justify-between text-left"
+        class="flex w-full items-center justify-between px-3.5 py-2.5 text-left transition-colors hover:bg-surface2/60"
         onClick={toggle}
         aria-expanded={isOpen()}
       >
-        <span class="flex items-center gap-2 text-sm font-semibold text-neutral-900 dark:text-neutral-100">
-          <span
-            class={`inline-block text-lg leading-none transition-transform ${isOpen() ? 'rotate-90' : 'rotate-0'}`}
-            aria-hidden="true"
-          >
-            ›
-          </span>
+        <span class="flex items-center gap-2 text-sm font-medium text-ink">
+          <Icon name="chevronRight" size={14} class={cx('text-faint transition-transform', isOpen() && 'rotate-90')} />
           {props.title}
         </span>
-        <span class="text-xs uppercase tracking-[0.1em] text-neutral-500 dark:text-neutral-400">
-          {isOpen() ? 'Hide' : 'Show'}
-        </span>
+        <span class="text-2xs uppercase tracking-wide text-faint">{isOpen() ? 'Hide' : 'Show'}</span>
       </button>
       <Show when={isOpen()}>
-        <div class="mt-2">{props.children}</div>
+        <div class="border-t border-line p-3.5">{props.children}</div>
       </Show>
     </div>
   )
@@ -485,8 +452,6 @@ export default function NodeDeepView(props: NodeDeepViewProps) {
     const fingerprintData = parseAttributes(current.fingerprintAttrs)
     const networksData = extractField(dynamicData, 'networks') ?? extractField(fingerprintData, 'networks')
     const signalsData = extractField(dynamicData, 'signals') ?? extractField(fingerprintData, 'signals')
-    const healthData = parseAttributes(current.healthChecks)
-    const formattedHealth = prettifyData(healthData ?? current.healthChecks)
     const healthSummary = summarizeHealthChecks(current.healthChecks)
     return {
       configData,
@@ -494,7 +459,6 @@ export default function NodeDeepView(props: NodeDeepViewProps) {
       fingerprintData,
       networksData,
       signalsData,
-      formattedHealth,
       healthSummary,
     }
   })
@@ -505,13 +469,6 @@ export default function NodeDeepView(props: NodeDeepViewProps) {
     return buildResourceUsage(data.configData, data.fingerprintData, allocations())
   })
 
-  const badgeToneForHealth = (tone: string) => {
-    if (tone === 'healthy') return 'success' as const
-    if (tone === 'degraded') return 'warning' as const
-    if (tone === 'unhealthy') return 'danger' as const
-    return 'neutral' as const
-  }
-
   const healthEntries = createMemo(() => {
     const parsed = parsedNodeData()
     if (!parsed) return [] as NodeHealthEntry[]
@@ -519,207 +476,188 @@ export default function NodeDeepView(props: NodeDeepViewProps) {
   })
 
   return (
-    <Show when={!props.nodes.loading} fallback={<p class="text-neutral-500">Loading workers…</p>}>
-      <Show when={!props.nodes.error} fallback={<p class="text-red-500">Failed to load workers.</p>}>
-        <Show when={node()} fallback={<p class="text-neutral-500">Worker not found.</p>}>
+    <Show when={!props.nodes.loading} fallback={<div class="py-6"><Spinner label="Loading worker…" /></div>}>
+      <Show when={!props.nodes.error} fallback={<Note tone="danger">Failed to load worker.</Note>}>
+        <Show when={node()} fallback={<Note tone="warn">Worker not found.</Note>}>
           {(currentNode) => {
             const current = currentNode()
             const parsed = parsedNodeData()
             if (!parsed) return null
             return (
-              <div class="space-y-4">
-                <DetailSection>
-                  <div class="flex flex-wrap items-start justify-between gap-3">
-                    <div>
-                      <h2 class="text-2xl font-semibold">{current.id || 'Unknown worker'}</h2>
-                      <p class="text-sm text-neutral-500">
-                        Pool {current.pool || '—'} · Availability {current.availability || '—'}
-                      </p>
-                    </div>
-                    <div class="flex flex-wrap items-center gap-2">
-                      <DetailBadge tone={badgeToneForHealth(parsed.healthSummary.tone)}>{current.status || 'Unknown'}</DetailBadge>
-                      <span class="text-xs text-neutral-500">Last heartbeat {formatRelativeTime(current.lastHeartbeat)}</span>
-                    </div>
-                  </div>
-                  <div class="mt-3 flex flex-wrap gap-2 text-xs">
-                    <span class="rounded border border-neutral-300 px-2 py-1 text-neutral-700 dark:border-neutral-700 dark:text-neutral-200">
-                      Allocations {allocations().length}
-                    </span>
-                    <span class="rounded border border-neutral-300 px-2 py-1 text-neutral-700 dark:border-neutral-700 dark:text-neutral-200">
-                      Health {parsed.healthSummary.label}
-                    </span>
-                  </div>
-                </DetailSection>
+              <div>
+                <PageHeader
+                  eyebrow="Worker"
+                  title={current.id || 'Unknown worker'}
+                  badges={
+                    <>
+                      <StatusBadge status={current.status || 'unknown'} />
+                      <Badge tone={parsed.healthSummary.tone} dot class="uppercase tracking-wide">{parsed.healthSummary.label}</Badge>
+                      <Badge tone="neutral">{allocations().length} allocation{allocations().length === 1 ? '' : 's'}</Badge>
+                    </>
+                  }
+                  subtitle={
+                    <>
+                      Pool {current.pool || 'default'} · availability {current.availability || '—'} · heartbeat {formatRelativeTime(current.lastHeartbeat)}
+                    </>
+                  }
+                />
 
-                <DetailSection title="Allocations">
-                  <Show when={allocations().length > 0} fallback={<p class="text-sm text-neutral-500">No allocations assigned.</p>}>
-                    <div class="space-y-2">
-                      <For each={allocations()}>
-                        {(allocation) => {
-                          const artifactRows = parseArtifactStates(allocation.artifactStates)
-                          const unstagedCount = artifactRows.filter((row) => row.state !== 'staged').length
-                          return (
-                            <div class="rounded border border-neutral-200 bg-white px-3 py-2 text-sm text-neutral-800 dark:border-neutral-700 dark:bg-neutral-950/60 dark:text-neutral-200">
-                              <div class="flex flex-wrap items-center justify-between gap-2">
-                                <span class="flex flex-wrap items-center gap-2">
-                                  <span class="font-semibold">Allocation #{String(allocation.id)}</span>
-                                  <Show when={allocation.instanceId}>
-                                    <InstancePill id={allocation.instanceId!} />
-                                  </Show>
-                                </span>
-                                <span class="flex flex-wrap items-center gap-2">
-                                  <Show when={unstagedCount > 0}>
-                                    <DetailBadge tone={artifactRows.some((row) => row.state === 'failed') ? 'danger' : 'warning'}>
-                                      staging artifacts ({unstagedCount})
-                                    </DetailBadge>
-                                  </Show>
-                                  <DetailBadge tone="neutral">{allocation.status || 'Unknown'}</DetailBadge>
-                                </span>
-                              </div>
-                              <div class="mt-2 flex flex-wrap gap-2 text-xs text-neutral-600 dark:text-neutral-400">
-                                <span class="rounded border border-neutral-200 bg-neutral-50 px-2 py-1 dark:border-neutral-800 dark:bg-neutral-900">
-                                  Job <A class="underline" href={`/jobs/${encodeURIComponent(allocation.jobId || '')}`}>{allocation.jobId || '—'}</A>
-                                </span>
-                                <span class="rounded border border-neutral-200 bg-neutral-50 px-2 py-1 dark:border-neutral-800 dark:bg-neutral-900">
-                                  Spec{' '}
-                                  <A class="underline" href={`/jobs/${encodeURIComponent(allocation.jobId || '')}/specs/${encodeURIComponent(allocation.jobConfigId || '')}`}>
-                                    {allocation.jobConfigId || '—'}
-                                  </A>
-                                </span>
-                                <span class="rounded border border-neutral-200 bg-neutral-50 px-2 py-1 dark:border-neutral-800 dark:bg-neutral-900">
-                                  Task Config {allocation.taskConfigId ? String(allocation.taskConfigId) : '—'}
-                                </span>
-                              </div>
-                            </div>
-                          )
-                        }}
-                      </For>
-                    </div>
-                  </Show>
-                </DetailSection>
-
-                <DetailSection title="Resource usage">
-                  <Show when={resourceUsage().length > 0} fallback={<p class="text-sm text-neutral-500">No resource data available.</p>}>
-                    <div class="space-y-3">
-                      <For each={resourceUsage()}>
-                        {(entry) => (
-                          <div class="space-y-2">
-                            <div class="flex items-center justify-between text-sm">
-                              <div>
-                                <p class="font-medium text-neutral-800 dark:text-neutral-100">{entry.label}</p>
-                                <p class="text-xs text-neutral-500 dark:text-neutral-400">{formatUsage(entry)}</p>
-                              </div>
-                              <span class="text-xs font-semibold text-neutral-700 dark:text-neutral-200">
-                                {resourcePercent(entry)}%
-                              </span>
-                            </div>
-                            <div class="h-2 w-full overflow-hidden rounded bg-neutral-200 dark:bg-neutral-800">
-                              <div
-                                class="h-full rounded bg-emerald-500 dark:bg-emerald-400"
-                                style={{ width: `${resourcePercent(entry)}%` }}
-                              />
-                            </div>
-                          </div>
-                        )}
-                      </For>
-                    </div>
-                  </Show>
-                </DetailSection>
-
-                <DetailSection title="Worker metadata">
-                  <div class="grid gap-3 lg:grid-cols-2">
-                    <KeyValueGrid
-                      title="Static Config"
-                      data={parsed.configData}
-                      emptyLabel="No static config provided"
-                    />
-                    <KeyValueGrid
-                      title="Dynamic Config"
-                      data={parsed.dynamicData}
-                      emptyLabel="No dynamic config provided"
-                    />
-                  </div>
-
-                  <div class="mt-3 space-y-3">
-                    <CollapsibleSection
-                      title="Health Checks"
-                      defaultOpen={true}
-                      open={sectionOpen().health}
-                      onToggle={(open) => setSectionState('health', open)}
-                    >
-                      <div class="space-y-3 rounded border border-neutral-200 bg-neutral-50 p-3 shadow-sm dark:border-neutral-800 dark:bg-neutral-900/60">
-                        <div class="flex items-center justify-between">
-                          <p class="text-xs uppercase tracking-[0.1em] text-neutral-500 dark:text-neutral-400">Overall status</p>
-                          <DetailBadge tone={badgeToneForHealth(parsed.healthSummary.tone)}>{parsed.healthSummary.label}</DetailBadge>
-                        </div>
-                        <Show
-                          when={healthEntries().length > 0}
-                          fallback={<p class="text-sm text-neutral-500">No health check data</p>}
-                        >
-                          <div class="grid gap-2 md:grid-cols-2">
-                            <For each={healthEntries()}>
-                              {(entry) => (
-                                <article class="rounded border border-neutral-200 bg-white p-3 dark:border-neutral-700 dark:bg-neutral-950/60">
-                                  <div class="flex items-start justify-between gap-2">
-                                    <p class="text-sm font-semibold text-neutral-900 dark:text-neutral-100">{entry.label}</p>
-                                    <DetailBadge tone={badgeToneForHealth(entry.tone)}>{entry.status}</DetailBadge>
-                                  </div>
-                                  <Show when={entry.details}>
-                                    <div class="mt-2 text-xs text-neutral-700 dark:text-neutral-300">
-                                      {renderValue(entry.details)}
-                                    </div>
-                                  </Show>
-                                </article>
-                              )}
+                <div class="space-y-4">
+                  <SectionCard title="Allocations" flush>
+                    <Show when={allocations().length > 0} fallback={<p class="px-4 py-4 text-sm text-muted">No allocations assigned.</p>}>
+                      <TableShell>
+                        <table class={tableClass}>
+                          <thead class={theadClass}>
+                            <tr>
+                              <th class={thClass}>ID</th>
+                              <th class={thClass}>Instance</th>
+                              <th class={thClass}>Status</th>
+                              <th class={thClass}>Job</th>
+                              <th class={thClass}>Spec</th>
+                              <th class={thClass}>Task config</th>
+                            </tr>
+                          </thead>
+                          <tbody class="divide-y divide-line">
+                            <For each={allocations()}>
+                              {(allocation) => {
+                                const artifactRows = parseArtifactStates(allocation.artifactStates)
+                                const unstagedCount = artifactRows.filter((row) => row.state !== 'staged').length
+                                return (
+                                  <tr class={trHoverClass}>
+                                    <td class={tdClass + ' font-mono text-xs'}>#{String(allocation.id)}</td>
+                                    <td class={tdClass}>
+                                      <Show when={allocation.instanceId} fallback={<span class="text-faint">—</span>}>
+                                        <MonoBadge title={`Stateful instance ${allocation.instanceId}`}>{allocation.instanceId}</MonoBadge>
+                                      </Show>
+                                    </td>
+                                    <td class={tdClass}>
+                                      <span class="inline-flex flex-wrap items-center gap-1.5">
+                                        <StatusBadge status={allocation.status || 'unknown'} />
+                                        <Show when={unstagedCount > 0}>
+                                          <Badge tone={artifactRows.some((row) => row.state === 'failed') ? 'danger' : 'warn'}>
+                                            staging {unstagedCount}
+                                          </Badge>
+                                        </Show>
+                                      </span>
+                                    </td>
+                                    <td class={tdClass}>
+                                      <A class="font-medium hover:text-brass-strong" href={`/jobs/${encodeURIComponent(allocation.jobId || '')}`}>{allocation.jobId || '—'}</A>
+                                    </td>
+                                    <td class={tdClass}>
+                                      <A class="font-mono text-xs text-muted hover:text-brass-strong" href={`/jobs/${encodeURIComponent(allocation.jobId || '')}/specs/${encodeURIComponent(allocation.jobConfigId || '')}`}>
+                                        {allocation.jobConfigId || '—'}
+                                      </A>
+                                    </td>
+                                    <td class={tdClass + ' font-mono text-xs text-muted'}>{allocation.taskConfigId ? String(allocation.taskConfigId) : '—'}</td>
+                                  </tr>
+                                )
+                              }}
                             </For>
-                          </div>
-                        </Show>
+                          </tbody>
+                        </table>
+                      </TableShell>
+                    </Show>
+                  </SectionCard>
+
+                  <SectionCard title="Resource usage">
+                    <Show when={resourceUsage().length > 0} fallback={<p class="text-sm text-muted">No resource data available.</p>}>
+                      <div class="grid gap-x-8 gap-y-4 md:grid-cols-2 xl:grid-cols-3">
+                        <For each={resourceUsage()}>
+                          {(entry) => (
+                            <div>
+                              <div class="flex items-baseline justify-between text-sm">
+                                <p class="font-medium text-ink">{entry.label}</p>
+                                <span class="font-mono text-xs tabular-nums text-muted">
+                                  {formatUsage(entry)} · {resourcePercent(entry)}%
+                                </span>
+                              </div>
+                              <div class="mt-1.5 h-1.5 w-full overflow-hidden rounded-full bg-line/70">
+                                <div
+                                  class={cx('h-full rounded-full transition-all', resourceBarClass(resourcePercent(entry)), entry.used > 0 && 'min-w-[3px]')}
+                                  style={{ width: `${resourcePercent(entry)}%` }}
+                                />
+                              </div>
+                            </div>
+                          )}
+                        </For>
                       </div>
-                    </CollapsibleSection>
+                    </Show>
+                  </SectionCard>
 
-                    <CollapsibleSection
-                      title="Fingerprint"
-                      defaultOpen={false}
-                      open={sectionOpen().fingerprint}
-                      onToggle={(open) => setSectionState('fingerprint', open)}
-                    >
-                      <KeyValueGrid
+                  <SectionCard title="Health checks" flush>
+                    <div class="p-3.5">
+                      <div class="mb-3 flex items-center justify-between">
+                        <p class="text-xs text-muted">Overall status</p>
+                        <Badge tone={parsed.healthSummary.tone} dot class="uppercase tracking-wide">{parsed.healthSummary.label}</Badge>
+                      </div>
+                      <Show
+                        when={healthEntries().length > 0}
+                        fallback={<p class="text-sm text-muted">No health check data.</p>}
+                      >
+                        {/* CSS columns give a masonry layout so tall cards don't leave holes. */}
+                        <div class="gap-2 md:columns-2 [&>*]:mb-2 [&>*]:break-inside-avoid">
+                          <For each={healthEntries()}>
+                            {(entry) => (
+                              <article class="rounded-md border border-line bg-surface2/40 p-3">
+                                <div class="flex items-start justify-between gap-2">
+                                  <p class="text-sm font-medium text-ink">{entry.label}</p>
+                                  <Badge tone={entry.tone} dot class="uppercase tracking-wide">{entry.status}</Badge>
+                                </div>
+                                <Show when={entry.details}>
+                                  <div class="mt-2 text-xs text-muted">
+                                    {renderValue(entry.details)}
+                                  </div>
+                                </Show>
+                              </article>
+                            )}
+                          </For>
+                        </div>
+                      </Show>
+                    </div>
+                  </SectionCard>
+
+                  <SectionCard title="Metadata">
+                    <div class="grid gap-4 lg:grid-cols-2">
+                      <div>
+                        <p class="eyebrow mb-2">Static config</p>
+                        <KeyValueGrid data={parsed.configData} emptyLabel="No static config provided." />
+                      </div>
+                      <div>
+                        <p class="eyebrow mb-2">Dynamic config</p>
+                        <KeyValueGrid data={parsed.dynamicData} emptyLabel="No dynamic config provided." />
+                      </div>
+                    </div>
+
+                    <div class="mt-4 space-y-2.5">
+                      <CollapsibleSection
                         title="Fingerprint"
-                        showTitle={false}
-                        data={parsed.fingerprintData}
-                        emptyLabel="No fingerprint data"
-                      />
-                    </CollapsibleSection>
+                        defaultOpen={false}
+                        open={sectionOpen().fingerprint}
+                        onToggle={(open) => setSectionState('fingerprint', open)}
+                      >
+                        <KeyValueGrid data={parsed.fingerprintData} emptyLabel="No fingerprint data." />
+                      </CollapsibleSection>
 
-                    <CollapsibleSection
-                      title="Networks"
-                      defaultOpen={false}
-                      open={sectionOpen().networks}
-                      onToggle={(open) => setSectionState('networks', open)}
-                    >
-                      <KeyValueGrid
+                      <CollapsibleSection
                         title="Networks"
-                        showTitle={false}
-                        data={parsed.networksData}
-                        emptyLabel="No network data"
-                      />
-                    </CollapsibleSection>
+                        defaultOpen={false}
+                        open={sectionOpen().networks}
+                        onToggle={(open) => setSectionState('networks', open)}
+                      >
+                        <KeyValueGrid data={parsed.networksData} emptyLabel="No network data." />
+                      </CollapsibleSection>
 
-                    <CollapsibleSection
-                      title="Signals"
-                      defaultOpen={false}
-                      open={sectionOpen().signals}
-                      onToggle={(open) => setSectionState('signals', open)}
-                    >
-                      <KeyValueGrid
+                      <CollapsibleSection
                         title="Signals"
-                        showTitle={false}
-                        data={parsed.signalsData}
-                        emptyLabel="No signal data"
-                      />
-                    </CollapsibleSection>
-                  </div>
-                </DetailSection>
+                        defaultOpen={false}
+                        open={sectionOpen().signals}
+                        onToggle={(open) => setSectionState('signals', open)}
+                      >
+                        <KeyValueGrid data={parsed.signalsData} emptyLabel="No signal data." />
+                      </CollapsibleSection>
+                    </div>
+                  </SectionCard>
+                </div>
               </div>
             )
           }}

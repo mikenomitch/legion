@@ -1,14 +1,12 @@
 import { For, Show, createMemo, createResource, createSignal } from 'solid-js'
 import { getStoredToken, managerClient, setStoredToken } from '../grpcClient'
 import { beginOidcLogin, rememberClientId } from '../utils/oidc'
+import { Badge, Button, DefList, Field, Note, SectionCard, Spinner, StatusBadge, Tabs, cx, inputClass, selectClass } from '../components/ui'
 import {
   JoinTokensPanel,
   PoliciesPanel,
   TokensPanel,
   UsersPanel,
-  buttonClass,
-  inputClass,
-  sectionClass,
 } from '../components/acl/AdminPanels'
 
 type Tab = 'identity' | 'policies' | 'tokens' | 'users' | 'workers'
@@ -110,175 +108,163 @@ export default function Access() {
     void refetch()
   }
 
-  const tabClass = (id: Tab) =>
-    `rounded-t border-x border-t px-3 py-1.5 text-sm font-semibold ${
-      tab() === id
-        ? 'border-neutral-300 bg-white dark:border-neutral-700 dark:bg-neutral-900'
-        : 'border-transparent text-neutral-500 hover:text-neutral-800 dark:hover:text-neutral-200'
-    }`
-
   return (
-    <div class="space-y-4">
-      <div class="flex gap-1 border-b border-neutral-300 dark:border-neutral-700">
-        <For each={TABS}>
-          {(entry) => (
-            <button type="button" class={tabClass(entry.id)} onClick={() => setTab(entry.id)}>
-              {entry.label}
-            </button>
-          )}
-        </For>
-      </div>
+    <div>
+      <Tabs class="mb-5" tabs={TABS} active={tab()} onChange={(id) => setTab(id as Tab)} />
 
       <Show when={tab() === 'identity'}>
         <div class="space-y-4">
-          <section class={sectionClass}>
-            <h2 class="text-lg font-semibold">Current identity</h2>
-            <Show when={whoami()} fallback={<p class="mt-2 text-sm text-neutral-500">Loading…</p>}>
+          <SectionCard
+            title="Current identity"
+            actions={
+              <Show when={hasStoredToken()}>
+                <Button icon="logOut" onClick={logout}>Log out</Button>
+              </Show>
+            }
+          >
+            <Show when={whoami()} fallback={<Spinner label="Loading identity…" />}>
               {(identity) => (
-                <dl class="mt-3 grid gap-x-8 gap-y-2 text-sm sm:grid-cols-2">
-                  <div>
-                    <dt class="text-neutral-500">ACLs</dt>
-                    <dd class="font-medium">
-                      {identity().aclEnabled
-                        ? identity().auditOnly
-                          ? 'Enabled (audit-only)'
-                          : 'Enabled'
-                        : 'Disabled — every caller has full access'}
-                    </dd>
-                  </div>
-                  <div>
-                    <dt class="text-neutral-500">Principal</dt>
-                    <dd class="font-medium">
-                      {identity().principal}{' '}
-                      <span class="text-neutral-500">(via {identity().source})</span>
-                    </dd>
-                  </div>
-                  <div>
-                    <dt class="text-neutral-500">Token type</dt>
-                    <dd class="font-medium">{identity().tokenType}</dd>
-                  </div>
-                  <div>
-                    <dt class="text-neutral-500">Policies</dt>
-                    <dd class="font-medium">
-                      {identity().policies.length > 0 ? identity().policies.join(', ') : '—'}
-                    </dd>
-                  </div>
-                  <Show when={identity().expiresAt}>
-                    <div>
-                      <dt class="text-neutral-500">Expires</dt>
-                      <dd class="font-medium">{identity().expiresAt}</dd>
-                    </div>
-                  </Show>
-                </dl>
+                <DefList
+                  cols={3}
+                  items={[
+                    [
+                      'ACLs',
+                      identity().aclEnabled ? (
+                        <StatusBadge status={identity().auditOnly ? 'enabled (audit-only)' : 'enabled'} />
+                      ) : (
+                        <span class="inline-flex items-center gap-2">
+                          <StatusBadge status="disabled" />
+                          <span class="text-xs text-faint">every caller has full access</span>
+                        </span>
+                      ),
+                    ],
+                    [
+                      'Principal',
+                      <>
+                        {identity().principal} <span class="text-faint">(via {identity().source})</span>
+                      </>,
+                    ],
+                    ['Token type', identity().tokenType],
+                    [
+                      'Policies',
+                      identity().policies.length > 0 ? (
+                        <span class="inline-flex flex-wrap gap-1">
+                          <For each={identity().policies}>{(policy) => <Badge tone="neutral">{policy}</Badge>}</For>
+                        </span>
+                      ) : (
+                        <span class="text-faint">—</span>
+                      ),
+                    ],
+                    ...(identity().expiresAt ? ([['Expires', identity().expiresAt]] as Array<[string, string]>) : []),
+                  ]}
+                />
               )}
             </Show>
             <Show when={notice()}>
-              <p class="mt-3 text-sm text-emerald-600 dark:text-emerald-400">{notice()}</p>
+              <Note tone="ok" class="mt-3" onDismiss={() => setNotice(null)}>{notice()}</Note>
             </Show>
             <Show when={error()}>
-              <p class="mt-3 text-sm text-rose-600 dark:text-rose-400">{error()}</p>
+              <Note tone="danger" class="mt-3" onDismiss={() => setError(null)}>{error()}</Note>
             </Show>
-            <Show when={hasStoredToken()}>
-              <button type="button" class={`mt-4 ${buttonClass}`} onClick={logout}>
-                Log out (remove stored token)
-              </button>
-            </Show>
-          </section>
+          </SectionCard>
 
           <Show when={oidcMethods().length > 0}>
-            <section class={sectionClass}>
-              <h2 class="text-lg font-semibold">Single sign-on</h2>
-              <p class="mt-1 text-sm text-neutral-500">
-                Redirects to your identity provider, then exchanges the ID token for a Legion ACL
-                token.
-              </p>
-              <div class="mt-3 flex flex-wrap gap-2">
+            <SectionCard
+              title="Single sign-on"
+              description="Redirects to your identity provider, then exchanges the ID token for a Legion ACL token."
+            >
+              <div class="flex flex-wrap gap-2">
                 <For each={oidcMethods()}>
                   {(method) => (
-                    <button type="button" class={buttonClass} onClick={() => void loginOidc(method.name)}>
+                    <Button variant="primary" size="md" onClick={() => void loginOidc(method.name)}>
                       Continue with {method.name}
-                    </button>
+                    </Button>
                   )}
                 </For>
               </div>
-            </section>
+            </SectionCard>
           </Show>
 
-          <section class={sectionClass}>
-            <h2 class="text-lg font-semibold">Log in with username / password</h2>
-            <form class="mt-3 flex flex-col gap-3 sm:max-w-md" onSubmit={loginUserpass}>
-              <input
-                class={inputClass}
-                placeholder="username"
-                autocomplete="username"
-                value={username()}
-                onInput={(event) => setUsername(event.currentTarget.value)}
-              />
-              <input
-                class={inputClass}
-                placeholder="password"
-                type="password"
-                autocomplete="current-password"
-                value={password()}
-                onInput={(event) => setPassword(event.currentTarget.value)}
-              />
-              <button type="submit" class={`self-start ${buttonClass}`}>
-                Log in
-              </button>
-            </form>
-          </section>
+          <div class="grid items-start gap-4 lg:grid-cols-2">
+            <SectionCard title="Log in with username / password">
+              <form class="flex flex-col gap-3" onSubmit={loginUserpass}>
+                <Field label="Username">
+                  <input
+                    class={inputClass}
+                    autocomplete="username"
+                    value={username()}
+                    onInput={(event) => setUsername(event.currentTarget.value)}
+                  />
+                </Field>
+                <Field label="Password">
+                  <input
+                    class={inputClass}
+                    type="password"
+                    autocomplete="current-password"
+                    value={password()}
+                    onInput={(event) => setPassword(event.currentTarget.value)}
+                  />
+                </Field>
+                <Button type="submit" variant="primary" size="md" class="self-start">
+                  Log in
+                </Button>
+              </form>
+            </SectionCard>
+
+            <SectionCard
+              title="Use an existing token"
+              description="Paste an ACL token secret. It is stored in this browser only and sent as a bearer token on every request."
+            >
+              <div class="flex flex-col gap-3">
+                <Field label="Token secret">
+                  <input
+                    class={cx(inputClass, 'font-mono')}
+                    placeholder="lgn_…"
+                    value={tokenInput()}
+                    onInput={(event) => setTokenInput(event.currentTarget.value)}
+                  />
+                </Field>
+                <Button size="md" class="self-start" onClick={saveToken}>
+                  Save token
+                </Button>
+              </div>
+            </SectionCard>
+          </div>
 
           <Show when={jwtMethods().length > 0}>
-            <section class={sectionClass}>
-              <h2 class="text-lg font-semibold">Exchange an external token</h2>
-              <p class="mt-1 text-sm text-neutral-500">
-                Paste a JWT issued by your identity system; the selected auth method validates it
-                and mints an ACL token.
-              </p>
-              <form class="mt-3 flex flex-col gap-3 sm:max-w-md" onSubmit={loginJwt}>
-                <select
-                  class={inputClass}
-                  value={jwtMethod()}
-                  onChange={(event) => setJwtMethod(event.currentTarget.value)}
-                >
-                  <option value="" disabled>
-                    choose a method
-                  </option>
-                  <For each={jwtMethods()}>
-                    {(method) => <option value={method.name}>{method.name}</option>}
-                  </For>
-                </select>
-                <input
-                  class={inputClass}
-                  placeholder="eyJ…"
-                  value={jwtInput()}
-                  onInput={(event) => setJwtInput(event.currentTarget.value)}
-                />
-                <button type="submit" class={`self-start ${buttonClass}`} disabled={jwtMethod() === ''}>
+            <SectionCard
+              title="Exchange an external token"
+              description="Paste a JWT issued by your identity system; the selected auth method validates it and mints an ACL token."
+            >
+              <form class="flex max-w-lg flex-col gap-3" onSubmit={loginJwt}>
+                <Field label="Auth method">
+                  <select
+                    class={cx(selectClass, "w-full")}
+                    value={jwtMethod()}
+                    onChange={(event) => setJwtMethod(event.currentTarget.value)}
+                  >
+                    <option value="" disabled>
+                      choose a method
+                    </option>
+                    <For each={jwtMethods()}>
+                      {(method) => <option value={method.name}>{method.name}</option>}
+                    </For>
+                  </select>
+                </Field>
+                <Field label="JWT">
+                  <input
+                    class={cx(inputClass, 'font-mono')}
+                    placeholder="eyJ…"
+                    value={jwtInput()}
+                    onInput={(event) => setJwtInput(event.currentTarget.value)}
+                  />
+                </Field>
+                <Button type="submit" variant="primary" size="md" class="self-start" disabled={jwtMethod() === ''}>
                   Exchange
-                </button>
+                </Button>
               </form>
-            </section>
+            </SectionCard>
           </Show>
-
-          <section class={sectionClass}>
-            <h2 class="text-lg font-semibold">Use an existing token</h2>
-            <p class="mt-1 text-sm text-neutral-500">
-              Paste an ACL token secret. It is stored in this browser only and sent as a bearer
-              token on every request.
-            </p>
-            <div class="mt-3 flex flex-col gap-3 sm:max-w-md">
-              <input
-                class={inputClass}
-                placeholder="lgn_…"
-                value={tokenInput()}
-                onInput={(event) => setTokenInput(event.currentTarget.value)}
-              />
-              <button type="button" class={`self-start ${buttonClass}`} onClick={saveToken}>
-                Save token
-              </button>
-            </div>
-          </section>
         </div>
       </Show>
 

@@ -1,6 +1,7 @@
 import { For, Show, createEffect, createMemo, createSignal } from 'solid-js'
 import { managerClient } from '../grpcClient'
 import { KvEntry, KvValueType } from '../gen/legion_pb'
+import { Badge, Button, ConfirmButton, EmptyState, Field, Icon, Note, SectionCard, Spinner, cx, inputClass, selectClass, textareaClass } from '../components/ui'
 
 type TreeNode = {
   name: string
@@ -168,28 +169,36 @@ export default function KeyValue() {
     }
   }
 
-  const renderTree = (node: TreeNode) => (
-    <ul class="space-y-1 pl-4">
+  const renderTree = (node: TreeNode, depth: number) => (
+    <ul class={cx(depth > 0 && 'ml-3 border-l border-line pl-2')}>
       <For each={node.children}>
         {(child) => (
           <li>
             <button
               type="button"
-              class={`flex w-full items-center gap-2 rounded px-2 py-1 text-left text-sm transition ${
+              class={cx(
+                'flex w-full items-center gap-1.5 rounded-md px-2 py-1 text-left text-sm transition-colors',
                 child.entry && selectedKey() === child.path
-                  ? 'bg-neutral-900 text-white dark:bg-neutral-100 dark:text-neutral-900'
-                  : 'text-neutral-700 hover:bg-neutral-100 dark:text-neutral-300 dark:hover:bg-neutral-900'
-              }`}
+                  ? 'bg-brass/10 font-medium text-ink'
+                  : 'text-muted hover:bg-surface2 hover:text-ink',
+              )}
               onClick={() => {
                 if (child.entry) {
                   setSelectedKey(child.path)
                 }
               }}
             >
-              <span class="text-xs">{child.children.length > 0 ? '📁' : '📄'}</span>
-              <span>{child.name}</span>
+              <Icon
+                name={child.children.length > 0 ? 'folder' : 'file'}
+                size={13}
+                class={cx(child.entry && selectedKey() === child.path ? 'text-brass' : 'text-faint')}
+              />
+              <span class="truncate font-mono text-xs">{child.name}</span>
+              <Show when={child.entry && child.children.length === 0}>
+                <span class="ml-auto text-2xs text-faint">{valueTypeLabel(child.entry!.valueType)}</span>
+              </Show>
             </button>
-            <Show when={child.children.length > 0}>{renderTree(child)}</Show>
+            <Show when={child.children.length > 0}>{renderTree(child, depth + 1)}</Show>
           </li>
         )}
       </For>
@@ -197,92 +206,59 @@ export default function KeyValue() {
   )
 
   return (
-    <div class="space-y-6">
-      <header class="space-y-2">
-        <p class="text-sm uppercase tracking-[0.2em] text-neutral-500 dark:text-neutral-400">
-          Key/Value
-        </p>
-        <h1 class="text-2xl font-semibold text-neutral-900 dark:text-neutral-100">
-          Key/Value Store
-        </h1>
-        <p class="max-w-2xl text-sm text-neutral-600 dark:text-neutral-300">
-          Browse nested keys, inspect values, and update entries with version-aware saves.
-        </p>
-      </header>
-
-      <div class="grid gap-6 lg:grid-cols-[280px_1fr]">
-        <section class="rounded border border-neutral-200 bg-white/90 p-4 shadow-[4px_4px_0_#d4d4d8] dark:border-neutral-800 dark:bg-neutral-900/60 dark:shadow-[4px_4px_0_#0b0d12]">
-          <div class="flex items-center justify-between">
-            <h2 class="text-sm font-semibold uppercase tracking-[0.12em] text-neutral-600 dark:text-neutral-300">
-              Keys
-            </h2>
-            <button
-              type="button"
-              class="rounded border border-neutral-300 px-2 py-1 text-xs font-semibold uppercase tracking-[0.08em] text-neutral-700 shadow-sm transition hover:-translate-y-0.5 dark:border-neutral-700 dark:text-neutral-200"
-              onClick={() => void refresh()}
-            >
-              Refresh
-            </button>
+    <div class="grid items-stretch gap-4 lg:grid-cols-[300px_1fr]">
+      <SectionCard
+        title="Keys"
+        actions={
+          <>
+            <Button size="xs" icon="plus" onClick={() => setSelectedKey(null)}>New</Button>
+            <Button size="xs" icon="refresh" onClick={() => void refresh()} aria-label="Refresh keys" />
+          </>
+        }
+        flush
+        class="flex flex-col"
+        contentClass="min-h-0 flex-1"
+      >
+        <Show when={!loading()} fallback={<div class="p-4"><Spinner /></div>}>
+          <div class="h-full min-h-[16rem] max-h-[640px] overflow-auto p-2">
+            {entries().length > 0 ? (
+              renderTree(tree(), 0)
+            ) : (
+              <EmptyState icon="database" title="No keys stored yet" body="Create your first entry with the editor." class="py-6" />
+            )}
           </div>
-          <Show when={!loading()} fallback={<p class="mt-3 text-sm text-neutral-500">Loading…</p>}>
-            <Show when={!error()} fallback={<p class="mt-3 text-sm text-red-500">{error()}</p>}>
-              <div class="mt-3 max-h-[480px] overflow-auto pr-2">
-                {entries().length > 0 ? (
-                  renderTree(tree())
-                ) : (
-                  <p class="text-sm text-neutral-500">No keys stored yet.</p>
-                )}
-              </div>
-            </Show>
+        </Show>
+      </SectionCard>
+
+      <SectionCard
+        title={selectedEntry() ? 'Edit entry' : 'New entry'}
+        description={selectedEntry() ? <span class="font-mono">{selectedEntry()!.key}</span> : 'Create a key/value entry.'}
+        actions={
+          <Show when={selectedEntry()}>
+            <ConfirmButton label="Delete" size="xs" onConfirm={() => void handleDelete()} />
           </Show>
-        </section>
-
-        <section class="space-y-4 rounded border border-neutral-200 bg-white/90 p-4 shadow-[4px_4px_0_#d4d4d8] dark:border-neutral-800 dark:bg-neutral-900/60 dark:shadow-[4px_4px_0_#0b0d12]">
-          <div class="flex flex-wrap items-center justify-between gap-3">
-            <div>
-              <h2 class="text-sm font-semibold uppercase tracking-[0.12em] text-neutral-600 dark:text-neutral-300">
-                Entry
-              </h2>
-              <p class="text-sm text-neutral-500 dark:text-neutral-400">
-                {selectedEntry() ? 'Editing existing entry' : 'Create a new entry'}
-              </p>
-            </div>
-            <Show when={selectedEntry()}>
-              <button
-                type="button"
-                class="rounded border border-red-500 px-3 py-2 text-xs font-semibold uppercase tracking-[0.08em] text-red-600 shadow-sm transition hover:-translate-y-0.5 dark:border-red-400 dark:text-red-300"
-                onClick={() => void handleDelete()}
-              >
-                Delete
-              </button>
-            </Show>
-          </div>
-
+        }
+      >
+        <div class="space-y-4">
           <Show when={status()}>
-            <p class="rounded border border-green-500 bg-green-50 px-3 py-2 text-sm text-green-700 dark:border-green-700 dark:bg-green-900/40 dark:text-green-200">
-              {status()}
-            </p>
+            <Note tone="ok" onDismiss={() => setStatus(null)}>{status()}</Note>
           </Show>
           <Show when={error()}>
-            <p class="rounded border border-red-500 bg-red-50 px-3 py-2 text-sm text-red-700 dark:border-red-700 dark:bg-red-900/40 dark:text-red-200">
-              {error()}
-            </p>
+            <Note tone="danger" onDismiss={() => setError(null)}>{error()}</Note>
           </Show>
 
-          <div class="grid gap-4 md:grid-cols-[1fr_180px]">
-            <label class="flex flex-col gap-2 text-sm font-semibold text-neutral-700 dark:text-neutral-300">
-              Key
+          <div class="grid gap-4 md:grid-cols-[1fr_160px]">
+            <Field label="Key">
               <input
-                class="rounded border border-neutral-300 bg-white px-3 py-2 text-sm text-neutral-800 shadow-sm focus:border-neutral-900 focus:outline-none dark:border-neutral-700 dark:bg-neutral-950 dark:text-neutral-200"
+                class={cx(inputClass, 'font-mono')}
                 value={editKey()}
                 onInput={(event) => setEditKey(event.currentTarget.value)}
                 placeholder="config/service/name"
               />
-            </label>
-            <label class="flex flex-col gap-2 text-sm font-semibold text-neutral-700 dark:text-neutral-300">
-              Type
+            </Field>
+            <Field label="Type">
               <select
-                class="rounded border border-neutral-300 bg-white px-3 py-2 text-sm text-neutral-800 shadow-sm focus:border-neutral-900 focus:outline-none dark:border-neutral-700 dark:bg-neutral-950 dark:text-neutral-200"
+                class={cx(selectClass, "w-full")}
                 value={editType()}
                 onChange={(event) => setEditType(Number(event.currentTarget.value))}
               >
@@ -290,55 +266,41 @@ export default function KeyValue() {
                 <option value={KvValueType.NUMBER}>number</option>
                 <option value={KvValueType.JSON}>json</option>
               </select>
-            </label>
+            </Field>
           </div>
 
-          <label class="flex flex-col gap-2 text-sm font-semibold text-neutral-700 dark:text-neutral-300">
-            Value
+          <Field label="Value">
             <textarea
-              class="min-h-[140px] rounded border border-neutral-300 bg-white px-3 py-2 text-sm text-neutral-800 shadow-sm focus:border-neutral-900 focus:outline-none dark:border-neutral-700 dark:bg-neutral-950 dark:text-neutral-200"
+              class={cx(textareaClass, 'min-h-[140px]')}
               value={editValue()}
               onInput={(event) => setEditValue(event.currentTarget.value)}
             />
-          </label>
+          </Field>
 
           <div class="flex flex-wrap items-center gap-3">
-            <button
-              type="button"
-              class="rounded border border-neutral-300 bg-neutral-900 px-4 py-2 text-xs font-semibold uppercase tracking-[0.08em] text-white shadow-[3px_3px_0_#d4d4d8] transition hover:-translate-y-0.5 dark:border-neutral-700 dark:bg-neutral-100 dark:text-neutral-900 dark:shadow-[3px_3px_0_#0b0d12]"
-              onClick={() => void handleSave()}
-            >
-              Save
-            </button>
+            <Button variant="primary" size="md" onClick={() => void handleSave()}>
+              {selectedEntry() ? 'Save changes' : 'Create entry'}
+            </Button>
             <Show when={selectedEntry()}>
-              <span class="text-xs text-neutral-500 dark:text-neutral-400">
-                Version {String(selectedEntry()?.version ?? '—')} • {valueTypeLabel(selectedEntry()?.valueType ?? 0)}
-              </span>
+              <Badge tone="neutral" mono>v{String(selectedEntry()?.version ?? '—')}</Badge>
+              <span class="text-xs text-faint">Saves are version-checked to prevent lost updates.</span>
             </Show>
           </div>
 
           <Show when={selectedEntry()?.valueType === KvValueType.JSON}>
-            <div class="space-y-3 rounded border border-neutral-200 bg-neutral-50 p-3 dark:border-neutral-800 dark:bg-neutral-950/60">
-              <h3 class="text-xs font-semibold uppercase tracking-[0.12em] text-neutral-500 dark:text-neutral-400">
-                JSON Patch
-              </h3>
+            <div class="space-y-3 rounded-md border border-line bg-surface2/40 p-3">
+              <p class="eyebrow">JSON Patch (RFC 6902)</p>
               <textarea
-                class="min-h-[100px] rounded border border-neutral-300 bg-white px-3 py-2 text-sm text-neutral-800 shadow-sm focus:border-neutral-900 focus:outline-none dark:border-neutral-700 dark:bg-neutral-950 dark:text-neutral-200"
+                class={cx(textareaClass, 'min-h-[90px]')}
                 value={patchValue()}
                 onInput={(event) => setPatchValue(event.currentTarget.value)}
                 placeholder='[{"op":"replace","path":"/name","value":"new"}]'
               />
-              <button
-                type="button"
-                class="rounded border border-neutral-300 px-3 py-2 text-xs font-semibold uppercase tracking-[0.08em] text-neutral-700 shadow-sm transition hover:-translate-y-0.5 dark:border-neutral-700 dark:text-neutral-200"
-                onClick={() => void handlePatch()}
-              >
-                Apply Patch
-              </button>
+              <Button onClick={() => void handlePatch()}>Apply patch</Button>
             </div>
           </Show>
-        </section>
-      </div>
+        </div>
+      </SectionCard>
     </div>
   )
 }

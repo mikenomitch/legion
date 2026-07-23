@@ -1,12 +1,12 @@
 import { A, useNavigate, useParams } from '@solidjs/router'
 import { For, Show, createMemo, createResource, createSignal, onCleanup, onMount } from 'solid-js'
-import { DetailBadge, DetailSection, InstancePill, detailDangerButtonClass, detailTabButtonClass } from '../../components/DetailPrimitives'
+import { Badge, CodeBlock, ConfirmButton, EmptyState, MonoBadge, Note, PageHeader, SectionCard, Spinner, StatusBadge, TableShell, Tabs, linkClass, tableClass, tdClass, thClass, theadClass, trHoverClass } from '../../components/ui'
 import DagVisualization from '../../components/DagVisualization'
 import { InstanceInfo } from '../../gen/legion_pb'
 import LogViewer from '../../components/LogViewer'
 import { managerClient } from '../../grpcClient'
-import { formatDate } from '../../utils/format'
-import { buildTaskRuntimeByName, buildTaskRuntimeFromStatuses, extractJobSpecData, instanceStateTone, taskStatusTone, topoSortTaskNames, type TaskRuntimeSummary } from '../../utils/jobspec'
+import { formatDate, formatRelativeTime } from '../../utils/format'
+import { buildTaskRuntimeByName, buildTaskRuntimeFromStatuses, extractJobSpecData, topoSortTaskNames, type TaskRuntimeSummary } from '../../utils/jobspec'
 import { POLL_INTERVAL_MS } from '../../utils/polling'
 
 export default function JobDetail() {
@@ -15,8 +15,11 @@ export default function JobDetail() {
   const jobName = createMemo(() => decodeURIComponent(params.id))
   const [activeTab, setActiveTab] = createSignal<'overview' | 'spec' | 'logs'>('overview')
   const [actionMessage, setActionMessage] = createSignal('')
+  const [actionFailed, setActionFailed] = createSignal(false)
 
-  const [jobData] = createResource(async () => {
+  // Keyed on the route param so navigating job→job (e.g. via the command
+  // palette) refetches instead of showing the previous job's data.
+  const [jobData] = createResource(jobName, async () => {
     const [jobInfo, ledger, rollouts, spec, specHistory] = await Promise.all([
       managerClient.getJobInfo({ name: jobName() }),
       managerClient.getLedger({}),
@@ -137,7 +140,7 @@ export default function JobDetail() {
   )
 
   // The DAG is only meaningful when tasks actually depend on each other.
-  // Single-task and independent-task jobs render as the "Tasks by group" cards
+  // Single-task and independent-task jobs render as the "Tasks" cards
   // instead of a big empty canvas with disconnected nodes.
   const dagHasEdges = createMemo(() => {
     const tasks = jobData()?.taskSpec?.tasks ?? []
@@ -149,250 +152,330 @@ export default function JobDetail() {
   const destroyJob = async () => {
     try {
       const response = await managerClient.destroyJob({ name: jobName() })
+      setActionFailed(false)
       setActionMessage(response.message || 'Job destroyed')
       setTimeout(() => navigate('/jobs'), 900)
     } catch (error) {
       console.error(error)
+      setActionFailed(true)
       setActionMessage('Destroy failed: stop the job first, then retry.')
     }
   }
 
   return (
-    <Show when={!jobData.loading} fallback={<p>Loading job…</p>}>
-      <Show when={!jobData.error && jobData()} fallback={<p class="text-rose-500">Failed to load job.</p>}>
-        <div class="space-y-4">
-          <DetailSection>
-            <div class="flex flex-wrap items-start justify-between gap-3">
-              <div>
-                <h2 class="text-2xl font-semibold">{jobData()!.job?.name || jobData()!.job?.id}</h2>
-                <p class="text-sm text-neutral-500">Status: {jobData()!.job?.status || 'unknown'} · Allocations: {jobData()!.allocations.length}</p>
-              </div>
-              <button type="button" onClick={destroyJob} class={detailDangerButtonClass}>
-                Delete Job
-              </button>
+    <Show when={!jobData.loading} fallback={<div class="py-6"><Spinner label="Loading job…" /></div>}>
+      <Show when={!jobData.error && jobData()} fallback={<Note tone="danger">Failed to load job.</Note>}>
+        <div>
+          <PageHeader
+            eyebrow="Job"
+            title={jobData()!.job?.name || jobData()!.job?.id}
+            badges={
+              <>
+                <StatusBadge status={jobData()!.job?.status || 'unknown'} />
+                <Badge tone="neutral">{jobData()!.allocations.length} allocation{jobData()!.allocations.length === 1 ? '' : 's'}</Badge>
+              </>
+            }
+            actions={<ConfirmButton label="Delete job" onConfirm={() => void destroyJob()} />}
+          />
+          <Show when={actionMessage()}>
+            <div aria-live="polite">
+              <Note tone={actionFailed() ? 'danger' : 'info'} class="mb-4">{actionMessage()}</Note>
             </div>
-            <Show when={actionMessage()}><p class="mt-2 text-sm text-neutral-600 dark:text-neutral-300">{actionMessage()}</p></Show>
+          </Show>
 
-            <div class="mt-4 flex gap-2">
-              <button type="button" onClick={() => setActiveTab('overview')} class={detailTabButtonClass(activeTab() === 'overview')}>Overview</button>
-              <button type="button" onClick={() => setActiveTab('spec')} class={detailTabButtonClass(activeTab() === 'spec')}>Job Spec</button>
-              <button type="button" onClick={() => setActiveTab('logs')} class={detailTabButtonClass(activeTab() === 'logs')}>Logs</button>
-            </div>
-          </DetailSection>
+          <Tabs
+            class="mb-5"
+            tabs={[
+              { id: 'overview', label: 'Overview' },
+              { id: 'spec', label: 'Job spec', count: jobData()!.specHistory.length },
+              { id: 'logs', label: 'Logs' },
+            ]}
+            active={activeTab()}
+            onChange={(id) => setActiveTab(id as 'overview' | 'spec' | 'logs')}
+          />
 
           <Show when={activeTab() === 'overview'}>
-            <Show when={jobData()!.activeRollout}>
-              <DetailSection class="border-amber-300 bg-amber-50/70 dark:border-amber-700 dark:bg-amber-950/30">
-                <h3 class="font-semibold">Active rollout</h3>
-                <p class="text-sm">Rollout #{String(jobData()!.activeRollout!.id)} · {jobData()!.activeRollout!.status}</p>
-                <A href={`/rollouts/${jobData()!.activeRollout!.id}`} class="text-sm underline">Open rollout</A>
-              </DetailSection>
-            </Show>
-
-
-            <Show when={jobData()!.activeRollout}>
-              <DetailSection>
-                <h3 class="font-semibold">Allocations in active rollout target</h3>
-                <div class="mt-2 space-y-1 text-sm">
-                  <For each={jobData()!.allocations.filter((allocation) => allocation.jobConfigId === jobData()!.activeRollout!.toJobConfigId)}>
-                    {(allocation) => <p>#{String(allocation.id)} on <A class="underline" href={`/nodes/${encodeURIComponent(allocation.nodeId)}`}>{allocation.nodeId}</A> · {allocation.status}</p>}
-                  </For>
-                </div>
-              </DetailSection>
-            </Show>
-
-            <DetailSection>
-              <h3 class="mb-2 font-semibold">Tasks by group</h3>
-              <Show
-                when={jobData()!.taskSpec?.tasks.length}
-                fallback={<p class="text-sm text-neutral-500">No task information available in current job spec.</p>}
-              >
-                <div class="space-y-4">
-                  <For each={[...new Set(jobData()!.taskSpec!.tasks.map((task) => task.group))]}>
-                    {(groupName) => (
-                      <div class="rounded border border-neutral-200 p-3 dark:border-neutral-700">
-                        <h4 class="text-sm font-semibold uppercase tracking-wide text-neutral-500">Group {groupName}</h4>
-                        <div class="mt-3 grid gap-2 md:grid-cols-2 xl:grid-cols-3">
-                          <For each={jobData()!.taskSpec!.tasks.filter((task) => task.group === groupName)}>
-                            {(task) => {
-                              const runtime = () => taskRuntime().get(task.name)
-                              const primaryStatus = () =>
-                                runtime()?.statuses[0] ?? (statusLoading() ? 'loading…' : 'not allocated')
-                              return (
-                                <A
-                                  href={`/jobs/${encodeURIComponent(jobName())}/tasks/${encodeURIComponent(task.name)}`}
-                                  class="rounded border border-neutral-200 bg-neutral-50 p-3 transition hover:border-neutral-400 hover:bg-white dark:border-neutral-700 dark:bg-neutral-900"
-                                >
-                                  <div class="flex items-start justify-between gap-2">
-                                    <div>
-                                      <p class="text-sm font-semibold">{task.name}</p>
-                                      <p class="text-xs text-neutral-500">{task.kind} · lifecycle {task.lifecycle}</p>
-                                    </div>
-                                    <DetailBadge tone={taskStatusTone(primaryStatus())}>
-                                      <span class={statusLoading() && !runtime() ? 'animate-pulse' : ''}>{primaryStatus()}</span>
-                                    </DetailBadge>
-                                  </div>
-                                  <Show when={task.stateful}>
-                                    <div class="mt-2 flex flex-wrap items-center gap-2">
-                                      <DetailBadge tone="neutral">stateful · {task.stateful!.mode}</DetailBadge>
-                                      <Show when={task.stateful!.storagePath}>
-                                        <span class="font-mono text-[11px] text-neutral-500" title="Persistent storage path">
-                                          {task.stateful!.storagePath}
-                                        </span>
-                                      </Show>
-                                    </div>
-                                  </Show>
-                                  <Show when={task.lifecycle === 'sidecar'}>
-                                    <p class="mt-2 text-xs text-indigo-600 dark:text-indigo-300">
-                                      Sidecar task for group <span class="font-semibold">{task.group}</span>
-                                    </p>
-                                  </Show>
-                                  <Show when={task.dependsOn.length > 0}>
-                                    <p class="mt-2 text-xs text-neutral-500">
-                                      Depends on: {task.dependsOn.map((dependency) => dependency.task).join(', ')}
-                                    </p>
-                                  </Show>
-                                </A>
-                              )
-                            }}
-                          </For>
-                        </div>
-                      </div>
-                    )}
-                  </For>
-                </div>
+            <div class="space-y-4">
+              <Show when={jobData()!.activeRollout}>
+                <Note tone="info">
+                  <div class="flex flex-wrap items-center gap-x-3 gap-y-1">
+                    <span class="font-semibold">Rollout #{String(jobData()!.activeRollout!.id)} in progress</span>
+                    <StatusBadge status={jobData()!.activeRollout!.status} />
+                    <span class="text-xs opacity-80">
+                      {jobData()!.allocations.filter((allocation) => allocation.jobConfigId === jobData()!.activeRollout!.toJobConfigId).length} allocation(s) on target config
+                    </span>
+                    <A href={`/rollouts/${jobData()!.activeRollout!.id}`} class={linkClass}>Open rollout</A>
+                  </div>
+                </Note>
               </Show>
-            </DetailSection>
 
-            <Show when={dagHasEdges()}>
-              <DetailSection>
-                <h3 class="mb-2 font-semibold">Task DAG</h3>
-                <DagVisualization
-                  tasks={jobData()!.taskSpec!.tasks}
-                  layers={topoSortTaskNames(jobData()!.taskSpec!.tasks)}
-                  taskRuntime={taskRuntime()}
-                  statusLoading={statusLoading()}
-                  jobName={jobName()}
-                />
-              </DetailSection>
-            </Show>
-
-            <Show when={showInstancesPanel()}>
-              <DetailSection>
-                <h3 class="mb-2 font-semibold">Instances</h3>
-                <p class="mb-2 text-xs text-neutral-500">
-                  Stable identities for stateful tasks — instance ids and storage survive allocation reschedules.
-                </p>
+              <SectionCard title="Tasks">
                 <Show
-                  when={(instances() ?? []).length > 0}
-                  fallback={
-                    <p class="text-sm text-neutral-500">
-                      {instances() === undefined ? 'Loading instances…' : 'No instances yet.'}
-                    </p>
-                  }
+                  when={jobData()!.taskSpec?.tasks.length}
+                  fallback={<p class="text-sm text-muted">No task information available in the current job spec.</p>}
                 >
-                  <div class="overflow-x-auto">
-                    <table class="min-w-full text-sm">
-                      <thead>
-                        <tr class="text-left">
-                          <th class="py-2 pr-4">Instance</th>
-                          <th class="py-2 pr-4">Mode</th>
-                          <th class="py-2 pr-4">State</th>
-                          <th class="py-2 pr-4">Slot</th>
-                          <th class="py-2 pr-4">Allocation</th>
-                          <th class="py-2 pr-4">Storage</th>
-                          <th class="py-2 pr-4">Created</th>
+                  <div class="space-y-4">
+                    <For each={[...new Set(jobData()!.taskSpec!.tasks.map((task) => task.group))]}>
+                      {(groupName) => (
+                        <div>
+                          <p class="eyebrow mb-2">Group · {groupName}</p>
+                          <div class="grid gap-2.5 md:grid-cols-2 xl:grid-cols-3">
+                            <For each={jobData()!.taskSpec!.tasks.filter((task) => task.group === groupName)}>
+                              {(task) => {
+                                const runtime = () => taskRuntime().get(task.name)
+                                const primaryStatus = () =>
+                                  runtime()?.statuses[0] ?? (statusLoading() ? 'loading' : 'not allocated')
+                                return (
+                                  <A
+                                    href={`/jobs/${encodeURIComponent(jobName())}/tasks/${encodeURIComponent(task.name)}`}
+                                    class="group rounded-lg border border-line bg-surface p-3 transition-colors hover:border-brass/50 hover:bg-surface2/50"
+                                  >
+                                    <div class="flex items-start justify-between gap-2">
+                                      <div class="min-w-0">
+                                        <p class="truncate text-sm font-semibold text-ink group-hover:text-brass-strong">{task.name}</p>
+                                        <p class="mt-0.5 text-xs text-faint">{task.kind} · {task.lifecycle}</p>
+                                      </div>
+                                      <StatusBadge status={primaryStatus()} loading={statusLoading() && !runtime()} />
+                                    </div>
+                                    <Show when={task.stateful || task.dependsOn.length > 0 || task.lifecycle === 'sidecar'}>
+                                      <div class="mt-2 flex flex-wrap items-center gap-1.5">
+                                        <Show when={task.stateful}>
+                                          <Badge tone="accent">stateful · {task.stateful!.mode}</Badge>
+                                        </Show>
+                                        <Show when={task.lifecycle === 'sidecar'}>
+                                          <Badge tone="neutral">sidecar</Badge>
+                                        </Show>
+                                        <Show when={task.dependsOn.length > 0}>
+                                          <span class="text-2xs text-faint">
+                                            after {task.dependsOn.map((dependency) => dependency.task).join(', ')}
+                                          </span>
+                                        </Show>
+                                      </div>
+                                    </Show>
+                                    <Show when={task.stateful?.storagePath}>
+                                      <p class="mt-1.5 truncate font-mono text-2xs text-faint" title={`Persistent storage path: ${task.stateful!.storagePath}`}>
+                                        {task.stateful!.storagePath}
+                                      </p>
+                                    </Show>
+                                  </A>
+                                )
+                              }}
+                            </For>
+                          </div>
+                        </div>
+                      )}
+                    </For>
+                  </div>
+                </Show>
+              </SectionCard>
+
+              <Show when={dagHasEdges()}>
+                <SectionCard title="Task graph" description="Execution order derived from task dependencies.">
+                  <DagVisualization
+                    tasks={jobData()!.taskSpec!.tasks}
+                    layers={topoSortTaskNames(jobData()!.taskSpec!.tasks)}
+                    taskRuntime={taskRuntime()}
+                    statusLoading={statusLoading()}
+                    jobName={jobName()}
+                  />
+                </SectionCard>
+              </Show>
+
+              <Show when={showInstancesPanel()}>
+                <SectionCard
+                  title="Instances"
+                  description="Stable identities for stateful tasks — instance ids and storage survive reschedules."
+                  flush
+                >
+                  <Show
+                    when={(instances() ?? []).length > 0}
+                    fallback={
+                      <p class="px-4 py-4 text-sm text-muted">
+                        {instances() === undefined ? 'Loading instances…' : 'No instances yet.'}
+                      </p>
+                    }
+                  >
+                    <TableShell>
+                      <table class={tableClass}>
+                        <thead class={theadClass}>
+                          <tr>
+                            <th class={thClass}>Instance</th>
+                            <th class={thClass}>Mode</th>
+                            <th class={thClass}>State</th>
+                            <th class={thClass}>Slot</th>
+                            <th class={thClass}>Allocation</th>
+                            <th class={thClass}>Storage</th>
+                            <th class={thClass + ' text-right'}>Created</th>
+                          </tr>
+                        </thead>
+                        <tbody class="divide-y divide-line">
+                          <For each={instances() ?? []}>
+                            {(instance) => (
+                              <tr class={trHoverClass}>
+                                <td class={tdClass + ' font-mono text-xs'}>{instance.instanceId}</td>
+                                <td class={tdClass + ' text-muted'}>{instance.mode}</td>
+                                <td class={tdClass}><StatusBadge status={instance.state} /></td>
+                                <td class={tdClass + ' tabular-nums text-muted'}>{instance.slotIndex !== undefined ? String(instance.slotIndex) : '—'}</td>
+                                <td class={tdClass + ' font-mono text-xs text-muted'}>{instance.currentAllocId !== undefined ? `#${String(instance.currentAllocId)}` : '—'}</td>
+                                <td class={tdClass}>
+                                  <Show when={instance.storageHandle} fallback={<span class="text-faint">—</span>}>
+                                    <span class="inline-block max-w-[12rem] truncate align-bottom font-mono text-xs text-muted" title={instance.storageHandle}>
+                                      {instance.storageHandle}
+                                    </span>
+                                  </Show>
+                                </td>
+                                <td class={tdClass + ' whitespace-nowrap text-right text-xs text-faint'}>{formatDate(instance.createdAt)}</td>
+                              </tr>
+                            )}
+                          </For>
+                        </tbody>
+                      </table>
+                    </TableShell>
+                    <Show when={hasKeyedTasks()}>
+                      <p class="border-t border-line px-4 py-2.5 text-xs text-faint">
+                        Keyed instances are managed from the CLI via <code class="rounded bg-surface2 px-1 font-mono">legion instance create/destroy</code> — read-only here.
+                      </p>
+                    </Show>
+                  </Show>
+                </SectionCard>
+              </Show>
+
+              <SectionCard title="Allocations" flush>
+                <Show
+                  when={jobData()!.allocations.length > 0}
+                  fallback={<EmptyState icon="boxes" title="No allocations" body="The scheduler has not placed this job on any worker yet." />}
+                >
+                  <TableShell>
+                    <table class={tableClass}>
+                      <thead class={theadClass}>
+                        <tr>
+                          <th class={thClass}>ID</th>
+                          <th class={thClass}>Instance</th>
+                          <th class={thClass}>Status</th>
+                          <th class={thClass}>Worker</th>
+                          <th class={thClass}>Job config</th>
                         </tr>
                       </thead>
-                      <tbody>
-                        <For each={instances() ?? []}>
-                          {(instance) => (
-                            <tr class="border-t border-neutral-200 dark:border-neutral-800">
-                              <td class="py-2 pr-4 font-mono text-xs">{instance.instanceId}</td>
-                              <td class="py-2 pr-4">{instance.mode}</td>
-                              <td class="py-2 pr-4">
-                                <DetailBadge tone={instanceStateTone(instance.state)}>{instance.state}</DetailBadge>
-                              </td>
-                              <td class="py-2 pr-4">{instance.slotIndex !== undefined ? String(instance.slotIndex) : '—'}</td>
-                              <td class="py-2 pr-4">{instance.currentAllocId !== undefined ? `#${String(instance.currentAllocId)}` : '—'}</td>
-                              <td class="py-2 pr-4">
-                                <Show when={instance.storageHandle} fallback={<span class="text-neutral-500">—</span>}>
-                                  <span class="inline-block max-w-[12rem] truncate align-bottom font-mono text-xs" title={instance.storageHandle}>
-                                    {instance.storageHandle}
-                                  </span>
+                      <tbody class="divide-y divide-line">
+                        <For each={jobData()!.allocations}>
+                          {(allocation) => (
+                            <tr class={trHoverClass}>
+                              <td class={tdClass + ' font-mono text-xs'}>#{String(allocation.id)}</td>
+                              <td class={tdClass}>
+                                <Show when={allocation.instanceId} fallback={<span class="text-faint">—</span>}>
+                                  <MonoBadge title={`Stateful instance ${allocation.instanceId}`}>{allocation.instanceId}</MonoBadge>
                                 </Show>
                               </td>
-                              <td class="py-2 pr-4 text-xs text-neutral-500">{formatDate(instance.createdAt)}</td>
+                              <td class={tdClass}><StatusBadge status={allocation.status} /></td>
+                              <td class={tdClass}>
+                                <A class="text-muted hover:text-brass-strong" href={`/nodes/${encodeURIComponent(allocation.nodeId)}`}>{allocation.nodeId}</A>
+                              </td>
+                              <td class={tdClass}>
+                                <A class="font-mono text-xs text-muted hover:text-brass-strong" href={`/jobs/${encodeURIComponent(jobName())}/specs/${encodeURIComponent(allocation.jobConfigId)}`}>
+                                  {allocation.jobConfigId}
+                                </A>
+                              </td>
                             </tr>
                           )}
                         </For>
                       </tbody>
                     </table>
-                  </div>
+                  </TableShell>
                 </Show>
-                <Show when={hasKeyedTasks()}>
-                  <p class="mt-3 text-xs text-neutral-500">
-                    Keyed instances are managed from the CLI via <code class="rounded bg-neutral-100 px-1 font-mono dark:bg-neutral-800">legion instance create/destroy</code> — read-only here.
-                  </p>
+              </SectionCard>
+
+              <SectionCard title="Rollout history" flush>
+                <Show
+                  when={jobData()!.rollouts.length > 0}
+                  fallback={<EmptyState icon="rocket" title="No rollouts" body="Rollouts appear when you submit a new version of this job." />}
+                >
+                  <TableShell>
+                    <table class={tableClass}>
+                      <thead class={theadClass}>
+                        <tr>
+                          <th class={thClass}>Rollout</th>
+                          <th class={thClass}>Status</th>
+                          <th class={thClass}>Config change</th>
+                          <th class={thClass + ' text-right'}>Updated</th>
+                        </tr>
+                      </thead>
+                      <tbody class="divide-y divide-line">
+                        <For each={jobData()!.rollouts}>
+                          {(rollout) => (
+                            <tr class={trHoverClass}>
+                              <td class={tdClass}>
+                                <A href={`/rollouts/${rollout.id}`} class="font-medium hover:text-brass-strong">#{String(rollout.id)}</A>
+                              </td>
+                              <td class={tdClass}><StatusBadge status={rollout.status} /></td>
+                              <td class={tdClass}>
+                                <span class="inline-flex flex-wrap items-center gap-1.5 font-mono text-xs text-muted">
+                                  <A class="hover:text-brass-strong" href={`/jobs/${encodeURIComponent(jobName())}/specs/${encodeURIComponent(rollout.fromJobConfigId || '')}`}>{rollout.fromJobConfigId || '—'}</A>
+                                  <span class="text-faint">→</span>
+                                  <A class="hover:text-brass-strong" href={`/jobs/${encodeURIComponent(jobName())}/specs/${encodeURIComponent(rollout.toJobConfigId)}`}>{rollout.toJobConfigId}</A>
+                                </span>
+                              </td>
+                              <td class={tdClass + ' whitespace-nowrap text-right text-xs text-faint'}>{formatRelativeTime(rollout.updatedAt)}</td>
+                            </tr>
+                          )}
+                        </For>
+                      </tbody>
+                    </table>
+                  </TableShell>
                 </Show>
-              </DetailSection>
-            </Show>
-
-            <DetailSection>
-              <h3 class="mb-2 font-semibold">Allocations</h3>
-              <div class="overflow-x-auto">
-                <table class="min-w-full text-sm">
-                  <thead><tr class="text-left"><th class="py-2 pr-4">ID</th><th class="py-2 pr-4">Instance</th><th class="py-2 pr-4">Status</th><th class="py-2 pr-4">Worker</th><th class="py-2 pr-4">Job Config</th></tr></thead>
-                  <tbody>
-                    <For each={jobData()!.allocations}>{(allocation) => (
-                      <tr class="border-t border-neutral-200 dark:border-neutral-800"><td class="py-2 pr-4">{String(allocation.id)}</td><td class="py-2 pr-4"><Show when={allocation.instanceId} fallback={<span class="text-neutral-500">—</span>}><InstancePill id={allocation.instanceId!} /></Show></td><td class="py-2 pr-4">{allocation.status}</td><td class="py-2 pr-4"><A class="underline" href={`/nodes/${encodeURIComponent(allocation.nodeId)}`}>{allocation.nodeId}</A></td><td class="py-2 pr-4"><A class="underline" href={`/jobs/${encodeURIComponent(jobName())}/specs/${encodeURIComponent(allocation.jobConfigId)}`}>{allocation.jobConfigId}</A></td></tr>
-                    )}</For>
-                  </tbody>
-                </table>
-              </div>
-            </DetailSection>
-
-            <DetailSection>
-              <h3 class="mb-2 font-semibold">Associated rollouts</h3>
-              <div class="space-y-2">
-                <For each={jobData()!.rollouts}>{(rollout) => (
-                  <div class="rounded border border-neutral-200 p-3 dark:border-neutral-700">
-                    <div class="flex items-center justify-between gap-2"><A href={`/rollouts/${rollout.id}`} class="font-semibold underline">Rollout #{String(rollout.id)}</A><span>{rollout.status}</span></div>
-                    <p class="mt-1 text-xs text-neutral-500">Updated {formatDate(rollout.updatedAt)}</p>
-                    <p class="mt-1 text-xs">from <A class="underline" href={`/jobs/${encodeURIComponent(jobName())}/specs/${encodeURIComponent(rollout.fromJobConfigId || '')}`}>{rollout.fromJobConfigId || '—'}</A> → to <A class="underline" href={`/jobs/${encodeURIComponent(jobName())}/specs/${encodeURIComponent(rollout.toJobConfigId)}`}>{rollout.toJobConfigId}</A></p>
-                  </div>
-                )}</For>
-              </div>
-            </DetailSection>
+              </SectionCard>
+            </div>
           </Show>
 
           <Show when={activeTab() === 'spec'}>
-            <DetailSection>
-              <h3 class="font-semibold">Current spec submissions</h3>
-              <For each={jobData()!.spec}>{(submission) => (
-                <div class="mt-3 rounded border border-neutral-200 p-3 dark:border-neutral-700">
-                  <div class="text-sm font-semibold">{submission.path}</div>
-                  <pre class="mt-2 max-h-80 overflow-auto rounded bg-neutral-100 p-2 text-xs dark:bg-neutral-950">{submission.content}</pre>
+            <div class="space-y-4">
+              <SectionCard title="Current spec">
+                <div class="space-y-3">
+                  <For each={jobData()!.spec}>
+                    {(submission) => <CodeBlock code={submission.content} label={submission.path} maxHClass="max-h-96" />}
+                  </For>
                 </div>
-              )}</For>
-            </DetailSection>
+              </SectionCard>
 
-            <DetailSection>
-              <h3 class="font-semibold">Spec history</h3>
-              <div class="mt-2 space-y-2">
-                <For each={jobData()!.specHistory}>{(item) => (
-                  <A href={`/jobs/${encodeURIComponent(jobName())}/specs/${encodeURIComponent(item.configId)}`} class="block rounded border border-neutral-200 p-3 text-sm hover:border-neutral-400 dark:border-neutral-700">
-                    {item.configId} · version {item.version !== undefined ? String(item.version) : '—'} · {formatDate(item.createdAt)}
-                  </A>
-                )}</For>
-              </div>
-            </DetailSection>
+              <SectionCard title="Spec history" flush>
+                <Show
+                  when={jobData()!.specHistory.length > 0}
+                  fallback={<EmptyState icon="file" title="No spec history" />}
+                >
+                  <TableShell>
+                    <table class={tableClass}>
+                      <thead class={theadClass}>
+                        <tr>
+                          <th class={thClass}>Config</th>
+                          <th class={thClass}>Version</th>
+                          <th class={thClass + ' text-right'}>Created</th>
+                        </tr>
+                      </thead>
+                      <tbody class="divide-y divide-line">
+                        <For each={jobData()!.specHistory}>
+                          {(item) => (
+                            <tr class={trHoverClass}>
+                              <td class={tdClass}>
+                                <A href={`/jobs/${encodeURIComponent(jobName())}/specs/${encodeURIComponent(item.configId)}`} class="font-mono text-xs font-medium hover:text-brass-strong">
+                                  {item.configId}
+                                </A>
+                              </td>
+                              <td class={tdClass + ' tabular-nums text-muted'}>{item.version !== undefined ? String(item.version) : '—'}</td>
+                              <td class={tdClass + ' whitespace-nowrap text-right text-xs text-faint'}>{formatDate(item.createdAt)}</td>
+                            </tr>
+                          )}
+                        </For>
+                      </tbody>
+                    </table>
+                  </TableShell>
+                </Show>
+              </SectionCard>
+            </div>
           </Show>
 
           <Show when={activeTab() === 'logs'}>
-            <DetailSection title="Task logs" actions={<span class="text-xs text-neutral-500">live tail across this job's allocations</span>}>
+            <SectionCard title="Task logs" description="Live tail across this job's allocations.">
               <LogViewer job={jobName()} />
-            </DetailSection>
+            </SectionCard>
           </Show>
         </div>
       </Show>

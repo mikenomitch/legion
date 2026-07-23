@@ -1,13 +1,12 @@
-import { A, Route, Router, useLocation, useNavigate, type RouteSectionProps } from '@solidjs/router'
+import { A, Navigate, Route, Router, useLocation, useNavigate, type RouteSectionProps } from '@solidjs/router'
 import { For, Show, createEffect, createMemo, createResource, createSignal, onCleanup, onMount } from 'solid-js'
-import type { LedgerNode, Rollout } from './gen/legion_pb'
 import Breadcrumbs from './components/Breadcrumbs'
 import { AclBanner } from './components/AclBanner'
+import { Icon, PageHeader, cx, type IconName } from './components/ui'
 import { managerClient, managerEndpoint } from './grpcClient'
 import { commandPaletteIndexItems } from './utils/commandPalette'
 import Access from './pages/Access'
 import OidcCallback from './pages/OidcCallback'
-import Deployments from './pages/Deployments'
 import Events from './pages/Events'
 import JobDetail from './pages/details/JobDetail'
 import JobSpecDetail from './pages/details/JobSpecDetail'
@@ -33,6 +32,7 @@ type SidebarItem = {
   path: string
   title: string
   copy: string
+  icon: IconName
 }
 
 type SidebarSection = {
@@ -52,11 +52,7 @@ type CommandPaletteItem = {
 
 type SidebarNode = SidebarItem | SidebarSection
 
-const baseNavItems: SidebarItem[] = [
-  { kind: 'item', label: 'Overview', path: '/', title: 'Overview', copy: 'Jobs running on the cluster.' },
-]
-
-const detailRoutes = new Set(['jobs', 'nodes', 'manager', 'rollouts', 'deployments'])
+const detailRoutes = new Set(['jobs', 'nodes', 'manager', 'rollouts'])
 
 const decodePathSegment = (value: string) => {
   try {
@@ -73,6 +69,16 @@ const resolveInitialTheme = (): 'light' | 'dark' => {
   return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
 }
 
+// Geometric vexillum (legion standard): finial, crossbar, hanging banner.
+const BrandMark = (props: { class?: string }) => (
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" class={props.class} aria-hidden="true">
+    <path d="M12 4.5v17" />
+    <circle cx="12" cy="2.8" r="1.1" fill="currentColor" stroke="none" />
+    <path d="M5 6.5h14" />
+    <path d="M7 6.5v7l2.5-1.5L12 13.5l2.5-1.5L17 13.5v-7" />
+  </svg>
+)
+
 const Layout = (props: RouteSectionProps) => {
   const location = useLocation()
   const navigate = useNavigate()
@@ -88,52 +94,53 @@ const Layout = (props: RouteSectionProps) => {
 
   const navItems = createMemo(() => {
     const base: SidebarNode[] = [
-      ...baseNavItems,
+      { kind: 'item', label: 'Overview', path: '/', title: 'Overview', copy: 'Cluster health at a glance.', icon: 'gauge' },
       {
         kind: 'section',
         heading: 'Workloads',
         items: [
-          { kind: 'item', label: 'Jobs', path: '/jobs', title: 'Jobs', copy: 'Jobs and their health status.' },
-          { kind: 'item', label: 'Rollouts', path: '/rollouts', title: 'Rollouts', copy: 'Rollout execution details.' },
+          { kind: 'item', label: 'Jobs', path: '/jobs', title: 'Jobs', copy: 'Every job on the cluster and its health.', icon: 'layers' },
+          { kind: 'item', label: 'Rollouts', path: '/rollouts', title: 'Rollouts', copy: 'Version rollouts and their progress.', icon: 'rocket' },
         ],
       },
       {
         kind: 'section',
         heading: 'Cluster',
         items: [
-          { kind: 'item', label: 'Worker Nodes', path: '/nodes', title: 'Worker Nodes', copy: 'Inventory of worker nodes.' },
-          { kind: 'item', label: 'Manager Nodes', path: '/manager', title: 'Manager Nodes', copy: 'Manager config snapshots.' },
-          { kind: 'item', label: 'Events', path: '/events', title: 'Events', copy: 'Live stream of scheduler activity.' },
-          { kind: 'item', label: 'Raft', path: '/raft', title: 'Raft', copy: 'Raft elections, failover, and history.' },
-          { kind: 'item', label: 'KV', path: '/kv', title: 'KV', copy: 'Browse and edit key/value entries.' },
-          { kind: 'item', label: 'Access', path: '/access', title: 'Access', copy: 'ACL status, tokens, and login.' },
+          { kind: 'item', label: 'Workers', path: '/nodes', title: 'Workers', copy: 'Worker nodes running your allocations.', icon: 'server' },
+          { kind: 'item', label: 'Managers', path: '/manager', title: 'Managers', copy: 'Manager nodes and their configuration.', icon: 'network' },
+          { kind: 'item', label: 'Raft', path: '/raft', title: 'Raft', copy: 'Consensus status, elections, and membership.', icon: 'gitBranch' },
+          { kind: 'item', label: 'Events', path: '/events', title: 'Events', copy: 'Live stream of scheduler activity.', icon: 'radio' },
         ],
       },
       {
         kind: 'section',
-        heading: 'Development',
+        heading: 'System',
         items: [
-          { kind: 'item', label: 'API', path: '/api', title: 'API', copy: 'Interactive gRPC explorer.' },
-          { kind: 'item', label: 'State Explorer', path: '/state-explorer', title: 'State Explorer', copy: 'Explore and query manager state SQLite data.' },
+          { kind: 'item', label: 'KV Store', path: '/kv', title: 'KV Store', copy: 'Browse and edit key/value entries.', icon: 'database' },
+          { kind: 'item', label: 'Access', path: '/access', title: 'Access', copy: 'Identity, tokens, policies, and login.', icon: 'shieldCheck' },
+        ],
+      },
+      {
+        kind: 'section',
+        heading: 'Developer',
+        items: [
+          { kind: 'item', label: 'API Explorer', path: '/api', title: 'API Explorer', copy: 'Call any manager RPC interactively.', icon: 'terminal' },
+          { kind: 'item', label: 'State Explorer', path: '/state-explorer', title: 'State Explorer', copy: 'Query the manager state store with SQL.', icon: 'boxes' },
         ],
       },
     ]
 
     if (o11yStatus()?.o11yEnabled) {
-      const developmentIndex = base.findIndex((item) => item.kind === 'section' && item.heading === 'Development')
-      const observabilityItem: SidebarItem = {
+      const developer = base.find((item) => item.kind === 'section' && item.heading === 'Developer') as SidebarSection | undefined
+      developer?.items.push({
         kind: 'item',
         label: 'Observability',
         path: '/observability',
         title: 'Observability',
         copy: 'Manager logs and operational telemetry.',
-      }
-
-      if (developmentIndex >= 0) {
-        ;(base[developmentIndex] as SidebarSection).items.push(observabilityItem)
-      } else {
-        base.push(observabilityItem)
-      }
+        icon: 'eye',
+      })
     }
 
     return base
@@ -183,9 +190,13 @@ const Layout = (props: RouteSectionProps) => {
   })
 
   const totalCommandPaletteEntries = createMemo(() => commandPaletteEntries().length)
-  const commandPaletteInstruction = () => (totalCommandPaletteEntries() === 0 ? 'No matches' : `Navigate to ${totalCommandPaletteEntries()} destinations`)
+
+  // Remember what was focused before the palette opened so closing it
+  // returns focus there instead of dropping it on <body>.
+  let paletteReturnFocus: HTMLElement | null = null
 
   const openCommandPalette = () => {
+    paletteReturnFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null
     setCommandPaletteQuery('')
     setCommandPaletteOpen(true)
     setCommandPaletteSelected(0)
@@ -193,7 +204,10 @@ const Layout = (props: RouteSectionProps) => {
   }
 
   const closeCommandPalette = () => {
+    if (!commandPaletteOpen()) return
     setCommandPaletteOpen(false)
+    paletteReturnFocus?.focus()
+    paletteReturnFocus = null
   }
 
   const executeCommand = (href: string) => {
@@ -277,6 +291,10 @@ const Layout = (props: RouteSectionProps) => {
   }
 
   const onGlobalCommandPaletteKeydown = (event: KeyboardEvent) => {
+    if (event.key === 'Escape' && isNavOpen()) {
+      setIsNavOpen(false)
+      return
+    }
     if (commandPaletteOpen()) {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
         event.preventDefault()
@@ -291,6 +309,9 @@ const Layout = (props: RouteSectionProps) => {
     }
 
     if ((event.key.toLowerCase() === 'u') && !event.metaKey && !event.ctrlKey && !event.altKey && !isEditableTarget(event)) {
+      // Don't hijack the key while a link/button has focus (keyboard users).
+      const active = document.activeElement as HTMLElement | null
+      if (active && active !== document.body && active.closest('a, button, [role="button"]')) return
       event.preventDefault()
       navigateUpOneLevel()
       return
@@ -356,7 +377,7 @@ const Layout = (props: RouteSectionProps) => {
     const normalized = location.pathname.replace(/\/+$/, '') || '/'
     const segments = normalized.split('/').filter(Boolean)
     const topLevelPath = segments.length > 0 ? `/${segments[0]}` : '/'
-    const visibleNavItems = navItems().flatMap((entry) => (entry.kind === 'item' ? [entry] : entry.items))
+    const visibleNavItems = flattenedNavItems()
     const topLevel = visibleNavItems.find((item) => item.path === topLevelPath) ?? visibleNavItems[0]
     const title =
       segments.length <= 1
@@ -375,141 +396,210 @@ const Layout = (props: RouteSectionProps) => {
     return segments.length > 1 && detailRoutes.has(segments[0] ?? '')
   }
 
+  const NavLink = (itemProps: { item: SidebarItem }) => (
+    <A
+      href={itemProps.item.path}
+      class={cx(
+        'group relative flex items-center gap-2.5 rounded-md px-2.5 py-1.5 text-sm transition-colors',
+        isActiveNavPath(itemProps.item.path)
+          ? 'bg-brass/10 font-medium text-ink'
+          : 'text-muted hover:bg-surface2 hover:text-ink',
+      )}
+    >
+      <span
+        class={cx(
+          'absolute -left-2.5 top-1/2 h-4 w-0.5 -translate-y-1/2 rounded-full bg-brass transition-opacity',
+          isActiveNavPath(itemProps.item.path) ? 'opacity-100' : 'opacity-0',
+        )}
+      />
+      <Icon name={itemProps.item.icon} size={15} class={cx(isActiveNavPath(itemProps.item.path) ? 'text-brass' : 'text-faint group-hover:text-muted')} />
+      {itemProps.item.label}
+    </A>
+  )
+
   return (
-    <div class="min-h-screen bg-neutral-50 text-neutral-900 dark:bg-neutral-950 dark:text-neutral-100">
+    <div class="min-h-screen">
       <div class="flex min-h-screen">
-        <aside class={`fixed inset-y-0 left-0 z-40 w-64 shrink-0 transform border-r border-neutral-200 bg-white/95 px-5 py-6 transition md:sticky md:top-0 md:h-screen md:translate-x-0 dark:border-neutral-800 dark:bg-neutral-950 ${isNavOpen() ? 'translate-x-0' : '-translate-x-full'}`}>
-          <div class="mb-6 flex items-center justify-between">
-            <A href="/" class="block text-lg font-semibold uppercase tracking-[0.18em]">Legion</A>
+        <aside
+          id="app-sidebar"
+          class={cx(
+            'fixed inset-y-0 left-0 z-40 flex w-60 shrink-0 transform flex-col border-r border-line bg-surface transition md:sticky md:top-0 md:h-screen md:translate-x-0',
+            isNavOpen() ? 'translate-x-0' : '-translate-x-full',
+          )}
+        >
+          <div class="flex items-center justify-between px-4 pb-4 pt-5">
+            <A href="/" class="flex items-center gap-2.5">
+              <span class="flex h-7 w-7 items-center justify-center rounded-md bg-brass/15 text-brass">
+                <BrandMark class="h-[18px] w-[18px]" />
+              </span>
+              <span class="font-display text-sm font-bold uppercase tracking-[0.28em] text-ink">Legion</span>
+            </A>
             <button
               type="button"
-              class="rounded border px-2 py-1 text-sm md:hidden"
+              class="rounded-md p-1.5 text-muted hover:bg-surface2 md:hidden"
               onClick={() => setIsNavOpen(false)}
               aria-label="Close menu"
             >
-              ✕
+              <Icon name="x" size={16} />
             </button>
           </div>
-            <nav class="space-y-2">
-              <For each={navItems()}>
-                {(entry) => (
-                  <Show
+          <nav class="flex-1 space-y-4 overflow-y-auto px-2.5 pb-4">
+            <For each={navItems()}>
+              {(entry) => (
+                <Show
                   when={entry.kind === 'section'}
-                  fallback={
-                    <A
-                      href={(entry as SidebarItem).path}
-                      class={`block rounded border px-3 py-2 text-sm font-semibold ${isActiveNavPath((entry as SidebarItem).path) ? 'border-neutral-900 bg-neutral-900 text-white dark:border-neutral-200 dark:bg-neutral-100 dark:text-neutral-900' : 'border-neutral-200 text-neutral-700 dark:border-neutral-800 dark:text-neutral-300'}`}
-                    >
-                      {(entry as SidebarItem).label}
-                    </A>
-                  }
+                  fallback={<NavLink item={entry as SidebarItem} />}
                 >
-                  <p class="px-3 pb-1 pt-4 text-[11px] font-medium uppercase tracking-[0.2em] text-neutral-500">{(entry as SidebarSection).heading}</p>
-                  <For each={(entry as SidebarSection).items}>
-                    {(item) => (
-                      <A
-                        href={item.path}
-                        class={`mb-1 block rounded border px-3 py-2 text-sm font-semibold ${isActiveNavPath(item.path) ? 'border-neutral-900 bg-neutral-900 text-white dark:border-neutral-200 dark:bg-neutral-100 dark:text-neutral-900' : 'border-neutral-200 text-neutral-700 dark:border-neutral-800 dark:text-neutral-300'}`}
-                      >
-                        {item.label}
-                      </A>
-                    )}
-                  </For>
+                  <div>
+                    <p class="eyebrow px-2.5 pb-1.5">{(entry as SidebarSection).heading}</p>
+                    <div class="space-y-0.5">
+                      <For each={(entry as SidebarSection).items}>
+                        {(item) => <NavLink item={item} />}
+                      </For>
+                    </div>
+                  </div>
                 </Show>
               )}
             </For>
           </nav>
-          <p class="mt-auto pt-6 text-xs text-neutral-500">Manager endpoint {managerEndpoint}</p>
+          <div class="border-t border-line px-4 py-3">
+            <p class="eyebrow mb-1">Manager</p>
+            <p class="truncate font-mono text-2xs text-muted" title={managerEndpoint}>
+              {managerEndpoint.replace(/^https?:\/\//, '')}
+            </p>
+          </div>
         </aside>
-          <Show when={isNavOpen()}>
-          <button
-            type="button"
-            class="fixed inset-0 z-30 bg-black/30 backdrop-blur-[1px] md:hidden"
+        <Show when={isNavOpen()}>
+          {/* Click-to-close scrim; keyboard users close via Escape or the ✕ button. */}
+          <div
+            class="fixed inset-0 z-30 bg-black/40 backdrop-blur-[1px] md:hidden"
             onClick={() => setIsNavOpen(false)}
-            aria-label="Close menu overlay"
+            aria-hidden="true"
           />
         </Show>
-          <div class="relative flex min-h-screen min-w-0 flex-1 flex-col md:ml-0">
-            <AclBanner />
+        <div class="relative flex min-h-screen min-w-0 flex-1 flex-col">
+          <AclBanner />
+          <div class="sticky top-0 z-20 flex h-12 items-center gap-3 border-b border-line bg-canvas/85 px-4 backdrop-blur md:px-6">
             <button
               type="button"
-              class="absolute right-4 top-4 z-20 flex h-9 w-9 items-center justify-center rounded border bg-white/90 text-base dark:border-neutral-700 dark:bg-neutral-900/80"
-              onClick={() => setTheme((value) => (value === 'dark' ? 'light' : 'dark'))}
-            aria-label={theme() === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
+              class="rounded-md p-1.5 text-muted hover:bg-surface2 md:hidden"
+              onClick={() => setIsNavOpen((value) => !value)}
+              aria-label="Open menu"
+              aria-expanded={isNavOpen()}
+              aria-controls="app-sidebar"
             >
-              {theme() === 'dark' ? '☀' : '☾'}
+              <Icon name="menu" size={17} />
             </button>
+            <Breadcrumbs />
+            <div class="flex-1" />
             <button
               type="button"
-              class="absolute right-14 top-4 z-20 rounded border bg-white/90 px-2 py-1 text-xs dark:border-neutral-700 dark:bg-neutral-900/80"
+              class="hidden items-center gap-2 rounded-md border border-line bg-surface px-2.5 py-1.5 text-xs text-faint transition-colors hover:border-line-strong hover:text-muted sm:flex"
               onClick={openCommandPalette}
-              title="Open command palette"
               aria-label="Open command palette"
             >
-              ⌘K
+              <Icon name="search" size={13} />
+              <span>Search…</span>
+              <kbd class="rounded border border-line bg-surface2 px-1 font-mono text-2xs">⌘K</kbd>
             </button>
-            <Show when={commandPaletteOpen()}>
+            <button
+              type="button"
+              class="rounded-md p-1.5 text-muted transition-colors hover:bg-surface2 hover:text-ink sm:hidden"
+              onClick={openCommandPalette}
+              aria-label="Open command palette"
+            >
+              <Icon name="search" size={16} />
+            </button>
+            <button
+              type="button"
+              class="rounded-md p-1.5 text-muted transition-colors hover:bg-surface2 hover:text-ink"
+              onClick={() => setTheme((value) => (value === 'dark' ? 'light' : 'dark'))}
+              aria-label={theme() === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
+            >
+              <Icon name={theme() === 'dark' ? 'sun' : 'moon'} size={16} />
+            </button>
+          </div>
+          <Show when={commandPaletteOpen()}>
+            <div
+              class="fixed inset-0 z-50 flex items-start justify-center bg-black/50 p-4 pt-[12vh] backdrop-blur-[2px]"
+              data-command-palette
+              onClick={closeCommandPalette}
+              onKeyDown={(event) => {
+                // Keep focus on the search input — the palette is keyboard-driven.
+                if (event.key === 'Tab') {
+                  event.preventDefault()
+                  commandPaletteInput?.focus()
+                }
+              }}
+            >
               <div
-                class="fixed inset-0 z-50 flex items-start justify-center bg-black/40 p-4 backdrop-blur-[1px]"
-                data-command-palette
-                onClick={closeCommandPalette}
+                role="dialog"
+                aria-modal="true"
+                aria-label="Command palette"
+                class="w-full max-w-xl overflow-hidden rounded-xl border border-line bg-surface shadow-pop"
+                onClick={(event) => event.stopPropagation()}
               >
-                <div
-                  class="w-full max-w-xl rounded border border-neutral-200 bg-white shadow-2xl dark:border-neutral-700 dark:bg-neutral-900"
-                  onClick={(event) => event.stopPropagation()}
-                >
-                  <div class="border-b border-neutral-200 px-3 py-2 dark:border-neutral-700">
-                    <input
-                      ref={commandPaletteInput}
-                      value={commandPaletteQuery()}
-                      onInput={(event) => setCommandPaletteQuery(event.currentTarget.value)}
-                      onKeyDown={onCommandPaletteKeydown}
-                      placeholder="Search pages and current index items"
-                      class="w-full rounded border border-neutral-300 bg-white px-3 py-2 text-sm outline-none dark:border-neutral-700 dark:bg-neutral-950"
-                      aria-label="Search command palette"
-                    />
-                  </div>
-                  <div class="max-h-[24rem] overflow-auto px-1 py-2 text-sm">
-                    <p class="px-3 pb-2 text-xs uppercase tracking-wide text-neutral-500">{commandPaletteInstruction()}</p>
+                <div class="flex items-center gap-2.5 border-b border-line px-4 py-3">
+                  <Icon name="search" size={16} class="text-faint" />
+                  <input
+                    ref={commandPaletteInput}
+                    value={commandPaletteQuery()}
+                    onInput={(event) => setCommandPaletteQuery(event.currentTarget.value)}
+                    onKeyDown={onCommandPaletteKeydown}
+                    placeholder="Jump to a page, job, node…"
+                    class="w-full border-none bg-transparent p-0 text-sm text-ink placeholder:text-faint focus:outline-none focus:ring-0"
+                    role="combobox"
+                    aria-expanded="true"
+                    aria-controls="command-palette-listbox"
+                    aria-activedescendant={`command-palette-option-${commandPaletteSelected()}`}
+                    aria-label="Search command palette"
+                  />
+                  <kbd class="rounded border border-line bg-surface2 px-1.5 py-0.5 font-mono text-2xs text-faint">esc</kbd>
+                </div>
+                <div id="command-palette-listbox" role="listbox" aria-label="Destinations" class="max-h-[22rem] overflow-auto p-1.5 text-sm">
+                  <Show
+                    when={totalCommandPaletteEntries() > 0}
+                    fallback={<p class="px-3 py-6 text-center text-sm text-faint">No matches.</p>}
+                  >
                     <For each={commandPaletteEntries()}>
                       {(entry, index) => {
                         const isActive = () => index() === commandPaletteSelected()
                         return (
                           <button
                             type="button"
+                            role="option"
+                            id={`command-palette-option-${index()}`}
+                            aria-selected={isActive()}
+                            tabindex={-1}
                             onMouseEnter={() => setCommandPaletteSelected(index())}
                             onClick={() => executeCommand(entry.href)}
-                            class={`w-full rounded px-3 py-2 text-left ${isActive() ? 'bg-neutral-900 text-white dark:bg-neutral-700' : 'hover:bg-neutral-100 dark:hover:bg-neutral-800'}`}
+                            class={cx(
+                              'flex w-full items-center justify-between gap-3 rounded-md px-3 py-2 text-left transition-colors',
+                              isActive() ? 'bg-brass/10' : 'hover:bg-surface2',
+                            )}
                           >
-                            <div class="flex justify-between gap-2">
-                              <span class="font-medium">{entry.label}</span>
-                              <span class={`text-[11px] uppercase ${isActive() ? 'text-neutral-200' : 'text-neutral-500'}`}>{entry.group}</span>
-                            </div>
-                            <p class={`text-xs ${isActive() ? 'text-neutral-200' : 'text-neutral-500'}`}>{entry.description}</p>
+                            <span class="min-w-0">
+                              <span class={cx('block truncate font-medium', isActive() ? 'text-ink' : 'text-ink')}>{entry.label}</span>
+                              <span class="block truncate text-xs text-faint">{entry.description}</span>
+                            </span>
+                            <span class={cx('shrink-0 text-2xs uppercase tracking-wide', isActive() ? 'text-brass' : 'text-faint')}>{entry.group}</span>
                           </button>
                         )
                       }}
                     </For>
-                  </div>
+                  </Show>
+                </div>
+                <div class="flex items-center gap-3 border-t border-line px-4 py-2 text-2xs text-faint">
+                  <span><kbd class="font-mono">↑↓</kbd> navigate</span>
+                  <span><kbd class="font-mono">↵</kbd> open</span>
+                  <span><kbd class="font-mono">esc</kbd> close</span>
                 </div>
               </div>
-            </Show>
-            <main class="flex-1 min-w-0 px-4 pt-8 pb-6 md:px-8 md:pt-10">
-            <div class="mb-3 md:hidden">
-              <button
-                type="button"
-                class="rounded border px-3 py-2"
-                onClick={() => setIsNavOpen((value) => !value)}
-              >
-                ☰ Menu
-              </button>
             </div>
-            <Breadcrumbs />
+          </Show>
+          <main class="flex-1 min-w-0 px-4 py-6 md:px-8">
             <Show when={!isDetailRoute()}>
-              <section class="mb-5 rounded border border-neutral-200 bg-white/90 px-4 py-3 dark:border-neutral-800 dark:bg-neutral-900/60">
-                <h1 class="text-2xl font-semibold text-neutral-900 dark:text-neutral-100">{pageMeta().title}</h1>
-                <p class="mt-1 text-sm text-neutral-600 dark:text-neutral-300">{pageMeta().subtitle}</p>
-              </section>
+              <PageHeader title={pageMeta().title} subtitle={pageMeta().subtitle} />
             </Show>
             {props.children}
           </main>
@@ -520,22 +610,19 @@ const Layout = (props: RouteSectionProps) => {
 }
 
 const AppRoutes = () => {
-  const [ledger] = createResource(async (): Promise<readonly LedgerNode[]> => (await managerClient.getLedger({})).nodes)
-  const [rollouts] = createResource(async (): Promise<readonly Rollout[]> => (await managerClient.listRollouts({ activeOnly: true, page: 1, pageSize: 20 })).rollouts)
-
   return (
     <Route path="/" component={(props) => <Layout {...props}>{props.children}</Layout>}>
-      <Route path="/" component={() => <Homepage ledger={ledger} rollouts={rollouts} />} />
+      <Route path="/" component={Homepage} />
       <Route path="/nodes" component={Nodes} />
       <Route path="/nodes/:id" component={NodeDetail} />
-        <Route path="/manager" component={Manager} />
-        <Route path="/raft" component={Raft} />
+      <Route path="/manager" component={Manager} />
+      <Route path="/raft" component={Raft} />
       <Route path="/manager/:id" component={ManagerNodeDetail} />
       <Route path="/jobs" component={Jobs} />
       <Route path="/jobs/:id" component={JobDetail} />
       <Route path="/jobs/:id/tasks/:taskName" component={TaskDetail} />
       <Route path="/jobs/:id/specs/:configId" component={JobSpecDetail} />
-      <Route path="/deployments" component={Deployments} />
+      <Route path="/deployments" component={() => <Navigate href="/rollouts" />} />
       <Route path="/rollouts" component={Rollouts} />
       <Route path="/rollouts/:id" component={RolloutDetail} />
       <Route path="/kv" component={KeyValue} />
@@ -546,7 +633,7 @@ const AppRoutes = () => {
       <Route path="/observability" component={Observability} />
       <Route path="/state-explorer" component={StateExplorer} />
       <Route path="/testing" component={TestingUtils} />
-      <Route path="*" component={() => <Homepage ledger={ledger} rollouts={rollouts} />} />
+      <Route path="*" component={Homepage} />
     </Route>
   )
 }

@@ -1,17 +1,6 @@
 import { For, Show, createResource, createSignal } from 'solid-js'
 import { managerClient } from '../../grpcClient'
-
-// Shared styling for the ACL admin panels.
-export const sectionClass =
-  'rounded border border-neutral-200 bg-white/90 p-4 dark:border-neutral-800 dark:bg-neutral-900/60'
-export const inputClass =
-  'w-full rounded border border-neutral-300 bg-white px-3 py-2 text-sm font-mono dark:border-neutral-700 dark:bg-neutral-900'
-export const buttonClass =
-  'rounded border border-neutral-900 bg-neutral-900 px-3 py-1.5 text-sm font-semibold text-white dark:border-neutral-200 dark:bg-neutral-100 dark:text-neutral-900'
-export const dangerButtonClass =
-  'rounded border border-rose-300 px-2 py-1 text-xs font-semibold text-rose-600 hover:bg-rose-50 dark:border-rose-800 dark:text-rose-400 dark:hover:bg-rose-900/30'
-const tableHeadClass = 'px-2 py-1.5 text-left text-xs font-medium uppercase tracking-wide text-neutral-500'
-const tableCellClass = 'px-2 py-1.5 align-top'
+import { Badge, Button, ConfirmButton, CopyButton, Field, Note, SectionCard, TableShell, checkboxClass, cx, inputClass, tableClass, tdClass, textareaClass, thClass, theadClass, trHoverClass } from '../ui'
 
 function errorText(err: unknown): string {
   return err instanceof Error ? err.message : String(err)
@@ -21,10 +10,10 @@ function Feedback(props: { error: string | null; notice: string | null }) {
   return (
     <>
       <Show when={props.error}>
-        <p class="mt-2 text-sm text-rose-600 dark:text-rose-400">{props.error}</p>
+        <Note tone="danger" class="mt-3">{props.error}</Note>
       </Show>
       <Show when={props.notice}>
-        <p class="mt-2 text-sm text-emerald-600 dark:text-emerald-400">{props.notice}</p>
+        <Note tone="ok" class="mt-3">{props.notice}</Note>
       </Show>
     </>
   )
@@ -32,24 +21,51 @@ function Feedback(props: { error: string | null; notice: string | null }) {
 
 // One-time secret reveal with a copy button (tokens are shown exactly once).
 function SecretReveal(props: { label: string; secret: string }) {
-  const [copied, setCopied] = createSignal(false)
-  const copy = async () => {
-    await navigator.clipboard.writeText(props.secret)
-    setCopied(true)
-  }
   return (
-    <div class="mt-3 rounded border border-amber-300 bg-amber-50 p-3 text-sm dark:border-amber-700 dark:bg-amber-900/20">
+    <div class="mt-3 rounded-md border border-amber-500/40 bg-amber-500/5 p-3 text-sm">
       <p class="font-semibold text-amber-800 dark:text-amber-200">
         {props.label} — shown only once, store it now.
       </p>
       <div class="mt-2 flex items-center gap-2">
-        <code class="block flex-1 overflow-x-auto whitespace-nowrap rounded bg-white/70 px-2 py-1 dark:bg-neutral-900/60">
+        <code class="block flex-1 overflow-x-auto whitespace-nowrap rounded-md border border-line bg-surface px-2.5 py-1.5 font-mono text-xs">
           {props.secret}
         </code>
-        <button type="button" class={buttonClass} onClick={copy}>
-          {copied() ? 'Copied' : 'Copy'}
-        </button>
+        <CopyButton text={props.secret} size="sm" />
       </div>
+    </div>
+  )
+}
+
+function PolicyPicker(props: {
+  policies: readonly { name: string }[] | undefined
+  selected: string[]
+  onToggle: (name: string) => void
+}) {
+  return (
+    <div class="flex flex-wrap gap-2">
+      <For each={props.policies ?? []}>
+        {(policy) => (
+          <label
+            class={cx(
+              'flex cursor-pointer items-center gap-1.5 rounded-md border px-2 py-1 text-xs font-medium transition-colors',
+              props.selected.includes(policy.name)
+                ? 'border-brass/50 bg-brass/10 text-ink'
+                : 'border-line text-muted hover:bg-surface2',
+            )}
+          >
+            <input
+              type="checkbox"
+              class={checkboxClass}
+              checked={props.selected.includes(policy.name)}
+              onChange={() => props.onToggle(policy.name)}
+            />
+            {policy.name}
+          </label>
+        )}
+      </For>
+      <Show when={(props.policies ?? []).length === 0}>
+        <p class="text-sm text-muted">Create a policy first.</p>
+      </Show>
     </div>
   )
 }
@@ -111,68 +127,70 @@ export function PoliciesPanel() {
 
   return (
     <div class="space-y-4">
-      <section class={sectionClass}>
-        <h3 class="font-semibold">Policies</h3>
-        <p class="mt-1 text-sm text-neutral-500">
-          Named rule sets over resources (job, node, kv, state, operator, acl) and actions
-          (read, write), optionally scoped by job names, node pools, or KV paths. Deny rules
-          override allows.
-        </p>
-        <Show when={(policies() ?? []).length > 0} fallback={<p class="mt-3 text-sm text-neutral-500">No policies yet.</p>}>
-          <table class="mt-3 w-full text-sm">
-            <thead>
-              <tr>
-                <th class={tableHeadClass}>Name</th>
-                <th class={tableHeadClass}>Description</th>
-                <th class={tableHeadClass}>Updated</th>
-                <th class={tableHeadClass} />
-              </tr>
-            </thead>
-            <tbody>
-              <For each={policies()}>
-                {(policy) => (
-                  <tr class="border-t border-neutral-200 dark:border-neutral-800">
-                    <td class={`${tableCellClass} font-mono`}>{policy.name}</td>
-                    <td class={tableCellClass}>{policy.description}</td>
-                    <td class={`${tableCellClass} text-neutral-500`}>{policy.updatedAt}</td>
-                    <td class={`${tableCellClass} text-right`}>
-                      <button type="button" class="mr-2 text-xs underline" onClick={() => edit(policy.name)}>
-                        edit
-                      </button>
-                      <button type="button" class={dangerButtonClass} onClick={() => void remove(policy.name)}>
-                        delete
-                      </button>
-                    </td>
-                  </tr>
-                )}
-              </For>
-            </tbody>
-          </table>
+      <SectionCard
+        title="Policies"
+        description="Named rule sets over resources (job, node, kv, state, operator, acl) and actions (read, write), optionally scoped by job names, node pools, or KV paths. Deny rules override allows."
+        flush
+      >
+        <Show when={(policies() ?? []).length > 0} fallback={<p class="px-4 py-4 text-sm text-muted">No policies yet.</p>}>
+          <TableShell>
+            <table class={tableClass}>
+              <thead class={theadClass}>
+                <tr>
+                  <th class={thClass}>Name</th>
+                  <th class={thClass}>Description</th>
+                  <th class={thClass}>Updated</th>
+                  <th class={thClass} />
+                </tr>
+              </thead>
+              <tbody class="divide-y divide-line">
+                <For each={policies()}>
+                  {(policy) => (
+                    <tr class={trHoverClass}>
+                      <td class={cx(tdClass, 'font-mono text-xs font-medium')}>{policy.name}</td>
+                      <td class={cx(tdClass, 'text-muted')}>{policy.description}</td>
+                      <td class={cx(tdClass, 'whitespace-nowrap text-xs text-faint')}>{policy.updatedAt}</td>
+                      <td class={cx(tdClass, 'text-right')}>
+                        <div class="inline-flex items-center gap-1.5">
+                          <Button size="xs" onClick={() => edit(policy.name)}>Edit</Button>
+                          <ConfirmButton label="Delete" size="xs" onConfirm={() => void remove(policy.name)} />
+                        </div>
+                      </td>
+                    </tr>
+                  )}
+                </For>
+              </tbody>
+            </table>
+          </TableShell>
         </Show>
-        <Feedback error={error()} notice={notice()} />
-      </section>
+        <div class="px-4 pb-3">
+          <Feedback error={error()} notice={notice()} />
+        </div>
+      </SectionCard>
 
-      <section class={sectionClass}>
-        <h3 class="font-semibold">Create or update a policy</h3>
-        <form class="mt-3 flex flex-col gap-3" onSubmit={apply}>
-          <input class={inputClass} placeholder="policy name" value={name()} onInput={(e) => setName(e.currentTarget.value)} />
-          <input
-            class={inputClass}
-            placeholder="description (optional)"
-            value={description()}
-            onInput={(e) => setDescription(e.currentTarget.value)}
-          />
-          <textarea
-            class={`${inputClass} min-h-44`}
-            value={rules()}
-            onInput={(e) => setRules(e.currentTarget.value)}
-            spellcheck={false}
-          />
-          <button type="submit" class={`self-start ${buttonClass}`}>
+      <SectionCard title="Create or update a policy">
+        <form class="flex flex-col gap-3" onSubmit={apply}>
+          <div class="grid gap-3 sm:grid-cols-2">
+            <Field label="Name">
+              <input class={cx(inputClass, 'font-mono')} placeholder="dev-read-write" value={name()} onInput={(e) => setName(e.currentTarget.value)} />
+            </Field>
+            <Field label="Description (optional)">
+              <input class={inputClass} placeholder="What this policy grants" value={description()} onInput={(e) => setDescription(e.currentTarget.value)} />
+            </Field>
+          </div>
+          <Field label="Rules (JSON)">
+            <textarea
+              class={cx(textareaClass, 'min-h-44')}
+              value={rules()}
+              onInput={(e) => setRules(e.currentTarget.value)}
+              spellcheck={false}
+            />
+          </Field>
+          <Button type="submit" variant="primary" size="md" class="self-start">
             Save policy
-          </button>
+          </Button>
         </form>
-      </section>
+      </SectionCard>
     </div>
   )
 }
@@ -224,74 +242,69 @@ export function TokensPanel() {
 
   return (
     <div class="space-y-4">
-      <section class={sectionClass}>
-        <h3 class="font-semibold">Tokens</h3>
-        <p class="mt-1 text-sm text-neutral-500">
-          Secrets are stored hashed and never shown after creation; revoke by accessor ID.
-        </p>
-        <Show when={(tokens() ?? []).length > 0} fallback={<p class="mt-3 text-sm text-neutral-500">No tokens yet.</p>}>
-          <table class="mt-3 w-full text-sm">
-            <thead>
-              <tr>
-                <th class={tableHeadClass}>Accessor</th>
-                <th class={tableHeadClass}>Name</th>
-                <th class={tableHeadClass}>Type</th>
-                <th class={tableHeadClass}>Policies</th>
-                <th class={tableHeadClass}>Expires</th>
-                <th class={tableHeadClass} />
-              </tr>
-            </thead>
-            <tbody>
-              <For each={tokens()}>
-                {(token) => (
-                  <tr class="border-t border-neutral-200 dark:border-neutral-800">
-                    <td class={`${tableCellClass} font-mono text-xs`}>{token.accessorId}</td>
-                    <td class={tableCellClass}>{token.name}</td>
-                    <td class={tableCellClass}>{token.tokenType}</td>
-                    <td class={tableCellClass}>{token.policies.join(', ')}</td>
-                    <td class={`${tableCellClass} text-neutral-500`}>{token.expiresAt ?? 'never'}</td>
-                    <td class={`${tableCellClass} text-right`}>
-                      <button type="button" class={dangerButtonClass} onClick={() => void revoke(token.accessorId)}>
-                        revoke
-                      </button>
-                    </td>
-                  </tr>
-                )}
-              </For>
-            </tbody>
-          </table>
+      <SectionCard
+        title="Tokens"
+        description="Secrets are stored hashed and never shown after creation; revoke by accessor ID."
+        flush
+      >
+        <Show when={(tokens() ?? []).length > 0} fallback={<p class="px-4 py-4 text-sm text-muted">No tokens yet.</p>}>
+          <TableShell>
+            <table class={tableClass}>
+              <thead class={theadClass}>
+                <tr>
+                  <th class={thClass}>Accessor</th>
+                  <th class={thClass}>Name</th>
+                  <th class={thClass}>Type</th>
+                  <th class={thClass}>Policies</th>
+                  <th class={thClass}>Expires</th>
+                  <th class={thClass} />
+                </tr>
+              </thead>
+              <tbody class="divide-y divide-line">
+                <For each={tokens()}>
+                  {(token) => (
+                    <tr class={trHoverClass}>
+                      <td class={cx(tdClass, 'font-mono text-xs')}>{token.accessorId}</td>
+                      <td class={tdClass}>{token.name}</td>
+                      <td class={cx(tdClass, 'text-muted')}>{token.tokenType}</td>
+                      <td class={tdClass}>
+                        <span class="inline-flex flex-wrap gap-1">
+                          <For each={token.policies}>{(policy) => <Badge tone="neutral">{policy}</Badge>}</For>
+                        </span>
+                      </td>
+                      <td class={cx(tdClass, 'whitespace-nowrap text-xs text-faint')}>{token.expiresAt ?? 'never'}</td>
+                      <td class={cx(tdClass, 'text-right')}>
+                        <ConfirmButton label="Revoke" size="xs" onConfirm={() => void revoke(token.accessorId)} />
+                      </td>
+                    </tr>
+                  )}
+                </For>
+              </tbody>
+            </table>
+          </TableShell>
         </Show>
-        <Feedback error={error()} notice={null} />
-      </section>
+        <div class="px-4 pb-3">
+          <Feedback error={error()} notice={null} />
+        </div>
+      </SectionCard>
 
-      <section class={sectionClass}>
-        <h3 class="font-semibold">Create a client token</h3>
-        <form class="mt-3 flex flex-col gap-3 sm:max-w-md" onSubmit={create}>
-          <input class={inputClass} placeholder="token name (e.g. ci-deployer)" value={name()} onInput={(e) => setName(e.currentTarget.value)} />
-          <div class="flex flex-wrap gap-2">
-            <For each={policies() ?? []}>
-              {(policy) => (
-                <label class="flex items-center gap-1.5 rounded border border-neutral-300 px-2 py-1 text-sm dark:border-neutral-700">
-                  <input
-                    type="checkbox"
-                    checked={selectedPolicies().includes(policy.name)}
-                    onChange={() => toggle(policy.name)}
-                  />
-                  {policy.name}
-                </label>
-              )}
-            </For>
-            <Show when={(policies() ?? []).length === 0}>
-              <p class="text-sm text-neutral-500">Create a policy first.</p>
-            </Show>
-          </div>
-          <input class={inputClass} placeholder="ttl, e.g. 720h (optional)" value={ttl()} onInput={(e) => setTtl(e.currentTarget.value)} />
-          <button type="submit" class={`self-start ${buttonClass}`}>
+      <SectionCard title="Create a client token">
+        <form class="flex max-w-lg flex-col gap-3" onSubmit={create}>
+          <Field label="Token name">
+            <input class={inputClass} placeholder="e.g. ci-deployer" value={name()} onInput={(e) => setName(e.currentTarget.value)} />
+          </Field>
+          <Field label="Policies">
+            <PolicyPicker policies={policies()} selected={selectedPolicies()} onToggle={toggle} />
+          </Field>
+          <Field label="TTL (optional)" hint="e.g. 720h — empty means no expiry.">
+            <input class={cx(inputClass, 'font-mono')} placeholder="720h" value={ttl()} onInput={(e) => setTtl(e.currentTarget.value)} />
+          </Field>
+          <Button type="submit" variant="primary" size="md" class="self-start">
             Create token
-          </button>
+          </Button>
         </form>
         <Show when={secret()}>{(value) => <SecretReveal label="Token secret" secret={value()} />}</Show>
-      </section>
+      </SectionCard>
     </div>
   )
 }
@@ -343,72 +356,70 @@ export function UsersPanel() {
 
   return (
     <div class="space-y-4">
-      <section class={sectionClass}>
-        <h3 class="font-semibold">Users</h3>
-        <p class="mt-1 text-sm text-neutral-500">
-          Username/password identities for the built-in login form (argon2id-hashed).
-        </p>
-        <Show when={(users() ?? []).length > 0} fallback={<p class="mt-3 text-sm text-neutral-500">No users yet.</p>}>
-          <table class="mt-3 w-full text-sm">
-            <thead>
-              <tr>
-                <th class={tableHeadClass}>Username</th>
-                <th class={tableHeadClass}>Policies</th>
-                <th class={tableHeadClass}>Updated</th>
-                <th class={tableHeadClass} />
-              </tr>
-            </thead>
-            <tbody>
-              <For each={users()}>
-                {(user) => (
-                  <tr class="border-t border-neutral-200 dark:border-neutral-800">
-                    <td class={`${tableCellClass} font-mono`}>{user.username}</td>
-                    <td class={tableCellClass}>{user.policies.join(', ')}</td>
-                    <td class={`${tableCellClass} text-neutral-500`}>{user.updatedAt}</td>
-                    <td class={`${tableCellClass} text-right`}>
-                      <button type="button" class={dangerButtonClass} onClick={() => void remove(user.username)}>
-                        delete
-                      </button>
-                    </td>
-                  </tr>
-                )}
-              </For>
-            </tbody>
-          </table>
+      <SectionCard
+        title="Users"
+        description="Username/password identities for the built-in login form (argon2id-hashed)."
+        flush
+      >
+        <Show when={(users() ?? []).length > 0} fallback={<p class="px-4 py-4 text-sm text-muted">No users yet.</p>}>
+          <TableShell>
+            <table class={tableClass}>
+              <thead class={theadClass}>
+                <tr>
+                  <th class={thClass}>Username</th>
+                  <th class={thClass}>Policies</th>
+                  <th class={thClass}>Updated</th>
+                  <th class={thClass} />
+                </tr>
+              </thead>
+              <tbody class="divide-y divide-line">
+                <For each={users()}>
+                  {(user) => (
+                    <tr class={trHoverClass}>
+                      <td class={cx(tdClass, 'font-mono text-xs font-medium')}>{user.username}</td>
+                      <td class={tdClass}>
+                        <span class="inline-flex flex-wrap gap-1">
+                          <For each={user.policies}>{(policy) => <Badge tone="neutral">{policy}</Badge>}</For>
+                        </span>
+                      </td>
+                      <td class={cx(tdClass, 'whitespace-nowrap text-xs text-faint')}>{user.updatedAt}</td>
+                      <td class={cx(tdClass, 'text-right')}>
+                        <ConfirmButton label="Delete" size="xs" onConfirm={() => void remove(user.username)} />
+                      </td>
+                    </tr>
+                  )}
+                </For>
+              </tbody>
+            </table>
+          </TableShell>
         </Show>
-        <Feedback error={error()} notice={notice()} />
-      </section>
+        <div class="px-4 pb-3">
+          <Feedback error={error()} notice={notice()} />
+        </div>
+      </SectionCard>
 
-      <section class={sectionClass}>
-        <h3 class="font-semibold">Create or update a user</h3>
-        <form class="mt-3 flex flex-col gap-3 sm:max-w-md" onSubmit={upsert}>
-          <input class={inputClass} placeholder="username" value={username()} onInput={(e) => setUsername(e.currentTarget.value)} />
-          <input
-            class={inputClass}
-            placeholder="password (leave empty to keep current)"
-            type="password"
-            value={password()}
-            onInput={(e) => setPassword(e.currentTarget.value)}
-          />
-          <div class="flex flex-wrap gap-2">
-            <For each={policies() ?? []}>
-              {(policy) => (
-                <label class="flex items-center gap-1.5 rounded border border-neutral-300 px-2 py-1 text-sm dark:border-neutral-700">
-                  <input
-                    type="checkbox"
-                    checked={selectedPolicies().includes(policy.name)}
-                    onChange={() => toggle(policy.name)}
-                  />
-                  {policy.name}
-                </label>
-              )}
-            </For>
-          </div>
-          <button type="submit" class={`self-start ${buttonClass}`}>
+      <SectionCard title="Create or update a user">
+        <form class="flex max-w-lg flex-col gap-3" onSubmit={upsert}>
+          <Field label="Username">
+            <input class={inputClass} autocomplete="off" value={username()} onInput={(e) => setUsername(e.currentTarget.value)} />
+          </Field>
+          <Field label="Password" hint="Leave empty to keep the current password.">
+            <input
+              class={inputClass}
+              type="password"
+              autocomplete="new-password"
+              value={password()}
+              onInput={(e) => setPassword(e.currentTarget.value)}
+            />
+          </Field>
+          <Field label="Policies">
+            <PolicyPicker policies={policies()} selected={selectedPolicies()} onToggle={toggle} />
+          </Field>
+          <Button type="submit" variant="primary" size="md" class="self-start">
             Save user
-          </button>
+          </Button>
         </form>
-      </section>
+      </SectionCard>
     </div>
   )
 }
@@ -451,59 +462,65 @@ export function JoinTokensPanel() {
 
   return (
     <div class="space-y-4">
-      <section class={sectionClass}>
-        <h3 class="font-semibold">Worker join tokens</h3>
-        <p class="mt-1 text-sm text-neutral-500">
-          A join token introduces a worker in one command. Create one, then run the printed
-          command on the worker host; the token pins the worker type and the manager address.
-        </p>
-        <Show when={(tokens() ?? []).length > 0} fallback={<p class="mt-3 text-sm text-neutral-500">No join tokens.</p>}>
-          <table class="mt-3 w-full text-sm">
-            <thead>
-              <tr>
-                <th class={tableHeadClass}>ID</th>
-                <th class={tableHeadClass}>Worker type</th>
-                <th class={tableHeadClass}>Description</th>
-                <th class={tableHeadClass}>Expires</th>
-                <th class={tableHeadClass} />
-              </tr>
-            </thead>
-            <tbody>
-              <For each={tokens()}>
-                {(token) => (
-                  <tr class="border-t border-neutral-200 dark:border-neutral-800">
-                    <td class={`${tableCellClass} font-mono text-xs`}>{token.id}</td>
-                    <td class={tableCellClass}>{token.workerType}</td>
-                    <td class={tableCellClass}>{token.description}</td>
-                    <td class={`${tableCellClass} text-neutral-500`}>{token.expiresAt ?? 'never'}</td>
-                    <td class={`${tableCellClass} text-right`}>
-                      <button type="button" class={dangerButtonClass} onClick={() => void revoke(token.id)}>
-                        revoke
-                      </button>
-                    </td>
-                  </tr>
-                )}
-              </For>
-            </tbody>
-          </table>
+      <SectionCard
+        title="Worker join tokens"
+        description="A join token introduces a worker in one command. Create one, then run the printed command on the worker host; the token pins the worker type and the manager address."
+        flush
+      >
+        <Show when={(tokens() ?? []).length > 0} fallback={<p class="px-4 py-4 text-sm text-muted">No join tokens.</p>}>
+          <TableShell>
+            <table class={tableClass}>
+              <thead class={theadClass}>
+                <tr>
+                  <th class={thClass}>ID</th>
+                  <th class={thClass}>Worker type</th>
+                  <th class={thClass}>Description</th>
+                  <th class={thClass}>Expires</th>
+                  <th class={thClass} />
+                </tr>
+              </thead>
+              <tbody class="divide-y divide-line">
+                <For each={tokens()}>
+                  {(token) => (
+                    <tr class={trHoverClass}>
+                      <td class={cx(tdClass, 'font-mono text-xs')}>{token.id}</td>
+                      <td class={tdClass}>{token.workerType}</td>
+                      <td class={cx(tdClass, 'text-muted')}>{token.description}</td>
+                      <td class={cx(tdClass, 'whitespace-nowrap text-xs text-faint')}>{token.expiresAt ?? 'never'}</td>
+                      <td class={cx(tdClass, 'text-right')}>
+                        <ConfirmButton label="Revoke" size="xs" onConfirm={() => void revoke(token.id)} />
+                      </td>
+                    </tr>
+                  )}
+                </For>
+              </tbody>
+            </table>
+          </TableShell>
         </Show>
-        <Feedback error={error()} notice={null} />
-      </section>
+        <div class="px-4 pb-3">
+          <Feedback error={error()} notice={null} />
+        </div>
+      </SectionCard>
 
-      <section class={sectionClass}>
-        <h3 class="font-semibold">Create a join token</h3>
-        <form class="mt-3 flex flex-col gap-3 sm:max-w-md" onSubmit={create}>
-          <input class={inputClass} placeholder="worker type" value={workerType()} onInput={(e) => setWorkerType(e.currentTarget.value)} />
-          <input class={inputClass} placeholder="ttl, e.g. 24h ('none' to disable expiry)" value={ttl()} onInput={(e) => setTtl(e.currentTarget.value)} />
-          <input class={inputClass} placeholder="description (optional)" value={description()} onInput={(e) => setDescription(e.currentTarget.value)} />
-          <button type="submit" class={`self-start ${buttonClass}`}>
+      <SectionCard title="Create a join token">
+        <form class="flex max-w-lg flex-col gap-3" onSubmit={create}>
+          <Field label="Worker type">
+            <input class={inputClass} value={workerType()} onInput={(e) => setWorkerType(e.currentTarget.value)} />
+          </Field>
+          <Field label="TTL" hint="e.g. 24h — use 'none' to disable expiry.">
+            <input class={cx(inputClass, 'font-mono')} value={ttl()} onInput={(e) => setTtl(e.currentTarget.value)} />
+          </Field>
+          <Field label="Description (optional)">
+            <input class={inputClass} value={description()} onInput={(e) => setDescription(e.currentTarget.value)} />
+          </Field>
+          <Button type="submit" variant="primary" size="md" class="self-start">
             Create join token
-          </button>
+          </Button>
         </form>
         <Show when={joinCommand()}>
           {(value) => <SecretReveal label="Run on the worker host" secret={value()} />}
         </Show>
-      </section>
+      </SectionCard>
     </div>
   )
 }

@@ -1,8 +1,8 @@
-type HealthTone = 'healthy' | 'unhealthy' | 'unknown'
+import type { Tone } from './status'
 
 type HealthSummary = {
   label: string
-  tone: HealthTone
+  tone: Tone
 }
 
 const FAIL_KEYWORDS = ['fail', 'failed', 'error', 'unhealthy', 'critical', 'down']
@@ -32,20 +32,21 @@ const extractHealthStrings = (value: unknown): string[] => {
   return bucket.map((entry) => entry.trim()).filter((entry) => entry.length > 0)
 }
 
-const inferHealthTone = (values: string[]): HealthTone => {
+const inferHealthTone = (values: string[]): Tone => {
   const normalized = values.map((entry) => entry.toLowerCase())
   if (normalized.some((entry) => FAIL_KEYWORDS.some((keyword) => entry.includes(keyword)))) {
-    return 'unhealthy'
+    return 'danger'
   }
   if (normalized.some((entry) => PASS_KEYWORDS.some((keyword) => entry.includes(keyword)))) {
-    return 'healthy'
+    return 'ok'
   }
-  return 'unknown'
+  return 'neutral'
 }
 
+// Summarize a node's raw health-check JSON blob into a label + tone for badges.
 export const summarizeHealthChecks = (healthChecks?: string): HealthSummary => {
   if (!healthChecks || healthChecks.trim() === '' || healthChecks.trim() === '{}') {
-    return { label: 'No checks', tone: 'unknown' }
+    return { label: 'no checks', tone: 'neutral' }
   }
 
   let parsed: unknown = healthChecks
@@ -57,21 +58,11 @@ export const summarizeHealthChecks = (healthChecks?: string): HealthSummary => {
 
   const values = extractHealthStrings(parsed)
   if (values.length === 0) {
-    return { label: 'No checks', tone: 'unknown' }
+    return { label: 'no checks', tone: 'neutral' }
   }
 
   const tone = inferHealthTone(values)
-  if (tone === 'healthy') return { label: 'Healthy', tone }
-  if (tone === 'unhealthy') return { label: 'Unhealthy', tone }
-  return { label: 'Unknown', tone }
-}
-
-export const healthToneClasses = (tone: HealthTone): string => {
-  if (tone === 'healthy') {
-    return 'border-emerald-300 bg-emerald-50 text-emerald-700 dark:border-emerald-600 dark:bg-emerald-950 dark:text-emerald-100'
-  }
-  if (tone === 'unhealthy') {
-    return 'border-rose-300 bg-rose-50 text-rose-700 dark:border-rose-600 dark:bg-rose-950 dark:text-rose-100'
-  }
-  return 'border-amber-300 bg-amber-50 text-amber-700 dark:border-amber-600 dark:bg-amber-950 dark:text-amber-100'
+  if (tone === 'ok') return { label: 'healthy', tone }
+  if (tone === 'danger') return { label: 'unhealthy', tone }
+  return { label: 'unknown', tone: 'warn' }
 }

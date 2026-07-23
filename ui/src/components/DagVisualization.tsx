@@ -40,10 +40,10 @@ type DagVisualizationProps = {
 type Tone = 'success' | 'warning' | 'danger' | 'neutral'
 
 const toneStyle: Record<Tone, { bar: string; bg: string; ring: string; dot: string; text: string }> = {
-  success: { bar: 'bg-emerald-500', bg: 'bg-white dark:bg-neutral-900', ring: 'ring-emerald-400/40 dark:ring-emerald-500/30', dot: 'bg-emerald-500', text: 'text-emerald-700 dark:text-emerald-300' },
-  warning: { bar: 'bg-amber-500', bg: 'bg-white dark:bg-neutral-900', ring: 'ring-amber-400/40 dark:ring-amber-500/30', dot: 'bg-amber-500', text: 'text-amber-700 dark:text-amber-300' },
-  danger: { bar: 'bg-rose-500', bg: 'bg-white dark:bg-neutral-900', ring: 'ring-rose-400/40 dark:ring-rose-500/30', dot: 'bg-rose-500', text: 'text-rose-700 dark:text-rose-300' },
-  neutral: { bar: 'bg-neutral-300 dark:bg-neutral-600', bg: 'bg-white dark:bg-neutral-900', ring: 'ring-neutral-300/40 dark:ring-neutral-600/30', dot: 'bg-neutral-400 dark:bg-neutral-500', text: 'text-neutral-500 dark:text-neutral-400' },
+  success: { bar: 'bg-emerald-500', bg: 'bg-surface', ring: 'ring-emerald-400/40 dark:ring-emerald-500/30', dot: 'bg-emerald-500', text: 'text-emerald-700 dark:text-emerald-300' },
+  warning: { bar: 'bg-amber-500', bg: 'bg-surface', ring: 'ring-amber-400/40 dark:ring-amber-500/30', dot: 'bg-amber-500', text: 'text-amber-700 dark:text-amber-300' },
+  danger: { bar: 'bg-red-500', bg: 'bg-surface', ring: 'ring-red-400/40 dark:ring-red-500/30', dot: 'bg-red-500', text: 'text-red-700 dark:text-red-300' },
+  neutral: { bar: 'bg-line-strong', bg: 'bg-surface', ring: 'ring-line/60', dot: 'bg-faint', text: 'text-muted' },
 }
 
 const conditionStroke: Record<string, string> = { success: '#10b981', complete: '#0ea5e9', start: '#f59e0b' }
@@ -193,7 +193,7 @@ export default function DagVisualization(props: DagVisualizationProps) {
     const runtime = props.taskRuntime.get(taskName)
     const fallback = props.statusLoading ? 'loading…' : 'not allocated'
     const status = runtime?.statuses[0] ?? fallback
-    return { status, tone: taskStatusTone(status) as Tone }
+    return { status, tone: taskStatusTone(status) }
   }
 
   // ── Pan & zoom state ──────────────────────────────────────────────
@@ -299,23 +299,23 @@ export default function DagVisualization(props: DagVisualizationProps) {
 
       {/* Toolbar / legend */}
       <div class="flex flex-wrap items-center justify-between gap-3">
-        <div class="flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-neutral-500 dark:text-neutral-400">
-          <span class="inline-flex items-center gap-1.5"><span class="h-2.5 w-2.5 rounded-full bg-emerald-500" /> Running</span>
-          <span class="inline-flex items-center gap-1.5"><span class="h-2.5 w-2.5 rounded-full bg-amber-500" /> Pending</span>
-          <span class="inline-flex items-center gap-1.5"><span class="h-2.5 w-2.5 rounded-full bg-rose-500" /> Failed</span>
-          <span class="inline-flex items-center gap-1.5"><span class="h-2.5 w-2.5 rounded-full bg-neutral-400" /> Idle</span>
+        <div class="flex flex-wrap items-center gap-x-4 gap-y-1 text-2xs text-muted">
+          <span class="inline-flex items-center gap-1.5"><span class="h-2 w-2 rounded-full bg-emerald-500" /> Running</span>
+          <span class="inline-flex items-center gap-1.5"><span class="h-2 w-2 rounded-full bg-amber-500" /> Pending</span>
+          <span class="inline-flex items-center gap-1.5"><span class="h-2 w-2 rounded-full bg-red-500" /> Failed</span>
+          <span class="inline-flex items-center gap-1.5"><span class="h-2 w-2 rounded-full bg-faint" /> Idle</span>
           <Show when={hasSidecars()}>
             <span class="inline-flex items-center gap-1.5">
               <svg width="20" height="8" class="shrink-0"><line x1="1" y1="4" x2="19" y2="4" stroke={SIDECAR_COLOR} stroke-width="2" stroke-dasharray="4 3" /></svg>
               Sidecar (runs alongside)
             </span>
           </Show>
-          <span class="border-l border-neutral-300 pl-3 dark:border-neutral-700">drag to pan · scroll to zoom</span>
+          <span class="border-l border-line pl-3">drag to pan · scroll to zoom</span>
         </div>
         <div class="flex items-center gap-1">
-          <button type="button" onClick={() => zoomButton(1 / 1.2)} class="h-7 w-7 rounded border border-neutral-300 text-sm font-semibold text-neutral-600 transition hover:bg-neutral-100 dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-800" aria-label="Zoom out">−</button>
-          <button type="button" onClick={() => zoomButton(1.2)} class="h-7 w-7 rounded border border-neutral-300 text-sm font-semibold text-neutral-600 transition hover:bg-neutral-100 dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-800" aria-label="Zoom in">+</button>
-          <button type="button" onClick={fitToView} class="h-7 rounded border border-neutral-300 px-2 text-[11px] font-semibold uppercase tracking-wide text-neutral-600 transition hover:bg-neutral-100 dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-800">Fit</button>
+          <button type="button" onClick={() => zoomButton(1 / 1.2)} class="h-7 w-7 rounded-md border border-line text-sm font-semibold text-muted transition-colors hover:bg-surface2 hover:text-ink" aria-label="Zoom out">−</button>
+          <button type="button" onClick={() => zoomButton(1.2)} class="h-7 w-7 rounded-md border border-line text-sm font-semibold text-muted transition-colors hover:bg-surface2 hover:text-ink" aria-label="Zoom in">+</button>
+          <button type="button" onClick={fitToView} class="h-7 rounded-md border border-line px-2 text-2xs font-semibold uppercase tracking-wide text-muted transition-colors hover:bg-surface2 hover:text-ink">Fit</button>
         </div>
       </div>
 
@@ -324,10 +324,10 @@ export default function DagVisualization(props: DagVisualizationProps) {
         ref={viewport}
         onWheel={onWheel}
         onMouseDown={onBackgroundMouseDown}
-        class="relative h-[560px] w-full overflow-hidden rounded-xl border border-neutral-200 bg-neutral-50 dark:border-neutral-800 dark:bg-neutral-950"
+        class="relative h-[560px] w-full overflow-hidden rounded-lg border border-line bg-canvas"
         style={{
           cursor: panning() ? 'grabbing' : 'grab',
-          'background-image': 'radial-gradient(circle, rgba(120,120,140,0.18) 1px, transparent 1px)',
+          'background-image': 'radial-gradient(circle, rgb(var(--c-line-strong) / 0.35) 1px, transparent 1px)',
           'background-size': '22px 22px',
         }}
       >
@@ -353,8 +353,8 @@ export default function DagVisualization(props: DagVisualizationProps) {
                 const x = PAD_X + colIdx() * (NODE_W + H_GAP) - 16
                 return (
                   <>
-                    <rect x={x} y={20} width={NODE_W + 32} height={canvasH() - 40} rx="12" fill="currentColor" class="text-neutral-200/30 dark:text-neutral-800/40" />
-                    <text x={x + (NODE_W + 32) / 2} y={40} text-anchor="middle" font-size="11" font-weight="700" letter-spacing="0.12em" fill="currentColor" class="text-neutral-400 dark:text-neutral-500">
+                    <rect x={x} y={20} width={NODE_W + 32} height={canvasH() - 40} rx="12" fill="rgb(var(--c-surface2) / 0.5)" />
+                    <text x={x + (NODE_W + 32) / 2} y={40} text-anchor="middle" font-size="11" font-weight="700" letter-spacing="0.12em" fill="rgb(var(--c-faint))">
                       STAGE {colIdx() + 1}
                     </text>
                   </>
@@ -373,7 +373,7 @@ export default function DagVisualization(props: DagVisualizationProps) {
                 const flowing = () => statusFor(edge.to).tone === 'warning'
                 return (
                   <g style={{ opacity: active() ? 1 : 0.12, transition: 'opacity 0.15s' }}>
-                    <path d={path} fill="none" stroke-width="5" class="stroke-neutral-200/70 dark:stroke-neutral-800/70" stroke-linecap="round" />
+                    <path d={path} fill="none" stroke-width="5" stroke="rgb(var(--c-line) / 0.7)" stroke-linecap="round" />
                     <path d={path} fill="none" stroke={color} stroke-width={active() && hovered() ? 2.75 : 2} stroke-linecap="round" marker-end={`url(#dag-arrow-${markerKey})`} classList={{ 'dag-edge-flow': flowing() }} />
                     <Show when={edge.condition}>
                       <g>
@@ -433,7 +433,7 @@ export default function DagVisualization(props: DagVisualizationProps) {
                     style={{
                       left: `${pos.x}px`, top: `${pos.y}px`, width: `${pos.w}px`, height: `${pos.h}px`,
                       'border-color': SIDECAR_COLOR,
-                      'background-color': 'color-mix(in srgb, ' + SIDECAR_COLOR + ' 7%, white)',
+                      'background-color': 'color-mix(in srgb, ' + SIDECAR_COLOR + ' 8%, rgb(var(--c-surface)))',
                       opacity: dimmed() ? 0.35 : 1,
                       'z-index': hovered() === taskName ? 20 : 1,
                     }}
@@ -443,7 +443,7 @@ export default function DagVisualization(props: DagVisualizationProps) {
                       <div class="flex items-center gap-1.5 min-w-0">
                         <span class="shrink-0 text-[11px]" style={{ color: SIDECAR_COLOR }}>{lifecycleGlyph('sidecar')}</span>
                         <span class={`h-1.5 w-1.5 shrink-0 rounded-full ${style().dot} ${inProgress() ? 'animate-pulse' : ''}`} />
-                        <span class="truncate text-[12px] font-semibold text-neutral-900 dark:text-neutral-100">{pos.task.name}</span>
+                        <span class="truncate text-[12px] font-semibold text-ink">{pos.task.name}</span>
                         <span class="ml-auto shrink-0 rounded px-1.5 py-0.5 text-[8px] font-bold uppercase tracking-wider text-white" style={{ 'background-color': SIDECAR_COLOR }}>Sidecar</span>
                       </div>
                       <div class="flex items-center gap-1.5 text-[9px] min-w-0">
@@ -466,7 +466,7 @@ export default function DagVisualization(props: DagVisualizationProps) {
                   onMouseEnter={() => setHovered(taskName)}
                   onMouseLeave={() => setHovered(null)}
                   draggable={false}
-                  class={`group absolute flex flex-col overflow-hidden rounded-xl border border-neutral-200 shadow-sm ring-1 transition-all duration-150 hover:-translate-y-0.5 hover:shadow-lg dark:border-neutral-700 ${style().ring} ${style().bg}`}
+                  class={`group absolute flex flex-col overflow-hidden rounded-xl border border-line shadow-sm ring-1 transition-all duration-150 hover:-translate-y-0.5 hover:shadow-lg ${style().ring} ${style().bg}`}
                   style={{ left: `${pos.x}px`, top: `${pos.y}px`, width: `${pos.w}px`, height: `${pos.h}px`, opacity: dimmed() ? 0.35 : 1, 'z-index': hovered() === taskName ? 20 : 1 }}
                 >
                   <div class="h-1 w-full shrink-0" style={{ 'background-color': groupColor() }} />
@@ -475,10 +475,10 @@ export default function DagVisualization(props: DagVisualizationProps) {
                     <div class="flex flex-1 flex-col justify-center gap-1 px-3 py-2 min-w-0">
                       <div class="flex items-center gap-2 min-w-0">
                         <span class={`h-2 w-2 shrink-0 rounded-full ${style().dot} ${inProgress() ? 'animate-pulse' : ''}`} />
-                        <span class="truncate text-[13px] font-semibold text-neutral-900 dark:text-neutral-100">{pos.task.name}</span>
+                        <span class="truncate text-[13px] font-semibold text-ink">{pos.task.name}</span>
                       </div>
-                      <div class="flex items-center gap-1.5 text-[10px] text-neutral-500 dark:text-neutral-400 min-w-0">
-                        <span class="shrink-0 rounded bg-neutral-100 px-1.5 py-0.5 font-medium dark:bg-neutral-800">{pos.task.kind}</span>
+                      <div class="flex items-center gap-1.5 text-[10px] text-muted min-w-0">
+                        <span class="shrink-0 rounded bg-surface2 px-1.5 py-0.5 font-medium">{pos.task.kind}</span>
                         <span class="inline-flex shrink-0 items-center gap-0.5" title={`${pos.task.lifecycle} lifecycle`}>{lifecycleGlyph(pos.task.lifecycle)} {pos.task.lifecycle}</span>
                         <span class="ml-auto inline-flex shrink-0 items-center gap-1 truncate font-medium" style={{ color: groupColor() }} title={`group: ${pos.task.group}`}>
                           <span class="h-1.5 w-1.5 rounded-full" style={{ 'background-color': groupColor() }} />
@@ -496,11 +496,11 @@ export default function DagVisualization(props: DagVisualizationProps) {
 
         {/* Group legend overlay */}
         <Show when={groupColors().size > 1}>
-          <div class="pointer-events-none absolute bottom-3 left-3 flex max-w-[70%] flex-wrap gap-x-3 gap-y-1 rounded-lg border border-neutral-200/80 bg-white/85 px-3 py-2 text-[10px] shadow-sm backdrop-blur dark:border-neutral-700/80 dark:bg-neutral-900/85">
-            <span class="font-semibold uppercase tracking-wide text-neutral-400">Groups</span>
+          <div class="pointer-events-none absolute bottom-3 left-3 flex max-w-[70%] flex-wrap gap-x-3 gap-y-1 rounded-lg border border-line/80 bg-surface/85 px-3 py-2 text-[10px] shadow-sm backdrop-blur">
+            <span class="font-semibold uppercase tracking-wide text-faint">Groups</span>
             <For each={[...groupColors().entries()]}>
               {([group, color]) => (
-                <span class="inline-flex items-center gap-1 text-neutral-600 dark:text-neutral-300">
+                <span class="inline-flex items-center gap-1 text-muted">
                   <span class="h-2 w-2 rounded-full" style={{ 'background-color': color }} />
                   {group}
                 </span>
@@ -510,7 +510,7 @@ export default function DagVisualization(props: DagVisualizationProps) {
         </Show>
 
         {/* Zoom indicator */}
-        <div class="pointer-events-none absolute bottom-3 right-3 rounded-md border border-neutral-200/80 bg-white/85 px-2 py-1 text-[10px] font-semibold tabular-nums text-neutral-500 shadow-sm backdrop-blur dark:border-neutral-700/80 dark:bg-neutral-900/85 dark:text-neutral-400">
+        <div class="pointer-events-none absolute bottom-3 right-3 rounded-md border border-line/80 bg-surface/85 px-2 py-1 text-[10px] font-semibold tabular-nums text-muted shadow-sm backdrop-blur">
           {Math.round(scale() * 100)}%
         </div>
       </div>

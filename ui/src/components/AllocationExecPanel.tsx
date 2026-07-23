@@ -8,6 +8,7 @@ import { managerClient } from '../grpcClient'
 import type { JobAction } from '../gen/legion_pb'
 import ExecTerminal from './ExecTerminal'
 import type { ExecStartOptions } from '../lib/execSocket'
+import { Badge, Button, Icon, checkboxClass, cx, inputClass, selectClass } from './ui'
 
 interface Props {
   allocationId: bigint
@@ -69,52 +70,53 @@ export default function AllocationExecPanel(props: Props) {
   }
 
   return (
-    <div class="mt-3 border-t border-neutral-200 pt-3 dark:border-neutral-700">
+    <div class="mt-3 border-t border-line pt-3">
       <button
-        class="text-sm font-medium text-blue-600 hover:underline dark:text-blue-400"
+        type="button"
+        class="flex items-center gap-1.5 text-sm font-medium text-brass-strong transition-colors hover:text-brass"
         onClick={() => setOpen(!open())}
+        aria-expanded={open()}
       >
-        {open() ? '▾' : '▸'} Exec &amp; actions
+        <Icon name="chevronRight" size={13} class={cx('transition-transform', open() && 'rotate-90')} />
+        <Icon name="terminal" size={14} />
+        Exec &amp; actions
       </button>
 
       <Show when={open()}>
-        <div class="mt-3 space-y-4">
+        <div class="mt-3 space-y-3">
           {/* Exec launcher */}
-          <div class="rounded-md border border-neutral-200 p-3 dark:border-neutral-700">
-            <p class="mb-2 text-xs font-semibold uppercase tracking-wide text-neutral-500">
-              Run a command
-            </p>
+          <div class="rounded-md border border-line bg-surface p-3">
+            <p class="eyebrow mb-2">Run a command</p>
             <div class="flex flex-wrap items-center gap-2">
               <input
-                class="flex-1 rounded border border-neutral-300 px-2 py-1 font-mono text-sm dark:border-neutral-600 dark:bg-neutral-800"
+                class={cx(inputClass, 'flex-1 font-mono')}
                 value={command()}
                 onInput={(e) => setCommand(e.currentTarget.value)}
                 placeholder="/bin/sh"
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') launchExec()
+                }}
               />
-              <label class="flex items-center gap-1 text-sm">
+              <label class="flex items-center gap-1.5 text-xs text-muted">
                 <input
                   type="checkbox"
+                  class={checkboxClass}
                   checked={interactive()}
                   onChange={(e) => setInteractive(e.currentTarget.checked)}
                 />
                 Interactive (tty)
               </label>
-              <button
-                class="rounded bg-blue-600 px-3 py-1 text-sm font-medium text-white hover:bg-blue-700"
-                onClick={launchExec}
-              >
+              <Button variant="primary" icon="terminal" onClick={launchExec}>
                 Exec
-              </button>
+              </Button>
             </div>
           </div>
 
           {/* Actions */}
           <Show when={(actions()?.length ?? 0) > 0}>
-            <div class="rounded-md border border-neutral-200 p-3 dark:border-neutral-700">
-              <p class="mb-2 text-xs font-semibold uppercase tracking-wide text-neutral-500">
-                Actions
-              </p>
-              <div class="space-y-3">
+            <div class="rounded-md border border-line bg-surface p-3">
+              <p class="eyebrow mb-2">Actions</p>
+              <div class="space-y-2.5">
                 <For each={actions()}>
                   {(action) => <ActionForm action={action} onRun={launchAction} />}
                 </For>
@@ -148,30 +150,27 @@ function ActionForm(props: {
     setValues({ ...values(), [name]: value })
 
   return (
-    <div class="rounded border border-neutral-200 p-2 dark:border-neutral-700">
-      <div class="flex items-center justify-between">
-        <div>
+    <div class="rounded-md border border-line bg-surface2/40 p-2.5">
+      <div class="flex items-center justify-between gap-2">
+        <div class="min-w-0">
           <span class="font-mono text-sm font-semibold">{props.action.name}</span>
           <Show when={props.action.tty}>
-            <span class="ml-2 rounded bg-neutral-200 px-1 text-xs dark:bg-neutral-700">tty</span>
+            <Badge tone="neutral" class="ml-2">tty</Badge>
           </Show>
           <Show when={props.action.description}>
-            <p class="text-xs text-neutral-500">{props.action.description}</p>
+            <p class="mt-0.5 text-xs text-faint">{props.action.description}</p>
           </Show>
         </div>
-        <button
-          class="rounded bg-emerald-600 px-3 py-1 text-sm font-medium text-white hover:bg-emerald-700"
-          onClick={() => props.onRun(props.action, values())}
-        >
+        <Button variant="accent" icon="play" onClick={() => props.onRun(props.action, values())}>
           Run
-        </button>
+        </Button>
       </div>
       <Show when={props.action.params.length > 0}>
         <div class="mt-2 grid gap-2 sm:grid-cols-2">
           <For each={props.action.params}>
             {(param) => (
               <label class="text-xs">
-                <span class="text-neutral-600 dark:text-neutral-300">
+                <span class="text-muted">
                   {param.name}
                   {param.required ? ' *' : ''}
                 </span>
@@ -180,7 +179,7 @@ function ActionForm(props: {
                   fallback={
                     <input
                       type={param.type === 'int' ? 'number' : 'text'}
-                      class="mt-0.5 w-full rounded border border-neutral-300 px-2 py-1 font-mono text-sm dark:border-neutral-600 dark:bg-neutral-800"
+                      class={cx(inputClass, 'mt-0.5 font-mono')}
                       value={values()[param.name] ?? ''}
                       placeholder={param.sensitive ? '••••' : param.default}
                       onInput={(e) => setParam(param.name, e.currentTarget.value)}
@@ -188,7 +187,7 @@ function ActionForm(props: {
                   }
                 >
                   <select
-                    class="mt-0.5 w-full rounded border border-neutral-300 px-2 py-1 text-sm dark:border-neutral-600 dark:bg-neutral-800"
+                    class={cx(selectClass, 'mt-0.5 w-full')}
                     value={values()[param.name] ?? ''}
                     onChange={(e) => setParam(param.name, e.currentTarget.value)}
                   >
