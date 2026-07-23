@@ -15,8 +15,11 @@ export default function JobDetail() {
   const jobName = createMemo(() => decodeURIComponent(params.id))
   const [activeTab, setActiveTab] = createSignal<'overview' | 'spec' | 'logs'>('overview')
   const [actionMessage, setActionMessage] = createSignal('')
+  const [actionFailed, setActionFailed] = createSignal(false)
 
-  const [jobData] = createResource(async () => {
+  // Keyed on the route param so navigating job→job (e.g. via the command
+  // palette) refetches instead of showing the previous job's data.
+  const [jobData] = createResource(jobName, async () => {
     const [jobInfo, ledger, rollouts, spec, specHistory] = await Promise.all([
       managerClient.getJobInfo({ name: jobName() }),
       managerClient.getLedger({}),
@@ -149,10 +152,12 @@ export default function JobDetail() {
   const destroyJob = async () => {
     try {
       const response = await managerClient.destroyJob({ name: jobName() })
+      setActionFailed(false)
       setActionMessage(response.message || 'Job destroyed')
       setTimeout(() => navigate('/jobs'), 900)
     } catch (error) {
       console.error(error)
+      setActionFailed(true)
       setActionMessage('Destroy failed: stop the job first, then retry.')
     }
   }
@@ -173,7 +178,9 @@ export default function JobDetail() {
             actions={<ConfirmButton label="Delete job" onConfirm={() => void destroyJob()} />}
           />
           <Show when={actionMessage()}>
-            <Note tone="info" class="mb-4">{actionMessage()}</Note>
+            <div aria-live="polite">
+              <Note tone={actionFailed() ? 'danger' : 'info'} class="mb-4">{actionMessage()}</Note>
+            </div>
           </Show>
 
           <Tabs
@@ -236,7 +243,7 @@ export default function JobDetail() {
                                           <Badge tone="accent">stateful · {task.stateful!.mode}</Badge>
                                         </Show>
                                         <Show when={task.lifecycle === 'sidecar'}>
-                                          <Badge tone="info">sidecar</Badge>
+                                          <Badge tone="neutral">sidecar</Badge>
                                         </Show>
                                         <Show when={task.dependsOn.length > 0}>
                                           <span class="text-2xs text-faint">

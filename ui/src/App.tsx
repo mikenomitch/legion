@@ -1,6 +1,5 @@
 import { A, Navigate, Route, Router, useLocation, useNavigate, type RouteSectionProps } from '@solidjs/router'
 import { For, Show, createEffect, createMemo, createResource, createSignal, onCleanup, onMount } from 'solid-js'
-import type { LedgerNode, Rollout } from './gen/legion_pb'
 import Breadcrumbs from './components/Breadcrumbs'
 import { AclBanner } from './components/AclBanner'
 import { Icon, PageHeader, cx, type IconName } from './components/ui'
@@ -192,7 +191,12 @@ const Layout = (props: RouteSectionProps) => {
 
   const totalCommandPaletteEntries = createMemo(() => commandPaletteEntries().length)
 
+  // Remember what was focused before the palette opened so closing it
+  // returns focus there instead of dropping it on <body>.
+  let paletteReturnFocus: HTMLElement | null = null
+
   const openCommandPalette = () => {
+    paletteReturnFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null
     setCommandPaletteQuery('')
     setCommandPaletteOpen(true)
     setCommandPaletteSelected(0)
@@ -200,7 +204,10 @@ const Layout = (props: RouteSectionProps) => {
   }
 
   const closeCommandPalette = () => {
+    if (!commandPaletteOpen()) return
     setCommandPaletteOpen(false)
+    paletteReturnFocus?.focus()
+    paletteReturnFocus = null
   }
 
   const executeCommand = (href: string) => {
@@ -284,6 +291,10 @@ const Layout = (props: RouteSectionProps) => {
   }
 
   const onGlobalCommandPaletteKeydown = (event: KeyboardEvent) => {
+    if (event.key === 'Escape' && isNavOpen()) {
+      setIsNavOpen(false)
+      return
+    }
     if (commandPaletteOpen()) {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
         event.preventDefault()
@@ -298,6 +309,9 @@ const Layout = (props: RouteSectionProps) => {
     }
 
     if ((event.key.toLowerCase() === 'u') && !event.metaKey && !event.ctrlKey && !event.altKey && !isEditableTarget(event)) {
+      // Don't hijack the key while a link/button has focus (keyboard users).
+      const active = document.activeElement as HTMLElement | null
+      if (active && active !== document.body && active.closest('a, button, [role="button"]')) return
       event.preventDefault()
       navigateUpOneLevel()
       return
@@ -407,6 +421,7 @@ const Layout = (props: RouteSectionProps) => {
     <div class="min-h-screen">
       <div class="flex min-h-screen">
         <aside
+          id="app-sidebar"
           class={cx(
             'fixed inset-y-0 left-0 z-40 flex w-60 shrink-0 transform flex-col border-r border-line bg-surface transition md:sticky md:top-0 md:h-screen md:translate-x-0',
             isNavOpen() ? 'translate-x-0' : '-translate-x-full',
@@ -455,11 +470,11 @@ const Layout = (props: RouteSectionProps) => {
           </div>
         </aside>
         <Show when={isNavOpen()}>
-          <button
-            type="button"
+          {/* Click-to-close scrim; keyboard users close via Escape or the ✕ button. */}
+          <div
             class="fixed inset-0 z-30 bg-black/40 backdrop-blur-[1px] md:hidden"
             onClick={() => setIsNavOpen(false)}
-            aria-label="Close menu overlay"
+            aria-hidden="true"
           />
         </Show>
         <div class="relative flex min-h-screen min-w-0 flex-1 flex-col">
@@ -470,6 +485,8 @@ const Layout = (props: RouteSectionProps) => {
               class="rounded-md p-1.5 text-muted hover:bg-surface2 md:hidden"
               onClick={() => setIsNavOpen((value) => !value)}
               aria-label="Open menu"
+              aria-expanded={isNavOpen()}
+              aria-controls="app-sidebar"
             >
               <Icon name="menu" size={17} />
             </button>
@@ -507,8 +524,18 @@ const Layout = (props: RouteSectionProps) => {
               class="fixed inset-0 z-50 flex items-start justify-center bg-black/50 p-4 pt-[12vh] backdrop-blur-[2px]"
               data-command-palette
               onClick={closeCommandPalette}
+              onKeyDown={(event) => {
+                // Keep focus on the search input — the palette is keyboard-driven.
+                if (event.key === 'Tab') {
+                  event.preventDefault()
+                  commandPaletteInput?.focus()
+                }
+              }}
             >
               <div
+                role="dialog"
+                aria-modal="true"
+                aria-label="Command palette"
                 class="w-full max-w-xl overflow-hidden rounded-xl border border-line bg-surface shadow-pop"
                 onClick={(event) => event.stopPropagation()}
               >
@@ -521,11 +548,15 @@ const Layout = (props: RouteSectionProps) => {
                     onKeyDown={onCommandPaletteKeydown}
                     placeholder="Jump to a page, job, node…"
                     class="w-full border-none bg-transparent p-0 text-sm text-ink placeholder:text-faint focus:outline-none focus:ring-0"
+                    role="combobox"
+                    aria-expanded="true"
+                    aria-controls="command-palette-listbox"
+                    aria-activedescendant={`command-palette-option-${commandPaletteSelected()}`}
                     aria-label="Search command palette"
                   />
                   <kbd class="rounded border border-line bg-surface2 px-1.5 py-0.5 font-mono text-2xs text-faint">esc</kbd>
                 </div>
-                <div class="max-h-[22rem] overflow-auto p-1.5 text-sm">
+                <div id="command-palette-listbox" role="listbox" aria-label="Destinations" class="max-h-[22rem] overflow-auto p-1.5 text-sm">
                   <Show
                     when={totalCommandPaletteEntries() > 0}
                     fallback={<p class="px-3 py-6 text-center text-sm text-faint">No matches.</p>}
@@ -536,6 +567,10 @@ const Layout = (props: RouteSectionProps) => {
                         return (
                           <button
                             type="button"
+                            role="option"
+                            id={`command-palette-option-${index()}`}
+                            aria-selected={isActive()}
+                            tabindex={-1}
                             onMouseEnter={() => setCommandPaletteSelected(index())}
                             onClick={() => executeCommand(entry.href)}
                             class={cx(
@@ -555,9 +590,9 @@ const Layout = (props: RouteSectionProps) => {
                   </Show>
                 </div>
                 <div class="flex items-center gap-3 border-t border-line px-4 py-2 text-2xs text-faint">
-                  <span><kbd class="font-mono">↑↓</kbd> or <kbd class="font-mono">j/k</kbd> navigate</span>
+                  <span><kbd class="font-mono">↑↓</kbd> navigate</span>
                   <span><kbd class="font-mono">↵</kbd> open</span>
-                  <span><kbd class="font-mono">u</kbd> up one level</span>
+                  <span><kbd class="font-mono">esc</kbd> close</span>
                 </div>
               </div>
             </div>
@@ -575,12 +610,9 @@ const Layout = (props: RouteSectionProps) => {
 }
 
 const AppRoutes = () => {
-  const [ledger] = createResource(async (): Promise<readonly LedgerNode[]> => (await managerClient.getLedger({})).nodes)
-  const [rollouts] = createResource(async (): Promise<readonly Rollout[]> => (await managerClient.listRollouts({ activeOnly: true, page: 1, pageSize: 20 })).rollouts)
-
   return (
     <Route path="/" component={(props) => <Layout {...props}>{props.children}</Layout>}>
-      <Route path="/" component={() => <Homepage ledger={ledger} rollouts={rollouts} />} />
+      <Route path="/" component={Homepage} />
       <Route path="/nodes" component={Nodes} />
       <Route path="/nodes/:id" component={NodeDetail} />
       <Route path="/manager" component={Manager} />
@@ -601,7 +633,7 @@ const AppRoutes = () => {
       <Route path="/observability" component={Observability} />
       <Route path="/state-explorer" component={StateExplorer} />
       <Route path="/testing" component={TestingUtils} />
-      <Route path="*" component={() => <Homepage ledger={ledger} rollouts={rollouts} />} />
+      <Route path="*" component={Homepage} />
     </Route>
   )
 }

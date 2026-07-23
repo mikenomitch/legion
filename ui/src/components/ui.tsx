@@ -166,7 +166,7 @@ export function SectionCard(props: SectionCardProps) {
   return (
     <section class={cx('overflow-hidden rounded-lg border border-line bg-surface shadow-card', props.class)}>
       <Show when={props.title || props.actions || props.description}>
-        <header class="flex flex-wrap items-center justify-between gap-x-4 gap-y-1 border-b border-line px-4 py-2.5">
+        <header class="flex min-h-[44px] flex-wrap items-center justify-between gap-x-4 gap-y-1 border-b border-line px-4 py-2">
           <div class="min-w-0">
             <Show when={props.title}>
               <h3 class="eyebrow !text-muted">{props.title}</h3>
@@ -308,14 +308,32 @@ export function LoadingRows(props: { rows?: number; class?: string }) {
 export type TabItem = { id: string; label: string; count?: number }
 
 export function Tabs(props: { tabs: readonly TabItem[]; active: string; onChange: (id: string) => void; class?: string }) {
+  let listRef: HTMLDivElement | undefined
+  // Roving tabindex + arrow keys per the WAI-ARIA tabs pattern.
+  const onKeyDown = (event: KeyboardEvent, index: number) => {
+    const total = props.tabs.length
+    let next: number | undefined
+    if (event.key === 'ArrowRight') next = (index + 1) % total
+    else if (event.key === 'ArrowLeft') next = (index - 1 + total) % total
+    else if (event.key === 'Home') next = 0
+    else if (event.key === 'End') next = total - 1
+    if (next === undefined) return
+    event.preventDefault()
+    const tab = props.tabs[next]
+    props.onChange(tab.id)
+    const buttons = listRef?.querySelectorAll<HTMLButtonElement>('[role="tab"]')
+    buttons?.[next]?.focus()
+  }
   return (
-    <div class={cx('flex items-center gap-1 overflow-x-auto border-b border-line', props.class)} role="tablist">
-      {props.tabs.map((tab) => (
+    <div ref={listRef} class={cx('flex items-center gap-1 overflow-x-auto border-b border-line', props.class)} role="tablist">
+      {props.tabs.map((tab, index) => (
         <button
           type="button"
           role="tab"
           aria-selected={props.active === tab.id}
+          tabindex={props.active === tab.id ? 0 : -1}
           onClick={() => props.onChange(tab.id)}
+          onKeyDown={(event) => onKeyDown(event, index)}
           class={cx(
             '-mb-px flex items-center gap-1.5 whitespace-nowrap border-b-2 px-3 py-2 text-sm font-medium transition-colors',
             props.active === tab.id
@@ -341,7 +359,9 @@ type ButtonVariant = 'primary' | 'subtle' | 'ghost' | 'danger' | 'accent'
 type ButtonSize = 'xs' | 'sm' | 'md'
 
 const buttonVariantClasses: Record<ButtonVariant, string> = {
-  primary: 'bg-ink text-canvas hover:bg-ink/85 border border-transparent',
+  // Brass fill with inverse text works in both themes: dark gold on light
+  // canvas text in light mode, light gold with near-black text in dark mode.
+  primary: 'bg-brass font-semibold text-canvas hover:bg-brass-strong border border-transparent',
   accent: 'bg-brass/15 text-brass-strong hover:bg-brass/25 border border-brass/30',
   subtle: 'border border-line bg-surface text-ink hover:border-line-strong hover:bg-surface2',
   ghost: 'border border-transparent text-muted hover:bg-surface2 hover:text-ink',
@@ -383,16 +403,24 @@ export function Button(props: ButtonProps) {
 }
 
 // Two-step destructive button: first click arms it, second click confirms.
+// A short grace period after arming means an accidental double-click cannot
+// confirm; blur and Escape disarm; the state change is announced politely.
 export function ConfirmButton(props: { label: string; confirmLabel?: string; onConfirm: () => void; size?: ButtonSize; icon?: IconName; class?: string; disabled?: boolean }) {
   const [armed, setArmed] = createSignal(false)
   let timer: ReturnType<typeof setTimeout> | undefined
+  let armedAt = 0
+  const disarm = () => {
+    setArmed(false)
+    if (timer) clearTimeout(timer)
+  }
   const click = () => {
     if (armed()) {
-      setArmed(false)
-      if (timer) clearTimeout(timer)
+      if (Date.now() - armedAt < 450) return
+      disarm()
       props.onConfirm()
       return
     }
+    armedAt = Date.now()
     setArmed(true)
     timer = setTimeout(() => setArmed(false), 4000)
   }
@@ -404,8 +432,17 @@ export function ConfirmButton(props: { label: string; confirmLabel?: string; onC
       disabled={props.disabled}
       class={cx(armed() && 'border-red-500 bg-red-500/15 font-semibold', props.class)}
       onClick={click}
+      onBlur={disarm}
+      onKeyDown={(event: KeyboardEvent) => {
+        if (event.key === 'Escape' && armed()) {
+          event.stopPropagation()
+          disarm()
+        }
+      }}
     >
-      {armed() ? (props.confirmLabel ?? `Confirm ${props.label.toLowerCase()}?`) : props.label}
+      <span aria-live="polite">
+        {armed() ? (props.confirmLabel ?? `Confirm ${props.label.toLowerCase()}?`) : props.label}
+      </span>
     </Button>
   )
 }
@@ -459,7 +496,7 @@ export const linkClass = 'font-medium text-brass-strong underline-offset-2 hover
 
 export const tableClass = 'min-w-full divide-y divide-line text-sm'
 export const theadClass = 'bg-surface2/60'
-export const thClass = 'px-4 py-2 text-left text-2xs font-semibold uppercase tracking-wider text-faint'
+export const thClass = 'px-4 py-2 text-left text-2xs font-semibold uppercase tracking-wider text-muted'
 export const tdClass = 'px-4 py-2 align-middle text-ink'
 export const trHoverClass = 'transition-colors hover:bg-surface2/50'
 
@@ -490,7 +527,7 @@ export function CodeBlock(props: { code: string; class?: string; maxHClass?: str
         </div>
       </Show>
       <Show when={!props.label}>
-        <div class="absolute right-1.5 top-1.5 opacity-0 transition-opacity group-hover:opacity-100">
+        <div class="absolute right-1.5 top-1.5 opacity-0 transition-opacity focus-within:opacity-100 group-hover:opacity-100">
           <CopyButton text={props.code} label="" class="bg-surface/90" />
         </div>
       </Show>

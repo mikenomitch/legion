@@ -1,6 +1,7 @@
 import { createEffect, createMemo, createResource, createSignal } from 'solid-js'
 import SharedIndex from '../components/SharedIndex'
 import { managerClient } from '../grpcClient'
+import { debounced } from '../utils/debounce'
 import { formatRelativeTime } from '../utils/format'
 
 export default function Jobs() {
@@ -8,6 +9,7 @@ export default function Jobs() {
   const [sort, setSort] = createSignal('created_at:desc')
   const [page, setPage] = createSignal(1)
   const [pageSize, setPageSize] = createSignal(20)
+  const searchQuery = debounced(search)
 
   createEffect(() => {
     search()
@@ -27,7 +29,7 @@ export default function Jobs() {
   })
 
   const [data] = createResource(
-    () => ({ search: search(), sort: sort(), page: page(), pageSize: pageSize() }),
+    () => ({ search: searchQuery(), sort: sort(), page: page(), pageSize: pageSize() }),
     async (input) => {
       const [sortBy, sortOrder] = input.sort.split(':')
       return managerClient.listJobs({ query: input.search, sortBy, sortOrder, page: input.page, pageSize: input.pageSize })

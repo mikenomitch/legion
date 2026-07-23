@@ -206,7 +206,7 @@ export default function KeyValue() {
   )
 
   return (
-    <div class="grid items-start gap-4 lg:grid-cols-[300px_1fr]">
+    <div class="grid items-stretch gap-4 lg:grid-cols-[300px_1fr]">
       <SectionCard
         title="Keys"
         actions={
@@ -216,9 +216,11 @@ export default function KeyValue() {
           </>
         }
         flush
+        class="flex flex-col"
+        contentClass="min-h-0 flex-1"
       >
         <Show when={!loading()} fallback={<div class="p-4"><Spinner /></div>}>
-          <div class="max-h-[540px] overflow-auto p-2">
+          <div class="h-full min-h-[16rem] max-h-[640px] overflow-auto p-2">
             {entries().length > 0 ? (
               renderTree(tree(), 0)
             ) : (

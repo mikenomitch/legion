@@ -40,7 +40,8 @@ export default function TaskDetail() {
   const jobName = createMemo(() => decodeURIComponent(params.id))
   const taskName = createMemo(() => decodeURIComponent(params.taskName))
 
-  const [data] = createResource(async () => {
+  // Keyed on the route params so task→task navigation refetches.
+  const [data] = createResource(() => `${jobName()}/${taskName()}`, async () => {
     const [jobInfo, rollouts, spec, ledger] = await Promise.all([
       managerClient.getJobInfo({ name: jobName() }),
       managerClient.listRollouts({ jobId: jobName(), activeOnly: false, page: 1, pageSize: 200 }),

@@ -491,7 +491,7 @@ export default function NodeDeepView(props: NodeDeepViewProps) {
                   badges={
                     <>
                       <StatusBadge status={current.status || 'unknown'} />
-                      <Badge tone={parsed.healthSummary.tone} dot>{parsed.healthSummary.label}</Badge>
+                      <Badge tone={parsed.healthSummary.tone} dot class="uppercase tracking-wide">{parsed.healthSummary.label}</Badge>
                       <Badge tone="neutral">{allocations().length} allocation{allocations().length === 1 ? '' : 's'}</Badge>
                     </>
                   }
@@ -561,7 +561,7 @@ export default function NodeDeepView(props: NodeDeepViewProps) {
 
                   <SectionCard title="Resource usage">
                     <Show when={resourceUsage().length > 0} fallback={<p class="text-sm text-muted">No resource data available.</p>}>
-                      <div class="grid gap-x-8 gap-y-4 md:grid-cols-2">
+                      <div class="grid gap-x-8 gap-y-4 md:grid-cols-2 xl:grid-cols-3">
                         <For each={resourceUsage()}>
                           {(entry) => (
                             <div>
@@ -571,9 +571,9 @@ export default function NodeDeepView(props: NodeDeepViewProps) {
                                   {formatUsage(entry)} · {resourcePercent(entry)}%
                                 </span>
                               </div>
-                              <div class="mt-1.5 h-1.5 w-full overflow-hidden rounded-full bg-surface2">
+                              <div class="mt-1.5 h-1.5 w-full overflow-hidden rounded-full bg-line/70">
                                 <div
-                                  class={cx('h-full rounded-full transition-all', resourceBarClass(resourcePercent(entry)))}
+                                  class={cx('h-full rounded-full transition-all', resourceBarClass(resourcePercent(entry)), entry.used > 0 && 'min-w-[3px]')}
                                   style={{ width: `${resourcePercent(entry)}%` }}
                                 />
                               </div>
@@ -587,20 +587,21 @@ export default function NodeDeepView(props: NodeDeepViewProps) {
                   <SectionCard title="Health checks" flush>
                     <div class="p-3.5">
                       <div class="mb-3 flex items-center justify-between">
-                        <p class="text-xs text-faint">Overall status</p>
-                        <Badge tone={parsed.healthSummary.tone} dot>{parsed.healthSummary.label}</Badge>
+                        <p class="text-xs text-muted">Overall status</p>
+                        <Badge tone={parsed.healthSummary.tone} dot class="uppercase tracking-wide">{parsed.healthSummary.label}</Badge>
                       </div>
                       <Show
                         when={healthEntries().length > 0}
                         fallback={<p class="text-sm text-muted">No health check data.</p>}
                       >
-                        <div class="grid gap-2 md:grid-cols-2">
+                        {/* CSS columns give a masonry layout so tall cards don't leave holes. */}
+                        <div class="gap-2 md:columns-2 [&>*]:mb-2 [&>*]:break-inside-avoid">
                           <For each={healthEntries()}>
                             {(entry) => (
                               <article class="rounded-md border border-line bg-surface2/40 p-3">
                                 <div class="flex items-start justify-between gap-2">
                                   <p class="text-sm font-medium text-ink">{entry.label}</p>
-                                  <Badge tone={entry.tone} dot>{entry.status}</Badge>
+                                  <Badge tone={entry.tone} dot class="uppercase tracking-wide">{entry.status}</Badge>
                                 </div>
                                 <Show when={entry.details}>
                                   <div class="mt-2 text-xs text-muted">

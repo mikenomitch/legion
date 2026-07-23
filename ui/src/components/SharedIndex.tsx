@@ -39,6 +39,8 @@ type SharedIndexProps = {
   emptyLabel: string
   emptyHint?: string
   extraFilters?: JSX.Element
+  // Hide the Status column for entities that have no meaningful status (e.g. manager config snapshots).
+  hideStatus?: boolean
 }
 
 export default function SharedIndex(props: SharedIndexProps) {
@@ -112,6 +114,10 @@ export default function SharedIndex(props: SharedIndexProps) {
     if (event.metaKey || event.ctrlKey || event.altKey) return
     if (document.querySelector('[data-command-palette]')) return
     if (isTextInputTarget(event)) return
+    // Never steal activation from a focused link/button — Tab-focus and the
+    // j/k virtual selection are separate systems and the focused element wins.
+    const active = document.activeElement as HTMLElement | null
+    if (active && active !== document.body && active.closest('a, button, [role="button"]')) return
 
     const key = event.key.toLowerCase()
     if (key === 'j' || event.key === 'ArrowDown') {
@@ -125,6 +131,7 @@ export default function SharedIndex(props: SharedIndexProps) {
       return
     }
     if (key === 'o' || event.key === 'Enter') {
+      if (selectedIndex() < 0) return
       event.preventDefault()
       openSelectedIndexItem()
     }
@@ -170,18 +177,31 @@ export default function SharedIndex(props: SharedIndexProps) {
       </div>
 
       <SectionCard flush>
-        <Show when={!props.loading} fallback={<LoadingRows rows={5} />}>
+        {/* Keep the previous rows visible during a refetch — only show the
+            skeleton when there is nothing to display yet. */}
+        <Show when={!props.loading || props.items.length > 0} fallback={<LoadingRows rows={5} />}>
           <Show when={!props.error} fallback={<Note tone="danger" class="m-4">{props.error}</Note>}>
             <Show
               when={props.items.length > 0}
-              fallback={<EmptyState icon="search" title={props.emptyLabel} body={props.emptyHint} />}
+              fallback={
+                <Show
+                  when={props.search.trim()}
+                  fallback={<EmptyState icon="search" title={props.emptyLabel} body={props.emptyHint} />}
+                >
+                  <EmptyState icon="search" title={`No ${props.entityLabel.toLowerCase()} match "${props.search.trim()}"`}>
+                    <Button size="xs" class="mt-1" onClick={() => props.onSearch('')}>Clear search</Button>
+                  </EmptyState>
+                </Show>
+              }
             >
               <div class="overflow-x-auto">
                 <table class={tableClass}>
                   <thead class={theadClass}>
                     <tr>
                       <th class={thClass}>{props.entityLabel.replace(/s$/, '')}</th>
-                      <th class={thClass}>Status</th>
+                      <Show when={!props.hideStatus}>
+                        <th class={thClass}>Status</th>
+                      </Show>
                       <For each={props.columns ?? []}>{(column) => <th class={cx(thClass, column.class)}>{column.header}</th>}</For>
                       <th class={cx(thClass, 'text-right')}>Updated</th>
                     </tr>
@@ -206,11 +226,13 @@ export default function SharedIndex(props: SharedIndexProps) {
                               <p class="mt-0.5 text-xs text-faint">{item.subtitle}</p>
                             </Show>
                           </td>
-                          <td class={tdClass}>
-                            <Show when={item.status !== undefined} fallback={<span class="text-faint">—</span>}>
-                              <StatusBadge status={item.status} />
-                            </Show>
-                          </td>
+                          <Show when={!props.hideStatus}>
+                            <td class={tdClass}>
+                              <Show when={item.status !== undefined} fallback={<span class="text-faint">—</span>}>
+                                <StatusBadge status={item.status} />
+                              </Show>
+                            </td>
+                          </Show>
                           <For each={props.columns ?? []}>
                             {(column) => <td class={cx(tdClass, 'text-muted', column.class)}>{item.cells?.[column.key] ?? '—'}</td>}
                           </For>
@@ -225,7 +247,7 @@ export default function SharedIndex(props: SharedIndexProps) {
           </Show>
         </Show>
 
-        <footer class="flex flex-wrap items-center justify-between gap-2 border-t border-line px-4 py-2 text-xs text-muted">
+        <footer class={cx('flex flex-wrap items-center justify-between gap-2 border-t border-line px-4 py-2 text-xs text-muted', props.totalCount === 0 && 'hidden')}>
           <span class="tabular-nums">
             {props.totalCount} total · page {props.page} of {totalPages()}
           </span>

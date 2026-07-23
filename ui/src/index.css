@@ -20,8 +20,8 @@
   --c-line: 228 225 216;
   --c-line-strong: 203 198 185;
   --c-ink: 30 28 23;
-  --c-muted: 106 101 90;
-  --c-faint: 154 148 135;
+  --c-muted: 100 95 84;
+  --c-faint: 128 122 110;
   --c-brass: 143 106 21;
   --c-brass-strong: 110 81 16;
   color-scheme: light;
@@ -34,8 +34,8 @@
   --c-line: 45 41 32;
   --c-line-strong: 68 61 46;
   --c-ink: 235 230 219;
-  --c-muted: 162 154 138;
-  --c-faint: 112 105 90;
+  --c-muted: 168 160 144;
+  --c-faint: 140 132 114;
   --c-brass: 214 180 90;
   --c-brass-strong: 231 201 122;
   color-scheme: dark;

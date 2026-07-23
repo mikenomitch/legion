@@ -2,6 +2,7 @@ import { createEffect, createMemo, createResource, createSignal } from 'solid-js
 import SharedIndex from '../components/SharedIndex'
 import { checkboxClass } from '../components/ui'
 import { managerClient } from '../grpcClient'
+import { debounced } from '../utils/debounce'
 import { formatRelativeTime } from '../utils/format'
 
 const isActiveStatus = (status: string) => !['completed', 'failed', 'cancelled', 'completed_incomplete'].includes(status.toLowerCase())
@@ -11,6 +12,7 @@ export default function Rollouts() {
   const [sort, setSort] = createSignal('updated_at:desc')
   const [page, setPage] = createSignal(1)
   const [pageSize, setPageSize] = createSignal(20)
+  const searchQuery = debounced(search)
   const [activeOnly, setActiveOnly] = createSignal(false)
 
   createEffect(() => {
@@ -29,7 +31,7 @@ export default function Rollouts() {
   })
 
   const [data] = createResource(
-    () => ({ search: search(), sort: sort(), page: page(), pageSize: pageSize(), activeOnly: activeOnly() }),
+    () => ({ search: searchQuery(), sort: sort(), page: page(), pageSize: pageSize(), activeOnly: activeOnly() }),
     async (input) => {
       const [sortBy, sortOrder] = input.sort.split(':')
       return managerClient.listRollouts({ query: input.search, sortBy, sortOrder, page: input.page, pageSize: input.pageSize, activeOnly: input.activeOnly })

@@ -30,7 +30,7 @@ export default function RolloutDetail() {
   const [logFilter, setLogFilter] = createSignal('')
   const [message, setMessage] = createSignal('')
 
-  const [data, { refetch }] = createResource(async () => {
+  const [data, { refetch }] = createResource(rolloutId, async () => {
     const [status, events, ledger] = await Promise.all([
       managerClient.getRolloutStatus({ id: rolloutId() }),
       managerClient.listRolloutEvents({ rolloutId: rolloutId(), limit: 1000 }),

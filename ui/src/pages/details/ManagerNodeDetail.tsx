@@ -14,8 +14,8 @@ function prettyJsonLine(line: string): string {
 
 export default function ManagerNodeDetail() {
   const params = useParams()
-  const [data] = createResource(async () => {
-    const response = await managerClient.getManagerConfigs({ query: decodeURIComponent(params.id), page: 1, pageSize: 1 })
+  const [data] = createResource(() => params.id, async (id) => {
+    const response = await managerClient.getManagerConfigs({ query: decodeURIComponent(id), page: 1, pageSize: 1 })
     return response.configs[0]
   })
   const [o11y] = createResource(async () => managerClient.getObservability({ maxLines: 200 }))

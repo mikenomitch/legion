@@ -5,8 +5,8 @@ import { managerClient } from '../../grpcClient'
 
 export default function JobSpecDetail() {
   const params = useParams()
-  const [data] = createResource(async () => {
-    const id = decodeURIComponent(params.configId)
+  const [data] = createResource(() => params.configId, async (raw) => {
+    const id = decodeURIComponent(raw)
     const response = await managerClient.getJobSpecByConfig({ configId: id })
     return { configId: id, submissions: response.submissions }
   })

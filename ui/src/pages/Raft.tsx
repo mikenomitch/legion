@@ -56,7 +56,7 @@ export default function Raft() {
       </Show>
 
       <Show when={status() && !status()?.status?.enabled}>
-        <Note tone="info">
+        <Note tone="neutral">
           Raft is disabled on this manager — it runs standalone. Enable raft in the manager config for
           leader election and multi-manager failover.
         </Note>

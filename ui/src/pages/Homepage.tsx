@@ -1,17 +1,29 @@
 import { A } from '@solidjs/router'
-import { For, Show, createMemo, type Resource } from 'solid-js'
+import { For, Show, createMemo, createResource, createSignal, onCleanup, onMount } from 'solid-js'
 import { EmptyState, LoadingRows, MonoBadge, Note, SectionCard, StatCard, StatusBadge, TableShell, linkClass, tableClass, tdClass, thClass, theadClass, trHoverClass } from '../components/ui'
-import type { LedgerNode, Rollout } from '../gen/legion_pb'
+import { managerClient } from '../grpcClient'
 import { asDisplay, formatRelativeTime } from '../utils/format'
 import { summarizeHealthChecks } from '../utils/health'
 import { statusTone } from '../utils/status'
+import { POLL_INTERVAL_MS } from '../utils/polling'
 
-interface HomepageProps {
-  ledger: Resource<readonly LedgerNode[] | undefined>
-  rollouts: Resource<readonly Rollout[] | undefined>
-}
+export default function Homepage() {
+  // Poll while the page is mounted so the dashboard stays live; the previous
+  // value is kept during refetches so the tables never flash.
+  const [tick, setTick] = createSignal(0)
+  onMount(() => {
+    const timer = setInterval(() => setTick((value) => value + 1), POLL_INTERVAL_MS)
+    onCleanup(() => clearInterval(timer))
+  })
 
-export default function Homepage(props: HomepageProps) {
+  // +1 because a 0 source is falsy to createResource and would skip the first fetch.
+  const [ledger] = createResource(() => tick() + 1, async () => (await managerClient.getLedger({})).nodes)
+  const [rollouts] = createResource(
+    () => tick() + 1,
+    async () => (await managerClient.listRollouts({ activeOnly: true, page: 1, pageSize: 20 })).rollouts,
+  )
+
+  const props = { ledger, rollouts }
   const workers = createMemo(() => props.ledger() ?? [])
   const allocations = createMemo(() =>
     workers().flatMap((entry) =>
@@ -30,9 +42,12 @@ export default function Homepage(props: HomepageProps) {
   const activeRollouts = createMemo(() => props.rollouts() ?? [])
 
   return (
-    <Show when={!props.ledger.loading} fallback={<LoadingRows rows={6} class="p-0" />}>
+    <Show when={props.ledger() !== undefined || !props.ledger.loading} fallback={<LoadingRows rows={6} class="p-0" />}>
       <Show when={!props.ledger.error} fallback={<Note tone="danger">Failed to reach the manager. Check that it is running and that the UI can reach its gRPC-Web endpoint.</Note>}>
         <div class="space-y-5">
+          <Show when={props.rollouts.error}>
+            <Note tone="danger">Failed to load rollouts.</Note>
+          </Show>
           <div class="grid grid-cols-2 gap-3 lg:grid-cols-4">
             <StatCard
               label="Workers"
@@ -41,7 +56,7 @@ export default function Homepage(props: HomepageProps) {
               value={
                 <>
                   {readyWorkers()}
-                  <span class="text-base font-normal text-faint"> / {workers().length} up</span>
+                  <span class="font-sans text-sm font-normal text-muted"> / {workers().length} up</span>
                 </>
               }
               tone={workers().length > 0 && readyWorkers() < workers().length ? 'warn' : 'neutral'}
@@ -59,7 +74,7 @@ export default function Homepage(props: HomepageProps) {
               value={
                 <>
                   {runningAllocations()}
-                  <span class="text-base font-normal text-faint"> / {allocations().length} healthy</span>
+                  <span class="font-sans text-sm font-normal text-muted"> / {allocations().length} healthy</span>
                 </>
               }
               tone={allocations().length > 0 && runningAllocations() < allocations().length ? 'warn' : 'neutral'}

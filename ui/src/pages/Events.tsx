@@ -74,12 +74,16 @@ export default function Events() {
     }
 
     while (!abortController.signal.aborted) {
+      // gRPC-Web streams have no "open" signal, so treat a stream that
+      // survives its first moments without erroring as live even while quiet.
+      let liveTimer: ReturnType<typeof setTimeout> | undefined
       try {
         setConnection((state) => (state === 'connecting' ? 'connecting' : 'reconnecting'))
         const stream = managerClient.streamEvents(
           { afterId: cursor },
           { signal: abortController.signal },
         )
+        liveTimer = setTimeout(() => setConnection('live'), 1500)
         for await (const event of stream) {
           setConnection('live')
           cursor = event.id > cursor ? event.id : cursor
@@ -88,6 +92,8 @@ export default function Events() {
       } catch (error) {
         if (abortController.signal.aborted) return
         console.error('Scheduler event stream interrupted; reconnecting', error)
+      } finally {
+        if (liveTimer) clearTimeout(liveTimer)
       }
       setConnection('reconnecting')
       await new Promise((resolve) => setTimeout(resolve, RECONNECT_DELAY_MS))
@@ -135,7 +141,7 @@ export default function Events() {
   return (
     <div class="space-y-3">
       <div class="flex flex-wrap items-center gap-2">
-        <span class="flex items-center gap-2 rounded-md border border-line bg-surface px-2.5 py-1.5 text-xs font-medium text-muted">
+        <span class="flex items-center gap-2 px-1 text-xs font-medium text-muted" role="status">
           <Dot tone={connectionTone(connection())} pulse={connection() === 'live'} />
           {connectionLabel()}
         </span>
