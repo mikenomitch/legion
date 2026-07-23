@@ -64,6 +64,12 @@
   //       subTemplate: "{region}:node:{pool}",
   //     },
   //   ],
+  //   // Map a verified control-plane (`legion`) token's claims to ACL
+  //   // policies so a workload can authenticate back to Legion. Empty (the
+  //   // default) = tokens verify to a principal but grant no policies.
+  //   controlPlaneBindings: [
+  //     { claim: "legion.io/job", value: "api", policies: ["kv-reader"] },
+  //   ],
   // },
   persistence: {
     type: "local_disk",

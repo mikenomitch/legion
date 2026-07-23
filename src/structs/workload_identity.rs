@@ -183,11 +183,25 @@ impl WorkloadIdentity {
         validate_identity_name(&self.name)
             .with_context(|| format!("task {task_name} declares an invalid identity name"))?;
 
-        if self.audience.is_empty() {
-            bail!("{scope} must declare at least one audience");
-        }
-        if self.audience.iter().any(|a| a.trim().is_empty()) {
-            bail!("{scope} audience entries cannot be empty");
+        // The reserved control-plane identity `legion` authenticates back to
+        // Legion itself, so its audience is always the cluster issuer and the
+        // manager owns it — an operator must not set one. Every other identity
+        // must declare a non-empty audience (an audience-less token is
+        // replayable against any trusting provider).
+        if self.name == CONTROL_PLANE_IDENTITY_NAME {
+            if !self.audience.is_empty() {
+                bail!(
+                    "{scope} is the reserved control-plane identity {CONTROL_PLANE_IDENTITY_NAME:?}; \
+                     its audience is always the cluster issuer, so leave `audience` unset"
+                );
+            }
+        } else {
+            if self.audience.is_empty() {
+                bail!("{scope} must declare at least one audience");
+            }
+            if self.audience.iter().any(|a| a.trim().is_empty()) {
+                bail!("{scope} audience entries cannot be empty");
+            }
         }
 
         if !self.delivers_env() && !self.delivers_file() {
@@ -1046,6 +1060,11 @@ mod tests {
             validate_identity_name(good).unwrap_or_else(|e| panic!("{good:?}: {e}"));
             let mut id = identity("aws");
             id.name = good.to_string();
+            // The reserved `legion` name is control-plane-shaped: no operator
+            // audience (the manager owns it).
+            if good == CONTROL_PLANE_IDENTITY_NAME {
+                id.audience.clear();
+            }
             id.validate("api", false)
                 .unwrap_or_else(|e| panic!("{good:?}: {e}"));
         }
@@ -1062,6 +1081,32 @@ mod tests {
     fn distinct_identities_validate() {
         let ids = vec![identity("aws"), identity("gcp")];
         validate_identities("api", &ids, false).unwrap();
+    }
+
+    // --- reserved control-plane identity `legion` (Phase 7) ---
+
+    #[test]
+    fn control_plane_identity_rejects_operator_audience() {
+        // The reserved `legion` identity's audience is manager-owned (the
+        // cluster issuer); setting one is rejected.
+        let mut id = identity(CONTROL_PLANE_IDENTITY_NAME);
+        id.audience = vec!["sts.amazonaws.com".into()];
+        let err = id.validate("api", false).unwrap_err();
+        assert!(err.to_string().contains("control-plane"), "{err}");
+    }
+
+    #[test]
+    fn control_plane_identity_validates_without_audience() {
+        let id = WorkloadIdentity {
+            name: CONTROL_PLANE_IDENTITY_NAME.into(),
+            audience: Vec::new(),
+            file: Some(WorkloadIdentityFile {
+                path: "/var/run/legion/identity/legion/token".into(),
+                mode: Some("0400".into()),
+            }),
+            ..Default::default()
+        };
+        id.validate("api", false).unwrap();
     }
 
     #[test]

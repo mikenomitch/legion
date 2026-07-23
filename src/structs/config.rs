@@ -422,6 +422,13 @@ pub struct WorkloadIdentityConfig {
     /// matchers.
     #[serde(default)]
     pub node_identities: Option<Vec<NodeIdentityConfig>>,
+    /// Binding rules mapping a verified control-plane token's claims (e.g.
+    /// `legion.io/job`) to ACL policy names, so a workload authenticating back
+    /// to Legion with its reserved `legion` identity carries policies. Empty
+    /// (the default) means control-plane tokens verify to a principal but grant
+    /// no policies — the identity primitive only.
+    #[serde(default)]
+    pub control_plane_bindings: Option<Vec<AclBindingRule>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -436,6 +443,8 @@ pub struct WorkloadIdentityConfigFull {
     pub sub_template: String,
     #[serde(default)]
     pub node_identities: Vec<NodeIdentityConfig>,
+    #[serde(default)]
+    pub control_plane_bindings: Vec<AclBindingRule>,
 }
 
 impl WorkloadIdentityConfigFull {
@@ -469,6 +478,7 @@ impl Default for WorkloadIdentityConfigFull {
             rotation_age: DEF_WORKLOAD_IDENTITY_ROTATION_AGE.into(),
             sub_template: crate::structs::workload_identity::DEFAULT_SUB_TEMPLATE.into(),
             node_identities: Vec::new(),
+            control_plane_bindings: Vec::new(),
         }
     }
 }
@@ -484,6 +494,7 @@ impl From<WorkloadIdentityConfigFull> for WorkloadIdentityConfig {
             rotation_age: Some(val.rotation_age),
             sub_template: Some(val.sub_template),
             node_identities: Some(val.node_identities),
+            control_plane_bindings: Some(val.control_plane_bindings),
         }
     }
 }
@@ -500,6 +511,10 @@ impl WorkloadIdentityConfig {
             rotation_age: self.rotation_age.clone().unwrap_or(d.rotation_age),
             sub_template: self.sub_template.clone().unwrap_or(d.sub_template),
             node_identities: self.node_identities.clone().unwrap_or(d.node_identities),
+            control_plane_bindings: self
+                .control_plane_bindings
+                .clone()
+                .unwrap_or(d.control_plane_bindings),
         }
     }
 }

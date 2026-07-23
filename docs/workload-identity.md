@@ -21,10 +21,13 @@ integration cookbook. The design rationale lives in
 > `IssueWorkloadIdentityToken` gRPC; worker-side delivery, refresh, and
 > change modes (`src/worker/identity.rs`); the background rotation loop
 > (`src/manager/daemon.rs`); per-task `identities` spec validation and
-> task-kind capability gating; and manager config (off by default). The
-> [node identities](#node-identities) config/claims model consumed by the
-> artifact system is implemented; node-token *issuance* (a node mode on the
-> issuance RPC) is still pending — see the note in that section.
+> task-kind capability gating; and manager config (off by default).
+> [Node identities](#node-identities) are issued via `IssueNodeIdentityToken`
+> and consumed by the artifact system. The
+> [control-plane identity](#control-plane-identity) (`legion`) is verified
+> in-process and mapped to policies via `controlPlaneBindings`. Still pending:
+> task-scoped `auth.identity` for artifacts (needs the fetching alloc id), and
+> a first-class control-plane authorization model beyond binding rules.
 
 ## The token
 
@@ -440,13 +443,14 @@ blur the per-task `sub` security boundary, so matchers accept `kv` and
 `nodeIdentity` only. The planned artifact pre-warm layer authenticates its
 warm fetches the same way (a warm pull happens before any task exists).
 
-> **Issuance status.** The config shape, validation, `sub`/claims model, and
-> the artifact-spec surface are implemented. Actual *node* token issuance to
-> workers is still pending: the `IssueWorkloadIdentityToken` RPC (fully wired
-> for task identities) gains a node mode, gated on node registration, plus
-> worker-side node-token delivery/refresh. Until those land, an artifact
-> fetch authenticating with `nodeIdentity` fails with an actionable error
-> suggesting `auth.kv` or anonymous access.
+> **Issuance status.** Node-token issuance is implemented: the
+> `IssueNodeIdentityToken` RPC mints a cluster-grain token for a registered
+> node (claims `region`, `pool`, and `legion.io/scope = "node"`), authorized
+> against the caller's per-node worker credential exactly like task issuance.
+> The worker resolves `auth.nodeIdentity` through it — a fresh token per
+> artifact fetch, used immediately and never persisted. (Task-scoped
+> `auth.identity` for artifacts still needs the fetching allocation's id
+> threaded into the request and remains pending.)
 
 ## Provider integration cookbook
 
@@ -508,10 +512,49 @@ vault write auth/jwt/role/api \
 
 Vault can bind arbitrary claims, so you rarely need a custom `subTemplate`.
 
-## Control-plane identity (forward-compatible)
+## Control-plane identity
 
-The reserved identity name `legion` is issued with `aud` set to the cluster's
-own issuer, so a workload can authenticate back to Legion itself with the same
-signer, JWKS, and verification machinery. Mapping a verified control-plane
-token to *permissions* (which KV prefixes / APIs it may touch) is a separate
-ACL effort; this feature provides only the verified identity primitive.
+A task authenticates back to Legion itself with the reserved identity name
+`legion`. Declare it like any other identity, but **omit `audience`** — the
+manager owns it and always stamps `aud` = the cluster issuer:
+
+```jsonnet
+identities: [
+  {
+    name: 'legion',                 // reserved control-plane identity
+    // no `audience` — the manager sets it to the cluster issuer
+    file: { path: '/var/run/legion/identity/legion/token', mode: '0400' },
+  },
+]
+```
+
+Declaring `legion` with an `audience` is rejected at admission (the name is
+reserved and its audience is manager-owned).
+
+The manager verifies these tokens with the **same in-process signer/JWKS** it
+uses for everything else, via a built-in auth method registered under the name
+`legion` whenever workload identity is enabled — no self-referential OIDC
+discovery, no network round-trip. A workload presents its `legion` token as an
+`Authorization: Bearer` credential on a manager RPC (or via `legion login
+--method legion --jwt <token>`); it authenticates as principal
+`legion:<sub>`.
+
+Mapping that verified identity to *permissions* is done with binding rules —
+the same claim→policy mechanism as external JWT auth methods — under
+`workloadIdentity.controlPlaneBindings`:
+
+```jsonnet
+workloadIdentity: {
+  enabled: true,
+  controlPlaneBindings: [
+    // Grant the `kv-reader` policy to any workload whose job is `api`.
+    { claim: 'legion.io/job', value: 'api', policies: ['kv-reader'] },
+  ],
+}
+```
+
+With no binding rules (the default), a control-plane token still verifies to a
+principal but carries no policies — the identity primitive only. Broader
+control-plane authorization (a first-class policy model for workload → manager
+access) remains a separate ACL effort; `controlPlaneBindings` is the seam it
+builds on.

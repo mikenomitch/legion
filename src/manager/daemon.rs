@@ -67,10 +67,64 @@ pub async fn run_manager(config: ManagerConfig, run_worker: bool) -> R<()> {
 
     let store_copy_b = store.clone();
 
-    let authenticator = Arc::new(
-        crate::manager::acl::Authenticator::from_config(&full_config.acl)
-            .context("invalid acl configuration")?,
-    );
+    // Workload identity (OIDC issuer): only constructed when enabled. The
+    // signing keys are restored from (or first-boot persisted to) the store,
+    // so tokens held by third parties stay verifiable across restarts. Built
+    // before the authenticator so the control-plane identity method can verify
+    // `legion` tokens against the same in-process issuer.
+    let workload_identity_state = if full_config.workload_identity.enabled {
+        // When the issuer URL is unset, fall back to this manager's own
+        // listener. Match the scheme to the listener: with server TLS on it
+        // speaks only HTTPS, so an http:// issuer would make `iss`/`jwks_uri`
+        // point at an endpoint the manager won't answer. Operators should still
+        // set an externally-reachable HTTPS issuer for real federation.
+        let scheme = if full_config.server.tls.enabled {
+            "https"
+        } else {
+            "http"
+        };
+        let default_issuer = format!(
+            "{scheme}://{}:{}",
+            resolve_manager_host(&full_config.server.host),
+            full_config.server.port
+        );
+        let state = WorkloadIdentityState::initialize(
+            &store,
+            &full_config.workload_identity,
+            &default_issuer,
+            std::time::SystemTime::now(),
+        )?;
+        info!(
+            issuer = %state.issuer_url()?,
+            jwks_path = %state.jwks_path(),
+            "Workload identity enabled; serving OIDC discovery and JWKS"
+        );
+        Some(Arc::new(state))
+    } else {
+        None
+    };
+
+    let authenticator = {
+        let mut authenticator = crate::manager::acl::Authenticator::from_config(&full_config.acl)
+            .context("invalid acl configuration")?;
+        // Phase 7: when workload identity is on, register the built-in
+        // control-plane method so a workload can authenticate back to Legion
+        // with its reserved `legion` token, verified against the in-process
+        // issuer. Reserves the method name `legion` (a config auth method of
+        // that name would collide and fail startup).
+        if let Some(state) = workload_identity_state.clone() {
+            authenticator
+                .register_method(Box::new(
+                    crate::manager::auth_method::ControlPlaneIdentityMethod::new(
+                        state,
+                        full_config.workload_identity.control_plane_bindings.clone(),
+                        authenticator.login_ttl,
+                    ),
+                ))
+                .context("failed to register the control-plane identity auth method")?;
+        }
+        Arc::new(authenticator)
+    };
     if authenticator.enabled {
         info!(
             audit_only = authenticator.audit_only,
@@ -123,41 +177,6 @@ pub async fn run_manager(config: ManagerConfig, run_worker: bool) -> R<()> {
     };
 
     let store_for_rotation = store.clone();
-
-    // Workload identity (OIDC issuer): only constructed when enabled. The
-    // signing keys are restored from (or first-boot persisted to) the store,
-    // so tokens held by third parties stay verifiable across restarts.
-    let workload_identity_state = if full_config.workload_identity.enabled {
-        // When the issuer URL is unset, fall back to this manager's own
-        // listener. Match the scheme to the listener: with server TLS on it
-        // speaks only HTTPS, so an http:// issuer would make `iss`/`jwks_uri`
-        // point at an endpoint the manager won't answer. Operators should still
-        // set an externally-reachable HTTPS issuer for real federation.
-        let scheme = if full_config.server.tls.enabled {
-            "https"
-        } else {
-            "http"
-        };
-        let default_issuer = format!(
-            "{scheme}://{}:{}",
-            resolve_manager_host(&full_config.server.host),
-            full_config.server.port
-        );
-        let state = WorkloadIdentityState::initialize(
-            &store,
-            &full_config.workload_identity,
-            &default_issuer,
-            std::time::SystemTime::now(),
-        )?;
-        info!(
-            issuer = %state.issuer_url()?,
-            jwks_path = %state.jwks_path(),
-            "Workload identity enabled; serving OIDC discovery and JWKS"
-        );
-        Some(Arc::new(state))
-    } else {
-        None
-    };
 
     // Clone store + authenticator for the exec WebSocket listener before the
     // service takes ownership of them.
