@@ -271,11 +271,13 @@ service Manager {
   // compromised worker can only obtain tokens for allocations placed on it,
   // scoped to audiences the spec already declared.
   //
-  // Authorization: the request's `node_id` must match the node the
-  // allocation is placed on. This is the same trust model as Heartbeat —
-  // workers are admitted via join token and identified by their claimed
-  // node id; there is no per-request worker credential yet (TODO: bind
-  // worker RPCs to a per-node credential once worker mTLS lands).
+  // Authorization: the caller must present the per-node worker token minted
+  // at WorkerRegister (attached to every worker-plane RPC), whose principal
+  // is `node:<node_id>`. The manager requires that principal to match the
+  // request's `node_id`, which in turn must be the node the allocation is
+  // placed on — so a worker can only obtain tokens for allocations on its own
+  // node, and cannot forge a peer's node id to steal that peer's federation
+  // credentials. Management tokens (and ACL-disabled deployments) are exempt.
   //
   // Errors:
   // - FailedPrecondition: workload identity is not enabled on this manager
@@ -287,6 +289,31 @@ service Manager {
   // - Internal: signing failed.
   rpc IssueWorkloadIdentityToken (IssueWorkloadIdentityTokenRequest)
       returns (IssueWorkloadIdentityTokenReply);
+
+  // Issues a short-lived, asymmetrically-signed OIDC token for a *node*
+  // identity — the cluster-grain credential declared under
+  // `workloadIdentity.nodeIdentities` (see docs/workload-identity.md). Unlike
+  // a task identity it is scoped to the worker node, not an allocation: its
+  // claims are `region`, `pool`, and `node` (audit-only), with
+  // `legion.io/scope = "node"` so relying parties can tell node tokens from
+  // task tokens issued by the same cluster. Used by the worker to authenticate
+  // cluster-level artifact fetches (`auth.nodeIdentity`) and, later, pre-warm.
+  //
+  // Called by the worker for its own node. Authorization is identical to
+  // IssueWorkloadIdentityToken: the caller's authenticated per-node worker
+  // token principal (`node:<node_id>`) must match the request's `node_id`, so
+  // a worker cannot mint another node's credential. All claims are derived
+  // server-side from the node's registration record and the named identity's
+  // config — never from the request.
+  //
+  // Errors:
+  // - FailedPrecondition: workload identity is not enabled on this manager.
+  // - NotFound: no node with `node_id` is registered, or no node identity
+  //   named `identity_name` is configured.
+  // - PermissionDenied: `node_id` does not match the caller's credential.
+  // - Internal: signing failed.
+  rpc IssueNodeIdentityToken (IssueNodeIdentityTokenRequest)
+      returns (IssueNodeIdentityTokenReply);
 
   // Worker heartbeat endpoint.
   //
@@ -1555,6 +1582,29 @@ message IssueWorkloadIdentityTokenReply {
   int64 expires_at = 2;
 
   // Echo of the identity name the token was issued for.
+  string name = 3;
+}
+
+// Request payload for IssueNodeIdentityToken.
+message IssueNodeIdentityTokenRequest {
+  // The worker node the token is requested for. Must be registered and must
+  // match the caller's authenticated per-node credential.
+  string node_id = 1;
+
+  // Name of the node identity declared under `workloadIdentity.nodeIdentities`.
+  // Selects the audience, TTL, and subject template. Unknown names → NotFound.
+  string identity_name = 2;
+}
+
+// Reply payload for IssueNodeIdentityToken.
+message IssueNodeIdentityTokenReply {
+  // The signed JWT (ES256). Treat as a secret: never log it.
+  string token = 1;
+
+  // Token expiry (`exp`) as Unix seconds.
+  int64 expires_at = 2;
+
+  // Echo of the node identity name the token was issued for.
   string name = 3;
 }
 

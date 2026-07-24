@@ -44,6 +44,15 @@ Important `TaskConfig` fields:
   deleted. Full semantics (policy precedence, debounce, fail/recovery,
   per-kind capability matrix) live in the
   ["Reactive updates" section of the KV store doc](kv-store.md#reactive-updates-kv-driven-task-updates).
+- `identities`: named workload identities (OIDC). The manager mints a
+  short-lived, asymmetrically-signed JWT per allocation for each declared
+  identity, derived from real scheduling facts, for federating with external
+  systems (AWS `AssumeRoleWithWebIdentity`, GCP Workload Identity Federation,
+  Vault JWT auth). Each identity has its own audience, TTL, delivery (env
+  and/or file), and change mode (`noop`/`signal`/`restart`). See
+  [Workload Identity](workload-identity.md) for the full spec reference,
+  claim semantics, and provider cookbook. Tasks without `identities` behave
+  exactly as before.
 
 ## Task Lists and Dependency Readiness
 

@@ -31,36 +31,37 @@ use crate::structs::{
     CreateInstancesRequest, DeleteKvReply, DeleteKvRequest, DeleteSavedStateQueryReply,
     DeleteSavedStateQueryRequest, DestroyInstanceReply, DestroyInstanceRequest, DestroyJobReply,
     DestroyJobRequest, ExecClientFrame, FailedAllocation, GetAllocationLogsReply,
-    GetAllocationLogsRequest,
-    GetArtifactCredentialReply, GetArtifactCredentialRequest, GetInstanceReply, GetInstanceRequest,
-    GetJobInfoReply, GetJobInfoRequest, GetJobSpecByConfigRequest, GetJobSpecReply,
-    GetJobSpecRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply,
-    GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest, GetNodeReply,
-    GetNodeRequest, GetNodesReply, GetNodesRequest, GetObservabilityReply, GetObservabilityRequest,
-    GetRaftJoinTokenReply, GetRaftJoinTokenRequest, GetRaftStatusReply, GetRaftStatusRequest,
-    GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest,
-    GetStateStoreSchemaReply, GetStateStoreSchemaRequest, GetTaskLogsRequest, HealthCheckReply,
-    HealthCheckRequest, HeartbeatReply, HeartbeatRequest, Instance, InstanceInfo, InstanceMode,
-    InstanceState, IssueRaftCommandReply, IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply,
-    IssueWorkloadIdentityTokenRequest, JobConfig, JobSpecHistoryItem, KvEntry, KvInjectionAction,
-    KvValueType, LedgerNode, ListEventsReply, ListEventsRequest, ListInstancesReply,
-    ListInstancesRequest, ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobsReply,
-    ListJobsRequest, ListKvReply, ListKvRequest, ListRaftHistoryReply, ListRaftHistoryRequest,
-    ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply, ListRolloutsRequest,
-    ListJobActionsReply, ListJobActionsRequest, ListSavedStateQueriesReply,
-    ListSavedStateQueriesRequest, ListServicesReply, ListServicesRequest, Node, NodeMsg,
-    PatchKvReply, PatchKvRequest, PlanJobReply, PlanJobRequest, PlannedAllocation, PutKvReply,
-    PutKvRequest, QueryStateStoreReply, QueryStateStoreRequest, RaftHistoryEvent, RaftStatus,
-    ReleaseKvLockReply, ReleaseKvLockRequest, RenewKvLockReply, RenewKvLockRequest,
-    ReplaceInstanceReply, ReplaceInstanceRequest, ResolveServiceReply, ResolveServiceRequest,
-    RestartWorkerReply, RestartWorkerRequest, RolloutAllocationStatus,
-    RolloutEvent, RolloutGroupStatus, RolloutProgression, RolloutReplacement, RunJobReply,
-    RunJobRequest, SavedStateQuery, SchedulerEvent, ServiceEndpoint, ServiceSummary,
-    StartInstanceReply, StartInstanceRequest, StopInstanceReply, StopInstanceRequest, StopJobReply,
-    StopJobRequest, StopRolloutReply, StopRolloutRequest, StreamEventsRequest, Submission,
-    TaskConfig, TaskOnUnhealthyConfig, UpdateNodeDynamicReply, UpdateNodeDynamicRequest,
-    UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest, WorkerConfig, WorkerPreRegisterReply,
-    WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest,
+    GetAllocationLogsRequest, GetArtifactCredentialReply, GetArtifactCredentialRequest,
+    GetInstanceReply, GetInstanceRequest, GetJobInfoReply, GetJobInfoRequest,
+    GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest, GetKvLockReply,
+    GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest,
+    GetManagerConfigsReply, GetManagerConfigsRequest, GetNodeReply, GetNodeRequest, GetNodesReply,
+    GetNodesRequest, GetObservabilityReply, GetObservabilityRequest, GetRaftJoinTokenReply,
+    GetRaftJoinTokenRequest, GetRaftStatusReply, GetRaftStatusRequest, GetRolloutReply,
+    GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest, GetStateStoreSchemaReply,
+    GetStateStoreSchemaRequest, GetTaskLogsRequest, HealthCheckReply, HealthCheckRequest,
+    HeartbeatReply, HeartbeatRequest, Instance, InstanceInfo, InstanceMode, InstanceState,
+    IssueNodeIdentityTokenReply, IssueNodeIdentityTokenRequest, IssueRaftCommandReply,
+    IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply, IssueWorkloadIdentityTokenRequest,
+    JobConfig, JobSpecHistoryItem, KvEntry, KvInjectionAction, KvValueType, LedgerNode,
+    ListEventsReply, ListEventsRequest, ListInstancesReply, ListInstancesRequest,
+    ListJobActionsReply, ListJobActionsRequest, ListJobSpecHistoryReply, ListJobSpecHistoryRequest,
+    ListJobsReply, ListJobsRequest, ListKvReply, ListKvRequest, ListRaftHistoryReply,
+    ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply,
+    ListRolloutsRequest, ListSavedStateQueriesReply, ListSavedStateQueriesRequest,
+    ListServicesReply, ListServicesRequest, Node, NodeMsg, PatchKvReply, PatchKvRequest,
+    PlanJobReply, PlanJobRequest, PlannedAllocation, PutKvReply, PutKvRequest,
+    QueryStateStoreReply, QueryStateStoreRequest, RaftHistoryEvent, RaftStatus, ReleaseKvLockReply,
+    ReleaseKvLockRequest, RenewKvLockReply, RenewKvLockRequest, ReplaceInstanceReply,
+    ReplaceInstanceRequest, ResolveServiceReply, ResolveServiceRequest, RestartWorkerReply,
+    RestartWorkerRequest, RolloutAllocationStatus, RolloutEvent, RolloutGroupStatus,
+    RolloutProgression, RolloutReplacement, RunJobReply, RunJobRequest, SavedStateQuery,
+    SchedulerEvent, ServiceEndpoint, ServiceSummary, StartInstanceReply, StartInstanceRequest,
+    StopInstanceReply, StopInstanceRequest, StopJobReply, StopJobRequest, StopRolloutReply,
+    StopRolloutRequest, StreamEventsRequest, Submission, TaskConfig, TaskOnUnhealthyConfig,
+    UpdateNodeDynamicReply, UpdateNodeDynamicRequest, UpsertSavedStateQueryReply,
+    UpsertSavedStateQueryRequest, WorkerConfig, WorkerPreRegisterReply, WorkerPreRegisterRequest,
+    WorkerRegisterReply, WorkerRegisterRequest,
 };
 use crate::structs::{
     AuthMethodInfo, BootstrapAclReply, BootstrapAclRequest, CreateAclTokenReply,
@@ -3289,9 +3290,14 @@ impl Manager for ManagerDaemonService {
         request: Request<IssueWorkloadIdentityTokenRequest>,
     ) -> Result<Response<IssueWorkloadIdentityTokenReply>, Status> {
         // ACL: worker-plane endpoint (workers fetch tokens for allocations
-        // placed on them; the manager already checks node ownership below).
+        // placed on them; node ownership is enforced against the authenticated
+        // principal below).
         let identity = self.authenticate_acl(&request)?;
         acl::enforce_worker_plane(&identity)?;
+        // Capture the caller's authenticated identity before `identity` is
+        // shadowed by the spec-identity lookup further down.
+        let caller_is_management = identity.is_management;
+        let caller_principal = identity.principal.clone();
         let req = request.into_inner();
         tracing::Span::current().record("alloc_id", req.alloc_id);
         tracing::Span::current().record("identity_name", req.identity_name.as_str());
@@ -3310,13 +3316,21 @@ impl Manager for ManagerDaemonService {
             .map_err(|e| map_store_error("Error loading allocation", e))?
             .ok_or_else(|| Status::not_found(format!("allocation {} not found", req.alloc_id)))?;
 
-        // AuthZ: a worker may only request tokens for allocations placed on
-        // it. This is the same trust model as Heartbeat — workers are
-        // admitted via join token and identified by their claimed node id;
-        // there is no per-request worker credential today.
-        // TODO(worker-authn): bind worker RPCs to a per-node credential
-        // (mTLS or a join-token-derived bearer) so node_id is proven rather
-        // than claimed; see the join-token trust model in src/structs/token.rs.
+        // AuthZ: a worker may only request tokens for allocations placed on it.
+        // Bind the request to the *authenticated* principal: a node worker
+        // token has principal `node:<node_id>` (minted at WorkerRegister and
+        // attached to every worker-plane RPC), so require it to match the
+        // node_id in the request. This closes cross-node identity theft — a
+        // compromised worker cannot set `node_id` to a peer's and mint that
+        // peer's federation credentials. Management/ACL-disabled callers
+        // (is_management) are exempt. This mints AWS/GCP/Vault-scoped tokens,
+        // so unlike Heartbeat the node id must be proven, not merely claimed.
+        if !caller_is_management && caller_principal != format!("node:{}", req.node_id) {
+            return Err(Status::permission_denied(format!(
+                "worker {caller_principal:?} may not request tokens for node {:?}",
+                req.node_id
+            )));
+        }
         if allocation.node_id != req.node_id {
             return Err(Status::permission_denied(format!(
                 "allocation {} is not placed on node {:?}",
@@ -3373,6 +3387,78 @@ impl Manager for ManagerDaemonService {
         );
 
         Ok(Response::new(IssueWorkloadIdentityTokenReply {
+            token: issued.token,
+            expires_at: issued.expires_at as i64,
+            name: req.identity_name,
+        }))
+    }
+
+    #[instrument(skip_all, fields(node_id, identity_name))]
+    async fn issue_node_identity_token(
+        &self,
+        request: Request<IssueNodeIdentityTokenRequest>,
+    ) -> Result<Response<IssueNodeIdentityTokenReply>, Status> {
+        // ACL: worker-plane endpoint. Node ownership is bound to the
+        // authenticated principal below (same trust model as task issuance).
+        let identity = self.authenticate_acl(&request)?;
+        acl::enforce_worker_plane(&identity)?;
+        let caller_is_management = identity.is_management;
+        let caller_principal = identity.principal.clone();
+        let req = request.into_inner();
+        tracing::Span::current().record("node_id", req.node_id.as_str());
+        tracing::Span::current().record("identity_name", req.identity_name.as_str());
+
+        let Some(state) = self.workload_identity.as_ref() else {
+            return Err(Status::failed_precondition(
+                "workload identity is not enabled on this manager \
+                 (set workloadIdentity.enabled: true in the manager config)",
+            ));
+        };
+
+        // Bind the request to the authenticated per-node principal — a worker
+        // may only mint its own node's credential.
+        if !caller_is_management && caller_principal != format!("node:{}", req.node_id) {
+            return Err(Status::permission_denied(format!(
+                "worker {caller_principal:?} may not request tokens for node {:?}",
+                req.node_id
+            )));
+        }
+
+        // Node identity config owns audience / TTL / sub template.
+        let node_identity = state.node_identity(&req.identity_name).ok_or_else(|| {
+            Status::not_found(format!(
+                "no node identity named {:?} is configured \
+                 (declare it under workloadIdentity.nodeIdentities)",
+                req.identity_name
+            ))
+        })?;
+
+        // Region/pool derived server-side from the node's registration record.
+        let node = self
+            .store
+            .get_node(&req.node_id)
+            .map_err(|_| Status::not_found(format!("node {:?} is not registered", req.node_id)))?;
+
+        let claims = crate::structs::workload_identity::NodeIdentityClaims {
+            region: DEF_CLUSTER_REGION.to_string(),
+            pool: node.pool.clone(),
+            node_id: req.node_id.clone(),
+        };
+
+        let issued = state
+            .issue_node(&claims, &node_identity, std::time::SystemTime::now())
+            .map_err(|e| {
+                error!(error = ?e, "Error signing node identity token");
+                Status::internal("failed to sign node identity token")
+            })?;
+
+        info!(
+            expires_at = issued.expires_at,
+            kid = %issued.kid,
+            "Issued node identity token"
+        );
+
+        Ok(Response::new(IssueNodeIdentityTokenReply {
             token: issued.token,
             expires_at: issued.expires_at as i64,
             name: req.identity_name,
@@ -5865,6 +5951,177 @@ mod tests {
 
         let err = manager
             .issue_workload_identity_token(issue_request(allocation.id, "aws", "node-evil"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn issue_token_binds_node_id_to_authenticated_worker() -> R<()> {
+        use crate::manager::acl::Authenticator;
+        use crate::structs::AclConfigFull;
+
+        let store = setup_store()?;
+        insert_node(&store, "node-2")?;
+        // Allocation is placed on node-1 by submit_and_place_identity_task.
+        let allocation =
+            submit_and_place_identity_task(&store, "wi-job", aws_identity_task("api"))?;
+        let state = wi_state(&store)?;
+
+        // ACLs on: the caller's worker token principal is `node:<id>`.
+        let auth = Arc::new(Authenticator::from_config(&AclConfigFull {
+            enabled: true,
+            ..Default::default()
+        })?);
+        let node1_token = auth.mint_node_token(&store, "node-1")?;
+        let node2_token = auth.mint_node_token(&store, "node-2")?;
+        let manager = ManagerDaemonService::new(store)
+            .with_workload_identity(Some(state))
+            .with_authenticator(auth);
+
+        let authed = |token: &str, node_id: &str| {
+            let mut request = issue_request(allocation.id, "aws", node_id);
+            request.metadata_mut().insert(
+                "authorization",
+                format!("Bearer {token}").parse().expect("ascii token"),
+            );
+            request
+        };
+
+        // node-1's own token issues for its own allocation.
+        let reply = manager
+            .issue_workload_identity_token(authed(&node1_token, "node-1"))
+            .await?
+            .into_inner();
+        assert_eq!(reply.name, "aws");
+
+        // node-2's token forging node-1 in the request is denied: the request
+        // node_id must match the authenticated principal, not just the
+        // allocation's node.
+        let err = manager
+            .issue_workload_identity_token(authed(&node2_token, "node-1"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+
+        // And node-2 asking for node-2 (matching principal) is still rejected
+        // because the allocation is not on node-2 — defense in depth.
+        let err = manager
+            .issue_workload_identity_token(authed(&node2_token, "node-2"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        Ok(())
+    }
+
+    /// A workload-identity state that also declares a `pull` node identity.
+    fn wi_state_with_node_identity(store: &Store) -> R<Arc<WorkloadIdentityState>> {
+        use crate::structs::workload_identity::NodeIdentityConfig;
+        let config = crate::structs::WorkloadIdentityConfigFull {
+            enabled: true,
+            issuer: Some("https://manager.test:4747".into()),
+            node_identities: vec![NodeIdentityConfig {
+                name: "pull".into(),
+                audience: vec!["sts.amazonaws.com".into()],
+                ttl: Some("15m".into()),
+                sub_template: None,
+            }],
+            ..Default::default()
+        };
+        Ok(Arc::new(WorkloadIdentityState::initialize(
+            store,
+            &config,
+            "http://127.0.0.1:4747",
+            std::time::SystemTime::now(),
+        )?))
+    }
+
+    #[tokio::test]
+    async fn issue_node_token_derives_claims_from_node_record() -> R<()> {
+        let store = setup_store()?;
+        insert_node(&store, "node-1")?;
+        let state = wi_state_with_node_identity(&store)?;
+        let manager = ManagerDaemonService::new(store).with_workload_identity(Some(state.clone()));
+
+        let reply = manager
+            .issue_node_identity_token(Request::new(IssueNodeIdentityTokenRequest {
+                node_id: "node-1".into(),
+                identity_name: "pull".into(),
+            }))
+            .await?
+            .into_inner();
+        assert_eq!(reply.name, "pull");
+
+        // Verifies against the issuer; claims are node-scoped and derived from
+        // the node record (pool) — never from the request.
+        let claims = state.verify(&reply.token, "sts.amazonaws.com")?;
+        assert_eq!(claims["sub"], json!("auto:node:default"));
+        assert_eq!(claims["legion.io/scope"], json!("node"));
+        assert_eq!(claims["legion.io/pool"], json!("default"));
+        assert_eq!(claims["legion.io/node"], json!("node-1"));
+        assert!(claims.get("legion.io/alloc").is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn issue_node_token_rejects_unknown_identity_and_node() -> R<()> {
+        let store = setup_store()?;
+        insert_node(&store, "node-1")?;
+        let state = wi_state_with_node_identity(&store)?;
+        let manager = ManagerDaemonService::new(store).with_workload_identity(Some(state));
+
+        let err = manager
+            .issue_node_identity_token(Request::new(IssueNodeIdentityTokenRequest {
+                node_id: "node-1".into(),
+                identity_name: "bogus".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound);
+
+        let err = manager
+            .issue_node_identity_token(Request::new(IssueNodeIdentityTokenRequest {
+                node_id: "ghost".into(),
+                identity_name: "pull".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn issue_node_token_binds_node_id_to_authenticated_worker() -> R<()> {
+        use crate::manager::acl::Authenticator;
+        use crate::structs::AclConfigFull;
+
+        let store = setup_store()?;
+        insert_node(&store, "node-1")?;
+        insert_node(&store, "node-2")?;
+        let state = wi_state_with_node_identity(&store)?;
+        let auth = Arc::new(Authenticator::from_config(&AclConfigFull {
+            enabled: true,
+            ..Default::default()
+        })?);
+        let node2_token = auth.mint_node_token(&store, "node-2")?;
+        let manager = ManagerDaemonService::new(store)
+            .with_workload_identity(Some(state))
+            .with_authenticator(auth);
+
+        // node-2's credential may not mint node-1's token.
+        let mut request = Request::new(IssueNodeIdentityTokenRequest {
+            node_id: "node-1".into(),
+            identity_name: "pull".into(),
+        });
+        request.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {node2_token}")
+                .parse()
+                .expect("ascii token"),
+        );
+        let err = manager
+            .issue_node_identity_token(request)
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::PermissionDenied);

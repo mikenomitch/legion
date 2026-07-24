@@ -82,11 +82,63 @@ impl WorkerStateStore {
     pub fn save(&self, allocations: &[PersistedAllocation]) -> R<()> {
         if let Some(parent) = self.path.parent() {
             ensure_dir(parent)?;
+            // The state file embeds each task's full env — including any
+            // env-delivered workload-identity token — so keep it owner-only.
+            // The directory guard denies traversal to the file regardless of
+            // its own mode; the atomic 0600 write below is defense in depth.
+            if !parent.as_os_str().is_empty() {
+                crate::util::restrict_dir_to_owner(parent)?;
+            }
         }
         let contents = serde_json::to_string_pretty(allocations)?;
-        fs::write(&self.path, contents)?;
+        write_owner_only(&self.path, contents.as_bytes())?;
         Ok(())
     }
+}
+
+/// Atomically write `contents` to `path` with mode 0600 (temp file created at
+/// that mode from the start, then renamed), so token bytes in the worker state
+/// are never observable at the process umask. Off Unix this is a plain write.
+fn write_owner_only(path: &Path, contents: &[u8]) -> R<()> {
+    use std::io::Write;
+
+    let tmp = path.with_file_name(format!(
+        ".{}.tmp-{}",
+        path.file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "worker_state.json".into()),
+        crate::util::random_string(6)
+    ));
+
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+
+    let write_result = (|| -> R<()> {
+        let mut file = options
+            .open(&tmp)
+            .with_context(|| format!("failed to create worker state temp file {tmp:?}"))?;
+        file.write_all(contents)
+            .with_context(|| format!("failed to write worker state {tmp:?}"))?;
+        file.sync_all()
+            .with_context(|| format!("failed to fsync worker state {tmp:?}"))?;
+        Ok(())
+    })();
+    if let Err(err) = write_result {
+        let _ = fs::remove_file(&tmp);
+        return Err(err);
+    }
+    if let Err(err) = fs::rename(&tmp, path)
+        .with_context(|| format!("failed to move worker state into place at {path:?}"))
+    {
+        let _ = fs::remove_file(&tmp);
+        return Err(err);
+    }
+    Ok(())
 }
 
 pub fn pid_is_running(pid: u32) -> bool {

@@ -122,6 +122,17 @@
                     },
                     changeMode: "noop",
                 },
+                {
+                    // Reserved control-plane identity: authenticates back to
+                    // Legion itself. Omit `audience` — the manager owns it and
+                    // stamps aud = the cluster issuer.
+                    name: "legion",
+                    file: {
+                        path: "/var/run/legion/identity/legion/token",
+                        mode: "0400",
+                    },
+                    changeMode: "noop",
+                },
             ],
             // Task-level KV policy defaults; entries override field-by-field
             // (see docs/kv-store.md "Reactive updates"). Keys are camelCase.

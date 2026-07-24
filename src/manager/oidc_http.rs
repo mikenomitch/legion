@@ -7,7 +7,7 @@
 //!
 //! Rather than binding a second listener, [`OidcHttpLayer`] is a small tower
 //! layer mounted **outermost** on the manager's main listener (which already
-//! has `accept_http1(true)`, see `crate::manager::agent`). It intercepts GET
+//! has `accept_http1(true)`, see `crate::manager::daemon`). It intercepts GET
 //! requests for exactly two paths — [`DISCOVERY_PATH`] and the configured
 //! JWKS path — and answers them directly; every other request falls through
 //! to CORS → grpc-web → the gRPC `Manager` service untouched. This keeps the

@@ -415,7 +415,6 @@ pub struct WorkloadIdentityConfig {
     pub signing_alg: Option<String>,
     pub default_ttl: Option<String>,
     pub rotation_age: Option<String>,
-    pub default_audience: Option<Vec<String>>,
     /// Cluster-default `sub` template; per-identity `subTemplate` overrides it.
     pub sub_template: Option<String>,
     /// Identities issued to worker nodes rather than tasks (artifact system
@@ -423,6 +422,13 @@ pub struct WorkloadIdentityConfig {
     /// matchers.
     #[serde(default)]
     pub node_identities: Option<Vec<NodeIdentityConfig>>,
+    /// Binding rules mapping a verified control-plane token's claims (e.g.
+    /// `legion.io/job`) to ACL policy names, so a workload authenticating back
+    /// to Legion with its reserved `legion` identity carries policies. Empty
+    /// (the default) means control-plane tokens verify to a principal but grant
+    /// no policies — the identity primitive only.
+    #[serde(default)]
+    pub control_plane_bindings: Option<Vec<AclBindingRule>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -434,10 +440,11 @@ pub struct WorkloadIdentityConfigFull {
     pub signing_alg: String,
     pub default_ttl: String,
     pub rotation_age: String,
-    pub default_audience: Vec<String>,
     pub sub_template: String,
     #[serde(default)]
     pub node_identities: Vec<NodeIdentityConfig>,
+    #[serde(default)]
+    pub control_plane_bindings: Vec<AclBindingRule>,
 }
 
 impl WorkloadIdentityConfigFull {
@@ -469,9 +476,9 @@ impl Default for WorkloadIdentityConfigFull {
             signing_alg: "ES256".into(),
             default_ttl: DEF_WORKLOAD_IDENTITY_TTL.into(),
             rotation_age: DEF_WORKLOAD_IDENTITY_ROTATION_AGE.into(),
-            default_audience: Vec::new(),
             sub_template: crate::structs::workload_identity::DEFAULT_SUB_TEMPLATE.into(),
             node_identities: Vec::new(),
+            control_plane_bindings: Vec::new(),
         }
     }
 }
@@ -485,9 +492,9 @@ impl From<WorkloadIdentityConfigFull> for WorkloadIdentityConfig {
             signing_alg: Some(val.signing_alg),
             default_ttl: Some(val.default_ttl),
             rotation_age: Some(val.rotation_age),
-            default_audience: Some(val.default_audience),
             sub_template: Some(val.sub_template),
             node_identities: Some(val.node_identities),
+            control_plane_bindings: Some(val.control_plane_bindings),
         }
     }
 }
@@ -502,9 +509,12 @@ impl WorkloadIdentityConfig {
             signing_alg: self.signing_alg.clone().unwrap_or(d.signing_alg),
             default_ttl: self.default_ttl.clone().unwrap_or(d.default_ttl),
             rotation_age: self.rotation_age.clone().unwrap_or(d.rotation_age),
-            default_audience: self.default_audience.clone().unwrap_or(d.default_audience),
             sub_template: self.sub_template.clone().unwrap_or(d.sub_template),
             node_identities: self.node_identities.clone().unwrap_or(d.node_identities),
+            control_plane_bindings: self
+                .control_plane_bindings
+                .clone()
+                .unwrap_or(d.control_plane_bindings),
         }
     }
 }

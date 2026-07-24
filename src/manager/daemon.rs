@@ -67,10 +67,64 @@ pub async fn run_manager(config: ManagerConfig, run_worker: bool) -> R<()> {
 
     let store_copy_b = store.clone();
 
-    let authenticator = Arc::new(
-        crate::manager::acl::Authenticator::from_config(&full_config.acl)
-            .context("invalid acl configuration")?,
-    );
+    // Workload identity (OIDC issuer): only constructed when enabled. The
+    // signing keys are restored from (or first-boot persisted to) the store,
+    // so tokens held by third parties stay verifiable across restarts. Built
+    // before the authenticator so the control-plane identity method can verify
+    // `legion` tokens against the same in-process issuer.
+    let workload_identity_state = if full_config.workload_identity.enabled {
+        // When the issuer URL is unset, fall back to this manager's own
+        // listener. Match the scheme to the listener: with server TLS on it
+        // speaks only HTTPS, so an http:// issuer would make `iss`/`jwks_uri`
+        // point at an endpoint the manager won't answer. Operators should still
+        // set an externally-reachable HTTPS issuer for real federation.
+        let scheme = if full_config.server.tls.enabled {
+            "https"
+        } else {
+            "http"
+        };
+        let default_issuer = format!(
+            "{scheme}://{}:{}",
+            resolve_manager_host(&full_config.server.host),
+            full_config.server.port
+        );
+        let state = WorkloadIdentityState::initialize(
+            &store,
+            &full_config.workload_identity,
+            &default_issuer,
+            std::time::SystemTime::now(),
+        )?;
+        info!(
+            issuer = %state.issuer_url()?,
+            jwks_path = %state.jwks_path(),
+            "Workload identity enabled; serving OIDC discovery and JWKS"
+        );
+        Some(Arc::new(state))
+    } else {
+        None
+    };
+
+    let authenticator = {
+        let mut authenticator = crate::manager::acl::Authenticator::from_config(&full_config.acl)
+            .context("invalid acl configuration")?;
+        // Phase 7: when workload identity is on, register the built-in
+        // control-plane method so a workload can authenticate back to Legion
+        // with its reserved `legion` token, verified against the in-process
+        // issuer. Reserves the method name `legion` (a config auth method of
+        // that name would collide and fail startup).
+        if let Some(state) = workload_identity_state.clone() {
+            authenticator
+                .register_method(Box::new(
+                    crate::manager::auth_method::ControlPlaneIdentityMethod::new(
+                        state,
+                        full_config.workload_identity.control_plane_bindings.clone(),
+                        authenticator.login_ttl,
+                    ),
+                ))
+                .context("failed to register the control-plane identity auth method")?;
+        }
+        Arc::new(authenticator)
+    };
     if authenticator.enabled {
         info!(
             audit_only = authenticator.audit_only,
@@ -124,31 +178,6 @@ pub async fn run_manager(config: ManagerConfig, run_worker: bool) -> R<()> {
 
     let store_for_rotation = store.clone();
 
-    // Workload identity (OIDC issuer): only constructed when enabled. The
-    // signing keys are restored from (or first-boot persisted to) the store,
-    // so tokens held by third parties stay verifiable across restarts.
-    let workload_identity_state = if full_config.workload_identity.enabled {
-        let default_issuer = format!(
-            "http://{}:{}",
-            resolve_manager_host(&full_config.server.host),
-            full_config.server.port
-        );
-        let state = WorkloadIdentityState::initialize(
-            &store,
-            &full_config.workload_identity,
-            &default_issuer,
-            std::time::SystemTime::now(),
-        )?;
-        info!(
-            issuer = %state.issuer_url()?,
-            jwks_path = %state.jwks_path(),
-            "Workload identity enabled; serving OIDC discovery and JWKS"
-        );
-        Some(Arc::new(state))
-    } else {
-        None
-    };
-
     // Clone store + authenticator for the exec WebSocket listener before the
     // service takes ownership of them.
     let exec_ws_state = crate::manager::exec_ws::ExecWsState {
@@ -182,7 +211,9 @@ pub async fn run_manager(config: ManagerConfig, run_worker: bool) -> R<()> {
             }
         });
     } else {
-        info!("Exec is disabled (exec.enabled=false); ExecAllocation and the exec WebSocket are off");
+        info!(
+            "Exec is disabled (exec.enabled=false); ExecAllocation and the exec WebSocket are off"
+        );
     }
 
     let tls_identity = load_server_tls_identity(&full_config.server.tls)?;
@@ -261,9 +292,11 @@ pub async fn run_manager(config: ManagerConfig, run_worker: bool) -> R<()> {
 /// window. Every transition is persisted, so a restart mid-overlap restores
 /// the exact same key set.
 ///
-/// HA note: in a multi-manager deployment only the primary acts (same
-/// leader-only convention as other store-mutating loops); standbys share the
-/// replicated `signing_key` table and keep serving an identical JWKS.
+/// HA note: only the primary *rotates* (same leader-only convention as other
+/// store-mutating loops). Standbys don't rotate, but they must not serve a
+/// boot-frozen JWKS — keys are read once at startup — so on each tick a standby
+/// reloads the key set from the replicated `signing_key` table, picking up
+/// keys the primary rotated in (staleness bounded by the check interval).
 #[instrument(err, skip_all)]
 async fn start_workload_identity_rotation(
     store: Store,
@@ -285,7 +318,13 @@ async fn start_workload_identity_rotation(
                 Err(err) => warn!(error = ?err, "Workload identity rotation tick failed"),
             }
         } else {
-            debug!("Skipping workload identity rotation on non-primary manager");
+            // Standby: don't rotate, but refresh the key set so this manager's
+            // JWKS/signer track keys the primary rotated in.
+            match state.reload_from_store(&store) {
+                Ok(true) => info!("Refreshed workload identity signing keys from store (standby)"),
+                Ok(false) => debug!("Workload identity signing keys unchanged (standby)"),
+                Err(err) => warn!(error = ?err, "Failed to refresh signing keys on standby"),
+            }
         }
         tokio::time::sleep(interval).await;
     }

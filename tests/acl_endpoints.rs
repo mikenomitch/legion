@@ -114,6 +114,7 @@ fn endpoint_table() -> Vec<(&'static str, Plane)> {
         ("ListInstances", Plane::Protected("job:read")),
         ("GetInstance", Plane::Protected("job:read")),
         ("IssueWorkloadIdentityToken", Plane::Worker),
+        ("IssueNodeIdentityToken", Plane::Worker),
         ("GetAllocationLogs", Plane::Protected("job:read")),
         ("ExecAllocation", Plane::Protected("exec:write")),
         ("ListJobActions", Plane::Protected("job:read")),
@@ -623,6 +624,16 @@ async fn call_endpoint(
                     alloc_id: 1,
                     identity_name: "default".into(),
                     node_id: NODE_ID.into(),
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "IssueNodeIdentityToken" => svc
+            .issue_node_identity_token(req(
+                IssueNodeIdentityTokenRequest {
+                    node_id: NODE_ID.into(),
+                    identity_name: "default".into(),
                 },
                 token,
             ))

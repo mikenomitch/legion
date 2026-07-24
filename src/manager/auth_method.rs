@@ -498,6 +498,107 @@ impl AuthMethod for JwtAuthMethod {
     }
 }
 
+/// Built-in control-plane identity method (workload-identity plan Phase 7).
+///
+/// Verifies a bearer token this cluster issued for its reserved `legion`
+/// identity — `aud` equal to the cluster's own issuer — against the manager's
+/// **in-process** signing keys (no network / self-referential discovery), and
+/// maps it to a principal `workload:<sub>` plus any policies from the
+/// configured binding rules. Auto-registered under the name `legion` whenever
+/// `workloadIdentity.enabled`, so a workload can authenticate back to Legion
+/// with the same token it federates outward with.
+///
+/// This delivers the *verified identity primitive*: with no binding rules a
+/// control-plane token verifies to a principal but grants no policies. Mapping
+/// claims to permissions is done via `workloadIdentity.controlPlaneBindings`,
+/// the seam the broader ACL effort builds on.
+pub struct ControlPlaneIdentityMethod {
+    state: std::sync::Arc<crate::manager::workload_identity::WorkloadIdentityState>,
+    binding_rules: Vec<AclBindingRule>,
+    token_ttl: Duration,
+}
+
+impl ControlPlaneIdentityMethod {
+    pub fn new(
+        state: std::sync::Arc<crate::manager::workload_identity::WorkloadIdentityState>,
+        binding_rules: Vec<AclBindingRule>,
+        token_ttl: Duration,
+    ) -> Self {
+        Self {
+            state,
+            binding_rules,
+            token_ttl,
+        }
+    }
+
+    fn identity_from_token(&self, token: &str) -> Result<VerifiedIdentity, AuthError> {
+        let claims = self.state.verify_control_plane(token).map_err(|e| {
+            AuthError::InvalidCredentials(format!("control-plane token verification failed: {e:#}"))
+        })?;
+        let claims = Value::Object(claims);
+        let sub = claims
+            .get("sub")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        Ok(VerifiedIdentity {
+            // The authenticator prefixes this with the method name, yielding a
+            // `legion:<sub>` principal — distinct from node (`node:`) and user
+            // principals.
+            principal: sub.to_string(),
+            policies: bound_policies(&self.binding_rules, &claims),
+            expires_at: claims
+                .get("exp")
+                .and_then(Value::as_i64)
+                .and_then(|exp| OffsetDateTime::from_unix_timestamp(exp).ok())
+                .and_then(|dt| dt.format(&Rfc3339).ok()),
+        })
+    }
+}
+
+impl AuthMethod for ControlPlaneIdentityMethod {
+    fn name(&self) -> &str {
+        crate::structs::workload_identity::CONTROL_PLANE_IDENTITY_NAME
+    }
+
+    fn login<'a>(
+        &'a self,
+        _store: &'a Store,
+        credentials: LoginCredentials<'a>,
+    ) -> BoxFuture<'a, Result<VerifiedIdentity, AuthError>> {
+        Box::pin(async move {
+            let jwt = credentials.jwt.ok_or_else(|| {
+                AuthError::InvalidRequest(
+                    "control-plane login requires the `legion` identity token as `jwt`".into(),
+                )
+            })?;
+            let identity = self.identity_from_token(jwt)?;
+            if identity.policies.is_empty() {
+                return Err(AuthError::Denied(
+                    "control-plane token verified but no controlPlaneBindings granted any policies"
+                        .into(),
+                ));
+            }
+            Ok(identity)
+        })
+    }
+
+    fn validate_bearer(&self, credential: &str) -> Option<Result<VerifiedIdentity, AuthError>> {
+        Some(self.identity_from_token(credential))
+    }
+
+    fn login_token_ttl(&self) -> Duration {
+        self.token_ttl
+    }
+
+    fn public_info(&self) -> MethodPublicInfo {
+        MethodPublicInfo {
+            name: self.name().to_string(),
+            kind: "workload-identity".to_string(),
+            ..Default::default()
+        }
+    }
+}
+
 /// Built-in webhook method: delegates verification to an external endpoint.
 ///
 /// Legion POSTs `{"method", "username"?, "password"?, "jwt"?}` to
@@ -1044,6 +1145,88 @@ mod auth_method_test {
         assert!(decoding_key_from_jwks(&jwks, Some("rsa-1"), Algorithm::HS256).is_err());
         // Without kid, falls back to the first usable asymmetric key.
         assert!(decoding_key_from_jwks(&jwks, None, Algorithm::RS256).is_ok());
+    }
+
+    #[tokio::test]
+    async fn control_plane_method_verifies_legion_tokens_and_maps_policies() {
+        use crate::manager::workload_identity::WorkloadIdentityState;
+        use crate::structs::workload_identity::{
+            WorkloadIdentity, WorkloadIdentityClaims, CONTROL_PLANE_IDENTITY_NAME,
+        };
+        use crate::structs::{AclBindingRule, WorkloadIdentityConfigFull};
+        use std::sync::Arc;
+        use std::time::SystemTime;
+
+        let store = webhook_store();
+        let config = WorkloadIdentityConfigFull {
+            enabled: true,
+            issuer: Some("https://manager.test:4747".into()),
+            ..Default::default()
+        };
+        let state = Arc::new(
+            WorkloadIdentityState::initialize(
+                &store,
+                &config,
+                "https://manager.test:4747",
+                SystemTime::now(),
+            )
+            .expect("wi state"),
+        );
+
+        // Issue a control-plane (`legion`) token: no operator audience → aud is
+        // the cluster issuer.
+        let claims = WorkloadIdentityClaims {
+            region: "auto".into(),
+            job: "api".into(),
+            group: "web".into(),
+            task: "server".into(),
+            node_id: "node-1".into(),
+            alloc_id: "7".into(),
+            instance: None,
+            slot: None,
+        };
+        let legion = WorkloadIdentity {
+            name: CONTROL_PLANE_IDENTITY_NAME.into(),
+            audience: Vec::new(),
+            ..Default::default()
+        };
+        let token = state
+            .issue(&claims, &legion, SystemTime::now())
+            .expect("issue")
+            .token;
+
+        // Method maps the verified token → principal + policies via binding rules.
+        let method = ControlPlaneIdentityMethod::new(
+            state.clone(),
+            vec![AclBindingRule {
+                claim: Some("legion.io/job".into()),
+                value: Some("api".into()),
+                policies: vec!["kv-reader".into()],
+            }],
+            Duration::from_secs(60),
+        );
+        let verified = method
+            .validate_bearer(&token)
+            .expect("method interprets JWT")
+            .expect("token verifies");
+        assert_eq!(verified.principal, "auto:api:web:server");
+        assert_eq!(verified.policies, vec!["kv-reader"]);
+
+        // A token minted for a foreign audience (a normal federation token) is
+        // NOT accepted as a control-plane credential.
+        let aws = WorkloadIdentity {
+            name: "aws".into(),
+            audience: vec!["sts.amazonaws.com".into()],
+            ..Default::default()
+        };
+        let aws_token = state
+            .issue(&claims, &aws, SystemTime::now())
+            .expect("issue aws")
+            .token;
+        assert!(method
+            .validate_bearer(&aws_token)
+            .expect("interprets")
+            .is_err());
     }
 
     #[test]
