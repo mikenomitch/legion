@@ -475,6 +475,7 @@ impl<'a> Scheduler<'a> {
             required_counts,
             &allocations_by_node,
             mode,
+            None,
         )?;
         info!(
             %job_config_id,
@@ -538,6 +539,7 @@ impl<'a> Scheduler<'a> {
             required_counts,
             &allocations_by_node,
             mode,
+            None,
         )?;
         info!(
             job_id = %job_config.name,
@@ -615,7 +617,22 @@ impl<'a> Scheduler<'a> {
             }
         }
 
-        let allocations_by_node = self.store.cached_allocations_by_node()?;
+        let mut allocations_by_node = self.store.cached_allocations_by_node()?;
+        // A `Fresh` plan replaces the job's allocations wholesale: whichever
+        // handler asked for it either already dropped the previous ones
+        // (`job_update`) or drops them the moment this plan applies
+        // (`job_submit`). Counting them against node capacity here would
+        // demand headroom for two copies of the job and fail a plain
+        // resubmit of anything using more than half a node — and it would
+        // contradict `plan_only` / `plan_for_config`, which drop them and so
+        // report a plan the apply path then refuses.
+        if matches!(mode, PlanMode::Fresh) {
+            if let Some(job_id) = self.store.job_id_for_job_config(job_config_id)? {
+                for allocations in allocations_by_node.values_mut() {
+                    allocations.retain(|alloc| alloc.job_id != job_id);
+                }
+            }
+        }
         let existing_counts =
             Self::existing_alloc_counts_by_task(job_config_id, &allocations_by_node);
         if let Some(task_targets) = task_targets {
@@ -644,6 +661,7 @@ impl<'a> Scheduler<'a> {
             required_counts,
             &allocations_by_node,
             mode.clone(),
+            task_targets,
         )?;
         debug!(
             %job_config_id,
@@ -825,6 +843,7 @@ impl<'a> Scheduler<'a> {
         required_counts: HashMap<i64, u32>,
         allocations_by_node: &HashMap<String, Vec<Allocation>>,
         mode: PlanMode,
+        task_targets: Option<&HashMap<i64, u32>>,
     ) -> R<Vec<PlannedAllocation>> {
         tasks.sort_by_key(|a| a.0);
 
@@ -848,7 +867,10 @@ impl<'a> Scheduler<'a> {
             ResourceLedger::new(&nodes, allocations_by_node, resource_policy)?;
         let mut group_per_key: HashMap<String, Option<String>> = HashMap::new();
         let mut group_sizes: HashMap<String, usize> = HashMap::new();
-        let mut group_constraints: HashMap<String, Vec<ConstraintSet>> = HashMap::new();
+        // Hard filters (constraints + permit) of every member of a group. A
+        // multi-task group is placed on a single node, so that node must
+        // satisfy all of them.
+        let mut group_filters: HashMap<String, Vec<(ConstraintSet, PermitSet)>> = HashMap::new();
         let mut task_group_map: HashMap<i64, (String, Option<String>)> = HashMap::new();
         let mut task_id_to_group: HashMap<i64, String> = HashMap::new();
         let task_name_to_id: HashMap<String, i64> = all_tasks
@@ -874,16 +896,19 @@ impl<'a> Scheduler<'a> {
                 }
                 _ => {}
             }
-            if group_sizes.get(&task_config.group).copied().unwrap_or(0) > 1 {
-                let constraint_set =
-                    ConstraintSet::new(&task_config.constraints).with_context(|| {
-                        format!("Failed to parse constraints for task {}", task_config.name)
-                    })?;
-                group_constraints
-                    .entry(task_config.group.clone())
-                    .or_default()
-                    .push(constraint_set);
-            }
+            // Collected for every task, not just the second and later members:
+            // group size is only known once the whole list has been walked, and
+            // the first member's filters count just as much as the rest.
+            let constraint_set =
+                ConstraintSet::new(&task_config.constraints).with_context(|| {
+                    format!("Failed to parse constraints for task {}", task_config.name)
+                })?;
+            let permit_set = PermitSet::new(&task_config.permit)
+                .with_context(|| format!("Failed to parse permit for task {}", task_config.name))?;
+            group_filters
+                .entry(task_config.group.clone())
+                .or_default()
+                .push((constraint_set, permit_set));
             task_group_map.insert(*task_id, (task_config.group.clone(), per_key));
             task_id_to_group.insert(*task_id, task_config.group.clone());
         }
@@ -901,10 +926,17 @@ impl<'a> Scheduler<'a> {
                 if group_sizes.get(group_name).copied().unwrap_or(0) <= 1 {
                     continue;
                 }
+                // Only allocations on nodes that are still placement
+                // candidates pin their group. An allocation left behind on a
+                // drained or lost node (a fenced stateful task waits out its
+                // `onLost.replaceAfter` there) would otherwise pin the group
+                // to a node nothing can be placed on, blocking replacement of
+                // its every group-mate. Later passes re-converge the group
+                // onto whichever candidate node the survivors landed on.
+                let Some(node) = node_lookup.get(node_id.as_str()) else {
+                    continue;
+                };
                 let token = if let Some(per_key) = per_key.as_deref() {
-                    let node = node_lookup
-                        .get(node_id.as_str())
-                        .context("missing node for allocation")?;
                     let value = node_attribute(node, per_key).with_context(|| {
                         format!("Node {} missing attribute {}", node_id, per_key)
                     })?;
@@ -932,16 +964,18 @@ impl<'a> Scheduler<'a> {
         }
 
         let mut group_candidates: HashMap<GroupKey, Vec<&Node>> = HashMap::new();
-        for (group_name, constraint_sets) in &group_constraints {
+        for (group_name, filters) in &group_filters {
+            if group_sizes.get(group_name).copied().unwrap_or(0) <= 1 {
+                continue;
+            }
             let per_key = group_per_key
                 .get(group_name)
                 .and_then(|value| value.clone());
             let mut grouped: HashMap<String, Vec<&Node>> = HashMap::new();
             for node in &nodes {
-                if !constraint_sets
-                    .iter()
-                    .all(|constraint| constraint.is_satisfied(node, None))
-                {
+                if !filters.iter().all(|(constraint, permit)| {
+                    constraint.is_satisfied(node, None) && permit.is_permitted(node)
+                }) {
                     continue;
                 }
                 let token = if let Some(per_key) = per_key.as_deref() {
@@ -993,6 +1027,19 @@ impl<'a> Scheduler<'a> {
                     );
                 }
 
+                // Deterministic order so an explicit target budget below is
+                // always spent on the same groups.
+                let mut grouped = grouped.into_iter().collect::<Vec<_>>();
+                grouped.sort_by(|left, right| left.0.cmp(&right.0));
+
+                // `count.per` normally converges each group to `count.num`
+                // independently. An explicit target is a total for the task
+                // (rollouts stage placements that way), so it has to cap the
+                // sum across groups instead — otherwise a canary step places
+                // the whole fleet at once.
+                let mut target_budget = task_targets
+                    .map(|_| required_counts.get(&task_id).copied().unwrap_or_default());
+
                 for (group_name, group) in grouped {
                     let placed = if matches!(mode, PlanMode::Reschedule) {
                         Self::count_existing_allocations_in_group(
@@ -1003,7 +1050,11 @@ impl<'a> Scheduler<'a> {
                     } else {
                         0
                     };
-                    let needed = task_config.count.num.saturating_sub(placed);
+                    let mut needed = task_config.count.num.saturating_sub(placed);
+                    if let Some(budget) = target_budget.as_mut() {
+                        needed = needed.min(*budget);
+                        *budget -= needed;
+                    }
                     let group_key = GroupKey {
                         name: task_config.group.clone(),
                         token: group_name.to_string(),
@@ -1818,8 +1869,11 @@ impl<'a> Scheduler<'a> {
                     .as_u64()
                     .context("nodes_considered must be a positive integer or percentage")?;
 
-                if count == 0 {
-                    bail!("nodes_considered must be at least 1");
+                // Matches the floor the percentage form clamps to, and the
+                // one `nodes_considered_limit` enforces: a subset of one
+                // leaves the policy nothing to compare.
+                if count < 2 {
+                    bail!("nodes_considered must be at least 2");
                 }
 
                 Ok(Some(NodesConsidered::Count(count)))
@@ -4311,6 +4365,480 @@ mod tests {
 
         assert_eq!(outcome.allocations.len(), 1);
         assert_eq!(outcome.allocations[0].node_id, "node-a");
+
+        Ok(())
+    }
+
+    #[test]
+    fn multi_task_group_honors_constraints_of_every_member() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", json!({ "role": "web" })))?;
+        store.insert_node(make_node_msg("node-b", json!({ "role": "db" })))?;
+
+        // The constrained task is listed FIRST in the group: the group's node
+        // must still satisfy it.
+        let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "group-first-constraint".into(),
+            tasks: vec![
+                TaskConfig {
+                    group: "app".into(),
+                    constraints: json!({ "role": "db" }),
+                    ..TaskConfig::new("database", "noop")
+                },
+                TaskConfig {
+                    group: "app".into(),
+                    ..TaskConfig::new("sidecar", "noop")
+                },
+            ],
+            version: None,
+        };
+
+        store.handle_job_submit(&job, &[dummy_submission()])?;
+        let job_config_id = store.get_job_config(&job.name)?.id();
+        let scheduler = Scheduler::new(&store)?;
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+
+        assert_eq!(outcome.allocations.len(), 2);
+        for allocation in &outcome.allocations {
+            assert_eq!(allocation.node_id, "node-b");
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn distinct_constraint_limits_one_allocation_per_attribute_value() -> R<()> {
+        let store = setup_store_with_scheduler("spread", None)?;
+        store.insert_node(make_node_msg("node-a", json!({ "zone": "east" })))?;
+        store.insert_node(make_node_msg("node-b", json!({ "zone": "east" })))?;
+        store.insert_node(make_node_msg("node-c", json!({ "zone": "west" })))?;
+
+        let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "distinct-zone".into(),
+            tasks: vec![TaskConfig {
+                count: TaskCount::new(2),
+                constraints: json!([{ "key": "zone", "operator": "distinct" }]),
+                ..TaskConfig::new("api", "noop")
+            }],
+            version: None,
+        };
+        store.handle_job_submit(&job, &[dummy_submission()])?;
+        let job_config_id = store.get_job_config(&job.name)?.id();
+        let scheduler = Scheduler::new(&store)?;
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+
+        let zones = outcome
+            .allocations
+            .iter()
+            .map(|alloc| {
+                let node = store.get_node(&alloc.node_id)?;
+                Ok(node
+                    .config_attrs
+                    .get("zone")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string())
+            })
+            .collect::<R<HashSet<_>>>()?;
+        assert_eq!(zones.len(), 2, "one allocation per distinct zone");
+
+        Ok(())
+    }
+
+    #[test]
+    fn unavailable_nodes_are_not_placement_candidates() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", json!({})))?;
+        let mut draining = make_node_msg("node-b", json!({}));
+        draining.availability = "draining".into();
+        store.insert_node(draining)?;
+
+        let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "avail".into(),
+            tasks: vec![TaskConfig {
+                count: TaskCount::new(2),
+                ..TaskConfig::new("api", "noop")
+            }],
+            version: None,
+        };
+        store.handle_job_submit(&job, &[dummy_submission()])?;
+        let job_config_id = store.get_job_config(&job.name)?.id();
+        let scheduler = Scheduler::new(&store)?;
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+        assert!(outcome
+            .allocations
+            .iter()
+            .all(|alloc| alloc.node_id == "node-a"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn custom_item_resources_are_consumed_once() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg(
+            "node-a",
+            json!({ "resources": { "gpu": ["gpu0", "gpu1"] } }),
+        ))?;
+
+        let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "gpu-job".into(),
+            tasks: vec![TaskConfig {
+                count: TaskCount::new(2),
+                resources: json!({ "memory": 64, "gpu": ["gpu0"] }),
+                ..TaskConfig::new("trainer", "noop")
+            }],
+            version: None,
+        };
+        store.handle_job_submit(&job, &[dummy_submission()])?;
+        let job_config_id = store.get_job_config(&job.name)?.id();
+        let scheduler = Scheduler::new(&store)?;
+        let result = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh);
+        assert!(
+            result.is_err(),
+            "second allocation cannot claim an already-consumed gpu item"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn reserved_resources_reduce_schedulable_capacity() -> R<()> {
+        let store = setup_store()?;
+        // 8 GiB total, 7 GiB reserved -> only 1 GiB schedulable.
+        store.insert_node(make_node_msg(
+            "node-a",
+            json!({ "reservedResources": { "memory": 7168 } }),
+        ))?;
+
+        let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "reserved".into(),
+            tasks: vec![TaskConfig {
+                resources: json!({ "memory": 2048 }),
+                ..TaskConfig::new("api", "noop")
+            }],
+            version: None,
+        };
+        store.handle_job_submit(&job, &[dummy_submission()])?;
+        let job_config_id = store.get_job_config(&job.name)?.id();
+        let scheduler = Scheduler::new(&store)?;
+        assert!(scheduler
+            .plan_and_apply(&job_config_id, PlanMode::Fresh)
+            .is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn reschedule_places_only_the_missing_allocations() -> R<()> {
+        let store = setup_store_with_scheduler("spread", None)?;
+        store.insert_node(make_node_msg("node-a", json!({})))?;
+        store.insert_node(make_node_msg("node-b", json!({})))?;
+
+        let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "scale-up".into(),
+            tasks: vec![TaskConfig {
+                count: TaskCount::new(3),
+                ..TaskConfig::new("api", "noop")
+            }],
+            version: None,
+        };
+        store.handle_job_submit(&job, &[dummy_submission()])?;
+        let job_config_id = store.get_job_config(&job.name)?.id();
+        let task_id = task_id_for(&store, &job_config_id, "api")?;
+        store.place_alloc("node-a", task_id)?;
+
+        let scheduler = Scheduler::new(&store)?;
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Reschedule)?;
+        assert_eq!(outcome.allocations.len(), 2, "places only the missing two");
+
+        Ok(())
+    }
+
+    #[test]
+    fn group_mixing_count_per_values_is_rejected() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", json!({ "region": "east" })))?;
+
+        let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "mixed-per".into(),
+            tasks: vec![
+                TaskConfig {
+                    group: "app".into(),
+                    count: TaskCount::per(1, "region"),
+                    ..TaskConfig::new("api", "noop")
+                },
+                TaskConfig {
+                    group: "app".into(),
+                    count: TaskCount::new(1),
+                    ..TaskConfig::new("cache", "noop")
+                },
+            ],
+            version: None,
+        };
+        store.handle_job_submit(&job, &[dummy_submission()])?;
+        let job_config_id = store.get_job_config(&job.name)?.id();
+        let scheduler = Scheduler::new(&store)?;
+        assert!(scheduler
+            .plan_and_apply(&job_config_id, PlanMode::Fresh)
+            .is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_plans_cannot_oversubscribe_a_node() -> R<()> {
+        let store = setup_store()?;
+        // One node with room for exactly one 6000 MiB allocation.
+        store.insert_node(make_node_msg("node-a", json!({})))?;
+
+        let mut config_ids = Vec::new();
+        for name in ["job-one", "job-two"] {
+            let job = JobConfig {
+                rollout: None,
+                rollout_by_group: Default::default(),
+                name: name.into(),
+                tasks: vec![TaskConfig {
+                    resources: json!({ "memory": 6000 }),
+                    ..TaskConfig::new("api", "noop")
+                }],
+                version: None,
+            };
+            store.handle_job_submit(&job, &[dummy_submission()])?;
+            config_ids.push(store.get_job_config(name)?.id());
+        }
+
+        let handles = config_ids
+            .into_iter()
+            .map(|job_config_id| {
+                let store = store.clone();
+                std::thread::spawn(move || {
+                    let scheduler = Scheduler::new(&store)?;
+                    scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let mut applied = 0;
+        for handle in handles {
+            if let Ok(Ok(outcome)) = handle.join() {
+                applied += outcome.allocations.len();
+            }
+        }
+
+        assert_eq!(applied, 1, "only one plan may claim the node");
+        assert_eq!(store.allocs_for_node("node-a")?.len(), 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn failed_batch_dependency_blocks_dependent_task() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", json!({})))?;
+
+        let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "dag-failure".into(),
+            tasks: vec![
+                TaskConfig {
+                    lifecycle: TaskLifecycle::Batch,
+                    group: "build".into(),
+                    ..TaskConfig::new("migrate", "noop")
+                },
+                TaskConfig {
+                    lifecycle: TaskLifecycle::Service,
+                    group: "serve".into(),
+                    depends_on: vec![crate::structs::TaskDependency {
+                        task: "migrate".into(),
+                        condition: TaskDependencyCondition::Success,
+                    }],
+                    ..TaskConfig::new("api", "noop")
+                },
+            ],
+            version: None,
+        };
+        store.handle_job_submit(&job, &[dummy_submission()])?;
+        let job_config_id = store.get_job_config(&job.name)?.id();
+        let migrate_id = task_id_for(&store, &job_config_id, "migrate")?;
+        store.set_task_status(migrate_id, TaskStatusState::Failed)?;
+
+        let scheduler = Scheduler::new(&store)?;
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+        assert!(
+            outcome
+                .allocations
+                .iter()
+                .all(|alloc| alloc.task_config_id == migrate_id),
+            "api must not be placed while its dependency has failed"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn fresh_replan_ignores_the_jobs_own_outgoing_allocations() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", json!({ "zone": "east" })))?;
+
+        let v1 = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "heavy".into(),
+            tasks: vec![TaskConfig {
+                resources: json!({ "memory": 6000 }),
+                affinities: json!({ "zone": "east" }),
+                ..TaskConfig::new("api", "noop")
+            }],
+            version: None,
+        };
+        store.handle_job_submit(&v1, &[dummy_submission()])?;
+        let v1_id = store.get_job_config(&v1.name)?.id();
+        let scheduler = Scheduler::new(&store)?;
+        assert_eq!(
+            scheduler
+                .plan_and_apply(&v1_id, PlanMode::Fresh)?
+                .allocations
+                .len(),
+            1
+        );
+
+        // A schedule-relevant change (affinity) forces a real replan.
+        let v2 = JobConfig {
+            tasks: vec![TaskConfig {
+                resources: json!({ "memory": 6000 }),
+                affinities: json!({ "zone": "west" }),
+                ..TaskConfig::new("api", "noop")
+            }],
+            ..v1.clone()
+        };
+        store.handle_job_submit(&v2, &[dummy_submission()])?;
+        let v2_id = store.get_job_config(&v2.name)?.id();
+        assert_ne!(v1_id, v2_id);
+
+        let outcome = scheduler.plan_and_apply(&v2_id, PlanMode::Fresh)?;
+        assert_eq!(outcome.allocations.len(), 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn lost_node_replacement_respects_node_capacity() -> R<()> {
+        let store = setup_store()?;
+        // Both nodes fingerprint 8192 MiB, so a 6000 MiB task fits once each.
+        store.insert_node(make_node_msg("node-a", json!({})))?;
+        store.insert_node(make_node_msg("node-b", json!({})))?;
+
+        let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "capacity".into(),
+            tasks: vec![TaskConfig {
+                count: TaskCount::new(2),
+                resources: json!({ "memory": 6000 }),
+                ..TaskConfig::new("api", "noop")
+            }],
+            version: None,
+        };
+        store.handle_job_submit(&job, &[dummy_submission()])?;
+        let job_config_id = store.get_job_config(&job.name)?.id();
+        let scheduler = Scheduler::new(&store)?;
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+        assert_eq!(outcome.allocations.len(), 2);
+
+        // node-a dies. node-b is the only candidate left and has no room, so
+        // no replacement may be placed there.
+        let _ = store.mark_nodes_as_lost(&["node-a".to_string()]);
+
+        let on_node_b = store
+            .allocs_for_job_config(&job_config_id)?
+            .into_iter()
+            .filter(|alloc| alloc.node_id == "node-b")
+            .count();
+        assert_eq!(on_node_b, 1, "node-b has room for exactly one allocation");
+
+        Ok(())
+    }
+
+    #[test]
+    fn count_per_honors_explicit_task_targets() -> R<()> {
+        let store = setup_store_with_scheduler("spread", None)?;
+        store.insert_node(make_node_msg("node-a", json!({ "region": "east" })))?;
+        store.insert_node(make_node_msg("node-b", json!({ "region": "east" })))?;
+        store.insert_node(make_node_msg("node-c", json!({ "region": "west" })))?;
+        store.insert_node(make_node_msg("node-d", json!({ "region": "west" })))?;
+
+        let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "per-targets".into(),
+            tasks: vec![TaskConfig {
+                count: TaskCount::per(2, "region"),
+                ..TaskConfig::new("api", "noop")
+            }],
+            version: None,
+        };
+        store.handle_job_submit(&job, &[dummy_submission()])?;
+        let job_config_id = store.get_job_config(&job.name)?.id();
+        let task_id = task_id_for(&store, &job_config_id, "api")?;
+
+        // A rollout stages placements by passing explicit per-task targets.
+        let targets = HashMap::from([(task_id, 1)]);
+        let scheduler = Scheduler::new(&store)?;
+        let outcome = scheduler.plan_and_apply_with_targets(
+            &job_config_id,
+            PlanMode::Reschedule,
+            &targets,
+        )?;
+        assert_eq!(outcome.allocations.len(), 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn count_per_reschedule_only_refills_the_affected_group() -> R<()> {
+        let store = setup_store_with_scheduler("spread", None)?;
+        store.insert_node(make_node_msg("node-a", json!({ "region": "east" })))?;
+        store.insert_node(make_node_msg("node-b", json!({ "region": "east" })))?;
+        store.insert_node(make_node_msg("node-c", json!({ "region": "west" })))?;
+        store.insert_node(make_node_msg("node-d", json!({ "region": "west" })))?;
+
+        let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "per-refill".into(),
+            tasks: vec![TaskConfig {
+                count: TaskCount::per(2, "region"),
+                ..TaskConfig::new("api", "noop")
+            }],
+            version: None,
+        };
+        store.handle_job_submit(&job, &[dummy_submission()])?;
+        let job_config_id = store.get_job_config(&job.name)?.id();
+        let scheduler = Scheduler::new(&store)?;
+        let fresh = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+        assert_eq!(fresh.allocations.len(), 4);
+
+        store.mark_node_lost("node-c")?;
+        store.remove_allocs_for_node("node-c")?;
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Reschedule)?;
+        assert_eq!(outcome.allocations.len(), 1);
+        assert_eq!(outcome.allocations[0].node_id, "node-d");
 
         Ok(())
     }

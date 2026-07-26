@@ -38,10 +38,19 @@ Eval ordering:
 
 Dedup-on-claim behavior:
 
-- After claiming an eval, pending evals with same `job_id` are deleted.
-- Pending evals with same `node_id` are deleted.
+After claiming an eval, other pending evals are deleted when all of these hold:
 
-This keeps the queue from growing with redundant work for the same entity.
+- same `job_id` or same `node_id`,
+- same kind,
+- already claimable (`ready_at <= now`).
+
+This keeps the queue from growing with redundant work for the same entity
+without discarding work the claimed eval does not actually subsume: a
+`job_reschedule` must not drop a job's pending `rollout_tick` (ticks are
+self-perpetuating, so nothing would re-drive the rollout) or its `job_stop`,
+and an immediate eval must not cancel a delayed one, which is a timer rather
+than a queued duplicate (for example a batch task's next scheduled
+`job_update`).
 
 ## Supported Eval Kinds
 
@@ -170,6 +179,8 @@ patterns.
 
 ## Known Boundaries
 
-- Queue dedupe is scoped to job/node IDs, not full payload equivalence.
+- Queue dedupe is scoped to job/node IDs plus kind, not full payload
+  equivalence: two `job_reschedule` evals for the same job collapse even when
+  they were enqueued for different reasons.
 - Multi-manager shared queue/consensus is not implemented.
 
