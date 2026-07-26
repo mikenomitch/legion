@@ -405,7 +405,7 @@ impl Eval {
 
     fn default_fingerprint_attrs() -> serde_json::Value {
         json!({
-            "memory_total": "8388608",
+            "memory_total": "8589934592",
             "cpus": {
                 "cpu-1": { "frequency": "2400" },
                 "cpu-2": { "frequency": "2400" },
@@ -510,7 +510,7 @@ mod tests {
             last_heartbeat: "2023-01-01T00:00:00Z".into(),
             config_attrs: json!({ "node_id": id, "zone": zone }),
             fingerprint_attrs: json!({
-                "memory_total": "8388608",
+                "memory_total": "8589934592",
                 "cpus": {
                     "cpu-1": { "frequency": "2400" },
                     "cpu-2": { "frequency": "2400" },

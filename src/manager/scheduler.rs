@@ -2218,13 +2218,15 @@ impl ResourcePool {
         }
         values.insert("memory".to_string(), ResourceValue::Amount(memory_mib));
 
-        let (cpu_mhz, cores, cpu_unknown) = fingerprint_cpu(node)?;
-        if cpu_unknown {
+        let cpu = fingerprint_cpu(node)?;
+        if cpu.mhz_unknown {
             unknown.insert("cpu".to_string());
+        }
+        if cpu.cores_unknown {
             unknown.insert("cores".to_string());
         }
-        values.insert("cpu".to_string(), ResourceValue::Amount(cpu_mhz));
-        values.insert("cores".to_string(), ResourceValue::Amount(cores));
+        values.insert("cpu".to_string(), ResourceValue::Amount(cpu.mhz));
+        values.insert("cores".to_string(), ResourceValue::Amount(cpu.cores));
 
         let config_attrs = node.config_attrs.as_object().cloned().unwrap_or_default();
 
@@ -2361,6 +2363,45 @@ fn parse_resource_value(name: &str, value: &Value) -> R<ResourceValue> {
     }
 }
 
+/// Workers fingerprint `memory_total` straight from
+/// `sysinfo::System::total_memory`, which reports bytes.
+const BYTES_PER_MIB: f64 = 1024.0 * 1024.0;
+
+/// Per-core frequencies below this are not plausible for a real CPU and mean
+/// the platform did not report a usable value. `sysinfo` yields `0` where the
+/// frequency is unavailable, and on Apple Silicon it reports a small
+/// single-digit number (`4`) rather than MHz. Treating those as real capacity
+/// leaves a 10-core Mac advertising 40 MHz in total, which cannot satisfy even
+/// the built-in 100 MHz per-task default, so nothing schedules at all.
+const MIN_PLAUSIBLE_CPU_MHZ: f64 = 100.0;
+
+/// Node CPU capacity derived from a worker's fingerprint.
+///
+/// Frequency and core count are tracked separately because a platform can
+/// report one without the other: core count is reliable everywhere, while the
+/// per-core frequency is not.
+struct CpuFingerprint {
+    /// Summed clock across all cores in MHz, or `INFINITY` when unknown.
+    mhz: f64,
+    /// Number of cores, or `INFINITY` when unknown.
+    cores: f64,
+    mhz_unknown: bool,
+    cores_unknown: bool,
+}
+
+impl CpuFingerprint {
+    /// Nothing usable was reported; callers treat this as infinite capacity so
+    /// an unfingerprinted node does not silently reject every task.
+    fn unknown() -> Self {
+        CpuFingerprint {
+            mhz: f64::INFINITY,
+            cores: f64::INFINITY,
+            mhz_unknown: true,
+            cores_unknown: true,
+        }
+    }
+}
+
 fn fingerprint_memory_mib(node: &Node) -> R<(f64, bool)> {
     let total = node
         .fingerprint_attrs
@@ -2369,42 +2410,52 @@ fn fingerprint_memory_mib(node: &Node) -> R<(f64, bool)> {
         .and_then(|value| value.parse::<f64>().ok());
 
     match total {
-        Some(total) => Ok((total / 1024.0, false)),
+        Some(total) => Ok((total / BYTES_PER_MIB, false)),
         None => Ok((f64::INFINITY, true)),
     }
 }
 
-fn fingerprint_cpu(node: &Node) -> R<(f64, f64, bool)> {
-    let mut total_mhz = 0.0;
-    let mut cores = 0.0;
-    let mut known = false;
-    if let Some(cpus) = node
+fn fingerprint_cpu(node: &Node) -> R<CpuFingerprint> {
+    let cpus = node
         .fingerprint_attrs
         .get("cpus")
         .and_then(|val| val.as_object())
-    {
-        for cpu in cpus.values() {
-            if let Some(freq) = cpu.get("frequency") {
-                if let Some(freq) = freq.as_str().and_then(|val| val.parse::<f64>().ok()) {
-                    total_mhz += freq;
-                    known = true;
-                } else if let Some(freq) = freq.as_f64() {
-                    total_mhz += freq;
-                    known = true;
-                }
+        .filter(|cpus| !cpus.is_empty());
+
+    let Some(cpus) = cpus else {
+        return Ok(CpuFingerprint::unknown());
+    };
+
+    let mut total_mhz = 0.0;
+    let mut mhz_unknown = false;
+    for cpu in cpus.values() {
+        let freq = cpu.get("frequency").and_then(|freq| {
+            freq.as_str()
+                .and_then(|freq| freq.parse::<f64>().ok())
+                .or_else(|| freq.as_f64())
+        });
+
+        match freq {
+            Some(freq) if freq >= MIN_PLAUSIBLE_CPU_MHZ => total_mhz += freq,
+            // One bogus core makes the total meaningless, so drop the whole
+            // figure rather than advertise a partial sum.
+            _ => {
+                mhz_unknown = true;
+                break;
             }
-            cores += 1.0;
-        }
-        if !cpus.is_empty() {
-            known = true;
         }
     }
 
-    if known {
-        Ok((total_mhz, cores, false))
-    } else {
-        Ok((f64::INFINITY, f64::INFINITY, true))
-    }
+    Ok(CpuFingerprint {
+        mhz: if mhz_unknown {
+            f64::INFINITY
+        } else {
+            total_mhz
+        },
+        cores: cpus.len() as f64,
+        mhz_unknown,
+        cores_unknown: false,
+    })
 }
 
 fn config_value<'a>(attrs: &'a serde_json::Map<String, Value>, keys: &[&str]) -> Option<&'a Value> {
@@ -2491,7 +2542,7 @@ mod tests {
 
     fn default_fingerprint() -> Value {
         json!({
-            "memory_total": "8388608",
+            "memory_total": "8589934592",
             "cpus": {
                 "cpu-1": { "frequency": "2400" },
                 "cpu-2": { "frequency": "2400" },
@@ -3558,7 +3609,7 @@ mod tests {
             "node-a",
             json!({}),
             json!({
-                "memory_total": "524288",
+                "memory_total": "536870912",
                 "cpus": { "cpu-1": { "frequency": "1000" } }
             }),
             json!({}),
@@ -3601,7 +3652,7 @@ mod tests {
             last_heartbeat: String::new(),
             config_attrs: json!({}),
             fingerprint_attrs: json!({
-                "memory_total": "524288",
+                "memory_total": "536870912",
                 "cpus": { "cpu-1": { "frequency": "1000" } }
             }),
             dynamic_attrs: json!({}),
@@ -3667,6 +3718,100 @@ mod tests {
         Ok(())
     }
 
+    fn node_with_fingerprint(fingerprint_attrs: Value) -> Node {
+        Node {
+            id: "node-a".into(),
+            status: "active".into(),
+            pool: "default".into(),
+            availability: "available".into(),
+            last_heartbeat: String::new(),
+            config_attrs: json!({}),
+            fingerprint_attrs,
+            dynamic_attrs: json!({}),
+            health_checks: json!({}),
+        }
+    }
+
+    #[test]
+    fn memory_fingerprint_is_read_as_bytes() -> R<()> {
+        // 32 GiB, the unit sysinfo::System::total_memory reports.
+        let node = node_with_fingerprint(json!({ "memory_total": "34359738368" }));
+
+        let (memory_mib, unknown) = fingerprint_memory_mib(&node)?;
+
+        assert_eq!(memory_mib, 32.0 * 1024.0);
+        assert!(!unknown);
+        Ok(())
+    }
+
+    #[test]
+    fn implausible_cpu_frequency_falls_back_to_unknown() -> R<()> {
+        // Apple Silicon reports "4" per core rather than a figure in MHz.
+        // Summing it would advertise 40 MHz on a 10-core machine and reject
+        // every task, so the frequency is discarded while cores are kept.
+        let cpus = (1..=10)
+            .map(|i| (format!("cpu-{i}"), json!({ "frequency": "4" })))
+            .collect::<serde_json::Map<_, _>>();
+        let node = node_with_fingerprint(json!({ "cpus": cpus }));
+
+        let cpu = fingerprint_cpu(&node)?;
+
+        assert!(cpu.mhz_unknown);
+        assert_eq!(cpu.mhz, f64::INFINITY);
+        // Core count survives, so it still bin-packs on its own.
+        assert!(!cpu.cores_unknown);
+        assert_eq!(cpu.cores, 10.0);
+        Ok(())
+    }
+
+    #[test]
+    fn plausible_cpu_frequency_sums_across_cores() -> R<()> {
+        let node = node_with_fingerprint(json!({
+            "cpus": {
+                "cpu-1": { "frequency": "2400" },
+                "cpu-2": { "frequency": "2400" },
+            }
+        }));
+
+        let cpu = fingerprint_cpu(&node)?;
+
+        assert!(!cpu.mhz_unknown);
+        assert_eq!(cpu.mhz, 4800.0);
+        assert_eq!(cpu.cores, 2.0);
+        Ok(())
+    }
+
+    #[test]
+    fn absent_cpu_fingerprint_is_unknown() -> R<()> {
+        let cpu = fingerprint_cpu(&node_with_fingerprint(json!({ "cpus": {} })))?;
+
+        assert!(cpu.mhz_unknown);
+        assert!(cpu.cores_unknown);
+        assert_eq!(cpu.mhz, f64::INFINITY);
+        assert_eq!(cpu.cores, f64::INFINITY);
+        Ok(())
+    }
+
+    #[test]
+    fn default_task_request_fits_an_apple_silicon_node() -> R<()> {
+        // Regression: with the frequency summed as MHz this node advertised
+        // 40 MHz against the 100 MHz per-task default, so no job could ever
+        // be placed on an Apple Silicon worker.
+        let cpus = (1..=10)
+            .map(|i| (format!("cpu-{i}"), json!({ "frequency": "4" })))
+            .collect::<serde_json::Map<_, _>>();
+        let node = node_with_fingerprint(json!({
+            "memory_total": "34359738368",
+            "cpus": cpus,
+        }));
+        let pool = ResourcePool::from_node(&node)?;
+        let request =
+            ResourceRequest::from_value(&json!({ "memory": 128, "cpu": 100, "allocations": 1 }))?;
+
+        assert!(pool.can_fit(&request));
+        Ok(())
+    }
+
     #[test]
     fn max_allocations_limits_node_capacity() -> R<()> {
         let store = setup_store()?;
@@ -3674,7 +3819,7 @@ mod tests {
             "node-a",
             json!({ "maxAllocations": 1 }),
             json!({
-                "memory_total": "1048576",
+                "memory_total": "1073741824",
                 "cpus": { "cpu-1": { "frequency": "1000" } }
             }),
             json!({}),
@@ -4188,7 +4333,7 @@ mod tests {
             "node-a",
             json!({}),
             json!({
-                "memory_total": "2097152",
+                "memory_total": "2147483648",
                 "cpus": { "cpu-1": { "frequency": "2000" } }
             }),
             json!({}),
@@ -4197,7 +4342,7 @@ mod tests {
             "node-b",
             json!({}),
             json!({
-                "memory_total": "2097152",
+                "memory_total": "2147483648",
                 "cpus": { "cpu-1": { "frequency": "2000" } }
             }),
             json!({}),

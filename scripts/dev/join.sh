@@ -12,8 +12,8 @@ Options:
   --log-tail-lines <n>    Number of startup log lines to print per worker (default: 30).
   --manager-addr <addr>   Manager address workers should connect to.
                           Defaults:
-                          - local mode: http://127.0.0.1:4748
-                          - linux mode: http://192.168.64.1:4748
+                          - local mode: http://127.0.0.1:4747
+                          - linux mode: http://192.168.64.1:4747
   --name-prefix <prefix>  Linux container name prefix (default: legion-dev-worker).
   --platform <platform>   Container platform in Linux mode (default: linux/arm64).
   -h, --help              Show this help.
@@ -80,10 +80,12 @@ while (($# > 0)); do
 done
 
 if [[ -z "$manager_addr" ]]; then
+    # The insecure :4748 bootstrap listener was removed; `join -a` requests a
+    # token over the authenticated API on the main manager port.
     if [[ "$linux_mode" == true ]]; then
-        manager_addr="http://192.168.64.1:4748"
+        manager_addr="http://192.168.64.1:4747"
     else
-        manager_addr="http://127.0.0.1:4748"
+        manager_addr="http://127.0.0.1:4747"
     fi
 fi
 

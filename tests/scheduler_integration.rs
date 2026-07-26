@@ -539,7 +539,8 @@ fn extra_node_specs(count: usize, start_index: usize) -> Vec<NodeSpec> {
 }
 
 fn build_node(spec: &NodeSpec) -> Node {
-    let memory_total = format!("{}", (spec.memory_mib * 1024.0) as u64);
+    // Workers fingerprint memory in bytes (sysinfo::System::total_memory).
+    let memory_total = format!("{}", (spec.memory_mib * 1024.0 * 1024.0) as u64);
     let cpu_per_core = spec.cpu_mhz / 2.0;
     let config_attrs = json!({
         "zone": spec.zone,
