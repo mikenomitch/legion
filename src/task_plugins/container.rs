@@ -600,7 +600,7 @@ mod tests {
 
     #[test]
     fn container_plugin_validates_schema() -> R<()> {
-        let plugin = ContainerTaskPlugin::default();
+        let plugin = ContainerTaskPlugin;
         let config = json!({
             "image": "alpine",
             "command": ["echo", "ok"]
@@ -672,7 +672,7 @@ mod tests {
     #[test]
     #[ignore = "requires an OCI runtime (youki/runc/crun) + network"]
     fn oci_runtime_runs_container_and_captures_logs() -> R<()> {
-        let plugin = ContainerTaskPlugin::default();
+        let plugin = ContainerTaskPlugin;
         let allocation = alloc();
         // Also proves the host's DNS files are bind-mounted in (host networking
         // is useless without resolver config) and that env reaches the task.
@@ -719,7 +719,7 @@ mod tests {
     #[ignore = "requires an OCI runtime (youki/runc/crun) + network"]
     fn oci_runtime_stop_kills_running_container() -> R<()> {
         let binary = std::env::var(OCI_RUNTIME_ENV).unwrap_or_else(|_| DEFAULT_OCI_RUNTIME.into());
-        let plugin = ContainerTaskPlugin::default();
+        let plugin = ContainerTaskPlugin;
         let allocation = alloc();
         let name = container_name(&allocation);
         let task = container_task("stoptest", json!(["/bin/sleep", "60"]));

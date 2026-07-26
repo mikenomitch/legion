@@ -5,7 +5,6 @@
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -170,6 +169,7 @@ fn task_allocation(
         self_terminate_after_seconds: 0,
         task_artifacts: artifacts.to_string(),
         network: String::new(),
+        task_connect: String::new(),
     }
 }
 

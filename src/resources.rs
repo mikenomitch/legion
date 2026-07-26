@@ -149,11 +149,13 @@ mod tests {
 
     #[test]
     fn resource_defaults_apply_with_aliases() -> R<()> {
-        let mut config = ManagerConfigFull::default();
-        config.task_resource_defaults = Some(json!({
-            "memory": 512,
-            "cpus": 200,
-        }));
+        let config = ManagerConfigFull {
+            task_resource_defaults: Some(json!({
+                "memory": 512,
+                "cpus": 200,
+            })),
+            ..Default::default()
+        };
         let policy = ResourcePolicy::from_manager_config(&config)?;
         let normalized = policy.normalize_task_resources(&json!({}), true)?;
         let normalized = normalized.as_object().context("missing object")?;
@@ -167,11 +169,13 @@ mod tests {
 
     #[test]
     fn required_custom_resources_are_enforced() -> R<()> {
-        let mut config = ManagerConfigFull::default();
-        config.custom_resources = Some(json!({
-            "gpu": "required",
-            "disk": "optional",
-        }));
+        let config = ManagerConfigFull {
+            custom_resources: Some(json!({
+                "gpu": "required",
+                "disk": "optional",
+            })),
+            ..Default::default()
+        };
         let policy = ResourcePolicy::from_manager_config(&config)?;
         let err = policy
             .normalize_task_resources(&json!({}), true)

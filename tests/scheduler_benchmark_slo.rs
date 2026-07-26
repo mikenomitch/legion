@@ -139,7 +139,7 @@ fn submit_jobs(store: &Store, scenario: &SchedulerScenario) -> anyhow::Result<Ve
             rollout_by_group: Default::default(),
             version: None,
         };
-        store.handle_job_submit(&job, &[submission.clone()])?;
+        store.handle_job_submit(&job, std::slice::from_ref(&submission))?;
         ids.push(store.get_job_config(&job.name)?.id());
     }
 
@@ -164,7 +164,7 @@ fn apply_churn(
     if scenario.churn_every == 0 || scenario.churn_nodes == 0 {
         return Ok(());
     }
-    if iteration == 0 || iteration % scenario.churn_every != 0 {
+    if iteration == 0 || !iteration.is_multiple_of(scenario.churn_every) {
         return Ok(());
     }
 

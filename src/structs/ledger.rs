@@ -135,42 +135,6 @@ impl From<Allocation> for LedgerAllocation {
     }
 }
 
-#[cfg(test)]
-mod ledger_tests {
-    use super::*;
-    use serde_json::json;
-
-    fn allocation(instance_id: Option<&str>) -> Allocation {
-        Allocation {
-            id: 7,
-            status: "running".into(),
-            resources: json!({"cpu": 100}),
-            node_id: "node-a".into(),
-            job_config_id: "jc-1".into(),
-            task_config_id: 3,
-            job_id: "db".into(),
-            instance_id: instance_id.map(Into::into),
-            network: None,
-        }
-    }
-
-    #[test]
-    fn ledger_allocation_round_trips_instance_id() {
-        let msg = LedgerAllocation::from(allocation(Some("db-default-2")));
-        assert_eq!(msg.instance_id.as_deref(), Some("db-default-2"));
-        let back = msg.into_allocation().unwrap();
-        assert_eq!(back.instance_id.as_deref(), Some("db-default-2"));
-    }
-
-    #[test]
-    fn ledger_allocation_omits_instance_id_for_stateless() {
-        let msg = LedgerAllocation::from(allocation(None));
-        assert_eq!(msg.instance_id, None);
-        let back = msg.into_allocation().unwrap();
-        assert_eq!(back.instance_id, None);
-    }
-}
-
 impl LedgerAllocation {
     pub fn into_allocation(self) -> R<Allocation> {
         let LedgerAllocation {
@@ -205,5 +169,41 @@ impl LedgerAllocation {
             instance_id,
             network,
         })
+    }
+}
+
+#[cfg(test)]
+mod ledger_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn allocation(instance_id: Option<&str>) -> Allocation {
+        Allocation {
+            id: 7,
+            status: "running".into(),
+            resources: json!({"cpu": 100}),
+            node_id: "node-a".into(),
+            job_config_id: "jc-1".into(),
+            task_config_id: 3,
+            job_id: "db".into(),
+            instance_id: instance_id.map(Into::into),
+            network: None,
+        }
+    }
+
+    #[test]
+    fn ledger_allocation_round_trips_instance_id() {
+        let msg = LedgerAllocation::from(allocation(Some("db-default-2")));
+        assert_eq!(msg.instance_id.as_deref(), Some("db-default-2"));
+        let back = msg.into_allocation().unwrap();
+        assert_eq!(back.instance_id.as_deref(), Some("db-default-2"));
+    }
+
+    #[test]
+    fn ledger_allocation_omits_instance_id_for_stateless() {
+        let msg = LedgerAllocation::from(allocation(None));
+        assert_eq!(msg.instance_id, None);
+        let back = msg.into_allocation().unwrap();
+        assert_eq!(back.instance_id, None);
     }
 }

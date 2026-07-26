@@ -659,6 +659,117 @@ async fn wait_for_next_eval(store: &Store, notifier: &Notify, worker_id: usize) 
     }
 }
 
+fn handle_claimed_eval(store: &Store, worker_id: usize, eval: &Eval) {
+    let started = std::time::Instant::now();
+    info!(
+        worker_id,
+        eval_id = %eval.id,
+        kind = %eval.kind,
+        "Dispatching claimed eval"
+    );
+    match eval.handle(store) {
+        Ok(message) => {
+            info!(
+                worker_id,
+                eval_id = %eval.id,
+                kind = %eval.kind,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "Eval {} handled successfully: {}", eval.id, message
+            );
+            let completed = drafts::eval_completed(eval, &message, started.elapsed());
+            if let Err(e) = store.complete_eval_with_event(&eval.id, true, completed) {
+                error!(worker_id, "Error completing eval {}: {:?}", eval.id, e);
+            }
+        }
+        Err(e) => {
+            error!(worker_id, eval_id = %eval.id, elapsed_ms = started.elapsed().as_millis() as u64, "Error handling eval {}: {:?}", eval.id, e);
+            let failed = drafts::eval_failed(eval, &e, started.elapsed());
+            if let Err(complete_err) = store.complete_eval_with_event(&eval.id, false, failed) {
+                error!(
+                    worker_id,
+                    "Error marking eval {} as failed after handling error: {:?}",
+                    eval.id,
+                    complete_err
+                );
+            }
+        }
+    }
+}
+
+#[instrument(err, skip_all)]
+fn parse_worker_config(config_path: &str) -> R<WorkerConfigAlt> {
+    // Pluginify jsonnet
+    let mut vm = JsonnetVm::new();
+    let rendered = vm
+        .evaluate_file(config_path)
+        .map_err(|e| {
+            let err = anyhow!("Error parsing worker config at path {config_path}: {e}");
+            error!("{err}");
+            err
+        })?
+        .to_string();
+
+    let config: WorkerConfigAlt = serde_json::from_str(&rendered)
+        .with_context(|| format!("Error parsing worker config at path {config_path}"))?;
+
+    Ok(config)
+}
+
+#[instrument(err, skip_all)]
+async fn load_initial_data(store: &Store, config: &ManagerConfig) -> R<()> {
+    let worker_conf_path = config.with_defaults().worker_config_path.clone();
+    let sub_paths = fs::read_dir(worker_conf_path)?;
+
+    for path in sub_paths {
+        let path = path.unwrap().path();
+        let path_str = path.to_str().unwrap();
+        let wcp = parse_worker_config(path_str)?;
+
+        let af = wcp.additional_node_checks.unwrap_or([].to_vec());
+        let attrs = wcp.attributes.unwrap_or(HashMap::new());
+        let resources = wcp
+            .resources
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?
+            .unwrap_or_else(|| "{}".to_string());
+        let reserved_resources = wcp
+            .reserved_resources
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?
+            .unwrap_or_else(|| "{}".to_string());
+
+        let artifacts = match wcp.artifacts.as_ref() {
+            None => String::new(),
+            Some(config) => {
+                // Fail fast on malformed fetch settings (bad humantime /
+                // byte-size strings) at manager startup, not on the worker.
+                config.fetch_with_defaults().with_context(|| {
+                    format!("invalid artifacts config in worker config {path_str}")
+                })?;
+                serde_json::to_string(config)?
+            }
+        };
+
+        let wc = WorkerConfigMsg {
+            name: wcp.worker_type.clone(),
+            pool: wcp.pool.unwrap_or("default".into()),
+            additional_node_checks: af,
+            attributes: attrs,
+            name_prefix: wcp.name_prefix,
+            resources,
+            reserved_resources,
+            max_allocations: wcp.max_allocations,
+            artifacts,
+        };
+
+        store.insert_worker_type(&wc)?;
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -900,115 +1011,4 @@ mod tests {
 
         Ok(())
     }
-}
-
-fn handle_claimed_eval(store: &Store, worker_id: usize, eval: &Eval) {
-    let started = std::time::Instant::now();
-    info!(
-        worker_id,
-        eval_id = %eval.id,
-        kind = %eval.kind,
-        "Dispatching claimed eval"
-    );
-    match eval.handle(store) {
-        Ok(message) => {
-            info!(
-                worker_id,
-                eval_id = %eval.id,
-                kind = %eval.kind,
-                elapsed_ms = started.elapsed().as_millis() as u64,
-                "Eval {} handled successfully: {}", eval.id, message
-            );
-            let completed = drafts::eval_completed(eval, &message, started.elapsed());
-            if let Err(e) = store.complete_eval_with_event(&eval.id, true, completed) {
-                error!(worker_id, "Error completing eval {}: {:?}", eval.id, e);
-            }
-        }
-        Err(e) => {
-            error!(worker_id, eval_id = %eval.id, elapsed_ms = started.elapsed().as_millis() as u64, "Error handling eval {}: {:?}", eval.id, e);
-            let failed = drafts::eval_failed(eval, &e, started.elapsed());
-            if let Err(complete_err) = store.complete_eval_with_event(&eval.id, false, failed) {
-                error!(
-                    worker_id,
-                    "Error marking eval {} as failed after handling error: {:?}",
-                    eval.id,
-                    complete_err
-                );
-            }
-        }
-    }
-}
-
-#[instrument(err, skip_all)]
-fn parse_worker_config(config_path: &str) -> R<WorkerConfigAlt> {
-    // Pluginify jsonnet
-    let mut vm = JsonnetVm::new();
-    let rendered = vm
-        .evaluate_file(config_path)
-        .map_err(|e| {
-            let err = anyhow!("Error parsing worker config at path {config_path}: {e}");
-            error!("{err}");
-            err
-        })?
-        .to_string();
-
-    let config: WorkerConfigAlt = serde_json::from_str(&rendered)
-        .with_context(|| format!("Error parsing worker config at path {config_path}"))?;
-
-    Ok(config)
-}
-
-#[instrument(err, skip_all)]
-async fn load_initial_data(store: &Store, config: &ManagerConfig) -> R<()> {
-    let worker_conf_path = config.with_defaults().worker_config_path.clone();
-    let sub_paths = fs::read_dir(worker_conf_path)?;
-
-    for path in sub_paths {
-        let path = path.unwrap().path();
-        let path_str = path.to_str().unwrap();
-        let wcp = parse_worker_config(path_str)?;
-
-        let af = wcp.additional_node_checks.unwrap_or([].to_vec());
-        let attrs = wcp.attributes.unwrap_or(HashMap::new());
-        let resources = wcp
-            .resources
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()?
-            .unwrap_or_else(|| "{}".to_string());
-        let reserved_resources = wcp
-            .reserved_resources
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()?
-            .unwrap_or_else(|| "{}".to_string());
-
-        let artifacts = match wcp.artifacts.as_ref() {
-            None => String::new(),
-            Some(config) => {
-                // Fail fast on malformed fetch settings (bad humantime /
-                // byte-size strings) at manager startup, not on the worker.
-                config.fetch_with_defaults().with_context(|| {
-                    format!("invalid artifacts config in worker config {path_str}")
-                })?;
-                serde_json::to_string(config)?
-            }
-        };
-
-        let wc = WorkerConfigMsg {
-            name: wcp.worker_type.clone(),
-            pool: wcp.pool.unwrap_or("default".into()),
-            additional_node_checks: af,
-            attributes: attrs,
-            name_prefix: wcp.name_prefix,
-            resources,
-            reserved_resources,
-            max_allocations: wcp.max_allocations,
-            artifacts,
-        };
-
-        store.insert_worker_type(&wc)?;
-    }
-
-    Ok(())
 }

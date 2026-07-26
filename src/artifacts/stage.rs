@@ -1141,7 +1141,6 @@ mod tests {
     use super::*;
     use crate::artifacts::status::ArtifactState;
     use crate::structs::ArtifactAuth;
-    use std::io::Write as _;
     use tempfile::tempdir;
 
     #[test]
@@ -1775,7 +1774,7 @@ mod tests {
             },
         ];
 
-        let specs = vec![spec("https://example.com/a"), spec("https://example.com/b")];
+        let specs = [spec("https://example.com/a"), spec("https://example.com/b")];
         let fingerprint_specs = [
             specs[0].clone(),
             specs[1].clone(),

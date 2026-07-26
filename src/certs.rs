@@ -198,8 +198,8 @@ mod tests {
             ca_key_path.to_string_lossy().into_owned(),
         )?;
 
-        assert!(cert.cert.pem().len() > 0);
-        assert!(cert.key_pair.serialize_pem().len() > 0);
+        assert!(!cert.cert.pem().is_empty());
+        assert!(!cert.key_pair.serialize_pem().is_empty());
 
         Ok(())
     }
@@ -209,8 +209,8 @@ mod tests {
         let tmp = TmpCertDir::new();
         let cert = create_ca_cert(tmp.path())?;
         let (cert_signed, key, _) = signed_cert_with_ca(&cert, "test")?;
-        assert!(cert_signed.len() > 0);
-        assert!(key.len() > 0);
+        assert!(!cert_signed.is_empty());
+        assert!(!key.is_empty());
 
         Ok(())
     }

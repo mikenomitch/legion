@@ -465,7 +465,7 @@ mod tests {
 
     #[test]
     fn bin_pack_prefers_more_loaded_node() {
-        let nodes = vec![node("node-a"), node("node-b")];
+        let nodes = [node("node-a"), node("node-b")];
         let allocations: HashMap<String, Vec<Allocation>> = HashMap::from([(
             String::from("node-a"),
             vec![alloc("node-a", 1, "other-job")],
@@ -487,7 +487,7 @@ mod tests {
             &planned,
             SchedulerWeights::for_policy("bin_pack"),
         );
-        let policy = BinPackPolicy::default();
+        let policy = BinPackPolicy;
 
         let choice = policy.select_node(ctx).expect("node expected");
         assert_eq!(choice.id, "node-b");
@@ -495,7 +495,7 @@ mod tests {
 
     #[test]
     fn bin_pack_picks_any_node_on_tie() {
-        let nodes = vec![node("node-a"), node("node-b")];
+        let nodes = [node("node-a"), node("node-b")];
         let allocations: HashMap<String, Vec<Allocation>> = HashMap::new();
         let planned = HashMap::from([
             (String::from("node-a"), 1_usize),
@@ -517,7 +517,7 @@ mod tests {
             &planned,
             SchedulerWeights::for_policy("bin_pack"),
         );
-        let policy = BinPackPolicy::default();
+        let policy = BinPackPolicy;
 
         let choice = policy.select_node(ctx).expect("node expected");
         assert!(["node-a", "node-b"].contains(&choice.id.as_str()));
@@ -525,7 +525,7 @@ mod tests {
 
     #[test]
     fn bin_pack_counts_planned_and_active_allocations() {
-        let nodes = vec![node("node-a"), node("node-b")];
+        let nodes = [node("node-a"), node("node-b")];
         let allocations: HashMap<String, Vec<Allocation>> = HashMap::from([
             (
                 String::from("node-a"),
@@ -556,7 +556,7 @@ mod tests {
             &planned,
             SchedulerWeights::for_policy("bin_pack"),
         );
-        let policy = BinPackPolicy::default();
+        let policy = BinPackPolicy;
 
         let choice = policy.select_node(ctx).expect("node expected");
         assert_eq!(choice.id, "node-b");
@@ -583,7 +583,7 @@ mod tests {
             &planned,
             SchedulerWeights::for_policy("bin_pack"),
         );
-        let policy = BinPackPolicy::default();
+        let policy = BinPackPolicy;
 
         let choice = policy.select_node(ctx);
         assert!(choice.is_none());
@@ -591,7 +591,7 @@ mod tests {
 
     #[test]
     fn spread_picks_any_node_on_equal_load() {
-        let nodes = vec![node("node-a"), node("node-b")];
+        let nodes = [node("node-a"), node("node-b")];
         let allocations: HashMap<String, Vec<Allocation>> = HashMap::from([(
             String::from("node-a"),
             vec![alloc("node-a", 1, "other-job")],
@@ -613,7 +613,7 @@ mod tests {
             &planned,
             SchedulerWeights::for_policy("spread"),
         );
-        let policy = SpreadPolicy::default();
+        let policy = SpreadPolicy;
 
         let choice = policy.select_node(ctx).expect("node expected");
         assert!(["node-a", "node-b"].contains(&choice.id.as_str()));
@@ -621,7 +621,7 @@ mod tests {
 
     #[test]
     fn spread_picks_any_node_on_tie() {
-        let nodes = vec![node("node-a"), node("node-b")];
+        let nodes = [node("node-a"), node("node-b")];
         let allocations: HashMap<String, Vec<Allocation>> = HashMap::new();
         let planned = HashMap::from([
             (String::from("node-a"), 1_usize),
@@ -643,7 +643,7 @@ mod tests {
             &planned,
             SchedulerWeights::for_policy("spread"),
         );
-        let policy = SpreadPolicy::default();
+        let policy = SpreadPolicy;
 
         let choice = policy.select_node(ctx).expect("node expected");
         assert!(["node-a", "node-b"].contains(&choice.id.as_str()));
@@ -651,7 +651,7 @@ mod tests {
 
     #[test]
     fn bin_pack_treats_near_equal_scores_as_tie() {
-        let nodes = vec![node("node-a"), node("node-b")];
+        let nodes = [node("node-a"), node("node-b")];
         let allocations: HashMap<String, Vec<Allocation>> = HashMap::from([(
             String::from("node-a"),
             vec![alloc("node-a", 1, "other-job")],
@@ -660,7 +660,7 @@ mod tests {
 
         let task = task("web");
         let affinity_set = AffinitySet::new(&task.affinities).expect("affinities");
-        let policy = BinPackPolicy::default();
+        let policy = BinPackPolicy;
 
         let mut seen = std::collections::HashSet::new();
         for _ in 0..64 {
@@ -695,7 +695,7 @@ mod tests {
 
     #[test]
     fn spread_prefers_node_with_same_node_as_affinity() {
-        let nodes = vec![node("node-a"), node("node-b")];
+        let nodes = [node("node-a"), node("node-b")];
         let allocations: HashMap<String, Vec<Allocation>> = HashMap::from([(
             String::from("node-a"),
             vec![alloc_for_task("node-a", 1, "job", 1)],
@@ -720,7 +720,7 @@ mod tests {
             &planned,
             SchedulerWeights::for_policy("spread"),
         );
-        let policy = SpreadPolicy::default();
+        let policy = SpreadPolicy;
 
         let choice = policy.select_node(ctx).expect("node expected");
         assert_eq!(choice.id, "node-a");
@@ -747,7 +747,7 @@ mod tests {
             &planned,
             SchedulerWeights::for_policy("spread"),
         );
-        let policy = SpreadPolicy::default();
+        let policy = SpreadPolicy;
 
         let choice = policy.select_node(ctx);
         assert!(choice.is_none());

@@ -2564,7 +2564,7 @@ mod tests {
             .count();
         assert_eq!(db_on_node_b, 1);
 
-        assert!(outcome.deltas.len() >= 1);
+        assert!(!outcome.deltas.is_empty());
         let total_added: usize = outcome.deltas.iter().map(|delta| delta.added.len()).sum();
         let total_removed: usize = outcome.deltas.iter().map(|delta| delta.removed.len()).sum();
         assert_eq!(total_added, 3);
@@ -3553,7 +3553,7 @@ mod tests {
             dynamic_attrs: json!({}),
             health_checks: json!({}),
         };
-        let nodes = vec![node];
+        let nodes = [node];
         let candidate_refs = nodes.iter().collect::<Vec<_>>();
         let task = TaskConfig {
             count: TaskCount::new(3),
@@ -4093,7 +4093,7 @@ mod tests {
         assert_eq!(indexed.get(&(1, "node-a".to_string())), Some(&2));
         assert_eq!(indexed.get(&(1, "node-b".to_string())), Some(&1));
         assert_eq!(indexed.get(&(2, "node-a".to_string())), Some(&1));
-        assert!(indexed.get(&(2, "node-b".to_string())).is_none());
+        assert!(!indexed.contains_key(&(2, "node-b".to_string())));
     }
 
     #[test]
