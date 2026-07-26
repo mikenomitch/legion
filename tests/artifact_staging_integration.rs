@@ -170,6 +170,7 @@ fn task_allocation(
         task_identities: String::new(),
         self_terminate_after_seconds: 0,
         task_artifacts: artifacts.to_string(),
+        task_resources: String::new(),
         network: String::new(),
     }
 }

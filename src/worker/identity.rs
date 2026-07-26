@@ -903,6 +903,7 @@ mod tests {
             task_identities: serde_json::to_string(&identities)?,
             self_terminate_after_seconds: 0,
             task_artifacts: String::new(),
+            task_resources: String::new(),
 
             network: String::new(),
         };
@@ -963,6 +964,7 @@ mod tests {
             task_identities: serde_json::to_string(&identities)?,
             self_terminate_after_seconds: 0,
             task_artifacts: String::new(),
+            task_resources: String::new(),
 
             network: String::new(),
         };

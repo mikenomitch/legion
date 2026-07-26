@@ -59,6 +59,18 @@ impl WorkerCredentials {
     }
 }
 
+/// Port the worker's own gRPC server listens on, and the port it advertises to
+/// the manager as its `workerAddress`. Overridable via `LEGION_WORKER_PORT` so
+/// several workers can run on one host (local multi-node testing); the manager
+/// dispatches to the advertised address, so both uses must agree.
+fn worker_server_port() -> u64 {
+    std::env::var("LEGION_WORKER_PORT")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|port| *port > 0)
+        .unwrap_or(DEF_WORKER_SERVER_PORT)
+}
+
 /// Everything needed to (re-)register this worker with the manager.
 #[derive(Debug, Clone)]
 struct RegistrationPayload {
@@ -113,7 +125,8 @@ async fn run_worker_with_manager(
     name_override: Option<&str>,
     join_secret: Option<String>,
 ) -> R<()> {
-    let addr = format!("{DEF_MANAGER_HOSTNAME}:{DEF_WORKER_SERVER_PORT}").parse()?;
+    let server_port = worker_server_port();
+    let addr = format!("{DEF_MANAGER_HOSTNAME}:{server_port}").parse()?;
 
     info!(%manager_addr, %worker_type, "Worker connecting to manager");
 
@@ -220,10 +233,7 @@ async fn run_worker_with_manager(
     }
     config_attrs.insert(
         "workerAddress".into(),
-        Value::String(format!(
-            "http://{}:{}",
-            DEF_MANAGER_HOSTNAME, DEF_WORKER_SERVER_PORT
-        )),
+        Value::String(format!("http://{}:{}", DEF_MANAGER_HOSTNAME, server_port)),
     );
 
     let registration = RegistrationPayload {

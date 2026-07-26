@@ -164,6 +164,12 @@ pub fn build_task_allocation(
     } else {
         serde_json::to_string(volumes)?
     };
+    // As declared, without the scheduler's defaults folded in, so an isolating
+    // kind can size its runtime only where the job actually asked for a size.
+    let task_resources = match task.resources.as_object() {
+        Some(resources) if !resources.is_empty() => serde_json::to_string(&task.resources)?,
+        _ => String::new(),
+    };
     Ok(TaskAllocation {
         allocation_id: allocation.id,
         job_id: allocation.job_id.clone(),
@@ -180,6 +186,7 @@ pub fn build_task_allocation(
         self_terminate_after_seconds,
         task_artifacts,
         task_volumes,
+        task_resources,
     })
 }
 

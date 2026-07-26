@@ -11,7 +11,7 @@
 use std::path::PathBuf;
 
 use oci_client::client::{ClientConfig, ClientProtocol};
-use oci_client::manifest::{OciDescriptor, OciImageManifest};
+use oci_client::manifest::{ImageIndexEntry, OciDescriptor, OciImageManifest};
 use oci_client::secrets::RegistryAuth;
 use oci_client::{Client, Reference};
 
@@ -77,12 +77,50 @@ fn registry_auth(req: &FetchRequest<'_>) -> R<RegistryAuth> {
     }
 }
 
-fn oci_client(protocol: ClientProtocol) -> Client {
-    Client::new(ClientConfig {
+/// The host architecture under the registry's (Go) naming.
+fn image_arch() -> &'static str {
+    match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        "x86" => "amd",
+        "aarch64" => "arm64",
+        "powerpc64" => "ppc64le",
+        other => other,
+    }
+}
+
+/// Picks `linux/<host arch>` out of a multi-platform image index.
+///
+/// Container images hold Linux guests whatever the host runs — Apple
+/// `container` boots a Linux VM on macOS — so the platform to pull is not the
+/// host's. oci-client's default resolver uses the host's, which on macOS asks
+/// for `darwin/arm64` and matches nothing ("no entry found in image index
+/// manifest matching client's default platform"). On Linux this resolves the
+/// same entry the default would.
+fn linux_platform_resolver(manifests: &[ImageIndexEntry]) -> Option<String> {
+    manifests
+        .iter()
+        .find(|entry| {
+            entry.platform.as_ref().is_some_and(|platform| {
+                platform.os == "linux" && platform.architecture == image_arch()
+            })
+        })
+        .map(|entry| entry.digest.clone())
+}
+
+/// `for_image` selects the image-layout path's Linux platform resolution.
+/// ORAS artifacts (`mediaType`) are not container rootfs and keep the host
+/// platform default, since a platform-indexed ORAS artifact is meant for the
+/// machine fetching it.
+fn oci_client(protocol: ClientProtocol, for_image: bool) -> Client {
+    let mut config = ClientConfig {
         protocol,
         connect_timeout: Some(std::time::Duration::from_secs(30)),
         ..ClientConfig::default()
-    })
+    };
+    if for_image {
+        config.platform_resolver = Some(Box::new(linux_platform_resolver));
+    }
+    Client::new(config)
 }
 
 fn blocking_runtime() -> R<tokio::runtime::Runtime> {
@@ -149,7 +187,10 @@ impl ArtifactFetcher for OciFetcher {
             return Ok(None);
         }
         let auth = registry_auth(req)?;
-        let client = oci_client(protocol.clone());
+        // Pinning HEADs the reference itself, so no platform is selected: a
+        // multi-platform tag pins to its index digest, which is what the
+        // per-node fetch then resolves a platform manifest out of.
+        let client = oci_client(protocol.clone(), false);
         let runtime = blocking_runtime()?;
         let digest = runtime
             .block_on(client.fetch_manifest_digest(&reference, &auth))
@@ -169,7 +210,7 @@ impl ArtifactFetcher for OciFetcher {
     fn fetch(&self, req: &FetchRequest<'_>, sink: &mut ArtifactSink) -> R<FetchedArtifact> {
         let (reference, protocol) = parse_reference(req)?;
         let auth = registry_auth(req)?;
-        let client = oci_client(protocol);
+        let client = oci_client(protocol, req.media_type.is_none());
         let runtime = blocking_runtime()?;
 
         // Resolve (possibly via an image index) to one platform manifest.

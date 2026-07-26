@@ -424,8 +424,11 @@
                 },
             },
             resources: {
-                cpus: 0.2,
-                memory: 128,
+                // The container kind applies these to the runtime, not just to
+                // scheduling: memory (MiB) and cores size the guest. `cpu`/`cpus`
+                // (MHz) has no runtime analogue, so declare cores here.
+                cores: 1,
+                memory: 256,
             },
             constraints: {
                 os: "macos",

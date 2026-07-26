@@ -1258,6 +1258,13 @@ fn task_from_allocation(allocation: &TaskAllocation) -> R<(Allocation, TaskConfi
     } else {
         Some(serde_json::from_str(&allocation.network).context("Invalid allocation network JSON")?)
     };
+    // Declared resources, used by isolating kinds to size the workload. Empty
+    // when the jobspec declared none, so kinds keep their runtime defaults.
+    let resources = if allocation.task_resources.trim().is_empty() {
+        serde_json::json!({})
+    } else {
+        serde_json::from_str(&allocation.task_resources).context("Invalid task resources JSON")?
+    };
 
     let task = TaskConfig {
         config: task_config,
@@ -1265,6 +1272,7 @@ fn task_from_allocation(allocation: &TaskAllocation) -> R<(Allocation, TaskConfi
         on_unhealthy,
         identities,
         artifacts,
+        resources,
         ..TaskConfig::new(&allocation.task_name, &allocation.task_kind)
     };
     let alloc = Allocation {
@@ -1493,6 +1501,7 @@ mod tests {
             task_identities: String::new(),
             self_terminate_after_seconds: 0,
             task_artifacts: String::new(),
+            task_resources: String::new(),
 
             network: String::new(),
         };
@@ -1545,7 +1554,7 @@ mod tests {
             task_identities: String::new(),
             self_terminate_after_seconds: 0,
             task_artifacts: serde_json::to_string(&[artifact])?,
-
+            task_resources: String::new(),
             network: String::new(),
         };
         let outcome = manager.begin_task_allocation(&ta)?;
@@ -1588,6 +1597,7 @@ mod tests {
             task_identities: String::new(),
             self_terminate_after_seconds: 0,
             task_artifacts: serde_json::to_string(&artifacts)?,
+            task_resources: String::new(),
 
             network: String::new(),
         };
