@@ -1154,6 +1154,12 @@ pub struct TaskConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[tabled(skip)]
     pub service: Option<crate::structs::network::ServiceConfig>,
+    /// Services this task dials through node-local loopback forwarders (see
+    /// `docs/service-discovery.md`). None = today's behavior: no forwarders,
+    /// no extra env, zero cost.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[tabled(skip)]
+    pub connect: Option<crate::structs::network::ConnectConfig>,
     /// Workload identities issued to this task (workload-identity OIDC plan).
     /// Empty = today's behavior; the feature is opt-in per task.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1590,6 +1596,8 @@ struct TaskConfigInput {
     #[serde(default)]
     service: Option<crate::structs::network::ServiceConfig>,
     #[serde(default)]
+    connect: Option<crate::structs::network::ConnectConfig>,
+    #[serde(default)]
     identities: Vec<WorkloadIdentity>,
     #[serde(default)]
     stateful: Option<StatefulConfig>,
@@ -1700,6 +1708,7 @@ impl TaskConfigInput {
             }),
             network: self.network,
             service: self.service,
+            connect: self.connect,
             identities: self.identities,
             stateful: self.stateful,
             artifacts: self.artifacts,
@@ -1872,6 +1881,7 @@ impl TaskConfig {
             kv_injections: None,
             network: None,
             service: None,
+            connect: None,
             identities: Vec::new(),
             stateful: None,
             artifacts: Vec::new(),
@@ -1914,6 +1924,23 @@ impl TaskConfig {
             }
         }
         Ok(())
+    }
+
+    /// Validate the task's `connect` block and `service.allow` intentions.
+    /// No connect block and no allow list = today's behavior, always valid.
+    /// Deliberately does not require the upstream services to exist yet.
+    pub fn validate_connect(&self) -> R<()> {
+        // Validate against the desugared network so a `service.port` number
+        // shorthand still counts as a declared static port.
+        let mut network = self.network.clone();
+        let mut service = self.service.clone();
+        crate::structs::network::normalize_task_network(&self.name, &mut network, &mut service)?;
+        crate::structs::network::validate_task_connect(
+            &self.name,
+            network.as_ref(),
+            self.connect.as_ref(),
+            service.as_ref(),
+        )
     }
 
     /// Whether this task declares a stateful block. Gates the stateful-only
@@ -2107,12 +2134,7 @@ impl TaskConfig {
             let is_shell = matches!(action.command.first().map(String::as_str), Some(cmd)
                 if cmd.ends_with("sh") || cmd == "bash" || cmd == "zsh")
                 && action.command.iter().any(|a| a == "-c");
-            if is_shell
-                && action
-                    .command
-                    .iter()
-                    .any(|a| a.contains("${param."))
-            {
+            if is_shell && action.command.iter().any(|a| a.contains("${param.")) {
                 warn!(
                     task = %self.name,
                     action = %action.name,
@@ -2301,7 +2323,9 @@ mod tests {
     #[test]
     fn action_render_uses_default_when_param_omitted() {
         let action = sample_action();
-        let (argv, _) = action.render_command(&std::collections::HashMap::new()).unwrap();
+        let (argv, _) = action
+            .render_command(&std::collections::HashMap::new())
+            .unwrap();
         assert_eq!(argv.last().unwrap(), "sessions");
     }
 
@@ -3295,6 +3319,72 @@ mod tests {
         });
         let config: JobConfig = serde_json::from_value(spec)?;
         config.tasks[0].validate_kv_injections()?;
+        Ok(())
+    }
+
+    #[test]
+    fn connect_block_parses_from_the_jobspec_and_validates() -> R<()> {
+        let spec = serde_json::json!({
+            "name": "demo",
+            "task": {
+                "kind": "exec",
+                "connect": {
+                    "upstreams": [
+                        { "service": "db" },
+                        { "service": "cache", "localPort": 6379 },
+                        { "service": "web", "balance": "least_conn" },
+                    ]
+                },
+                "service": { "port": 8080, "allow": ["gateway"] }
+            }
+        });
+        let config: JobConfig = serde_json::from_value(spec)?;
+        let task = &config.tasks[0];
+        let connect = task.connect.as_ref().expect("connect not parsed");
+        assert_eq!(connect.upstreams.len(), 3);
+        assert_eq!(connect.upstreams[1].local_port, Some(6379));
+        assert_eq!(
+            task.service
+                .as_ref()
+                .map(|service| service.allow.as_slice()),
+            Some(["gateway".to_string()].as_slice())
+        );
+        task.validate_connect()?;
+        Ok(())
+    }
+
+    #[test]
+    fn connect_validation_sees_the_service_port_shorthand_as_a_static_port() {
+        // `service.port: 6379` desugars to a static network port, so pinning
+        // an upstream to the same loopback port must be rejected.
+        let spec = serde_json::json!({
+            "name": "demo",
+            "task": {
+                "kind": "exec",
+                "connect": { "upstreams": [{ "service": "cache", "localPort": 6379 }] },
+                "service": { "port": 6379 }
+            }
+        });
+        let config: JobConfig = serde_json::from_value(spec).expect("job config");
+        let err = config.tasks[0]
+            .validate_connect()
+            .expect_err("upstream localPort colliding with the task port must be rejected");
+        assert!(
+            err.to_string()
+                .contains("collides with a static port declared in network.ports"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn tasks_without_connect_stay_unchanged() -> R<()> {
+        let spec = serde_json::json!({ "name": "demo", "task": { "kind": "exec" } });
+        let config: JobConfig = serde_json::from_value(spec)?;
+        assert!(config.tasks[0].connect.is_none());
+        config.tasks[0].validate_connect()?;
+        // No connect block must not appear in the serialized task config.
+        let encoded = serde_json::to_value(&config.tasks[0])?;
+        assert!(encoded.get("connect").is_none());
         Ok(())
     }
 

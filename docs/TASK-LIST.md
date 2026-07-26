@@ -108,7 +108,29 @@
   - [x] I can declare a named service on a task
   - [x] I can declare health checks on that task
   - [x] Can query address and port from other services
-  - [ ] I can declare which other jobs have access to my service (intentions; needs workload identity + L4 forwarder)
+  - [x] I can connect to another service by name, with load balancing, without
+    writing any client code (`connect.upstreams` -> `$LEGION_UPSTREAM_<SVC>`;
+    node-local loopback forwarder; `round_robin` / `random` / `least_conn`,
+    pluggable via one trait impl + one registry arm)
+  - [x] I can declare which other jobs have access to my service
+    (`service.allow`, matched against the consuming job id)
+    - Caveat: enforced on the connect path only. The manager filters the
+      per-node endpoint feed, so a denied consumer's forwarder has nothing to
+      dial and closes the connection. This is not cryptographic identity — a
+      task that already knows a backend's `address:port` can still dial it
+      directly, and the hop is unauthenticated and unencrypted. Identity-backed
+      enforcement lands with mTLS below. `legion service doctor <svc>` prints
+      the `allow` list so a denied consumer can see why it resolves to nothing
+      (it reads it off `ListServices`, so `job:read` is enough).
+    - Breaking output change: `legion service list -j` / `resolve -j` now emit
+      the standard `{ok, data}` envelope instead of a bare JSON array, so
+      scripts using `jq '.[0]'` need `jq '.data[0]'` — or `resolve --one`,
+      which needs no `jq`.
+  - [ ] DNS (`<service>.svc.legion`) + template functions (`{{ range endpoints "db" }}`)
+  - [ ] mTLS between forwarders, so intentions rest on workload identity rather
+    than the control plane alone
+  - [ ] L7 (routing/retries/WASM middleware), datapath plugin ABI (bridge/CNI),
+    observability service graph
   
 - [x] Persisting state
   - [x] Saving the SQLite works (litestream-like)?

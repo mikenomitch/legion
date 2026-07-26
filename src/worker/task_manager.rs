@@ -1073,6 +1073,14 @@ fn task_from_allocation(allocation: &TaskAllocation) -> R<(Allocation, TaskConfi
     } else {
         Some(serde_json::from_str(&allocation.network).context("Invalid allocation network JSON")?)
     };
+    // Declared upstreams. The loopback ports they were assigned arrive on
+    // `allocation.network.upstreams`; this is the declaration side (service
+    // names and balancing strategies) the forwarder syncs against.
+    let connect = if allocation.task_connect.trim().is_empty() {
+        None
+    } else {
+        Some(serde_json::from_str(&allocation.task_connect).context("Invalid task connect JSON")?)
+    };
 
     let task = TaskConfig {
         config: task_config,
@@ -1080,6 +1088,7 @@ fn task_from_allocation(allocation: &TaskAllocation) -> R<(Allocation, TaskConfi
         on_unhealthy,
         identities,
         artifacts,
+        connect,
         ..TaskConfig::new(&allocation.task_name, &allocation.task_kind)
     };
     let alloc = Allocation {
@@ -1309,6 +1318,7 @@ mod tests {
             task_artifacts: String::new(),
 
             network: String::new(),
+            task_connect: String::new(),
         };
         let new = manager.reconcile_allocations(std::slice::from_ref(&ta));
         assert_eq!(new.len(), 1);
@@ -1318,6 +1328,70 @@ mod tests {
         manager.runtimes.insert(9, TaskRuntime::default());
         let new = manager.reconcile_allocations(std::slice::from_ref(&ta));
         assert!(new.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn task_connect_round_trips_through_the_wire() -> R<()> {
+        // The declared `connect` block and the loopback ports it was assigned
+        // travel on different fields (task_connect / network.upstreams) and
+        // must both survive the manager -> worker hop: the forwarder syncs
+        // listeners from the pair.
+        let connect: crate::structs::ConnectConfig = serde_json::from_value(json!({
+            "upstreams": [
+                { "service": "db" },
+                { "service": "cache", "localPort": 6379, "balance": "least_conn" },
+            ]
+        }))?;
+        let task = TaskConfig {
+            config: json!({ "command": ["true"] }),
+            connect: Some(connect.clone()),
+            ..TaskConfig::new("api", "exec")
+        };
+        let placed = Allocation {
+            network: Some(crate::structs::AllocNetwork {
+                address: Some("10.0.0.4".into()),
+                ports: Vec::new(),
+                upstreams: vec![
+                    crate::structs::AllocUpstream {
+                        service: "db".into(),
+                        local_port: 20003,
+                        balance: "round_robin".into(),
+                    },
+                    crate::structs::AllocUpstream {
+                        service: "cache".into(),
+                        local_port: 6379,
+                        balance: "least_conn".into(),
+                    },
+                ],
+            }),
+            ..alloc()
+        };
+
+        let wire = crate::manager::dispatcher::build_task_allocation(&task, &placed, None)?;
+        let (parsed_alloc, parsed_task) = task_from_allocation(&wire)?;
+        assert_eq!(parsed_task.connect, Some(connect));
+        let network = parsed_alloc.network.context("network lost on the wire")?;
+        assert_eq!(
+            network.upstream("db").map(|upstream| upstream.local_port),
+            Some(20003)
+        );
+        assert_eq!(
+            network
+                .upstream("cache")
+                .map(|upstream| upstream.balance.as_str()),
+            Some("least_conn")
+        );
+
+        // A task without upstreams comes back with no connect block at all.
+        let plain = TaskConfig {
+            config: json!({ "command": ["true"] }),
+            ..TaskConfig::new("api", "exec")
+        };
+        let wire = crate::manager::dispatcher::build_task_allocation(&plain, &alloc(), None)?;
+        assert_eq!(wire.task_connect, "");
+        let (_, parsed_task) = task_from_allocation(&wire)?;
+        assert_eq!(parsed_task.connect, None);
         Ok(())
     }
 
@@ -1360,6 +1434,7 @@ mod tests {
             task_artifacts: serde_json::to_string(&[artifact])?,
 
             network: String::new(),
+            task_connect: String::new(),
         };
         let outcome = manager.begin_task_allocation(&ta)?;
         let job = match outcome {
@@ -1402,6 +1477,7 @@ mod tests {
             task_artifacts: serde_json::to_string(&artifacts)?,
 
             network: String::new(),
+            task_connect: String::new(),
         };
 
         let outcome = manager.begin_task_allocation(&ta)?;
@@ -1490,9 +1566,9 @@ mod tests {
         let snapshot = manager.allocation_health_snapshot();
         assert_eq!(snapshot.len(), 2);
         assert_eq!(snapshot[0].allocation_id, 3);
-        assert_eq!(snapshot[0].healthy, false);
+        assert!(!snapshot[0].healthy);
         assert_eq!(snapshot[1].allocation_id, 9);
-        assert_eq!(snapshot[1].healthy, true);
+        assert!(snapshot[1].healthy);
 
         Ok(())
     }

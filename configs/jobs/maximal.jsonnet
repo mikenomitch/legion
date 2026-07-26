@@ -105,6 +105,30 @@
                 port: "http",      // label from network.ports; or a number/'dynamic' to declare inline
                 tags: ["v1", "public"],
                 meta: { protocol: "http" },
+                // Connect intentions (see docs/service-discovery.md): job ids
+                // allowed to reach this service through a `connect` upstream.
+                // Omit the field (or use ["*"]) to allow every job. Denied
+                // consumers simply get an empty endpoint list; enforcement is
+                // control-plane + forwarder, not cryptographic identity.
+                allow: ["gateway", "maximal-demo"],
+            },
+            // Services this task dials, each via a node-local loopback
+            // forwarder that load-balances across the upstream's healthy
+            // endpoints. The task reads $LEGION_UPSTREAM_<SERVICE>
+            // ("127.0.0.1:<port>") and $LEGION_UPSTREAM_PORT_<SERVICE>.
+            // The named service need not exist yet.
+            connect: {
+                upstreams: [
+                    // Minimal form: loopback port assigned at placement out of
+                    // the same per-node range as host ports.
+                    { service: "db" },
+                    // Pin the loopback port for clients that cannot read env
+                    // vars. Must not collide with a static port above.
+                    { service: "cache", localPort: 6379 },
+                    // Strategy override: round_robin (default) | random |
+                    // least_conn.
+                    { service: "search", balance: "least_conn" },
+                ],
             },
             // Workload identities (see docs/workload-identity.md): each named
             // identity gets its own short-lived OIDC token, delivered as a

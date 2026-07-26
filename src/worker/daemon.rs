@@ -2,12 +2,15 @@ use crate::prelude::*;
 
 use crate::structs::token::JoinToken;
 use crate::structs::{
-    manager_client::ManagerClient, worker_server::WorkerServer, HealthCheckRequest,
-    HeartbeatRequest, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterRequest,
+    manager_client::ManagerClient, worker_server::WorkerServer, AllocNetwork, HealthCheckRequest,
+    HeartbeatReply, HeartbeatRequest, TaskAllocation, UpstreamEndpoints, WorkerPreRegisterReply,
+    WorkerPreRegisterRequest, WorkerRegisterRequest,
 };
 use crate::util::random_string;
 use crate::worker::{
     artifact_credentials::ManagerCredentialSource,
+    balance::Endpoint,
+    forwarder::{UpstreamForwarder, UpstreamSpec},
     identity::{ManagerTokenIssuer, PreparedIdentity, WorkerIdentityManager},
     node_check::{fingerprint_node, run_health_checks},
     server::WorkerDaemonService,
@@ -212,6 +215,10 @@ async fn run_worker_with_manager(
     // stateful allocations whose `selfTerminateAfter` window outlives this
     // clock (see docs/stateful-workloads.md "Node loss and fencing").
     let last_successful_heartbeat = Arc::new(Mutex::new(std::time::Instant::now()));
+    // Node-local connect datapath. It owns no state of its own: every
+    // heartbeat reply tells it which loopback listeners to run and where each
+    // one may send traffic. Idle (and free) until a task declares upstreams.
+    let forwarder = Arc::new(UpstreamForwarder::new());
     let heartbeat_fut = start_heartbeats(
         name.clone(),
         client.clone(),
@@ -220,6 +227,7 @@ async fn run_worker_with_manager(
         last_successful_heartbeat.clone(),
         credentials.clone(),
         registration,
+        forwarder,
     );
     let self_fence_fut = start_self_fence_watchdog(task_manager.clone(), last_successful_heartbeat);
     let checks_fut = start_node_checks(
@@ -353,6 +361,10 @@ const SELF_FENCE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 /// disable self-fencing); failures are retried forever with backoff while
 /// `last_successful_heartbeat` tracks the last time the manager actually
 /// acknowledged us. The self-fence watchdog reads that clock.
+// The loop drives every per-heartbeat subsystem (tasks, identities, upstream
+// forwarders, self-fence clock); they are threaded by parameter rather than
+// bundled so each one's lifetime stays visible at the call site.
+#[allow(clippy::too_many_arguments)]
 #[instrument(err, skip_all)]
 async fn start_heartbeats(
     name: String,
@@ -362,6 +374,7 @@ async fn start_heartbeats(
     last_successful_heartbeat: Arc<Mutex<std::time::Instant>>,
     credentials: Arc<WorkerCredentials>,
     registration: RegistrationPayload,
+    forwarder: Arc<UpstreamForwarder>,
 ) -> R<()> {
     let mut backoff = HEARTBEAT_RETRY_MIN;
 
@@ -372,6 +385,7 @@ async fn start_heartbeats(
             &task_manager,
             &identity_manager,
             &credentials,
+            &forwarder,
         )
         .await
         {
@@ -422,6 +436,7 @@ async fn heartbeat_tick(
     task_manager: &Arc<Mutex<WorkerTaskManager>>,
     identity_manager: &Arc<WorkerIdentityManager>,
     credentials: &Arc<WorkerCredentials>,
+    forwarder: &Arc<UpstreamForwarder>,
 ) -> R<()> {
     let mut client_clone = client.clone();
 
@@ -466,6 +481,9 @@ async fn heartbeat_tick(
         };
         debug!(worker = %name, elapsed_ms = start.elapsed().as_millis() as u64, "Heartbeat acknowledged by manager");
         let reply = response.into_inner();
+        // The manager acknowledged us, so this reply is authoritative for the
+        // connect datapath (see `apply_upstreams` on fail-static semantics).
+        apply_upstreams(forwarder, &reply).await;
         // Allocations whose launch was dispatched this tick. Their refresh
         // loops are spawned before the (async, unawaited) launch registers
         // them in the task manager, so they must be treated as live by the
@@ -546,6 +564,84 @@ async fn heartbeat_tick(
     }
 
     Ok(())
+}
+
+/// Drive the node-local connect datapath from one *successful* heartbeat
+/// reply: reconcile the loopback listeners against the desired allocation set,
+/// then publish this tick's endpoint snapshot.
+///
+/// Only called after the manager acknowledged the heartbeat, which is what
+/// makes the datapath fail-static — while the manager is unreachable the
+/// forwarders keep their last known good endpoints instead of blackholing
+/// traffic. Within a successful reply an empty endpoint list *is* authoritative
+/// (a killed or intention-denied backend must stop receiving traffic), while an
+/// upstream missing from `upstream_endpoints` entirely keeps its current list.
+async fn apply_upstreams(forwarder: &UpstreamForwarder, reply: &HeartbeatReply) {
+    let specs = upstream_specs(&reply.desired_allocations);
+    forwarder.sync(&specs).await;
+    for update in &reply.upstream_endpoints {
+        forwarder.set_endpoints(
+            update.allocation_id,
+            &update.service,
+            dialable_endpoints(update),
+        );
+    }
+}
+
+/// Derive the listeners a desired allocation set implies: one per upstream of
+/// every allocation whose task declares a `connect` block.
+///
+/// `task_connect` is the declaration side (which services, which strategy);
+/// the loopback ports those upstreams were *assigned* live on the allocation's
+/// network, next to its host ports, because both come out of the same per-node
+/// port space. Allocations that declare no upstreams cost one string check.
+fn upstream_specs(desired: &[TaskAllocation]) -> Vec<UpstreamSpec> {
+    let mut specs = Vec::new();
+    for allocation in desired {
+        if allocation.task_connect.trim().is_empty() || allocation.network.trim().is_empty() {
+            continue;
+        }
+        let network: AllocNetwork = match serde_json::from_str(&allocation.network) {
+            Ok(network) => network,
+            Err(err) => {
+                // Retrying cannot fix a payload the manager wrote; skip this
+                // allocation's upstreams rather than the whole heartbeat.
+                warn!(
+                    allocation_id = allocation.allocation_id,
+                    error = ?err,
+                    "Skipping upstream forwarders; invalid allocation network payload"
+                );
+                continue;
+            }
+        };
+        for upstream in &network.upstreams {
+            specs.push(UpstreamSpec {
+                allocation_id: allocation.allocation_id,
+                service: upstream.service.clone(),
+                local_port: upstream.local_port,
+                balance: upstream.balance.clone(),
+            });
+        }
+    }
+    specs
+}
+
+/// Endpoints from one `UpstreamEndpoints` entry that the forwarder can
+/// actually dial. The manager mirrors `ResolveService` and keeps entries whose
+/// node advertises no address (or whose port is unassigned); those are not
+/// dialable, so they are dropped here rather than turned into a bogus
+/// `:0` address. Endpoints are already healthy-only and intention-filtered.
+fn dialable_endpoints(update: &UpstreamEndpoints) -> Vec<Endpoint> {
+    update
+        .endpoints
+        .iter()
+        .filter(|endpoint| !endpoint.address.trim().is_empty() && endpoint.port != 0)
+        .map(|endpoint| Endpoint {
+            addr: format!("{}:{}", endpoint.address, endpoint.port),
+            allocation_id: endpoint.allocation_id,
+            node_id: endpoint.node_id.clone(),
+        })
+        .collect()
 }
 
 /// Self-fence watchdog (the worker half of the at-most-one guarantee; see
@@ -727,6 +823,7 @@ mod tests {
                 fingerprint_attrs: "{}".into(),
                 health_checks: "[]".into(),
             },
+            Arc::new(UpstreamForwarder::new()),
         ));
 
         // Long enough for several failed attempts (first retry after 500ms).
@@ -810,6 +907,158 @@ mod tests {
                 process.kill();
             }
         }
+        Ok(())
+    }
+
+    /// A desired allocation declaring one upstream, with the loopback port it
+    /// was assigned at placement time.
+    fn connect_allocation(allocation_id: i64, service: &str, local_port: u16) -> TaskAllocation {
+        TaskAllocation {
+            allocation_id,
+            task_connect: json!({ "upstreams": [{ "service": service }] }).to_string(),
+            network: json!({
+                "ports": [{ "name": "http", "hostPort": 20000 }],
+                "upstreams": [{
+                    "service": service,
+                    "localPort": local_port,
+                    "balance": "least_conn",
+                }],
+            })
+            .to_string(),
+            ..TaskAllocation::default()
+        }
+    }
+
+    #[test]
+    fn upstream_specs_come_from_the_allocation_network() {
+        let specs = upstream_specs(&[connect_allocation(11, "db", 20003)]);
+        assert_eq!(
+            specs,
+            vec![UpstreamSpec {
+                allocation_id: 11,
+                service: "db".into(),
+                local_port: 20003,
+                balance: "least_conn".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn upstream_specs_skip_allocations_without_connect() {
+        let plain = TaskAllocation {
+            allocation_id: 1,
+            network: json!({ "ports": [{ "name": "http", "hostPort": 20000 }] }).to_string(),
+            ..TaskAllocation::default()
+        };
+        // Declared upstreams but no network yet (or a corrupt payload) cannot
+        // produce a listener — there is no port to bind.
+        let unplaced = TaskAllocation {
+            allocation_id: 2,
+            task_connect: json!({ "upstreams": [{ "service": "db" }] }).to_string(),
+            ..TaskAllocation::default()
+        };
+        let corrupt = TaskAllocation {
+            allocation_id: 3,
+            task_connect: json!({ "upstreams": [{ "service": "db" }] }).to_string(),
+            network: "{not json".into(),
+            ..TaskAllocation::default()
+        };
+        assert!(upstream_specs(&[plain, unplaced, corrupt]).is_empty());
+    }
+
+    #[test]
+    fn dialable_endpoints_drop_entries_the_worker_cannot_dial() {
+        let update = UpstreamEndpoints {
+            allocation_id: 11,
+            service: "db".into(),
+            endpoints: vec![
+                crate::structs::ServiceEndpoint {
+                    address: "10.0.0.5".into(),
+                    port: 20001,
+                    allocation_id: 42,
+                    node_id: "node-b".into(),
+                    ..crate::structs::ServiceEndpoint::default()
+                },
+                // Node advertises no address yet.
+                crate::structs::ServiceEndpoint {
+                    address: String::new(),
+                    port: 20002,
+                    ..crate::structs::ServiceEndpoint::default()
+                },
+                // No port assigned to the advertised label.
+                crate::structs::ServiceEndpoint {
+                    address: "10.0.0.6".into(),
+                    port: 0,
+                    ..crate::structs::ServiceEndpoint::default()
+                },
+            ],
+        };
+
+        assert_eq!(
+            dialable_endpoints(&update),
+            vec![Endpoint {
+                addr: "10.0.0.5:20001".into(),
+                allocation_id: 42,
+                node_id: "node-b".into(),
+            }]
+        );
+    }
+
+    /// The forwarder is driven entirely by heartbeat replies: one reply must
+    /// both start the listener and fill in where it may send traffic.
+    #[tokio::test]
+    async fn heartbeat_reply_starts_and_feeds_upstream_forwarders() -> R<()> {
+        let local_port = {
+            let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let port = socket.local_addr()?.port();
+            drop(socket);
+            port
+        };
+        let forwarder = UpstreamForwarder::new();
+        let reply = HeartbeatReply {
+            message: "ack".into(),
+            desired_allocations: vec![connect_allocation(11, "db", local_port)],
+            upstream_endpoints: vec![UpstreamEndpoints {
+                allocation_id: 11,
+                service: "db".into(),
+                endpoints: vec![crate::structs::ServiceEndpoint {
+                    address: "10.0.0.5".into(),
+                    port: 20001,
+                    allocation_id: 42,
+                    node_id: "node-b".into(),
+                    ..crate::structs::ServiceEndpoint::default()
+                }],
+            }],
+        };
+
+        apply_upstreams(&forwarder, &reply).await;
+        assert_eq!(
+            forwarder.active(),
+            vec![UpstreamSpec {
+                allocation_id: 11,
+                service: "db".into(),
+                local_port,
+                balance: "least_conn".into(),
+            }]
+        );
+        // The listener is live on the loopback port the task will dial.
+        assert!(
+            tokio::net::TcpListener::bind(("127.0.0.1", local_port))
+                .await
+                .is_err(),
+            "the forwarder must hold the upstream's loopback port"
+        );
+
+        // The allocation going away takes its listener with it.
+        apply_upstreams(
+            &forwarder,
+            &HeartbeatReply {
+                message: "ack".into(),
+                ..HeartbeatReply::default()
+            },
+        )
+        .await;
+        assert!(forwarder.active().is_empty());
         Ok(())
     }
 }

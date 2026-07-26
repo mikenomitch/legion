@@ -59,6 +59,8 @@ Even with `--allow-write`, `legion_state_query` is forced to read-only.
 | `legion_instance_list` | no | List a job's stateful instances (slot + keyed). |
 | `legion_instance_get` | no | Inspect one stateful instance. |
 | `legion_node_list` | no | List worker nodes. |
+| `legion_service_list` | no | List declared services with healthy/total endpoint counts — what a job can connect to. |
+| `legion_service_resolve` | no | Resolve a service to its endpoints (address, port, allocation, node, health). |
 | `legion_acl_whoami` | no | ACL status + caller identity (diagnose PermissionDenied). |
 | `legion_events` | no | List scheduler events; poll with `after_id` to tail. |
 | `legion_job_logs` | no | Fetch captured task stdout/stderr for a job. |
@@ -125,6 +127,65 @@ legion job validate ./configs/jobs/demo.jsonnet --json
 (`validate_job_config`), so an agent can self-correct before touching the cluster.
 The schema embeds the built-in task-kind config schemas (`exec`, `container`, …)
 under `taskKinds`, derived from the typed Rust structs.
+
+## 4a. Wiring workloads together (service discovery + connect)
+
+An agent authoring a multi-task system should never have to invent, inject, or
+reconcile addresses. Declare the producer's port once and let the consumer name
+the service ([Service Discovery](service-discovery.md)):
+
+```jsonnet
+// producer
+service: { port: 8080, allow: ["api"] },      // allow is optional; omit = any job
+// consumer
+connect: { upstreams: [{ service: "db", balance: "least_conn" }] },
+```
+
+The consumer's task then dials `$LEGION_UPSTREAM_DB` (`127.0.0.1:<port>`) and
+the worker load-balances that connection across `db`'s healthy endpoints. Two
+properties matter for agents specifically:
+
+- **Order-independent.** An upstream naming a service that does not exist yet is
+  *not* a validation error, so an agent may submit producer and consumer in
+  either order (or in separate jobs) without a two-phase dance. An unresolvable
+  upstream simply has no endpoints until the service appears.
+- **Self-correctable before mutating.** `legion job validate <spec>` runs the
+  same connect validation the manager applies on submit — unknown `balance`
+  strategy (the error lists the valid names), duplicate upstream service,
+  `localPort` colliding with a declared static port, empty `service.allow`
+  entry. Validate, fix, then submit.
+
+To observe the result — all read-only, all `-j`, all on the standard envelope:
+
+```bash
+legion service list -j                # every declared service + healthy/total counts
+legion service resolve web -j         # healthy endpoints
+legion service resolve web --all -j   # include unhealthy, with per-endpoint status
+legion service resolve web --one      # one random address:port, no jq needed
+legion service doctor web -j          # layered diagnosis: checks[] + verdict + hints
+```
+
+`doctor -j` returns the whole ladder as data (`checks[]` with
+`layer`/`status`/`summary`/`details`, plus `ok` and the resolved `endpoints`),
+so an agent can branch on the first failing layer instead of parsing prose. It
+also reports the service's `allow` list, which is how an agent tells "no healthy
+endpoints" apart from "this consumer is not permitted" — and because that list
+comes back on `ListServices` (`ServiceSummary.allow`) rather than out of the
+state store, the whole report needs only `job:read`.
+
+`service list -j` and `service resolve -j` used to print a bare JSON array;
+they now use the envelope like everything else, so the array lives under
+`.data`. Scripts pinned to `jq '.[0]'` need `jq '.data[0]'`, or `--one`.
+
+Over MCP the same catalog is `legion_service_list` and `legion_service_resolve`
+(both read-only, always listed); over gRPC it is `ListServices` /
+`ResolveService`.
+
+> **Scope note for agents reasoning about isolation:** `service.allow` is
+> enforced on the connect path only — the manager omits denied endpoints from
+> the consumer's feed. It is not cryptographic identity and not a network
+> policy; do not treat it as a security boundary. See
+> [Service Discovery](service-discovery.md#intentions-serviceallow).
 
 ## 5. Idempotency keys
 
@@ -291,8 +352,10 @@ Prefer read-only operations; treat anything with `mutates: true` /
 Implemented: MCP server, structured envelope + typed errors, capabilities catalog,
 `job schema`/`job validate`, idempotency keys, `--wait`/`job wait`, saved-query
 library, the scheduler event stream (`events list`/`events follow`,
-`legion_events`), and **task log retrieval** (`legion job logs` /
-`legion_job_logs`).
+`legion_events`), **task log retrieval** (`legion job logs` /
+`legion_job_logs`), and the **service catalog** (`legion service
+list|resolve|doctor`, `legion_service_list` / `legion_service_resolve`) with the
+declarative wiring described in [§4a](#4a-wiring-workloads-together-service-discovery--connect).
 
 The task-log path captures task stdout/stderr to per-allocation files via the
 `TaskPlugin` runtime (`TaskRuntime.log_dir`), reads them on the node with

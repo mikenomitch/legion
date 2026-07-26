@@ -1640,6 +1640,60 @@ message HeartbeatReply {
   //
   // Default: empty list when manager has no desired allocations for this node.
   repeated TaskAllocation desired_allocations = 2;
+
+  // Current endpoint set for every upstream declared by the desired
+  // allocations on this node (see `TaskAllocation.task_connect`). This is the
+  // service-discovery feed for the node-local forwarders: the worker applies
+  // it to the running forwarders and the next accepted connection is balanced
+  // across the addresses listed here.
+  //
+  // One entry per (allocation, upstream service) pair, refreshed on every
+  // heartbeat — that is, every `WORKER_HEARTBEAT_DURATION_SEC` (2s), which is
+  // the endpoint refresh cadence a consumer observes after a backend comes up,
+  // goes unhealthy, or moves.
+  //
+  // Default: empty list when no desired allocation declares upstreams. The
+  // manager performs no catalog work at all in that case, so nodes running
+  // only plain jobs pay nothing for this field.
+  repeated UpstreamEndpoints upstream_endpoints = 3;
+}
+
+// The endpoints one allocation may currently reach for one upstream service.
+//
+// Sent in `HeartbeatReply.upstream_endpoints`, this is the manager's answer to
+// "where should this allocation's forwarder for service X send traffic right
+// now". It is a snapshot, not a delta: each heartbeat carries the full list.
+message UpstreamEndpoints {
+  // Allocation consuming the service — the allocation whose task declared this
+  // upstream in its `connect` block. Identifies which node-local forwarder the
+  // endpoint list applies to.
+  int64 allocation_id = 1;
+
+  // Upstream service name, exactly as written in the task's
+  // `connect.upstreams[].service`. Echoed so the worker can match the list to
+  // one of its listeners without relying on ordering.
+  string service = 2;
+
+  // Endpoints the consumer may dial, already filtered by the manager:
+  //
+  // - **healthy only** — an endpoint appears when its latest health snapshot is
+  //   healthy *and* its node is alive, the same liveness rule `ResolveService`
+  //   applies. Unhealthy or lost backends are simply absent.
+  // - **intention filtered** — when the target service declares
+  //   `service.allow`, an endpoint is visible only if that list is empty,
+  //   contains `"*"`, or contains the consuming allocation's job id. A denied
+  //   consumer receives an empty list rather than an error.
+  //
+  // Endpoint fields carry the same meaning as in `ResolveServiceReply`; a
+  // consumer dials `address:port`, and skips entries whose `address` is empty
+  // or whose `port` is 0 (the backing node advertises no address yet).
+  //
+  // An empty list is authoritative and means "send no traffic": it is how a
+  // scaled-to-zero, unhealthy, or intention-denied service is reported.
+  // Workers only replace their endpoint list on a *successful* heartbeat, so a
+  // manager outage leaves the last known good set in place (fail-static)
+  // rather than blackholing traffic.
+  repeated ServiceEndpoint endpoints = 3;
 }
 
 // Failed allocation report item from worker to manager.
@@ -2390,6 +2444,21 @@ message ServiceSummary {
 
   // Service tags declared in the task's `service.tags`.
   repeated string tags = 6;
+
+  // Connect intentions declared in the task's `service.allow`: the job IDs
+  // permitted to reach this service through a `connect.upstreams` entry.
+  //
+  // Empty — the default — means *every* job may connect, and so does a single
+  // `"*"` entry; the two are reported verbatim rather than normalized so
+  // tooling can tell "no policy declared" from "explicitly open". Intentions
+  // gate the connect datapath only: they filter the endpoint list a consuming
+  // allocation receives in `HeartbeatReply.upstream_endpoints`, and never
+  // affect who may *read* the catalog through ListServices/ResolveService.
+  //
+  // Reported here so a read-only caller (`job:read`) can explain why its
+  // consumer resolves to nothing — `legion service doctor` prints this list —
+  // without needing state-store access to the underlying task config.
+  repeated string allow = 7;
 }
 
 // Reply payload for ListServices.
@@ -3136,11 +3205,32 @@ message TaskAllocation {
   // JSON-encoded task unhealthy handling policy.
   string task_on_unhealthy = 10;
 
-  // JSON-encoded assigned network payload (address + ports) for this
-  // allocation, matching the `AllocNetwork` shape. Workers use it to inject
-  // `LEGION_PORT_*` / `LEGION_ADDR_*` environment variables into the task.
-  // Empty string when the task declares no network block.
+  // JSON-encoded assigned network payload (address + ports + upstreams) for
+  // this allocation, matching the `AllocNetwork` shape. Workers use it to
+  // inject `LEGION_PORT_*` / `LEGION_ADDR_*` environment variables into the
+  // task, and — when the task declares upstreams — the `upstreams` array
+  // (`[{"service":"db","localPort":20003,"balance":"round_robin"}]`) carries
+  // the loopback ports the node-local forwarders listen on, surfaced to the
+  // task as `LEGION_UPSTREAM_*`.
+  //
+  // Empty string when the task declares no network block and no upstreams.
   string network = 14;
+
+  // JSON-encoded `connect` block declared by the task, matching the
+  // `ConnectConfig` shape: `{"upstreams":[{"service":"db"},
+  // {"service":"cache","localPort":6379,"balance":"least_conn"}]}`.
+  //
+  // This is the *declared* form (which services the task dials and with which
+  // balancing strategy); the *assigned* loopback ports live in `network`
+  // alongside the task's host ports, because both come out of the same
+  // per-node port space. The worker starts one loopback TCP forwarder per
+  // upstream and load-balances new connections across that service's healthy
+  // endpoints, which the manager refreshes every heartbeat in
+  // `HeartbeatReply.upstream_endpoints`.
+  //
+  // Empty string (not `{}`) when the task declares no upstreams, so jobs that
+  // do not use connect stay byte-identical on the wire.
+  string task_connect = 15;
 
   // JSON-encoded list of normalized artifact specs for this task.
   //

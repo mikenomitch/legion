@@ -544,5 +544,23 @@ pub fn get_migrations() -> Migrations<'static> {
         // Vec<ActionSpec>; NULL/absent == no actions. Appended last so
         // databases created before this feature migrate cleanly.
         M::up("ALTER TABLE task_config ADD COLUMN actions JSONB;").down(""),
+        // Upstream services a task connects to (service-discovery connect
+        // layer). JSON-encoded ConnectConfig; NULL/absent == the task declares
+        // no upstreams and gets no forwarders. Appended last so databases
+        // created before this feature migrate cleanly.
+        M::up("ALTER TABLE task_config ADD COLUMN connect JSONB;").down(""),
+        // Service-name lookup for the discovery catalog. `Store::service_endpoints`
+        // filters on `COALESCE(json_extract(service,'$.name'), name)` — exactly
+        // `ServiceConfig::service_name` — and the connect upstream feed runs
+        // that lookup on every node's heartbeat (every 2s), so it has to be a
+        // seek rather than a cluster-wide scan. Partial on `json_valid` so a
+        // hand-corrupted `service` value can never fail this migration, nor
+        // block later writes to the table.
+        M::up(
+            "CREATE INDEX IF NOT EXISTS idx_task_config_service_name
+             ON task_config(COALESCE(json_extract(service, '$.name'), name))
+             WHERE service IS NOT NULL AND json_valid(service);",
+        )
+        .down("DROP INDEX IF EXISTS idx_task_config_service_name;"),
     ])
 }

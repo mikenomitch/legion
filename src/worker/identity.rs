@@ -904,6 +904,7 @@ mod tests {
             task_artifacts: String::new(),
 
             network: String::new(),
+            task_connect: String::new(),
         };
 
         let prepared = manager.prepare_task_allocation(&mut allocation).await?;
@@ -963,6 +964,7 @@ mod tests {
             task_artifacts: String::new(),
 
             network: String::new(),
+            task_connect: String::new(),
         };
 
         let prepared = manager.prepare_task_allocation(&mut allocation).await?;

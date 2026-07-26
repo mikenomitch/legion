@@ -448,6 +448,33 @@ pub fn catalog() -> Vec<Capability> {
             mutates: true,
             read_only_safe: false,
         },
+        // --- Service discovery ---
+        Capability {
+            name: "service.list",
+            cli: "legion service list",
+            grpc: Some("Manager/ListServices"),
+            summary: "List declared services with healthy/total endpoint counts.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "service.resolve",
+            cli: "legion service resolve <SERVICE> [--one] [--all]",
+            grpc: Some("Manager/ResolveService"),
+            summary: "Resolve a service to its healthy endpoint addresses; --one prints a single \
+                 random address:port for scripts.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "service.doctor",
+            cli: "legion service doctor <SERVICE>",
+            grpc: None,
+            summary: "Walk the discovery layers (declared, placed, node, port, health) and name \
+                 the failing one; also reports the service's connect intentions.",
+            mutates: false,
+            read_only_safe: true,
+        },
         // --- Discovery ---
         Capability {
             name: "capabilities",
@@ -534,5 +561,19 @@ mod tests {
             .try_get_matches_from(["capabilities", "--json"])
             .unwrap();
         assert!(m.get_flag("json"));
+    }
+
+    #[test]
+    fn service_discovery_commands_are_catalogued_read_only() {
+        let caps = catalog();
+        for name in ["service.list", "service.resolve", "service.doctor"] {
+            let cap = caps
+                .iter()
+                .find(|cap| cap.name == name)
+                .unwrap_or_else(|| panic!("{name} missing from the capability catalog"));
+            assert!(!cap.mutates, "{name} must not mutate");
+            assert!(cap.read_only_safe, "{name} must be agent-safe");
+            assert!(cap.cli.starts_with("legion service "), "{name} cli");
+        }
     }
 }
