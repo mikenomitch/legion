@@ -1952,7 +1952,7 @@ mod tests {
             availability: "available".into(),
             config_attrs: "{}".into(),
             fingerprint_attrs: json!({
-                "memory_total": "8388608",
+                "memory_total": "8589934592",
                 "cpus": {
                     "cpu-1": { "frequency": "2400" }
                 }
