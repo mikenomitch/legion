@@ -1,6 +1,6 @@
 import { A } from '@solidjs/router'
-import { createResource, createSignal, Show } from 'solid-js'
-import { managerClient } from '../grpcClient'
+import { createSignal, Show } from 'solid-js'
+import { managerIdentity } from '../utils/connection'
 import { Icon } from './ui'
 
 const DISMISS_KEY = 'legion-acl-warning-dismissed'
@@ -17,6 +17,9 @@ const dismissClass = 'shrink-0 rounded-md p-1 opacity-60 transition-opacity hove
 // default). Dismissal is remembered in localStorage; the banner also clears
 // itself when ACLs are turned on. With ACLs enabled and no credential, a
 // session-dismissable prompt links to the Access page instead.
+//
+// The identity comes from the connection probe (utils/connection) rather than
+// its own WhoAmI call — same question, one request.
 export function AclBanner() {
   const [dismissed, setDismissed] = createSignal(
     localStorage.getItem(DISMISS_KEY) === 'true',
@@ -24,13 +27,7 @@ export function AclBanner() {
   const [loginDismissed, setLoginDismissed] = createSignal(
     sessionStorage.getItem(LOGIN_DISMISS_KEY) === 'true',
   )
-  const [whoami] = createResource(async () => {
-    try {
-      return await managerClient.whoAmI({})
-    } catch {
-      return null
-    }
-  })
+  const whoami = managerIdentity
 
   const dismiss = () => {
     localStorage.setItem(DISMISS_KEY, 'true')

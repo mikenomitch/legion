@@ -48,6 +48,8 @@ const ICON_PATHS: Record<string, string> = {
   zap: 'M13 2 3 14h9l-1 8 10-12h-9l1-8z',
   users: 'M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2 M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8z M22 21v-2a4 4 0 0 0-3-3.87 M16 3.13a4 4 0 0 1 0 7.75',
   gitBranch: 'M6 3v12 M18 9a3 3 0 1 0 0-6 3 3 0 0 0 0 6z M6 21a3 3 0 1 0 0-6 3 3 0 0 0 0 6z M15 6a9 9 0 0 0-9 9',
+  externalLink: 'M15 3h6v6 M10 14 21 3 M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6',
+  stethoscope: 'M11 2v2a4 4 0 0 1-8 0V2 M7 8v3a6 6 0 0 0 12 0V9 M19 9a2 2 0 1 0 0-4 2 2 0 0 0 0 4z M13 20a3 3 0 1 0 6 0v-3',
 }
 
 export type IconName = keyof typeof ICON_PATHS
@@ -285,7 +287,7 @@ export function LoadingRows(props: { rows?: number; class?: string }) {
   return (
     <div class={cx('space-y-2 p-4', props.class)} role="status" aria-label="Loading">
       {Array.from({ length: props.rows ?? 3 }).map(() => (
-        <div class="h-8 animate-pulse rounded-md bg-surface2" />
+        <div class="skeleton h-8" />
       ))}
     </div>
   )

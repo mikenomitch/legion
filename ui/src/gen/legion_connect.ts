@@ -3,7 +3,7 @@
 /* eslint-disable */
 // @ts-nocheck
 
-import { AcquireKvLockReply, AcquireKvLockRequest, AdvanceRolloutReply, AdvanceRolloutRequest, BootstrapAclReply, BootstrapAclRequest, CreateAclTokenReply, CreateAclTokenRequest, CreateInstanceReply, CreateInstanceRequest, CreateInstancesReply, CreateInstancesRequest, CreateJoinTokenReply, CreateJoinTokenRequest, DeleteAclPolicyReply, DeleteAclPolicyRequest, DeleteAclTokenReply, DeleteAclTokenRequest, DeleteAclUserReply, DeleteAclUserRequest, DeleteJoinTokenReply, DeleteJoinTokenRequest, DeleteKvReply, DeleteKvRequest, DeleteSavedStateQueryReply, DeleteSavedStateQueryRequest, DestroyInstanceReply, DestroyInstanceRequest, DestroyJobReply, DestroyJobRequest, ExecClientFrame, ExecServerFrame, GetAclPolicyReply, GetAclPolicyRequest, GetAllocationLogsReply, GetAllocationLogsRequest, GetArtifactCredentialReply, GetArtifactCredentialRequest, GetAuthMethodsReply, GetAuthMethodsRequest, GetInstanceReply, GetInstanceRequest, GetJobInfoReply, GetJobInfoRequest, GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest, GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest, GetObservabilityReply, GetObservabilityRequest, GetRaftJoinTokenReply, GetRaftJoinTokenRequest, GetRaftStatusReply, GetRaftStatusRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest, GetStateStoreSchemaReply, GetStateStoreSchemaRequest, GetTaskLogsReply, GetTaskLogsRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, IssueRaftCommandReply, IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply, IssueWorkloadIdentityTokenRequest, ListAclPoliciesReply, ListAclPoliciesRequest, ListAclTokensReply, ListAclTokensRequest, ListAclUsersReply, ListAclUsersRequest, ListEventsReply, ListEventsRequest, ListInstancesReply, ListInstancesRequest, ListJobActionsReply, ListJobActionsRequest, ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobsReply, ListJobsRequest, ListJoinTokensReply, ListJoinTokensRequest, ListKvReply, ListKvRequest, ListRaftHistoryReply, ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply, ListRolloutsRequest, ListSavedStateQueriesReply, ListSavedStateQueriesRequest, LoginReply, LoginRequest, PatchKvReply, PatchKvRequest, PlanJobReply, PlanJobRequest, PostWorkReply, PostWorkRequest, PutKvReply, PutKvRequest, QueryStateStoreReply, QueryStateStoreRequest, ReleaseKvLockReply, ReleaseKvLockRequest, RenewKvLockReply, RenewKvLockRequest, ReplaceInstanceReply, ReplaceInstanceRequest, RestartWorkerReply, RestartWorkerRequest, RunJobReply, RunJobRequest, SchedulerEvent, StartInstanceReply, StartInstanceRequest, StopInstanceReply, StopInstanceRequest, StopJobReply, StopJobRequest, StopRolloutReply, StopRolloutRequest, StreamEventsRequest, UpdateNodeDynamicReply, UpdateNodeDynamicRequest, UpsertAclPolicyReply, UpsertAclPolicyRequest, UpsertAclUserReply, UpsertAclUserRequest, UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest, WhoAmIReply, WhoAmIRequest, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest } from "./legion_pb.js";
+import { AcquireKvLockReply, AcquireKvLockRequest, AdvanceRolloutReply, AdvanceRolloutRequest, BootstrapAclReply, BootstrapAclRequest, CreateAclTokenReply, CreateAclTokenRequest, CreateInstanceReply, CreateInstanceRequest, CreateInstancesReply, CreateInstancesRequest, CreateJoinTokenReply, CreateJoinTokenRequest, DeleteAclPolicyReply, DeleteAclPolicyRequest, DeleteAclTokenReply, DeleteAclTokenRequest, DeleteAclUserReply, DeleteAclUserRequest, DeleteJoinTokenReply, DeleteJoinTokenRequest, DeleteKvReply, DeleteKvRequest, DeleteSavedStateQueryReply, DeleteSavedStateQueryRequest, DestroyInstanceReply, DestroyInstanceRequest, DestroyJobReply, DestroyJobRequest, ExecClientFrame, ExecServerFrame, GetAclPolicyReply, GetAclPolicyRequest, GetAllocationLogsReply, GetAllocationLogsRequest, GetArtifactCredentialReply, GetArtifactCredentialRequest, GetAuthMethodsReply, GetAuthMethodsRequest, GetInstanceReply, GetInstanceRequest, GetJobInfoReply, GetJobInfoRequest, GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest, GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest, GetObservabilityReply, GetObservabilityRequest, GetRaftJoinTokenReply, GetRaftJoinTokenRequest, GetRaftStatusReply, GetRaftStatusRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest, GetStateStoreSchemaReply, GetStateStoreSchemaRequest, GetTaskLogsReply, GetTaskLogsRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, IssueNodeIdentityTokenReply, IssueNodeIdentityTokenRequest, IssueRaftCommandReply, IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply, IssueWorkloadIdentityTokenRequest, ListAclPoliciesReply, ListAclPoliciesRequest, ListAclTokensReply, ListAclTokensRequest, ListAclUsersReply, ListAclUsersRequest, ListEventsReply, ListEventsRequest, ListInstancesReply, ListInstancesRequest, ListJobActionsReply, ListJobActionsRequest, ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobsReply, ListJobsRequest, ListJoinTokensReply, ListJoinTokensRequest, ListKvReply, ListKvRequest, ListRaftHistoryReply, ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply, ListRolloutsRequest, ListSavedStateQueriesReply, ListSavedStateQueriesRequest, ListServicesReply, ListServicesRequest, LoginReply, LoginRequest, PatchKvReply, PatchKvRequest, PlanJobReply, PlanJobRequest, PostWorkReply, PostWorkRequest, PutKvReply, PutKvRequest, QueryStateStoreReply, QueryStateStoreRequest, ReleaseKvLockReply, ReleaseKvLockRequest, RenewKvLockReply, RenewKvLockRequest, ReplaceInstanceReply, ReplaceInstanceRequest, ResolveServiceReply, ResolveServiceRequest, RestartWorkerReply, RestartWorkerRequest, RunJobReply, RunJobRequest, SchedulerEvent, StartInstanceReply, StartInstanceRequest, StopInstanceReply, StopInstanceRequest, StopJobReply, StopJobRequest, StopRolloutReply, StopRolloutRequest, StreamEventsRequest, UpdateNodeDynamicReply, UpdateNodeDynamicRequest, UpsertAclPolicyReply, UpsertAclPolicyRequest, UpsertAclUserReply, UpsertAclUserRequest, UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest, WhoAmIReply, WhoAmIRequest, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest } from "./legion_pb.js";
 import { MethodKind } from "@bufbuild/protobuf";
 
 /**
@@ -473,11 +473,13 @@ export const Manager = {
      * compromised worker can only obtain tokens for allocations placed on it,
      * scoped to audiences the spec already declared.
      *
-     * Authorization: the request's `node_id` must match the node the
-     * allocation is placed on. This is the same trust model as Heartbeat —
-     * workers are admitted via join token and identified by their claimed
-     * node id; there is no per-request worker credential yet (TODO: bind
-     * worker RPCs to a per-node credential once worker mTLS lands).
+     * Authorization: the caller must present the per-node worker token minted
+     * at WorkerRegister (attached to every worker-plane RPC), whose principal
+     * is `node:<node_id>`. The manager requires that principal to match the
+     * request's `node_id`, which in turn must be the node the allocation is
+     * placed on — so a worker can only obtain tokens for allocations on its own
+     * node, and cannot forge a peer's node id to steal that peer's federation
+     * credentials. Management tokens (and ACL-disabled deployments) are exempt.
      *
      * Errors:
      * - FailedPrecondition: workload identity is not enabled on this manager
@@ -494,6 +496,38 @@ export const Manager = {
       name: "IssueWorkloadIdentityToken",
       I: IssueWorkloadIdentityTokenRequest,
       O: IssueWorkloadIdentityTokenReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Issues a short-lived, asymmetrically-signed OIDC token for a *node*
+     * identity — the cluster-grain credential declared under
+     * `workloadIdentity.nodeIdentities` (see docs/workload-identity.md). Unlike
+     * a task identity it is scoped to the worker node, not an allocation: its
+     * claims are `region`, `pool`, and `node` (audit-only), with
+     * `legion.io/scope = "node"` so relying parties can tell node tokens from
+     * task tokens issued by the same cluster. Used by the worker to authenticate
+     * cluster-level artifact fetches (`auth.nodeIdentity`) and, later, pre-warm.
+     *
+     * Called by the worker for its own node. Authorization is identical to
+     * IssueWorkloadIdentityToken: the caller's authenticated per-node worker
+     * token principal (`node:<node_id>`) must match the request's `node_id`, so
+     * a worker cannot mint another node's credential. All claims are derived
+     * server-side from the node's registration record and the named identity's
+     * config — never from the request.
+     *
+     * Errors:
+     * - FailedPrecondition: workload identity is not enabled on this manager.
+     * - NotFound: no node with `node_id` is registered, or no node identity
+     *   named `identity_name` is configured.
+     * - PermissionDenied: `node_id` does not match the caller's credential.
+     * - Internal: signing failed.
+     *
+     * @generated from rpc legion.Manager.IssueNodeIdentityToken
+     */
+    issueNodeIdentityToken: {
+      name: "IssueNodeIdentityToken",
+      I: IssueNodeIdentityTokenRequest,
+      O: IssueNodeIdentityTokenReply,
       kind: MethodKind.Unary,
     },
     /**
@@ -809,6 +843,38 @@ export const Manager = {
       name: "GetKvLock",
       I: GetKvLockRequest,
       O: GetKvLockReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Lists all declared services with aggregate endpoint health.
+     *
+     * A service exists when a stored task config declares a `service` block.
+     * The reply is derived (a projection) from task configs, allocations, and
+     * allocation health snapshots; there is no separate registration mechanism
+     * and no way for the catalog to drift from scheduler state.
+     *
+     * @generated from rpc legion.Manager.ListServices
+     */
+    listServices: {
+      name: "ListServices",
+      I: ListServicesRequest,
+      O: ListServicesReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Resolves one service name to its endpoint addresses and ports.
+     *
+     * By default only healthy endpoints are returned: an endpoint is healthy
+     * when its allocation's latest health snapshot reports healthy AND its node
+     * is not lost/down. Endpoints without any health snapshot yet (still
+     * booting) are excluded unless `include_unhealthy` is set.
+     *
+     * @generated from rpc legion.Manager.ResolveService
+     */
+    resolveService: {
+      name: "ResolveService",
+      I: ResolveServiceRequest,
+      O: ResolveServiceReply,
       kind: MethodKind.Unary,
     },
     /**

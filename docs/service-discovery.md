@@ -113,7 +113,14 @@ legion service doctor web            # walk the layers, name the failing one
 ```
 
 The same data is available over gRPC: `ListServices` and `ResolveService` on
-the `Manager` service (see `proto/legion.proto`).
+the `Manager` service (see `proto/legion.proto`). Both carry the service's
+`meta` map; `meta.protocol` (`http`, `https`, …) is the convention clients use
+to turn `address:port` into a URL.
+
+The UI has a **Services** page with the same catalog, per-endpoint health, and
+a visual version of `doctor`. Endpoints link straight to the address when the
+service speaks HTTP, and job/task pages show their own services, assigned
+ports, declared checks, and per-allocation health.
 
 `doctor` checks, in order: service declared → allocations placed → nodes
 alive → port assigned → health checks passing — and prints a verdict, the

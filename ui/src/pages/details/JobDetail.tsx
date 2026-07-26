@@ -2,9 +2,11 @@ import { A, useNavigate, useParams } from '@solidjs/router'
 import { For, Show, createMemo, createResource, createSignal, onCleanup, onMount } from 'solid-js'
 import { Badge, CodeBlock, ConfirmButton, EmptyState, MonoBadge, Note, PageHeader, SectionCard, Spinner, StatusBadge, TableShell, Tabs, linkClass, tableClass, tdClass, thClass, theadClass, trHoverClass } from '../../components/ui'
 import DagVisualization from '../../components/DagVisualization'
+import { AllocationPorts, ServiceEndpointsTable, ServiceTags } from '../../components/ServiceEndpoints'
 import { InstanceInfo } from '../../gen/legion_pb'
 import LogViewer from '../../components/LogViewer'
 import { managerClient } from '../../grpcClient'
+import { allocationHealthLabel, fetchAllocationRuntime, parseAllocNetwork } from '../../utils/allocations'
 import { formatDate, formatRelativeTime } from '../../utils/format'
 import { buildTaskRuntimeByName, buildTaskRuntimeFromStatuses, extractJobSpecData, topoSortTaskNames, type TaskRuntimeSummary } from '../../utils/jobspec'
 import { POLL_INTERVAL_MS } from '../../utils/polling'
@@ -20,21 +22,37 @@ export default function JobDetail() {
   // Keyed on the route param so navigating job→job (e.g. via the command
   // palette) refetches instead of showing the previous job's data.
   const [jobData] = createResource(jobName, async () => {
-    const [jobInfo, ledger, rollouts, spec, specHistory] = await Promise.all([
+    const [jobInfo, ledger, rollouts, spec, specHistory, services] = await Promise.all([
       managerClient.getJobInfo({ name: jobName() }),
       managerClient.getLedger({}),
       managerClient.listRollouts({ jobId: jobName(), activeOnly: false, page: 1, pageSize: 200 }),
       managerClient.getJobSpec({ name: jobName() }),
       managerClient.listJobSpecHistory({ name: jobName() }),
+      managerClient.listServices({}),
     ])
 
+    const jobId = jobInfo.job?.id ?? jobName()
     const allocations = ledger.nodes.flatMap((node) =>
-      node.allocations.filter((allocation) => allocation.jobId === (jobInfo.job?.id ?? jobName())),
+      node.allocations.filter((allocation) => allocation.jobId === jobId),
     )
 
     const latestRollout = rollouts.rollouts[0]
     const rolloutStatus = latestRollout ? await managerClient.getRolloutStatus({ id: latestRollout.id }) : undefined
     const specData = extractJobSpecData(spec.submissions)
+
+    // Endpoints for this job's services, unhealthy included: an endpoint that
+    // exists but is failing is exactly what someone is looking for here.
+    const jobServices = services.services.filter((service) => service.jobId === jobId)
+    const endpoints = (
+      await Promise.all(
+        jobServices.map((service) =>
+          managerClient
+            .resolveService({ service: service.service, includeUnhealthy: true })
+            .then((reply) => reply.endpoints)
+            .catch(() => []),
+        ),
+      )
+    ).flat()
 
     return {
       job: jobInfo.job,
@@ -45,6 +63,8 @@ export default function JobDetail() {
       specHistory: specHistory.items,
       taskSpec: specData,
       taskRuntime: buildTaskRuntimeByName(rolloutStatus?.groups ?? []),
+      services: jobServices,
+      endpoints,
     }
   })
 
@@ -83,6 +103,12 @@ export default function JobDetail() {
         return new Map<string, TaskRuntimeSummary>()
       }
     },
+  )
+
+  // Latest health snapshot per allocation, refreshed with the status poll.
+  const [allocationHealth] = createResource(
+    () => [jobName(), statusTick()] as const,
+    async ([name]) => fetchAllocationRuntime(name),
   )
 
   // Prefer live state-store status; fall back to rollout-derived runtime.
@@ -269,6 +295,51 @@ export default function JobDetail() {
                 </Show>
               </SectionCard>
 
+              {/* Where this job is reachable. Endpoints are derived from the
+                  allocations plus health, so this is the honest answer to
+                  "is my service up and what is its address". */}
+              <Show when={jobData()!.services.length > 0}>
+                <SectionCard
+                  title="Services"
+                  description="Endpoints this job advertises to the rest of the cluster."
+                  flush
+                >
+                  <div class="divide-y divide-line">
+                    <For each={jobData()!.services}>
+                      {(service) => {
+                        const endpoints = () => jobData()!.endpoints.filter((endpoint) => endpoint.service === service.service)
+                        return (
+                          <div class="p-4">
+                            <div class="mb-2.5 flex flex-wrap items-center gap-2">
+                              <A href={`/services/${encodeURIComponent(service.service)}`} class="font-medium text-ink hover:text-brass-strong">
+                                {service.service}
+                              </A>
+                              <StatusBadge
+                                status={
+                                  service.totalCount === 0
+                                    ? 'no endpoints'
+                                    : service.healthyCount === 0
+                                      ? 'unavailable'
+                                      : service.healthyCount === service.totalCount
+                                        ? 'healthy'
+                                        : 'degraded'
+                                }
+                              />
+                              <span class="text-xs text-faint">
+                                {service.healthyCount}/{service.totalCount} healthy · task {service.taskName}
+                              </span>
+                              <span class="flex-1" />
+                              <ServiceTags tags={service.tags} meta={service.meta} />
+                            </div>
+                            <ServiceEndpointsTable endpoints={endpoints()} />
+                          </div>
+                        )
+                      }}
+                    </For>
+                  </div>
+                </SectionCard>
+              </Show>
+
               <Show when={dagHasEdges()}>
                 <SectionCard title="Task graph" description="Execution order derived from task dependencies.">
                   <DagVisualization
@@ -352,13 +423,17 @@ export default function JobDetail() {
                           <th class={thClass}>ID</th>
                           <th class={thClass}>Instance</th>
                           <th class={thClass}>Status</th>
+                          <th class={thClass}>Health</th>
+                          <th class={thClass}>Ports</th>
                           <th class={thClass}>Worker</th>
                           <th class={thClass}>Job config</th>
                         </tr>
                       </thead>
                       <tbody class="divide-y divide-line">
                         <For each={jobData()!.allocations}>
-                          {(allocation) => (
+                          {(allocation) => {
+                            const health = () => allocationHealth()?.get(Number(allocation.id))
+                            return (
                             <tr class={trHoverClass}>
                               <td class={tdClass + ' font-mono text-xs'}>#{String(allocation.id)}</td>
                               <td class={tdClass}>
@@ -368,6 +443,12 @@ export default function JobDetail() {
                               </td>
                               <td class={tdClass}><StatusBadge status={allocation.status} /></td>
                               <td class={tdClass}>
+                                <StatusBadge status={allocationHealthLabel(health())} title={health()?.status || undefined} />
+                              </td>
+                              <td class={tdClass}>
+                                <AllocationPorts network={parseAllocNetwork(allocation.network)} />
+                              </td>
+                              <td class={tdClass}>
                                 <A class="text-muted hover:text-brass-strong" href={`/nodes/${encodeURIComponent(allocation.nodeId)}`}>{allocation.nodeId}</A>
                               </td>
                               <td class={tdClass}>
@@ -376,7 +457,8 @@ export default function JobDetail() {
                                 </A>
                               </td>
                             </tr>
-                          )}
+                            )
+                          }}
                         </For>
                       </tbody>
                     </table>

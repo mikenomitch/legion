@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -87,6 +87,22 @@ impl ServiceConfig {
             ServicePort::Label(label) if label != "dynamic" => Some(label),
             _ => None,
         }
+    }
+
+    /// `service.meta` flattened to strings for transport (the wire type is a
+    /// `map<string, string>`). String values pass through unchanged; anything
+    /// else is rendered as compact JSON so nothing is silently dropped.
+    pub fn meta_strings(&self) -> BTreeMap<String, String> {
+        self.meta
+            .iter()
+            .map(|(key, value)| {
+                let text = match value {
+                    Value::String(text) => text.clone(),
+                    other => other.to_string(),
+                };
+                (key.clone(), text)
+            })
+            .collect()
     }
 }
 
@@ -186,6 +202,9 @@ pub struct ServiceEndpointRow {
     pub healthy: bool,
     pub health_status: String,
     pub tags: Vec<String>,
+    pub meta: BTreeMap<String, String>,
+    /// `network.ports` entry the service advertises, when it names a label.
+    pub port_label: Option<String>,
 }
 
 /// Uppercase a port label for env var use, mapping non-alphanumerics to `_`.

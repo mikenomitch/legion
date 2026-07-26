@@ -3827,6 +3827,114 @@ export class IssueWorkloadIdentityTokenReply extends Message<IssueWorkloadIdenti
 }
 
 /**
+ * Request payload for IssueNodeIdentityToken.
+ *
+ * @generated from message legion.IssueNodeIdentityTokenRequest
+ */
+export class IssueNodeIdentityTokenRequest extends Message<IssueNodeIdentityTokenRequest> {
+  /**
+   * The worker node the token is requested for. Must be registered and must
+   * match the caller's authenticated per-node credential.
+   *
+   * @generated from field: string node_id = 1;
+   */
+  nodeId = "";
+
+  /**
+   * Name of the node identity declared under `workloadIdentity.nodeIdentities`.
+   * Selects the audience, TTL, and subject template. Unknown names → NotFound.
+   *
+   * @generated from field: string identity_name = 2;
+   */
+  identityName = "";
+
+  constructor(data?: PartialMessage<IssueNodeIdentityTokenRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.IssueNodeIdentityTokenRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "identity_name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): IssueNodeIdentityTokenRequest {
+    return new IssueNodeIdentityTokenRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): IssueNodeIdentityTokenRequest {
+    return new IssueNodeIdentityTokenRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): IssueNodeIdentityTokenRequest {
+    return new IssueNodeIdentityTokenRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: IssueNodeIdentityTokenRequest | PlainMessage<IssueNodeIdentityTokenRequest> | undefined, b: IssueNodeIdentityTokenRequest | PlainMessage<IssueNodeIdentityTokenRequest> | undefined): boolean {
+    return proto3.util.equals(IssueNodeIdentityTokenRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for IssueNodeIdentityToken.
+ *
+ * @generated from message legion.IssueNodeIdentityTokenReply
+ */
+export class IssueNodeIdentityTokenReply extends Message<IssueNodeIdentityTokenReply> {
+  /**
+   * The signed JWT (ES256). Treat as a secret: never log it.
+   *
+   * @generated from field: string token = 1;
+   */
+  token = "";
+
+  /**
+   * Token expiry (`exp`) as Unix seconds.
+   *
+   * @generated from field: int64 expires_at = 2;
+   */
+  expiresAt = protoInt64.zero;
+
+  /**
+   * Echo of the node identity name the token was issued for.
+   *
+   * @generated from field: string name = 3;
+   */
+  name = "";
+
+  constructor(data?: PartialMessage<IssueNodeIdentityTokenReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.IssueNodeIdentityTokenReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "token", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "expires_at", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 3, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): IssueNodeIdentityTokenReply {
+    return new IssueNodeIdentityTokenReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): IssueNodeIdentityTokenReply {
+    return new IssueNodeIdentityTokenReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): IssueNodeIdentityTokenReply {
+    return new IssueNodeIdentityTokenReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: IssueNodeIdentityTokenReply | PlainMessage<IssueNodeIdentityTokenReply> | undefined, b: IssueNodeIdentityTokenReply | PlainMessage<IssueNodeIdentityTokenReply> | undefined): boolean {
+    return proto3.util.equals(IssueNodeIdentityTokenReply, a, b);
+  }
+}
+
+/**
  * Request payload for Heartbeat.
  *
  * @generated from message legion.HeartbeatRequest
@@ -6756,6 +6864,406 @@ export class GetKvLockReply extends Message<GetKvLockReply> {
 }
 
 /**
+ * Request payload for ListServices. Currently no filters; all declared
+ * services are returned.
+ *
+ * @generated from message legion.ListServicesRequest
+ */
+export class ListServicesRequest extends Message<ListServicesRequest> {
+  constructor(data?: PartialMessage<ListServicesRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListServicesRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListServicesRequest {
+    return new ListServicesRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListServicesRequest {
+    return new ListServicesRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListServicesRequest {
+    return new ListServicesRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListServicesRequest | PlainMessage<ListServicesRequest> | undefined, b: ListServicesRequest | PlainMessage<ListServicesRequest> | undefined): boolean {
+    return proto3.util.equals(ListServicesRequest, a, b);
+  }
+}
+
+/**
+ * Aggregate view of one declared service.
+ *
+ * @generated from message legion.ServiceSummary
+ */
+export class ServiceSummary extends Message<ServiceSummary> {
+  /**
+   * Service name (from `service.name`, defaulting to the task name).
+   *
+   * @generated from field: string service = 1;
+   */
+  service = "";
+
+  /**
+   * Job ID whose task declares this service.
+   *
+   * @generated from field: string job_id = 2;
+   */
+  jobId = "";
+
+  /**
+   * Task name declaring this service.
+   *
+   * @generated from field: string task_name = 3;
+   */
+  taskName = "";
+
+  /**
+   * Count of endpoints currently passing health (see ResolveService for the
+   * healthy definition).
+   *
+   * @generated from field: uint32 healthy_count = 4;
+   */
+  healthyCount = 0;
+
+  /**
+   * Total endpoint (allocation) count for this service, healthy or not.
+   *
+   * @generated from field: uint32 total_count = 5;
+   */
+  totalCount = 0;
+
+  /**
+   * Service tags declared in the task's `service.tags`.
+   *
+   * @generated from field: repeated string tags = 6;
+   */
+  tags: string[] = [];
+
+  /**
+   * Service metadata declared in the task's `service.meta`, stringified.
+   *
+   * Free-form, but `protocol` is conventional (`http`, `https`, `grpc`, …) and
+   * is what clients use to turn an endpoint into a URL.
+   *
+   * @generated from field: map<string, string> meta = 7;
+   */
+  meta: { [key: string]: string } = {};
+
+  constructor(data?: PartialMessage<ServiceSummary>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ServiceSummary";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "service", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "job_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "task_name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "healthy_count", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 5, name: "total_count", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 6, name: "tags", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 7, name: "meta", kind: "map", K: 9 /* ScalarType.STRING */, V: {kind: "scalar", T: 9 /* ScalarType.STRING */} },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ServiceSummary {
+    return new ServiceSummary().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ServiceSummary {
+    return new ServiceSummary().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ServiceSummary {
+    return new ServiceSummary().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ServiceSummary | PlainMessage<ServiceSummary> | undefined, b: ServiceSummary | PlainMessage<ServiceSummary> | undefined): boolean {
+    return proto3.util.equals(ServiceSummary, a, b);
+  }
+}
+
+/**
+ * Reply payload for ListServices.
+ *
+ * @generated from message legion.ListServicesReply
+ */
+export class ListServicesReply extends Message<ListServicesReply> {
+  /**
+   * All declared services. Empty when no stored task config declares a
+   * `service` block.
+   *
+   * @generated from field: repeated legion.ServiceSummary services = 1;
+   */
+  services: ServiceSummary[] = [];
+
+  constructor(data?: PartialMessage<ListServicesReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListServicesReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "services", kind: "message", T: ServiceSummary, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListServicesReply {
+    return new ListServicesReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListServicesReply {
+    return new ListServicesReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListServicesReply {
+    return new ListServicesReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListServicesReply | PlainMessage<ListServicesReply> | undefined, b: ListServicesReply | PlainMessage<ListServicesReply> | undefined): boolean {
+    return proto3.util.equals(ListServicesReply, a, b);
+  }
+}
+
+/**
+ * Request payload for ResolveService.
+ *
+ * @generated from message legion.ResolveServiceRequest
+ */
+export class ResolveServiceRequest extends Message<ResolveServiceRequest> {
+  /**
+   * Service name to resolve. Matches `service.name` (defaulting to the task
+   * name) on stored task configs.
+   *
+   * @generated from field: string service = 1;
+   */
+  service = "";
+
+  /**
+   * When true, endpoints failing (or missing) health are also returned, with
+   * `healthy` set accordingly. Default false: only healthy endpoints.
+   *
+   * @generated from field: bool include_unhealthy = 2;
+   */
+  includeUnhealthy = false;
+
+  constructor(data?: PartialMessage<ResolveServiceRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ResolveServiceRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "service", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "include_unhealthy", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ResolveServiceRequest {
+    return new ResolveServiceRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ResolveServiceRequest {
+    return new ResolveServiceRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ResolveServiceRequest {
+    return new ResolveServiceRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ResolveServiceRequest | PlainMessage<ResolveServiceRequest> | undefined, b: ResolveServiceRequest | PlainMessage<ResolveServiceRequest> | undefined): boolean {
+    return proto3.util.equals(ResolveServiceRequest, a, b);
+  }
+}
+
+/**
+ * One resolvable endpoint of a service.
+ *
+ * @generated from message legion.ServiceEndpoint
+ */
+export class ServiceEndpoint extends Message<ServiceEndpoint> {
+  /**
+   * Service name this endpoint belongs to.
+   *
+   * @generated from field: string service = 1;
+   */
+  service = "";
+
+  /**
+   * Job ID whose task declares the service.
+   *
+   * @generated from field: string job_id = 2;
+   */
+  jobId = "";
+
+  /**
+   * Task name declaring the service.
+   *
+   * @generated from field: string task_name = 3;
+   */
+  taskName = "";
+
+  /**
+   * Allocation ID backing this endpoint.
+   *
+   * @generated from field: int64 allocation_id = 4;
+   */
+  allocationId = protoInt64.zero;
+
+  /**
+   * Node ID currently hosting the endpoint.
+   *
+   * @generated from field: string node_id = 5;
+   */
+  nodeId = "";
+
+  /**
+   * Routable address (host/IP) of the endpoint's node. Derived from the
+   * node's advertised worker address. Empty when the node has no advertised
+   * address.
+   *
+   * @generated from field: string address = 6;
+   */
+  address = "";
+
+  /**
+   * Host port assigned to the service's advertised port label.
+   *
+   * @generated from field: uint32 port = 7;
+   */
+  port = 0;
+
+  /**
+   * True when the endpoint's latest allocation health snapshot is healthy and
+   * its node is alive.
+   *
+   * @generated from field: bool healthy = 8;
+   */
+  healthy = false;
+
+  /**
+   * Human-readable health status detail from the latest snapshot (for
+   * example `healthy`, `starting`, or a check failure description). Empty
+   * when no snapshot has been reported yet.
+   *
+   * @generated from field: string health_status = 9;
+   */
+  healthStatus = "";
+
+  /**
+   * Service tags declared in the task's `service.tags`.
+   *
+   * @generated from field: repeated string tags = 10;
+   */
+  tags: string[] = [];
+
+  /**
+   * Service metadata declared in the task's `service.meta`, stringified.
+   *
+   * Free-form, but `protocol` is conventional (`http`, `https`, `grpc`, …) and
+   * is what clients use to turn `address:port` into a URL.
+   *
+   * @generated from field: map<string, string> meta = 11;
+   */
+  meta: { [key: string]: string } = {};
+
+  /**
+   * Name of the `network.ports` entry this endpoint advertises, when the
+   * service names a port label rather than a literal port number.
+   *
+   * @generated from field: string port_label = 12;
+   */
+  portLabel = "";
+
+  constructor(data?: PartialMessage<ServiceEndpoint>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ServiceEndpoint";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "service", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "job_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "task_name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "allocation_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 5, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "address", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 7, name: "port", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 8, name: "healthy", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 9, name: "health_status", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 10, name: "tags", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 11, name: "meta", kind: "map", K: 9 /* ScalarType.STRING */, V: {kind: "scalar", T: 9 /* ScalarType.STRING */} },
+    { no: 12, name: "port_label", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ServiceEndpoint {
+    return new ServiceEndpoint().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ServiceEndpoint {
+    return new ServiceEndpoint().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ServiceEndpoint {
+    return new ServiceEndpoint().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ServiceEndpoint | PlainMessage<ServiceEndpoint> | undefined, b: ServiceEndpoint | PlainMessage<ServiceEndpoint> | undefined): boolean {
+    return proto3.util.equals(ServiceEndpoint, a, b);
+  }
+}
+
+/**
+ * Reply payload for ResolveService.
+ *
+ * @generated from message legion.ResolveServiceReply
+ */
+export class ResolveServiceReply extends Message<ResolveServiceReply> {
+  /**
+   * Matching endpoints. Empty when the service is unknown or (by default) has
+   * no healthy endpoints — callers can distinguish the two via ListServices.
+   *
+   * @generated from field: repeated legion.ServiceEndpoint endpoints = 1;
+   */
+  endpoints: ServiceEndpoint[] = [];
+
+  constructor(data?: PartialMessage<ResolveServiceReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ResolveServiceReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "endpoints", kind: "message", T: ServiceEndpoint, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ResolveServiceReply {
+    return new ResolveServiceReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ResolveServiceReply {
+    return new ResolveServiceReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ResolveServiceReply {
+    return new ResolveServiceReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ResolveServiceReply | PlainMessage<ResolveServiceReply> | undefined, b: ResolveServiceReply | PlainMessage<ResolveServiceReply> | undefined): boolean {
+    return proto3.util.equals(ResolveServiceReply, a, b);
+  }
+}
+
+/**
  * Request payload for GetArtifactCredential.
  *
  * @generated from message legion.GetArtifactCredentialRequest
@@ -7666,6 +8174,15 @@ export class LedgerAllocation extends Message<LedgerAllocation> {
   jobId = "";
 
   /**
+   * JSON-encoded assigned network payload (address + ports) for this
+   * allocation, matching the `AllocNetwork` shape. Empty string when the
+   * task declares no network block.
+   *
+   * @generated from field: string network = 10;
+   */
+  network = "";
+
+  /**
    * Optional JSON-encoded per-artifact staging states from the latest worker
    * health snapshot. Same payload as `AllocationHealth.artifact_states`.
    *
@@ -7704,6 +8221,7 @@ export class LedgerAllocation extends Message<LedgerAllocation> {
     { no: 5, name: "job_config_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 6, name: "task_config_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
     { no: 7, name: "job_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 10, name: "network", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 8, name: "artifact_states", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
     { no: 9, name: "instance_id", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
   ]);
@@ -9530,6 +10048,16 @@ export class TaskAllocation extends Message<TaskAllocation> {
   taskOnUnhealthy = "";
 
   /**
+   * JSON-encoded assigned network payload (address + ports) for this
+   * allocation, matching the `AllocNetwork` shape. Workers use it to inject
+   * `LEGION_PORT_*` / `LEGION_ADDR_*` environment variables into the task.
+   * Empty string when the task declares no network block.
+   *
+   * @generated from field: string network = 14;
+   */
+  network = "";
+
+  /**
    * JSON-encoded list of normalized artifact specs for this task.
    *
    * This is the post-admission form: kind-implicit artifacts (for example a
@@ -9597,6 +10125,7 @@ export class TaskAllocation extends Message<TaskAllocation> {
     { no: 8, name: "task_config", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 9, name: "task_checks", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 10, name: "task_on_unhealthy", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 14, name: "network", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 11, name: "task_artifacts", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 12, name: "task_identities", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 13, name: "self_terminate_after_seconds", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },

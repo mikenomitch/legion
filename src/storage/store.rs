@@ -121,9 +121,16 @@ struct AllocationTaskState {
     network_raw: Option<String>,
 }
 
-/// A service declared in a job's latest config: (service, job_id, task_name,
-/// tags). Endpoint counts come from `service_endpoints`.
-pub type DeclaredService = (String, String, String, Vec<String>);
+/// A service declared in a job's latest config. Endpoint counts come from
+/// `service_endpoints`.
+#[derive(Debug, Clone)]
+pub struct DeclaredService {
+    pub service: String,
+    pub job_id: String,
+    pub task_name: String,
+    pub tags: Vec<String>,
+    pub meta: BTreeMap<String, String>,
+}
 
 #[derive(Debug, Clone)]
 pub struct PlanSubmission {
@@ -4297,6 +4304,8 @@ impl Store {
                 healthy,
                 health_status,
                 tags: service.tags.clone(),
+                meta: service.meta_strings(),
+                port_label: service.port_label().map(str::to_string),
             });
         }
 
@@ -4329,12 +4338,13 @@ impl Store {
             let (task_name, service_raw, job_id) = row?;
             let service: crate::structs::ServiceConfig = from_str(&service_raw)
                 .with_context(|| format!("invalid stored service config for task {task_name}"))?;
-            declared.push((
-                service.service_name(&task_name).to_string(),
+            declared.push(DeclaredService {
+                service: service.service_name(&task_name).to_string(),
                 job_id,
+                tags: service.tags.clone(),
+                meta: service.meta_strings(),
                 task_name,
-                service.tags.clone(),
-            ));
+            });
         }
         Ok(declared)
     }
@@ -10570,7 +10580,7 @@ mod tests {
 
         // But the declared service is still listed (0 endpoints).
         let declared = store.declared_services()?;
-        assert!(declared.iter().any(|(service, ..)| service == "web"));
+        assert!(declared.iter().any(|entry| entry.service == "web"));
         Ok(())
     }
 

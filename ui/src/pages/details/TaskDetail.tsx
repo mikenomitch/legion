@@ -4,6 +4,8 @@ import { Badge, DefList, EmptyState, Note, PageHeader, SectionCard, Spinner, Sta
 import LogViewer from '../../components/LogViewer'
 import { managerClient } from '../../grpcClient'
 import AllocationExecPanel from '../../components/AllocationExecPanel'
+import { AllocationPorts, ServiceEndpointsTable, ServiceTags } from '../../components/ServiceEndpoints'
+import { allocationHealthLabel, fetchAllocationRuntime, parseAllocNetwork } from '../../utils/allocations'
 import {
   artifactProgressPercent,
   buildTaskRuntimeByName,
@@ -42,11 +44,12 @@ export default function TaskDetail() {
 
   // Keyed on the route params so task→task navigation refetches.
   const [data] = createResource(() => `${jobName()}/${taskName()}`, async () => {
-    const [jobInfo, rollouts, spec, ledger] = await Promise.all([
+    const [jobInfo, rollouts, spec, ledger, allocationHealth] = await Promise.all([
       managerClient.getJobInfo({ name: jobName() }),
       managerClient.listRollouts({ jobId: jobName(), activeOnly: false, page: 1, pageSize: 200 }),
       managerClient.getJobSpec({ name: jobName() }),
       managerClient.getLedger({}),
+      fetchAllocationRuntime(jobName()),
     ])
 
     const latestRollout = rollouts.rollouts[0]
@@ -64,6 +67,16 @@ export default function TaskDetail() {
       .flatMap((node) => node.allocations)
       .filter((alloc) => alloc.jobId === jobName() && runnable.has(alloc.status))
 
+    // Endpoints for the service this task declares (if any), unhealthy
+    // included so a failing endpoint is visible rather than absent.
+    const serviceName = taskSpec?.service ? (taskSpec.service.name ?? taskName()) : undefined
+    const endpoints = serviceName
+      ? await managerClient
+          .resolveService({ service: serviceName, includeUnhealthy: true })
+          .then((reply) => reply.endpoints.filter((endpoint) => endpoint.taskName === taskName()))
+          .catch(() => [])
+      : []
+
     return {
       job: jobInfo.job,
       taskSpec,
@@ -71,8 +84,19 @@ export default function TaskDetail() {
       jobAllocations,
       latestRollout,
       groups: rolloutStatus?.groups ?? [],
+      allocationHealth,
+      serviceName,
+      endpoints,
     }
   })
+
+  // The ledger identifies allocations by task_config_id only, so the task name
+  // comes from the same state-store lookup that carries health.
+  const taskAllocations = createMemo(() =>
+    (data()?.jobAllocations ?? []).filter(
+      (alloc) => data()?.allocationHealth.get(Number(alloc.id))?.taskName === taskName(),
+    ),
+  )
 
   return (
     <Show when={!data.loading} fallback={<div class="py-6"><Spinner label="Loading task…" /></div>}>
@@ -188,23 +212,149 @@ export default function TaskDetail() {
                 </SectionCard>
               </Show>
 
-              <SectionCard title="Health">
-                <Show
-                  when={data()!.taskRuntime}
-                  fallback={<p class="text-sm text-muted">No runtime health found for this task yet.</p>}
+              {/* Discovery: what this task advertises, on which port, and
+                  where it is reachable right now. */}
+              <Show when={data()!.taskSpec!.service || data()!.taskSpec!.ports.length > 0}>
+                <SectionCard
+                  title="Service & ports"
+                  description="What this task advertises to discovery, and the ports it declares."
+                  actions={
+                    <Show when={data()!.serviceName}>
+                      <A class={linkClass + ' text-sm'} href={`/services/${encodeURIComponent(data()!.serviceName!)}`}>
+                        Open service
+                      </A>
+                    </Show>
+                  }
                 >
-                  <div class="flex flex-wrap items-center gap-2">
-                    <StatusBadge
-                      status={data()!.taskRuntime!.healthy === undefined ? 'unknown' : data()!.taskRuntime!.healthy ? 'healthy' : 'unhealthy'}
-                    />
-                    <Badge tone="neutral">{data()!.taskRuntime!.allocations.length} allocation{data()!.taskRuntime!.allocations.length === 1 ? '' : 's'}</Badge>
+                  <div class="space-y-4">
+                    <Show when={data()!.taskSpec!.service}>
+                      <DefList
+                        cols={3}
+                        items={[
+                          ['Service', <span class="font-medium text-ink">{data()!.serviceName}</span>],
+                          ['Advertised port', <span class="font-mono text-xs">{data()!.taskSpec!.service!.port}</span>],
+                          [
+                            'Tags & meta',
+                            <ServiceTags tags={data()!.taskSpec!.service!.tags} meta={data()!.taskSpec!.service!.meta} />,
+                          ],
+                        ]}
+                      />
+                    </Show>
+
+                    <Show when={data()!.taskSpec!.ports.length > 0}>
+                      <div>
+                        <p class="eyebrow mb-1.5">
+                          Declared ports
+                          <Show when={data()!.taskSpec!.networkMode}>
+                            <span class="ml-2 normal-case tracking-normal text-faint">mode {data()!.taskSpec!.networkMode}</span>
+                          </Show>
+                        </p>
+                        <div class="flex flex-wrap gap-1.5">
+                          <For each={data()!.taskSpec!.ports}>
+                            {(port) => (
+                              <Badge tone="neutral" mono>
+                                {port.name}
+                                {port.staticPort === undefined ? ' · dynamic' : ` · ${port.staticPort}`}
+                                {port.to === undefined ? '' : ` → ${port.to}`}
+                              </Badge>
+                            )}
+                          </For>
+                        </div>
+                      </div>
+                    </Show>
+
+                    <Show when={data()!.serviceName}>
+                      <div>
+                        <p class="eyebrow mb-1.5">Live endpoints</p>
+                        <ServiceEndpointsTable
+                          endpoints={data()!.endpoints}
+                          emptyTitle="No endpoints yet"
+                          emptyBody="An endpoint appears once an allocation is placed, gets its port, and passes its checks."
+                        />
+                      </div>
+                    </Show>
                   </div>
-                  <Show when={data()!.taskRuntime!.health.length > 0}>
-                    <ul class="mt-3 space-y-1 text-sm text-muted">
-                      <For each={data()!.taskRuntime!.health}>{(health) => <li>· {health}</li>}</For>
-                    </ul>
-                  </Show>
-                </Show>
+                </SectionCard>
+              </Show>
+
+              <SectionCard
+                title="Health"
+                description="Declared checks, and what the workers last reported for each allocation."
+              >
+                <div class="space-y-4">
+                  <div>
+                    <p class="eyebrow mb-1.5">Declared checks</p>
+                    <Show
+                      when={data()!.taskSpec!.checks.length > 0}
+                      fallback={
+                        <p class="text-sm text-muted">
+                          No checks declared — the task counts as healthy as soon as it is running.
+                        </p>
+                      }
+                    >
+                      <TableShell>
+                        <table class={tableClass}>
+                          <thead class={theadClass}>
+                            <tr>
+                              <th class={thClass}>Check</th>
+                              <th class={thClass}>Kind</th>
+                              <th class={thClass}>Target</th>
+                              <th class={thClass}>Interval</th>
+                              <th class={thClass}>Timeout</th>
+                              <th class={thClass}>Unhealthy after</th>
+                            </tr>
+                          </thead>
+                          <tbody class="divide-y divide-line">
+                            <For each={data()!.taskSpec!.checks}>
+                              {(check) => (
+                                <tr class={trHoverClass}>
+                                  <td class={tdClass}>{check.name ?? check.type}</td>
+                                  <td class={tdClass + ' text-muted'}>{check.kind}</td>
+                                  <td class={tdClass + ' font-mono text-xs text-muted'}>
+                                    {[check.port ? `port ${check.port}` : undefined, check.path].filter(Boolean).join(' ') || '—'}
+                                  </td>
+                                  <td class={tdClass + ' text-muted'}>{check.every ?? '—'}</td>
+                                  <td class={tdClass + ' text-muted'}>{check.timeout ?? '—'}</td>
+                                  <td class={tdClass + ' tabular-nums text-muted'}>
+                                    {check.unhealthyAfterCount === undefined ? '—' : `${check.unhealthyAfterCount} failures`}
+                                  </td>
+                                </tr>
+                              )}
+                            </For>
+                          </tbody>
+                        </table>
+                      </TableShell>
+                    </Show>
+                  </div>
+
+                  <div>
+                    <p class="eyebrow mb-1.5">Reported health</p>
+                    <Show
+                      when={taskAllocations().length > 0}
+                      fallback={<p class="text-sm text-muted">No allocations running for this task.</p>}
+                    >
+                      <ul class="space-y-1.5">
+                        <For each={taskAllocations()}>
+                          {(alloc) => {
+                            const health = () => data()!.allocationHealth.get(Number(alloc.id))
+                            return (
+                              <li class="flex flex-wrap items-center gap-2 rounded-md border border-line bg-surface2/40 px-2.5 py-1.5 text-sm">
+                                <span class="font-mono text-xs font-semibold">#{String(alloc.id)}</span>
+                                <StatusBadge status={allocationHealthLabel(health())} />
+                                <span class="text-xs text-faint">on {alloc.nodeId}</span>
+                                <Show when={health()?.status}>
+                                  <span class="text-xs text-muted">· {health()!.status}</span>
+                                </Show>
+                                <span class="flex-1" />
+                                <AllocationPorts network={parseAllocNetwork(alloc.network)} />
+                              </li>
+                            )
+                          }}
+                        </For>
+                      </ul>
+                    </Show>
+                  </div>
+                </div>
               </SectionCard>
 
               <SectionCard

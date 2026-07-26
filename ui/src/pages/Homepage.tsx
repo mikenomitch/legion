@@ -22,6 +22,10 @@ export default function Homepage() {
     () => tick() + 1,
     async () => (await managerClient.listRollouts({ activeOnly: true, page: 1, pageSize: 20 })).rollouts,
   )
+  const [services] = createResource(
+    () => tick() + 1,
+    async () => (await managerClient.listServices({})).services,
+  )
 
   const props = { ledger, rollouts }
   const workers = createMemo(() => props.ledger() ?? [])
@@ -40,6 +44,10 @@ export default function Homepage() {
   )
   const jobCount = createMemo(() => new Set(allocations().map(({ allocation }) => allocation.jobId)).size)
   const activeRollouts = createMemo(() => props.rollouts() ?? [])
+  // A service with no healthy endpoint is a cluster-level problem, so it earns
+  // a slot on the overview next to workers and allocations.
+  const allServices = createMemo(() => services() ?? [])
+  const servicesUp = createMemo(() => allServices().filter((service) => service.healthyCount > 0).length)
 
   return (
     <Show when={props.ledger() !== undefined || !props.ledger.loading} fallback={<LoadingRows rows={6} class="p-0" />}>
@@ -48,7 +56,7 @@ export default function Homepage() {
           <Show when={props.rollouts.error}>
             <Note tone="danger">Failed to load rollouts.</Note>
           </Show>
-          <div class="grid grid-cols-2 gap-3 lg:grid-cols-4">
+          <div class="grid grid-cols-2 gap-3 lg:grid-cols-5">
             <StatCard
               label="Workers"
               icon="server"
@@ -78,6 +86,19 @@ export default function Homepage() {
                 </>
               }
               tone={allocations().length > 0 && runningAllocations() < allocations().length ? 'warn' : 'neutral'}
+            />
+            <StatCard
+              label="Services"
+              icon="radio"
+              href="/services"
+              value={
+                <>
+                  {servicesUp()}
+                  <span class="font-sans text-sm font-normal text-muted"> / {allServices().length} up</span>
+                </>
+              }
+              hint="with a healthy endpoint"
+              tone={allServices().length > 0 && servicesUp() < allServices().length ? 'danger' : 'neutral'}
             />
             <StatCard
               label="Active rollouts"
