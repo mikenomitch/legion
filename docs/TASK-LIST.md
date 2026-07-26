@@ -24,6 +24,17 @@
   - [x] Affinities and anti-affinities work
   - [x] Some task group equivalent works
   - [ ] Worker groups + taint/toleration equiv
+  - [ ] Let a node override its builtin resource capacity (`cpu`, `memory`, `cores`)
+    - `ResourcePool::from_node` skips builtin names when reading a node's
+      `resources` block, so `resources: { cpu: 40000 }` in a worker config is
+      silently ignored rather than applied or rejected. Capacity can only come
+      from the fingerprint today, which leaves no escape hatch when a platform
+      fingerprints badly (see the Apple Silicon CPU frequency case) and no way
+      to deliberately under- or over-subscribe a node.
+    - Decide whether an override replaces the fingerprint or is a separate
+      ceiling, and how it composes with `reservedResources`. Whichever way it
+      lands, an ignored key should warn or fail validation instead of passing
+      silently.
   - [ ] Scheduling on same node as existing job works
   - [ ] Priorities and eviction works (eviction toggled at the pool level)
     - [ ] At least think about fair scheduling policies (do a lil LLMing to figure out if there's some 80/20 you can do here)
