@@ -4178,15 +4178,18 @@ impl Manager for ManagerDaemonService {
 
         let mut summaries: std::collections::BTreeMap<String, ServiceSummary> =
             std::collections::BTreeMap::new();
-        for (service, job_id, task_name, tags) in declared {
-            summaries.entry(service.clone()).or_insert(ServiceSummary {
-                service,
-                job_id,
-                task_name,
-                healthy_count: 0,
-                total_count: 0,
-                tags,
-            });
+        for entry in declared {
+            summaries
+                .entry(entry.service.clone())
+                .or_insert(ServiceSummary {
+                    service: entry.service,
+                    job_id: entry.job_id,
+                    task_name: entry.task_name,
+                    healthy_count: 0,
+                    total_count: 0,
+                    tags: entry.tags,
+                    meta: entry.meta.into_iter().collect(),
+                });
         }
         for endpoint in endpoints {
             let summary = summaries
@@ -4198,6 +4201,7 @@ impl Manager for ManagerDaemonService {
                     healthy_count: 0,
                     total_count: 0,
                     tags: endpoint.tags.clone(),
+                    meta: endpoint.meta.clone().into_iter().collect(),
                 });
             summary.total_count += 1;
             if endpoint.healthy {
@@ -4237,6 +4241,8 @@ impl Manager for ManagerDaemonService {
                 healthy: endpoint.healthy,
                 health_status: endpoint.health_status,
                 tags: endpoint.tags,
+                meta: endpoint.meta.into_iter().collect(),
+                port_label: endpoint.port_label.unwrap_or_default(),
             })
             .collect();
 

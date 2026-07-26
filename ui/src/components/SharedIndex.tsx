@@ -39,6 +39,8 @@ type SharedIndexProps = {
   emptyLabel: string
   emptyHint?: string
   extraFilters?: JSX.Element
+  // Page-level actions, rendered at the end of the filter row.
+  actions?: JSX.Element
   // Hide the Status column for entities that have no meaningful status (e.g. manager config snapshots).
   hideStatus?: boolean
 }
@@ -174,6 +176,7 @@ export default function SharedIndex(props: SharedIndexProps) {
         >
           <For each={props.sortOptions}>{(option) => <option value={option.value}>{option.label}</option>}</For>
         </select>
+        {props.actions}
       </div>
 
       <SectionCard flush>

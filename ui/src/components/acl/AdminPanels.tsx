@@ -424,8 +424,9 @@ export function UsersPanel() {
   )
 }
 
-export function JoinTokensPanel() {
-  const [tokens, { refetch }] = createResource(async () => (await managerClient.listJoinTokens({})).tokens)
+// The create-a-join-token form on its own, so the Workers page can offer it
+// too: "a worker is missing" is discovered there, not on the Access page.
+export function CreateJoinTokenForm(props: { onCreated?: () => void }) {
   const [workerType, setWorkerType] = createSignal('default')
   const [ttl, setTtl] = createSignal('24h')
   const [description, setDescription] = createSignal('')
@@ -444,11 +445,39 @@ export function JoinTokensPanel() {
       })
       setJoinCommand(`legion join ${reply.token}`)
       setDescription('')
-      void refetch()
+      props.onCreated?.()
     } catch (err) {
       setError(errorText(err))
     }
   }
+
+  return (
+    <>
+      <form class="flex max-w-lg flex-col gap-3" onSubmit={create}>
+        <Field label="Worker type">
+          <input class={inputClass} value={workerType()} onInput={(e) => setWorkerType(e.currentTarget.value)} />
+        </Field>
+        <Field label="TTL" hint="e.g. 24h — use 'none' to disable expiry.">
+          <input class={cx(inputClass, 'font-mono')} value={ttl()} onInput={(e) => setTtl(e.currentTarget.value)} />
+        </Field>
+        <Field label="Description (optional)">
+          <input class={inputClass} value={description()} onInput={(e) => setDescription(e.currentTarget.value)} />
+        </Field>
+        <Button type="submit" variant="primary" size="md" class="self-start">
+          Create join token
+        </Button>
+      </form>
+      <Feedback error={error()} notice={null} />
+      <Show when={joinCommand()}>
+        {(value) => <SecretReveal label="Run on the worker host" secret={value()} />}
+      </Show>
+    </>
+  )
+}
+
+export function JoinTokensPanel() {
+  const [tokens, { refetch }] = createResource(async () => (await managerClient.listJoinTokens({})).tokens)
+  const [error, setError] = createSignal<string | null>(null)
 
   const revoke = async (id: string) => {
     setError(null)
@@ -503,23 +532,7 @@ export function JoinTokensPanel() {
       </SectionCard>
 
       <SectionCard title="Create a join token">
-        <form class="flex max-w-lg flex-col gap-3" onSubmit={create}>
-          <Field label="Worker type">
-            <input class={inputClass} value={workerType()} onInput={(e) => setWorkerType(e.currentTarget.value)} />
-          </Field>
-          <Field label="TTL" hint="e.g. 24h — use 'none' to disable expiry.">
-            <input class={cx(inputClass, 'font-mono')} value={ttl()} onInput={(e) => setTtl(e.currentTarget.value)} />
-          </Field>
-          <Field label="Description (optional)">
-            <input class={inputClass} value={description()} onInput={(e) => setDescription(e.currentTarget.value)} />
-          </Field>
-          <Button type="submit" variant="primary" size="md" class="self-start">
-            Create join token
-          </Button>
-        </form>
-        <Show when={joinCommand()}>
-          {(value) => <SecretReveal label="Run on the worker host" secret={value()} />}
-        </Show>
+        <CreateJoinTokenForm onCreated={() => void refetch()} />
       </SectionCard>
     </div>
   )

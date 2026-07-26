@@ -2390,6 +2390,12 @@ message ServiceSummary {
 
   // Service tags declared in the task's `service.tags`.
   repeated string tags = 6;
+
+  // Service metadata declared in the task's `service.meta`, stringified.
+  //
+  // Free-form, but `protocol` is conventional (`http`, `https`, `grpc`, …) and
+  // is what clients use to turn an endpoint into a URL.
+  map<string, string> meta = 7;
 }
 
 // Reply payload for ListServices.
@@ -2446,6 +2452,16 @@ message ServiceEndpoint {
 
   // Service tags declared in the task's `service.tags`.
   repeated string tags = 10;
+
+  // Service metadata declared in the task's `service.meta`, stringified.
+  //
+  // Free-form, but `protocol` is conventional (`http`, `https`, `grpc`, …) and
+  // is what clients use to turn `address:port` into a URL.
+  map<string, string> meta = 11;
+
+  // Name of the `network.ports` entry this endpoint advertises, when the
+  // service names a port label rather than a literal port number.
+  string port_label = 12;
 }
 
 // Reply payload for ResolveService.

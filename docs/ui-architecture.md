@@ -53,6 +53,7 @@ Routes in `App.tsx`:
 - `/` overview dashboard (KPI stat cards, active rollouts, workers and
   allocations tables)
 - `/jobs` (+ `/jobs/:id`, `/jobs/:id/tasks/:taskName`, `/jobs/:id/specs/:configId`)
+- `/services` (+ `/services/:name`)
 - `/rollouts` (+ `/rollouts/:id`); `/deployments` redirects here
 - `/nodes` (+ `/nodes/:id`)
 - `/manager` (+ `/manager/:id`)
@@ -88,11 +89,33 @@ an `afterId` cursor so no events are missed across disconnects.
   Instances panel (id, mode, color-coded state, slot, current allocation,
   storage handle, created). Keyed instance create/destroy is CLI-only
   (`legion instance ...`); the UI does not mutate instances.
+- `Services.tsx`: the discovery catalog (`ListServices`) with healthy/total
+  counts; `pages/details/ServiceDetail.tsx` resolves endpoints
+  (`ResolveService`, unhealthy included) and renders the same layered
+  diagnosis as `legion service doctor` (`utils/services.ts`). Endpoint
+  addresses link out when the service's `meta.protocol` is web-reachable.
 - `Rollouts.tsx`: rollout list, per-group status, event logs, manual advance action.
 - `Events.tsx`: live scheduler event feed with filtering and pause/resume.
 - `KeyValue.tsx`: key tree browser and CRUD/patch editor.
 - `Manager.tsx`: manager config snapshots.
 - `TestingUtils.tsx`: placeholder (not implemented yet).
+
+## Service Discovery
+
+Discovery is surfaced in three places, all reading the same projection:
+
+- **Services** (`/services`, `/services/:name`): the catalog, per-endpoint
+  health, and the doctor-style diagnosis.
+- **Job detail**: a Services card with each declared service's endpoints, and
+  Health/Ports columns on the allocation table.
+- **Task detail**: the declared `service`/`network.ports` blocks, live
+  endpoints for that task, the declared `checks` table, and the latest
+  per-allocation health snapshot.
+
+Allocation ports and health come from the state store
+(`utils/allocations.ts`): the ledger carries the assigned `network` blob but
+not the owning task name or the health snapshot, so one SQL query joins
+`allocation` → `task_config` → `allocation_health` per job.
 
 ## Stateful Workloads
 
