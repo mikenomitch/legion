@@ -31,7 +31,7 @@ use crate::structs::{
 };
 use crate::util::random_string;
 
-use rand::{seq::SliceRandom, thread_rng, Rng};
+use rand::{thread_rng, Rng};
 use rusqlite::{
     named_params, params, params_from_iter, types::ValueRef, Connection, Error as RusqliteError,
     OpenFlags, OptionalExtension, Row, Transaction,
@@ -59,6 +59,12 @@ pub enum Msg {
 
 pub type MemSafeConn = Arc<Mutex<Connection>>;
 const READ_MODEL_LOCK_ERROR: &str = "Error locking read model";
+
+/// RFC3339 with the subsecond field pinned to nine digits, so the rendered
+/// string sorts lexicographically in chronological order. Used for any
+/// timestamp SQL compares or orders by (see `Store::sortable_timestamp`).
+const SORTABLE_TIMESTAMP_FORMAT: &[time::format_description::BorrowedFormatItem<'_>] =
+    format_description!("[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:9]Z");
 
 /// Parse a nullable JSONB text column into an optional typed value, mapping
 /// parse failures onto rusqlite conversion errors.
@@ -1078,6 +1084,21 @@ impl Store {
         Ok(OffsetDateTime::now_utc().format(&Rfc3339)?)
     }
 
+    /// RFC3339 with a fixed-width, nine-digit subsecond field.
+    ///
+    /// `Rfc3339` trims trailing zeros from the subsecond field, so its output
+    /// has a variable length and does NOT sort lexicographically in
+    /// chronological order: `…:03.4374Z` compares GREATER than
+    /// `…:03.437409Z` because `'Z' > '0'`. Any column SQL orders or ranges
+    /// with `<=` must therefore be written through this format instead.
+    fn sortable_timestamp(at: OffsetDateTime) -> R<String> {
+        Ok(at.format(SORTABLE_TIMESTAMP_FORMAT)?)
+    }
+
+    fn sortable_now() -> R<String> {
+        Self::sortable_timestamp(OffsetDateTime::now_utc())
+    }
+
     fn insert_task_statuses(
         tx: &Transaction<'_>,
         task_ids: &[i64],
@@ -1756,8 +1777,18 @@ impl Store {
             self.events().node_lost_after_missed_heartbeats(node_id);
         }
 
+        // Per-node, log-and-continue: a job that currently has nowhere to go
+        // (cluster at capacity, unsatisfiable constraints) must not stop the
+        // other lost nodes from being drained, nor abort the caller's
+        // node-status sweep. `recheck_lost_nodes` retries every tick.
         for node_id in ids {
-            self.reschedule_allocations_for_lost_node(node_id)?;
+            if let Err(err) = self.reschedule_allocations_for_lost_node(node_id) {
+                warn!(
+                    %node_id,
+                    error = ?err,
+                    "Failed rescheduling allocations off lost node"
+                );
+            }
         }
 
         Ok(())
@@ -4463,75 +4494,33 @@ impl Store {
         Ok(allocations)
     }
 
+    /// Bring a job config back to its desired allocation counts.
+    ///
+    /// Runs the real scheduler in `Reschedule` mode rather than a second,
+    /// simplified placement pass: replacements after a node loss or a node
+    /// join have to honor node capacity, distinct constraints, group
+    /// co-location and stateful instance counts exactly like every other
+    /// placement path, and be scored by the configured policy.
     #[instrument(err, skip_all)]
     pub fn reconcile_job_config_allocations(&self, job_config_id: &str) -> R<()> {
-        let nodes: Vec<Node> = self
-            .get_nodes()?
-            .into_iter()
-            .filter(|node| node.availability == "available")
-            .collect();
-
-        if nodes.is_empty() {
-            bail!("No nodes available to place allocations");
-        }
-
-        let tasks = self.get_task_configs_for_job_config(job_config_id)?;
-        if tasks.is_empty() {
+        if self
+            .get_task_configs_for_job_config(job_config_id)?
+            .is_empty()
+        {
             return Ok(());
         }
 
-        let allocations_by_node = self.get_allocs_by_node()?;
-        let mut rng = thread_rng();
-
-        for (task_id, task_config) in tasks {
-            let constraint_set =
-                ConstraintSet::new(&task_config.constraints).with_context(|| {
-                    format!("Failed to parse constraints for task {}", task_config.name)
-                })?;
-            let permit_set = PermitSet::new(&task_config.permit)
-                .with_context(|| format!("Failed to parse permit for task {}", task_config.name))?;
-            let eligible = nodes
-                .iter()
-                .filter(|node| {
-                    constraint_set.is_satisfied(node, None) && permit_set.is_permitted(node)
-                })
-                .collect::<Vec<_>>();
-
-            if eligible.is_empty() {
-                bail!(
-                    "Failed to place task {}: no available nodes matching constraints or permit",
-                    task_config.name
-                );
-            }
-
-            if let Some(per_key) = task_config.count.per.as_deref() {
-                let grouped = group_nodes_by_attr(&eligible, per_key);
-                if grouped.is_empty() {
-                    bail!(
-                        "Failed to place task {}: no eligible nodes with attribute {}",
-                        task_config.name,
-                        per_key
-                    );
-                }
-
-                for group in grouped.values() {
-                    let placed = count_allocations_in_group(&allocations_by_node, task_id, group);
-                    for _ in placed..task_config.count.num {
-                        let node = group
-                            .choose(&mut rng)
-                            .context("No nodes available to place allocations")?;
-                        self.place_alloc(&node.id, task_id)?;
-                    }
-                }
-            } else {
-                let current = self.count_allocations_for_task(task_id)?;
-                for _ in current..task_config.count.num {
-                    let node = eligible
-                        .choose(&mut rng)
-                        .context("No nodes available to place allocations")?;
-                    self.place_alloc(&node.id, task_id)?;
-                }
-            }
+        let scheduler = crate::manager::scheduler::Scheduler::new(self)?;
+        let outcome = scheduler.plan_and_apply(
+            job_config_id,
+            crate::manager::scheduler::PlanMode::Reschedule,
+        )?;
+        if !outcome.allocations.is_empty() {
+            debug!(
+                %job_config_id,
+                placed = outcome.allocations.len(),
+                "Reconciled job config allocations"
+            );
         }
 
         Ok(())
@@ -5533,7 +5522,7 @@ impl Store {
             ":job_config_id": if eval.job_config_id.is_empty() { None::<String> } else { Some(eval.job_config_id.clone()) },
             ":node_id": if eval.node_name.is_empty() { None::<String> } else { Some(eval.node_name.clone()) },
             ":priority": eval.priority,
-            ":ready_at": Self::now_rfc3339()?,
+            ":ready_at": Self::sortable_now()?,
         };
 
         conn.execute(&INSERT_EVAL, params)?;
@@ -5562,7 +5551,7 @@ impl Store {
     // #[instrument(err, skip_all)]
     pub fn get_next_eval(&self) -> R<Option<Eval>> {
         let conn = self.read_connection()?;
-        let now = Self::now_rfc3339()?;
+        let now = Self::sortable_now()?;
         let eval = conn.query_row(&GET_NEXT_EVAL, [now], |row| self.eval_from_row(row));
 
         match eval {
@@ -5590,7 +5579,7 @@ impl Store {
                     LIMIT 1
                 )
                 RETURNING id, status, type, job_id, job_config_id, node_id, priority, ready_at;",
-                named_params! {":now": Self::now_rfc3339()?},
+                named_params! {":now": Self::sortable_now()?},
                 |row| self.eval_from_row(row),
             )
             .optional()?;
@@ -5605,16 +5594,32 @@ impl Store {
         };
 
         let eval_id = eval.id.clone();
+        // Collapse only work this claim genuinely subsumes: same entity, same
+        // kind, and already claimable.
+        //
+        // Matching on kind matters because different kinds are not
+        // interchangeable — dropping a job's `rollout_tick` because a
+        // `job_reschedule` for it was claimed stalls the rollout forever
+        // (ticks are self-perpetuating, nothing re-drives them), and dropping
+        // a `job_stop` the same way loses an operator's request outright.
+        //
+        // Matching on `ready_at` matters because a delayed eval is a timer,
+        // not a queued duplicate: a batch task's next scheduled `job_update`
+        // must survive an unrelated `job_update` running now.
         tx.execute(
             "DELETE FROM eval
             WHERE status = 'pending'
               AND id != :id
+              AND type = :type
+              AND ready_at <= :now
               AND (
                 (:job_id IS NOT NULL AND :job_id != '' AND job_id = :job_id)
                 OR (:node_id IS NOT NULL AND :node_id != '' AND node_id = :node_id)
               );",
             named_params! {
                 ":id": eval_id,
+                ":type": eval.kind,
+                ":now": Self::sortable_now()?,
                 ":job_id": if eval.job_id.trim().is_empty() { None::<String> } else { Some(eval.job_id.clone()) },
                 ":node_id": if eval.node_name.trim().is_empty() { None::<String> } else { Some(eval.node_name.clone()) },
             },
@@ -5767,7 +5772,7 @@ impl Store {
             .map(str::to_string);
 
         let ready_at =
-            (OffsetDateTime::now_utc() + time::Duration::try_from(delay)?).format(&Rfc3339)?;
+            Self::sortable_timestamp(OffsetDateTime::now_utc() + time::Duration::try_from(delay)?)?;
 
         let params = named_params! {
             ":id": None::<i64>,
@@ -6504,59 +6509,6 @@ impl Store {
 /// identity stability (same instance => same handle across reschedules).
 fn mint_storage_handle() -> String {
     format!("local-dir/{}", random_string(32))
-}
-
-fn group_nodes_by_attr<'a>(nodes: &'a [&'a Node], key: &str) -> HashMap<String, Vec<&'a Node>> {
-    let mut grouped: HashMap<String, Vec<&'a Node>> = HashMap::new();
-    for node in nodes {
-        if key == "id" {
-            grouped.entry(node.id.clone()).or_default().push(*node);
-            continue;
-        }
-        let Some(value) = node_attribute(node, key) else {
-            continue;
-        };
-        let token = value_token(value);
-        grouped.entry(token).or_default().push(*node);
-    }
-    grouped
-}
-
-fn count_allocations_in_group(
-    allocations_by_node: &HashMap<String, Vec<Allocation>>,
-    task_id: i64,
-    nodes: &[&Node],
-) -> u32 {
-    let mut count = 0;
-    for node in nodes {
-        if let Some(allocs) = allocations_by_node.get(&node.id) {
-            count += allocs
-                .iter()
-                .filter(|alloc| alloc.task_config_id == task_id)
-                .count() as u32;
-        }
-    }
-    count
-}
-
-fn node_attribute<'a>(node: &'a Node, key: &str) -> Option<&'a Value> {
-    node.config_attrs
-        .as_object()
-        .and_then(|attrs| attrs.get(key))
-        .or_else(|| {
-            node.fingerprint_attrs
-                .as_object()
-                .and_then(|attrs| attrs.get(key))
-        })
-        .or_else(|| {
-            node.dynamic_attrs
-                .as_object()
-                .and_then(|attrs| attrs.get(key))
-        })
-}
-
-fn value_token(value: &Value) -> String {
-    serde_json::to_string(value).unwrap_or_default()
 }
 
 fn task_schedule_equivalent(left: &TaskConfig, right: &TaskConfig) -> bool {
@@ -7991,6 +7943,89 @@ mod tests {
             .claim_eval()?
             .context("delayed eval should now be claimable")?;
         assert_eq!(claimed.id, delayed.id);
+
+        Ok(())
+    }
+
+    #[test]
+    fn claim_eval_dedupe_spares_other_kinds_and_delayed_work() -> R<()> {
+        let store = setup_store()?;
+        let job_config_id = submit_job(&store, "job-a", vec![task("api")])?;
+        let cfg = Some(job_config_id.as_str());
+
+        // A rollout's next tick and a batch task's next scheduled update are
+        // both pending for the same job when a reschedule gets claimed.
+        store.enqueue_eval("rollout_tick", Some("job-a"), cfg, None, Some(50))?;
+        store.enqueue_eval_after_delay(
+            "job_update",
+            Some("job-a"),
+            cfg,
+            None,
+            Some(50),
+            Duration::from_secs(3600),
+        )?;
+        // Two identical reschedules: the redundant one is what dedupe is for.
+        store.enqueue_eval("job_reschedule", Some("job-a"), cfg, None, Some(50))?;
+        store.enqueue_eval("job_reschedule", Some("job-a"), cfg, None, Some(50))?;
+
+        let claimed = store.claim_eval()?.context("eval should be claimed")?;
+        assert_eq!(claimed.kind, "rollout_tick");
+        store.complete_eval(&claimed.id, true)?;
+        let claimed = store.claim_eval()?.context("eval should be claimed")?;
+        assert_eq!(claimed.kind, "job_reschedule");
+
+        let remaining: Vec<String> = store
+            .get_evals()?
+            .into_iter()
+            .filter(|eval| eval.status == "pending")
+            .map(|eval| eval.kind)
+            .collect();
+        assert_eq!(
+            remaining,
+            vec!["job_update".to_string()],
+            "only the duplicate reschedule should have been collapsed"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn zero_delay_evals_are_immediately_claimable() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-1", "ready"))?;
+
+        // `ready_at` is range-compared as text in SQL, so a timestamp format
+        // that does not sort lexicographically makes a freshly enqueued eval
+        // intermittently invisible. Roughly one write in ten lands on a
+        // trailing-zero subsecond, so a single round would miss the
+        // regression.
+        for _ in 0..200 {
+            let enqueued = store.enqueue_eval("node_join", None, None, Some("node-1"), Some(50))?;
+            let claimed = store
+                .claim_eval()?
+                .context("zero-delay eval should be claimable right away")?;
+            assert_eq!(claimed.id, enqueued.id);
+            store.complete_eval(&claimed.id, true)?;
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn sortable_timestamps_sort_chronologically() -> R<()> {
+        let base = OffsetDateTime::from_unix_timestamp(1_700_000_000)?;
+        let earlier = Store::sortable_timestamp(base + TimeDuration::nanoseconds(437_400_000))?;
+        let later = Store::sortable_timestamp(base + TimeDuration::nanoseconds(437_409_000))?;
+        assert!(
+            earlier < later,
+            "expected {earlier} to sort before {later} as text"
+        );
+        assert_eq!(earlier.len(), later.len());
+        // Still a valid RFC3339 instant, so parsing paths are unaffected.
+        assert_eq!(
+            OffsetDateTime::parse(&later, &Rfc3339)?,
+            base + TimeDuration::nanoseconds(437_409_000)
+        );
 
         Ok(())
     }

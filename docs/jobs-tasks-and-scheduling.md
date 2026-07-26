@@ -151,6 +151,10 @@ Two paths exist:
 
 - Manager heartbeat checker marks stale nodes as lost.
 - Lost-node allocations are removed and affected job configs reconciled.
+- Reconciliation runs the scheduler in `Reschedule` mode, so replacements
+  honor node capacity, constraints, group co-location and the configured
+  policy exactly like any other placement. A job with nowhere to go is logged
+  and retried on the next tick rather than force-placed.
 - `node_drop` eval path does equivalent reconciliation.
 
 ## Dynamic Node Attr Update
