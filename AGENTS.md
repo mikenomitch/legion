@@ -127,8 +127,10 @@ this?"
   roadmaps, competitive gap analyses, library-evaluation research, migration
   write-ups, and assorted dev notes. The index is
   [`internal_docs/README.md`](internal_docs/README.md).
-  - `internal_docs/plans/` — design plans and proposals.
-  - `internal_docs/calls/` — judgement-call records, one per plan (see below).
+  - `internal_docs/plans/` — design plans and proposals; how to write one is in
+    [`plans/README.md`](internal_docs/plans/README.md).
+  - `internal_docs/calls/` — judgement-call records, one per plan; the template
+    is in [`calls/README.md`](internal_docs/calls/README.md).
   - `internal_docs/TASK-LIST.md` — the higher-level To Do list.
   - `internal_docs/MILESTONES.md` — goal milestones.
   - `internal_docs/differentiators.md` — why Legion differs from K8s and Nomad.
@@ -140,6 +142,28 @@ this?"
 Moving a document between trees is a normal thing to do — a plan that has fully
 shipped often deserves a rewritten public counterpart in `docs/`, while the plan
 itself stays in `internal_docs/plans/`.
+
+### Plan non-trivial features before building them (required)
+
+Any non-trivial feature gets a plan in `internal_docs/plans/<feature>-plan.md`
+before the code: the problem, the prior art, goals and non-goals, what exists in
+the code today, the proposed design shown as the user-facing surface, phases that
+each ship on their own, the testing plan, and the rollout story.
+
+- **Required** for a new user-facing surface (jobspec block, RPC, CLI verb, env
+  var, UI page), a new or reshaped subsystem, a changed default, a security
+  boundary, an on-disk/wire format change, or anything needing a migration.
+  **Not required** for bug fixes, behavior-preserving refactors, or doc-only
+  work.
+- **Keep the status honest at the top** (`PLANNED` / `IN EXECUTION` / `SHIPPED` /
+  `SUPERSEDED`), and name what was deliberately deferred. Never silently rewrite
+  a superseded plan — head it with which document wins now.
+- **Register it** in the plan table in `internal_docs/README.md`, and link its
+  judgement-calls doc from the title.
+- **The plan is not the public doc.** When the feature ships, its `docs/` page
+  must stand on its own; the plan stays as history.
+- The full structure is in
+  [`internal_docs/plans/README.md`](internal_docs/plans/README.md).
 
 ### All new features must be well documented (required)
 
@@ -181,7 +205,8 @@ knowingly accepted a limitation or trade-off.
 - **Rank entries by project impact, highest first**; the entry number is its
   rank. Insert new entries at their rank rather than appending, and fix any
   citation of an entry by number.
-- The full template and a worked example are in [`CLAUDE.md`](CLAUDE.md).
+- The full template and a worked example are in
+  [`internal_docs/calls/README.md`](internal_docs/calls/README.md).
 - **Append to the existing file** when a plan already has one; never start a
   second calls file for the same plan.
 - **Link it from the plan** with a `> **Judgement calls:** …` line under the

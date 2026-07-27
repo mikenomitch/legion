@@ -43,6 +43,11 @@ architecture and behavior docs are public.
 Design plans and proposals live in [`plans/`](plans/). Each plan carries a
 `> **Judgement calls:**` pointer under its title.
 
+**Every non-trivial feature gets a plan before the code** — a new user-facing
+surface, subsystem, default, security boundary, format change, or migration.
+When one is required and what goes in it:
+[`plans/README.md`](plans/README.md).
+
 | Plan | Status |
 | --- | --- |
 | [artifact-system-plan.md](plans/artifact-system-plan.md) | shipped |
@@ -70,8 +75,9 @@ were, and why.
 **Every non-trivial feature must leave one.** Name the file after its plan with
 `_calls` appended (`plans/<name>.md` → `calls/<name>_calls.md`), append to the
 existing file rather than starting a second one, and link it from the plan
-header. See the Documentation section of [`AGENTS.md`](../AGENTS.md) for the full
-rule.
+header. Entries give the call, the alternatives, the trade-off, and why — ranked
+by project impact. The full template and a worked example:
+[`calls/README.md`](calls/README.md).
 
 - [artifact-system-plan_calls.md](calls/artifact-system-plan_calls.md)
 - [artifact-cache-and-prewarm-plan_calls.md](calls/artifact-cache-and-prewarm-plan_calls.md)
