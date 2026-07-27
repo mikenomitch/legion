@@ -115,6 +115,31 @@ Params:     {"size":"20G"}
 If you need a hard bound, put the volume on a filesystem that has one (see
 [Putting it on a real disk](#putting-it-on-a-real-disk)).
 
+## Day-2 operations
+
+The spec declares [actions](../exec-and-actions.md) — pre-baked commands that
+run *inside* the container, so the image's own `psql`/`pg_dump` do the work and
+nothing needs installing on your machine:
+
+```bash
+legion action run postgres psql --tty            # interactive psql
+legion action run postgres sql -p query='SELECT count(*) FROM t'
+legion action run postgres dump > backup.sql     # pg_dump to stdout
+```
+
+That trio covers the daily loop: poke at data, run a one-off statement, take an
+ad-hoc backup. Worth adding as your deployment matures — a `vacuum` action
+(`VACUUM ANALYZE`), a `top` action (`SELECT * FROM pg_stat_activity`), and a
+`restore` action taking a dump on stdin. Storage-side operations deliberately
+stay out of the jobspec: `legion volume list/get/delete` and
+`legion instance replace` are the operator's tools, not the job's.
+
+The spec also carries a **commented-out scheduled backup task** — a nightly
+`pg_dump` to compressed files. Uncomment it and point it somewhere durable
+(object storage, a `host` volume on a backup disk). Volumes are storage, not
+backups: a dead disk and `volume delete --force` both lose data; only a copy
+that leaves the node is a safety net.
+
 ## What survives what
 
 | Event | Data | Instance id |
@@ -176,6 +201,35 @@ own data. The fencing window still applies — the replacement waits for
 `onLost.replaceAfter` before binding, which is exactly what stops two Postgres
 processes from opening one data directory across a partition.
 
+### What node loss looks like on NFS, step by step
+
+The question that matters: *the node dies — how does Postgres come back with
+the same volume?* Answer: automatically. The walkthrough, with the default
+fencing policy:
+
+1. `node-a1` (running `postgres-db-0`) drops off the network. Nothing is
+   replaced yet: a missed heartbeat is not proof of death, and the volume row
+   still says `nfs`, unpinned.
+2. At ~90s the partitioned worker self-fences: it kills the Postgres process
+   locally (`onLost.selfTerminateAfter`). Its mount is released with it.
+3. At 3m (`onLost.replaceAfter`) the manager confirms the loss and frees the
+   allocation. `legion instance get postgres-db-0` had been showing
+   `pending-loss-confirmation` the whole time.
+4. The scheduler places a replacement on any node advertising the `nfs`
+   driver — no pin, because the volume is not node-local. The new worker's
+   `mount` reattaches the **same** export subdirectory: the volume row carries
+   the server/export params and the driver's recorded attrs, and the subdir
+   defaults to the volume id, so the mount is deterministic.
+5. Postgres starts against its own data directory. Same instance id, same
+   volume, different node. Total downtime ≈ `replaceAfter` plus Postgres
+   recovery.
+
+Nothing to run, nothing to reattach by hand. If you set `replaceAfter:
+'never'`, step 3 waits for you: `legion instance replace postgres-db-0` is the
+manual trigger. Compare the `local-dir` version of the same story in
+[When the node dies](#when-the-node-dies) — that one *waits for the node*,
+because the bytes are on it.
+
 Two things to know before doing this in production:
 
 - **NFS and Postgres need care.** Use `hard` mounts (a soft mount can return
@@ -234,19 +288,27 @@ store](../kv-store.md) for leader election.
 ## Backups
 
 Volumes are storage, not backups: `legion volume delete --force` and a failed
-disk both lose data. Run `pg_dump` (or `pg_basebackup`) as a scheduled task
-writing to object storage:
+disk both lose data. Two built-in paths:
+
+- **On demand:** `legion action run postgres dump > backup.sql`.
+- **Scheduled:** the spec ships a commented-out nightly `pg_dump` task —
+  uncomment it and point the output somewhere durable (object storage via
+  `aws s3 cp -`, or a `host` volume on a dedicated backup disk):
 
 ```jsonnet
-{
+// already in configs/jobs/postgres.jsonnet, commented out
+tasks+: [{
   name: 'backup',
-  kind: 'exec',
+  kind: 'container',
+  group: 'db',
+  lifecycle: 'batch',
   schedule: '0 3 * * *',
   config: {
-    command: ['sh', '-c',
-      'pg_dump "$DATABASE_URL" | gzip | aws s3 cp - s3://backups/pg-$(date +%F).sql.gz'],
+    image: 'postgres:16-alpine',
+    command: ['sh', '-c', 'pg_dump "$DATABASE_URL" | gzip > "$LEGION_TASK_DIR/pg-$(date +%F).sql.gz"'],
+    env: { DATABASE_URL: 'postgres://postgres:legion-demo@postgres.service.legion:5432/legion' },
   },
-}
+}],
 ```
 
 ## Troubleshooting

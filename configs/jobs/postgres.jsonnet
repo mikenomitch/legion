@@ -76,5 +76,60 @@
       // Give initdb room on a fresh volume before failing the allocation.
       boot_grace_time: '60s',
     }],
+
+    // Day-2 operations, pre-baked (docs/exec-and-actions.md). Actions run
+    // inside the container via the task's exec support, so `psql` is the
+    // image's own binary and no client install is needed on the operator's
+    // machine:
+    //   legion action run postgres psql --tty      # interactive shell
+    //   legion action run postgres sql -p query='SELECT 1'
+    //   legion action run postgres dump > backup.sql
+    actions: [
+      {
+        name: 'psql',
+        description: 'Interactive psql shell inside the container',
+        command: ['psql', '-U', 'postgres', '-d', 'legion'],
+        tty: true,
+      },
+      {
+        name: 'sql',
+        description: 'Run one SQL statement and print the result',
+        command: ['psql', '-U', 'postgres', '-d', 'legion', '-c', '${param.query}'],
+        params: [{ name: 'query', description: 'SQL to execute' }],
+        timeout: '60s',
+      },
+      {
+        name: 'dump',
+        description: 'pg_dump the database to stdout (redirect to a file)',
+        command: ['pg_dump', '-U', 'postgres', 'legion'],
+        timeout: '10m',
+      },
+    ],
   }],
+
+  // --- Scheduled backups (uncomment to enable) -------------------------------
+  // Volumes are storage, not backups: a dead disk and `volume delete --force`
+  // both lose data. A scheduled task dumping to object storage (or any path
+  // outside the cluster) is the actual safety net. The `dump` action above is
+  // the on-demand version of the same thing.
+  //
+  // tasks+: [{
+  //   name: 'backup',
+  //   kind: 'container',
+  //   group: 'db',
+  //   lifecycle: 'batch',
+  //   schedule: '0 3 * * *',            // 03:00 daily
+  //   config: {
+  //     image: 'postgres:16-alpine',
+  //     command: ['sh', '-c', 'pg_dump "$DATABASE_URL" | gzip > "$LEGION_TASK_DIR/pg-$(date +%F).sql.gz"'],
+  //     env: {
+  //       // Resolve the running instance through service discovery; in a real
+  //       // deployment inject the password from KV instead of inlining it.
+  //       DATABASE_URL: 'postgres://postgres:legion-demo@postgres.service.legion:5432/legion',
+  //     },
+  //   },
+  //   // Ship the dump off-cluster: swap the command above for `aws s3 cp -`
+  //   // (plus credentials via workload identity) or mount a `host` volume of
+  //   // a backup disk via `volumes: [...]`.
+  // }],
 }

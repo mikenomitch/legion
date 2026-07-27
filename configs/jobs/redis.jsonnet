@@ -58,6 +58,39 @@
         every: '10s',
         timeout: '3s',
       }],
+
+      // Day-2 operations. Exec-kind actions run as sibling host processes with
+      // the task's env, so $LEGION_PORT_REDIS resolves inside the shell:
+      //   legion action run redis cli --tty
+      //   legion action run redis command -p cmd='INFO keyspace'
+      //   legion action run redis save
+      actions: [
+        {
+          name: 'cli',
+          description: 'Interactive redis-cli against this instance',
+          command: ['sh', '-c', 'exec redis-cli -p "$LEGION_PORT_REDIS"'],
+          tty: true,
+        },
+        {
+          name: 'command',
+          description: 'Run one redis command and print the reply',
+          command: ['sh', '-c', 'exec redis-cli -p "$LEGION_PORT_REDIS" ${param.cmd}'],
+          params: [{
+            name: 'cmd',
+            description: 'Command to run, e.g. "INFO keyspace"',
+            // The param lands inside sh -c, so constrain it to characters that
+            // cannot break out of the command (no quotes, ;, |, &, $, etc).
+            pattern: '[A-Za-z0-9 ._:*-]+',
+          }],
+          timeout: '30s',
+        },
+        {
+          name: 'save',
+          description: 'Force an immediate synchronous save of the AOF/RDB state',
+          command: ['sh', '-c', 'exec redis-cli -p "$LEGION_PORT_REDIS" BGREWRITEAOF'],
+          timeout: '60s',
+        },
+      ],
     },
     {
       // --- Cache: no persistence, no pin, no volume lifecycle. ---

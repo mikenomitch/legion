@@ -144,6 +144,21 @@ A `tmpfs` claim is shared per task, so two allocations on one node share it. For
 private per-allocation scratch, `$LEGION_TASK_DIR` already exists and is cleaned
 up on stop.
 
+## Day-2 operations
+
+The store task declares [actions](../exec-and-actions.md). Exec-kind actions
+run as sibling host processes with the task's env, so `$LEGION_PORT_REDIS`
+resolves without you looking the port up:
+
+```bash
+legion action run redis cli --tty                    # interactive redis-cli
+legion action run redis command -p cmd='INFO keyspace'
+legion action run redis save                         # BGREWRITEAOF now
+```
+
+The `command` action constrains its param to redis-safe characters, since it
+lands inside a shell.
+
 ## Choosing between them
 
 | | Cache | Store |
