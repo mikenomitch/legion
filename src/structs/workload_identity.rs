@@ -1,6 +1,6 @@
 //! Workload identity spec types, claims, and the `sub` template renderer.
 //!
-//! See `docs/plans/workload-identity-oidc-plan.md`. This module owns the
+//! See `internal_docs/plans/workload-identity-oidc-plan.md`. This module owns the
 //! *spec-level* and *claims-level* primitives:
 //!
 //! - [`WorkloadIdentity`] — one named identity declared on a task.

@@ -85,7 +85,7 @@ The manager exposes persistence status through existing manager status APIs
 - Keep `ttlSeconds` comfortably above `renewIntervalSeconds` (default 15s / 5s).
 - For manual failover (`none`), operators must ensure only one writer is active.
 - The lease lock object is written at `<dir(key)>/lock.json` — see
-  [`rustyriver-migration.md`](./rustyriver-migration.md) for the lock-key naming
+  [`rustyriver-migration.md`](../internal_docs/rustyriver-migration.md) for the lock-key naming
   detail and the one optional upstream enhancement.
 - Disaster recovery (point-in-time restore from the replica) uses
   `rustyriver::restore`.

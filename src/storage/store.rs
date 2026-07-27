@@ -6515,7 +6515,7 @@ impl Store {
 
 /// Mint an opaque storage handle for an instance. The `local-dir/` scheme is
 /// the placeholder contract for v1: attach/detach drivers are a follow-up (see
-/// `docs/plans/volume-plugin-system-plan.md`); today the handle only proves
+/// `internal_docs/plans/volume-plugin-system-plan.md`); today the handle only proves
 /// identity stability (same instance => same handle across reschedules).
 fn mint_storage_handle() -> String {
     format!("local-dir/{}", random_string(32))

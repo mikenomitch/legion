@@ -70,7 +70,7 @@ Every Manager gRPC endpoint must enforce ACLs. When you add an RPC:
   missing `check_acl` calls in the handlers; never silence the test by
   classifying an unprotected endpoint as `Open`.
 - Never log token secrets; log accessor IDs. See `docs/auth-and-acls.md` and
-  `docs/plans/auth-acl-plan.md` for the model and roadmap.
+  `internal_docs/plans/auth-acl-plan.md` for the model and roadmap.
 
 ## Tracing Guidance
 - Use `#[instrument]` on async or queue/loop boundaries (RPC handlers, scheduler entrypoints, eval worker loops).
@@ -109,28 +109,93 @@ the MCP server). Keep these surfaces agent-friendly when contributing. See
   can self-correct before mutating the cluster.
 - **Document new agent surfaces** in `docs/agent-readiness.md`.
 
-## Docs, Plan, and To Dos
-- Docs, Plan, and To Dos live in `docs/`
-- `docs/agent-readiness.md` describes the agent-facing surfaces (MCP, structured
-  output, capabilities, validate/schema, idempotency, wait, saved queries)
-- `docs/NEXT_UP.md` contains the immediate todos for the current task that the human developer is working on
-- `docs/TASK-LIST.md` contains a higher-level To Do list
-- `docs/differentiators.md` contains a list of reasons that legion is different from K8s and Nomad
-- Every gRPC method and every request/response attribute must be documented with in-depth, public-facing proto comments in `proto/legion.proto` and treated as the source of truth for API behavior.
-- Architecture and behavior docs:
-  - `docs/architecture-managers-workers.md`
-  - `docs/plugin-system.md`
-  - `docs/scheduler-and-eval-loop.md`
-  - `docs/jobs-tasks-and-scheduling.md`
-  - `docs/task-kind-plugins.md`
-  - `docs/task-kind-exec.md`
-  - `docs/task-kind-container.md`
-  - `docs/task-kind-noop.md`
-  - `docs/state-store.md`
-  - `docs/observability.md`
-  - `docs/ui-architecture.md`
-  - `docs/kv-store.md`
-  - `docs/auth-and-acls.md`
-  - `docs/testing-and-benchmarks.md`
-  - `docs/codebase-conventions.md`
-  - `docs/agent-readiness.md`
+## Documentation
+
+Legion keeps **two** documentation trees. Every new document goes in exactly one
+of them; when in doubt, ask "would I be happy for a prospective user to read
+this?"
+
+- **`docs/` — public.** Written for people using, operating, or evaluating
+  Legion, and for contributors reading the code. Architecture, behavior, API,
+  and operational reference all belong here. This is a technical product, so
+  deeply technical material is welcome in public docs — it just has to be *fit
+  for a public audience*: accurate, finished, and self-contained, with no
+  to-do lists, scratch notes, private roadmaps, or promises of unshipped work.
+  The index is [`docs/README.md`](docs/README.md).
+- **`internal_docs/` — internal.** Anything that is a *plan*, a *to do*, or a
+  *development note*: design plans and proposals, task lists, milestones,
+  roadmaps, competitive gap analyses, library-evaluation research, migration
+  write-ups, and assorted dev notes. The index is
+  [`internal_docs/README.md`](internal_docs/README.md).
+  - `internal_docs/plans/` — design plans and proposals.
+  - `internal_docs/calls/` — judgement-call records, one per plan (see below).
+  - `internal_docs/TASK-LIST.md` — the higher-level To Do list.
+  - `internal_docs/MILESTONES.md` — goal milestones.
+  - `internal_docs/differentiators.md` — why Legion differs from K8s and Nomad.
+  - `internal_docs/development.md` — running locally, Linux worker containers,
+    CI notes.
+  - `internal_docs/NEXT_UP.md` — when present, the immediate todos for whatever
+    the human developer is working on right now.
+
+Moving a document between trees is a normal thing to do — a plan that has fully
+shipped often deserves a rewritten public counterpart in `docs/`, while the plan
+itself stays in `internal_docs/plans/`.
+
+### All new features must be well documented (required)
+
+A feature is not finished until its documentation is. For every new feature or
+material change to an existing one:
+
+- **Write or update the public page in `docs/`.** It must cover what the feature
+  is and why it exists, the job-spec / config / CLI surface with a working
+  example, the defaults, the failure modes and their diagnostics, and the
+  interaction with anything adjacent. New surfaces get their own page; extensions
+  go in the existing page.
+- **Update every doc the change touches**, not just the main one: task-kind
+  capability tables, `docs/agent-readiness.md` for new agent surfaces,
+  `README.md`'s doc list and `docs/README.md`'s index for a new page.
+- **Every gRPC method and every request/response attribute** must be documented
+  with in-depth, public-facing proto comments in `proto/legion.proto` — that file
+  is the source of truth for API behavior.
+- **Every new job-config field** goes into `configs/jobs/maximal.jsonnet`.
+- Document what is *not* done as honestly as what is: unimplemented parts,
+  platform gaps, and known limitations belong in the public doc rather than in a
+  reader's bug report.
+
+### Record judgement calls for any non-trivial feature (required)
+
+On any non-trivial feature, write down the judgement calls you made in a document
+in `internal_docs/calls/`. A judgement call is anywhere you interpreted an
+ambiguous request, chose between real alternatives, deviated from the plan, or
+knowingly accepted a limitation or trade-off.
+
+- **Name the file after the plan** it belongs to, with `_calls` appended:
+  `internal_docs/plans/<plan-name>.md` →
+  `internal_docs/calls/<plan-name>_calls.md`. If the work has no plan, name it
+  after the feature (`<feature>_calls.md`).
+- **One entry per call**, each stating *what was decided*, *what the alternatives
+  were*, and *why* — plus the consequence when the decision is a trade-off.
+- **Append to the existing file** when a plan already has one; never start a
+  second calls file for the same plan.
+- **Link it from the plan** with a `> **Judgement calls:** …` line under the
+  title.
+- Judgement calls are internal by definition — they never go in `docs/`. Anything
+  in them a *user* needs to know (a limitation, a default, a rejected shape they
+  might expect) must also be stated in the public doc.
+
+### Key public docs
+
+- `docs/architecture-managers-workers.md`, `docs/scheduler-and-eval-loop.md`,
+  `docs/jobs-tasks-and-scheduling.md`, `docs/state-store.md`
+- `docs/plugin-system.md`, `docs/task-kind-plugins.md`, `docs/task-kind-exec.md`,
+  `docs/task-kind-container.md`, `docs/task-kind-noop.md`,
+  `docs/rollout-strategy-plugins.md`
+- `docs/artifacts.md`, `docs/kv-store.md`, `docs/auth-and-acls.md`,
+  `docs/workload-identity.md`, `docs/stateful-workloads.md`,
+  `docs/service-discovery.md`, `docs/exec-and-actions.md`, `docs/rollouts.md`
+- `docs/logging.md`, `docs/observability.md`, `docs/event-stream.md`,
+  `docs/ui-architecture.md`
+- `docs/persistence-streaming.md`, `docs/raft-operations.md`
+- `docs/testing-and-benchmarks.md`, `docs/codebase-conventions.md`
+- `docs/agent-readiness.md` — the agent-facing surfaces (MCP, structured output,
+  capabilities, validate/schema, idempotency, wait, saved queries)

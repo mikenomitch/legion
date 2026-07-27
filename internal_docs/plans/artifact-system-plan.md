@@ -1,5 +1,7 @@
 # Plan: Artifact Fetching for Tasks
 
+> **Judgement calls:** [`calls/artifact-system-plan_calls.md`](../calls/artifact-system-plan_calls.md)
+
 ## Problem Statement
 
 Tasks need *stuff* before they can run: binaries and tarballs from release
@@ -39,7 +41,7 @@ needs (the `ArtifactSink` write abstraction, digests everywhere, per-artifact
 status reporting) are part of this plan's contract so the cache slots in
 without reshaping anything.
 
-`docs/TASK-LIST.md` ("Artifact system"), `docs/differentiators.md`
+`internal_docs/TASK-LIST.md` ("Artifact system"), `internal_docs/differentiators.md`
 ("Artifacts … Type, auth, how to get them"), and `docs/plugin-system.md`
 ("Artifact acquisition plugins") all anticipate this work; this plan gives
 it a concrete shape.
@@ -129,7 +131,7 @@ values) each fetch uses.
 - **No KV ACLs.** Which tasks may reference which KV secret paths is a
   separate ACL effort. This plan inherits today's trust model and
   documents that loudly (see Auth and Judgement Calls; tracked in
-  `docs/TASK-LIST.md`).
+  `internal_docs/TASK-LIST.md`).
 - **No live re-fetch of changed artifacts under a running task.** Artifacts
   are resolved at staging time; reacting to a moved tag mid-flight is
   rollout territory (`resolve` controls when tags are re-read).
@@ -595,7 +597,7 @@ existing trust model for `$ref` jobspec resolution and is accepted for now,
 with three obligations this plan carries: (1) the user-facing
 `docs/artifacts.md` states it in a call-out box, (2) `src/artifacts/auth.rs`
 carries the comment below at the credential-read site, (3) it is tracked in
-`docs/TASK-LIST.md` under the ACL System item so it cannot be missed when
+`internal_docs/TASK-LIST.md` under the ACL System item so it cannot be missed when
 ACLs land.
 
 ```rust
@@ -603,7 +605,7 @@ ACLs land.
 // any KV path via auth.kv, so possession of job-submit access implies read
 // access to every KV credential. Revisit when the ACL system lands — the
 // artifact credential read below must become an early enforcement point.
-// Tracked in docs/TASK-LIST.md (ACL System).
+// Tracked in internal_docs/TASK-LIST.md (ACL System).
 ```
 
 #### Task workload identity (`identity`)
@@ -1060,57 +1062,20 @@ core — extensibility parity with task-kind plugins, completing the
 - Node identities are opt-in config under the already-off-by-default
   `workloadIdentity` section.
 
-## Judgement Calls (decided here, reversible later)
+## Judgement Calls
 
-1. **First-class task field, not per-kind config.** The alternative (each
-   kind grows its own `download` options) was rejected: it forfeits reuse,
-   splinters auth, and makes admission validation per-kind. Kinds keep
-   agency through the three-hook recipe (§8).
-2. **Cache excluded from this plan, by design.** Fetch-at-staging is
-   correct on its own; the `ArtifactSink` seam and digest-everywhere
-   contract let the companion plan add the cache without touching fetchers,
-   specs, or plugins. The cost — repeat downloads on restart — is accepted
-   and documented until that plan lands.
-3. **Blocking `ArtifactFetcher` trait run on blocking threads**, matching
-   the existing getters and — decisively — the dylib plugin boundary
-   (Phase 6), where async traits across `cdylib` are a hazard. Parallelism
-   comes from the worker's fetch pool, not async fan-out.
-4. **OCI via the `oci-client` crate** (decided, was an open question):
-   registry auth flows and manifest/media-type handling are
-   well-trodden, security-sensitive code; the dependency cost is worth not
-   re-implementing the token dance.
-5. **Pin by default (`resolve: 'pin'`), roll explicitly
-   (`resolve: 'always'`)** (decided, was an open question): deterministic
-   rollouts are the safe default; tag-tracking is available but opt-in,
-   with its mid-rollout drift cost documented.
-6. **Cluster auth defaults support `kv` and `nodeIdentity`, never task
-   `identity`.** Task identities are a per-task security boundary (the WI
-   plan's `sub` rules); silently attaching one cluster-wide would blur it.
-   Node identity exists precisely to be the cluster-grain credential.
-7. **Fetch failures reuse `on_unhealthy` budgets** (decided, was an open
-   question): a staging failure is an allocation failure — restart, then
-   move, then job-fail, like any other. A dedicated `onFetchFailure`
-   policy (e.g., registry outage ≠ unhealthy task) is a documented
-   potential follow-up once real-world flakiness data exists.
-8. **KV ACL gap accepted for now** — with documentation, a source-code
-   comment at the credential-read site, and a TASK-LIST callout so the
-   artifact credential path becomes an early ACL enforcement point later.
-9. **Container `image` remains the user-facing field** and desugars at
-   admission — but gated off by default until the cache plan lands (see
-   Rollout) to avoid regressing runtime-side image caching.
-10. **All-or-nothing staging per task** (any artifact failure fails the
-    allocation through the existing failure path). Partial staging plus
-    per-artifact retry policies was judged not worth the state-machine
-    complexity in v1.
-11. **Interpolation is dumb substitution** (`${artifact.<name>}` only, no
-    expressions), mirroring the WI plan's sub-template philosophy: easy to
-    validate at admission, nothing to sandbox.
+Split out into
+[`calls/artifact-system-plan_calls.md`](../calls/artifact-system-plan_calls.md)
+— eleven decisions (first-class task field, cache deferred, blocking fetcher
+trait, `oci-client`, pin-by-default, cluster auth grain, fetch-failure budgets,
+the KV ACL gap, container `image` desugaring, all-or-nothing staging, dumb
+interpolation).
 
 ## Follow-Ups (noted, not scoped here)
 
 - **Windows staging**: hardlink/copy fallbacks, path semantics, and
   image consumption on Windows need a dedicated pass when Windows workers
-  become a priority. Tracked in `docs/TASK-LIST.md` (Windows support) so
+  become a priority. Tracked in `internal_docs/TASK-LIST.md` (Windows support) so
   it is not missed.
 - **`onFetchFailure` policy** distinct from `on_unhealthy` (Judgement Call
   7) if registry/store outages prove to deserve different budgets than

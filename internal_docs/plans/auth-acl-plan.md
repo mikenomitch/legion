@@ -1,5 +1,7 @@
 # Auth & ACL System Plan
 
+> **Judgement calls:** [`calls/auth-acl-plan_calls.md`](../calls/auth-acl-plan_calls.md)
+
 Status: **Phases 1–4 executed** (see §3 and the per-phase notes in §4 for the
 few deliberately deferred items: dynamic auth-method dylib plugins, worker
 mTLS, workload-identity API credentials, and the token-resolution cache).
@@ -10,7 +12,7 @@ and KV subtrees, and cheap enough to drop into every endpoint as one line of
 code. This document records the research that drove the design, the design
 itself, what is implemented today, and what comes next.
 
-User-facing docs: [docs/auth-and-acls.md](../auth-and-acls.md).
+User-facing docs: [docs/auth-and-acls.md](../../docs/auth-and-acls.md).
 Contributor rules: AGENTS.md ("Auth & ACL Checks").
 
 ---

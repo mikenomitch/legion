@@ -474,7 +474,7 @@ pub fn validate_job_config(config: &JobConfig) -> R<()> {
     // live allocations sharing one instance id, storage handle, and workload
     // identity at once — violating the "at most one live allocation per
     // instance" invariant (docs/stateful-workloads.md) with no fencing to make
-    // it safe (docs/stateful-vs-nomad-k8s.md). Reject the combo at admission:
+    // it safe (internal_docs/stateful-vs-nomad-k8s.md). Reject the combo at admission:
     // stateful groups must roll with the default stop-then-start strategy until
     // fencing exists.
     for task in &config.tasks {

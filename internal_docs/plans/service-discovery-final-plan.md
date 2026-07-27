@@ -1,5 +1,7 @@
 # Service Discovery: Final Plan (v1 implementation + mesh follow-on)
 
+> **Judgement calls:** [`calls/service-discovery-final-plan_calls.md`](../calls/service-discovery-final-plan_calls.md)
+
 > **This is the rectified, authoritative plan.** It consolidates and supersedes the
 > design in [service-discovery-plan.md](service-discovery-plan.md) (kept for rationale
 > and the full mesh design), the [config cookbook / mesh extensions](service-discovery-mesh-and-config.md),

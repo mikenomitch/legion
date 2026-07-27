@@ -1,5 +1,5 @@
 //! The artifact system: one fetch/verify/unpack/stage pipeline shared by
-//! every task kind (see `docs/plans/artifact-system-plan.md` and the
+//! every task kind (see `internal_docs/plans/artifact-system-plan.md` and the
 //! user-facing `docs/artifacts.md`).
 //!
 //! Layout mirrors the plan:

@@ -8,7 +8,7 @@ replica N's data.
 
 The `stateful` task block introduces that handle: the **instance**.
 
-> Design plan: [stateful-workloads-and-instance-identity-plan.md](plans/stateful-workloads-and-instance-identity-plan.md).
+> Design plan: [stateful-workloads-and-instance-identity-plan.md](../internal_docs/plans/stateful-workloads-and-instance-identity-plan.md).
 > Related: [workload-identity.md](workload-identity.md) (the instance id feeds
 > the reschedule-stable token subject).
 
@@ -315,7 +315,7 @@ one instance id, storage handle, and workload-identity subject at the same
 time. The node-loss fencing described in [Node loss and fencing
 (at-most-one)](#node-loss-and-fencing-at-most-one) cannot help here — a
 createFirst overlap is deliberate and on healthy nodes, not a partition
-artifact (see [stateful-vs-nomad-k8s.md](stateful-vs-nomad-k8s.md)).
+artifact (see [stateful-vs-nomad-k8s.md](../internal_docs/stateful-vs-nomad-k8s.md)).
 
 Therefore **a stateful task may not use a `createFirst` rollout**: the combo is
 rejected at job admission with an actionable error pointing at this invariant.
@@ -656,7 +656,7 @@ What v1 deliberately does **not** do: actually attach/mount anything, pin
 node-local handles to nodes, or garbage-collect dropped handles. Concrete
 drivers (local dir, network volumes, attach-before-start/detach-on-stop
 hooks) are specified in the
-[volume plugin system plan](plans/volume-plugin-system-plan.md).
+[volume plugin system plan](../internal_docs/plans/volume-plugin-system-plan.md).
 
 ## Workload Identity Integration
 

@@ -488,7 +488,7 @@ pub fn get_migrations() -> Migrations<'static> {
         // Per-artifact staging states from the latest worker heartbeat
         // (JSON Vec<ArtifactStatus>); NULL == task declares no artifacts.
         M::up("ALTER TABLE allocation_health ADD COLUMN artifact_states TEXT;").down(""),
-        // ACL policies: named rule documents (see docs/plans/auth-acl-plan.md).
+        // ACL policies: named rule documents (see internal_docs/plans/auth-acl-plan.md).
         M::up(
             "CREATE TABLE IF NOT EXISTS acl_policy (
             name STRING PRIMARY KEY,

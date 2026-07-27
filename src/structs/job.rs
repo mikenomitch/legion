@@ -948,7 +948,7 @@ pub struct StatefulConfig {
     pub initial_instances: Option<Vec<String>>,
     /// Optional persistent storage bound to each instance (contract only in
     /// v1; drivers are a follow-up, see
-    /// `docs/plans/volume-plugin-system-plan.md`).
+    /// `internal_docs/plans/volume-plugin-system-plan.md`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage: Option<StatefulStorageConfig>,
     /// Node-loss fencing policy (`onLost`): worker self-fence window plus
@@ -1170,7 +1170,7 @@ pub struct TaskConfig {
     #[tabled(skip)]
     pub artifacts: Vec<ArtifactSpec>,
     /// Pre-baked, parameterized command templates runnable against a running
-    /// allocation of this task (see `docs/plans/exec-and-actions-plan.md`).
+    /// allocation of this task (see `internal_docs/plans/exec-and-actions-plan.md`).
     /// Empty = no actions. Guarded by the `action` ACL resource, separate
     /// from raw `exec`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

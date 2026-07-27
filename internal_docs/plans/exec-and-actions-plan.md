@@ -1,5 +1,7 @@
 # Workload Exec & Actions Plan
 
+> **Judgement calls:** [`calls/exec-and-actions-plan_calls.md`](../calls/exec-and-actions-plan_calls.md)
+
 Status: **In execution.** Open questions resolved (§6); the backbone (proto,
 plugin trait, worker exec), manager proxy, CLI, WebSocket bridge, and UI are
 being implemented on this branch.
@@ -395,7 +397,7 @@ New rule scope selectors (alongside today's `names`/`paths`/`pools`):
 **Decision — why not Nomad-style named capabilities** (`alloc-exec`,
 `alloc-node-exec`, `action-exec`): Legion's whole ACL system is six
 resources × two actions with scope selectors, and the auth plan
-(`docs/plans/auth-acl-plan.md`) explicitly chose a small closed vocabulary.
+(`internal_docs/plans/auth-acl-plan.md`) explicitly chose a small closed vocabulary.
 Adding two resources + two selectors preserves the mental model; adding a
 parallel capability vocabulary just for exec would fork it.
 
@@ -644,48 +646,13 @@ Each phase is independently shippable; 1–2 alone deliver S2/S1 for the CLI.
 
 ## 6. Open questions — resolved
 
-All eight were decided before implementation. Decisions and rationale:
-
-- **Q1 — youki exec: ship without it.** Container exec lands for the docker
-  and Apple `container` runtimes; the youki path reports
-  `exec_support().exec = false` (honest capability reporting, S4). Youki
-  exec needs its own flag handling and its image-loading story is itself
-  still pending — blocking every other surface on it buys nothing.
-- **Q2 — selector naming: `action_names`.** ACL rules already carry an
-  `actions: ["read","write"]` field; reusing `actions` as a scope selector
-  would make one JSON key mean two things in the same object. Verbose but
-  unambiguous, and consistent with the plural selector style (`names`,
-  `paths`, `pools`).
-- **Q3 — sensitive params: yes, in the initial schema.**
-  `params[].sensitive: true` redacts the value in audit events, CLI echo,
-  and UI history. Added now because events are persisted — retrofitting
-  redaction cannot fix already-written history.
-- **Q4 — Windows workers: experimental.** `portable-pty` gives us ConPTY,
-  but with zero Windows CI the honest label is experimental; documented as
-  such in the capability tables. No code is gated — it just isn't promised.
-- **Q5 — libghostty: xterm.js now, revisit on trigger.** Adopt a
-  ghostty-based renderer only when (a) an official libghostty-vt WASM
-  release exists and (b) a maintained renderer passes a terminal acceptance
-  check (vim, resize, mouse, 256color). The `<Terminal>` component keeps to
-  the xterm.js-compatible surface so the swap stays a one-file change.
-- **Q6 — job-scoped target: newest running alloc, with a stateful guard.**
-  `legion exec --job` / `legion action run <job>` without `--alloc` picks
-  the newest *running* allocation and prints which one it picked. When the
-  target task is stateful (allocations are not interchangeable), an explicit
-  `--alloc` is required. Random selection (Nomad's choice) hides the
-  decision from the operator; newest-with-echo keeps it debuggable.
-- **Q7 — SSH gateway: nothing extra needed now.** The frame protocol already
-  carries everything an SSH front-end would bridge (argv, tty flag,
-  winsize/resize, stdin half-close, in-band exit code, `session_id`). A
-  future gateway is additive; out of scope here.
-- **Q8 — staging allocations: active-only in v1.** Exec targets `active`
-  allocations; anything else fails with the allocation's current state in
-  the error. Exec-into-staging is deferred until the artifact-cache plan
-  settles staging observability.
+All eight were decided before implementation. The decisions and their rationale
+are split out into
+[`calls/exec-and-actions-plan_calls.md`](../calls/exec-and-actions-plan_calls.md).
 
 ## 7. References
 
-- `docs/plans/auth-acl-plan.md` — ACL vocabulary rationale this plan extends.
+- `internal_docs/plans/auth-acl-plan.md` — ACL vocabulary rationale this plan extends.
 - `src/task_plugins/mod.rs` — `TaskPlugin` trait + `supports_*` idiom.
 - `src/manager/oidc_http.rs` — precedent for plain-HTTP routes on the gRPC listener.
 - `src/manager/dispatcher.rs` — manager→worker dialing reused by the exec proxy.
