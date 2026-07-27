@@ -257,6 +257,51 @@ service Manager {
   // - NotFound: no instance row with this id exists.
   rpc GetInstance (GetInstanceRequest) returns (GetInstanceReply);
 
+  // === VOLUMES (see docs/volumes.md) ===
+
+  // Lists volumes, optionally filtered by job, node, plugin, instance, or
+  // state. Includes `destroyed` tombstones so an operator can still see where
+  // a job's storage went after it was reclaimed.
+  //
+  // A volume is the concrete storage behind an instance's opaque
+  // `{plugin}/{volume_id}` storage handle: which driver owns it, which node it
+  // is pinned to (node-local drivers only), what the driver recorded about it,
+  // and where it sits in the reclaim state machine.
+  rpc ListVolumes (ListVolumesRequest) returns (ListVolumesReply);
+
+  // Returns one volume by id.
+  //
+  // Errors:
+  // - NotFound: no volume row with this id exists.
+  rpc GetVolume (GetVolumeRequest) returns (GetVolumeReply);
+
+  // Deletes a volume: detaches it from its instance (which will mint a fresh
+  // one on its next placement) and queues its storage for the owning worker's
+  // `destroy`. Confirmed asynchronously — the volume sits in `destroying`
+  // until the driver reports success, and the manager re-dispatches on every
+  // heartbeat until it does, so nothing leaks if a worker dies mid-destroy.
+  //
+  // `force` skips driver confirmation and marks the volume `destroyed`
+  // immediately. This is the escape hatch for a node-local volume whose node
+  // is never coming back; it leaves whatever bytes exist on that node, which
+  // is why it is not the default.
+  //
+  // Deleting an already-`destroyed` volume succeeds as a no-op, so the call is
+  // safe to retry.
+  //
+  // Errors:
+  // - NotFound: no volume row with this id exists.
+  rpc DeleteVolume (DeleteVolumeRequest) returns (DeleteVolumeReply);
+
+  // Lists the volume plugins installed across the cluster, with each one's
+  // capabilities and the nodes providing it.
+  //
+  // The manager loads no storage drivers itself: everything here is
+  // aggregated from what workers advertise in their fingerprints. That is also
+  // what job admission validates against, so this endpoint answers "why was my
+  // job rejected for plugin X" directly.
+  rpc ListVolumePlugins (ListVolumePluginsRequest) returns (ListVolumePluginsReply);
+
   // Issues a short-lived, asymmetrically-signed OIDC workload-identity token
   // for one named identity declared on the task of a placed allocation
   // (see docs/workload-identity.md).
@@ -665,6 +710,22 @@ message WorkerConfig {
   //
   // Default: empty string (worker applies conservative built-in defaults).
   string artifacts = 9;
+
+  // JSON-encoded host volumes this worker offers to jobs (see
+  // docs/volumes.md). These are paths that already exist on the machine —
+  // a models directory, a dedicated NVMe mount — which jobs claim by name
+  // through the `host` volume plugin.
+  //
+  // Shape: `{"models":{"path":"/mnt/models","readOnly":true},
+  //          "pgdata":{"path":"/mnt/nvme0/pg","create":true}}`.
+  // `readOnly` makes a read-write claim an error rather than silently
+  // downgrading it; `create` (default false) makes the worker create a
+  // missing directory, which is off by default so a typo cannot silently
+  // produce an empty volume where real data was meant to be.
+  //
+  // Default: empty string (the `host` plugin reports itself unavailable on
+  // this node, and jobs claiming it are rejected at admission).
+  string host_volumes = 10;
 }
 
 // Reply payload for WorkerPreRegister.
@@ -1454,14 +1515,20 @@ message InstanceInfo {
   string updated_at = 11;
 
   // Diagnostic detail explaining a non-obvious lifecycle situation; unset in
-  // the common case. Currently the only producer is the node-loss
-  // confirmation gate (see docs/stateful-workloads.md "Node loss and
-  // fencing"): when the instance's current allocation sits on a `lost` node,
-  // this carries `pending-loss-confirmation: ...` describing why the
-  // instance has not been replaced yet (the manager is waiting out
-  // `stateful.onLost.replaceAfter`, or `replaceAfter: "never"` requires node
-  // recovery / ReplaceInstance). The instance stays `active` while gated —
-  // its workload may well still be running on the partitioned node.
+  // the common case. Two producers, and they never apply at once:
+  //
+  // - `pending-loss-confirmation: ...` — the instance's current allocation
+  //   sits on a `lost` node and the manager is waiting out
+  //   `stateful.onLost.replaceAfter` (or `replaceAfter: "never"` requires node
+  //   recovery / ReplaceInstance) before rebinding it. The instance stays
+  //   `active` while gated — its workload may well still be running on the
+  //   partitioned node. See docs/stateful-workloads.md "Node loss and fencing".
+  //
+  // - `volume-pinned: ...` — the instance is awaiting placement and holds
+  //   node-local storage, so it can only be placed on the node holding its
+  //   data. It waits for that node rather than starting on empty storage;
+  //   `legion volume delete --force <id>` abandons the data and frees the
+  //   instance to place elsewhere. See docs/volumes.md.
   optional string detail = 12;
 }
 
@@ -1492,6 +1559,210 @@ message GetInstanceReply {
   // The requested instance. Manager returns NotFound instead of returning
   // this field unset.
   InstanceInfo instance = 1;
+}
+
+// === VOLUME MESSAGES (see docs/volumes.md) ===
+
+// One volume: the concrete storage behind an instance's opaque
+// `{plugin}/{volume_id}` storage handle.
+message VolumeInfo {
+  // Volume id — the second half of the storage handle.
+  string volume_id = 1;
+
+  // Declared name within its task. `data` for the per-instance volume that
+  // comes from `stateful.storage`; otherwise the name from `volumes[]`.
+  string name = 2;
+
+  // Volume plugin that materializes it (`local-dir`, `host`, `nfs`, `tmpfs`,
+  // or an installed exec plugin).
+  string plugin = 3;
+
+  // Owning job, when the volume belongs to one.
+  optional string job_id = 4;
+
+  // The instance whose lifecycle owns this volume. Unset for volumes that
+  // outlive any instance.
+  optional string instance_id = 5;
+
+  // Task the volume was declared on.
+  optional string task_name = 6;
+
+  // Lifecycle state:
+  // - `pending`: the row and handle exist; no worker has materialized it yet
+  //   (provisioning is lazy — the first mount creates the storage);
+  // - `created`: a worker mounted it at least once, and `node_id` is set;
+  // - `destroying`: reclaim requested; a worker runs the driver's `destroy`
+  //   and confirms (re-dispatched every heartbeat until it does);
+  // - `destroyed`: reclaimed. The row is kept as a tombstone.
+  string state = 7;
+
+  // Node the volume lives on. For node-local plugins this is a hard placement
+  // constraint on the owning instance from the moment it is set: a
+  // replacement allocation can only be placed on this node.
+  optional string node_id = 8;
+
+  // True when the volume only exists on `node_id`, so its instance can only be
+  // replaced there. False for network storage (`nfs`), whose instances
+  // reschedule freely.
+  bool node_local = 9;
+
+  // True when the volume is mounted read-only.
+  bool read_only = 10;
+
+  // How the volume is handed to its consumer: `filesystem` (a host directory
+  // the task reads directly) or `block` (a raw device or disk image the task
+  // attaches — what a microVM kind needs). The same split Kubernetes makes
+  // with `volumeMode`, for the same reason. See docs/volumes.md.
+  string volume_mode = 17;
+
+  // Block mode: the filesystem the device carries (`ext4`). Unset for
+  // filesystem-mode volumes.
+  optional string fs = 18;
+
+  // JSON object of the plugin params the volume was created with.
+  string params = 11;
+
+  // JSON object of driver-recorded metadata (an NFS source, a dataset name),
+  // handed back to the driver on every later operation.
+  string attrs = 12;
+
+  // Host path from the most recent successful mount. Diagnostic only — the
+  // driver is always asked again rather than trusting this.
+  optional string mount_path = 13;
+
+  // Last driver failure, so a stuck volume explains itself here rather than
+  // only in a worker log.
+  optional string last_error = 14;
+
+  // RFC3339 creation timestamp.
+  string created_at = 15;
+
+  // RFC3339 timestamp of the last state change.
+  string updated_at = 16;
+}
+
+// Request payload for ListVolumes. Every filter is optional; omitting all of
+// them lists the whole cluster.
+message ListVolumesRequest {
+  // Only volumes owned by this job.
+  optional string job_id = 1;
+
+  // Only volumes currently living on this node.
+  optional string node_id = 2;
+
+  // Only volumes materialized by this plugin.
+  optional string plugin = 3;
+
+  // Only volumes owned by this instance.
+  optional string instance_id = 4;
+
+  // Only volumes in this state (`pending`, `created`, `destroying`,
+  // `destroyed`).
+  optional string state = 5;
+}
+
+// Reply payload for ListVolumes.
+message ListVolumesReply {
+  // Matching volumes, newest first.
+  repeated VolumeInfo volumes = 1;
+}
+
+// Request payload for GetVolume.
+message GetVolumeRequest {
+  // Volume id to fetch.
+  string volume_id = 1;
+}
+
+// Reply payload for GetVolume.
+message GetVolumeReply {
+  // The requested volume. Manager returns NotFound instead of returning this
+  // field unset.
+  VolumeInfo volume = 1;
+}
+
+// Request payload for DeleteVolume.
+message DeleteVolumeRequest {
+  // Volume id to delete.
+  string volume_id = 1;
+
+  // Skip driver confirmation and mark the volume destroyed immediately. Use
+  // only when the owning node is gone for good: whatever bytes exist there are
+  // left behind.
+  bool force = 2;
+
+  // Optional idempotency key; a repeat with the same key returns the first
+  // result and reports `deduplicated`.
+  optional string idempotency_key = 3;
+}
+
+// Reply payload for DeleteVolume.
+message DeleteVolumeReply {
+  // The volume after the request, in `destroying` (queued for its driver) or
+  // `destroyed` (forced).
+  VolumeInfo volume = 1;
+
+  // Human-readable acknowledgement.
+  string message = 2;
+
+  // True when an idempotency key replayed a previous call.
+  bool deduplicated = 3;
+}
+
+// Request payload for ListVolumePlugins.
+message ListVolumePluginsRequest {
+}
+
+// One volume plugin as the cluster sees it, aggregated from worker
+// fingerprints.
+message VolumePluginInfo {
+  // Plugin name, as used in `stateful.storage.plugin` / `volumes[].plugin`.
+  string name = 1;
+
+  // True when the plugin's volumes only exist on the node that created them,
+  // so instances holding one are pinned there.
+  bool node_local = 2;
+
+  // True when volume contents do NOT survive an unmount (`tmpfs`). Rejected
+  // for `stateful.storage`, which promises data survives reschedules.
+  bool ephemeral = 3;
+
+  // Access modes the driver supports (`single-writer`, `multi-reader`).
+  repeated string access_modes = 4;
+
+  // Params a job MUST supply. Admission names any that are missing.
+  repeated string required_params = 5;
+
+  // Params a job MAY supply.
+  repeated string optional_params = 6;
+
+  // Volume modes this plugin can serve (`filesystem`, `block`). Admission
+  // intersects this with the task kind's supported modes and the job's
+  // requested mode, so a mismatch is a submit-time error rather than a task
+  // that starts and immediately fails.
+  repeated string volume_modes = 10;
+
+  // Optional contract operations this plugin implements beyond the required
+  // four (`snapshot`, `restore`, `clone`, `expand`). Empty for a plugin that
+  // implements only the required set.
+  repeated string ops = 11;
+
+  // One line of human-readable context: what the plugin does, or why it is
+  // unusable on the nodes that have it.
+  string detail = 7;
+
+  // Every node with the plugin installed, including ones where it is unusable
+  // (no `mount` binary, wrong OS, no host volumes declared).
+  repeated string nodes = 8;
+
+  // Nodes where the plugin is installed AND usable — the set placement can
+  // actually use.
+  repeated string available_nodes = 9;
+}
+
+// Reply payload for ListVolumePlugins.
+message ListVolumePluginsReply {
+  // Installed plugins, sorted by name.
+  repeated VolumePluginInfo plugins = 1;
 }
 
 // Request payload for ListJobs.
@@ -1627,6 +1898,16 @@ message HeartbeatRequest {
   //
   // Default: empty list.
   repeated AllocationHealth allocation_health = 4;
+
+  // Volume operation outcomes since the last heartbeat (see
+  // docs/volumes.md). Workers own the drivers; the manager owns the volume
+  // state machine, and this is how driver results get back to it: a
+  // successful mount pins the volume's node, a failure is recorded on the
+  // row (and surfaced by `legion volume list`), and a confirmed destroy is
+  // what advances a volume from `destroying` to `destroyed`.
+  //
+  // Default: empty list.
+  repeated VolumeReport volume_reports = 5;
 }
 
 // Reply payload for Heartbeat.
@@ -1640,6 +1921,77 @@ message HeartbeatReply {
   //
   // Default: empty list when manager has no desired allocations for this node.
   repeated TaskAllocation desired_allocations = 2;
+
+  // Volumes this worker should reclaim by calling its plugin's `destroy`
+  // (see docs/volumes.md). The manager re-sends a volume on every heartbeat
+  // until the worker confirms it in `HeartbeatRequest.volume_reports`, so a
+  // worker that dies mid-destroy simply retries and storage is never leaked.
+  //
+  // A node-local volume is only ever sent to the node it is pinned to.
+  //
+  // Default: empty list.
+  repeated VolumeDestroyRequest volume_destroy = 3;
+}
+
+// One volume operation outcome reported by a worker.
+message VolumeReport {
+  // Volume ID (the second half of an instance's `plugin/volume_id` storage
+  // handle).
+  string volume_id = 1;
+
+  // Operation this reports on: `mount`, `unmount`, or `destroy`.
+  string op = 2;
+
+  // True when the driver succeeded.
+  bool ok = 3;
+
+  // Host path the volume was mounted at. Set for successful mounts only.
+  string mount_path = 4;
+
+  // Whether the driver reports this volume as node-local. Authoritative: the
+  // worker asked the plugin, so this overrides the manager's mint-time guess
+  // and determines whether the owning instance is pinned to this node.
+  bool node_local = 5;
+
+  // JSON object of driver metadata to persist on the volume row and hand back
+  // on the next operation (an NFS source, a ZFS dataset). Empty when the
+  // driver recorded nothing.
+  string attrs = 6;
+
+  // Failure detail when `ok` is false. Recorded on the volume row so a stuck
+  // volume explains itself in `legion volume list` rather than only in a
+  // worker log.
+  string error = 7;
+
+  // Block mode: the filesystem the driver reports the device carries
+  // (`ext4`), recorded on the volume row so a consumer knows what to mount
+  // inside a guest without probing. Empty for filesystem-mode mounts.
+  string fs = 8;
+
+  // True when this mount CREATED the storage rather than reattaching it. Lets
+  // a consumer tell first-boot-initialize from reattach without guessing from
+  // an empty directory.
+  bool fresh = 9;
+}
+
+// One volume the manager wants a worker to reclaim.
+message VolumeDestroyRequest {
+  // Volume ID to destroy.
+  string volume_id = 1;
+
+  // Plugin that owns it.
+  string plugin = 2;
+
+  // Volume name within its task (`data` for instance storage).
+  string name = 3;
+
+  // JSON object of the plugin params the volume was created with. Drivers
+  // that need them to find the storage (an NFS `server`/`export`) get them
+  // back here.
+  string params = 4;
+
+  // JSON object of driver metadata recorded on previous operations.
+  string attrs = 5;
 }
 
 // Failed allocation report item from worker to manager.
@@ -3195,6 +3547,27 @@ message TaskAllocation {
   // applies the 90s default even when the jobspec declares no `onLost`
   // block.
   uint64 self_terminate_after_seconds = 13;
+
+  // JSON-encoded list of volume mounts for this allocation (see
+  // docs/volumes.md). Array of objects matching the `VolumeMount` shape:
+  // `[{"volumeId":"…","name":"data","plugin":"local-dir","params":{…},
+  //    "attrs":{…},"path":"/var/lib/db","readOnly":false,
+  //    "instanceVolume":true}]`.
+  //
+  // This is the post-admission form: the plugin is resolved (the `local-dir`
+  // default is already applied), the volume id is known, and `attrs` carries
+  // whatever the driver recorded on a previous mount. The worker mounts
+  // exactly this list through its volume plugins before starting the task and
+  // unmounts on stop — it never re-derives a volume from the jobspec.
+  //
+  // Entries with `instanceVolume: true` come from `stateful.storage` and are
+  // additionally exported as `LEGION_STORAGE_DIR`; the rest come from the
+  // task's `volumes[]` claims. Every entry is exported as
+  // `LEGION_VOLUME_<NAME>` with the resolved host path.
+  //
+  // Empty string when the task declares no volumes (the mount step is skipped
+  // entirely).
+  string task_volumes = 15;
 }
 
 // Request payload for PostWork.

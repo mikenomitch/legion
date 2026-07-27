@@ -11,6 +11,10 @@ import { formatDate, formatRelativeTime } from '../../utils/format'
 import { buildTaskRuntimeByName, buildTaskRuntimeFromStatuses, extractJobSpecData, topoSortTaskNames, type TaskRuntimeSummary } from '../../utils/jobspec'
 import { POLL_INTERVAL_MS } from '../../utils/polling'
 
+// A storage handle is `{plugin}/{volume_id}`; plugin names never contain a
+// slash, so the split is unambiguous.
+const volumeIdFromHandle = (handle: string) => handle.slice(handle.indexOf('/') + 1)
+
 export default function JobDetail() {
   const params = useParams()
   const navigate = useNavigate()
@@ -390,9 +394,15 @@ export default function JobDetail() {
                                 <td class={tdClass + ' font-mono text-xs text-muted'}>{instance.currentAllocId !== undefined ? `#${String(instance.currentAllocId)}` : '—'}</td>
                                 <td class={tdClass}>
                                   <Show when={instance.storageHandle} fallback={<span class="text-faint">—</span>}>
-                                    <span class="inline-block max-w-[12rem] truncate align-bottom font-mono text-xs text-muted" title={instance.storageHandle}>
+                                    {/* The handle is `{plugin}/{volume_id}` — link the volume id
+                                        straight to the volume that holds this instance's data. */}
+                                    <A
+                                      href={`/volumes/${encodeURIComponent(volumeIdFromHandle(instance.storageHandle!))}`}
+                                      class="inline-block max-w-[12rem] truncate align-bottom font-mono text-xs text-muted hover:text-brass-strong"
+                                      title={instance.storageHandle}
+                                    >
                                       {instance.storageHandle}
-                                    </span>
+                                    </A>
                                   </Show>
                                 </td>
                                 <td class={tdClass + ' whitespace-nowrap text-right text-xs text-faint'}>{formatDate(instance.createdAt)}</td>

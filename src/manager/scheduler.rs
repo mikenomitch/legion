@@ -1177,10 +1177,39 @@ impl<'a> Scheduler<'a> {
             allocations_by_node,
             node_lookup,
         );
+        // Storage is a hard placement requirement: a node without the task's
+        // volume plugin (or with it installed-but-unusable) can never run the
+        // task, so filter it out here rather than letting the task start and
+        // fail at mount time.
+        let required_plugins = task_config.required_volume_plugins();
         let base_eligible = nodes
             .iter()
-            .filter(|node| constraint_set.is_satisfied(node, None) && permit_set.is_permitted(node))
+            .filter(|node| {
+                constraint_set.is_satisfied(node, None)
+                    && permit_set.is_permitted(node)
+                    && node_provides_volume_plugins(node, &required_plugins)
+            })
             .collect::<Vec<_>>();
+        if base_eligible.is_empty() && !required_plugins.is_empty() {
+            let missing = required_plugins
+                .iter()
+                .filter(|plugin| {
+                    !nodes
+                        .iter()
+                        .any(|node| node_provides_volume_plugins(node, &[(*plugin).clone()].into()))
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if !missing.is_empty() {
+                bail!(
+                    "Failed to place task {}: no node provides volume plugin(s) {}. \
+                     Install them under plugins/volumes/<name>/ on a worker, or check \
+                     `legion volume plugins` for why an installed one is unusable",
+                    task_config.name,
+                    missing.join(", ")
+                );
+            }
+        }
 
         Ok(TaskPlan {
             constraint_set,
@@ -1230,6 +1259,20 @@ impl<'a> Scheduler<'a> {
             &plan.task_request,
         );
 
+        // Instances holding node-local storage can only be replaced on the node
+        // their data lives on. Pins are consumed one per placement, in slot
+        // order; the allocation binder independently prefers the instance whose
+        // volume is pinned to the node an allocation landed on, so the two
+        // agree even if their orderings differ (see docs/volumes.md).
+        let mut pins: std::collections::VecDeque<(String, String)> = self
+            .store
+            .pinned_placements_for_task(task_id)
+            .unwrap_or_else(|err| {
+                warn!(task_id, error = ?err, "Failed loading volume pins; placing unpinned");
+                Vec::new()
+            })
+            .into();
+
         for _ in 0..count {
             let eligible = Self::eligible_nodes(
                 candidates,
@@ -1245,6 +1288,31 @@ impl<'a> Scheduler<'a> {
                     task_config.name
                 );
             }
+
+            // A pinned instance is not a preference: placing it elsewhere would
+            // silently start the workload on empty storage, so failing the eval
+            // with a diagnostic is the correct outcome.
+            let pin = pins.pop_front();
+            let eligible = match pin.as_ref() {
+                None => eligible,
+                Some((instance_id, node_id)) => {
+                    let pinned = eligible
+                        .iter()
+                        .copied()
+                        .filter(|node| node.id.as_str() == node_id.as_str())
+                        .collect::<Vec<_>>();
+                    if pinned.is_empty() {
+                        bail!(
+                            "Failed to place task {}: instance {instance_id} holds node-local \
+                             storage on node {node_id}, which is unavailable. Waiting for that \
+                             node to return; use `legion volume delete --force <id>` to abandon \
+                             the data if it never will",
+                            task_config.name
+                        );
+                    }
+                    pinned
+                }
+            };
 
             let node_id = if let Some(group_key) = group_key {
                 if let Some(existing) = group_assignments.get(group_key) {
@@ -1971,6 +2039,39 @@ impl<'a> Scheduler<'a> {
 
         deltas
     }
+}
+
+/// Whether a node advertises every plugin in `required`, and reports each as
+/// usable. An installed-but-unavailable plugin (no `mount` binary, no declared
+/// host volumes) is treated as absent — it cannot serve a mount either way, and
+/// skipping the node produces a better error than a failed task start.
+fn node_provides_volume_plugins(
+    node: &Node,
+    required: &std::collections::BTreeSet<String>,
+) -> bool {
+    if required.is_empty() {
+        return true;
+    }
+    let Some(plugins) = node.fingerprint_attrs.get("volumePlugins") else {
+        // A node that advertises nothing predates plugin fingerprinting (or is
+        // a test fixture). Assume the built-ins rather than excluding it, so an
+        // upgrade doesn't strand every stateful job on the old workers.
+        return required
+            .iter()
+            .all(|name| crate::volumes::BUILTIN_VOLUME_PLUGINS.contains(&name.as_str()));
+    };
+    required.iter().all(|name| {
+        plugins
+            .get(name)
+            .map(|caps| {
+                // Missing `available` means an older worker that predates the
+                // field; assume usable rather than silently excluding it.
+                caps.get("available")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true)
+            })
+            .unwrap_or(false)
+    })
 }
 
 fn group_nodes_by_attr<'a>(nodes: &'a [&'a Node], key: &str) -> HashMap<String, Vec<&'a Node>> {
@@ -2728,6 +2829,9 @@ mod tests {
                 initial_instances: None,
                 on_lost: None,
                 storage: Some(crate::structs::StatefulStorageConfig {
+                    plugin: None,
+                    mode: None,
+                    params: None,
                     path: "/var/lib/data".into(),
                     retain_on_scale_in: None,
                     retain_on_stop: None,
@@ -2893,6 +2997,9 @@ mod tests {
                 initial_instances: None,
                 on_lost: None,
                 storage: Some(crate::structs::StatefulStorageConfig {
+                    plugin: None,
+                    mode: None,
+                    params: None,
                     path: "/workspace".into(),
                     retain_on_scale_in: None,
                     retain_on_stop: None,

@@ -26,12 +26,13 @@ use crate::cmd::output::CliError;
 use crate::prelude::*;
 use crate::structs::{
     exec_client_frame, exec_server_frame, CreateInstanceRequest, CreateInstancesRequest,
-    DestroyInstanceRequest, DestroyJobRequest, ExecClientFrame, ExecInput, ExecStart,
-    GetAllocationLogsRequest, GetInstanceRequest, GetJobInfoRequest, GetJobSpecRequest,
+    DeleteVolumeRequest, DestroyInstanceRequest, DestroyJobRequest, ExecClientFrame, ExecInput,
+    ExecStart, GetAllocationLogsRequest, GetInstanceRequest, GetJobInfoRequest, GetJobSpecRequest,
     GetLedgerRequest, GetNodesRequest, GetRolloutStatusRequest, GetStateStoreSchemaRequest,
-    JobConfig, ListEventsRequest, ListInstancesRequest, ListJobActionsRequest, ListJobsRequest,
-    ListRolloutsRequest, QueryStateStoreRequest, ReplaceInstanceRequest, RunJobRequest,
-    StartInstanceRequest, StopInstanceRequest, StopJobRequest,
+    GetVolumeRequest, JobConfig, ListEventsRequest, ListInstancesRequest, ListJobActionsRequest,
+    ListJobsRequest, ListRolloutsRequest, ListVolumePluginsRequest, ListVolumesRequest,
+    QueryStateStoreRequest, ReplaceInstanceRequest, RunJobRequest, StartInstanceRequest,
+    StopInstanceRequest, StopJobRequest,
 };
 use crate::task_plugins::validate_job_config;
 use serde::Serialize;
@@ -182,6 +183,54 @@ fn tool_defs() -> Vec<ToolDef> {
                 "additionalProperties": false
             }),
             mutates: false,
+        },
+        ToolDef {
+            name: "legion_volume_list",
+            description: "List volumes — the persistent storage behind stateful instances (see docs/volumes.md). Every filter is optional. `nodeLocal: true` with a `nodeId` means the owning instance can ONLY be replaced on that node; `lastError` explains a volume stuck in pending or destroying.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "job_id": { "type": "string", "description": "Filter by owning job." },
+                    "node_id": { "type": "string", "description": "Filter by the node the volume lives on." },
+                    "plugin": { "type": "string", "description": "Filter by volume plugin (local-dir, host, nfs, tmpfs, ...)." },
+                    "instance_id": { "type": "string", "description": "Filter by owning stateful instance." },
+                    "state": { "type": "string", "description": "Filter by state: pending, created, destroying, destroyed." }
+                },
+                "additionalProperties": false
+            }),
+            mutates: false,
+        },
+        ToolDef {
+            name: "legion_volume_get",
+            description: "Inspect one volume: plugin, params, driver metadata, node pin, mount path, and last driver error.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": { "volume_id": { "type": "string", "description": "Volume id (the second half of an instance's plugin/volume_id storage handle)." } },
+                "required": ["volume_id"],
+                "additionalProperties": false
+            }),
+            mutates: false,
+        },
+        ToolDef {
+            name: "legion_volume_plugins",
+            description: "List the volume plugins installed across the cluster with their capabilities and which nodes can actually use them. Use this to answer why a job was rejected for an unknown or unusable volume plugin.",
+            input_schema: empty_schema,
+            mutates: false,
+        },
+        ToolDef {
+            name: "legion_volume_delete",
+            description: "Delete a volume and reclaim its storage. DESTROYS DATA: the owning instance mints a fresh, empty volume on its next placement. Reclaim is confirmed asynchronously by the owning worker; `force: true` tombstones it immediately WITHOUT driver confirmation, leaving any bytes behind — only for a node that is gone for good. Mutating.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "volume_id": { "type": "string", "description": "Volume id." },
+                    "force": { "type": "boolean", "description": "Skip driver confirmation (node is permanently gone). Default false." },
+                    "idempotency_key": { "type": "string", "description": "Retry-safe key; a repeat returns the first result." }
+                },
+                "required": ["volume_id"],
+                "additionalProperties": false
+            }),
+            mutates: true,
         },
         ToolDef {
             name: "legion_node_list",
@@ -617,7 +666,11 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             let command: Vec<String> = args
                 .get("command")
                 .and_then(Value::as_array)
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default();
             if command.is_empty() {
                 return Err("command must be a non-empty array".to_string());
@@ -645,6 +698,37 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             let instance_id = str_arg(&args, "instance_id")?;
             let mut client = connect().await?;
             grpc(client.get_instance(GetInstanceRequest { instance_id })).await
+        }
+        "legion_volume_list" => {
+            let mut client = connect().await?;
+            grpc(client.list_volumes(ListVolumesRequest {
+                job_id: opt_str_arg(&args, "job_id"),
+                node_id: opt_str_arg(&args, "node_id"),
+                plugin: opt_str_arg(&args, "plugin"),
+                instance_id: opt_str_arg(&args, "instance_id"),
+                state: opt_str_arg(&args, "state"),
+            }))
+            .await
+        }
+        "legion_volume_get" => {
+            let volume_id = str_arg(&args, "volume_id")?;
+            let mut client = connect().await?;
+            grpc(client.get_volume(GetVolumeRequest { volume_id })).await
+        }
+        "legion_volume_plugins" => {
+            let mut client = connect().await?;
+            grpc(client.list_volume_plugins(ListVolumePluginsRequest {})).await
+        }
+        "legion_volume_delete" => {
+            let volume_id = str_arg(&args, "volume_id")?;
+            let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
+            let mut client = connect().await?;
+            grpc(client.delete_volume(DeleteVolumeRequest {
+                volume_id,
+                force,
+                idempotency_key: opt_str_arg(&args, "idempotency_key"),
+            }))
+            .await
         }
         "legion_instance_create" => {
             let job_id = str_arg(&args, "job_id")?;
@@ -903,7 +987,11 @@ async fn run_exec_oneshot(
     let mut stderr = Vec::new();
     let mut exit_code = -1i32;
     let mut exit_message = String::new();
-    while let Some(frame) = inbound.message().await.map_err(|s| s.message().to_string())? {
+    while let Some(frame) = inbound
+        .message()
+        .await
+        .map_err(|s| s.message().to_string())?
+    {
         match frame.frame {
             Some(exec_server_frame::Frame::Stdout(o)) => stdout.extend_from_slice(&o.data),
             Some(exec_server_frame::Frame::Stderr(o)) => stderr.extend_from_slice(&o.data),

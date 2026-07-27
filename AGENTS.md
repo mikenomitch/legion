@@ -126,6 +126,7 @@ the MCP server). Keep these surfaces agent-friendly when contributing. See
   - `docs/task-kind-exec.md`
   - `docs/task-kind-container.md`
   - `docs/task-kind-noop.md`
+  - `docs/volumes.md`
   - `docs/state-store.md`
   - `docs/observability.md`
   - `docs/ui-architecture.md`

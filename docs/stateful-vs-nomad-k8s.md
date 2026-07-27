@@ -12,13 +12,13 @@ will compare us to. Written 2026-06; updated as primitives land.
 | Identity survives reschedule | ✅ (pod name + PVC re-bind) | ✅ (index + `per_alloc` volume) | ✅ (instance row re-binds id + storage handle) |
 | On-demand keyed instances | ❌ (no native analog; operators build it) | ⚠️ Parameterized/dispatch jobs (one-shot batch flavor) | ✅ Keyed mode: never-recycled ids, create/destroy/list API |
 | Identity → credentials | Projected SA tokens per pod | Workload identity per alloc/task | ✅ OIDC tokens with instance-keyed `sub` |
-| Persistent volumes | ✅ PVC templates + CSI ecosystem | ✅ Host volumes + CSI + sticky dynamic host volumes | ❌ **Contract only** — opaque `storage_handle`, no drivers ([plan](plans/volume-plugin-system-plan.md)) |
+| Persistent volumes | ✅ PVC templates + CSI ecosystem | ✅ Host volumes + CSI + sticky dynamic host volumes | ✅ Volume plugins: `local-dir`/`host`/`nfs`/`tmpfs` built in, CNI-style exec ABI for the rest ([docs](volumes.md)) |
 | Storage retention policy | `persistentVolumeClaimRetentionPolicy` (whenScaled / whenDeleted) | Volume lifecycle is operator-managed | ✅ `retainOnScaleIn` (= whenScaled) + `retainOnStop` (= whenDeleted, governs `job stop`; `job destroy` always deletes) |
 | Stable network identity | ✅ Per-pod DNS via headless Service | ⚠️ Via Consul service registration | ❌ **None** — instances are not addressable by name |
 | At-most-one instance (fencing) | ✅ StatefulSet never replaces a pod on a lost node without confirmation/force-delete | ⚠️ `prevent_reschedule_on_lost` opt-in | ✅ Lease-based fencing on by default (`stateful.onLost`): worker self-fences after `selfTerminateAfter`, manager replaces only after `replaceAfter` > that — stronger than K8s's manual default; `'never'` + `instance replace` for the K8s flavor. Create-first rollouts remain rejected for stateful tasks |
 | Ordered startup / scaling | ✅ OrderedReady (0..N-1, one at a time) | ❌ | ⚠️ Ordered **updates** landed (`rollout.slots.order: sequential`, one slot per step, highest first, health-gated); initial bring-up places 0..N-1 in order but is not yet health-gated per slot |
 | Staged/partitioned stateful updates | ✅ `partition` rolling updates by ordinal | ⚠️ Generic update stanza (canary/max_parallel), not ordinal-aware | ✅ `rollout.slots.updateFrom` (= K8s partition): only slots ≥ N update; lowering the floor promotes the rest, ordered and health-gated |
-| Storage-aware placement | ✅ Volume topology constraints | ✅ Volume-aware scheduling | ❌ Deferred to volume plugins (node-local pinning) |
+| Storage-aware placement | ✅ Volume topology constraints | ✅ Volume-aware scheduling | ✅ Node-local volumes pin their instance; nodes without a task's plugin are filtered before scoring |
 | Data migration on drain | ❌ (storage-class dependent) | ⚠️ `migrate` for sticky ephemeral disk | ❌ |
 | Per-instance ops (stop/start one) | ⚠️ `kubectl delete pod` (recreated); no pause | ❌ (alloc stop = reschedule) | ✅ keyed stop/start (in progress); ❌ per-slot |
 

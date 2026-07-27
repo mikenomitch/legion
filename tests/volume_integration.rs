@@ -1,0 +1,483 @@
+//! Integration coverage for the volume lifecycle (see docs/volumes.md).
+//!
+//! These exercise the manager's half — the volume table, node pinning, and the
+//! reclaim state machine — against a real store, since that is where the
+//! invariants live. The driver half is covered by the conformance harness
+//! (`src/volumes/conformance.rs`, also reachable as
+//! `legion volume plugin test`), which runs against built-ins and exec plugins
+//! alike.
+
+use legion::prelude::{json, Context, R};
+use legion::storage::store::{Store, VolumeFilter};
+use legion::structs::{
+    config::ManagerConfigFull, job::JobConfig, job::StatefulConfig, job::StatefulStorageConfig,
+    job::TaskConfig, job::TaskCount, job::VolumeSpec, Eval, InstanceMode, Node, NodeMsg,
+    Submission, VolumeState,
+};
+use serde_json::{Map, Value};
+use std::collections::BTreeMap;
+use tempfile::Builder;
+
+const NODE_A: &str = "node-a";
+const NODE_B: &str = "node-b";
+
+struct Cluster {
+    store: Store,
+    eval_seq: u64,
+    job_config_ids: BTreeMap<String, String>,
+}
+
+impl Cluster {
+    fn new() -> R<Self> {
+        let store_dir = Builder::new()
+            .prefix("legion-volume-it-")
+            .tempdir()
+            .context("temp store dir")?
+            .keep();
+        let store = Store::start_storage(&ManagerConfigFull {
+            store_path: store_dir.to_str().context("store path")?.to_string(),
+            scheduling_policy: "bin_pack".to_string(),
+            scheduler_settings: Some(json!({ "nodes_considered": "100%" })),
+            ..Default::default()
+        })?;
+        Ok(Cluster {
+            store,
+            eval_seq: 0,
+            job_config_ids: BTreeMap::new(),
+        })
+    }
+
+    /// A node advertising the built-in plugins, so admission and placement see
+    /// realistic capability data instead of the pre-fingerprinting fallback.
+    fn add_node(&self, id: &str) -> R<()> {
+        let mut fingerprint = Map::new();
+        fingerprint.insert("arch".into(), json!("aarch64"));
+        fingerprint.insert(
+            "volumePlugins".into(),
+            json!({
+                "local-dir": {
+                    "apiVersion": 1, "name": "local-dir", "nodeLocal": true,
+                    "ephemeral": false, "accessModes": ["single-writer"], "available": true
+                },
+                "nfs": {
+                    "apiVersion": 1, "name": "nfs", "nodeLocal": false,
+                    "ephemeral": false, "accessModes": ["single-writer"],
+                    "requiredParams": ["server", "export"], "available": true
+                }
+            }),
+        );
+        fingerprint.insert("memory_total".into(), json!("68719476736"));
+        fingerprint.insert(
+            "cpus".into(),
+            json!({ "cpu-1": { "frequency": 2000.0 }, "cpu-2": { "frequency": 2000.0 } }),
+        );
+        self.store.insert_node(NodeMsg::from(Node {
+            id: id.to_string(),
+            pool: "default".into(),
+            status: "ready".into(),
+            availability: "available".into(),
+            last_heartbeat: "2023-01-01T00:00:00Z".into(),
+            config_attrs: json!({
+                "node_id": id,
+                "maxAllocations": 20,
+                "resources": { "memory": 65536, "cpu": 40000 },
+            }),
+            fingerprint_attrs: Value::Object(fingerprint),
+            dynamic_attrs: json!({}),
+            health_checks: json!({}),
+        }))?;
+        Ok(())
+    }
+
+    fn submit(&mut self, config: JobConfig) -> R<()> {
+        let name = config.name.clone();
+        self.store.handle_job_submit(
+            &config,
+            &[Submission {
+                path: format!("{name}.json"),
+                content: "{}".to_string(),
+                is_primary: true,
+            }],
+        )?;
+        let config_id = self.store.get_job_config(&name)?.id();
+        self.job_config_ids.insert(name.clone(), config_id.clone());
+        self.eval("job_submit", &name, &config_id)?;
+        Ok(())
+    }
+
+    fn eval(&mut self, kind: &str, job: &str, config_id: &str) -> R<()> {
+        self.eval_seq += 1;
+        self.store.insert_eval(&Eval {
+            id: self.eval_seq.to_string(),
+            status: "pending".into(),
+            kind: kind.into(),
+            job_id: job.to_string(),
+            job_config_id: config_id.to_string(),
+            node_name: String::new(),
+            priority: 50,
+        })?;
+        let eval = self.store.get_next_eval()?.context("no eval queued")?;
+        let outcome = eval.handle(&self.store);
+        self.store.set_eval_status(
+            &eval.id,
+            if outcome.is_ok() {
+                "complete"
+            } else {
+                "failed"
+            },
+        )?;
+        outcome.map(|_| ())
+    }
+
+    fn reschedule(&mut self, job: &str) -> R<()> {
+        let config_id = self.job_config_ids.get(job).cloned().context("job")?;
+        self.eval("job_reschedule", job, &config_id)
+    }
+
+    fn volumes(&self) -> R<Vec<legion::structs::Volume>> {
+        self.store.list_volumes(&VolumeFilter::default())
+    }
+
+    /// Stand in for a worker mounting the volume and reporting it back.
+    fn report_mounted(&self, volume_id: &str, node_id: &str, node_local: bool) -> R<()> {
+        self.store.record_volume_mounted(
+            volume_id,
+            node_id,
+            &format!("/var/lib/legion/volumes/{volume_id}"),
+            node_local,
+            None,
+            &BTreeMap::new(),
+        )
+    }
+}
+
+fn stateful_job(name: &str, count: u32, plugin: &str, params: Option<Value>) -> JobConfig {
+    JobConfig {
+        name: name.to_string(),
+        tasks: vec![TaskConfig {
+            count: TaskCount {
+                num: count,
+                per: None,
+            },
+            config: json!({ "command": ["sleep", "60"] }),
+            stateful: Some(StatefulConfig {
+                mode: InstanceMode::Slot,
+                id_source: None,
+                initial_instances: None,
+                on_lost: None,
+                storage: Some(StatefulStorageConfig {
+                    path: "/var/lib/db".into(),
+                    plugin: Some(plugin.to_string()),
+                    mode: None,
+                    params,
+                    retain_on_scale_in: None,
+                    retain_on_stop: None,
+                }),
+            }),
+            ..TaskConfig::new("db", "exec")
+        }],
+        rollout: None,
+        rollout_by_group: Default::default(),
+        version: None,
+    }
+}
+
+#[test]
+fn placement_mints_one_volume_per_slot_with_a_matching_handle() -> R<()> {
+    let mut cluster = Cluster::new()?;
+    cluster.add_node(NODE_A)?;
+    cluster.submit(stateful_job("db", 3, "local-dir", None))?;
+
+    let volumes = cluster.volumes()?;
+    assert_eq!(volumes.len(), 3, "one volume per slot");
+    for volume in &volumes {
+        assert_eq!(volume.plugin, "local-dir");
+        assert_eq!(volume.state, VolumeState::Pending, "provisioning is lazy");
+        assert!(volume.node_local, "local-dir is node-local");
+        assert!(volume.node_id.is_none(), "no pin before the first mount");
+    }
+
+    // Every handle must have a row and vice versa — that invariant is what
+    // lets the reaper treat "unreferenced" as an unambiguous reclaim signal.
+    let instances = cluster.store.list_instances("db")?;
+    let handles: Vec<String> = instances
+        .iter()
+        .filter_map(|instance| instance.storage_handle.clone())
+        .collect();
+    assert_eq!(handles.len(), 3);
+    for volume in &volumes {
+        assert!(
+            handles.contains(&volume.handle()),
+            "volume {} has no instance referencing it",
+            volume.volume_id
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn a_mount_report_pins_the_node_and_survives_a_reschedule() -> R<()> {
+    let mut cluster = Cluster::new()?;
+    cluster.add_node(NODE_A)?;
+    cluster.add_node(NODE_B)?;
+    cluster.submit(stateful_job("db", 1, "local-dir", None))?;
+
+    let volume = cluster.volumes()?.remove(0);
+    cluster.report_mounted(&volume.volume_id, NODE_A, true)?;
+
+    let pinned = cluster
+        .store
+        .get_volume(&volume.volume_id)?
+        .context("volume")?;
+    assert_eq!(pinned.state, VolumeState::Created);
+    assert_eq!(pinned.node_id.as_deref(), Some(NODE_A));
+    assert!(pinned.pins_placement(), "a mounted node-local volume pins");
+
+    // The instance keeps the same handle across a reschedule — the whole point
+    // of the identity/storage pairing.
+    let before = cluster.store.list_instances("db")?[0]
+        .storage_handle
+        .clone();
+    cluster.store.remove_allocs_for_node(NODE_A)?;
+    cluster.reschedule("db")?;
+    let after = cluster.store.list_instances("db")?[0]
+        .storage_handle
+        .clone();
+    assert_eq!(before, after, "the replacement reattaches the same volume");
+    assert_eq!(cluster.volumes()?.len(), 1, "no second volume was minted");
+    Ok(())
+}
+
+#[test]
+fn a_pinned_instance_awaiting_placement_reports_its_node() -> R<()> {
+    let mut cluster = Cluster::new()?;
+    cluster.add_node(NODE_A)?;
+    cluster.submit(stateful_job("db", 1, "local-dir", None))?;
+
+    let volume = cluster.volumes()?.remove(0);
+    cluster.report_mounted(&volume.volume_id, NODE_A, true)?;
+
+    // With the allocation gone, the instance is awaiting placement and the
+    // scheduler must be told it can only go back to NODE_A.
+    cluster.store.remove_allocs_for_node(NODE_A)?;
+    let task_id = cluster
+        .store
+        .get_task_configs_for_job_config(cluster.job_config_ids.get("db").context("job")?)?
+        .first()
+        .map(|(id, _)| *id)
+        .context("task config")?;
+    let pins = cluster.store.pinned_placements_for_task(task_id)?;
+    assert_eq!(pins.len(), 1, "the awaiting instance is pinned");
+    assert_eq!(pins[0].1, NODE_A);
+    Ok(())
+}
+
+#[test]
+fn network_volumes_never_pin() -> R<()> {
+    let mut cluster = Cluster::new()?;
+    cluster.add_node(NODE_A)?;
+    cluster.submit(stateful_job(
+        "db",
+        1,
+        "nfs",
+        Some(json!({ "server": "10.0.0.5", "export": "/exports/legion" })),
+    ))?;
+
+    let volume = cluster.volumes()?.remove(0);
+    assert!(!volume.node_local, "nfs is advertised as network storage");
+    // Even after mounting somewhere, an nfs volume must not constrain
+    // placement — that is the difference between "comes back here" and
+    // "comes back".
+    cluster.report_mounted(&volume.volume_id, NODE_A, false)?;
+    let mounted = cluster
+        .store
+        .get_volume(&volume.volume_id)?
+        .context("volume")?;
+    assert!(!mounted.pins_placement());
+
+    let task_id = cluster
+        .store
+        .get_task_configs_for_job_config(cluster.job_config_ids.get("db").context("job")?)?
+        .first()
+        .map(|(id, _)| *id)
+        .context("task config")?;
+    cluster.store.remove_allocs_for_node(NODE_A)?;
+    assert!(
+        cluster
+            .store
+            .pinned_placements_for_task(task_id)?
+            .is_empty(),
+        "network volumes impose no placement constraint"
+    );
+    Ok(())
+}
+
+#[test]
+fn scaling_in_reclaims_only_when_retention_is_off() -> R<()> {
+    for (retain, expected) in [
+        (true, VolumeState::Created),
+        (false, VolumeState::Destroying),
+    ] {
+        let mut cluster = Cluster::new()?;
+        cluster.add_node(NODE_A)?;
+        let mut job = stateful_job("db", 2, "local-dir", None);
+        job.tasks[0]
+            .stateful
+            .as_mut()
+            .unwrap()
+            .storage
+            .as_mut()
+            .unwrap()
+            .retain_on_scale_in = Some(retain);
+        cluster.submit(job.clone())?;
+
+        for volume in cluster.volumes()? {
+            cluster.report_mounted(&volume.volume_id, NODE_A, true)?;
+        }
+
+        // Scale 2 -> 1: slot 1's instance is terminated.
+        let mut scaled = job.clone();
+        scaled.tasks[0].count.num = 1;
+        cluster.submit(scaled)?;
+        cluster.store.reap_orphaned_volumes()?;
+
+        let states: Vec<VolumeState> = cluster
+            .volumes()?
+            .iter()
+            .map(|volume| volume.state)
+            .collect();
+        assert!(
+            states.contains(&expected),
+            "retainOnScaleIn: {retain} should leave a volume {expected:?}, got {states:?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn a_destroyed_volume_is_only_reclaimed_after_the_driver_confirms() -> R<()> {
+    let mut cluster = Cluster::new()?;
+    cluster.add_node(NODE_A)?;
+    cluster.submit(stateful_job("db", 1, "local-dir", None))?;
+    let volume = cluster.volumes()?.remove(0);
+    cluster.report_mounted(&volume.volume_id, NODE_A, true)?;
+
+    let deleted = cluster.store.delete_volume(&volume.volume_id, false)?;
+    assert_eq!(
+        deleted.state,
+        VolumeState::Destroying,
+        "an un-forced delete waits for the driver"
+    );
+    // Detaching the handle first means the instance mints a fresh volume next
+    // placement instead of pointing at storage being reclaimed.
+    assert!(cluster.store.list_instances("db")?[0]
+        .storage_handle
+        .is_none());
+
+    // The manager keeps re-dispatching until a worker confirms.
+    let pending = cluster.store.volumes_to_destroy_for_node(NODE_A)?;
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].volume_id, volume.volume_id);
+
+    cluster.store.mark_volume_destroyed(&volume.volume_id)?;
+    let done = cluster
+        .store
+        .get_volume(&volume.volume_id)?
+        .context("volume")?;
+    assert_eq!(done.state, VolumeState::Destroyed);
+    assert!(done.node_id.is_none());
+    assert!(
+        cluster
+            .store
+            .volumes_to_destroy_for_node(NODE_A)?
+            .is_empty(),
+        "a confirmed destroy stops being re-dispatched"
+    );
+    Ok(())
+}
+
+#[test]
+fn force_delete_tombstones_without_driver_confirmation() -> R<()> {
+    let mut cluster = Cluster::new()?;
+    cluster.add_node(NODE_A)?;
+    cluster.submit(stateful_job("db", 1, "local-dir", None))?;
+    let volume = cluster.volumes()?.remove(0);
+    cluster.report_mounted(&volume.volume_id, NODE_A, true)?;
+
+    // The escape hatch for a node that is never coming back: the row is
+    // settled immediately, so the instance stops being pinned to a dead node.
+    let deleted = cluster.store.delete_volume(&volume.volume_id, true)?;
+    assert_eq!(deleted.state, VolumeState::Destroyed);
+    assert!(deleted.node_id.is_none());
+    assert!(!deleted.pins_placement());
+    assert!(
+        cluster
+            .store
+            .volumes_to_destroy_for_node(NODE_A)?
+            .is_empty(),
+        "a forced delete asks no driver to do anything"
+    );
+    Ok(())
+}
+
+#[test]
+fn task_volume_claims_are_shared_and_outlive_instance_churn() -> R<()> {
+    let mut cluster = Cluster::new()?;
+    cluster.add_node(NODE_A)?;
+    let mut job = stateful_job("db", 2, "local-dir", None);
+    job.tasks[0].volumes = vec![VolumeSpec {
+        name: "models".into(),
+        plugin: Some("local-dir".into()),
+        mode: None,
+        params: None,
+        path: Some("/models".into()),
+        read_only: Some(true),
+    }];
+    cluster.submit(job)?;
+
+    let claims: Vec<_> = cluster
+        .volumes()?
+        .into_iter()
+        .filter(|volume| volume.instance_id.is_none())
+        .collect();
+    assert_eq!(
+        claims.len(),
+        1,
+        "a claim is shared by the whole task, not one per replica"
+    );
+    assert_eq!(claims[0].name, "models");
+    assert!(claims[0].read_only);
+
+    // Instance churn must not reclaim a claim: it is storage Legion does not
+    // own the lifecycle of.
+    cluster.store.remove_allocs_for_node(NODE_A)?;
+    cluster.store.reap_orphaned_volumes()?;
+    let claim = cluster
+        .store
+        .get_volume(&claims[0].volume_id)?
+        .context("claim")?;
+    assert_eq!(claim.state, VolumeState::Pending);
+    Ok(())
+}
+
+#[test]
+fn stateless_jobs_create_no_volumes() -> R<()> {
+    let mut cluster = Cluster::new()?;
+    cluster.add_node(NODE_A)?;
+    cluster.submit(JobConfig {
+        name: "web".into(),
+        tasks: vec![TaskConfig {
+            count: TaskCount { num: 2, per: None },
+            config: json!({ "command": ["sleep", "60"] }),
+            ..TaskConfig::new("web", "exec")
+        }],
+        rollout: None,
+        rollout_by_group: Default::default(),
+        version: None,
+    })?;
+    assert!(
+        cluster.volumes()?.is_empty(),
+        "jobs without storage are untouched by the volume system"
+    );
+    Ok(())
+}

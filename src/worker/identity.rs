@@ -889,6 +889,7 @@ mod tests {
 
         let manager = Arc::new(WorkerIdentityManager::new(FakeIssuer::new(900)));
         let mut allocation = TaskAllocation {
+            task_volumes: String::new(),
             allocation_id: 7,
             job_id: "job".into(),
             job_config_id: "jc".into(),
@@ -948,6 +949,7 @@ mod tests {
             ..Default::default()
         }];
         let mut allocation = TaskAllocation {
+            task_volumes: String::new(),
             allocation_id: 8,
             job_id: "job".into(),
             job_config_id: "jc".into(),

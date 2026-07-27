@@ -22,3 +22,4 @@ pub mod raft;
 pub mod service;
 pub mod start;
 pub mod state;
+pub mod volume;

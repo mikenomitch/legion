@@ -202,6 +202,51 @@ pub fn catalog() -> Vec<Capability> {
             mutates: true,
             read_only_safe: false,
         },
+        // --- Volumes (see docs/volumes.md) ---
+        Capability {
+            name: "volume.list",
+            cli: "legion volume list [--job <J>] [--node <N>] [--plugin <P>]",
+            grpc: Some("Manager/ListVolumes"),
+            summary: "List volumes (storage behind stateful instances), with state and node pin.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "volume.get",
+            cli: "legion volume get <ID>",
+            grpc: Some("Manager/GetVolume"),
+            summary: "Inspect one volume: plugin, params, node pin, mount path, last error.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "volume.delete",
+            cli: "legion volume delete <ID> [--force]",
+            grpc: Some("Manager/DeleteVolume"),
+            summary: "Delete a volume and reclaim its storage (DESTROYS DATA). --force \
+                 tombstones without driver confirmation for a node that is gone for good. \
+                 Supports --idempotency-key.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "volume.plugins",
+            cli: "legion volume plugins",
+            grpc: Some("Manager/ListVolumePlugins"),
+            summary: "List volume plugins installed across the cluster, with capabilities and \
+                 which nodes can actually use them.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "volume.plugin.test",
+            cli: "legion volume plugin test <NAME>",
+            grpc: None,
+            summary: "Run the volume contract conformance suite against a plugin locally \
+                 (mount/write/unmount/remount/read/destroy plus idempotency). No manager needed.",
+            mutates: false,
+            read_only_safe: true,
+        },
         // --- Rollouts ---
         Capability {
             name: "rollout.list",

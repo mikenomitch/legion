@@ -37,6 +37,7 @@ pub(crate) fn build_bundle(
     command: &[String],
     env: &std::collections::HashMap<String, String>,
     hostname: &str,
+    volumes: &[crate::task_plugins::RuntimeVolume],
 ) -> R<()> {
     if command.is_empty() {
         bail!("container command must include at least one entry");
@@ -60,7 +61,7 @@ pub(crate) fn build_bundle(
     // (`postgres`, `nobody:nogroup`) map to their real uid/gid instead of
     // silently running as root.
     let user = resolve_user(&rootfs, image.user.as_deref());
-    let spec = build_spec(command, env, &image, &user, hostname);
+    let spec = build_spec(command, env, &image, &user, hostname, volumes);
     let config_path = bundle_dir.join("config.json");
     std::fs::write(&config_path, serde_json::to_vec_pretty(&spec)?)
         .with_context(|| format!("write {}", config_path.display()))?;
@@ -373,12 +374,39 @@ fn dns_mounts() -> Vec<Value> {
 /// no private network namespace (the container shares host networking until
 /// network orchestration lands; host DNS files are bind-mounted in), and a
 /// writable root.
+/// Bind mounts for the allocation's volumes, in declaration order.
+///
+/// This is where `stateful.storage.path` and `volumes[].path` become real for a
+/// container: the driver produced a host path, and the container sees it at the
+/// declared destination. Volumes with no `path` are skipped — admission rejects
+/// that combination for container tasks, so reaching here means a jobspec
+/// changed kind after the fact.
+fn volume_mounts(volumes: &[crate::task_plugins::RuntimeVolume]) -> Vec<Value> {
+    volumes
+        .iter()
+        .filter_map(|volume| {
+            let destination = volume.path.as_deref()?;
+            // `rbind` (not plain `bind`) so a volume that is itself a mount
+            // point — an NFS export, a tmpfs — carries its submounts in.
+            let mut options = vec!["rbind".to_string(), "rprivate".to_string()];
+            options.push(if volume.read_only { "ro" } else { "rw" }.to_string());
+            Some(json!({
+                "destination": destination,
+                "type": "bind",
+                "source": volume.host_path.display().to_string(),
+                "options": options,
+            }))
+        })
+        .collect()
+}
+
 fn build_spec(
     command: &[String],
     task_env: &std::collections::HashMap<String, String>,
     image: &ImageConfig,
     user: &ResolvedUser,
     hostname: &str,
+    volumes: &[crate::task_plugins::RuntimeVolume],
 ) -> Value {
     let mut env = merge_env(&image.env, task_env);
     if let Some(home) = &user.home {
@@ -402,6 +430,8 @@ fn build_spec(
               "options": ["nosuid", "noexec", "nodev", "ro"] }),
     ];
     mounts.extend(dns_mounts());
+    // Volumes last so a job can deliberately shadow a default mount point.
+    mounts.extend(volume_mounts(volumes));
 
     json!({
         "ociVersion": "1.0.2",
@@ -589,6 +619,7 @@ mod tests {
             &image,
             &user,
             "legion-7",
+            &[],
         );
 
         assert_eq!(spec["process"]["args"], json!(["/bin/echo", "hi"]));
@@ -630,7 +661,14 @@ mod tests {
             gid: 70,
             home: Some("/var/lib/postgresql".to_string()),
         };
-        let spec = build_spec(&["true".to_string()], &HashMap::new(), &image, &user, "h");
+        let spec = build_spec(
+            &["true".to_string()],
+            &HashMap::new(),
+            &image,
+            &user,
+            "h",
+            &[],
+        );
         let env = spec["process"]["env"].as_array().unwrap();
         assert!(env.iter().any(|e| e == "HOME=/from-image"));
         assert!(!env.iter().any(|e| e == "HOME=/var/lib/postgresql"));

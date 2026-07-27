@@ -1049,6 +1049,10 @@ pub struct WorkerConfigAlt {
     pub max_allocations: Option<u32>,
     #[serde(default)]
     pub artifacts: Option<WorkerArtifactsConfig>,
+    /// Host paths this worker offers to jobs through the `host` volume plugin
+    /// (see docs/volumes.md), keyed by the name jobs claim.
+    #[serde(default)]
+    pub host_volumes: Option<HashMap<String, crate::volumes::HostVolumeConfig>>,
 }
 
 /// Default concurrent artifact fetches per worker.

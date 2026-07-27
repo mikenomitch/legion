@@ -154,6 +154,43 @@ Contract specifics (the rest follows the common pattern above):
   cluster's `artifacts.allowedSchemes` (and the worker-side allowlist if
   customized).
 
+## 6) Volume Plugins
+
+Purpose: materialize persistent storage for stateful tasks (and volume claims
+on any task). See [docs/volumes.md](volumes.md) for the user-facing doc and
+[plans/volume-plugin-system-plan.md](plans/volume-plugin-system-plan.md) for the
+design.
+
+- Built-in drivers (in-process, ship in the binary):
+  `local-dir` (the default), `host`, `nfs`, `tmpfs` — `src/volumes/builtins.rs`.
+- Reference exec plugin: `plugins/volumes/example/` (a ~60-line shell script).
+
+Entry trait: `VolumePlugin` in `src/volumes/mod.rs`.
+
+Contract specifics — this category deliberately differs from the others:
+
+- **The ABI is exec, not `cdylib`** (CNI-style): a plugin is any executable at
+  `plugins/volumes/<name>/<name>` that reads a JSON request on stdin and writes
+  a JSON response on stdout, with the operation as `argv[1]`. Volume operations
+  are low-frequency (task start/stop), usually shell out to system tools
+  (`mount`, `zfs`, a cloud CLI), and must not be able to take a worker down when
+  they crash. Process isolation buys all three and the per-call fork cost is
+  irrelevant at this rate.
+- Manifest: `{"kind": "volumes", "name": "<name>", "legionVolumeApiVersion": 1}`
+  — note the distinct version key, since the volume contract versions
+  independently of the dylib plugin API.
+- Four operations, all **required to be idempotent**: `capabilities`, `mount`,
+  `unmount`, `destroy`. `create`, `attach`, `detach`, `snapshot`, `restore`, and
+  `expand` are reserved names a plugin may advertise for forward compatibility.
+- **Plugins run on workers only.** The manager owns the volume state machine but
+  loads no drivers: it learns what exists from the capabilities workers publish
+  in their fingerprints. The control plane therefore needs no storage
+  credentials and no mount privileges.
+- Built-ins win over exec plugins on a name collision, so an installed plugin
+  cannot silently redefine what `local-dir` means on a running cluster.
+- `legion volume plugin test <name>` runs the contract conformance suite against
+  a plugin — the same suite Legion's own tests use, no manager required.
+
 ## Build Behavior
 
 `build.rs` behavior:
@@ -199,7 +236,6 @@ See docs/plans/auth-acl-plan.md for the full reasoning.
 Based on `docs/TASK-LIST.md`, `README.md`, and `docs/differentiators.md`, these are intended but not present as first-class plugin frameworks today:
 
 - Networking/CNI plugins (a declarative `datapath` plugin kind + CNI compatibility shim is designed in [plans/service-discovery-plan.md](plans/service-discovery-plan.md)).
-- Volume plugins.
 - Command/API endpoint extension plugins.
 - Logging/observability pipeline plugins.
 - Eval hooks / scheduler reaction hooks.

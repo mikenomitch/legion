@@ -9,8 +9,10 @@ replica N's data.
 The `stateful` task block introduces that handle: the **instance**.
 
 > Design plan: [stateful-workloads-and-instance-identity-plan.md](plans/stateful-workloads-and-instance-identity-plan.md).
-> Related: [workload-identity.md](workload-identity.md) (the instance id feeds
-> the reschedule-stable token subject).
+> Related: [volumes.md](volumes.md) (the storage an instance's handle points
+> at), [workload-identity.md](workload-identity.md) (the instance id feeds the
+> reschedule-stable token subject).
+> Guides: [Postgres](guides/postgres.md), [Redis](guides/redis.md).
 
 ## Concepts
 
@@ -106,8 +108,11 @@ pending -> active -> rescheduling -> active -> ... -> stopped/terminated
                                    // selfTerminateAfter; 'never' = wait for
                                    // node recovery or operator override
       },
-      storage: {                 // optional persistent-state contract
-        path: '/var/lib/db',     // absolute path the state is exposed at
+      storage: {                 // optional persistent storage (docs/volumes.md)
+        path: '/var/lib/db',     // container: bind destination; exec:
+                                 // informational (read $LEGION_STORAGE_DIR)
+        plugin: 'local-dir',     // volume plugin; default 'local-dir'
+        params: { size: '10G' }, // passed to the plugin verbatim
         retainOnScaleIn: true,   // default true (K8s whenScaled: Retain)
         retainOnStop: true,      // default true (K8s whenDeleted: Retain);
                                  // slot mode only — see retention section
@@ -177,6 +182,8 @@ time, so they are present at process start for `exec` and `container` tasks:
 | `LEGION_INSTANCE_ID` | stateful tasks | Stable instance id; survives reschedules. |
 | `LEGION_INSTANCE_MODE` | stateful tasks | `slot` or `keyed`. |
 | `LEGION_INSTANCE_SLOT` | slot mode only | Ordinal slot index `0..count-1`. |
+| `LEGION_STORAGE_DIR` | tasks with `stateful.storage` | The instance volume's path. See [volumes.md](volumes.md#how-path-works-per-task-kind) for why exec and container tasks get different values. |
+| `LEGION_VOLUME_<NAME>` | per declared volume | Same, for every volume including `volumes[]` claims. |
 
 Apps key their durable state and "who am I" decisions on
 `LEGION_INSTANCE_ID`; `LEGION_ALLOC_ID` is the ephemeral placement id.
@@ -644,19 +651,21 @@ unconditionally.
 
 ## Storage Handle Contract
 
-Each instance optionally owns an opaque `storage_handle`, minted on first
-placement when the task declares `stateful.storage` (currently a
-`local-dir/<id>` token). The contract is:
+Each instance optionally owns a `storage_handle`, minted on first placement
+when the task declares `stateful.storage`. It is a `{plugin}/{volume_id}` pair
+(`local-dir/9f2c…`): which driver owns the storage, and which volume. The
+contract is:
 
 - the handle binds to the **instance**, never the allocation;
 - every allocation for the instance sees the same handle;
 - handles survive reschedules, config updates, and (by default) scale cycles.
 
-What v1 deliberately does **not** do: actually attach/mount anything, pin
-node-local handles to nodes, or garbage-collect dropped handles. Concrete
-drivers (local dir, network volumes, attach-before-start/detach-on-stop
-hooks) are specified in the
-[volume plugin system plan](plans/volume-plugin-system-plan.md).
+Behind the handle is a real volume, materialized by a plugin on whatever node
+the instance lands on: mounted before the task starts, unmounted on stop, and
+reclaimed when the handle is dropped. Node-local volumes additionally **pin**
+their instance to the node holding the data, so a replacement can never start on
+an empty disk. See **[docs/volumes.md](volumes.md)** for plugins, the driver
+contract, and `legion volume`.
 
 ## Workload Identity Integration
 

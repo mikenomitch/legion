@@ -22,6 +22,10 @@ from the CLI, the MCP server, the UI, and raw gRPC.
 | `artifact.staged` | info | Every artifact for an allocation staged successfully (digests, bytes, durations in metadata). |
 | `artifact.failed` | warn | One artifact's fetch failed — per-artifact detail (redacted source, error, attempts) alongside the allocation-level `allocation.failed`. |
 | `artifact.pinned` | info | Mutable artifact references were pinned to digests at submit (one event per changing submit; pins in metadata). |
+| `volume.mounted` | info | A worker materialized a [volume](volumes.md) at a host path. For a node-local volume this is also when its instance becomes pinned to that node. |
+| `volume.failed` | warn | A driver operation failed (mount/unmount/destroy). The detail is also recorded on the volume row, so `legion volume get` explains a stuck volume. |
+| `volume.reclaiming` | info | A volume's instance no longer references it, so its storage is queued for the driver's `destroy`. |
+| `volume.destroyed` | info | A driver confirmed a volume's storage is gone. |
 | `node.registered` | info | A worker registered (or re-registered). |
 | `node.ready` | info | A known node rejoined and was marked ready. |
 | `node.lost` | warn | A node was marked lost (explicitly or via missed heartbeats). |

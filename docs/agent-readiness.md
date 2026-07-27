@@ -58,6 +58,9 @@ Even with `--allow-write`, `legion_state_query` is forced to read-only.
 | `legion_rollout_status` | no | Rollout progress + allocation health. |
 | `legion_instance_list` | no | List a job's stateful instances (slot + keyed). |
 | `legion_instance_get` | no | Inspect one stateful instance. |
+| `legion_volume_list` | no | List volumes — the storage behind stateful instances. Filters by job/node/plugin/instance/state. |
+| `legion_volume_get` | no | Inspect one volume: plugin, params, node pin, mount path, last driver error. |
+| `legion_volume_plugins` | no | Volume plugins installed across the cluster and which nodes can use them. Answers "why was my job rejected for plugin X". |
 | `legion_node_list` | no | List worker nodes. |
 | `legion_acl_whoami` | no | ACL status + caller identity (diagnose PermissionDenied). |
 | `legion_events` | no | List scheduler events; poll with `after_id` to tail. |
@@ -70,6 +73,7 @@ Even with `--allow-write`, `legion_state_query` is forced to read-only.
 | `legion_instance_create` | **yes** | Create a keyed-mode stateful instance (never-recycled id; supports `idempotency_key`). |
 | `legion_instance_destroy` | **yes** | Destroy a keyed instance, stop its allocation, drop its storage (supports `idempotency_key`). |
 | `legion_instance_replace` | **yes** | Force-replace an instance's allocation stuck on a LOST node (skips the `onLost.replaceAfter` loss-confirmation gate; split-brain risk if the node is only partitioned; supports `idempotency_key`). |
+| `legion_volume_delete` | **yes** | Delete a volume and reclaim its storage. DESTROYS DATA; `force: true` tombstones without driver confirmation for a node that is gone for good (supports `idempotency_key`). |
 
 Tool errors are returned in-band (`result.isError = true` with a text payload),
 following MCP convention; transport/protocol errors use JSON-RPC `error`.
@@ -79,7 +83,7 @@ all console logs to **stderr** so stdout stays a clean protocol stream.
 
 ## 2. Structured output envelope
 
-The agent-facing commands (`job`, `instance`, `state`, `node`, `kv`,
+The agent-facing commands (`job`, `instance`, `volume`, `state`, `node`, `kv`,
 `capabilities`) accept
 `--json` / `-j` and emit exactly one of two shapes (bootstrap/cluster-admin
 commands such as `start`, `join`, and `raft` are operator-oriented and are not

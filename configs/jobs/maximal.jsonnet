@@ -80,8 +80,27 @@
                     selfTerminateAfter: "90s",
                     replaceAfter: "3m",
                 },
+                // Per-instance persistent storage, materialized by a volume
+                // plugin on whatever node the instance lands on (see
+                // docs/volumes.md). Each slot gets its OWN volume, reattached
+                // on every reschedule — replica 2's disk is replica 2's disk.
                 storage: {
+                    // Where the task sees it. For `container` tasks this is a
+                    // real bind mount; `exec` tasks run in the host mount
+                    // namespace and read $LEGION_STORAGE_DIR instead.
                     path: "/var/lib/web",
+                    // Volume plugin. Defaults to "local-dir" (a directory on
+                    // the worker's disk, node-local). "nfs" is the built-in
+                    // network option, which lets instances reschedule anywhere.
+                    plugin: "local-dir",
+                    // How the task consumes it: "filesystem" (a directory —
+                    // the default, and what exec/container want) or "block" (a
+                    // raw device or disk image a microVM attaches). Admission
+                    // rejects a mode the task kind or the plugin cannot serve.
+                    mode: "filesystem",
+                    // Passed to the plugin verbatim; it declares which are
+                    // required (`legion volume plugins` lists them).
+                    params: { size: "10G" },
                     // K8s persistentVolumeClaimRetentionPolicy analogs (both
                     // default true = Retain). retainOnScaleIn ~ whenScaled;
                     // retainOnStop ~ whenDeleted and governs `job stop` only
@@ -90,6 +109,22 @@
                     retainOnStop: true,
                 },
             },
+            // Claims on storage that exists independently of any instance —
+            // an operator's host path, an NFS export, scratch space (see
+            // docs/volumes.md). Unlike stateful.storage these are shared, are
+            // never provisioned or reclaimed by instance churn, and are valid
+            // on STATELESS tasks too. Each becomes LEGION_VOLUME_<NAME>.
+            volumes: [
+                {
+                    name: "models",
+                    // The `host` plugin claims a path the operator declared in
+                    // the worker config's `hostVolumes` map, by name.
+                    plugin: "host",
+                    params: { name: "models" },
+                    path: "/models",
+                    readOnly: true,
+                },
+            ],
             config: {
                 command: ["sleep", "1"],
             },

@@ -29,28 +29,29 @@ use crate::structs::{
     AcquireKvLockRequest, AdvanceRolloutReply, AdvanceRolloutRequest, AllocationHealth,
     AllocationLog, CreateInstanceReply, CreateInstanceRequest, CreateInstancesReply,
     CreateInstancesRequest, DeleteKvReply, DeleteKvRequest, DeleteSavedStateQueryReply,
-    DeleteSavedStateQueryRequest, DestroyInstanceReply, DestroyInstanceRequest, DestroyJobReply,
-    DestroyJobRequest, ExecClientFrame, FailedAllocation, GetAllocationLogsReply,
-    GetAllocationLogsRequest, GetArtifactCredentialReply, GetArtifactCredentialRequest,
-    GetInstanceReply, GetInstanceRequest, GetJobInfoReply, GetJobInfoRequest,
-    GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest, GetKvLockReply,
-    GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest,
+    DeleteSavedStateQueryRequest, DeleteVolumeReply, DeleteVolumeRequest, DestroyInstanceReply,
+    DestroyInstanceRequest, DestroyJobReply, DestroyJobRequest, ExecClientFrame, FailedAllocation,
+    GetAllocationLogsReply, GetAllocationLogsRequest, GetArtifactCredentialReply,
+    GetArtifactCredentialRequest, GetInstanceReply, GetInstanceRequest, GetJobInfoReply,
+    GetJobInfoRequest, GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest,
+    GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest,
     GetManagerConfigsReply, GetManagerConfigsRequest, GetNodeReply, GetNodeRequest, GetNodesReply,
     GetNodesRequest, GetObservabilityReply, GetObservabilityRequest, GetRaftJoinTokenReply,
     GetRaftJoinTokenRequest, GetRaftStatusReply, GetRaftStatusRequest, GetRolloutReply,
     GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest, GetStateStoreSchemaReply,
-    GetStateStoreSchemaRequest, GetTaskLogsRequest, HealthCheckReply, HealthCheckRequest,
-    HeartbeatReply, HeartbeatRequest, Instance, InstanceInfo, InstanceMode, InstanceState,
-    IssueNodeIdentityTokenReply, IssueNodeIdentityTokenRequest, IssueRaftCommandReply,
-    IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply, IssueWorkloadIdentityTokenRequest,
-    JobConfig, JobSpecHistoryItem, KvEntry, KvInjectionAction, KvValueType, LedgerNode,
-    ListEventsReply, ListEventsRequest, ListInstancesReply, ListInstancesRequest,
-    ListJobActionsReply, ListJobActionsRequest, ListJobSpecHistoryReply, ListJobSpecHistoryRequest,
-    ListJobsReply, ListJobsRequest, ListKvReply, ListKvRequest, ListRaftHistoryReply,
-    ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply,
-    ListRolloutsRequest, ListSavedStateQueriesReply, ListSavedStateQueriesRequest,
-    ListServicesReply, ListServicesRequest, Node, NodeMsg, PatchKvReply, PatchKvRequest,
-    PlanJobReply, PlanJobRequest, PlannedAllocation, PutKvReply, PutKvRequest,
+    GetStateStoreSchemaRequest, GetTaskLogsRequest, GetVolumeReply, GetVolumeRequest,
+    HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, Instance, InstanceInfo,
+    InstanceMode, InstanceState, IssueNodeIdentityTokenReply, IssueNodeIdentityTokenRequest,
+    IssueRaftCommandReply, IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply,
+    IssueWorkloadIdentityTokenRequest, JobConfig, JobSpecHistoryItem, KvEntry, KvInjectionAction,
+    KvValueType, LedgerNode, ListEventsReply, ListEventsRequest, ListInstancesReply,
+    ListInstancesRequest, ListJobActionsReply, ListJobActionsRequest, ListJobSpecHistoryReply,
+    ListJobSpecHistoryRequest, ListJobsReply, ListJobsRequest, ListKvReply, ListKvRequest,
+    ListRaftHistoryReply, ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest,
+    ListRolloutsReply, ListRolloutsRequest, ListSavedStateQueriesReply,
+    ListSavedStateQueriesRequest, ListServicesReply, ListServicesRequest, ListVolumePluginsReply,
+    ListVolumePluginsRequest, ListVolumesReply, ListVolumesRequest, Node, NodeMsg, PatchKvReply,
+    PatchKvRequest, PlanJobReply, PlanJobRequest, PlannedAllocation, PutKvReply, PutKvRequest,
     QueryStateStoreReply, QueryStateStoreRequest, RaftHistoryEvent, RaftStatus, ReleaseKvLockReply,
     ReleaseKvLockRequest, RenewKvLockReply, RenewKvLockRequest, ReplaceInstanceReply,
     ReplaceInstanceRequest, ResolveServiceReply, ResolveServiceRequest, RestartWorkerReply,
@@ -236,7 +237,11 @@ fn map_raft_event(event: crate::storage::persistence::RaftHistoryEvent) -> RaftH
 /// `proto/legion.proto`), attaching the node-loss diagnostic when the
 /// instance is gated (see [`instance_loss_detail`]).
 fn map_instance_info(store: &Store, instance: Instance) -> InstanceInfo {
-    let detail = instance_loss_detail(store, &instance);
+    // Loss confirmation first: it explains an instance that is bound but
+    // waiting. A volume pin explains one that is UNBOUND and waiting — the two
+    // never apply at once, and both answer "why has this not come back".
+    let detail = instance_loss_detail(store, &instance)
+        .or_else(|| instance_volume_pin_detail(store, &instance));
     InstanceInfo {
         instance_id: instance.instance_id,
         job_id: instance.job_id,
@@ -277,6 +282,41 @@ fn instance_loss_detail(store: &Store, instance: &Instance) -> Option<String> {
          (stateful.onLost.replaceAfter) elapses, keeps it if the node returns first, or \
          replaces it immediately on operator override (`legion instance replace {}`)",
         node.id, instance.instance_id
+    ))
+}
+
+/// `volume-pinned` diagnostic for instance get/list: when an instance is
+/// awaiting placement and holds node-local storage, name the node it is waiting
+/// for. Without this, a replica stuck pending looks like a capacity problem
+/// when it is really a storage-locality one (see docs/volumes.md).
+fn instance_volume_pin_detail(store: &Store, instance: &Instance) -> Option<String> {
+    // Only instances the scheduler is actually trying to place. A stopped or
+    // terminated instance is not waiting for anything, so telling its reader
+    // "this can only be placed on node-a1" would be noise at best.
+    if instance.current_alloc_id.is_some()
+        || !matches!(
+            instance.state,
+            InstanceState::Pending | InstanceState::Rescheduling
+        )
+    {
+        return None;
+    }
+    let volume = store
+        .list_volumes(&crate::storage::store::VolumeFilter {
+            instance_id: Some(instance.instance_id.clone()),
+            ..Default::default()
+        })
+        .ok()?
+        .into_iter()
+        .find(|volume| volume.pins_placement())?;
+    let node_id = volume.node_id.clone()?;
+    let node_status = store
+        .get_node(&node_id)
+        .map(|node| node.status)
+        .unwrap_or_else(|_| "unknown".into());
+    Some(format!(
+        "volume-pinned: volume {} ({}) is node-local and lives on node {node_id} (status:          {node_status}), so this instance can only be placed there. It waits for that node          rather than starting on empty storage; `legion volume delete --force {}` abandons          the data and frees the instance to place elsewhere",
+        volume.volume_id, volume.plugin, volume.volume_id
     ))
 }
 
@@ -1094,6 +1134,148 @@ impl ManagerDaemonService {
         Ok(notes)
     }
 
+    /// Admission check for volume declarations, against what the cluster
+    /// actually provides.
+    ///
+    /// The manager loads no storage drivers, so "does plugin X exist" is only
+    /// answerable from worker fingerprints — which is exactly why this lives at
+    /// admission rather than in `validate_job_config` (which is offline and
+    /// cluster-blind). Catching it here means a job with unavailable storage is
+    /// rejected at submit with an actionable message, instead of placing and
+    /// then failing at mount.
+    fn validate_job_volumes(&self, config: &JobConfig) -> R<()> {
+        let needs_check = config
+            .tasks
+            .iter()
+            .any(|task| !task.required_volume_plugins().is_empty());
+        if !needs_check {
+            return Ok(());
+        }
+        let cluster = self.store.cluster_volume_plugins()?;
+        if cluster.is_empty() {
+            // Nothing in the cluster advertises plugin metadata: either no
+            // worker has joined yet, or they predate fingerprinting. Either
+            // way there is nothing to validate against, and rejecting the job
+            // would be worse than letting placement decide.
+            debug!("No volume plugin metadata advertised yet; skipping volume admission checks");
+            return Ok(());
+        }
+
+        let mut registry = crate::task_plugins::TaskPluginRegistry::new();
+        for task in &config.tasks {
+            let mut declarations: Vec<VolumeDeclaration> = Vec::new();
+            if let Some(storage) = task
+                .stateful
+                .as_ref()
+                .and_then(|stateful| stateful.storage.as_ref())
+            {
+                declarations.push(VolumeDeclaration {
+                    label: "stateful.storage".to_string(),
+                    plugin: storage.plugin_name().to_string(),
+                    mode: storage.volume_mode(),
+                    params: storage.param_map(),
+                    is_instance_volume: true,
+                });
+            }
+            for volume in &task.volumes {
+                declarations.push(VolumeDeclaration {
+                    label: format!("volume {:?}", volume.name),
+                    plugin: volume.plugin_name().to_string(),
+                    mode: volume.volume_mode(),
+                    params: volume.param_map(),
+                    is_instance_volume: false,
+                });
+            }
+            if declarations.is_empty() {
+                continue;
+            }
+
+            // What the task KIND can consume. A microVM kind takes a block
+            // device and cannot use a directory; exec and container are the
+            // reverse. Loaded lazily so jobs without volumes never pay for it.
+            let kind_modes = match registry.load_plugin(&task.kind, false) {
+                Ok(()) => registry
+                    .plugin(&task.kind)
+                    .map(|plugin| plugin.supported_volume_modes().to_vec())
+                    .unwrap_or_else(|| vec![crate::volumes::VolumeMode::Filesystem]),
+                // An unknown kind fails elsewhere with a better message; do not
+                // turn "no such task kind" into a confusing volume error.
+                Err(_) => vec![crate::volumes::VolumeMode::Filesystem],
+            };
+
+            for VolumeDeclaration {
+                label,
+                plugin,
+                mode,
+                params,
+                is_instance_volume,
+            } in declarations
+            {
+                if !kind_modes.contains(&mode) {
+                    bail!(
+                        "task {} {label}: task kind `{}` cannot consume a `{mode}` volume (it \
+                         supports: {}). Filesystem volumes are directories a process reads; \
+                         block volumes are devices a guest attaches",
+                        task.name,
+                        task.kind,
+                        kind_modes
+                            .iter()
+                            .map(|mode| mode.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                }
+                let Some(entry) = cluster.get(&plugin) else {
+                    bail!(
+                        "task {} {label}: no node in the cluster provides volume plugin `{plugin}`.                          Install it under plugins/volumes/{plugin}/ on a worker, or run                          `legion volume plugins` to see what is available",
+                        task.name
+                    );
+                };
+                if entry.available_nodes.is_empty() {
+                    bail!(
+                        "task {} {label}: volume plugin `{plugin}` is installed on {} but unusable                          everywhere: {}",
+                        task.name,
+                        entry.nodes.join(", "),
+                        entry.capabilities.detail
+                    );
+                }
+                if !entry.capabilities.serves_mode(mode) {
+                    bail!(
+                        "task {} {label}: volume plugin `{plugin}` cannot serve a `{mode}` volume \
+                         (it serves: {}). Pick a plugin that does, or change the volume's `mode`",
+                        task.name,
+                        entry
+                            .capabilities
+                            .volume_modes
+                            .iter()
+                            .map(|mode| mode.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                }
+                let missing = entry.capabilities.missing_params(&params);
+                if !missing.is_empty() {
+                    bail!(
+                        "task {} {label}: volume plugin `{plugin}` requires params: {}",
+                        task.name,
+                        missing.join(", ")
+                    );
+                }
+                // An instance volume promises data survives reschedules; an
+                // ephemeral driver cannot keep that promise, and a job that
+                // silently loses its database on every restart is the worst
+                // possible failure mode.
+                if is_instance_volume && entry.capabilities.ephemeral {
+                    bail!(
+                        "task {} {label}: volume plugin `{plugin}` is ephemeral (its contents do                          not survive an unmount), so it cannot back stateful.storage — which                          promises an instance's data survives reschedules. Declare it under                          `volumes` instead if you want scratch space",
+                        task.name
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Resolves one mutable reference to its digest using the same auth chain
     /// a worker would: KV credentials are read directly from the store the
     /// manager owns. Identity-authed resolution needs token issuance (WI plan
@@ -1708,6 +1890,10 @@ impl Manager for ManagerDaemonService {
             error!("Error validating task configs: {:?}", e);
             Status::invalid_argument(format!("Error validating task configs: {e}"))
         })?;
+        self.validate_job_volumes(&config).map_err(|e| {
+            error!("Error validating volumes: {:?}", e);
+            Status::invalid_argument(format!("Error validating volumes: {e:#}"))
+        })?;
         // Artifact admission: desugar/auth/pin. Pin resolution can reach
         // registries, so it runs as blocking work.
         let artifact_pins =
@@ -2276,6 +2462,10 @@ impl Manager for ManagerDaemonService {
         validate_job_config(&config).map_err(|e| {
             error!("Error validating task configs: {:?}", e);
             Status::invalid_argument(format!("Error validating task configs: {e}"))
+        })?;
+        self.validate_job_volumes(&config).map_err(|e| {
+            error!("Error validating volumes: {:?}", e);
+            Status::invalid_argument(format!("Error validating volumes: {e:#}"))
         })?;
         // Artifact admission for plan mirrors run: pins resolve here too so
         // the plan shows the digests a submit would ship.
@@ -3284,6 +3474,204 @@ impl Manager for ManagerDaemonService {
         }))
     }
 
+    /// List volumes, optionally filtered. See docs/volumes.md.
+    #[instrument(skip_all)]
+    async fn list_volumes(
+        &self,
+        request: Request<ListVolumesRequest>,
+    ) -> Result<Response<ListVolumesReply>, Status> {
+        // Volumes are job-scoped storage, so they read under the `job`
+        // resource. Listing gates coarsely and filters per-item below, like
+        // the other list endpoints.
+        let identity =
+            self.check_acl(&request, AclResource::Job, AclAction::Read, AclScope::any())?;
+        let inner = request.into_inner();
+        let filter = crate::storage::store::VolumeFilter {
+            job_id: non_empty(inner.job_id),
+            node_id: non_empty(inner.node_id),
+            plugin: non_empty(inner.plugin),
+            instance_id: non_empty(inner.instance_id),
+            state: inner
+                .state
+                .as_deref()
+                .filter(|state| !state.trim().is_empty())
+                .map(|state| {
+                    state.parse::<crate::structs::VolumeState>().map_err(|err| {
+                        Status::invalid_argument(format!("invalid volume state filter: {err}"))
+                    })
+                })
+                .transpose()?,
+        };
+
+        let volumes = self
+            .store
+            .list_volumes(&filter)
+            .map_err(|e| map_store_error("Error listing volumes", e))?
+            .into_iter()
+            .filter(|volume| match volume.job_id.as_deref() {
+                Some(job_id) => {
+                    identity.allows(AclResource::Job, AclAction::Read, &AclScope::job(job_id))
+                }
+                // Volumes with no owning job (operator-created, future) are
+                // only visible to callers who can read any job.
+                None => identity.allows(AclResource::Job, AclAction::Read, &AclScope::any()),
+            })
+            .map(volume_info)
+            .collect();
+
+        Ok(Response::new(ListVolumesReply { volumes }))
+    }
+
+    /// Fetch one volume by id.
+    #[instrument(skip_all)]
+    async fn get_volume(
+        &self,
+        request: Request<GetVolumeRequest>,
+    ) -> Result<Response<GetVolumeReply>, Status> {
+        // Coarse gate first, precise job scope after the lookup, so a
+        // credential-less caller cannot probe volume existence via
+        // NotFound-vs-PermissionDenied.
+        let identity =
+            self.check_acl(&request, AclResource::Job, AclAction::Read, AclScope::any())?;
+        let inner = request.into_inner();
+        let volume = self
+            .store
+            .get_volume(&inner.volume_id)
+            .map_err(|e| map_store_error("Error loading volume", e))?
+            .ok_or_else(|| Status::not_found(format!("volume {} not found", inner.volume_id)))?;
+        if let Some(job_id) = volume.job_id.as_deref() {
+            acl::enforce(
+                &identity,
+                AclResource::Job,
+                AclAction::Read,
+                &AclScope::job(job_id),
+            )?;
+        }
+
+        Ok(Response::new(GetVolumeReply {
+            volume: Some(volume_info(volume)),
+        }))
+    }
+
+    /// Delete a volume: detach it from its instance and queue its storage for
+    /// the owning worker's `destroy` (or, with `force`, tombstone it outright).
+    #[instrument(skip_all)]
+    async fn delete_volume(
+        &self,
+        request: Request<DeleteVolumeRequest>,
+    ) -> Result<Response<DeleteVolumeReply>, Status> {
+        let identity = self.check_acl(
+            &request,
+            AclResource::Job,
+            AclAction::Write,
+            AclScope::any(),
+        )?;
+        let inner = request.into_inner();
+        let idempotency_key = inner.idempotency_key.unwrap_or_default();
+
+        if let Some(message) = self
+            .store
+            .idempotency_lookup(&idempotency_key)
+            .map_err(|e| map_store_error("Error checking idempotency", e))?
+        {
+            let volume = self
+                .store
+                .get_volume(&inner.volume_id)
+                .map_err(|e| map_store_error("Error loading volume", e))?;
+            return Ok(Response::new(DeleteVolumeReply {
+                volume: volume.map(volume_info),
+                message,
+                deduplicated: true,
+            }));
+        }
+
+        let existing = self
+            .store
+            .get_volume(&inner.volume_id)
+            .map_err(|e| map_store_error("Error loading volume", e))?
+            .ok_or_else(|| Status::not_found(format!("volume {} not found", inner.volume_id)))?;
+        if let Some(job_id) = existing.job_id.as_deref() {
+            acl::enforce(
+                &identity,
+                AclResource::Job,
+                AclAction::Write,
+                &AclScope::job(job_id),
+            )?;
+        }
+
+        let volume = self
+            .store
+            .delete_volume(&inner.volume_id, inner.force)
+            .map_err(|e| map_store_error("Error deleting volume", e))?;
+        let message = if inner.force {
+            format!(
+                "Volume {} marked destroyed without driver confirmation; any data on its node                  is left behind",
+                volume.volume_id
+            )
+        } else {
+            format!(
+                "Volume {} queued for reclamation by its {} driver",
+                volume.volume_id, volume.plugin
+            )
+        };
+        if !idempotency_key.is_empty() {
+            if let Err(err) =
+                self.store
+                    .idempotency_record(&idempotency_key, "DeleteVolume", &message)
+            {
+                warn!(error = ?err, "Failed recording idempotency key for DeleteVolume");
+            }
+        }
+
+        Ok(Response::new(DeleteVolumeReply {
+            volume: Some(volume_info(volume)),
+            message,
+            deduplicated: false,
+        }))
+    }
+
+    /// The volume plugins installed across the cluster, aggregated from worker
+    /// fingerprints (the manager loads no drivers of its own).
+    #[instrument(skip_all)]
+    async fn list_volume_plugins(
+        &self,
+        request: Request<ListVolumePluginsRequest>,
+    ) -> Result<Response<ListVolumePluginsReply>, Status> {
+        // Cluster capability data, like node fingerprints: gated on node read.
+        self.check_acl(
+            &request,
+            AclResource::Node,
+            AclAction::Read,
+            AclScope::any(),
+        )?;
+        let plugins = self
+            .store
+            .cluster_volume_plugins()
+            .map_err(|e| map_store_error("Error listing volume plugins", e))?
+            .into_iter()
+            .map(|(name, entry)| crate::structs::VolumePluginInfo {
+                name,
+                node_local: entry.capabilities.node_local,
+                ephemeral: entry.capabilities.ephemeral,
+                access_modes: entry.capabilities.access_modes,
+                volume_modes: entry
+                    .capabilities
+                    .volume_modes
+                    .iter()
+                    .map(|mode| mode.to_string())
+                    .collect(),
+                ops: entry.capabilities.ops,
+                required_params: entry.capabilities.required_params,
+                optional_params: entry.capabilities.optional_params,
+                detail: entry.capabilities.detail,
+                nodes: entry.nodes,
+                available_nodes: entry.available_nodes,
+            })
+            .collect();
+
+        Ok(Response::new(ListVolumePluginsReply { plugins }))
+    }
+
     #[instrument(skip_all, fields(alloc_id, identity_name, node_id))]
     async fn issue_workload_identity_token(
         &self,
@@ -3499,12 +3887,20 @@ impl Manager for ManagerDaemonService {
             );
         }
 
+        // Volume outcomes flow manager-ward here: workers own the drivers, the
+        // manager owns the state machine (see docs/volumes.md).
+        apply_volume_reports(&self.store, &id, &req.volume_reports);
+
         let desired_allocations = build_desired_allocations(&self.store, &id, &req.allocation_ids)
             .map_err(|e| map_store_error("Error building desired allocations", e))?;
+        // Reclaim work for this node. Re-sent every heartbeat until the worker
+        // confirms, so a worker that dies mid-destroy simply retries.
+        let volume_destroy = build_volume_destroy_requests(&self.store, &id);
 
         let reply = HeartbeatReply {
             message: "ack".into(),
             desired_allocations,
+            volume_destroy,
         };
 
         Ok(Response::new(reply))
@@ -3562,6 +3958,7 @@ impl Manager for ManagerDaemonService {
             reserved_resources: worker_config.reserved_resources,
             max_allocations: worker_config.max_allocations,
             artifacts: worker_config.artifacts,
+            host_volumes: worker_config.host_volumes,
         };
 
         let reply = WorkerPreRegisterReply {
@@ -5738,10 +6135,180 @@ fn build_desired_allocations(
             Some(instance_id) => store.get_instance(instance_id)?,
             None => None,
         };
-        allocations.push(build_task_allocation(task, &allocation, instance.as_ref())?);
+        let volumes =
+            store.volume_mounts_for_allocation(&allocation.job_id, task, instance.as_ref())?;
+        allocations.push(build_task_allocation(
+            task,
+            &allocation,
+            instance.as_ref(),
+            &volumes,
+        )?);
     }
 
     Ok(allocations)
+}
+
+/// Apply the volume operation outcomes a worker reported.
+///
+/// A successful mount pins the volume's node (and corrects the manager's
+/// mint-time node-local guess with what the driver actually said); a confirmed
+/// destroy is the only thing that advances `destroying -> destroyed`; a failure
+/// is recorded on the row so `legion volume list` explains a stuck volume.
+/// Failures here are logged, never fatal to the heartbeat — a wedged volume
+/// must not stop a node from reporting its allocations.
+fn apply_volume_reports(store: &Store, node_id: &str, reports: &[crate::structs::VolumeReport]) {
+    for report in reports {
+        if !report.ok {
+            let plugin = store
+                .get_volume(&report.volume_id)
+                .ok()
+                .flatten()
+                .map(|volume| volume.plugin)
+                .unwrap_or_else(|| "unknown".to_string());
+            warn!(
+                node_id,
+                volume_id = %report.volume_id,
+                op = %report.op,
+                error = %report.error,
+                "Volume operation failed on worker"
+            );
+            if let Err(err) = store.record_volume_error(&report.volume_id, &report.error) {
+                warn!(error = ?err, "Failed recording volume error");
+            }
+            store
+                .events()
+                .volume_failed(&report.volume_id, &plugin, node_id, &report.error);
+            continue;
+        }
+
+        match report.op.as_str() {
+            "mount" => {
+                let attrs = serde_json::from_str(&report.attrs).unwrap_or_default();
+                if let Err(err) = store.record_volume_mounted(
+                    &report.volume_id,
+                    node_id,
+                    &report.mount_path,
+                    report.node_local,
+                    Some(report.fs.as_str()).filter(|fs| !fs.is_empty()),
+                    &attrs,
+                ) {
+                    warn!(error = ?err, "Failed recording volume mount");
+                    continue;
+                }
+                if let Ok(Some(volume)) = store.get_volume(&report.volume_id) {
+                    store
+                        .events()
+                        .volume_mounted(&volume, node_id, &report.mount_path);
+                }
+            }
+            "destroy" => {
+                let plugin = store
+                    .get_volume(&report.volume_id)
+                    .ok()
+                    .flatten()
+                    .map(|volume| volume.plugin)
+                    .unwrap_or_else(|| "unknown".to_string());
+                if let Err(err) = store.mark_volume_destroyed(&report.volume_id) {
+                    warn!(error = ?err, "Failed marking volume destroyed");
+                    continue;
+                }
+                store
+                    .events()
+                    .volume_destroyed(&report.volume_id, &plugin, node_id);
+            }
+            // `unmount` needs no state change: the volume stays `created` and
+            // keeps its pin, which is exactly what makes a reschedule reattach.
+            _ => {}
+        }
+    }
+}
+
+/// Volumes this node should reclaim, filtered to plugins it actually has.
+///
+/// A node-local volume only ever goes to its own node. An unpinned or network
+/// volume can go to any node with the plugin, so we check this node advertises
+/// it before asking — otherwise a worker would fail the same destroy forever.
+fn build_volume_destroy_requests(
+    store: &Store,
+    node_id: &str,
+) -> Vec<crate::structs::VolumeDestroyRequest> {
+    let volumes = match store.volumes_to_destroy_for_node(node_id) {
+        Ok(volumes) => volumes,
+        Err(err) => {
+            warn!(node_id, error = ?err, "Failed listing volumes to destroy");
+            return Vec::new();
+        }
+    };
+    if volumes.is_empty() {
+        return Vec::new();
+    }
+    let node_plugins = store
+        .get_node(node_id)
+        .ok()
+        .and_then(|node| {
+            node.fingerprint_attrs
+                .get("volumePlugins")
+                .and_then(Value::as_object)
+                .map(|plugins| {
+                    plugins
+                        .keys()
+                        .cloned()
+                        .collect::<std::collections::HashSet<_>>()
+                })
+        })
+        .unwrap_or_default();
+
+    volumes
+        .into_iter()
+        .filter(|volume| node_plugins.contains(&volume.plugin))
+        .map(|volume| crate::structs::VolumeDestroyRequest {
+            volume_id: volume.volume_id,
+            plugin: volume.plugin,
+            name: volume.name,
+            params: serde_json::to_string(&volume.params).unwrap_or_else(|_| "{}".into()),
+            attrs: serde_json::to_string(&volume.attrs).unwrap_or_else(|_| "{}".into()),
+        })
+        .collect()
+}
+
+/// An optional proto string filter, treating empty/whitespace as absent —
+/// One volume declaration flattened for the admission check, from either
+/// `stateful.storage` or a `volumes[]` claim.
+struct VolumeDeclaration {
+    label: String,
+    plugin: String,
+    mode: crate::volumes::VolumeMode,
+    params: std::collections::BTreeMap<String, Value>,
+    is_instance_volume: bool,
+}
+
+/// gRPC clients differ on whether an unset filter arrives as None or "".
+fn non_empty(value: Option<String>) -> Option<String> {
+    value.filter(|value| !value.trim().is_empty())
+}
+
+/// Wire form of a stored volume.
+fn volume_info(volume: crate::structs::Volume) -> crate::structs::VolumeInfo {
+    crate::structs::VolumeInfo {
+        volume_id: volume.volume_id,
+        name: volume.name,
+        plugin: volume.plugin,
+        job_id: volume.job_id,
+        instance_id: volume.instance_id,
+        task_name: volume.task_name,
+        state: volume.state.to_string(),
+        node_id: volume.node_id,
+        node_local: volume.node_local,
+        volume_mode: volume.volume_mode.to_string(),
+        fs: volume.fs,
+        read_only: volume.read_only,
+        params: serde_json::to_string(&volume.params).unwrap_or_else(|_| "{}".into()),
+        attrs: serde_json::to_string(&volume.attrs).unwrap_or_else(|_| "{}".into()),
+        mount_path: volume.mount_path,
+        last_error: volume.last_error,
+        created_at: volume.created_at,
+        updated_at: volume.updated_at,
+    }
 }
 
 #[cfg(test)]
@@ -6188,6 +6755,9 @@ mod tests {
                 initial_instances: None,
                 on_lost: None,
                 storage: Some(crate::structs::StatefulStorageConfig {
+                    plugin: None,
+                    mode: None,
+                    params: None,
                     path: "/var/lib/db".into(),
                     retain_on_scale_in: None,
                     retain_on_stop: None,
@@ -8432,6 +9002,9 @@ mod tests {
                 initial_instances: None,
                 on_lost: None,
                 storage: Some(crate::structs::StatefulStorageConfig {
+                    plugin: None,
+                    mode: None,
+                    params: None,
                     path: "/workspace".into(),
                     retain_on_scale_in: None,
                     retain_on_stop: None,

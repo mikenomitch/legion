@@ -14,6 +14,7 @@ pub mod ledger;
 pub mod network;
 pub mod node;
 pub mod token;
+pub mod volume;
 pub mod workload_identity;
 
 pub use acl::*;
@@ -25,4 +26,5 @@ pub use ledger::*;
 pub use network::*;
 pub use node::*;
 pub use token::*;
+pub use volume::*;
 pub use workload_identity::*;
