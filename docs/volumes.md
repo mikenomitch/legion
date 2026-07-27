@@ -194,9 +194,11 @@ destroy. Node-local. Zero configuration — this is what a bare
 storage: { path: '/var/lib/db', params: { size: '10G', mode: '0700' } }
 ```
 
-`size` is **recorded, not enforced** in filesystem mode — a directory has no
-quota, and pretending otherwise would be worse than being honest. `mode` sets
-the directory permissions.
+`size` is **not a quota** in filesystem mode — a directory has no enforcement,
+and pretending otherwise would be worse than being honest. It *is* used for
+placement: the scheduler checks a node's free disk can hold a task's node-local
+volumes before placing there (network drivers like `nfs` are exempt — their
+bytes live on the storage server). `mode` sets the directory permissions.
 
 In **block mode** it serves a sparse disk image at
 `<volume dir>/<volume_id>/disk.img`, formatted with `params.fs` (default
@@ -337,7 +339,10 @@ legion volume get 9f2c8a1b…
 # What can this cluster do?
 legion volume drivers
 
-# Reclaim (DESTROYS DATA — the instance mints a fresh, empty volume next time)
+# Reclaim (DESTROYS DATA — the instance mints a fresh, empty volume next time).
+# Refused while a live allocation runs against the volume: stop the workload
+# first. The worker also refuses to reclaim storage under a live mount, so even
+# --force cannot rm -rf a running database.
 legion volume delete 9f2c8a1b…
 
 # The node is never coming back

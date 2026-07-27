@@ -517,14 +517,15 @@ async fn heartbeat_tick(
         // does not wait behind a slow task start.
         if !reply.volume_destroy.is_empty() {
             let requests = reply.volume_destroy.clone();
-            let manager_handle = task_manager.clone();
-            // Drivers shell out (umount, rm -rf), so keep them off the async
-            // runtime's worker threads.
+            // Take the Arc under a brief lock, then run the drivers with NO
+            // task-manager lock held: a destroy against a hung storage backend
+            // must stall that destroy, not the heartbeats this loop exists to
+            // send (a worker that cannot heartbeat self-fences its stateful
+            // allocations — one stuck volume must not become an outage).
+            // spawn_blocking because drivers shell out (umount, rm -rf).
+            let volumes = task_manager.lock().expect("task manager").volumes_handle();
             tokio::task::spawn_blocking(move || {
-                manager_handle
-                    .lock()
-                    .expect("task manager")
-                    .destroy_volumes(&requests);
+                volumes.destroy_requested(&requests);
             });
         }
 

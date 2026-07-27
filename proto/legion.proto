@@ -277,7 +277,14 @@ service Manager {
 
   // Deletes a volume: detaches it from its instance (which will mint a fresh
   // one on its next placement) and queues its storage for the owning worker's
-  // `destroy`. Confirmed asynchronously — the volume sits in `destroying`
+  // `destroy`.
+  //
+  // Refuses with FailedPrecondition while a live allocation is running against
+  // the volume — deleting storage under a running workload is the one mistake
+  // this API must not allow. Stop the workload first (job stop, instance stop,
+  // scale in). `force` overrides the refusal, and the worker still refuses to
+  // run a driver destroy for a volume it currently has mounted, so even a
+  // forced delete only abandons the record. Confirmed asynchronously — the volume sits in `destroying`
   // until the driver reports success, and the manager re-dispatches on every
   // heartbeat until it does, so nothing leaks if a worker dies mid-destroy.
   //
@@ -291,6 +298,8 @@ service Manager {
   //
   // Errors:
   // - NotFound: no volume row with this id exists.
+  // - FailedPrecondition: a live allocation is running against the volume and
+  //   `force` was not set.
   rpc DeleteVolume (DeleteVolumeRequest) returns (DeleteVolumeReply);
 
   // Lists the volume drivers installed across the cluster, with each one's

@@ -43,15 +43,24 @@ pub struct MountedVolume {
 }
 
 /// Volume drivers plus the mounts this worker holds.
+///
+/// Every method takes `&self`: the bookkeeping lives behind its own small
+/// mutexes, **never held across a driver call**. That structure is
+/// load-bearing — driver operations shell out (`mount`, `mkfs`, a hung NFS
+/// server) and can stall for minutes, and the caller (the task manager /
+/// heartbeat path) must not have its lock chained to ours. A destroy that
+/// hangs must cost that destroy, not the node's heartbeats — a worker that
+/// cannot heartbeat self-fences its stateful allocations, which would turn one
+/// stuck volume into an outage.
 pub struct WorkerVolumeManager {
     registry: VolumeDriverRegistry,
     node_id: String,
-    mounted: HashMap<i64, Vec<MountedVolume>>,
+    mounted: Mutex<HashMap<i64, Vec<MountedVolume>>>,
     /// Outcomes waiting for the next heartbeat.
-    reports: Vec<VolumeReport>,
+    reports: Mutex<Vec<VolumeReport>>,
     /// Volume ids already reclaimed this process, so a manager that re-sends a
     /// destroy before its confirmation lands does not re-run the driver.
-    destroyed: std::collections::HashSet<String>,
+    destroyed: Mutex<std::collections::HashSet<String>>,
 }
 
 impl WorkerVolumeManager {
@@ -59,10 +68,14 @@ impl WorkerVolumeManager {
         WorkerVolumeManager {
             registry: VolumeDriverRegistry::with_discovery(config),
             node_id: node_id.into(),
-            mounted: HashMap::new(),
-            reports: Vec::new(),
-            destroyed: std::collections::HashSet::new(),
+            mounted: Mutex::new(HashMap::new()),
+            reports: Mutex::new(Vec::new()),
+            destroyed: Mutex::new(std::collections::HashSet::new()),
         }
+    }
+
+    fn push_report(&self, report: VolumeReport) {
+        self.reports.lock().expect("volume reports").push(report);
     }
 
     /// Capabilities to publish in this node's fingerprint. The manager has no
@@ -84,7 +97,7 @@ impl WorkerVolumeManager {
     /// operator nothing.
     #[instrument(err, skip_all, fields(allocation_id = allocation.id))]
     pub fn mount_for_allocation(
-        &mut self,
+        &self,
         allocation: &Allocation,
         instance: Option<&VolumeInstanceRef>,
         mounts: &[VolumeMount],
@@ -98,7 +111,7 @@ impl WorkerVolumeManager {
                 Ok(volume) => mounted.push(volume),
                 Err(err) => {
                     let detail = format!("{err:#}");
-                    self.reports.push(VolumeReport {
+                    self.push_report(VolumeReport {
                         volume_id: mount.volume_id.clone(),
                         op: VolumeOp::Mount.as_str().to_string(),
                         ok: false,
@@ -122,12 +135,15 @@ impl WorkerVolumeManager {
             }
         }
 
-        self.mounted.insert(allocation.id, mounted.clone());
+        self.mounted
+            .lock()
+            .expect("volume mounts")
+            .insert(allocation.id, mounted.clone());
         Ok(mounted)
     }
 
     fn mount_one(
-        &mut self,
+        &self,
         allocation: &Allocation,
         instance: Option<&VolumeInstanceRef>,
         mount: &VolumeMount,
@@ -198,7 +214,7 @@ impl WorkerVolumeManager {
             path = %host_path.display(),
             "Mounted volume"
         );
-        self.reports.push(VolumeReport {
+        self.push_report(VolumeReport {
             volume_id: mount.volume_id.clone(),
             op: VolumeOp::Mount.as_str().to_string(),
             ok: true,
@@ -235,8 +251,13 @@ impl WorkerVolumeManager {
     /// unmount is reported and logged but never blocks the allocation from
     /// being torn down, or the worker would wedge on a hung NFS server.
     #[instrument(skip_all, fields(allocation_id))]
-    pub fn unmount_for_allocation(&mut self, allocation_id: i64) {
-        let Some(mounts) = self.mounted.remove(&allocation_id) else {
+    pub fn unmount_for_allocation(&self, allocation_id: i64) {
+        let Some(mounts) = self
+            .mounted
+            .lock()
+            .expect("volume mounts")
+            .remove(&allocation_id)
+        else {
             return;
         };
         for mount in mounts.iter().rev() {
@@ -244,7 +265,7 @@ impl WorkerVolumeManager {
         }
     }
 
-    fn unmount_one(&mut self, mount: &MountedVolume) {
+    fn unmount_one(&self, mount: &MountedVolume) {
         let Some(plugin) = self.registry.get(&mount.driver) else {
             return;
         };
@@ -255,7 +276,7 @@ impl WorkerVolumeManager {
                     driver = %mount.driver,
                     "Unmounted volume"
                 );
-                self.reports.push(VolumeReport {
+                self.push_report(VolumeReport {
                     volume_id: mount.volume_id.clone(),
                     op: VolumeOp::Unmount.as_str().to_string(),
                     ok: true,
@@ -274,7 +295,7 @@ impl WorkerVolumeManager {
                     error = ?err,
                     "Failed to unmount volume"
                 );
-                self.reports.push(VolumeReport {
+                self.push_report(VolumeReport {
                     volume_id: mount.volume_id.clone(),
                     op: VolumeOp::Unmount.as_str().to_string(),
                     ok: false,
@@ -293,25 +314,74 @@ impl WorkerVolumeManager {
     ///
     /// The manager re-sends until it sees a confirmation, so a failure here is
     /// just a retry next heartbeat — which is what makes reclaim crash-safe.
+    ///
+    /// Two guards:
+    /// - a volume this worker **currently has mounted for a live allocation**
+    ///   is refused, not destroyed. `rm -rf` under a running database is the
+    ///   one mistake this subsystem must never make; the destroy retries after
+    ///   the allocation stops and unmounts.
+    /// - the driver call runs with **no lock held**: `mounted` is consulted
+    ///   and released before dispatch, so a hung driver stalls this reclaim,
+    ///   not mounts, reports, or the caller.
     #[instrument(skip_all)]
-    pub fn destroy_requested(&mut self, requests: &[VolumeDestroyRequest]) {
-        // The set only exists to suppress a repeat within the window between
-        // running a destroy and the manager seeing the confirmation. Once a
-        // volume stops being requested that window has closed, so forget it —
-        // otherwise a long-lived worker accumulates an id per volume it has
-        // ever reclaimed.
-        let requested: std::collections::HashSet<&str> = requests
-            .iter()
-            .map(|request| request.volume_id.as_str())
-            .collect();
-        self.destroyed.retain(|id| requested.contains(id.as_str()));
+    pub fn destroy_requested(&self, requests: &[VolumeDestroyRequest]) {
+        // Once the manager stops asking about an id, its confirmation window
+        // has closed — forget it rather than accumulating one entry per volume
+        // this worker has ever reclaimed.
+        {
+            let requested: std::collections::HashSet<&str> = requests
+                .iter()
+                .map(|request| request.volume_id.as_str())
+                .collect();
+            self.destroyed
+                .lock()
+                .expect("destroyed volumes")
+                .retain(|id| requested.contains(id.as_str()));
+        }
 
         for request in requests {
-            if self.destroyed.contains(&request.volume_id) {
+            if self
+                .destroyed
+                .lock()
+                .expect("destroyed volumes")
+                .contains(&request.volume_id)
+            {
                 continue;
             }
-            let Some(plugin) = self.registry.get(&request.driver) else {
-                // The manager filters by advertised plugins, so this only
+            // In-use guard: never destroy under a live mount.
+            let in_use_by = self
+                .mounted
+                .lock()
+                .expect("volume mounts")
+                .iter()
+                .find(|(_, mounts)| {
+                    mounts
+                        .iter()
+                        .any(|mount| mount.volume_id == request.volume_id)
+                })
+                .map(|(allocation_id, _)| *allocation_id);
+            if let Some(allocation_id) = in_use_by {
+                warn!(
+                    volume_id = %request.volume_id,
+                    allocation_id,
+                    "Refusing to destroy a volume mounted by a live allocation; will retry"
+                );
+                self.push_report(VolumeReport {
+                    volume_id: request.volume_id.clone(),
+                    op: VolumeOp::Destroy.as_str().to_string(),
+                    ok: false,
+                    mount_path: String::new(),
+                    node_local: false,
+                    attrs: String::new(),
+                    error: format!("in use by allocation {allocation_id} on this node"),
+                    fs: String::new(),
+                    fresh: false,
+                });
+                continue;
+            }
+
+            let Some(driver) = self.registry.get(&request.driver) else {
+                // The manager filters by advertised drivers, so this only
                 // happens mid-reconfiguration. Stay quiet and let it retry.
                 debug!(
                     volume_id = %request.volume_id,
@@ -339,15 +409,18 @@ impl WorkerVolumeManager {
                 node: self.registry.node_ref(&self.node_id),
             };
 
-            match plugin.destroy(&volume_request) {
+            match driver.destroy(&volume_request) {
                 Ok(()) => {
                     info!(
                         volume_id = %request.volume_id,
                         driver = %request.driver,
                         "Destroyed volume"
                     );
-                    self.destroyed.insert(request.volume_id.clone());
-                    self.reports.push(VolumeReport {
+                    self.destroyed
+                        .lock()
+                        .expect("destroyed volumes")
+                        .insert(request.volume_id.clone());
+                    self.push_report(VolumeReport {
                         volume_id: request.volume_id.clone(),
                         op: VolumeOp::Destroy.as_str().to_string(),
                         ok: true,
@@ -366,7 +439,7 @@ impl WorkerVolumeManager {
                         error = ?err,
                         "Failed to destroy volume; will retry"
                     );
-                    self.reports.push(VolumeReport {
+                    self.push_report(VolumeReport {
                         volume_id: request.volume_id.clone(),
                         op: VolumeOp::Destroy.as_str().to_string(),
                         ok: false,
@@ -383,23 +456,28 @@ impl WorkerVolumeManager {
     }
 
     /// Take the pending outcomes for the next heartbeat.
-    pub fn drain_reports(&mut self) -> Vec<VolumeReport> {
-        std::mem::take(&mut self.reports)
+    pub fn drain_reports(&self) -> Vec<VolumeReport> {
+        std::mem::take(&mut *self.reports.lock().expect("volume reports"))
     }
 
     /// Put drained outcomes back after a failed heartbeat, ahead of anything
     /// recorded since, so ordering per volume is preserved.
-    pub fn requeue_reports(&mut self, mut reports: Vec<VolumeReport>) {
+    pub fn requeue_reports(&self, mut reports: Vec<VolumeReport>) {
         if reports.is_empty() {
             return;
         }
-        reports.append(&mut self.reports);
-        self.reports = reports;
+        let mut pending = self.reports.lock().expect("volume reports");
+        reports.append(&mut pending);
+        *pending = reports;
     }
 
     /// The volumes currently mounted for an allocation (diagnostics/tests).
-    pub fn mounts_for(&self, allocation_id: i64) -> Option<&[MountedVolume]> {
-        self.mounted.get(&allocation_id).map(Vec::as_slice)
+    pub fn mounts_for(&self, allocation_id: i64) -> Option<Vec<MountedVolume>> {
+        self.mounted
+            .lock()
+            .expect("volume mounts")
+            .get(&allocation_id)
+            .cloned()
     }
 }
 
@@ -528,7 +606,7 @@ mod tests {
     #[test]
     fn mounts_persist_across_unmount_and_remount() -> R<()> {
         let root = temp_root("cycle");
-        let mut volumes = manager(&root);
+        let volumes = manager(&root);
         let mounts = vec![mount_spec("data", "local-dir", Some("/var/lib/db"), true)];
 
         let mounted = volumes.mount_for_allocation(&allocation(), Some(&instance()), &mounts)?;
@@ -552,7 +630,7 @@ mod tests {
     #[test]
     fn a_failed_mount_releases_the_ones_already_made() -> R<()> {
         let root = temp_root("rollback");
-        let mut volumes = manager(&root);
+        let volumes = manager(&root);
         // `host` with no declared claims is unusable, so the second mount fails.
         let mounts = vec![
             mount_spec("data", "local-dir", Some("/var/lib/db"), true),
@@ -586,7 +664,7 @@ mod tests {
     #[test]
     fn unknown_plugin_fails_with_the_installed_list() -> R<()> {
         let root = temp_root("unknown");
-        let mut volumes = manager(&root);
+        let volumes = manager(&root);
         let mounts = vec![mount_spec("data", "ceph", Some("/data"), true)];
         let err = volumes
             .mount_for_allocation(&allocation(), Some(&instance()), &mounts)
@@ -618,7 +696,7 @@ mod tests {
                 create: false,
             },
         );
-        let mut volumes = WorkerVolumeManager::new(
+        let volumes = WorkerVolumeManager::new(
             "node-1",
             VolumeRuntimeConfig {
                 volume_root: root.join("volumes"),
@@ -640,7 +718,7 @@ mod tests {
     #[test]
     fn a_destroy_runs_once_per_request_window_and_is_then_forgotten() -> R<()> {
         let root = temp_root("destroy");
-        let mut volumes = manager(&root);
+        let volumes = manager(&root);
         let mounts = vec![mount_spec("data", "local-dir", Some("/var/lib/db"), true)];
         let mounted = volumes.mount_for_allocation(&allocation(), Some(&instance()), &mounts)?;
         let dir = mounted[0].host_path.clone();
@@ -669,7 +747,7 @@ mod tests {
         // Once the manager stops asking, the id is forgotten rather than
         // accumulating for the worker's lifetime.
         volumes.destroy_requested(&[]);
-        assert!(volumes.destroyed.is_empty());
+        assert!(volumes.destroyed.lock().expect("destroyed").is_empty());
 
         std::fs::remove_dir_all(&root).ok();
         Ok(())

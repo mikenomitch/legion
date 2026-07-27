@@ -1191,6 +1191,14 @@ pub fn validate_volume_name(task: &str, name: &str) -> R<()> {
     Ok(())
 }
 
+/// The `size` param of a volume declaration in bytes, when present and
+/// parseable. Used for placement-time disk accounting; a driver still receives
+/// the raw string.
+pub fn volume_param_size_bytes(params: &BTreeMap<String, Value>) -> Option<u64> {
+    let raw = crate::volumes::param_str(params, "size")?;
+    crate::structs::config::parse_byte_size(&raw).ok()
+}
+
 /// Params as a sorted map. Anything that is not a JSON object (including
 /// absent) is an empty map — the plugin's `requiredParams` check then produces
 /// a message naming the missing keys, which is more useful than a type error.
@@ -2366,6 +2374,34 @@ impl TaskConfig {
             drivers.insert(volume.driver_name().to_string());
         }
         drivers
+    }
+
+    /// The volume declarations of this task as `(driver, size param)` pairs,
+    /// for placement-time disk accounting. Instance storage first, then
+    /// claims. Sizes that are absent or unparseable yield `None` — the
+    /// scheduler skips those rather than guessing.
+    pub fn volume_size_declarations(&self) -> Vec<(String, Option<u64>)> {
+        let size_of = |params: &std::collections::BTreeMap<String, Value>| {
+            crate::structs::job::volume_param_size_bytes(params)
+        };
+        let mut out = Vec::new();
+        if let Some(storage) = self
+            .stateful
+            .as_ref()
+            .and_then(|stateful| stateful.storage.as_ref())
+        {
+            out.push((
+                storage.driver_name().to_string(),
+                size_of(&storage.param_map()),
+            ));
+        }
+        for volume in &self.volumes {
+            out.push((
+                volume.driver_name().to_string(),
+                size_of(&volume.param_map()),
+            ));
+        }
+        out
     }
 
     /// Validate workload identities declared on this task (see the

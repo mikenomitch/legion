@@ -1273,6 +1273,16 @@ impl<'a> Scheduler<'a> {
             })
             .into();
 
+        // Disk accounting for node-local volumes, within this plan. Placing 3
+        // replicas that each provision a 100G local volume onto a node with
+        // 150G free must fail the third placement, not fill the disk at
+        // runtime. Deliberately per-plan and best-effort (fingerprinted free
+        // space, no cross-plan reservation ledger): the durable guard is the
+        // fingerprint itself, which shrinks as volumes fill. Remote volumes
+        // (nfs) never count — their bytes live on the storage server, and
+        // charging them to the node would block placements for no reason.
+        let mut planned_local_bytes: HashMap<String, u64> = HashMap::new();
+
         for _ in 0..count {
             let eligible = Self::eligible_nodes(
                 candidates,
@@ -1285,6 +1295,38 @@ impl<'a> Scheduler<'a> {
             if eligible.is_empty() {
                 bail!(
                     "Failed to place task {}: no available nodes matching constraints, permit, or resources",
+                    task_config.name
+                );
+            }
+
+            // Disk fit: drop nodes whose remaining free disk (minus what this
+            // plan already put there) cannot hold the task's node-local
+            // volumes. Nodes that don't report disk are not excluded — missing
+            // data is not evidence of a full disk.
+            let eligible: Vec<&Node> = eligible
+                .into_iter()
+                .filter(|node| {
+                    let wanted = task_local_volume_bytes(node, task_config);
+                    if wanted == 0 {
+                        return true;
+                    }
+                    match fingerprint_disk_free_bytes(node) {
+                        None => true,
+                        Some(free) => {
+                            let already = planned_local_bytes
+                                .get(node.id.as_str())
+                                .copied()
+                                .unwrap_or(0);
+                            free.saturating_sub(already) >= wanted
+                        }
+                    }
+                })
+                .collect();
+            if eligible.is_empty() {
+                bail!(
+                    "Failed to place task {}: no node has enough free disk for its node-local \
+                     volume(s). Shrink the volume `size`, add disk, or use a network driver \
+                     (nfs), whose storage does not consume node disk",
                     task_config.name
                 );
             }
@@ -1369,6 +1411,12 @@ impl<'a> Scheduler<'a> {
                 )?
             };
 
+            if let Some(node) = node_lookup.get(node_id.as_str()) {
+                let wanted = task_local_volume_bytes(node, task_config);
+                if wanted > 0 {
+                    *planned_local_bytes.entry(node_id.clone()).or_default() += wanted;
+                }
+            }
             *planned.entry(node_id.clone()).or_default() += 1;
             planned_task_allocations
                 .entry(node_id.clone())
@@ -2072,6 +2120,55 @@ fn node_provides_volume_drivers(
             })
             .unwrap_or(false)
     })
+}
+
+/// Bytes of **node-local** volume storage one placement of this task would put
+/// on `node`, judged by the node's own advertised driver capabilities.
+///
+/// The locality question is per node deliberately: `size` on an `nfs` volume
+/// consumes the NFS server's disk, not this node's, so remote drivers must not
+/// count — that is the difference between "volumes respect node disk" and
+/// "volumes double-count storage that lives elsewhere". Drivers the node does
+/// not advertise fall back to the built-in set's locality. `tmpfs` is
+/// node-local but RAM-backed, so it is excluded from *disk* accounting too.
+/// Declarations without a parseable `size` contribute nothing — this is
+/// placement sanity, not quota enforcement.
+fn task_local_volume_bytes(node: &Node, task_config: &TaskConfig) -> u64 {
+    let advertised = node.fingerprint_attrs.get("volumeDrivers");
+    task_config
+        .volume_size_declarations()
+        .into_iter()
+        .filter_map(|(driver, size)| {
+            let size = size?;
+            if driver == "tmpfs" {
+                return None;
+            }
+            let node_local = advertised
+                .and_then(|drivers| drivers.get(&driver))
+                .and_then(|caps| caps.get("nodeLocal"))
+                .and_then(Value::as_bool)
+                .unwrap_or_else(|| {
+                    // Unadvertised: assume the built-ins' locality (nfs is the
+                    // one remote built-in), and treat unknown drivers as local
+                    // — over-counting delays a placement; under-counting fills
+                    // a disk.
+                    driver != "nfs"
+                });
+            node_local.then_some(size)
+        })
+        .sum()
+}
+
+/// Free disk on a node, from the kitchen-sink fingerprint
+/// (`disk_available_space`, bytes as a string). `None` when the node does not
+/// report it — the disk check is skipped for such nodes rather than excluding
+/// them on missing data.
+fn fingerprint_disk_free_bytes(node: &Node) -> Option<u64> {
+    match node.fingerprint_attrs.get("disk_available_space")? {
+        Value::String(raw) => raw.parse().ok(),
+        Value::Number(number) => number.as_u64(),
+        _ => None,
+    }
 }
 
 fn group_nodes_by_attr<'a>(nodes: &'a [&'a Node], key: &str) -> HashMap<String, Vec<&'a Node>> {

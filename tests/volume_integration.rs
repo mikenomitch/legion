@@ -47,9 +47,14 @@ impl Cluster {
         })
     }
 
-    /// A node advertising the built-in plugins, so admission and placement see
+    /// A node advertising the built-in drivers, so admission and placement see
     /// realistic capability data instead of the pre-fingerprinting fallback.
     fn add_node(&self, id: &str) -> R<()> {
+        self.add_node_with_disk(id, 100 * 1024 * 1024 * 1024)
+    }
+
+    /// Same, with an explicit free-disk figure for placement-accounting tests.
+    fn add_node_with_disk(&self, id: &str, disk_free_bytes: u64) -> R<()> {
         let mut fingerprint = Map::new();
         fingerprint.insert("arch".into(), json!("aarch64"));
         fingerprint.insert(
@@ -67,6 +72,11 @@ impl Cluster {
             }),
         );
         fingerprint.insert("memory_total".into(), json!("68719476736"));
+        fingerprint.insert("disk_total_space".into(), json!("214748364800"));
+        fingerprint.insert(
+            "disk_available_space".into(),
+            json!(disk_free_bytes.to_string()),
+        );
         fingerprint.insert(
             "cpus".into(),
             json!({ "cpu-1": { "frequency": 2000.0 }, "cpu-2": { "frequency": 2000.0 } }),
@@ -479,5 +489,77 @@ fn stateless_jobs_create_no_volumes() -> R<()> {
         cluster.volumes()?.is_empty(),
         "jobs without storage are untouched by the volume system"
     );
+    Ok(())
+}
+
+#[test]
+fn delete_refuses_while_a_live_allocation_mounts_the_volume() -> R<()> {
+    let mut cluster = Cluster::new()?;
+    cluster.add_node(NODE_A)?;
+    cluster.submit(stateful_job("db", 1, "local-dir", None))?;
+    let volume = cluster.volumes()?.remove(0);
+    cluster.report_mounted(&volume.volume_id, NODE_A, true)?;
+
+    // The instance is bound to a live allocation, so an un-forced delete must
+    // refuse: detaching the handle and reclaiming under a running database is
+    // the one mistake the lifecycle must never allow.
+    let refreshed = cluster
+        .store
+        .get_volume(&volume.volume_id)?
+        .context("volume")?;
+    let in_use = cluster.store.volume_in_use(&refreshed)?;
+    assert!(
+        in_use.is_some(),
+        "a bound instance's volume must report in-use"
+    );
+
+    // After the workload is gone, delete proceeds.
+    cluster.store.remove_allocs_for_node(NODE_A)?;
+    let refreshed = cluster
+        .store
+        .get_volume(&volume.volume_id)?
+        .context("volume")?;
+    assert!(cluster.store.volume_in_use(&refreshed)?.is_none());
+    let deleted = cluster.store.delete_volume(&volume.volume_id, false)?;
+    assert_eq!(deleted.state, VolumeState::Destroying);
+    Ok(())
+}
+
+#[test]
+fn node_local_volume_sizes_respect_node_disk() -> R<()> {
+    let mut cluster = Cluster::new()?;
+    // 5 GiB free: fits one 4G volume, not two.
+    cluster.add_node_with_disk(NODE_A, 5 * 1024 * 1024 * 1024)?;
+
+    let err = cluster
+        .submit(stateful_job(
+            "db",
+            2,
+            "local-dir",
+            Some(json!({ "size": "4G" })),
+        ))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("free disk"),
+        "second replica must fail disk fit, got: {err}"
+    );
+    Ok(())
+}
+
+#[test]
+fn remote_volume_sizes_ignore_node_disk() -> R<()> {
+    let mut cluster = Cluster::new()?;
+    // 1 GiB free — far less than the declared size. An nfs volume's bytes live
+    // on the NFS server, so node disk must not gate the placement.
+    cluster.add_node_with_disk(NODE_A, 1024 * 1024 * 1024)?;
+
+    cluster.submit(stateful_job(
+        "db",
+        2,
+        "nfs",
+        Some(json!({ "server": "10.0.0.5", "export": "/exports/legion", "size": "100G" })),
+    ))?;
+    assert_eq!(cluster.volumes()?.len(), 2, "both replicas placed");
     Ok(())
 }

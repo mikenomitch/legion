@@ -66,7 +66,12 @@ pub struct WorkerTaskManager {
     /// Volume drivers plus the mounts held for each allocation. Mounting
     /// happens here, between `prepare_runtime` and `start`, so a task can never
     /// start before its storage is real (see docs/volumes.md).
-    volumes: WorkerVolumeManager,
+    ///
+    /// Behind an `Arc` so the daemon can clone a handle out from under the
+    /// task-manager lock and run slow driver operations (destroys against a
+    /// hung NFS server, say) without chaining that lock — which the heartbeat
+    /// path needs — to a driver's fate.
+    volumes: Arc<WorkerVolumeManager>,
     /// Resolved mount lists per allocation, kept so a worker restart can
     /// re-mount exactly what the manager last dispatched.
     volume_specs: HashMap<i64, Vec<VolumeMount>>,
@@ -109,7 +114,7 @@ impl WorkerTaskManager {
                 Box::new(crate::artifacts::AnonymousCredentials),
             )),
             log_sinks: default_sinks(),
-            volumes: WorkerVolumeManager::new(
+            volumes: Arc::new(WorkerVolumeManager::new(
                 String::new(),
                 crate::volumes::VolumeRuntimeConfig {
                     volume_root: alloc_root_parent.join("volumes"),
@@ -117,7 +122,7 @@ impl WorkerTaskManager {
                     host_volumes: HashMap::new(),
                     plugin_dir: crate::util::plugin_root_dir(),
                 },
-            ),
+            )),
             volume_specs: HashMap::new(),
         }
     }
@@ -205,7 +210,7 @@ impl WorkerTaskManager {
             .parent()
             .map(std::path::Path::to_path_buf)
             .unwrap_or_else(|| self.alloc_root.clone());
-        self.volumes = WorkerVolumeManager::new(
+        self.volumes = Arc::new(WorkerVolumeManager::new(
             node_id,
             crate::volumes::VolumeRuntimeConfig {
                 volume_root: data_dir.join("volumes"),
@@ -213,7 +218,7 @@ impl WorkerTaskManager {
                 host_volumes,
                 plugin_dir: crate::util::plugin_root_dir(),
             },
-        );
+        ));
         info!(
             node_id,
             drivers = ?self.volumes.driver_names(),
@@ -239,9 +244,11 @@ impl WorkerTaskManager {
         self.volumes.requeue_reports(reports);
     }
 
-    /// Run the driver `destroy` for volumes the manager asked to reclaim.
-    pub fn destroy_volumes(&mut self, requests: &[VolumeDestroyRequest]) {
-        self.volumes.destroy_requested(requests);
+    /// A handle to the volume manager for work that must NOT run under the
+    /// task-manager lock — reclaim dispatch, whose driver calls can stall on a
+    /// dead storage backend. Cheap to clone; see the field docs.
+    pub fn volumes_handle(&self) -> Arc<WorkerVolumeManager> {
+        self.volumes.clone()
     }
 
     /// Applies the worker's artifact fetch settings and credential source

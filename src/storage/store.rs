@@ -7044,6 +7044,54 @@ impl Store {
         Ok(())
     }
 
+    /// Is this volume actively backing a running workload right now?
+    ///
+    /// Returns a human-readable "who" when it is. Deleting a mounted volume
+    /// would detach the handle and then `rm -rf` under a live database, so
+    /// `DeleteVolume` refuses while this returns `Some` (unless forced) — the
+    /// same reason Kubernetes puts a protection finalizer on in-use PVCs. The
+    /// worker independently refuses to run a driver `destroy` for a volume it
+    /// currently has mounted, so even a forced delete cannot pull storage out
+    /// from under a running task; force only abandons the bookkeeping.
+    #[instrument(err, skip_all)]
+    pub fn volume_in_use(&self, volume: &Volume) -> R<Option<String>> {
+        let conn = self.read_connection()?;
+        // Instance volume: in use iff its instance's binding points at a live
+        // allocation and the handle still references this volume.
+        if let Some(instance_id) = volume.instance_id.as_deref() {
+            let alloc: Option<i64> = conn
+                .query_row(
+                    "SELECT current_alloc_id FROM instance \
+                     WHERE instance_id = ?1 AND storage_handle = ?2 \
+                     AND current_alloc_id IS NOT NULL;",
+                    params![instance_id, volume.handle()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            return Ok(alloc.map(|alloc_id| {
+                format!("instance {instance_id} (allocation {alloc_id}) is running against it")
+            }));
+        }
+        // Task claim: in use while any allocation of the declaring task lives.
+        if let (Some(job_id), Some(task_name)) =
+            (volume.job_id.as_deref(), volume.task_name.as_deref())
+        {
+            let alloc: Option<i64> = conn
+                .query_row(
+                    "SELECT allocation.id FROM allocation \
+                     INNER JOIN task_config ON task_config.id = allocation.task_config_id \
+                     WHERE task_config.job_id = ?1 AND task_config.name = ?2 LIMIT 1;",
+                    params![job_id, task_name],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            return Ok(alloc.map(|alloc_id| {
+                format!("task {task_name} of job {job_id} (allocation {alloc_id}) mounts it")
+            }));
+        }
+        Ok(None)
+    }
+
     /// Operator-initiated reclaim (`legion volume delete`).
     ///
     /// Without `force` the volume is queued for its driver like any other

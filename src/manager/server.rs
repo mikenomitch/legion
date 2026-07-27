@@ -3599,6 +3599,25 @@ impl Manager for ManagerDaemonService {
             )?;
         }
 
+        // In-use protection: deleting a volume a live workload is writing to
+        // would detach the handle and then reclaim storage under it. Stop the
+        // workload first (job stop / instance stop / scale in); --force remains
+        // the override for storage that is already unreachable.
+        if !inner.force {
+            if let Some(who) = self
+                .store
+                .volume_in_use(&existing)
+                .map_err(|e| map_store_error("Error checking volume usage", e))?
+            {
+                return Err(Status::failed_precondition(format!(
+                    "volume {} is in use: {who}. Stop the workload first, or pass --force to \
+                     abandon the volume record anyway (the worker will still refuse to reclaim \
+                     storage under a live mount)",
+                    inner.volume_id
+                )));
+            }
+        }
+
         let volume = self
             .store
             .delete_volume(&inner.volume_id, inner.force)

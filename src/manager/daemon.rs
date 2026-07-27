@@ -1013,10 +1013,33 @@ async fn load_initial_data(store: &Store, config: &ManagerConfig) -> R<()> {
             None => String::new(),
             Some(volumes) => {
                 for (name, volume) in volumes {
-                    if !volume.path.starts_with('/') {
-                        bail!(
-                            "worker config {path_str}: hostVolumes.{name}.path must be absolute,                              got {:?}",
+                    // Exactly one of path/device: a path serves filesystem
+                    // claims, a device serves block claims, and an entry with
+                    // both would be ambiguous about which a claim gets.
+                    match (volume.path.trim().is_empty(), volume.device.as_deref()) {
+                        (true, None) => bail!(
+                            "worker config {path_str}: hostVolumes.{name} needs a `path` \
+                             (filesystem) or a `device` (block)"
+                        ),
+                        (false, Some(_)) => bail!(
+                            "worker config {path_str}: hostVolumes.{name} declares both `path` \
+                             and `device`; declare two entries if you mean both"
+                        ),
+                        (false, None) if !volume.path.starts_with('/') => bail!(
+                            "worker config {path_str}: hostVolumes.{name}.path must be absolute, \
+                             got {:?}",
                             volume.path
+                        ),
+                        (true, Some(device)) if !device.starts_with('/') => bail!(
+                            "worker config {path_str}: hostVolumes.{name}.device must be \
+                             absolute, got {device:?}"
+                        ),
+                        _ => {}
+                    }
+                    if volume.create && volume.device.is_some() {
+                        bail!(
+                            "worker config {path_str}: hostVolumes.{name} sets `create` on a \
+                             `device` entry; Legion never creates or formats devices"
                         );
                     }
                 }
