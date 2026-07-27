@@ -116,6 +116,7 @@ fn build_apple_launch(
     allocation: &Allocation,
     config: &ContainerTaskConfig,
     env: &HashMap<String, String>,
+    volumes: &[crate::task_plugins::RuntimeVolume],
 ) -> Vec<String> {
     let mut args = vec![
         "run".to_string(),
@@ -126,6 +127,19 @@ fn build_apple_launch(
     for (key, value) in env {
         args.push("--env".to_string());
         args.push(format!("{key}={value}"));
+    }
+    // Docker-compatible `--volume host:dest[:ro]`. Volumes with no declared
+    // path are skipped; admission rejects that for container tasks.
+    for volume in volumes {
+        let Some(destination) = volume.path.as_deref() else {
+            continue;
+        };
+        args.push("--volume".to_string());
+        let suffix = if volume.read_only { ":ro" } else { "" };
+        args.push(format!(
+            "{}:{destination}{suffix}",
+            volume.host_path.display()
+        ));
     }
     args.push(config.image.clone());
     args.push("--".to_string());
@@ -379,6 +393,15 @@ impl TaskPlugin for ContainerTaskPlugin {
                 .into_iter()
                 .collect();
         merged_env.extend(config.env.clone());
+        // Volume vars carry the IN-CONTAINER destination (the worker resolved
+        // them that way for this kind), so they are meaningful inside the
+        // sandbox — unlike LEGION_ALLOC_DIR and friends, which name host paths
+        // the container cannot see.
+        for (key, value) in &runtime.extra_env {
+            if key.starts_with("LEGION_VOLUME_") || key == "LEGION_STORAGE_DIR" {
+                merged_env.insert(key.clone(), value.clone());
+            }
+        }
 
         let mut cmd = match &runtime_kind {
             ContainerRuntime::AppleContainer => {
@@ -389,7 +412,12 @@ impl TaskPlugin for ContainerTaskPlugin {
                     "Starting container task"
                 );
                 let mut cmd = Command::new("container");
-                cmd.args(build_apple_launch(allocation, &config, &merged_env));
+                cmd.args(build_apple_launch(
+                    allocation,
+                    &config,
+                    &merged_env,
+                    &runtime.volumes,
+                ));
                 cmd
             }
             ContainerRuntime::Oci { binary } => {
@@ -414,6 +442,7 @@ impl TaskPlugin for ContainerTaskPlugin {
                     &config.command,
                     &merged_env,
                     &container_name(allocation),
+                    &runtime.volumes,
                 )?;
 
                 info!(
@@ -616,7 +645,7 @@ mod tests {
             "command": ["ls", "-l"],
             "env": { "MODE": "test" }
         }))?;
-        let args = build_apple_launch(&alloc(), &config, &config.env.clone());
+        let args = build_apple_launch(&alloc(), &config, &config.env.clone(), &[]);
         assert_eq!(args[0], "run");
         assert!(args.contains(&"--rm".to_string()));
         assert!(args.contains(&"--env".to_string()));
@@ -757,7 +786,7 @@ mod tests {
         }))?;
         let mut env: HashMap<String, String> = config.env.clone();
         env.insert("LEGION_PORT_HTTP".to_string(), "20000".to_string());
-        let args = build_apple_launch(&alloc(), &config, &env);
+        let args = build_apple_launch(&alloc(), &config, &env, &[]);
         assert!(args.contains(&"LEGION_PORT_HTTP=20000".to_string()));
         Ok(())
     }

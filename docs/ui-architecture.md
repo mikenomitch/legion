@@ -94,6 +94,13 @@ an `afterId` cursor so no events are missed across disconnects.
   (`ResolveService`, unhealthy included) and renders the same layered
   diagnosis as `legion service doctor` (`utils/services.ts`). Endpoint
   addresses link out when the service's `meta.protocol` is web-reachable.
+- `Volumes.tsx`: the volume index (`ListVolumes`) plus a plugin table
+  (`ListVolumeDrivers`). Node-local volumes are marked with `*` because that is
+  the property deciding whether a stateful workload can move at all;
+  `pages/details/VolumeDetail.tsx` shows one volume's plugin params, driver
+  metadata, node pin, and last driver error. Deletion is CLI-only
+  (`legion volume delete`) — it destroys data, and a two-click confirm in a
+  dashboard is not the right gate for that.
 - `Rollouts.tsx`: rollout list, per-group status, event logs, manual advance action.
 - `Events.tsx`: live scheduler event feed with filtering and pause/resume.
 - `KeyValue.tsx`: key tree browser and CRUD/patch editor.
@@ -116,6 +123,22 @@ Allocation ports and health come from the state store
 (`utils/allocations.ts`): the ledger carries the assigned `network` blob but
 not the owning task name or the health snapshot, so one SQL query joins
 `allocation` → `task_config` → `allocation_health` per job.
+
+## Volumes
+
+Storage is surfaced wherever the question "where is my data" gets asked
+(`utils/volumes.ts` holds the shared state/scope vocabulary):
+
+- **Volumes** (`/volumes`, `/volumes/:id`): the index, with counts for pinned,
+  reclaiming, and driver-erroring volumes, plus a warning banner when a plugin
+  is installed but unusable everywhere (the reason jobs get rejected at submit).
+  Destroyed tombstones are filtered out by default.
+- **Job detail**: each instance's storage handle links to the volume holding
+  that replica's data.
+- **Task detail**: a Volumes card listing this task's live volumes with state,
+  owning instance, and node.
+- **Worker detail**: volumes materialized on that host, with an explicit note
+  that draining or losing the node strands the node-local ones.
 
 ## Stateful Workloads
 

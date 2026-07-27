@@ -177,15 +177,15 @@ lazy_static! {
 //
 
 pub const WORKER_TYPE_ATTRS: &str = r#"
-name, pool, additional_node_checks, attributes, name_prefix, resources, reserved_resources, max_allocations, artifacts
+name, pool, additional_node_checks, attributes, name_prefix, resources, reserved_resources, max_allocations, artifacts, host_volumes
 "#;
 
 pub const WORKER_TYPE_PARAM_SET: &str = r#"
-pool = :pool, additional_node_checks = :additional_node_checks, attributes = :attributes, name_prefix = :name_prefix, resources = :resources, reserved_resources = :reserved_resources, max_allocations = :max_allocations, artifacts = :artifacts
+pool = :pool, additional_node_checks = :additional_node_checks, attributes = :attributes, name_prefix = :name_prefix, resources = :resources, reserved_resources = :reserved_resources, max_allocations = :max_allocations, artifacts = :artifacts, host_volumes = :host_volumes
 "#;
 
 pub const WORKER_TYPE_ATTRS_VALS: &str = r#"
-:name, :pool, :additional_node_checks, :attributes, :name_prefix, :resources, :reserved_resources, :max_allocations, :artifacts
+:name, :pool, :additional_node_checks, :attributes, :name_prefix, :resources, :reserved_resources, :max_allocations, :artifacts, :host_volumes
 "#;
 
 lazy_static! {
@@ -306,11 +306,11 @@ lazy_static! {
 //
 
 pub const TASK_CONFIG_ATTRS: &str = r#"
-id, name, kind, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_id, job_config_id, identities, stateful, artifacts, network, service, actions
+id, name, kind, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_id, job_config_id, identities, stateful, artifacts, network, service, actions, volumes
 "#;
 
 pub const TASK_CONFIG_INSERT_ATTRS: &str = r#"
-name, kind, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_id, job_config_id, identities, stateful, artifacts, network, service, actions
+name, kind, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_id, job_config_id, identities, stateful, artifacts, network, service, actions, volumes
 "#;
 
 // pub const TASK_CONFIG_PARAM_SET: &str = r#"
@@ -318,7 +318,7 @@ name, kind, count, count_per, group_name, lifecycle, schedule, depends_on, confi
 // "#;
 
 pub const TASK_CONFIG_ATTRS_VALS: &str = r#"
-:name, :kind, :count, :count_per, :group_name, :lifecycle, :schedule, :depends_on, :config, :resources, :constraints, :permit, :affinities, :checks, :on_unhealthy, :kv_injections, :job_id, :job_config_id, :identities, :stateful, :artifacts, :network, :service, :actions
+:name, :kind, :count, :count_per, :group_name, :lifecycle, :schedule, :depends_on, :config, :resources, :constraints, :permit, :affinities, :checks, :on_unhealthy, :kv_injections, :job_id, :job_config_id, :identities, :stateful, :artifacts, :network, :service, :actions, :volumes
 "#;
 
 lazy_static! {

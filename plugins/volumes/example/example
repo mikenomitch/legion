@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# Reference volume driver — the whole contract in one shell script,
+# packaged as an exec plugin under plugins/volumes/.
+#
+# The exec ABI: Legion runs this with the operation as $1 and a JSON request on
+# stdin, and reads a JSON response from stdout. Exit 0 means success; any other
+# exit is a failure, and Legion prefers a `{"error":{...}}` object on stdout
+# over stderr text when composing the message.
+#
+# This driver stores each volume as a directory under `<node.volumeDir>/example/`
+# — functionally the same as the built-in `local-dir`, deliberately, so you can
+# diff behavior against a known-good driver while writing your own.
+#
+# Try it:
+#   legion volume driver test example
+#
+# See docs/volumes.md ("Writing a volume driver") for the full contract.
+set -euo pipefail
+
+op="${1:-}"
+request="$(cat)"
+
+# Minimal scoped JSON string reader: `json_str volume id` reads `.volume.id`.
+#
+# Scoping matters — the request has an `id` inside both `volume` and `node`, and
+# an unscoped search would silently return the wrong one. Real plugins should
+# use `jq` or a language with a JSON parser; this stays dependency-free so the
+# reference runs anywhere Legion does.
+json_str() {
+  local scope="$1" key="$2"
+  printf '%s' "$request" |
+    tr -d '\n' |
+    # Everything after `"<scope>": {`, then the first `"<key>": "…"` before the
+    # object closes.
+    sed -n "s/.*\"$scope\"[[:space:]]*:[[:space:]]*{//p" |
+    sed -n "s/^[^}]*\"$key\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p"
+}
+
+fail() {
+  printf '{"error":{"code":"%s","message":"%s"}}\n' "$1" "$2"
+  exit 1
+}
+
+case "$op" in
+  capabilities)
+    # `available: false` here would tell Legion to skip this node for
+    # placement and explain why in `legion volume plugins`.
+    cat <<'JSON'
+{
+  "apiVersion": 1,
+  "name": "example",
+  "nodeLocal": true,
+  "ephemeral": false,
+  "accessModes": ["single-writer"],
+  "requiredParams": [],
+  "optionalParams": ["mode"],
+  "available": true,
+  "detail": "Reference exec driver: a directory per volume. Copy me."
+}
+JSON
+    ;;
+
+  mount)
+    volume_id="$(json_str volume id)"
+    volume_dir="$(json_str node volumeDir)"
+    [ -n "$volume_id" ] || fail EINVAL "request carried no volume id"
+    [ -n "$volume_dir" ] || fail EINVAL "request carried no node.volumeDir"
+
+    dir="$volume_dir/example/$volume_id"
+    mkdir -p "$dir" || fail EIO "could not create $dir"
+    # Idempotent by construction: mkdir -p on an existing directory is a no-op
+    # and we always return the same path.
+    printf '{"apiVersion":1,"mountPath":"%s","attrs":{"driver":"example"}}\n' "$dir"
+    ;;
+
+  unmount)
+    # Nothing is mounted — the task read the directory directly — so releasing
+    # it is a no-op. Data must survive: never delete here.
+    echo '{}'
+    ;;
+
+  destroy)
+    volume_id="$(json_str volume id)"
+    volume_dir="$(json_str node volumeDir)"
+    dir="$volume_dir/example/$volume_id"
+    # Destroying something already gone is a success, not an error.
+    rm -rf "$dir"
+    echo '{}'
+    ;;
+
+  *)
+    fail ENOTSUP "unsupported operation: $op"
+    ;;
+esac

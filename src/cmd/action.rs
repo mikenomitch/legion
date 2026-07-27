@@ -114,7 +114,10 @@ async fn list(matches: &ArgMatches) -> R<()> {
 
 async fn run(matches: &ArgMatches) -> R<()> {
     let job = matches.get_one::<String>("job").expect("required").clone();
-    let action = matches.get_one::<String>("action").expect("required").clone();
+    let action = matches
+        .get_one::<String>("action")
+        .expect("required")
+        .clone();
     let tty = matches.get_flag("tty");
     let want_stdin = matches.get_flag("stdin") || tty;
 
@@ -163,7 +166,11 @@ async fn newest_alloc_for_job(
     let mut best: Option<i64> = None;
     for node in ledger.nodes {
         for alloc in node.allocations {
-            if alloc.job_id == job && (alloc.status == "placed" || alloc.status == "active" || alloc.status == "running") {
+            if alloc.job_id == job
+                && (alloc.status == "placed"
+                    || alloc.status == "active"
+                    || alloc.status == "running")
+            {
                 best = Some(best.map_or(alloc.id, |b| b.max(alloc.id)));
             }
         }

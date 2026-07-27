@@ -63,7 +63,7 @@ When one is required and what goes in it:
 | [service-discovery-critique.md](plans/service-discovery-critique.md) | superseded (self-critique) |
 | [stateful-workloads-and-instance-identity-plan.md](plans/stateful-workloads-and-instance-identity-plan.md) | shipped |
 | [workload-identity-oidc-plan.md](plans/workload-identity-oidc-plan.md) | shipped (task identities) |
-| [volume-plugin-system-plan.md](plans/volume-plugin-system-plan.md) | planned |
+| [volume-plugin-system-plan.md](plans/volume-plugin-system-plan.md) | shipped (v1; CSI bridge + snapshot/clone deferred) |
 | [shared-alloc-dir-proposal.md](plans/shared-alloc-dir-proposal.md) | proposal |
 
 ## Judgement calls

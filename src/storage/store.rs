@@ -27,10 +27,11 @@ use crate::structs::{
     ManagerNodeConfig, Node, NodeMsg, ReplaceAfter, ResolvedOnLostPolicy, Rollout, RolloutConfig,
     SigningKeyRecord, StatefulConfig, StatefulOnLostConfig, Submission, TaskCheck, TaskConfig,
     TaskCount, TaskDependency, TaskLifecycle, TaskOnUnhealthyConfig, TaskSchedule, TaskStatusState,
-    WorkerConfig,
+    Volume, WorkerConfig,
 };
 use crate::util::random_string;
 
+use lazy_static::lazy_static;
 use rand::{thread_rng, Rng};
 use rusqlite::{
     named_params, params, params_from_iter, types::ValueRef, Connection, Error as RusqliteError,
@@ -504,7 +505,7 @@ impl Store {
 
         let mut task_stmt = conn.prepare(
             r#"
-            SELECT id, name, kind, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_config_id, identities, stateful, artifacts, network, service, actions
+            SELECT id, name, kind, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_config_id, identities, stateful, artifacts, network, service, actions, volumes
             FROM task_config;
             "#,
         )?;
@@ -541,6 +542,7 @@ impl Store {
                 network: parse_json_column(21, row.get(21)?)?,
                 service: parse_json_column(22, row.get(22)?)?,
                 actions: self.parse_actions_column(23, row.get(23)?)?,
+                volumes: self.parse_volumes_column(24, row.get(24)?)?,
             };
             let job_config_id: String = row.get(17)?;
             Ok((job_config_id, id, task))
@@ -1327,6 +1329,7 @@ impl Store {
             reserved_resources,
             max_allocations,
             artifacts,
+            host_volumes: row.get(9)?,
         })
     }
 
@@ -1411,6 +1414,23 @@ impl Store {
         idx: usize,
         raw: Option<String>,
     ) -> Result<Vec<crate::structs::ArtifactSpec>, rusqlite::Error> {
+        let Some(raw) = raw else {
+            return Ok(Vec::new());
+        };
+        serde_json::from_str(&raw).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(
+                idx,
+                rusqlite::types::Type::Text,
+                Box::new(err),
+            )
+        })
+    }
+
+    fn parse_volumes_column(
+        &self,
+        idx: usize,
+        raw: Option<String>,
+    ) -> Result<Vec<crate::structs::VolumeSpec>, rusqlite::Error> {
         let Some(raw) = raw else {
             return Ok(Vec::new());
         };
@@ -1520,6 +1540,7 @@ impl Store {
             network: parse_json_column(22, row.get(22)?)?,
             service: parse_json_column(23, row.get(23)?)?,
             actions: self.parse_actions_column(24, row.get(24)?)?,
+            volumes: self.parse_volumes_column(25, row.get(25)?)?,
         };
 
         Ok(task_config)
@@ -2025,6 +2046,7 @@ impl Store {
             ":reserved_resources": reserved_resources_to_save,
             ":max_allocations": config.max_allocations,
             ":artifacts": config.artifacts,
+            ":host_volumes": config.host_volumes,
         };
 
         let config = conn.query_row(&INSERT_WORKER_TYPE, params, |row| {
@@ -2521,6 +2543,11 @@ impl Store {
             } else {
                 Some(serde_json::to_string(&t.actions)?)
             };
+            let volumes = if t.volumes.is_empty() {
+                None
+            } else {
+                Some(serde_json::to_string(&t.volumes)?)
+            };
             let schedule = t.schedule.as_ref().map(ToString::to_string);
             let task_params = named_params! {
                 ":name": t.name,
@@ -2547,9 +2574,14 @@ impl Store {
                 ":network": network,
                 ":service": service,
                 ":actions": actions,
+                ":volumes": volumes,
             };
 
             let task_id: i64 = tx.query_row(&INSERT_TASK, task_params, |row| row.get(0))?;
+            // Claim rows exist from submit so `legion volume list` shows what a
+            // job asked for before anything is placed, and a resubmit refreshes
+            // params without disturbing a live volume's pin.
+            self.sync_task_volume_claims_tx(&tx, &job.id, t)?;
             task_ids.push(task_id);
         }
 
@@ -3483,7 +3515,7 @@ impl Store {
         // Stateful tasks: pick (or re-materialize) the instance this
         // allocation will fulfill before writing the row, so the binding is
         // atomic with the placement.
-        let instance_id = self.assign_stateful_instance_tx(tx, task_id)?;
+        let instance_id = self.assign_stateful_instance_tx(tx, task_id, node_id)?;
 
         let params = named_params! {
             ":status": "placed",
@@ -3525,7 +3557,12 @@ impl Store {
     ///   config. Instances only come into existence via CreateInstance; this
     ///   never creates one. Keyed ids are not ordinals, so "any unbound" is
     ///   correct — a rescheduling instance is simply the unbound one.
-    fn assign_stateful_instance_tx(&self, tx: &Transaction<'_>, task_id: i64) -> R<Option<String>> {
+    fn assign_stateful_instance_tx(
+        &self,
+        tx: &Transaction<'_>,
+        task_id: i64,
+        node_id: &str,
+    ) -> R<Option<String>> {
         let (job_id, group, task_name, count, stateful): (
             String,
             String,
@@ -3553,7 +3590,9 @@ impl Store {
             .with_context(|| format!("invalid stateful config for task {task_name}"))?;
         if stateful.mode == InstanceMode::Keyed {
             return self
-                .assign_keyed_instance_tx(tx, task_id, &job_id, &group, &task_name, &stateful)
+                .assign_keyed_instance_tx(
+                    tx, task_id, &job_id, &group, &task_name, &stateful, node_id,
+                )
                 .map(Some);
         }
 
@@ -3599,8 +3638,24 @@ impl Store {
         .collect();
 
         let desired = count.max(0) as u32;
-        let slot = (0..desired)
-            .find(|slot| !taken.contains(slot) && !job_taken.contains(slot))
+        // Node-local storage makes slot choice matter: an allocation that
+        // landed on node-a1 must bind the slot whose data is ON node-a1, not
+        // just the lowest free one. Preferring the pinned slot makes the
+        // planner's pin and the binder's choice agree even if their orderings
+        // diverge — the allocation always meets its own data.
+        let pinned_slot = (0..desired)
+            .filter(|slot| !taken.contains(slot))
+            .find(|slot| {
+                let candidate = slot_instance_id(&job_id, &group, *slot);
+                matches!(
+                    self.pinned_node_for_instance_tx(tx, &candidate),
+                    Ok(Some(pinned)) if pinned == node_id
+                )
+            });
+        let slot = pinned_slot
+            .or_else(|| {
+                (0..desired).find(|slot| !taken.contains(slot) && !job_taken.contains(slot))
+            })
             .or_else(|| (0..desired).find(|slot| !taken.contains(slot)))
             .with_context(|| {
                 format!(
@@ -3647,9 +3702,16 @@ impl Store {
                 // Terminated slot: the same id and storage handle come back.
                 // Mint a handle only if none was retained and the task (still)
                 // declares storage.
-                let storage_handle = existing
-                    .storage_handle
-                    .or_else(|| stateful.storage.as_ref().map(|_| mint_storage_handle()));
+                let storage_handle = match existing.storage_handle {
+                    Some(handle) => Some(handle),
+                    None => self.mint_instance_volume_tx(
+                        tx,
+                        &instance_id,
+                        &job_id,
+                        &task_name,
+                        stateful.storage.as_ref(),
+                    )?,
+                };
                 tx.execute(
                     "UPDATE instance SET task_name = ?1, storage_handle = ?2, updated_at = ?3 \
                      WHERE instance_id = ?4;",
@@ -3657,7 +3719,13 @@ impl Store {
                 )?;
             }
             None => {
-                let storage_handle = stateful.storage.as_ref().map(|_| mint_storage_handle());
+                let storage_handle = self.mint_instance_volume_tx(
+                    tx,
+                    &instance_id,
+                    &job_id,
+                    &task_name,
+                    stateful.storage.as_ref(),
+                )?;
                 tx.execute(
                     "INSERT INTO instance (instance_id, job_id, group_name, task_name, mode, \
                      state, slot_index, current_alloc_id, storage_handle, created_at, updated_at) \
@@ -3699,19 +3767,32 @@ impl Store {
         group: &str,
         task_name: &str,
         stateful: &StatefulConfig,
+        node_id: &str,
     ) -> R<String> {
+        // Unbound live instances of this (job, group, task), oldest first.
+        // Ordering by `node_local_pin DESC` first makes an allocation bind the
+        // instance whose node-local data already lives on the node it landed
+        // on; without a pin the ordering is unchanged (oldest wins), so keyed
+        // binding without volumes behaves exactly as before.
         let instance: Option<Instance> = tx
             .query_row(
-                "SELECT instance_id, job_id, group_name, task_name, mode, state, slot_index, \
-                 current_alloc_id, storage_handle, created_at, updated_at FROM instance \
-                 WHERE job_id = ?1 AND group_name = ?2 AND task_name = ?3 \
-                 AND mode = 'keyed' AND state NOT IN ('terminated', 'stopped') \
-                 AND instance_id NOT IN (\
+                "SELECT instance.instance_id, instance.job_id, instance.group_name, \
+                 instance.task_name, instance.mode, instance.state, instance.slot_index, \
+                 instance.current_alloc_id, instance.storage_handle, instance.created_at, \
+                 instance.updated_at FROM instance \
+                 LEFT JOIN volume ON volume.instance_id = instance.instance_id \
+                 AND volume.node_local = 1 AND volume.state IN ('pending', 'created') \
+                 AND instance.storage_handle = volume.driver || '/' || volume.volume_id \
+                 WHERE instance.job_id = ?1 AND instance.group_name = ?2 \
+                 AND instance.task_name = ?3 \
+                 AND instance.mode = 'keyed' AND instance.state NOT IN ('terminated', 'stopped') \
+                 AND instance.instance_id NOT IN (\
                      SELECT instance_id FROM allocation \
                      WHERE task_config_id = ?4 AND instance_id IS NOT NULL\
                  ) \
-                 ORDER BY created_at ASC, instance_id ASC LIMIT 1;",
-                params![job_id, group, task_name, task_id],
+                 ORDER BY (volume.node_id = ?5) DESC, instance.created_at ASC, \
+                 instance.instance_id ASC LIMIT 1;",
+                params![job_id, group, task_name, task_id, node_id],
                 |row| self.instance_from_row(row),
             )
             .optional()?;
@@ -3723,12 +3804,21 @@ impl Store {
             )
         })?;
 
-        if instance.storage_handle.is_none() && stateful.storage.is_some() {
-            let now = Self::now_rfc3339()?;
-            tx.execute(
-                "UPDATE instance SET storage_handle = ?1, updated_at = ?2 WHERE instance_id = ?3;",
-                params![mint_storage_handle(), now, instance.instance_id],
-            )?;
+        if instance.storage_handle.is_none() {
+            if let Some(handle) = self.mint_instance_volume_tx(
+                tx,
+                &instance.instance_id,
+                job_id,
+                task_name,
+                stateful.storage.as_ref(),
+            )? {
+                let now = Self::now_rfc3339()?;
+                tx.execute(
+                    "UPDATE instance SET storage_handle = ?1, updated_at = ?2 \
+                     WHERE instance_id = ?3;",
+                    params![handle, now, instance.instance_id],
+                )?;
+            }
         }
 
         Ok(instance.instance_id)
@@ -6511,14 +6601,735 @@ impl Store {
         let rows = stmt.query_map([job_id], |row| self.job_kv_reference_from_row(row))?;
         Self::collect_rows(rows)
     }
+
+    // =====
+    // VOLUMES
+    // =====
+    //
+    // The manager owns the volume state machine; workers own the drivers. See
+    // docs/volumes.md and internal_docs/plans/volume-plugin-system-plan.md.
+
+    fn volume_from_row(&self, row: &Row<'_>) -> Result<Volume, rusqlite::Error> {
+        let state: String = row.get(6)?;
+        Ok(Volume {
+            volume_id: row.get(0)?,
+            name: row.get(1)?,
+            driver: row.get(2)?,
+            job_id: row.get(3)?,
+            instance_id: row.get(4)?,
+            task_name: row.get(5)?,
+            state: state.parse().map_err(|err: String| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    6,
+                    rusqlite::types::Type::Text,
+                    Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, err)),
+                )
+            })?,
+            node_id: row.get(7)?,
+            node_local: row.get::<_, i64>(8)? != 0,
+            read_only: row.get::<_, i64>(9)? != 0,
+            params: parse_json_map_column(10, row.get(10)?)?,
+            attrs: parse_json_map_column(11, row.get(11)?)?,
+            mount_path: row.get(12)?,
+            last_error: row.get(13)?,
+            created_at: row.get(14)?,
+            updated_at: row.get(15)?,
+            volume_mode: row.get::<_, String>(16)?.parse().map_err(|err: String| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    16,
+                    rusqlite::types::Type::Text,
+                    Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, err)),
+                )
+            })?,
+            fs: row.get(17)?,
+        })
+    }
+
+    /// Mint an instance's storage handle and the volume row behind it.
+    ///
+    /// Both happen in the SAME transaction as the placement, so a handle can
+    /// never exist without a row — which is what lets the reaper treat "no
+    /// instance references this volume" as an unambiguous reclaim signal.
+    /// Returns `None` for tasks that declare no `stateful.storage`.
+    fn mint_instance_volume_tx(
+        &self,
+        tx: &Transaction<'_>,
+        instance_id: &str,
+        job_id: &str,
+        task_name: &str,
+        storage: Option<&crate::structs::StatefulStorageConfig>,
+    ) -> R<Option<String>> {
+        let Some(storage) = storage else {
+            return Ok(None);
+        };
+        let driver = storage.driver_name().to_string();
+        // Mint the handle first so the format lives in exactly one place, then
+        // split the id back out for the row.
+        let handle = mint_storage_handle(&driver);
+        let volume_id = handle
+            .split_once('/')
+            .map(|(_, id)| id.to_string())
+            .context("minted storage handle is malformed")?;
+        let now = Self::now_rfc3339()?;
+        let params = serde_json::to_string(&storage.param_map())?;
+        // The manager learns node-locality from worker fingerprints. Default
+        // to `true` when nothing advertises the plugin yet: wrongly pinning
+        // costs a placement delay, while wrongly NOT pinning silently starts
+        // the workload on an empty volume. Corrected on first mount, when the
+        // worker reports what the driver actually said.
+        let node_local = self.driver_is_node_local_tx(tx, &driver)?;
+        tx.execute(
+            "INSERT INTO volume (volume_id, name, driver, job_id, instance_id, task_name, \
+             state, node_id, node_local, read_only, params, attrs, mount_path, last_error, \
+             created_at, updated_at, volume_mode, fs) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', NULL, ?7, 0, ?8, '{}', NULL, NULL, ?9, \
+             ?9, ?10, ?11);",
+            params![
+                volume_id,
+                crate::structs::INSTANCE_VOLUME_NAME,
+                driver,
+                job_id,
+                instance_id,
+                task_name,
+                node_local as i64,
+                params,
+                now,
+                storage.volume_mode().as_str(),
+                (storage.volume_mode() == crate::volumes::VolumeMode::Block).then(|| storage
+                    .param_map()
+                    .get("fs")
+                    .and_then(Value::as_str)
+                    .unwrap_or(crate::volumes::DEFAULT_BLOCK_FS)
+                    .to_string()),
+            ],
+        )?;
+        info!(volume_id, driver, instance_id, "Minted instance volume");
+        Ok(Some(handle))
+    }
+
+    /// Upsert the volume rows behind a task's `volumes[]` claims.
+    ///
+    /// Claims are **shared**: their id is derived from
+    /// `(job, group, task, name)`, so every allocation of the task mounts the
+    /// same volume. That is what "claim of storage that already exists" means —
+    /// a read-only `/mnt/models` shared by ten replicas is the point. Per-
+    /// allocation scratch is `$LEGION_TASK_DIR`, not a volume.
+    ///
+    /// Unlike instance volumes these have no `instance_id`, so instance churn
+    /// never reclaims them; only a job destroy (via the reaper) or an explicit
+    /// `legion volume delete` does.
+    fn sync_task_volume_claims_tx(
+        &self,
+        tx: &Transaction<'_>,
+        job_id: &str,
+        task: &TaskConfig,
+    ) -> R<()> {
+        let now = Self::now_rfc3339()?;
+        for claim in &task.volumes {
+            let volume_id = claim_volume_id(job_id, &task.group, &task.name, &claim.name);
+            let driver = claim.driver_name().to_string();
+            let node_local = self.driver_is_node_local_tx(tx, &driver)?;
+            let params = serde_json::to_string(&claim.param_map())?;
+            // Re-submitting a job refreshes params/driver without resetting a
+            // live volume's node pin or state — EXCEPT when the row is a
+            // tombstone. A claim id is a pure function of (job, group, task,
+            // name), so re-declaring one after a job destroy lands on the same
+            // row; leaving it `destroyed` would make the claim invisible in
+            // `legion volume list` and immune to the reaper, even though the
+            // worker happily mounts it.
+            tx.execute(
+                "INSERT INTO volume (volume_id, name, driver, job_id, instance_id, task_name, \
+                 state, node_id, node_local, read_only, params, attrs, mount_path, last_error, \
+                 created_at, updated_at, volume_mode) \
+                 VALUES (?1, ?2, ?3, ?4, NULL, ?5, 'pending', NULL, ?6, ?7, ?8, '{}', NULL, \
+                 NULL, ?9, ?9, ?10) \
+                 ON CONFLICT(volume_id) DO UPDATE SET \
+                 driver = ?3, job_id = ?4, task_name = ?5, node_local = ?6, read_only = ?7, \
+                 params = ?8, updated_at = ?9, volume_mode = ?10, \
+                 state = CASE WHEN volume.state = 'destroyed' THEN 'pending' ELSE volume.state END, \
+                 last_error = CASE WHEN volume.state = 'destroyed' THEN NULL ELSE volume.last_error END;",
+                params![
+                    volume_id,
+                    claim.name,
+                    driver,
+                    job_id,
+                    task.name,
+                    node_local as i64,
+                    claim.is_read_only() as i64,
+                    params,
+                    now,
+                    claim.volume_mode().as_str(),
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The volume mounts a worker must materialize for one allocation.
+    ///
+    /// Resolves the task's declarations against the `volume` table so the
+    /// worker receives concrete ids and the driver attrs from previous mounts —
+    /// it never re-derives a volume from the jobspec. Instance storage comes
+    /// first so `LEGION_STORAGE_DIR` is unambiguous.
+    #[instrument(err, skip_all)]
+    pub fn volume_mounts_for_allocation(
+        &self,
+        job_id: &str,
+        task: &TaskConfig,
+        instance: Option<&Instance>,
+    ) -> R<Vec<crate::structs::VolumeMount>> {
+        let mut mounts = Vec::new();
+
+        if let (Some(storage), Some(instance)) = (
+            task.stateful
+                .as_ref()
+                .and_then(|stateful| stateful.storage.as_ref()),
+            instance,
+        ) {
+            if let Some(handle) = instance.storage_handle.as_deref() {
+                let handle = crate::volumes::StorageHandle::parse(handle)?;
+                let attrs = self
+                    .get_volume(&handle.volume_id)?
+                    .map(|volume| volume.attrs)
+                    .unwrap_or_default();
+                mounts.push(crate::structs::VolumeMount {
+                    volume_id: handle.volume_id,
+                    name: crate::structs::INSTANCE_VOLUME_NAME.to_string(),
+                    driver: handle.driver,
+                    mode: storage.volume_mode(),
+                    params: storage.param_map(),
+                    attrs,
+                    path: Some(storage.path.clone()),
+                    read_only: false,
+                    instance_volume: true,
+                });
+            }
+        }
+
+        for claim in &task.volumes {
+            let volume_id = claim_volume_id(job_id, &task.group, &task.name, &claim.name);
+            let attrs = self
+                .get_volume(&volume_id)?
+                .map(|volume| volume.attrs)
+                .unwrap_or_default();
+            mounts.push(crate::structs::VolumeMount {
+                volume_id,
+                name: claim.name.clone(),
+                driver: claim.driver_name().to_string(),
+                mode: claim.volume_mode(),
+                params: claim.param_map(),
+                attrs,
+                path: claim.path.clone(),
+                read_only: claim.is_read_only(),
+                instance_volume: false,
+            });
+        }
+
+        Ok(mounts)
+    }
+
+    /// Whether any node advertises `driver` as node-local. Unknown drivers are
+    /// treated as node-local (see [`Self::mint_instance_volume_tx`]).
+    fn driver_is_node_local_tx(&self, tx: &Transaction<'_>, driver: &str) -> R<bool> {
+        let mut stmt = tx.prepare("SELECT fingerprint_attrs FROM node;")?;
+        let rows = stmt.query_map([], |row| row.get::<_, Value>(0))?;
+        for row in rows {
+            let Ok(attrs) = row else { continue };
+            if let Some(node_local) = attrs
+                .get("volumeDrivers")
+                .and_then(|drivers| drivers.get(driver))
+                .and_then(|caps| caps.get("nodeLocal"))
+                .and_then(Value::as_bool)
+            {
+                return Ok(node_local);
+            }
+        }
+        Ok(true)
+    }
+
+    #[instrument(err, skip_all)]
+    pub fn get_volume(&self, volume_id: &str) -> R<Option<Volume>> {
+        let conn = self.read_connection()?;
+        let volume = conn
+            .query_row(VOLUME_SELECT.as_str(), [volume_id], |row| {
+                self.volume_from_row(row)
+            })
+            .optional()?;
+        Ok(volume)
+    }
+
+    /// Volumes matching the given filters, newest first. Every filter is
+    /// optional; passing none lists the whole cluster.
+    #[instrument(err, skip_all)]
+    pub fn list_volumes(&self, filter: &VolumeFilter) -> R<Vec<Volume>> {
+        let conn = self.read_connection()?;
+        let mut sql = VOLUME_SELECT_ALL.clone();
+        let mut clauses: Vec<String> = Vec::new();
+        let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if let Some(job_id) = filter.job_id.as_deref() {
+            clauses.push(format!("job_id = ?{}", args.len() + 1));
+            args.push(Box::new(job_id.to_string()));
+        }
+        if let Some(node_id) = filter.node_id.as_deref() {
+            clauses.push(format!("node_id = ?{}", args.len() + 1));
+            args.push(Box::new(node_id.to_string()));
+        }
+        if let Some(driver) = filter.driver.as_deref() {
+            clauses.push(format!("driver = ?{}", args.len() + 1));
+            args.push(Box::new(driver.to_string()));
+        }
+        if let Some(instance_id) = filter.instance_id.as_deref() {
+            clauses.push(format!("instance_id = ?{}", args.len() + 1));
+            args.push(Box::new(instance_id.to_string()));
+        }
+        if let Some(state) = filter.state {
+            clauses.push(format!("state = ?{}", args.len() + 1));
+            args.push(Box::new(state.as_str().to_string()));
+        }
+        if !clauses.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&clauses.join(" AND "));
+        }
+        sql.push_str(" ORDER BY created_at DESC, volume_id ASC;");
+
+        let mut stmt = conn.prepare(&sql)?;
+        let refs = args
+            .iter()
+            .map(|arg| arg.as_ref() as &dyn rusqlite::ToSql)
+            .collect::<Vec<_>>();
+        let rows = stmt.query_map(refs.as_slice(), |row| self.volume_from_row(row))?;
+        Self::collect_rows(rows)
+    }
+
+    /// Record a successful mount reported by a worker: pin the node, refresh
+    /// the driver's attrs, and clear any previous error.
+    ///
+    /// This is where `node_local` becomes authoritative — the worker asked the
+    /// driver, so its answer beats the manager's mint-time guess.
+    #[instrument(err, skip_all)]
+    pub fn record_volume_mounted(
+        &self,
+        volume_id: &str,
+        node_id: &str,
+        mount_path: &str,
+        node_local: bool,
+        fs: Option<&str>,
+        attrs: &BTreeMap<String, Value>,
+    ) -> R<()> {
+        let conn = self.write_connection()?;
+        let now = Self::now_rfc3339()?;
+        let attrs_json = serde_json::to_string(attrs)?;
+        // A successful mount is proof the storage exists and is in use, so it
+        // is allowed to correct a stale `destroyed` tombstone — a task volume
+        // claim re-declared after a job destroy lands on the same deterministic
+        // id, and leaving it tombstoned would make a mounted volume invisible
+        // in `legion volume list` and immune to the reaper.
+        //
+        // `destroying` is the one state a mount report must NOT overwrite: a
+        // reclaim is deliberately in flight, and resurrecting the row would
+        // race the driver's destroy.
+        conn.execute(
+            "UPDATE volume SET state = 'created', node_id = ?1, mount_path = ?2, \
+             node_local = ?3, attrs = ?4, fs = COALESCE(?5, fs), last_error = NULL, \
+             updated_at = ?6 WHERE volume_id = ?7 AND state != 'destroying';",
+            params![
+                node_id,
+                mount_path,
+                node_local as i64,
+                attrs_json,
+                fs,
+                now,
+                volume_id
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Record a driver failure against a volume so it explains itself in
+    /// `legion volume list` instead of only in a worker log.
+    #[instrument(err, skip_all)]
+    pub fn record_volume_error(&self, volume_id: &str, error: &str) -> R<()> {
+        let conn = self.write_connection()?;
+        let now = Self::now_rfc3339()?;
+        conn.execute(
+            "UPDATE volume SET last_error = ?1, updated_at = ?2 WHERE volume_id = ?3;",
+            params![error, now, volume_id],
+        )?;
+        Ok(())
+    }
+
+    /// Mark every live volume no instance references as `destroying`.
+    ///
+    /// One rule covers every way a handle can be dropped — keyed destroy, slot
+    /// scale-in with `retainOnScaleIn: false`, `retainOnStop: false` on job
+    /// stop, and a job destroy that cascades the instance rows away. Reclaim
+    /// therefore cannot be forgotten by a code path that drops a handle
+    /// without knowing about volumes.
+    ///
+    /// Returns the volumes newly marked, for event emission.
+    #[instrument(err, skip_all)]
+    pub fn reap_orphaned_volumes(&self) -> R<Vec<Volume>> {
+        let mut conn = self.write_connection()?;
+        let tx = conn.transaction()?;
+        let now = Self::now_rfc3339()?;
+        let orphans: Vec<Volume> = {
+            let mut stmt = tx.prepare(&format!(
+                // Two orphan rules, one query:
+                //  - an INSTANCE volume no instance references any more (keyed
+                //    destroy, scale-in without retention, retainOnStop: false,
+                //    or a job destroy that cascaded the instance rows away);
+                //  - a task CLAIM whose job no longer exists.
+                // Reconciling on "nothing references this" means no handle-drop
+                // path can forget to free storage.
+                "{} WHERE state IN ('pending', 'created') AND (\
+                     (instance_id IS NOT NULL AND NOT EXISTS (\
+                         SELECT 1 FROM instance \
+                         WHERE instance.instance_id = volume.instance_id \
+                         AND instance.storage_handle = volume.driver || '/' || volume.volume_id\
+                     )) \
+                     OR (instance_id IS NULL AND job_id IS NOT NULL AND NOT EXISTS (\
+                         SELECT 1 FROM job WHERE job.id = volume.job_id\
+                     ))\
+                 );",
+                *VOLUME_SELECT_ALL
+            ))?;
+            let rows = stmt.query_map([], |row| self.volume_from_row(row))?;
+            Self::collect_rows(rows)?
+        };
+        for volume in &orphans {
+            tx.execute(
+                "UPDATE volume SET state = 'destroying', updated_at = ?1 WHERE volume_id = ?2;",
+                params![now, volume.volume_id],
+            )?;
+        }
+        tx.commit()?;
+        if !orphans.is_empty() {
+            info!(
+                count = orphans.len(),
+                "Marked orphaned volumes for reclamation"
+            );
+        }
+        Ok(orphans)
+    }
+
+    /// Volumes this node should run `destroy` for.
+    ///
+    /// A node-local volume can only be reclaimed by its own node. A volume
+    /// with no pin (never mounted, or a network driver) may be reclaimed by
+    /// any node that has the plugin — the caller filters on that.
+    #[instrument(err, skip_all)]
+    pub fn volumes_to_destroy_for_node(&self, node_id: &str) -> R<Vec<Volume>> {
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare(&format!(
+            "{} WHERE state = 'destroying' \
+             AND (node_id = ?1 OR node_id IS NULL OR node_local = 0) \
+             ORDER BY updated_at ASC;",
+            *VOLUME_SELECT_ALL
+        ))?;
+        let rows = stmt.query_map([node_id], |row| self.volume_from_row(row))?;
+        Self::collect_rows(rows)
+    }
+
+    /// A worker confirmed the driver reclaimed the volume.
+    #[instrument(err, skip_all)]
+    pub fn mark_volume_destroyed(&self, volume_id: &str) -> R<()> {
+        let conn = self.write_connection()?;
+        let now = Self::now_rfc3339()?;
+        conn.execute(
+            "UPDATE volume SET state = 'destroyed', node_id = NULL, mount_path = NULL, \
+             last_error = NULL, updated_at = ?1 WHERE volume_id = ?2;",
+            params![now, volume_id],
+        )?;
+        info!(volume_id, "Volume destroyed");
+        Ok(())
+    }
+
+    /// Is this volume actively backing a running workload right now?
+    ///
+    /// Returns a human-readable "who" when it is. Deleting a mounted volume
+    /// would detach the handle and then `rm -rf` under a live database, so
+    /// `DeleteVolume` refuses while this returns `Some` (unless forced) — the
+    /// same reason Kubernetes puts a protection finalizer on in-use PVCs. The
+    /// worker independently refuses to run a driver `destroy` for a volume it
+    /// currently has mounted, so even a forced delete cannot pull storage out
+    /// from under a running task; force only abandons the bookkeeping.
+    #[instrument(err, skip_all)]
+    pub fn volume_in_use(&self, volume: &Volume) -> R<Option<String>> {
+        let conn = self.read_connection()?;
+        // Instance volume: in use iff its instance's binding points at a live
+        // allocation and the handle still references this volume.
+        if let Some(instance_id) = volume.instance_id.as_deref() {
+            let alloc: Option<i64> = conn
+                .query_row(
+                    "SELECT current_alloc_id FROM instance \
+                     WHERE instance_id = ?1 AND storage_handle = ?2 \
+                     AND current_alloc_id IS NOT NULL;",
+                    params![instance_id, volume.handle()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            return Ok(alloc.map(|alloc_id| {
+                format!("instance {instance_id} (allocation {alloc_id}) is running against it")
+            }));
+        }
+        // Task claim: in use while any allocation of the declaring task lives.
+        if let (Some(job_id), Some(task_name)) =
+            (volume.job_id.as_deref(), volume.task_name.as_deref())
+        {
+            let alloc: Option<i64> = conn
+                .query_row(
+                    "SELECT allocation.id FROM allocation \
+                     INNER JOIN task_config ON task_config.id = allocation.task_config_id \
+                     WHERE task_config.job_id = ?1 AND task_config.name = ?2 LIMIT 1;",
+                    params![job_id, task_name],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            return Ok(alloc.map(|alloc_id| {
+                format!("task {task_name} of job {job_id} (allocation {alloc_id}) mounts it")
+            }));
+        }
+        Ok(None)
+    }
+
+    /// Operator-initiated reclaim (`legion volume delete`).
+    ///
+    /// Without `force` the volume is queued for its driver like any other
+    /// reclaim. With `force` it is marked `destroyed` immediately, WITHOUT
+    /// driver confirmation — the escape hatch for a node-local volume whose
+    /// node is never coming back. Forcing leaves whatever bytes exist on the
+    /// (dead) node; that is the operator's explicit call, and the reason it is
+    /// not the default.
+    #[instrument(err, skip_all)]
+    pub fn delete_volume(&self, volume_id: &str, force: bool) -> R<Volume> {
+        let mut conn = self.write_connection()?;
+        let tx = conn.transaction()?;
+        let volume: Volume = tx
+            .query_row(VOLUME_SELECT.as_str(), [volume_id], |row| {
+                self.volume_from_row(row)
+            })
+            .optional()?
+            .with_context(|| format!("no volume {volume_id}"))?;
+        let now = Self::now_rfc3339()?;
+
+        // Detaching the handle first means the instance mints a fresh volume
+        // on its next placement instead of pointing at storage being reclaimed.
+        if let Some(instance_id) = volume.instance_id.as_deref() {
+            tx.execute(
+                "UPDATE instance SET storage_handle = NULL, updated_at = ?1 \
+                 WHERE instance_id = ?2 AND storage_handle = ?3;",
+                params![now, instance_id, volume.handle()],
+            )?;
+        }
+        let state = if force { "destroyed" } else { "destroying" };
+        tx.execute(
+            "UPDATE volume SET state = ?1, updated_at = ?2, \
+             node_id = CASE WHEN ?1 = 'destroyed' THEN NULL ELSE node_id END \
+             WHERE volume_id = ?3;",
+            params![state, now, volume_id],
+        )?;
+        tx.commit()?;
+
+        warn!(volume_id, force, "Operator requested volume deletion");
+        self.get_volume(volume_id)?
+            .with_context(|| format!("volume {volume_id} vanished during delete"))
+    }
+
+    /// Node pins for the instances of `task_id` that are awaiting placement.
+    ///
+    /// A node-local volume binds its instance to one node, so a replacement
+    /// allocation for that instance must land there. Returns `(instance_id,
+    /// node_id)` pairs for live instances of this task that have a pinned
+    /// volume and no current allocation — exactly the set the next plan must
+    /// place. Ordered so slot pools are deterministic.
+    #[instrument(err, skip_all)]
+    pub fn pinned_placements_for_task(&self, task_id: i64) -> R<Vec<(String, String)>> {
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare(
+            "SELECT instance.instance_id, volume.node_id \
+             FROM instance \
+             INNER JOIN volume ON volume.instance_id = instance.instance_id \
+             INNER JOIN task_config ON task_config.id = ?1 \
+             WHERE instance.job_id = task_config.job_id \
+             AND instance.group_name = task_config.group_name \
+             AND instance.task_name = task_config.name \
+             AND instance.state IN ('pending', 'rescheduling') \
+             AND instance.current_alloc_id IS NULL \
+             AND instance.storage_handle = volume.driver || '/' || volume.volume_id \
+             AND volume.node_local = 1 \
+             AND volume.node_id IS NOT NULL \
+             AND volume.state IN ('pending', 'created') \
+             ORDER BY instance.slot_index ASC, instance.instance_id ASC;",
+        )?;
+        let rows = stmt.query_map([task_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Self::collect_rows(rows)
+    }
+
+    /// The node a specific instance's volume is pinned to, if any. Used by the
+    /// allocation binder to pair an allocation with the instance whose data
+    /// already lives on the node it landed on.
+    fn pinned_node_for_instance_tx(
+        &self,
+        tx: &Transaction<'_>,
+        instance_id: &str,
+    ) -> R<Option<String>> {
+        let node_id = tx
+            .query_row(
+                "SELECT volume.node_id FROM volume \
+                 INNER JOIN instance ON instance.instance_id = volume.instance_id \
+                 WHERE volume.instance_id = ?1 AND volume.node_local = 1 \
+                 AND volume.node_id IS NOT NULL AND volume.state IN ('pending', 'created') \
+                 AND instance.storage_handle = volume.driver || '/' || volume.volume_id \
+                 LIMIT 1;",
+                [instance_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?;
+        Ok(node_id.flatten())
+    }
+
+    /// Volume driver capabilities advertised across the cluster, keyed by
+    /// driver name, with the node ids that provide each.
+    ///
+    /// This is the manager's only source of driver metadata (it loads no
+    /// drivers itself), so it backs both admission validation and
+    /// `legion volume drivers`.
+    #[instrument(err, skip_all)]
+    pub fn cluster_volume_drivers(&self) -> R<BTreeMap<String, ClusterVolumeDriver>> {
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare("SELECT id, status, fingerprint_attrs FROM node;")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Value>(2)?,
+            ))
+        })?;
+
+        let mut out: BTreeMap<String, ClusterVolumeDriver> = BTreeMap::new();
+        for row in rows {
+            let (node_id, status, attrs) = row?;
+            let Some(drivers) = attrs.get("volumeDrivers").and_then(Value::as_object) else {
+                continue;
+            };
+            for (name, raw) in drivers {
+                let Ok(caps) =
+                    serde_json::from_value::<crate::volumes::VolumeCapabilities>(raw.clone())
+                else {
+                    continue;
+                };
+                let entry = out
+                    .entry(name.clone())
+                    .or_insert_with(|| ClusterVolumeDriver {
+                        capabilities: caps.clone(),
+                        nodes: Vec::new(),
+                        available_nodes: Vec::new(),
+                    });
+                entry.nodes.push(node_id.clone());
+                // "Available" means a live node could actually mount it, which
+                // is the question admission and placement care about.
+                if caps.available && status != "lost" {
+                    entry.available_nodes.push(node_id.clone());
+                    entry.capabilities = caps;
+                }
+            }
+        }
+        for entry in out.values_mut() {
+            entry.nodes.sort();
+            entry.nodes.dedup();
+            entry.available_nodes.sort();
+            entry.available_nodes.dedup();
+        }
+        Ok(out)
+    }
 }
 
-/// Mint an opaque storage handle for an instance. The `local-dir/` scheme is
-/// the placeholder contract for v1: attach/detach drivers are a follow-up (see
-/// `internal_docs/plans/volume-plugin-system-plan.md`); today the handle only proves
-/// identity stability (same instance => same handle across reschedules).
-fn mint_storage_handle() -> String {
-    format!("local-dir/{}", random_string(32))
+/// Filters for [`Store::list_volumes`].
+#[derive(Debug, Clone, Default)]
+pub struct VolumeFilter {
+    pub job_id: Option<String>,
+    pub node_id: Option<String>,
+    pub driver: Option<String>,
+    pub instance_id: Option<String>,
+    pub state: Option<crate::structs::VolumeState>,
+}
+
+/// A volume driver as the cluster sees it: one capability record plus the
+/// nodes providing it.
+#[derive(Debug, Clone)]
+pub struct ClusterVolumeDriver {
+    pub capabilities: crate::volumes::VolumeCapabilities,
+    /// Every node that has the driver installed, including ones where it is
+    /// unusable.
+    pub nodes: Vec<String>,
+    /// Nodes where the driver is installed AND usable — the placement set.
+    pub available_nodes: Vec<String>,
+}
+
+const VOLUME_COLUMNS: &str = "volume_id, name, driver, job_id, instance_id, task_name, state, \
+     node_id, node_local, read_only, params, attrs, mount_path, last_error, created_at, \
+     updated_at, volume_mode, fs";
+
+lazy_static! {
+    static ref VOLUME_SELECT: String =
+        format!("SELECT {VOLUME_COLUMNS} FROM volume WHERE volume_id = ?;");
+    static ref VOLUME_SELECT_ALL: String = format!("SELECT {VOLUME_COLUMNS} FROM volume");
+}
+
+/// Deterministic id for a task volume claim.
+///
+/// Claims are shared per `(job, group, task, name)`, so the id must be a pure
+/// function of those — a resubmit has to land on the same volume, not orphan
+/// the old one. The readable prefix keeps `legion volume list` legible; the
+/// hash suffix keeps ids unique after the prefix is sanitized and truncated.
+fn claim_volume_id(job_id: &str, group: &str, task: &str, name: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(format!("{job_id}\u{1}{group}\u{1}{task}\u{1}{name}"));
+    let digest = format!("{:x}", hasher.finalize());
+    let label = format!("{job_id}-{task}-{name}")
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .take(48)
+        .collect::<String>();
+    format!("claim-{label}-{}", &digest[..12])
+}
+
+/// Parse a JSONB object column into a sorted map, tolerating NULL and
+/// non-object values (both become empty).
+fn parse_json_map_column(
+    idx: usize,
+    raw: Option<String>,
+) -> Result<BTreeMap<String, Value>, rusqlite::Error> {
+    let Some(raw) = raw else {
+        return Ok(BTreeMap::new());
+    };
+    let value: Value = serde_json::from_str(&raw).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(idx, rusqlite::types::Type::Text, Box::new(err))
+    })?;
+    Ok(value
+        .as_object()
+        .map(|map| {
+            map.iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+/// Mint an opaque storage handle for an instance: `{driver}/{volume_id}`.
+///
+/// The format predates volume drivers (instances already minted
+/// `local-dir/<rand>`), which is exactly why it was kept — every instance row
+/// written before this feature still parses. See `docs/volumes.md`.
+fn mint_storage_handle(driver: &str) -> String {
+    format!("{driver}/{}", random_string(32))
 }
 
 fn task_schedule_equivalent(left: &TaskConfig, right: &TaskConfig) -> bool {
@@ -6957,6 +7768,7 @@ mod tests {
         attrs.insert("test".to_string(), "val".to_string());
 
         let worker_config = WorkerConfig {
+            host_volumes: String::new(),
             name: "test".to_string(),
             pool: "default".to_string(),
             additional_node_checks: vec![],
@@ -6989,6 +7801,7 @@ mod tests {
         let store = setup_store()?;
 
         let worker_config = WorkerConfig {
+            host_volumes: String::new(),
             name: "empty".to_string(),
             pool: "default".to_string(),
             additional_node_checks: vec![],
@@ -9126,6 +9939,9 @@ mod tests {
                 initial_instances: None,
                 on_lost: None,
                 storage: with_storage.then(|| crate::structs::StatefulStorageConfig {
+                    driver: None,
+                    mode: None,
+                    params: None,
                     path: "/var/lib/data".into(),
                     retain_on_scale_in: None,
                     retain_on_stop: None,
@@ -9432,6 +10248,9 @@ mod tests {
                 initial_instances: None,
                 on_lost: None,
                 storage: Some(crate::structs::StatefulStorageConfig {
+                    driver: None,
+                    mode: None,
+                    params: None,
                     path: "/var/lib/data".into(),
                     retain_on_scale_in: Some(false),
                     retain_on_stop: None,
@@ -9588,6 +10407,9 @@ mod tests {
                 initial_instances: None,
                 on_lost: None,
                 storage: Some(crate::structs::StatefulStorageConfig {
+                    driver: None,
+                    mode: None,
+                    params: None,
                     path: "/var/lib/data".into(),
                     retain_on_scale_in: None,
                     retain_on_stop: Some(false),
@@ -9664,6 +10486,9 @@ mod tests {
                 initial_instances: None,
                 on_lost: None,
                 storage: Some(crate::structs::StatefulStorageConfig {
+                    driver: None,
+                    mode: None,
+                    params: None,
                     path: "/var/lib/data".into(),
                     retain_on_scale_in: None,
                     retain_on_stop: Some(false),
@@ -9734,6 +10559,9 @@ mod tests {
                 initial_instances: None,
                 on_lost: None,
                 storage: with_storage.then(|| crate::structs::StatefulStorageConfig {
+                    driver: None,
+                    mode: None,
+                    params: None,
                     path: "/workspace".into(),
                     retain_on_scale_in: None,
                     retain_on_stop: None,

@@ -16,6 +16,7 @@ import ManagerNodeDetail from './pages/details/ManagerNodeDetail'
 import NodeDetail from './pages/details/NodeDetail'
 import RolloutDetail from './pages/details/RolloutDetail'
 import ServiceDetail from './pages/details/ServiceDetail'
+import VolumeDetail from './pages/details/VolumeDetail'
 import TaskDetail from './pages/details/TaskDetail'
 import Homepage from './pages/Homepage'
 import Jobs from './pages/Jobs'
@@ -24,6 +25,7 @@ import Manager from './pages/Manager'
 import Nodes from './pages/Nodes'
 import Rollouts from './pages/Rollouts'
 import Services from './pages/Services'
+import Volumes from './pages/Volumes'
 import ApiExplorer from './pages/ApiExplorer'
 import Observability from './pages/Observability'
 import TestingUtils from './pages/TestingUtils'
@@ -56,7 +58,7 @@ type CommandPaletteItem = {
 
 type SidebarNode = SidebarItem | SidebarSection
 
-const detailRoutes = new Set(['jobs', 'nodes', 'manager', 'rollouts', 'services'])
+const detailRoutes = new Set(['jobs', 'nodes', 'manager', 'rollouts', 'services', 'volumes'])
 
 const decodePathSegment = (value: string) => {
   try {
@@ -121,6 +123,7 @@ const Layout = (props: RouteSectionProps) => {
           { kind: 'item', label: 'Jobs', path: '/jobs', title: 'Jobs', copy: 'Every job on the cluster and its health.', icon: 'layers' },
           { kind: 'item', label: 'Services', path: '/services', title: 'Services', copy: 'Discoverable endpoints and their health.', icon: 'radio' },
           { kind: 'item', label: 'Rollouts', path: '/rollouts', title: 'Rollouts', copy: 'Version rollouts and their progress.', icon: 'rocket' },
+          { kind: 'item', label: 'Volumes', path: '/volumes', title: 'Volumes', copy: 'Persistent storage behind stateful tasks.', icon: 'hardDrive' },
         ],
       },
       {
@@ -724,6 +727,8 @@ const AppRoutes = () => {
       <Route path="/jobs/:id/specs/:configId" component={JobSpecDetail} />
       <Route path="/services" component={Services} />
       <Route path="/services/:name" component={ServiceDetail} />
+      <Route path="/volumes" component={Volumes} />
+      <Route path="/volumes/:id" component={VolumeDetail} />
       <Route path="/deployments" component={() => <Navigate href="/rollouts" />} />
       <Route path="/rollouts" component={Rollouts} />
       <Route path="/rollouts/:id" component={RolloutDetail} />

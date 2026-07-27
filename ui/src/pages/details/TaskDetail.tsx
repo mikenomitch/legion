@@ -15,6 +15,7 @@ import {
   type ArtifactStateRow,
   type JobTaskArtifact,
 } from '../../utils/jobspec'
+import { shortVolumeId, volumePinsPlacement, volumeStateTone } from '../../utils/volumes'
 
 // Checksum column value: pinned sources carry their digest in the source
 // (`…@sha256:…`); otherwise fall back to the declared checksum.
@@ -44,12 +45,15 @@ export default function TaskDetail() {
 
   // Keyed on the route params so task→task navigation refetches.
   const [data] = createResource(() => `${jobName()}/${taskName()}`, async () => {
-    const [jobInfo, rollouts, spec, ledger, allocationHealth] = await Promise.all([
+    const [jobInfo, rollouts, spec, ledger, allocationHealth, volumes] = await Promise.all([
       managerClient.getJobInfo({ name: jobName() }),
       managerClient.listRollouts({ jobId: jobName(), activeOnly: false, page: 1, pageSize: 200 }),
       managerClient.getJobSpec({ name: jobName() }),
       managerClient.getLedger({}),
       fetchAllocationRuntime(jobName()),
+      // Actual volumes rather than the declaration: this page should answer
+      // "where is my data and is it healthy", which the spec cannot.
+      managerClient.listVolumes({ jobId: jobName() }).catch(() => ({ volumes: [] })),
     ])
 
     const latestRollout = rollouts.rollouts[0]
@@ -87,6 +91,11 @@ export default function TaskDetail() {
       allocationHealth,
       serviceName,
       endpoints,
+      // Tombstones belong on the Volumes page (which has a filter for them);
+      // here they are just noise between the reader and their live storage.
+      volumes: volumes.volumes.filter(
+        (volume) => volume.taskName === taskName() && volume.state !== 'destroyed',
+      ),
     }
   })
 
@@ -139,7 +148,10 @@ export default function TaskDetail() {
                           <span class="inline-flex flex-wrap items-center gap-2">
                             <Badge tone="accent">stateful · {data()!.taskSpec!.stateful!.mode}</Badge>
                             <Show when={data()!.taskSpec!.stateful!.storagePath}>
-                              <span class="font-mono text-xs text-muted" title="Persistent storage path">{data()!.taskSpec!.stateful!.storagePath}</span>
+                              <span class="font-mono text-xs text-muted" title="Where the task sees its instance storage">{data()!.taskSpec!.stateful!.storagePath}</span>
+                            </Show>
+                            <Show when={data()!.volumes.find((volume) => volume.instanceId)}>
+                              {(volume) => <Badge tone={volume().nodeLocal ? 'neutral' : 'ok'}>{volume().driver}</Badge>}
                             </Show>
                           </span>,
                         ]] as Array<[string, any]>)
@@ -166,6 +178,70 @@ export default function TaskDetail() {
                   ]}
                 />
               </SectionCard>
+
+              <Show when={(data()!.volumes ?? []).length > 0}>
+                <SectionCard
+                  title="Volumes"
+                  description="Persistent storage for this task. A node-local volume pins its instance to the node holding the data."
+                  flush
+                >
+                  <TableShell>
+                    <table class={tableClass}>
+                      <thead class={theadClass}>
+                        <tr>
+                          <th class={thClass}>Volume</th>
+                          <th class={thClass}>Driver</th>
+                          <th class={thClass}>State</th>
+                          <th class={thClass}>Instance</th>
+                          <th class={thClass}>Node</th>
+                        </tr>
+                      </thead>
+                      <tbody class="divide-y divide-line">
+                        <For each={data()!.volumes}>
+                          {(volume) => (
+                            <tr class={trHoverClass}>
+                              <td class={tdClass}>
+                                <A
+                                  href={`/volumes/${encodeURIComponent(volume.volumeId)}`}
+                                  class="font-mono text-xs text-ink hover:text-brass-strong"
+                                  title={volume.volumeId}
+                                >
+                                  {shortVolumeId(volume.volumeId)}
+                                </A>
+                                <div class="text-2xs text-faint">{volume.name}</div>
+                              </td>
+                              <td class={tdClass}>
+                                <Badge tone={volume.nodeLocal ? 'neutral' : 'ok'}>{volume.driver}</Badge>
+                              </td>
+                              <td class={tdClass}>
+                                <Badge tone={volumeStateTone(volume)} dot class="uppercase tracking-wide">
+                                  {volume.state}
+                                </Badge>
+                                <Show when={volume.lastError}>
+                                  <div class="mt-0.5 max-w-[16rem] truncate text-2xs text-red-500" title={volume.lastError}>
+                                    {volume.lastError}
+                                  </div>
+                                </Show>
+                              </td>
+                              <td class={tdClass + ' font-mono text-xs text-muted'}>{volume.instanceId ?? '—'}</td>
+                              <td class={tdClass}>
+                                <Show when={volume.nodeId} fallback={<span class="text-faint">—</span>}>
+                                  <A href={`/nodes/${encodeURIComponent(volume.nodeId!)}`} class="text-muted hover:text-brass-strong">
+                                    {volume.nodeId}
+                                  </A>
+                                  <Show when={volumePinsPlacement(volume)}>
+                                    <span class="ml-1 text-brass-strong" title="Node-local: this instance can only be replaced here">*</span>
+                                  </Show>
+                                </Show>
+                              </td>
+                            </tr>
+                          )}
+                        </For>
+                      </tbody>
+                    </table>
+                  </TableShell>
+                </SectionCard>
+              </Show>
 
               <Show when={data()!.taskSpec!.artifacts.length > 0}>
                 <SectionCard title="Artifacts" flush>

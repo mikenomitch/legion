@@ -702,6 +702,9 @@ mod tests {
                 initial_instances: None,
                 on_lost: None,
                 storage: Some(StatefulStorageConfig {
+                    driver: None,
+                    mode: None,
+                    params: None,
                     path: "/var/lib/data".into(),
                     retain_on_scale_in: None,
                     retain_on_stop: None,
@@ -782,6 +785,9 @@ mod tests {
                 initial_instances: None,
                 on_lost: None,
                 storage: Some(StatefulStorageConfig {
+                    driver: None,
+                    mode: None,
+                    params: None,
                     path: "/workspace".into(),
                     retain_on_scale_in: None,
                     retain_on_stop: None,

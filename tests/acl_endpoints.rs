@@ -113,6 +113,12 @@ fn endpoint_table() -> Vec<(&'static str, Plane)> {
         ("ReplaceInstance", Plane::Protected("job:write")),
         ("ListInstances", Plane::Protected("job:read")),
         ("GetInstance", Plane::Protected("job:read")),
+        // Volumes are job-scoped storage, so they read/write under `job`.
+        // ListVolumePlugins is cluster capability data, like node fingerprints.
+        ("ListVolumes", Plane::Protected("job:read")),
+        ("GetVolume", Plane::Protected("job:read")),
+        ("DeleteVolume", Plane::Protected("job:write")),
+        ("ListVolumeDrivers", Plane::Protected("node:read")),
         ("IssueWorkloadIdentityToken", Plane::Worker),
         ("IssueNodeIdentityToken", Plane::Worker),
         ("GetAllocationLogs", Plane::Protected("job:read")),
@@ -616,6 +622,34 @@ async fn call_endpoint(
                 },
                 token,
             ))
+            .await
+            .map(|_| ()),
+        "ListVolumes" => svc
+            .list_volumes(req(ListVolumesRequest::default(), token))
+            .await
+            .map(|_| ()),
+        "GetVolume" => svc
+            .get_volume(req(
+                GetVolumeRequest {
+                    volume_id: "missing-volume".into(),
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "DeleteVolume" => svc
+            .delete_volume(req(
+                DeleteVolumeRequest {
+                    volume_id: "missing-volume".into(),
+                    force: false,
+                    idempotency_key: None,
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "ListVolumeDrivers" => svc
+            .list_volume_drivers(req(ListVolumeDriversRequest {}, token))
             .await
             .map(|_| ()),
         "IssueWorkloadIdentityToken" => svc

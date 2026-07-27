@@ -13,4 +13,5 @@ pub mod structs;
 pub mod task_plugins;
 pub mod tracing_util;
 pub mod util;
+pub mod volumes;
 pub mod worker;

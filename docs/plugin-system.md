@@ -154,6 +154,69 @@ Contract specifics (the rest follows the common pattern above):
   cluster's `artifacts.allowedSchemes` (and the worker-side allowlist if
   customized).
 
+## 6) Volume Plugins
+
+Purpose: materialize persistent storage for stateful tasks (and volume claims
+on any task). See [docs/volumes.md](volumes.md) for the user-facing doc and
+[plans/volume-plugin-system-plan.md](../internal_docs/plans/volume-plugin-system-plan.md) for the
+design.
+
+- Built-in drivers (in-process, ship in the binary):
+  `local-dir` (the default), `host`, `nfs`, `tmpfs` — `src/volumes/builtins.rs`.
+- Reference exec plugin: `plugins/volumes/example/` (a ~60-line shell script).
+
+Entry trait: `VolumeDriver` in `src/volumes/mod.rs`. In the jobspec and API the
+selectable thing is called a **driver** (`storage: { driver: 'nfs' }`); "plugin"
+refers to the packaging that delivers one (`plugins/volumes/<name>/` with a
+`plugin.json`).
+
+Contract specifics — this category deliberately differs from the others:
+
+- **The ABI is exec, not `cdylib`** (CNI-style): a plugin is any executable at
+  `plugins/volumes/<name>/<name>` that reads a JSON request on stdin and writes
+  a JSON response on stdout, with the operation as `argv[1]`. Volume operations
+  are low-frequency (task start/stop), usually shell out to system tools
+  (`mount`, `zfs`, a cloud CLI), and must not be able to take a worker down when
+  they crash. Process isolation buys all three and the per-call fork cost is
+  irrelevant at this rate.
+- Manifest: `{"kind": "volumes", "name": "<name>", "legionVolumeApiVersion": 1}`
+  — note the distinct version key, since the volume contract versions
+  independently of the dylib plugin API.
+- Four operations, all **required to be idempotent**: `capabilities`, `mount`,
+  `unmount`, `destroy`. `create`, `attach`, `detach`, `snapshot`, `restore`, and
+  `expand` are reserved names a plugin may advertise for forward compatibility.
+- **Drivers run on workers only.** The manager owns the volume state machine but
+  loads no drivers: it learns what exists from the capabilities workers publish
+  in their fingerprints. The control plane therefore needs no storage
+  credentials and no mount privileges.
+- Built-ins win over exec plugins on a name collision, so an installed plugin
+  cannot silently redefine what `local-dir` means on a running cluster.
+- `legion volume driver test <name>` runs the contract conformance suite against
+  a driver — the same suite Legion's own tests use, no manager required.
+
+### Coexistence with CNI (the networking kind)
+
+"CNI-style" above describes the *architecture* (exec binaries, JSON over
+stdio, versioned manifest), not wire compatibility — and the two systems
+cannot collide on a host that runs both:
+
+- **Separate trees.** Legion discovers volume plugins only under its own
+  `plugins/volumes/<name>/` directories (each gated by a `plugin.json`).
+  CNI binaries live in `/opt/cni/bin` with configs in `/etc/cni/net.d`;
+  Legion never reads either, and CNI runtimes never read Legion's tree.
+- **Different ABI on purpose.** CNI passes the verb via the `CNI_COMMAND`
+  environment variable and network config on stdin; Legion passes the op as
+  `argv[1]` and a self-describing request on stdin. A binary cannot be
+  mistaken for the other kind by accident, and a CNI plugin dropped into
+  `plugins/volumes/` fails loudly at `capabilities` rather than half-working.
+- **Different version keys.** `legionVolumeApiVersion` in the manifest vs
+  CNI's `cniVersion` in network config — each contract evolves independently.
+- **Networking stays CNI's job.** When Legion grows a first-class `datapath`
+  plugin kind (planned; see the note under
+  [Planned Plugin Categories](#planned-plugin-categories-not-implemented-yet)),
+  the design is a *shim that drives real CNI plugins* with their own protocol —
+  reusing the ecosystem, not re-inventing it under the volume ABI.
+
 ## Build Behavior
 
 `build.rs` behavior:
@@ -199,7 +262,6 @@ See internal_docs/plans/auth-acl-plan.md for the full reasoning.
 These categories are intended but are not first-class plugin frameworks today:
 
 - Networking/CNI plugins (a declarative `datapath` plugin kind + CNI compatibility shim is designed in [plans/service-discovery-plan.md](../internal_docs/plans/service-discovery-plan.md)).
-- Volume plugins.
 - Command/API endpoint extension plugins.
 - Logging/observability pipeline plugins.
 - Eval hooks / scheduler reaction hooks.

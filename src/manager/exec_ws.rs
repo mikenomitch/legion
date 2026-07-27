@@ -200,8 +200,10 @@ async fn bridge(websocket: hyper_tungstenite::HyperWebsocket, state: ExecWsState
     while let Some(item) = out_rx.recv().await {
         match item {
             Ok(frame) => {
-                let is_exit =
-                    matches!(frame.frame, Some(crate::structs::exec_server_frame::Frame::Exit(_)));
+                let is_exit = matches!(
+                    frame.frame,
+                    Some(crate::structs::exec_server_frame::Frame::Exit(_))
+                );
                 let bytes = frame.encode_to_vec();
                 if ws_out.send(Message::Binary(bytes)).await.is_err() {
                     break;

@@ -48,6 +48,8 @@ Main tables (see migrations):
 - `kv_entry`, `kv_lock`, `job_kv_reference`
 - `allocation_epoch`, `plan_submission`
 - `rollout`, `allocation_health`, `rollout_event`
+- `instance` (stateful identity), `volume` (the storage its handle points at —
+  see [volumes.md](volumes.md))
 
 ## Allocation Epoch and Plan Submission Safety
 
