@@ -2107,12 +2107,7 @@ impl TaskConfig {
             let is_shell = matches!(action.command.first().map(String::as_str), Some(cmd)
                 if cmd.ends_with("sh") || cmd == "bash" || cmd == "zsh")
                 && action.command.iter().any(|a| a == "-c");
-            if is_shell
-                && action
-                    .command
-                    .iter()
-                    .any(|a| a.contains("${param."))
-            {
+            if is_shell && action.command.iter().any(|a| a.contains("${param.")) {
                 warn!(
                     task = %self.name,
                     action = %action.name,
@@ -2301,7 +2296,9 @@ mod tests {
     #[test]
     fn action_render_uses_default_when_param_omitted() {
         let action = sample_action();
-        let (argv, _) = action.render_command(&std::collections::HashMap::new()).unwrap();
+        let (argv, _) = action
+            .render_command(&std::collections::HashMap::new())
+            .unwrap();
         assert_eq!(argv.last().unwrap(), "sessions");
     }
 

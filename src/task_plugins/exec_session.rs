@@ -260,7 +260,11 @@ impl ExecSession for PipeExecSession {
     }
 
     fn try_wait(&mut self) -> R<Option<i32>> {
-        match self.child.try_wait().context("exec child try_wait failed")? {
+        match self
+            .child
+            .try_wait()
+            .context("exec child try_wait failed")?
+        {
             Some(status) => Ok(Some(status.code().unwrap_or(-1))),
             None => Ok(None),
         }

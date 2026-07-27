@@ -58,15 +58,15 @@ fn exit_frame(code: i32, message: String) -> ExecServerFrame {
 
 fn started_frame(session_id: String) -> ExecServerFrame {
     ExecServerFrame {
-        frame: Some(exec_server_frame::Frame::Started(ExecStarted { session_id })),
+        frame: Some(exec_server_frame::Frame::Started(ExecStarted {
+            session_id,
+        })),
     }
 }
 
 fn pong_frame() -> ExecServerFrame {
     ExecServerFrame {
-        frame: Some(exec_server_frame::Frame::Pong(
-            crate::structs::ExecPing {},
-        )),
+        frame: Some(exec_server_frame::Frame::Pong(crate::structs::ExecPing {})),
     }
 }
 

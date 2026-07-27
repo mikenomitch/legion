@@ -617,7 +617,11 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             let command: Vec<String> = args
                 .get("command")
                 .and_then(Value::as_array)
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default();
             if command.is_empty() {
                 return Err("command must be a non-empty array".to_string());
@@ -903,7 +907,11 @@ async fn run_exec_oneshot(
     let mut stderr = Vec::new();
     let mut exit_code = -1i32;
     let mut exit_message = String::new();
-    while let Some(frame) = inbound.message().await.map_err(|s| s.message().to_string())? {
+    while let Some(frame) = inbound
+        .message()
+        .await
+        .map_err(|s| s.message().to_string())?
+    {
         match frame.frame {
             Some(exec_server_frame::Frame::Stdout(o)) => stdout.extend_from_slice(&o.data),
             Some(exec_server_frame::Frame::Stderr(o)) => stderr.extend_from_slice(&o.data),

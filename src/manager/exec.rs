@@ -79,7 +79,9 @@ fn resolve_exec_start(
     let allocation = store
         .get_allocation_by_id(start.allocation_id)
         .map_err(|e| Status::internal(format!("failed to load allocation: {e}")))?
-        .ok_or_else(|| Status::not_found(format!("allocation {} not found", start.allocation_id)))?;
+        .ok_or_else(|| {
+            Status::not_found(format!("allocation {} not found", start.allocation_id))
+        })?;
 
     // Q8: exec targets running allocations only. A dispatched allocation is
     // `placed`; terminal/failed allocations are removed from the ledger, so

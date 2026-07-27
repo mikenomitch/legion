@@ -68,7 +68,10 @@ pub async fn handle(matches: &ArgMatches) -> R<()> {
     }
     let tty = matches.get_flag("tty");
     let want_stdin = matches.get_flag("stdin") || tty;
-    let task = matches.get_one::<String>("task").cloned().unwrap_or_default();
+    let task = matches
+        .get_one::<String>("task")
+        .cloned()
+        .unwrap_or_default();
 
     let mut client = connect_manager_client().await?;
 
@@ -115,7 +118,11 @@ async fn resolve_allocation(
     let mut best: Option<i64> = None;
     for node in ledger.nodes {
         for alloc in node.allocations {
-            if &alloc.job_id == job && (alloc.status == "placed" || alloc.status == "active" || alloc.status == "running") {
+            if &alloc.job_id == job
+                && (alloc.status == "placed"
+                    || alloc.status == "active"
+                    || alloc.status == "running")
+            {
                 best = Some(best.map_or(alloc.id, |b| b.max(alloc.id)));
             }
         }
@@ -290,10 +297,12 @@ fn spawn_resize_watcher(tx: mpsc::Sender<ExecClientFrame>) {
 }
 
 fn current_winsize() -> Option<ExecWinsize> {
-    crossterm::terminal::size().ok().map(|(cols, rows)| ExecWinsize {
-        cols: cols as u32,
-        rows: rows as u32,
-    })
+    crossterm::terminal::size()
+        .ok()
+        .map(|(cols, rows)| ExecWinsize {
+            cols: cols as u32,
+            rows: rows as u32,
+        })
 }
 
 /// Restores cooked terminal mode when dropped.
