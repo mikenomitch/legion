@@ -1,6 +1,6 @@
 //! Artifact spec types shared by every task kind.
 //!
-//! See `docs/plans/artifact-system-plan.md` and the user-facing
+//! See `internal_docs/plans/artifact-system-plan.md` and the user-facing
 //! `docs/artifacts.md`. This module owns the *spec-level* primitives:
 //!
 //! - [`ArtifactSpec`] — one declared artifact on a task (string shorthand or

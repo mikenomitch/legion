@@ -1,6 +1,6 @@
 //! Stable instance identity for stateful workloads.
 //!
-//! See `docs/plans/stateful-workloads-and-instance-identity-plan.md` and
+//! See `internal_docs/plans/stateful-workloads-and-instance-identity-plan.md` and
 //! `docs/stateful-workloads.md`. An [`Instance`] is a logical entity one level
 //! above an allocation: it owns a stable id that survives reschedules, binds to
 //! persistent state via an opaque `storage_handle`, and feeds the
@@ -138,7 +138,7 @@ pub struct Instance {
     /// Opaque reference to bound persistent state. Minted on first placement
     /// when the task declares `stateful.storage` and reattached on every
     /// subsequent allocation. Concrete drivers are a follow-up (see
-    /// `docs/plans/volume-plugin-system-plan.md`).
+    /// `internal_docs/plans/volume-plugin-system-plan.md`).
     pub storage_handle: Option<String>,
     /// RFC 3339 creation timestamp.
     pub created_at: String,

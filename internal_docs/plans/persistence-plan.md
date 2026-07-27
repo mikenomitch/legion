@@ -1,5 +1,7 @@
 # Persistence Plan: Pluggable Backends for the Manager Store
 
+> **Judgement calls:** [`calls/persistence-plan_calls.md`](../calls/persistence-plan_calls.md)
+
 ## Status and Goal
 
 This document proposes a **pluggable persistence layer** under the current SQLite-backed `Store` so operators can pick a reliability/complexity profile:

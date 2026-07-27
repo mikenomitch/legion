@@ -1,5 +1,7 @@
 # Plan: Workload Identity via OIDC
 
+> **Judgement calls:** [`calls/workload-identity-oidc-plan_calls.md`](../calls/workload-identity-oidc-plan_calls.md)
+
 ## Problem Statement
 
 Legion schedules workloads but has no way to give a running task a **verifiable,
@@ -457,8 +459,8 @@ control-plane identity later is a config + authz change, not a re-architecture.
    [Stateful Workloads & Instance Identity plan](stateful-workloads-and-instance-identity-plan.md)
    (at least its instance primitive + alloc→instance mapping must land first).
 6. **Docs** — new `docs/workload-identity.md`; cross-link from README, plus updates to
-   [docs/jobs-tasks-and-scheduling.md](../jobs-tasks-and-scheduling.md) (spec API),
-   [docs/architecture-managers-workers.md](../architecture-managers-workers.md)
+   [docs/jobs-tasks-and-scheduling.md](../../docs/jobs-tasks-and-scheduling.md) (spec API),
+   [docs/architecture-managers-workers.md](../../docs/architecture-managers-workers.md)
    (manager-as-IdP, HTTP listener), and a provider-integration cookbook
    (AWS / GCP / Vault) in the new doc.
 

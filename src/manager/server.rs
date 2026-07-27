@@ -4302,7 +4302,7 @@ impl Manager for ManagerDaemonService {
     /// reference any KV path via auth.kv, so possession of job-submit access
     /// implies read access to every KV credential. Revisit when the ACL
     /// system lands — this credential read must become an early enforcement
-    /// point. Tracked in docs/TASK-LIST.md (ACL System).
+    /// point. Tracked in internal_docs/TASK-LIST.md (ACL System).
     #[instrument(skip_all, fields(node_id = %request.get_ref().node_id, kv_path = %request.get_ref().kv_path, source = %request.get_ref().source))]
     async fn get_artifact_credential(
         &self,

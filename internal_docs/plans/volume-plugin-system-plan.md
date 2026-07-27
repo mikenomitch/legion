@@ -1,5 +1,7 @@
 # Plan: Volume Plugin System
 
+> **Judgement calls:** [`calls/volume-plugin-system-plan_calls.md`](../calls/volume-plugin-system-plan_calls.md)
+
 > **Status:** PLANNED — not implemented. This plan is the follow-up that the
 > [Stateful Workloads & Instance Identity plan](stateful-workloads-and-instance-identity-plan.md)
 > defers to: that plan defines the *binding* (instance → storage handle, attach-before-start,
@@ -74,14 +76,15 @@ This plan fills in what a `storage_handle` *is*: a structured reference
 | **CNI** | Exec-plugin ABI: JSON on stdin, operation via env/args, JSON result on stdout, versioned contract, plugin discovery from a conf + bin dir. Battle-tested, language-agnostic, and easy to write a plugin for in an afternoon. |
 | **Nomad host volumes** | The "operator pre-creates, jobs claim by name" model → our `host` built-in. Also dynamic host volumes (plugin-provisioned node-local dirs) → our `local-dir` built-in. |
 | **Nomad/K8s CSI** | Controller vs node split (provision/attach are cluster-level concerns; mount is node-level), access modes, and the idea of a compatibility bridge instead of native vendor drivers. |
-| **Legion's own plugin system** ([docs/plugin-system.md](../plugin-system.md)) | Manifest validation (`plugin.json` with kind/name/api version) and the `plugins/<kind>/<name>/` layout — volume plugins reuse the same discovery conventions under `plugins/volumes/<name>/`. |
+| **Legion's own plugin system** ([docs/plugin-system.md](../../docs/plugin-system.md)) | Manifest validation (`plugin.json` with kind/name/api version) and the `plugins/<kind>/<name>/` layout — volume plugins reuse the same discovery conventions under `plugins/volumes/<name>/`. |
 
 > ★ Judgement call ────────────────────────────────
 > The request asked for a "CNI compatibility layer." CNI is the *networking* plugin
 > standard; its storage-side sibling is **CSI**. We read the intent as: (a) adopt the
 > CNI-style exec-plugin *model* for our native ABI, and (b) provide a compatibility
 > layer to the existing storage-driver ecosystem — which is CSI. Both are reflected
-> above. (Recorded in [docs/calls](../calls/).)
+> above. (Recorded in
+> [`calls/volume-plugin-system-plan_calls.md`](../calls/volume-plugin-system-plan_calls.md).)
 > ─────────────────────────────────────────────────
 
 ---

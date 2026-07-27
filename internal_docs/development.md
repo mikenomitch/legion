@@ -39,3 +39,17 @@ Can use this command to inspect them/test:
 grpcui -proto proto/legion.proto -plaintext localhost:4747
 
 Or use `grpcurl`
+
+### CI lint baseline (2026-06)
+
+CI runs `cargo clippy --all -- -D warnings` and will fail on lint errors that
+predate your branch — for a while we carried a local "33-error baseline" and
+held it steady. That baseline was cleared: auto-fixable lints were fixed
+properly, and `too_many_arguments` plus the tonic-`Status` `result_large_err`
+sites got targeted `#[allow]`s pending real refactors. Keep it at zero rather
+than re-accumulating a baseline.
+
+One CI gotcha worth remembering: a Scheduler Benchmark Gate failure was a
+workflow-token permission problem (`paths-filter` needs `pull-requests: read`),
+not a code regression. Check the workflow permissions before chasing a
+benchmark diff.

@@ -1,5 +1,7 @@
 # Plan: Stateful Workloads & Instance Identity
 
+> **Judgement calls:** [`calls/stateful-workloads-and-instance-identity-plan_calls.md`](../calls/stateful-workloads-and-instance-identity-plan_calls.md)
+
 > **Related:** This plan defines the stable *instance identity* primitive that
 > [Workload Identity via OIDC](workload-identity-oidc-plan.md) consumes to issue a
 > token whose subject persists across reschedules. Read them together: this doc owns

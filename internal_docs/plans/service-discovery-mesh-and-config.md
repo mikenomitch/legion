@@ -1,5 +1,7 @@
 # Service Discovery: Config Cookbook, Observability & Mesh Extensions
 
+> **Judgement calls:** [`calls/service-discovery-final-plan_calls.md`](../calls/service-discovery-final-plan_calls.md)
+
 > Companion to [service-discovery-plan.md](service-discovery-plan.md). That doc owns the
 > core model; this one shows **how you configure it across real scenarios**, plans
 > **observability** for the mesh, sketches **additional mesh features** (traffic
@@ -206,7 +208,7 @@ discovery: {
 ## Part B — Observability Plan for the Mesh
 
 Legion is already OTEL-native (tracing/metrics/logs) per
-[docs/observability.md](../observability.md). Service discovery and the mesh are a
+[docs/observability.md](../../docs/observability.md). Service discovery and the mesh are a
 **goldmine of golden-signal telemetry that the app gets for free**, because traffic
 already flows through a Legion-owned data path (the node forwarder / L7 waypoint). This
 is the same reason meshes (Istio/Linkerd) are adopted primarily *for observability*, not
@@ -241,7 +243,7 @@ reschedules.
 
 The catalog + per-call peer identity yields a live **service map**: nodes = services
 (with health %), edges = observed `caller → callee` with RED stats. This is a UI view
-([docs/ui-architecture.md](../ui-architecture.md)) built entirely from data the mesh
+([docs/ui-architecture.md](../../docs/ui-architecture.md)) built entirely from data the mesh
 already produces — comparable to Kiali/Hubble but with **no extra component to deploy**.
 It also flags **intention violations** (attempted-but-denied edges) — a security signal
 Hubble is prized for.
@@ -274,7 +276,7 @@ of them are mandatory; an L4-only service pays for none of them.
 | **Access logging** | L4/L7 | `connect.l7.access_log` | waypoint → OTEL logs. |
 
 **Rollout integration:** canary `split` weights are exactly what the existing
-**rollout strategy plugins** ([docs/rollouts.md](../rollouts.md)) want to drive — a
+**rollout strategy plugins** ([docs/rollouts.md](../../docs/rollouts.md)) want to drive — a
 progressive rollout can shift `split` 10→25→50→100 and watch the mesh's RED metrics
 (B1) to auto-rollback on error-rate breach. The mesh closes the loop the rollout system
 is missing today: *metric-aware* progression.
@@ -304,7 +306,7 @@ story**, because the data path is the worst place for untrusted/arbitrary code:
 - **It's synchronous and hot.** Every request waits on your code. A 5ms `println!`-debug
   or a lock contention becomes p99 latency for the whole service.
 - **A panic/segfault takes down the node forwarder** — i.e. *all* mesh traffic on that
-  node, not one task (the documented cdylib risk in [plugin-system.md](../plugin-system.md)).
+  node, not one task (the documented cdylib risk in [plugin-system.md](../../docs/plugin-system.md)).
 - **No resource bound.** An infinite loop or 4GB allocation in a native plugin wedges
   the data plane. Head-of-line blocking, OOM.
 - **Security.** Native code in the forwarder sees *all* services' traffic and runs with

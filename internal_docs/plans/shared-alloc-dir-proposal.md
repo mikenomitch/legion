@@ -1,5 +1,7 @@
 # Proposal: Shared Files Between Tasks in the Same Allocation
 
+> **Judgement calls:** [`calls/shared-alloc-dir-proposal_calls.md`](../calls/shared-alloc-dir-proposal_calls.md)
+
 > **Status:** PROPOSAL — not implemented. Companion to the file-isolation
 > work that made per-allocation directories owner-only (`0700`): that work
 > answers "tasks on the same *node* must not read each other's files"; this

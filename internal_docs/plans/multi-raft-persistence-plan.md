@@ -1,10 +1,12 @@
 # Plan: Multi-Raft Persistence for the Manager Store
 
+> **Judgement calls:** [`calls/multi-raft-persistence-plan_calls.md`](../calls/multi-raft-persistence-plan_calls.md)
+
 > **Related:**
-> - [`docs/persistence-plan.md`](../persistence-plan.md) — the parent pluggable-persistence roadmap. This plan executes (and supersedes) its *“Remaining GA work (store replication path)”* section.
-> - [`docs/raft-operations.md`](../raft-operations.md) — current Raft control-plane operator workflows (election/failover/membership/join-token).
-> - [`docs/state-store.md`](../state-store.md) — the SQLite store, read-model cache, and allocation-epoch CAS this plan replicates.
-> - [`docs/persistence-streaming.md`](../persistence-streaming.md) — the Litestream tier this plan sits *above* on the durability gradient.
+> - [`internal_docs/plans/persistence-plan.md`](persistence-plan.md) — the parent pluggable-persistence roadmap. This plan executes (and supersedes) its *“Remaining GA work (store replication path)”* section.
+> - [`docs/raft-operations.md`](../../docs/raft-operations.md) — current Raft control-plane operator workflows (election/failover/membership/join-token).
+> - [`docs/state-store.md`](../../docs/state-store.md) — the SQLite store, read-model cache, and allocation-epoch CAS this plan replicates.
+> - [`docs/persistence-streaming.md`](../../docs/persistence-streaming.md) — the Litestream tier this plan sits *above* on the durability gradient.
 >
 > **Deliverable of this document:** a plan, not the implementation. The implementation is decomposed below into a Claude Dynamic Workflow so it can be executed (and re-executed) phase-by-phase with verification at every step.
 
@@ -43,7 +45,7 @@ This plan is modeled on Diptanu Gon Choudhury's multi-raft scheduling write-up
 Legion's Raft backend today is a **control-plane simulation**, not a replicated store:
 
 1. **No real consensus.** [`RaftPersistenceDriver`](../../src/storage/persistence.rs) tracks `role`/`term`/`commit_index`/`applied_index` in an in-process `Mutex<RaftState>` and mutates them when an operator issues a command. `openraft` is a dependency but only `OpenRaftConfig::default()` is constructed and stored in an unused field (`_raft_config`). No log, no network, no quorum, no apply loop.
-2. **Writes are not replicated.** Every mutation goes through `Store::write_connection()` → local SQLite ([`src/storage/store.rs`](../../src/storage/store.rs)). The persistence driver is consulted only for `status()` / `raft_status()` / operator commands — it is **not on the write path**. So `persistence.type = raft` gives leader-election *theater* with single-node durability underneath (as [`docs/state-store.md`](../state-store.md) and [`docs/raft-operations.md`](../raft-operations.md) both admit: “manager data is still local SQLite per node”).
+2. **Writes are not replicated.** Every mutation goes through `Store::write_connection()` → local SQLite ([`src/storage/store.rs`](../../src/storage/store.rs)). The persistence driver is consulted only for `status()` / `raft_status()` / operator commands — it is **not on the write path**. So `persistence.type = raft` gives leader-election *theater* with single-node durability underneath (as [`docs/state-store.md`](../../docs/state-store.md) and [`docs/raft-operations.md`](../../docs/raft-operations.md) both admit: “manager data is still local SQLite per node”).
 3. **Even once real, a single Raft group is a throughput ceiling.** This is the exact bottleneck the source tweet calls out: one log serializes *all* writes, so user-request bursts and status floods contend with — and stall — the scheduler.
 4. **Test coverage is near zero.** [`src/storage/persistence.rs`](../../src/storage/persistence.rs) has 3 unit tests (local-disk status, streaming standby, raft *bootstrap-status*). There are **no** apply/replay tests, **no** multi-node tests, **no** snapshot/restore tests, **no** partition/fault-injection tests, and **no** Raft entries in [`tests/`](../../tests). The user explicitly asked that missing Raft tests and functionality be added.
 
@@ -53,7 +55,7 @@ We want Legion to be **faster and more scalable than Nomad/K8s** (per [`README.m
 
 ## Goals
 
-- **Real replicated writes.** Mutating store operations become deterministic commands proposed to Raft, committed by quorum, then applied to local SQLite (rqlite-style command replication, *not* WAL shipping — decision inherited from [`docs/persistence-plan.md`](../persistence-plan.md)).
+- **Real replicated writes.** Mutating store operations become deterministic commands proposed to Raft, committed by quorum, then applied to local SQLite (rqlite-style command replication, *not* WAL shipping — decision inherited from [`internal_docs/plans/persistence-plan.md`](persistence-plan.md)).
 - **Multi-raft by default.** When `persistence.type = raft`, state is partitioned across the **control / scheduler / status** lanes automatically. No extra config required to get lane isolation.
 - **Scheduler critical path is isolated and fast.** Allocation/eval/plan-submission writes ride their own Raft group; their apply latency and throughput must stay within SLO regardless of control-lane or status-lane load. This is the success metric.
 - **Ergonomics stay reasonable.** One `persistence: { type: "raft" }` block, one cluster-join token that enrolls a node into *all* lanes, and a single aggregate `raft status` summary (with `--per-lane` for detail). Operators should not have to reason about three groups for day-to-day use.
@@ -84,7 +86,7 @@ We want Legion to be **faster and more scalable than Nomad/K8s** (per [`README.m
 | Raft CLI | [`src/cmd/raft.rs`](../../src/cmd/raft.rs) | `raft status|history|command|join-token`. |
 | Config | [`src/structs/config.rs:146`](../../src/structs/config.rs) | `PersistenceType::{LocalDisk,Streaming,Raft}`; `RaftPersistenceConfig{node_id,bootstrap,peers,join_token_ttl_seconds}` (+ `*Full` variants). Default backend = `LocalDisk`. |
 | Tables (state machine) | [`src/storage/migrations.rs`](../../src/storage/migrations.rs) | 23 tables incl. `node`, `worker_type`, `job`, `job_config`, `task_config`, `task_status`, `allocation`, `allocation_epoch`, `allocation_epoch_partition`, `plan_submission`, `eval`, `kv_*`, `rollout*`, `idempotency_record`. |
-| Epoch CAS | [`docs/state-store.md`](../state-store.md) | `allocation_epoch` compare-and-swap already guards placement against stale cluster state — the basis for tolerating cross-lane read lag. |
+| Epoch CAS | [`docs/state-store.md`](../../docs/state-store.md) | `allocation_epoch` compare-and-swap already guards placement against stale cluster state — the basis for tolerating cross-lane read lag. |
 | Idempotency | AGENTS.md / `Store::idempotency_*` | Mutating RPCs carry `idempotency_key`; commands must dedupe on apply (replay-safety). |
 | Read model cache | [`src/storage/store.rs:105`](../../src/storage/store.rs) | In-memory `SchedulingReadModel` already decouples scheduler reads from the write DB — the natural projection point for a multi-lane read view. |
 | Raft tests | [`src/storage/persistence.rs:714`](../../src/storage/persistence.rs) | 3 unit tests; **no** integration/multi-node/fault/perf tests anywhere. |
@@ -119,7 +121,7 @@ Each lane is an independent openraft group with its own log, leader, quorum, and
 
 ### 1a) Where service discovery fits — and why it does **not** get its own lane (recommendation)
 
-Service discovery is not built yet — it is an open item on [`docs/TASK-LIST.md`](../TASK-LIST.md) (named services on a task, health checks, querying address/port from other services, per-service access ACLs) and a stated [`README.md`](../../README.md) goal, so this is forward-looking guidance for when it lands. It is worth deciding now because SD's write profile is exactly the kind of thing the lane model exists to place correctly.
+Service discovery is not built yet — it is an open item on [`internal_docs/TASK-LIST.md`](../TASK-LIST.md) (named services on a task, health checks, querying address/port from other services, per-service access ACLs) and a stated [`README.md`](../../README.md) goal, so this is forward-looking guidance for when it lands. It is worth deciding now because SD's write profile is exactly the kind of thing the lane model exists to place correctly.
 
 **The key realization: "service discovery" is not one write class — it is four concerns, each of which already maps to an existing lane (or to no lane at all).**
 
@@ -218,7 +220,7 @@ Lanes commit independently, so a placement (scheduler lane) may briefly run agai
 ### 6) Write routing, leadership, and gating
 
 - Each lane elects its own leader; a node can lead some lanes and follow others (load spreads naturally).
-- A mutating RPC routes its command to the **current leader of that command's lane**. On a follower, openraft returns `ForwardToLeader`; the driver either forwards or returns `FAILED_PRECONDITION` + leader hint (matching the redirect model already described in [`docs/persistence-plan.md`](../persistence-plan.md)).
+- A mutating RPC routes its command to the **current leader of that command's lane**. On a follower, openraft returns `ForwardToLeader`; the driver either forwards or returns `FAILED_PRECONDITION` + leader hint (matching the redirect model already described in [`internal_docs/plans/persistence-plan.md`](persistence-plan.md)).
 - Reads are served locally from the read model (followers can serve reads; linearizable reads use openraft `ensure_linearizable` when explicitly requested).
 
 ### 7) Default-on multi-raft + escape hatch
@@ -444,7 +446,7 @@ An optional control loop that closes the observe→diagnose→act loop, modeled 
 5. **`src/storage/migrations.rs`** — add `node_health` table (status lane); no destructive changes to existing tables.
 6. **`src/manager/server.rs` / `src/cmd/raft.rs`** — surface per-lane status/history; add `--lane` flags; **add `raft diagnose`, `raft tuning`, `raft explain`**; keep aggregate defaults. **Add the read-only `legion_raft_diagnose` MCP tool and seed `agent:raft-bottlenecks`.** Update `catalog()` in `src/cmd/capabilities.rs` and MCP tools in `src/cmd/mcp.rs` for any new/renamed surfaces (AGENTS.md requirement).
 7. **`ui/src/pages/Raft.tsx` / `Observability.tsx`** — disclosure-layered Raft health UI (verdict banner, leadership map, per-lane cards with explain-tooltips, effective-config panel, recommendations, Learn affordance).
-8. **Docs** — update `docs/raft-operations.md`, `docs/state-store.md`, `docs/persistence-plan.md` (mark store-replication items done); add `docs/multi-raft.md` (operator guide) **and `docs/multi-raft-tuning.md` (generated knob reference + symptom→fix matrix + plain-language "how it works" explainer + glossary)**; cross-link from `README.md`.
+8. **Docs** — update `docs/raft-operations.md`, `docs/state-store.md`, `internal_docs/plans/persistence-plan.md` (mark store-replication items done); add `docs/multi-raft.md` (operator guide) **and `docs/multi-raft-tuning.md` (generated knob reference + symptom→fix matrix + plain-language "how it works" explainer + glossary)**; cross-link from `README.md`.
 
 ---
 
