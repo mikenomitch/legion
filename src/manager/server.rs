@@ -946,36 +946,6 @@ impl ManagerDaemonService {
         }
     }
 
-    fn cancel_active_rollouts_for_job(&self, job_id: &str) -> Result<(), Status> {
-        let active_rollouts = self
-            .store
-            .list_rollouts(Some(job_id), true)
-            .map_err(|e| map_store_error("Error listing active rollouts", e))?;
-
-        for rollout in active_rollouts {
-            self.store
-                .update_rollout_status(
-                    rollout.id,
-                    "cancelled",
-                    false,
-                    Some("Rollout superseded by newer job update"),
-                )
-                .map_err(|e| map_store_error("Error cancelling superseded rollout", e))?;
-            self.store
-                .append_rollout_event(
-                    rollout.id,
-                    &rollout.job_id,
-                    None,
-                    "warn",
-                    "Rollout cancelled because a newer job config was submitted",
-                    Some(&json!({ "status": "cancelled", "reason": "superseded" }).to_string()),
-                )
-                .map_err(|e| map_store_error("Error writing rollout cancel event", e))?;
-        }
-
-        Ok(())
-    }
-
     /// Service wired with cluster config (artifact admission settings + node
     /// identity names). `run_manager` validates the config before this.
     pub fn with_manager_config(
