@@ -1,7 +1,7 @@
 # Stateful Support: Legion vs Nomad vs Kubernetes
 
 An honest gap analysis of Legion's stateful primitives (see
-[stateful-workloads.md](stateful-workloads.md)) against the two systems users
+[stateful-workloads.md](../docs/stateful-workloads.md)) against the two systems users
 will compare us to. Written 2026-06; updated as primitives land.
 
 ## Primitive-by-primitive
@@ -12,7 +12,7 @@ will compare us to. Written 2026-06; updated as primitives land.
 | Identity survives reschedule | ✅ (pod name + PVC re-bind) | ✅ (index + `per_alloc` volume) | ✅ (instance row re-binds id + storage handle) |
 | On-demand keyed instances | ❌ (no native analog; operators build it) | ⚠️ Parameterized/dispatch jobs (one-shot batch flavor) | ✅ Keyed mode: never-recycled ids, create/destroy/list API |
 | Identity → credentials | Projected SA tokens per pod | Workload identity per alloc/task | ✅ OIDC tokens with instance-keyed `sub` |
-| Persistent volumes | ✅ PVC templates + CSI ecosystem | ✅ Host volumes + CSI + sticky dynamic host volumes | ✅ Volume plugins: `local-dir`/`host`/`nfs`/`tmpfs` built in, CNI-style exec ABI for the rest ([docs](volumes.md)) |
+| Persistent volumes | ✅ PVC templates + CSI ecosystem | ✅ Host volumes + CSI + sticky dynamic host volumes | ✅ Volume plugins: `local-dir`/`host`/`nfs`/`tmpfs` built in, CNI-style exec ABI for the rest ([docs](../docs/volumes.md)) |
 | Storage retention policy | `persistentVolumeClaimRetentionPolicy` (whenScaled / whenDeleted) | Volume lifecycle is operator-managed | ✅ `retainOnScaleIn` (= whenScaled) + `retainOnStop` (= whenDeleted, governs `job stop`; `job destroy` always deletes) |
 | Stable network identity | ✅ Per-pod DNS via headless Service | ⚠️ Via Consul service registration | ❌ **None** — instances are not addressable by name |
 | At-most-one instance (fencing) | ✅ StatefulSet never replaces a pod on a lost node without confirmation/force-delete | ⚠️ `prevent_reschedule_on_lost` opt-in | ✅ Lease-based fencing on by default (`stateful.onLost`): worker self-fences after `selfTerminateAfter`, manager replaces only after `replaceAfter` > that — stronger than K8s's manual default; `'never'` + `instance replace` for the K8s flavor. Create-first rollouts remain rejected for stateful tasks |
@@ -39,7 +39,7 @@ will compare us to. Written 2026-06; updated as primitives land.
    non-storage gap.
 
 3. ~~**At-most-one / fencing guarantees.**~~ **Landed** (`stateful.onLost`,
-   see [stateful-workloads.md](stateful-workloads.md#node-loss-and-fencing-at-most-one)):
+   see [stateful-workloads.md](../docs/stateful-workloads.md#node-loss-and-fencing-at-most-one)):
    node-loss replacement is now gated behind a loss-confirmation window
    coordinated with a worker-side self-fence, on by default for every
    stateful task — stronger than K8s (which needs manual force-delete) and
@@ -50,7 +50,7 @@ will compare us to. Written 2026-06; updated as primitives land.
 
 4. ~~**Ordinal-aware orchestration.**~~ **Mostly landed**
    (`rollout.slots`, see
-   [stateful-workloads.md](stateful-workloads.md#ordered-rollouts-for-slot-pools)):
+   [stateful-workloads.md](../docs/stateful-workloads.md#ordered-rollouts-for-slot-pools)):
    one-at-a-time updates in reverse ordinal order (`order: 'sequential'`,
    the OrderedReady update analog) and partitioned rollouts ("update slots
    ≥ 2 only", `updateFrom`, the `partition` analog with the lower-the-floor

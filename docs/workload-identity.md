@@ -9,7 +9,7 @@ spec.
 
 This document describes the feature, the job-spec API, and a provider
 integration cookbook. The design rationale lives in
-[docs/plans/workload-identity-oidc-plan.md](plans/workload-identity-oidc-plan.md).
+[internal_docs/plans/workload-identity-oidc-plan.md](../internal_docs/plans/workload-identity-oidc-plan.md).
 
 > **Implementation status.** Fully implemented end to end for *task*
 > identities: the token/claims model and the security-critical `sub` template

@@ -1,5 +1,7 @@
 # Plan: Artifact Cache and Pre-Warming
 
+> **Judgement calls:** [`calls/artifact-cache-and-prewarm-plan_calls.md`](../calls/artifact-cache-and-prewarm-plan_calls.md)
+
 ## Problem Statement
 
 The artifact system ([artifact-system-plan.md](artifact-system-plan.md))
@@ -23,7 +25,7 @@ and policy-driven pre-pulling, cache advertisement to the manager, and a
 soft scheduler scoring term so warm nodes win placement on the next
 scheduling pass.
 
-`docs/differentiators.md` anticipates exactly this: "Pre-fetching artifacts
+`internal_docs/differentiators.md` anticipates exactly this: "Pre-fetching artifacts
 in deploy process … Artifact cache generally? This should be built in for
 the scaling cases. Multiple layers of pre-fetching and tagging nodes as
 being pre-warmed."
@@ -461,33 +463,13 @@ Phases 1–2.)
 - Cache directories are self-contained under the worker state dir; wiping
   them is always safe (everything refetches).
 
-## Judgement Calls (decided here, reversible later)
+## Judgement Calls
 
-1. **The cache is the only coordination point; pre-pull is a hint.** No
-   "artifact placement" bookkeeping in the manager beyond advertised attrs
-   and warm progress. Correctness never depends on warm state — that is
-   what keeps this entire plan optional and deletable.
-2. **sqlite cache index** (bundled rusqlite) over a JSON sidecar:
-   crash-safe pins/refcounts and LRU queries beat hand-rolled file locking,
-   and the dependency cost is zero.
-3. **Dedicated `ReportArtifactCache` RPC** rather than reusing
-   `UpdateNodeDynamic`, specifically to *avoid* its `job_update` eval
-   fan-out on mass warming.
-4. **TTL means "revalidation window for mutable sources."** Pinned
-   artifacts are immutable and exempt; retention for everyone is
-   LRU-under-budget. One word, one meaning.
-5. **Hardlinked stages don't count against `resources.disk`.** The cache
-   budget governs shared bytes; `resources.disk` governs the task's own
-   writable footprint. Copies (cross-filesystem fallback) do count. Fuzzy
-   at the edges, but double-counting shared layers per task would punish
-   exactly the dedupe the cache exists to provide.
-6. **Warm pins are TTL-bounded (default 1h) and rank below allocation
-   pins**; warming refuses to evict pinned entries. Warmth should survive
-   until the rollout that wanted it, and never longer at running tasks'
-   expense.
-7. **Only digest-pinned artifacts participate in scoring.** Mutable refs
-   lack stable identity, and the asymmetry nudges users toward the pinning
-   that `resolve: 'pin'` already defaults to.
+Split out into
+[`calls/artifact-cache-and-prewarm-plan_calls.md`](../calls/artifact-cache-and-prewarm-plan_calls.md)
+— seven decisions, ranked by project impact (cache as the only coordination
+point, warm-pin ranking, digest-pinned-only scoring, dedicated report RPC, TTL
+semantics, hardlink disk accounting, sqlite index).
 
 ## Open Questions
 

@@ -4,6 +4,8 @@ A distributed scheduler similar to Kubernetes or Nomad.
 
 ## Documentation
 
+Full index: [docs/README.md](docs/README.md).
+
 - [Managers and Workers](docs/architecture-managers-workers.md)
 - [Plugin System](docs/plugin-system.md)
 - [Scheduler and Eval Loop](docs/scheduler-and-eval-loop.md)
@@ -13,8 +15,12 @@ A distributed scheduler similar to Kubernetes or Nomad.
 - [Task Kind: exec](docs/task-kind-exec.md)
 - [Task Kind: container](docs/task-kind-container.md)
 - [Task Kind: noop](docs/task-kind-noop.md)
+- [Artifacts (images, files, git, S3, OCI/ORAS)](docs/artifacts.md)
+- [Stateful Workloads & Instance Identity](docs/stateful-workloads.md)
+- [Rollouts](docs/rollouts.md) and [Rollout Strategy Plugins](docs/rollout-strategy-plugins.md)
 - [Service Discovery](docs/service-discovery.md)
 - [State Store](docs/state-store.md)
+- [Streaming Persistence](docs/persistence-streaming.md) and [Running Raft](docs/raft-operations.md)
 - [Logging (task logs, tailing, rotation, shipping, OTLP traces)](docs/logging.md)
 - [Observability](docs/observability.md)
 - [UI Architecture](docs/ui-architecture.md)
@@ -25,6 +31,9 @@ A distributed scheduler similar to Kubernetes or Nomad.
 - [Testing and Benchmarks](docs/testing-and-benchmarks.md)
 - [Codebase Conventions](docs/codebase-conventions.md)
 - [Agent Readiness (MCP, structured output, agent workflow)](docs/agent-readiness.md)
+
+Plans, roadmaps, and development notes live in
+[internal_docs/](internal_docs/README.md).
 
 It aims to be differentiated from the above based on the following:
 - Ease:

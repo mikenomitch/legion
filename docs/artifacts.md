@@ -9,9 +9,9 @@ task starts, and the task references them by name — no hardcoded paths, no
 credentials in the job spec.
 
 This document is the user-facing reference. The design rationale lives in
-[docs/plans/artifact-system-plan.md](plans/artifact-system-plan.md); the
+[internal_docs/plans/artifact-system-plan.md](../internal_docs/plans/artifact-system-plan.md); the
 caching/pre-warming layer is a separate, not-yet-implemented plan
-([docs/plans/artifact-cache-and-prewarm-plan.md](plans/artifact-cache-and-prewarm-plan.md)).
+([internal_docs/plans/artifact-cache-and-prewarm-plan.md](../internal_docs/plans/artifact-cache-and-prewarm-plan.md)).
 
 > **Implementation status.** The system is implemented end-to-end: spec +
 > admission validation, task directories, the staging pipeline with five
@@ -300,7 +300,7 @@ re-submit.
 > namespace accordingly: anyone who can submit jobs can read any KV value by
 > staging an artifact with it. When the ACL system lands, the
 > `GetArtifactCredential` handler is the enforcement point (tracked in
-> [docs/TASK-LIST.md](TASK-LIST.md) under *ACL System*; the SECURITY BOUNDARY
+> [internal_docs/TASK-LIST.md](../internal_docs/TASK-LIST.md) under *ACL System*; the SECURITY BOUNDARY
 > comment sits at the handler in `src/manager/server.rs` and on the RPC in
 > `proto/legion.proto`).
 
@@ -421,7 +421,7 @@ all-or-nothing and falls back to a full fresh fetch when:
 Reuse applies only on the same node, per allocation — allocations *moved* to
 another node always fetch fresh, and explicit stops/removals delete the task
 directory. Cross-allocation and cross-node caching remain the
-[cache plan's](plans/artifact-cache-and-prewarm-plan.md) territory.
+[cache plan's](../internal_docs/plans/artifact-cache-and-prewarm-plan.md) territory.
 
 ```jsonnet
 // configs/workers/default.jsonnet — values shown are the defaults
@@ -595,7 +595,7 @@ Remember the allowlists: a custom scheme must be added to the cluster's
   reschedules onto the same node — fetches from origin. The
   content-addressed cache, disk budgets, pre-pull, and scheduler locality
   scoring are the companion plan
-  ([artifact-cache-and-prewarm-plan.md](plans/artifact-cache-and-prewarm-plan.md));
+  ([artifact-cache-and-prewarm-plan.md](../internal_docs/plans/artifact-cache-and-prewarm-plan.md));
   the `ArtifactSink` write seam exists so it slots in without changing
   specs, fetchers, or plugins.
 - **Checksums verify single-file payloads** (and, for OCI, the manifest
@@ -616,4 +616,4 @@ Remember the allowlists: a custom scheme must be added to the cluster's
   [Failure semantics](#staging-mechanics)); there is no dedicated
   `onFetchFailure` policy yet.
 - **Windows staging** has not had a dedicated pass (tracked in
-  [docs/TASK-LIST.md](TASK-LIST.md)).
+  [internal_docs/TASK-LIST.md](../internal_docs/TASK-LIST.md)).

@@ -7,7 +7,7 @@ both the CLI and the web UI. Access is gated by two ACL resources (`exec` and
 full shell access.
 
 Design rationale and the alternatives considered live in
-[docs/plans/exec-and-actions-plan.md](plans/exec-and-actions-plan.md).
+[internal_docs/plans/exec-and-actions-plan.md](../internal_docs/plans/exec-and-actions-plan.md).
 
 - [Exec](#exec)
 - [Actions](#actions)

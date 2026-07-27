@@ -68,7 +68,7 @@
   - Everything has an easily accessible type and spec
   
 - [ ] Artifact system
-  - Plan: [docs/plans/artifact-system-plan.md](plans/artifact-system-plan.md); user doc: [docs/artifacts.md](artifacts.md)
+  - Plan: [internal_docs/plans/artifact-system-plan.md](plans/artifact-system-plan.md); user doc: [docs/artifacts.md](../docs/artifacts.md)
   - [x] Able to grab docker images (oci:// fetcher + ORAS mediaType; container `image`
     desugar ships behind `artifacts.containerImageDesugar`, default off until the cache lands;
     Linux OCI-runtime bundle conversion now implemented in `src/task_plugins/oci_bundle.rs`)
@@ -88,7 +88,7 @@
       Linux container workloads (`src/task_plugins/oci_bundle.rs`; runs on youki/runc/crun)
     - [ ] Windows staging (tracked under the Windows support pass below)
   - [ ] Artifact cache + pre-warming/pre-pull + scheduler locality scoring
-    - Plan: [docs/plans/artifact-cache-and-prewarm-plan.md](plans/artifact-cache-and-prewarm-plan.md)
+    - Plan: [internal_docs/plans/artifact-cache-and-prewarm-plan.md](plans/artifact-cache-and-prewarm-plan.md)
 
 - [ ] Rollouts
   - [x] A new version of a job starts a deployment
@@ -104,7 +104,7 @@
   - [x] When I update one of these, the task restarts (if configured to do so)
   - [x] I can use one of these in the defintion
 
-- [ ] Service Discovery ([plan](plans/service-discovery-final-plan.md), [docs](service-discovery.md))
+- [ ] Service Discovery ([plan](plans/service-discovery-final-plan.md), [docs](../docs/service-discovery.md))
   - [x] I can declare a named service on a task
   - [x] I can declare health checks on that task
   - [x] Can query address and port from other services
@@ -199,6 +199,6 @@
 
 - [ ] Windows support pass
   - [ ] Artifact staging on Windows: hardlink/reflink fallbacks, path semantics, image
-    consumption (see Follow-Ups in docs/plans/artifact-system-plan.md)
+    consumption (see Follow-Ups in internal_docs/plans/artifact-system-plan.md)
 
 - [x] Workload identity tokens (OIDC; see docs/workload-identity.md)

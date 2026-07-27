@@ -408,7 +408,7 @@ fn build_lease_store(
 /// rustyriver's `S3Leaser` owns the `lock.json` lock filename and writes it under
 /// a configurable prefix, so we map the configured lease `key` to its directory.
 /// e.g. `"leases/default/primary.json"` → prefix `"leases/default"` → lock object
-/// `"leases/default/lock.json"`. See docs/rustyriver-migration.md.
+/// `"leases/default/lock.json"`. See internal_docs/rustyriver-migration.md.
 fn lease_path_prefix(key: &str) -> String {
     match key.trim().rsplit_once('/') {
         Some((dir, _file)) => dir.to_string(),

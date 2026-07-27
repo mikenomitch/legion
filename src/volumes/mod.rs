@@ -1,8 +1,8 @@
 //! The volume plugin system: the contract between Legion and storage drivers.
 //!
 //! See `docs/volumes.md` for the user-facing doc and
-//! `docs/plans/volume-plugin-system-plan.md` for the design (including the
-//! judgement calls behind the shape below).
+//! `internal_docs/plans/volume-plugin-system-plan.md` for the design (its
+//! judgement calls are in `internal_docs/calls/volume-plugin-system-plan_calls.md`).
 //!
 //! Layout:
 //! - this module — the [`VolumePlugin`] trait, request/response types, and the

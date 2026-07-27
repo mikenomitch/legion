@@ -102,4 +102,4 @@ For production-ready operator workflows, raft events are recorded with:
 - Raft snapshots/compaction tied to SQLite state-machine durability.
 - Cross-node deterministic replay validation for mutating APIs.
 
-Track progress in `docs/persistence-plan.md`.
+Track progress in `internal_docs/plans/persistence-plan.md`.

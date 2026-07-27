@@ -1,5 +1,7 @@
 # Service Discovery: Self-Critique & Revisions
 
+> **Judgement calls:** [`calls/service-discovery-final-plan_calls.md`](../calls/service-discovery-final-plan_calls.md)
+
 > A deliberate red-team of [service-discovery-plan.md](service-discovery-plan.md) and
 > [service-discovery-mesh-and-config.md](service-discovery-mesh-and-config.md), informed
 > by a survey of concrete failure modes in K8s, Nomad, Consul, Istio/Envoy, Eureka, ZK,

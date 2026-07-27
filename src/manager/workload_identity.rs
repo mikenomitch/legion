@@ -1,7 +1,7 @@
 //! Manager-as-OIDC-IdP: signing keys, token issuance, JWKS, and the OIDC
 //! discovery document.
 //!
-//! See `docs/plans/workload-identity-oidc-plan.md`. The spec/claims primitives
+//! See `internal_docs/plans/workload-identity-oidc-plan.md`. The spec/claims primitives
 //! live in `crate::structs::workload_identity`; this module owns the crypto and
 //! issuer side:
 //!

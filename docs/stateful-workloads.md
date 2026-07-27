@@ -8,7 +8,7 @@ replica N's data.
 
 The `stateful` task block introduces that handle: the **instance**.
 
-> Design plan: [stateful-workloads-and-instance-identity-plan.md](plans/stateful-workloads-and-instance-identity-plan.md).
+> Design plan: [stateful-workloads-and-instance-identity-plan.md](../internal_docs/plans/stateful-workloads-and-instance-identity-plan.md).
 > Related: [volumes.md](volumes.md) (the storage an instance's handle points
 > at), [workload-identity.md](workload-identity.md) (the instance id feeds the
 > reschedule-stable token subject).
@@ -322,7 +322,7 @@ one instance id, storage handle, and workload-identity subject at the same
 time. The node-loss fencing described in [Node loss and fencing
 (at-most-one)](#node-loss-and-fencing-at-most-one) cannot help here — a
 createFirst overlap is deliberate and on healthy nodes, not a partition
-artifact (see [stateful-vs-nomad-k8s.md](stateful-vs-nomad-k8s.md)).
+artifact (see [stateful-vs-nomad-k8s.md](../internal_docs/stateful-vs-nomad-k8s.md)).
 
 Therefore **a stateful task may not use a `createFirst` rollout**: the combo is
 rejected at job admission with an actionable error pointing at this invariant.

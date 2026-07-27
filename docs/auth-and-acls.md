@@ -8,7 +8,7 @@ overrides an allow.
 
 **ACLs are off by default.** With ACLs disabled every caller has full access
 and the UI shows a dismissable warning. Design rationale and roadmap live in
-[docs/plans/auth-acl-plan.md](plans/auth-acl-plan.md).
+[internal_docs/plans/auth-acl-plan.md](../internal_docs/plans/auth-acl-plan.md).
 
 ## Quick start
 

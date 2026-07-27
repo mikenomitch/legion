@@ -1,7 +1,15 @@
 # Plan: Volume Plugin System
 
-> **Status:** IMPLEMENTED (v1). User doc: [docs/volumes.md](../volumes.md).
-> Guides: [Postgres](../guides/postgres.md), [Redis](../guides/redis.md).
+> **Judgement calls:** [`calls/volume-plugin-system-plan_calls.md`](../calls/volume-plugin-system-plan_calls.md)
+
+> **Status:** SHIPPED (v1). User doc:
+> [docs/volumes.md](../../docs/volumes.md). Guides:
+> [Postgres](../../docs/guides/postgres.md),
+> [Redis](../../docs/guides/redis.md).
+>
+> **Deliberately deferred:** the CSI bridge, snapshot/restore/clone/expand
+> (named in the contract, unimplemented), multiple volumes per instance, and
+> cross-node data migration. Each is called out in its section below.
 >
 > This plan is the follow-up that the
 > [Stateful Workloads & Instance Identity plan](stateful-workloads-and-instance-identity-plan.md)
@@ -10,7 +18,8 @@
 > real, plus the mount pipeline, scheduling constraints, and operator surfaces.
 >
 > The design below is the **revised** plan. Where it departs from the original
-> proposal the reasoning is recorded inline under **★ Judgement call** markers.
+> proposal, the reasoning is in
+> [`calls/volume-plugin-system-plan_calls.md`](../calls/volume-plugin-system-plan_calls.md).
 
 ## Problem Statement
 
@@ -86,99 +95,27 @@ reference backed by a `volume` row — and the drivers that act on it.
 | **Nomad host volumes** | "Operator pre-declares, jobs claim by name" → our `host` built-in. Dynamic host volumes → our `local-dir` built-in. |
 | **CSI** | Access modes, idempotency-as-a-rule, and the *idea* of a compatibility bridge rather than native vendor drivers. |
 | **K8s StatefulSet** | `volumeClaimTemplates` semantics (one volume per replica, reattached by ordinal) — which Legion already had via instances. |
-| **Legion's plugin system** ([docs/plugin-system.md](../plugin-system.md)) | Manifest validation (`plugin.json` with kind/name/api version) and the `plugins/<kind>/<name>/` layout. Volume plugins live at `plugins/volumes/<name>/`. |
+| **Legion's plugin system** ([docs/plugin-system.md](../../docs/plugin-system.md)) | Manifest validation (`plugin.json` with kind/name/api version) and the `plugins/<kind>/<name>/` layout. Volume plugins live at `plugins/volumes/<name>/`. |
 
 ---
 
 ## Revisions to the original proposal
 
 The original plan proposed seven operations split across manager (controller)
-and worker (node), with a `volumes` table whose transitions were manager-driven.
-Building it surfaced three problems, and the design changed in response.
+and worker (node). Building it changed four things; the reasoning for each is in
+[`calls/volume-plugin-system-plan_calls.md`](../calls/volume-plugin-system-plan_calls.md),
+ranked by impact.
 
-> ★ **Judgement call 1 — collapse seven operations into four.**
-> The original op set was `capabilities / create / attach / mount / unmount /
-> detach / destroy`, mirroring CSI. CSI needs `stage` vs `publish` because many
-> pods share one staged volume per node, and `ControllerPublish` vs `NodeStage`
-> because cloud disks attach out-of-band. **Legion v1 has neither**: an instance
-> has at most one live allocation by construction (the fencing invariant), so
-> there is never a second consumer to stage for. Six of the seven ops collapse
-> to two useful ones.
->
-> v1 contract: **`capabilities`, `mount`, `unmount`, `destroy`**. `create`,
-> `attach`, `detach`, `snapshot`, `restore`, and `expand` are **reserved names**
-> in the ABI: a plugin advertises them in `capabilities.ops` and Legion will
-> dispatch them when the feature lands, but nothing calls them today, so no
-> plugin has to implement them. Provisioning is lazy-on-first-mount, which is
-> what `local-dir`, `host`, `nfs`, and `tmpfs` all want anyway (and matches
-> open question 1's leaning).
+| Change | Was | Calls entry |
+| --- | --- | --- |
+| Four ops, not seven | `capabilities/create/attach/mount/unmount/detach/destroy` | 3 |
+| Drivers run only on workers | Manager "controller" ops + worker "node" ops | 1 |
+| `path` is kind-aware | "the mount target inside the task fs", uniformly | 5 |
+| Two declaration sites | Only `stateful.storage` | 6 |
 
-> ★ **Judgement call 2 — every plugin operation runs on a worker; the manager
-> only owns the state machine.**
-> The original plan split ops between "manager (controller)" and "worker
-> (node)". But the manager cannot `mkdir` on a remote node's disk, and for every
-> v1 plugin `create` and `destroy` are node-side filesystem operations. Making
-> the manager a plugin host would mean loading drivers into the control plane
-> and giving it storage credentials, for no benefit.
->
-> Instead: **workers own the plugin registry; the manager owns the `volume`
-> table, pinning, and orchestration.** The manager needs plugin *metadata* for
-> admission validation — it gets that from worker fingerprints, which advertise
-> each installed plugin's capabilities. A plugin no node advertises is rejected
-> at submit time with a clear message. `destroy` is dispatched to the owning
-> worker over the heartbeat channel (a `volume_ops` list in the reply) and
-> confirmed on the next heartbeat, so it is crash-safe and retried.
->
-> Consequence: the control plane needs zero storage privileges, and a future
-> controller-side plugin (EBS `CreateVolume`) is an additive capability flag
-> (`controller: true`), not a redesign.
-
-> ★ **Judgement call 3 — `path` semantics are kind-aware, and `path` is optional.**
-> The original plan said `path` is "where the task sees it (mount target inside
-> task fs)". That is exactly right for `container` (a bind mount into the
-> rootfs) and *impossible* for `exec`, which runs a host process in the host
-> mount namespace — there is no filesystem view to mount into, and creating a
-> real mount at `/var/lib/db` on the host would be an unrequested, unscoped
-> mutation of the operator's machine.
->
-> Resolution:
-> - **`container`**: `path` is required and becomes a real bind mount
->   (`{destination: path, type: bind, source: <host path>, options: [rbind, rw|ro]}`)
->   in the OCI spec.
-> - **`exec`**: the task gets the **host path** via environment variables —
->   `LEGION_VOLUME_<NAME>` for every volume, plus `LEGION_STORAGE_DIR` for the
->   stateful one. `path` is accepted, reported in the UI/CLI as the *intended*
->   path, and not mounted. Declaring it is not an error (jobs move between kinds),
->   but the docs are explicit that exec tasks should read the env var.
->
-> This is why the guides use `PGDATA=$LEGION_STORAGE_DIR` for exec and
-> `/var/lib/postgresql/data` for container. Both read naturally.
-
-> ★ **Judgement call 4 — two declaration sites, one pipeline.**
-> `stateful.storage` (per-instance, lifecycle-managed) and `task.volumes[]`
-> (claims of pre-existing/shared storage, any task) are different *lifecycles*,
-> so they are different fields — the same split K8s makes between
-> `volumeClaimTemplates` and `volumes`, and Nomad makes between per-alloc CSI
-> volumes and host volumes. They compile to the same `VolumeMount` list on the
-> wire and share one worker mount pipeline, so the cost is a few lines of
-> admission code, and the win is that a stateless job can mount `/mnt/models`
-> read-only without pretending to be stateful.
-
-> ★ **Judgement call 5 — one instance volume in v1, but the schema takes N.**
-> `stateful.storage` is a single object, not a list, because `Instance` has one
-> `storage_handle` column and 95% of stateful workloads want exactly one data
-> volume. The `volume` table carries a `name` column and is keyed by
-> `(instance_id, name)`, so adding `stateful.volumes: [...]` later is purely
-> additive — no migration of existing rows, no handle format change.
-
-> ★ **Judgement call 6 — no manager-side `create` means no `pending` state.**
-> Volumes are born `pending` at handle-mint time (placement), become `created`
-> the first time a worker successfully mounts them (which is also when
-> `node_id` is recorded for node-local plugins), and go `destroying → destroyed`
-> on reclaim. A volume that never mounted is just a `pending` row and a name; no
-> external resource leaks, so nothing needs a two-phase create.
-
----
+Two further shape decisions that the plan did not take a position on: one
+instance volume in v1 with a schema that takes N (entry 9), and lazy
+provisioning with no `create` operation (entry 11).
 
 ## Proposed Design
 
@@ -378,57 +315,22 @@ with `state ∈ { pending, created, destroying, destroyed }`.
 The `sandbox` task kind (OCI images booted inside microVMs) is the first
 consumer that cannot use a filesystem volume at all: a guest kernel attaches a
 virtio-blk device, not a host directory. Its plan
-(`docs/plans/sandbox-snapshots-and-fast-start-plan.md` §0) is written as a
-dependency on this one. Three of its asks were genuinely blocking; the rest are
-recorded below as decided-but-deferred.
+(`sandbox-snapshots-and-fast-start-plan.md` §0) is written as a dependency on
+this one. Three of its asks were genuinely blocking.
 
-### Implemented
-
-> ★ **Judgement call 11 — `volume_mode: filesystem | block`.**
-> `mount` returning only a host path is right for `exec` (a process reads a
-> directory) and useless for a microVM. Rather than let a VM kind grow a
-> parallel storage mechanism, the contract now carries the same
-> `Filesystem | Block` split Kubernetes has, for the same reason.
->
-> - `capabilities` gains `volumeModes`; `mount` returns `devicePath` + `fs` for
->   block, `mountPath` for filesystem, and the worker rejects a driver that
->   answers in the wrong shape rather than passing a bad path downstream.
-> - `stateful.storage.mode` / `volumes[].mode` declare it, defaulting to
->   filesystem so every existing jobspec is unchanged.
-> - `TaskPlugin::supported_volume_modes()` declares the kind's side, and
->   admission intersects **kind ∩ plugin ∩ requested**, naming all three in the
->   error.
-> - `local-dir` serves block mode as a sparse, formatted disk image — a plain
->   file, so no loop device and no root. `host` serves it as an operator-declared
->   `device`.
->
-> **The plugin formats, never the consumer.** Driven by `params.fs`, on the
-> first mount only. That keeps `mkfs` out of untrusted guests and makes "is this
-> volume fresh?" a driver-side fact — `mount` returns `fresh: true` exactly once,
-> which is the first-boot-initialize signal. `mount` never reformats an existing
-> image; the conformance suite checks that explicitly, because getting it wrong
-> silently destroys the volume you asked to reattach.
-
-> ★ **Judgement call 12 — `clone` is reserved now, implemented later.**
-> Added beside `snapshot`/`restore`/`expand`. Settling the *name* costs nothing
-> and is what stops the sandbox snapshot work from forcing an ABI break;
-> implementing reflink clone before there is a consumer to test it against would
-> be speculative. `local-dir` via `FICLONE`/`clonefile` is the natural first
-> implementation.
-
-> ★ **Judgement call 13 — a driver may return a not-yet-populated device.**
-> Lazy/fetch-on-read disks (NBD/FUSE over a CAS base, qcow2 backing chains,
-> dm-thin over sparse) all fit behind `mount` with **no new contract surface** —
-> but only if a plugin author knows they are allowed to. Now stated explicitly
-> in the contract docs rather than left as a non-obvious inference.
+| Change | Calls entry |
+| --- | --- |
+| `volume_mode: filesystem \| block` end to end, with a three-way admission check | 4 |
+| `clone` reserved in the contract | 14 |
+| `mount` may return a not-yet-populated device | 15 |
 
 Also landed: `volume_mode` and `fs` columns on the `volume` table (so a future
 restore/clone knows the shape without re-probing), `volumeModes` and `ops` on
 `ListVolumePlugins`, and `legion volume plugin test --mode block|filesystem`
 with a block-specific cycle. Block persistence is verified by fingerprinting the
 image across unmount/remount rather than mounting it — Legion hands out the
-device and the *guest* owns the filesystem, and the harness deliberately needs no
-privileges.
+device and the *guest* owns the filesystem, and the harness deliberately needs
+no privileges.
 
 ### Already in place
 
@@ -466,38 +368,6 @@ The exec ABI, `plugin.json` discovery, two-phase destroy, orphan reconciliation,
 and the CSI bridge all survive contact with the sandbox work unchanged. Nothing
 hypervisor-specific entered the contract: `block` is generic, and everything
 about virtio, kernels, or memory snapshots stays in the task kind.
-
-## Judgement calls made during implementation
-
-Beyond the six design calls above, four decisions were made while building and
-testing it:
-
-7. **Reclaim is reconciled, not triggered.** Instrumenting each of the four
-   handle-drop sites (keyed destroy, scale-in, `retainOnStop`, job destroy) to
-   also mark a volume would mean any future code path that drops a handle
-   silently leaks storage. Instead a background loop marks any volume no
-   instance references. One rule, no way to forget it.
-
-8. **A node that advertises no `volumePlugins` fingerprint is assumed to have
-   the built-ins.** Excluding such nodes outright is technically correct but
-   would strand every stateful job on an upgrade until the last worker
-   restarted. The built-ins ship in the binary, so assuming them is both
-   backward-compatible and true. Same leniency at admission: with no plugin
-   metadata anywhere, the check is skipped rather than rejecting every job.
-
-9. **A successful mount report may correct a stale `destroyed` tombstone, but
-   never a `destroying` row.** Task volume claims have deterministic ids, so a
-   claim re-declared after a job destroy lands on the same row; leaving it
-   tombstoned would make a genuinely mounted volume invisible in
-   `legion volume list` and immune to the reaper. A mount is proof the storage
-   exists. `destroying` is excluded because a reclaim is deliberately in flight.
-
-10. **Task volume claims are shared per `(job, group, task, name)`**, not per
-    allocation. That is what "a claim on storage that already exists" means, and
-    it is right for the dominant case (N replicas mounting one models
-    directory read-only). Per-allocation scratch already exists as
-    `$LEGION_TASK_DIR`; the `tmpfs` sharing caveat is documented rather than
-    special-cased.
 
 ## Open Questions (block mode)
 

@@ -4,7 +4,7 @@ Legion has built-in service discovery: declare a service on a task and other
 workloads (and you) can find its healthy endpoints — no Consul, no sidecars, no
 extra components. Works the same on Linux and macOS.
 
-Design background lives in [docs/plans/service-discovery-final-plan.md](plans/service-discovery-final-plan.md)
+Design background lives in [internal_docs/plans/service-discovery-final-plan.md](../internal_docs/plans/service-discovery-final-plan.md)
 (and the docs it consolidates). This page documents what is implemented today.
 
 ## Quick start
@@ -158,4 +158,4 @@ ports are first-come-first-served per node.
 DNS (`<service>.svc.legion` from a node-local resolver), template functions
 (`{{ range endpoints "db" }}`), the `datapath` plugin ABI (bridge/CNI), the
 per-node L4 forwarder with mTLS + intentions (`service.allow`), and the opt-in
-L7 layer. See the [final plan](plans/service-discovery-final-plan.md) §8.
+L7 layer. See the [final plan](../internal_docs/plans/service-discovery-final-plan.md) §8.

@@ -6607,7 +6607,7 @@ impl Store {
     // =====
     //
     // The manager owns the volume state machine; workers own the drivers. See
-    // docs/volumes.md and docs/plans/volume-plugin-system-plan.md.
+    // docs/volumes.md and internal_docs/plans/volume-plugin-system-plan.md.
 
     fn volume_from_row(&self, row: &Row<'_>) -> Result<Volume, rusqlite::Error> {
         let state: String = row.get(6)?;

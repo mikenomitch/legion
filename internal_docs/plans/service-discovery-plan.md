@@ -1,8 +1,10 @@
 # Plan: Service Discovery
 
+> **Judgement calls:** [`calls/service-discovery-final-plan_calls.md`](../calls/service-discovery-final-plan_calls.md)
+
 > **Related:** Service discovery is the connective tissue between several existing
-> primitives. It *consumes* health from the existing [`checks`](../jobs-tasks-and-scheduling.md)
-> model, reuses the [KV reactive-update](../kv-store.md) reconciliation path for
+> primitives. It *consumes* health from the existing [`checks`](../../docs/jobs-tasks-and-scheduling.md)
+> model, reuses the [KV reactive-update](../../docs/kv-store.md) reconciliation path for
 > endpoint-change actions, borrows the [Stateful Workloads & Instance Identity](stateful-workloads-and-instance-identity-plan.md)
 > primitive for stable per-instance DNS, and derives mesh authorization identity from
 > [Workload Identity via OIDC](workload-identity-oidc-plan.md). Read those for the
@@ -22,7 +24,7 @@ records `node_id`/`job_id`/`task_config_id` but **no port, no address, and no se
 name**. There is no `network` block, no `service` block, and `Node`
 ([src/structs/node.rs:13](../../src/structs/node.rs)) exposes no routable address
 outside of opaque `fingerprint_attrs`. The TASK-LIST states the gap exactly
-([docs/TASK-LIST.md:86](../TASK-LIST.md)):
+([internal_docs/TASK-LIST.md:86](../TASK-LIST.md)):
 
 > - [ ] I can declare a named service on a task
 > - [ ] I can declare health checks on that task  *(✅ `checks` already exist)*
@@ -146,10 +148,10 @@ Grounding the design in current code so we extend rather than reinvent.
 | Health checks | `TaskCheck` / `TaskCheckKind` ([src/structs/job.rs:475](../../src/structs/job.rs), [:359](../../src/structs/job.rs)) | `http`/`tcp`/`exec`, plus `boot`/`readiness`/`health` types. The feed for only-healthy. Add `grpc`. |
 | Node record | [src/structs/node.rs:13](../../src/structs/node.rs) | `fingerprint_attrs`/`dynamic_attrs` (JSON). A **networking fingerprinter** records routable addrs + available datapaths here. |
 | Template engine | `KvTemplateSource` ([src/structs/job.rs:874](../../src/structs/job.rs)), `{{ kv "…" }}` | Already renders env/files from KV. Add `service`/`endpoints` template funcs. |
-| KV → reconcile | [docs/kv-store.md](../kv-store.md) `on_change` actions | `none`/`restart`/`rollout`/`fail` vocabulary reused for endpoint-change reactions. |
-| Eval loop | [docs/scheduler-and-eval-loop.md](../scheduler-and-eval-loop.md) | Eval kinds + dedup-on-claim; a new endpoint-sync trigger rides this. |
+| KV → reconcile | [docs/kv-store.md](../../docs/kv-store.md) `on_change` actions | `none`/`restart`/`rollout`/`fail` vocabulary reused for endpoint-change reactions. |
+| Eval loop | [docs/scheduler-and-eval-loop.md](../../docs/scheduler-and-eval-loop.md) | Eval kinds + dedup-on-claim; a new endpoint-sync trigger rides this. |
 | Scheduler | `src/manager/scheduler.rs` | Port assignment happens at placement, alongside resource fit. |
-| Plugin runtime | [src/plugin_runtime.rs](../../src/plugin_runtime.rs), [docs/plugin-system.md](../plugin-system.md) | In-process cdylib plugins (`get` symbol, `plugin.json`, `legionApiVersion`). The datapath plugin is a **new plugin kind** here. |
+| Plugin runtime | [src/plugin_runtime.rs](../../src/plugin_runtime.rs), [docs/plugin-system.md](../../docs/plugin-system.md) | In-process cdylib plugins (`get` symbol, `plugin.json`, `legionApiVersion`). The datapath plugin is a **new plugin kind** here. |
 | Workload identity | [workload-identity-oidc-plan.md](workload-identity-oidc-plan.md) | SPIFFE-style `sub` — the identity intentions are keyed on. |
 | Instance identity | [stateful-workloads-and-instance-identity-plan.md](stateful-workloads-and-instance-identity-plan.md) | Stable `instance_id`/slot → stable *per-instance* DNS (headless analog). |
 
@@ -325,7 +327,7 @@ files: [{
 ```
 
 When the endpoint set changes, Legion re-renders and applies the same
-`on_change` action vocabulary the [KV reactive path](../kv-store.md) already implements
+`on_change` action vocabulary the [KV reactive path](../../docs/kv-store.md) already implements
 (`restart`/`rollout`/`fail`, plus `signal` from the WI plan). This unifies "config
 changed" handling across KV, identity tokens, and service endpoints under one mechanism.
 
@@ -424,7 +426,7 @@ CNI's critiques: it fork/exec's binaries passing JSON (imperative, hard to debug
 chaining is underspecified, it is L3/L4-only and node-local with no service/identity
 concept, and it makes cluster-centric assumptions that misfit single-node tools (why
 Podman left CNI for netavark). Legion already has a better substrate: **in-process
-cdylib plugins** ([docs/plugin-system.md](../plugin-system.md)) — fast, no fork/exec, a
+cdylib plugins** ([docs/plugin-system.md](../../docs/plugin-system.md)) — fast, no fork/exec, a
 validated `plugin.json` manifest. We add a new plugin **kind: `datapath`** with a
 *declarative, reconciled, idempotent* ABI (not CNI's one-shot ADD/DEL):
 
@@ -526,7 +528,7 @@ L4 + L7 intentions, template `endpoints` function).
 4. **Scheduler** (`src/manager/scheduler.rs`) — dynamic-port assignment during placement
    (fit ports alongside resources; respect static-port conflicts as a hard filter);
    write `AllocNetwork` onto the allocation.
-5. **Eval loop** ([docs/scheduler-and-eval-loop.md](../scheduler-and-eval-loop.md)) —
+5. **Eval loop** ([docs/scheduler-and-eval-loop.md](../../docs/scheduler-and-eval-loop.md)) —
    on allocation health/lifecycle transition, recompute the affected service's endpoint
    set and enqueue a (dedup-on-claim) endpoint-push to workers running consumers /
    resolvers; reuse the template re-render + `on_change` path from KV.

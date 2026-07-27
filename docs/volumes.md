@@ -6,7 +6,7 @@ that — replica 2 always comes back as replica 2. This doc covers the *storage*
 half: what replica 2's disk actually is, who creates it, and what happens to it
 when the replica goes away.
 
-> Design plan: [volume-plugin-system-plan.md](plans/volume-plugin-system-plan.md).
+> Design plan: [volume-plugin-system-plan.md](../internal_docs/plans/volume-plugin-system-plan.md).
 > Guides: [Postgres](guides/postgres.md), [Redis](guides/redis.md).
 
 ## The short version

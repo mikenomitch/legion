@@ -158,7 +158,7 @@ Contract specifics (the rest follows the common pattern above):
 
 Purpose: materialize persistent storage for stateful tasks (and volume claims
 on any task). See [docs/volumes.md](volumes.md) for the user-facing doc and
-[plans/volume-plugin-system-plan.md](plans/volume-plugin-system-plan.md) for the
+[plans/volume-plugin-system-plan.md](../internal_docs/plans/volume-plugin-system-plan.md) for the
 design.
 
 - Built-in drivers (in-process, ship in the binary):
@@ -229,13 +229,13 @@ the plan is:
    secret hashing, and policy evaluation stay in core regardless; methods
    can only ever yield policy names, never management access.
 
-See docs/plans/auth-acl-plan.md for the full reasoning.
+See internal_docs/plans/auth-acl-plan.md for the full reasoning.
 
 ## Planned Plugin Categories (Not Implemented Yet)
 
-Based on `docs/TASK-LIST.md`, `README.md`, and `docs/differentiators.md`, these are intended but not present as first-class plugin frameworks today:
+These categories are intended but are not first-class plugin frameworks today:
 
-- Networking/CNI plugins (a declarative `datapath` plugin kind + CNI compatibility shim is designed in [plans/service-discovery-plan.md](plans/service-discovery-plan.md)).
+- Networking/CNI plugins (a declarative `datapath` plugin kind + CNI compatibility shim is designed in [plans/service-discovery-plan.md](../internal_docs/plans/service-discovery-plan.md)).
 - Command/API endpoint extension plugins.
 - Logging/observability pipeline plugins.
 - Eval hooks / scheduler reaction hooks.

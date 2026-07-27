@@ -1,5 +1,7 @@
 # Plan: KV-Driven Task Updates, Injection, and Capabilities
 
+> **Judgement calls:** [`calls/kv-reactive-task-updates-plan_calls.md`](../calls/kv-reactive-task-updates-plan_calls.md)
+
 ## Status (2026-06-09)
 
 Implemented and shipped (see `docs/kv-store.md` "Reactive updates" for the

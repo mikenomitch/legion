@@ -14,7 +14,7 @@
     * Type, auth, how to get them: one `artifacts` task field shared by every kind,
       pluggable fetchers (`plugins/artifacts/<scheme>/`), KV-backed auth with cluster
       matchers, digest pinning at submit
-    * How to cache them: still planned (docs/plans/artifact-cache-and-prewarm-plan.md)
+    * How to cache them: still planned (internal_docs/plans/artifact-cache-and-prewarm-plan.md)
   * Task Group Setup plugins
   * Configuration language??
   * Pluggable Node Statuses for degradation (Disk Pressure, Network Pressure, ect)
