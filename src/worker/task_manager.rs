@@ -2,8 +2,7 @@ use crate::artifacts::{ArtifactStager, ArtifactStatusBoard, CredentialSource, St
 use crate::prelude::*;
 use crate::structs::{
     substitute_artifact_tokens, Allocation, AllocationHealth, TaskAllocation, TaskConfig,
-    TaskOnUnhealthyConfig, VolumeDestroyRequest, VolumeMount, VolumeReport,
-    WorkerArtifactFetchConfigFull,
+    TaskOnUnhealthyConfig, VolumeMount, VolumeReport, WorkerArtifactFetchConfigFull,
 };
 use crate::task_plugins::{TaskPluginRegistry, TaskRuntime};
 use crate::worker::log_sink::{default_sinks, LogResource, LogSink};

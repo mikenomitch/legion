@@ -3624,7 +3624,8 @@ impl Manager for ManagerDaemonService {
             .map_err(|e| map_store_error("Error deleting volume", e))?;
         let message = if inner.force {
             format!(
-                "Volume {} marked destroyed without driver confirmation; any data on its node                  is left behind",
+                "Volume {} marked destroyed without driver confirmation; any data on its node \
+                 is left behind",
                 volume.volume_id
             )
         } else {

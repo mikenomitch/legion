@@ -117,10 +117,12 @@ microVM-specific: nothing hypervisor-shaped entered the contract.
 ## 5. `volume delete` refuses while anything runs against the volume — at both layers
 
 **Call.** `DeleteVolume` returns `FailedPrecondition`, naming the instance or
-allocation that holds the volume, while any live workload mounts it — and
-`--force` does not override that check. Independently, a worker refuses a
-`destroy` request for a volume it currently has mounted. Deleting storage means
-first expressing intent about the *workload* (`legion job stop`,
+allocation that holds the volume, while any live workload mounts it. `--force`
+overrides the *manager's* check — it abandons the row without driver
+confirmation — but the second layer is independent: a worker refuses a
+`destroy` request for a volume it currently has mounted, so even `--force`
+cannot reclaim storage under a live mount. Deleting storage means first
+expressing intent about the *workload* (`legion job stop`,
 `legion instance stop/destroy`), then about the data.
 
 **Alternatives.** (a) Cascade: have delete stop the workload itself, K8s-PVC

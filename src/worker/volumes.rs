@@ -61,6 +61,12 @@ pub struct WorkerVolumeManager {
     /// Volume ids already reclaimed this process, so a manager that re-sends a
     /// destroy before its confirmation lands does not re-run the driver.
     destroyed: Mutex<std::collections::HashSet<String>>,
+    /// True while a destroy pass is running. The heartbeat spawns a pass per
+    /// tick while anything is pending; if one hangs on a dead storage backend,
+    /// the ticks behind it must skip (the manager re-asks forever) rather than
+    /// stack a blocked thread each — which would drain the blocking pool and
+    /// stall unrelated work.
+    destroy_pass: std::sync::atomic::AtomicBool,
 }
 
 impl WorkerVolumeManager {
@@ -71,6 +77,7 @@ impl WorkerVolumeManager {
             mounted: Mutex::new(HashMap::new()),
             reports: Mutex::new(Vec::new()),
             destroyed: Mutex::new(std::collections::HashSet::new()),
+            destroy_pass: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -325,6 +332,24 @@ impl WorkerVolumeManager {
     ///   not mounts, reports, or the caller.
     #[instrument(skip_all)]
     pub fn destroy_requested(&self, requests: &[VolumeDestroyRequest]) {
+        use std::sync::atomic::Ordering;
+        // One pass at a time. Skipping is free — the manager re-sends every
+        // heartbeat until a driver confirms — and it caps a hung driver's cost
+        // at one blocked thread instead of one per tick.
+        if self.destroy_pass.swap(true, Ordering::Acquire) {
+            debug!("Skipping volume destroy pass; a previous pass is still running");
+            return;
+        }
+        // Reset on every exit path, including a driver panic: a stuck flag
+        // would silently disable reclaim on this worker until restart.
+        struct Reset<'a>(&'a std::sync::atomic::AtomicBool);
+        impl Drop for Reset<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        let _reset = Reset(&self.destroy_pass);
+
         // Once the manager stops asking about an id, its confirmation window
         // has closed — forget it rather than accumulating one entry per volume
         // this worker has ever reclaimed.

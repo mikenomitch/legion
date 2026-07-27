@@ -460,9 +460,10 @@ legion volume delete <id> --force   # tombstone the stranded volume
 legion action run postgres sql -p query="$(cat backup.sql)"   # or psql < backup.sql
 ```
 
-`--force` is the "the node is never coming back" affirmation. The two guard
-rails still hold: the manager refuses while a live allocation mounts the
-volume, and a worker never destroys storage under a live mount.
+`--force` is the "the node is never coming back" affirmation: it abandons the
+volume record without waiting for a driver that can no longer answer. One
+guard rail survives even `--force` — a worker never destroys storage under a
+live mount — so a mistyped id cannot reclaim a running database's disk.
 
 ### Fast local disk (NVMe) the operator provisioned
 
