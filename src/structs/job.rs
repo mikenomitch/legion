@@ -915,10 +915,15 @@ impl RolloutConfig {
 #[serde(rename_all = "camelCase")]
 pub struct StatefulConfig {
     /// Instance id assignment mode: `slot` (fixed ordinal pool `0..count-1`,
-    /// ids reused within the pool) or `keyed` (created on demand via the
-    /// CreateInstance/DestroyInstance RPCs, ids never recycled). In keyed
-    /// mode `count.num` is ignored: the set of live instances created via
-    /// the API is the desired allocation count.
+    /// ids reused within the pool — the default) or `keyed` (created on demand
+    /// via the CreateInstance/DestroyInstance RPCs, ids never recycled). In
+    /// keyed mode `count.num` is ignored: the set of live instances created
+    /// via the API is the desired allocation count.
+    ///
+    /// Defaults to `slot`, so the minimal stateful task is just
+    /// `stateful: { storage: { path: '/data' } }`. Keyed mode changes who owns
+    /// cardinality (the instance API, not the spec), so it is always explicit.
+    #[serde(default)]
     pub mode: InstanceMode,
     /// Where keyed instance ids come from by default: `caller` (the
     /// CreateInstance request must supply one) or `uuid` (server-minted when
@@ -3341,6 +3346,24 @@ mod tests {
         assert_eq!(config.tasks[0].count, TaskCount::new(1));
         assert_eq!(config.tasks[1].count, TaskCount::new(3));
         assert_eq!(config.tasks[2].count, TaskCount::new(1));
+        Ok(())
+    }
+
+    #[test]
+    fn stateful_mode_defaults_to_slot() -> R<()> {
+        // The minimal stateful task: no `mode`, just storage. Slot is the
+        // StatefulSet-shaped common case; keyed changes who owns cardinality
+        // and must be asked for explicitly.
+        let config: JobConfig = serde_json::from_value(serde_json::json!({
+            "name": "job",
+            "tasks": [{
+                "name": "db", "kind": "exec", "count": 2,
+                "stateful": { "storage": { "path": "/data" } }
+            }]
+        }))?;
+        let stateful = config.tasks[0].stateful.as_ref().expect("stateful parsed");
+        assert_eq!(stateful.mode, InstanceMode::Slot);
+        config.tasks[0].validate_stateful()?;
         Ok(())
     }
 

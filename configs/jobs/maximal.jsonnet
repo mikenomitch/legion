@@ -68,7 +68,7 @@
             // sees LEGION_INSTANCE_ID / LEGION_INSTANCE_SLOT /
             // LEGION_INSTANCE_MODE (and LEGION_ALLOC_ID) in its env.
             stateful: {
-                mode: "slot",
+                mode: "slot",  // the default; shown for completeness
                 // Node-loss fencing (at-most-one; see docs/stateful-workloads.md
                 // "Node loss and fencing"): the worker self-fences this task
                 // after losing manager contact for selfTerminateAfter; the

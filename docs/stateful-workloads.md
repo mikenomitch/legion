@@ -95,7 +95,7 @@ pending -> active -> rescheduling -> active -> ... -> stopped/terminated
     kind: 'exec',
     count: 3,                    // slot cardinality: slots 0, 1, 2
     stateful: {
-      mode: 'slot',              // 'slot' | 'keyed'
+      mode: 'slot',              // 'slot' (default) | 'keyed'
       // idSource: 'caller',     // keyed only: 'caller' | 'uuid'
       // initialInstances: ['user-1', 'user-2'],  // keyed only: seed list
       onLost: {                  // optional; node-loss fencing policy — see
@@ -125,7 +125,8 @@ pending -> active -> rescheduling -> active -> ... -> stopped/terminated
 
 Validation rules (enforced at `job validate` / submit time):
 
-- `mode` is required (`slot` or `keyed`).
+- `mode` defaults to `'slot'`; declare `'keyed'` explicitly to switch to the
+  instance-management model.
 - `idSource` is only valid in keyed mode (`'caller'` or `'uuid'`).
 - Slot mode requires `count.num >= 1` and cannot be combined with `count.per`
   (per-attribute pools would collide on slot ids).

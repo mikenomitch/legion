@@ -19,7 +19,6 @@ when the replica goes away.
     kind: 'exec',
     count: 3,
     stateful: {
-      mode: 'slot',
       storage: { path: '/var/lib/postgresql/data' },   // that's it
     },
     config: { command: ['postgres', '-D', '$LEGION_STORAGE_DIR'] },
@@ -27,8 +26,9 @@ when the replica goes away.
 }
 ```
 
-Three replicas, three independent data directories, each reattached to its own
-replica across restarts, redeploys, and reschedules. Nothing to install and
+Three replicas (slot mode is the default), three independent data
+directories, each reattached to its own replica across restarts, redeploys,
+and reschedules. Nothing to install and
 nothing to configure: the default `local-dir` driver ships in the binary.
 
 ## Concepts
