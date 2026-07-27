@@ -103,7 +103,48 @@ kind of thing that costs every plugin author ten minutes exactly once, forever.
 Paying a one-time rename to make the trait signature self-explanatory is the
 right trade on a seam meant to be extended.
 
-## 4. Only the task-execution axis is renamed; the other five `kind`s stay
+## 4. The volume system's `RuntimeVolume` is renamed too, but its `driver` is left alone
+
+**Call.** Merging `main` brought in the volume plugin system, which landed two
+names in the space this rename touches. `RuntimeVolume` — the typed mount handed
+to `prepare`/`start`, hanging off `TaskInstance.volumes` — becomes
+`MountedVolume`. The volume plugin axis (`driver: 'host'`) is left exactly as it
+is.
+
+```rust
+pub struct TaskInstance {
+    pub volumes: Vec<MountedVolume>,   // renamed: it is what the worker mounted
+    ...
+}
+```
+
+```jsonnet
+volumes: [{ name: 'data', driver: 'host', path: '/data' }],  // untouched
+```
+
+**Alternatives.** (a) Leave `RuntimeVolume` — it is main's name, freshly landed,
+and touching it widens a rename PR into someone else's subsystem. (b) Also
+rename volume `driver` → something else for one-word-one-concept purity, or
+conversely adopt `driver` for task runtimes to match.
+
+**Trade-off.** Renaming `RuntimeVolume` puts this PR's hands on code it did not
+otherwise need to touch, and anyone with in-flight work against the volume
+branch gets a conflict on the type name. Leaving `driver` means Legion now has
+two words for "pluggable component": `runtime` for what runs a task, `driver`
+for what provisions a volume.
+
+**Why (simplicity).** `RuntimeVolume` is the same collision this PR exists to
+remove — it reads as "task-runtime volume" when it means "a volume as mounted for
+the running instance", and it sits on the struct that was just renamed away from
+`Runtime` for that exact reason. Leaving it would have reintroduced the
+ambiguity one field below where it was fixed. Seven call sites, all mechanical.
+`driver` stays because the two words are genuinely doing different jobs at
+different layers, and "volume driver" is the industry term (Docker, CSI) the way
+"container runtime" is; collapsing them onto one word would lose more than it
+gains. Worth revisiting only if a third pluggable axis makes the split look
+arbitrary.
+
+## 5. Only the task-execution axis is renamed; the other five `kind`s stay
 
 **Call.** `TaskCheckKind`, `SchedulerEvent.kind`, `Eval.kind`,
 `AuthMethod.kind`, `PluginManifest.kind`, and the state-inspector object kind
@@ -132,7 +173,7 @@ churn the scheduler, event stream, and auth surfaces for no gain, and would make
 different token. The request was read as "rename the thing we were discussing,
 everywhere it appears", not "purge the token `kind`".
 
-## 5. One phase, not a staged migration
+## 6. One phase, not a staged migration
 
 **Call.** The rename lands as a single change across proto, structs, storage,
 plugin API, configs, tests, UI, and docs.

@@ -120,9 +120,11 @@ pub struct TaskInstance {
     /// stage here; the exec runtime's `cwd` defaults here.
     pub task_dir: Option<std::path::PathBuf>,
     /// Env vars injected by the worker core (`LEGION_ALLOC_DIR`,
-    /// `LEGION_TASK_DIR`, `LEGION_ARTIFACT_<NAME>`). Runtimes that run host
-    /// processes apply these at start; runtimes with isolated filesystems
-    /// (container) skip them until they grow volume plumbing.
+    /// `LEGION_TASK_DIR`, `LEGION_ARTIFACT_<NAME>`, `LEGION_VOLUME_<NAME>`).
+    /// Runtimes that run host processes apply these at start; runtimes with isolated
+    /// filesystems apply the subset that means something inside the sandbox
+    /// (the container runtime applies the volume vars, whose values are already
+    /// in-container destinations).
     pub extra_env: std::collections::BTreeMap<String, String>,
     /// Typed staged artifacts (artifact system plan §8), attached before
     /// `prepare()` so plugins consume payloads instead of guessing paths.
@@ -131,6 +133,34 @@ pub struct TaskInstance {
     /// capture is enabled by the worker. `None` leaves the child attached to
     /// the worker's standard streams.
     pub log_dir: Option<PathBuf>,
+    /// Volumes the worker mounted for this allocation before `prepare()` (see
+    /// docs/volumes.md). Kinds with an isolated filesystem turn these into real
+    /// mounts; host-process kinds just read `LEGION_VOLUME_*` from
+    /// [`Self::extra_env`], which the worker already filled in.
+    pub volumes: Vec<MountedVolume>,
+}
+
+/// One mounted volume, as a task kind sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MountedVolume {
+    /// Declared volume name (`data`, `models`, …).
+    pub name: String,
+    /// How the driver handed it over: a directory or a block device.
+    pub mode: crate::volumes::VolumeMode,
+    /// Where it lives on this host. In filesystem mode the bind source; in
+    /// block mode the device (or raw disk image) to attach.
+    pub host_path: PathBuf,
+    /// Where the task should see it — the bind destination for a container, the
+    /// guest path for a microVM. `None` when the job declared no path, which
+    /// only makes sense for runtimes without a filesystem view.
+    pub path: Option<String>,
+    /// Block mode: the filesystem the device carries, so a consumer knows what
+    /// to mount inside a guest without probing.
+    pub fs: Option<String>,
+    /// True when this mount created the storage rather than reattaching it —
+    /// the signal to run first-boot initialization.
+    pub fresh: bool,
+    pub read_only: bool,
 }
 
 /// Whether exec into a runtime means host-level (unsandboxed) access, used by
@@ -216,6 +246,17 @@ pub trait TaskPlugin: Send + Sync {
     /// true get File/Tree payloads with zero further code: the worker core
     /// stages them into the task dir and exposes `${artifact.<name>}` /
     /// `LEGION_ARTIFACT_<NAME>`.
+    /// Volume modes this kind can consume (see docs/volumes.md). Most kinds
+    /// run a process against a directory; a microVM kind attaches a block
+    /// device instead and cannot use a path at all.
+    ///
+    /// Admission intersects this with the plugin's supported modes and the
+    /// job's requested mode, so a mismatch is a submit-time error naming all
+    /// three rather than a task that starts and immediately fails.
+    fn supported_volume_modes(&self) -> &'static [crate::volumes::VolumeMode] {
+        &[crate::volumes::VolumeMode::Filesystem]
+    }
+
     fn supports_artifacts(&self) -> bool {
         false
     }
@@ -361,6 +402,7 @@ pub fn validate_job_config(config: &JobConfig) -> R<()> {
         task.validate_kv_injections()?;
         task.validate_network()?;
         task.validate_stateful()?;
+        task.validate_volumes()?;
         task.validate_identities()?;
         task.validate_artifacts()?;
         task.validate_actions()?;

@@ -34,7 +34,10 @@
         {
             name: "parser",
             runtime: "exec",
-            lifecycle: "service",
+            // Batch: downstream stages gate on this task's success, and only
+            // batch tasks can satisfy a complete/success condition (services
+            // never exit).
+            lifecycle: "batch",
             group: "pipeline-a",
             dependsOn: [
                 {
@@ -70,7 +73,7 @@
         {
             name: "transformer",
             runtime: "exec",
-            lifecycle: "service",
+            lifecycle: "batch",
             group: "pipeline-b",
             dependsOn: [
                 {
@@ -106,7 +109,7 @@
         {
             name: "joiner",
             runtime: "exec",
-            lifecycle: "service",
+            lifecycle: "batch",
             group: "join",
             dependsOn: [
                 {

@@ -183,6 +183,12 @@ struct ExecLinuxOptions {
     cgroup: Option<String>,
 }
 
+/// Parsed on every platform so a landlock jobspec validates the same way for a
+/// macOS developer as it does on a worker, but the paths are only ever consumed
+/// by `apply_landlock`, which is Linux-only. The fields are therefore dead
+/// everywhere else; dead-code analysis still applies on Linux, where a truly
+/// unused field is a real bug.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #[derive(Clone, Debug)]
 struct LandlockOptions {
     read_only_paths: Vec<String>,

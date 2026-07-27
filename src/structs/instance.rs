@@ -18,11 +18,15 @@ use serde::{Deserialize, Serialize};
 /// within a fixed pool (replica 3 coming back must be replica 3), while keyed
 /// ids are never reused so a new sandbox can never inherit a dead one's
 /// identity or state.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum InstanceMode {
     /// Fixed pool of ordinal slots `0..count.num-1` (StatefulSet style). Slot
     /// ids are deterministic and reused across reschedules and scale cycles.
+    /// The default: `stateful: { storage: { path: … } }` alone gives a slot
+    /// pool, which is the StatefulSet-shaped common case; keyed mode is the
+    /// one that changes the whole management model and so must be asked for.
+    #[default]
     Slot,
     /// Instances created on demand via the CreateInstance/DestroyInstance
     /// management RPCs with never-recycled ids (sandbox / dispatch style).

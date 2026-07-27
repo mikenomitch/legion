@@ -156,6 +156,7 @@ fn task_allocation(
     artifacts: serde_json::Value,
 ) -> TaskAllocation {
     TaskAllocation {
+        task_volumes: String::new(),
         allocation_id: id,
         job_id: "job".into(),
         job_config_id: "job-1".into(),
@@ -169,6 +170,7 @@ fn task_allocation(
         task_identities: String::new(),
         self_terminate_after_seconds: 0,
         task_artifacts: artifacts.to_string(),
+        task_resources: String::new(),
         network: String::new(),
     }
 }
@@ -503,7 +505,7 @@ async fn admission_normalizes_artifacts_and_preserves_plain_jobs() -> R<()> {
         instance_id: None,
         network: None,
     };
-    let dispatched = build_task_allocation(with_artifacts, &allocation, None)?;
+    let dispatched = build_task_allocation(with_artifacts, &allocation, None, &[])?;
     assert!(dispatched.task_artifacts.contains("secrets/private-pull"));
 
     let plain = tasks
@@ -512,7 +514,7 @@ async fn admission_normalizes_artifacts_and_preserves_plain_jobs() -> R<()> {
         .find(|task| task.name == "plain")
         .context("plain task")?;
     assert!(plain.artifacts.is_empty());
-    let dispatched_plain = build_task_allocation(plain, &allocation, None)?;
+    let dispatched_plain = build_task_allocation(plain, &allocation, None, &[])?;
     assert_eq!(dispatched_plain.task_artifacts, "");
     Ok(())
 }

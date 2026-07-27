@@ -11,6 +11,20 @@ LEGION_ADDR=http://127.0.0.1:4748 cargo run -- join -a
 <!-- Now you can make calls to legion (note that the port is different, should be TLS in the future) -->
 LEGION_ADDR=http://127.0.0.1:4747 cargo run -- ledger
 
+### Running a second cluster on one machine
+
+A worker serves its own gRPC endpoint on port 4848 and advertises that address
+to the manager, so two workers on one host collide (the manager dispatches both
+allocations to whichever process owns the port). Set `LEGION_WORKER_PORT` to
+give a second worker its own, and point the manager at a free port and store
+path:
+
+```bash
+LEGION_WORKER_PORT=4858 \
+LEGION_WORKER_STATE_PATH=/tmp/legion-test/worker-state.json \
+  cargo run -- start worker "$TOKEN" --name test-worker
+```
+
 ### Linux worker containers for local manager testing
 
 Use the mise helper to start worker(s) in Linux containers (via Apple's `container` tool) and connect them to your local manager:

@@ -1,5 +1,5 @@
 import { A } from '@solidjs/router'
-import { For, Show, createMemo, createSignal, type JSX, type Resource } from 'solid-js'
+import { For, Show, createMemo, createResource, createSignal, onCleanup, onMount, type JSX, type Resource } from 'solid-js'
 import { Badge, CodeBlock, Icon, MonoBadge, Note, PageHeader, SectionCard, Spinner, StatusBadge, TableShell, cx, tableClass, tdClass, thClass, theadClass, trHoverClass } from './ui'
 import { AllocationPorts } from './ServiceEndpoints'
 import type { LedgerAllocation, LedgerNode, NodeMsg } from '../gen/legion_pb'
@@ -7,7 +7,10 @@ import { parseAllocNetwork } from '../utils/allocations'
 import { formatBytes, formatRelativeTime } from '../utils/format'
 import { summarizeHealthChecks } from '../utils/health'
 import { parseArtifactStates } from '../utils/jobspec'
+import { managerClient } from '../grpcClient'
+import { POLL_INTERVAL_MS } from '../utils/polling'
 import type { Tone } from '../utils/status'
+import { shortVolumeId, volumePinsPlacement, volumeStateTone } from '../utils/volumes'
 
 export interface NodeDeepViewProps {
   nodes: Resource<readonly NodeMsg[] | undefined>
@@ -502,6 +505,21 @@ const DEFAULT_SECTION_STATE: Record<NodeSectionKey, boolean> = {
 
 export default function NodeDeepView(props: NodeDeepViewProps) {
   const [sectionOpen, setSectionOpen] = createSignal(DEFAULT_SECTION_STATE)
+  const [volumeTick, setVolumeTick] = createSignal(0)
+  onMount(() => {
+    const timer = setInterval(() => setVolumeTick((value) => value + 1), POLL_INTERVAL_MS)
+    onCleanup(() => clearInterval(timer))
+  })
+  // Volumes living on this node. Losing the node means losing (or at least
+  // stranding) these, so they belong on the node page, not just the job's.
+  const [nodeVolumes] = createResource(
+    () => [props.nodes()?.[0]?.id, volumeTick()] as const,
+    async ([nodeId]) => {
+      if (!nodeId) return []
+      const reply = await managerClient.listVolumes({ nodeId })
+      return reply.volumes.filter((volume) => volume.state !== 'destroyed')
+    },
+  )
   const allocationsByNode = createMemo(() => {
     const map = new Map<string, readonly LedgerAllocation[]>()
     ;(props.ledger() ?? []).forEach((entry) => {
@@ -720,6 +738,68 @@ export default function NodeDeepView(props: NodeDeepViewProps) {
                       </Show>
                     </div>
                   </SectionCard>
+
+                  <Show when={(nodeVolumes() ?? []).length > 0}>
+                    <SectionCard
+                      title="Volumes"
+                      description="Storage materialized on this host. Node-local volumes pin their instance here — if this node goes away, those instances wait for it."
+                      flush
+                    >
+                      <TableShell>
+                        <table class={tableClass}>
+                          <thead class={theadClass}>
+                            <tr>
+                              <th class={thClass}>Volume</th>
+                              <th class={thClass}>Driver</th>
+                              <th class={thClass}>State</th>
+                              <th class={thClass}>Owner</th>
+                            </tr>
+                          </thead>
+                          <tbody class="divide-y divide-line">
+                            <For each={nodeVolumes() ?? []}>
+                              {(volume) => (
+                                <tr class={trHoverClass}>
+                                  <td class={tdClass}>
+                                    <A
+                                      href={`/volumes/${encodeURIComponent(volume.volumeId)}`}
+                                      class="font-mono text-xs text-ink hover:text-brass-strong"
+                                      title={volume.volumeId}
+                                    >
+                                      {shortVolumeId(volume.volumeId)}
+                                    </A>
+                                    <div class="text-2xs text-faint">{volume.name}</div>
+                                  </td>
+                                  <td class={tdClass}>
+                                    <Badge tone={volume.nodeLocal ? 'neutral' : 'ok'}>{volume.driver}</Badge>
+                                  </td>
+                                  <td class={tdClass}>
+                                    <Badge tone={volumeStateTone(volume)} dot class="uppercase tracking-wide">
+                                      {volume.state}
+                                    </Badge>
+                                  </td>
+                                  <td class={tdClass}>
+                                    <Show when={volume.jobId} fallback={<span class="text-faint">—</span>}>
+                                      <A href={`/jobs/${encodeURIComponent(volume.jobId!)}`} class="text-muted hover:text-brass-strong">
+                                        {volume.jobId}
+                                      </A>
+                                    </Show>
+                                    <Show when={volume.instanceId}>
+                                      <div class="font-mono text-2xs text-faint">{volume.instanceId}</div>
+                                    </Show>
+                                  </td>
+                                </tr>
+                              )}
+                            </For>
+                          </tbody>
+                        </table>
+                      </TableShell>
+                      <Show when={(nodeVolumes() ?? []).some(volumePinsPlacement)}>
+                        <p class="border-t border-line px-4 py-2 text-2xs text-faint">
+                          Draining or losing this node will strand the node-local volumes above until it returns.
+                        </p>
+                      </Show>
+                    </SectionCard>
+                  </Show>
 
                   <SectionCard
                     title="Metadata"

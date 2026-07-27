@@ -62,13 +62,24 @@
             runtime: "exec",
             group: "frontend",
             lifecycle: "service",
+            // Cross-group dependency: service and batch tasks may depend on
+            // tasks in any group. web is not planned until the prep group's
+            // batch task has succeeded. (A service may only take a
+            // complete/success condition on a batch task — services never
+            // complete.)
+            dependsOn: [
+                {
+                    task: "batch",
+                    condition: "success",
+                },
+            ],
             // Stable instance identity (see docs/stateful-workloads.md):
             // slot mode gives each replica an ordinal slot 0..count-1 whose
             // instance id and storage handle survive reschedules. The task
             // sees LEGION_INSTANCE_ID / LEGION_INSTANCE_SLOT /
             // LEGION_INSTANCE_MODE (and LEGION_ALLOC_ID) in its env.
             stateful: {
-                mode: "slot",
+                mode: "slot",  // the default; shown for completeness
                 // Node-loss fencing (at-most-one; see docs/stateful-workloads.md
                 // "Node loss and fencing"): the worker self-fences this task
                 // after losing manager contact for selfTerminateAfter; the
@@ -80,8 +91,27 @@
                     selfTerminateAfter: "90s",
                     replaceAfter: "3m",
                 },
+                // Per-instance persistent storage, materialized by a volume
+                // driver on whatever node the instance lands on (see
+                // docs/volumes.md). Each slot gets its OWN volume, reattached
+                // on every reschedule — replica 2's disk is replica 2's disk.
                 storage: {
+                    // Where the task sees it. For `container` tasks this is a
+                    // real bind mount; `exec` tasks run in the host mount
+                    // namespace and read $LEGION_STORAGE_DIR instead.
                     path: "/var/lib/web",
+                    // Volume driver. Defaults to "local-dir" (a directory on
+                    // the worker's disk, node-local). "nfs" is the built-in
+                    // network option, which lets instances reschedule anywhere.
+                    driver: "local-dir",
+                    // How the task consumes it: "filesystem" (a directory —
+                    // the default, and what exec/container want) or "block" (a
+                    // raw device or disk image a microVM attaches). Admission
+                    // rejects a mode the task kind or the plugin cannot serve.
+                    mode: "filesystem",
+                    // Passed to the driver verbatim; it declares which are
+                    // required (`legion volume drivers` lists them).
+                    params: { size: "10G" },
                     // K8s persistentVolumeClaimRetentionPolicy analogs (both
                     // default true = Retain). retainOnScaleIn ~ whenScaled;
                     // retainOnStop ~ whenDeleted and governs `job stop` only
@@ -90,6 +120,22 @@
                     retainOnStop: true,
                 },
             },
+            // Claims on storage that exists independently of any instance —
+            // an operator's host path, an NFS export, scratch space (see
+            // docs/volumes.md). Unlike stateful.storage these are shared, are
+            // never provisioned or reclaimed by instance churn, and are valid
+            // on STATELESS tasks too. Each becomes LEGION_VOLUME_<NAME>.
+            volumes: [
+                {
+                    name: "models",
+                    // The `host` driver claims a path the operator declared in
+                    // the worker config's `hostVolumes` map, by name.
+                    driver: "host",
+                    params: { name: "models" },
+                    path: "/models",
+                    readOnly: true,
+                },
+            ],
             config: {
                 command: ["sleep", "1"],
             },
@@ -307,10 +353,15 @@
             runtime: "exec",
             group: "frontend",
             lifecycle: "sidecar",
+            // Sidecars are group-bound: they run alongside their group's
+            // primary task, so they may only depend on tasks in their own
+            // group (a cross-group dependency here is rejected at
+            // validation — put it on the group's primary instead, as web
+            // does above).
             dependsOn: [
                 {
-                    task: "batch",
-                    condition: "success",
+                    task: "web",
+                    condition: "start",
                 },
             ],
             config: {
@@ -389,8 +440,11 @@
                 },
             },
             resources: {
-                cpus: 0.2,
-                memory: 128,
+                // The container kind applies these to the runtime, not just to
+                // scheduling: memory (MiB) and cores size the guest. `cpu`/`cpus`
+                // (MHz) has no runtime analogue, so declare cores here.
+                cores: 1,
+                memory: 256,
             },
             constraints: {
                 os: "macos",

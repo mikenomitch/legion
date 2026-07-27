@@ -27,6 +27,8 @@ Plans, roadmaps, to-do lists, and development notes live in
 - [Artifacts](artifacts.md) — declaring, fetching, verifying, and staging inputs.
 - [Stateful Workloads & Instance Identity](stateful-workloads.md) — slot and
   keyed instances, storage handles, fencing.
+- [Volumes](volumes.md) — persistent storage for stateful tasks: plugins, the
+  driver contract, node pinning, and reclaim.
 - [Rollouts](rollouts.md) — update strategies, health gating, manual/auto
   progression.
 - [Rollout Strategy Plugins](rollout-strategy-plugins.md)

@@ -54,6 +54,9 @@ impl ContainerTaskConfig {
 const OCI_RUNTIME_ENV: &str = "LEGION_OCI_RUNTIME";
 const DEFAULT_OCI_RUNTIME: &str = "youki";
 
+/// Apple's container CLI (macOS). Installed via `brew install container`.
+const APPLE_CONTAINER_BIN: &str = "container";
+
 /// The container runtime for this node, chosen by OS.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ContainerRuntime {
@@ -90,6 +93,47 @@ impl ContainerRuntime {
     fn supports_exec(&self) -> bool {
         matches!(self, Self::AppleContainer)
     }
+
+    /// Confirms the runtime can actually launch a container, with an error the
+    /// operator can act on. Without this the failure surfaces as a bare
+    /// "No such file or directory" from `spawn`, or — worse on macOS, where
+    /// the CLI is installed but its daemon is not running — as a started
+    /// allocation whose container exits immediately.
+    fn preflight(&self) -> R<()> {
+        match self {
+            Self::AppleContainer => {
+                // One call covers both: a missing CLI errors as NotFound, and a
+                // stopped daemon exits non-zero.
+                let status = Command::new(APPLE_CONTAINER_BIN)
+                    .args(["system", "status"])
+                    .output();
+                match status {
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => bail!(
+                        "the Apple `container` runtime is not installed on this node \
+                         (install it with `brew install container`)"
+                    ),
+                    Err(err) => bail!("failed to probe the Apple `container` runtime: {err}"),
+                    Ok(output) if !output.status.success() => bail!(
+                        "the Apple `container` service is not running on this node \
+                         (start it with `container system start`): {}",
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    ),
+                    Ok(_) => Ok(()),
+                }
+            }
+            Self::Oci { binary } => match Command::new(binary).arg("--version").output() {
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => bail!(
+                    "OCI runtime `{binary}` is not installed on this node \
+                     (install youki/runc/crun, or set {OCI_RUNTIME_ENV} to one that is)"
+                ),
+                Err(err) => bail!("failed to probe OCI runtime `{binary}`: {err}"),
+                // A runtime that answers `--version` at all is present; some
+                // report a non-zero status for unrelated reasons, which is not
+                // worth failing the allocation over.
+                Ok(_) => Ok(()),
+            },
+        }
+    }
 }
 
 /// Deterministic per-allocation container name / OCI container id.
@@ -109,28 +153,107 @@ fn work_root(allocation: &Allocation, instance: &TaskInstance) -> PathBuf {
         .join(".container")
 }
 
-/// Apple `container run` launch (docker-compatible). The `--` terminator lets a
-/// flag-bearing command pass through swift-argument-parser. `env` is the
-/// merged Legion + task env (task values already win on conflicts).
+/// A positive numeric entry from the task's free-form `resources` map.
+/// Legion's scheduler reads `memory` as MiB and `cores` as a core count
+/// (`src/manager/scheduler.rs`), so those are the units used here.
+fn resource_amount(resources: &Value, key: &str) -> Option<f64> {
+    resources
+        .get(key)
+        .and_then(Value::as_f64)
+        .filter(|amount| *amount > 0.0)
+}
+
+/// Apple `container run` launch (docker-compatible). `env` is the merged
+/// Legion + task env (task values already win on conflicts).
+///
+/// Note there is no `--` terminator before the command: Apple's parser treats
+/// `--` as the target executable and the container fails to start. It is not
+/// needed either — everything after the image is captured as process
+/// arguments, flags included.
 fn build_apple_launch(
     allocation: &Allocation,
+    task: &TaskConfig,
     config: &ContainerTaskConfig,
     env: &HashMap<String, String>,
+    volumes: &[crate::task_plugins::MountedVolume],
+    image: &str,
 ) -> Vec<String> {
     let mut args = vec![
         "run".to_string(),
         "--rm".to_string(),
         "--name".to_string(),
         container_name(allocation),
+        // The task's stdout/stderr are captured as its logs; Apple's image
+        // fetch progress would otherwise be interleaved into stderr.log.
+        "--progress".to_string(),
+        "none".to_string(),
     ];
+
+    // Declared resources become the guest VM's size. Apple `container` boots a
+    // VM per container, so an unsized guest gets the runtime default (1 GiB /
+    // 4 CPUs) no matter what the job asked the scheduler to reserve.
+    if let Some(memory_mib) = resource_amount(&task.resources, "memory") {
+        args.push("--memory".to_string());
+        args.push(format!("{}M", memory_mib.round().max(1.0) as u64));
+    }
+    if let Some(cores) = resource_amount(&task.resources, "cores") {
+        args.push("--cpus".to_string());
+        args.push(format!("{}", cores.round().max(1.0) as u64));
+    }
+
+    // Assigned ports are host ports, but the container has its own IP inside a
+    // VM, so they must be published to be reachable — by peers via service
+    // discovery and by the worker's own health checks. `to` is the
+    // container-side port when the job pinned one; otherwise the task is
+    // expected to bind the host port it was handed via `LEGION_PORT_<NAME>`.
+    if let Some(network) = allocation.network.as_ref() {
+        for port in &network.ports {
+            args.push("--publish".to_string());
+            args.push(format!(
+                "{}:{}",
+                port.host_port,
+                port.to.unwrap_or(port.host_port)
+            ));
+        }
+    }
+
+    // Sorted so the launch argv is stable across starts (HashMap order is not).
+    let mut env: Vec<_> = env.iter().collect();
+    env.sort_by_key(|(key, _)| *key);
     for (key, value) in env {
         args.push("--env".to_string());
         args.push(format!("{key}={value}"));
     }
-    args.push(config.image.clone());
-    args.push("--".to_string());
+    // Docker-compatible `--volume host:dest[:ro]`. Volumes with no declared
+    // path are skipped; admission rejects that for container tasks.
+    for volume in volumes {
+        let Some(destination) = volume.path.as_deref() else {
+            continue;
+        };
+        args.push("--volume".to_string());
+        let suffix = if volume.read_only { ":ro" } else { "" };
+        args.push(format!(
+            "{}:{destination}{suffix}",
+            volume.host_path.display()
+        ));
+    }
+
+    args.push(image.to_string());
     args.extend(config.command.clone());
     args
+}
+
+/// Best-effort removal of a container left behind under this allocation's
+/// name. `run --name` fails outright when the name is taken, which happens
+/// whenever a previous start was not torn down cleanly (worker crash, or a
+/// `--rm` run killed before the runtime could reap it). Errors are ignored:
+/// "no such container" is the normal case.
+fn remove_stale_container(oci_runtime: &ContainerRuntime, name: &str) {
+    let (program, args): (&str, Vec<&str>) = match oci_runtime {
+        ContainerRuntime::AppleContainer => (APPLE_CONTAINER_BIN, vec!["rm", "--force", name]),
+        ContainerRuntime::Oci { binary } => (binary.as_str(), vec!["delete", "--force", name]),
+    };
+    let _ = Command::new(program).args(&args).output();
 }
 
 /// Imports a staged OCI layout into Apple `container` so the subsequent `run`
@@ -145,7 +268,7 @@ fn apple_load_image(oci_layout: &Path, reference: &str) -> R<()> {
         .context("archive OCI layout")?;
     builder.finish().context("finish OCI layout archive")?;
 
-    let output = Command::new("container")
+    let output = Command::new(APPLE_CONTAINER_BIN)
         .args(["image", "load", "--input"])
         .arg(&archive_path)
         .output()
@@ -202,7 +325,7 @@ fn build_exec_command(
     command: &[String],
 ) -> Vec<String> {
     let program = match oci_runtime {
-        ContainerRuntime::AppleContainer => "container".to_string(),
+        ContainerRuntime::AppleContainer => APPLE_CONTAINER_BIN.to_string(),
         ContainerRuntime::Oci { binary } => binary.clone(),
     };
     let name = format!("legion-{allocation_id}");
@@ -227,6 +350,20 @@ fn staged_image_layout(instance: &TaskInstance) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// The reference of the staged image, recorded alongside its layout. This is
+/// the *pinned* reference the artifact pipeline resolved and imported, so
+/// launching it (instead of the jobspec's tag) is what makes digest pinning
+/// mean anything: a tag can move between the pin and the run.
+fn staged_image_reference(instance: &TaskInstance) -> Option<String> {
+    instance
+        .state
+        .get("artifactImage")
+        .and_then(|image| image.get("reference"))
+        .and_then(Value::as_str)
+        .filter(|reference| !reference.is_empty())
+        .map(str::to_string)
+}
+
 #[derive(Default)]
 pub struct ContainerTaskPlugin;
 
@@ -239,9 +376,21 @@ impl TaskPlugin for ContainerTaskPlugin {
         derived_schema::<ContainerTaskConfig>()
     }
 
+    /// Reported per node so operators can see which nodes can actually run
+    /// containers. The key is omitted (rather than reported as failing) when
+    /// the runtime is unusable: a node without a container runtime is still a
+    /// perfectly healthy node for every other kind, and node health is the
+    /// conjunction of every check it publishes.
     fn readiness(&self) -> Map<String, Value> {
         let mut map = Map::new();
-        map.insert("container".into(), Value::String("pass".into()));
+        match ContainerRuntime::detect().and_then(|oci_runtime| oci_runtime.preflight()) {
+            Ok(()) => {
+                map.insert("container".into(), Value::String("pass".into()));
+            }
+            Err(err) => {
+                debug!(error = %err, "Container runtime unavailable on this node");
+            }
+        }
         map
     }
 
@@ -284,7 +433,7 @@ impl TaskPlugin for ContainerTaskPlugin {
     ) -> R<Box<dyn ExecSession>> {
         let oci_runtime = ContainerRuntime::detect()?;
         if !oci_runtime.supports_exec() {
-            bail!("this container instance does not support exec yet");
+            bail!("this container runtime does not support exec yet");
         }
         // Delegate to the runtime's `exec` subcommand against the running
         // container. The command runs inside the container's namespaces, so
@@ -371,6 +520,7 @@ impl TaskPlugin for ContainerTaskPlugin {
     ) -> R<()> {
         let config = ContainerTaskConfig::from_value(&task.config)?;
         let oci_runtime = ContainerRuntime::detect()?;
+        oci_runtime.preflight()?;
 
         // Legion-provided env (allocation identity + assigned ports) first;
         // user-declared env overrides on key conflicts.
@@ -379,17 +529,45 @@ impl TaskPlugin for ContainerTaskPlugin {
                 .into_iter()
                 .collect();
         merged_env.extend(config.env.clone());
+        // Volume vars carry the IN-CONTAINER destination (the worker resolved
+        // them that way for this kind), so they are meaningful inside the
+        // sandbox — unlike LEGION_ALLOC_DIR and friends, which name host paths
+        // the container cannot see.
+        for (key, value) in &instance.extra_env {
+            if key.starts_with("LEGION_VOLUME_") || key == "LEGION_STORAGE_DIR" {
+                merged_env.insert(key.clone(), value.clone());
+            }
+        }
+
+        // A container still holding this allocation's name would make `run`
+        // fail; restarts and worker crashes both leave one behind.
+        remove_stale_container(&oci_runtime, &container_name(allocation));
 
         let mut cmd = match &oci_runtime {
             ContainerRuntime::AppleContainer => {
+                // `consume_artifact` already imported the staged layout, so
+                // launching its pinned reference runs exactly the image the
+                // artifact pipeline resolved — and needs no registry pull.
+                // Without a staged image, the jobspec's own reference is used
+                // and Apple `container` pulls it itself.
+                let image =
+                    staged_image_reference(instance).unwrap_or_else(|| config.image.clone());
                 info!(
                     allocation_id = allocation.id,
                     task_name = %task.name,
-                    program = "container",
+                    program = APPLE_CONTAINER_BIN,
+                    %image,
                     "Starting container task"
                 );
-                let mut cmd = Command::new("container");
-                cmd.args(build_apple_launch(allocation, &config, &merged_env));
+                let mut cmd = Command::new(APPLE_CONTAINER_BIN);
+                cmd.args(build_apple_launch(
+                    allocation,
+                    task,
+                    &config,
+                    &merged_env,
+                    &instance.volumes,
+                    &image,
+                ));
                 cmd
             }
             ContainerRuntime::Oci { binary } => {
@@ -414,6 +592,7 @@ impl TaskPlugin for ContainerTaskPlugin {
                     &config.command,
                     &merged_env,
                     &container_name(allocation),
+                    &instance.volumes,
                 )?;
 
                 info!(
@@ -456,24 +635,21 @@ impl TaskPlugin for ContainerTaskPlugin {
         // deleted container is gone, which is success.
         if let Ok(oci_runtime) = ContainerRuntime::detect() {
             let name = container_name(allocation);
-            let teardown: Option<(&str, Vec<String>)> = match &oci_runtime {
-                ContainerRuntime::AppleContainer => {
-                    Some(("container", vec!["stop".into(), name.clone()]))
+            let (program, args): (&str, Vec<&str>) = match &oci_runtime {
+                // `stop` signals the container's init and waits, so the
+                // workload gets a chance to shut down; `--rm` then reaps it.
+                ContainerRuntime::AppleContainer => (APPLE_CONTAINER_BIN, vec!["stop", &name]),
+                ContainerRuntime::Oci { binary } => {
+                    (binary.as_str(), vec!["delete", "--force", &name])
                 }
-                ContainerRuntime::Oci { binary } => Some((
-                    binary.as_str(),
-                    vec!["delete".into(), "--force".into(), name.clone()],
-                )),
             };
-            if let Some((program, args)) = teardown {
-                info!(
-                    allocation_id = allocation.id,
-                    task_name = %task.name,
-                    oci_runtime = program,
-                    "Tearing down container by name"
-                );
-                let _ = Command::new(program).args(&args).output();
-            }
+            info!(
+                allocation_id = allocation.id,
+                task_name = %task.name,
+                oci_runtime = program,
+                "Tearing down container by name"
+            );
+            let _ = Command::new(program).args(&args).output();
         }
 
         if let Some(mut child) = instance.child.take() {
@@ -536,9 +712,27 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// A minimal container task carrying the given `resources` (and optionally
+    /// a different name), for launch-argv assertions.
+    fn task_with(resources: Value, name: Option<&str>) -> TaskConfig {
+        serde_json::from_value(json!({
+            "name": name.unwrap_or("web"),
+            "runtime": "container",
+            "config": { "image": "alpine", "command": ["echo", "ok"] },
+            "resources": resources,
+        }))
+        .expect("task config deserializes")
+    }
+
     fn alloc() -> Allocation {
+        alloc_with_id(7)
+    }
+
+    /// End-to-end tests run concurrently and name their container after the
+    /// allocation id, so each needs its own.
+    fn alloc_with_id(id: i64) -> Allocation {
         Allocation {
-            id: 7,
+            id,
             status: "running".into(),
             resources: json!({}),
             node_id: "node-1".into(),
@@ -603,6 +797,43 @@ mod tests {
         assert!(details.contains("invalid type"));
     }
 
+    /// A missing runtime binary must name itself and how to install it — the
+    /// bare `spawn` failure it replaces was "No such file or directory".
+    #[test]
+    fn preflight_reports_a_missing_oci_runtime() {
+        let oci_runtime = ContainerRuntime::Oci {
+            binary: "legion-no-such-oci-runtime".into(),
+        };
+        let err = oci_runtime.preflight().expect_err("missing runtime");
+        let message = err.to_string();
+        assert!(message.contains("legion-no-such-oci-runtime"), "{message}");
+        assert!(message.contains(OCI_RUNTIME_ENV), "{message}");
+    }
+
+    /// On a node whose runtime actually works, preflight must not fail the
+    /// allocation. Gated on a real runtime operation rather than on the binary
+    /// existing: macOS ships the CLI and the daemon separately, and a node with
+    /// the CLI but no running daemon genuinely cannot start containers — which
+    /// is the case preflight exists to report. Skipped where that operation
+    /// does not succeed (most CI machines).
+    #[test]
+    fn preflight_passes_when_the_runtime_is_usable() {
+        let oci_runtime = ContainerRuntime::detect().expect("supported OS");
+        let (probe, args) = match &oci_runtime {
+            // `ls` needs the daemon, so it fails exactly where a launch would.
+            ContainerRuntime::AppleContainer => (APPLE_CONTAINER_BIN, ["ls"]),
+            ContainerRuntime::Oci { binary } => (binary.as_str(), ["--version"]),
+        };
+        let usable = Command::new(probe)
+            .args(args)
+            .output()
+            .is_ok_and(|output| output.status.success());
+        if !usable {
+            return;
+        }
+        assert!(oci_runtime.preflight().is_ok(), "usable runtime must pass");
+    }
+
     #[test]
     fn container_plugin_validates_schema() -> R<()> {
         let plugin = ContainerTaskPlugin::default();
@@ -614,28 +845,165 @@ mod tests {
         Ok(())
     }
 
+    /// Apple's parser reads `--` as the target executable ("failed to find
+    /// target executable --"), and captures everything after the image as
+    /// process arguments regardless, so the command must follow the image
+    /// directly — flags and all.
     #[test]
-    fn apple_launch_terminates_args_with_separator() -> R<()> {
+    fn apple_launch_passes_command_after_image_without_separator() -> R<()> {
         let config = ContainerTaskConfig::from_value(&json!({
             "image": "alpine",
             "command": ["ls", "-l"],
             "env": { "MODE": "test" }
         }))?;
-        let args = build_apple_launch(&alloc(), &config, &config.env.clone());
+        let args = build_apple_launch(
+            &alloc(),
+            &task_with(json!({}), None),
+            &config,
+            &config.env,
+            &[],
+            &config.image,
+        );
         assert_eq!(args[0], "run");
         assert!(args.contains(&"--rm".to_string()));
         assert!(args.contains(&"--env".to_string()));
         assert!(args.contains(&"MODE=test".to_string()));
-        let sep = args
-            .iter()
-            .position(|a| a == "--")
-            .expect("separator present");
+        assert!(!args.contains(&"--".to_string()), "no separator: {args:?}");
         let image_idx = args
             .iter()
             .position(|a| a == "alpine")
             .expect("image present");
-        assert_eq!(sep, image_idx + 1);
-        assert_eq!(args[sep + 1], "ls");
+        assert_eq!(args[image_idx + 1..], ["ls".to_string(), "-l".to_string()]);
+        Ok(())
+    }
+
+    /// Image-fetch progress would otherwise be interleaved into the task's
+    /// captured stderr.
+    #[test]
+    fn apple_launch_silences_runtime_progress() -> R<()> {
+        let config = ContainerTaskConfig::from_value(&json!({
+            "image": "alpine",
+            "command": ["echo", "ok"]
+        }))?;
+        let args = build_apple_launch(
+            &alloc(),
+            &task_with(json!({}), None),
+            &config,
+            &config.env,
+            &[],
+            &config.image,
+        );
+        let idx = args
+            .iter()
+            .position(|a| a == "--progress")
+            .expect("progress flag present");
+        assert_eq!(args[idx + 1], "none");
+        Ok(())
+    }
+
+    #[test]
+    fn apple_launch_maps_declared_resources() -> R<()> {
+        let config = ContainerTaskConfig::from_value(&json!({
+            "image": "alpine",
+            "command": ["echo", "ok"]
+        }))?;
+        let task = task_with(json!({ "memory": 256, "cores": 2 }), None);
+        let args = build_apple_launch(&alloc(), &task, &config, &config.env, &[], &config.image);
+        let memory = args
+            .iter()
+            .position(|a| a == "--memory")
+            .expect("memory flag");
+        assert_eq!(args[memory + 1], "256M");
+        let cpus = args.iter().position(|a| a == "--cpus").expect("cpus flag");
+        assert_eq!(args[cpus + 1], "2");
+
+        // Unset resources leave the runtime's own defaults alone.
+        let bare = build_apple_launch(
+            &alloc(),
+            &task_with(json!({}), None),
+            &config,
+            &config.env,
+            &[],
+            &config.image,
+        );
+        assert!(!bare.contains(&"--memory".to_string()));
+        assert!(!bare.contains(&"--cpus".to_string()));
+        Ok(())
+    }
+
+    /// The container has its own IP inside a VM, so assigned host ports only
+    /// reach it when published.
+    #[test]
+    fn apple_launch_publishes_assigned_ports() -> R<()> {
+        let config = ContainerTaskConfig::from_value(&json!({
+            "image": "alpine",
+            "command": ["echo", "ok"]
+        }))?;
+        let mut allocation = alloc();
+        allocation.network = Some(crate::structs::network::AllocNetwork {
+            address: Some("127.0.0.1".into()),
+            ports: vec![
+                crate::structs::network::AllocPort {
+                    name: "http".into(),
+                    host_port: 21000,
+                    to: Some(8080),
+                },
+                crate::structs::network::AllocPort {
+                    name: "metrics".into(),
+                    host_port: 21001,
+                    to: None,
+                },
+            ],
+        });
+        let args = build_apple_launch(
+            &allocation,
+            &task_with(json!({}), None),
+            &config,
+            &config.env,
+            &[],
+            &config.image,
+        );
+        assert!(args.contains(&"21000:8080".to_string()), "{args:?}");
+        // No container-side port declared: the task binds the port it was
+        // handed via LEGION_PORT_METRICS, so both sides are the host port.
+        assert!(args.contains(&"21001:21001".to_string()), "{args:?}");
+        Ok(())
+    }
+
+    /// A staged image is launched by the reference the artifact pipeline
+    /// pinned, not the jobspec's tag — otherwise a moving tag could run a
+    /// different image than the one that was resolved and imported.
+    #[test]
+    fn staged_image_reference_overrides_configured_tag() -> R<()> {
+        let instance = TaskInstance {
+            state: json!({
+                "artifactImage": {
+                    "ociLayout": "/tmp/x/layout",
+                    "reference": "docker.io/library/alpine@sha256:abc",
+                }
+            }),
+            ..TaskInstance::default()
+        };
+        let image = staged_image_reference(&instance).expect("staged reference");
+        assert_eq!(image, "docker.io/library/alpine@sha256:abc");
+
+        let config = ContainerTaskConfig::from_value(&json!({
+            "image": "alpine:latest",
+            "command": ["echo", "ok"]
+        }))?;
+        let args = build_apple_launch(
+            &alloc(),
+            &task_with(json!({}), None),
+            &config,
+            &config.env,
+            &[],
+            &image,
+        );
+        assert!(args.contains(&image), "{args:?}");
+        assert!(!args.contains(&"alpine:latest".to_string()), "{args:?}");
+
+        // No staged image: the jobspec's own reference is what runs.
+        assert_eq!(staged_image_reference(&TaskInstance::default()), None);
         Ok(())
     }
 
@@ -666,6 +1034,97 @@ mod tests {
         .expect("task config deserializes")
     }
 
+    /// End-to-end macOS run via Apple `container`: launch alpine, assert
+    /// stdout/stderr capture, that the declared resources sized the guest, and
+    /// that the runtime's own progress output stayed out of the task's logs.
+    ///
+    /// Run with:
+    /// `cargo test --lib apple_container_runs -- --ignored --nocapture`
+    #[test]
+    #[ignore = "requires Apple `container` (macOS) + network"]
+    fn apple_container_runs_and_captures_logs() -> R<()> {
+        let plugin = ContainerTaskPlugin::default();
+        let allocation = alloc_with_id(9001);
+        let mut task = container_task(
+            "logtest",
+            json!([
+                "/bin/sh",
+                "-c",
+                "echo stdout-line; echo stderr-line 1>&2; nproc"
+            ]),
+        );
+        task.resources = json!({ "memory": 256, "cores": 1 });
+
+        let tmp = tempfile::tempdir()?;
+        let mut instance = TaskInstance {
+            alloc_dir: Some(tmp.path().to_path_buf()),
+            log_dir: Some(tmp.path().join("logs")),
+            ..TaskInstance::default()
+        };
+
+        plugin.start(&allocation, &task, &mut instance)?;
+        let status = instance.child.take().expect("child handle set").wait()?;
+        assert!(status.success(), "container exited cleanly: {status:?}");
+
+        let log_dir = instance.log_dir.as_ref().expect("log dir");
+        let stdout = std::fs::read_to_string(log_dir.join("stdout.log"))?;
+        let stderr = std::fs::read_to_string(log_dir.join("stderr.log"))?;
+        assert!(stdout.contains("stdout-line"), "stdout: {stdout:?}");
+        assert!(stderr.contains("stderr-line"), "stderr: {stderr:?}");
+        // Apple reports one CPU more than requested (the guest's own
+        // housekeeping core), so an unsized guest's default of 4 would show 5.
+        assert!(
+            stdout.contains("\n2\n") || stdout.trim_end().ends_with('2'),
+            "guest sized to the requested core count: {stdout:?}"
+        );
+        assert!(
+            !stderr.contains("Fetching image"),
+            "runtime progress must stay out of task logs: {stderr:?}"
+        );
+        Ok(())
+    }
+
+    /// End-to-end macOS stop: Apple `container` is daemon-backed, so killing
+    /// the foreground `run` leaves the container up — `stop()` must tear it
+    /// down by name. Also covers the restart path, since a surviving container
+    /// would make the next `run --name` fail.
+    #[test]
+    #[ignore = "requires Apple `container` (macOS) + network"]
+    fn apple_container_stop_kills_running_container() -> R<()> {
+        let plugin = ContainerTaskPlugin::default();
+        let allocation = alloc_with_id(9002);
+        let name = container_name(&allocation);
+        let task = container_task("stoptest", json!(["/bin/sleep", "120"]));
+
+        let tmp = tempfile::tempdir()?;
+        let mut instance = TaskInstance {
+            alloc_dir: Some(tmp.path().to_path_buf()),
+            ..TaskInstance::default()
+        };
+        plugin.start(&allocation, &task, &mut instance)?;
+        std::thread::sleep(std::time::Duration::from_secs(20));
+
+        let running = Command::new(APPLE_CONTAINER_BIN)
+            .args(["inspect", &name])
+            .output()?;
+        assert!(
+            running.status.success(),
+            "container should exist before stop"
+        );
+
+        plugin.stop(&allocation, &task, &mut instance)?;
+        std::thread::sleep(std::time::Duration::from_secs(3));
+
+        let after = Command::new(APPLE_CONTAINER_BIN)
+            .args(["inspect", &name])
+            .output()?;
+        assert!(
+            !after.status.success(),
+            "container should be gone after stop"
+        );
+        Ok(())
+    }
+
     /// End-to-end Linux run via an OCI runtime: pull alpine through the shared
     /// fetcher, build a bundle, run it, and assert stdout/stderr log capture.
     /// Point `LEGION_OCI_RUNTIME` at an installed runtime (`runc`/`crun`/
@@ -675,10 +1134,10 @@ mod tests {
     /// `LEGION_OCI_RUNTIME=runc cargo test --lib oci_runtime_runs_container \
     ///   -- --ignored --nocapture`
     #[test]
-    #[ignore = "requires an OCI instance (youki/runc/crun) + network"]
+    #[ignore = "requires an OCI runtime (youki/runc/crun) + network"]
     fn oci_runtime_runs_container_and_captures_logs() -> R<()> {
         let plugin = ContainerTaskPlugin::default();
-        let allocation = alloc();
+        let allocation = alloc_with_id(9003);
         // Also proves the host's DNS files are bind-mounted in (host networking
         // is useless without resolver config) and that env reaches the task.
         let task = container_task(
@@ -723,11 +1182,11 @@ mod tests {
     /// tears it down via `<runtime> delete --force` (killing the foreground
     /// `run` alone leaves the container init reparented and alive).
     #[test]
-    #[ignore = "requires an OCI instance (youki/runc/crun) + network"]
+    #[ignore = "requires an OCI runtime (youki/runc/crun) + network"]
     fn oci_runtime_stop_kills_running_container() -> R<()> {
         let binary = std::env::var(OCI_RUNTIME_ENV).unwrap_or_else(|_| DEFAULT_OCI_RUNTIME.into());
         let plugin = ContainerTaskPlugin::default();
-        let allocation = alloc();
+        let allocation = alloc_with_id(9004);
         let name = container_name(&allocation);
         let task = container_task("stoptest", json!(["/bin/sleep", "60"]));
 
@@ -764,7 +1223,14 @@ mod tests {
         }))?;
         let mut env: HashMap<String, String> = config.env.clone();
         env.insert("LEGION_PORT_HTTP".to_string(), "20000".to_string());
-        let args = build_apple_launch(&alloc(), &config, &env);
+        let args = build_apple_launch(
+            &alloc(),
+            &task_with(json!({}), None),
+            &config,
+            &env,
+            &[],
+            &config.image,
+        );
         assert!(args.contains(&"LEGION_PORT_HTTP=20000".to_string()));
         Ok(())
     }

@@ -480,6 +480,18 @@ async fn start_node_status_checker(store: Store, check_seconds: u64) -> R<()> {
         if let Err(err) = store.reconcile_incomplete_rollouts() {
             warn!(error = ?err, "Failed reconciling completed_incomplete rollouts");
         }
+        // Volumes whose instance no longer references them (keyed destroy,
+        // scale-in without retention, job destroy) are queued for reclaim.
+        // One reconciling rule covers every way a handle can be dropped, so no
+        // code path can forget to free storage (see docs/volumes.md).
+        match store.reap_orphaned_volumes() {
+            Ok(orphans) => {
+                for volume in orphans {
+                    store.events().volume_reclaiming(&volume);
+                }
+            }
+            Err(err) => warn!(error = ?err, "Failed reaping orphaned volumes"),
+        }
         tokio::time::sleep(tokio::time::Duration::from_secs(check_seconds)).await;
     }
 }
@@ -995,6 +1007,46 @@ async fn load_initial_data(store: &Store, config: &ManagerConfig) -> R<()> {
             }
         };
 
+        // Host volumes are validated here so a typo (a relative path) fails at
+        // manager startup rather than at a task's first mount.
+        let host_volumes = match wcp.host_volumes.as_ref() {
+            None => String::new(),
+            Some(volumes) => {
+                for (name, volume) in volumes {
+                    // Exactly one of path/device: a path serves filesystem
+                    // claims, a device serves block claims, and an entry with
+                    // both would be ambiguous about which a claim gets.
+                    match (volume.path.trim().is_empty(), volume.device.as_deref()) {
+                        (true, None) => bail!(
+                            "worker config {path_str}: hostVolumes.{name} needs a `path` \
+                             (filesystem) or a `device` (block)"
+                        ),
+                        (false, Some(_)) => bail!(
+                            "worker config {path_str}: hostVolumes.{name} declares both `path` \
+                             and `device`; declare two entries if you mean both"
+                        ),
+                        (false, None) if !volume.path.starts_with('/') => bail!(
+                            "worker config {path_str}: hostVolumes.{name}.path must be absolute, \
+                             got {:?}",
+                            volume.path
+                        ),
+                        (true, Some(device)) if !device.starts_with('/') => bail!(
+                            "worker config {path_str}: hostVolumes.{name}.device must be \
+                             absolute, got {device:?}"
+                        ),
+                        _ => {}
+                    }
+                    if volume.create && volume.device.is_some() {
+                        bail!(
+                            "worker config {path_str}: hostVolumes.{name} sets `create` on a \
+                             `device` entry; Legion never creates or formats devices"
+                        );
+                    }
+                }
+                serde_json::to_string(volumes)?
+            }
+        };
+
         let wc = WorkerConfigMsg {
             name: wcp.worker_type.clone(),
             pool: wcp.pool.unwrap_or("default".into()),
@@ -1005,6 +1057,7 @@ async fn load_initial_data(store: &Store, config: &ManagerConfig) -> R<()> {
             reserved_resources,
             max_allocations: wcp.max_allocations,
             artifacts,
+            host_volumes,
         };
 
         store.insert_worker_type(&wc)?;

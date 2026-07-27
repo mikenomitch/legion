@@ -544,6 +544,65 @@ pub fn get_migrations() -> Migrations<'static> {
         // Vec<ActionSpec>; NULL/absent == no actions. Appended last so
         // databases created before this feature migrate cleanly.
         M::up("ALTER TABLE task_config ADD COLUMN actions JSONB;").down(""),
+        // Volume claims declared on a task (volume driver system). JSON-encoded
+        // Vec<VolumeSpec>; NULL/absent == no claims. The per-instance volume
+        // from `stateful.storage` is NOT here — it lives in the stateful
+        // column and materializes through the instance's storage handle.
+        M::up("ALTER TABLE task_config ADD COLUMN volumes JSONB;").down(""),
+        // Volumes: the manager's record of storage a plugin has (or will)
+        // materialize. See docs/volumes.md.
+        //
+        // - `volume_id` is the second half of an instance's
+        //   `{plugin}/{volume_id}` storage handle, so a handle always has a row.
+        // - `node_id` is the pin: set the first time a node-local volume
+        //   mounts, and the constraint every later placement of its instance
+        //   must satisfy.
+        // - `state` is the two-phase destroy machine: pending -> created ->
+        //   destroying -> destroyed. A crash mid-destroy retries; nothing leaks.
+        // - No FK to `instance`: a volume deliberately OUTLIVES its instance
+        //   row through the destroying/destroyed states, which is what lets the
+        //   reaper finish reclaiming storage after a job is destroyed.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS volume (
+            volume_id STRING PRIMARY KEY,
+            name STRING NOT NULL DEFAULT 'data',
+            driver STRING NOT NULL,
+            job_id STRING,
+            instance_id STRING,
+            task_name STRING,
+            state STRING NOT NULL,
+            node_id STRING,
+            node_local INTEGER NOT NULL DEFAULT 1,
+            read_only INTEGER NOT NULL DEFAULT 0,
+            params JSONB NOT NULL DEFAULT '{}',
+            attrs JSONB NOT NULL DEFAULT '{}',
+            mount_path STRING,
+            last_error STRING,
+            created_at TIMESTAMP NOT NULL,
+            updated_at TIMESTAMP NOT NULL
+        )",
+        )
+        .down("DROP TABLE IF EXISTS volume;"),
+        M::up("CREATE INDEX IF NOT EXISTS idx_volume_instance ON volume(instance_id);")
+            .down("DROP INDEX IF EXISTS idx_volume_instance;"),
+        M::up("CREATE INDEX IF NOT EXISTS idx_volume_node ON volume(node_id);")
+            .down("DROP INDEX IF EXISTS idx_volume_node;"),
+        M::up("CREATE INDEX IF NOT EXISTS idx_volume_state ON volume(state);")
+            .down("DROP INDEX IF EXISTS idx_volume_state;"),
+        // Host paths a worker type offers through the `host` volume driver
+        // (JSON map of name -> {path, readOnly, create}); empty == none.
+        M::up("ALTER TABLE worker_type ADD COLUMN host_volumes TEXT NOT NULL DEFAULT '';")
+            .down(""),
+        // How a volume is handed to its consumer: `filesystem` (a directory) or
+        // `block` (a device/disk image). Recorded rather than re-derived so a
+        // future restore/clone knows the shape without re-probing the plugin.
+        M::up(
+            "ALTER TABLE volume ADD COLUMN volume_mode STRING NOT NULL DEFAULT 'filesystem';",
+        )
+        .down(""),
+        // Block mode: the filesystem the device carries, so a consumer knows
+        // what to mount without probing.
+        M::up("ALTER TABLE volume ADD COLUMN fs STRING;").down(""),
         // The task-execution axis was renamed `kind` -> `runtime` (see
         // internal_docs/plans/task-runtime-rename-plan.md). Column rename only;
         // values are unchanged, so existing clusters migrate on manager start

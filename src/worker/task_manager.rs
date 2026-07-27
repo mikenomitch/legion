@@ -2,13 +2,14 @@ use crate::artifacts::{ArtifactStager, ArtifactStatusBoard, CredentialSource, St
 use crate::prelude::*;
 use crate::structs::{
     substitute_artifact_tokens, Allocation, AllocationHealth, TaskAllocation, TaskConfig,
-    TaskOnUnhealthyConfig, WorkerArtifactFetchConfigFull,
+    TaskOnUnhealthyConfig, VolumeMount, VolumeReport, WorkerArtifactFetchConfigFull,
 };
 use crate::task_plugins::{TaskInstance, TaskPluginRegistry};
 use crate::worker::log_sink::{default_sinks, LogResource, LogSink};
 use crate::worker::logs::{read_allocation_logs, CapturedStream};
 use crate::worker::state::{pid_is_running, PersistedAllocation, WorkerStateStore};
 use crate::worker::task_health::{spawn_health_monitor, HealthMonitorHandle};
+use crate::worker::volumes::{volume_env, WorkerVolumeManager};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -61,6 +62,18 @@ pub struct WorkerTaskManager {
     artifact_status: ArtifactStatusBoard,
     stager: Arc<ArtifactStager>,
     log_sinks: Vec<Box<dyn LogSink>>,
+    /// Volume drivers plus the mounts held for each allocation. Mounting
+    /// happens here, between `prepare_instance` and `start`, so a task can never
+    /// start before its storage is real (see docs/volumes.md).
+    ///
+    /// Behind an `Arc` so the daemon can clone a handle out from under the
+    /// task-manager lock and run slow driver operations (destroys against a
+    /// hung NFS server, say) without chaining that lock — which the heartbeat
+    /// path needs — to a driver's fate.
+    volumes: Arc<WorkerVolumeManager>,
+    /// Resolved mount lists per allocation, kept so a worker restart can
+    /// re-mount exactly what the manager last dispatched.
+    volume_specs: HashMap<i64, Vec<VolumeMount>>,
 }
 
 impl Default for WorkerTaskManager {
@@ -76,6 +89,13 @@ impl WorkerTaskManager {
 
     pub fn with_state_store(state_store: WorkerStateStore) -> Self {
         let alloc_root = Self::alloc_root_for(&state_store);
+        // Volume data lives beside the alloc dirs (`<state dir>/volumes/`), not
+        // inside them: alloc dirs are wiped on stop, and persistent storage
+        // that vanished with its allocation would defeat the whole point.
+        let alloc_root_parent = alloc_root
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| alloc_root.clone());
         Self {
             registry: TaskPluginRegistry::new(),
             instances: HashMap::new(),
@@ -93,6 +113,16 @@ impl WorkerTaskManager {
                 Box::new(crate::artifacts::AnonymousCredentials),
             )),
             log_sinks: default_sinks(),
+            volumes: Arc::new(WorkerVolumeManager::new(
+                String::new(),
+                crate::volumes::VolumeRuntimeConfig {
+                    volume_root: alloc_root_parent.join("volumes"),
+                    data_dir: alloc_root_parent,
+                    host_volumes: HashMap::new(),
+                    plugin_dir: crate::util::plugin_root_dir(),
+                },
+            )),
+            volume_specs: HashMap::new(),
         }
     }
 
@@ -164,6 +194,60 @@ impl WorkerTaskManager {
                 .map(|cwd| cwd.join(&root))
                 .unwrap_or(root)
         }
+    }
+
+    /// Wire up the volume drivers once the worker knows its node id and the
+    /// operator's `hostVolumes` declarations (called after pre-registration,
+    /// before any allocation can arrive).
+    pub fn configure_volumes(
+        &mut self,
+        node_id: &str,
+        host_volumes: HashMap<String, crate::volumes::HostVolumeConfig>,
+    ) {
+        let data_dir = self
+            .alloc_root
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| self.alloc_root.clone());
+        self.volumes = Arc::new(WorkerVolumeManager::new(
+            node_id,
+            crate::volumes::VolumeRuntimeConfig {
+                volume_root: data_dir.join("volumes"),
+                data_dir,
+                host_volumes,
+                plugin_dir: crate::util::plugin_root_dir(),
+            },
+        ));
+        info!(
+            node_id,
+            drivers = ?self.volumes.driver_names(),
+            "Loaded volume drivers"
+        );
+    }
+
+    /// Volume plugin capabilities for this node's fingerprint. The manager
+    /// learns what storage exists in the cluster only from this.
+    pub fn volume_fingerprint(&self) -> Value {
+        self.volumes.fingerprint()
+    }
+
+    /// Volume operation outcomes for the next heartbeat.
+    pub fn drain_volume_reports(&mut self) -> Vec<VolumeReport> {
+        self.volumes.drain_reports()
+    }
+
+    /// Put drained reports back after a failed heartbeat. A lost destroy
+    /// confirmation would leave the manager re-dispatching the same reclaim
+    /// forever, so reports are never dropped on a dead connection.
+    pub fn requeue_volume_reports(&mut self, reports: Vec<VolumeReport>) {
+        self.volumes.requeue_reports(reports);
+    }
+
+    /// A handle to the volume manager for work that must NOT run under the
+    /// task-manager lock — reclaim dispatch, whose driver calls can stall on a
+    /// dead storage backend. Cheap to clone; see the field docs.
+    pub fn volumes_handle(&self) -> Arc<WorkerVolumeManager> {
+        self.volumes.clone()
     }
 
     /// Applies the worker's artifact fetch settings and credential source
@@ -291,7 +375,7 @@ impl WorkerTaskManager {
         }
     }
 
-    /// Creates the allocation + task directories and returns a instance
+    /// Creates the allocation + task directories and returns a task instance
     /// pre-wired with dirs and the `LEGION_ALLOC_DIR`/`LEGION_TASK_DIR` env.
     fn prepare_instance(&self, allocation: &Allocation, task: &TaskConfig) -> R<TaskInstance> {
         let alloc_dir = self.alloc_dir(allocation.id);
@@ -336,6 +420,8 @@ impl WorkerTaskManager {
                 }
             }
         }
+        self.volumes.unmount_for_allocation(allocation_id);
+        self.volume_specs.remove(&allocation_id);
         self.instances.remove(&allocation_id);
         self.allocations.remove(&allocation_id);
         self.task_configs.remove(&allocation_id);
@@ -495,12 +581,21 @@ impl WorkerTaskManager {
             }
         }
 
+        // Release storage after the process is gone, never before: unmounting
+        // under a live task is how you corrupt a database. Best-effort — the
+        // data survives an unmount by contract, and a stuck driver must not
+        // block teardown.
+        self.volumes.unmount_for_allocation(allocation_id);
+
         self.instances.remove(&allocation_id);
         self.allocations.remove(&allocation_id);
         self.task_configs.remove(&allocation_id);
         self.allocation_health.remove(&allocation_id);
         self.self_fence_windows.remove(&allocation_id);
         self.artifact_status.remove(allocation_id);
+        if remove_dirs {
+            self.volume_specs.remove(&allocation_id);
+        }
         if remove_dirs {
             self.cleanup_alloc_dir(allocation_id);
         }
@@ -585,9 +680,16 @@ impl WorkerTaskManager {
         self.start_prepared_allocation(allocation, task)
     }
 
-    /// Runs `consume_artifact` hooks + `prepare` + `start` against the
-    /// already-registered instance, then records the allocation as started.
+    /// Runs `consume_artifact` hooks + volume mounts + `prepare` + `start`
+    /// against the already-registered instance, then records the allocation as
+    /// started.
     fn start_prepared_allocation(&mut self, allocation: &Allocation, task: &TaskConfig) -> R<()> {
+        // Storage first: a task must never observe a missing or empty data
+        // directory because its volume was still being mounted. A failure here
+        // fails the allocation, which is the honest outcome — the manager
+        // reschedules and the operator sees the driver's error.
+        self.mount_allocation_volumes(allocation)?;
+
         let plugin = self
             .registry
             .plugin(&task.runtime)
@@ -642,6 +744,12 @@ impl WorkerTaskManager {
     /// and heartbeats must keep flowing).
     pub fn begin_task_allocation(&mut self, allocation: &TaskAllocation) -> R<BeginOutcome> {
         let (alloc, task) = task_from_allocation(allocation)?;
+        // The manager resolved these against the volume table, so they carry
+        // concrete ids and the driver attrs from previous mounts. Recorded
+        // before any start path so both the direct and post-staging routes
+        // mount the same list.
+        self.volume_specs
+            .insert(alloc.id, parse_volume_mounts(allocation)?);
         // A re-dispatch of an id we already run is an in-place update (for
         // example a config change reusing the allocation): stop the old
         // process but keep the task directory — when the artifact list is
@@ -765,6 +873,57 @@ impl WorkerTaskManager {
         self.start_prepared_allocation(allocation, &started_task)
     }
 
+    /// Mount the allocation's volumes and expose them to the task.
+    ///
+    /// Two env views, because the two task kinds see different filesystems
+    /// (see docs/volumes.md, "How `path` works per task kind"):
+    /// - `exec` runs in the host mount namespace, so `LEGION_VOLUME_<NAME>`
+    ///   carries the **host** path and there is nothing to mount into;
+    /// - `container` gets a real bind mount at the declared `path`, so its env
+    ///   carries the **destination** path — the host path would be meaningless
+    ///   inside the container.
+    fn mount_allocation_volumes(&mut self, allocation: &Allocation) -> R<()> {
+        let Some(specs) = self.volume_specs.get(&allocation.id).cloned() else {
+            return Ok(());
+        };
+        if specs.is_empty() {
+            return Ok(());
+        }
+        // Re-mounting an allocation we already hold mounts for (an in-place
+        // re-dispatch) would leak the old ones.
+        self.volumes.unmount_for_allocation(allocation.id);
+
+        let task = self.task_configs.get(&allocation.id).cloned();
+        let instance = task
+            .as_ref()
+            .and_then(|task| crate::worker::volumes::instance_ref_from_task(allocation, task));
+        let mounted = self
+            .volumes
+            .mount_for_allocation(allocation, instance.as_ref(), &specs)?;
+
+        let in_task_view = task
+            .map(|task| task.runtime == "container")
+            .unwrap_or(false);
+        if let Some(instance) = self.instances.get_mut(&allocation.id) {
+            for (key, value) in volume_env(&mounted, in_task_view) {
+                instance.extra_env.insert(key, value);
+            }
+            instance.volumes = mounted
+                .iter()
+                .map(|mount| crate::task_plugins::MountedVolume {
+                    name: mount.name.clone(),
+                    mode: mount.mode,
+                    host_path: mount.host_path.clone(),
+                    path: mount.path.clone(),
+                    fs: mount.fs.clone(),
+                    fresh: mount.fresh,
+                    read_only: mount.read_only,
+                })
+                .collect();
+        }
+        Ok(())
+    }
+
     /// Arm (or re-arm) the self-fence window for a running allocation and
     /// persist it.
     pub fn set_self_fence_window(&mut self, allocation_id: i64, window: std::time::Duration) {
@@ -858,6 +1017,20 @@ impl WorkerTaskManager {
                 .insert(record.allocation.id, record.allocation.clone());
             self.task_configs
                 .insert(record.allocation.id, record.task.clone());
+            self.volume_specs
+                .insert(record.allocation.id, record.volumes.clone());
+            // The task survived the worker restart and is still writing to its
+            // volume, so re-establish the mount (idempotent by contract) and
+            // re-record the ownership this process lost. A failure is logged,
+            // not fatal: the process is already running, and the manager sees
+            // the failed mount report and can act on it.
+            if let Err(err) = self.mount_allocation_volumes(&record.allocation) {
+                warn!(
+                    allocation_id = record.allocation.id,
+                    error = ?err,
+                    "Failed to re-establish volume mounts for a restored allocation"
+                );
+            }
             if let Some(window_secs) = record.self_terminate_after_secs {
                 self.self_fence_windows.insert(
                     record.allocation.id,
@@ -904,6 +1077,11 @@ impl WorkerTaskManager {
                     .self_fence_windows
                     .get(allocation_id)
                     .map(std::time::Duration::as_secs),
+                volumes: self
+                    .volume_specs
+                    .get(allocation_id)
+                    .cloned()
+                    .unwrap_or_default(),
             });
         }
 
@@ -1044,6 +1222,15 @@ fn spawn_staging_thread(manager: Arc<Mutex<WorkerTaskManager>>, job: StagingJob)
     }
 }
 
+/// The resolved volume mounts carried by a dispatch. Empty string means the
+/// task declares no storage, so nothing is mounted at all.
+fn parse_volume_mounts(allocation: &TaskAllocation) -> R<Vec<VolumeMount>> {
+    if allocation.task_volumes.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    serde_json::from_str(&allocation.task_volumes).context("Invalid task volumes JSON")
+}
+
 fn task_from_allocation(allocation: &TaskAllocation) -> R<(Allocation, TaskConfig)> {
     let task_config: serde_json::Value =
         serde_json::from_str(&allocation.task_config).context("Invalid task configuration JSON")?;
@@ -1073,6 +1260,13 @@ fn task_from_allocation(allocation: &TaskAllocation) -> R<(Allocation, TaskConfi
     } else {
         Some(serde_json::from_str(&allocation.network).context("Invalid allocation network JSON")?)
     };
+    // Declared resources, used by isolating kinds to size the workload. Empty
+    // when the jobspec declared none, so kinds keep their instance defaults.
+    let resources = if allocation.task_resources.trim().is_empty() {
+        serde_json::json!({})
+    } else {
+        serde_json::from_str(&allocation.task_resources).context("Invalid task resources JSON")?
+    };
 
     let task = TaskConfig {
         config: task_config,
@@ -1080,6 +1274,7 @@ fn task_from_allocation(allocation: &TaskAllocation) -> R<(Allocation, TaskConfi
         on_unhealthy,
         identities,
         artifacts,
+        resources,
         ..TaskConfig::new(&allocation.task_name, &allocation.task_runtime)
     };
     let alloc = Allocation {
@@ -1297,6 +1492,7 @@ mod tests {
         let mut manager = manager_in(&temp_dir);
 
         let ta = TaskAllocation {
+            task_volumes: String::new(),
             allocation_id: 9,
             job_id: "job".into(),
             job_config_id: "job-1".into(),
@@ -1310,6 +1506,7 @@ mod tests {
             task_identities: String::new(),
             self_terminate_after_seconds: 0,
             task_artifacts: String::new(),
+            task_resources: String::new(),
 
             network: String::new(),
         };
@@ -1348,6 +1545,7 @@ mod tests {
         artifact.name = Some("tool".into());
         artifact.unpack = crate::structs::ArtifactUnpack::File;
         let ta = TaskAllocation {
+            task_volumes: String::new(),
             allocation_id: 11,
             job_id: "job".into(),
             job_config_id: "job-1".into(),
@@ -1361,7 +1559,7 @@ mod tests {
             task_identities: String::new(),
             self_terminate_after_seconds: 0,
             task_artifacts: serde_json::to_string(&[artifact])?,
-
+            task_resources: String::new(),
             network: String::new(),
         };
         let outcome = manager.begin_task_allocation(&ta)?;
@@ -1390,6 +1588,7 @@ mod tests {
 
         let artifacts = vec![ArtifactSpec::from_source("https://example.com/tool.tar.gz")];
         let ta = TaskAllocation {
+            task_volumes: String::new(),
             allocation_id: 11,
             job_id: "job".into(),
             job_config_id: "job-1".into(),
@@ -1403,6 +1602,7 @@ mod tests {
             task_identities: String::new(),
             self_terminate_after_seconds: 0,
             task_artifacts: serde_json::to_string(&artifacts)?,
+            task_resources: String::new(),
 
             network: String::new(),
         };

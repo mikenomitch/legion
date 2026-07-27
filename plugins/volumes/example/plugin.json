@@ -1,0 +1,5 @@
+{
+  "kind": "volumes",
+  "name": "example",
+  "legionVolumeApiVersion": 1
+}

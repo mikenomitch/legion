@@ -889,6 +889,7 @@ mod tests {
 
         let manager = Arc::new(WorkerIdentityManager::new(FakeIssuer::new(900)));
         let mut allocation = TaskAllocation {
+            task_volumes: String::new(),
             allocation_id: 7,
             job_id: "job".into(),
             job_config_id: "jc".into(),
@@ -902,6 +903,7 @@ mod tests {
             task_identities: serde_json::to_string(&identities)?,
             self_terminate_after_seconds: 0,
             task_artifacts: String::new(),
+            task_resources: String::new(),
 
             network: String::new(),
         };
@@ -948,6 +950,7 @@ mod tests {
             ..Default::default()
         }];
         let mut allocation = TaskAllocation {
+            task_volumes: String::new(),
             allocation_id: 8,
             job_id: "job".into(),
             job_config_id: "jc".into(),
@@ -961,6 +964,7 @@ mod tests {
             task_identities: serde_json::to_string(&identities)?,
             self_terminate_after_seconds: 0,
             task_artifacts: String::new(),
+            task_resources: String::new(),
 
             network: String::new(),
         };

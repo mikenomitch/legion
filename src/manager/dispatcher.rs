@@ -52,7 +52,13 @@ pub fn dispatch_allocations(store: &Store, allocations: &[Allocation]) -> R<()> 
                 Some(instance_id) => store.get_instance(instance_id)?,
                 None => None,
             };
-            let task_allocation = build_task_allocation(task, allocation, instance.as_ref())?;
+            // Volume mounts are resolved here (not on the worker) so the
+            // worker receives concrete volume ids and the driver attrs from
+            // previous mounts, and never re-derives storage from a jobspec.
+            let volumes =
+                store.volume_mounts_for_allocation(&allocation.job_id, task, instance.as_ref())?;
+            let task_allocation =
+                build_task_allocation(task, allocation, instance.as_ref(), &volumes)?;
             let request = crate::structs::PostWorkRequest {
                 allocation: Some(task_allocation),
             };
@@ -119,6 +125,7 @@ pub fn build_task_allocation(
     task: &TaskConfig,
     allocation: &Allocation,
     instance: Option<&Instance>,
+    volumes: &[crate::structs::VolumeMount],
 ) -> R<TaskAllocation> {
     let mut config = task.config.clone();
     inject_runtime_env(&mut config, allocation, instance);
@@ -151,6 +158,18 @@ pub fn build_task_allocation(
     } else {
         serde_json::to_string(&task.artifacts)?
     };
+    // Same rule for volumes: jobs without storage are unchanged on the wire.
+    let task_volumes = if volumes.is_empty() {
+        String::new()
+    } else {
+        serde_json::to_string(volumes)?
+    };
+    // As declared, without the scheduler's defaults folded in, so an isolating
+    // runtime can size its sandbox only where the job actually asked for a size.
+    let task_resources = match task.resources.as_object() {
+        Some(resources) if !resources.is_empty() => serde_json::to_string(&task.resources)?,
+        _ => String::new(),
+    };
     Ok(TaskAllocation {
         allocation_id: allocation.id,
         job_id: allocation.job_id.clone(),
@@ -166,6 +185,8 @@ pub fn build_task_allocation(
         task_identities,
         self_terminate_after_seconds,
         task_artifacts,
+        task_volumes,
+        task_resources,
     })
 }
 
@@ -270,7 +291,7 @@ mod tests {
             config: json!({ "command": ["true"] }),
             ..TaskConfig::new("web", "exec")
         };
-        let built = build_task_allocation(&task, &allocation(None), None)?;
+        let built = build_task_allocation(&task, &allocation(None), None, &[])?;
         let env = env_from(&built);
         assert_eq!(env["LEGION_ALLOC_ID"], json!("42"));
         assert!(!env.contains_key("LEGION_INSTANCE_ID"));
@@ -289,6 +310,7 @@ mod tests {
             &task,
             &allocation(Some("job-default-1")),
             Some(&slot_instance()),
+            &[],
         )?;
         let env = env_from(&built);
         assert_eq!(env["LEGION_ALLOC_ID"], json!("42"));
@@ -310,8 +332,12 @@ mod tests {
             config: json!({ "command": ["true"] }),
             ..TaskConfig::new("sandbox", "exec")
         };
-        let built =
-            build_task_allocation(&task, &allocation(Some("sandbox-7f3a")), Some(&instance))?;
+        let built = build_task_allocation(
+            &task,
+            &allocation(Some("sandbox-7f3a")),
+            Some(&instance),
+            &[],
+        )?;
         let env = env_from(&built);
         assert_eq!(env["LEGION_INSTANCE_ID"], json!("sandbox-7f3a"));
         assert_eq!(env["LEGION_INSTANCE_MODE"], json!("keyed"));
@@ -338,6 +364,7 @@ mod tests {
             &task,
             &allocation(Some("job-default-1")),
             Some(&slot_instance()),
+            &[],
         )?;
         let env = env_from(&built);
         assert_eq!(env["LEGION_INSTANCE_ID"], json!("job-default-1"));
@@ -352,7 +379,7 @@ mod tests {
             config: json!({ "command": ["true"] }),
             ..TaskConfig::new("web", "exec")
         };
-        let built = build_task_allocation(&task, &allocation(None), None)?;
+        let built = build_task_allocation(&task, &allocation(None), None, &[])?;
         assert_eq!(built.self_terminate_after_seconds, 0);
         Ok(())
     }
@@ -376,6 +403,7 @@ mod tests {
             &task,
             &allocation(Some("job-default-1")),
             Some(&slot_instance()),
+            &[],
         )?;
         assert_eq!(built.self_terminate_after_seconds, 90);
         Ok(())
@@ -401,6 +429,7 @@ mod tests {
             &task,
             &allocation(Some("job-default-1")),
             Some(&slot_instance()),
+            &[],
         )?;
         assert_eq!(built.self_terminate_after_seconds, 30);
         Ok(())
@@ -412,7 +441,7 @@ mod tests {
             config: json!({ "command": ["true"] }),
             ..TaskConfig::new("web", "exec")
         };
-        build_task_allocation(&task, &allocation(None), None)?;
+        build_task_allocation(&task, &allocation(None), None, &[])?;
         assert!(task.config.get("env").is_none());
         Ok(())
     }

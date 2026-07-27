@@ -17,6 +17,12 @@ pub struct PersistedAllocation {
     /// a worker restart. `None`/absent = stateless allocation, no fencing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub self_terminate_after_secs: Option<u64>,
+    /// Volume mounts the manager last dispatched for this allocation (see
+    /// docs/volumes.md). Persisted so a restarted worker re-mounts exactly
+    /// this storage instead of waiting for the next dispatch — a restored
+    /// task is still running and still needs its data directory.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub volumes: Vec<crate::structs::VolumeMount>,
 }
 
 #[derive(Debug, Clone)]

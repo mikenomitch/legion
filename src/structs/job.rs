@@ -9,6 +9,7 @@ use std::time::Duration;
 use tabled::Tabled;
 
 use crate::prelude::{anyhow, bail, R};
+use crate::volumes::VolumeMode;
 use tracing::warn;
 
 use super::artifact::{validate_task_artifacts, ArtifactSpec};
@@ -914,10 +915,15 @@ impl RolloutConfig {
 #[serde(rename_all = "camelCase")]
 pub struct StatefulConfig {
     /// Instance id assignment mode: `slot` (fixed ordinal pool `0..count-1`,
-    /// ids reused within the pool) or `keyed` (created on demand via the
-    /// CreateInstance/DestroyInstance RPCs, ids never recycled). In keyed
-    /// mode `count.num` is ignored: the set of live instances created via
-    /// the API is the desired allocation count.
+    /// ids reused within the pool — the default) or `keyed` (created on demand
+    /// via the CreateInstance/DestroyInstance RPCs, ids never recycled). In
+    /// keyed mode `count.num` is ignored: the set of live instances created
+    /// via the API is the desired allocation count.
+    ///
+    /// Defaults to `slot`, so the minimal stateful task is just
+    /// `stateful: { storage: { path: '/data' } }`. Keyed mode changes who owns
+    /// cardinality (the instance API, not the spec), so it is always explicit.
+    #[serde(default)]
     pub mode: InstanceMode,
     /// Where keyed instance ids come from by default: `caller` (the
     /// CreateInstance request must supply one) or `uuid` (server-minted when
@@ -1074,12 +1080,36 @@ impl StatefulConfig {
 
 /// Persistent storage contract for a stateful task. Each instance gets an
 /// opaque `storage_handle` minted on first placement and reattached on every
-/// subsequent allocation for that instance.
+/// subsequent allocation for that instance, and a `volume` row materialized by
+/// the named plugin on whatever node the instance lands on (see
+/// `docs/volumes.md`).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StatefulStorageConfig {
-    /// Absolute path inside the task where the instance's storage is exposed.
+    /// Where the task sees the storage.
+    ///
+    /// **container**: the bind-mount destination inside the container's
+    /// filesystem (required for container tasks).
+    /// **exec**: informational only — an exec task runs in the host mount
+    /// namespace, so there is no filesystem view to mount into; read
+    /// `$LEGION_STORAGE_DIR` instead. Documented in docs/volumes.md.
     pub path: String,
+    /// Volume driver that materializes this storage. Defaults to `local-dir`
+    /// (a directory on the worker's disk). The driver must be advertised by at
+    /// least one node or the job is rejected at admission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub driver: Option<String>,
+    /// How the task consumes it: `filesystem` (a directory — the default, and
+    /// what `exec` and `container` want) or `block` (a raw device or disk
+    /// image, which is what a microVM kind attaches). Admission rejects a mode
+    /// the task kind or the driver cannot serve.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<VolumeMode>,
+    /// Driver-specific parameters, passed through verbatim (`size` for
+    /// `local-dir`, `server`/`export` for `nfs`, …). The driver declares which
+    /// are required; admission names any that are missing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<Value>,
     /// Whether to keep an instance's storage handle when its slot is scaled
     /// in (so a later scale-out reattaches the same data). Defaults to true,
     /// mirroring K8s PVC retention (`whenScaled: Retain`).
@@ -1099,6 +1129,10 @@ pub struct StatefulStorageConfig {
     pub retain_on_stop: Option<bool>,
 }
 
+/// The volume name a task's `stateful.storage` is exposed under
+/// (`LEGION_VOLUME_DATA`, plus the `LEGION_STORAGE_DIR` alias).
+pub const INSTANCE_VOLUME_NAME: &str = "data";
+
 impl StatefulStorageConfig {
     /// Effective scale-in retention policy (defaults to retain).
     pub fn retains_on_scale_in(&self) -> bool {
@@ -1109,6 +1143,166 @@ impl StatefulStorageConfig {
     pub fn retains_on_stop(&self) -> bool {
         self.retain_on_stop.unwrap_or(true)
     }
+
+    /// How the task consumes this storage, defaulting to `filesystem`.
+    pub fn volume_mode(&self) -> VolumeMode {
+        self.mode.unwrap_or_default()
+    }
+
+    /// The driver that materializes this storage, defaulting to `local-dir`.
+    pub fn driver_name(&self) -> &str {
+        self.driver
+            .as_deref()
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or(crate::volumes::DEFAULT_VOLUME_DRIVER)
+    }
+
+    /// Params as a map, tolerating an absent or non-object `params`.
+    pub fn param_map(&self) -> BTreeMap<String, Value> {
+        volume_param_map(self.params.as_ref())
+    }
+
+    /// The wire form the worker mounts: a per-instance volume named
+    /// [`INSTANCE_VOLUME_NAME`].
+    pub fn as_volume_spec(&self) -> VolumeSpec {
+        VolumeSpec {
+            name: INSTANCE_VOLUME_NAME.to_string(),
+            driver: Some(self.driver_name().to_string()),
+            mode: self.mode,
+            params: self.params.clone(),
+            path: Some(self.path.clone()),
+            read_only: None,
+        }
+    }
+}
+
+/// Volume names flow into env var names and CLI arguments, so they carry the
+/// same charset restriction instance ids do.
+pub fn validate_volume_name(task: &str, name: &str) -> R<()> {
+    if name.is_empty() || name.len() > 64 {
+        bail!("task {task} volume name {name:?} must be 1-64 characters");
+    }
+    if !name
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+    {
+        bail!("task {task} volume name {name:?} may only contain [A-Za-z0-9._-]");
+    }
+    Ok(())
+}
+
+/// The `size` param of a volume declaration in bytes, when present and
+/// parseable. Used for placement-time disk accounting; a driver still receives
+/// the raw string.
+pub fn volume_param_size_bytes(params: &BTreeMap<String, Value>) -> Option<u64> {
+    let raw = crate::volumes::param_str(params, "size")?;
+    crate::structs::config::parse_byte_size(&raw).ok()
+}
+
+/// Params as a sorted map. Anything that is not a JSON object (including
+/// absent) is an empty map — the plugin's `requiredParams` check then produces
+/// a message naming the missing keys, which is more useful than a type error.
+pub fn volume_param_map(params: Option<&Value>) -> BTreeMap<String, Value> {
+    params
+        .and_then(Value::as_object)
+        .map(|map| {
+            map.iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A claim on storage that exists independently of any instance: an operator's
+/// host path, an NFS export, a scratch tmpfs. Declared per task as
+/// `volumes: [...]` and valid on **stateless tasks too** — mounting
+/// `/mnt/models` read-only is not a stateful workload.
+///
+/// The difference from [`StatefulStorageConfig`] is lifecycle, not mechanism:
+/// these are never provisioned or destroyed by the instance lifecycle, and
+/// several tasks may hold the same claim. Both compile to the same mount list
+/// on the wire and share one worker pipeline (see docs/volumes.md).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct VolumeSpec {
+    /// Volume name within the task, `[A-Za-z0-9._-]{1,64}` and unique per
+    /// task. Becomes `LEGION_VOLUME_<NAME>` in the task env.
+    pub name: String,
+    /// Volume driver. Defaults to `local-dir`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub driver: Option<String>,
+    /// `filesystem` (default) or `block` — see
+    /// [`StatefulStorageConfig::mode`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<VolumeMode>,
+    /// Driver-specific parameters, passed through verbatim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<Value>,
+    /// Where the task sees it. Required for container tasks (the bind
+    /// destination); informational for exec tasks, which read
+    /// `$LEGION_VOLUME_<NAME>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Mount read-only. Rejected on `stateful.storage` (an instance volume
+    /// nobody can write to is always a mistake).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_only: Option<bool>,
+}
+
+impl VolumeSpec {
+    pub fn volume_mode(&self) -> VolumeMode {
+        self.mode.unwrap_or_default()
+    }
+
+    pub fn driver_name(&self) -> &str {
+        self.driver
+            .as_deref()
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or(crate::volumes::DEFAULT_VOLUME_DRIVER)
+    }
+
+    pub fn param_map(&self) -> BTreeMap<String, Value> {
+        volume_param_map(self.params.as_ref())
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        self.read_only.unwrap_or(false)
+    }
+}
+
+/// One resolved mount handed to a worker in `TaskAllocation.task_volumes`.
+///
+/// This is the post-admission form: the driver is resolved, the volume id is
+/// known (minted from the instance's storage handle for instance volumes, or
+/// derived deterministically for task claims), and the worker mounts exactly
+/// this list without re-deriving anything.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct VolumeMount {
+    /// Volume id — the second half of the `driver/volume_id` handle.
+    pub volume_id: String,
+    /// Declared name within the task.
+    pub name: String,
+    pub driver: String,
+    /// Resolved consumption mode. The worker asks the driver for exactly this,
+    /// and a task kind reads it to know whether it got a path or a device.
+    #[serde(default)]
+    pub mode: VolumeMode,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub params: BTreeMap<String, Value>,
+    /// Driver metadata recorded by a previous mount, handed back so drivers
+    /// stay stateless between calls.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub attrs: BTreeMap<String, Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub read_only: bool,
+    /// True when this mount is the instance's `stateful.storage`. The worker
+    /// uses it to also export `LEGION_STORAGE_DIR`, and the manager to know
+    /// which mount owns a lifecycle.
+    #[serde(default)]
+    pub instance_volume: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Tabled)]
@@ -1166,6 +1360,12 @@ pub struct TaskConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[tabled(skip)]
     pub stateful: Option<StatefulConfig>,
+    /// Claims on storage that exists independently of any instance — a host
+    /// path, an NFS export, a scratch tmpfs (see `docs/volumes.md`). Valid on
+    /// stateless tasks too; empty = no mounts, today's behavior.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[tabled(skip)]
+    pub volumes: Vec<VolumeSpec>,
     /// Artifacts fetched into the task directory before start (artifact
     /// system plan). Empty = today's behavior; staging is skipped entirely.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1603,6 +1803,8 @@ struct TaskConfigInput {
     identities: Vec<WorkloadIdentity>,
     #[serde(default)]
     stateful: Option<StatefulConfig>,
+    #[serde(default)]
+    volumes: Vec<VolumeSpec>,
     // `onLost` is only valid INSIDE the stateful block. Without this field
     // serde would silently ignore a task-level `onLost`, which is exactly
     // the misplacement users will type (and on a stateless task there is
@@ -1740,6 +1942,7 @@ impl TaskConfigInput {
             service: self.service,
             identities: self.identities,
             stateful: self.stateful,
+            volumes: self.volumes,
             artifacts: self.artifacts,
             actions: self.actions,
         })
@@ -1912,6 +2115,7 @@ impl TaskConfig {
             service: None,
             identities: Vec::new(),
             stateful: None,
+            volumes: Vec::new(),
             artifacts: Vec::new(),
             actions: Vec::new(),
         }
@@ -2069,6 +2273,16 @@ impl TaskConfig {
                     storage.path
                 );
             }
+            if storage
+                .params
+                .as_ref()
+                .is_some_and(|params| !params.is_object())
+            {
+                bail!(
+                    "task {} stateful.storage.params must be an object of driver parameters",
+                    self.name
+                );
+            }
         }
 
         // Node-loss fencing: durations must parse and replaceAfter must
@@ -2080,6 +2294,152 @@ impl TaskConfig {
             .map_err(|err| anyhow::anyhow!("task {}: {err}", self.name))?;
 
         Ok(())
+    }
+
+    /// Validate volume declarations — `volumes[]` claims and the instance
+    /// volume from `stateful.storage` (see `docs/volumes.md`).
+    ///
+    /// Only spec-shape rules live here. Whether the named plugin exists, and
+    /// whether its required params are present, needs the cluster's advertised
+    /// plugin capabilities and so is enforced at admission
+    /// ([`crate::volumes` capability checks in the manager]).
+    pub fn validate_volumes(&self) -> R<()> {
+        let mut seen = std::collections::BTreeSet::new();
+
+        // The instance volume owns the reserved name, so a task claim cannot
+        // collide with it and quietly shadow the instance's storage.
+        if let Some(storage) = self
+            .stateful
+            .as_ref()
+            .and_then(|stateful| stateful.storage.as_ref())
+        {
+            seen.insert(INSTANCE_VOLUME_NAME.to_string());
+            if storage
+                .driver
+                .as_deref()
+                .is_some_and(|name| name.trim().is_empty())
+            {
+                bail!(
+                    "task {} stateful.storage.driver cannot be empty; omit it to use the default \
+                     ({})",
+                    self.name,
+                    crate::volumes::DEFAULT_VOLUME_DRIVER
+                );
+            }
+        }
+
+        for volume in &self.volumes {
+            validate_volume_name(&self.name, &volume.name)?;
+            if !seen.insert(volume.name.clone()) {
+                bail!(
+                    "task {} declares volume {:?} more than once (names become \
+                     LEGION_VOLUME_* and must be unique)",
+                    self.name,
+                    volume.name
+                );
+            }
+            if volume
+                .driver
+                .as_deref()
+                .is_some_and(|name| name.trim().is_empty())
+            {
+                bail!(
+                    "task {} volume {:?} has an empty driver; omit it to use the default ({})",
+                    self.name,
+                    volume.name,
+                    crate::volumes::DEFAULT_VOLUME_DRIVER
+                );
+            }
+            if volume
+                .params
+                .as_ref()
+                .is_some_and(|params| !params.is_object())
+            {
+                bail!(
+                    "task {} volume {:?} params must be an object of driver parameters",
+                    self.name,
+                    volume.name
+                );
+            }
+            if let Some(path) = volume.path.as_deref() {
+                if !path.starts_with('/') {
+                    bail!(
+                        "task {} volume {:?} path must be absolute, got {:?}",
+                        self.name,
+                        volume.name,
+                        path
+                    );
+                }
+            }
+        }
+
+        // A container has a filesystem view, so a volume with no destination
+        // would be mounted nowhere: the task would silently not see it. Exec
+        // tasks have no such view and read `$LEGION_VOLUME_<NAME>` instead, so
+        // `path` is optional there.
+        if self.runtime == "container" {
+            for volume in &self.volumes {
+                if volume.path.is_none() {
+                    bail!(
+                        "task {} volume {:?} needs a `path`: container tasks mount volumes into \
+                         the container filesystem, so Legion needs a destination",
+                        self.name,
+                        volume.name
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Volume drivers this task needs a node to provide, across its
+    /// `stateful.storage` and its `volumes[]` claims.
+    ///
+    /// Placement filters candidate nodes on this set, and job admission checks
+    /// the cluster advertises every entry — the two ways a job with unavailable
+    /// storage is stopped before a task ever fails to start.
+    pub fn required_volume_drivers(&self) -> std::collections::BTreeSet<String> {
+        let mut drivers = std::collections::BTreeSet::new();
+        if let Some(storage) = self
+            .stateful
+            .as_ref()
+            .and_then(|stateful| stateful.storage.as_ref())
+        {
+            drivers.insert(storage.driver_name().to_string());
+        }
+        for volume in &self.volumes {
+            drivers.insert(volume.driver_name().to_string());
+        }
+        drivers
+    }
+
+    /// The volume declarations of this task as `(driver, size param)` pairs,
+    /// for placement-time disk accounting. Instance storage first, then
+    /// claims. Sizes that are absent or unparseable yield `None` — the
+    /// scheduler skips those rather than guessing.
+    pub fn volume_size_declarations(&self) -> Vec<(String, Option<u64>)> {
+        let size_of = |params: &std::collections::BTreeMap<String, Value>| {
+            crate::structs::job::volume_param_size_bytes(params)
+        };
+        let mut out = Vec::new();
+        if let Some(storage) = self
+            .stateful
+            .as_ref()
+            .and_then(|stateful| stateful.storage.as_ref())
+        {
+            out.push((
+                storage.driver_name().to_string(),
+                size_of(&storage.param_map()),
+            ));
+        }
+        for volume in &self.volumes {
+            out.push((
+                volume.driver_name().to_string(),
+                size_of(&volume.param_map()),
+            ));
+        }
+        out
     }
 
     /// Validate workload identities declared on this task (see the
@@ -3113,6 +3473,24 @@ mod tests {
     }
 
     #[test]
+    fn stateful_mode_defaults_to_slot() -> R<()> {
+        // The minimal stateful task: no `mode`, just storage. Slot is the
+        // StatefulSet-shaped common case; keyed changes who owns cardinality
+        // and must be asked for explicitly.
+        let config: JobConfig = serde_json::from_value(serde_json::json!({
+            "name": "job",
+            "tasks": [{
+                "name": "db", "runtime": "exec", "count": 2,
+                "stateful": { "storage": { "path": "/data" } }
+            }]
+        }))?;
+        let stateful = config.tasks[0].stateful.as_ref().expect("stateful parsed");
+        assert_eq!(stateful.mode, InstanceMode::Slot);
+        config.tasks[0].validate_stateful()?;
+        Ok(())
+    }
+
+    #[test]
     fn stateful_storage_retain_defaults_to_true() -> R<()> {
         let spec = serde_json::json!({
             "name": "demo",
@@ -3183,6 +3561,9 @@ mod tests {
                     initial_instances: None,
                     on_lost: None,
                     storage: Some(StatefulStorageConfig {
+                        driver: None,
+                        mode: None,
+                        params: None,
                         path: "/workspace".into(),
                         retain_on_scale_in: None,
                         retain_on_stop: Some(value),
@@ -3268,6 +3649,9 @@ mod tests {
                     initial_instances: None,
                     on_lost: None,
                     storage: Some(StatefulStorageConfig {
+                        driver: None,
+                        mode: None,
+                        params: None,
                         path: bad_path.into(),
                         retain_on_scale_in: None,
                         retain_on_stop: None,

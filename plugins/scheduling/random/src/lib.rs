@@ -66,7 +66,7 @@ mod tests {
         TaskConfig {
             name: name.into(),
             count: 1,
-            kind: "noop".into(),
+            runtime: "noop".into(),
             config: json!({}),
             resources: json!({}),
             constraints: json!({}),

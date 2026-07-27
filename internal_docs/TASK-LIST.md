@@ -115,6 +115,14 @@
   - [x] Raft Works (leader election/failover controls, observability, CLI/UI ops)
  
 - [ ] Stateful support
+  - [x] Volume plugin system (docs/volumes.md): `VolumePlugin` contract, exec ABI,
+    built-in `local-dir`/`host`/`nfs`/`tmpfs`, reference exec plugin, conformance
+    harness (`legion volume plugin test`), volume table + reclaim, node-local
+    pinning, `legion volume` CLI + MCP tools, UI, Postgres/Redis guides
+  - [ ] CSI bridge plugin (the contract is designed for it; nothing in core changes)
+  - [ ] Snapshots / restore / expand (op names reserved in the contract)
+  - [ ] Multiple volumes per instance (`stateful.volumes: [...]`; schema already
+    keyed by (instance, name), so purely additive)
   - [ ] ???
   
 - [ ] Short-lived jobs
