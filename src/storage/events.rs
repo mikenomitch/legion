@@ -547,13 +547,13 @@ pub mod drafts {
             "volume.mounted",
             format!(
                 "Volume {} ({}) mounted on {node_id} at {path}",
-                volume.volume_id, volume.plugin
+                volume.volume_id, volume.driver
             ),
         )
         .node(node_id)
         .meta(json!({
             "volumeId": volume.volume_id,
-            "plugin": volume.plugin,
+            "driver": volume.driver,
             "name": volume.name,
             "instanceId": volume.instance_id,
             "nodeLocal": volume.node_local,
@@ -568,15 +568,15 @@ pub mod drafts {
     /// `volume.failed` — a driver operation failed. Surfaced as a warning, not
     /// an error: the allocation's own failure event carries the fatal signal,
     /// and reclaim failures are retried.
-    pub fn volume_failed(volume_id: &str, plugin: &str, node_id: &str, error: &str) -> EventDraft {
+    pub fn volume_failed(volume_id: &str, driver: &str, node_id: &str, error: &str) -> EventDraft {
         EventDraft::warn(
             "volume.failed",
-            format!("Volume {volume_id} ({plugin}) failed on {node_id}: {error}"),
+            format!("Volume {volume_id} ({driver}) failed on {node_id}: {error}"),
         )
         .node(node_id)
         .meta(json!({
             "volumeId": volume_id,
-            "plugin": plugin,
+            "driver": driver,
             "error": error,
         }))
     }
@@ -588,12 +588,12 @@ pub mod drafts {
             "volume.reclaiming",
             format!(
                 "Volume {} ({}) queued for reclamation",
-                volume.volume_id, volume.plugin
+                volume.volume_id, volume.driver
             ),
         )
         .meta(json!({
             "volumeId": volume.volume_id,
-            "plugin": volume.plugin,
+            "driver": volume.driver,
             "instanceId": volume.instance_id,
             "nodeId": volume.node_id,
         }));
@@ -607,13 +607,13 @@ pub mod drafts {
     }
 
     /// `volume.destroyed` — a driver confirmed the storage is gone.
-    pub fn volume_destroyed(volume_id: &str, plugin: &str, node_id: &str) -> EventDraft {
+    pub fn volume_destroyed(volume_id: &str, driver: &str, node_id: &str) -> EventDraft {
         EventDraft::info(
             "volume.destroyed",
-            format!("Volume {volume_id} ({plugin}) destroyed on {node_id}"),
+            format!("Volume {volume_id} ({driver}) destroyed on {node_id}"),
         )
         .node(node_id)
-        .meta(json!({ "volumeId": volume_id, "plugin": plugin }))
+        .meta(json!({ "volumeId": volume_id, "driver": driver }))
     }
 
     /// `artifact.pinned` — mutable references were pinned to digests at
@@ -865,16 +865,16 @@ impl EventRecorder<'_> {
         self.emit(drafts::volume_mounted(volume, node_id, path));
     }
 
-    pub fn volume_failed(self, volume_id: &str, plugin: &str, node_id: &str, error: &str) {
-        self.emit(drafts::volume_failed(volume_id, plugin, node_id, error));
+    pub fn volume_failed(self, volume_id: &str, driver: &str, node_id: &str, error: &str) {
+        self.emit(drafts::volume_failed(volume_id, driver, node_id, error));
     }
 
     pub fn volume_reclaiming(self, volume: &crate::structs::Volume) {
         self.emit(drafts::volume_reclaiming(volume));
     }
 
-    pub fn volume_destroyed(self, volume_id: &str, plugin: &str, node_id: &str) {
-        self.emit(drafts::volume_destroyed(volume_id, plugin, node_id));
+    pub fn volume_destroyed(self, volume_id: &str, driver: &str, node_id: &str) {
+        self.emit(drafts::volume_destroyed(volume_id, driver, node_id));
     }
 }
 

@@ -26,7 +26,7 @@
         // Container tasks get a real bind mount at this path, so it can be
         // exactly what the image expects.
         path: '/var/lib/postgresql/data',
-        plugin: 'local-dir',
+        driver: 'local-dir',
         params: { size: '20G' },
         // Both default true. Keeping them explicit here because losing a
         // database to a scale-in is not a thing to leave implicit.

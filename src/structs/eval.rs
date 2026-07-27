@@ -702,7 +702,7 @@ mod tests {
                 initial_instances: None,
                 on_lost: None,
                 storage: Some(StatefulStorageConfig {
-                    plugin: None,
+                    driver: None,
                     mode: None,
                     params: None,
                     path: "/var/lib/data".into(),
@@ -785,7 +785,7 @@ mod tests {
                 initial_instances: None,
                 on_lost: None,
                 storage: Some(StatefulStorageConfig {
-                    plugin: None,
+                    driver: None,
                     mode: None,
                     params: None,
                     path: "/workspace".into(),

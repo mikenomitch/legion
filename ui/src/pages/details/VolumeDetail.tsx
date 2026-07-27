@@ -40,16 +40,16 @@ export default function VolumeDetail() {
   const [data] = createResource(
     () => [volumeId(), tick()] as const,
     async ([id]) => {
-      const [volume, plugins] = await Promise.all([
+      const [volume, drivers] = await Promise.all([
         managerClient.getVolume({ volumeId: id }),
-        managerClient.listVolumePlugins({}),
+        managerClient.listVolumeDrivers({}),
       ])
-      return { volume: volume.volume, plugins: plugins.plugins }
+      return { volume: volume.volume, drivers: drivers.drivers }
     },
   )
 
   const volume = () => data()?.volume
-  const plugin = createMemo(() => data()?.plugins.find((entry) => entry.name === volume()?.plugin))
+  const driver = createMemo(() => data()?.drivers.find((entry) => entry.name === volume()?.driver))
   const params_ = createMemo(() => parseJsonMap(volume()?.params))
   const attrs = createMemo(() => parseJsonMap(volume()?.attrs))
 
@@ -67,7 +67,7 @@ export default function VolumeDetail() {
                 title={<span class="font-mono text-lg">{vol().volumeId}</span>}
                 subtitle={
                   <span>
-                    Volume <span class="font-mono">{vol().name}</span> · {vol().plugin}
+                    Volume <span class="font-mono">{vol().name}</span> · {vol().driver}
                   </span>
                 }
                 actions={
@@ -110,7 +110,7 @@ export default function VolumeDetail() {
                 <DefList
                   cols={3}
                   items={[
-                    ['Plugin', <span class="font-mono text-xs">{vol().plugin}</span>],
+                    ['Driver', <span class="font-mono text-xs">{vol().driver}</span>],
                     ['Volume name', <span class="font-mono text-xs">{vol().name}</span>],
                     [
                       'Mode',
@@ -128,7 +128,7 @@ export default function VolumeDetail() {
                     [
                       'Storage handle',
                       <span class="font-mono text-xs" title="What the instance's storage_handle points at">
-                        {vol().plugin}/{vol().volumeId}
+                        {vol().driver}/{vol().volumeId}
                       </span>,
                     ],
                     [
@@ -188,7 +188,7 @@ export default function VolumeDetail() {
 
               <div class="grid gap-4 lg:grid-cols-2">
                 <SectionCard
-                  title="Plugin params"
+                  title="Driver params"
                   description="Declared in the jobspec and passed to the driver verbatim."
                 >
                   <Show
@@ -221,9 +221,9 @@ export default function VolumeDetail() {
                 </SectionCard>
               </div>
 
-              <Show when={plugin()}>
+              <Show when={driver()}>
                 {(info) => (
-                  <SectionCard title={`Plugin: ${info().name}`} description={info().detail}>
+                  <SectionCard title={`Driver: ${info().name}`} description={info().detail}>
                     <DefList
                       cols={3}
                       items={[

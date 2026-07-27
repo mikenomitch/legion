@@ -5,8 +5,8 @@
 //! - *"Where did my database's data go?"* — `volume list` / `volume get`.
 //! - *"Why is this replica stuck pending?"* — the pin and `lastError` columns.
 //! - *"That node is never coming back"* — `volume delete --force`.
-//! - *"What storage can this cluster do?"* — `volume plugins`.
-//! - *"Does my driver behave?"* — `volume plugin test`.
+//! - *"What storage can this cluster do?"* — `volume drivers`.
+//! - *"Does my driver behave?"* — `volume driver test`.
 
 use std::collections::BTreeMap;
 
@@ -16,15 +16,15 @@ use crate::cmd::helpers::{connect_manager_client, json_flag};
 use crate::cmd::output::{self, OutputFormat};
 use crate::prelude::*;
 use crate::structs::{
-    DeleteVolumeRequest, GetVolumeRequest, ListVolumePluginsRequest, ListVolumesRequest, VolumeInfo,
+    DeleteVolumeRequest, GetVolumeRequest, ListVolumeDriversRequest, ListVolumesRequest, VolumeInfo,
 };
 
 #[derive(Tabled)]
 struct VolumeRow {
     #[tabled(rename = "VOLUME")]
     volume: String,
-    #[tabled(rename = "PLUGIN")]
-    plugin: String,
+    #[tabled(rename = "DRIVER")]
+    driver: String,
     #[tabled(rename = "JOB")]
     job: String,
     #[tabled(rename = "INSTANCE")]
@@ -39,7 +39,7 @@ impl From<&VolumeInfo> for VolumeRow {
     fn from(volume: &VolumeInfo) -> Self {
         VolumeRow {
             volume: volume.volume_id.clone(),
-            plugin: volume.plugin.clone(),
+            driver: volume.driver.clone(),
             job: volume.job_id.clone().unwrap_or_else(|| "—".into()),
             instance: volume.instance_id.clone().unwrap_or_else(|| "—".into()),
             state: volume.state.clone(),
@@ -55,9 +55,9 @@ impl From<&VolumeInfo> for VolumeRow {
 }
 
 #[derive(Tabled)]
-struct PluginRow {
-    #[tabled(rename = "PLUGIN")]
-    plugin: String,
+struct DriverRow {
+    #[tabled(rename = "DRIVER")]
+    driver: String,
     #[tabled(rename = "SCOPE")]
     scope: String,
     #[tabled(rename = "NODES")]
@@ -84,7 +84,7 @@ pub fn config() -> Command {
                 )
                 .arg(Arg::new("job").long("job").short('J').help("Filter by job"))
                 .arg(Arg::new("node").long("node").help("Filter by node"))
-                .arg(Arg::new("plugin").long("plugin").help("Filter by plugin"))
+                .arg(Arg::new("driver").long("driver").help("Filter by driver"))
                 .arg(
                     Arg::new("instance")
                         .long("instance")
@@ -99,7 +99,7 @@ pub fn config() -> Command {
         )
         .subcommand(
             Command::new("get")
-                .about("Show one volume, including its plugin params and last driver error")
+                .about("Show one volume, including its driver params and last driver error")
                 .arg(Arg::new("id").help("Volume id").required(true))
                 .arg(json_flag()),
         )
@@ -132,36 +132,36 @@ pub fn config() -> Command {
                 .arg(json_flag()),
         )
         .subcommand(
-            Command::new("plugins")
-                .about("List the volume plugins installed across the cluster")
+            Command::new("drivers")
+                .about("List the volume drivers installed across the cluster")
                 .arg(json_flag()),
         )
         .subcommand(
-            Command::new("plugin")
-                .about("Volume plugin authoring tools")
+            Command::new("driver")
+                .about("Volume driver authoring tools")
                 .subcommand_required(true)
                 .arg_required_else_help(true)
                 .subcommand(
                     Command::new("test")
-                        .about("Run the volume contract conformance suite against a plugin")
+                        .about("Run the volume contract conformance suite against a driver")
                         .long_about(
-                            "Run a plugin through the full contract locally:\n\n  \
+                            "Run a driver through the full contract locally:\n\n  \
                              capabilities -> mount -> write -> unmount -> mount -> read back \
                              -> unmount -> destroy\n\n\
                              plus a double-call idempotency check on every operation. This is \
-                             the same suite Legion's own tests run, so a plugin that passes \
+                             the same suite Legion's own tests run, so a driver that passes \
                              here behaves correctly in a cluster.\n\n\
-                             Works against built-ins and against exec plugins under \
+                             Works against built-ins and against exec drivers under \
                              plugins/volumes/<name>/.",
                         )
-                        .arg(Arg::new("name").help("Plugin name").required(true))
+                        .arg(Arg::new("name").help("Driver name").required(true))
                         .arg(
                             Arg::new("param")
                                 .long("param")
                                 .short('p')
                                 .action(ArgAction::Append)
                                 .value_name("KEY=VALUE")
-                                .help("Plugin param (repeatable), e.g. -p server=10.0.0.1"),
+                                .help("Driver param (repeatable), e.g. -p server=10.0.0.1"),
                         )
                         .arg(
                             Arg::new("mode")
@@ -186,9 +186,9 @@ pub async fn handle(matches: &ArgMatches) -> R<()> {
         Some(("list", sub)) => list(sub).await,
         Some(("get", sub)) => get(sub).await,
         Some(("delete", sub)) => delete(sub).await,
-        Some(("plugins", sub)) => plugins(sub).await,
-        Some(("plugin", sub)) => match sub.subcommand() {
-            Some(("test", sub)) => test_plugin(sub),
+        Some(("drivers", sub)) => drivers(sub).await,
+        Some(("driver", sub)) => match sub.subcommand() {
+            Some(("test", sub)) => test_driver(sub),
             _ => unreachable!(),
         },
         _ => unreachable!(),
@@ -200,7 +200,7 @@ async fn list(matches: &ArgMatches) -> R<()> {
     let request = tonic::Request::new(ListVolumesRequest {
         job_id: matches.get_one::<String>("job").cloned(),
         node_id: matches.get_one::<String>("node").cloned(),
-        plugin: matches.get_one::<String>("plugin").cloned(),
+        driver: matches.get_one::<String>("driver").cloned(),
         instance_id: matches.get_one::<String>("instance").cloned(),
         state: matches.get_one::<String>("state").cloned(),
     });
@@ -265,7 +265,7 @@ async fn get(matches: &ArgMatches) -> R<()> {
 
     println!("Volume:     {}", volume.volume_id);
     println!("Name:       {}", volume.name);
-    println!("Plugin:     {}", volume.plugin);
+    println!("Driver:     {}", volume.driver);
     println!("State:      {}", volume.state);
     println!(
         "Scope:      {}",
@@ -297,7 +297,7 @@ async fn get(matches: &ArgMatches) -> R<()> {
         println!("Params:     {}", volume.params);
     }
     if volume.attrs != "{}" && !volume.attrs.is_empty() {
-        println!("Driver:     {}", volume.attrs);
+        println!("Metadata:   {}", volume.attrs);
     }
     if let Some(error) = volume.last_error.as_deref() {
         println!("Last error: {error}");
@@ -339,30 +339,30 @@ async fn delete(matches: &ArgMatches) -> R<()> {
     Ok(())
 }
 
-async fn plugins(matches: &ArgMatches) -> R<()> {
+async fn drivers(matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(matches);
     let mut client = connect_manager_client().await?;
     let reply = output::resolve(
         format,
-        "failed to list volume plugins",
+        "failed to list volume drivers",
         client
-            .list_volume_plugins(tonic::Request::new(ListVolumePluginsRequest {}))
+            .list_volume_drivers(tonic::Request::new(ListVolumeDriversRequest {}))
             .await,
     )?
     .into_inner();
 
     if format.is_json() {
-        output::print_success(&reply.plugins);
+        output::print_success(&reply.drivers);
         return Ok(());
     }
 
-    if reply.plugins.is_empty() {
-        println!("No volume plugins advertised. Are any workers connected?");
+    if reply.drivers.is_empty() {
+        println!("No volume drivers advertised. Are any workers connected?");
         return Ok(());
     }
-    let rows = reply.plugins.iter().map(|plugin| PluginRow {
-        plugin: plugin.name.clone(),
-        scope: match (plugin.node_local, plugin.ephemeral) {
+    let rows = reply.drivers.iter().map(|driver| DriverRow {
+        driver: driver.name.clone(),
+        scope: match (driver.node_local, driver.ephemeral) {
             (_, true) => "ephemeral".to_string(),
             (true, false) => "node-local".to_string(),
             (false, false) => "network".to_string(),
@@ -371,28 +371,28 @@ async fn plugins(matches: &ArgMatches) -> R<()> {
         // worth investigating.
         nodes: format!(
             "{}/{}",
-            plugin.available_nodes.len(),
-            plugin.nodes.len().max(plugin.available_nodes.len())
+            driver.available_nodes.len(),
+            driver.nodes.len().max(driver.available_nodes.len())
         ),
-        required: if plugin.required_params.is_empty() {
+        required: if driver.required_params.is_empty() {
             "—".to_string()
         } else {
-            plugin.required_params.join(",")
+            driver.required_params.join(",")
         },
-        detail: plugin.detail.clone(),
+        detail: driver.detail.clone(),
     });
     println!("{}", Table::new(rows));
-    println!("\nNODES is usable/installed. `ephemeral` plugins cannot back stateful.storage.");
+    println!("\nNODES is usable/installed. `ephemeral` drivers cannot back stateful.storage.");
     Ok(())
 }
 
-/// Run the contract suite locally against a built-in or exec plugin. Needs no
-/// manager: a plugin author iterates against this alone.
-fn test_plugin(matches: &ArgMatches) -> R<()> {
+/// Run the contract suite locally against a built-in or exec driver. Needs no
+/// manager: a driver author iterates against this alone.
+fn test_driver(matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(matches);
     let name = matches
         .get_one::<String>("name")
-        .context("plugin name")?
+        .context("driver name")?
         .clone();
 
     let scratch = match matches.get_one::<String>("dir") {
@@ -417,27 +417,27 @@ fn test_plugin(matches: &ArgMatches) -> R<()> {
     // config; a local run gets none, so it will report itself unavailable —
     // documented in the conformance output rather than silently passing.
     let registry =
-        crate::volumes::VolumePluginRegistry::with_discovery(crate::volumes::VolumeRuntimeConfig {
+        crate::volumes::VolumeDriverRegistry::with_discovery(crate::volumes::VolumeRuntimeConfig {
             volume_root: scratch.join("volumes"),
             data_dir: scratch.clone(),
             host_volumes: HashMap::new(),
             plugin_dir: crate::util::plugin_root_dir(),
         });
-    let plugin = registry.require(&name)?;
+    let driver = registry.require(&name)?;
     let mode: crate::volumes::VolumeMode = matches
         .get_one::<String>("mode")
         .map(String::as_str)
         .unwrap_or("filesystem")
         .parse()
         .map_err(|err: String| anyhow!(err))?;
-    let report = crate::volumes::conformance::run(plugin, &scratch, params, mode);
+    let report = crate::volumes::conformance::run(driver, &scratch, params, mode);
 
     if format.is_json() {
         output::print_success(&report);
     } else {
         println!(
             "Volume plugin conformance: {} ({mode} mode)\n",
-            report.plugin
+            report.driver
         );
         for check in &report.checks {
             let mark = match (check.passed, check.skipped) {
@@ -449,10 +449,10 @@ fn test_plugin(matches: &ArgMatches) -> R<()> {
         }
         println!();
         if report.passed {
-            println!("PASS — {} honors the volume contract.", report.plugin);
+            println!("PASS — {} honors the volume contract.", report.driver);
         } else {
             println!(
-                "FAIL — {} check(s) failed. See docs/volumes.md \"Writing a volume plugin\".",
+                "FAIL — {} check(s) failed. See docs/volumes.md \"Writing a volume driver\".",
                 report.failures().len()
             );
         }
@@ -467,6 +467,6 @@ fn test_plugin(matches: &ArgMatches) -> R<()> {
         Ok(())
     } else {
         // Non-zero exit so CI can gate on it.
-        bail!("volume plugin {} failed conformance", report.plugin);
+        bail!("volume driver {} failed conformance", report.driver);
     }
 }

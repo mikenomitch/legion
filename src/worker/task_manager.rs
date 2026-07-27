@@ -216,8 +216,8 @@ impl WorkerTaskManager {
         );
         info!(
             node_id,
-            plugins = ?self.volumes.plugin_names(),
-            "Loaded volume plugins"
+            drivers = ?self.volumes.driver_names(),
+            "Loaded volume drivers"
         );
     }
 

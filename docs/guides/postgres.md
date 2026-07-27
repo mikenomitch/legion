@@ -16,7 +16,7 @@ legion volume list --job postgres
 ```
 
 ```
- VOLUME    PLUGIN     JOB       INSTANCE          STATE    NODE
+ VOLUME    DRIVER     JOB       INSTANCE          STATE    NODE
  9f2c8a…   local-dir  postgres  postgres-db-0     created  node-a1*
 
 * node-local: the owning instance can only be replaced on that node.
@@ -45,7 +45,7 @@ psql "postgres://postgres:legion-demo@10.0.0.4:29315/legion"
       mode: 'slot',
       storage: {
         path: '/var/lib/postgresql/data',
-        plugin: 'local-dir',
+        driver: 'local-dir',
         params: { size: '20G' },
         retainOnScaleIn: true,
         retainOnStop: true,
@@ -101,7 +101,7 @@ legion volume get 9f2c8a1b…
 
 ```
 Volume:     9f2c8a1b…
-Plugin:     local-dir
+Driver:     local-dir
 State:      created
 Scope:      node-local (instance is pinned to its node)
 Job:        postgres
@@ -165,7 +165,7 @@ Put the data somewhere every node can reach:
 ```jsonnet
 storage: {
   path: '/var/lib/postgresql/data',
-  plugin: 'nfs',
+  driver: 'nfs',
   params: { server: '10.0.0.5', export: '/exports/postgres', options: 'vers=4,hard' },
 }
 ```
@@ -183,7 +183,7 @@ Two things to know before doing this in production:
   server honors `fsync`. Postgres's own documentation is the authority here.
 - **The mount needs privileges.** The worker must run as root, or `nfs` reports
   itself unavailable and the job is rejected at submit with the reason. Check
-  with `legion volume plugins`.
+  with `legion volume drivers`.
 
 ## Putting it on a real disk
 
@@ -203,7 +203,7 @@ declare it on the worker and claim it:
 
 ```jsonnet
 // jobspec
-volumes: [{ name: 'pgdata', plugin: 'host', params: { name: 'pgdata' },
+volumes: [{ name: 'pgdata', driver: 'host', params: { name: 'pgdata' },
             path: '/var/lib/postgresql/data' }],
 // and drop stateful.storage — the host volume IS the storage now
 ```
@@ -255,7 +255,7 @@ writing to object storage:
 cause is `PGDATA` pointing at the mount root — see above.
 
 **The volume is stuck in `pending`.** No worker has mounted it yet. `legion
-volume get <id>` shows `lastError` if a driver failed; `legion volume plugins`
+volume get <id>` shows `lastError` if a driver failed; `legion volume drivers`
 shows whether the plugin is usable on any node.
 
 **The instance will not place.** Almost always the node-local pin. `legion

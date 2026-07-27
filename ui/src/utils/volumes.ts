@@ -1,4 +1,4 @@
-import type { VolumeInfo, VolumePluginInfo } from '../gen/legion_pb'
+import type { VolumeDriverInfo, VolumeInfo } from '../gen/legion_pb'
 import type { Tone } from './status'
 
 // Volume lifecycle: pending -> created -> destroying -> destroyed.
@@ -32,15 +32,15 @@ export const volumeScopeHint = (volume: Pick<VolumeInfo, 'nodeLocal'>) =>
 export const volumePinsPlacement = (volume: VolumeInfo) =>
   volume.nodeLocal && !!volume.nodeId && (volume.state === 'created' || volume.state === 'pending')
 
-export const pluginScope = (plugin: VolumePluginInfo) => {
-  if (plugin.ephemeral) return 'ephemeral'
-  return plugin.nodeLocal ? 'node-local' : 'network'
+export const driverScope = (driver: VolumeDriverInfo) => {
+  if (driver.ephemeral) return 'ephemeral'
+  return driver.nodeLocal ? 'node-local' : 'network'
 }
 
-export const pluginScopeTone = (plugin: VolumePluginInfo): Tone => {
-  if (plugin.availableNodes.length === 0) return 'danger'
-  if (plugin.ephemeral) return 'warn'
-  return plugin.nodeLocal ? 'neutral' : 'ok'
+export const driverScopeTone = (driver: VolumeDriverInfo): Tone => {
+  if (driver.availableNodes.length === 0) return 'danger'
+  if (driver.ephemeral) return 'warn'
+  return driver.nodeLocal ? 'neutral' : 'ok'
 }
 
 // Params/attrs arrive as JSON strings on the wire. Render them as sorted

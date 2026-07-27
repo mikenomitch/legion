@@ -30,7 +30,7 @@ use crate::structs::{
     ExecStart, GetAllocationLogsRequest, GetInstanceRequest, GetJobInfoRequest, GetJobSpecRequest,
     GetLedgerRequest, GetNodesRequest, GetRolloutStatusRequest, GetStateStoreSchemaRequest,
     GetVolumeRequest, JobConfig, ListEventsRequest, ListInstancesRequest, ListJobActionsRequest,
-    ListJobsRequest, ListRolloutsRequest, ListVolumePluginsRequest, ListVolumesRequest,
+    ListJobsRequest, ListRolloutsRequest, ListVolumeDriversRequest, ListVolumesRequest,
     QueryStateStoreRequest, ReplaceInstanceRequest, RunJobRequest, StartInstanceRequest,
     StopInstanceRequest, StopJobRequest,
 };
@@ -192,7 +192,7 @@ fn tool_defs() -> Vec<ToolDef> {
                 "properties": {
                     "job_id": { "type": "string", "description": "Filter by owning job." },
                     "node_id": { "type": "string", "description": "Filter by the node the volume lives on." },
-                    "plugin": { "type": "string", "description": "Filter by volume plugin (local-dir, host, nfs, tmpfs, ...)." },
+                    "driver": { "type": "string", "description": "Filter by volume driver (local-dir, host, nfs, tmpfs, ...)." },
                     "instance_id": { "type": "string", "description": "Filter by owning stateful instance." },
                     "state": { "type": "string", "description": "Filter by state: pending, created, destroying, destroyed." }
                 },
@@ -202,18 +202,18 @@ fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_volume_get",
-            description: "Inspect one volume: plugin, params, driver metadata, node pin, mount path, and last driver error.",
+            description: "Inspect one volume: driver, params, driver metadata, node pin, mount path, and last driver error.",
             input_schema: || json!({
                 "type": "object",
-                "properties": { "volume_id": { "type": "string", "description": "Volume id (the second half of an instance's plugin/volume_id storage handle)." } },
+                "properties": { "volume_id": { "type": "string", "description": "Volume id (the second half of an instance's driver/volume_id storage handle)." } },
                 "required": ["volume_id"],
                 "additionalProperties": false
             }),
             mutates: false,
         },
         ToolDef {
-            name: "legion_volume_plugins",
-            description: "List the volume plugins installed across the cluster with their capabilities and which nodes can actually use them. Use this to answer why a job was rejected for an unknown or unusable volume plugin.",
+            name: "legion_volume_drivers",
+            description: "List the volume drivers installed across the cluster with their capabilities and which nodes can actually use them. Use this to answer why a job was rejected for an unknown or unusable volume driver.",
             input_schema: empty_schema,
             mutates: false,
         },
@@ -704,7 +704,7 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             grpc(client.list_volumes(ListVolumesRequest {
                 job_id: opt_str_arg(&args, "job_id"),
                 node_id: opt_str_arg(&args, "node_id"),
-                plugin: opt_str_arg(&args, "plugin"),
+                driver: opt_str_arg(&args, "driver"),
                 instance_id: opt_str_arg(&args, "instance_id"),
                 state: opt_str_arg(&args, "state"),
             }))
@@ -715,9 +715,9 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             let mut client = connect().await?;
             grpc(client.get_volume(GetVolumeRequest { volume_id })).await
         }
-        "legion_volume_plugins" => {
+        "legion_volume_drivers" => {
             let mut client = connect().await?;
-            grpc(client.list_volume_plugins(ListVolumePluginsRequest {})).await
+            grpc(client.list_volume_drivers(ListVolumeDriversRequest {})).await
         }
         "legion_volume_delete" => {
             let volume_id = str_arg(&args, "volume_id")?;

@@ -165,7 +165,10 @@ design.
   `local-dir` (the default), `host`, `nfs`, `tmpfs` — `src/volumes/builtins.rs`.
 - Reference exec plugin: `plugins/volumes/example/` (a ~60-line shell script).
 
-Entry trait: `VolumePlugin` in `src/volumes/mod.rs`.
+Entry trait: `VolumeDriver` in `src/volumes/mod.rs`. In the jobspec and API the
+selectable thing is called a **driver** (`storage: { driver: 'nfs' }`); "plugin"
+refers to the packaging that delivers one (`plugins/volumes/<name>/` with a
+`plugin.json`).
 
 Contract specifics — this category deliberately differs from the others:
 
@@ -182,14 +185,14 @@ Contract specifics — this category deliberately differs from the others:
 - Four operations, all **required to be idempotent**: `capabilities`, `mount`,
   `unmount`, `destroy`. `create`, `attach`, `detach`, `snapshot`, `restore`, and
   `expand` are reserved names a plugin may advertise for forward compatibility.
-- **Plugins run on workers only.** The manager owns the volume state machine but
+- **Drivers run on workers only.** The manager owns the volume state machine but
   loads no drivers: it learns what exists from the capabilities workers publish
   in their fingerprints. The control plane therefore needs no storage
   credentials and no mount privileges.
 - Built-ins win over exec plugins on a name collision, so an installed plugin
   cannot silently redefine what `local-dir` means on a running cluster.
-- `legion volume plugin test <name>` runs the contract conformance suite against
-  a plugin — the same suite Legion's own tests use, no manager required.
+- `legion volume driver test <name>` runs the contract conformance suite against
+  a driver — the same suite Legion's own tests use, no manager required.
 
 ## Build Behavior
 

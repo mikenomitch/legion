@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use crate::prelude::*;
 use crate::structs::{Allocation, TaskConfig, VolumeDestroyRequest, VolumeMount, VolumeReport};
 use crate::volumes::{
-    volume_env_var, VolumeInstanceRef, VolumeMode, VolumeOp, VolumePluginRegistry, VolumeRef,
+    volume_env_var, VolumeDriverRegistry, VolumeInstanceRef, VolumeMode, VolumeOp, VolumeRef,
     VolumeRequest, VolumeRuntimeConfig,
 };
 
@@ -21,7 +21,7 @@ use crate::volumes::{
 pub struct MountedVolume {
     pub volume_id: String,
     pub name: String,
-    pub plugin: String,
+    pub driver: String,
     /// How the driver handed it over.
     pub mode: VolumeMode,
     /// Absolute path on this host: the directory in filesystem mode, the
@@ -44,7 +44,7 @@ pub struct MountedVolume {
 
 /// Volume drivers plus the mounts this worker holds.
 pub struct WorkerVolumeManager {
-    registry: VolumePluginRegistry,
+    registry: VolumeDriverRegistry,
     node_id: String,
     mounted: HashMap<i64, Vec<MountedVolume>>,
     /// Outcomes waiting for the next heartbeat.
@@ -57,7 +57,7 @@ pub struct WorkerVolumeManager {
 impl WorkerVolumeManager {
     pub fn new(node_id: impl Into<String>, config: VolumeRuntimeConfig) -> Self {
         WorkerVolumeManager {
-            registry: VolumePluginRegistry::with_discovery(config),
+            registry: VolumeDriverRegistry::with_discovery(config),
             node_id: node_id.into(),
             mounted: HashMap::new(),
             reports: Vec::new(),
@@ -72,7 +72,7 @@ impl WorkerVolumeManager {
         serde_json::to_value(self.registry.capabilities()).unwrap_or_else(|_| json!({}))
     }
 
-    pub fn plugin_names(&self) -> Vec<String> {
+    pub fn driver_names(&self) -> Vec<String> {
         self.registry.names()
     }
 
@@ -115,7 +115,7 @@ impl WorkerVolumeManager {
                     bail!(
                         "failed to mount volume `{}` ({}) for allocation {}: {detail}",
                         mount.name,
-                        mount.plugin,
+                        mount.driver,
                         allocation.id
                     );
                 }
@@ -132,20 +132,20 @@ impl WorkerVolumeManager {
         instance: Option<&VolumeInstanceRef>,
         mount: &VolumeMount,
     ) -> R<MountedVolume> {
-        let plugin = self.registry.require(&mount.plugin)?;
+        let plugin = self.registry.require(&mount.driver)?;
         let capabilities = plugin.capabilities();
         if !capabilities.available {
             bail!(
-                "volume plugin `{}` is not usable on this node: {}",
-                mount.plugin,
+                "volume driver `{}` is not usable on this node: {}",
+                mount.driver,
                 capabilities.detail
             );
         }
         let missing = capabilities.missing_params(&mount.params);
         if !missing.is_empty() {
             bail!(
-                "volume plugin `{}` requires params: {}",
-                mount.plugin,
+                "volume driver `{}` requires params: {}",
+                mount.driver,
                 missing.join(", ")
             );
         }
@@ -154,8 +154,8 @@ impl WorkerVolumeManager {
         // actually got the allocation is not the one admission looked at.
         if !capabilities.serves_mode(mount.mode) {
             bail!(
-                "volume plugin `{}` does not serve {} mode on this node (it serves: {})",
-                mount.plugin,
+                "volume driver `{}` does not serve {} mode on this node (it serves: {})",
+                mount.driver,
                 mount.mode,
                 capabilities
                     .volume_modes
@@ -173,7 +173,7 @@ impl WorkerVolumeManager {
             volume: VolumeRef {
                 id: mount.volume_id.clone(),
                 name: mount.name.clone(),
-                plugin: mount.plugin.clone(),
+                driver: mount.driver.clone(),
                 attrs: mount.attrs.clone(),
                 read_only: mount.read_only,
             },
@@ -187,12 +187,12 @@ impl WorkerVolumeManager {
         // A driver that answers in the wrong shape (a path for a block
         // request) would fail much later, in the task kind, with a confusing
         // error. Catch it at the boundary.
-        result.validate_for(mount.mode, &mount.plugin)?;
+        result.validate_for(mount.mode, &mount.driver)?;
         let host_path = result.resolved_path().cloned().expect("validated above");
         info!(
             allocation_id = allocation.id,
             volume_id = %mount.volume_id,
-            plugin = %mount.plugin,
+            driver = %mount.driver,
             mode = %mount.mode,
             fresh = result.fresh,
             path = %host_path.display(),
@@ -219,7 +219,7 @@ impl WorkerVolumeManager {
         Ok(MountedVolume {
             volume_id: mount.volume_id.clone(),
             name: mount.name.clone(),
-            plugin: mount.plugin.clone(),
+            driver: mount.driver.clone(),
             mode: mount.mode,
             host_path,
             fs: result.fs,
@@ -245,14 +245,14 @@ impl WorkerVolumeManager {
     }
 
     fn unmount_one(&mut self, mount: &MountedVolume) {
-        let Some(plugin) = self.registry.get(&mount.plugin) else {
+        let Some(plugin) = self.registry.get(&mount.driver) else {
             return;
         };
         match plugin.unmount(&mount.request) {
             Ok(()) => {
                 info!(
                     volume_id = %mount.volume_id,
-                    plugin = %mount.plugin,
+                    driver = %mount.driver,
                     "Unmounted volume"
                 );
                 self.reports.push(VolumeReport {
@@ -270,7 +270,7 @@ impl WorkerVolumeManager {
             Err(err) => {
                 warn!(
                     volume_id = %mount.volume_id,
-                    plugin = %mount.plugin,
+                    driver = %mount.driver,
                     error = ?err,
                     "Failed to unmount volume"
                 );
@@ -310,13 +310,13 @@ impl WorkerVolumeManager {
             if self.destroyed.contains(&request.volume_id) {
                 continue;
             }
-            let Some(plugin) = self.registry.get(&request.plugin) else {
+            let Some(plugin) = self.registry.get(&request.driver) else {
                 // The manager filters by advertised plugins, so this only
                 // happens mid-reconfiguration. Stay quiet and let it retry.
                 debug!(
                     volume_id = %request.volume_id,
-                    plugin = %request.plugin,
-                    "Ignoring destroy for a plugin this node does not have"
+                    driver = %request.driver,
+                    "Ignoring destroy for a driver this node does not have"
                 );
                 continue;
             };
@@ -329,7 +329,7 @@ impl WorkerVolumeManager {
                 volume: VolumeRef {
                     id: request.volume_id.clone(),
                     name: request.name.clone(),
-                    plugin: request.plugin.clone(),
+                    driver: request.driver.clone(),
                     attrs: serde_json::from_str(&request.attrs).unwrap_or_default(),
                     read_only: false,
                 },
@@ -343,7 +343,7 @@ impl WorkerVolumeManager {
                 Ok(()) => {
                     info!(
                         volume_id = %request.volume_id,
-                        plugin = %request.plugin,
+                        driver = %request.driver,
                         "Destroyed volume"
                     );
                     self.destroyed.insert(request.volume_id.clone());
@@ -362,7 +362,7 @@ impl WorkerVolumeManager {
                 Err(err) => {
                     warn!(
                         volume_id = %request.volume_id,
-                        plugin = %request.plugin,
+                        driver = %request.driver,
                         error = ?err,
                         "Failed to destroy volume; will retry"
                     );
@@ -508,14 +508,14 @@ mod tests {
 
     fn mount_spec(
         name: &str,
-        plugin: &str,
+        driver: &str,
         path: Option<&str>,
         instance_volume: bool,
     ) -> VolumeMount {
         VolumeMount {
             volume_id: format!("vol-{name}"),
             name: name.to_string(),
-            plugin: plugin.to_string(),
+            driver: driver.to_string(),
             mode: VolumeMode::Filesystem,
             params: Default::default(),
             attrs: Default::default(),
@@ -649,7 +649,7 @@ mod tests {
 
         let request = VolumeDestroyRequest {
             volume_id: "vol-data".into(),
-            plugin: "local-dir".into(),
+            driver: "local-dir".into(),
             name: "data".into(),
             params: "{}".into(),
             attrs: "{}".into(),
@@ -680,7 +680,7 @@ mod tests {
         let mounts = vec![MountedVolume {
             volume_id: "vol-1".into(),
             name: "data".into(),
-            plugin: "local-dir".into(),
+            driver: "local-dir".into(),
             mode: VolumeMode::Filesystem,
             host_path: PathBuf::from("/var/lib/legion/volumes/local-dir/vol-1"),
             fs: None,
@@ -693,7 +693,7 @@ mod tests {
                 VolumeRef {
                     id: "vol-1".into(),
                     name: "data".into(),
-                    plugin: "local-dir".into(),
+                    driver: "local-dir".into(),
                     attrs: Default::default(),
                     read_only: false,
                 },

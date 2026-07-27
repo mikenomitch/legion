@@ -29,7 +29,7 @@ pub mod builtins;
 pub mod conformance;
 pub mod exec;
 
-pub use exec::ExecVolumePlugin;
+pub use exec::ExecVolumeDriver;
 
 /// Volume contract version. Bumped only for breaking ABI changes; exec plugins
 /// declare it in `plugin.json` (`legionVolumeApiVersion`) and echo it in every
@@ -37,16 +37,16 @@ pub use exec::ExecVolumePlugin;
 pub const VOLUME_API_VERSION: u32 = 1;
 
 /// Plugin used when a task declares storage without naming one.
-pub const DEFAULT_VOLUME_PLUGIN: &str = "local-dir";
+pub const DEFAULT_VOLUME_DRIVER: &str = "local-dir";
 
 /// The drivers compiled into every Legion binary.
 ///
 /// Used as the assumed plugin set for a node that advertises no
-/// `volumePlugins` fingerprint at all — a worker from before this feature, or
+/// `volumeDrivers` fingerprint at all — a worker from before this feature, or
 /// a test fixture. Excluding such nodes outright would strand every stateful
 /// job until an entire cluster was upgraded; assuming the built-ins is both
 /// backward-compatible and true, since they ship in the binary.
-pub const BUILTIN_VOLUME_PLUGINS: [&str; 4] = ["local-dir", "host", "nfs", "tmpfs"];
+pub const BUILTIN_VOLUME_DRIVERS: [&str; 4] = ["local-dir", "host", "nfs", "tmpfs"];
 
 /// The only access mode v1 admits. Reported by `capabilities` and recorded on
 /// the volume row so multi-reader can be enabled per plugin later without a
@@ -301,7 +301,7 @@ pub struct VolumeRef {
     /// Declared volume name within the task (`data`, `models`, …). Becomes
     /// `LEGION_VOLUME_<NAME>`.
     pub name: String,
-    pub plugin: String,
+    pub driver: String,
     /// Driver-owned metadata recorded on the volume row by a previous mount
     /// (an NFS export path, a ZFS dataset). Opaque to Legion.
     #[serde(default)]
@@ -424,8 +424,8 @@ impl VolumeRequest {
     pub fn require_param(&self, key: &str) -> R<String> {
         self.param_str(key).with_context(|| {
             format!(
-                "volume plugin {} requires the `{key}` param",
-                self.volume.plugin
+                "volume driver {} requires the `{key}` param",
+                self.volume.driver
             )
         })
     }
@@ -524,14 +524,14 @@ impl MountResult {
     /// Reject a driver that answered in the wrong shape — a filesystem-mode
     /// result for a block request is a plugin bug, and catching it here beats
     /// the consumer failing on a path it cannot open.
-    pub fn validate_for(&self, mode: VolumeMode, plugin: &str) -> R<()> {
+    pub fn validate_for(&self, mode: VolumeMode, driver: &str) -> R<()> {
         let path = match mode {
             VolumeMode::Filesystem => self.mount_path.as_ref(),
             VolumeMode::Block => self.device_path.as_ref(),
         };
         let path = path.with_context(|| {
             format!(
-                "volume plugin `{plugin}` returned no {} for a {mode} mount",
+                "volume driver `{driver}` returned no {} for a {mode} mount",
                 match mode {
                     VolumeMode::Filesystem => "mountPath",
                     VolumeMode::Block => "devicePath",
@@ -539,7 +539,7 @@ impl MountResult {
             )
         })?;
         if !path.is_absolute() {
-            bail!("volume plugin `{plugin}` returned a relative path {path:?}");
+            bail!("volume driver `{driver}` returned a relative path {path:?}");
         }
         Ok(())
     }
@@ -551,7 +551,7 @@ impl MountResult {
 /// partial failures, so "already mounted" / "already gone" is a success, not an
 /// error. That rule is what lets the manager treat volume state as a simple
 /// two-phase state machine.
-pub trait VolumePlugin: Send + Sync {
+pub trait VolumeDriver: Send + Sync {
     fn name(&self) -> &str;
 
     /// What this driver supports, evaluated against *this* node right now —
@@ -626,20 +626,20 @@ pub struct HostVolumeConfig {
 
 /// The plugins available on one worker: built-ins plus anything discovered
 /// under `plugins/volumes/`.
-pub struct VolumePluginRegistry {
-    plugins: HashMap<String, Box<dyn VolumePlugin>>,
+pub struct VolumeDriverRegistry {
+    drivers: HashMap<String, Box<dyn VolumeDriver>>,
     config: VolumeRuntimeConfig,
 }
 
-impl VolumePluginRegistry {
+impl VolumeDriverRegistry {
     /// Built-ins only. `with_discovery` adds exec plugins from disk.
     pub fn with_builtins(config: VolumeRuntimeConfig) -> Self {
-        let mut registry = VolumePluginRegistry {
-            plugins: HashMap::new(),
+        let mut registry = VolumeDriverRegistry {
+            drivers: HashMap::new(),
             config: config.clone(),
         };
-        for plugin in builtins::all(&config) {
-            registry.plugins.insert(plugin.name().to_string(), plugin);
+        for driver in builtins::all(&config) {
+            registry.drivers.insert(driver.name().to_string(), driver);
         }
         registry
     }
@@ -653,24 +653,24 @@ impl VolumePluginRegistry {
         let root = config.plugin_dir.join("volumes");
         match exec::discover(&root) {
             Ok(found) => {
-                for plugin in found {
-                    let name = plugin.name().to_string();
-                    if registry.plugins.contains_key(&name) {
+                for driver in found {
+                    let name = driver.name().to_string();
+                    if registry.drivers.contains_key(&name) {
                         // Built-ins win: an exec plugin cannot silently
                         // shadow `local-dir` and change what a running
                         // cluster's default storage means.
                         warn!(
-                            plugin = %name,
-                            "Ignoring exec volume plugin that shadows a built-in"
+                            driver = %name,
+                            "Ignoring exec volume driver that shadows a built-in"
                         );
                         continue;
                     }
-                    info!(plugin = %name, "Loaded exec volume plugin");
-                    registry.plugins.insert(name, Box::new(plugin));
+                    info!(driver = %name, "Loaded exec volume driver");
+                    registry.drivers.insert(name, Box::new(driver));
                 }
             }
             Err(err) => {
-                debug!(dir = %root.display(), error = ?err, "No exec volume plugins discovered");
+                debug!(dir = %root.display(), error = ?err, "No exec volume drivers discovered");
             }
         }
         registry
@@ -680,32 +680,32 @@ impl VolumePluginRegistry {
         &self.config
     }
 
-    pub fn get(&self, name: &str) -> Option<&dyn VolumePlugin> {
-        self.plugins.get(name).map(|plugin| plugin.as_ref())
+    pub fn get(&self, name: &str) -> Option<&dyn VolumeDriver> {
+        self.drivers.get(name).map(|driver| driver.as_ref())
     }
 
-    pub fn require(&self, name: &str) -> R<&dyn VolumePlugin> {
+    pub fn require(&self, name: &str) -> R<&dyn VolumeDriver> {
         self.get(name).with_context(|| {
             format!(
-                "no volume plugin named `{name}` on this node (have: {})",
+                "no volume driver named `{name}` on this node (have: {})",
                 self.names().join(", ")
             )
         })
     }
 
     pub fn names(&self) -> Vec<String> {
-        let mut names = self.plugins.keys().cloned().collect::<Vec<_>>();
+        let mut names = self.drivers.keys().cloned().collect::<Vec<_>>();
         names.sort();
         names
     }
 
-    /// Capabilities of every registered plugin, keyed by name. This is what the
-    /// worker publishes in `fingerprint.volumePlugins` and what the manager
-    /// validates jobs against.
+    /// Capabilities of every registered driver, keyed by name. This is what
+    /// the worker publishes in `fingerprint.volumeDrivers` and what the
+    /// manager validates jobs against.
     pub fn capabilities(&self) -> BTreeMap<String, VolumeCapabilities> {
         let mut out = BTreeMap::new();
-        for (name, plugin) in &self.plugins {
-            out.insert(name.clone(), plugin.capabilities());
+        for (name, driver) in &self.drivers {
+            out.insert(name.clone(), driver.capabilities());
         }
         out
     }
@@ -728,29 +728,29 @@ impl VolumePluginRegistry {
 /// instance row parses without a migration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StorageHandle {
-    pub plugin: String,
+    pub driver: String,
     pub volume_id: String,
 }
 
 impl StorageHandle {
-    pub fn new(plugin: impl Into<String>, volume_id: impl Into<String>) -> Self {
+    pub fn new(driver: impl Into<String>, volume_id: impl Into<String>) -> Self {
         StorageHandle {
-            plugin: plugin.into(),
+            driver: driver.into(),
             volume_id: volume_id.into(),
         }
     }
 
-    /// Parse `plugin/volume_id`. Plugin names never contain `/`, so the split
+    /// Parse `driver/volume_id`. Driver names never contain `/`, so the split
     /// is unambiguous even if a driver ever puts one in a volume id.
     pub fn parse(raw: &str) -> R<Self> {
-        let (plugin, volume_id) = raw
+        let (driver, volume_id) = raw
             .split_once('/')
-            .with_context(|| format!("malformed storage handle {raw:?}: expected plugin/id"))?;
-        if plugin.is_empty() || volume_id.is_empty() {
-            bail!("malformed storage handle {raw:?}: expected plugin/id");
+            .with_context(|| format!("malformed storage handle {raw:?}: expected driver/id"))?;
+        if driver.is_empty() || volume_id.is_empty() {
+            bail!("malformed storage handle {raw:?}: expected driver/id");
         }
         Ok(StorageHandle {
-            plugin: plugin.to_string(),
+            driver: driver.to_string(),
             volume_id: volume_id.to_string(),
         })
     }
@@ -758,7 +758,7 @@ impl StorageHandle {
 
 impl std::fmt::Display for StorageHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}/{}", self.plugin, self.volume_id)
+        write!(f, "{}/{}", self.driver, self.volume_id)
     }
 }
 
@@ -857,7 +857,7 @@ mod tests {
     #[test]
     fn storage_handle_roundtrips() -> R<()> {
         let handle = StorageHandle::parse("local-dir/abc123")?;
-        assert_eq!(handle.plugin, "local-dir");
+        assert_eq!(handle.driver, "local-dir");
         assert_eq!(handle.volume_id, "abc123");
         assert_eq!(handle.to_string(), "local-dir/abc123");
         Ok(())
@@ -867,7 +867,7 @@ mod tests {
     fn storage_handle_rejects_malformed() {
         assert!(StorageHandle::parse("nope").is_err());
         assert!(StorageHandle::parse("/abc").is_err());
-        assert!(StorageHandle::parse("plugin/").is_err());
+        assert!(StorageHandle::parse("driver/").is_err());
     }
 
     #[test]

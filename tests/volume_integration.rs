@@ -53,7 +53,7 @@ impl Cluster {
         let mut fingerprint = Map::new();
         fingerprint.insert("arch".into(), json!("aarch64"));
         fingerprint.insert(
-            "volumePlugins".into(),
+            "volumeDrivers".into(),
             json!({
                 "local-dir": {
                     "apiVersion": 1, "name": "local-dir", "nodeLocal": true,
@@ -151,7 +151,7 @@ impl Cluster {
     }
 }
 
-fn stateful_job(name: &str, count: u32, plugin: &str, params: Option<Value>) -> JobConfig {
+fn stateful_job(name: &str, count: u32, driver: &str, params: Option<Value>) -> JobConfig {
     JobConfig {
         name: name.to_string(),
         tasks: vec![TaskConfig {
@@ -167,7 +167,7 @@ fn stateful_job(name: &str, count: u32, plugin: &str, params: Option<Value>) -> 
                 on_lost: None,
                 storage: Some(StatefulStorageConfig {
                     path: "/var/lib/db".into(),
-                    plugin: Some(plugin.to_string()),
+                    driver: Some(driver.to_string()),
                     mode: None,
                     params,
                     retain_on_scale_in: None,
@@ -191,7 +191,7 @@ fn placement_mints_one_volume_per_slot_with_a_matching_handle() -> R<()> {
     let volumes = cluster.volumes()?;
     assert_eq!(volumes.len(), 3, "one volume per slot");
     for volume in &volumes {
-        assert_eq!(volume.plugin, "local-dir");
+        assert_eq!(volume.driver, "local-dir");
         assert_eq!(volume.state, VolumeState::Pending, "provisioning is lazy");
         assert!(volume.node_local, "local-dir is node-local");
         assert!(volume.node_id.is_none(), "no pin before the first mount");
@@ -427,7 +427,7 @@ fn task_volume_claims_are_shared_and_outlive_instance_churn() -> R<()> {
     let mut job = stateful_job("db", 2, "local-dir", None);
     job.tasks[0].volumes = vec![VolumeSpec {
         name: "models".into(),
-        plugin: Some("local-dir".into()),
+        driver: Some("local-dir".into()),
         mode: None,
         params: None,
         path: Some("/models".into()),

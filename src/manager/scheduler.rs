@@ -1178,33 +1178,33 @@ impl<'a> Scheduler<'a> {
             node_lookup,
         );
         // Storage is a hard placement requirement: a node without the task's
-        // volume plugin (or with it installed-but-unusable) can never run the
+        // volume driver (or with it installed-but-unusable) can never run the
         // task, so filter it out here rather than letting the task start and
         // fail at mount time.
-        let required_plugins = task_config.required_volume_plugins();
+        let required_drivers = task_config.required_volume_drivers();
         let base_eligible = nodes
             .iter()
             .filter(|node| {
                 constraint_set.is_satisfied(node, None)
                     && permit_set.is_permitted(node)
-                    && node_provides_volume_plugins(node, &required_plugins)
+                    && node_provides_volume_drivers(node, &required_drivers)
             })
             .collect::<Vec<_>>();
-        if base_eligible.is_empty() && !required_plugins.is_empty() {
-            let missing = required_plugins
+        if base_eligible.is_empty() && !required_drivers.is_empty() {
+            let missing = required_drivers
                 .iter()
                 .filter(|plugin| {
                     !nodes
                         .iter()
-                        .any(|node| node_provides_volume_plugins(node, &[(*plugin).clone()].into()))
+                        .any(|node| node_provides_volume_drivers(node, &[(*plugin).clone()].into()))
                 })
                 .cloned()
                 .collect::<Vec<_>>();
             if !missing.is_empty() {
                 bail!(
-                    "Failed to place task {}: no node provides volume plugin(s) {}. \
+                    "Failed to place task {}: no node provides volume driver(s) {}. \
                      Install them under plugins/volumes/<name>/ on a worker, or check \
-                     `legion volume plugins` for why an installed one is unusable",
+                     `legion volume drivers` for why an installed one is unusable",
                     task_config.name,
                     missing.join(", ")
                 );
@@ -2041,27 +2041,27 @@ impl<'a> Scheduler<'a> {
     }
 }
 
-/// Whether a node advertises every plugin in `required`, and reports each as
-/// usable. An installed-but-unavailable plugin (no `mount` binary, no declared
+/// Whether a node advertises every driver in `required`, and reports each as
+/// usable. An installed-but-unavailable driver (no `mount` binary, no declared
 /// host volumes) is treated as absent — it cannot serve a mount either way, and
 /// skipping the node produces a better error than a failed task start.
-fn node_provides_volume_plugins(
+fn node_provides_volume_drivers(
     node: &Node,
     required: &std::collections::BTreeSet<String>,
 ) -> bool {
     if required.is_empty() {
         return true;
     }
-    let Some(plugins) = node.fingerprint_attrs.get("volumePlugins") else {
+    let Some(drivers) = node.fingerprint_attrs.get("volumeDrivers") else {
         // A node that advertises nothing predates plugin fingerprinting (or is
         // a test fixture). Assume the built-ins rather than excluding it, so an
         // upgrade doesn't strand every stateful job on the old workers.
         return required
             .iter()
-            .all(|name| crate::volumes::BUILTIN_VOLUME_PLUGINS.contains(&name.as_str()));
+            .all(|name| crate::volumes::BUILTIN_VOLUME_DRIVERS.contains(&name.as_str()));
     };
     required.iter().all(|name| {
-        plugins
+        drivers
             .get(name)
             .map(|caps| {
                 // Missing `available` means an older worker that predates the
@@ -2829,7 +2829,7 @@ mod tests {
                 initial_instances: None,
                 on_lost: None,
                 storage: Some(crate::structs::StatefulStorageConfig {
-                    plugin: None,
+                    driver: None,
                     mode: None,
                     params: None,
                     path: "/var/lib/data".into(),
@@ -2997,7 +2997,7 @@ mod tests {
                 initial_instances: None,
                 on_lost: None,
                 storage: Some(crate::structs::StatefulStorageConfig {
-                    plugin: None,
+                    driver: None,
                     mode: None,
                     params: None,
                     path: "/workspace".into(),

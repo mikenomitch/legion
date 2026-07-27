@@ -17,7 +17,7 @@
 //! start costs nothing at this rate.
 //!
 //! `plugins/volumes/example/` is a ~60-line shell implementation of the whole
-//! contract; `legion volume plugin test example` runs the conformance harness
+//! contract; `legion volume driver test example` runs the conformance harness
 //! against it.
 
 use std::io::Write;
@@ -28,7 +28,7 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use crate::prelude::*;
-use crate::volumes::{MountResult, VolumeCapabilities, VolumeOp, VolumePlugin, VolumeRequest};
+use crate::volumes::{MountResult, VolumeCapabilities, VolumeDriver, VolumeOp, VolumeRequest};
 
 /// Manifest key/value contract for `plugins/volumes/<name>/plugin.json`.
 #[derive(Debug, Clone, Deserialize)]
@@ -46,12 +46,12 @@ const PLUGIN_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// An out-of-tree driver invoked as a subprocess.
 #[derive(Debug)]
-pub struct ExecVolumePlugin {
+pub struct ExecVolumeDriver {
     name: String,
     binary: PathBuf,
 }
 
-impl ExecVolumePlugin {
+impl ExecVolumeDriver {
     /// Validate `<root>/plugin.json` and locate the executable.
     pub fn load(root: &Path, name: &str) -> R<Self> {
         let manifest_path = root.join("plugin.json");
@@ -74,7 +74,7 @@ impl ExecVolumePlugin {
         }
         if manifest.legion_volume_api_version != super::VOLUME_API_VERSION {
             bail!(
-                "volume plugin {name} declares legionVolumeApiVersion {} (host supports {})",
+                "volume driver {name} declares legionVolumeApiVersion {} (host supports {})",
                 manifest.legion_volume_api_version,
                 super::VOLUME_API_VERSION
             );
@@ -83,11 +83,11 @@ impl ExecVolumePlugin {
         let binary = root.join(name);
         if !binary.is_file() {
             bail!(
-                "volume plugin {name} has a manifest but no executable at {}",
+                "volume driver {name} has a manifest but no executable at {}",
                 binary.display()
             );
         }
-        Ok(ExecVolumePlugin {
+        Ok(ExecVolumeDriver {
             name: name.to_string(),
             binary,
         })
@@ -109,7 +109,7 @@ impl ExecVolumePlugin {
             .spawn()
             .with_context(|| {
                 format!(
-                    "failed to run volume plugin {} at {}",
+                    "failed to run volume driver {} at {}",
                     self.name,
                     self.binary.display()
                 )
@@ -118,15 +118,15 @@ impl ExecVolumePlugin {
         child
             .stdin
             .as_mut()
-            .context("volume plugin stdin unavailable")?
+            .context("volume driver stdin unavailable")?
             .write_all(&payload)
-            .with_context(|| format!("failed to write request to volume plugin {}", self.name))?;
+            .with_context(|| format!("failed to write request to volume driver {}", self.name))?;
         // Close stdin so the plugin's `cat` (or read loop) terminates.
         drop(child.stdin.take());
 
         let output = wait_with_timeout(child, PLUGIN_TIMEOUT).with_context(|| {
             format!(
-                "volume plugin {} timed out running `{}`",
+                "volume driver {} timed out running `{}`",
                 self.name, request.op
             )
         })?;
@@ -141,7 +141,7 @@ impl ExecVolumePlugin {
         // successful mounts.
         if let Some(message) = parse_error_payload(&stdout) {
             bail!(
-                "volume plugin {} failed running `{}`: {message}",
+                "volume driver {} failed running `{}`: {message}",
                 self.name,
                 request.op
             );
@@ -150,14 +150,14 @@ impl ExecVolumePlugin {
             // Ops with no payload (`unmount`, `destroy`) may print nothing.
             return serde_json::from_str::<T>("{}").with_context(|| {
                 format!(
-                    "volume plugin {} returned no output for `{}`",
+                    "volume driver {} returned no output for `{}`",
                     self.name, request.op
                 )
             });
         }
         serde_json::from_str::<T>(&stdout).with_context(|| {
             format!(
-                "volume plugin {} returned invalid JSON for `{}`: {stdout}",
+                "volume driver {} returned invalid JSON for `{}`: {stdout}",
                 self.name, request.op
             )
         })
@@ -193,12 +193,12 @@ fn parse_error_payload(stdout: &str) -> Option<String> {
 /// status.
 fn plugin_error(name: &str, op: VolumeOp, stdout: &str, stderr: &str) -> String {
     if let Some(message) = parse_error_payload(stdout) {
-        return format!("volume plugin {name} failed running `{op}`: {message}");
+        return format!("volume driver {name} failed running `{op}`: {message}");
     }
     if !stderr.is_empty() {
-        return format!("volume plugin {name} failed running `{op}`: {stderr}");
+        return format!("volume driver {name} failed running `{op}`: {stderr}");
     }
-    format!("volume plugin {name} exited non-zero running `{op}`")
+    format!("volume driver {name} exited non-zero running `{op}`")
 }
 
 /// `Child::wait_with_output` with a deadline. Polls rather than reading
@@ -218,7 +218,7 @@ fn wait_with_timeout(mut child: std::process::Child, timeout: Duration) -> R<std
     }
 }
 
-impl VolumePlugin for ExecVolumePlugin {
+impl VolumeDriver for ExecVolumeDriver {
     fn name(&self) -> &str {
         &self.name
     }
@@ -232,7 +232,7 @@ impl VolumePlugin for ExecVolumePlugin {
             super::VolumeRef {
                 id: String::new(),
                 name: String::new(),
-                plugin: self.name.clone(),
+                driver: self.name.clone(),
                 attrs: Default::default(),
                 read_only: false,
             },
@@ -270,18 +270,18 @@ impl VolumePlugin for ExecVolumePlugin {
 /// Every valid exec plugin under `root` (`<root>/<name>/plugin.json`).
 /// Directories that fail validation are logged and skipped: one broken plugin
 /// must not stop a worker from starting.
-pub fn discover(root: &Path) -> R<Vec<ExecVolumePlugin>> {
+pub fn discover(root: &Path) -> R<Vec<ExecVolumeDriver>> {
     let entries = std::fs::read_dir(root)
         .with_context(|| format!("no volume plugin directory at {}", root.display()))?;
-    let mut plugins = Vec::new();
+    let mut drivers = Vec::new();
     for entry in entries {
         let entry = entry?;
         if !entry.file_type()?.is_dir() {
             continue;
         }
         let name = entry.file_name().to_string_lossy().to_string();
-        match ExecVolumePlugin::load(&entry.path(), &name) {
-            Ok(plugin) => plugins.push(plugin),
+        match ExecVolumeDriver::load(&entry.path(), &name) {
+            Ok(driver) => drivers.push(driver),
             Err(err) => warn!(
                 plugin = %name,
                 error = ?err,
@@ -289,8 +289,8 @@ pub fn discover(root: &Path) -> R<Vec<ExecVolumePlugin>> {
             ),
         }
     }
-    plugins.sort_by(|left, right| left.name.cmp(&right.name));
-    Ok(plugins)
+    drivers.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(drivers)
 }
 
 #[cfg(test)]
@@ -334,7 +334,7 @@ mod tests {
             VolumeRef {
                 id: "vol-1".into(),
                 name: "data".into(),
-                plugin: "demo".into(),
+                driver: "demo".into(),
                 attrs: Default::default(),
                 read_only: false,
             },
@@ -361,16 +361,16 @@ mod tests {
              *) echo '{}';;\n\
              esac\n",
         )?;
-        let plugin = ExecVolumePlugin::load(&root.join("demo"), "demo")?;
+        let driver = ExecVolumeDriver::load(&root.join("demo"), "demo")?;
 
-        let caps = plugin.capabilities();
+        let caps = driver.capabilities();
         assert!(caps.available, "{}", caps.detail);
         assert!(caps.node_local);
 
-        let mounted = plugin.mount(&request(VolumeOp::Mount))?;
+        let mounted = driver.mount(&request(VolumeOp::Mount))?;
         assert_eq!(mounted.mount_path, Some(PathBuf::from("/tmp/demo-vol")));
-        plugin.unmount(&request(VolumeOp::Unmount))?;
-        plugin.destroy(&request(VolumeOp::Destroy))?;
+        driver.unmount(&request(VolumeOp::Unmount))?;
+        driver.destroy(&request(VolumeOp::Destroy))?;
 
         std::fs::remove_dir_all(&root).ok();
         Ok(())
@@ -388,8 +388,8 @@ mod tests {
              echo '{\"error\":{\"code\":\"ENOSPC\",\"message\":\"disk full\"}}'\n\
              exit 1\n",
         )?;
-        let plugin = ExecVolumePlugin::load(&root.join("demo"), "demo")?;
-        let err = plugin
+        let driver = ExecVolumeDriver::load(&root.join("demo"), "demo")?;
+        let err = driver
             .mount(&request(VolumeOp::Mount))
             .unwrap_err()
             .to_string();
@@ -409,8 +409,8 @@ mod tests {
             1,
             "#!/bin/sh\ncat > /dev/null\necho '{\"error\":{\"message\":\"nope\"}}'\n",
         )?;
-        let plugin = ExecVolumePlugin::load(&root.join("demo"), "demo")?;
-        let err = plugin
+        let driver = ExecVolumeDriver::load(&root.join("demo"), "demo")?;
+        let err = driver
             .mount(&request(VolumeOp::Mount))
             .unwrap_err()
             .to_string();
@@ -424,7 +424,7 @@ mod tests {
     fn rejects_wrong_api_version_and_missing_binary() -> R<()> {
         let root = temp_root("bad");
         write_plugin(&root, "old", 99, "#!/bin/sh\nexit 0\n")?;
-        let err = ExecVolumePlugin::load(&root.join("old"), "old")
+        let err = ExecVolumeDriver::load(&root.join("old"), "old")
             .unwrap_err()
             .to_string();
         assert!(err.contains("legionVolumeApiVersion"), "{err}");
@@ -435,7 +435,7 @@ mod tests {
             no_binary.join("plugin.json"),
             r#"{"kind":"volumes","name":"ghost","legionVolumeApiVersion":1}"#,
         )?;
-        let err = ExecVolumePlugin::load(&no_binary, "ghost")
+        let err = ExecVolumeDriver::load(&no_binary, "ghost")
             .unwrap_err()
             .to_string();
         assert!(err.contains("no executable"), "{err}");
@@ -453,8 +453,8 @@ mod tests {
             1,
             "#!/bin/sh\ncat > /dev/null\necho 'not json at all'\n",
         )?;
-        let plugin = ExecVolumePlugin::load(&root.join("demo"), "demo")?;
-        let err = plugin
+        let driver = ExecVolumeDriver::load(&root.join("demo"), "demo")?;
+        let err = driver
             .mount(&request(VolumeOp::Mount))
             .unwrap_err()
             .to_string();

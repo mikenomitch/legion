@@ -53,7 +53,7 @@ and Nomad's host/CSI volumes.
   (models, certs, a shared cache) into *any* task is a first-class use case, not
   a stateful-only one.
 - **End-user simplicity**: a stateful task says *what* it needs
-  (`storage: { path: '/var/lib/db', plugin: 'local-dir' }`) and never sees mount
+  (`storage: { path: '/var/lib/db', driver: 'local-dir' }`) and never sees mount
   mechanics. The default (`plugin` omitted) just works on a laptop.
 
 ## Non-Goals
@@ -194,7 +194,7 @@ nothing downstream knows whether a plugin is in-process or exec'd.
 Plus a reference **exec** plugin at `plugins/volumes/example/` — a ~60-line
 POSIX shell script implementing the full contract over a directory tree. Its job
 is to prove the ABI end to end and to be the thing you copy when writing a real
-one; `legion volume plugin test example` runs the conformance harness against it.
+one; `legion volume driver test example` runs the conformance harness against it.
 
 ### 4) Job spec (user-facing)
 
@@ -206,7 +206,7 @@ stateful: {
   storage: {
     path: '/var/lib/db',       // container: bind destination. exec: informational
                                // (read $LEGION_STORAGE_DIR instead)
-    plugin: 'local-dir',       // default when omitted
+    driver: 'local-dir',       // default when omitted
     params: { size: '10G' },   // passed to the plugin verbatim
     readOnly: false,
     retainOnScaleIn: true,     // unchanged
@@ -241,7 +241,7 @@ Admission validation:
 ### 5) Scheduler integration
 
 - **Plugin availability.** Workers advertise
-  `fingerprint.volumePlugins: { "<name>": { nodeLocal, ephemeral, available, … } }`.
+  `fingerprint.volumeDrivers: { "<name>": { nodeLocal, ephemeral, available, … } }`.
   A task's required plugin set filters candidate nodes before scoring; when
   nothing matches the eval fails with *"no node provides volume plugin X"*
   rather than a generic no-capacity error.
@@ -289,14 +289,14 @@ with `state ∈ { pending, created, destroying, destroyed }`.
 3. **Scheduler** — plugin fingerprinting, node filtering, node-local pinning,
    binder pairing.
 4. **Exec dispatcher + conformance harness** — manifest discovery, JSON ABI,
-   timeouts, `legion volume plugin test`, reference shell plugin.
+   timeouts, `legion volume driver test`, reference shell driver.
 5. **Surfaces** — RPCs, `legion volume …`, MCP tools, UI index/detail/cross-links.
 6. **Guides** — Postgres and Redis, with runnable jobspecs.
 7. *(future)* CSI bridge, snapshots, multi-volume `stateful.volumes[]`.
 
 ## Testing Plan
 
-- **Conformance harness** (shared by tests and `legion volume plugin test`):
+- **Conformance harness** (shared by tests and `legion volume driver test`):
   every plugin runs `capabilities → mount → write file → unmount → mount →
   read file back → unmount → destroy`, plus a double-call idempotency check on
   every op. Built-ins and exec plugins go through the identical harness.
@@ -326,7 +326,7 @@ this one. Three of its asks were genuinely blocking.
 
 Also landed: `volume_mode` and `fs` columns on the `volume` table (so a future
 restore/clone knows the shape without re-probing), `volumeModes` and `ops` on
-`ListVolumePlugins`, and `legion volume plugin test --mode block|filesystem`
+`ListVolumeDrivers`, and `legion volume driver test --mode block|filesystem`
 with a block-specific cycle. Block persistence is verified by fingerprinting the
 image across unmount/remount rather than mounting it — Legion hands out the
 device and the *guest* owns the filesystem, and the harness deliberately needs

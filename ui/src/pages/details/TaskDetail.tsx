@@ -151,7 +151,7 @@ export default function TaskDetail() {
                               <span class="font-mono text-xs text-muted" title="Where the task sees its instance storage">{data()!.taskSpec!.stateful!.storagePath}</span>
                             </Show>
                             <Show when={data()!.volumes.find((volume) => volume.instanceId)}>
-                              {(volume) => <Badge tone={volume().nodeLocal ? 'neutral' : 'ok'}>{volume().plugin}</Badge>}
+                              {(volume) => <Badge tone={volume().nodeLocal ? 'neutral' : 'ok'}>{volume().driver}</Badge>}
                             </Show>
                           </span>,
                         ]] as Array<[string, any]>)
@@ -190,7 +190,7 @@ export default function TaskDetail() {
                       <thead class={theadClass}>
                         <tr>
                           <th class={thClass}>Volume</th>
-                          <th class={thClass}>Plugin</th>
+                          <th class={thClass}>Driver</th>
                           <th class={thClass}>State</th>
                           <th class={thClass}>Instance</th>
                           <th class={thClass}>Node</th>
@@ -211,7 +211,7 @@ export default function TaskDetail() {
                                 <div class="text-2xs text-faint">{volume.name}</div>
                               </td>
                               <td class={tdClass}>
-                                <Badge tone={volume.nodeLocal ? 'neutral' : 'ok'}>{volume.plugin}</Badge>
+                                <Badge tone={volume.nodeLocal ? 'neutral' : 'ok'}>{volume.driver}</Badge>
                               </td>
                               <td class={tdClass}>
                                 <Badge tone={volumeStateTone(volume)} dot class="uppercase tracking-wide">

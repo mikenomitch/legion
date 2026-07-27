@@ -3,7 +3,7 @@
 /* eslint-disable */
 // @ts-nocheck
 
-import { AcquireKvLockReply, AcquireKvLockRequest, AdvanceRolloutReply, AdvanceRolloutRequest, BootstrapAclReply, BootstrapAclRequest, CreateAclTokenReply, CreateAclTokenRequest, CreateInstanceReply, CreateInstanceRequest, CreateInstancesReply, CreateInstancesRequest, CreateJoinTokenReply, CreateJoinTokenRequest, DeleteAclPolicyReply, DeleteAclPolicyRequest, DeleteAclTokenReply, DeleteAclTokenRequest, DeleteAclUserReply, DeleteAclUserRequest, DeleteJoinTokenReply, DeleteJoinTokenRequest, DeleteKvReply, DeleteKvRequest, DeleteSavedStateQueryReply, DeleteSavedStateQueryRequest, DeleteVolumeReply, DeleteVolumeRequest, DestroyInstanceReply, DestroyInstanceRequest, DestroyJobReply, DestroyJobRequest, ExecClientFrame, ExecServerFrame, GetAclPolicyReply, GetAclPolicyRequest, GetAllocationLogsReply, GetAllocationLogsRequest, GetArtifactCredentialReply, GetArtifactCredentialRequest, GetAuthMethodsReply, GetAuthMethodsRequest, GetInstanceReply, GetInstanceRequest, GetJobInfoReply, GetJobInfoRequest, GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest, GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest, GetObservabilityReply, GetObservabilityRequest, GetRaftJoinTokenReply, GetRaftJoinTokenRequest, GetRaftStatusReply, GetRaftStatusRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest, GetStateStoreSchemaReply, GetStateStoreSchemaRequest, GetTaskLogsReply, GetTaskLogsRequest, GetVolumeReply, GetVolumeRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, IssueNodeIdentityTokenReply, IssueNodeIdentityTokenRequest, IssueRaftCommandReply, IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply, IssueWorkloadIdentityTokenRequest, ListAclPoliciesReply, ListAclPoliciesRequest, ListAclTokensReply, ListAclTokensRequest, ListAclUsersReply, ListAclUsersRequest, ListEventsReply, ListEventsRequest, ListInstancesReply, ListInstancesRequest, ListJobActionsReply, ListJobActionsRequest, ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobsReply, ListJobsRequest, ListJoinTokensReply, ListJoinTokensRequest, ListKvReply, ListKvRequest, ListRaftHistoryReply, ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply, ListRolloutsRequest, ListSavedStateQueriesReply, ListSavedStateQueriesRequest, ListServicesReply, ListServicesRequest, ListVolumePluginsReply, ListVolumePluginsRequest, ListVolumesReply, ListVolumesRequest, LoginReply, LoginRequest, PatchKvReply, PatchKvRequest, PlanJobReply, PlanJobRequest, PostWorkReply, PostWorkRequest, PutKvReply, PutKvRequest, QueryStateStoreReply, QueryStateStoreRequest, ReleaseKvLockReply, ReleaseKvLockRequest, RenewKvLockReply, RenewKvLockRequest, ReplaceInstanceReply, ReplaceInstanceRequest, ResolveServiceReply, ResolveServiceRequest, RestartWorkerReply, RestartWorkerRequest, RunJobReply, RunJobRequest, SchedulerEvent, StartInstanceReply, StartInstanceRequest, StopInstanceReply, StopInstanceRequest, StopJobReply, StopJobRequest, StopRolloutReply, StopRolloutRequest, StreamEventsRequest, UpdateNodeDynamicReply, UpdateNodeDynamicRequest, UpsertAclPolicyReply, UpsertAclPolicyRequest, UpsertAclUserReply, UpsertAclUserRequest, UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest, WhoAmIReply, WhoAmIRequest, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest } from "./legion_pb.js";
+import { AcquireKvLockReply, AcquireKvLockRequest, AdvanceRolloutReply, AdvanceRolloutRequest, BootstrapAclReply, BootstrapAclRequest, CreateAclTokenReply, CreateAclTokenRequest, CreateInstanceReply, CreateInstanceRequest, CreateInstancesReply, CreateInstancesRequest, CreateJoinTokenReply, CreateJoinTokenRequest, DeleteAclPolicyReply, DeleteAclPolicyRequest, DeleteAclTokenReply, DeleteAclTokenRequest, DeleteAclUserReply, DeleteAclUserRequest, DeleteJoinTokenReply, DeleteJoinTokenRequest, DeleteKvReply, DeleteKvRequest, DeleteSavedStateQueryReply, DeleteSavedStateQueryRequest, DeleteVolumeReply, DeleteVolumeRequest, DestroyInstanceReply, DestroyInstanceRequest, DestroyJobReply, DestroyJobRequest, ExecClientFrame, ExecServerFrame, GetAclPolicyReply, GetAclPolicyRequest, GetAllocationLogsReply, GetAllocationLogsRequest, GetArtifactCredentialReply, GetArtifactCredentialRequest, GetAuthMethodsReply, GetAuthMethodsRequest, GetInstanceReply, GetInstanceRequest, GetJobInfoReply, GetJobInfoRequest, GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest, GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest, GetObservabilityReply, GetObservabilityRequest, GetRaftJoinTokenReply, GetRaftJoinTokenRequest, GetRaftStatusReply, GetRaftStatusRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest, GetStateStoreSchemaReply, GetStateStoreSchemaRequest, GetTaskLogsReply, GetTaskLogsRequest, GetVolumeReply, GetVolumeRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, IssueNodeIdentityTokenReply, IssueNodeIdentityTokenRequest, IssueRaftCommandReply, IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply, IssueWorkloadIdentityTokenRequest, ListAclPoliciesReply, ListAclPoliciesRequest, ListAclTokensReply, ListAclTokensRequest, ListAclUsersReply, ListAclUsersRequest, ListEventsReply, ListEventsRequest, ListInstancesReply, ListInstancesRequest, ListJobActionsReply, ListJobActionsRequest, ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobsReply, ListJobsRequest, ListJoinTokensReply, ListJoinTokensRequest, ListKvReply, ListKvRequest, ListRaftHistoryReply, ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply, ListRolloutsRequest, ListSavedStateQueriesReply, ListSavedStateQueriesRequest, ListServicesReply, ListServicesRequest, ListVolumeDriversReply, ListVolumeDriversRequest, ListVolumesReply, ListVolumesRequest, LoginReply, LoginRequest, PatchKvReply, PatchKvRequest, PlanJobReply, PlanJobRequest, PostWorkReply, PostWorkRequest, PutKvReply, PutKvRequest, QueryStateStoreReply, QueryStateStoreRequest, ReleaseKvLockReply, ReleaseKvLockRequest, RenewKvLockReply, RenewKvLockRequest, ReplaceInstanceReply, ReplaceInstanceRequest, ResolveServiceReply, ResolveServiceRequest, RestartWorkerReply, RestartWorkerRequest, RunJobReply, RunJobRequest, SchedulerEvent, StartInstanceReply, StartInstanceRequest, StopInstanceReply, StopInstanceRequest, StopJobReply, StopJobRequest, StopRolloutReply, StopRolloutRequest, StreamEventsRequest, UpdateNodeDynamicReply, UpdateNodeDynamicRequest, UpsertAclPolicyReply, UpsertAclPolicyRequest, UpsertAclUserReply, UpsertAclUserRequest, UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest, WhoAmIReply, WhoAmIRequest, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest } from "./legion_pb.js";
 import { MethodKind } from "@bufbuild/protobuf";
 
 /**
@@ -459,12 +459,12 @@ export const Manager = {
       kind: MethodKind.Unary,
     },
     /**
-     * Lists volumes, optionally filtered by job, node, plugin, instance, or
+     * Lists volumes, optionally filtered by job, node, driver, instance, or
      * state. Includes `destroyed` tombstones so an operator can still see where
      * a job's storage went after it was reclaimed.
      *
      * A volume is the concrete storage behind an instance's opaque
-     * `{plugin}/{volume_id}` storage handle: which driver owns it, which node it
+     * `{driver}/{volume_id}` storage handle: which driver owns it, which node it
      * is pinned to (node-local drivers only), what the driver recorded about it,
      * and where it sits in the reclaim state machine.
      *
@@ -517,20 +517,20 @@ export const Manager = {
       kind: MethodKind.Unary,
     },
     /**
-     * Lists the volume plugins installed across the cluster, with each one's
+     * Lists the volume drivers installed across the cluster, with each one's
      * capabilities and the nodes providing it.
      *
      * The manager loads no storage drivers itself: everything here is
      * aggregated from what workers advertise in their fingerprints. That is also
      * what job admission validates against, so this endpoint answers "why was my
-     * job rejected for plugin X" directly.
+     * job rejected for driver X" directly.
      *
-     * @generated from rpc legion.Manager.ListVolumePlugins
+     * @generated from rpc legion.Manager.ListVolumeDrivers
      */
-    listVolumePlugins: {
-      name: "ListVolumePlugins",
-      I: ListVolumePluginsRequest,
-      O: ListVolumePluginsReply,
+    listVolumeDrivers: {
+      name: "ListVolumeDrivers",
+      I: ListVolumeDriversRequest,
+      O: ListVolumeDriversReply,
       kind: MethodKind.Unary,
     },
     /**

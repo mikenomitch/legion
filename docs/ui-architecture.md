@@ -95,7 +95,7 @@ an `afterId` cursor so no events are missed across disconnects.
   diagnosis as `legion service doctor` (`utils/services.ts`). Endpoint
   addresses link out when the service's `meta.protocol` is web-reachable.
 - `Volumes.tsx`: the volume index (`ListVolumes`) plus a plugin table
-  (`ListVolumePlugins`). Node-local volumes are marked with `*` because that is
+  (`ListVolumeDrivers`). Node-local volumes are marked with `*` because that is
   the property deciding whether a stateful workload can move at all;
   `pages/details/VolumeDetail.tsx` shows one volume's plugin params, driver
   metadata, node pin, and last driver error. Deletion is CLI-only

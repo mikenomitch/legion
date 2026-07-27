@@ -28,15 +28,15 @@ when the replica goes away.
 ```
 
 Three replicas, three independent data directories, each reattached to its own
-replica across restarts, redeploys, and reschedules. No plugin to install and
-nothing to configure: the default `local-dir` plugin ships in the binary.
+replica across restarts, redeploys, and reschedules. Nothing to install and
+nothing to configure: the default `local-dir` driver ships in the binary.
 
 ## Concepts
 
 ### Volume vs storage handle
 
 An **instance** owns an opaque `storage_handle` that looks like
-`local-dir/9f2c…`. That is `{plugin}/{volume_id}`: which driver owns the
+`local-dir/9f2c…`. That is `{driver}/{volume_id}`: which driver owns the
 storage, and which volume it is. The **volume** is the row behind that handle —
 where it lives, what the driver recorded about it, and where it is in its
 lifecycle.
@@ -45,7 +45,7 @@ lifecycle.
 | --- | --- | --- | --- |
 | Lifetime | one placement | the workload's logical life | the data's life |
 | Dies when | rescheduled | destroyed / scaled in | reclaimed |
-| Identified by | churning integer | stable string id | `{plugin}/{volume_id}` |
+| Identified by | churning integer | stable string id | `{driver}/{volume_id}` |
 
 Volumes deliberately **outlive** their instances: when an instance is destroyed
 its bytes still need reclaiming, so the volume row sticks around until a driver
@@ -75,7 +75,7 @@ tasks: [{
   count: 8,
   // Stateless. Still mounts a volume.
   volumes: [
-    { name: 'models', plugin: 'host', params: { name: 'models' },
+    { name: 'models', driver: 'host', params: { name: 'models' },
       path: '/models', readOnly: true },
   ],
   config: { image: 'ghcr.io/acme/inference:1.2', command: ['serve'] },
@@ -84,7 +84,7 @@ tasks: [{
 
 ### Node-local vs network
 
-Every plugin declares whether its volumes are **node-local**:
+Every driver declares whether its volumes are **node-local**:
 
 - **node-local** (`local-dir`, `host`, `tmpfs`) — the bytes exist on one
   machine. The instance holding one is **pinned** to that node: replacements can
@@ -92,7 +92,7 @@ Every plugin declares whether its volumes are **node-local**:
 - **network** (`nfs`) — any node can reach the storage. The instance
   reschedules freely, and the volume follows.
 
-This is the single most important property of a plugin, because it decides
+This is the single most important property of a driver, because it decides
 whether "my database comes back on the same machine" or "my database comes
 back". `legion volume list` marks a pin with `*`:
 
@@ -122,7 +122,7 @@ stateful: {
   mode: 'keyed',
   storage: {
     path: '/workspace',        // where the TASK sees it (the guest path)
-    plugin: 'local-dir',
+    driver: 'local-dir',
     mode: 'block',
     params: { size: '4G', fs: 'ext4' },
   },
@@ -132,7 +132,7 @@ stateful: {
 Three things have to agree, and admission checks all three at submit:
 
 1. the **task kind's** supported modes (`exec`/`container` → filesystem);
-2. the **plugin's** supported modes (`legion volume plugins` shows them);
+2. the **driver's** supported modes (`legion volume drivers` shows them);
 3. the mode the **job** asked for.
 
 ```
@@ -141,7 +141,7 @@ supports: filesystem). Filesystem volumes are directories a process reads; block
 volumes are devices a guest attaches
 ```
 
-**The plugin formats, never the guest.** A block volume is created and
+**The driver formats, never the guest.** A block volume is created and
 formatted with `params.fs` (default `ext4`) on its first mount, so `mkfs` never
 runs inside an untrusted guest and "is this volume fresh?" is a driver-side
 fact rather than a guess. `mount` returns `fresh: true` exactly once — on the
@@ -179,9 +179,9 @@ stateful: { mode: 'slot', storage: { path: '/var/lib/postgresql/data' } }
 config: { image: 'postgres:16', env: { PGDATA: '/var/lib/postgresql/data' } }
 ```
 
-## Built-in plugins
+## Built-in drivers
 
-Four drivers ship in the binary. `legion volume plugins` shows what a given
+Four drivers ship in the binary. `legion volume drivers` shows what a given
 cluster actually has, including anything installed out of tree.
 
 ### `local-dir` (the default)
@@ -203,7 +203,7 @@ In **block mode** it serves a sparse disk image at
 `ext4`) at `params.size` (default 1GiB). Here `size` *is* real — it is the
 image's size — and the image is a plain file, so producing one needs no
 privileges and no loop device. Block mode is advertised only on nodes with the
-matching `mkfs` on `PATH`; elsewhere the plugin reports filesystem mode only
+matching `mkfs` on `PATH`; elsewhere the driver reports filesystem mode only
 and says why.
 
 ### `host`
@@ -225,7 +225,7 @@ scaled-in job must never delete `/mnt/models`.
 
 ```jsonnet
 // jobspec
-volumes: [{ name: 'models', plugin: 'host', params: { name: 'models' },
+volumes: [{ name: 'models', driver: 'host', params: { name: 'models' },
             path: '/models', readOnly: true }],
 ```
 
@@ -258,7 +258,7 @@ reschedule anywhere that can reach the server.
 ```jsonnet
 storage: {
   path: '/var/lib/db',
-  plugin: 'nfs',
+  driver: 'nfs',
   params: { server: '10.0.0.5', export: '/exports/legion', options: 'vers=4,hard' },
 }
 ```
@@ -270,7 +270,7 @@ storage: {
 | `subdir` | optional | Subdirectory within the export (default: the volume id) |
 | `options` | optional | `mount -o` string (default `vers=4`, or `resvport` on macOS) |
 
-Mounting needs privileges: run the worker as root, or the plugin reports itself
+Mounting needs privileges: run the worker as root, or the driver reports itself
 unavailable and jobs claiming it are rejected at admission with the reason.
 
 ### `tmpfs`
@@ -280,7 +280,7 @@ has no tmpfs, and quietly substituting a disk-backed directory would turn "this
 is in RAM and capped at 512M" into a lie.
 
 ```jsonnet
-volumes: [{ name: 'scratch', plugin: 'tmpfs', params: { size: '2G' },
+volumes: [{ name: 'scratch', driver: 'tmpfs', params: { size: '2G' },
             path: '/scratch' }],
 ```
 
@@ -329,13 +329,13 @@ Retention is governed by the same knobs stateful workloads already had —
 # Everything, or filtered
 legion volume list
 legion volume list --job db --state created
-legion volume list --node node-a1 --plugin local-dir
+legion volume list --node node-a1 --driver local-dir
 
-# One volume: plugin, params, driver metadata, node pin, last driver error
+# One volume: driver, params, metadata, node pin, last driver error
 legion volume get 9f2c8a1b…
 
 # What can this cluster do?
-legion volume plugins
+legion volume drivers
 
 # Reclaim (DESTROYS DATA — the instance mints a fresh, empty volume next time)
 legion volume delete 9f2c8a1b…
@@ -346,7 +346,7 @@ legion volume delete 9f2c8a1b… --force
 
 Every command takes `-j`/`--json` and emits the standard envelope. The same
 operations are exposed over MCP as `legion_volume_list`, `legion_volume_get`,
-`legion_volume_plugins`, and `legion_volume_delete`.
+`legion_volume_drivers`, and `legion_volume_delete`.
 
 ### When a replica will not place
 
@@ -384,23 +384,24 @@ Admission validates volume declarations against what the cluster actually
 advertises, so storage problems surface at submit rather than at task start:
 
 ```
-task postgres stateful.storage: no node in the cluster provides volume plugin
+task postgres stateful.storage: no node in the cluster provides volume driver
 `zfs`. Install it under plugins/volumes/zfs/ on a worker, or run
-`legion volume plugins` to see what is available
+`legion volume drivers` to see what is available
 
-task cache volume "scratch": volume plugin `tmpfs` is installed on node-a1 but
+task cache volume "scratch": volume driver `tmpfs` is installed on node-a1 but
 unusable everywhere: tmpfs mounts are Linux-only
 
-task db stateful.storage: volume plugin `nfs` requires params: export
+task db stateful.storage: volume driver `nfs` requires params: export
 ```
 
-`legion volume plugins` shows a `NODES` column as *usable/installed* — a gap
+`legion volume drivers` shows a `NODES` column as *usable/installed* — a gap
 between the two is exactly the thing to investigate.
 
-## Writing a volume plugin
+## Writing a volume driver
 
-A volume plugin is any executable that reads a JSON request on stdin and writes
-a JSON response on stdout. Legion runs it with the operation as `argv[1]`. This
+A volume driver is any executable that reads a JSON request on stdin and writes
+a JSON response on stdout, installed under `plugins/volumes/`. Legion runs it
+with the operation as `argv[1]`. This
 is CNI's model, chosen for the same reasons: language-agnostic, crash-isolated
 from the worker, and testable from a shell.
 
@@ -417,13 +418,13 @@ restarts and partial failures, so "already done" is a success, not an error.
 
 | Op | Purpose |
 | --- | --- |
-| `capabilities` | Report `nodeLocal`, `ephemeral`, access modes, required/optional params, and whether the plugin is usable on **this** node right now |
+| `capabilities` | Report `nodeLocal`, `ephemeral`, access modes, required/optional params, and whether the driver is usable on **this** node right now |
 | `mount` | Make the volume available at a host path, provisioning it if this is the first call. Return `mountPath` |
 | `unmount` | Release the mount. The data survives |
 | `destroy` | Delete the volume and its data |
 
 `create`, `attach`, `detach`, `snapshot`, `restore`, `clone`, and `expand` are
-**reserved names**: a plugin may advertise them in `capabilities.ops`, and
+**reserved names**: a driver may advertise them in `capabilities.ops`, and
 Legion will dispatch them when those features land, without an ABI break.
 
 `clone` — "make a new volume that starts as a copy-on-write copy of this one" —
@@ -442,7 +443,7 @@ Settling its name now is what keeps that work from forcing an ABI break.
   "volume": {
     "id": "vol-9f2c…",
     "name": "data",
-    "plugin": "zfs",
+    "driver": "zfs",
     "attrs": { "dataset": "tank/legion/vol-9f2c" },  // what you recorded last time
     "readOnly": false
   },
@@ -477,12 +478,12 @@ over stderr text:
 then run the conformance suite — the same one Legion's own tests use:
 
 ```bash
-legion volume plugin test example
-legion volume plugin test local-dir --mode block -p size=1G
+legion volume driver test example
+legion volume driver test local-dir --mode block -p size=1G
 ```
 
 ```
-Volume plugin conformance: example
+Volume driver conformance: example (filesystem mode)
 
   ✓ capabilities.apiVersion  v1
   ✓ capabilities             nodeLocal=true ephemeral=false accessModes=[single-writer]
@@ -499,27 +500,27 @@ PASS — example honors the volume contract.
 ```
 
 It needs no manager and exits non-zero on failure, so it drops straight into CI.
-Pass driver params with `-p key=value` (`legion volume plugin test nfs -p
+Pass driver params with `-p key=value` (`legion volume driver test nfs -p
 server=10.0.0.5 -p export=/exports/legion`).
 
 ### CSI
 
 Legion core does not speak CSI, and won't. The mapping onto this contract is
-small enough to live in one plugin: `mount` → `NodeStageVolume` +
+small enough to live in one driver: `mount` → `NodeStageVolume` +
 `NodePublishVolume`, `unmount` → the unpublish/unstage pair, `destroy` →
-`DeleteVolume`. A `csi-bridge` exec plugin is the intended path to the existing
+`DeleteVolume`. A `csi-bridge` exec driver is the intended path to the existing
 driver ecosystem; nothing in the contract needs to change for it.
 
 ## Where volumes run
 
 Workers own the drivers. The manager owns the state machine — which volumes
 exist, their pins, their reclaim status — and never loads a driver or touches
-storage. It learns what plugins exist entirely from the capabilities workers
-publish in their fingerprints, which is also what `legion volume plugins` and
+storage. It learns what drivers exist entirely from the capabilities workers
+publish in their fingerprints, which is also what `legion volume drivers` and
 job admission read.
 
 The practical consequence: the control plane needs no storage credentials and no
-`mount` privileges, and adding a plugin is a worker-side operation that needs no
+`mount` privileges, and adding a driver is a worker-side operation that needs no
 manager restart.
 
 ## What v1 does not do

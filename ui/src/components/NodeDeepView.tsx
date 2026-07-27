@@ -750,7 +750,7 @@ export default function NodeDeepView(props: NodeDeepViewProps) {
                           <thead class={theadClass}>
                             <tr>
                               <th class={thClass}>Volume</th>
-                              <th class={thClass}>Plugin</th>
+                              <th class={thClass}>Driver</th>
                               <th class={thClass}>State</th>
                               <th class={thClass}>Owner</th>
                             </tr>
@@ -770,7 +770,7 @@ export default function NodeDeepView(props: NodeDeepViewProps) {
                                     <div class="text-2xs text-faint">{volume.name}</div>
                                   </td>
                                   <td class={tdClass}>
-                                    <Badge tone={volume.nodeLocal ? 'neutral' : 'ok'}>{volume.plugin}</Badge>
+                                    <Badge tone={volume.nodeLocal ? 'neutral' : 'ok'}>{volume.driver}</Badge>
                                   </td>
                                   <td class={tdClass}>
                                     <Badge tone={volumeStateTone(volume)} dot class="uppercase tracking-wide">

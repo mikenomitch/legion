@@ -191,10 +191,10 @@ async fn run_worker_with_manager(
 
     let mut fingerprint_data = fingerprint_node(config.additional_node_checks.clone());
     // The manager loads no storage drivers of its own, so this is its only
-    // source of truth for what volume plugins exist in the cluster: it backs
-    // job admission, placement filtering, and `legion volume plugins`.
+    // source of truth for what volume drivers exist in the cluster: it backs
+    // job admission, placement filtering, and `legion volume drivers`.
     fingerprint_data.insert(
-        "volumePlugins".into(),
+        "volumeDrivers".into(),
         task_manager
             .lock()
             .expect("task manager")

@@ -197,7 +197,7 @@ export class WorkerConfig extends Message<WorkerConfig> {
    * JSON-encoded host volumes this worker offers to jobs (see
    * docs/volumes.md). These are paths that already exist on the machine —
    * a models directory, a dedicated NVMe mount — which jobs claim by name
-   * through the `host` volume plugin.
+   * through the `host` volume driver.
    *
    * Shape: `{"models":{"path":"/mnt/models","readOnly":true},
    *          "pgdata":{"path":"/mnt/nvme0/pg","create":true}}`.
@@ -206,7 +206,7 @@ export class WorkerConfig extends Message<WorkerConfig> {
    * missing directory, which is off by default so a typo cannot silently
    * produce an empty volume where real data was meant to be.
    *
-   * Default: empty string (the `host` plugin reports itself unavailable on
+   * Default: empty string (the `host` driver reports itself unavailable on
    * this node, and jobs claiming it are rejected at admission).
    *
    * @generated from field: string host_volumes = 10;
@@ -3519,7 +3519,7 @@ export class GetInstanceReply extends Message<GetInstanceReply> {
 
 /**
  * One volume: the concrete storage behind an instance's opaque
- * `{plugin}/{volume_id}` storage handle.
+ * `{driver}/{volume_id}` storage handle.
  *
  * @generated from message legion.VolumeInfo
  */
@@ -3540,12 +3540,12 @@ export class VolumeInfo extends Message<VolumeInfo> {
   name = "";
 
   /**
-   * Volume plugin that materializes it (`local-dir`, `host`, `nfs`, `tmpfs`,
-   * or an installed exec plugin).
+   * Volume driver that materializes it (`local-dir`, `host`, `nfs`, `tmpfs`,
+   * or an installed exec driver).
    *
-   * @generated from field: string plugin = 3;
+   * @generated from field: string driver = 3;
    */
-  plugin = "";
+  driver = "";
 
   /**
    * Owning job, when the volume belongs to one.
@@ -3583,7 +3583,7 @@ export class VolumeInfo extends Message<VolumeInfo> {
   state = "";
 
   /**
-   * Node the volume lives on. For node-local plugins this is a hard placement
+   * Node the volume lives on. For node-local drivers this is a hard placement
    * constraint on the owning instance from the moment it is set: a
    * replacement allocation can only be placed on this node.
    *
@@ -3626,7 +3626,7 @@ export class VolumeInfo extends Message<VolumeInfo> {
   fs?: string;
 
   /**
-   * JSON object of the plugin params the volume was created with.
+   * JSON object of the driver params the volume was created with.
    *
    * @generated from field: string params = 11;
    */
@@ -3680,7 +3680,7 @@ export class VolumeInfo extends Message<VolumeInfo> {
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "volume_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 2, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
-    { no: 3, name: "plugin", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "driver", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 4, name: "job_id", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
     { no: 5, name: "instance_id", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
     { no: 6, name: "task_name", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
@@ -3737,11 +3737,11 @@ export class ListVolumesRequest extends Message<ListVolumesRequest> {
   nodeId?: string;
 
   /**
-   * Only volumes materialized by this plugin.
+   * Only volumes materialized by this driver.
    *
-   * @generated from field: optional string plugin = 3;
+   * @generated from field: optional string driver = 3;
    */
-  plugin?: string;
+  driver?: string;
 
   /**
    * Only volumes owned by this instance.
@@ -3768,7 +3768,7 @@ export class ListVolumesRequest extends Message<ListVolumesRequest> {
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "job_id", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
     { no: 2, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
-    { no: 3, name: "plugin", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 3, name: "driver", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
     { no: 4, name: "instance_id", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
     { no: 5, name: "state", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
   ]);
@@ -4033,54 +4033,54 @@ export class DeleteVolumeReply extends Message<DeleteVolumeReply> {
 }
 
 /**
- * Request payload for ListVolumePlugins.
+ * Request payload for ListVolumeDrivers.
  *
- * @generated from message legion.ListVolumePluginsRequest
+ * @generated from message legion.ListVolumeDriversRequest
  */
-export class ListVolumePluginsRequest extends Message<ListVolumePluginsRequest> {
-  constructor(data?: PartialMessage<ListVolumePluginsRequest>) {
+export class ListVolumeDriversRequest extends Message<ListVolumeDriversRequest> {
+  constructor(data?: PartialMessage<ListVolumeDriversRequest>) {
     super();
     proto3.util.initPartial(data, this);
   }
 
   static readonly runtime: typeof proto3 = proto3;
-  static readonly typeName = "legion.ListVolumePluginsRequest";
+  static readonly typeName = "legion.ListVolumeDriversRequest";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
   ]);
 
-  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListVolumePluginsRequest {
-    return new ListVolumePluginsRequest().fromBinary(bytes, options);
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListVolumeDriversRequest {
+    return new ListVolumeDriversRequest().fromBinary(bytes, options);
   }
 
-  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListVolumePluginsRequest {
-    return new ListVolumePluginsRequest().fromJson(jsonValue, options);
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListVolumeDriversRequest {
+    return new ListVolumeDriversRequest().fromJson(jsonValue, options);
   }
 
-  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListVolumePluginsRequest {
-    return new ListVolumePluginsRequest().fromJsonString(jsonString, options);
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListVolumeDriversRequest {
+    return new ListVolumeDriversRequest().fromJsonString(jsonString, options);
   }
 
-  static equals(a: ListVolumePluginsRequest | PlainMessage<ListVolumePluginsRequest> | undefined, b: ListVolumePluginsRequest | PlainMessage<ListVolumePluginsRequest> | undefined): boolean {
-    return proto3.util.equals(ListVolumePluginsRequest, a, b);
+  static equals(a: ListVolumeDriversRequest | PlainMessage<ListVolumeDriversRequest> | undefined, b: ListVolumeDriversRequest | PlainMessage<ListVolumeDriversRequest> | undefined): boolean {
+    return proto3.util.equals(ListVolumeDriversRequest, a, b);
   }
 }
 
 /**
- * One volume plugin as the cluster sees it, aggregated from worker
+ * One volume driver as the cluster sees it, aggregated from worker
  * fingerprints.
  *
- * @generated from message legion.VolumePluginInfo
+ * @generated from message legion.VolumeDriverInfo
  */
-export class VolumePluginInfo extends Message<VolumePluginInfo> {
+export class VolumeDriverInfo extends Message<VolumeDriverInfo> {
   /**
-   * Plugin name, as used in `stateful.storage.plugin` / `volumes[].plugin`.
+   * Driver name, as used in `stateful.storage.driver` / `volumes[].driver`.
    *
    * @generated from field: string name = 1;
    */
   name = "";
 
   /**
-   * True when the plugin's volumes only exist on the node that created them,
+   * True when the driver's volumes only exist on the node that created them,
    * so instances holding one are pinned there.
    *
    * @generated from field: bool node_local = 2;
@@ -4117,7 +4117,7 @@ export class VolumePluginInfo extends Message<VolumePluginInfo> {
   optionalParams: string[] = [];
 
   /**
-   * Volume modes this plugin can serve (`filesystem`, `block`). Admission
+   * Volume modes this driver can serve (`filesystem`, `block`). Admission
    * intersects this with the task kind's supported modes and the job's
    * requested mode, so a mismatch is a submit-time error rather than a task
    * that starts and immediately fails.
@@ -4127,8 +4127,8 @@ export class VolumePluginInfo extends Message<VolumePluginInfo> {
   volumeModes: string[] = [];
 
   /**
-   * Optional contract operations this plugin implements beyond the required
-   * four (`snapshot`, `restore`, `clone`, `expand`). Empty for a plugin that
+   * Optional contract operations this driver implements beyond the required
+   * four (`snapshot`, `restore`, `clone`, `expand`). Empty for a driver that
    * implements only the required set.
    *
    * @generated from field: repeated string ops = 11;
@@ -4136,7 +4136,7 @@ export class VolumePluginInfo extends Message<VolumePluginInfo> {
   ops: string[] = [];
 
   /**
-   * One line of human-readable context: what the plugin does, or why it is
+   * One line of human-readable context: what the driver does, or why it is
    * unusable on the nodes that have it.
    *
    * @generated from field: string detail = 7;
@@ -4144,7 +4144,7 @@ export class VolumePluginInfo extends Message<VolumePluginInfo> {
   detail = "";
 
   /**
-   * Every node with the plugin installed, including ones where it is unusable
+   * Every node with the driver installed, including ones where it is unusable
    * (no `mount` binary, wrong OS, no host volumes declared).
    *
    * @generated from field: repeated string nodes = 8;
@@ -4152,20 +4152,20 @@ export class VolumePluginInfo extends Message<VolumePluginInfo> {
   nodes: string[] = [];
 
   /**
-   * Nodes where the plugin is installed AND usable — the set placement can
+   * Nodes where the driver is installed AND usable — the set placement can
    * actually use.
    *
    * @generated from field: repeated string available_nodes = 9;
    */
   availableNodes: string[] = [];
 
-  constructor(data?: PartialMessage<VolumePluginInfo>) {
+  constructor(data?: PartialMessage<VolumeDriverInfo>) {
     super();
     proto3.util.initPartial(data, this);
   }
 
   static readonly runtime: typeof proto3 = proto3;
-  static readonly typeName = "legion.VolumePluginInfo";
+  static readonly typeName = "legion.VolumeDriverInfo";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 2, name: "node_local", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
@@ -4180,61 +4180,61 @@ export class VolumePluginInfo extends Message<VolumePluginInfo> {
     { no: 9, name: "available_nodes", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
   ]);
 
-  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): VolumePluginInfo {
-    return new VolumePluginInfo().fromBinary(bytes, options);
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): VolumeDriverInfo {
+    return new VolumeDriverInfo().fromBinary(bytes, options);
   }
 
-  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): VolumePluginInfo {
-    return new VolumePluginInfo().fromJson(jsonValue, options);
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): VolumeDriverInfo {
+    return new VolumeDriverInfo().fromJson(jsonValue, options);
   }
 
-  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): VolumePluginInfo {
-    return new VolumePluginInfo().fromJsonString(jsonString, options);
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): VolumeDriverInfo {
+    return new VolumeDriverInfo().fromJsonString(jsonString, options);
   }
 
-  static equals(a: VolumePluginInfo | PlainMessage<VolumePluginInfo> | undefined, b: VolumePluginInfo | PlainMessage<VolumePluginInfo> | undefined): boolean {
-    return proto3.util.equals(VolumePluginInfo, a, b);
+  static equals(a: VolumeDriverInfo | PlainMessage<VolumeDriverInfo> | undefined, b: VolumeDriverInfo | PlainMessage<VolumeDriverInfo> | undefined): boolean {
+    return proto3.util.equals(VolumeDriverInfo, a, b);
   }
 }
 
 /**
- * Reply payload for ListVolumePlugins.
+ * Reply payload for ListVolumeDrivers.
  *
- * @generated from message legion.ListVolumePluginsReply
+ * @generated from message legion.ListVolumeDriversReply
  */
-export class ListVolumePluginsReply extends Message<ListVolumePluginsReply> {
+export class ListVolumeDriversReply extends Message<ListVolumeDriversReply> {
   /**
-   * Installed plugins, sorted by name.
+   * Installed drivers, sorted by name.
    *
-   * @generated from field: repeated legion.VolumePluginInfo plugins = 1;
+   * @generated from field: repeated legion.VolumeDriverInfo drivers = 1;
    */
-  plugins: VolumePluginInfo[] = [];
+  drivers: VolumeDriverInfo[] = [];
 
-  constructor(data?: PartialMessage<ListVolumePluginsReply>) {
+  constructor(data?: PartialMessage<ListVolumeDriversReply>) {
     super();
     proto3.util.initPartial(data, this);
   }
 
   static readonly runtime: typeof proto3 = proto3;
-  static readonly typeName = "legion.ListVolumePluginsReply";
+  static readonly typeName = "legion.ListVolumeDriversReply";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
-    { no: 1, name: "plugins", kind: "message", T: VolumePluginInfo, repeated: true },
+    { no: 1, name: "drivers", kind: "message", T: VolumeDriverInfo, repeated: true },
   ]);
 
-  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListVolumePluginsReply {
-    return new ListVolumePluginsReply().fromBinary(bytes, options);
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListVolumeDriversReply {
+    return new ListVolumeDriversReply().fromBinary(bytes, options);
   }
 
-  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListVolumePluginsReply {
-    return new ListVolumePluginsReply().fromJson(jsonValue, options);
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListVolumeDriversReply {
+    return new ListVolumeDriversReply().fromJson(jsonValue, options);
   }
 
-  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListVolumePluginsReply {
-    return new ListVolumePluginsReply().fromJsonString(jsonString, options);
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListVolumeDriversReply {
+    return new ListVolumeDriversReply().fromJsonString(jsonString, options);
   }
 
-  static equals(a: ListVolumePluginsReply | PlainMessage<ListVolumePluginsReply> | undefined, b: ListVolumePluginsReply | PlainMessage<ListVolumePluginsReply> | undefined): boolean {
-    return proto3.util.equals(ListVolumePluginsReply, a, b);
+  static equals(a: ListVolumeDriversReply | PlainMessage<ListVolumeDriversReply> | undefined, b: ListVolumeDriversReply | PlainMessage<ListVolumeDriversReply> | undefined): boolean {
+    return proto3.util.equals(ListVolumeDriversReply, a, b);
   }
 }
 
@@ -4793,7 +4793,7 @@ export class HeartbeatReply extends Message<HeartbeatReply> {
   desiredAllocations: TaskAllocation[] = [];
 
   /**
-   * Volumes this worker should reclaim by calling its plugin's `destroy`
+   * Volumes this worker should reclaim by calling its driver's `destroy`
    * (see docs/volumes.md). The manager re-sends a volume on every heartbeat
    * until the worker confirms it in `HeartbeatRequest.volume_reports`, so a
    * worker that dies mid-destroy simply retries and storage is never leaked.
@@ -4843,7 +4843,7 @@ export class HeartbeatReply extends Message<HeartbeatReply> {
  */
 export class VolumeReport extends Message<VolumeReport> {
   /**
-   * Volume ID (the second half of an instance's `plugin/volume_id` storage
+   * Volume ID (the second half of an instance's `driver/volume_id` storage
    * handle).
    *
    * @generated from field: string volume_id = 1;
@@ -4873,7 +4873,7 @@ export class VolumeReport extends Message<VolumeReport> {
 
   /**
    * Whether the driver reports this volume as node-local. Authoritative: the
-   * worker asked the plugin, so this overrides the manager's mint-time guess
+   * worker asked the driver, so this overrides the manager's mint-time guess
    * and determines whether the owning instance is pinned to this node.
    *
    * @generated from field: bool node_local = 5;
@@ -4966,11 +4966,11 @@ export class VolumeDestroyRequest extends Message<VolumeDestroyRequest> {
   volumeId = "";
 
   /**
-   * Plugin that owns it.
+   * Driver that owns it.
    *
-   * @generated from field: string plugin = 2;
+   * @generated from field: string driver = 2;
    */
-  plugin = "";
+  driver = "";
 
   /**
    * Volume name within its task (`data` for instance storage).
@@ -4980,7 +4980,7 @@ export class VolumeDestroyRequest extends Message<VolumeDestroyRequest> {
   name = "";
 
   /**
-   * JSON object of the plugin params the volume was created with. Drivers
+   * JSON object of the driver params the volume was created with. Drivers
    * that need them to find the storage (an NFS `server`/`export`) get them
    * back here.
    *
@@ -5004,7 +5004,7 @@ export class VolumeDestroyRequest extends Message<VolumeDestroyRequest> {
   static readonly typeName = "legion.VolumeDestroyRequest";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "volume_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
-    { no: 2, name: "plugin", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "driver", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 3, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 4, name: "params", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 5, name: "attrs", kind: "scalar", T: 9 /* ScalarType.STRING */ },
@@ -11079,14 +11079,14 @@ export class TaskAllocation extends Message<TaskAllocation> {
   /**
    * JSON-encoded list of volume mounts for this allocation (see
    * docs/volumes.md). Array of objects matching the `VolumeMount` shape:
-   * `[{"volumeId":"…","name":"data","plugin":"local-dir","params":{…},
+   * `[{"volumeId":"…","name":"data","driver":"local-dir","params":{…},
    *    "attrs":{…},"path":"/var/lib/db","readOnly":false,
    *    "instanceVolume":true}]`.
    *
-   * This is the post-admission form: the plugin is resolved (the `local-dir`
+   * This is the post-admission form: the driver is resolved (the `local-dir`
    * default is already applied), the volume id is known, and `attrs` carries
    * whatever the driver recorded on a previous mount. The worker mounts
-   * exactly this list through its volume plugins before starting the task and
+   * exactly this list through its volume drivers before starting the task and
    * unmounts on stop — it never re-derives a volume from the jobspec.
    *
    * Entries with `instanceVolume: true` come from `stateful.storage` and are

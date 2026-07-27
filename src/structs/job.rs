@@ -1079,7 +1079,7 @@ impl StatefulConfig {
 /// the named plugin on whatever node the instance lands on (see
 /// `docs/volumes.md`).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StatefulStorageConfig {
     /// Where the task sees the storage.
     ///
@@ -1089,19 +1089,19 @@ pub struct StatefulStorageConfig {
     /// namespace, so there is no filesystem view to mount into; read
     /// `$LEGION_STORAGE_DIR` instead. Documented in docs/volumes.md.
     pub path: String,
-    /// Volume plugin that materializes this storage. Defaults to `local-dir`
-    /// (a directory on the worker's disk). The plugin must be advertised by at
+    /// Volume driver that materializes this storage. Defaults to `local-dir`
+    /// (a directory on the worker's disk). The driver must be advertised by at
     /// least one node or the job is rejected at admission.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub plugin: Option<String>,
+    pub driver: Option<String>,
     /// How the task consumes it: `filesystem` (a directory — the default, and
     /// what `exec` and `container` want) or `block` (a raw device or disk
     /// image, which is what a microVM kind attaches). Admission rejects a mode
-    /// the task kind or the plugin cannot serve.
+    /// the task kind or the driver cannot serve.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<VolumeMode>,
-    /// Plugin-specific parameters, passed through verbatim (`size` for
-    /// `local-dir`, `server`/`export` for `nfs`, …). The plugin declares which
+    /// Driver-specific parameters, passed through verbatim (`size` for
+    /// `local-dir`, `server`/`export` for `nfs`, …). The driver declares which
     /// are required; admission names any that are missing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<Value>,
@@ -1144,12 +1144,12 @@ impl StatefulStorageConfig {
         self.mode.unwrap_or_default()
     }
 
-    /// The plugin that materializes this storage, defaulting to `local-dir`.
-    pub fn plugin_name(&self) -> &str {
-        self.plugin
+    /// The driver that materializes this storage, defaulting to `local-dir`.
+    pub fn driver_name(&self) -> &str {
+        self.driver
             .as_deref()
             .filter(|name| !name.trim().is_empty())
-            .unwrap_or(crate::volumes::DEFAULT_VOLUME_PLUGIN)
+            .unwrap_or(crate::volumes::DEFAULT_VOLUME_DRIVER)
     }
 
     /// Params as a map, tolerating an absent or non-object `params`.
@@ -1162,7 +1162,7 @@ impl StatefulStorageConfig {
     pub fn as_volume_spec(&self) -> VolumeSpec {
         VolumeSpec {
             name: INSTANCE_VOLUME_NAME.to_string(),
-            plugin: Some(self.plugin_name().to_string()),
+            driver: Some(self.driver_name().to_string()),
             mode: self.mode,
             params: self.params.clone(),
             path: Some(self.path.clone()),
@@ -1215,14 +1215,14 @@ pub struct VolumeSpec {
     /// Volume name within the task, `[A-Za-z0-9._-]{1,64}` and unique per
     /// task. Becomes `LEGION_VOLUME_<NAME>` in the task env.
     pub name: String,
-    /// Volume plugin. Defaults to `local-dir`.
+    /// Volume driver. Defaults to `local-dir`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub plugin: Option<String>,
+    pub driver: Option<String>,
     /// `filesystem` (default) or `block` — see
     /// [`StatefulStorageConfig::mode`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<VolumeMode>,
-    /// Plugin-specific parameters, passed through verbatim.
+    /// Driver-specific parameters, passed through verbatim.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<Value>,
     /// Where the task sees it. Required for container tasks (the bind
@@ -1241,11 +1241,11 @@ impl VolumeSpec {
         self.mode.unwrap_or_default()
     }
 
-    pub fn plugin_name(&self) -> &str {
-        self.plugin
+    pub fn driver_name(&self) -> &str {
+        self.driver
             .as_deref()
             .filter(|name| !name.trim().is_empty())
-            .unwrap_or(crate::volumes::DEFAULT_VOLUME_PLUGIN)
+            .unwrap_or(crate::volumes::DEFAULT_VOLUME_DRIVER)
     }
 
     pub fn param_map(&self) -> BTreeMap<String, Value> {
@@ -1259,18 +1259,18 @@ impl VolumeSpec {
 
 /// One resolved mount handed to a worker in `TaskAllocation.task_volumes`.
 ///
-/// This is the post-admission form: the plugin is resolved, the volume id is
+/// This is the post-admission form: the driver is resolved, the volume id is
 /// known (minted from the instance's storage handle for instance volumes, or
 /// derived deterministically for task claims), and the worker mounts exactly
 /// this list without re-deriving anything.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct VolumeMount {
-    /// Volume id — the second half of the `plugin/volume_id` handle.
+    /// Volume id — the second half of the `driver/volume_id` handle.
     pub volume_id: String,
     /// Declared name within the task.
     pub name: String,
-    pub plugin: String,
+    pub driver: String,
     /// Resolved consumption mode. The worker asks the driver for exactly this,
     /// and a task kind reads it to know whether it got a path or a device.
     #[serde(default)]
@@ -2228,7 +2228,7 @@ impl TaskConfig {
                 .is_some_and(|params| !params.is_object())
             {
                 bail!(
-                    "task {} stateful.storage.params must be an object of plugin parameters",
+                    "task {} stateful.storage.params must be an object of driver parameters",
                     self.name
                 );
             }
@@ -2264,15 +2264,15 @@ impl TaskConfig {
         {
             seen.insert(INSTANCE_VOLUME_NAME.to_string());
             if storage
-                .plugin
+                .driver
                 .as_deref()
                 .is_some_and(|name| name.trim().is_empty())
             {
                 bail!(
-                    "task {} stateful.storage.plugin cannot be empty; omit it to use the default \
+                    "task {} stateful.storage.driver cannot be empty; omit it to use the default \
                      ({})",
                     self.name,
-                    crate::volumes::DEFAULT_VOLUME_PLUGIN
+                    crate::volumes::DEFAULT_VOLUME_DRIVER
                 );
             }
         }
@@ -2288,15 +2288,15 @@ impl TaskConfig {
                 );
             }
             if volume
-                .plugin
+                .driver
                 .as_deref()
                 .is_some_and(|name| name.trim().is_empty())
             {
                 bail!(
-                    "task {} volume {:?} has an empty plugin; omit it to use the default ({})",
+                    "task {} volume {:?} has an empty driver; omit it to use the default ({})",
                     self.name,
                     volume.name,
-                    crate::volumes::DEFAULT_VOLUME_PLUGIN
+                    crate::volumes::DEFAULT_VOLUME_DRIVER
                 );
             }
             if volume
@@ -2305,7 +2305,7 @@ impl TaskConfig {
                 .is_some_and(|params| !params.is_object())
             {
                 bail!(
-                    "task {} volume {:?} params must be an object of plugin parameters",
+                    "task {} volume {:?} params must be an object of driver parameters",
                     self.name,
                     volume.name
                 );
@@ -2342,25 +2342,25 @@ impl TaskConfig {
         Ok(())
     }
 
-    /// Volume plugins this task needs a node to provide, across its
+    /// Volume drivers this task needs a node to provide, across its
     /// `stateful.storage` and its `volumes[]` claims.
     ///
     /// Placement filters candidate nodes on this set, and job admission checks
     /// the cluster advertises every entry — the two ways a job with unavailable
     /// storage is stopped before a task ever fails to start.
-    pub fn required_volume_plugins(&self) -> std::collections::BTreeSet<String> {
-        let mut plugins = std::collections::BTreeSet::new();
+    pub fn required_volume_drivers(&self) -> std::collections::BTreeSet<String> {
+        let mut drivers = std::collections::BTreeSet::new();
         if let Some(storage) = self
             .stateful
             .as_ref()
             .and_then(|stateful| stateful.storage.as_ref())
         {
-            plugins.insert(storage.plugin_name().to_string());
+            drivers.insert(storage.driver_name().to_string());
         }
         for volume in &self.volumes {
-            plugins.insert(volume.plugin_name().to_string());
+            drivers.insert(volume.driver_name().to_string());
         }
-        plugins
+        drivers
     }
 
     /// Validate workload identities declared on this task (see the
@@ -3415,7 +3415,7 @@ mod tests {
                     initial_instances: None,
                     on_lost: None,
                     storage: Some(StatefulStorageConfig {
-                        plugin: None,
+                        driver: None,
                         mode: None,
                         params: None,
                         path: "/workspace".into(),
@@ -3503,7 +3503,7 @@ mod tests {
                     initial_instances: None,
                     on_lost: None,
                     storage: Some(StatefulStorageConfig {
-                        plugin: None,
+                        driver: None,
                         mode: None,
                         params: None,
                         path: bad_path.into(),

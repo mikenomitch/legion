@@ -111,7 +111,7 @@ pending -> active -> rescheduling -> active -> ... -> stopped/terminated
       storage: {                 // optional persistent storage (docs/volumes.md)
         path: '/var/lib/db',     // container: bind destination; exec:
                                  // informational (read $LEGION_STORAGE_DIR)
-        plugin: 'local-dir',     // volume plugin; default 'local-dir'
+        driver: 'local-dir',     // volume driver; default 'local-dir'
         params: { size: '10G' }, // passed to the plugin verbatim
         retainOnScaleIn: true,   // default true (K8s whenScaled: Retain)
         retainOnStop: true,      // default true (K8s whenDeleted: Retain);

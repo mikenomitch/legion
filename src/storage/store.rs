@@ -3782,7 +3782,7 @@ impl Store {
                  instance.updated_at FROM instance \
                  LEFT JOIN volume ON volume.instance_id = instance.instance_id \
                  AND volume.node_local = 1 AND volume.state IN ('pending', 'created') \
-                 AND instance.storage_handle = volume.plugin || '/' || volume.volume_id \
+                 AND instance.storage_handle = volume.driver || '/' || volume.volume_id \
                  WHERE instance.job_id = ?1 AND instance.group_name = ?2 \
                  AND instance.task_name = ?3 \
                  AND instance.mode = 'keyed' AND instance.state NOT IN ('terminated', 'stopped') \
@@ -6614,7 +6614,7 @@ impl Store {
         Ok(Volume {
             volume_id: row.get(0)?,
             name: row.get(1)?,
-            plugin: row.get(2)?,
+            driver: row.get(2)?,
             job_id: row.get(3)?,
             instance_id: row.get(4)?,
             task_name: row.get(5)?,
@@ -6662,10 +6662,10 @@ impl Store {
         let Some(storage) = storage else {
             return Ok(None);
         };
-        let plugin = storage.plugin_name().to_string();
+        let driver = storage.driver_name().to_string();
         // Mint the handle first so the format lives in exactly one place, then
         // split the id back out for the row.
-        let handle = mint_storage_handle(&plugin);
+        let handle = mint_storage_handle(&driver);
         let volume_id = handle
             .split_once('/')
             .map(|(_, id)| id.to_string())
@@ -6677,9 +6677,9 @@ impl Store {
         // costs a placement delay, while wrongly NOT pinning silently starts
         // the workload on an empty volume. Corrected on first mount, when the
         // worker reports what the driver actually said.
-        let node_local = self.plugin_is_node_local_tx(tx, &plugin)?;
+        let node_local = self.driver_is_node_local_tx(tx, &driver)?;
         tx.execute(
-            "INSERT INTO volume (volume_id, name, plugin, job_id, instance_id, task_name, \
+            "INSERT INTO volume (volume_id, name, driver, job_id, instance_id, task_name, \
              state, node_id, node_local, read_only, params, attrs, mount_path, last_error, \
              created_at, updated_at, volume_mode, fs) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', NULL, ?7, 0, ?8, '{}', NULL, NULL, ?9, \
@@ -6687,7 +6687,7 @@ impl Store {
             params![
                 volume_id,
                 crate::structs::INSTANCE_VOLUME_NAME,
-                plugin,
+                driver,
                 job_id,
                 instance_id,
                 task_name,
@@ -6703,7 +6703,7 @@ impl Store {
                     .to_string()),
             ],
         )?;
-        info!(volume_id, plugin, instance_id, "Minted instance volume");
+        info!(volume_id, driver, instance_id, "Minted instance volume");
         Ok(Some(handle))
     }
 
@@ -6727,10 +6727,10 @@ impl Store {
         let now = Self::now_rfc3339()?;
         for claim in &task.volumes {
             let volume_id = claim_volume_id(job_id, &task.group, &task.name, &claim.name);
-            let plugin = claim.plugin_name().to_string();
-            let node_local = self.plugin_is_node_local_tx(tx, &plugin)?;
+            let driver = claim.driver_name().to_string();
+            let node_local = self.driver_is_node_local_tx(tx, &driver)?;
             let params = serde_json::to_string(&claim.param_map())?;
-            // Re-submitting a job refreshes params/plugin without resetting a
+            // Re-submitting a job refreshes params/driver without resetting a
             // live volume's node pin or state — EXCEPT when the row is a
             // tombstone. A claim id is a pure function of (job, group, task,
             // name), so re-declaring one after a job destroy lands on the same
@@ -6738,20 +6738,20 @@ impl Store {
             // `legion volume list` and immune to the reaper, even though the
             // worker happily mounts it.
             tx.execute(
-                "INSERT INTO volume (volume_id, name, plugin, job_id, instance_id, task_name, \
+                "INSERT INTO volume (volume_id, name, driver, job_id, instance_id, task_name, \
                  state, node_id, node_local, read_only, params, attrs, mount_path, last_error, \
                  created_at, updated_at, volume_mode) \
                  VALUES (?1, ?2, ?3, ?4, NULL, ?5, 'pending', NULL, ?6, ?7, ?8, '{}', NULL, \
                  NULL, ?9, ?9, ?10) \
                  ON CONFLICT(volume_id) DO UPDATE SET \
-                 plugin = ?3, job_id = ?4, task_name = ?5, node_local = ?6, read_only = ?7, \
+                 driver = ?3, job_id = ?4, task_name = ?5, node_local = ?6, read_only = ?7, \
                  params = ?8, updated_at = ?9, volume_mode = ?10, \
                  state = CASE WHEN volume.state = 'destroyed' THEN 'pending' ELSE volume.state END, \
                  last_error = CASE WHEN volume.state = 'destroyed' THEN NULL ELSE volume.last_error END;",
                 params![
                     volume_id,
                     claim.name,
-                    plugin,
+                    driver,
                     job_id,
                     task.name,
                     node_local as i64,
@@ -6795,7 +6795,7 @@ impl Store {
                 mounts.push(crate::structs::VolumeMount {
                     volume_id: handle.volume_id,
                     name: crate::structs::INSTANCE_VOLUME_NAME.to_string(),
-                    plugin: handle.plugin,
+                    driver: handle.driver,
                     mode: storage.volume_mode(),
                     params: storage.param_map(),
                     attrs,
@@ -6815,7 +6815,7 @@ impl Store {
             mounts.push(crate::structs::VolumeMount {
                 volume_id,
                 name: claim.name.clone(),
-                plugin: claim.plugin_name().to_string(),
+                driver: claim.driver_name().to_string(),
                 mode: claim.volume_mode(),
                 params: claim.param_map(),
                 attrs,
@@ -6828,16 +6828,16 @@ impl Store {
         Ok(mounts)
     }
 
-    /// Whether any node advertises `plugin` as node-local. Unknown plugins are
+    /// Whether any node advertises `driver` as node-local. Unknown drivers are
     /// treated as node-local (see [`Self::mint_instance_volume_tx`]).
-    fn plugin_is_node_local_tx(&self, tx: &Transaction<'_>, plugin: &str) -> R<bool> {
+    fn driver_is_node_local_tx(&self, tx: &Transaction<'_>, driver: &str) -> R<bool> {
         let mut stmt = tx.prepare("SELECT fingerprint_attrs FROM node;")?;
         let rows = stmt.query_map([], |row| row.get::<_, Value>(0))?;
         for row in rows {
             let Ok(attrs) = row else { continue };
             if let Some(node_local) = attrs
-                .get("volumePlugins")
-                .and_then(|plugins| plugins.get(plugin))
+                .get("volumeDrivers")
+                .and_then(|drivers| drivers.get(driver))
                 .and_then(|caps| caps.get("nodeLocal"))
                 .and_then(Value::as_bool)
             {
@@ -6874,9 +6874,9 @@ impl Store {
             clauses.push(format!("node_id = ?{}", args.len() + 1));
             args.push(Box::new(node_id.to_string()));
         }
-        if let Some(plugin) = filter.plugin.as_deref() {
-            clauses.push(format!("plugin = ?{}", args.len() + 1));
-            args.push(Box::new(plugin.to_string()));
+        if let Some(driver) = filter.driver.as_deref() {
+            clauses.push(format!("driver = ?{}", args.len() + 1));
+            args.push(Box::new(driver.to_string()));
         }
         if let Some(instance_id) = filter.instance_id.as_deref() {
             clauses.push(format!("instance_id = ?{}", args.len() + 1));
@@ -6985,7 +6985,7 @@ impl Store {
                      (instance_id IS NOT NULL AND NOT EXISTS (\
                          SELECT 1 FROM instance \
                          WHERE instance.instance_id = volume.instance_id \
-                         AND instance.storage_handle = volume.plugin || '/' || volume.volume_id\
+                         AND instance.storage_handle = volume.driver || '/' || volume.volume_id\
                      )) \
                      OR (instance_id IS NULL AND job_id IS NOT NULL AND NOT EXISTS (\
                          SELECT 1 FROM job WHERE job.id = volume.job_id\
@@ -7107,7 +7107,7 @@ impl Store {
              AND instance.task_name = task_config.name \
              AND instance.state IN ('pending', 'rescheduling') \
              AND instance.current_alloc_id IS NULL \
-             AND instance.storage_handle = volume.plugin || '/' || volume.volume_id \
+             AND instance.storage_handle = volume.driver || '/' || volume.volume_id \
              AND volume.node_local = 1 \
              AND volume.node_id IS NOT NULL \
              AND volume.state IN ('pending', 'created') \
@@ -7131,7 +7131,7 @@ impl Store {
                  INNER JOIN instance ON instance.instance_id = volume.instance_id \
                  WHERE volume.instance_id = ?1 AND volume.node_local = 1 \
                  AND volume.node_id IS NOT NULL AND volume.state IN ('pending', 'created') \
-                 AND instance.storage_handle = volume.plugin || '/' || volume.volume_id \
+                 AND instance.storage_handle = volume.driver || '/' || volume.volume_id \
                  LIMIT 1;",
                 [instance_id],
                 |row| row.get::<_, Option<String>>(0),
@@ -7140,14 +7140,14 @@ impl Store {
         Ok(node_id.flatten())
     }
 
-    /// Volume plugin capabilities advertised across the cluster, keyed by
-    /// plugin name, with the node ids that provide each.
+    /// Volume driver capabilities advertised across the cluster, keyed by
+    /// driver name, with the node ids that provide each.
     ///
-    /// This is the manager's only source of plugin metadata (it loads no
+    /// This is the manager's only source of driver metadata (it loads no
     /// drivers itself), so it backs both admission validation and
-    /// `legion volume plugins`.
+    /// `legion volume drivers`.
     #[instrument(err, skip_all)]
-    pub fn cluster_volume_plugins(&self) -> R<BTreeMap<String, ClusterVolumePlugin>> {
+    pub fn cluster_volume_drivers(&self) -> R<BTreeMap<String, ClusterVolumeDriver>> {
         let conn = self.read_connection()?;
         let mut stmt = conn.prepare("SELECT id, status, fingerprint_attrs FROM node;")?;
         let rows = stmt.query_map([], |row| {
@@ -7158,13 +7158,13 @@ impl Store {
             ))
         })?;
 
-        let mut out: BTreeMap<String, ClusterVolumePlugin> = BTreeMap::new();
+        let mut out: BTreeMap<String, ClusterVolumeDriver> = BTreeMap::new();
         for row in rows {
             let (node_id, status, attrs) = row?;
-            let Some(plugins) = attrs.get("volumePlugins").and_then(Value::as_object) else {
+            let Some(drivers) = attrs.get("volumeDrivers").and_then(Value::as_object) else {
                 continue;
             };
-            for (name, raw) in plugins {
+            for (name, raw) in drivers {
                 let Ok(caps) =
                     serde_json::from_value::<crate::volumes::VolumeCapabilities>(raw.clone())
                 else {
@@ -7172,7 +7172,7 @@ impl Store {
                 };
                 let entry = out
                     .entry(name.clone())
-                    .or_insert_with(|| ClusterVolumePlugin {
+                    .or_insert_with(|| ClusterVolumeDriver {
                         capabilities: caps.clone(),
                         nodes: Vec::new(),
                         available_nodes: Vec::new(),
@@ -7201,24 +7201,24 @@ impl Store {
 pub struct VolumeFilter {
     pub job_id: Option<String>,
     pub node_id: Option<String>,
-    pub plugin: Option<String>,
+    pub driver: Option<String>,
     pub instance_id: Option<String>,
     pub state: Option<crate::structs::VolumeState>,
 }
 
-/// A volume plugin as the cluster sees it: one capability record plus the
+/// A volume driver as the cluster sees it: one capability record plus the
 /// nodes providing it.
 #[derive(Debug, Clone)]
-pub struct ClusterVolumePlugin {
+pub struct ClusterVolumeDriver {
     pub capabilities: crate::volumes::VolumeCapabilities,
-    /// Every node that has the plugin installed, including ones where it is
+    /// Every node that has the driver installed, including ones where it is
     /// unusable.
     pub nodes: Vec<String>,
-    /// Nodes where the plugin is installed AND usable — the placement set.
+    /// Nodes where the driver is installed AND usable — the placement set.
     pub available_nodes: Vec<String>,
 }
 
-const VOLUME_COLUMNS: &str = "volume_id, name, plugin, job_id, instance_id, task_name, state, \
+const VOLUME_COLUMNS: &str = "volume_id, name, driver, job_id, instance_id, task_name, state, \
      node_id, node_local, read_only, params, attrs, mount_path, last_error, created_at, \
      updated_at, volume_mode, fs";
 
@@ -7275,13 +7275,13 @@ fn parse_json_map_column(
         .unwrap_or_default())
 }
 
-/// Mint an opaque storage handle for an instance: `{plugin}/{volume_id}`.
+/// Mint an opaque storage handle for an instance: `{driver}/{volume_id}`.
 ///
 /// The format predates volume drivers (instances already minted
 /// `local-dir/<rand>`), which is exactly why it was kept — every instance row
 /// written before this feature still parses. See `docs/volumes.md`.
-fn mint_storage_handle(plugin: &str) -> String {
-    format!("{plugin}/{}", random_string(32))
+fn mint_storage_handle(driver: &str) -> String {
+    format!("{driver}/{}", random_string(32))
 }
 
 fn task_schedule_equivalent(left: &TaskConfig, right: &TaskConfig) -> bool {
@@ -9891,7 +9891,7 @@ mod tests {
                 initial_instances: None,
                 on_lost: None,
                 storage: with_storage.then(|| crate::structs::StatefulStorageConfig {
-                    plugin: None,
+                    driver: None,
                     mode: None,
                     params: None,
                     path: "/var/lib/data".into(),
@@ -10200,7 +10200,7 @@ mod tests {
                 initial_instances: None,
                 on_lost: None,
                 storage: Some(crate::structs::StatefulStorageConfig {
-                    plugin: None,
+                    driver: None,
                     mode: None,
                     params: None,
                     path: "/var/lib/data".into(),
@@ -10359,7 +10359,7 @@ mod tests {
                 initial_instances: None,
                 on_lost: None,
                 storage: Some(crate::structs::StatefulStorageConfig {
-                    plugin: None,
+                    driver: None,
                     mode: None,
                     params: None,
                     path: "/var/lib/data".into(),
@@ -10438,7 +10438,7 @@ mod tests {
                 initial_instances: None,
                 on_lost: None,
                 storage: Some(crate::structs::StatefulStorageConfig {
-                    plugin: None,
+                    driver: None,
                     mode: None,
                     params: None,
                     path: "/var/lib/data".into(),
@@ -10511,7 +10511,7 @@ mod tests {
                 initial_instances: None,
                 on_lost: None,
                 storage: with_storage.then(|| crate::structs::StatefulStorageConfig {
-                    plugin: None,
+                    driver: None,
                     mode: None,
                     params: None,
                     path: "/workspace".into(),

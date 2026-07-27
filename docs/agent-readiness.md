@@ -60,7 +60,7 @@ Even with `--allow-write`, `legion_state_query` is forced to read-only.
 | `legion_instance_get` | no | Inspect one stateful instance. |
 | `legion_volume_list` | no | List volumes — the storage behind stateful instances. Filters by job/node/plugin/instance/state. |
 | `legion_volume_get` | no | Inspect one volume: plugin, params, node pin, mount path, last driver error. |
-| `legion_volume_plugins` | no | Volume plugins installed across the cluster and which nodes can use them. Answers "why was my job rejected for plugin X". |
+| `legion_volume_drivers` | no | Volume plugins installed across the cluster and which nodes can use them. Answers "why was my job rejected for plugin X". |
 | `legion_node_list` | no | List worker nodes. |
 | `legion_acl_whoami` | no | ACL status + caller identity (diagnose PermissionDenied). |
 | `legion_events` | no | List scheduler events; poll with `after_id` to tail. |

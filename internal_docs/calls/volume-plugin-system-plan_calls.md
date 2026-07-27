@@ -15,7 +15,7 @@ Entries are ranked by project impact, highest first.
 manager owns the `volume` table, node pinning, and reclaim orchestration, but
 loads no driver and never touches storage. It learns what plugins exist entirely
 from the capabilities workers publish in their node fingerprints — which is what
-job admission validates against and what `legion volume plugins` renders.
+job admission validates against and what `legion volume drivers` renders.
 Reclaim is dispatched to the owning worker over the heartbeat channel and
 confirmed on the next heartbeat.
 
@@ -251,7 +251,7 @@ Removing the operation removes a failure mode rather than deferring one.
 
 ## 12. A node advertising no volume plugins is assumed to have the built-ins
 
-**Call.** A node whose fingerprint carries no `volumePlugins` key at all is
+**Call.** A node whose fingerprint carries no `volumeDrivers` key at all is
 treated as providing `local-dir`, `host`, `nfs`, and `tmpfs`. Nodes that *do*
 advertise are filtered precisely. Admission skips its check entirely when nothing
 in the cluster advertises anything.

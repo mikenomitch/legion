@@ -205,7 +205,7 @@ pub fn catalog() -> Vec<Capability> {
         // --- Volumes (see docs/volumes.md) ---
         Capability {
             name: "volume.list",
-            cli: "legion volume list [--job <J>] [--node <N>] [--plugin <P>]",
+            cli: "legion volume list [--job <J>] [--node <N>] [--driver <D>]",
             grpc: Some("Manager/ListVolumes"),
             summary: "List volumes (storage behind stateful instances), with state and node pin.",
             mutates: false,
@@ -215,7 +215,7 @@ pub fn catalog() -> Vec<Capability> {
             name: "volume.get",
             cli: "legion volume get <ID>",
             grpc: Some("Manager/GetVolume"),
-            summary: "Inspect one volume: plugin, params, node pin, mount path, last error.",
+            summary: "Inspect one volume: driver, params, node pin, mount path, last error.",
             mutates: false,
             read_only_safe: true,
         },
@@ -230,19 +230,19 @@ pub fn catalog() -> Vec<Capability> {
             read_only_safe: false,
         },
         Capability {
-            name: "volume.plugins",
-            cli: "legion volume plugins",
-            grpc: Some("Manager/ListVolumePlugins"),
-            summary: "List volume plugins installed across the cluster, with capabilities and \
+            name: "volume.drivers",
+            cli: "legion volume drivers",
+            grpc: Some("Manager/ListVolumeDrivers"),
+            summary: "List volume drivers installed across the cluster, with capabilities and \
                  which nodes can actually use them.",
             mutates: false,
             read_only_safe: true,
         },
         Capability {
-            name: "volume.plugin.test",
-            cli: "legion volume plugin test <NAME>",
+            name: "volume.driver.test",
+            cli: "legion volume driver test <NAME>",
             grpc: None,
-            summary: "Run the volume contract conformance suite against a plugin locally \
+            summary: "Run the volume contract conformance suite against a driver locally \
                  (mount/write/unmount/remount/read/destroy plus idempotency). No manager needed.",
             mutates: false,
             read_only_safe: true,

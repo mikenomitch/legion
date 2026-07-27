@@ -9,7 +9,7 @@
 //! plus a double-call idempotency check on every operation, because "already
 //! done is a success" is the rule the whole retry model rests on.
 //!
-//! The same harness backs `legion volume plugin test <name>`, so a plugin
+//! The same harness backs `legion volume driver test <name>`, so a driver
 //! author runs exactly what CI runs.
 
 use std::collections::BTreeMap;
@@ -19,7 +19,7 @@ use serde::Serialize;
 
 use crate::prelude::*;
 use crate::volumes::{
-    VolumeMode, VolumeNodeRef, VolumeOp, VolumePlugin, VolumeRef, VolumeRequest, VOLUME_API_VERSION,
+    VolumeDriver, VolumeMode, VolumeNodeRef, VolumeOp, VolumeRef, VolumeRequest, VOLUME_API_VERSION,
 };
 
 /// One checked behavior.
@@ -69,7 +69,7 @@ impl ConformanceCheck {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConformanceReport {
-    pub plugin: String,
+    pub driver: String,
     pub passed: bool,
     pub checks: Vec<ConformanceCheck>,
 }
@@ -88,7 +88,7 @@ impl ConformanceReport {
 /// so a plugin author sees the whole picture in one run. Steps that cannot run
 /// because an earlier one failed are reported as failures with that reason.
 pub fn run(
-    plugin: &dyn VolumePlugin,
+    driver: &dyn VolumeDriver,
     scratch: &Path,
     params: BTreeMap<String, Value>,
     mode: VolumeMode,
@@ -96,12 +96,12 @@ pub fn run(
     let mut checks = Vec::new();
     let volume_id = format!("conformance-{}", crate::util::random_string(12));
 
-    let caps = plugin.capabilities();
+    let caps = driver.capabilities();
     if caps.api_version != VOLUME_API_VERSION {
         checks.push(ConformanceCheck::fail(
             "capabilities.apiVersion",
             format!(
-                "plugin speaks contract v{}, host speaks v{VOLUME_API_VERSION}",
+                "driver speaks contract v{}, host speaks v{VOLUME_API_VERSION}",
                 caps.api_version
             ),
         ));
@@ -129,20 +129,20 @@ pub fn run(
     if !caps.serves_mode(mode) {
         checks.push(ConformanceCheck::fail(
             "capabilities.volumeModes",
-            format!("plugin does not serve {mode} mode; run with --mode on a mode it supports"),
+            format!("driver does not serve {mode} mode; run with --mode on a mode it supports"),
         ));
-        return finish(plugin.name(), checks);
+        return finish(driver.name(), checks);
     }
 
     if !caps.available {
         checks.push(ConformanceCheck::fail(
             "capabilities.available",
             format!(
-                "plugin reports itself unusable on this node: {}",
+                "driver reports itself unusable on this node: {}",
                 caps.detail
             ),
         ));
-        return finish(plugin.name(), checks);
+        return finish(driver.name(), checks);
     }
     let missing = caps.missing_params(&params);
     if !missing.is_empty() {
@@ -153,7 +153,7 @@ pub fn run(
                 missing.join(", ")
             ),
         ));
-        return finish(plugin.name(), checks);
+        return finish(driver.name(), checks);
     }
 
     let request = |op: VolumeOp| -> VolumeRequest {
@@ -164,7 +164,7 @@ pub fn run(
             volume: VolumeRef {
                 id: volume_id.clone(),
                 name: "data".to_string(),
-                plugin: plugin.name().to_string(),
+                driver: driver.name().to_string(),
                 attrs: BTreeMap::new(),
                 read_only: false,
             },
@@ -180,11 +180,11 @@ pub fn run(
     };
 
     // --- mount ---
-    let mount_path: PathBuf = match plugin.mount(&request(VolumeOp::Mount)) {
+    let mount_path: PathBuf = match driver.mount(&request(VolumeOp::Mount)) {
         Ok(result) => {
-            if let Err(err) = result.validate_for(mode, plugin.name()) {
+            if let Err(err) = result.validate_for(mode, driver.name()) {
                 checks.push(ConformanceCheck::fail("mount", format!("{err:#}")));
-                return finish(plugin.name(), checks);
+                return finish(driver.name(), checks);
             }
             let path = result.resolved_path().cloned().expect("validated above");
             checks.push(ConformanceCheck::pass(
@@ -212,12 +212,12 @@ pub fn run(
         }
         Err(err) => {
             checks.push(ConformanceCheck::fail("mount", format!("{err:#}")));
-            return finish(plugin.name(), checks);
+            return finish(driver.name(), checks);
         }
     };
 
     // --- mount is idempotent ---
-    match plugin.mount(&request(VolumeOp::Mount)) {
+    match driver.mount(&request(VolumeOp::Mount)) {
         Ok(again) if again.resolved_path() == Some(&mount_path) => {
             checks.push(ConformanceCheck::pass(
                 "mount.idempotent",
@@ -272,8 +272,8 @@ pub fn run(
                         "write",
                         format!("could not write to the mount path: {err}"),
                     ));
-                    let _ = plugin.destroy(&request(VolumeOp::Destroy));
-                    return finish(plugin.name(), checks);
+                    let _ = driver.destroy(&request(VolumeOp::Destroy));
+                    return finish(driver.name(), checks);
                 }
             }
         }
@@ -298,18 +298,18 @@ pub fn run(
                     "write",
                     format!("could not read the device: {err}"),
                 ));
-                let _ = plugin.destroy(&request(VolumeOp::Destroy));
-                return finish(plugin.name(), checks);
+                let _ = driver.destroy(&request(VolumeOp::Destroy));
+                return finish(driver.name(), checks);
             }
         },
     };
 
     // --- unmount / remount / data survives ---
-    match plugin.unmount(&request(VolumeOp::Unmount)) {
+    match driver.unmount(&request(VolumeOp::Unmount)) {
         Ok(()) => checks.push(ConformanceCheck::pass("unmount", "released")),
         Err(err) => checks.push(ConformanceCheck::fail("unmount", format!("{err:#}"))),
     }
-    match plugin.unmount(&request(VolumeOp::Unmount)) {
+    match driver.unmount(&request(VolumeOp::Unmount)) {
         Ok(()) => checks.push(ConformanceCheck::pass(
             "unmount.idempotent",
             "second unmount succeeded",
@@ -320,12 +320,12 @@ pub fn run(
         )),
     }
 
-    match plugin.mount(&request(VolumeOp::Mount)) {
+    match driver.mount(&request(VolumeOp::Mount)) {
         Ok(remounted) => {
             if caps.ephemeral {
                 checks.push(ConformanceCheck::skip(
                     "persistence",
-                    "plugin declares itself ephemeral; data is not expected to survive unmount",
+                    "driver declares itself ephemeral; data is not expected to survive unmount",
                 ));
             } else {
                 checks.push(verify_persistence(
@@ -341,14 +341,14 @@ pub fn run(
         )),
     }
 
-    let _ = plugin.unmount(&request(VolumeOp::Unmount));
+    let _ = driver.unmount(&request(VolumeOp::Unmount));
 
     // --- destroy ---
-    match plugin.destroy(&request(VolumeOp::Destroy)) {
+    match driver.destroy(&request(VolumeOp::Destroy)) {
         Ok(()) => checks.push(ConformanceCheck::pass("destroy", "removed")),
         Err(err) => checks.push(ConformanceCheck::fail("destroy", format!("{err:#}"))),
     }
-    match plugin.destroy(&request(VolumeOp::Destroy)) {
+    match driver.destroy(&request(VolumeOp::Destroy)) {
         Ok(()) => checks.push(ConformanceCheck::pass(
             "destroy.idempotent",
             "second destroy succeeded",
@@ -359,7 +359,7 @@ pub fn run(
         )),
     }
 
-    finish(plugin.name(), checks)
+    finish(driver.name(), checks)
 }
 
 const PROBE_PAYLOAD: &str = "legion volume conformance probe\n";
@@ -433,10 +433,10 @@ fn verify_persistence(
     }
 }
 
-fn finish(plugin: &str, checks: Vec<ConformanceCheck>) -> ConformanceReport {
+fn finish(driver: &str, checks: Vec<ConformanceCheck>) -> ConformanceReport {
     ConformanceReport {
         passed: checks.iter().all(|check| check.passed),
-        plugin: plugin.to_string(),
+        driver: driver.to_string(),
         checks,
     }
 }
@@ -444,7 +444,7 @@ fn finish(plugin: &str, checks: Vec<ConformanceCheck>) -> ConformanceReport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::volumes::builtins::LocalDirPlugin;
+    use crate::volumes::builtins::LocalDirDriver;
 
     fn temp_root(label: &str) -> PathBuf {
         let unique = std::time::SystemTime::now()
@@ -459,8 +459,8 @@ mod tests {
     #[test]
     fn local_dir_passes_the_contract_suite() {
         let root = temp_root("local-dir");
-        let plugin = LocalDirPlugin::new(root.join("volumes"));
-        let report = run(&plugin, &root, BTreeMap::new(), VolumeMode::Filesystem);
+        let driver = LocalDirDriver::new(root.join("volumes"));
+        let report = run(&driver, &root, BTreeMap::new(), VolumeMode::Filesystem);
         assert!(
             report.passed,
             "local-dir failed conformance: {:?}",
@@ -472,8 +472,8 @@ mod tests {
     #[test]
     fn reports_missing_required_params_instead_of_failing_at_mount() {
         let root = temp_root("host-params");
-        let plugin =
-            crate::volumes::builtins::HostPlugin::new(crate::volumes::VolumeRuntimeConfig {
+        let driver =
+            crate::volumes::builtins::HostDriver::new(crate::volumes::VolumeRuntimeConfig {
                 volume_root: root.join("volumes"),
                 data_dir: root.clone(),
                 host_volumes: {
@@ -492,7 +492,7 @@ mod tests {
                 },
                 plugin_dir: root.join("plugins"),
             });
-        let report = run(&plugin, &root, BTreeMap::new(), VolumeMode::Filesystem);
+        let report = run(&driver, &root, BTreeMap::new(), VolumeMode::Filesystem);
         assert!(!report.passed);
         let failure = report.failures()[0];
         assert_eq!(failure.name, "params");

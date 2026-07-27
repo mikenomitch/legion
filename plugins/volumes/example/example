@@ -1,19 +1,20 @@
 #!/usr/bin/env bash
-# Reference volume plugin — the whole contract in one shell script.
+# Reference volume driver — the whole contract in one shell script,
+# packaged as an exec plugin under plugins/volumes/.
 #
 # The exec ABI: Legion runs this with the operation as $1 and a JSON request on
 # stdin, and reads a JSON response from stdout. Exit 0 means success; any other
 # exit is a failure, and Legion prefers a `{"error":{...}}` object on stdout
 # over stderr text when composing the message.
 #
-# This plugin stores each volume as a directory under `<node.volumeDir>/example/`
+# This driver stores each volume as a directory under `<node.volumeDir>/example/`
 # — functionally the same as the built-in `local-dir`, deliberately, so you can
 # diff behavior against a known-good driver while writing your own.
 #
 # Try it:
-#   legion volume plugin test example
+#   legion volume driver test example
 #
-# See docs/volumes.md ("Writing a volume plugin") for the full contract.
+# See docs/volumes.md ("Writing a volume driver") for the full contract.
 set -euo pipefail
 
 op="${1:-}"
@@ -54,7 +55,7 @@ case "$op" in
   "requiredParams": [],
   "optionalParams": ["mode"],
   "available": true,
-  "detail": "Reference exec plugin: a directory per volume. Copy me."
+  "detail": "Reference exec driver: a directory per volume. Copy me."
 }
 JSON
     ;;

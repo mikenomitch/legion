@@ -23,8 +23,8 @@ import { clearCommandPaletteIndexItems, setCommandPaletteIndexItems } from '../u
 import { formatRelativeTime } from '../utils/format'
 import { POLL_INTERVAL_MS } from '../utils/polling'
 import {
-  pluginScope,
-  pluginScopeTone,
+  driverScope,
+  driverScopeTone,
   shortVolumeId,
   volumePinsPlacement,
   volumeStateTone,
@@ -44,9 +44,9 @@ export default function Volumes() {
     () => tick() + 1,
     async () => (await managerClient.listVolumes({})).volumes,
   )
-  const [plugins] = createResource(
+  const [drivers] = createResource(
     () => tick() + 1,
-    async () => (await managerClient.listVolumePlugins({})).plugins,
+    async () => (await managerClient.listVolumeDrivers({})).drivers,
   )
 
   const filtered = createMemo(() => {
@@ -58,7 +58,7 @@ export default function Volumes() {
       .filter((volume) => (state === 'live' ? volume.state !== 'destroyed' : state === 'all' || volume.state === state))
       .filter((volume) =>
         !query ||
-        `${volume.volumeId} ${volume.name} ${volume.plugin} ${volume.jobId ?? ''} ${volume.instanceId ?? ''} ${volume.nodeId ?? ''}`
+        `${volume.volumeId} ${volume.name} ${volume.driver} ${volume.jobId ?? ''} ${volume.instanceId ?? ''} ${volume.nodeId ?? ''}`
           .toLowerCase()
           .includes(query),
       )
@@ -70,8 +70,8 @@ export default function Volumes() {
     setCommandPaletteIndexItems(
       (volumes() ?? []).map((volume) => ({
         id: `Volumes:${volume.volumeId}`,
-        label: volume.instanceId ? `${volume.instanceId} (${volume.plugin})` : shortVolumeId(volume.volumeId),
-        subtitle: `${volume.plugin} · ${volume.state}`,
+        label: volume.instanceId ? `${volume.instanceId} (${volume.driver})` : shortVolumeId(volume.volumeId),
+        subtitle: `${volume.driver} · ${volume.state}`,
         href: `/volumes/${encodeURIComponent(volume.volumeId)}`,
         source: 'Volumes',
       })),
@@ -89,8 +89,8 @@ export default function Volumes() {
     }
   })
 
-  const unusablePlugins = createMemo(() =>
-    (plugins() ?? []).filter((plugin) => plugin.availableNodes.length === 0),
+  const unusableDrivers = createMemo(() =>
+    (drivers() ?? []).filter((driver) => driver.availableNodes.length === 0),
   )
 
   return (
@@ -124,15 +124,15 @@ export default function Volumes() {
         />
       </div>
 
-      <Show when={unusablePlugins().length > 0}>
+      <Show when={unusableDrivers().length > 0}>
         <Note tone="warn">
-          {unusablePlugins().length === 1 ? 'One volume plugin is' : `${unusablePlugins().length} volume plugins are`}{' '}
+          {unusableDrivers().length === 1 ? 'One volume driver is' : `${unusableDrivers().length} volume drivers are`}{' '}
           installed but unusable on every node, so jobs claiming{' '}
-          {unusablePlugins().length === 1 ? 'it' : 'them'} are rejected at submit:{' '}
-          <For each={unusablePlugins()}>
-            {(plugin, index) => (
+          {unusableDrivers().length === 1 ? 'it' : 'them'} are rejected at submit:{' '}
+          <For each={unusableDrivers()}>
+            {(driver, index) => (
               <>
-                <span class="font-mono">{plugin.name}</span> ({plugin.detail}){index() < unusablePlugins().length - 1 ? '; ' : ''}
+                <span class="font-mono">{driver.name}</span> ({driver.detail}){index() < unusableDrivers().length - 1 ? '; ' : ''}
               </>
             )}
           </For>
@@ -145,7 +145,7 @@ export default function Volumes() {
           <input
             value={search()}
             onInput={(event) => setSearch(event.currentTarget.value)}
-            placeholder="Search by volume, instance, job, node, or plugin…"
+            placeholder="Search by volume, instance, job, node, or driver…"
             class={cx(inputClass, 'pl-8')}
             aria-label="Search volumes"
           />
@@ -182,7 +182,7 @@ export default function Volumes() {
                 <thead class={theadClass}>
                   <tr>
                     <th class={thClass}>Volume</th>
-                    <th class={thClass}>Plugin</th>
+                    <th class={thClass}>Driver</th>
                     <th class={thClass}>State</th>
                     <th class={thClass}>Owner</th>
                     <th class={thClass}>Node</th>
@@ -204,7 +204,7 @@ export default function Volumes() {
                           <div class="text-2xs text-faint">{volume.name}</div>
                         </td>
                         <td class={tdClass}>
-                          <Badge tone={volume.nodeLocal ? 'neutral' : 'ok'}>{volume.plugin}</Badge>
+                          <Badge tone={volume.nodeLocal ? 'neutral' : 'ok'}>{volume.driver}</Badge>
                           <Show when={volume.volumeMode === 'block'}>
                             <Badge tone="accent" class="ml-1" title="A raw device or disk image, not a directory">
                               block
@@ -265,20 +265,20 @@ export default function Volumes() {
       </SectionCard>
 
       <SectionCard
-        title="Plugins"
+        title="Drivers"
         description="Storage drivers advertised by workers. The manager loads none itself — this is what job admission validates against."
         flush
       >
-        <Show when={!plugins.loading || (plugins() ?? []).length > 0} fallback={<LoadingRows rows={3} />}>
+        <Show when={!drivers.loading || (drivers() ?? []).length > 0} fallback={<LoadingRows rows={3} />}>
           <Show
-            when={(plugins() ?? []).length > 0}
-            fallback={<EmptyState icon="boxes" title="No plugins advertised" body="Are any workers connected?" />}
+            when={(drivers() ?? []).length > 0}
+            fallback={<EmptyState icon="boxes" title="No drivers advertised" body="Are any workers connected?" />}
           >
             <TableShell>
               <table class={tableClass}>
                 <thead class={theadClass}>
                   <tr>
-                    <th class={thClass}>Plugin</th>
+                    <th class={thClass}>Driver</th>
                     <th class={thClass}>Scope</th>
                     <th class={thClass}>Nodes</th>
                     <th class={thClass}>Required params</th>
@@ -286,24 +286,24 @@ export default function Volumes() {
                   </tr>
                 </thead>
                 <tbody class="divide-y divide-line">
-                  <For each={plugins() ?? []}>
-                    {(plugin) => (
+                  <For each={drivers() ?? []}>
+                    {(driver) => (
                       <tr class={trHoverClass}>
-                        <td class={cx(tdClass, 'font-mono text-xs font-medium')}>{plugin.name}</td>
+                        <td class={cx(tdClass, 'font-mono text-xs font-medium')}>{driver.name}</td>
                         <td class={tdClass}>
-                          <Badge tone={pluginScopeTone(plugin)}>{pluginScope(plugin)}</Badge>
+                          <Badge tone={driverScopeTone(driver)}>{driverScope(driver)}</Badge>
                         </td>
                         <td class={cx(tdClass, 'tabular-nums text-muted')}>
-                          {plugin.availableNodes.length} / {Math.max(plugin.nodes.length, plugin.availableNodes.length)}
+                          {driver.availableNodes.length} / {Math.max(driver.nodes.length, driver.availableNodes.length)}
                           <span class="text-faint"> usable</span>
                         </td>
                         <td class={cx(tdClass, 'font-mono text-xs text-muted')}>
-                          {plugin.requiredParams.length > 0 ? plugin.requiredParams.join(', ') : '—'}
-                          <Show when={plugin.volumeModes.includes('block')}>
+                          {driver.requiredParams.length > 0 ? driver.requiredParams.join(', ') : '—'}
+                          <Show when={driver.volumeModes.includes('block')}>
                             <div class="text-2xs text-faint">serves block mode</div>
                           </Show>
                         </td>
-                        <td class={cx(tdClass, 'text-xs text-muted')}>{plugin.detail}</td>
+                        <td class={cx(tdClass, 'text-xs text-muted')}>{driver.detail}</td>
                       </tr>
                     )}
                   </For>

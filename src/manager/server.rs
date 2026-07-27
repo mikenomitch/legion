@@ -49,8 +49,8 @@ use crate::structs::{
     ListJobSpecHistoryRequest, ListJobsReply, ListJobsRequest, ListKvReply, ListKvRequest,
     ListRaftHistoryReply, ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest,
     ListRolloutsReply, ListRolloutsRequest, ListSavedStateQueriesReply,
-    ListSavedStateQueriesRequest, ListServicesReply, ListServicesRequest, ListVolumePluginsReply,
-    ListVolumePluginsRequest, ListVolumesReply, ListVolumesRequest, Node, NodeMsg, PatchKvReply,
+    ListSavedStateQueriesRequest, ListServicesReply, ListServicesRequest, ListVolumeDriversReply,
+    ListVolumeDriversRequest, ListVolumesReply, ListVolumesRequest, Node, NodeMsg, PatchKvReply,
     PatchKvRequest, PlanJobReply, PlanJobRequest, PlannedAllocation, PutKvReply, PutKvRequest,
     QueryStateStoreReply, QueryStateStoreRequest, RaftHistoryEvent, RaftStatus, ReleaseKvLockReply,
     ReleaseKvLockRequest, RenewKvLockReply, RenewKvLockRequest, ReplaceInstanceReply,
@@ -316,7 +316,7 @@ fn instance_volume_pin_detail(store: &Store, instance: &Instance) -> Option<Stri
         .unwrap_or_else(|_| "unknown".into());
     Some(format!(
         "volume-pinned: volume {} ({}) is node-local and lives on node {node_id} (status:          {node_status}), so this instance can only be placed there. It waits for that node          rather than starting on empty storage; `legion volume delete --force {}` abandons          the data and frees the instance to place elsewhere",
-        volume.volume_id, volume.plugin, volume.volume_id
+        volume.volume_id, volume.driver, volume.volume_id
     ))
 }
 
@@ -1147,17 +1147,17 @@ impl ManagerDaemonService {
         let needs_check = config
             .tasks
             .iter()
-            .any(|task| !task.required_volume_plugins().is_empty());
+            .any(|task| !task.required_volume_drivers().is_empty());
         if !needs_check {
             return Ok(());
         }
-        let cluster = self.store.cluster_volume_plugins()?;
+        let cluster = self.store.cluster_volume_drivers()?;
         if cluster.is_empty() {
             // Nothing in the cluster advertises plugin metadata: either no
             // worker has joined yet, or they predate fingerprinting. Either
             // way there is nothing to validate against, and rejecting the job
             // would be worse than letting placement decide.
-            debug!("No volume plugin metadata advertised yet; skipping volume admission checks");
+            debug!("No volume driver metadata advertised yet; skipping volume admission checks");
             return Ok(());
         }
 
@@ -1171,7 +1171,7 @@ impl ManagerDaemonService {
             {
                 declarations.push(VolumeDeclaration {
                     label: "stateful.storage".to_string(),
-                    plugin: storage.plugin_name().to_string(),
+                    driver: storage.driver_name().to_string(),
                     mode: storage.volume_mode(),
                     params: storage.param_map(),
                     is_instance_volume: true,
@@ -1180,7 +1180,7 @@ impl ManagerDaemonService {
             for volume in &task.volumes {
                 declarations.push(VolumeDeclaration {
                     label: format!("volume {:?}", volume.name),
-                    plugin: volume.plugin_name().to_string(),
+                    driver: volume.driver_name().to_string(),
                     mode: volume.volume_mode(),
                     params: volume.param_map(),
                     is_instance_volume: false,
@@ -1205,7 +1205,7 @@ impl ManagerDaemonService {
 
             for VolumeDeclaration {
                 label,
-                plugin,
+                driver,
                 mode,
                 params,
                 is_instance_volume,
@@ -1225,15 +1225,15 @@ impl ManagerDaemonService {
                             .join(", ")
                     );
                 }
-                let Some(entry) = cluster.get(&plugin) else {
+                let Some(entry) = cluster.get(&driver) else {
                     bail!(
-                        "task {} {label}: no node in the cluster provides volume plugin `{plugin}`.                          Install it under plugins/volumes/{plugin}/ on a worker, or run                          `legion volume plugins` to see what is available",
+                        "task {} {label}: no node in the cluster provides volume driver `{driver}`.                          Install it under plugins/volumes/{driver}/ on a worker, or run                          `legion volume drivers` to see what is available",
                         task.name
                     );
                 };
                 if entry.available_nodes.is_empty() {
                     bail!(
-                        "task {} {label}: volume plugin `{plugin}` is installed on {} but unusable                          everywhere: {}",
+                        "task {} {label}: volume driver `{driver}` is installed on {} but unusable                          everywhere: {}",
                         task.name,
                         entry.nodes.join(", "),
                         entry.capabilities.detail
@@ -1241,8 +1241,8 @@ impl ManagerDaemonService {
                 }
                 if !entry.capabilities.serves_mode(mode) {
                     bail!(
-                        "task {} {label}: volume plugin `{plugin}` cannot serve a `{mode}` volume \
-                         (it serves: {}). Pick a plugin that does, or change the volume's `mode`",
+                        "task {} {label}: volume driver `{driver}` cannot serve a `{mode}` volume \
+                         (it serves: {}). Pick a driver that does, or change the volume's `mode`",
                         task.name,
                         entry
                             .capabilities
@@ -1256,7 +1256,7 @@ impl ManagerDaemonService {
                 let missing = entry.capabilities.missing_params(&params);
                 if !missing.is_empty() {
                     bail!(
-                        "task {} {label}: volume plugin `{plugin}` requires params: {}",
+                        "task {} {label}: volume driver `{driver}` requires params: {}",
                         task.name,
                         missing.join(", ")
                     );
@@ -1267,7 +1267,7 @@ impl ManagerDaemonService {
                 // possible failure mode.
                 if is_instance_volume && entry.capabilities.ephemeral {
                     bail!(
-                        "task {} {label}: volume plugin `{plugin}` is ephemeral (its contents do                          not survive an unmount), so it cannot back stateful.storage — which                          promises an instance's data survives reschedules. Declare it under                          `volumes` instead if you want scratch space",
+                        "task {} {label}: volume driver `{driver}` is ephemeral (its contents do                          not survive an unmount), so it cannot back stateful.storage — which                          promises an instance's data survives reschedules. Declare it under                          `volumes` instead if you want scratch space",
                         task.name
                     );
                 }
@@ -3489,7 +3489,7 @@ impl Manager for ManagerDaemonService {
         let filter = crate::storage::store::VolumeFilter {
             job_id: non_empty(inner.job_id),
             node_id: non_empty(inner.node_id),
-            plugin: non_empty(inner.plugin),
+            driver: non_empty(inner.driver),
             instance_id: non_empty(inner.instance_id),
             state: inner
                 .state
@@ -3611,7 +3611,7 @@ impl Manager for ManagerDaemonService {
         } else {
             format!(
                 "Volume {} queued for reclamation by its {} driver",
-                volume.volume_id, volume.plugin
+                volume.volume_id, volume.driver
             )
         };
         if !idempotency_key.is_empty() {
@@ -3630,13 +3630,13 @@ impl Manager for ManagerDaemonService {
         }))
     }
 
-    /// The volume plugins installed across the cluster, aggregated from worker
+    /// The volume drivers installed across the cluster, aggregated from worker
     /// fingerprints (the manager loads no drivers of its own).
     #[instrument(skip_all)]
-    async fn list_volume_plugins(
+    async fn list_volume_drivers(
         &self,
-        request: Request<ListVolumePluginsRequest>,
-    ) -> Result<Response<ListVolumePluginsReply>, Status> {
+        request: Request<ListVolumeDriversRequest>,
+    ) -> Result<Response<ListVolumeDriversReply>, Status> {
         // Cluster capability data, like node fingerprints: gated on node read.
         self.check_acl(
             &request,
@@ -3644,12 +3644,12 @@ impl Manager for ManagerDaemonService {
             AclAction::Read,
             AclScope::any(),
         )?;
-        let plugins = self
+        let drivers = self
             .store
-            .cluster_volume_plugins()
-            .map_err(|e| map_store_error("Error listing volume plugins", e))?
+            .cluster_volume_drivers()
+            .map_err(|e| map_store_error("Error listing volume drivers", e))?
             .into_iter()
-            .map(|(name, entry)| crate::structs::VolumePluginInfo {
+            .map(|(name, entry)| crate::structs::VolumeDriverInfo {
                 name,
                 node_local: entry.capabilities.node_local,
                 ephemeral: entry.capabilities.ephemeral,
@@ -3669,7 +3669,7 @@ impl Manager for ManagerDaemonService {
             })
             .collect();
 
-        Ok(Response::new(ListVolumePluginsReply { plugins }))
+        Ok(Response::new(ListVolumeDriversReply { drivers }))
     }
 
     #[instrument(skip_all, fields(alloc_id, identity_name, node_id))]
@@ -6159,11 +6159,11 @@ fn build_desired_allocations(
 fn apply_volume_reports(store: &Store, node_id: &str, reports: &[crate::structs::VolumeReport]) {
     for report in reports {
         if !report.ok {
-            let plugin = store
+            let driver = store
                 .get_volume(&report.volume_id)
                 .ok()
                 .flatten()
-                .map(|volume| volume.plugin)
+                .map(|volume| volume.driver)
                 .unwrap_or_else(|| "unknown".to_string());
             warn!(
                 node_id,
@@ -6177,7 +6177,7 @@ fn apply_volume_reports(store: &Store, node_id: &str, reports: &[crate::structs:
             }
             store
                 .events()
-                .volume_failed(&report.volume_id, &plugin, node_id, &report.error);
+                .volume_failed(&report.volume_id, &driver, node_id, &report.error);
             continue;
         }
 
@@ -6202,11 +6202,11 @@ fn apply_volume_reports(store: &Store, node_id: &str, reports: &[crate::structs:
                 }
             }
             "destroy" => {
-                let plugin = store
+                let driver = store
                     .get_volume(&report.volume_id)
                     .ok()
                     .flatten()
-                    .map(|volume| volume.plugin)
+                    .map(|volume| volume.driver)
                     .unwrap_or_else(|| "unknown".to_string());
                 if let Err(err) = store.mark_volume_destroyed(&report.volume_id) {
                     warn!(error = ?err, "Failed marking volume destroyed");
@@ -6214,7 +6214,7 @@ fn apply_volume_reports(store: &Store, node_id: &str, reports: &[crate::structs:
                 }
                 store
                     .events()
-                    .volume_destroyed(&report.volume_id, &plugin, node_id);
+                    .volume_destroyed(&report.volume_id, &driver, node_id);
             }
             // `unmount` needs no state change: the volume stays `created` and
             // keeps its pin, which is exactly what makes a reschedule reattach.
@@ -6242,15 +6242,15 @@ fn build_volume_destroy_requests(
     if volumes.is_empty() {
         return Vec::new();
     }
-    let node_plugins = store
+    let node_drivers = store
         .get_node(node_id)
         .ok()
         .and_then(|node| {
             node.fingerprint_attrs
-                .get("volumePlugins")
+                .get("volumeDrivers")
                 .and_then(Value::as_object)
-                .map(|plugins| {
-                    plugins
+                .map(|drivers| {
+                    drivers
                         .keys()
                         .cloned()
                         .collect::<std::collections::HashSet<_>>()
@@ -6260,10 +6260,10 @@ fn build_volume_destroy_requests(
 
     volumes
         .into_iter()
-        .filter(|volume| node_plugins.contains(&volume.plugin))
+        .filter(|volume| node_drivers.contains(&volume.driver))
         .map(|volume| crate::structs::VolumeDestroyRequest {
             volume_id: volume.volume_id,
-            plugin: volume.plugin,
+            driver: volume.driver,
             name: volume.name,
             params: serde_json::to_string(&volume.params).unwrap_or_else(|_| "{}".into()),
             attrs: serde_json::to_string(&volume.attrs).unwrap_or_else(|_| "{}".into()),
@@ -6276,7 +6276,7 @@ fn build_volume_destroy_requests(
 /// `stateful.storage` or a `volumes[]` claim.
 struct VolumeDeclaration {
     label: String,
-    plugin: String,
+    driver: String,
     mode: crate::volumes::VolumeMode,
     params: std::collections::BTreeMap<String, Value>,
     is_instance_volume: bool,
@@ -6292,7 +6292,7 @@ fn volume_info(volume: crate::structs::Volume) -> crate::structs::VolumeInfo {
     crate::structs::VolumeInfo {
         volume_id: volume.volume_id,
         name: volume.name,
-        plugin: volume.plugin,
+        driver: volume.driver,
         job_id: volume.job_id,
         instance_id: volume.instance_id,
         task_name: volume.task_name,
@@ -6755,7 +6755,7 @@ mod tests {
                 initial_instances: None,
                 on_lost: None,
                 storage: Some(crate::structs::StatefulStorageConfig {
-                    plugin: None,
+                    driver: None,
                     mode: None,
                     params: None,
                     path: "/var/lib/db".into(),
@@ -9002,7 +9002,7 @@ mod tests {
                 initial_instances: None,
                 on_lost: None,
                 storage: Some(crate::structs::StatefulStorageConfig {
-                    plugin: None,
+                    driver: None,
                     mode: None,
                     params: None,
                     path: "/workspace".into(),

@@ -1,8 +1,8 @@
 //! The manager's record of a volume — what a `storage_handle` points at.
 //!
 //! An [`Instance`](crate::structs::Instance) owns an opaque
-//! `{plugin}/{volume_id}` handle; the `volume` row is the other half of that
-//! pair: which plugin, which node it is pinned to, what the driver recorded
+//! `{driver}/{volume_id}` handle; the `volume` row is the other half of that
+//! pair: which driver, which node it is pinned to, what the driver recorded
 //! about it, and where it is in the destroy state machine.
 //!
 //! Volumes deliberately **outlive** their instances: an instance can be
@@ -78,7 +78,7 @@ pub struct Volume {
     pub volume_id: String,
     /// Declared name within the task (`data` for the instance volume).
     pub name: String,
-    pub plugin: String,
+    pub driver: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub job_id: Option<String>,
     /// The instance whose lifecycle owns this volume. `None` for task
@@ -122,7 +122,7 @@ pub struct Volume {
 impl Volume {
     /// The storage handle this volume backs.
     pub fn handle(&self) -> String {
-        format!("{}/{}", self.plugin, self.volume_id)
+        format!("{}/{}", self.driver, self.volume_id)
     }
 
     /// True when this volume constrains where its instance may be placed.

@@ -17,7 +17,7 @@ legion volume list --job redis
 ```
 
 ```
- VOLUME    PLUGIN     JOB    INSTANCE       STATE    NODE
+ VOLUME    DRIVER     JOB    INSTANCE       STATE    NODE
  4471be…   local-dir  redis  redis-store-0  created  node-a1*
 ```
 
@@ -39,7 +39,7 @@ legion service resolve redis-cache  # the pool
 
   stateful: {
     mode: 'slot',
-    storage: { path: '/var/lib/redis', plugin: 'local-dir', params: { size: '5G' } },
+    storage: { path: '/var/lib/redis', driver: 'local-dir', params: { size: '5G' } },
   },
 
   config: {
@@ -124,7 +124,7 @@ Some workloads want a big scratch area without wanting durability. Claim one
 under `volumes` rather than `stateful.storage`:
 
 ```jsonnet
-volumes: [{ name: 'scratch', plugin: 'tmpfs', params: { size: '1G' },
+volumes: [{ name: 'scratch', driver: 'tmpfs', params: { size: '1G' },
             path: '/scratch' }],
 ```
 
@@ -134,7 +134,7 @@ itself as *ephemeral*, which is why admission rejects it under
 cannot. Trying it produces:
 
 ```
-task cache stateful.storage: volume plugin `tmpfs` is ephemeral (its contents do
+task cache stateful.storage: volume driver `tmpfs` is ephemeral (its contents do
 not survive an unmount), so it cannot back stateful.storage — which promises an
 instance's data survives reschedules. Declare it under `volumes` instead if you
 want scratch space
@@ -168,7 +168,7 @@ network storage:
 ```jsonnet
 storage: {
   path: '/var/lib/redis',
-  plugin: 'nfs',
+  driver: 'nfs',
   params: { server: '10.0.0.5', export: '/exports/redis' },
 }
 ```

@@ -118,7 +118,7 @@ fn endpoint_table() -> Vec<(&'static str, Plane)> {
         ("ListVolumes", Plane::Protected("job:read")),
         ("GetVolume", Plane::Protected("job:read")),
         ("DeleteVolume", Plane::Protected("job:write")),
-        ("ListVolumePlugins", Plane::Protected("node:read")),
+        ("ListVolumeDrivers", Plane::Protected("node:read")),
         ("IssueWorkloadIdentityToken", Plane::Worker),
         ("IssueNodeIdentityToken", Plane::Worker),
         ("GetAllocationLogs", Plane::Protected("job:read")),
@@ -648,8 +648,8 @@ async fn call_endpoint(
             ))
             .await
             .map(|_| ()),
-        "ListVolumePlugins" => svc
-            .list_volume_plugins(req(ListVolumePluginsRequest {}, token))
+        "ListVolumeDrivers" => svc
+            .list_volume_drivers(req(ListVolumeDriversRequest {}, token))
             .await
             .map(|_| ()),
         "IssueWorkloadIdentityToken" => svc

@@ -26,7 +26,7 @@
           // informational — the command below reads $LEGION_STORAGE_DIR, which
           // carries the real host path (see docs/volumes.md).
           path: '/var/lib/redis',
-          plugin: 'local-dir',
+          driver: 'local-dir',
           params: { size: '5G' },
         },
       },
@@ -72,7 +72,7 @@
       // per-instance lifecycle.
       //
       // On Linux, swap this for a real RAM disk:
-      //   volumes: [{ name: 'scratch', plugin: 'tmpfs',
+      //   volumes: [{ name: 'scratch', driver: 'tmpfs',
       //               params: { size: '1G' }, path: '/scratch' }],
       // `tmpfs` is ephemeral, which is exactly why admission would reject it
       // under stateful.storage.

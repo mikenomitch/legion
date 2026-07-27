@@ -2,10 +2,10 @@
 //!
 //! These ship inside the Legion binary so a single-binary cluster has working
 //! stateful storage with nothing installed. They implement the same
-//! [`VolumePlugin`] trait the exec dispatcher does, so nothing downstream knows
+//! [`VolumeDriver`] trait the exec dispatcher does, so nothing downstream knows
 //! whether a driver is in-process or a subprocess.
 //!
-//! | Plugin | Node-local | Summary |
+//! | Driver | Node-local | Summary |
 //! | --- | --- | --- |
 //! | `local-dir` | yes | A directory under the worker's state dir. The default. |
 //! | `host` | yes | Claims an operator-declared host path by name. |
@@ -17,17 +17,17 @@ use std::path::PathBuf;
 use crate::prelude::*;
 use crate::volumes::{
     create_dir_with_mode, is_mount_point, run_mount_command, MountResult, VolumeCapabilities,
-    VolumeMode, VolumePlugin, VolumeRequest, VolumeRuntimeConfig, ACCESS_MODE_MULTI_READER,
+    VolumeDriver, VolumeMode, VolumeRequest, VolumeRuntimeConfig, ACCESS_MODE_MULTI_READER,
     ACCESS_MODE_SINGLE_WRITER,
 };
 
 /// Every built-in, constructed against one worker's runtime config.
-pub fn all(config: &VolumeRuntimeConfig) -> Vec<Box<dyn VolumePlugin>> {
+pub fn all(config: &VolumeRuntimeConfig) -> Vec<Box<dyn VolumeDriver>> {
     vec![
-        Box::new(LocalDirPlugin::new(config.volume_root.clone())),
-        Box::new(HostPlugin::new(config.clone())),
-        Box::new(NfsPlugin::new(config.volume_root.clone())),
-        Box::new(TmpfsPlugin::new(config.volume_root.clone())),
+        Box::new(LocalDirDriver::new(config.volume_root.clone())),
+        Box::new(HostDriver::new(config.clone())),
+        Box::new(NfsDriver::new(config.volume_root.clone())),
+        Box::new(TmpfsDriver::new(config.volume_root.clone())),
     ]
 }
 
@@ -43,13 +43,13 @@ pub fn all(config: &VolumeRuntimeConfig) -> Vec<Box<dyn VolumePlugin>> {
 /// instance holding one can only be replaced on that machine. `size` is
 /// recorded as an attribute but **not enforced**: a directory has no quota, and
 /// pretending otherwise would be worse than being honest about it.
-pub struct LocalDirPlugin {
+pub struct LocalDirDriver {
     root: PathBuf,
 }
 
-impl LocalDirPlugin {
+impl LocalDirDriver {
     pub fn new(volume_root: PathBuf) -> Self {
-        LocalDirPlugin {
+        LocalDirDriver {
             root: volume_root.join("local-dir"),
         }
     }
@@ -122,7 +122,7 @@ impl LocalDirPlugin {
     }
 }
 
-impl VolumePlugin for LocalDirPlugin {
+impl VolumeDriver for LocalDirDriver {
     fn name(&self) -> &str {
         "local-dir"
     }
@@ -203,17 +203,17 @@ impl VolumePlugin for LocalDirPlugin {
 /// to the operator, not to Legion, so a scaled-in job must never delete
 /// `/mnt/models`. This is the escape hatch for "the bytes are already on the
 /// machine" and the way to put a database on a specific NVMe.
-pub struct HostPlugin {
+pub struct HostDriver {
     config: VolumeRuntimeConfig,
 }
 
-impl HostPlugin {
+impl HostDriver {
     pub fn new(config: VolumeRuntimeConfig) -> Self {
-        HostPlugin { config }
+        HostDriver { config }
     }
 }
 
-impl VolumePlugin for HostPlugin {
+impl VolumeDriver for HostDriver {
     fn name(&self) -> &str {
         "host"
     }
@@ -256,7 +256,7 @@ impl VolumePlugin for HostPlugin {
         if declared.is_empty() {
             return caps.unavailable(
                 "no hostVolumes declared in this worker's config; add \
-                 `hostVolumes: { <name>: { path: '/…' } }` to use this plugin",
+                 `hostVolumes: { <name>: { path: '/…' } }` to use this driver",
             );
         }
         caps.with_detail(format!("declared host volumes: {}", declared.join(", ")))
@@ -353,13 +353,13 @@ impl VolumePlugin for HostPlugin {
 /// The subdirectory (default: the volume id) is created *inside* the mounted
 /// export, which sidesteps the chicken-and-egg of provisioning on a filesystem
 /// you have to mount first.
-pub struct NfsPlugin {
+pub struct NfsDriver {
     root: PathBuf,
 }
 
-impl NfsPlugin {
+impl NfsDriver {
     pub fn new(volume_root: PathBuf) -> Self {
-        NfsPlugin {
+        NfsDriver {
             root: volume_root.join("nfs"),
         }
     }
@@ -422,7 +422,7 @@ fn default_nfs_options() -> &'static str {
     }
 }
 
-impl VolumePlugin for NfsPlugin {
+impl VolumeDriver for NfsDriver {
     fn name(&self) -> &str {
         "nfs"
     }
@@ -508,13 +508,13 @@ impl VolumePlugin for NfsPlugin {
 ///
 /// Linux only — macOS has no tmpfs, and quietly substituting a disk-backed
 /// directory would turn "this is in RAM and capped at 512M" into a lie.
-pub struct TmpfsPlugin {
+pub struct TmpfsDriver {
     root: PathBuf,
 }
 
-impl TmpfsPlugin {
+impl TmpfsDriver {
     pub fn new(volume_root: PathBuf) -> Self {
-        TmpfsPlugin {
+        TmpfsDriver {
             root: volume_root.join("tmpfs"),
         }
     }
@@ -526,7 +526,7 @@ impl TmpfsPlugin {
 
 const DEFAULT_TMPFS_SIZE: &str = "64M";
 
-impl VolumePlugin for TmpfsPlugin {
+impl VolumeDriver for TmpfsDriver {
     fn name(&self) -> &str {
         "tmpfs"
     }
@@ -550,7 +550,7 @@ impl VolumePlugin for TmpfsPlugin {
 
     fn mount(&self, request: &VolumeRequest) -> R<MountResult> {
         if !cfg!(target_os = "linux") {
-            bail!("the tmpfs volume plugin is Linux-only");
+            bail!("the tmpfs volume driver is Linux-only");
         }
         let mountpoint = self.mountpoint_for(&request.volume.id);
         std::fs::create_dir_all(&mountpoint).with_context(|| {
@@ -641,13 +641,13 @@ mod tests {
         dir
     }
 
-    fn request(op: VolumeOp, plugin: &str, root: &std::path::Path) -> VolumeRequest {
+    fn request(op: VolumeOp, driver: &str, root: &std::path::Path) -> VolumeRequest {
         VolumeRequest::new(
             op,
             VolumeRef {
                 id: "vol-test".into(),
                 name: "data".into(),
-                plugin: plugin.into(),
+                driver: driver.into(),
                 attrs: BTreeMap::new(),
                 read_only: false,
             },
@@ -662,7 +662,7 @@ mod tests {
     #[test]
     fn local_dir_mounts_creates_and_destroys() -> R<()> {
         let root = temp_root("local-dir");
-        let plugin = LocalDirPlugin::new(root.join("volumes"));
+        let plugin = LocalDirDriver::new(root.join("volumes"));
         let req = request(VolumeOp::Mount, "local-dir", &root);
 
         let mounted = plugin.mount(&req)?;
@@ -720,7 +720,7 @@ mod tests {
     #[test]
     fn local_dir_records_size_without_enforcing_it() -> R<()> {
         let root = temp_root("local-dir-size");
-        let plugin = LocalDirPlugin::new(root.join("volumes"));
+        let plugin = LocalDirDriver::new(root.join("volumes"));
         let mut params = BTreeMap::new();
         params.insert("size".to_string(), json!("10G"));
         let req = request(VolumeOp::Mount, "local-dir", &root).with_params(params);
@@ -748,7 +748,7 @@ mod tests {
             return Ok(());
         }
         let root = temp_root("local-dir-block");
-        let plugin = LocalDirPlugin::new(root.join("volumes"));
+        let plugin = LocalDirDriver::new(root.join("volumes"));
         let mut params = BTreeMap::new();
         params.insert("size".to_string(), json!("16MiB"));
         let req = request(VolumeOp::Mount, "local-dir", &root)
@@ -789,7 +789,7 @@ mod tests {
             return;
         }
         let root = temp_root("local-dir-block-conformance");
-        let plugin = LocalDirPlugin::new(root.join("volumes"));
+        let plugin = LocalDirDriver::new(root.join("volumes"));
         let mut params = BTreeMap::new();
         params.insert("size".to_string(), json!("16MiB"));
         let report = crate::volumes::conformance::run(&plugin, &root, params, VolumeMode::Block);
@@ -805,10 +805,10 @@ mod tests {
     fn filesystem_only_plugins_refuse_block_mode() {
         // nfs and tmpfs hand out directories; admission and the worker both
         // gate on this rather than letting a microVM get a path it cannot use.
-        assert!(!NfsPlugin::new(PathBuf::from("/tmp/v"))
+        assert!(!NfsDriver::new(PathBuf::from("/tmp/v"))
             .capabilities()
             .serves_mode(VolumeMode::Block));
-        assert!(!TmpfsPlugin::new(PathBuf::from("/tmp/v"))
+        assert!(!TmpfsDriver::new(PathBuf::from("/tmp/v"))
             .capabilities()
             .serves_mode(VolumeMode::Block));
     }
@@ -827,7 +827,7 @@ mod tests {
                 create: false,
             },
         );
-        let plugin = HostPlugin::new(VolumeRuntimeConfig {
+        let plugin = HostDriver::new(VolumeRuntimeConfig {
             volume_root: root.join("volumes"),
             data_dir: root.clone(),
             host_volumes,
@@ -864,7 +864,7 @@ mod tests {
                 create: false,
             },
         );
-        let plugin = HostPlugin::new(VolumeRuntimeConfig {
+        let plugin = HostDriver::new(VolumeRuntimeConfig {
             volume_root: root.join("volumes"),
             data_dir: root.clone(),
             host_volumes,
@@ -909,7 +909,7 @@ mod tests {
                 create: false,
             },
         );
-        let plugin = HostPlugin::new(VolumeRuntimeConfig {
+        let plugin = HostDriver::new(VolumeRuntimeConfig {
             volume_root: root.join("volumes"),
             data_dir: root.clone(),
             host_volumes,
@@ -931,7 +931,7 @@ mod tests {
 
     #[test]
     fn host_plugin_is_unavailable_without_declarations() {
-        let plugin = HostPlugin::new(VolumeRuntimeConfig::default());
+        let plugin = HostDriver::new(VolumeRuntimeConfig::default());
         let caps = plugin.capabilities();
         assert!(!caps.available);
         assert!(caps.detail.contains("hostVolumes"));
@@ -939,7 +939,7 @@ mod tests {
 
     #[test]
     fn nfs_is_not_node_local() {
-        let plugin = NfsPlugin::new(PathBuf::from("/tmp/volumes"));
+        let plugin = NfsDriver::new(PathBuf::from("/tmp/volumes"));
         let caps = plugin.capabilities();
         assert!(!caps.node_local, "nfs volumes must not pin instances");
         assert_eq!(caps.required_params, vec!["server", "export"]);
@@ -947,7 +947,7 @@ mod tests {
 
     #[test]
     fn tmpfs_declares_itself_ephemeral() {
-        let plugin = TmpfsPlugin::new(PathBuf::from("/tmp/volumes"));
+        let plugin = TmpfsDriver::new(PathBuf::from("/tmp/volumes"));
         let caps = plugin.capabilities();
         assert!(caps.ephemeral);
         assert!(caps.node_local);
