@@ -30,7 +30,7 @@ export default function ExecTerminal(props: ExecTerminalProps) {
       convertEol: !props.interactive,
       cursorBlink: props.interactive,
       fontSize: 13,
-      fontFamily: '"JetBrains Mono Variable", "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
+      fontFamily: '"Fira Code Variable", "Fira Code", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
       theme: { background: '#0d0c0a', cursor: '#d6b45a' },
     })
     fit = new FitAddon()

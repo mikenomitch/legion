@@ -1,6 +1,6 @@
 @import '@fontsource-variable/inter';
 @import '@fontsource-variable/space-grotesk';
-@import '@fontsource-variable/jetbrains-mono';
+@import '@fontsource-variable/fira-code';
 
 @tailwind base;
 @tailwind components;
