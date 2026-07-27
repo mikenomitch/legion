@@ -4,6 +4,8 @@ Companion to
 [`plans/shared-alloc-dir-proposal.md`](../plans/shared-alloc-dir-proposal.md)
 (status: proposal, not implemented).
 
+Entries are ranked by project impact, highest first.
+
 ## 1. Share by request, private by default — one explicit shared directory
 
 Tasks in the same allocation may share files, but only through a purpose-built

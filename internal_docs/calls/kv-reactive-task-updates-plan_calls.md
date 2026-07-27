@@ -5,14 +5,17 @@ Companion to
 Decisions made while implementing the plan where it was ambiguous,
 contradictory, or silent. Recorded during the 2026-06-09 implementation pass.
 
-## 1. No `kv_reactive_updates` feature flag
+Entries are ranked by project impact, highest first.
 
-The plan called for gating reactive KV updates behind a flag, but the feature
-shipped earlier without one and is default-on; gating it now would regress
-existing jobs. The per-reference defaults are already opt-in (`watch` defaults to
-false), which serves the flag's purpose. Likewise, the `kv_or()` optional-lookup
-helper stays deferred (all references are required in v1). Both deviations are
-noted in the plan's status header.
+## 1. Policy precedence is field-by-field
+
+A per-entry policy overrides only the fields it sets (`watch` became
+`Option<bool>` to distinguish unset from explicit false). The previous
+all-or-nothing rule silently made `maximal.jsonnet`'s own example inert — which
+also exposed that the example used snake_case keys serde dropped; both fixed and
+locked by tests. Two other latent bugs fixed in passing: bare-before-braced `kv`
+token replacement corrupting rendered templates, and file injections duplicating
+on every re-render (now upserted by path).
 
 ## 2. Debounce: fixed window from first event, last event per key wins
 
@@ -32,15 +35,14 @@ rescheduled (no storm). Dependency edges are retained, so a later put to the
 missing key recovers the job via its `onChange` action; `onChange: none` does not
 auto-recover (manual `job run` does).
 
-## 4. Policy precedence is field-by-field
+## 4. No `kv_reactive_updates` feature flag
 
-A per-entry policy overrides only the fields it sets (`watch` became
-`Option<bool>` to distinguish unset from explicit false). The previous
-all-or-nothing rule silently made `maximal.jsonnet`'s own example inert — which
-also exposed that the example used snake_case keys serde dropped; both fixed and
-locked by tests. Two other latent bugs fixed in passing: bare-before-braced `kv`
-token replacement corrupting rendered templates, and file injections duplicating
-on every re-render (now upserted by path).
+The plan called for gating reactive KV updates behind a flag, but the feature
+shipped earlier without one and is default-on; gating it now would regress
+existing jobs. The per-reference defaults are already opt-in (`watch` defaults to
+false), which serves the flag's purpose. Likewise, the `kv_or()` optional-lookup
+helper stays deferred (all references are required in v1). Both deviations are
+noted in the plan's status header.
 
 ## 5. Red-team fixes (2026-06 adversarial review)
 

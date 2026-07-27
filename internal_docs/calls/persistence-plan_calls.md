@@ -3,6 +3,8 @@
 Companion to [`plans/persistence-plan.md`](../plans/persistence-plan.md).
 The decisions behind the persistence tiers, pulled out of the option analysis.
 
+Entries are ranked by project impact, highest first.
+
 ## 1. Three tiers, not one HA story
 
 Local disk, streaming replication with lease failover, and Raft consensus are all
@@ -11,11 +13,12 @@ for consensus they don't need. The cost is a persistence driver boundary and
 three sets of documented guarantees; the benefit is that the simplest deployment
 stays a single binary with a SQLite file.
 
-## 2. Driver boundary first, behavior unchanged
+## 2. Raft replicates *commands*, not the WAL
 
-Phase 0 introduced the abstraction under the existing SQLite `Store` with no
-behavior change. Every later tier is an implementation of that seam, so no tier
-gets to reshape the store's API on its way in.
+The strongest tier replicates deterministic commands through the log and applies
+them to each node's SQLite, instead of shipping WAL frames. WAL-level replication
+would couple consensus to SQLite's file format and make deterministic apply tests
+impossible.
 
 ## 3. Streaming tier: lease-only single-primary, not consensus
 
@@ -26,14 +29,7 @@ what makes it split-brain-safe. The accepted trade-off is async replication: a
 failover can lose the last few seconds of writes, which is stated in the tier's
 guarantees rather than hidden.
 
-## 4. Raft replicates *commands*, not the WAL
-
-The strongest tier replicates deterministic commands through the log and applies
-them to each node's SQLite, instead of shipping WAL frames. WAL-level replication
-would couple consensus to SQLite's file format and make deterministic apply tests
-impossible.
-
-## 5. Litestream as the streaming engine — later superseded by rustyriver
+## 4. Litestream as the streaming engine — later superseded by rustyriver
 
 The plan's Phase 1 recommendation was to run Litestream itself rather than write a
 Rust WAL shipper: no mature Rust crate was equivalent, and hand-rolling WAL
@@ -47,19 +43,25 @@ That call has since been revisited exactly on the terms it set out: with
 Litestream v0.5 — the same adapter boundary is satisfied in-process, so the
 sidecar binary went away without re-taking on the WAL correctness risk.
 
-## 6. Managed external database: considered, deferred
+## 5. Driver boundary first, behavior unchanged
+
+Phase 0 introduced the abstraction under the existing SQLite `Store` with no
+behavior change. Every later tier is an implementation of that seam, so no tier
+gets to reshape the store's API on its way in.
+
+## 6. Guarantees are documented per tier (RPO/RTO/consistency)
+
+An explicit decision matrix exists so users can pick the simplest mode that meets
+their needs, rather than defaulting to the most durable one out of uncertainty.
+
+## 7. Managed external database: considered, deferred
 
 An external managed DB backend is documented as a real option but not built first;
 it trades Legion's single-binary story for someone else's operational surface, and
 the streaming tier covers most of the same need.
 
-## 7. Cluster UX is token- and command-driven
+## 8. Cluster UX is token- and command-driven
 
 Join tokens and `legion manager persistence …` verbs instead of IP-heavy manual
 operations, so the HA tiers keep the same "one command" ergonomics as the rest of
 the product.
-
-## 8. Guarantees are documented per tier (RPO/RTO/consistency)
-
-An explicit decision matrix exists so users can pick the simplest mode that meets
-their needs, rather than defaulting to the most durable one out of uncertainty.

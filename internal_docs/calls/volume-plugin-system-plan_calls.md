@@ -5,6 +5,8 @@ Companion to
 Decisions made while writing the plan where the request was ambiguous or where a
 real alternative existed. Recorded during the 2026-06-09 implementation pass.
 
+Entries are ranked by project impact, highest first.
+
 ## 1. "CNI compatibility layer" in the request → CSI
 
 The request asked for a volume plugin system "similar to CNI or Nomad's volume

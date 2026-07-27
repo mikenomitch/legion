@@ -173,8 +173,15 @@ knowingly accepted a limitation or trade-off.
   `internal_docs/plans/<plan-name>.md` →
   `internal_docs/calls/<plan-name>_calls.md`. If the work has no plan, name it
   after the feature (`<feature>_calls.md`).
-- **One entry per call**, each stating *what was decided*, *what the alternatives
-  were*, and *why* — plus the consequence when the decision is a trade-off.
+- **One entry per call**, each stating *the call*, *the alternative(s)* that were
+  genuinely on the table, *the trade-off* it costs, and *why* it won — tied to a
+  core product goal (simplicity/ease, extensibility, performance) where it can
+  be. Show the user-facing surface (jobspec, CLI, error message, env var)
+  whenever the call is visible to a user.
+- **Rank entries by project impact, highest first**; the entry number is its
+  rank. Insert new entries at their rank rather than appending, and fix any
+  citation of an entry by number.
+- The full template and a worked example are in [`CLAUDE.md`](CLAUDE.md).
 - **Append to the existing file** when a plan already has one; never start a
   second calls file for the same plan.
 - **Link it from the plan** with a `> **Judgement calls:** …` line under the

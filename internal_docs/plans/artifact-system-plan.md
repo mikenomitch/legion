@@ -1066,10 +1066,10 @@ core — extensibility parity with task-kind plugins, completing the
 
 Split out into
 [`calls/artifact-system-plan_calls.md`](../calls/artifact-system-plan_calls.md)
-— eleven decisions (first-class task field, cache deferred, blocking fetcher
-trait, `oci-client`, pin-by-default, cluster auth grain, fetch-failure budgets,
-the KV ACL gap, container `image` desugaring, all-or-nothing staging, dumb
-interpolation).
+— eleven decisions, ranked by project impact (first-class task field,
+pin-by-default, the KV ACL gap, cluster auth grain, cache deferred, container
+`image` desugaring, blocking fetcher trait, all-or-nothing staging,
+fetch-failure budgets, dumb interpolation, `oci-client`).
 
 ## Follow-Ups (noted, not scoped here)
 
@@ -1078,10 +1078,10 @@ interpolation).
   become a priority. Tracked in `internal_docs/TASK-LIST.md` (Windows support) so
   it is not missed.
 - **`onFetchFailure` policy** distinct from `on_unhealthy` (Judgement Call
-  7) if registry/store outages prove to deserve different budgets than
-  task unhealthiness.
+  9, *Fetch failures reuse `on_unhealthy` budgets*) if registry/store
+  outages prove to deserve different budgets than task unhealthiness.
 - **KV ACL enforcement** at `GetArtifactCredential` when the ACL system
-  lands (Judgement Call 8; TASK-LIST).
+  lands (Judgement Call 3, *KV ACL gap accepted for now*; TASK-LIST).
 - The **cache and pre-warm plan** consumes this plan's seams:
   `ArtifactSink`, digests, `artifact_states`, and node identity.
 

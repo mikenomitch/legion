@@ -467,9 +467,9 @@ Phases 1–2.)
 
 Split out into
 [`calls/artifact-cache-and-prewarm-plan_calls.md`](../calls/artifact-cache-and-prewarm-plan_calls.md)
-— seven decisions (cache as the only coordination point, sqlite index,
-dedicated report RPC, TTL semantics, hardlink disk accounting, warm-pin
-ranking, digest-pinned-only scoring).
+— seven decisions, ranked by project impact (cache as the only coordination
+point, warm-pin ranking, digest-pinned-only scoring, dedicated report RPC, TTL
+semantics, hardlink disk accounting, sqlite index).
 
 ## Open Questions
 
