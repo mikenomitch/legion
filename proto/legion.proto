@@ -3577,6 +3577,20 @@ message TaskAllocation {
   // Empty string when the task declares no volumes (the mount step is skipped
   // entirely).
   string task_volumes = 15;
+
+  // JSON-encoded task `resources` block, exactly as declared in the jobspec
+  // (`{"memory": 256, "cores": 1}`). Scheduler-side defaults are NOT folded
+  // in: this is what the job asked for, so a kind can tell "unset" from
+  // "explicitly requested" and leave its runtime's own defaults alone.
+  //
+  // Task kinds that isolate a workload use this to size it — the `container`
+  // kind maps `memory` (MiB) and `cores` onto the runtime's memory/CPU
+  // limits, since a guest that ignores the reservation the scheduler made on
+  // its behalf can overcommit the node. Kinds that run host processes
+  // (`exec`) ignore it; enforcement there needs cgroups/jobobjects.
+  //
+  // Empty string when the task declares no resources.
+  string task_resources = 16;
 }
 
 // Request payload for PostWork.
