@@ -62,6 +62,17 @@
             kind: "exec",
             group: "frontend",
             lifecycle: "service",
+            // Cross-group dependency: service and batch tasks may depend on
+            // tasks in any group. web is not planned until the prep group's
+            // batch task has succeeded. (A service may only take a
+            // complete/success condition on a batch task — services never
+            // complete.)
+            dependsOn: [
+                {
+                    task: "batch",
+                    condition: "success",
+                },
+            ],
             // Stable instance identity (see docs/stateful-workloads.md):
             // slot mode gives each replica an ordinal slot 0..count-1 whose
             // instance id and storage handle survive reschedules. The task
@@ -342,10 +353,15 @@
             kind: "exec",
             group: "frontend",
             lifecycle: "sidecar",
+            // Sidecars are group-bound: they run alongside their group's
+            // primary task, so they may only depend on tasks in their own
+            // group (a cross-group dependency here is rejected at
+            // validation — put it on the group's primary instead, as web
+            // does above).
             dependsOn: [
                 {
-                    task: "batch",
-                    condition: "success",
+                    task: "web",
+                    condition: "start",
                 },
             ],
             config: {
