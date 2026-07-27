@@ -70,6 +70,23 @@ Dependency conditions:
 
 Only ready tasks enter the current planning pass.
 
+Lifecycle rules, enforced at submit and by `legion job validate`:
+
+- Dependencies may cross groups for `service` and `batch` tasks (e.g. a
+  service in one group waiting on a batch prep task in another).
+- `sidecar` tasks are group-bound: they run alongside their group's primary
+  task, so they may only depend on tasks in their own group. Rejected as
+  `Sidecar task <x> depends on task <y> outside group <g>`. To gate the whole
+  group on another group's task, put the dependency on the group's primary
+  task instead. A sidecar also requires a non-sidecar primary task in its
+  group.
+- A `service` task cannot take a `complete` or `success` condition on
+  another service, because services never exit. Those conditions are only
+  satisfiable by `batch` targets.
+
+See `configs/jobs/maximal.jsonnet` and `configs/jobs/dag-exec-mac-sidecars.jsonnet`
+for validating examples of both the cross-group and sidecar shapes.
+
 ## Constraints, Permits, and Affinities
 
 ### Constraints

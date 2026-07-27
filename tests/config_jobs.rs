@@ -1,5 +1,9 @@
 use jsonnet::JsonnetVm;
+use legion::manager::rollout_strategy::validate_rollout_strategy_name;
+use legion::plugin_runtime::plugin_paths;
 use legion::structs::JobConfig;
+use legion::task_plugins::{validate_job_config, TaskPluginRegistry};
+use legion::util::plugin_root_dir;
 use serde_json::Value;
 
 #[derive(Default)]
@@ -89,6 +93,98 @@ fn config_jobs_parse() {
             path_str
         );
     }
+}
+
+/// Reports why `validate_job_config` cannot run for this config in the current
+/// environment: a task kind or rollout strategy that resolves to a dylib
+/// plugin shipped in `plugins/` but not built here (plugins only build with
+/// LEGION_BUILD_PLUGINS=1). Uses the same loaders production uses, so builtin
+/// kinds/strategies never trigger a skip, and a name with no plugin directory
+/// at all is a real validation failure rather than a skip.
+fn unbuilt_plugin_dependency(config: &JobConfig) -> Option<String> {
+    let plugin_root = plugin_root_dir();
+    let mut registry = TaskPluginRegistry::new();
+    for task in &config.tasks {
+        if registry.load_plugin(&task.kind, false).is_err()
+            && !plugin_paths("tasks", &task.kind, &plugin_root)
+                .dylib
+                .exists()
+        {
+            return Some(format!("task kind {} is not built", task.kind));
+        }
+    }
+
+    let strategies = config
+        .rollout
+        .iter()
+        .chain(config.rollout_by_group.values())
+        .filter_map(|rollout| rollout.strategy.as_deref());
+    for strategy in strategies {
+        if validate_rollout_strategy_name(strategy).is_err()
+            && !plugin_paths("rollouts", strategy, &plugin_root)
+                .dylib
+                .exists()
+        {
+            return Some(format!("rollout strategy {} is not built", strategy));
+        }
+    }
+    None
+}
+
+// Every shipped example must survive the full submit-time validation the
+// manager (and `legion job validate`) applies, not just parsing — this is
+// what catches an example drifting from the validator (e.g. a sidecar
+// declaring a cross-group dependency).
+#[test]
+fn config_jobs_pass_full_validation() {
+    let jobs_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("configs")
+        .join("jobs");
+
+    let mut failures = Vec::new();
+    for entry in std::fs::read_dir(&jobs_dir).expect("jobs dir should read") {
+        let entry = entry.expect("entry should read");
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("jsonnet") {
+            continue;
+        }
+
+        let path_str = path.to_string_lossy();
+        let rendered = render_job_spec(&path_str, &default_jsonnet_vars());
+        let config: JobConfig = serde_json::from_str(&rendered)
+            .unwrap_or_else(|e| panic!("failed to parse {}: {}", path_str, e));
+
+        if let Some(reason) = unbuilt_plugin_dependency(&config) {
+            eprintln!("skipping validation of {}: {}", path_str, reason);
+            continue;
+        }
+
+        if let Err(e) = validate_job_config(&config) {
+            failures.push(format!("{} failed full validation: {:#}", path_str, e));
+        }
+    }
+
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+// The canonical example must always validate end to end with builtin task
+// kinds only, so `legion job validate configs/jobs/maximal.jsonnet` works on
+// any checkout without built plugins. No skip gate on purpose: if maximal
+// ever grows a plugin-only surface, this failing is the prompt to decide
+// that deliberately.
+#[test]
+fn maximal_job_spec_passes_full_validation() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("configs")
+        .join("jobs")
+        .join("maximal.jsonnet");
+    let path_str = path.to_string_lossy();
+    let rendered = render_job_spec(&path_str, &default_jsonnet_vars());
+    let config: JobConfig = serde_json::from_str(&rendered)
+        .unwrap_or_else(|e| panic!("failed to parse {}: {}", path_str, e));
+
+    validate_job_config(&config)
+        .unwrap_or_else(|e| panic!("maximal.jsonnet failed full validation: {:#}", e));
 }
 
 #[test]
