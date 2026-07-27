@@ -194,6 +194,29 @@ Contract specifics — this category deliberately differs from the others:
 - `legion volume driver test <name>` runs the contract conformance suite against
   a driver — the same suite Legion's own tests use, no manager required.
 
+### Coexistence with CNI (the networking kind)
+
+"CNI-style" above describes the *architecture* (exec binaries, JSON over
+stdio, versioned manifest), not wire compatibility — and the two systems
+cannot collide on a host that runs both:
+
+- **Separate trees.** Legion discovers volume plugins only under its own
+  `plugins/volumes/<name>/` directories (each gated by a `plugin.json`).
+  CNI binaries live in `/opt/cni/bin` with configs in `/etc/cni/net.d`;
+  Legion never reads either, and CNI runtimes never read Legion's tree.
+- **Different ABI on purpose.** CNI passes the verb via the `CNI_COMMAND`
+  environment variable and network config on stdin; Legion passes the op as
+  `argv[1]` and a self-describing request on stdin. A binary cannot be
+  mistaken for the other kind by accident, and a CNI plugin dropped into
+  `plugins/volumes/` fails loudly at `capabilities` rather than half-working.
+- **Different version keys.** `legionVolumeApiVersion` in the manifest vs
+  CNI's `cniVersion` in network config — each contract evolves independently.
+- **Networking stays CNI's job.** When Legion grows a first-class `datapath`
+  plugin kind (planned; see the note under
+  [Planned Plugin Categories](#planned-plugin-categories-not-implemented-yet)),
+  the design is a *shim that drives real CNI plugins* with their own protocol —
+  reusing the ecosystem, not re-inventing it under the volume ABI.
+
 ## Build Behavior
 
 `build.rs` behavior:

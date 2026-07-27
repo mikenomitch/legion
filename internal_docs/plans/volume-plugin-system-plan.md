@@ -110,12 +110,12 @@ ranked by impact.
 | --- | --- | --- |
 | Four ops, not seven | `capabilities/create/attach/mount/unmount/detach/destroy` | 3 |
 | Drivers run only on workers | Manager "controller" ops + worker "node" ops | 1 |
-| `path` is kind-aware | "the mount target inside the task fs", uniformly | 5 |
-| Two declaration sites | Only `stateful.storage` | 6 |
+| `path` is kind-aware | "the mount target inside the task fs", uniformly | 7 |
+| Two declaration sites | Only `stateful.storage` | 8 |
 
 Two further shape decisions that the plan did not take a position on: one
-instance volume in v1 with a schema that takes N (entry 9), and lazy
-provisioning with no `create` operation (entry 11).
+instance volume in v1 with a schema that takes N (entry 14), and lazy
+provisioning with no `create` operation (entry 16).
 
 ## Proposed Design
 
@@ -321,8 +321,8 @@ this one. Three of its asks were genuinely blocking.
 | Change | Calls entry |
 | --- | --- |
 | `volume_mode: filesystem \| block` end to end, with a three-way admission check | 4 |
-| `clone` reserved in the contract | 14 |
-| `mount` may return a not-yet-populated device | 15 |
+| `clone` reserved in the contract | 19 |
+| `mount` may return a not-yet-populated device | 20 |
 
 Also landed: `volume_mode` and `fs` columns on the `volume` table (so a future
 restore/clone knows the shape without re-probing), `volumeModes` and `ops` on
@@ -368,6 +368,28 @@ The exec ABI, `plugin.json` discovery, two-phase destroy, orphan reconciliation,
 and the CSI bridge all survive contact with the sandbox work unchanged. Nothing
 hypervisor-specific entered the contract: `block` is generic, and everything
 about virtio, kernels, or memory snapshots stays in the task kind.
+
+## Revision 3: operational review (2026-07-27 feedback pass)
+
+A review pass against real-workload lifecycles, with each scenario written up as
+a walkthrough in `docs/volumes.md` ("Common workflows") and used to audit the
+interfaces. Changes, ranked reasoning in the calls file:
+
+| Change | Calls entry |
+| --- | --- |
+| `volume delete` refuses while a live workload mounts the volume, at manager *and* worker | 5 |
+| Driver calls moved off the worker's task-manager lock (a hung NFS op could cascade into self-fencing) | 6 |
+| Node-local volume `size` counts against fingerprinted node disk; `nfs`/`tmpfs` exempt | 10 |
+| Public vocabulary renamed `plugin:` → `driver:` (packaging keeps "plugin") | 11 |
+| `stateful.mode` defaults to `'slot'` | 12 |
+| CNI coexistence documented as structural (separate trees, deliberately different ABI) | 21 |
+
+Also landed, no contract impact: actions on the example jobs (`psql`/`sql`/
+`dump`, `cli`/`command`/`save`) plus a commented-out scheduled backup task in
+the Postgres spec, and an explicit NFS node-loss recovery walkthrough in the
+Postgres guide. The workflow audit found the interfaces sufficient for every
+scenario except data migration between drivers, which is deliberately manual
+(backup → delete → re-mint → restore) until `snapshot`/`restore` land.
 
 ## Open Questions (block mode)
 

@@ -3,9 +3,10 @@
 Companion to
 [`plans/volume-plugin-system-plan.md`](../plans/volume-plugin-system-plan.md).
 Decisions made while writing the plan and while implementing it, where the
-request was ambiguous or a real alternative existed. Entries 2 and 8 were
-recorded during the 2026-06-09 plan pass; the rest during the implementation
-pass that shipped v1.
+request was ambiguous or a real alternative existed. Entries 2 and 13 were
+recorded during the 2026-06-09 plan pass; entries 5, 6, 10, 11, 12, and 21
+during the 2026-07-27 feedback pass (revision 3); the rest during the
+implementation pass that shipped v1.
 
 Entries are ranked by project impact, highest first.
 
@@ -113,7 +114,52 @@ door on a whole class of workload. Kubernetes made the same split for the same
 reason, which is also the argument that it is generic rather than
 microVM-specific: nothing hypervisor-shaped entered the contract.
 
-## 5. `path` means different things per task kind, and the docs say so
+## 5. `volume delete` refuses while anything runs against the volume — at both layers
+
+**Call.** `DeleteVolume` returns `FailedPrecondition`, naming the instance or
+allocation that holds the volume, while any live workload mounts it — and
+`--force` does not override that check. Independently, a worker refuses a
+`destroy` request for a volume it currently has mounted. Deleting storage means
+first expressing intent about the *workload* (`legion job stop`,
+`legion instance stop/destroy`), then about the data.
+
+**Alternatives.** (a) Cascade: have delete stop the workload itself, K8s-PVC
+style, one command doing both. (b) Trust the operator: delete means delete,
+immediately, like `rm`.
+
+**Trade-off.** Reclaiming storage from a stuck-but-alive workload is two
+commands instead of one. Accepted — the second command is the one that stops a
+database.
+
+**Why (safety, defence in depth).** The command names a volume, not a workload;
+inferring "and kill whatever uses it" from a storage command is exactly the
+class of surprise an orchestrator should not spring. Two independent layers
+because the manager's view can be stale: even a `--force` issued against a
+wedged cluster cannot `rm -rf` a directory a live database is writing, because
+the worker holding the mount is the one asked to do it, and it declines.
+
+## 6. Driver calls never run under the worker's task-manager lock
+
+**Call.** `WorkerVolumeManager` is shared as an `Arc` with interior mutexes that
+are never held across a driver call, and heartbeat-dispatched destroys run on a
+blocking task *outside* the task-manager lock. Mount results and destroy
+confirmations travel through a report queue drained by the next heartbeat.
+
+**Alternative.** Run driver operations inline where they are triggered, under
+the task-manager lock — the first implementation, and the natural one.
+
+**Trade-off.** More architecture: a handle to clone, interior locking, a report
+queue, and an in-use set that must be pruned per request window. Accepted.
+
+**Why (a storage plugin must not be able to take down a node).** A driver is
+arbitrary third-party code, and `nfs` operations in particular can hang on a
+dead server for minutes. Held under the task-manager lock, that hang blocks
+heartbeats; blocked heartbeats look like a dead node; the manager confirms the
+loss and the worker self-fences — a wedged *volume op* escalating to the fencing
+machinery killing healthy tasks. The lock split caps the blast radius of a bad
+driver at the volume it was touching.
+
+## 7. `path` means different things per task kind, and the docs say so
 
 **Call.** For `container`, `path` is a real bind-mount destination and is
 required. For `exec` there is no filesystem view to mount into, so `path` is
@@ -142,7 +188,7 @@ namespace. Making `path` real there means Legion mutating `/var/lib/db` on the
 operator's machine because a jobspec asked — an unrequested, unscoped change to a
 host, needing privileges. An honest asymmetry beats a uniform surface that lies.
 
-## 6. Two declaration sites: `stateful.storage` and `task.volumes[]`
+## 8. Two declaration sites: `stateful.storage` and `task.volumes[]`
 
 **Call.** Per-instance storage stays on `stateful.storage` (one volume per
 replica, provisioned and reclaimed with the instance). Claims on storage that
@@ -164,7 +210,7 @@ is shared. K8s splits them (`volumeClaimTemplates` vs `volumes`) and Nomad split
 them, for this reason. The win is that a stateless inference job can mount
 `/mnt/models` read-only without pretending to be stateful.
 
-## 7. Reclaim is reconciled, not triggered
+## 9. Reclaim is reconciled, not triggered
 
 **Call.** A background loop marks any volume that no instance references as
 `destroying`. Nothing at the four handle-drop sites (keyed destroy, slot scale-in
@@ -184,7 +230,78 @@ invisible until a disk fills. With one reconciling rule — "no instance referen
 this" — there is no path to forget. The same rule also catches a volume orphaned
 by a crash between the handle drop and the mark.
 
-## 8. "CNI compatibility layer" in the request → CSI
+## 10. Node-local volume sizes count against node disk; remote ones don't
+
+**Call.** Placement subtracts the declared `size` of every **node-local** volume
+(`local-dir`, `host`, and any exec driver advertising `nodeLocal`) from the
+node's fingerprinted free disk, accumulating across allocations planned in the
+same eval. Network (`nfs`) and RAM-backed (`tmpfs`) volumes are exempt — their
+bytes are not on the node's disk. The failure names the fix:
+
+```
+no node has enough free disk for its node-local volume(s). Shrink the volume
+`size`, add disk, or use a network driver (nfs) whose capacity does not come
+from the node
+```
+
+**Alternatives.** (a) Treat `size` as purely advisory and let mounts fail (or
+disks fill) at runtime. (b) Go further and enforce `size` as a runtime quota via
+filesystem projects/loop devices.
+
+**Trade-off.** `size` is a placement claim, not a quota — a task can still write
+past it, and a volume that declares no size is not counted. Both stated in
+`docs/volumes.md` rather than implied.
+
+**Why.** A 100G `nfs` volume on a node with a 1G root disk is *fine* and must
+not be blocked; a 100G `local-dir` on a 10G disk is a guaranteed later failure
+that placement had the information to prevent. Failing at eval with a named
+reason beats failing at mount at 3am. Quotas are a driver feature to grow into
+(`expand` is already reserved), not a scheduler feature to fake.
+
+## 11. The config word is `driver`; "plugin" is only the packaging
+
+**Call.** Everything a user selects or sees says **driver**: `storage: { driver:
+'nfs' }`, `legion volume drivers`, `legion volume driver test`, the `DRIVER`
+column, `VolumeInfo.driver`, fingerprints' `volumeDrivers`. "Plugin" survives
+only where it names delivery: `plugins/volumes/<name>/`, `plugin.json`, and the
+plugin-system doc. The rename landed pre-release with `deny_unknown_fields`, so
+a stale `plugin:` key fails loudly at submit instead of being ignored.
+
+**Alternatives.** (a) Keep "plugin" everywhere, matching the rest of Legion's
+plugin system. (b) K8s vocabulary: `storageClass`/`provisioner`.
+
+**Trade-off.** Two words for one subsystem, needing exactly one sentence of
+definition ("a driver is what serves volumes; a plugin is how a driver is
+delivered") — and a breaking rename, taken now precisely because nothing public
+has shipped.
+
+**Why.** `plugin: 'nfs'` in a jobspec collided head-on with task-kind plugins
+(`kind: 'container'` *is* a plugin) and read as "which code do I load" rather
+than "which system serves my bytes". Docker and Nomad both call this exact
+concept a volume driver, so the word arrives pre-taught. The built-ins also
+aren't plugins in any packaging sense — calling them drivers is simply accurate.
+
+## 12. `stateful.mode` defaults to `'slot'`
+
+**Call.** `mode` became optional, defaulting to `slot`, so the minimal stateful
+block is `stateful: { storage: { path: ... } }`. Keyed stays an explicit opt-in.
+
+**Alternative.** Keep `mode` required — the original shape, on the theory that
+identity semantics are too important to default.
+
+**Trade-off.** A default can be learned by omission: someone may run slot
+workloads for months without knowing the word. Accepted; the docs spell the
+default everywhere the field appears.
+
+**Why.** Slot is the right answer for essentially every database-shaped
+workload — K8s made the same shape *the* StatefulSet, not an option of it.
+Keyed mode is the specialised one (you know when you need per-key instances),
+and specialised modes are the ones that should cost a line of config. The
+zero-decision path producing the safe, ordinary thing is the design goal of the
+whole defaults story (`local-dir`, `filesystem`, retain-on-scale-in — and now
+`slot`).
+
+## 13. "CNI compatibility layer" in the request → CSI
 
 The request asked for a volume plugin system "similar to CNI or Nomad's volume
 plugins" with "a CNI compatibility layer (optional)". CNI is the *networking*
@@ -199,7 +316,7 @@ two separate things and did both:
 Alternative considered: literally bridging to CNI plugins — rejected as a
 category error (CNI plugins configure network interfaces, not storage).
 
-## 9. One instance volume in v1, with a schema that takes N
+## 14. One instance volume in v1, with a schema that takes N
 
 **Call.** `stateful.storage` is a single object, not a list. The `volume` table
 is nonetheless keyed by `(instance, name)`, so `stateful.volumes: [...]` is purely
@@ -215,7 +332,7 @@ the retention knobs, and the CLI is real work with no current consumer.
 **Why (simplicity).** 95% of stateful workloads want exactly one data volume, and
 the singular form reads better for all of them.
 
-## 10. Task volume claims are shared per `(job, group, task, name)`
+## 15. Task volume claims are shared per `(job, group, task, name)`
 
 **Call.** A `volumes[]` claim gets a deterministic id derived from those four
 values, so every allocation of the task mounts the same volume, and a resubmit
@@ -233,7 +350,7 @@ already exists and is already cleaned up on stop.
 the point of it: ten replicas mounting one read-only models directory is the
 dominant case.
 
-## 11. Provisioning is lazy: the first `mount` creates the storage
+## 16. Provisioning is lazy: the first `mount` creates the storage
 
 **Call.** There is no `create` operation in v1. A volume row is born `pending` and
 becomes `created` the first time a worker mounts it.
@@ -249,7 +366,7 @@ created-but-never-mounted state that can leak an external resource.
 create a directory before it knows the node, and `host` has nothing to create.
 Removing the operation removes a failure mode rather than deferring one.
 
-## 12. A node advertising no volume plugins is assumed to have the built-ins
+## 17. A node advertising no volume plugins is assumed to have the built-ins
 
 **Call.** A node whose fingerprint carries no `volumeDrivers` key at all is
 treated as providing `local-dir`, `host`, `nfs`, and `tmpfs`. Nodes that *do*
@@ -268,7 +385,7 @@ job until the last worker in a cluster was upgraded. The built-ins ship inside
 the binary, so assuming them is not merely convenient — it is true of any worker
 running Legion at all.
 
-## 13. A successful mount may correct a stale `destroyed` tombstone, never a `destroying` one
+## 18. A successful mount may correct a stale `destroyed` tombstone, never a `destroying` one
 
 **Call.** `record_volume_mounted` accepts any state except `destroying`. A worker
 reporting a successful mount for a tombstoned volume resurrects the row.
@@ -289,7 +406,7 @@ the reaper — found in live testing, not review. A mount is proof the storage
 exists; `destroying` is excluded because a reclaim is deliberately in flight and
 resurrecting the row would race the driver.
 
-## 14. `clone` is reserved now and implemented later
+## 19. `clone` is reserved now and implemented later
 
 **Call.** `clone` — "make a new volume that starts as a copy-on-write copy of
 this one" — is named in the contract and reserved in `capabilities.ops` alongside
@@ -304,7 +421,7 @@ building the semantics without a consumer to test against means guessing at the
 wrong shape — particularly around cross-node fan-out, where a node-local clone
 can only ever produce forks pinned to the origin node.
 
-## 15. A driver may return a device that is not yet fully populated
+## 20. A driver may return a device that is not yet fully populated
 
 **Call.** `mount` is explicitly allowed to hand back a device backed by lazy
 fetch — an NBD/FUSE device over a content-addressed base, a qcow2 backing chain,
@@ -318,3 +435,21 @@ now stated rather than left to be discovered.
 **Why (extensibility).** Fast-start disks need no new contract surface *if*
 plugin authors know they may rely on this. An unstated property is one nobody
 builds against.
+
+## 21. Coexistence with real CNI is structural, not configured
+
+**Call.** Nothing was changed to "support" hosts that also run CNI networking
+plugins, because the isolation is already structural, and
+`docs/plugin-system.md` now says so: Legion discovers volume plugins only under
+its own `plugins/volumes/` tree (never `/opt/cni/bin` or `/etc/cni/net.d`), and
+the ABIs differ on purpose — op as `argv[1]` + self-describing JSON vs CNI's
+`CNI_COMMAND` env var — so neither kind of binary can be half-run as the other.
+
+**Alternative.** Make the volume exec ABI literally CNI-wire-compatible so
+existing plugin tooling could be reused.
+
+**Why rejected.** Category error (see entry 13): CNI binaries configure network
+interfaces, and wire-compat would *invite* dropping them into the volume path,
+converting a loud `capabilities` failure into subtle half-operation. Reusing the
+actual CNI ecosystem is the planned `datapath` plugin kind's job — a shim that
+speaks real CNI to real CNI plugins.

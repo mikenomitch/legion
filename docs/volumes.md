@@ -402,6 +402,173 @@ task db stateful.storage: volume driver `nfs` requires params: export
 `legion volume drivers` shows a `NODES` column as *usable/installed* — a gap
 between the two is exactly the thing to investigate.
 
+## Common workflows
+
+The scenarios below are the design's test suite in prose: each is a real
+storage topology, and each should be achievable in a few lines of spec plus at
+most one CLI command. Where a workflow needs an honest caveat, it is written
+next to the workflow rather than hidden in a limitations section.
+
+### A database with zero storage decisions
+
+```jsonnet
+stateful: { storage: { path: '/var/lib/postgresql/data' } },
+```
+
+Every field has a default: `mode: 'slot'`, `driver: 'local-dir'`,
+`volume_mode: 'filesystem'`, retention on. One replica, one volume, data
+survives restarts and reschedules to the same node. This is the dev-cluster
+and single-node-production shape; the [Postgres guide](guides/postgres.md)
+builds on it.
+
+### Remote volume: lose the node, replace the instance, reattach
+
+```jsonnet
+stateful: {
+  storage: { path: '/data', driver: 'nfs',
+             params: { server: '10.0.0.5', export: '/exports/pg' } },
+  onLost: { selfTerminateAfter: '90s', replaceAfter: '3m' },
+},
+```
+
+The node dies → the partitioned worker self-fences at 90s → the manager frees
+the allocation at 3m → the scheduler places a replacement on **any** node
+advertising `nfs` (no pin — the volume is not node-local) → `mount` reattaches
+the same export subdirectory, because the volume row carries the params and the
+subdir defaults to the volume id. No operator action; total downtime ≈
+`replaceAfter` + application recovery. Step-by-step narration:
+[the Postgres guide](guides/postgres.md#what-node-loss-looks-like-on-nfs-step-by-step).
+
+Prefer a human in the loop? `replaceAfter: 'never'` parks the instance until
+someone runs `legion instance replace <id>`. Same reattach, manual trigger.
+
+### Node-local volume: lose the node, wait for it
+
+With `local-dir` the bytes are on the node, so the same failure pins the
+replacement instead of moving it — see
+[When a replica will not place](#when-a-replica-will-not-place). This is a
+feature: silently starting a database on an empty disk *looks* like recovery
+and is actually data loss. You choose per job, at submit time, which failure
+mode you want: `nfs` moves freely, `local-dir` waits or is explicitly
+abandoned.
+
+### Abandon a dead node and restore from backup
+
+```bash
+legion volume delete <id> --force   # tombstone the stranded volume
+# the instance mints a fresh, empty volume and places on a healthy node
+legion action run postgres sql -p query="$(cat backup.sql)"   # or psql < backup.sql
+```
+
+`--force` is the "the node is never coming back" affirmation. The two guard
+rails still hold: the manager refuses while a live allocation mounts the
+volume, and a worker never destroys storage under a live mount.
+
+### Fast local disk (NVMe) the operator provisioned
+
+Worker config names the disks; the job claims one by name:
+
+```jsonc
+// worker config
+"hostVolumes": { "nvme0": { "path": "/mnt/nvme0" } }
+```
+
+```jsonnet
+stateful: { storage: { path: '/data', driver: 'host', params: { name: 'nvme0' } } },
+```
+
+`host` is node-local, so this pins like `local-dir` — the right behavior for
+hardware you chose deliberately. A `device` entry instead of `path` serves the
+same disk as a raw block device.
+
+### Shared read-only model / artifact cache
+
+```jsonnet
+volumes: [{ name: 'models', driver: 'nfs', path: '/models', read_only: true,
+            params: { server: '10.0.0.5', export: '/exports/models' } }],
+```
+
+A `volumes` claim (not `stateful.storage`) is shared per task: every replica on
+every node mounts the same export, read-only, with no instance identity and no
+pin. Scale the fleet freely; the cache is just there. With `driver: 'host'`
+this becomes "every node has the dataset pre-synced at a named path."
+
+### Scratch space
+
+```jsonnet
+volumes: [{ name: 'scratch', driver: 'tmpfs', path: '/scratch',
+            params: { size: '1G' } }],
+```
+
+`tmpfs` is RAM-backed, wiped on unmount, Linux-only, and refuses to back
+`stateful.storage` (it advertises itself as ephemeral; admission enforces it).
+For private per-allocation scratch, `$LEGION_TASK_DIR` needs no declaration at
+all.
+
+### A sandbox (or tenant) per key, with pause and resume
+
+```jsonnet
+stateful: { mode: 'keyed', storage: { path: '/home/user' } },
+```
+
+```bash
+legion instance create sandbox --id user-42     # mint the key + its volume
+legion instance stop  sandbox-user-42           # pause: allocation stops, volume retained
+legion instance start sandbox-user-42           # resume: same key, same volume, any valid node
+legion instance destroy sandbox-user-42         # tombstone the key; reaper reclaims the volume
+```
+
+Stop/start is suspend/resume for stateful sandboxes: the storage handle stays
+with the id while nothing runs. Destroy drops the handle, and reclaim is
+reconciled — the reaper marks the orphaned volume `destroying` and the owning
+worker's driver confirms.
+
+### Ordered rollout of a quorum system
+
+```jsonnet
+rollout: { slots: { order: 'sequential' } },
+```
+
+Updates replace **allocations**, never instances, so slot N's replacement
+re-mounts slot N's existing volume — a rollout cannot touch data. `sequential`
+updates one slot at a time, highest ordinal first, each step health-gated
+(the StatefulSet `OrderedReady` analog). For a staged canary, add
+`updateFrom: 2`: slots ≥ 2 get the new config, slots 0–1 keep running the old
+one until you lower the floor.
+
+### Scale in without losing data, scale back out and reattach
+
+```bash
+# count: 3 → 1: slots 1 and 2 stop; their volumes stay `created` (retention
+# defaults to retain). count: 1 → 3 later: the same volumes reattach.
+legion volume list --job db   # the retained rows are visible the whole time
+```
+
+Set `retainOnScaleIn: false` to trade reattach-on-scale-out for automatic
+reclaim. Either way the behavior is declared in the spec, not decided in an
+incident.
+
+### Changing the driver of a live job
+
+Resubmitting with a different `driver` affects only volumes minted **after**
+the change (scale-out, new keys, post-`--force` re-mints). Existing instances
+keep their existing volume — driver, params, and data — because the storage
+handle records the driver it was created with. Nothing migrates bytes behind
+your back. To actually move data: back up, `legion volume delete` the old
+volume (workload stopped), let the instance mint under the new driver, restore.
+
+### A block device for a VM or sandbox runtime
+
+```jsonnet
+stateful: { storage: { driver: 'local-dir', mode: 'block',
+                       params: { size: '10G', fs: 'ext4' } } },
+```
+
+The driver creates and formats a disk image and hands the task a device path
+instead of a mount path — the shape microVM runtimes want to attach as a
+virtio disk. Filesystem tasks and block volumes are cross-checked at admission
+(a plain container asking for `mode: 'block'` is rejected with the reason).
+
 ## Writing a volume driver
 
 A volume driver is any executable that reads a JSON request on stdin and writes
