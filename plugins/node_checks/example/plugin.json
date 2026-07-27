@@ -1,5 +1,5 @@
 {
   "kind": "node_checks",
   "name": "example",
-  "legionApiVersion": 1
+  "legionApiVersion": 2
 }

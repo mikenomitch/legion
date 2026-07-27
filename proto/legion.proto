@@ -1620,7 +1620,7 @@ message VolumeInfo {
 
   // How the volume is handed to its consumer: `filesystem` (a host directory
   // the task reads directly) or `block` (a raw device or disk image the task
-  // attaches — what a microVM kind needs). The same split Kubernetes makes
+  // attaches — what a microVM runtime needs). The same split Kubernetes makes
   // with `volumeMode`, for the same reason. See docs/volumes.md.
   string volume_mode = 17;
 
@@ -1745,7 +1745,7 @@ message VolumeDriverInfo {
   repeated string optional_params = 6;
 
   // Volume modes this driver can serve (`filesystem`, `block`). Admission
-  // intersects this with the task kind's supported modes and the job's
+  // intersects this with the task runtime's supported modes and the job's
   // requested mode, so a mismatch is a submit-time error rather than a task
   // that starts and immediately fails.
   repeated string volume_modes = 10;
@@ -3584,13 +3584,13 @@ message TaskAllocation {
 
   // JSON-encoded task `resources` block, exactly as declared in the jobspec
   // (`{"memory": 256, "cores": 1}`). Scheduler-side defaults are NOT folded
-  // in: this is what the job asked for, so a kind can tell "unset" from
-  // "explicitly requested" and leave its runtime's own defaults alone.
+  // in: this is what the job asked for, so a runtime can tell "unset" from
+  // "explicitly requested" and leave its own defaults alone.
   //
-  // Task kinds that isolate a workload use this to size it — the `container`
-  // kind maps `memory` (MiB) and `cores` onto the runtime's memory/CPU
+  // Task runtimes that isolate a workload use this to size it — the `container`
+  // runtime maps `memory` (MiB) and `cores` onto the sandbox's memory/CPU
   // limits, since a guest that ignores the reservation the scheduler made on
-  // its behalf can overcommit the node. Kinds that run host processes
+  // its behalf can overcommit the node. Runtimes that run host processes
   // (`exec`) ignore it; enforcement there needs cgroups/jobobjects.
   //
   // Empty string when the task declares no resources.

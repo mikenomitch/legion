@@ -1,6 +1,6 @@
 // Long-running container service on macOS (Apple `container` runtime).
 //
-// Exercises the parts of the container kind that a batch task does not:
+// Exercises the parts of the container runtime that a batch task does not:
 // dynamic port publishing, health checks against the published port, service
 // discovery, exec, and declared actions.
 //
@@ -23,7 +23,7 @@
   name: 'mac-container-service',
   task: {
     name: 'web',
-    kind: 'container',
+    runtime: 'container',
     lifecycle: 'service',
     config: {
       image: 'nginx:alpine',

@@ -15,7 +15,7 @@
     {
       // --- Durable: an AOF-backed Redis whose data survives everything. ---
       name: 'store',
-      kind: 'exec',
+      runtime: 'exec',
       count: 1,
       group: 'store',
 
@@ -59,7 +59,7 @@
         timeout: '3s',
       }],
 
-      // Day-2 operations. Exec-kind actions run as sibling host processes with
+      // Day-2 operations. Exec-runtime actions run as sibling host processes with
       // the task's env, so $LEGION_PORT_REDIS resolves inside the shell:
       //   legion action run redis cli --tty
       //   legion action run redis command -p cmd='INFO keyspace'
@@ -95,7 +95,7 @@
     {
       // --- Cache: no persistence, no pin, no volume lifecycle. ---
       name: 'cache',
-      kind: 'exec',
+      runtime: 'exec',
       count: 2,
       group: 'cache',
 

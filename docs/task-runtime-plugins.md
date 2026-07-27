@@ -57,7 +57,7 @@ Per-task state container, passed `&mut` to every hook:
   - optional PID
   - allocation and task directories, injected env, staged artifacts, log dir
 
-`TaskInstance` was previously named `TaskRuntime`. It was renamed when the task
+`TaskInstance` was previously named `TaskInstance`. It was renamed when the task
 axis took the word `runtime`, so that a hook signature no longer has two
 different "runtimes" in it. Out-of-tree plugins must rename the type at their
 call sites; the fields and semantics are unchanged.

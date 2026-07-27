@@ -107,7 +107,7 @@
                     // How the task consumes it: "filesystem" (a directory —
                     // the default, and what exec/container want) or "block" (a
                     // raw device or disk image a microVM attaches). Admission
-                    // rejects a mode the task kind or the plugin cannot serve.
+                    // rejects a mode the task runtime or the plugin cannot serve.
                     mode: "filesystem",
                     // Passed to the driver verbatim; it declares which are
                     // required (`legion volume drivers` lists them).
@@ -440,7 +440,7 @@
                 },
             },
             resources: {
-                // The container kind applies these to the runtime, not just to
+                // The container runtime applies these to the sandbox, not just to
                 // scheduling: memory (MiB) and cores size the guest. `cpu`/`cpus`
                 // (MHz) has no runtime analogue, so declare cores here.
                 cores: 1,

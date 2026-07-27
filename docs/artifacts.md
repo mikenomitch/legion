@@ -539,7 +539,7 @@ the same dylib pattern as task-runtime plugins (see
 
 ```
 plugins/artifacts/<scheme>/
-  plugin.json                              # {"kind":"artifacts","name":"<scheme>","legionApiVersion":1}
+  plugin.json                              # {"kind":"artifacts","name":"<scheme>","legionApiVersion":2}
   Cargo.toml                               # cdylib depending on the legion crate
   src/lib.rs                               # exports get()
 ```

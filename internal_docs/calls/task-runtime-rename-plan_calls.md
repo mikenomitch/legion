@@ -144,7 +144,41 @@ different layers, and "volume driver" is the industry term (Docker, CSI) the way
 gains. Worth revisiting only if a third pluggable axis makes the split look
 arbitrary.
 
-## 5. Only the task-execution axis is renamed; the other five `kind`s stay
+## 5. `PLUGIN_API_VERSION` is bumped to 2, for every plugin category at once
+
+**Call.** The shared plugin API version goes 1 → 2, and all five in-tree
+`plugin.json` manifests move with it.
+
+```json
+{ "kind": "tasks", "name": "noop", "legionApiVersion": 2 }
+```
+
+**Alternatives.** (a) Leave it at 1 — the manifest check is about the *loader*
+contract, and arguably a struct rename is a source break the compiler already
+catches. (b) Give task plugins their own version so an artifact or scheduling
+plugin is not invalidated by a change that cannot affect it.
+
+**Trade-off.** Every out-of-tree plugin must rebuild, including artifact,
+scheduling, node-check and rollout plugins that this rename never touched. That
+is a real and slightly unfair cost imposed on plugin authors.
+
+**Why (correctness over convenience).** This was found the hard way: a `noop`
+dylib built an hour earlier, against the pre-merge `TaskInstance`, loaded
+cleanly — its manifest still said `1`, which still matched — and then took the
+test process down with `SIGBUS`. The version guard exists precisely to prevent
+that, and it silently failed to, because `main`'s volume work had added a field
+to `TaskInstance` without bumping it and this rename changed the struct again.
+A layout mismatch across a `dylib` boundary is undefined behavior, so the
+failure mode is memory corruption rather than the clean "plugin too old" error
+the manifest check promises. Leaving the version at 1 would mean this PR's
+documented plugin break (calls §3) reaches users as a crash. The per-category
+split was rejected because every plugin links the whole `legion` crate and
+passes Rust types across the boundary — the categories do not actually have
+independent ABIs, so splitting the number would encode a guarantee that is not
+true. Documented in the plugin-system doc with a version-history table, so the
+next layout change has an obvious place to register itself.
+
+## 6. Only the task-execution axis is renamed; the other five `kind`s stay
 
 **Call.** `TaskCheckKind`, `SchedulerEvent.kind`, `Eval.kind`,
 `AuthMethod.kind`, `PluginManifest.kind`, and the state-inspector object kind
@@ -173,7 +207,7 @@ churn the scheduler, event stream, and auth surfaces for no gain, and would make
 different token. The request was read as "rename the thing we were discussing,
 everywhere it appears", not "purge the token `kind`".
 
-## 6. One phase, not a staged migration
+## 7. One phase, not a staged migration
 
 **Call.** The rename lands as a single change across proto, structs, storage,
 plugin API, configs, tests, UI, and docs.

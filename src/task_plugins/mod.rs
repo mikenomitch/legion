@@ -1347,7 +1347,7 @@ mod tests {
     }
 
     #[test]
-    fn noop_kind_rejects_artifacts_when_plugin_available() {
+    fn noop_runtime_rejects_artifacts_when_plugin_available() {
         // The noop plugin is a dylib; gate the assertion on its presence like
         // the other noop tests.
         if std::env::var("LEGION_SKIP_PLUGIN_BUILD").is_ok() {
