@@ -162,7 +162,7 @@ fn task_allocation(
         node_id: "node-1".into(),
         task_config_id: 1,
         task_name: "tool-task".into(),
-        task_kind: "exec".into(),
+        task_runtime: "exec".into(),
         task_config: config.to_string(),
         task_checks: String::new(),
         task_on_unhealthy: String::new(),
@@ -347,7 +347,7 @@ fn artifact_states_flow_through_store_to_rollout_status() -> R<()> {
         "name": "artifact-status-job",
         "tasks": [{
             "name": "tool",
-            "kind": "exec",
+            "runtime": "exec",
             "artifacts": ["https://releases.example.com/tool-v1.tar.gz"],
             "config": {"command": ["./tool"]},
         }],
@@ -446,7 +446,7 @@ async fn admission_normalizes_artifacts_and_preserves_plain_jobs() -> R<()> {
         "tasks": [
             {
                 "name": "with-artifacts",
-                "kind": "exec",
+                "runtime": "exec",
                 "artifacts": [
                     {"source": "https://private.example.com/build.tar.gz", "name": "build"},
                     {"source": "https://public.example.com/tool.tar.gz", "name": "tool",
@@ -456,7 +456,7 @@ async fn admission_normalizes_artifacts_and_preserves_plain_jobs() -> R<()> {
             },
             {
                 "name": "plain",
-                "kind": "exec",
+                "runtime": "exec",
                 "config": {"command": ["true"]},
             },
         ],
@@ -528,7 +528,7 @@ async fn plain_http_artifact_rejected_at_admission_by_default() -> R<()> {
         "name": "http-artifact-job",
         "tasks": [{
             "name": "tool",
-            "kind": "exec",
+            "runtime": "exec",
             "artifacts": ["http://insecure.example.com/tool.tar.gz"],
             "config": {"command": ["true"]},
         }],
@@ -585,7 +585,7 @@ async fn git_ref_pins_to_commit_sha_at_submit() -> R<()> {
         "name": "git-pin-job",
         "tasks": [{
             "name": "repo",
-            "kind": "exec",
+            "runtime": "exec",
             "artifacts": [{"source": source.clone(), "name": "repo"}],
             "config": {"command": ["true"]},
         }],
@@ -636,7 +636,7 @@ async fn git_ref_pins_to_commit_sha_at_submit() -> R<()> {
         "name": "git-pin-job",
         "tasks": [{
             "name": "repo",
-            "kind": "exec",
+            "runtime": "exec",
             "artifacts": [{"source": source, "name": "repo"}],
             "config": {"command": ["true"]},
         }],
@@ -666,7 +666,7 @@ async fn resolve_always_passes_reference_through() -> R<()> {
         "name": "resolve-always-job",
         "tasks": [{
             "name": "repo",
-            "kind": "exec",
+            "runtime": "exec",
             "artifacts": [{
                 "source": "git::https://example.invalid/repo?ref=main",
                 "resolve": "always",

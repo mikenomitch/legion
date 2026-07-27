@@ -8,7 +8,7 @@
 // "batch" stages complete quickly to unblock their successors.
 local service(name, group, deps=[]) = {
   name: name,
-  kind: 'exec',
+  runtime: 'exec',
   lifecycle: 'service',
   group: group,
   dependsOn: deps,
@@ -18,7 +18,7 @@ local service(name, group, deps=[]) = {
 
 local batch(name, group, seconds, deps=[]) = {
   name: name,
-  kind: 'exec',
+  runtime: 'exec',
   lifecycle: 'batch',
   group: group,
   dependsOn: deps,
@@ -28,7 +28,7 @@ local batch(name, group, seconds, deps=[]) = {
 
 local sidecar(name, group, deps=[]) = {
   name: name,
-  kind: 'exec',
+  runtime: 'exec',
   lifecycle: 'sidecar',
   group: group,
   dependsOn: deps,

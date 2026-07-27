@@ -1,6 +1,6 @@
 import { A } from '@solidjs/router'
 import { For, Show, createMemo, createSignal, onCleanup, onMount } from 'solid-js'
-import type { JobTask, TaskRuntimeSummary } from '../utils/jobspec'
+import type { JobTask, TaskInstanceSummary } from '../utils/jobspec'
 import { taskStatusTone } from '../utils/jobspec'
 
 // ── Layout constants ────────────────────────────────────────────────
@@ -31,7 +31,7 @@ type DockLink = { parent: string; child: string; x1: number; y1: number; x2: num
 type DagVisualizationProps = {
   tasks: JobTask[]
   layers: string[][]
-  taskRuntime: Map<string, TaskRuntimeSummary>
+  taskInstances: Map<string, TaskInstanceSummary>
   statusLoading?: boolean
   jobName: string
 }
@@ -190,7 +190,7 @@ export default function DagVisualization(props: DagVisualizationProps) {
   const hasSidecars = createMemo(() => dockedSidecars().size > 0)
 
   const statusFor = (taskName: string): { status: string; tone: Tone } => {
-    const runtime = props.taskRuntime.get(taskName)
+    const runtime = props.taskInstances.get(taskName)
     const fallback = props.statusLoading ? 'loading…' : 'not allocated'
     const status = runtime?.statuses[0] ?? fallback
     return { status, tone: taskStatusTone(status) }
@@ -478,7 +478,7 @@ export default function DagVisualization(props: DagVisualizationProps) {
                         <span class="truncate text-[13px] font-semibold text-ink">{pos.task.name}</span>
                       </div>
                       <div class="flex items-center gap-1.5 text-[10px] text-muted min-w-0">
-                        <span class="shrink-0 rounded bg-surface2 px-1.5 py-0.5 font-medium">{pos.task.kind}</span>
+                        <span class="shrink-0 rounded bg-surface2 px-1.5 py-0.5 font-medium">{pos.task.runtime}</span>
                         <span class="inline-flex shrink-0 items-center gap-0.5" title={`${pos.task.lifecycle} lifecycle`}>{lifecycleGlyph(pos.task.lifecycle)} {pos.task.lifecycle}</span>
                         <span class="ml-auto inline-flex shrink-0 items-center gap-1 truncate font-medium" style={{ color: groupColor() }} title={`group: ${pos.task.group}`}>
                           <span class="h-1.5 w-1.5 rounded-full" style={{ 'background-color': groupColor() }} />

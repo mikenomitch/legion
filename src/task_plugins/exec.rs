@@ -2,7 +2,7 @@ use crate::prelude::*;
 use crate::structs::{Allocation, TaskConfig};
 use crate::task_plugins::{
     configure_task_log_capture, derived_schema, spawn_pipe, spawn_pty, spawn_task_process,
-    ExecOptions, ExecSession, ExecSupport, TaskPlugin, TaskRuntime,
+    ExecOptions, ExecSession, ExecSupport, TaskInstance, TaskPlugin,
 };
 #[cfg(target_os = "linux")]
 use landlock::{AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr, ABI};
@@ -263,16 +263,16 @@ impl TaskPlugin for ExecTaskPlugin {
         &self,
         allocation: &Allocation,
         task: &TaskConfig,
-        runtime: &mut TaskRuntime,
+        instance: &mut TaskInstance,
         mut opts: ExecOptions,
     ) -> R<Box<dyn ExecSession>> {
         // Run the exec command in the same *context* the task got: its env
         // (worker-injected first, then task env), and its working directory.
         // It is a sibling host process — the running task has no namespace to
-        // join — which is the honest semantic for the `exec` kind.
+        // join — which is the honest semantic for the `exec` runtime.
         let config = self.parse_config(&task.config)?;
 
-        let mut env = runtime.extra_env.clone();
+        let mut env = instance.extra_env.clone();
         for (k, v) in &config.env {
             env.insert(k.clone(), v.clone());
         }
@@ -287,7 +287,7 @@ impl TaskPlugin for ExecTaskPlugin {
                 .cwd
                 .as_deref()
                 .map(std::path::PathBuf::from)
-                .or_else(|| runtime.task_dir.clone());
+                .or_else(|| instance.task_dir.clone());
         }
 
         info!(
@@ -308,7 +308,7 @@ impl TaskPlugin for ExecTaskPlugin {
         &self,
         allocation: &Allocation,
         task: &TaskConfig,
-        _runtime: &mut TaskRuntime,
+        _instance: &mut TaskInstance,
     ) -> R<()> {
         info!(
             allocation_id = allocation.id,
@@ -322,7 +322,7 @@ impl TaskPlugin for ExecTaskPlugin {
         &self,
         allocation: &Allocation,
         task: &TaskConfig,
-        runtime: &mut TaskRuntime,
+        instance: &mut TaskInstance,
     ) -> R<()> {
         let config = self.parse_config(&task.config)?;
         let (program, args) = config
@@ -334,7 +334,7 @@ impl TaskPlugin for ExecTaskPlugin {
         // Artifacts stage into the task directory; a landlocked task must be
         // able to read them, so the task dir rides along automatically.
         if let (Some(landlock), Some(task_dir)) =
-            (linux_options.landlock.as_mut(), runtime.task_dir.as_ref())
+            (linux_options.landlock.as_mut(), instance.task_dir.as_ref())
         {
             landlock
                 .read_write_paths
@@ -369,7 +369,7 @@ impl TaskPlugin for ExecTaskPlugin {
                 cmd.current_dir(cwd);
             }
             None => {
-                if let Some(task_dir) = runtime.task_dir.as_ref() {
+                if let Some(task_dir) = instance.task_dir.as_ref() {
                     cmd.current_dir(task_dir);
                 }
             }
@@ -383,7 +383,7 @@ impl TaskPlugin for ExecTaskPlugin {
             // allocation's tree to the task user, or the dropped-privilege
             // process could not enter its own cwd or read staged artifacts —
             // while every other allocation stays unreachable to it.
-            if let Some(alloc_dir) = runtime.alloc_dir.as_ref() {
+            if let Some(alloc_dir) = instance.alloc_dir.as_ref() {
                 chown_tree(alloc_dir, user.uid, user.gid).with_context(|| {
                     format!(
                         "failed to hand allocation dir {} to exec task user",
@@ -397,15 +397,15 @@ impl TaskPlugin for ExecTaskPlugin {
         // worker-injected LEGION_TASK_DIR/LEGION_ARTIFACT_*), so explicit
         // task env can override on collision.
         cmd.envs(crate::task_plugins::allocation_env(allocation, task));
-        if !runtime.extra_env.is_empty() {
-            cmd.envs(&runtime.extra_env);
+        if !instance.extra_env.is_empty() {
+            cmd.envs(&instance.extra_env);
         }
         if !config.env.is_empty() {
             cmd.envs(&config.env);
         }
 
         configure_linux_process_options(&mut cmd, &linux_options, &allocation.id, &task.name)?;
-        configure_task_log_capture(&mut cmd, runtime)?;
+        configure_task_log_capture(&mut cmd, instance)?;
 
         let child = spawn_task_process(&mut cmd).with_context(|| {
             format!(
@@ -413,13 +413,18 @@ impl TaskPlugin for ExecTaskPlugin {
                 task.name, allocation.id
             )
         })?;
-        runtime.pid = Some(child.id());
-        runtime.child = Some(child);
+        instance.pid = Some(child.id());
+        instance.child = Some(child);
         Ok(())
     }
 
-    fn stop(&self, allocation: &Allocation, task: &TaskConfig, runtime: &mut TaskRuntime) -> R<()> {
-        if let Some(mut child) = runtime.child.take() {
+    fn stop(
+        &self,
+        allocation: &Allocation,
+        task: &TaskConfig,
+        instance: &mut TaskInstance,
+    ) -> R<()> {
+        if let Some(mut child) = instance.child.take() {
             info!(
                 allocation_id = allocation.id,
                 task_name = %task.name,
@@ -427,8 +432,8 @@ impl TaskPlugin for ExecTaskPlugin {
             );
             let _ = child.kill();
             let _ = child.wait();
-            runtime.pid = None;
-        } else if let Some(pid) = runtime.pid.take() {
+            instance.pid = None;
+        } else if let Some(pid) = instance.pid.take() {
             info!(
                 allocation_id = allocation.id,
                 task_name = %task.name,
@@ -448,14 +453,14 @@ impl TaskPlugin for ExecTaskPlugin {
         &self,
         allocation: &Allocation,
         task: &TaskConfig,
-        runtime: &mut TaskRuntime,
+        instance: &mut TaskInstance,
     ) -> R<()> {
         info!(
             allocation_id = allocation.id,
             task_name = %task.name,
             "Destroying exec task"
         );
-        self.stop(allocation, task, runtime)
+        self.stop(allocation, task, instance)
     }
 }
 

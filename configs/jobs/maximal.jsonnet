@@ -59,7 +59,7 @@
         {
             name: "web",
             count: 2,
-            kind: "exec",
+            runtime: "exec",
             group: "frontend",
             lifecycle: "service",
             // Stable instance identity (see docs/stateful-workloads.md):
@@ -229,7 +229,7 @@
                 num: 3,
                 per: "region",
             },
-            kind: "exec",
+            runtime: "exec",
             group: "prep",
             lifecycle: "batch",
             schedule: "every 15m",
@@ -304,7 +304,7 @@
         {
             name: "shell",
             count: 1,
-            kind: "exec",
+            runtime: "exec",
             group: "frontend",
             lifecycle: "sidecar",
             dependsOn: [
@@ -341,7 +341,7 @@
         },
         {
             name: "sandbox",
-            kind: "exec",
+            runtime: "exec",
             group: "sandboxes",
             lifecycle: "service",
             // Keyed-mode stateful task (see docs/stateful-workloads.md):
@@ -380,7 +380,7 @@
         {
             name: "container",
             count: 1,
-            kind: "container",
+            runtime: "container",
             config: {
                 image: "alpine:latest",
                 command: ["echo", "hello", "from", "container"],

@@ -71,7 +71,7 @@ export type JobTaskService = {
 
 export type JobTask = {
   name: string
-  kind: string
+  runtime: string
   lifecycle: string
   group: string
   config?: Record<string, unknown>
@@ -89,7 +89,7 @@ export type JobSpecData = {
   tasks: JobTask[]
 }
 
-export type TaskRuntimeSummary = {
+export type TaskInstanceSummary = {
   statuses: string[]
   health: string[]
   healthy?: boolean
@@ -299,7 +299,7 @@ const normalizeTask = (value: unknown): JobTask | null => {
 
   return {
     name,
-    kind: readTaskString(raw.kind, 'unknown'),
+    runtime: readTaskString(raw.runtime, 'unknown'),
     lifecycle: readTaskString(raw.lifecycle, 'service'),
     group: readTaskString(raw.group, 'default'),
     config: raw.config && typeof raw.config === 'object' ? (raw.config as Record<string, unknown>) : undefined,
@@ -340,16 +340,16 @@ export const extractJobSpecData = (submissions: readonly Submission[]): JobSpecD
   return null
 }
 
-export const buildTaskRuntimeByName = (
+export const buildTaskInstancesByName = (
   groups: readonly RolloutGroupStatus[],
-): Map<string, TaskRuntimeSummary> => {
-  const runtime = new Map<string, TaskRuntimeSummary>()
+): Map<string, TaskInstanceSummary> => {
+  const instances = new Map<string, TaskInstanceSummary>()
 
   for (const group of groups) {
     for (const allocation of group.allocations) {
-      const existing = runtime.get(allocation.taskName)
+      const existing = instances.get(allocation.taskName)
       if (!existing) {
-        runtime.set(allocation.taskName, {
+        instances.set(allocation.taskName, {
           statuses: allocation.status ? [allocation.status] : [],
           health: allocation.allocationHealth ? [allocation.allocationHealth] : [],
           healthy: allocation.allocationHealthy,
@@ -373,25 +373,25 @@ export const buildTaskRuntimeByName = (
     }
   }
 
-  return runtime
+  return instances
 }
 
-// Builds a runtime summary map from a plain task-name -> status map. Used to
+// Builds a per-task instance summary map from a plain task-name -> status map. Used to
 // drive live node coloring in the DAG from the manager state store, which is
 // authoritative even for jobs that were deployed without a rollout.
-export const buildTaskRuntimeFromStatuses = (
+export const buildTaskInstancesFromStatuses = (
   statusByName: ReadonlyMap<string, string>,
-): Map<string, TaskRuntimeSummary> => {
-  const runtime = new Map<string, TaskRuntimeSummary>()
+): Map<string, TaskInstanceSummary> => {
+  const instances = new Map<string, TaskInstanceSummary>()
   for (const [name, status] of statusByName) {
-    runtime.set(name, {
+    instances.set(name, {
       statuses: status ? [status] : [],
       health: [],
       healthy: undefined,
       allocations: [],
     })
   }
-  return runtime
+  return instances
 }
 
 export const topoSortTaskNames = (tasks: readonly JobTask[]): string[][] => {

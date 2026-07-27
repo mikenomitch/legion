@@ -11,10 +11,10 @@ Full index: [docs/README.md](docs/README.md).
 - [Scheduler and Eval Loop](docs/scheduler-and-eval-loop.md)
 - [Event Stream](docs/event-stream.md)
 - [Jobs, Tasks, and Scheduling](docs/jobs-tasks-and-scheduling.md)
-- [Task Kind Plugins](docs/task-kind-plugins.md)
-- [Task Kind: exec](docs/task-kind-exec.md)
-- [Task Kind: container](docs/task-kind-container.md)
-- [Task Kind: noop](docs/task-kind-noop.md)
+- [Task Runtime Plugins](docs/task-runtime-plugins.md)
+- [Task Runtime: exec](docs/task-runtime-exec.md)
+- [Task Runtime: container](docs/task-runtime-container.md)
+- [Task Runtime: noop](docs/task-runtime-noop.md)
 - [Artifacts (images, files, git, S3, OCI/ORAS)](docs/artifacts.md)
 - [Stateful Workloads & Instance Identity](docs/stateful-workloads.md)
 - [Rollouts](docs/rollouts.md) and [Rollout Strategy Plugins](docs/rollout-strategy-plugins.md)
@@ -47,7 +47,7 @@ It aims to be differentiated from the above based on the following:
   - It is a small binary that can run on edge devices.
 - Flexiblity:
   - It has a plugin system for:
-    - Workload kind (containers, WASM, binaries, VMs, etc)
+    - Workload runtime (containers, WASM, binaries, VMs, etc)
     - Scheduler logic (optimize for utilization, resilience, speed)
     - Networking
     - Volumes

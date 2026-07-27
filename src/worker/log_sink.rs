@@ -25,7 +25,7 @@ pub struct LogResource {
     pub job_id: String,
     pub node_id: String,
     pub task_name: String,
-    pub task_kind: String,
+    pub task_runtime: String,
     pub log_dir: PathBuf,
 }
 
@@ -41,7 +41,7 @@ impl LogResource {
         attrs.insert("legion.allocation.id".into(), json!(self.allocation_id));
         attrs.insert("legion.node.id".into(), json!(self.node_id));
         attrs.insert("legion.task.name".into(), json!(self.task_name));
-        attrs.insert("legion.task.kind".into(), json!(self.task_kind));
+        attrs.insert("legion.task.runtime".into(), json!(self.task_runtime));
         attrs
     }
 }
@@ -140,7 +140,7 @@ mod tests {
             job_id: "web".into(),
             node_id: "node-1".into(),
             task_name: "api".into(),
-            task_kind: "exec".into(),
+            task_runtime: "exec".into(),
             log_dir: dir.to_path_buf(),
         }
     }

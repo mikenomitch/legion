@@ -21,7 +21,7 @@ integration cookbook. The design rationale lives in
 > `IssueWorkloadIdentityToken` gRPC; worker-side delivery, refresh, and
 > change modes (`src/worker/identity.rs`); the background rotation loop
 > (`src/manager/daemon.rs`); per-task `identities` spec validation and
-> task-kind capability gating; and manager config (off by default).
+> task-runtime capability gating; and manager config (off by default).
 > [Node identities](#node-identities) are issued via `IssueNodeIdentityToken`
 > and consumed by the artifact system. The
 > [control-plane identity](#control-plane-identity) (`legion`) is verified
@@ -83,7 +83,7 @@ can federate into several providers at once.
 ```jsonnet
 {
   name: 'api',
-  kind: 'exec',
+  runtime: 'exec',
   identities: [
     {
       name: 'aws',                       // unique per task
@@ -117,7 +117,7 @@ A full runnable example is at
   (`iss`/`sub`/`aud`/…) or use the `legion.io/*` namespace.
 - **Change mode / delivery compatibility:** `env` + `changeMode: noop` is
   rejected (env can't refresh in place); `signal` requires `changeSignal`.
-- The task kind must support the requested delivery (capability gating below).
+- The task runtime must support the requested delivery (capability gating below).
 
 ### Change mode (refresh behavior)
 
@@ -130,7 +130,7 @@ When a token is re-issued before expiry, `changeMode` governs what happens:
   refresh an env-delivered token without a restart.
 - `restart`: rewrite, then restart the task.
 
-### Task-kind capability gating
+### Task-runtime capability gating
 
 | Kind | env delivery | file delivery | signal |
 | --- | --- | --- | --- |

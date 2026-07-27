@@ -1,5 +1,5 @@
 //! The artifact system: one fetch/verify/unpack/stage pipeline shared by
-//! every task kind (see `internal_docs/plans/artifact-system-plan.md` and the
+//! every task runtime (see `internal_docs/plans/artifact-system-plan.md` and the
 //! user-facing `docs/artifacts.md`).
 //!
 //! Layout mirrors the plan:
@@ -27,7 +27,7 @@ pub use fetcher::{ArtifactFetcher, Credential, FetchLimits, FetchRequest, Fetche
 pub use stage::{AnonymousCredentials, ArtifactSink, ArtifactStager, CredentialSource};
 pub use status::{ArtifactState, ArtifactStatus, ArtifactStatusBoard};
 
-/// What staging produced for one artifact, attached to `TaskRuntime` before
+/// What staging produced for one artifact, attached to `TaskInstance` before
 /// `prepare()` so plugins consume typed payloads instead of guessing paths.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StagedArtifact {
@@ -46,7 +46,7 @@ pub enum StagedPayload {
     File { path: PathBuf },
     /// An unpacked tree rooted at `dir`.
     Tree { dir: PathBuf },
-    /// An OCI image as an on-disk OCI layout. Image-consuming kinds turn
+    /// An OCI image as an on-disk OCI layout. Image-consuming runtimes turn
     /// this into whatever their runtime wants.
     Image {
         oci_layout: PathBuf,

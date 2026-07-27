@@ -4,7 +4,7 @@
 //! reference; they run a *bundle*: an extracted root filesystem plus a
 //! `config.json` runtime spec. This module turns the on-disk OCI **image**
 //! layout produced by the `oci://` artifact fetcher into that bundle so the
-//! container task kind can run it on Linux.
+//! container task runtime can run it on Linux.
 //!
 //! The conversion is deliberately self-contained (no external `umoci`/`skopeo`
 //! dependency): read the image manifest + config from the layout, extract each

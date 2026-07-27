@@ -29,7 +29,7 @@
     tasks: [
         {
             name: "replica",
-            kind: "exec",
+            runtime: "exec",
             count: 3,
             stateful: {
                 // Fixed pool of ordinal slots; ids are reused within the pool

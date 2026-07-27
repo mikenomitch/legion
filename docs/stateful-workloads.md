@@ -90,7 +90,7 @@ pending -> active -> rescheduling -> active -> ... -> stopped/terminated
   name: 'db',
   tasks: [{
     name: 'replica',
-    kind: 'exec',
+    runtime: 'exec',
     count: 3,                    // slot cardinality: slots 0, 1, 2
     stateful: {
       mode: 'slot',              // 'slot' | 'keyed'
@@ -168,7 +168,7 @@ Think of it as "create these on first run if they don't already exist", not
 
 ## Environment Variables
 
-Injected by the manager into the task's kind-config `env` map at dispatch
+Injected by the manager into the task's runtime config `env` map at dispatch
 time, so they are present at process start for `exec` and `container` tasks:
 
 | Variable | When | Meaning |

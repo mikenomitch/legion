@@ -15,7 +15,7 @@ Legion currently runs as a single-manager control plane plus one or more workers
 - Worker:
   - Registers itself with the manager (with a join token when ACLs are
     enforced) and receives a per-node credential for subsequent calls.
-  - Runs task allocations via task-kind plugins.
+  - Runs task allocations via task-runtime plugins.
   - Sends periodic heartbeat and health-check updates.
 
 Important: Legion now includes a Raft control-plane mode for manager leader election/failover and operator workflows. Full SQLite state-machine replication through Raft is still in progress; today, managers still persist local SQLite data.

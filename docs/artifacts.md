@@ -3,7 +3,7 @@
 Tasks need *stuff* before they can run: release tarballs, builds from
 S3-compatible storage, git repos, container images, ORAS artifacts (model
 weights, WASM modules). The artifact system is one declaration and one
-fetch/verify/unpack/stage pipeline shared by every task kind: tasks declare
+fetch/verify/unpack/stage pipeline shared by every task runtime: tasks declare
 `artifacts`, the worker stages them into a private task directory before the
 task starts, and the task references them by name — no hardcoded paths, no
 credentials in the job spec.
@@ -28,13 +28,13 @@ caching/pre-warming layer is a separate, not-yet-implemented plan
 ## Declaring artifacts
 
 `artifacts` is a first-class task field, beside `env`, `kv`, and
-`identities` — not inside the kind-specific `config`. A bare source string is
+`identities` — not inside the runtime-specific `config`. A bare source string is
 a complete artifact spec:
 
 ```jsonnet
 {
   name: 'tool',
-  kind: 'exec',
+  runtime: 'exec',
   lifecycle: 'batch',
   artifacts: [
     'https://github.com/acme/tool/releases/download/v1.4/tool-linux-amd64.tar.gz',
@@ -133,7 +133,7 @@ Enforced at admission (`job run` / `job plan`) **and** by offline
   in the task's `identities` list.
 - `mediaType` is only valid for `oci://` sources.
 - `mode` must be an octal file mode.
-- The task kind must support artifacts (`supports_artifacts` capability
+- The task runtime must support artifacts (`supports_artifacts` capability
   gate). `exec` and `container` do; **`noop` rejects artifact-bearing specs**.
 - Unknown fields in the object form are rejected.
 
@@ -163,9 +163,9 @@ artifact-bearing or not:
   dropped-privilege process keeps access to its own directory — and only
   its own.
 - Exposed to the task as `LEGION_ALLOC_DIR` and `LEGION_TASK_DIR` env vars
-  (for kinds that apply worker-injected env — see the
-  [capability matrix](#task-kind-support)).
-- The `exec` kind's `cwd` defaults to the task directory when the spec sets
+  (for runtimes that apply worker-injected env — see the
+  [capability matrix](#task-runtime-support)).
+- The `exec` runtime's `cwd` defaults to the task directory when the spec sets
   none.
 - `exec` tasks using landlock get the task directory appended to
   `read_write_paths` automatically — otherwise artifacts would stage
@@ -182,11 +182,11 @@ Named artifacts are addressable two ways, so tasks never hardcode staging
 paths:
 
 1. **`${artifact.<name>}` interpolation.** The worker substitutes the token
-   in every string field of the kind config just before start. It is dumb
+   in every string field of the runtime config just before start. It is dumb
    string substitution — no expression language — and unknown references were
    already rejected at admission.
 2. **`LEGION_ARTIFACT_<NAME>` env vars** (name uppercased, `-` → `_`),
-   holding the absolute staged path. Applied by kinds that inject
+   holding the absolute staged path. Applied by runtimes that inject
    worker-provided env (`exec`).
 
 Both expand to the staged *file path* for single files and the *destination
@@ -196,7 +196,7 @@ directories, OCI layouts).
 ```jsonnet
 {
   name: 'embedder',
-  kind: 'exec',
+  runtime: 'exec',
   artifacts: [
     { name: 'tool',  source: 'https://releases.acme.io/embed/v1.4.tar.gz', checksum: 'sha256:9f86…' },
     { name: 'model', source: 'oci://registry.acme.io/models/embedder@sha256:abc…', mediaType: 'application/vnd.acme.model.weights.v1' },
@@ -216,7 +216,7 @@ directories, OCI layouts).
 | `file://` | Copies a local file or directory tree. Dev workflows and node-local pre-provisioned artifacts. |
 | `git` | `git::https://github.com/acme/repo?ref=v1.2.0` (go-getter style) or `git://…`. Shallow clone (depth 1); `ref=` takes a branch, tag, or full 40-hex commit SHA (full SHAs are fetched as exact objects). The `.git` directory is stripped — tasks get a clean worktree. Credentials are injected via `GIT_CONFIG_*` environment variables (an `http.extraHeader` Authorization header), never argv. `resolve()` uses `git ls-remote` to pin refs to commit SHAs. |
 | `s3://` | `object_store`-backed; speaks any S3-compatible endpoint (AWS, MinIO, R2, GCS interop). Region/endpoint come from the credential object or query params (`s3://bucket/key?endpoint=https://minio.internal:9000&region=auto`) — query params win. Anonymous fetches skip request signing (public buckets). |
-| `oci://` | Built on the `oci-client` crate. Anonymous/basic/bearer registry auth; tags resolve to manifest digests for pinning. Without `mediaType`, the image is materialized as an on-disk **OCI layout** (what image-consuming kinds hand to their runtime; staged under `.oci/<name>/` unless `dest` is set). With `mediaType`, only matching ORAS layers are pulled, named by their `org.opencontainers.image.title` annotation (sanitized to a basename; digest hex as fallback). Blob sizes are checked against the size cap before any blob downloads. `?protocol=http` opts into plain-HTTP registries for dev/test. |
+| `oci://` | Built on the `oci-client` crate. Anonymous/basic/bearer registry auth; tags resolve to manifest digests for pinning. Without `mediaType`, the image is materialized as an on-disk **OCI layout** (what image-consuming runtimes hand to their OCI runtime; staged under `.oci/<name>/` unless `dest` is set). With `mediaType`, only matching ORAS layers are pulled, named by their `org.opencontainers.image.title` annotation (sanitized to a basename; digest hex as fallback). Blob sizes are checked against the size cap before any blob downloads. `?protocol=http` opts into plain-HTTP registries for dev/test. |
 
 Additional schemes can be served by [fetcher plugins](#fetcher-plugins).
 
@@ -495,17 +495,17 @@ Sources are redacted; errors name auth sources, never values.
   events are derived manager-side from heartbeat snapshot *transitions*, so
   steady-state heartbeats add nothing to the journal.
 
-## Task-kind support
+## Task-runtime support
 
 | Kind | artifacts | consumption |
 | --- | --- | --- |
 | `exec` | ✅ | File/Tree payloads staged into the task dir; `${artifact.*}` interpolation; `LEGION_ARTIFACT_*` / `LEGION_TASK_DIR` env; `cwd` defaults to the task dir; landlock auto-grants it. |
-| `container` | ✅ (image, behind a flag) | The implicit `image` artifact is consumed as an OCI layout (below). File/tree artifacts stage to the **host** task dir, which an isolated container filesystem cannot see, and worker-injected env is not applied — both deferred until the kind grows volume plumbing (same limitation as its KV file injection). |
+| `container` | ✅ (image, behind a flag) | The implicit `image` artifact is consumed as an OCI layout (below). File/tree artifacts stage to the **host** task dir, which an isolated container filesystem cannot see, and worker-injected env is not applied — both deferred until the runtime grows volume plumbing (same limitation as its KV file injection). |
 | `noop` | ❌ | Artifact-bearing specs rejected at validation/admission. |
 
-New kinds adopt artifacts through three optional `TaskPlugin` hooks —
+New runtimes adopt artifacts through three optional `TaskPlugin` hooks —
 `supports_artifacts()` (the capability gate), `implicit_artifacts()`
-(desugar kind config into artifacts at admission), and `consume_artifact()`
+(desugar runtime config into artifacts at admission), and `consume_artifact()`
 (handle non-file payloads such as OCI images or ORAS layers). Kinds that
 just need files in the task directory only implement the first.
 
@@ -524,7 +524,7 @@ local runtime:
 - **Linux (youki / any OCI runtime):** the layout is converted to an OCI
   runtime bundle (rootfs extraction + generated `config.json`) and run with
   `<runtime> run --bundle` — see
-  [task-kind-container.md](task-kind-container.md#linux-image--bundle).
+  [task-runtime-container.md](task-runtime-container.md#linux-image--bundle).
 
 The flag defaults to **off** until the artifact cache lands: without a
 cache, Legion-managed pulls re-download the image for every allocation,
@@ -534,7 +534,7 @@ off, container behavior is byte-identical to before the artifact system.
 ## Fetcher plugins
 
 Schemes beyond the built-ins are served by dynamic fetcher plugins, using
-the same dylib pattern as task-kind plugins (see
+the same dylib pattern as task-runtime plugins (see
 [docs/plugin-system.md](plugin-system.md)):
 
 ```
@@ -606,7 +606,7 @@ Remember the allowlists: a custom scheme must be added to the cluster's
 - **Cluster auth matcher changes apply at the next submit**, not to
   in-flight jobs (the effective auth is baked into the normalized spec at
   admission). KV credential *value* rotation applies immediately.
-- **Container kinds consume only the `Image` payload** (macOS imports it into
+- **Container runtimes consume only the `Image` payload** (macOS imports it into
   Apple `container`; Linux converts it to an OCI runtime bundle), and image
   desugaring is off by default; file/tree artifacts and env referencing inside
   containers wait on volume plumbing.

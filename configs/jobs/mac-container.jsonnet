@@ -2,7 +2,7 @@
   name: 'mac-container-demo',
   task: {
     name: 'hello-container',
-    kind: 'container',
+    runtime: 'container',
     config: {
       image: 'alpine:latest',
       command: ['echo', 'hello', 'from', 'macos', 'container'],

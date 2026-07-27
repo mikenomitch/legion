@@ -11,7 +11,7 @@ This approach was chosen because it is:
 - **Fast**: no RPC boundary between core scheduler/worker and plugin code.
 - **Simple to deploy**: plugins are shared libraries on disk under a predictable directory.
 - **Ergonomic for Rust extension authors**: plugin authors implement traits and export a `get` constructor.
-- **Flexible**: task kinds, scheduling policies, node checks, rollout strategies, and artifact fetchers can each be extended.
+- **Flexible**: task runtimes, scheduling policies, node checks, rollout strategies, and artifact fetchers can each be extended.
 
 ## Downsides and Risks to Watch
 
@@ -68,7 +68,7 @@ If any check fails, plugin loading fails with contextual errors.
 
 ## Plugin Types Implemented Today
 
-## 1) Task Kind Plugins
+## 1) Task Runtime Plugins
 
 Purpose: run workload tasks on workers.
 

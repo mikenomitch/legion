@@ -1,6 +1,6 @@
-# Task Kind: container
+# Task Runtime: container
 
-`container` is a built-in task kind implemented in `src/task_plugins/container.rs`.
+`container` is a built-in task runtime implemented in `src/task_plugins/container.rs`.
 
 ## Purpose
 
@@ -20,16 +20,16 @@ The runtime is chosen by operating system — no Docker dependency:
   references — they run a *bundle* (an extracted `rootfs/` + a `config.json`
   runtime spec), which Legion builds from the image's OCI layout (see
   [Linux: image → bundle](#linux-image--bundle)).
-- **Other OS:** the kind is rejected as unsupported.
+- **Other OS:** the runtime is rejected as unsupported.
 
 ### Linux: image → bundle
 
-A low-level OCI runtime cannot fetch an image, so the kind sources and converts
+A low-level OCI runtime cannot fetch an image, so the runtime sources and converts
 it (`src/task_plugins/oci_bundle.rs`):
 
 1. **Obtain the image's OCI layout.** If the image was staged through the
    artifact pipeline (`artifacts.containerImageDesugar`), that layout is used;
-   otherwise the kind pulls it anonymously through the shared `oci://` fetcher.
+   otherwise the runtime pulls it anonymously through the shared `oci://` fetcher.
    A layout pulled by an earlier start of the same allocation is reused, so
    in-place restarts don't refetch from the registry.
 2. **Build a bundle.** Extract each image layer into `rootfs/` (honoring
@@ -104,7 +104,7 @@ images (see [docs/artifacts.md](artifacts.md)):
   declared artifacts stage to the *host* task directory, which the
   container's isolated filesystem cannot see, and worker-injected env
   (`LEGION_TASK_DIR`, `LEGION_ARTIFACT_*`) is not applied — both wait on
-  volume plumbing, the same limitation as the kind's KV/identity file
+  volume plumbing, the same limitation as the runtime's KV/identity file
   injection.
 
 ## Capability Summary
@@ -115,7 +115,7 @@ images (see [docs/artifacts.md](artifacts.md)):
 | KV file injection | ❌ (needs volume plumbing) |
 | Identity env / file delivery | ✅ / ❌ |
 | Signal delivery | ❌ |
-| Artifacts | ✅ image (staged via `containerImageDesugar`, or pulled by the kind); file/tree + env deferred |
+| Artifacts | ✅ image (staged via `containerImageDesugar`, or pulled by the runtime); file/tree + env deferred |
 | Exec / interactive PTY | ✅ / ✅ on Apple `container` (sandboxed); ❌ on the Linux OCI runtimes (deferred) — see [docs/exec-and-actions.md](exec-and-actions.md) |
 
 Container exec runs inside the container's namespaces, so it is sandboxed
@@ -128,7 +128,7 @@ Container exec runs inside the container's namespaces, so it is sandboxed
   networking (with host DNS files bind-mounted read-only), and the root
   filesystem is writable (no volume mounts).
 - Private-registry image auth and digest pinning require the artifact pipeline
-  (`containerImageDesugar`); the kind's own fallback pull is anonymous.
+  (`containerImageDesugar`); the runtime's own fallback pull is anonymous.
 - zstd-compressed image layers are rejected (gzip and uncompressed supported).
 - No artifact cache yet, so an off-pipeline Linux pull fetches once per
   allocation (in-place restarts reuse the pulled layout; moves refetch).

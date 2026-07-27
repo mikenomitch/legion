@@ -8,7 +8,7 @@ import { AllocationPorts, ServiceEndpointsTable, ServiceTags } from '../../compo
 import { allocationHealthLabel, fetchAllocationRuntime, parseAllocNetwork } from '../../utils/allocations'
 import {
   artifactProgressPercent,
-  buildTaskRuntimeByName,
+  buildTaskInstancesByName,
   extractJobSpecData,
   parseArtifactStates,
   shortenArtifactDigest,
@@ -56,8 +56,8 @@ export default function TaskDetail() {
     const rolloutStatus = latestRollout ? await managerClient.getRolloutStatus({ id: latestRollout.id }) : undefined
 
     const taskSpec = extractJobSpecData(spec.submissions)?.tasks.find((task) => task.name === taskName())
-    const runtimeByTask = buildTaskRuntimeByName(rolloutStatus?.groups ?? [])
-    const taskRuntime = runtimeByTask.get(taskName())
+    const instancesByTask = buildTaskInstancesByName(rolloutStatus?.groups ?? [])
+    const taskInstances = instancesByTask.get(taskName())
 
     // All running allocations for this job (from the ledger), regardless of
     // whether a rollout produced them. The exec panel targets these; the
@@ -80,7 +80,7 @@ export default function TaskDetail() {
     return {
       job: jobInfo.job,
       taskSpec,
-      taskRuntime,
+      taskInstances,
       jobAllocations,
       latestRollout,
       groups: rolloutStatus?.groups ?? [],
@@ -113,7 +113,7 @@ export default function TaskDetail() {
                 </A>
               </>
             }
-            badges={<StatusBadge status={data()!.taskRuntime?.statuses[0] ?? 'unknown'} />}
+            badges={<StatusBadge status={data()!.taskInstances?.statuses[0] ?? 'unknown'} />}
           />
 
           <div class="space-y-4">
@@ -123,7 +123,7 @@ export default function TaskDetail() {
                   cols={3}
                   items={[
                     ['Group', data()!.taskSpec!.group],
-                    ['Kind', data()!.taskSpec!.kind],
+                    ['Runtime', data()!.taskSpec!.runtime],
                     [
                       'Lifecycle',
                       <span class="inline-flex items-center gap-2">
@@ -365,9 +365,9 @@ export default function TaskDetail() {
                   </Show>
                 }
               >
-                <Show when={data()!.taskRuntime?.allocations.length} fallback={<p class="text-sm text-muted">No runtime allocations available.</p>}>
+                <Show when={data()!.taskInstances?.allocations.length} fallback={<p class="text-sm text-muted">No runtime allocations available.</p>}>
                   <div class="space-y-2.5">
-                    <For each={data()!.taskRuntime!.allocations}>
+                    <For each={data()!.taskInstances!.allocations}>
                       {(allocation) => {
                         const artifactRows = parseArtifactStates(allocation.artifactStates)
                         return (
@@ -448,12 +448,12 @@ export default function TaskDetail() {
 
             <SectionCard title="Logs">
               <Show
-                when={(data()!.taskRuntime?.allocations.length ?? 0) > 0}
+                when={(data()!.taskInstances?.allocations.length ?? 0) > 0}
                 fallback={<p class="text-sm text-muted">No allocations are running for this task yet.</p>}
               >
                 <LogViewer
                   job={jobName()}
-                  allocationIds={data()!.taskRuntime!.allocations.map((allocation) => allocation.allocationId)}
+                  allocationIds={data()!.taskInstances!.allocations.map((allocation) => allocation.allocationId)}
                 />
               </Show>
             </SectionCard>

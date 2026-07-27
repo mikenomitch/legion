@@ -3,7 +3,7 @@
     tasks: {
         "first-task": {
             count: 1,
-            kind: "exec",
+            runtime: "exec",
             config: {
                 command: ["sleep", "1"],
             },
@@ -14,7 +14,7 @@
         },
         "second-task": {
             count: 2,
-            kind: "exec",
+            runtime: "exec",
             config: {
                 command: ["sleep", "2"],
             },

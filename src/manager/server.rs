@@ -1034,9 +1034,9 @@ impl ManagerDaemonService {
         let mut registry = crate::task_plugins::TaskPluginRegistry::new();
         for task in &mut config.tasks {
             if self.artifacts_config.container_image_desugar {
-                registry.load_plugin(&task.kind, false)?;
+                registry.load_plugin(&task.runtime, false)?;
                 let plugin = registry
-                    .plugin(&task.kind)
+                    .plugin(&task.runtime)
                     .context("task plugin loaded but missing")?;
                 if plugin.supports_artifacts() {
                     for implicit in plugin.implicit_artifacts(&task.config)? {
@@ -6541,7 +6541,7 @@ mod tests {
         let jobspec = json!({
             "name": "kv-job",
             "task": {
-                "kind": "exec",
+                "runtime": "exec",
                 "config": {
                     "command": ["echo", "hi"],
                     "env": {
@@ -6619,7 +6619,7 @@ mod tests {
         let jobspec = json!({
             "name": "kv-restart-policy-job",
             "task": {
-                "kind": "exec",
+                "runtime": "exec",
                 "kv": { "watch": true, "onChange": "restart", "onDelete": "fail" },
                 "env": [
                     {
@@ -6678,7 +6678,7 @@ mod tests {
         let jobspec = json!({
             "name": "kv-rollout-policy-job",
             "task": {
-                "kind": "exec",
+                "runtime": "exec",
                 "kv": { "watch": true, "onChange": "rollout", "onDelete": "fail" },
                 "files": [
                     {
@@ -6782,7 +6782,7 @@ mod tests {
         json!({
             "name": job,
             "task": {
-                "kind": "exec",
+                "runtime": "exec",
                 "kv": { "watch": true, "onChange": on_change, "onDelete": on_delete },
                 "env": [
                     {
@@ -6984,7 +6984,7 @@ mod tests {
             "tasks": [
                 {
                     "name": "task-a",
-                    "kind": "exec",
+                    "runtime": "exec",
                     "kv": { "watch": true, "onChange": "restart", "onDelete": "fail" },
                     "env": [
                         {
@@ -6996,7 +6996,7 @@ mod tests {
                 },
                 {
                     "name": "task-b",
-                    "kind": "exec",
+                    "runtime": "exec",
                     "kv": { "watch": true, "onChange": "restart", "onDelete": "fail" },
                     "env": [
                         {
@@ -7139,7 +7139,7 @@ mod tests {
         let jobspec = json!({
             "name": "kv-unwatched",
             "task": {
-                "kind": "exec",
+                "runtime": "exec",
                 // Defaults would watch, but the entry opts out explicitly.
                 "kv": { "watch": true, "onChange": "restart", "onDelete": "fail" },
                 "env": [
@@ -7184,7 +7184,7 @@ mod tests {
         let jobspec = json!({
             "name": "kv-precedence",
             "task": {
-                "kind": "exec",
+                "runtime": "exec",
                 "kv": { "watch": true, "onChange": "restart" },
                 "env": [
                     {
@@ -7232,7 +7232,7 @@ mod tests {
         let jobspec = json!({
             "name": "kv-template-kv",
             "task": {
-                "kind": "exec",
+                "runtime": "exec",
                 "kv": { "watch": true, "onChange": "restart", "onDelete": "fail" },
                 "env": [
                     {
@@ -7287,7 +7287,7 @@ mod tests {
             "tasks": [
                 {
                     "name": "watcher",
-                    "kind": "exec",
+                    "runtime": "exec",
                     "kv": { "watch": true, "onChange": "restart", "onDelete": "none" },
                     "env": [
                         { "name": "A", "value": { "template": "{{ kv \"iso/a\" }}" } }
@@ -7296,7 +7296,7 @@ mod tests {
                 },
                 {
                     "name": "bystander",
-                    "kind": "exec",
+                    "runtime": "exec",
                     "config": { "command": ["echo", "bye"], "env": { "STATIC": "fixed" } }
                 }
             ]
@@ -7344,7 +7344,7 @@ mod tests {
         let jobspec = json!({
             "name": "kv-file-rerender",
             "task": {
-                "kind": "exec",
+                "runtime": "exec",
                 "kv": { "watch": true, "onChange": "restart", "onDelete": "none" },
                 "files": [
                     {
@@ -7457,7 +7457,7 @@ mod tests {
         let jobspec = json!({
             "name": "kv-container-files",
             "task": {
-                "kind": "container",
+                "runtime": "container",
                 "files": [
                     {
                         "path": "/etc/app/conf",
@@ -7533,7 +7533,7 @@ mod tests {
         let jobspec = json!({
             "name": "replace-rollout",
             "task": {
-                "kind": "exec",
+                "runtime": "exec",
                 "group": "web",
                 "config": {
                     "command": ["echo", "v3"]

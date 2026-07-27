@@ -41,7 +41,7 @@ fn render_job_spec(path: &str, vars: &JsonnetVars) -> String {
 fn default_jsonnet_vars() -> JsonnetVars {
     JsonnetVars {
         ext_vars: vec![
-            ("task_kind".to_string(), "exec".to_string()),
+            ("task_runtime".to_string(), "exec".to_string()),
             ("task_count".to_string(), "1".to_string()),
             ("message".to_string(), "hello".to_string()),
         ],
@@ -189,7 +189,7 @@ fn variable_job_spec_renders_with_different_values() {
 
     let vars_one = JsonnetVars {
         ext_vars: vec![
-            ("task_kind".to_string(), "exec".to_string()),
+            ("task_runtime".to_string(), "exec".to_string()),
             ("task_count".to_string(), "1".to_string()),
             ("message".to_string(), "hello-one".to_string()),
         ],
@@ -204,7 +204,7 @@ fn variable_job_spec_renders_with_different_values() {
 
     let vars_two = JsonnetVars {
         ext_vars: vec![
-            ("task_kind".to_string(), "container".to_string()),
+            ("task_runtime".to_string(), "container".to_string()),
             ("task_count".to_string(), "2".to_string()),
             ("message".to_string(), "hello-two".to_string()),
         ],
@@ -220,7 +220,7 @@ fn variable_job_spec_renders_with_different_values() {
     assert_ne!(config_one.name, config_two.name);
     assert_eq!(config_one.tasks.len(), 1);
     assert_eq!(config_two.tasks.len(), 1);
-    assert_ne!(config_one.tasks[0].kind, config_two.tasks[0].kind);
+    assert_ne!(config_one.tasks[0].runtime, config_two.tasks[0].runtime);
     assert_ne!(config_one.tasks[0].count, config_two.tasks[0].count);
     assert_ne!(config_one.tasks[0].resources, config_two.tasks[0].resources);
 }

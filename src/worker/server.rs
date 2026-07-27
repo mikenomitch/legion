@@ -48,7 +48,7 @@ impl Worker for WorkerDaemonService {
 
         let allocation_id = allocation.allocation_id;
 
-        // Synchronous failures (bad config, unknown kind) surface here;
+        // Synchronous failures (bad config, unknown runtime) surface here;
         // artifact-bearing tasks stage on a background thread and report
         // staging failures through the heartbeat failure path.
         let task_manager = self.task_manager.clone();

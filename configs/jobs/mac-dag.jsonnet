@@ -3,7 +3,7 @@
   tasks: [
     {
       name: "bootstrap-init",
-      kind: "exec",
+      runtime: "exec",
       lifecycle: "batch",
       group: "bootstrap",
       config: {
@@ -19,7 +19,7 @@
     },
     {
       name: "bootstrap-observer",
-      kind: "exec",
+      runtime: "exec",
       lifecycle: "sidecar",
       group: "bootstrap",
       affinities: {
@@ -40,7 +40,7 @@
     },
     {
       name: "config-loader",
-      kind: "exec",
+      runtime: "exec",
       lifecycle: "service",
       group: "control",
       affinities: {
@@ -65,7 +65,7 @@
     },
     {
       name: "policy-audit",
-      kind: "exec",
+      runtime: "exec",
       lifecycle: "batch",
       group: "control",
       affinities: {
@@ -94,7 +94,7 @@
     },
     {
       name: "policy-cache",
-      kind: "exec",
+      runtime: "exec",
       lifecycle: "sidecar",
       group: "control",
       affinities: {
@@ -115,7 +115,7 @@
     },
     {
       name: "ingest-scan",
-      kind: "exec",
+      runtime: "exec",
       lifecycle: "batch",
       group: "ingest",
       affinities: {
@@ -140,7 +140,7 @@
     },
     {
       name: "ingest-parse",
-      kind: "exec",
+      runtime: "exec",
       lifecycle: "service",
       group: "ingest",
       affinities: {
@@ -161,7 +161,7 @@
     },
     {
       name: "ingest-shape",
-      kind: "exec",
+      runtime: "exec",
       lifecycle: "batch",
       group: "ingest",
       affinities: {
@@ -182,7 +182,7 @@
     },
     {
       name: "transform-index",
-      kind: "exec",
+      runtime: "exec",
       lifecycle: "service",
       group: "transform",
       affinities: {
@@ -207,7 +207,7 @@
     },
     {
       name: "transform-enrich",
-      kind: "exec",
+      runtime: "exec",
       lifecycle: "batch",
       group: "transform",
       affinities: {
@@ -228,7 +228,7 @@
     },
     {
       name: "transform-sidecar",
-      kind: "exec",
+      runtime: "exec",
       lifecycle: "sidecar",
       group: "transform",
       affinities: {
@@ -249,7 +249,7 @@
     },
     {
       name: "route-fast",
-      kind: "exec",
+      runtime: "exec",
       lifecycle: "service",
       group: "routing",
       affinities: {
@@ -270,7 +270,7 @@
     },
     {
       name: "route-slow",
-      kind: "exec",
+      runtime: "exec",
       lifecycle: "batch",
       group: "routing",
       affinities: {
@@ -291,7 +291,7 @@
     },
     {
       name: "route-branch",
-      kind: "exec",
+      runtime: "exec",
       lifecycle: "service",
       group: "routing",
       affinities: {
@@ -312,7 +312,7 @@
     },
     {
       name: "route-join",
-      kind: "exec",
+      runtime: "exec",
       lifecycle: "batch",
       group: "routing",
       affinities: {
@@ -337,7 +337,7 @@
     },
     {
       name: "route-join-sidecar",
-      kind: "exec",
+      runtime: "exec",
       lifecycle: "sidecar",
       group: "routing",
       affinities: {
@@ -358,7 +358,7 @@
     },
     {
       name: "sink-archive",
-      kind: "exec",
+      runtime: "exec",
       lifecycle: "batch",
       group: "sink",
       affinities: {
@@ -383,7 +383,7 @@
     },
     {
       name: "sink-compact",
-      kind: "exec",
+      runtime: "exec",
       lifecycle: "service",
       group: "sink",
       affinities: {
@@ -404,7 +404,7 @@
     },
     {
       name: "sink-sidecar",
-      kind: "exec",
+      runtime: "exec",
       lifecycle: "sidecar",
       group: "sink",
       affinities: {
@@ -425,7 +425,7 @@
     },
     {
       name: "telemetry-collector",
-      kind: "exec",
+      runtime: "exec",
       lifecycle: "batch",
       group: "telemetry",
       affinities: {
@@ -450,7 +450,7 @@
     },
     {
       name: "telemetry-sidecar",
-      kind: "exec",
+      runtime: "exec",
       lifecycle: "sidecar",
       group: "telemetry",
       affinities: {

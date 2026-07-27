@@ -2,7 +2,7 @@ use crate::prelude::*;
 use crate::structs::{Allocation, TaskConfig};
 use crate::task_plugins::{
     configure_task_log_capture, derived_schema, oci_bundle, spawn_pipe, spawn_pty,
-    spawn_task_process, ExecOptions, ExecSession, ExecSupport, TaskPlugin, TaskRuntime,
+    spawn_task_process, ExecOptions, ExecSession, ExecSupport, TaskInstance, TaskPlugin,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -100,11 +100,11 @@ fn container_name(allocation: &Allocation) -> String {
 /// Per-allocation scratch root for the image layout and bundle. Prefers the
 /// worker-provided allocation/task directory; falls back to a temp dir keyed
 /// by allocation id when the worker threaded none through.
-fn work_root(allocation: &Allocation, runtime: &TaskRuntime) -> PathBuf {
-    runtime
+fn work_root(allocation: &Allocation, instance: &TaskInstance) -> PathBuf {
+    instance
         .alloc_dir
         .clone()
-        .or_else(|| runtime.task_dir.clone())
+        .or_else(|| instance.task_dir.clone())
         .unwrap_or_else(|| std::env::temp_dir().join(format!("legion-container-{}", allocation.id)))
         .join(".container")
 }
@@ -196,12 +196,12 @@ fn pull_image_layout(image: &str, dest_root: &Path) -> R<PathBuf> {
 
 /// Builds the argv that execs `command` inside the allocation's container.
 fn build_exec_command(
-    runtime: &ContainerRuntime,
+    oci_runtime: &ContainerRuntime,
     allocation_id: i64,
     tty: bool,
     command: &[String],
 ) -> Vec<String> {
-    let program = match runtime {
+    let program = match oci_runtime {
         ContainerRuntime::AppleContainer => "container".to_string(),
         ContainerRuntime::Oci { binary } => binary.clone(),
     };
@@ -216,10 +216,10 @@ fn build_exec_command(
     argv
 }
 
-/// The OCI layout recorded on `runtime.state` by `consume_artifact` when the
+/// The OCI layout recorded on `instance.state` by `consume_artifact` when the
 /// image was staged through the artifact pipeline.
-fn staged_image_layout(runtime: &TaskRuntime) -> Option<PathBuf> {
-    runtime
+fn staged_image_layout(instance: &TaskInstance) -> Option<PathBuf> {
+    instance
         .state
         .get("artifactImage")
         .and_then(|image| image.get("ociLayout"))
@@ -249,7 +249,7 @@ impl TaskPlugin for ContainerTaskPlugin {
         true
     }
 
-    // Identity delivery mirrors the container kind's existing injection surface:
+    // Identity delivery mirrors the container runtime’s existing injection surface:
     // env injection is supported, file injection is not (delivering a file into a
     // container needs volume plumbing the container plugin doesn't yet implement,
     // same as kv file injection). An env-delivered identity on a container must
@@ -279,17 +279,17 @@ impl TaskPlugin for ContainerTaskPlugin {
         &self,
         allocation: &Allocation,
         task: &TaskConfig,
-        _runtime: &mut TaskRuntime,
+        _instance: &mut TaskInstance,
         mut opts: ExecOptions,
     ) -> R<Box<dyn ExecSession>> {
-        let runtime_kind = ContainerRuntime::detect()?;
-        if !runtime_kind.supports_exec() {
-            bail!("this container runtime does not support exec yet");
+        let oci_runtime = ContainerRuntime::detect()?;
+        if !oci_runtime.supports_exec() {
+            bail!("this container instance does not support exec yet");
         }
         // Delegate to the runtime's `exec` subcommand against the running
         // container. The command runs inside the container's namespaces, so
-        // it is genuinely sandboxed exec (unlike the exec kind).
-        opts.command = build_exec_command(&runtime_kind, allocation.id, opts.tty, &opts.command);
+        // it is genuinely sandboxed exec (unlike the exec runtime).
+        opts.command = build_exec_command(&oci_runtime, allocation.id, opts.tty, &opts.command);
 
         info!(
             allocation_id = allocation.id,
@@ -320,12 +320,12 @@ impl TaskPlugin for ContainerTaskPlugin {
     /// Consumes the staged `Image` payload. On macOS the OCI layout is loaded
     /// into Apple `container` immediately; on Linux the layout path is recorded
     /// and the bundle is built at `start` (the runtime runs a bundle, not an
-    /// image). File/tree artifacts are deferred until the kind grows volume
+    /// image). File/tree artifacts are deferred until the runtime grows volume
     /// plumbing (same limitation as its KV file injection).
     fn consume_artifact(
         &self,
         staged: &crate::artifacts::StagedArtifact,
-        runtime: &mut TaskRuntime,
+        instance: &mut TaskInstance,
     ) -> R<()> {
         if let crate::artifacts::StagedPayload::Image {
             oci_layout,
@@ -340,10 +340,10 @@ impl TaskPlugin for ContainerTaskPlugin {
                 "reference": reference,
                 "digest": staged.digest,
             });
-            if let Some(state) = runtime.state.as_object_mut() {
+            if let Some(state) = instance.state.as_object_mut() {
                 state.insert("artifactImage".into(), record);
             } else {
-                runtime.state = json!({ "artifactImage": record });
+                instance.state = json!({ "artifactImage": record });
             }
         }
         Ok(())
@@ -353,7 +353,7 @@ impl TaskPlugin for ContainerTaskPlugin {
         &self,
         allocation: &Allocation,
         task: &TaskConfig,
-        _runtime: &mut TaskRuntime,
+        _instance: &mut TaskInstance,
     ) -> R<()> {
         info!(
             allocation_id = allocation.id,
@@ -367,10 +367,10 @@ impl TaskPlugin for ContainerTaskPlugin {
         &self,
         allocation: &Allocation,
         task: &TaskConfig,
-        runtime: &mut TaskRuntime,
+        instance: &mut TaskInstance,
     ) -> R<()> {
         let config = ContainerTaskConfig::from_value(&task.config)?;
-        let runtime_kind = ContainerRuntime::detect()?;
+        let oci_runtime = ContainerRuntime::detect()?;
 
         // Legion-provided env (allocation identity + assigned ports) first;
         // user-declared env overrides on key conflicts.
@@ -380,7 +380,7 @@ impl TaskPlugin for ContainerTaskPlugin {
                 .collect();
         merged_env.extend(config.env.clone());
 
-        let mut cmd = match &runtime_kind {
+        let mut cmd = match &oci_runtime {
             ContainerRuntime::AppleContainer => {
                 info!(
                     allocation_id = allocation.id,
@@ -396,9 +396,9 @@ impl TaskPlugin for ContainerTaskPlugin {
                 // The runtime runs a bundle, not an image: get the image's OCI
                 // layout (from the artifact pipeline if staged, else pull it),
                 // convert it to a bundle, then `run` it.
-                let scratch = work_root(allocation, runtime);
+                let scratch = work_root(allocation, instance);
                 let pulled_layout = scratch.join("image").join("layout");
-                let layout = match staged_image_layout(runtime) {
+                let layout = match staged_image_layout(instance) {
                     Some(layout) => layout,
                     // A previous start of this allocation already pulled the
                     // layout; reuse it so in-place restarts don't refetch.
@@ -431,27 +431,32 @@ impl TaskPlugin for ContainerTaskPlugin {
             }
         };
 
-        configure_task_log_capture(&mut cmd, runtime)?;
+        configure_task_log_capture(&mut cmd, instance)?;
         let child = spawn_task_process(&mut cmd).with_context(|| {
             format!(
                 "Failed to spawn container task {} for allocation {}",
                 task.name, allocation.id
             )
         })?;
-        runtime.pid = Some(child.id());
-        runtime.child = Some(child);
+        instance.pid = Some(child.id());
+        instance.child = Some(child);
         Ok(())
     }
 
-    fn stop(&self, allocation: &Allocation, task: &TaskConfig, runtime: &mut TaskRuntime) -> R<()> {
+    fn stop(
+        &self,
+        allocation: &Allocation,
+        task: &TaskConfig,
+        instance: &mut TaskInstance,
+    ) -> R<()> {
         // Both runtimes keep the container alive when the launching CLI is
         // killed (Apple `container` is daemon-backed; an OCI runtime reparents
         // the container init when the foreground `run` is killed). Tear it down
         // explicitly by name first. Best-effort: an already-exited `--rm` /
         // deleted container is gone, which is success.
-        if let Ok(runtime_kind) = ContainerRuntime::detect() {
+        if let Ok(oci_runtime) = ContainerRuntime::detect() {
             let name = container_name(allocation);
-            let teardown: Option<(&str, Vec<String>)> = match &runtime_kind {
+            let teardown: Option<(&str, Vec<String>)> = match &oci_runtime {
                 ContainerRuntime::AppleContainer => {
                     Some(("container", vec!["stop".into(), name.clone()]))
                 }
@@ -464,14 +469,14 @@ impl TaskPlugin for ContainerTaskPlugin {
                 info!(
                     allocation_id = allocation.id,
                     task_name = %task.name,
-                    runtime = program,
+                    oci_runtime = program,
                     "Tearing down container by name"
                 );
                 let _ = Command::new(program).args(&args).output();
             }
         }
 
-        if let Some(mut child) = runtime.child.take() {
+        if let Some(mut child) = instance.child.take() {
             info!(
                 allocation_id = allocation.id,
                 task_name = %task.name,
@@ -479,8 +484,8 @@ impl TaskPlugin for ContainerTaskPlugin {
             );
             let _ = child.kill();
             let _ = child.wait();
-            runtime.pid = None;
-        } else if let Some(pid) = runtime.pid.take() {
+            instance.pid = None;
+        } else if let Some(pid) = instance.pid.take() {
             info!(
                 allocation_id = allocation.id,
                 task_name = %task.name,
@@ -500,19 +505,19 @@ impl TaskPlugin for ContainerTaskPlugin {
         &self,
         allocation: &Allocation,
         task: &TaskConfig,
-        runtime: &mut TaskRuntime,
+        instance: &mut TaskInstance,
     ) -> R<()> {
         info!(
             allocation_id = allocation.id,
             task_name = %task.name,
             "Destroying container task"
         );
-        self.stop(allocation, task, runtime)?;
+        self.stop(allocation, task, instance)?;
         // Drop the image/bundle scratch. Best-effort: when it lives under the
         // worker's alloc dir the worker removes that tree anyway, but the
         // temp-dir fallback (no alloc dir threaded through) would leak a
         // multi-hundred-MB rootfs without this.
-        let scratch = work_root(allocation, runtime);
+        let scratch = work_root(allocation, instance);
         if scratch.exists() {
             if let Err(err) = std::fs::remove_dir_all(&scratch) {
                 warn!(
@@ -636,16 +641,16 @@ mod tests {
 
     #[test]
     fn staged_image_layout_reads_state() {
-        let mut runtime = TaskRuntime {
+        let mut instance = TaskInstance {
             state: json!({ "artifactImage": { "ociLayout": "/tmp/x/layout" } }),
-            ..TaskRuntime::default()
+            ..TaskInstance::default()
         };
         assert_eq!(
-            staged_image_layout(&runtime),
+            staged_image_layout(&instance),
             Some(PathBuf::from("/tmp/x/layout"))
         );
-        runtime.state = json!({});
-        assert_eq!(staged_image_layout(&runtime), None);
+        instance.state = json!({});
+        assert_eq!(staged_image_layout(&instance), None);
     }
 
     fn container_task(name: &str, command: Value) -> TaskConfig {
@@ -655,7 +660,7 @@ mod tests {
             .unwrap_or_else(|_| "alpine:latest".to_string());
         serde_json::from_value(json!({
             "name": name,
-            "kind": "container",
+            "runtime": "container",
             "config": { "image": image, "command": command },
         }))
         .expect("task config deserializes")
@@ -670,7 +675,7 @@ mod tests {
     /// `LEGION_OCI_RUNTIME=runc cargo test --lib oci_runtime_runs_container \
     ///   -- --ignored --nocapture`
     #[test]
-    #[ignore = "requires an OCI runtime (youki/runc/crun) + network"]
+    #[ignore = "requires an OCI instance (youki/runc/crun) + network"]
     fn oci_runtime_runs_container_and_captures_logs() -> R<()> {
         let plugin = ContainerTaskPlugin::default();
         let allocation = alloc();
@@ -688,19 +693,21 @@ mod tests {
         );
 
         let tmp = tempfile::tempdir()?;
-        let mut runtime = TaskRuntime {
+        let mut instance = TaskInstance {
             alloc_dir: Some(tmp.path().to_path_buf()),
             log_dir: Some(tmp.path().join("logs")),
-            ..TaskRuntime::default()
+            ..TaskInstance::default()
         };
 
-        plugin.start(&allocation, &task, &mut runtime)?;
-        let mut child = runtime.child.take().expect("child handle set");
+        plugin.start(&allocation, &task, &mut instance)?;
+        let mut child = instance.child.take().expect("child handle set");
         let status = child.wait()?;
         assert!(status.success(), "container exited cleanly: {status:?}");
 
-        let stdout = std::fs::read_to_string(runtime.log_dir.as_ref().unwrap().join("stdout.log"))?;
-        let stderr = std::fs::read_to_string(runtime.log_dir.as_ref().unwrap().join("stderr.log"))?;
+        let stdout =
+            std::fs::read_to_string(instance.log_dir.as_ref().unwrap().join("stdout.log"))?;
+        let stderr =
+            std::fs::read_to_string(instance.log_dir.as_ref().unwrap().join("stderr.log"))?;
         assert!(
             stdout.contains("stdout-line"),
             "stdout captured: {stdout:?}"
@@ -716,7 +723,7 @@ mod tests {
     /// tears it down via `<runtime> delete --force` (killing the foreground
     /// `run` alone leaves the container init reparented and alive).
     #[test]
-    #[ignore = "requires an OCI runtime (youki/runc/crun) + network"]
+    #[ignore = "requires an OCI instance (youki/runc/crun) + network"]
     fn oci_runtime_stop_kills_running_container() -> R<()> {
         let binary = std::env::var(OCI_RUNTIME_ENV).unwrap_or_else(|_| DEFAULT_OCI_RUNTIME.into());
         let plugin = ContainerTaskPlugin::default();
@@ -725,11 +732,11 @@ mod tests {
         let task = container_task("stoptest", json!(["/bin/sleep", "60"]));
 
         let tmp = tempfile::tempdir()?;
-        let mut runtime = TaskRuntime {
+        let mut instance = TaskInstance {
             alloc_dir: Some(tmp.path().to_path_buf()),
-            ..TaskRuntime::default()
+            ..TaskInstance::default()
         };
-        plugin.start(&allocation, &task, &mut runtime)?;
+        plugin.start(&allocation, &task, &mut instance)?;
         std::thread::sleep(std::time::Duration::from_secs(3));
 
         let running = Command::new(&binary).args(["state", &name]).output()?;
@@ -738,7 +745,7 @@ mod tests {
             "container should exist before stop"
         );
 
-        plugin.stop(&allocation, &task, &mut runtime)?;
+        plugin.stop(&allocation, &task, &mut instance)?;
         std::thread::sleep(std::time::Duration::from_secs(1));
 
         let after = Command::new(&binary).args(["state", &name]).output()?;

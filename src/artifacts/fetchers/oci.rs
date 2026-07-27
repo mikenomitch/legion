@@ -268,7 +268,7 @@ impl OciFetcher {
     }
 
     /// Image materialization: write a complete on-disk OCI layout
-    /// (`oci-layout`, `index.json`, `blobs/`) that image-consuming kinds
+    /// (`oci-layout`, `index.json`, `blobs/`) that image-consuming runtimes
     /// hand to their runtime.
     #[allow(clippy::too_many_arguments)]
     fn fetch_image_layout(

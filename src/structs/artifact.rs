@@ -1,4 +1,4 @@
-//! Artifact spec types shared by every task kind.
+//! Artifact spec types shared by every task runtime.
 //!
 //! See `internal_docs/plans/artifact-system-plan.md` and the user-facing
 //! `docs/artifacts.md`. This module owns the *spec-level* primitives:
@@ -353,7 +353,7 @@ pub fn validate_artifact_dest(dest: &str) -> R<()> {
 }
 
 impl ArtifactSpec {
-    /// Convenience constructor for kind-implicit artifacts (for example the
+    /// Convenience constructor for runtime-implicit artifacts (for example the
     /// container `image` desugar).
     pub fn from_source(source: impl Into<String>) -> Self {
         ArtifactSpec {
@@ -535,7 +535,7 @@ pub fn substitute_artifact_tokens(value: &mut Value, paths: &HashMap<String, Str
 }
 
 /// Cross-field validation for a task's artifact list: per-spec shape rules,
-/// name uniqueness, `${artifact.<name>}` references in the kind config, and
+/// name uniqueness, `${artifact.<name>}` references in the runtime config, and
 /// `auth.identity` references into the task's `identities` list.
 ///
 /// Cluster-dependent rules (scheme allowlist, `auth.nodeIdentity` existence)

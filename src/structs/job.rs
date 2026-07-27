@@ -1117,7 +1117,9 @@ pub struct TaskConfig {
     pub name: String,
     #[serde(default = "default_task_count")]
     pub count: TaskCount,
-    pub kind: String,
+    /// Name of the task runtime plugin that runs this task (`exec`,
+    /// `container`, `noop`, or a plugin under `plugins/tasks/<name>/`).
+    pub runtime: String,
     #[serde(default = "default_task_group")]
     pub group: String,
     #[serde(default)]
@@ -1554,7 +1556,15 @@ struct TaskConfigInput {
     // from the default; resolved via `unwrap_or_default()` in conversion.
     #[serde(default)]
     count: Option<TaskCount>,
-    kind: String,
+    // Optional so the `kind` trap below can produce a rename hint instead of
+    // serde's bare "missing field `runtime`".
+    #[serde(default)]
+    runtime: Option<String>,
+    // `kind` was the pre-rename spelling of `runtime`. Serde would silently
+    // ignore it and then report `runtime` as missing, which tells the user
+    // nothing about what happened — so capture it and reject with the fix.
+    #[serde(default)]
+    kind: Option<String>,
     #[serde(default = "default_task_group")]
     group: String,
     #[serde(default)]
@@ -1619,6 +1629,34 @@ enum TaskDependencyInput {
 impl TaskConfigInput {
     fn into_task_config(self, name: String) -> Result<TaskConfig, String> {
         let name = self.name.unwrap_or(name);
+        // The task runtime axis was called `kind` before it was renamed to
+        // `runtime`. There is deliberately no alias (see
+        // internal_docs/calls/task-runtime-rename-plan_calls.md §1), so name
+        // the exact substitution rather than failing on a missing field.
+        let runtime = match (self.runtime, self.kind) {
+            (Some(_), Some(_)) => {
+                return Err(format!(
+                    "task {name} sets both runtime and kind; `kind` was renamed to \
+                     `runtime` — remove the kind field \
+                     (see docs/task-runtime-plugins.md)"
+                ))
+            }
+            (None, Some(kind)) => {
+                return Err(format!(
+                    "task {name}: unknown field `kind`, expected `runtime`. `kind` was \
+                     renamed to `runtime`; replace `kind: \"{kind}\"` with \
+                     `runtime: \"{kind}\"` (see docs/task-runtime-plugins.md)"
+                ))
+            }
+            (None, None) => {
+                return Err(format!(
+                    "task {name} is missing the required field `runtime`, which names \
+                     the task runtime plugin that runs it (for example \
+                     `runtime: \"exec\"`; see docs/task-runtime-plugins.md)"
+                ))
+            }
+            (Some(runtime), None) => runtime,
+        };
         // Keyed-mode cardinality is owned by the instance management API
         // (CreateInstance/DestroyInstance), never by the job spec. An explicit
         // `count` on a keyed task would be silently meaningless, so reject it
@@ -1665,7 +1703,7 @@ impl TaskConfigInput {
         Ok(TaskConfig {
             name,
             count: self.count.unwrap_or_default(),
-            kind: self.kind,
+            runtime,
             group: self.group,
             depends_on,
             lifecycle: self.lifecycle,
@@ -1853,11 +1891,11 @@ impl TaskCheck {
 }
 
 impl TaskConfig {
-    pub fn new(name: impl Into<String>, kind: impl Into<String>) -> Self {
+    pub fn new(name: impl Into<String>, runtime: impl Into<String>) -> Self {
         TaskConfig {
             name: name.into(),
             count: default_task_count(),
-            kind: kind.into(),
+            runtime: runtime.into(),
             group: default_task_group(),
             depends_on: Vec::new(),
             lifecycle: default_task_lifecycle(),
@@ -2107,12 +2145,7 @@ impl TaskConfig {
             let is_shell = matches!(action.command.first().map(String::as_str), Some(cmd)
                 if cmd.ends_with("sh") || cmd == "bash" || cmd == "zsh")
                 && action.command.iter().any(|a| a == "-c");
-            if is_shell
-                && action
-                    .command
-                    .iter()
-                    .any(|a| a.contains("${param."))
-            {
+            if is_shell && action.command.iter().any(|a| a.contains("${param.")) {
                 warn!(
                     task = %self.name,
                     action = %action.name,
@@ -2301,7 +2334,9 @@ mod tests {
     #[test]
     fn action_render_uses_default_when_param_omitted() {
         let action = sample_action();
-        let (argv, _) = action.render_command(&std::collections::HashMap::new()).unwrap();
+        let (argv, _) = action
+            .render_command(&std::collections::HashMap::new())
+            .unwrap();
         assert_eq!(argv.last().unwrap(), "sessions");
     }
 
@@ -2361,7 +2396,7 @@ mod tests {
             "name": "demo",
             "tasks": [
                 {
-                    "kind": "noop",
+                    "runtime": "noop",
                     "count": 1,
                     "config": {},
                     "resources": {},
@@ -2384,7 +2419,7 @@ mod tests {
             "name": "demo",
             "tasks": {
                 "first": {
-                    "kind": "noop",
+                    "runtime": "noop",
                     "config": {},
                     "resources": {},
                 }
@@ -2404,7 +2439,7 @@ mod tests {
         let spec = serde_json::json!({
             "name": "demo",
             "task": {
-                "kind": "noop",
+                "runtime": "noop",
             },
         });
 
@@ -2422,7 +2457,7 @@ mod tests {
             "tasks": [
                 {
                     "name": "named",
-                    "kind": "noop",
+                    "runtime": "noop",
                 }
             ],
         });
@@ -2440,7 +2475,7 @@ mod tests {
         let spec = serde_json::json!({
             "name": "demo",
             "task": {
-                "kind": "noop",
+                "runtime": "noop",
                 "count": { "num": 3, "per": "region" }
             }
         });
@@ -2457,7 +2492,7 @@ mod tests {
         let spec = serde_json::json!({
             "name": "demo",
             "task": {
-                "kind": "noop",
+                "runtime": "noop",
             }
         });
 
@@ -2473,7 +2508,7 @@ mod tests {
         let spec = serde_json::json!({
             "name": "demo",
             "task": {
-                "kind": "noop",
+                "runtime": "noop",
                 "lifecycle": "batch",
                 "schedule": "every 5m"
             }
@@ -2492,7 +2527,7 @@ mod tests {
         let spec = serde_json::json!({
             "name": "demo",
             "task": {
-                "kind": "noop",
+                "runtime": "noop",
                 "lifecycle": "batch",
                 "schedule": "0 * * * * *"
             }
@@ -2512,10 +2547,10 @@ mod tests {
             "name": "demo",
             "tasks": {
                 "build": {
-                    "kind": "noop"
+                    "runtime": "noop"
                 },
                 "deploy": {
-                    "kind": "noop",
+                    "runtime": "noop",
                     "dependsOn": [
                         "build",
                         { "task": "build", "condition": "success" }
@@ -2547,8 +2582,8 @@ mod tests {
         let spec = serde_json::json!({
             "name": "demo",
             "tasks": {
-                "web": { "kind": "noop", "group": "frontend" },
-                "api": { "kind": "noop", "group": "backend" }
+                "web": { "runtime": "noop", "group": "frontend" },
+                "api": { "runtime": "noop", "group": "backend" }
             },
             "rollout": {
                 "percentEachStep": 10,
@@ -2584,7 +2619,7 @@ mod tests {
     fn rollout_validation_rejects_conflicting_step_modes() {
         let spec = serde_json::json!({
             "name": "demo",
-            "task": { "kind": "noop" },
+            "task": { "runtime": "noop" },
             "rollout": {
                 "countEachStep": 1,
                 "percentEachStep": 10
@@ -2605,7 +2640,7 @@ mod tests {
     fn rollout_validation_rejects_invalid_percent_steps() {
         let spec = serde_json::json!({
             "name": "demo",
-            "task": { "kind": "noop" },
+            "task": { "runtime": "noop" },
             "rollout": {
                 "percentSteps": [10, 20, 90]
             }
@@ -2626,7 +2661,7 @@ mod tests {
         let spec = serde_json::json!({
             "name": "demo",
             "task": {
-                "kind": "noop",
+                "runtime": "noop",
                 "group": "frontend"
             },
             "rolloutByGroup": {
@@ -2650,7 +2685,7 @@ mod tests {
     fn rollout_slots_deserialize_and_round_trip() -> R<()> {
         let spec = serde_json::json!({
             "name": "demo",
-            "task": { "kind": "noop" },
+            "task": { "runtime": "noop" },
             "rollout": {
                 "slots": { "order": "sequential", "updateFrom": 2 }
             }
@@ -2704,7 +2739,7 @@ mod tests {
         ] {
             let spec = serde_json::json!({
                 "name": "demo",
-                "task": { "kind": "noop" },
+                "task": { "runtime": "noop" },
                 "rollout": { "slots": slots }
             });
             let config: JobConfig =
@@ -2723,7 +2758,7 @@ mod tests {
     fn rollout_validation_rejects_sequential_with_step_mode() {
         let spec = serde_json::json!({
             "name": "demo",
-            "task": { "kind": "noop" },
+            "task": { "runtime": "noop" },
             "rollout": {
                 "percentSteps": [50, 100],
                 "slots": { "order": "sequential" }
@@ -2745,8 +2780,8 @@ mod tests {
         let spec = serde_json::json!({
             "name": "demo",
             "tasks": {
-                "db": { "kind": "noop", "group": "data" },
-                "api": { "kind": "noop", "group": "backend" }
+                "db": { "runtime": "noop", "group": "data" },
+                "api": { "runtime": "noop", "group": "backend" }
             },
             "rollout": { "percentSteps": [25, 100] },
             "rolloutByGroup": {
@@ -2779,7 +2814,7 @@ mod tests {
         // sequential slots block instead of merging into a conflict.
         let reverse: JobConfig = serde_json::from_value(serde_json::json!({
             "name": "demo",
-            "tasks": { "db": { "kind": "noop", "group": "data" } },
+            "tasks": { "db": { "runtime": "noop", "group": "data" } },
             "rollout": { "slots": { "order": "sequential" } },
             "rolloutByGroup": { "data": { "countEachStep": 1 } }
         }))?;
@@ -2797,7 +2832,7 @@ mod tests {
         let spec = serde_json::json!({
             "name": "demo",
             "task": {
-                "kind": "exec",
+                "runtime": "exec",
                 "env": [{
                     "name": "A",
                     "value": { "template": "x", "templateKv": "templates/x" }
@@ -2863,7 +2898,7 @@ mod tests {
         let spec = serde_json::json!({
             "name": "demo",
             "task": {
-                "kind": "exec",
+                "runtime": "exec",
                 "identities": [
                     {
                         "name": "aws",
@@ -2903,7 +2938,7 @@ mod tests {
         let spec = serde_json::json!({
             "name": "demo",
             "task": {
-                "kind": "exec",
+                "runtime": "exec",
                 "identities": [
                     { "name": "aws", "audience": [], "env": "TOKEN", "changeMode": "restart" }
                 ]
@@ -2921,7 +2956,7 @@ mod tests {
         let spec = serde_json::json!({
             "name": "demo",
             "task": {
-                "kind": "exec",
+                "runtime": "exec",
                 "count": 3,
                 "stateful": {
                     "mode": "slot",
@@ -2953,7 +2988,7 @@ mod tests {
         let spec = serde_json::json!({
             "name": "demo",
             "task": {
-                "kind": "container",
+                "runtime": "container",
                 "stateful": {
                     "mode": "keyed",
                     "idSource": "caller",
@@ -2970,6 +3005,55 @@ mod tests {
     }
 
     #[test]
+    fn pre_rename_kind_field_is_rejected_with_a_runtime_hint() {
+        let spec = serde_json::json!({
+            "name": "demo",
+            "task": { "kind": "container" }
+        });
+        let err = serde_json::from_value::<JobConfig>(spec)
+            .expect_err("the pre-rename `kind` spelling must fail to parse");
+        let message = err.to_string();
+        // The whole point of rejecting rather than aliasing is that the error
+        // has to teach the substitution (calls doc §1).
+        assert!(
+            message.contains("unknown field `kind`")
+                && message.contains("expected `runtime`")
+                && message.contains("runtime: \"container\""),
+            "error must name the exact fix, got: {message}"
+        );
+    }
+
+    #[test]
+    fn declaring_both_runtime_and_kind_is_rejected() {
+        let spec = serde_json::json!({
+            "name": "demo",
+            "task": { "runtime": "exec", "kind": "exec" }
+        });
+        let err = serde_json::from_value::<JobConfig>(spec)
+            .expect_err("declaring both spellings must fail to parse");
+        assert!(
+            err.to_string().contains("remove the kind field"),
+            "unexpected error message: {err}"
+        );
+    }
+
+    #[test]
+    fn missing_runtime_names_the_field_and_its_purpose() {
+        let spec = serde_json::json!({
+            "name": "demo",
+            "task": { "group": "web" }
+        });
+        let err = serde_json::from_value::<JobConfig>(spec)
+            .expect_err("a task with no runtime must fail to parse");
+        let message = err.to_string();
+        assert!(
+            message.contains("missing the required field `runtime`")
+                && message.contains("runtime: \"exec\""),
+            "unexpected error message: {message}"
+        );
+    }
+
+    #[test]
     fn stateful_keyed_mode_rejects_explicit_count_at_parse_time() {
         for count in [
             serde_json::json!(3),
@@ -2978,7 +3062,7 @@ mod tests {
             let spec = serde_json::json!({
                 "name": "demo",
                 "task": {
-                    "kind": "exec",
+                    "runtime": "exec",
                     "count": count,
                     "stateful": { "mode": "keyed" }
                 }
@@ -3000,7 +3084,7 @@ mod tests {
             "name": "demo",
             "tasks": {
                 "sandbox": {
-                    "kind": "exec",
+                    "runtime": "exec",
                     "count": 1,
                     "stateful": { "mode": "keyed" }
                 }
@@ -3016,9 +3100,9 @@ mod tests {
         let spec = serde_json::json!({
             "name": "demo",
             "tasks": [
-                { "kind": "exec", "stateful": { "mode": "keyed" } },
-                { "kind": "exec", "count": 3, "stateful": { "mode": "slot" } },
-                { "kind": "exec", "group": "plain" }
+                { "runtime": "exec", "stateful": { "mode": "keyed" } },
+                { "runtime": "exec", "count": 3, "stateful": { "mode": "slot" } },
+                { "runtime": "exec", "group": "plain" }
             ]
         });
         let config: JobConfig = serde_json::from_value(spec)?;
@@ -3033,7 +3117,7 @@ mod tests {
         let spec = serde_json::json!({
             "name": "demo",
             "task": {
-                "kind": "exec",
+                "runtime": "exec",
                 "stateful": { "mode": "slot", "storage": { "path": "/data" } }
             }
         });
@@ -3057,7 +3141,7 @@ mod tests {
         let spec = serde_json::json!({
             "name": "demo",
             "task": {
-                "kind": "exec",
+                "runtime": "exec",
                 "count": 2,
                 "stateful": {
                     "mode": "slot",
@@ -3272,7 +3356,7 @@ mod tests {
         let spec = serde_json::json!({
             "name": "demo",
             "task": {
-                "kind": "exec",
+                "runtime": "exec",
                 "stateful": { "mode": "ordinal" }
             }
         });
@@ -3286,7 +3370,7 @@ mod tests {
         let spec = serde_json::json!({
             "name": "demo",
             "task": {
-                "kind": "exec",
+                "runtime": "exec",
                 "env": [{
                     "name": "A",
                     "value": { "template": "{{ kv \"x/y\" }}" }
@@ -3429,7 +3513,7 @@ mod tests {
         let spec = serde_json::json!({
             "name": "demo",
             "task": {
-                "kind": "exec",
+                "runtime": "exec",
                 "onLost": { "selfTerminateAfter": "90s" }
             }
         });
@@ -3446,7 +3530,7 @@ mod tests {
         let spec = serde_json::json!({
             "name": "demo",
             "task": {
-                "kind": "exec",
+                "runtime": "exec",
                 "count": 2,
                 "stateful": { "mode": "slot" },
                 "onLost": { "selfTerminateAfter": "90s" }
@@ -3462,7 +3546,7 @@ mod tests {
         let spec = serde_json::json!({
             "name": "demo",
             "task": {
-                "kind": "exec",
+                "runtime": "exec",
                 "count": 2,
                 "stateful": {
                     "mode": "slot",

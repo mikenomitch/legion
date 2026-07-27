@@ -10,7 +10,7 @@
 {
     name: "kv-reactive-demo",
     task: {
-        kind: "exec",
+        runtime: "exec",
         kv: {
             watch: true,
             onChange: "restart",

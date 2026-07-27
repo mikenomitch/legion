@@ -41,7 +41,7 @@ cannot read it. Tasks never need to enter the directory themselves — the
 worker opens the capture file descriptors before spawning the task.
 
 Capture is wired through the task plugin runtime: the worker sets a log
-directory on `TaskRuntime`, and the built-in `exec` and `container` task kinds
+directory on `TaskInstance`, and the built-in `exec` and `container` task runtimes
 redirect their child process to those files
 ([`configure_task_log_capture`](../src/task_plugins/mod.rs)). Because the task
 writes to a **real file descriptor** (not a pipe to the worker), logging keeps
@@ -94,7 +94,7 @@ attach correct OpenTelemetry **resource** attributes without re-deriving them:
     "legion.allocation.id": 42,
     "legion.node.id": "node-1",
     "legion.task.name": "api",
-    "legion.task.kind": "exec"
+    "legion.task.runtime": "exec"
   },
   "streams": { "stdout": "stdout.log", "stderr": "stderr.log" },
   "rotation": { "maxFileBytes": 10485760, "maxFiles": 5, "retentionDays": 7 }
@@ -370,10 +370,10 @@ before running.
   exporter doesn't echo to stdout, so there's no amplification loop).
 - If workers use an absolute `LEGION_WORKER_STATE_PATH`, set the task's `cwd` (or
   make the glob absolute) so the relative path still resolves.
-- **The `container` task kind cannot do this.** Legion's container kind has no
+- **The `container` task runtime cannot do this.** Legion's container runtime has no
   host volume mounts (only image/command/env), so a containerized collector can't
   read the node's log files. Use `exec` with a host-installed binary, as the
-  jobspecs do. (If host volume mounts are added to the container kind later, a
+  jobspecs do. (If host volume mounts are added to the container runtime later, a
   fully self-contained image-based shipper becomes possible.)
 
 ### Why a collector instead of built-in forwarding?

@@ -23,7 +23,7 @@ Important `TaskConfig` fields:
   - integer count
   - or `{ num, per }` for per-attribute placement
 - `group`: task grouping for rollout + automatic anti-affinity behavior
-- `kind`: task-kind plugin (`exec`, `container`, etc)
+- `runtime`: task-runtime plugin (`exec`, `container`, etc)
 - `resources`: normalized by manager `ResourcePolicy`
 - `constraints`: hard placement filter
 - `permit`: hard node restriction policy
@@ -42,7 +42,7 @@ Important `TaskConfig` fields:
   files with per-reference `watch`/`onChange`/`onDelete` policies that can
   restart, roll out, or fail the job when watched keys change or are
   deleted. Full semantics (policy precedence, debounce, fail/recovery,
-  per-kind capability matrix) live in the
+  per-runtime capability matrix) live in the
   ["Reactive updates" section of the KV store doc](kv-store.md#reactive-updates-kv-driven-task-updates).
 - `identities`: named workload identities (OIDC). The manager mints a
   short-lived, asymmetrically-signed JWT per allocation for each declared

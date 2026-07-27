@@ -348,7 +348,7 @@ service Manager {
   // proxies the stream to that worker's `Worker.ExecTask`.
   //
   // The first client frame must be an `ExecStart`. Raw commands require
-  // `exec:write` (with `host: true` for host-level kinds); action runs
+  // `exec:write` (with `host: true` for host-level runtimes); action runs
   // require `action:write` (or `exec:write`) and are rendered server-side
   // from the stored job spec.
   rpc ExecAllocation (stream ExecClientFrame) returns (stream ExecServerFrame);
@@ -3140,8 +3140,12 @@ message TaskAllocation {
   // Task name.
   string task_name = 6;
 
-  // Task kind/plugin name.
-  string task_kind = 7;
+  // Name of the task runtime plugin that runs this task (`exec`, `container`,
+  // `noop`, or a third-party plugin under `plugins/tasks/<name>/`). The worker
+  // resolves this against its task-plugin registry and fails the allocation if
+  // no plugin with this name is loadable. Mirrors the jobspec's
+  // `tasks.<name>.runtime` field.
+  string task_runtime = 7;
 
   // JSON-encoded task config payload.
   string task_config = 8;
@@ -3160,7 +3164,7 @@ message TaskAllocation {
 
   // JSON-encoded list of normalized artifact specs for this task.
   //
-  // This is the post-admission form: kind-implicit artifacts (for example a
+  // This is the post-admission form: runtime-implicit artifacts (for example a
   // container `image`) are already desugared in, `resolve: "pin"` references
   // are already pinned to digests, and cluster-level auth matchers are
   // already applied. Workers stage exactly this list and never re-derive or

@@ -544,5 +544,63 @@ pub fn get_migrations() -> Migrations<'static> {
         // Vec<ActionSpec>; NULL/absent == no actions. Appended last so
         // databases created before this feature migrate cleanly.
         M::up("ALTER TABLE task_config ADD COLUMN actions JSONB;").down(""),
+        // The task-execution axis was renamed `kind` -> `runtime` (see
+        // internal_docs/plans/task-runtime-rename-plan.md). Column rename only;
+        // values are unchanged, so existing clusters migrate on manager start
+        // with no operator action.
+        M::up("ALTER TABLE task_config RENAME COLUMN kind TO runtime;")
+            .down("ALTER TABLE task_config RENAME COLUMN runtime TO kind;"),
     ])
+}
+
+#[cfg(test)]
+mod migrations_test {
+    use super::*;
+    use rusqlite::Connection;
+
+    /// A cluster created before the `kind` -> `runtime` rename must migrate its
+    /// existing task rows in place, with the values preserved.
+    #[test]
+    fn task_config_kind_column_migrates_to_runtime() -> anyhow::Result<()> {
+        let migrations = get_migrations();
+        let mut conn = Connection::open_in_memory()?;
+        migrations.to_latest(&mut conn)?;
+
+        // Step back over the rename to reconstruct a pre-rename database.
+        let latest: u32 = conn.query_row("PRAGMA user_version;", [], |row| row.get(0))?;
+        migrations.to_version(&mut conn, (latest - 1) as usize)?;
+
+        conn.execute(
+            "INSERT INTO job (id, name, status, created_at)
+             VALUES ('job-1', 'demo', 'active', '2026-01-01T00:00:00Z');",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO job_config (id, name, type, meta, version, created_at, job_id)
+             VALUES ('jc-1', 'demo', 'service', '{}', 1, '2026-01-01T00:00:00Z', 'job-1');",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO task_config (id, count, name, kind, config, resources, constraints, job_id, job_config_id)
+             VALUES (1, 1, 'web', 'container', '{}', '{}', '{}', 'job-1', 'jc-1');",
+            [],
+        )?;
+
+        migrations.to_latest(&mut conn)?;
+
+        let runtime: String =
+            conn.query_row("SELECT runtime FROM task_config WHERE id = 1;", [], |row| {
+                row.get(0)
+            })?;
+        assert_eq!(runtime, "container");
+
+        // The old spelling must be gone, not shadowed by a leftover column.
+        let has_kind = conn
+            .prepare("SELECT kind FROM task_config;")
+            .err()
+            .is_some();
+        assert!(has_kind, "`kind` column should no longer exist");
+
+        Ok(())
+    }
 }
