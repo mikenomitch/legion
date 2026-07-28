@@ -38,8 +38,8 @@ use crate::structs::{Allocation, TaskConfig};
 use crate::task_plugins::microvm::{self, Backend, GuestDiskMount, GuestPayload, TapNet, VmSpec};
 use crate::task_plugins::{
     configure_task_log_capture, derived_schema, oci_bundle, oci_image, reap_task_process,
-    spawn_pipe, spawn_pty, spawn_task_process, ExecOptions, ExecSession, ExecSupport,
-    MountedVolume, TaskInstance, TaskPlugin,
+    spawn_pipe, spawn_pty, spawn_task_process, validate_schema, ExecOptions, ExecSession,
+    ExecSupport, MountedVolume, TaskInstance, TaskPlugin,
 };
 use crate::volumes::VolumeMode;
 use schemars::JsonSchema;
@@ -745,9 +745,24 @@ impl TaskPlugin for SandboxTaskPlugin {
         derived_schema::<SandboxTaskConfig>()
     }
 
-    /// Logs the backend this node resolved to. Workers load every built-in kind
-    /// at startup, so this is where an operator learns "sandboxes here run on
-    /// cloud-hypervisor" — or why they can't — without submitting a job.
+    /// Runs the typed parse, not just the derived JSON schema.
+    ///
+    /// The config carries a `#[serde(flatten)]` catch-all for forward
+    /// compatibility, which makes the derived schema accept *any* extra
+    /// property — so a schema-only check would pass a retired `state` block, a
+    /// guest too small to boot, or `network.mode: 'bridge'`, and the job would
+    /// only fail when a task tried to start on some node. Parsing here moves
+    /// every check in [`SandboxTaskConfig::validate`] to submit time, which is
+    /// where an agent or a human can still act on it.
+    fn validate_config(&self, config: &Value) -> R<()> {
+        validate_schema(&self.schema(), config)?;
+        SandboxTaskConfig::from_value(config)?;
+        Ok(())
+    }
+
+    /// Logs the backend this node resolved to. Workers load every built-in
+    /// runtime at startup, so this is where an operator learns "sandboxes here
+    /// run on cloud-hypervisor" — or why they can't — without submitting a job.
     fn setup(&self) -> R<()> {
         match Backend::detect(None) {
             Ok(backend) => info!(
@@ -1135,6 +1150,44 @@ mod tests {
         .expect_err("config.state was retired");
         assert!(err.to_string().contains("stateful"), "{err}");
         assert!(err.to_string().contains("volume"), "{err}");
+    }
+
+    /// Admission must run the *typed* parse, not just the derived JSON schema.
+    /// The config's `#[serde(flatten)]` catch-all makes the schema accept any
+    /// extra property, so a schema-only check passes every one of these and the
+    /// job fails later, at task start on some node, instead of at submit.
+    #[test]
+    fn validate_config_enforces_more_than_the_json_schema() {
+        for (label, config) in [
+            (
+                "retired state block",
+                json!({"image": "a", "command": ["x"], "state": {"path": "/w"}}),
+            ),
+            (
+                "guest too small to boot",
+                json!({"image": "a", "command": ["x"], "memory_mib": 16}),
+            ),
+            (
+                "zero vcpus",
+                json!({"image": "a", "command": ["x"], "vcpus": 0}),
+            ),
+            (
+                "unknown network mode",
+                json!({"image": "a", "command": ["x"], "network": {"mode": "bridge"}}),
+            ),
+        ] {
+            // The schema alone lets all of these through — that is the bug this
+            // guards, so assert it rather than assuming it.
+            validate_schema(&SandboxTaskPlugin.schema(), &config)
+                .unwrap_or_else(|err| panic!("{label}: schema unexpectedly rejected it: {err}"));
+            SandboxTaskPlugin
+                .validate_config(&config)
+                .expect_err(&format!("{label} must be rejected at admission"));
+        }
+
+        SandboxTaskPlugin
+            .validate_config(&json!({"image": "alpine", "command": ["true"]}))
+            .expect("a valid sandbox config still passes");
     }
 
     #[test]

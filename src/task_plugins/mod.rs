@@ -798,7 +798,7 @@ fn task_plugin_name_to_path(name: &str) -> String {
         .into_owned()
 }
 
-fn validate_schema(schema: &Value, config: &Value) -> R<()> {
+pub(crate) fn validate_schema(schema: &Value, config: &Value) -> R<()> {
     let schema = Box::leak(Box::new(schema.clone()));
     let compiled = JSONSchema::compile(schema).context("Invalid task config schema")?;
     if let Err(errors) = compiled.validate(config) {
@@ -885,11 +885,13 @@ mod tests {
     }
 
     fn sandbox_task() -> TaskConfig {
+        // No storage in the runtime config on purpose: a sandbox persists via
+        // `stateful.storage` (a block-mode volume), not a runtime-private
+        // field. See docs/task-runtime-sandbox.md.
         TaskConfig {
             config: json!({
                 "image": "alpine",
                 "command": ["/bin/sh", "-c", "sleep 1"],
-                "state": { "path": "/workspace" },
             }),
             ..TaskConfig::new("sandbox-task", "sandbox")
         }
