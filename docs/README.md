@@ -20,10 +20,10 @@ Plans, roadmaps, to-do lists, and development notes live in
 
 ## Workloads
 
-- [Task Kind Plugins](task-kind-plugins.md) — the task-kind plugin contract.
-- [Task Kind: exec](task-kind-exec.md)
-- [Task Kind: container](task-kind-container.md)
-- [Task Kind: noop](task-kind-noop.md)
+- [Task Runtime Plugins](task-runtime-plugins.md) — the task-runtime plugin contract.
+- [Task Runtime: exec](task-runtime-exec.md)
+- [Task Runtime: container](task-runtime-container.md)
+- [Task Runtime: noop](task-runtime-noop.md)
 - [Artifacts](artifacts.md) — declaring, fetching, verifying, and staging inputs.
 - [Stateful Workloads & Instance Identity](stateful-workloads.md) — slot and
   keyed instances, storage handles, fencing.

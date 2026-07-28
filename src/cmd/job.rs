@@ -79,7 +79,7 @@ pub fn config() -> Command {
         .args(jsonnet_var_args());
 
     let schema_cmd = Command::new("schema")
-        .about("Emit the JSON Schema for jobspecs and built-in task kinds")
+        .about("Emit the JSON Schema for jobspecs and built-in task runtimes")
         .arg(json_flag());
 
     let wait_cmd = Command::new("wait")
@@ -524,11 +524,11 @@ async fn job_schema(arg_matches: &ArgMatches) -> R<()> {
 }
 
 /// Assemble the jobspec JSON Schema: a documented top-level envelope plus the
-/// live, per-kind task config schemas derived from the built-in plugins.
+/// live, per-runtime task config schemas derived from the built-in plugins.
 pub(crate) fn build_jobspec_schema() -> Value {
-    let mut task_kinds = serde_json::Map::new();
+    let mut task_runtimes = serde_json::Map::new();
     for plugin in builtin_task_plugin_schemas() {
-        task_kinds.insert(plugin.name, plugin.schema);
+        task_runtimes.insert(plugin.name, plugin.schema);
     }
 
     json!({
@@ -536,7 +536,7 @@ pub(crate) fn build_jobspec_schema() -> Value {
         "title": "Legion Jobspec",
         "description": "A Legion job specification (the JSON a jsonnet jobspec renders to). \
             A job has a name and one or more tasks (use `task` for a single task or `tasks` for many). \
-            Each task's `config` object is validated against the schema for its `kind` under `taskKinds`.",
+            Each task's `config` object is validated against the schema for its `runtime` under `taskRuntimes`.",
         "type": "object",
         "required": ["name"],
         "properties": {
@@ -554,10 +554,10 @@ pub(crate) fn build_jobspec_schema() -> Value {
         "$defs": {
             "task": {
                 "type": "object",
-                "required": ["kind"],
+                "required": ["runtime"],
                 "properties": {
                     "name": { "type": "string", "description": "Task name (unique within the job)." },
-                    "kind": { "type": "string", "description": "Task kind/plugin (e.g. exec, container, noop)." },
+                    "runtime": { "type": "string", "description": "Task runtime plugin that runs this task (e.g. exec, container, noop)." },
                     "group": { "type": "string", "description": "Task group; tasks in a group are placed together." },
                     "lifecycle": { "type": "string", "enum": ["service", "batch", "sidecar"], "description": "Task lifecycle." },
                     "count": {
@@ -570,7 +570,7 @@ pub(crate) fn build_jobspec_schema() -> Value {
                             }}
                         ]
                     },
-                    "config": { "type": "object", "description": "Kind-specific config; validated against taskKinds[kind]." },
+                    "config": { "type": "object", "description": "Runtime-specific config; validated against taskRuntimes[runtime]." },
                     "dependsOn": {
                         "type": "array",
                         "items": { "type": "object", "required": ["task"], "properties": {
@@ -591,7 +591,7 @@ pub(crate) fn build_jobspec_schema() -> Value {
                 }
             }
         },
-        "taskKinds": task_kinds
+        "taskRuntimes": task_runtimes
     })
 }
 
@@ -1232,14 +1232,16 @@ mod tests {
     }
 
     #[test]
-    fn jobspec_schema_embeds_task_kinds() {
+    fn jobspec_schema_embeds_task_runtimes() {
         let schema = build_jobspec_schema();
         assert_eq!(schema["title"], "Legion Jobspec");
-        let kinds = schema["taskKinds"].as_object().expect("taskKinds object");
-        // Built-in kinds must be present and carry real derived schemas.
-        assert!(kinds.contains_key("exec"));
-        assert!(kinds.contains_key("container"));
-        assert!(kinds["exec"]["properties"].is_object());
+        let runtimes = schema["taskRuntimes"]
+            .as_object()
+            .expect("taskRuntimes object");
+        // Built-in runtimes must be present and carry real derived schemas.
+        assert!(runtimes.contains_key("exec"));
+        assert!(runtimes.contains_key("container"));
+        assert!(runtimes["exec"]["properties"].is_object());
     }
 
     #[test]
@@ -1275,7 +1277,7 @@ mod tests {
             {
               name: std.extVar("job_name"),
               task: {
-                kind: "noop",
+                runtime: "noop",
               },
             }
             "#,

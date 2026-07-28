@@ -120,7 +120,7 @@ fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_job_schema",
-            description: "Get the JSON Schema for jobspecs and built-in task kinds. Use this before authoring a jobspec.",
+            description: "Get the JSON Schema for jobspecs and built-in task runtimes. Use this before authoring a jobspec.",
             input_schema: empty_schema,
             mutates: false,
         },

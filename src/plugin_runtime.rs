@@ -2,7 +2,7 @@ use crate::prelude::*;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
-pub const PLUGIN_API_VERSION: u32 = 1;
+pub const PLUGIN_API_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -84,15 +84,17 @@ mod tests {
     fn validate_manifest_accepts_matching_manifest() -> R<()> {
         let root = temp_dir();
         std::fs::create_dir_all(&root)?;
+        // Built from the constant so a version bump does not need this test
+        // edited -- only the in-tree plugin.json manifests.
         std::fs::write(
             root.join("plugin.json"),
-            r#"{"kind":"tasks","name":"noop","legionApiVersion":1}"#,
+            format!(r#"{{"kind":"tasks","name":"noop","legionApiVersion":{PLUGIN_API_VERSION}}}"#),
         )?;
 
         let manifest = validate_manifest("tasks", "noop", &root)?;
         assert_eq!(manifest.kind, "tasks");
         assert_eq!(manifest.name, "noop");
-        assert_eq!(manifest.legion_api_version, 1);
+        assert_eq!(manifest.legion_api_version, PLUGIN_API_VERSION);
 
         std::fs::remove_dir_all(root)?;
         Ok(())

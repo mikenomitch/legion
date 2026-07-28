@@ -8,7 +8,7 @@ import LogViewer from '../../components/LogViewer'
 import { managerClient } from '../../grpcClient'
 import { allocationHealthLabel, fetchAllocationRuntime, parseAllocNetwork } from '../../utils/allocations'
 import { formatDate, formatRelativeTime } from '../../utils/format'
-import { buildTaskRuntimeByName, buildTaskRuntimeFromStatuses, extractJobSpecData, topoSortTaskNames, type TaskRuntimeSummary } from '../../utils/jobspec'
+import { buildTaskInstancesByName, buildTaskInstancesFromStatuses, extractJobSpecData, topoSortTaskNames, type TaskInstanceSummary } from '../../utils/jobspec'
 import { POLL_INTERVAL_MS } from '../../utils/polling'
 
 // A storage handle is `{plugin}/{volume_id}`; plugin names never contain a
@@ -66,7 +66,7 @@ export default function JobDetail() {
       spec: spec.submissions,
       specHistory: specHistory.items,
       taskSpec: specData,
-      taskRuntime: buildTaskRuntimeByName(rolloutStatus?.groups ?? []),
+      taskInstances: buildTaskInstancesByName(rolloutStatus?.groups ?? []),
       services: jobServices,
       endpoints,
     }
@@ -102,9 +102,9 @@ export default function JobDetail() {
             // ignore malformed rows
           }
         }
-        return buildTaskRuntimeFromStatuses(statusByName)
+        return buildTaskInstancesFromStatuses(statusByName)
       } catch {
-        return new Map<string, TaskRuntimeSummary>()
+        return new Map<string, TaskInstanceSummary>()
       }
     },
   )
@@ -116,16 +116,16 @@ export default function JobDetail() {
   )
 
   // Prefer live state-store status; fall back to rollout-derived runtime.
-  const taskRuntime = createMemo(() => {
+  const taskInstances = createMemo(() => {
     const live = liveRuntime()
     if (live && live.size > 0) return live
-    return jobData()?.taskRuntime ?? new Map<string, TaskRuntimeSummary>()
+    return jobData()?.taskInstances ?? new Map<string, TaskInstanceSummary>()
   })
 
   // True until the first status fetch resolves and there is no fallback data,
   // so tasks show "loading…" instead of a misleading "not allocated" on first paint.
   const statusLoading = createMemo(
-    () => liveRuntime() === undefined && (jobData()?.taskRuntime?.size ?? 0) === 0,
+    () => liveRuntime() === undefined && (jobData()?.taskInstances?.size ?? 0) === 0,
   )
 
   const statefulTasks = createMemo(() => (jobData()?.taskSpec?.tasks ?? []).filter((task) => task.stateful))
@@ -252,7 +252,7 @@ export default function JobDetail() {
                           <div class="grid gap-2.5 md:grid-cols-2 xl:grid-cols-3">
                             <For each={jobData()!.taskSpec!.tasks.filter((task) => task.group === groupName)}>
                               {(task) => {
-                                const runtime = () => taskRuntime().get(task.name)
+                                const runtime = () => taskInstances().get(task.name)
                                 const primaryStatus = () =>
                                   runtime()?.statuses[0] ?? (statusLoading() ? 'loading' : 'not allocated')
                                 return (
@@ -263,7 +263,7 @@ export default function JobDetail() {
                                     <div class="flex items-start justify-between gap-2">
                                       <div class="min-w-0">
                                         <p class="truncate text-sm font-semibold text-ink group-hover:text-brass-strong">{task.name}</p>
-                                        <p class="mt-0.5 text-xs text-faint">{task.kind} · {task.lifecycle}</p>
+                                        <p class="mt-0.5 text-xs text-faint">{task.runtime} · {task.lifecycle}</p>
                                       </div>
                                       <StatusBadge status={primaryStatus()} loading={statusLoading() && !runtime()} />
                                     </div>
@@ -349,7 +349,7 @@ export default function JobDetail() {
                   <DagVisualization
                     tasks={jobData()!.taskSpec!.tasks}
                     layers={topoSortTaskNames(jobData()!.taskSpec!.tasks)}
-                    taskRuntime={taskRuntime()}
+                    taskInstances={taskInstances()}
                     statusLoading={statusLoading()}
                     jobName={jobName()}
                   />

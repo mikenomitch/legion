@@ -52,7 +52,7 @@ Even with `--allow-write`, `legion_state_query` is forced to read-only.
 | `legion_job_list` | no | List jobs. |
 | `legion_job_info` | no | Inspect one job. |
 | `legion_job_spec` | no | Fetch a job's source submissions. |
-| `legion_job_schema` | no | JSON Schema for jobspecs + task kinds. |
+| `legion_job_schema` | no | JSON Schema for jobspecs + task runtimes. |
 | `legion_job_validate` | no | Validate a rendered jobspec (JSON). |
 | `legion_rollout_list` | no | List rollouts. |
 | `legion_rollout_status` | no | Rollout progress + allocation health. |
@@ -118,7 +118,7 @@ and the MCP `tools/list`; keep it in sync when adding operations
 Agents author far more reliably against a schema than against free-form Jsonnet.
 
 ```bash
-# Get the jobspec JSON Schema, including the live per-kind task config schemas:
+# Get the jobspec JSON Schema, including the live per-runtime task config schemas:
 legion job schema --json
 
 # Render and deeply validate a jobspec WITHOUT submitting it:
@@ -127,8 +127,8 @@ legion job validate ./configs/jobs/demo.jsonnet --json
 
 `job validate` runs the exact validation the manager applies on submit
 (`validate_job_config`), so an agent can self-correct before touching the cluster.
-The schema embeds the built-in task-kind config schemas (`exec`, `container`, …)
-under `taskKinds`, derived from the typed Rust structs.
+The schema embeds the built-in task-runtime config schemas (`exec`, `container`, …)
+under `taskRuntimes`, derived from the typed Rust structs.
 
 ## 5. Idempotency keys
 
@@ -241,7 +241,7 @@ How it is wired (read-only, agent-safe):
 
 1. Workers redirect task stdout/stderr into `stdout.log` / `stderr.log` under a
    per-allocation log directory threaded through the `TaskPlugin` runtime
-   (`TaskRuntime.log_dir`); built-in `exec` and `container` tasks capture
+   (`TaskInstance.log_dir`); built-in `exec` and `container` tasks capture
    automatically.
 2. `Worker.GetTaskLogs` reads those files on the node (with the byte cap / tail).
 3. `Manager.GetAllocationLogs` resolves a job (or allocation id) to its
@@ -299,6 +299,6 @@ library, the scheduler event stream (`events list`/`events follow`,
 `legion_job_logs`).
 
 The task-log path captures task stdout/stderr to per-allocation files via the
-`TaskPlugin` runtime (`TaskRuntime.log_dir`), reads them on the node with
+`TaskPlugin` runtime (`TaskInstance.log_dir`), reads them on the node with
 `Worker.GetTaskLogs`, and proxies through `Manager.GetAllocationLogs`. See
 [§6a](#6a-task-log-retrieval-legion-job-logs).

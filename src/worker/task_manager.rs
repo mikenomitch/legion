@@ -4,7 +4,7 @@ use crate::structs::{
     substitute_artifact_tokens, Allocation, AllocationHealth, TaskAllocation, TaskConfig,
     TaskOnUnhealthyConfig, VolumeMount, VolumeReport, WorkerArtifactFetchConfigFull,
 };
-use crate::task_plugins::{TaskPluginRegistry, TaskRuntime};
+use crate::task_plugins::{TaskInstance, TaskPluginRegistry};
 use crate::worker::log_sink::{default_sinks, LogResource, LogSink};
 use crate::worker::logs::{read_allocation_logs, CapturedStream};
 use crate::worker::state::{pid_is_running, PersistedAllocation, WorkerStateStore};
@@ -45,7 +45,7 @@ pub enum BeginOutcome {
 
 pub struct WorkerTaskManager {
     registry: TaskPluginRegistry,
-    runtimes: HashMap<i64, TaskRuntime>,
+    instances: HashMap<i64, TaskInstance>,
     allocations: HashMap<i64, Allocation>,
     task_configs: HashMap<i64, TaskConfig>,
     health_monitors: HashMap<i64, HealthMonitorHandle>,
@@ -63,7 +63,7 @@ pub struct WorkerTaskManager {
     stager: Arc<ArtifactStager>,
     log_sinks: Vec<Box<dyn LogSink>>,
     /// Volume drivers plus the mounts held for each allocation. Mounting
-    /// happens here, between `prepare_runtime` and `start`, so a task can never
+    /// happens here, between `prepare_instance` and `start`, so a task can never
     /// start before its storage is real (see docs/volumes.md).
     ///
     /// Behind an `Arc` so the daemon can clone a handle out from under the
@@ -98,7 +98,7 @@ impl WorkerTaskManager {
             .unwrap_or_else(|| alloc_root.clone());
         Self {
             registry: TaskPluginRegistry::new(),
-            runtimes: HashMap::new(),
+            instances: HashMap::new(),
             allocations: HashMap::new(),
             task_configs: HashMap::new(),
             health_monitors: HashMap::new(),
@@ -133,7 +133,7 @@ impl WorkerTaskManager {
             job_id: allocation.job_id.clone(),
             node_id: allocation.node_id.clone(),
             task_name: task.name.clone(),
-            task_kind: task.kind.clone(),
+            task_runtime: task.runtime.clone(),
             log_dir: self.state_store.allocation_log_dir(allocation.id),
         }
     }
@@ -277,7 +277,7 @@ impl WorkerTaskManager {
     }
 
     pub fn allocations_snapshot(&self) -> Vec<i64> {
-        let mut allocations = self.runtimes.keys().copied().collect::<Vec<_>>();
+        let mut allocations = self.instances.keys().copied().collect::<Vec<_>>();
         allocations.sort_unstable();
         allocations
     }
@@ -285,14 +285,14 @@ impl WorkerTaskManager {
     /// Whether this worker currently runs the allocation (used by identity
     /// refresh loops to stop once the allocation is gone).
     pub fn has_allocation(&self, allocation_id: i64) -> bool {
-        self.runtimes.contains_key(&allocation_id)
+        self.instances.contains_key(&allocation_id)
     }
 
     /// The tracked process id for an allocation, if any.
     pub fn allocation_pid(&self, allocation_id: i64) -> Option<u32> {
-        self.runtimes
+        self.instances
             .get(&allocation_id)
-            .and_then(|runtime| runtime.pid)
+            .and_then(|instance| instance.pid)
     }
 
     /// Read a single env value from the stored task config (test/diagnostic
@@ -375,9 +375,9 @@ impl WorkerTaskManager {
         }
     }
 
-    /// Creates the allocation + task directories and returns a runtime
+    /// Creates the allocation + task directories and returns a task instance
     /// pre-wired with dirs and the `LEGION_ALLOC_DIR`/`LEGION_TASK_DIR` env.
-    fn prepare_runtime(&self, allocation: &Allocation, task: &TaskConfig) -> R<TaskRuntime> {
+    fn prepare_instance(&self, allocation: &Allocation, task: &TaskConfig) -> R<TaskInstance> {
         let alloc_dir = self.alloc_dir(allocation.id);
         let task_dir = alloc_dir.join(&task.name);
         std::fs::create_dir_all(&task_dir)
@@ -387,16 +387,16 @@ impl WorkerTaskManager {
         // this allocation's artifacts, injected secrets, or output.
         crate::util::restrict_dir_to_owner(&alloc_dir)?;
         crate::util::restrict_dir_to_owner(&task_dir)?;
-        let mut runtime = TaskRuntime::default();
-        runtime
+        let mut instance = TaskInstance::default();
+        instance
             .extra_env
             .insert("LEGION_ALLOC_DIR".into(), alloc_dir.display().to_string());
-        runtime
+        instance
             .extra_env
             .insert("LEGION_TASK_DIR".into(), task_dir.display().to_string());
-        runtime.alloc_dir = Some(alloc_dir);
-        runtime.task_dir = Some(task_dir);
-        Ok(runtime)
+        instance.alloc_dir = Some(alloc_dir);
+        instance.task_dir = Some(task_dir);
+        Ok(instance)
     }
 
     pub fn record_failure(&mut self, allocation_id: i64, reason: impl Into<String>) {
@@ -407,14 +407,14 @@ impl WorkerTaskManager {
             self.allocations.get(&allocation_id),
             self.task_configs.get(&allocation_id),
         ) {
-            if let Some(plugin) = self.registry.plugin(&task.kind) {
-                if let Some(runtime) = self.runtimes.get_mut(&allocation_id) {
-                    if let Err(err) = plugin.destroy(allocation, task, runtime) {
+            if let Some(plugin) = self.registry.plugin(&task.runtime) {
+                if let Some(instance) = self.instances.get_mut(&allocation_id) {
+                    if let Err(err) = plugin.destroy(allocation, task, instance) {
                         warn!(
                             allocation_id,
                             task_name = %task.name,
                             error = ?err,
-                            "Failed to destroy allocation runtime"
+                            "Failed to destroy allocation instance"
                         );
                     }
                 }
@@ -422,7 +422,7 @@ impl WorkerTaskManager {
         }
         self.volumes.unmount_for_allocation(allocation_id);
         self.volume_specs.remove(&allocation_id);
-        self.runtimes.remove(&allocation_id);
+        self.instances.remove(&allocation_id);
         self.allocations.remove(&allocation_id);
         self.task_configs.remove(&allocation_id);
         self.allocation_health.remove(&allocation_id);
@@ -522,7 +522,7 @@ impl WorkerTaskManager {
             .iter()
             .map(|allocation| allocation.allocation_id)
             .collect::<std::collections::HashSet<_>>();
-        let existing_ids = self.runtimes.keys().copied().collect::<Vec<_>>();
+        let existing_ids = self.instances.keys().copied().collect::<Vec<_>>();
         for allocation_id in existing_ids {
             if desired_ids.contains(&allocation_id) {
                 continue;
@@ -538,7 +538,7 @@ impl WorkerTaskManager {
 
         allocations
             .iter()
-            .filter(|allocation| !self.runtimes.contains_key(&allocation.allocation_id))
+            .filter(|allocation| !self.instances.contains_key(&allocation.allocation_id))
             .cloned()
             .collect()
     }
@@ -559,22 +559,22 @@ impl WorkerTaskManager {
         let allocation = self.allocations.get(&allocation_id).cloned();
         let task = self.task_configs.get(&allocation_id).cloned();
         if let (Some(allocation), Some(task)) = (allocation.as_ref(), task.as_ref()) {
-            if let Some(plugin) = self.registry.plugin(&task.kind) {
-                if let Some(runtime) = self.runtimes.get_mut(&allocation_id) {
-                    if let Err(err) = plugin.stop(allocation, task, runtime) {
+            if let Some(plugin) = self.registry.plugin(&task.runtime) {
+                if let Some(instance) = self.instances.get_mut(&allocation_id) {
+                    if let Err(err) = plugin.stop(allocation, task, instance) {
                         warn!(
                             allocation_id,
                             task_name = %task.name,
                             error = ?err,
-                            "Failed to stop allocation runtime"
+                            "Failed to stop allocation instance"
                         );
                     }
-                    if let Err(err) = plugin.destroy(allocation, task, runtime) {
+                    if let Err(err) = plugin.destroy(allocation, task, instance) {
                         warn!(
                             allocation_id,
                             task_name = %task.name,
                             error = ?err,
-                            "Failed to destroy allocation runtime"
+                            "Failed to destroy allocation instance"
                         );
                     }
                 }
@@ -587,7 +587,7 @@ impl WorkerTaskManager {
         // block teardown.
         self.volumes.unmount_for_allocation(allocation_id);
 
-        self.runtimes.remove(&allocation_id);
+        self.instances.remove(&allocation_id);
         self.allocations.remove(&allocation_id);
         self.task_configs.remove(&allocation_id);
         self.allocation_health.remove(&allocation_id);
@@ -607,11 +607,11 @@ impl WorkerTaskManager {
     /// Whether an allocation is still wanted (used by staging threads to
     /// detect cancellation while they were fetching).
     pub fn is_allocation_active(&self, allocation_id: i64) -> bool {
-        self.runtimes.contains_key(&allocation_id)
+        self.instances.contains_key(&allocation_id)
     }
 
     /// Open a live exec session against a local allocation. Resolves the task
-    /// kind's plugin, checks its declared exec support, and spawns the
+    /// runtime plugin, checks its declared exec support, and spawns the
     /// session. The caller (worker exec RPC) drives the returned session.
     pub fn open_exec_session(
         &mut self,
@@ -640,24 +640,24 @@ impl WorkerTaskManager {
 
         let plugin = self
             .registry
-            .plugin(&task.kind)
-            .ok_or_else(|| anyhow!("no task plugin loaded for kind `{}`", task.kind))?;
+            .plugin(&task.runtime)
+            .ok_or_else(|| anyhow!("no task plugin loaded for runtime `{}`", task.runtime))?;
         let support = plugin.exec_support();
         if !support.exec {
-            bail!("task kind `{}` does not support exec", task.kind);
+            bail!("task runtime `{}` does not support exec", task.runtime);
         }
         if opts.tty && !support.pty {
             bail!(
-                "task kind `{}` does not support interactive (tty) exec",
-                task.kind
+                "task runtime `{}` does not support interactive (tty) exec",
+                task.runtime
             );
         }
 
-        let runtime = self
-            .runtimes
+        let instance = self
+            .instances
             .get_mut(&allocation_id)
-            .ok_or_else(|| anyhow!("no runtime for allocation {allocation_id}"))?;
-        plugin.exec(&allocation, &task, runtime, opts)
+            .ok_or_else(|| anyhow!("no instance for allocation {allocation_id}"))?;
+        plugin.exec(&allocation, &task, instance, opts)
     }
 
     /// Synchronous run for tasks without artifacts (and the post-staging
@@ -668,20 +668,20 @@ impl WorkerTaskManager {
         info!(
             allocation_id = allocation.id,
             task_name = %task.name,
-            task_kind = %task.kind,
+            task_runtime = %task.runtime,
             "Received task allocation"
         );
 
         self.registry
-            .load_plugin(&task.kind, true)
-            .with_context(|| format!("Failed to load task plugin {}", task.kind))?;
-        let runtime = self.prepare_runtime(allocation, task)?;
-        self.runtimes.insert(allocation.id, runtime);
+            .load_plugin(&task.runtime, true)
+            .with_context(|| format!("Failed to load task plugin {}", task.runtime))?;
+        let instance = self.prepare_instance(allocation, task)?;
+        self.instances.insert(allocation.id, instance);
         self.start_prepared_allocation(allocation, task)
     }
 
     /// Runs `consume_artifact` hooks + volume mounts + `prepare` + `start`
-    /// against the already-registered runtime, then records the allocation as
+    /// against the already-registered instance, then records the allocation as
     /// started.
     fn start_prepared_allocation(&mut self, allocation: &Allocation, task: &TaskConfig) -> R<()> {
         // Storage first: a task must never observe a missing or empty data
@@ -692,19 +692,19 @@ impl WorkerTaskManager {
 
         let plugin = self
             .registry
-            .plugin(&task.kind)
+            .plugin(&task.runtime)
             .context("Task plugin not loaded")?;
         let log_dir = self.state_store.allocation_log_dir(allocation.id);
-        let runtime = self
-            .runtimes
+        let instance = self
+            .instances
             .get_mut(&allocation.id)
-            .context("Task runtime missing")?;
-        runtime.log_dir = Some(log_dir);
+            .context("Task instance missing")?;
+        instance.log_dir = Some(log_dir);
 
-        let staged = runtime.staged_artifacts.clone();
+        let staged = instance.staged_artifacts.clone();
         for artifact in &staged {
             plugin
-                .consume_artifact(artifact, runtime)
+                .consume_artifact(artifact, instance)
                 .with_context(|| {
                     format!(
                         "consume artifact {} for task {}",
@@ -719,14 +719,14 @@ impl WorkerTaskManager {
             task_name = %task.name,
             "Preparing task allocation"
         );
-        plugin.prepare(allocation, task, runtime)?;
+        plugin.prepare(allocation, task, instance)?;
 
         info!(
             allocation_id = allocation.id,
             task_name = %task.name,
             "Starting task allocation"
         );
-        plugin.start(allocation, task, runtime)?;
+        plugin.start(allocation, task, instance)?;
 
         self.allocations.insert(allocation.id, allocation.clone());
         self.task_configs.insert(allocation.id, task.clone());
@@ -755,7 +755,7 @@ impl WorkerTaskManager {
         // process but keep the task directory — when the artifact list is
         // unchanged, staging reuses the already-fetched content via the
         // staging manifest instead of refetching.
-        if self.runtimes.contains_key(&alloc.id) {
+        if self.instances.contains_key(&alloc.id) {
             info!(
                 allocation_id = alloc.id,
                 task_name = %task.name,
@@ -787,22 +787,22 @@ impl WorkerTaskManager {
         info!(
             allocation_id = alloc.id,
             task_name = %task.name,
-            task_kind = %task.kind,
+            task_runtime = %task.runtime,
             artifacts = task.artifacts.len(),
             "Received task allocation with artifacts"
         );
         self.registry
-            .load_plugin(&task.kind, true)
-            .with_context(|| format!("Failed to load task plugin {}", task.kind))?;
+            .load_plugin(&task.runtime, true)
+            .with_context(|| format!("Failed to load task plugin {}", task.runtime))?;
         // Defense in depth: admission already gates on supports_artifacts.
         let plugin = self
             .registry
-            .plugin(&task.kind)
+            .plugin(&task.runtime)
             .context("Task plugin not loaded")?;
         if !plugin.supports_artifacts() {
             bail!(
-                "task kind {} does not support artifacts on this worker",
-                task.kind
+                "task runtime {} does not support artifacts on this worker",
+                task.runtime
             );
         }
 
@@ -810,12 +810,12 @@ impl WorkerTaskManager {
         // valid staging manifest matches the artifact list, and clears it
         // before any fresh fetch (covering partial content left by a worker
         // that died mid-staging).
-        let runtime = self.prepare_runtime(&alloc, &task)?;
-        let task_dir = runtime
+        let instance = self.prepare_instance(&alloc, &task)?;
+        let task_dir = instance
             .task_dir
             .clone()
             .context("task directory missing after prepare")?;
-        self.runtimes.insert(alloc.id, runtime);
+        self.instances.insert(alloc.id, instance);
         self.allocations.insert(alloc.id, alloc.clone());
         self.task_configs.insert(alloc.id, task.clone());
         self.artifact_status.init(alloc.id, &task.artifacts);
@@ -842,7 +842,7 @@ impl WorkerTaskManager {
     }
 
     /// Completes an allocation whose artifacts finished staging: interpolates
-    /// `${artifact.<name>}` into the kind config, exposes
+    /// `${artifact.<name>}` into the runtime config, exposes
     /// `LEGION_ARTIFACT_<NAME>` env vars, and runs consume/prepare/start.
     pub fn start_staged_allocation(
         &mut self,
@@ -851,19 +851,19 @@ impl WorkerTaskManager {
         staged: Vec<StagedArtifact>,
     ) -> R<()> {
         let mut artifact_paths: HashMap<String, String> = HashMap::new();
-        let runtime = self
-            .runtimes
+        let instance = self
+            .instances
             .get_mut(&allocation.id)
-            .context("Task runtime missing for staged allocation")?;
+            .context("Task instance missing for staged allocation")?;
         for artifact in &staged {
             if let Some(name) = artifact.name.as_deref() {
                 let path = artifact.reference_path().display().to_string();
                 let env_name = format!("LEGION_ARTIFACT_{}", name.to_uppercase().replace('-', "_"));
-                runtime.extra_env.insert(env_name, path.clone());
+                instance.extra_env.insert(env_name, path.clone());
                 artifact_paths.insert(name.to_string(), path);
             }
         }
-        runtime.staged_artifacts = staged;
+        instance.staged_artifacts = staged;
 
         // Worker-side interpolation is dumb substitution over the declared
         // names; admission already rejected unknown references.
@@ -901,14 +901,16 @@ impl WorkerTaskManager {
             .volumes
             .mount_for_allocation(allocation, instance.as_ref(), &specs)?;
 
-        let in_task_view = task.map(|task| task.kind == "container").unwrap_or(false);
-        if let Some(runtime) = self.runtimes.get_mut(&allocation.id) {
+        let in_task_view = task
+            .map(|task| task.runtime == "container")
+            .unwrap_or(false);
+        if let Some(instance) = self.instances.get_mut(&allocation.id) {
             for (key, value) in volume_env(&mounted, in_task_view) {
-                runtime.extra_env.insert(key, value);
+                instance.extra_env.insert(key, value);
             }
-            runtime.volumes = mounted
+            instance.volumes = mounted
                 .iter()
-                .map(|mount| crate::task_plugins::RuntimeVolume {
+                .map(|mount| crate::task_plugins::MountedVolume {
                     name: mount.name.clone(),
                     mode: mount.mode,
                     host_path: mount.host_path.clone(),
@@ -938,17 +940,17 @@ impl WorkerTaskManager {
             .task_configs
             .get(&allocation_id)
             .context("Task config missing for restart")?;
-        let runtime = self
-            .runtimes
+        let instance = self
+            .instances
             .get_mut(&allocation_id)
-            .context("Task runtime missing for restart")?;
+            .context("Task instance missing for restart")?;
         let plugin = self
             .registry
-            .plugin(&task.kind)
+            .plugin(&task.runtime)
             .context("Task plugin missing for restart")?;
 
-        plugin.stop(allocation, task, runtime)?;
-        plugin.start(allocation, task, runtime)?;
+        plugin.stop(allocation, task, instance)?;
+        plugin.start(allocation, task, instance)?;
         self.set_allocation_health(allocation_id, false, "restarting");
         self.persist_state();
         Ok(())
@@ -997,20 +999,20 @@ impl WorkerTaskManager {
 
             let alloc_dir = self.alloc_dir(record.allocation.id);
             let task_dir = alloc_dir.join(&record.task.name);
-            let mut runtime = TaskRuntime {
+            let mut instance = TaskInstance {
                 pid: Some(pid),
                 log_dir: Some(self.state_store.allocation_log_dir(record.allocation.id)),
-                ..TaskRuntime::default()
+                ..TaskInstance::default()
             };
-            runtime
+            instance
                 .extra_env
                 .insert("LEGION_ALLOC_DIR".into(), alloc_dir.display().to_string());
-            runtime
+            instance
                 .extra_env
                 .insert("LEGION_TASK_DIR".into(), task_dir.display().to_string());
-            runtime.alloc_dir = Some(alloc_dir);
-            runtime.task_dir = Some(task_dir);
-            self.runtimes.insert(record.allocation.id, runtime);
+            instance.alloc_dir = Some(alloc_dir);
+            instance.task_dir = Some(task_dir);
+            self.instances.insert(record.allocation.id, instance);
             self.allocations
                 .insert(record.allocation.id, record.allocation.clone());
             self.task_configs
@@ -1052,9 +1054,9 @@ impl WorkerTaskManager {
                 continue;
             };
             let pid = self
-                .runtimes
+                .instances
                 .get(allocation_id)
-                .and_then(|runtime| runtime.pid);
+                .and_then(|instance| instance.pid);
             if pid.is_none() {
                 // Allocations mid-staging have no pid yet by design; anything
                 // else without a pid is worth a warning.
@@ -1259,7 +1261,7 @@ fn task_from_allocation(allocation: &TaskAllocation) -> R<(Allocation, TaskConfi
         Some(serde_json::from_str(&allocation.network).context("Invalid allocation network JSON")?)
     };
     // Declared resources, used by isolating kinds to size the workload. Empty
-    // when the jobspec declared none, so kinds keep their runtime defaults.
+    // when the jobspec declared none, so kinds keep their instance defaults.
     let resources = if allocation.task_resources.trim().is_empty() {
         serde_json::json!({})
     } else {
@@ -1273,7 +1275,7 @@ fn task_from_allocation(allocation: &TaskAllocation) -> R<(Allocation, TaskConfi
         identities,
         artifacts,
         resources,
-        ..TaskConfig::new(&allocation.task_name, &allocation.task_kind)
+        ..TaskConfig::new(&allocation.task_name, &allocation.task_runtime)
     };
     let alloc = Allocation {
         id: allocation.allocation_id,
@@ -1350,13 +1352,16 @@ mod tests {
         let task_dir = temp_dir.path().join("allocs").join("5").join("exec-task");
         assert!(task_dir.is_dir(), "{} missing", task_dir.display());
 
-        let runtime = manager.runtimes.get(&5).expect("runtime");
-        assert_eq!(runtime.task_dir.as_deref(), Some(task_dir.as_path()));
+        let instance = manager.instances.get(&5).expect("instance");
+        assert_eq!(instance.task_dir.as_deref(), Some(task_dir.as_path()));
         assert_eq!(
-            runtime.extra_env.get("LEGION_TASK_DIR").map(String::as_str),
+            instance
+                .extra_env
+                .get("LEGION_TASK_DIR")
+                .map(String::as_str),
             Some(task_dir.to_str().unwrap())
         );
-        assert!(runtime.extra_env.contains_key("LEGION_ALLOC_DIR"));
+        assert!(instance.extra_env.contains_key("LEGION_ALLOC_DIR"));
         Ok(())
     }
 
@@ -1461,8 +1466,8 @@ mod tests {
 
         let allocation = alloc();
         manager
-            .runtimes
-            .insert(allocation.id, TaskRuntime::default());
+            .instances
+            .insert(allocation.id, TaskInstance::default());
         manager
             .allocations
             .insert(allocation.id, allocation.clone());
@@ -1475,7 +1480,7 @@ mod tests {
         assert!(manager.allocation_health.contains_key(&allocation.id));
         let _ = manager.reconcile_allocations(&[]);
         assert!(!manager.allocations.contains_key(&allocation.id));
-        assert!(!manager.runtimes.contains_key(&allocation.id));
+        assert!(!manager.instances.contains_key(&allocation.id));
         assert!(!manager.allocation_health.contains_key(&allocation.id));
 
         Ok(())
@@ -1494,7 +1499,7 @@ mod tests {
             node_id: "node-1".into(),
             task_config_id: 1,
             task_name: "exec-task".into(),
-            task_kind: "exec".into(),
+            task_runtime: "exec".into(),
             task_config: json!({"command": ["true"]}).to_string(),
             task_checks: String::new(),
             task_on_unhealthy: String::new(),
@@ -1510,7 +1515,7 @@ mod tests {
         assert_eq!(new[0].allocation_id, 9);
 
         // Already-running allocations are not returned again.
-        manager.runtimes.insert(9, TaskRuntime::default());
+        manager.instances.insert(9, TaskInstance::default());
         let new = manager.reconcile_allocations(std::slice::from_ref(&ta));
         assert!(new.is_empty());
         Ok(())
@@ -1547,7 +1552,7 @@ mod tests {
             node_id: "node-1".into(),
             task_config_id: 1,
             task_name: "exec-task".into(),
-            task_kind: "exec".into(),
+            task_runtime: "exec".into(),
             task_config: json!({"command": ["true"]}).to_string(),
             task_checks: String::new(),
             task_on_unhealthy: String::new(),
@@ -1590,7 +1595,7 @@ mod tests {
             node_id: "node-1".into(),
             task_config_id: 1,
             task_name: "exec-task".into(),
-            task_kind: "exec".into(),
+            task_runtime: "exec".into(),
             task_config: json!({"command": ["true"]}).to_string(),
             task_checks: String::new(),
             task_on_unhealthy: String::new(),
@@ -1639,9 +1644,9 @@ mod tests {
         };
 
         // Register as staging first (what begin_task_allocation does).
-        let runtime = manager.prepare_runtime(&allocation, &task)?;
-        let task_dir = runtime.task_dir.clone().unwrap();
-        manager.runtimes.insert(allocation.id, runtime);
+        let instance = manager.prepare_instance(&allocation, &task)?;
+        let task_dir = instance.task_dir.clone().unwrap();
+        manager.instances.insert(allocation.id, instance);
         manager
             .allocations
             .insert(allocation.id, allocation.clone());
@@ -1659,9 +1664,9 @@ mod tests {
         }];
         manager.start_staged_allocation(&allocation, &task, staged)?;
 
-        let runtime = manager.runtimes.get(&allocation.id).expect("runtime");
+        let instance = manager.instances.get(&allocation.id).expect("instance");
         assert_eq!(
-            runtime
+            instance
                 .extra_env
                 .get("LEGION_ARTIFACT_TOOL")
                 .map(String::as_str),
@@ -1727,8 +1732,8 @@ mod tests {
             ..alloc()
         };
         manager
-            .runtimes
-            .insert(allocation_id, TaskRuntime::default());
+            .instances
+            .insert(allocation_id, TaskInstance::default());
         manager.allocations.insert(allocation_id, allocation);
         manager
             .task_configs
@@ -1785,7 +1790,7 @@ mod tests {
         // The fenced allocation is gone and reported as failed; the others
         // keep running untouched.
         assert!(!manager.allocations.contains_key(&2));
-        assert!(!manager.runtimes.contains_key(&2));
+        assert!(!manager.instances.contains_key(&2));
         assert!(manager.allocations.contains_key(&1));
         assert!(manager.allocations.contains_key(&3));
         let failures = manager.drain_failures();
@@ -1886,19 +1891,19 @@ mod tests {
         {
             let guard = manager.lock().expect("task manager");
             assert!(guard.health_monitors.contains_key(&allocation.id));
-            let runtime = guard.runtimes.get(&allocation.id).expect("runtime");
+            let instance = guard.instances.get(&allocation.id).expect("instance");
             assert!(
-                runtime.task_dir.is_some(),
-                "restored runtime keeps task dir"
+                instance.task_dir.is_some(),
+                "restored instance keeps task dir"
             );
         }
 
         let pid = {
             let guard = manager.lock().expect("task manager");
             guard
-                .runtimes
+                .instances
                 .get(&allocation.id)
-                .and_then(|runtime| runtime.pid)
+                .and_then(|instance| instance.pid)
                 .context("pid missing")?
         };
 

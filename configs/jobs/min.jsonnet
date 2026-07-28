@@ -2,7 +2,7 @@
   name: 'min',
   task: {
     name: 'hello',
-    kind: 'container',
+    runtime: 'container',
     config: {
       image: 'mnomitch/hello_world_logger',
       command: ['echo', 'hello', 'from', 'min'],

@@ -15,7 +15,7 @@
 //      use the `console` sink in this job form — Vector's own stdout is captured
 //      by Legion, which would feed Vector its own output. We set VECTOR_LOG=warn
 //      to keep self-ingestion negligible; a real sink does not echo to stdout.
-//   3. Container task kind cannot do this (no host volume mounts). Use `exec`.
+//   3. Container task runtime cannot do this (no host volume mounts). Use `exec`.
 
 local lokiEndpoint = 'http://localhost:3100';  // <-- EDIT: your Loki endpoint
 
@@ -50,7 +50,7 @@ local vectorConfig = |||
   name: 'vector-log-shipper',
   task: {
     name: 'vector',
-    kind: 'exec',
+    runtime: 'exec',
     lifecycle: 'service',
     count: { num: 1, per: 'id' },  // one allocation per node
     config: {

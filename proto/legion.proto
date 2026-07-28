@@ -402,7 +402,7 @@ service Manager {
   // proxies the stream to that worker's `Worker.ExecTask`.
   //
   // The first client frame must be an `ExecStart`. Raw commands require
-  // `exec:write` (with `host: true` for host-level kinds); action runs
+  // `exec:write` (with `host: true` for host-level runtimes); action runs
   // require `action:write` (or `exec:write`) and are rendered server-side
   // from the stored job spec.
   rpc ExecAllocation (stream ExecClientFrame) returns (stream ExecServerFrame);
@@ -1620,7 +1620,7 @@ message VolumeInfo {
 
   // How the volume is handed to its consumer: `filesystem` (a host directory
   // the task reads directly) or `block` (a raw device or disk image the task
-  // attaches — what a microVM kind needs). The same split Kubernetes makes
+  // attaches — what a microVM runtime needs). The same split Kubernetes makes
   // with `volumeMode`, for the same reason. See docs/volumes.md.
   string volume_mode = 17;
 
@@ -1745,7 +1745,7 @@ message VolumeDriverInfo {
   repeated string optional_params = 6;
 
   // Volume modes this driver can serve (`filesystem`, `block`). Admission
-  // intersects this with the task kind's supported modes and the job's
+  // intersects this with the task runtime's supported modes and the job's
   // requested mode, so a mismatch is a submit-time error rather than a task
   // that starts and immediately fails.
   repeated string volume_modes = 10;
@@ -3501,8 +3501,12 @@ message TaskAllocation {
   // Task name.
   string task_name = 6;
 
-  // Task kind/plugin name.
-  string task_kind = 7;
+  // Name of the task runtime plugin that runs this task (`exec`, `container`,
+  // `noop`, or a third-party plugin under `plugins/tasks/<name>/`). The worker
+  // resolves this against its task-plugin registry and fails the allocation if
+  // no plugin with this name is loadable. Mirrors the jobspec's
+  // `tasks.<name>.runtime` field.
+  string task_runtime = 7;
 
   // JSON-encoded task config payload.
   string task_config = 8;
@@ -3521,7 +3525,7 @@ message TaskAllocation {
 
   // JSON-encoded list of normalized artifact specs for this task.
   //
-  // This is the post-admission form: kind-implicit artifacts (for example a
+  // This is the post-admission form: runtime-implicit artifacts (for example a
   // container `image`) are already desugared in, `resolve: "pin"` references
   // are already pinned to digests, and cluster-level auth matchers are
   // already applied. Workers stage exactly this list and never re-derive or
@@ -3580,13 +3584,13 @@ message TaskAllocation {
 
   // JSON-encoded task `resources` block, exactly as declared in the jobspec
   // (`{"memory": 256, "cores": 1}`). Scheduler-side defaults are NOT folded
-  // in: this is what the job asked for, so a kind can tell "unset" from
-  // "explicitly requested" and leave its runtime's own defaults alone.
+  // in: this is what the job asked for, so a runtime can tell "unset" from
+  // "explicitly requested" and leave its own defaults alone.
   //
-  // Task kinds that isolate a workload use this to size it — the `container`
-  // kind maps `memory` (MiB) and `cores` onto the runtime's memory/CPU
+  // Task runtimes that isolate a workload use this to size it — the `container`
+  // runtime maps `memory` (MiB) and `cores` onto the sandbox's memory/CPU
   // limits, since a guest that ignores the reservation the scheduler made on
-  // its behalf can overcommit the node. Kinds that run host processes
+  // its behalf can overcommit the node. Runtimes that run host processes
   // (`exec`) ignore it; enforcement there needs cgroups/jobobjects.
   //
   // Empty string when the task declares no resources.

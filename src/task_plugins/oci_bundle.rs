@@ -4,7 +4,7 @@
 //! reference; they run a *bundle*: an extracted root filesystem plus a
 //! `config.json` runtime spec. This module turns the on-disk OCI **image**
 //! layout produced by the `oci://` artifact fetcher into that bundle so the
-//! container task kind can run it on Linux.
+//! container task runtime can run it on Linux.
 //!
 //! The conversion is deliberately self-contained (no external `umoci`/`skopeo`
 //! dependency): read the image manifest + config from the layout, extract each
@@ -37,7 +37,7 @@ pub(crate) fn build_bundle(
     command: &[String],
     env: &std::collections::HashMap<String, String>,
     hostname: &str,
-    volumes: &[crate::task_plugins::RuntimeVolume],
+    volumes: &[crate::task_plugins::MountedVolume],
 ) -> R<()> {
     if command.is_empty() {
         bail!("container command must include at least one entry");
@@ -381,7 +381,7 @@ fn dns_mounts() -> Vec<Value> {
 /// declared destination. Volumes with no `path` are skipped — admission rejects
 /// that combination for container tasks, so reaching here means a jobspec
 /// changed kind after the fact.
-fn volume_mounts(volumes: &[crate::task_plugins::RuntimeVolume]) -> Vec<Value> {
+fn volume_mounts(volumes: &[crate::task_plugins::MountedVolume]) -> Vec<Value> {
     volumes
         .iter()
         .filter_map(|volume| {
@@ -406,7 +406,7 @@ fn build_spec(
     image: &ImageConfig,
     user: &ResolvedUser,
     hostname: &str,
-    volumes: &[crate::task_plugins::RuntimeVolume],
+    volumes: &[crate::task_plugins::MountedVolume],
 ) -> Value {
     let mut env = merge_env(&image.env, task_env);
     if let Some(home) = &user.home {

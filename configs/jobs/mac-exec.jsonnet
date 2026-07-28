@@ -2,7 +2,7 @@
   name: 'exec-me',
   tasks: [
     {
-      kind: 'exec',
+      runtime: 'exec',
       config: {
         command: ['touch', 'hi'],
         cwd: '/Users/mike/Desktop',

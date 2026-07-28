@@ -92,7 +92,7 @@ pending -> active -> rescheduling -> active -> ... -> stopped/terminated
   name: 'db',
   tasks: [{
     name: 'replica',
-    kind: 'exec',
+    runtime: 'exec',
     count: 3,                    // slot cardinality: slots 0, 1, 2
     stateful: {
       mode: 'slot',              // 'slot' (default) | 'keyed'
@@ -174,7 +174,7 @@ Think of it as "create these on first run if they don't already exist", not
 
 ## Environment Variables
 
-Injected by the manager into the task's kind-config `env` map at dispatch
+Injected by the manager into the task's runtime config `env` map at dispatch
 time, so they are present at process start for `exec` and `container` tasks:
 
 | Variable | When | Meaning |
@@ -183,7 +183,7 @@ time, so they are present at process start for `exec` and `container` tasks:
 | `LEGION_INSTANCE_ID` | stateful tasks | Stable instance id; survives reschedules. |
 | `LEGION_INSTANCE_MODE` | stateful tasks | `slot` or `keyed`. |
 | `LEGION_INSTANCE_SLOT` | slot mode only | Ordinal slot index `0..count-1`. |
-| `LEGION_STORAGE_DIR` | tasks with `stateful.storage` | The instance volume's path. See [volumes.md](volumes.md#how-path-works-per-task-kind) for why exec and container tasks get different values. |
+| `LEGION_STORAGE_DIR` | tasks with `stateful.storage` | The instance volume's path. See [volumes.md](volumes.md#how-path-works-per-task-runtime) for why exec and container tasks get different values. |
 | `LEGION_VOLUME_<NAME>` | per declared volume | Same, for every volume including `volumes[]` claims. |
 
 Apps key their durable state and "who am I" decisions on

@@ -10991,9 +10991,9 @@ export class TaskAllocation extends Message<TaskAllocation> {
   /**
    * Task kind/plugin name.
    *
-   * @generated from field: string task_kind = 7;
+   * @generated from field: string task_runtime = 7;
    */
-  taskKind = "";
+  taskRuntime = "";
 
   /**
    * JSON-encoded task config payload.
@@ -11115,7 +11115,7 @@ export class TaskAllocation extends Message<TaskAllocation> {
     { no: 4, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 5, name: "task_config_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
     { no: 6, name: "task_name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
-    { no: 7, name: "task_kind", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 7, name: "task_runtime", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 8, name: "task_config", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 9, name: "task_checks", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 10, name: "task_on_unhealthy", kind: "scalar", T: 9 /* ScalarType.STRING */ },

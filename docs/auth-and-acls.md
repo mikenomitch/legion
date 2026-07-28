@@ -45,7 +45,7 @@ legion acl whoami
 | `state` | raw state store, saved queries | SQL reads, schema | SQL writes, saved queries |
 | `operator` | raft, manager configs, observability | status/history/logs | raft commands, raft join tokens |
 | `acl` | tokens, policies, users | list/get | create/update/delete |
-| `exec` | exec into a running allocation | — | open a session (`host: true` for host-level kinds) |
+| `exec` | exec into a running allocation | — | open a session (`host: true` for host-level runtimes) |
 | `action` | run declared actions on an allocation | — | run an action (scope with `action_names`) |
 
 Actions are `read` and `write` (`write` does not imply `read`; grant both).

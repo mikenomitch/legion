@@ -3,7 +3,7 @@
     tasks: [
         {
             name: "api",
-            kind: "exec",
+            runtime: "exec",
             lifecycle: "service",
             group: "app",
             config: {
@@ -12,7 +12,7 @@
         },
         {
             name: "logger",
-            kind: "exec",
+            runtime: "exec",
             lifecycle: "sidecar",
             group: "app",
             config: {

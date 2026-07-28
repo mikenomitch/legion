@@ -84,7 +84,7 @@ pub fn catalog() -> Vec<Capability> {
             name: "job.schema",
             cli: "legion job schema",
             grpc: None,
-            summary: "Emit the JSON Schema for jobspecs and built-in task kinds.",
+            summary: "Emit the JSON Schema for jobspecs and built-in task runtimes.",
             mutates: false,
             read_only_safe: true,
         },

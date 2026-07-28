@@ -2,7 +2,7 @@
 
 use legion::prelude::*;
 use legion::structs::{Allocation, TaskConfig};
-use legion::task_plugins::{TaskPlugin, TaskRuntime};
+use legion::task_plugins::{TaskPlugin, TaskInstance};
 
 #[derive(Default)]
 struct NoopTaskPlugin;
@@ -30,7 +30,7 @@ impl TaskPlugin for NoopTaskPlugin {
         &self,
         allocation: &Allocation,
         task: &TaskConfig,
-        _runtime: &mut TaskRuntime,
+        _instance: &mut TaskInstance,
     ) -> legion::util::R<()> {
         info!(
             allocation_id = allocation.id,
@@ -44,9 +44,9 @@ impl TaskPlugin for NoopTaskPlugin {
         &self,
         allocation: &Allocation,
         task: &TaskConfig,
-        runtime: &mut TaskRuntime,
+        instance: &mut TaskInstance,
     ) -> legion::util::R<()> {
-        runtime.state = task.config.clone();
+        instance.state = task.config.clone();
         info!(
             allocation_id = allocation.id,
             task_name = %task.name,
@@ -60,7 +60,7 @@ impl TaskPlugin for NoopTaskPlugin {
         &self,
         allocation: &Allocation,
         task: &TaskConfig,
-        _runtime: &mut TaskRuntime,
+        _instance: &mut TaskInstance,
     ) -> legion::util::R<()> {
         info!(
             allocation_id = allocation.id,
@@ -74,7 +74,7 @@ impl TaskPlugin for NoopTaskPlugin {
         &self,
         allocation: &Allocation,
         task: &TaskConfig,
-        _runtime: &mut TaskRuntime,
+        _instance: &mut TaskInstance,
     ) -> legion::util::R<()> {
         info!(
             allocation_id = allocation.id,

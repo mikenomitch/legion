@@ -3,7 +3,7 @@
   tasks: [
     {
       name: 'task-one',
-      kind: 'exec',
+      runtime: 'exec',
       config: {
         command: ['sleep', '1'],
       },
@@ -19,7 +19,7 @@
     },
     {
       name: 'task-two',
-      kind: 'exec',
+      runtime: 'exec',
       config: {
         command: ['sleep', '1'],
       },

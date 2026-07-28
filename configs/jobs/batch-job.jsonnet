@@ -3,7 +3,7 @@
     tasks: [
         {
             name: "migrate",
-            kind: "exec",
+            runtime: "exec",
             lifecycle: "batch",
             group: "db",
             config: {

@@ -59,7 +59,7 @@
         {
             name: "web",
             count: 2,
-            kind: "exec",
+            runtime: "exec",
             group: "frontend",
             lifecycle: "service",
             // Cross-group dependency: service and batch tasks may depend on
@@ -107,7 +107,7 @@
                     // How the task consumes it: "filesystem" (a directory —
                     // the default, and what exec/container want) or "block" (a
                     // raw device or disk image a microVM attaches). Admission
-                    // rejects a mode the task kind or the plugin cannot serve.
+                    // rejects a mode the task runtime or the plugin cannot serve.
                     mode: "filesystem",
                     // Passed to the driver verbatim; it declares which are
                     // required (`legion volume drivers` lists them).
@@ -275,7 +275,7 @@
                 num: 3,
                 per: "region",
             },
-            kind: "exec",
+            runtime: "exec",
             group: "prep",
             lifecycle: "batch",
             schedule: "every 15m",
@@ -350,7 +350,7 @@
         {
             name: "shell",
             count: 1,
-            kind: "exec",
+            runtime: "exec",
             group: "frontend",
             lifecycle: "sidecar",
             // Sidecars are group-bound: they run alongside their group's
@@ -392,7 +392,7 @@
         },
         {
             name: "sandbox",
-            kind: "exec",
+            runtime: "exec",
             group: "sandboxes",
             lifecycle: "service",
             // Keyed-mode stateful task (see docs/stateful-workloads.md):
@@ -431,7 +431,7 @@
         {
             name: "container",
             count: 1,
-            kind: "container",
+            runtime: "container",
             config: {
                 image: "alpine:latest",
                 command: ["echo", "hello", "from", "container"],
@@ -440,7 +440,7 @@
                 },
             },
             resources: {
-                // The container kind applies these to the runtime, not just to
+                // The container runtime applies these to the sandbox, not just to
                 // scheduling: memory (MiB) and cores size the guest. `cpu`/`cpus`
                 // (MHz) has no runtime analogue, so declare cores here.
                 cores: 1,

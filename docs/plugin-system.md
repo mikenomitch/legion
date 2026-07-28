@@ -11,7 +11,7 @@ This approach was chosen because it is:
 - **Fast**: no RPC boundary between core scheduler/worker and plugin code.
 - **Simple to deploy**: plugins are shared libraries on disk under a predictable directory.
 - **Ergonomic for Rust extension authors**: plugin authors implement traits and export a `get` constructor.
-- **Flexible**: task kinds, scheduling policies, node checks, rollout strategies, and artifact fetchers can each be extended.
+- **Flexible**: task runtimes, scheduling policies, node checks, rollout strategies, and artifact fetchers can each be extended.
 
 ## Downsides and Risks to Watch
 
@@ -47,7 +47,7 @@ Example:
 {
   "kind": "tasks",
   "name": "noop",
-  "legionApiVersion": 1
+  "legionApiVersion": 2
 }
 ```
 
@@ -66,9 +66,27 @@ Before loading the dynamic library, Legion validates:
 
 If any check fails, plugin loading fails with contextual errors.
 
+### Version history
+
+The version is shared by every plugin category, because all plugins link the
+`legion` crate and pass Rust types across the boundary — a layout change in one
+shared struct invalidates any prebuilt library, whatever the category.
+
+| Version | Change |
+| --- | --- |
+| 2 | `TaskRuntime` renamed to `TaskInstance` and `RuntimeVolume` to `MountedVolume`; `TaskInstance` gained `volumes`. |
+| 1 | Initial. |
+
+**Rebuild your plugins when this number changes.** A library built against an
+older version whose manifest still claims the current one is not caught by the
+manifest check, and a struct-layout mismatch across the `dylib` boundary is
+undefined behavior — in practice a `SIGBUS` at first use, not a clean error.
+This is why the version is bumped for layout changes and not only for signature
+changes.
+
 ## Plugin Types Implemented Today
 
-## 1) Task Kind Plugins
+## 1) Task Runtime Plugins
 
 Purpose: run workload tasks on workers.
 
@@ -134,7 +152,7 @@ Entry trait: `ArtifactFetcher` in `src/artifacts/fetcher.rs`.
 Contract specifics (the rest follows the common pattern above):
 
 - Directory layout: `plugins/artifacts/<scheme>/` with a `plugin.json` of
-  `{"kind": "artifacts", "name": "<scheme>", "legionApiVersion": 1}` and the
+  `{"kind": "artifacts", "name": "<scheme>", "legionApiVersion": 2}` and the
   dylib at `plugins/artifacts/<scheme>/target/release/lib<scheme>.<ext>`.
 - Exported symbol: `get() -> Box<dyn ArtifactFetcher>` (the usual `get`
   constructor, returning the fetcher trait object).

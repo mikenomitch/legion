@@ -3,7 +3,7 @@
     tasks: [
         {
             name: "first-task",
-            kind: "exec",
+            runtime: "exec",
             config: {
                 command: ["echo", "hello", "from", "first task"],
             },
@@ -15,7 +15,7 @@
         },
         {
             name: "second-task",
-            kind: "exec",
+            runtime: "exec",
             config: {
                 command: ["echo", "hello", "from", "second task"],
             },

@@ -165,7 +165,7 @@ pub fn build_task_allocation(
         serde_json::to_string(volumes)?
     };
     // As declared, without the scheduler's defaults folded in, so an isolating
-    // kind can size its runtime only where the job actually asked for a size.
+    // runtime can size its sandbox only where the job actually asked for a size.
     let task_resources = match task.resources.as_object() {
         Some(resources) if !resources.is_empty() => serde_json::to_string(&task.resources)?,
         _ => String::new(),
@@ -177,7 +177,7 @@ pub fn build_task_allocation(
         node_id: allocation.node_id.clone(),
         task_config_id: allocation.task_config_id,
         task_name: task.name.clone(),
-        task_kind: task.kind.clone(),
+        task_runtime: task.runtime.clone(),
         task_config,
         task_checks,
         task_on_unhealthy,
@@ -190,8 +190,8 @@ pub fn build_task_allocation(
     })
 }
 
-/// Inject Legion runtime environment variables into the task's kind config
-/// `env` map (the map exec/container plugins already read):
+/// Inject Legion placement environment variables into the task config’s `env`
+/// map (the map exec/container plugins already read):
 ///
 /// - `LEGION_ALLOC_ID` — always; the ephemeral placement id (churns each move).
 /// - `LEGION_INSTANCE_ID` / `LEGION_INSTANCE_MODE` — stateful tasks only; the
@@ -205,7 +205,7 @@ pub fn build_task_allocation(
 /// `docs/stateful-workloads.md`.
 fn inject_runtime_env(config: &mut Value, allocation: &Allocation, instance: Option<&Instance>) {
     let Some(config) = config.as_object_mut() else {
-        // Non-object kind configs cannot carry an env map; plugins that accept
+        // Non-object task configs cannot carry an env map; plugins that accept
         // them do not read env either, so there is nothing to inject into.
         return;
     };

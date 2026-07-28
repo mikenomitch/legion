@@ -290,14 +290,14 @@ impl FetcherRegistry {
     }
 
     /// Loads `plugins/artifacts/<scheme>/` as a dylib exporting
-    /// `get() -> Box<dyn ArtifactFetcher>`, mirroring task-kind plugins.
+    /// `get() -> Box<dyn ArtifactFetcher>`, mirroring task-runtime plugins.
     fn load_dynamic(&mut self, scheme: &str) -> R<()> {
         let plugin_root = plugin_root_dir();
         let paths = plugin_paths("artifacts", scheme, &plugin_root);
         validate_manifest("artifacts", scheme, &paths.root)
             .with_context(|| format!("invalid artifact fetcher plugin manifest for {scheme}"))?;
         let path = paths.dylib.to_string_lossy().into_owned();
-        // SAFETY: identical dylib-loading contract as task-kind plugins; the
+        // SAFETY: identical dylib-loading contract as task-runtime plugins; the
         // plugin must export `get() -> Box<dyn ArtifactFetcher>`.
         unsafe {
             let lib = Library::new(&path)

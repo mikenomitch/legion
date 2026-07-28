@@ -8,13 +8,13 @@
 //   legion job run configs/jobs/mac-container.jsonnet
 //   legion job logs mac-container-demo
 //
-// `resources` is not just a scheduling reservation for this kind: Apple
+// `resources` is not just a scheduling reservation for this runtime: Apple
 // `container` boots a VM per container, so memory/cores size the guest.
 {
   name: 'mac-container-demo',
   task: {
     name: 'hello-container',
-    kind: 'container',
+    runtime: 'container',
     lifecycle: 'batch',
     config: {
       image: 'alpine:latest',

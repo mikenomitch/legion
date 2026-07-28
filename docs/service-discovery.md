@@ -16,7 +16,7 @@ The one-liner — a bare port number declares and advertises the port:
     name: "redis-job",
     tasks: [{
         name: "redis",
-        kind: "exec",
+        runtime: "exec",
         config: { command: ["redis-server", "--port", "6379"] },
         service: { port: 6379 },   // -> service "redis", static port 6379
     }],

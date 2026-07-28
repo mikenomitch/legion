@@ -19,7 +19,7 @@ pub fn random_string(length: usize) -> String {
 /// on-disk isolation boundary between workloads sharing a node: left to the
 /// process umask (commonly producing `0755`) any local process — including
 /// other tasks — could read staged artifacts, injected secrets, and captured
-/// task output. Task kinds that drop to a dedicated `user` hand the
+/// task output. Task runtimes that drop to a dedicated `user` hand the
 /// allocation tree over via chown so the boundary holds for them too.
 pub fn restrict_dir_to_owner(dir: &std::path::Path) -> crate::util::R<()> {
     #[cfg(unix)]

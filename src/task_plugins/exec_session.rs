@@ -9,7 +9,7 @@
 //! - [`PipeExecSession`] (non-interactive) runs the command with piped
 //!   stdio via `std::process::Command`, keeping stdout and stderr separate.
 //!
-//! Task kinds build a command + env and call [`spawn_pty`] / [`spawn_pipe`];
+//! Task runtimes build a command + env and call [`spawn_pty`] / [`spawn_pipe`];
 //! they do not depend on the backend types directly.
 
 use std::collections::BTreeMap;
@@ -29,7 +29,7 @@ pub struct ExecOptions {
     pub tty: bool,
     /// Initial terminal size (cols, rows). Ignored for pipe sessions.
     pub winsize: (u16, u16),
-    /// Working directory, when the kind wants to set one.
+    /// Working directory, when the runtime wants to set one.
     pub cwd: Option<std::path::PathBuf>,
     /// Extra environment for the exec'd process.
     pub env: BTreeMap<String, String>,

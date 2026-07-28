@@ -337,7 +337,7 @@ no privileges.
 The proposal's second blocking item — "the resolved volume must reach the
 worker" — was already built: `TaskAllocation.task_volumes` (field 15, the exact
 number and name proposed) carries the resolved mount list, and `TaskRuntime`
-exposes it to `prepare`/`start` as typed `RuntimeVolume`s. Block mode extended
+exposes it to `prepare`/`start` as typed `MountedVolume`s (renamed from `RuntimeVolume` by the task-runtime rename). Block mode extended
 that struct with `mode`, `fs`, and `fresh`; nothing else changed.
 
 ### Decided, not yet built

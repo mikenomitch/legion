@@ -1,6 +1,6 @@
-# Task Kind: exec
+# Task Runtime: exec
 
-`exec` is a built-in task kind implemented in `src/task_plugins/exec.rs`.
+`exec` is a built-in task runtime implemented in `src/task_plugins/exec.rs`.
 
 ## Purpose
 

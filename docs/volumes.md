@@ -16,7 +16,7 @@ when the replica goes away.
   name: 'db',
   tasks: [{
     name: 'postgres',
-    kind: 'exec',
+    runtime: 'exec',
     count: 3,
     stateful: {
       storage: { path: '/var/lib/postgresql/data' },   // that's it
@@ -71,7 +71,7 @@ on any task, stateful or not.
 ```jsonnet
 tasks: [{
   name: 'inference',
-  kind: 'container',
+  runtime: 'container',
   count: 8,
   // Stateless. Still mounts a volume.
   volumes: [
@@ -113,7 +113,7 @@ Every volume is handed over one of two ways, declared with `mode`:
   What `exec` and `container` tasks want.
 - **`block`** — a raw block device or disk image the task *attaches*. A guest
   kernel consumes a virtio-blk device, not a host directory, so a microVM task
-  kind cannot use a filesystem volume at all.
+  runtime cannot use a filesystem volume at all.
 
 This is the same split Kubernetes makes with `volumeMode`, for the same reason.
 
@@ -131,12 +131,12 @@ stateful: {
 
 Three things have to agree, and admission checks all three at submit:
 
-1. the **task kind's** supported modes (`exec`/`container` → filesystem);
+1. the **task runtime's** supported modes (`exec`/`container` → filesystem);
 2. the **driver's** supported modes (`legion volume drivers` shows them);
 3. the mode the **job** asked for.
 
 ```
-task db stateful.storage: task kind `exec` cannot consume a `block` volume (it
+task db stateful.storage: task runtime `exec` cannot consume a `block` volume (it
 supports: filesystem). Filesystem volumes are directories a process reads; block
 volumes are devices a guest attaches
 ```
@@ -156,9 +156,9 @@ dm-thin over a sparse file — so a consumer can start before the data finishes
 syncing. Nothing in the contract requires `mount` to block until every byte is
 local.
 
-## How `path` works per task kind
+## How `path` works per task runtime
 
-`path` is where the *task* sees the volume, and the two task kinds see different
+`path` is where the *task* sees the volume, and the two task runtimes see different
 filesystems. Legion does not pretend otherwise:
 
 | Kind | What `path` does | What the task should read |

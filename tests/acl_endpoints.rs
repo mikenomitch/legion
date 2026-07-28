@@ -170,7 +170,7 @@ fn jobspec(name: &str) -> String {
     serde_json::json!({
         "name": name,
         "tasks": [{
-            "kind": "noop",
+            "runtime": "noop",
             "count": 1,
             "config": {},
             "resources": {},

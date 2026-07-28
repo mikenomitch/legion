@@ -1,6 +1,6 @@
-# Task Kind: container
+# Task Runtime: container
 
-`container` is a built-in task kind implemented in `src/task_plugins/container.rs`.
+`container` is a built-in task runtime implemented in `src/task_plugins/container.rs`.
 
 ## Purpose
 
@@ -23,22 +23,22 @@ The runtime is chosen by operating system — no Docker dependency:
   references — they run a *bundle* (an extracted `rootfs/` + a `config.json`
   runtime spec), which Legion builds from the image's OCI layout (see
   [Linux: image → bundle](#linux-image--bundle)).
-- **Other OS:** the kind is rejected as unsupported.
+- **Other OS:** the runtime is rejected as unsupported.
 
-Before every launch the kind preflights its runtime and fails the allocation
+Before every launch the runtime preflights its OCI backend and fails the allocation
 with an actionable message when the binary is missing or (macOS) the
 `container` service is not running. Nodes publish a `container: pass` readiness
 check when the runtime is usable; the key is **omitted** when it is not, since
-a node without a container runtime is still healthy for every other kind.
+a node without a container runtime is still healthy for every other runtime.
 
 ### Linux: image → bundle
 
-A low-level OCI runtime cannot fetch an image, so the kind sources and converts
+A low-level OCI runtime cannot fetch an image, so the runtime sources and converts
 it (`src/task_plugins/oci_bundle.rs`):
 
 1. **Obtain the image's OCI layout.** If the image was staged through the
    artifact pipeline (`artifacts.containerImageDesugar`), that layout is used;
-   otherwise the kind pulls it anonymously through the shared `oci://` fetcher.
+   otherwise the runtime pulls it anonymously through the shared `oci://` fetcher.
    A layout pulled by an earlier start of the same allocation is reused, so
    in-place restarts don't refetch from the registry.
 2. **Build a bundle.** Extract each image layer into `rootfs/` (honoring
@@ -75,7 +75,7 @@ and the container fails to start with "failed to find target executable --".
 
 ## Resources and Ports
 
-Unlike the `exec` kind, `container` isolates its workload, so the task's
+Unlike the `exec` runtime, `container` isolates its workload, so the task's
 declared `resources` and assigned ports are applied to the runtime rather than
 being scheduling bookkeeping alone. Both ride the allocation payload
 (`TaskAllocation.task_resources` / `.network`).
@@ -150,7 +150,7 @@ images (see [docs/artifacts.md](artifacts.md)):
     which cannot pull, still gets its rootfs). Private-registry auth and digest
     pinning require the artifact pipeline (flag on).
 - **File/tree artifacts and env referencing are deferred:** explicitly
-  declared artifacts stage to the *host* task directory, and the kind does not
+  declared artifacts stage to the *host* task directory, and the runtime does not
   mount that directory into the container, so its isolated filesystem cannot
   see them; worker-injected env (`LEGION_TASK_DIR`, `LEGION_ARTIFACT_*`) is
   not applied either. Declared `volumes[]` are mounted (see
@@ -168,7 +168,7 @@ images (see [docs/artifacts.md](artifacts.md)):
 | Memory / CPU limits | ✅ macOS; ❌ Linux (no cgroup config yet) |
 | Port publishing | ✅ macOS; n/a on Linux (host networking) |
 | Volumes (`volumes[]`, `stateful.storage`) | ✅ bind-mounted at the declared `path` — see [docs/volumes.md](volumes.md) |
-| Artifacts | ✅ image (staged via `containerImageDesugar`, or pulled by the kind); file/tree + env deferred |
+| Artifacts | ✅ image (staged via `containerImageDesugar`, or pulled by the runtime); file/tree + env deferred |
 | Exec / interactive PTY | ✅ / ✅ on Apple `container` (sandboxed); ❌ on the Linux OCI runtimes (deferred) — see [docs/exec-and-actions.md](exec-and-actions.md) |
 
 Container exec runs inside the container's namespaces, so it is sandboxed
@@ -210,7 +210,7 @@ LEGION_OCI_RUNTIME=runc cargo test --lib oci_runtime -- --ignored --nocapture
 - Linux containers share host networking (with host DNS files bind-mounted
   read-only) and get no cgroup resource limits.
 - Private-registry image auth and digest pinning require the artifact pipeline
-  (`containerImageDesugar`); the kind's own fallback pull is anonymous.
+  (`containerImageDesugar`); the runtime's own fallback pull is anonymous.
 - zstd-compressed image layers are rejected (gzip and uncompressed supported).
 - No artifact cache yet, so an off-pipeline Linux pull fetches once per
   allocation (in-place restarts reuse the pulled layout; moves refetch).

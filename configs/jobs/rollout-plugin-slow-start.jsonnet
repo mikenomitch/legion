@@ -11,7 +11,7 @@
     },
     tasks: {
         api: {
-            kind: "exec",
+            runtime: "exec",
             count: 10,
             config: {
                 command: ["sleep", "1"],

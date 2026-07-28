@@ -3,7 +3,7 @@ function(job_name, cpu=100) {
     tasks: [
         {
             name: "variable-task",
-            kind: std.extVar("task_kind"),
+            runtime: std.extVar("task_runtime"),
             count: std.parseInt(std.extVar("task_count")),
             config: {
                 command: ["echo", std.extVar("message")],

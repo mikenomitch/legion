@@ -1044,9 +1044,9 @@ impl ManagerDaemonService {
         let mut registry = crate::task_plugins::TaskPluginRegistry::new();
         for task in &mut config.tasks {
             if self.artifacts_config.container_image_desugar {
-                registry.load_plugin(&task.kind, false)?;
+                registry.load_plugin(&task.runtime, false)?;
                 let plugin = registry
-                    .plugin(&task.kind)
+                    .plugin(&task.runtime)
                     .context("task plugin loaded but missing")?;
                 if plugin.supports_artifacts() {
                     for implicit in plugin.implicit_artifacts(&task.config)? {
@@ -1160,16 +1160,16 @@ impl ManagerDaemonService {
                 continue;
             }
 
-            // What the task KIND can consume. A microVM kind takes a block
+            // What the task RUNTIME can consume. A microVM runtime takes a block
             // device and cannot use a directory; exec and container are the
             // reverse. Loaded lazily so jobs without volumes never pay for it.
-            let kind_modes = match registry.load_plugin(&task.kind, false) {
+            let runtime_modes = match registry.load_plugin(&task.runtime, false) {
                 Ok(()) => registry
-                    .plugin(&task.kind)
+                    .plugin(&task.runtime)
                     .map(|plugin| plugin.supported_volume_modes().to_vec())
                     .unwrap_or_else(|| vec![crate::volumes::VolumeMode::Filesystem]),
-                // An unknown kind fails elsewhere with a better message; do not
-                // turn "no such task kind" into a confusing volume error.
+                // An unknown runtime fails elsewhere with a better message; do not
+                // turn "no such task runtime" into a confusing volume error.
                 Err(_) => vec![crate::volumes::VolumeMode::Filesystem],
             };
 
@@ -1181,14 +1181,14 @@ impl ManagerDaemonService {
                 is_instance_volume,
             } in declarations
             {
-                if !kind_modes.contains(&mode) {
+                if !runtime_modes.contains(&mode) {
                     bail!(
-                        "task {} {label}: task kind `{}` cannot consume a `{mode}` volume (it \
+                        "task {} {label}: task runtime `{}` cannot consume a `{mode}` volume (it \
                          supports: {}). Filesystem volumes are directories a process reads; \
                          block volumes are devices a guest attaches",
                         task.name,
-                        task.kind,
-                        kind_modes
+                        task.runtime,
+                        runtime_modes
                             .iter()
                             .map(|mode| mode.as_str())
                             .collect::<Vec<_>>()
@@ -7101,7 +7101,7 @@ mod tests {
         let jobspec = json!({
             "name": "kv-job",
             "task": {
-                "kind": "exec",
+                "runtime": "exec",
                 "config": {
                     "command": ["echo", "hi"],
                     "env": {
@@ -7179,7 +7179,7 @@ mod tests {
         let jobspec = json!({
             "name": "kv-restart-policy-job",
             "task": {
-                "kind": "exec",
+                "runtime": "exec",
                 "kv": { "watch": true, "onChange": "restart", "onDelete": "fail" },
                 "env": [
                     {
@@ -7238,7 +7238,7 @@ mod tests {
         let jobspec = json!({
             "name": "kv-rollout-policy-job",
             "task": {
-                "kind": "exec",
+                "runtime": "exec",
                 "kv": { "watch": true, "onChange": "rollout", "onDelete": "fail" },
                 "files": [
                     {
@@ -7342,7 +7342,7 @@ mod tests {
         json!({
             "name": job,
             "task": {
-                "kind": "exec",
+                "runtime": "exec",
                 "kv": { "watch": true, "onChange": on_change, "onDelete": on_delete },
                 "env": [
                     {
@@ -7544,7 +7544,7 @@ mod tests {
             "tasks": [
                 {
                     "name": "task-a",
-                    "kind": "exec",
+                    "runtime": "exec",
                     "kv": { "watch": true, "onChange": "restart", "onDelete": "fail" },
                     "env": [
                         {
@@ -7556,7 +7556,7 @@ mod tests {
                 },
                 {
                     "name": "task-b",
-                    "kind": "exec",
+                    "runtime": "exec",
                     "kv": { "watch": true, "onChange": "restart", "onDelete": "fail" },
                     "env": [
                         {
@@ -7699,7 +7699,7 @@ mod tests {
         let jobspec = json!({
             "name": "kv-unwatched",
             "task": {
-                "kind": "exec",
+                "runtime": "exec",
                 // Defaults would watch, but the entry opts out explicitly.
                 "kv": { "watch": true, "onChange": "restart", "onDelete": "fail" },
                 "env": [
@@ -7744,7 +7744,7 @@ mod tests {
         let jobspec = json!({
             "name": "kv-precedence",
             "task": {
-                "kind": "exec",
+                "runtime": "exec",
                 "kv": { "watch": true, "onChange": "restart" },
                 "env": [
                     {
@@ -7792,7 +7792,7 @@ mod tests {
         let jobspec = json!({
             "name": "kv-template-kv",
             "task": {
-                "kind": "exec",
+                "runtime": "exec",
                 "kv": { "watch": true, "onChange": "restart", "onDelete": "fail" },
                 "env": [
                     {
@@ -7847,7 +7847,7 @@ mod tests {
             "tasks": [
                 {
                     "name": "watcher",
-                    "kind": "exec",
+                    "runtime": "exec",
                     "kv": { "watch": true, "onChange": "restart", "onDelete": "none" },
                     "env": [
                         { "name": "A", "value": { "template": "{{ kv \"iso/a\" }}" } }
@@ -7856,7 +7856,7 @@ mod tests {
                 },
                 {
                     "name": "bystander",
-                    "kind": "exec",
+                    "runtime": "exec",
                     "config": { "command": ["echo", "bye"], "env": { "STATIC": "fixed" } }
                 }
             ]
@@ -7904,7 +7904,7 @@ mod tests {
         let jobspec = json!({
             "name": "kv-file-rerender",
             "task": {
-                "kind": "exec",
+                "runtime": "exec",
                 "kv": { "watch": true, "onChange": "restart", "onDelete": "none" },
                 "files": [
                     {
@@ -8017,7 +8017,7 @@ mod tests {
         let jobspec = json!({
             "name": "kv-container-files",
             "task": {
-                "kind": "container",
+                "runtime": "container",
                 "files": [
                     {
                         "path": "/etc/app/conf",
@@ -8093,7 +8093,7 @@ mod tests {
         let jobspec = json!({
             "name": "replace-rollout",
             "task": {
-                "kind": "exec",
+                "runtime": "exec",
                 "group": "web",
                 "config": {
                     "command": ["echo", "v3"]

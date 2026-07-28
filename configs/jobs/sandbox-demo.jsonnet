@@ -28,7 +28,7 @@
     tasks: [
         {
             name: "sandbox",
-            kind: "exec",
+            runtime: "exec",
             group: "sandboxes",
             stateful: {
                 // On-demand instances with never-recycled ids. A destroyed

@@ -175,7 +175,7 @@ material change to an existing one:
   example, the defaults, the failure modes and their diagnostics, and the
   interaction with anything adjacent. New surfaces get their own page; extensions
   go in the existing page.
-- **Update every doc the change touches**, not just the main one: task-kind
+- **Update every doc the change touches**, not just the main one: task-runtime
   capability tables, `docs/agent-readiness.md` for new agent surfaces,
   `README.md`'s doc list and `docs/README.md`'s index for a new page.
 - **Every gRPC method and every request/response attribute** must be documented
@@ -219,8 +219,8 @@ knowingly accepted a limitation or trade-off.
 
 - `docs/architecture-managers-workers.md`, `docs/scheduler-and-eval-loop.md`,
   `docs/jobs-tasks-and-scheduling.md`, `docs/state-store.md`
-- `docs/plugin-system.md`, `docs/task-kind-plugins.md`, `docs/task-kind-exec.md`,
-  `docs/task-kind-container.md`, `docs/task-kind-noop.md`,
+- `docs/plugin-system.md`, `docs/task-runtime-plugins.md`, `docs/task-runtime-exec.md`,
+  `docs/task-runtime-container.md`, `docs/task-runtime-noop.md`,
   `docs/rollout-strategy-plugins.md`
 - `docs/artifacts.md`, `docs/kv-store.md`, `docs/auth-and-acls.md`,
   `docs/workload-identity.md`, `docs/stateful-workloads.md`,

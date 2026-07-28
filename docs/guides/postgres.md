@@ -37,7 +37,7 @@ psql "postgres://postgres:legion-demo@10.0.0.4:29315/legion"
   name: 'postgres',
   tasks: [{
     name: 'postgres',
-    kind: 'container',
+    runtime: 'container',
     count: 1,
     group: 'db',
 
@@ -82,7 +82,7 @@ different topology (see [Scaling out](#scaling-out-replicas) below).
 
 **`storage.path`** is a real bind mount because this is a `container` task. An
 `exec` task would read `$LEGION_STORAGE_DIR` instead — see
-[docs/volumes.md](../volumes.md#how-path-works-per-task-kind).
+[docs/volumes.md](../volumes.md#how-path-works-per-task-runtime).
 
 **`PGDATA` is a subdirectory of the mount**, not the mount itself. The official
 image refuses to `initdb` into a directory that already exists with content, and
@@ -299,7 +299,7 @@ disk both lose data. Two built-in paths:
 // already in configs/jobs/postgres.jsonnet, commented out
 tasks+: [{
   name: 'backup',
-  kind: 'container',
+  runtime: 'container',
   group: 'db',
   lifecycle: 'batch',
   schedule: '0 3 * * *',

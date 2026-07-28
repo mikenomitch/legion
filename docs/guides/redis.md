@@ -33,7 +33,7 @@ legion service resolve redis-cache  # the pool
 ```jsonnet
 {
   name: 'store',
-  kind: 'exec',
+  runtime: 'exec',
   count: 1,
   group: 'store',
 
@@ -59,7 +59,7 @@ host mount namespace, so there is nothing to mount `/var/lib/redis` into.
 Legion exports the real host path as `LEGION_STORAGE_DIR` (and
 `LEGION_VOLUME_DATA`) and the `path` field is recorded as intent. A `container`
 task would use the path directly. See
-[docs/volumes.md](../volumes.md#how-path-works-per-task-kind).
+[docs/volumes.md](../volumes.md#how-path-works-per-task-runtime).
 
 **`--appendonly yes` is not optional here.** Without it Redis persists only via
 periodic RDB snapshots, so a restart silently drops everything written since the
@@ -88,7 +88,7 @@ redis-cli -h <addr> -p <port> GET greeting   # "hello"
 ```jsonnet
 {
   name: 'cache',
-  kind: 'exec',
+  runtime: 'exec',
   count: 2,
   group: 'cache',
   // No `stateful` block at all.
@@ -146,7 +146,7 @@ up on stop.
 
 ## Day-2 operations
 
-The store task declares [actions](../exec-and-actions.md). Exec-kind actions
+The store task declares [actions](../exec-and-actions.md). Exec-runtime actions
 run as sibling host processes with the task's env, so `$LEGION_PORT_REDIS`
 resolves without you looking the port up:
 

@@ -86,7 +86,7 @@ full surface.
 
 ```jsonnet
 task: {
-  kind: "exec",
+  runtime: "exec",
   // Task-level policy defaults for all injections below.
   kv: { watch: true, onChange: "restart", onDelete: "fail" },
   env: [
@@ -213,9 +213,9 @@ Recovery paths:
 
 ### Capability matrix
 
-Each task kind reports whether it supports KV injections; submits that
+Each task runtime reports whether it supports KV injections; submits that
 require an unsupported capability are rejected with an explicit error
-(`Task <name> kind <kind> does not support kv env/file injection`).
+(`Task <name> runtime <runtime> does not support kv env/file injection`).
 
 | Kind        | env injection | file injection |
 |-------------|---------------|----------------|

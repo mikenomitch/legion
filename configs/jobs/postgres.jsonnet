@@ -13,7 +13,7 @@
   name: 'postgres',
   tasks: [{
     name: 'postgres',
-    kind: 'container',
+    runtime: 'container',
     // Exactly one writer. Postgres refuses to start twice against one data
     // directory anyway; slot mode makes that a scheduling guarantee rather
     // than a crash (see docs/stateful-workloads.md "Node loss and fencing").
@@ -115,7 +115,7 @@
   //
   // tasks+: [{
   //   name: 'backup',
-  //   kind: 'container',
+  //   runtime: 'container',
   //   group: 'db',
   //   lifecycle: 'batch',
   //   schedule: '0 3 * * *',            // 03:00 daily

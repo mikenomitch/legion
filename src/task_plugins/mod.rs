@@ -71,13 +71,13 @@ pub const STDERR_LOG_FILE: &str = "stderr.log";
 
 /// Redirect a task process's stdout/stderr to per-allocation capture files.
 ///
-/// When `runtime.log_dir` is set (the worker threads an allocation log
-/// directory through the runtime), the directory is created and the command's
+/// When `instance.log_dir` is set (the worker threads an allocation log
+/// directory through the instance), the directory is created and the command's
 /// stdout/stderr are pointed at append-mode `stdout.log` / `stderr.log` files.
 /// When no log directory is configured this is a no-op and the child inherits
 /// the worker's standard streams, preserving prior behaviour.
-pub fn configure_task_log_capture(cmd: &mut Command, runtime: &TaskRuntime) -> R<()> {
-    let Some(log_dir) = runtime.log_dir.as_ref() else {
+pub fn configure_task_log_capture(cmd: &mut Command, instance: &TaskInstance) -> R<()> {
+    let Some(log_dir) = instance.log_dir.as_ref() else {
         return Ok(());
     };
     std::fs::create_dir_all(log_dir)
@@ -109,7 +109,7 @@ pub(crate) fn derived_schema<T: schemars::JsonSchema>() -> Value {
 }
 
 #[derive(Default)]
-pub struct TaskRuntime {
+pub struct TaskInstance {
     pub state: Value,
     pub child: Option<Child>,
     pub pid: Option<u32>,
@@ -117,13 +117,13 @@ pub struct TaskRuntime {
     /// the worker before `prepare()` and removed on destroy.
     pub alloc_dir: Option<std::path::PathBuf>,
     /// Private task directory (`allocs/<alloc_id>/<task_name>/`). Artifacts
-    /// stage here; the exec kind's `cwd` defaults here.
+    /// stage here; the exec runtime's `cwd` defaults here.
     pub task_dir: Option<std::path::PathBuf>,
     /// Env vars injected by the worker core (`LEGION_ALLOC_DIR`,
     /// `LEGION_TASK_DIR`, `LEGION_ARTIFACT_<NAME>`, `LEGION_VOLUME_<NAME>`).
-    /// Kinds that run host processes apply these at start; kinds with isolated
+    /// Runtimes that run host processes apply these at start; runtimes with isolated
     /// filesystems apply the subset that means something inside the sandbox
-    /// (the container kind applies the volume vars, whose values are already
+    /// (the container runtime applies the volume vars, whose values are already
     /// in-container destinations).
     pub extra_env: std::collections::BTreeMap<String, String>,
     /// Typed staged artifacts (artifact system plan §8), attached before
@@ -137,12 +137,12 @@ pub struct TaskRuntime {
     /// docs/volumes.md). Kinds with an isolated filesystem turn these into real
     /// mounts; host-process kinds just read `LEGION_VOLUME_*` from
     /// [`Self::extra_env`], which the worker already filled in.
-    pub volumes: Vec<RuntimeVolume>,
+    pub volumes: Vec<MountedVolume>,
 }
 
 /// One mounted volume, as a task kind sees it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RuntimeVolume {
+pub struct MountedVolume {
     /// Declared volume name (`data`, `models`, …).
     pub name: String,
     /// How the driver handed it over: a directory or a block device.
@@ -152,7 +152,7 @@ pub struct RuntimeVolume {
     pub host_path: PathBuf,
     /// Where the task should see it — the bind destination for a container, the
     /// guest path for a microVM. `None` when the job declared no path, which
-    /// only makes sense for kinds without a filesystem view.
+    /// only makes sense for runtimes without a filesystem view.
     pub path: Option<String>,
     /// Block mode: the filesystem the device carries, so a consumer knows what
     /// to mount inside a guest without probing.
@@ -163,23 +163,24 @@ pub struct RuntimeVolume {
     pub read_only: bool,
 }
 
-/// Whether exec into a kind means host-level (unsandboxed) access, used by
+/// Whether exec into a runtime means host-level (unsandboxed) access, used by
 /// the manager to pick the `host` ACL flag *before* it proxies to the worker.
 ///
 /// This is a static classification (it must not depend on the worker's OS or
-/// runtime detection, which the manager cannot see). The worker still checks
-/// real availability via [`TaskPlugin::exec_support`] and errors if a kind
-/// cannot actually exec. Unknown/dynamic kinds are treated as host-level so
+/// on what that worker detects locally, which the manager cannot see). The
+/// worker still checks
+/// real availability via [`TaskPlugin::exec_support`] and errors if a runtime
+/// cannot actually exec. Unknown/dynamic runtimes are treated as host-level so
 /// they require the stronger `exec:write` + `host` grant by default.
-pub fn kind_is_host_level(kind: &str) -> bool {
-    match kind {
+pub fn runtime_is_host_level(runtime: &str) -> bool {
+    match runtime {
         "container" => false,
         "exec" => true,
         _ => true,
     }
 }
 
-/// What a task kind can do for `legion exec` / actions.
+/// What a task runtime can do for `legion exec` / actions.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ExecSupport {
     /// One-shot + streamed exec (piped stdio).
@@ -223,17 +224,17 @@ pub trait TaskPlugin: Send + Sync {
         true
     }
 
-    /// Whether this kind can deliver a workload-identity token as an env var.
+    /// Whether this runtime can deliver a workload-identity token as an env var.
     fn supports_identity_env(&self) -> bool {
         false
     }
 
-    /// Whether this kind can deliver a workload-identity token as a file.
+    /// Whether this runtime can deliver a workload-identity token as a file.
     fn supports_identity_file(&self) -> bool {
         false
     }
 
-    /// Whether this kind can deliver a Unix signal to the running task (needed
+    /// Whether this runtime can deliver a Unix signal to the running task (needed
     /// for an identity with `changeMode: signal`).
     fn supports_signal(&self) -> bool {
         false
@@ -241,7 +242,7 @@ pub trait TaskPlugin: Send + Sync {
 
     /// Capability gate for the `artifacts` task field, mirroring
     /// `supports_kv_env_injection` and friends. Admission rejects
-    /// artifact-bearing specs for kinds that return false. Kinds that return
+    /// artifact-bearing specs for runtimes that return false. Runtimes that return
     /// true get File/Tree payloads with zero further code: the worker core
     /// stages them into the task dir and exposes `${artifact.<name>}` /
     /// `LEGION_ARTIFACT_<NAME>`.
@@ -260,7 +261,7 @@ pub trait TaskPlugin: Send + Sync {
         false
     }
 
-    /// Desugars kind-config fields into artifacts (artifact system plan §8).
+    /// Desugars runtime-config fields into artifacts (artifact system plan §8).
     /// The manager calls this at admission; this is how `container.image`
     /// joins the shared pipeline without changing its user-facing spec.
     fn implicit_artifacts(&self, task_config: &Value) -> R<Vec<crate::structs::ArtifactSpec>> {
@@ -273,35 +274,35 @@ pub trait TaskPlugin: Send + Sync {
     fn consume_artifact(
         &self,
         staged: &crate::artifacts::StagedArtifact,
-        runtime: &mut TaskRuntime,
+        instance: &mut TaskInstance,
     ) -> R<()> {
-        let _ = (staged, runtime);
+        let _ = (staged, instance);
         Ok(())
     }
 
-    /// What this kind supports for exec / actions. Defaults to none, so a
-    /// kind that has not opted in fails fast and honestly (S4 in the plan).
+    /// What this runtime supports for exec / actions. Defaults to none, so a
+    /// runtime that has not opted in fails fast and honestly (S4 in the plan).
     fn exec_support(&self) -> ExecSupport {
         ExecSupport::default()
     }
 
     /// Open a live exec session inside (or alongside) the running allocation.
-    /// The default rejects; kinds that report `exec_support().exec` override.
+    /// The default rejects; runtimes that report `exec_support().exec` override.
     fn exec(
         &self,
         _allocation: &Allocation,
         _task: &TaskConfig,
-        _runtime: &mut TaskRuntime,
+        _instance: &mut TaskInstance,
         _opts: ExecOptions,
     ) -> R<Box<dyn ExecSession>> {
-        bail!("task kind `{}` does not support exec", self.name())
+        bail!("task runtime `{}` does not support exec", self.name())
     }
 
     fn prepare(
         &self,
         _allocation: &Allocation,
         _task: &TaskConfig,
-        _runtime: &mut TaskRuntime,
+        _instance: &mut TaskInstance,
     ) -> R<()> {
         Ok(())
     }
@@ -310,7 +311,7 @@ pub trait TaskPlugin: Send + Sync {
         &self,
         _allocation: &Allocation,
         _task: &TaskConfig,
-        _runtime: &mut TaskRuntime,
+        _instance: &mut TaskInstance,
     ) -> R<()> {
         Ok(())
     }
@@ -319,7 +320,7 @@ pub trait TaskPlugin: Send + Sync {
         &self,
         _allocation: &Allocation,
         _task: &TaskConfig,
-        _runtime: &mut TaskRuntime,
+        _instance: &mut TaskInstance,
     ) -> R<()> {
         Ok(())
     }
@@ -328,7 +329,7 @@ pub trait TaskPlugin: Send + Sync {
         &self,
         _allocation: &Allocation,
         _task: &TaskConfig,
-        _runtime: &mut TaskRuntime,
+        _instance: &mut TaskInstance,
     ) -> R<()> {
         Ok(())
     }
@@ -355,21 +356,21 @@ impl TaskPluginRegistry {
         Self::default()
     }
 
-    pub fn load_plugin(&mut self, kind: &str, run_setup: bool) -> R<()> {
-        if self.plugins.contains_key(kind) {
+    pub fn load_plugin(&mut self, runtime: &str, run_setup: bool) -> R<()> {
+        if self.plugins.contains_key(runtime) {
             return Ok(());
         }
 
-        let plugin = load_task_plugin(kind)?;
+        let plugin = load_task_plugin(runtime)?;
         if run_setup {
             plugin.plugin.setup()?;
         }
-        self.plugins.insert(kind.to_string(), plugin);
+        self.plugins.insert(runtime.to_string(), plugin);
         Ok(())
     }
 
-    pub fn plugin(&self, kind: &str) -> Option<&dyn TaskPlugin> {
-        self.plugins.get(kind).map(|entry| entry.plugin.as_ref())
+    pub fn plugin(&self, runtime: &str) -> Option<&dyn TaskPlugin> {
+        self.plugins.get(runtime).map(|entry| entry.plugin.as_ref())
     }
 
     pub fn readiness_checks(&self) -> Map<String, Value> {
@@ -381,9 +382,9 @@ impl TaskPluginRegistry {
     }
 
     pub fn validate_task_config(&mut self, task: &TaskConfig) -> R<()> {
-        self.load_plugin(&task.kind, false)?;
+        self.load_plugin(&task.runtime, false)?;
         let plugin = self
-            .plugin(&task.kind)
+            .plugin(&task.runtime)
             .context("task plugin loaded but missing")?;
         plugin
             .validate_config(&task.config)
@@ -406,15 +407,15 @@ pub fn validate_job_config(config: &JobConfig) -> R<()> {
         task.validate_artifacts()?;
         task.validate_actions()?;
         if !task.artifacts.is_empty() {
-            registry.load_plugin(&task.kind, false)?;
+            registry.load_plugin(&task.runtime, false)?;
             let plugin = registry
-                .plugin(&task.kind)
+                .plugin(&task.runtime)
                 .context("task plugin loaded but missing")?;
             if !plugin.supports_artifacts() {
                 bail!(
-                    "Task {} kind {} does not support artifacts",
+                    "Task {} runtime {} does not support artifacts",
                     task.name,
-                    task.kind
+                    task.runtime
                 );
             }
         }
@@ -428,24 +429,24 @@ pub fn validate_job_config(config: &JobConfig) -> R<()> {
             validate_subject_field(&format!("task {} group", task.name), &task.group)?;
             validate_subject_field(&format!("task {} name", task.name), &task.name)?;
 
-            registry.load_plugin(&task.kind, false)?;
+            registry.load_plugin(&task.runtime, false)?;
             let plugin = registry
-                .plugin(&task.kind)
+                .plugin(&task.runtime)
                 .context("task plugin loaded but missing")?;
             for identity in &task.identities {
                 if identity.delivers_env() && !plugin.supports_identity_env() {
                     bail!(
-                        "Task {} kind {} does not support identity env delivery (identity {})",
+                        "Task {} runtime {} does not support identity env delivery (identity {})",
                         task.name,
-                        task.kind,
+                        task.runtime,
                         identity.name
                     );
                 }
                 if identity.delivers_file() && !plugin.supports_identity_file() {
                     bail!(
-                        "Task {} kind {} does not support identity file delivery (identity {})",
+                        "Task {} runtime {} does not support identity file delivery (identity {})",
                         task.name,
-                        task.kind,
+                        task.runtime,
                         identity.name
                     );
                 }
@@ -453,10 +454,10 @@ pub fn validate_job_config(config: &JobConfig) -> R<()> {
                     && !plugin.supports_signal()
                 {
                     bail!(
-                        "Task {} kind {} does not support signaling required by identity {} \
+                        "Task {} runtime {} does not support signaling required by identity {} \
                          changeMode signal",
                         task.name,
-                        task.kind,
+                        task.runtime,
                         identity.name
                     );
                 }
@@ -469,22 +470,22 @@ pub fn validate_job_config(config: &JobConfig) -> R<()> {
             );
         }
         if let Some(injections) = task.kv_injections.as_ref() {
-            registry.load_plugin(&task.kind, false)?;
+            registry.load_plugin(&task.runtime, false)?;
             let plugin = registry
-                .plugin(&task.kind)
+                .plugin(&task.runtime)
                 .context("task plugin loaded but missing")?;
             if !injections.env.is_empty() && !plugin.supports_kv_env_injection() {
                 bail!(
-                    "Task {} kind {} does not support kv env injection",
+                    "Task {} runtime {} does not support kv env injection",
                     task.name,
-                    task.kind
+                    task.runtime
                 );
             }
             if !injections.files.is_empty() && !plugin.supports_kv_file_injection() {
                 bail!(
-                    "Task {} kind {} does not support kv file injection",
+                    "Task {} runtime {} does not support kv file injection",
                     task.name,
-                    task.kind
+                    task.runtime
                 );
             }
         }
@@ -803,12 +804,12 @@ mod tests {
 
         let temp_dir = tempfile::TempDir::new()?;
         let log_dir = temp_dir.path().join("logs").join("1");
-        let runtime = TaskRuntime {
+        let instance = TaskInstance {
             log_dir: Some(log_dir.clone()),
-            ..TaskRuntime::default()
+            ..TaskInstance::default()
         };
 
-        configure_task_log_capture(&mut Command::new("true"), &runtime)?;
+        configure_task_log_capture(&mut Command::new("true"), &instance)?;
 
         let mode = std::fs::metadata(&log_dir)?.permissions().mode() & 0o777;
         assert_eq!(mode, 0o700, "log dir must be owner-only, got {mode:o}");
@@ -836,12 +837,12 @@ mod tests {
         let mut registry = TaskPluginRegistry::new();
         registry.load_plugin("exec", true)?;
         let plugin = registry.plugin("exec").context("missing exec plugin")?;
-        let mut runtime = TaskRuntime::default();
+        let mut instance = TaskInstance::default();
         let task = exec_task();
-        plugin.prepare(&alloc(), &task, &mut runtime)?;
-        plugin.start(&alloc(), &task, &mut runtime)?;
-        assert!(runtime.child.is_some());
-        plugin.stop(&alloc(), &task, &mut runtime)?;
+        plugin.prepare(&alloc(), &task, &mut instance)?;
+        plugin.start(&alloc(), &task, &mut instance)?;
+        assert!(instance.child.is_some());
+        plugin.stop(&alloc(), &task, &mut instance)?;
         Ok(())
     }
 
@@ -1346,7 +1347,7 @@ mod tests {
     }
 
     #[test]
-    fn noop_kind_rejects_artifacts_when_plugin_available() {
+    fn noop_runtime_rejects_artifacts_when_plugin_available() {
         // The noop plugin is a dylib; gate the assertion on its presence like
         // the other noop tests.
         if std::env::var("LEGION_SKIP_PLUGIN_BUILD").is_ok() {

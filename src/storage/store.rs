@@ -505,7 +505,7 @@ impl Store {
 
         let mut task_stmt = conn.prepare(
             r#"
-            SELECT id, name, kind, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_config_id, identities, stateful, artifacts, network, service, actions, volumes
+            SELECT id, name, runtime, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_config_id, identities, stateful, artifacts, network, service, actions, volumes
             FROM task_config;
             "#,
         )?;
@@ -519,7 +519,7 @@ impl Store {
             let depends_on = self.parse_depends_on_column(8, row.get(8)?)?;
             let task = TaskConfig {
                 name: row.get(1)?,
-                kind: row.get(2)?,
+                runtime: row.get(2)?,
                 count: TaskCount {
                     num: count_num,
                     per: count_per,
@@ -1517,7 +1517,7 @@ impl Store {
         let depends_on = self.parse_depends_on_column(8, row.get(8)?)?;
         let task_config = TaskConfig {
             name: row.get(1)?,
-            kind: row.get(2)?,
+            runtime: row.get(2)?,
             count: TaskCount {
                 num: count_num,
                 per: count_per,
@@ -2551,7 +2551,7 @@ impl Store {
             let schedule = t.schedule.as_ref().map(ToString::to_string);
             let task_params = named_params! {
                 ":name": t.name,
-                ":kind": t.kind,
+                ":runtime": t.runtime,
                 ":count": t.count.num,
                 ":count_per": t.count.per,
                 ":group_name": t.group,
@@ -8176,14 +8176,14 @@ mod tests {
         let task_one = TaskConfig {
             config: json!({ "message": "hello-1" }),
             resources: json!({ "memory": 256 }),
-            ..TaskConfig::new("task-1", "kind-1")
+            ..TaskConfig::new("task-1", "runtime-1")
         };
 
         let task_two = TaskConfig {
             count: TaskCount::new(2),
             config: json!({ "message": "hi-2" }),
             resources: json!({ "memory": 512 }),
-            ..TaskConfig::new("task-2", "kind-2")
+            ..TaskConfig::new("task-2", "runtime-2")
         };
 
         let task_configs = vec![task_one.clone(), task_two.clone()];
@@ -8216,7 +8216,7 @@ mod tests {
 
         let t1_from_store = latest_job_config.tasks.get(0).context("oof")?;
         assert_eq!(task_one.name, t1_from_store.name);
-        assert_eq!(task_one.kind, t1_from_store.kind);
+        assert_eq!(task_one.runtime, t1_from_store.runtime);
         assert_eq!(
             task_one.resources.get("memory").context("no memory 1")?,
             t1_from_store
@@ -8251,7 +8251,7 @@ mod tests {
         let task_one = TaskConfig {
             config: json!({ "message": "hello-1" }),
             resources: json!({ "memory": 256 }),
-            ..TaskConfig::new("task-1", "kind-1")
+            ..TaskConfig::new("task-1", "runtime-1")
         };
 
         let job_name = "rollback-job".to_string();
@@ -8297,7 +8297,7 @@ mod tests {
         let orig_task = TaskConfig {
             config: json!({ "message": "hello" }),
             resources: json!({ "memory": 256 }),
-            ..TaskConfig::new("orig-task", "kind-1")
+            ..TaskConfig::new("orig-task", "runtime-1")
         };
 
         let orig_task_configs = vec![orig_task.clone()];
@@ -8326,22 +8326,22 @@ mod tests {
         );
 
         // Submit an updates job config
-        // updated: task kind config
+        // updated: task runtime config
 
         let new_task = TaskConfig {
-            kind: "kind-new".to_string(),
+            runtime: "runtime-new".to_string(),
             ..orig_task
         };
         let new_task_configs = vec![new_task.clone()];
-        let job_config_with_modified_kind = JobConfig {
+        let job_config_with_modified_runtime = JobConfig {
             rollout: None,
             rollout_by_group: Default::default(),
             tasks: new_task_configs.clone(),
             ..job_config
         };
 
-        let submit_response =
-            store.handle_job_submit(&job_config_with_modified_kind.clone(), &orig_submissions)?;
+        let submit_response = store
+            .handle_job_submit(&job_config_with_modified_runtime.clone(), &orig_submissions)?;
         assert!(matches!(submit_response, JobSubmitOutcome::Updated { .. }));
 
         // Get config for initial insert
@@ -8359,7 +8359,7 @@ mod tests {
         let extra_task = TaskConfig {
             config: json!({ "message": "hello" }),
             resources: json!({ "memory": 256 }),
-            ..TaskConfig::new("extra-task", "kind-extra")
+            ..TaskConfig::new("extra-task", "runtime-extra")
         };
         let new_task_configs = vec![new_task.clone(), extra_task.clone()];
 
@@ -8367,7 +8367,7 @@ mod tests {
             rollout: None,
             rollout_by_group: Default::default(),
             tasks: new_task_configs.clone(),
-            ..job_config_with_modified_kind
+            ..job_config_with_modified_runtime
         };
 
         let submit_response =
@@ -8411,7 +8411,7 @@ mod tests {
         let orig_task = TaskConfig {
             config: json!({ "message": "hello" }),
             resources: json!({ "memory": 256 }),
-            ..TaskConfig::new("dupe-task", "kind")
+            ..TaskConfig::new("dupe-task", "runtime")
         };
 
         let orig_task_configs = vec![orig_task.clone()];
@@ -8578,7 +8578,7 @@ mod tests {
             },
         ];
 
-        let tasks = vec![TaskConfig::new("task-1", "kind-1")];
+        let tasks = vec![TaskConfig::new("task-1", "runtime-1")];
 
         let job_name = "solo-job".to_string();
         let job_config = JobConfig {
@@ -8637,7 +8637,7 @@ mod tests {
             is_primary: true,
         };
 
-        let tasks = vec![TaskConfig::new("task-shared", "kind")];
+        let tasks = vec![TaskConfig::new("task-shared", "runtime")];
 
         let job_one_config = JobConfig {
             rollout: None,
