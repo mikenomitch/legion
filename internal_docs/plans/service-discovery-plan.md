@@ -23,8 +23,8 @@ task**. Today an allocation ([src/structs/ledger.rs:12](../../src/structs/ledger
 records `node_id`/`job_id`/`task_config_id` but **no port, no address, and no service
 name**. There is no `network` block, no `service` block, and `Node`
 ([src/structs/node.rs:13](../../src/structs/node.rs)) exposes no routable address
-outside of opaque `fingerprint_attrs`. The TASK-LIST states the gap exactly
-([internal_docs/TASK-LIST.md:86](../TASK-LIST.md)):
+outside of opaque `fingerprint_attrs`. The TODO states the gap exactly
+([internal_docs/TODO.md](../TODO.md)):
 
 > - [ ] I can declare a named service on a task
 > - [ ] I can declare health checks on that task  *(✅ `checks` already exist)*
@@ -373,7 +373,7 @@ sidecar injected into the task.
 
 A service declares allowed callers by **identity**, not IP. Identity is the
 SPIFFE-style `sub` from the [WI plan](workload-identity-oidc-plan.md)
-(`region:job:group:task`). This satisfies the TASK-LIST's "declare which other jobs
+(`region:job:group:task`). This satisfies the TODO's "declare which other jobs
 have access."
 
 ```jsonnet
@@ -538,7 +538,7 @@ L4 + L7 intentions, template `endpoints` function).
 7. **Plugin runtime** ([src/plugin_runtime.rs](../../src/plugin_runtime.rs)) — register
    `datapath` plugin kind + manifest validation; ship built-ins `host`, `bridge`, `cni`.
 8. **Docs** — new `docs/service-discovery.md` (user-facing), `docs/datapath-plugins.md`
-   (ABI), update README doc list, plugin-system "Planned categories", and TASK-LIST.
+   (ABI), update README doc list, plugin-system "Planned categories", and TODO.
 
 ---
 
@@ -546,7 +546,7 @@ L4 + L7 intentions, template `endpoints` function).
 
 Each phase is independently shippable and leaves the tree green. **[R]** A hard line
 separates **v1** (a complete product — discoverable + reachable by DNS/env/template, with
-*no new data-plane component*) from **v2** (the opt-in mesh). The full TASK-LIST is
+*no new data-plane component*) from **v2** (the opt-in mesh). The full TODO is
 satisfied by v1 plus Phase 5's intentions; everything else is separately adopted. See the
 [critique](service-discovery-critique.md) Part E for the rationale.
 

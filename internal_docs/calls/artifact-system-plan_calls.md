@@ -16,7 +16,7 @@ Entries are ranked by project impact, highest first.
    rollouts are the safe default; tag-tracking is available but opt-in,
    with its mid-rollout drift cost documented.
 3. **KV ACL gap accepted for now** — with documentation, a source-code
-   comment at the credential-read site, and a TASK-LIST callout so the
+   comment at the credential-read site, and a TODO callout so the
    artifact credential path becomes an early ACL enforcement point later.
 4. **Cluster auth defaults support `kv` and `nodeIdentity`, never task
    `identity`.** Task identities are a per-task security boundary (the WI

@@ -210,7 +210,7 @@ Linux and macOS). A workflow can pipeline: implement-step → review-step per it
 - `configs/jobs/maximal.jsonnet` gains `network` + `service` (per AGENTS.md);
   new `configs/jobs/service-demo.jsonnet` (server + client);
   `docs/service-discovery.md` (user-facing: blocks, env vars, CLI, doctor, macOS
-  notes); README doc list; TASK-LIST checkboxes.
+  notes); README doc list; TODO checkboxes.
 
 ### S5 — Ship gate
 - fmt/clippy/tests green; §7 matrix executed on Linux (this environment); macOS steps

@@ -121,7 +121,7 @@ Each lane is an independent openraft group with its own log, leader, quorum, and
 
 ### 1a) Where service discovery fits — and why it does **not** get its own lane (recommendation)
 
-Service discovery is not built yet — it is an open item on [`internal_docs/TASK-LIST.md`](../TASK-LIST.md) (named services on a task, health checks, querying address/port from other services, per-service access ACLs) and a stated [`README.md`](../../README.md) goal, so this is forward-looking guidance for when it lands. It is worth deciding now because SD's write profile is exactly the kind of thing the lane model exists to place correctly.
+Service discovery is not built yet — it is an open item on [`internal_docs/TODO.md`](../TODO.md) (named services on a task, health checks, querying address/port from other services, per-service access ACLs) and a stated [`README.md`](../../README.md) goal, so this is forward-looking guidance for when it lands. It is worth deciding now because SD's write profile is exactly the kind of thing the lane model exists to place correctly.
 
 **The key realization: "service discovery" is not one write class — it is four concerns, each of which already maps to an existing lane (or to no lane at all).**
 

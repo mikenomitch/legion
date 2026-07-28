@@ -131,8 +131,8 @@ this?"
     [`plans/README.md`](internal_docs/plans/README.md).
   - `internal_docs/calls/` — judgement-call records, one per plan; the template
     is in [`calls/README.md`](internal_docs/calls/README.md).
-  - `internal_docs/TASK-LIST.md` — the higher-level To Do list.
-  - `internal_docs/MILESTONES.md` — goal milestones.
+  - `internal_docs/TODO.md` — the higher-level To Do list; open work grouped by
+    area at the top, shipped work in the Done section at the bottom.
   - `internal_docs/differentiators.md` — why Legion differs from K8s and Nomad.
   - `internal_docs/development.md` — running locally, Linux worker containers,
     CI notes.
@@ -142,6 +142,28 @@ this?"
 Moving a document between trees is a normal thing to do — a plan that has fully
 shipped often deserves a rewritten public counterpart in `docs/`, while the plan
 itself stays in `internal_docs/plans/`.
+
+### Keep `internal_docs/TODO.md` current (required)
+
+`internal_docs/TODO.md` is only useful if it describes the project as it is right
+now. When you finish work that appears there, update it **in the same change as
+the code** — not in a follow-up, and not "later".
+
+- **Check the item off and move it to the Done section.** Done entries keep the
+  same grouping, and gain a link to the plan and the public doc that now cover
+  the feature.
+- **Only check off what actually shipped.** If you did three of an item's five
+  sub-items, check those three and leave the rest open. Half-done work that reads
+  as finished is the failure mode this rule exists to prevent.
+- **Add what the work uncovered.** Anything you deliberately deferred, knowingly
+  left broken, or discovered along the way becomes a new open item, in the group
+  it belongs to, with a sentence of context and a link to the plan section or
+  code that explains it. This is the same information as the plan's deferred list
+  and the judgement-calls doc — TODO.md is where it stays visible.
+- **Link the PR** on anything that is in flight rather than merged, and keep the
+  "In flight (open PRs)" table at the top honest.
+- If the work has no entry yet and was not trivial, add one and check it off, so
+  the Done section stays a real record of what exists.
 
 ### Plan non-trivial features before building them (required)
 
