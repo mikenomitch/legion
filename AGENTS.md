@@ -26,6 +26,11 @@
 - Name tests descriptively with `_test` modules/functions.
 - Run full suite via `cargo test --all --locked`; avoid mutating shared fixtures.
 - Always run Rust tests unless the change only touches the front end or documentation.
+- **Scheduler changes ship with before/after benchmark numbers.** Run the
+  relevant `benches/scheduler_bench.rs` groups (e.g.
+  `cargo bench --bench scheduler_bench -- candidate_construction`) on the
+  base branch and on your change, and put both numbers in the PR. See
+  `docs/testing-and-benchmarks.md`.
 
 ## Commit & Pull Request Guidelines
 - Commits: short, imperative summaries (e.g., "Refactor store helpers").

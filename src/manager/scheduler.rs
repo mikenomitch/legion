@@ -12,9 +12,10 @@ use rand::{rngs::StdRng, SeedableRng};
 
 use crate::constraints::{AffinitySet, ConstraintSet, DistinctTracker, PermitSet};
 use crate::prelude::*;
-use crate::resources::ResourcePolicy;
+use crate::resources::{ResourcePolicy, ResourcePool, ResourceRequest, ResourceValue};
+use crate::scheduling_index::{IndexMode, IndexQueryOutcome};
 use crate::storage::errors::StorageError;
-use crate::storage::store::{PlanApplyOutcome, Store};
+use crate::storage::store::{PlanApplyOutcome, SharedNodeAllocations, Store};
 use crate::structs::{
     Allocation, JobConfig, Node, TaskConfig, TaskDependencyCondition, TaskLifecycle,
     TaskStatusState,
@@ -60,27 +61,66 @@ pub struct PlanOutcome {
     pub deltas: Vec<LedgerDelta>,
 }
 
+/// How candidate construction went for one planned task — the scheduling
+/// index's explain record, surfaced by `job plan` (docs/scheduling-indexes.md).
+#[derive(Debug, Clone)]
+pub struct TaskIndexUsage {
+    pub task_name: String,
+    /// The index that served candidates, `None` when the scan ran instead.
+    pub index: Option<String>,
+    /// `"on"` or `"shadow"` when an index participated.
+    pub mode: Option<&'static str>,
+    /// Candidate count handed to placement.
+    pub candidates: usize,
+    /// True when the candidate list was cut to the budget (fit-best-first).
+    pub truncated: bool,
+    /// Times placement exhausted truncated candidates and widened to a scan.
+    pub refills: u32,
+    /// True when the scan had to serve after the index came up short.
+    pub fell_back: bool,
+    /// Shadow mode only: did the index's candidate set match the scan's?
+    pub shadow_agreement: Option<bool>,
+    /// Why no index served, when one was expected to (`None` otherwise).
+    pub reason: Option<String>,
+}
+
+impl TaskIndexUsage {
+    fn scan(task_name: &str) -> Self {
+        TaskIndexUsage {
+            task_name: task_name.to_string(),
+            index: None,
+            mode: None,
+            candidates: 0,
+            truncated: false,
+            refills: 0,
+            fell_back: false,
+            shadow_agreement: None,
+            reason: None,
+        }
+    }
+}
+
+/// `build_plan`'s result: the placements plus the per-task index report.
+struct BuiltPlan {
+    placements: Vec<PlannedAllocation>,
+    index_report: Vec<TaskIndexUsage>,
+}
+
+/// One plan's capacity state, taken from the read model in a single lock
+/// acquisition: the allocations the plan places against, the cached free
+/// pools, and the nodes whose allocation set the plan itself changed by
+/// dropping the job's own allocations (a Fresh plan replaces them) — the
+/// ledger recomputes exactly those nodes from scratch.
+struct CapacitySnapshot {
+    allocations_by_node: SharedNodeAllocations,
+    pools: HashMap<String, ResourcePool>,
+    freed_nodes: HashSet<String>,
+}
+
 #[derive(Debug, Clone, Copy)]
 enum NodesConsidered {
     Count(u64),
     Percent(f64),
-}
-
-#[derive(Debug, Clone)]
-struct ResourceRequest {
-    values: HashMap<String, ResourceValue>,
-}
-
-#[derive(Debug, Clone)]
-struct ResourcePool {
-    values: HashMap<String, ResourceValue>,
-    unknown: HashSet<String>,
-}
-
-#[derive(Debug, Clone)]
-enum ResourceValue {
-    Amount(f64),
-    Items(HashSet<String>),
 }
 
 #[derive(Debug, Clone)]
@@ -95,6 +135,7 @@ struct TaskPlan<'a> {
     task_request: ResourceRequest,
     base_eligible: Vec<&'a Node>,
     distinct_tracker: Option<DistinctTracker>,
+    index_usage: TaskIndexUsage,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -151,7 +192,7 @@ impl PlanScoringCache {
         task_config: &TaskConfig,
         affinity_set: &AffinitySet,
         job_config_id: &str,
-        allocations_by_node: &HashMap<String, Vec<Allocation>>,
+        allocations_by_node: &SharedNodeAllocations,
         task_name_to_id: &HashMap<String, i64>,
         task_id_to_group: &HashMap<i64, String>,
         planned_task_allocations: &HashMap<String, Vec<i64>>,
@@ -176,11 +217,11 @@ impl PlanScoringCache {
                 let mut task_presence = HashSet::new();
                 let mut same_task_allocations = 0usize;
                 let mut same_group_allocations = 0usize;
-                let assigned_count = existing_allocs.map_or(0, Vec::len)
+                let assigned_count = existing_allocs.map_or(0, |allocs| allocs.len())
                     + planned.get(&node_id).copied().unwrap_or_default();
 
                 if let Some(allocs) = existing_allocs {
-                    for alloc in allocs {
+                    for alloc in allocs.iter() {
                         if alloc.job_config_id != job_config_id {
                             continue;
                         }
@@ -420,6 +461,8 @@ pub struct Scheduler<'a> {
 pub struct PlanConfigOutcome {
     pub allocations: Vec<PlannedAllocation>,
     pub task_lookup: HashMap<i64, String>,
+    /// Per-task scheduling-index usage (docs/scheduling-indexes.md).
+    pub index_report: Vec<TaskIndexUsage>,
 }
 
 impl<'a> Scheduler<'a> {
@@ -435,6 +478,17 @@ impl<'a> Scheduler<'a> {
 
     #[instrument(skip_all)]
     pub fn plan_only(&self, job_config_id: &str, mode: PlanMode) -> R<Vec<PlannedAllocation>> {
+        Ok(self.plan_only_with_report(job_config_id, mode)?.0)
+    }
+
+    /// `plan_only`, additionally returning the per-task scheduling-index
+    /// usage report for the `job plan` explain surface.
+    #[instrument(skip_all)]
+    pub fn plan_only_with_report(
+        &self,
+        job_config_id: &str,
+        mode: PlanMode,
+    ) -> R<(Vec<PlannedAllocation>, Vec<TaskIndexUsage>)> {
         let started = std::time::Instant::now();
         let mode_label = mode.as_str();
         info!(%job_config_id, mode = mode_label, "Starting scheduler plan_only");
@@ -453,38 +507,69 @@ impl<'a> Scheduler<'a> {
             }
         }
 
-        let mut allocations_by_node = self.store.cached_allocations_by_node()?;
-        if matches!(mode, PlanMode::Fresh) {
-            for allocations in allocations_by_node.values_mut() {
-                allocations.retain(|alloc| alloc.job_config_id != job_config_id);
-            }
-        }
+        let drop_own = |allocation: &Allocation| allocation.job_config_id == job_config_id;
+        let snapshot = self.capacity_snapshot(if matches!(mode, PlanMode::Fresh) {
+            Some(&drop_own)
+        } else {
+            None
+        })?;
 
         let required_counts = Self::required_counts_for_mode(
             &tasks,
             mode.clone(),
             job_config_id,
-            &allocations_by_node,
+            &snapshot.allocations_by_node,
         );
 
-        let plan = self.build_plan(
+        let BuiltPlan {
+            placements,
+            index_report,
+        } = self.build_plan(
             job_config_id,
             nodes,
             tasks,
             all_tasks,
             required_counts,
-            &allocations_by_node,
+            snapshot,
             mode,
             None,
         )?;
         info!(
             %job_config_id,
             mode = mode_label,
-            planned_allocations = plan.len(),
+            planned_allocations = placements.len(),
             elapsed_ms = started.elapsed().as_millis() as u64,
             "Completed scheduler plan_only"
         );
-        Ok(plan)
+        Ok((placements, index_report))
+    }
+
+    /// Takes the plan's capacity snapshot from the read model, optionally
+    /// dropping (and recording the nodes of) the allocations this plan
+    /// replaces.
+    fn capacity_snapshot(
+        &self,
+        should_drop: Option<&dyn Fn(&Allocation) -> bool>,
+    ) -> R<CapacitySnapshot> {
+        let (mut allocations_by_node, pools) = self.store.plan_capacity_snapshot()?;
+        let mut freed_nodes = HashSet::new();
+        if let Some(should_drop) = should_drop {
+            for (node_id, allocations) in allocations_by_node.iter_mut() {
+                // `Arc::make_mut` copies the vector even when nothing would
+                // be dropped, so check read-only first: only the planned
+                // job's own nodes pay for a copy.
+                if !allocations.iter().any(should_drop) {
+                    continue;
+                }
+                Arc::make_mut(allocations).retain(|allocation| !should_drop(allocation));
+                freed_nodes.insert(node_id.clone());
+            }
+        }
+        Ok(CapacitySnapshot {
+            allocations_by_node,
+            pools,
+            freed_nodes,
+        })
     }
 
     #[instrument(skip_all)]
@@ -517,27 +602,27 @@ impl<'a> Scheduler<'a> {
             .map(|(id, task, _count)| (*id, task.name.clone()))
             .collect::<HashMap<_, _>>();
 
-        let mut allocations_by_node = self.store.cached_allocations_by_node()?;
-        if let Some(job_id) = clear_job_id {
-            for allocations in allocations_by_node.values_mut() {
-                allocations.retain(|alloc| alloc.job_id != job_id);
-            }
-        }
+        let drop_cleared =
+            |allocation: &Allocation| Some(allocation.job_id.as_str()) == clear_job_id;
+        let snapshot = self.capacity_snapshot(clear_job_id.is_some().then_some(&drop_cleared))?;
 
         let required_counts = Self::required_counts_for_mode(
             &tasks,
             mode.clone(),
             &job_config.id(),
-            &allocations_by_node,
+            &snapshot.allocations_by_node,
         );
 
-        let allocations = self.build_plan(
+        let BuiltPlan {
+            placements,
+            index_report,
+        } = self.build_plan(
             &job_config.id(),
             nodes,
             tasks,
             all_tasks,
             required_counts,
-            &allocations_by_node,
+            snapshot,
             mode,
             None,
         )?;
@@ -545,14 +630,15 @@ impl<'a> Scheduler<'a> {
             job_id = %job_config.name,
             job_config_id = %job_config.id(),
             mode = mode_label,
-            planned_allocations = allocations.len(),
+            planned_allocations = placements.len(),
             elapsed_ms = started.elapsed().as_millis() as u64,
             "Completed scheduler plan_for_config"
         );
 
         Ok(PlanConfigOutcome {
-            allocations,
+            allocations: placements,
             task_lookup,
+            index_report,
         })
     }
 
@@ -608,8 +694,8 @@ impl<'a> Scheduler<'a> {
         }
 
         // Optimistic-concurrency fence, sampled HERE — before the capacity
-        // snapshot below (`cached_allocations_by_node`) that `build_plan`
-        // places against.
+        // snapshot below (`capacity_snapshot`) that `build_plan` places
+        // against.
         //
         // Every transaction that mutates a scope's allocations bumps that
         // scope's epoch (`bump_epochs_for_allocations_tx`), and
@@ -630,7 +716,7 @@ impl<'a> Scheduler<'a> {
         // candidate node now and select the affected subset at submit time —
         // never re-read. That is one batched query rather than one per node;
         // see `Store::allocation_version_vector_for_candidates`.
-        let candidate_node_ids: Vec<String> = nodes.iter().map(|node| node.id.clone()).collect();
+        let candidate_node_ids: Vec<&str> = nodes.iter().map(|node| node.id.as_str()).collect();
         let candidate_versions = self
             .store
             .allocation_version_vector_for_candidates(job_config_id, &candidate_node_ids)?;
@@ -645,7 +731,6 @@ impl<'a> Scheduler<'a> {
             }
         }
 
-        let mut allocations_by_node = self.store.cached_allocations_by_node()?;
         // A `Fresh` plan replaces the job's allocations wholesale: whichever
         // handler asked for it either already dropped the previous ones
         // (`job_update`) or drops them the moment this plan applies
@@ -654,15 +739,18 @@ impl<'a> Scheduler<'a> {
         // resubmit of anything using more than half a node — and it would
         // contradict `plan_only` / `plan_for_config`, which drop them and so
         // report a plan the apply path then refuses.
-        if matches!(mode, PlanMode::Fresh) {
-            if let Some(job_id) = self.store.job_id_for_job_config(job_config_id)? {
-                for allocations in allocations_by_node.values_mut() {
-                    allocations.retain(|alloc| alloc.job_id != job_id);
-                }
-            }
-        }
+        let replaced_job_id = if matches!(mode, PlanMode::Fresh) {
+            self.store.job_id_for_job_config(job_config_id)?
+        } else {
+            None
+        };
+        let drop_replaced = |allocation: &Allocation| {
+            Some(allocation.job_id.as_str()) == replaced_job_id.as_deref()
+        };
+        let snapshot =
+            self.capacity_snapshot(replaced_job_id.is_some().then_some(&drop_replaced))?;
         let existing_counts =
-            Self::existing_alloc_counts_by_task(job_config_id, &allocations_by_node);
+            Self::existing_alloc_counts_by_task(job_config_id, &snapshot.allocations_by_node);
         if let Some(task_targets) = task_targets {
             for (task_id, _config, desired) in &mut tasks {
                 if let Some(target) = task_targets.get(task_id) {
@@ -677,24 +765,33 @@ impl<'a> Scheduler<'a> {
             &tasks,
             mode.clone(),
             job_config_id,
-            &allocations_by_node,
+            &snapshot.allocations_by_node,
         );
 
         let build_started = std::time::Instant::now();
-        let placements = self.build_plan(
+        let BuiltPlan {
+            placements,
+            index_report,
+        } = self.build_plan(
             job_config_id,
             nodes,
             tasks,
             all_tasks,
             required_counts,
-            &allocations_by_node,
+            snapshot,
             mode.clone(),
             task_targets,
         )?;
+        let indexed_tasks = index_report
+            .iter()
+            .filter(|usage| usage.index.is_some())
+            .count();
         debug!(
             %job_config_id,
             mode = mode.as_str(),
             placement_count = placements.len(),
+            indexed_tasks,
+            planned_tasks = index_report.len(),
             build_plan_ms = build_started.elapsed().as_millis() as u64,
             "Scheduler build_plan completed"
         );
@@ -803,11 +900,11 @@ impl<'a> Scheduler<'a> {
 
     fn existing_alloc_counts_by_task(
         job_config_id: &str,
-        allocations_by_node: &HashMap<String, Vec<Allocation>>,
+        allocations_by_node: &SharedNodeAllocations,
     ) -> HashMap<i64, u32> {
         let mut counts = HashMap::new();
         for allocations in allocations_by_node.values() {
-            for allocation in allocations {
+            for allocation in allocations.iter() {
                 if allocation.job_config_id == job_config_id {
                     *counts.entry(allocation.task_config_id).or_default() += 1;
                 }
@@ -820,7 +917,7 @@ impl<'a> Scheduler<'a> {
         tasks: &[(i64, TaskConfig, u32)],
         mode: PlanMode,
         job_config_id: &str,
-        allocations_by_node: &HashMap<String, Vec<Allocation>>,
+        allocations_by_node: &SharedNodeAllocations,
     ) -> HashMap<i64, u32> {
         if matches!(mode, PlanMode::Fresh) {
             return tasks
@@ -831,7 +928,7 @@ impl<'a> Scheduler<'a> {
 
         let mut placed_by_task: HashMap<i64, u32> = HashMap::new();
         for allocations in allocations_by_node.values() {
-            for alloc in allocations {
+            for alloc in allocations.iter() {
                 if alloc.job_config_id == job_config_id {
                     *placed_by_task.entry(alloc.task_config_id).or_default() += 1;
                 }
@@ -849,11 +946,11 @@ impl<'a> Scheduler<'a> {
 
     fn existing_alloc_counts_by_task_node(
         job_config_id: &str,
-        allocations_by_node: &HashMap<String, Vec<Allocation>>,
+        allocations_by_node: &SharedNodeAllocations,
     ) -> HashMap<(i64, String), u32> {
         let mut counts = HashMap::new();
         for (node_id, allocations) in allocations_by_node {
-            for alloc in allocations {
+            for alloc in allocations.iter() {
                 if alloc.job_config_id == job_config_id {
                     *counts
                         .entry((alloc.task_config_id, node_id.clone()))
@@ -881,32 +978,38 @@ impl<'a> Scheduler<'a> {
             .sum()
     }
 
-    fn available_nodes(&self) -> R<Vec<Node>> {
-        let mut nodes: Vec<Node> = self
-            .store
-            .cached_nodes()?
-            .into_iter()
-            .filter(|node| node.availability == "available")
-            .collect();
-        nodes.sort_by(|a, b| a.id.cmp(&b.id));
-
-        Ok(nodes)
+    /// The plan's node set: every available node, sorted by id, snapshotted
+    /// as `Arc`s (refcount bumps — no per-plan deep clone of node JSON).
+    fn available_nodes(&self) -> R<Vec<Arc<Node>>> {
+        self.store.available_node_arcs()
     }
 
     fn build_plan(
         &self,
         job_config_id: &str,
-        nodes: Vec<Node>,
+        nodes: Vec<Arc<Node>>,
         mut tasks: Vec<(i64, TaskConfig, u32)>,
         all_tasks: Vec<(i64, TaskConfig)>,
         required_counts: HashMap<i64, u32>,
-        allocations_by_node: &HashMap<String, Vec<Allocation>>,
+        capacity: CapacitySnapshot,
         mode: PlanMode,
         task_targets: Option<&HashMap<i64, u32>>,
-    ) -> R<Vec<PlannedAllocation>> {
+    ) -> R<BuiltPlan> {
         tasks.sort_by_key(|a| a.0);
 
+        let CapacitySnapshot {
+            allocations_by_node,
+            pools,
+            freed_nodes,
+        } = capacity;
+        // The body reads allocations by reference throughout (the owned map
+        // outlives the plan); the pools move into the ledger below.
+        let allocations_by_node = &allocations_by_node;
         let mut placements = Vec::new();
+        let mut index_report: Vec<TaskIndexUsage> = Vec::new();
+        // Indexes arm only above the configured node threshold; below it the
+        // scan is cheaper than any bookkeeping (docs/scheduling-indexes.md).
+        let index_armed = self.store.index_settings.armed_for(nodes.len());
         let mut planned: HashMap<String, usize> = HashMap::new();
         let weights = self.scheduler_weights()?;
         let nodes_considered_setting = self.nodes_considered_setting()?;
@@ -919,11 +1022,18 @@ impl<'a> Scheduler<'a> {
             StdRng::from_rng(rand::thread_rng()).context("Failed to seed nodes_considered RNG")?;
         let existing_alloc_counts_by_task_node =
             Self::existing_alloc_counts_by_task_node(job_config_id, allocations_by_node);
-        let node_lookup: HashMap<&str, &Node> =
-            nodes.iter().map(|node| (node.id.as_str(), node)).collect();
+        let node_lookup: HashMap<&str, &Node> = nodes
+            .iter()
+            .map(|node| (node.id.as_str(), &**node))
+            .collect();
         let resource_policy = &self.store.resource_policy;
-        let mut resource_ledger =
-            ResourceLedger::new(&nodes, allocations_by_node, resource_policy)?;
+        let mut resource_ledger = ResourceLedger::from_snapshot(
+            pools,
+            &freed_nodes,
+            &node_lookup,
+            allocations_by_node,
+            resource_policy,
+        );
         let mut group_per_key: HashMap<String, Option<String>> = HashMap::new();
         let mut group_sizes: HashMap<String, usize> = HashMap::new();
         // Hard filters (constraints + permit) of every member of a group. A
@@ -974,7 +1084,7 @@ impl<'a> Scheduler<'a> {
 
         let mut group_assignments: HashMap<GroupKey, String> = HashMap::new();
         for (node_id, allocations) in allocations_by_node {
-            for allocation in allocations {
+            for allocation in allocations.iter() {
                 if allocation.job_config_id != job_config_id {
                     continue;
                 }
@@ -1031,7 +1141,7 @@ impl<'a> Scheduler<'a> {
                 .get(group_name)
                 .and_then(|value| value.clone());
             let mut grouped: HashMap<String, Vec<&Node>> = HashMap::new();
-            for node in &nodes {
+            for node in nodes.iter().map(|node| &**node) {
                 if !filters.iter().all(|(constraint, permit)| {
                     constraint.is_satisfied(node, None) && permit.is_permitted(node)
                 }) {
@@ -1066,13 +1176,17 @@ impl<'a> Scheduler<'a> {
                 continue;
             }
 
-            let mut plan = Self::build_task_plan(
+            let in_multi_task_group = group_sizes.get(&task_config.group).copied().unwrap_or(0) > 1;
+            let mut plan = self.build_task_plan(
                 task_id,
                 &task_config,
                 &nodes,
                 resource_policy,
                 allocations_by_node,
                 &node_lookup,
+                needed,
+                index_armed,
+                in_multi_task_group,
             )?;
 
             let base_eligible = plan.base_eligible.clone();
@@ -1206,18 +1320,213 @@ impl<'a> Scheduler<'a> {
                     &mut group_assignments,
                 )?;
             }
+            index_report.push(plan.index_usage.clone());
         }
 
-        Ok(placements)
+        Ok(BuiltPlan {
+            placements,
+            index_report,
+        })
+    }
+
+    /// Budget for a truncated (index-served) candidate list: a generous
+    /// multiple of what the task still needs, floored so small counts still
+    /// see real choice before scoring.
+    fn candidate_budget(needed: u32) -> usize {
+        (needed as usize).saturating_mul(8).max(64)
+    }
+
+    /// Today's authoritative candidate filter: constraints, permit, and
+    /// volume-driver support over every available node. The permanent
+    /// fallback the scheduling index is measured against.
+    fn scan_base_eligible<'b>(
+        nodes: impl IntoIterator<Item = &'b Node>,
+        constraint_set: &ConstraintSet,
+        permit_set: &PermitSet,
+        required_drivers: &std::collections::BTreeSet<String>,
+    ) -> Vec<&'b Node> {
+        nodes
+            .into_iter()
+            .filter(|node| {
+                constraint_set.is_satisfied(node, None)
+                    && permit_set.is_permitted(node)
+                    && node_provides_volume_drivers(node, required_drivers)
+            })
+            .collect()
+    }
+
+    /// Candidate construction through the scheduling index
+    /// (docs/scheduling-indexes.md). Every index candidate is re-verified
+    /// with exactly the scan's predicate, so a stale or wrong index costs
+    /// coverage, never correctness — and empty coverage falls straight back
+    /// to the scan. Untruncated results are re-sorted by node id so
+    /// index-served planning is byte-identical to scan planning; truncation
+    /// keeps the index's nearest-fit-first order.
+    fn indexed_base_eligible<'b>(
+        &self,
+        nodes: &'b [Arc<Node>],
+        node_lookup: &HashMap<&'b str, &'b Node>,
+        constraint_set: &ConstraintSet,
+        permit_set: &PermitSet,
+        task_request: &ResourceRequest,
+        required_drivers: &std::collections::BTreeSet<String>,
+        needed: u32,
+        allow_truncation: bool,
+        usage: &mut TaskIndexUsage,
+    ) -> R<Vec<&'b Node>> {
+        let metrics = crate::manager::telemetry::metrics();
+
+        // Partition bindings: the task's `=` constraints plus the pool its
+        // permit pins. A `pool` partition key always means the node's pool
+        // column, so only the permit may bind it.
+        let mut bindings = constraint_set.equality_bindings();
+        bindings.remove("pool");
+        if let Some(pool) = permit_set.pool_binding() {
+            bindings.insert("pool".to_string(), pool.clone());
+        }
+        let request_amounts: HashMap<String, f64> = task_request
+            .values
+            .iter()
+            .filter_map(|(name, value)| match value {
+                ResourceValue::Amount(amount) => Some((name.clone(), *amount)),
+                ResourceValue::Items(_) => None,
+            })
+            .collect();
+
+        let candidates =
+            match self
+                .store
+                .scheduling_index_query(&bindings, &request_amounts, None)?
+            {
+                IndexQueryOutcome::Disabled => {
+                    return Ok(Self::scan_base_eligible(
+                        node_refs(nodes),
+                        constraint_set,
+                        permit_set,
+                        required_drivers,
+                    ));
+                }
+                IndexQueryOutcome::Unusable { reason } => {
+                    metrics
+                        .scheduler_index_queries_total
+                        .inc(&["none", "unusable"]);
+                    usage.reason = Some(reason);
+                    return Ok(Self::scan_base_eligible(
+                        node_refs(nodes),
+                        constraint_set,
+                        permit_set,
+                        required_drivers,
+                    ));
+                }
+                IndexQueryOutcome::Candidates(candidates) => candidates,
+            };
+
+        let mut verified: Vec<&'b Node> = candidates
+            .node_ids
+            .iter()
+            .filter_map(|id| node_lookup.get(id.as_str()).copied())
+            .filter(|node| {
+                constraint_set.is_satisfied(node, None)
+                    && permit_set.is_permitted(node)
+                    && node_provides_volume_drivers(node, required_drivers)
+            })
+            .collect();
+
+        if candidates.mode == IndexMode::Shadow {
+            // The scan stays authoritative; the index runs alongside and any
+            // node it missed is a disagreement worth shouting about.
+            let scan = Self::scan_base_eligible(
+                node_refs(nodes),
+                constraint_set,
+                permit_set,
+                required_drivers,
+            );
+            let scan_ids: HashSet<&str> = scan.iter().map(|node| node.id.as_str()).collect();
+            let index_ids: HashSet<&str> = verified.iter().map(|node| node.id.as_str()).collect();
+            let agreement = scan_ids == index_ids;
+            usage.index = Some(candidates.index.clone());
+            usage.mode = Some(IndexMode::Shadow.as_str());
+            usage.shadow_agreement = Some(agreement);
+            metrics
+                .scheduler_index_queries_total
+                .inc(&[candidates.index.as_str(), "shadow"]);
+            metrics.scheduler_index_shadow_total.inc(&[
+                candidates.index.as_str(),
+                if agreement { "agree" } else { "disagree" },
+            ]);
+            if !agreement {
+                let missing: Vec<&&str> = scan_ids.difference(&index_ids).take(3).collect();
+                warn!(
+                    index = %candidates.index,
+                    scan_count = scan_ids.len(),
+                    index_count = index_ids.len(),
+                    missing_sample = ?missing,
+                    "Scheduling index shadow disagreement: index candidates diverge from the scan"
+                );
+            }
+            return Ok(scan);
+        }
+
+        if verified.is_empty() {
+            // Either nothing matches (the scan agrees and this plan fails
+            // with the usual diagnostic) or the index under-covered; one
+            // scan on the empty path tells them apart and keeps the scan's
+            // answer authoritative either way.
+            let scan = Self::scan_base_eligible(
+                node_refs(nodes),
+                constraint_set,
+                permit_set,
+                required_drivers,
+            );
+            usage.index = Some(candidates.index.clone());
+            usage.mode = Some(IndexMode::On.as_str());
+            if scan.is_empty() {
+                metrics
+                    .scheduler_index_queries_total
+                    .inc(&[candidates.index.as_str(), "used"]);
+            } else {
+                usage.fell_back = true;
+                metrics
+                    .scheduler_index_queries_total
+                    .inc(&[candidates.index.as_str(), "fell_back"]);
+                warn!(
+                    index = %candidates.index,
+                    scan_count = scan.len(),
+                    "Scheduling index found no eligible candidates but the scan did; using the scan"
+                );
+            }
+            return Ok(scan);
+        }
+
+        usage.index = Some(candidates.index.clone());
+        usage.mode = Some(IndexMode::On.as_str());
+        metrics
+            .scheduler_index_queries_total
+            .inc(&[candidates.index.as_str(), "used"]);
+        let budget = Self::candidate_budget(needed);
+        if allow_truncation && verified.len() > budget {
+            verified.truncate(budget);
+            usage.truncated = true;
+        } else {
+            verified.sort_by(|a, b| a.id.cmp(&b.id));
+        }
+        metrics
+            .scheduler_index_candidates
+            .observe(&[candidates.index.as_str()], verified.len() as f64);
+        Ok(verified)
     }
 
     fn build_task_plan<'b>(
+        &self,
         task_id: i64,
         task_config: &'b TaskConfig,
-        nodes: &'b [Node],
+        nodes: &'b [Arc<Node>],
         resource_policy: &ResourcePolicy,
-        allocations_by_node: &HashMap<String, Vec<Allocation>>,
+        allocations_by_node: &SharedNodeAllocations,
         node_lookup: &HashMap<&'b str, &'b Node>,
+        needed: u32,
+        index_armed: bool,
+        in_multi_task_group: bool,
     ) -> R<TaskPlan<'b>> {
         let task_resources =
             resource_policy.normalize_task_resources(&task_config.resources, true)?;
@@ -1241,14 +1550,39 @@ impl<'a> Scheduler<'a> {
         // task, so filter it out here rather than letting the task start and
         // fail at mount time.
         let required_drivers = task_config.required_volume_drivers();
-        let base_eligible = nodes
-            .iter()
-            .filter(|node| {
-                constraint_set.is_satisfied(node, None)
-                    && permit_set.is_permitted(node)
-                    && node_provides_volume_drivers(node, &required_drivers)
-            })
-            .collect::<Vec<_>>();
+
+        let mut index_usage = TaskIndexUsage::scan(&task_config.name);
+        // Truncating candidates is only safe when nothing downstream needs
+        // the full set: `count.per` targets every attribute group, `distinct`
+        // constraints need diversity, volume-pinned tasks need their exact
+        // node, and multi-task groups place from their own candidate sets.
+        let allow_truncation = index_armed
+            && task_config.count.per.is_none()
+            && constraint_set.distinct_keys().is_empty()
+            && task_config.volumes.is_empty()
+            && !in_multi_task_group;
+
+        let base_eligible = if index_armed {
+            self.indexed_base_eligible(
+                nodes,
+                node_lookup,
+                &constraint_set,
+                &permit_set,
+                &task_request,
+                &required_drivers,
+                needed,
+                allow_truncation,
+                &mut index_usage,
+            )?
+        } else {
+            Self::scan_base_eligible(
+                node_refs(nodes),
+                &constraint_set,
+                &permit_set,
+                &required_drivers,
+            )
+        };
+        index_usage.candidates = base_eligible.len();
         if base_eligible.is_empty() && !required_drivers.is_empty() {
             let missing = required_drivers
                 .iter()
@@ -1277,6 +1611,7 @@ impl<'a> Scheduler<'a> {
             task_request,
             base_eligible,
             distinct_tracker,
+            index_usage,
         })
     }
 
@@ -1287,7 +1622,7 @@ impl<'a> Scheduler<'a> {
         task_config: &TaskConfig,
         job_config_id: &str,
         candidates: &[&'b Node],
-        allocations_by_node: &HashMap<String, Vec<Allocation>>,
+        allocations_by_node: &SharedNodeAllocations,
         task_name_to_id: &HashMap<String, i64>,
         task_id_to_group: &HashMap<i64, String>,
         planned_task_allocations: &mut HashMap<String, Vec<i64>>,
@@ -1303,8 +1638,10 @@ impl<'a> Scheduler<'a> {
         group_key: Option<&GroupKey>,
         group_assignments: &mut HashMap<GroupKey, String>,
     ) -> R<()> {
+        // Owned so the truncated-index refill below can widen it mid-task.
+        let mut candidates: Vec<&'b Node> = candidates.to_vec();
         let mut scoring_cache = PlanScoringCache::from_plan(
-            candidates,
+            &candidates,
             task_id,
             task_config,
             &plan.affinity_set,
@@ -1343,13 +1680,65 @@ impl<'a> Scheduler<'a> {
         let mut planned_local_bytes: HashMap<String, u64> = HashMap::new();
 
         for _ in 0..count {
-            let eligible = Self::eligible_nodes(
-                candidates,
+            let mut eligible = Self::eligible_nodes(
+                &candidates,
                 &plan.constraint_set,
                 &plan.permit_set,
                 plan.distinct_tracker.as_ref(),
                 &scoring_cache,
             );
+
+            // A truncated (index-served) candidate list can run dry while the
+            // fleet still has room. Widen once to the authoritative scan and
+            // continue — only the single-task path truncates, so group
+            // pinning is never disturbed.
+            if eligible.is_empty() && plan.index_usage.truncated && group_key.is_none() {
+                let required_drivers = task_config.required_volume_drivers();
+                let mut widened = Self::scan_base_eligible(
+                    node_lookup.values().copied(),
+                    &plan.constraint_set,
+                    &plan.permit_set,
+                    &required_drivers,
+                );
+                widened.sort_by(|a, b| a.id.cmp(&b.id));
+                debug!(
+                    task = %task_config.name,
+                    truncated_count = candidates.len(),
+                    widened_count = widened.len(),
+                    "Scheduling index candidates exhausted; refilling from full scan"
+                );
+                plan.index_usage.truncated = false;
+                plan.index_usage.refills += 1;
+                plan.index_usage.fell_back = true;
+                crate::manager::telemetry::metrics()
+                    .scheduler_index_queries_total
+                    .inc(&[
+                        plan.index_usage.index.as_deref().unwrap_or("none"),
+                        "refilled",
+                    ]);
+                candidates = widened;
+                scoring_cache = PlanScoringCache::from_plan(
+                    &candidates,
+                    task_id,
+                    task_config,
+                    &plan.affinity_set,
+                    job_config_id,
+                    allocations_by_node,
+                    task_name_to_id,
+                    task_id_to_group,
+                    planned_task_allocations,
+                    planned,
+                    resource_ledger,
+                    &plan.task_request,
+                );
+                eligible = Self::eligible_nodes(
+                    &candidates,
+                    &plan.constraint_set,
+                    &plan.permit_set,
+                    plan.distinct_tracker.as_ref(),
+                    &scoring_cache,
+                );
+            }
 
             if eligible.is_empty() {
                 bail!(
@@ -1513,7 +1902,7 @@ impl<'a> Scheduler<'a> {
         task_config: &TaskConfig,
         affinity_set: &AffinitySet,
         job_config_id: &str,
-        allocations_by_node: &HashMap<String, Vec<Allocation>>,
+        allocations_by_node: &SharedNodeAllocations,
         task_name_to_id: &HashMap<String, i64>,
         task_id_to_group: &HashMap<i64, String>,
         planned_task_allocations: &HashMap<String, Vec<i64>>,
@@ -1991,7 +2380,7 @@ impl<'a> Scheduler<'a> {
     fn build_distinct_tracker<'b>(
         constraints: &ConstraintSet,
         task_id: i64,
-        allocations_by_node: &HashMap<String, Vec<Allocation>>,
+        allocations_by_node: &SharedNodeAllocations,
         node_lookup: &HashMap<&'b str, &'b Node>,
     ) -> Option<DistinctTracker> {
         let distinct_keys = constraints.distinct_keys();
@@ -2362,6 +2751,13 @@ fn task_colocation_preferences(affinities: &Value) -> Vec<(&str, f64)> {
     }
 }
 
+/// Borrows through a plan's `Arc`'d node snapshot as plain `&Node`s —
+/// everything below candidate construction works on borrows, untouched by
+/// how the snapshot is owned.
+fn node_refs(nodes: &[Arc<Node>]) -> impl Iterator<Item = &Node> {
+    nodes.iter().map(|node| &**node)
+}
+
 fn node_attribute<'a>(node: &'a Node, key: &str) -> Option<&'a Value> {
     node.config_attrs
         .as_object()
@@ -2378,70 +2774,36 @@ fn node_attribute<'a>(node: &'a Node, key: &str) -> Option<&'a Value> {
         })
 }
 
-impl ResourceRequest {
-    fn from_value(value: &Value) -> R<Self> {
-        let obj = value.as_object().context("resources must be an object")?;
-        let mut values = HashMap::new();
-
-        for (key, value) in obj {
-            let demand = match value {
-                Value::Number(num) => {
-                    let amount = num.as_f64().context("resource values must be numbers")?;
-                    if amount < 0.0 {
-                        bail!("resource {key} cannot be negative");
-                    }
-                    ResourceValue::Amount(amount)
-                }
-                Value::String(item) => {
-                    let mut items = HashSet::new();
-                    items.insert(item.clone());
-                    ResourceValue::Items(items)
-                }
-                Value::Array(items) => {
-                    let set = items.iter().map(value_token).collect::<HashSet<_>>();
-                    ResourceValue::Items(set)
-                }
-                _ => bail!("resource {key} must be a number or list"),
-            };
-
-            if matches!(demand, ResourceValue::Items(_)) && is_builtin_resource(key) {
-                bail!("resource {key} must be a number");
-            }
-
-            values.insert(key.clone(), demand);
-        }
-
-        Ok(ResourceRequest { values })
-    }
-}
-
 impl ResourceLedger {
-    fn new(
-        nodes: &[Node],
-        allocations_by_node: &HashMap<String, Vec<Allocation>>,
+    /// Builds the plan-time ledger from the read model's cached free pools —
+    /// no per-node JSON re-parsing. Nodes whose allocation set THIS plan
+    /// changed (`freed_nodes`: a Fresh plan drops the job's own allocations
+    /// before planning) are recomputed from scratch against the filtered
+    /// allocation map, which is exactly the value a full rebuild would
+    /// produce; every other node's cached pool already is that value. A
+    /// candidate node with no cached pool (removed or drained between the
+    /// node and capacity snapshots) simply fits nothing.
+    fn from_snapshot(
+        mut pools: HashMap<String, ResourcePool>,
+        freed_nodes: &HashSet<String>,
+        node_lookup: &HashMap<&str, &Node>,
+        allocations_by_node: &SharedNodeAllocations,
         policy: &ResourcePolicy,
-    ) -> R<Self> {
-        let mut pools = HashMap::new();
-        for node in nodes {
-            let mut pool = ResourcePool::from_node(node)?;
-            if !pool.unknown.is_empty() {
-                warn!(
-                    node_id = %node.id,
-                    unknown_resources = ?pool.unknown,
-                    "Node missing resource fingerprints; assuming infinite capacity"
-                );
-            }
-            if let Some(allocs) = allocations_by_node.get(&node.id) {
-                for alloc in allocs {
-                    let normalized = policy.normalize_task_resources(&alloc.resources, false)?;
-                    let request = ResourceRequest::from_value(&normalized)?;
-                    pool.apply_usage(&request);
-                }
-            }
-            pools.insert(node.id.clone(), pool);
+    ) -> Self {
+        for node_id in freed_nodes {
+            let Some(node) = node_lookup.get(node_id.as_str()) else {
+                continue;
+            };
+            let allocations = allocations_by_node
+                .get(node_id)
+                .map(|allocations| allocations.as_slice())
+                .unwrap_or(&[]);
+            pools.insert(
+                node_id.clone(),
+                ResourcePool::free_for_node(node, allocations, policy),
+            );
         }
-
-        Ok(ResourceLedger { pools })
+        ResourceLedger { pools }
     }
 
     fn can_fit(&self, node_id: &str, request: &ResourceRequest) -> bool {
@@ -2464,129 +2826,6 @@ impl ResourceLedger {
     }
 }
 
-impl ResourcePool {
-    fn from_node(node: &Node) -> R<Self> {
-        let mut values = HashMap::new();
-        let mut unknown = HashSet::new();
-
-        let (memory_mib, memory_unknown) = fingerprint_memory_mib(node)?;
-        if memory_unknown {
-            unknown.insert("memory".to_string());
-        }
-        values.insert("memory".to_string(), ResourceValue::Amount(memory_mib));
-
-        let cpu = fingerprint_cpu(node)?;
-        if cpu.mhz_unknown {
-            unknown.insert("cpu".to_string());
-        }
-        if cpu.cores_unknown {
-            unknown.insert("cores".to_string());
-        }
-        values.insert("cpu".to_string(), ResourceValue::Amount(cpu.mhz));
-        values.insert("cores".to_string(), ResourceValue::Amount(cpu.cores));
-
-        let config_attrs = node.config_attrs.as_object().cloned().unwrap_or_default();
-
-        let max_allocations = config_value(&config_attrs, &["maxAllocations", "max_allocations"])
-            .and_then(|value| value.as_f64());
-        let allocations = max_allocations.unwrap_or(f64::INFINITY);
-        values.insert(
-            "allocations".to_string(),
-            ResourceValue::Amount(allocations),
-        );
-
-        if let Some(custom) = config_value(&config_attrs, &["resources"]) {
-            let custom = custom
-                .as_object()
-                .context("node resources must be an object")?;
-            for (name, value) in custom {
-                if is_builtin_resource(name) {
-                    continue;
-                }
-                let resource = parse_resource_value(name, value)?;
-                values.insert(name.clone(), resource);
-            }
-        }
-
-        let mut pool = ResourcePool { values, unknown };
-
-        if let Some(reserved) =
-            config_value(&config_attrs, &["reservedResources", "reserved_resources"])
-        {
-            let reserved = reserved
-                .as_object()
-                .context("reserved_resources must be an object")?;
-            for (name, value) in reserved {
-                let reservation = parse_resource_value(name, value)?;
-                pool.reserve(name, &reservation);
-            }
-        }
-
-        Ok(pool)
-    }
-
-    fn can_fit(&self, request: &ResourceRequest) -> bool {
-        request.values.iter().all(|(name, demand)| match demand {
-            ResourceValue::Amount(amount) => match self.values.get(name) {
-                Some(ResourceValue::Amount(available)) => available >= amount,
-                _ => false,
-            },
-            ResourceValue::Items(items) => match self.values.get(name) {
-                Some(ResourceValue::Items(available)) => items.is_subset(available),
-                _ => false,
-            },
-        })
-    }
-
-    fn consume(&mut self, request: &ResourceRequest) {
-        self.apply_usage(request);
-    }
-
-    fn apply_usage(&mut self, request: &ResourceRequest) {
-        for (name, demand) in &request.values {
-            match demand {
-                ResourceValue::Amount(amount) => {
-                    let entry = self
-                        .values
-                        .entry(name.clone())
-                        .or_insert(ResourceValue::Amount(0.0));
-                    if let ResourceValue::Amount(available) = entry {
-                        *available -= amount;
-                    }
-                }
-                ResourceValue::Items(items) => {
-                    if let Some(ResourceValue::Items(available)) = self.values.get_mut(name) {
-                        for item in items {
-                            available.remove(item);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    fn reserve(&mut self, name: &str, reservation: &ResourceValue) {
-        match reservation {
-            ResourceValue::Amount(amount) => {
-                let entry = self
-                    .values
-                    .entry(name.to_string())
-                    .or_insert(ResourceValue::Amount(0.0));
-                if let ResourceValue::Amount(available) = entry {
-                    *available -= amount;
-                }
-            }
-            ResourceValue::Items(items) => {
-                if let Some(ResourceValue::Items(available)) = self.values.get_mut(name) {
-                    for item in items {
-                        available.remove(item);
-                    }
-                }
-            }
-        }
-    }
-}
-
 fn reschedule_rng() -> StdRng {
     if let Ok(seed) = std::env::var("LEGION_RESCHEDULE_SEED") {
         if let Ok(seed) = seed.parse::<u64>() {
@@ -2597,130 +2836,6 @@ fn reschedule_rng() -> StdRng {
         return StdRng::seed_from_u64(7);
     }
     StdRng::from_entropy()
-}
-
-fn parse_resource_value(name: &str, value: &Value) -> R<ResourceValue> {
-    match value {
-        Value::Number(num) => {
-            let amount = num.as_f64().context("resource values must be numbers")?;
-            if amount < 0.0 {
-                bail!("resource {name} cannot be negative");
-            }
-            Ok(ResourceValue::Amount(amount))
-        }
-        Value::String(item) => {
-            let mut items = HashSet::new();
-            items.insert(item.clone());
-            Ok(ResourceValue::Items(items))
-        }
-        Value::Array(items) => Ok(ResourceValue::Items(
-            items.iter().map(value_token).collect::<HashSet<_>>(),
-        )),
-        _ => bail!("resource {name} must be a number or list"),
-    }
-}
-
-/// Workers fingerprint `memory_total` straight from
-/// `sysinfo::System::total_memory`, which reports bytes.
-const BYTES_PER_MIB: f64 = 1024.0 * 1024.0;
-
-/// Per-core frequencies below this are not plausible for a real CPU and mean
-/// the platform did not report a usable value. `sysinfo` yields `0` where the
-/// frequency is unavailable, and on Apple Silicon it reports a small
-/// single-digit number (`4`) rather than MHz. Treating those as real capacity
-/// leaves a 10-core Mac advertising 40 MHz in total, which cannot satisfy even
-/// the built-in 100 MHz per-task default, so nothing schedules at all.
-const MIN_PLAUSIBLE_CPU_MHZ: f64 = 100.0;
-
-/// Node CPU capacity derived from a worker's fingerprint.
-///
-/// Frequency and core count are tracked separately because a platform can
-/// report one without the other: core count is reliable everywhere, while the
-/// per-core frequency is not.
-struct CpuFingerprint {
-    /// Summed clock across all cores in MHz, or `INFINITY` when unknown.
-    mhz: f64,
-    /// Number of cores, or `INFINITY` when unknown.
-    cores: f64,
-    mhz_unknown: bool,
-    cores_unknown: bool,
-}
-
-impl CpuFingerprint {
-    /// Nothing usable was reported; callers treat this as infinite capacity so
-    /// an unfingerprinted node does not silently reject every task.
-    fn unknown() -> Self {
-        CpuFingerprint {
-            mhz: f64::INFINITY,
-            cores: f64::INFINITY,
-            mhz_unknown: true,
-            cores_unknown: true,
-        }
-    }
-}
-
-fn fingerprint_memory_mib(node: &Node) -> R<(f64, bool)> {
-    let total = node
-        .fingerprint_attrs
-        .get("memory_total")
-        .and_then(|value| value.as_str())
-        .and_then(|value| value.parse::<f64>().ok());
-
-    match total {
-        Some(total) => Ok((total / BYTES_PER_MIB, false)),
-        None => Ok((f64::INFINITY, true)),
-    }
-}
-
-fn fingerprint_cpu(node: &Node) -> R<CpuFingerprint> {
-    let cpus = node
-        .fingerprint_attrs
-        .get("cpus")
-        .and_then(|val| val.as_object())
-        .filter(|cpus| !cpus.is_empty());
-
-    let Some(cpus) = cpus else {
-        return Ok(CpuFingerprint::unknown());
-    };
-
-    let mut total_mhz = 0.0;
-    let mut mhz_unknown = false;
-    for cpu in cpus.values() {
-        let freq = cpu.get("frequency").and_then(|freq| {
-            freq.as_str()
-                .and_then(|freq| freq.parse::<f64>().ok())
-                .or_else(|| freq.as_f64())
-        });
-
-        match freq {
-            Some(freq) if freq >= MIN_PLAUSIBLE_CPU_MHZ => total_mhz += freq,
-            // One bogus core makes the total meaningless, so drop the whole
-            // figure rather than advertise a partial sum.
-            _ => {
-                mhz_unknown = true;
-                break;
-            }
-        }
-    }
-
-    Ok(CpuFingerprint {
-        mhz: if mhz_unknown {
-            f64::INFINITY
-        } else {
-            total_mhz
-        },
-        cores: cpus.len() as f64,
-        mhz_unknown,
-        cores_unknown: false,
-    })
-}
-
-fn config_value<'a>(attrs: &'a serde_json::Map<String, Value>, keys: &[&str]) -> Option<&'a Value> {
-    keys.iter().find_map(|key| attrs.get(*key))
-}
-
-fn is_builtin_resource(name: &str) -> bool {
-    matches!(name, "memory" | "cpu" | "cores" | "allocations")
 }
 
 fn value_token(value: &Value) -> String {
@@ -2827,6 +2942,82 @@ mod tests {
         Ok(())
     }
 
+    /// The scheduling-index equivalence property on the `on` path, asserted
+    /// directly: untruncated index-served candidates are the scan's set in
+    /// the scan's (by-id) order, across constraint shapes. Shadow mode
+    /// asserts the same live comparison in the integration suite; this pins
+    /// the mode that actually serves.
+    #[test]
+    fn indexed_candidates_equal_scan_candidates_untruncated() -> R<()> {
+        let store = setup_store_with_scheduler(
+            "bin_pack",
+            Some(json!({
+                "index_min_nodes": 1,
+                "indexes": {
+                    "fit": false,
+                    "topo": ["pool", "region"],
+                },
+            })),
+        )?;
+        for idx in 0..40 {
+            store.insert_node(make_node_msg(
+                &format!("node-{idx:02}"),
+                json!({
+                    "region": format!("region-{}", idx % 4),
+                    "tier": if idx % 2 == 0 { "web" } else { "batch" },
+                }),
+            ))?;
+        }
+        let scheduler = Scheduler::new(&store)?;
+        let nodes = store.available_node_arcs()?;
+        let node_lookup: HashMap<&str, &Node> = nodes
+            .iter()
+            .map(|node| (node.id.as_str(), &**node))
+            .collect();
+        let no_drivers = std::collections::BTreeSet::new();
+        let request = ResourceRequest::from_value(&json!({ "memory": 64 }))?;
+
+        for constraints in [
+            json!({ "region": "region-1" }),
+            json!({ "region": "region-2", "tier": "web" }),
+            json!([
+                { "key": "region", "value": "region-3" },
+                { "key": "tier", "operator": "matches", "value": "^b" },
+            ]),
+        ] {
+            let constraint_set = ConstraintSet::new(&constraints)?;
+            let permit_set = PermitSet::new(&Value::Null)?;
+            let scan = Scheduler::scan_base_eligible(
+                node_refs(&nodes),
+                &constraint_set,
+                &permit_set,
+                &no_drivers,
+            );
+            let mut usage = TaskIndexUsage::scan("prop");
+            let indexed = scheduler.indexed_base_eligible(
+                &nodes,
+                &node_lookup,
+                &constraint_set,
+                &permit_set,
+                &request,
+                &no_drivers,
+                2,
+                false,
+                &mut usage,
+            )?;
+            assert_eq!(usage.index.as_deref(), Some("topo"), "{constraints}");
+            let scan_ids: Vec<&str> = scan.iter().map(|node| node.id.as_str()).collect();
+            let indexed_ids: Vec<&str> = indexed.iter().map(|node| node.id.as_str()).collect();
+            assert!(!scan_ids.is_empty(), "test data must match {constraints}");
+            assert_eq!(
+                indexed_ids, scan_ids,
+                "index-served candidates must equal the scan for {constraints}"
+            );
+        }
+
+        Ok(())
+    }
+
     fn dummy_submission() -> Submission {
         Submission {
             path: "job.jsonnet".into(),
@@ -2851,7 +3042,7 @@ mod tests {
         task_id: i64,
         affinity_set: &'a AffinitySet,
         job_config_id: &'a str,
-        allocations_by_node: &'a HashMap<String, Vec<Allocation>>,
+        allocations_by_node: &'a SharedNodeAllocations,
         task_name_to_id: &'a HashMap<String, i64>,
         task_id_to_group: &'a HashMap<i64, String>,
         planned_task_allocations: &'a HashMap<String, Vec<i64>>,
@@ -3654,7 +3845,7 @@ mod tests {
             ..TaskConfig::new("api", "noop")
         };
         let task_id = 7_i64;
-        let allocations_by_node: HashMap<String, Vec<Allocation>> = HashMap::new();
+        let allocations_by_node = SharedNodeAllocations::new();
         let planned_task_allocations: HashMap<String, Vec<i64>> = HashMap::new();
         let planned: HashMap<String, usize> = HashMap::new();
         let task_name_to_id = HashMap::from([(task.name.clone(), task_id)]);
@@ -3934,7 +4125,7 @@ mod tests {
         let mut pools = HashMap::new();
         pools.insert("node-a".to_string(), ResourcePool::from_node(&nodes[0])?);
         let mut ledger = ResourceLedger { pools };
-        let allocations_by_node: HashMap<String, Vec<Allocation>> = HashMap::new();
+        let allocations_by_node = SharedNodeAllocations::new();
         let mut planned: HashMap<String, usize> = HashMap::new();
         let mut planned_task_allocations: HashMap<String, Vec<i64>> = HashMap::new();
         let task_name_to_id = HashMap::from([(task.name.clone(), task_id)]);
@@ -3993,66 +4184,6 @@ mod tests {
             dynamic_attrs: json!({}),
             health_checks: json!({}),
         }
-    }
-
-    #[test]
-    fn memory_fingerprint_is_read_as_bytes() -> R<()> {
-        // 32 GiB, the unit sysinfo::System::total_memory reports.
-        let node = node_with_fingerprint(json!({ "memory_total": "34359738368" }));
-
-        let (memory_mib, unknown) = fingerprint_memory_mib(&node)?;
-
-        assert_eq!(memory_mib, 32.0 * 1024.0);
-        assert!(!unknown);
-        Ok(())
-    }
-
-    #[test]
-    fn implausible_cpu_frequency_falls_back_to_unknown() -> R<()> {
-        // Apple Silicon reports "4" per core rather than a figure in MHz.
-        // Summing it would advertise 40 MHz on a 10-core machine and reject
-        // every task, so the frequency is discarded while cores are kept.
-        let cpus = (1..=10)
-            .map(|i| (format!("cpu-{i}"), json!({ "frequency": "4" })))
-            .collect::<serde_json::Map<_, _>>();
-        let node = node_with_fingerprint(json!({ "cpus": cpus }));
-
-        let cpu = fingerprint_cpu(&node)?;
-
-        assert!(cpu.mhz_unknown);
-        assert_eq!(cpu.mhz, f64::INFINITY);
-        // Core count survives, so it still bin-packs on its own.
-        assert!(!cpu.cores_unknown);
-        assert_eq!(cpu.cores, 10.0);
-        Ok(())
-    }
-
-    #[test]
-    fn plausible_cpu_frequency_sums_across_cores() -> R<()> {
-        let node = node_with_fingerprint(json!({
-            "cpus": {
-                "cpu-1": { "frequency": "2400" },
-                "cpu-2": { "frequency": "2400" },
-            }
-        }));
-
-        let cpu = fingerprint_cpu(&node)?;
-
-        assert!(!cpu.mhz_unknown);
-        assert_eq!(cpu.mhz, 4800.0);
-        assert_eq!(cpu.cores, 2.0);
-        Ok(())
-    }
-
-    #[test]
-    fn absent_cpu_fingerprint_is_unknown() -> R<()> {
-        let cpu = fingerprint_cpu(&node_with_fingerprint(json!({ "cpus": {} })))?;
-
-        assert!(cpu.mhz_unknown);
-        assert!(cpu.cores_unknown);
-        assert_eq!(cpu.mhz, f64::INFINITY);
-        assert_eq!(cpu.cores, f64::INFINITY);
-        Ok(())
     }
 
     #[test]
@@ -4209,7 +4340,7 @@ mod tests {
 
         let scheduler = Scheduler::new(&store)?;
         let nodes = scheduler.available_nodes()?;
-        let eligible = nodes.iter().collect::<Vec<_>>();
+        let eligible = node_refs(&nodes).collect::<Vec<_>>();
         let setting = NodesConsidered::Count(2);
 
         let mut subsets = HashSet::new();
@@ -4425,10 +4556,10 @@ mod tests {
             (1, TaskConfig::new("api", "noop"), 3),
             (2, TaskConfig::new("worker", "noop"), 2),
         ];
-        let allocations_by_node = HashMap::from([
+        let allocations_by_node = SharedNodeAllocations::from([
             (
                 "node-a".to_string(),
-                vec![
+                Arc::new(vec![
                     Allocation {
                         id: 1,
                         job_id: "job-1".into(),
@@ -4451,11 +4582,11 @@ mod tests {
                         instance_id: None,
                         network: None,
                     },
-                ],
+                ]),
             ),
             (
                 "node-b".to_string(),
-                vec![Allocation {
+                Arc::new(vec![Allocation {
                     id: 3,
                     job_id: "other".into(),
                     job_config_id: "cfg-2".into(),
@@ -4465,7 +4596,7 @@ mod tests {
                     resources: json!({}),
                     instance_id: None,
                     network: None,
-                }],
+                }]),
             ),
         ]);
 
@@ -4482,10 +4613,10 @@ mod tests {
 
     #[test]
     fn existing_alloc_counts_by_task_node_indexes_by_task_and_node() {
-        let allocations_by_node = HashMap::from([
+        let allocations_by_node = SharedNodeAllocations::from([
             (
                 "node-a".to_string(),
-                vec![
+                Arc::new(vec![
                     Allocation {
                         id: 1,
                         job_id: "job-1".into(),
@@ -4519,11 +4650,11 @@ mod tests {
                         instance_id: None,
                         network: None,
                     },
-                ],
+                ]),
             ),
             (
                 "node-b".to_string(),
-                vec![
+                Arc::new(vec![
                     Allocation {
                         id: 4,
                         job_id: "job-1".into(),
@@ -4546,7 +4677,7 @@ mod tests {
                         instance_id: None,
                         network: None,
                     },
-                ],
+                ]),
             ),
         ]);
 

@@ -1305,6 +1305,53 @@ message PlanJobReply {
 
   // True when existing config is content-identical to planned config.
   bool same_content = 4;
+
+  // Per-task scheduling-index usage for this plan: which declared index (if
+  // any) generated each task's placement candidates, and why not when none
+  // did. One entry per task the plan considered. See
+  // docs/scheduling-indexes.md for the model.
+  repeated TaskIndexUsage index_usage = 5;
+}
+
+// How candidate construction went for one planned task — the scheduling
+// index's explain record. The scan (a full pass over every available node)
+// remains the authoritative fallback; these fields describe whether and how
+// an index short-circuited it.
+message TaskIndexUsage {
+  // Task the entry describes.
+  string task_name = 1;
+
+  // Name of the index that served candidates (e.g. the built-in "fit"), or
+  // empty when the plain scan ran.
+  string index = 2;
+
+  // "on" when the index generated the candidates, "shadow" when it ran
+  // alongside the authoritative scan for comparison. Empty when no index
+  // participated.
+  string mode = 3;
+
+  // Number of candidate nodes handed to placement scoring.
+  uint32 candidates = 4;
+
+  // True when the candidate list was cut to the per-task budget, keeping the
+  // index's nearest-fit-first order.
+  bool truncated = 5;
+
+  // Times placement exhausted a truncated candidate list and widened back to
+  // the full scan mid-task.
+  uint32 refills = 6;
+
+  // True when the scan ended up serving after the index came up short
+  // (empty coverage, or a truncated list that ran dry).
+  bool fell_back = 7;
+
+  // Shadow mode only: whether the index's candidate set matched the scan's
+  // exactly. Absent outside shadow mode.
+  optional bool shadow_agreement = 8;
+
+  // Why no index served when one might have been expected to — e.g.
+  // "no usable index: gpu needs [region]". Empty otherwise.
+  string reason = 9;
 }
 
 // Planned allocation display item.

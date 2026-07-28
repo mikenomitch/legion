@@ -1116,12 +1116,7 @@ fn build_in_place_exclusions(
         return Ok(None);
     }
 
-    let available_nodes = store
-        .cached_nodes()?
-        .into_iter()
-        .filter(|node| node.availability == "available")
-        .map(|node| node.id)
-        .collect::<HashSet<_>>();
+    let available_nodes = store.available_node_ids()?;
     if available_nodes.is_empty() {
         return Ok(None);
     }
