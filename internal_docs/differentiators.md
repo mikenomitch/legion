@@ -99,12 +99,3 @@
 * Use virtual fs for the alloc directory!
   * From Tim in meeting
   * “If Nomad v2 existed this is what we’d do”
-
-* Should this be using a Fly.io-like scheduler system possibly instead of the eval loop? (depending on which scheduler you're running)
-  * Does this even replace the eval loop?
-  * Every client checks for what jobs need running
-    * Submits a bid
-    * After N seconds, scheduler gives it to the best option and tells it it got it
-    * Each one will pre-warm ASAP but block on actual starting
-    * This is dope for speed at scale
-    * How would it work in the case of trying to optimize? (just set a longer time to evaluate and you’re good?)

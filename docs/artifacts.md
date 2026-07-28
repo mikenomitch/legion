@@ -301,7 +301,7 @@ re-submit.
 > namespace accordingly: anyone who can submit jobs can read any KV value by
 > staging an artifact with it. When the ACL system lands, the
 > `GetArtifactCredential` handler is the enforcement point (tracked in
-> [internal_docs/TASK-LIST.md](../internal_docs/TASK-LIST.md) under *ACL System*; the SECURITY BOUNDARY
+> [internal_docs/TODO.md](../internal_docs/TODO.md) under *Auth, TLS & security*; the SECURITY BOUNDARY
 > comment sits at the handler in `src/manager/server.rs` and on the RPC in
 > `proto/legion.proto`).
 
@@ -621,4 +621,4 @@ Remember the allowlists: a custom scheme must be added to the cluster's
   [Failure semantics](#staging-mechanics)); there is no dedicated
   `onFetchFailure` policy yet.
 - **Windows staging** has not had a dedicated pass (tracked in
-  [internal_docs/TASK-LIST.md](../internal_docs/TASK-LIST.md)).
+  [internal_docs/TODO.md](../internal_docs/TODO.md)).

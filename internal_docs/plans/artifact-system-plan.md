@@ -41,7 +41,7 @@ needs (the `ArtifactSink` write abstraction, digests everywhere, per-artifact
 status reporting) are part of this plan's contract so the cache slots in
 without reshaping anything.
 
-`internal_docs/TASK-LIST.md` ("Artifact system"), `internal_docs/differentiators.md`
+`internal_docs/TODO.md` ("Artifact system"), `internal_docs/differentiators.md`
 ("Artifacts … Type, auth, how to get them"), and `docs/plugin-system.md`
 ("Artifact acquisition plugins") all anticipate this work; this plan gives
 it a concrete shape.
@@ -131,7 +131,7 @@ values) each fetch uses.
 - **No KV ACLs.** Which tasks may reference which KV secret paths is a
   separate ACL effort. This plan inherits today's trust model and
   documents that loudly (see Auth and Judgement Calls; tracked in
-  `internal_docs/TASK-LIST.md`).
+  `internal_docs/TODO.md`).
 - **No live re-fetch of changed artifacts under a running task.** Artifacts
   are resolved at staging time; reacting to a moved tag mid-flight is
   rollout territory (`resolve` controls when tags are re-read).
@@ -597,7 +597,7 @@ existing trust model for `$ref` jobspec resolution and is accepted for now,
 with three obligations this plan carries: (1) the user-facing
 `docs/artifacts.md` states it in a call-out box, (2) `src/artifacts/auth.rs`
 carries the comment below at the credential-read site, (3) it is tracked in
-`internal_docs/TASK-LIST.md` under the ACL System item so it cannot be missed when
+`internal_docs/TODO.md` under the ACL System item so it cannot be missed when
 ACLs land.
 
 ```rust
@@ -605,7 +605,7 @@ ACLs land.
 // any KV path via auth.kv, so possession of job-submit access implies read
 // access to every KV credential. Revisit when the ACL system lands — the
 // artifact credential read below must become an early enforcement point.
-// Tracked in internal_docs/TASK-LIST.md (ACL System).
+// Tracked in internal_docs/TODO.md (ACL System).
 ```
 
 #### Task workload identity (`identity`)
@@ -962,7 +962,7 @@ The single biggest day-one UX unlock.
 ### Phase 2 — Secret auth via KV + cluster matchers
 `auth.kv`, credential JSON shapes, `GetArtifactCredential` RPC, cluster
 `artifacts.auth` matchers, redaction discipline, KV ACL caveat docs +
-code comment + TASK-LIST callout.
+code comment + TODO callout.
 **Win:** S4's auth model — private artifacts with zero secrets in job
 specs and centralized, instant rotation. (Depends on 1.)
 
@@ -1075,13 +1075,13 @@ fetch-failure budgets, dumb interpolation, `oci-client`).
 
 - **Windows staging**: hardlink/copy fallbacks, path semantics, and
   image consumption on Windows need a dedicated pass when Windows workers
-  become a priority. Tracked in `internal_docs/TASK-LIST.md` (Windows support) so
+  become a priority. Tracked in `internal_docs/TODO.md` (Windows support) so
   it is not missed.
 - **`onFetchFailure` policy** distinct from `on_unhealthy` (Judgement Call
   9, *Fetch failures reuse `on_unhealthy` budgets*) if registry/store
   outages prove to deserve different budgets than task unhealthiness.
 - **KV ACL enforcement** at `GetArtifactCredential` when the ACL system
-  lands (Judgement Call 3, *KV ACL gap accepted for now*; TASK-LIST).
+  lands (Judgement Call 3, *KV ACL gap accepted for now*; TODO).
 - The **cache and pre-warm plan** consumes this plan's seams:
   `ArtifactSink`, digests, `artifact_states`, and node identity.
 
@@ -1115,7 +1115,7 @@ fetch-failure budgets, dumb interpolation, `oci-client`).
 - **Phase 2:** S4's credential flow works with specs containing no secret
   material; rotating the KV value affects the next fetch with no job edit;
   no secret bytes appear in logs/traces under test assertion; the KV ACL
-  caveat appears in docs, code comment, and TASK-LIST.
+  caveat appears in docs, code comment, and TODO.
 - **Phase 3:** a MinIO-backed `s3://` artifact stages with endpoint/region
   from credential config.
 - **Phase 4:** a private-registry image task (flag on) and an ORAS

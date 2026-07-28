@@ -21,8 +21,9 @@ architecture and behavior docs are public.
 
 ## Current work
 
-- [TASK-LIST.md](TASK-LIST.md) — the higher-level To Do list.
-- [MILESTONES.md](MILESTONES.md) — goal milestones, near-term and beyond.
+- [TODO.md](TODO.md) — the higher-level To Do list. Open work at the top grouped
+  by area, shipped work in the Done section at the bottom. Check things off as
+  you finish them.
 - [differentiators.md](differentiators.md) — the running list of what makes
   Legion different from K8s and Nomad (part idea list, part roadmap).
 - [stateful-vs-nomad-k8s.md](stateful-vs-nomad-k8s.md) — honest gap analysis of
@@ -53,7 +54,7 @@ When one is required and what goes in it:
 | [artifact-system-plan.md](plans/artifact-system-plan.md) | shipped |
 | [artifact-cache-and-prewarm-plan.md](plans/artifact-cache-and-prewarm-plan.md) | planned |
 | [auth-acl-plan.md](plans/auth-acl-plan.md) | phases 1–4 executed |
-| [exec-and-actions-plan.md](plans/exec-and-actions-plan.md) | in execution |
+| [exec-and-actions-plan.md](plans/exec-and-actions-plan.md) | shipped (all five phases) |
 | [kv-reactive-task-updates-plan.md](plans/kv-reactive-task-updates-plan.md) | shipped |
 | [persistence-plan.md](plans/persistence-plan.md) | phases 0–1, 3 done |
 | [multi-raft-persistence-plan.md](plans/multi-raft-persistence-plan.md) | planned |
@@ -62,7 +63,7 @@ When one is required and what goes in it:
 | [service-discovery-mesh-and-config.md](plans/service-discovery-mesh-and-config.md) | superseded (cookbook + mesh extensions) |
 | [service-discovery-critique.md](plans/service-discovery-critique.md) | superseded (self-critique) |
 | [stateful-workloads-and-instance-identity-plan.md](plans/stateful-workloads-and-instance-identity-plan.md) | shipped |
-| [task-runtime-rename-plan.md](plans/task-runtime-rename-plan.md) | in execution |
+| [task-runtime-rename-plan.md](plans/task-runtime-rename-plan.md) | shipped |
 | [workload-identity-oidc-plan.md](plans/workload-identity-oidc-plan.md) | shipped (task identities) |
 | [volume-plugin-system-plan.md](plans/volume-plugin-system-plan.md) | shipped (v1; CSI bridge + snapshot/clone deferred) |
 | [sandbox-snapshots-and-fast-start-plan.md](plans/sandbox-snapshots-and-fast-start-plan.md) | planned (§0 convergence shipped with the sandbox kind) |

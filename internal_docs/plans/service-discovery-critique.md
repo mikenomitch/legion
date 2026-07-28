@@ -43,7 +43,7 @@ that killed App Mesh and SMI — is **shipping so much mesh that the simple core
 lands or never gets adopted**. The plan doesn't draw a hard line around "what is v1."
 
 **Revision:** Declare a hard v1 boundary: **v1 = Phases 1–3 only** (ports + env vars,
-the catalog projection, DNS + templates). That alone closes every box in the TASK-LIST
+the catalog projection, DNS + templates). That alone closes every box in the TODO
 except intentions, and it has **no new data-plane component**. The L4 forwarder, mTLS,
 intentions, L7, and middleware are explicitly **post-v1**, each independently justified.
 "Discoverable and reachable by DNS/env/template" is a complete, useful product; the mesh
@@ -186,7 +186,7 @@ Phase 8  Prepared-query failover (`*.query.legion`) + multi-region zone-ingress
 Phase 9  `legion://` gRPC proxyless resolver
 ```
 
-The whole TASK-LIST is satisfied by **v1 + Phase 5's intentions**. Everything else is a
+The whole TODO is satisfied by **v1 + Phase 5's intentions**. Everything else is a
 deliberate, separately-adopted capability — which is the simplicity the plan promised but
 the first draft quietly violated.
 
