@@ -176,14 +176,14 @@ bind. Prometheus counters cover the same ground fleet-wide — see
 ## Performance expectations
 
 Indexes remove the **per-task constraint scan** — the component that scales
-with tasks × nodes. What they deliberately do not touch is the per-plan
-snapshot (cloning the node set and building the resource ledger), which
-today dominates single-task plans; measured on a 5,000-node fleet, a
-12-task plan drops ~11% wall-clock with the default partition index while a
-1-task plan is unchanged within noise (numbers and method:
-`benchmarks/scheduler/README.md`). Expect wins to grow with task count,
-constraint count, and shard selectivity — and expect none on small fleets,
-where indexes intentionally never arm.
+with tasks × nodes. The per-plan snapshot they sit beside is cheap too
+(the read model hands plans `Arc`'d nodes and cached free-capacity pools —
+see [state-store.md](state-store.md)), so the index's win is visible in
+whole-plan wall-clock: on a 5,000-node fleet a 12-task plan runs ~21%
+faster with the default partition index than with the scan (numbers and
+method: `benchmarks/scheduler/README.md`). Expect wins to grow with task
+count, constraint count, and shard selectivity — and expect none on small
+fleets, where indexes intentionally never arm.
 
 ## Maintenance and consistency
 

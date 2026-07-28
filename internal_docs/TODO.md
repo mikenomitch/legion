@@ -51,13 +51,15 @@ How to use it:
       ([#137](https://github.com/mikenomitch/legion/pull/137))
 - [ ] Fix the slowest bits of the scheduler using the benchmarks in
       [docs/testing-and-benchmarks.md](../docs/testing-and-benchmarks.md).
-      Candidate construction is now index-served
-      ([docs/scheduling-indexes.md](../docs/scheduling-indexes.md)); the
-      `candidate_construction` bench group proves the dominant remaining
-      cost is the per-plan snapshot — `available_nodes()` cloning every
-      node and `ResourceLedger::new` re-parsing every node's capacity per
-      plan (~75 ms of a ~83 ms 12-task plan at 5k nodes; numbers in
+      Candidate construction is index-served
+      ([docs/scheduling-indexes.md](../docs/scheduling-indexes.md)) and the
+      per-plan snapshot is fixed (Arc'd nodes + cached free pools —
+      [plan](plans/scheduler-plan-snapshot-plan.md), numbers in
       [benchmarks/scheduler/README.md](../benchmarks/scheduler/README.md)).
+      The allocations map is shared per node the same way
+      (`SharedNodeAllocations`, copy-on-write). No O(cluster) per-plan
+      deep clone remains on the plan path; next candidates would come
+      from fresh profiling, not this list.
 - [ ] Scheduling-index follow-ups deferred from
       [plan](plans/scheduling-index-plan.md) (see its calls doc):
       index-served candidates for multi-task **group** co-placement (v1

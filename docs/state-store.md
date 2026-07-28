@@ -29,12 +29,21 @@ This reduces lock contention for read-heavy paths.
 
 In-memory `SchedulingReadModel` cache stores:
 
-- nodes
-- allocations by node
+- nodes (`Arc`'d, so a plan's node snapshot is refcount bumps rather than
+  deep clones of every node's JSON attributes)
+- allocations by node (each node's vector `Arc`'d the same way; the few
+  writers copy-on-write)
 - task configs by job config
+- per-node free resource pools (fingerprinted capacity minus current
+  allocation usage, for available nodes)
+- the scheduling indexes ([scheduling-indexes.md](scheduling-indexes.md))
 
-Scheduler hot paths consume this cache (`cached_nodes`, `cached_allocations_by_node`, `cached_task_configs_for_job_config`).
-Write operations update both DB and cache.
+Scheduler hot paths consume this cache (`available_node_arcs`,
+`plan_capacity_snapshot`, `cached_task_configs_for_job_config`; other
+callers use the deep-clone `cached_nodes`). Write operations update both DB
+and cache; the same write-locked pass re-derives the affected node's free
+pool and index projections, so derived state can never be observed out of
+step with the nodes and allocations it came from.
 
 ## Key Tables
 

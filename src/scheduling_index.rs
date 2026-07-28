@@ -22,8 +22,8 @@ use std::sync::Arc;
 
 use crate::constraints::{node_attr, value_token};
 use crate::prelude::*;
-use crate::resources::ResourcePolicy;
-use crate::structs::{Allocation, Node};
+use crate::resources::ResourcePool;
+use crate::structs::Node;
 
 /// Default for `schedulerSettings.index_min_nodes`: below this many candidate
 /// nodes no index arms and planning uses the plain scan. `0` disables
@@ -541,24 +541,15 @@ pub struct IndexSet {
 }
 
 impl IndexSet {
-    pub fn build(
-        settings: Arc<IndexSettings>,
-        nodes: &HashMap<String, Node>,
-        allocations_by_node: &HashMap<String, Vec<Allocation>>,
-        policy: &ResourcePolicy,
-    ) -> IndexSet {
-        let mut set = IndexSet {
+    pub fn new(settings: Arc<IndexSettings>) -> IndexSet {
+        IndexSet {
             states: settings
                 .indexes
                 .iter()
                 .map(|_| IndexState::default())
                 .collect(),
             settings,
-        };
-        for node_id in nodes.keys() {
-            set.reindex_node(node_id, nodes, allocations_by_node, policy);
         }
-        set
     }
 
     pub fn settings(&self) -> &IndexSettings {
@@ -571,49 +562,23 @@ impl IndexSet {
         self.settings.any_active()
     }
 
-    /// Re-projects one node into every index. Handles insert, update, and
-    /// availability-driven removal; skips shard surgery when the projection
-    /// is unchanged (the common heartbeat case).
-    pub fn reindex_node(
-        &mut self,
-        node_id: &str,
-        nodes: &HashMap<String, Node>,
-        allocations_by_node: &HashMap<String, Vec<Allocation>>,
-        policy: &ResourcePolicy,
-    ) {
+    /// Re-projects one **available** node into every index, reading free
+    /// resource capacity from the read model's cached pool (the same pool
+    /// the plan-time ledger clones, so the two can never disagree). Skips
+    /// shard surgery when the projection is unchanged (the common heartbeat
+    /// case). Callers remove unavailable or deleted nodes via
+    /// [`IndexSet::remove_node`] instead.
+    pub(crate) fn reindex_node(&mut self, node: &Node, pool: &ResourcePool) {
         if self.settings.indexes.is_empty() {
             return;
         }
-        let node = match nodes.get(node_id) {
-            // The index holds exactly the nodes the scheduler considers:
-            // available ones. Everything else is absent, same as removed.
-            Some(node) if node.availability == "available" => node,
-            _ => {
-                self.remove_node(node_id);
-                return;
-            }
-        };
-        let needs_free = self
-            .settings
-            .indexes
-            .iter()
-            .any(|spec| spec.resource_dim_names().next().is_some());
-        let free = if needs_free {
-            let allocs = allocations_by_node
-                .get(node_id)
-                .map(Vec::as_slice)
-                .unwrap_or(&[]);
-            crate::manager::scheduler::node_free_resource_amounts(node, allocs, policy)
-        } else {
-            HashMap::new()
-        };
         for (spec, state) in self.settings.indexes.iter().zip(self.states.iter_mut()) {
-            let projection = project_node(spec, node, &free);
-            if state.node_records.get(node_id) == Some(&projection) {
+            let projection = project_node(spec, node, pool);
+            if state.node_records.get(node.id.as_str()) == Some(&projection) {
                 continue;
             }
-            state.remove(node_id);
-            state.insert(node_id, projection);
+            state.remove(&node.id);
+            state.insert(&node.id, projection);
         }
     }
 
@@ -740,7 +705,7 @@ impl IndexSet {
     }
 }
 
-fn project_node(spec: &IndexSpec, node: &Node, free: &HashMap<String, f64>) -> NodeProjection {
+fn project_node(spec: &IndexSpec, node: &Node, pool: &ResourcePool) -> NodeProjection {
     let partition = spec
         .partition_by
         .iter()
@@ -750,7 +715,7 @@ fn project_node(spec: &IndexSpec, node: &Node, free: &HashMap<String, f64>) -> N
     let cell = spec
         .dims
         .iter()
-        .map(|dim| bucket_value(&dim.scale, dim_value(node, free, dim)))
+        .map(|dim| bucket_value(&dim.scale, dim_value(node, pool, dim)))
         .collect();
     (partition, cell)
 }
@@ -768,9 +733,9 @@ fn partition_token(node: &Node, key: &str) -> String {
 
 /// A missing or non-numeric dim value projects to zero — the node matches
 /// requests that don't ask for the dim and sorts last for ones that do.
-fn dim_value(node: &Node, free: &HashMap<String, f64>, dim: &DimSpec) -> f64 {
+fn dim_value(node: &Node, pool: &ResourcePool, dim: &DimSpec) -> f64 {
     if let Some(resource) = dim.attr.strip_prefix(RESOURCE_DIM_PREFIX) {
-        return free.get(resource).copied().unwrap_or(0.0);
+        return pool.amount(resource).unwrap_or(0.0);
     }
     node_attr(node, &dim.attr)
         .and_then(Value::as_f64)
@@ -825,23 +790,26 @@ mod tests {
         IndexSettings::from_scheduler_settings(Some(&value), "bin_pack").expect("settings")
     }
 
-    fn set_for(
-        value: Value,
-        nodes: Vec<Node>,
-    ) -> (
-        IndexSet,
-        HashMap<String, Node>,
-        HashMap<String, Vec<Allocation>>,
-    ) {
+    /// Free pool as the read model would compute it (no allocations here).
+    fn pool_for(node: &Node) -> ResourcePool {
+        let policy = crate::resources::ResourcePolicy::from_manager_config(&Default::default())
+            .expect("policy");
+        ResourcePool::free_for_node(node, &[], &policy)
+    }
+
+    fn set_for(value: Value, nodes: Vec<Node>) -> (IndexSet, HashMap<String, Node>) {
         let parsed = Arc::new(settings(value));
         let nodes: HashMap<String, Node> = nodes
             .into_iter()
             .map(|node| (node.id.clone(), node))
             .collect();
-        let allocations = HashMap::new();
-        let policy = ResourcePolicy::from_manager_config(&Default::default()).expect("policy");
-        let set = IndexSet::build(parsed, &nodes, &allocations, &policy);
-        (set, nodes, allocations)
+        let mut set = IndexSet::new(parsed);
+        for node in nodes.values() {
+            if node.availability == "available" {
+                set.reindex_node(node, &pool_for(node));
+            }
+        }
+        (set, nodes)
     }
 
     #[test]
@@ -990,7 +958,7 @@ mod tests {
 
     #[test]
     fn partition_query_returns_exactly_the_matching_nodes() {
-        let (set, _, _) = set_for(
+        let (set, _) = set_for(
             json!({ "indexes": { "fit": false, "topo": ["region"] } }),
             vec![
                 make_node("a", "default", json!({ "region": "east" })),
@@ -1011,7 +979,7 @@ mod tests {
 
     #[test]
     fn missing_partition_value_matches_no_bound_query() {
-        let (set, _, _) = set_for(
+        let (set, _) = set_for(
             json!({ "indexes": { "fit": false, "topo": ["region"] } }),
             vec![make_node("a", "default", json!({}))],
         );
@@ -1025,7 +993,7 @@ mod tests {
 
     #[test]
     fn unbound_partition_key_reports_unusable() {
-        let (set, _, _) = set_for(
+        let (set, _) = set_for(
             json!({ "indexes": { "fit": false, "topo": ["region", "zone"] } }),
             vec![make_node(
                 "a",
@@ -1098,7 +1066,7 @@ mod tests {
 
     #[test]
     fn tight_order_prefers_smallest_sufficient_fit() {
-        let (set, _, _) = set_for(
+        let (set, _) = set_for(
             json!({ "indexes": { "fit": false, "vram": ["pool", "resources.vram"] } }),
             fit_nodes(),
         );
@@ -1117,7 +1085,7 @@ mod tests {
 
     #[test]
     fn loose_order_prefers_most_headroom() {
-        let (set, _, _) = set_for(
+        let (set, _) = set_for(
             json!({ "indexes": { "fit": false, "vram": {
                 "partition_by": ["pool"], "dims": ["resources.vram"], "order": "loose",
             } } }),
@@ -1136,7 +1104,7 @@ mod tests {
 
     #[test]
     fn budget_truncates_but_never_hides_the_shard_size() {
-        let (set, _, _) = set_for(
+        let (set, _) = set_for(
             json!({ "indexes": { "fit": false, "vram": ["pool", "resources.vram"] } }),
             fit_nodes(),
         );
@@ -1153,7 +1121,7 @@ mod tests {
 
     #[test]
     fn zero_request_matches_zero_free_nodes() {
-        let (set, _, _) = set_for(
+        let (set, _) = set_for(
             json!({ "indexes": { "fit": false, "vram": ["pool", "resources.vram"] } }),
             fit_nodes(),
         );
@@ -1169,17 +1137,17 @@ mod tests {
 
     #[test]
     fn reindex_moves_updates_and_removes_nodes() {
-        let (mut set, mut nodes, allocations) = set_for(
+        let (mut set, mut nodes) = set_for(
             json!({ "indexes": { "fit": false, "topo": ["region"] } }),
             vec![make_node("a", "default", json!({ "region": "east" }))],
         );
-        let policy = ResourcePolicy::from_manager_config(&Default::default()).expect("policy");
         let east = HashMap::from([("region".to_string(), json!("east"))]);
         let west = HashMap::from([("region".to_string(), json!("west"))]);
 
         // Move a to west.
         nodes.get_mut("a").unwrap().config_attrs = json!({ "region": "west" });
-        set.reindex_node("a", &nodes, &allocations, &policy);
+        let node = nodes.get("a").unwrap();
+        set.reindex_node(node, &pool_for(node));
         let IndexQueryOutcome::Candidates(candidates) = set.query(&east, &HashMap::new(), None)
         else {
             panic!()
@@ -1191,23 +1159,20 @@ mod tests {
         };
         assert_eq!(candidates.node_ids, vec!["a"]);
 
-        // Unavailable nodes leave the index.
-        nodes.get_mut("a").unwrap().availability = "unavailable".into();
-        set.reindex_node("a", &nodes, &allocations, &policy);
+        // Unavailable/deleted nodes leave via remove_node (the read model
+        // decides membership), and removal is idempotent.
+        set.remove_node("a");
         let IndexQueryOutcome::Candidates(candidates) = set.query(&west, &HashMap::new(), None)
         else {
             panic!()
         };
         assert!(candidates.node_ids.is_empty());
-
-        // And removal is idempotent.
-        set.remove_node("a");
         set.remove_node("a");
     }
 
     #[test]
     fn min_nodes_zero_disables_queries() {
-        let (set, _, _) = set_for(
+        let (set, _) = set_for(
             json!({ "index_min_nodes": 0, "indexes": { "topo": ["region"] } }),
             vec![make_node("a", "default", json!({ "region": "east" }))],
         );
@@ -1220,7 +1185,7 @@ mod tests {
 
     #[test]
     fn pool_partition_reads_the_pool_column() {
-        let (set, _, _) = set_for(
+        let (set, _) = set_for(
             json!({ "indexes": { "fit": false, "pools": ["pool"] } }),
             vec![
                 make_node("a", "gpu-pool", json!({})),

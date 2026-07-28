@@ -3,7 +3,7 @@
 
 use crate::constraints::{ConstraintSet, DistinctTracker, PermitSet};
 use crate::prelude::*;
-use crate::resources::ResourcePolicy;
+use crate::resources::{ResourcePolicy, ResourcePool};
 use crate::scheduling_index::{IndexSet, IndexSettings};
 use crate::storage::errors::StorageError;
 use crate::storage::events::{drafts, EventDraft, SchedulerEventFilter, SchedulerEventRecord};
@@ -107,16 +107,31 @@ fn worker_address_host(config_attrs: &Value) -> Option<String> {
     }
 }
 
+/// Allocations per node, each node's vector shared by refcount: a plan's
+/// snapshot bumps refcounts instead of deep-cloning every allocation, and
+/// the few writers copy-on-write via `Arc::make_mut`.
+pub type SharedNodeAllocations = HashMap<String, Arc<Vec<Allocation>>>;
+
 #[derive(Debug, Clone, Default)]
 pub struct SchedulingReadModel {
-    pub nodes: HashMap<String, Node>,
-    pub allocations_by_node: HashMap<String, Vec<Allocation>>,
+    /// Nodes are `Arc`'d so a plan's snapshot is refcount bumps, not deep
+    /// clones of every node's JSON attribute bags. In-place updates go
+    /// through `Arc::make_mut` (copy-on-write while a plan still holds the
+    /// old snapshot).
+    pub nodes: HashMap<String, Arc<Node>>,
+    pub allocations_by_node: SharedNodeAllocations,
     pub task_configs: HashMap<String, Vec<(i64, TaskConfig)>>,
     /// Declared scheduling indexes over `nodes` (docs/scheduling-indexes.md).
     /// Maintained by the same write path that mutates `nodes` and
     /// `allocations_by_node`, so it cannot drift from them; derived state
     /// only, rebuilt on every full read-model load.
     pub indexes: IndexSet,
+    /// Free resource capacity per **available** node — fingerprinted
+    /// capacity minus every current allocation's usage — recomputed for the
+    /// affected node by the same reprojection pass that maintains
+    /// `indexes`. The plan-time `ResourceLedger` clones these instead of
+    /// re-parsing every node's JSON per plan.
+    pub(crate) node_pools: HashMap<String, ResourcePool>,
 }
 
 #[derive(Debug)]
@@ -146,6 +161,10 @@ pub struct DeclaredService {
     pub tags: Vec<String>,
     pub meta: BTreeMap<String, String>,
 }
+
+/// What [`Store::plan_capacity_snapshot`] hands the scheduler: current
+/// allocations by node plus the cached free pools, cloned under one guard.
+pub(crate) type PlanCapacityParts = (SharedNodeAllocations, HashMap<String, ResourcePool>);
 
 #[derive(Debug, Clone)]
 pub struct PlanSubmission {
@@ -1345,51 +1364,68 @@ impl Store {
         let mut allocs_stmt = conn.prepare(GET_ALLOCS.as_str())?;
         let allocs =
             Self::collect_rows(allocs_stmt.query_map([], |row| self.allocation_from_row(row))?)?;
-        let mut allocations_by_node: HashMap<String, Vec<Allocation>> = HashMap::new();
+        let mut grouped: HashMap<String, Vec<Allocation>> = HashMap::new();
         for alloc in allocs {
-            allocations_by_node
+            grouped
                 .entry(alloc.node_id.clone())
                 .or_default()
                 .push(alloc);
         }
-
-        let nodes: HashMap<String, Node> = nodes
+        let allocations_by_node: SharedNodeAllocations = grouped
             .into_iter()
-            .map(|node| (node.id.clone(), node))
+            .map(|(node_id, allocations)| (node_id, Arc::new(allocations)))
             .collect();
-        let indexes = IndexSet::build(
-            Arc::clone(&self.index_settings),
-            &nodes,
-            &allocations_by_node,
-            &self.resource_policy,
-        );
 
-        Ok(SchedulingReadModel {
-            nodes,
+        let node_ids: Vec<String> = nodes.iter().map(|node| node.id.clone()).collect();
+        let mut model = SchedulingReadModel {
+            nodes: nodes
+                .into_iter()
+                .map(|node| (node.id.clone(), Arc::new(node)))
+                .collect(),
             allocations_by_node,
             task_configs,
-            indexes,
-        })
+            indexes: IndexSet::new(Arc::clone(&self.index_settings)),
+            node_pools: HashMap::new(),
+        };
+        let id_refs: Vec<&str> = node_ids.iter().map(String::as_str).collect();
+        Self::reproject_model_nodes(&mut model, &self.resource_policy, &id_refs);
+
+        Ok(model)
     }
 
-    /// Re-projects `node_ids` into the read model's scheduling indexes.
-    /// Every read-model mutation that can change a node's projection —
-    /// node upserts, availability flips, attribute updates, allocation
-    /// changes — calls this inside the same write lock as the mutation, so
-    /// the indexes can never be observed out of step with `nodes`.
-    fn reindex_model_nodes(
+    /// Re-derives `node_ids`' cached state — the free resource pool and the
+    /// scheduling-index projections, both computed from the same pool so
+    /// they cannot disagree. Every read-model mutation that can change
+    /// either — node upserts, availability flips, attribute updates,
+    /// allocation changes — calls this inside the same write lock as the
+    /// mutation, so derived state is never observable out of step with
+    /// `nodes`. Unavailable or deleted nodes lose both.
+    fn reproject_model_nodes(
         model: &mut SchedulingReadModel,
         policy: &ResourcePolicy,
         node_ids: &[&str],
     ) {
-        if model.indexes.settings().indexes.is_empty() || node_ids.is_empty() {
+        if node_ids.is_empty() {
             return;
         }
         let started = Instant::now();
         for node_id in node_ids {
-            model
-                .indexes
-                .reindex_node(node_id, &model.nodes, &model.allocations_by_node, policy);
+            match model.nodes.get(*node_id) {
+                Some(node) if node.availability == "available" => {
+                    let allocations = model
+                        .allocations_by_node
+                        .get(*node_id)
+                        .map(|allocations| allocations.as_slice())
+                        .unwrap_or(&[]);
+                    let pool = ResourcePool::free_for_node(node, allocations, policy);
+                    model.indexes.reindex_node(node, &pool);
+                    model.node_pools.insert((*node_id).to_string(), pool);
+                }
+                _ => {
+                    model.node_pools.remove(*node_id);
+                    model.indexes.remove_node(node_id);
+                }
+            }
         }
         crate::manager::telemetry::metrics()
             .scheduler_index_maintenance_seconds
@@ -1424,8 +1460,8 @@ impl Store {
         }
         let mut guard = self.read_model_writer()?;
         let node_id = node.id.clone();
-        guard.nodes.insert(node_id.clone(), node);
-        Self::reindex_model_nodes(&mut guard, &self.resource_policy, &[node_id.as_str()]);
+        guard.nodes.insert(node_id.clone(), Arc::new(node));
+        Self::reproject_model_nodes(&mut guard, &self.resource_policy, &[node_id.as_str()]);
         Ok(())
     }
 
@@ -1438,8 +1474,8 @@ impl Store {
             .nodes
             .get_mut(node_id)
             .with_context(|| format!("Missing cached node {node_id}"))?;
-        cached.dynamic_attrs = dynamic_attrs;
-        Self::reindex_model_nodes(&mut guard, &self.resource_policy, &[node_id]);
+        Arc::make_mut(cached).dynamic_attrs = dynamic_attrs;
+        Self::reproject_model_nodes(&mut guard, &self.resource_policy, &[node_id]);
         Ok(())
     }
 
@@ -1450,12 +1486,13 @@ impl Store {
         let mut guard = self.read_model_writer()?;
         for id in ids {
             if let Some(node) = guard.nodes.get_mut(id) {
+                let node = Arc::make_mut(node);
                 node.status = "lost".to_string();
                 node.availability = "unavailable".to_string();
             }
         }
         let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
-        Self::reindex_model_nodes(&mut guard, &self.resource_policy, &id_refs);
+        Self::reproject_model_nodes(&mut guard, &self.resource_policy, &id_refs);
         Ok(())
     }
 
@@ -1467,6 +1504,7 @@ impl Store {
         guard.nodes.remove(id);
         guard.allocations_by_node.remove(id);
         guard.indexes.remove_node(id);
+        guard.node_pools.remove(id);
         Ok(())
     }
 
@@ -1476,18 +1514,20 @@ impl Store {
         }
         let mut guard = self.read_model_writer()?;
         for allocation in allocations {
-            guard
-                .allocations_by_node
-                .entry(allocation.node_id.clone())
-                .or_default()
-                .push(allocation.clone());
+            Arc::make_mut(
+                guard
+                    .allocations_by_node
+                    .entry(allocation.node_id.clone())
+                    .or_default(),
+            )
+            .push(allocation.clone());
         }
         let affected: HashSet<&str> = allocations
             .iter()
             .map(|allocation| allocation.node_id.as_str())
             .collect();
         let affected: Vec<&str> = affected.into_iter().collect();
-        Self::reindex_model_nodes(&mut guard, &self.resource_policy, &affected);
+        Self::reproject_model_nodes(&mut guard, &self.resource_policy, &affected);
         Ok(())
     }
 
@@ -1498,8 +1538,8 @@ impl Store {
         let mut guard = self.read_model_writer()?;
         guard
             .allocations_by_node
-            .insert(node_id.to_string(), Vec::new());
-        Self::reindex_model_nodes(&mut guard, &self.resource_policy, &[node_id]);
+            .insert(node_id.to_string(), Arc::new(Vec::new()));
+        Self::reproject_model_nodes(&mut guard, &self.resource_policy, &[node_id]);
         Ok(())
     }
 
@@ -1510,7 +1550,9 @@ impl Store {
         let mut guard = self.read_model_writer()?;
         for allocation in allocations {
             if let Some(node_allocs) = guard.allocations_by_node.get_mut(&allocation.node_id) {
-                node_allocs.retain(|alloc| alloc.id != allocation.id);
+                if node_allocs.iter().any(|alloc| alloc.id == allocation.id) {
+                    Arc::make_mut(node_allocs).retain(|alloc| alloc.id != allocation.id);
+                }
             }
         }
         let affected: HashSet<&str> = allocations
@@ -1518,7 +1560,7 @@ impl Store {
             .map(|allocation| allocation.node_id.as_str())
             .collect();
         let affected: Vec<&str> = affected.into_iter().collect();
-        Self::reindex_model_nodes(&mut guard, &self.resource_policy, &affected);
+        Self::reproject_model_nodes(&mut guard, &self.resource_policy, &affected);
         Ok(())
     }
 
@@ -1551,12 +1593,66 @@ impl Store {
         Ok(tasks)
     }
 
+    /// Deep-cloned allocations map, for callers that need owned vectors.
+    /// The scheduler snapshots the shared (`Arc`'d) map via
+    /// [`Store::plan_capacity_snapshot`] instead.
     pub fn cached_allocations_by_node(&self) -> R<HashMap<String, Vec<Allocation>>> {
-        Ok(self.read_model_reader()?.allocations_by_node.clone())
+        Ok(self
+            .read_model_reader()?
+            .allocations_by_node
+            .iter()
+            .map(|(node_id, allocations)| (node_id.clone(), Vec::clone(allocations)))
+            .collect())
     }
 
+    /// Deep-cloned node list, for callers that need owned `Node`s. The
+    /// scheduler uses [`Store::available_node_arcs`] instead — per-plan deep
+    /// clones of every node's JSON attributes are exactly the cost the Arc'd
+    /// read model exists to avoid.
     pub fn cached_nodes(&self) -> R<Vec<Node>> {
-        Ok(self.read_model_reader()?.nodes.values().cloned().collect())
+        Ok(self
+            .read_model_reader()?
+            .nodes
+            .values()
+            .map(|node| Node::clone(node))
+            .collect())
+    }
+
+    /// Ids of every available node. For callers that only need membership
+    /// (rollout node gating) — no node payload is cloned.
+    pub fn available_node_ids(&self) -> R<HashSet<String>> {
+        let guard = self.read_model_reader()?;
+        Ok(guard
+            .nodes
+            .values()
+            .filter(|node| node.availability == "available")
+            .map(|node| node.id.clone())
+            .collect())
+    }
+
+    /// The scheduler's per-plan node snapshot: every available node, sorted
+    /// by id, as `Arc`s — one read-lock pass, refcount bumps only.
+    pub fn available_node_arcs(&self) -> R<Vec<Arc<Node>>> {
+        let guard = self.read_model_reader()?;
+        let mut nodes: Vec<Arc<Node>> = guard
+            .nodes
+            .values()
+            .filter(|node| node.availability == "available")
+            .cloned()
+            .collect();
+        nodes.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(nodes)
+    }
+
+    /// The scheduler's per-plan capacity snapshot: current allocations and
+    /// the cached free pools, cloned under ONE read guard so they can never
+    /// disagree with each other. Taken after the plan's epoch sample (the
+    /// fence rule: sample no later than the capacity read), so any mutation
+    /// that lands after this snapshot bumps an epoch the apply-time
+    /// compare-and-set checks.
+    pub(crate) fn plan_capacity_snapshot(&self) -> R<PlanCapacityParts> {
+        let guard = self.read_model_reader()?;
+        Ok((guard.allocations_by_node.clone(), guard.node_pools.clone()))
     }
 
     /// Runs one scheduling-index candidate query under the read-model lock
@@ -1618,7 +1714,7 @@ impl Store {
     pub fn allocation_version_vector_for_candidates(
         &self,
         job_config_id: &str,
-        node_ids: &[String],
+        node_ids: &[&str],
     ) -> R<BTreeMap<String, i64>> {
         let mut versions = BTreeMap::new();
         let conn = self.read_connection()?;
@@ -4993,8 +5089,10 @@ impl Store {
         for node_id in alloc_node_ids {
             let allocs = self.allocs_for_node(&node_id)?;
             let mut guard = self.read_model_writer()?;
-            guard.allocations_by_node.insert(node_id.clone(), allocs);
-            Self::reindex_model_nodes(&mut guard, &self.resource_policy, &[node_id.as_str()]);
+            guard
+                .allocations_by_node
+                .insert(node_id.clone(), Arc::new(allocs));
+            Self::reproject_model_nodes(&mut guard, &self.resource_policy, &[node_id.as_str()]);
         }
         for job_config_id in task_job_config_ids {
             let tasks = self.get_task_configs_for_job_config(&job_config_id)?;
@@ -10796,6 +10894,117 @@ mod tests {
         Ok(())
     }
 
+    /// The cached-pool invariant behind `ResourceLedger::from_snapshot`
+    /// (scheduler-plan-snapshot plan): after ANY sequence of read-model
+    /// mutations, every available node's cached pool equals a from-scratch
+    /// `ResourcePool::free_for_node` computation, and only available nodes
+    /// have pools.
+    fn assert_pools_match_scratch(store: &Store) -> R<()> {
+        let model = store.scheduling_read_model()?;
+        for (node_id, node) in &model.nodes {
+            let cached = model.node_pools.get(node_id);
+            if node.availability != "available" {
+                assert!(
+                    cached.is_none(),
+                    "{node_id}: unavailable nodes have no pool"
+                );
+                continue;
+            }
+            let cached = cached.with_context(|| format!("{node_id}: missing cached pool"))?;
+            let allocations = model
+                .allocations_by_node
+                .get(node_id)
+                .map(|allocations| allocations.as_slice())
+                .unwrap_or(&[]);
+            let scratch = crate::resources::ResourcePool::free_for_node(
+                node,
+                allocations,
+                &store.resource_policy,
+            );
+            let amounts = |pool: &crate::resources::ResourcePool| -> Vec<(String, String)> {
+                let mut out: Vec<(String, String)> = pool
+                    .values
+                    .keys()
+                    .map(|name| (name.clone(), format!("{:?}", pool.amount(name))))
+                    .collect();
+                out.sort();
+                out
+            };
+            assert_eq!(
+                amounts(cached),
+                amounts(&scratch),
+                "{node_id}: cached pool drifted from scratch recompute"
+            );
+        }
+        for node_id in model.node_pools.keys() {
+            assert!(
+                model.nodes.contains_key(node_id),
+                "{node_id}: pool for a node that no longer exists"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn cached_node_pools_track_every_mutation() -> R<()> {
+        let store = setup_store()?;
+
+        // Join two nodes, one with fingerprints + custom resources.
+        let mut fingerprinted = make_node_msg("node-pool-a", "active");
+        fingerprinted.fingerprint_attrs = json!({
+            "memory_total": "1073741824",
+            "cpus": { "cpu-1": { "frequency": "1000" } },
+        })
+        .to_string();
+        fingerprinted.config_attrs = json!({ "resources": { "vram": 4096 } }).to_string();
+        store.insert_node(fingerprinted)?;
+        store.insert_node(make_node_msg("node-pool-b", "active"))?;
+        assert_pools_match_scratch(&store)?;
+
+        // Place allocations through the real plan/apply path.
+        let job = JobConfig {
+            name: "pool-prop".into(),
+            tasks: vec![TaskConfig {
+                count: TaskCount::new(2),
+                resources: json!({ "memory": 64, "cpu": 100 }),
+                ..TaskConfig::new("worker", "noop")
+            }],
+            rollout: None,
+            rollout_by_group: Default::default(),
+            version: None,
+        };
+        let submission = Submission {
+            path: "pool-prop.jsonnet".into(),
+            content: "{}".into(),
+            is_primary: true,
+        };
+        store.handle_job_submit(&job, &[submission])?;
+        let job_config_id = store.get_job_config("pool-prop")?.id();
+        let scheduler = crate::manager::scheduler::Scheduler::new(&store)?;
+        let outcome =
+            scheduler.plan_and_apply(&job_config_id, crate::manager::scheduler::PlanMode::Fresh)?;
+        assert!(!outcome.allocations.is_empty());
+        assert_pools_match_scratch(&store)?;
+
+        // Attribute update, drain, uncordon, allocation removal, node loss,
+        // and removal all reproject.
+        let dynamic: Map<String, Value> = [("zone".to_string(), json!("a"))].into_iter().collect();
+        store.update_node_dyamic("node-pool-a", &dynamic)?;
+        assert_pools_match_scratch(&store)?;
+        store.set_node_availability("node-pool-b", "drained")?;
+        assert_pools_match_scratch(&store)?;
+        store.set_node_availability("node-pool-b", "available")?;
+        assert_pools_match_scratch(&store)?;
+        store.remove_allocs_for_job(&store.get_job("pool-prop")?.id)?;
+        assert_pools_match_scratch(&store)?;
+        store.mark_node_lost("node-pool-a")?;
+        assert_pools_match_scratch(&store)?;
+        store.remove_node("node-pool-b")?;
+        assert_pools_match_scratch(&store)?;
+
+        Ok(())
+    }
+
     /// Phase C-1 (plan §7-C2): the node/node_health split's row lifecycle.
     /// Registration seeds both halves (control seeds `node`, status seeds
     /// `node_health`); a missing liveness row hydrates the registration
@@ -12502,8 +12711,10 @@ mod tests {
         // Nodes that have never held an allocation have no epoch row; the
         // batched read must report the same 0 the per-scope read does, because
         // that is the value `apply_plan_submission` compares against.
-        let sampled =
-            store.allocation_version_vector_for_candidates(&job_config_id, &candidates)?;
+        let sampled = store.allocation_version_vector_for_candidates(
+            &job_config_id,
+            &candidates.iter().map(String::as_str).collect::<Vec<_>>(),
+        )?;
         assert_eq!(sampled.get("node:node-a").copied(), Some(0));
         assert_eq!(sampled.get("node:node-b").copied(), Some(0));
         assert_eq!(
@@ -12526,7 +12737,10 @@ mod tests {
             PlanApplyOutcome::Applied(_)
         ));
 
-        let after = store.allocation_version_vector_for_candidates(&job_config_id, &candidates)?;
+        let after = store.allocation_version_vector_for_candidates(
+            &job_config_id,
+            &candidates.iter().map(String::as_str).collect::<Vec<_>>(),
+        )?;
         let per_scope = store.allocation_version_vector(
             &job_config_id,
             &HashSet::from(["node-a".to_string(), "node-b".to_string()]),
