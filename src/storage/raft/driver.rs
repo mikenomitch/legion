@@ -63,10 +63,12 @@ use crate::storage::persistence::{
 use crate::storage::raft::log_store::RaftLogStore;
 use crate::storage::raft::network::{ChannelPool, RaftTransportNetworkFactory};
 use crate::storage::raft::state_machine::StoreStateMachine;
-use crate::storage::raft::types::{encode_node_addr, fnv1a64, split_node_addr, TypeConfig};
+use crate::storage::raft::types::{
+    encode_node_addr, fnv1a64, node_addr_host_port, split_node_addr, TypeConfig,
+};
 use crate::storage::raft::{
     capture, quorum, Lane, RaftJoinHandler, RaftTransportRegistry, ReplicatedOp, ReplicationHandle,
-    StoreCommand,
+    StoreCommand, RAFT_CLUSTER_SECRET_METADATA_KEY,
 };
 use crate::storage::store::Store;
 use crate::structs::{
@@ -199,6 +201,26 @@ const LANE_CONVERGE_COOLDOWN_MAX_DOUBLINGS: u32 = 3;
 /// lane, no I/O. The campaign SCHEDULE lives in the per-lane governor, not in
 /// this interval.
 const LANE_CONVERGE_IDLE_POLL: Duration = Duration::from_millis(500);
+
+/// Ceiling on CONSECUTIVE "catching up" holds before a campaign may proceed
+/// anyway (~12s at the 500ms poll cadence).
+///
+/// The catching-up signal is "the lane's log grew between two polls" — the
+/// only log-currency signal openraft 0.9 gives a non-leader. But log growth
+/// cannot distinguish *catch-up replay* from *ordinary replication traffic*,
+/// so on a lane with sustained writes (status-lane heartbeats, a busy
+/// control lane) the hold fires on every poll and convergence starves
+/// forever — the standing split becomes the steady state exactly under the
+/// load lanes exist for (adversarial finding, 2026-07-28). Capping the hold
+/// keeps its value for the genuine case (bulk catch-up after a restart or
+/// snapshot install finishes within a few polls) while guaranteeing a lane
+/// under steady traffic still gets campaigned for. A campaign issued while
+/// genuinely behind loses and costs the lane roughly one election window
+/// (the campaigner's raised term deposes the incumbent via the replication
+/// stream — openraft 0.9 has no pre-vote), which the verdict/backoff/
+/// stand-down ladder above bounds to a small duty cycle; starvation has no
+/// bound at all.
+const LANE_CONVERGE_CATCHUP_HOLD_MAX_POLLS: u32 = 24;
 
 /// How long a join's per-lane membership change waits for the anchor
 /// leader's convergence loop to acquire a lane it does not lead yet (JC-40),
@@ -609,6 +631,18 @@ impl std::fmt::Display for NotRaftLeader {
 
 impl std::error::Error for NotRaftLeader {}
 
+impl NotRaftLeader {
+    /// Whether `err`'s cause chain carries a typed [`NotRaftLeader`]
+    /// rejection. The seam every tolerate-and-reconcile call site uses
+    /// (plan §8, Workstream D): a composite's cross-lane half may treat
+    /// exactly this error as "deferred to that lane's reconciler", while
+    /// every other error keeps failing loudly.
+    pub(crate) fn in_chain(err: &anyhow::Error) -> bool {
+        err.chain()
+            .any(|cause| cause.downcast_ref::<NotRaftLeader>().is_some())
+    }
+}
+
 /// A replicated mutation queued to a lane's pipeline thread.
 struct PipelineJob {
     /// The lane the *operation* was classified as (metadata carried in the
@@ -872,6 +906,65 @@ impl MultiRaftDriver {
         })
     }
 
+    /// Actively probe one raft member's transport listener: a fresh dial
+    /// (TCP + h2 handshake) with [`MEMBER_PROBE_TIMEOUT`]. Used by the
+    /// remove-member feasibility guard, where "alive" must mean "would ack
+    /// a membership entry right now", not "acked something at some point
+    /// under this leadership". Deliberately NOT the shared [`ChannelPool`]:
+    /// its `connect_lazy` channels hide connection state, and the probe
+    /// exists precisely to observe it.
+    fn probe_member_reachable(engine: &Engine, host_port: &str) -> bool {
+        let Ok(endpoint) = tonic::transport::Endpoint::from_shared(format!("http://{host_port}"))
+        else {
+            return false;
+        };
+        let endpoint = endpoint
+            .connect_timeout(MEMBER_PROBE_TIMEOUT)
+            .timeout(MEMBER_PROBE_TIMEOUT);
+        Self::block_on_engine(engine, async move { endpoint.connect().await.is_ok() })
+            .unwrap_or(false)
+    }
+
+    /// One lane's membership change, bounded by
+    /// [`MEMBERSHIP_CHANGE_TIMEOUT`] and mapped to an operator-actionable
+    /// error. On timeout the change may still be in flight — the error says
+    /// what state that leaves the lane in and how to get out of it.
+    fn membership_change_with_timeout<F>(
+        engine: &Engine,
+        command: &str,
+        lane: Lane,
+        target: &str,
+        change: F,
+    ) -> R<()>
+    where
+        F: std::future::Future<
+                Output = Result<
+                    openraft::raft::ClientWriteResponse<TypeConfig>,
+                    RaftError<NodeId, ClientWriteError<NodeId, BasicNode>>,
+                >,
+            > + Send,
+    {
+        let outcome = Self::block_on_engine(engine, async move {
+            tokio::time::timeout(MEMBERSHIP_CHANGE_TIMEOUT, change).await
+        })?;
+        match outcome {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(e)) => Err(map_write_error(command, Some(lane.wire_name()), e)
+                .context(format!("on lane {}", lane.wire_name()))),
+            Err(_elapsed) => bail!(
+                "membership change removing {target} on lane {} did not commit within {}s. \
+                 The most likely cause is that the RESULTING voter set cannot assemble a live \
+                 quorum (a remaining voter died between the reachability probe and the \
+                 commit), which leaves the lane in a joint configuration that keeps serving \
+                 reads but cannot commit writes. Restore a remaining voter and the change \
+                 will commit on its own; re-running the command after that is safe \
+                 (membership changes are idempotent)",
+                lane.wire_name(),
+                MEMBERSHIP_CHANGE_TIMEOUT.as_secs()
+            ),
+        }
+    }
+
     fn engine(&self) -> R<&Engine> {
         self.engine
             .get()
@@ -923,6 +1016,96 @@ impl MultiRaftDriver {
                 leader_name: None,
                 leader_addr: None,
             },
+        }
+    }
+
+    /// Forward one lane write to that lane's current leader over the
+    /// `RaftTransport.ForwardLaneWrite` RPC (plan §8, D2). Returns the op's
+    /// JSON-encoded return value on success. Every failure path is mapped
+    /// so the CALLER can keep its original typed rejection: a missing
+    /// leader hint, an unreachable target, a timeout, and a target that
+    /// does not lead the lane either all come back as errors carrying a
+    /// typed [`NotRaftLeader`] in the chain.
+    pub(crate) fn forward_lane_write(
+        &self,
+        op: &crate::storage::raft::forward::ForwardableLaneWrite,
+    ) -> R<serde_json::Value> {
+        use crate::storage::raft::forward::ForwardOutcome;
+        let engine = self.engine()?;
+        let lane = op.lane();
+        // In `single` topology every lane rides the one control group; the
+        // envelope's group_id must name a group ACTIVE on the receiver.
+        let group = if engine.lanes.len() == 1 {
+            Lane::Control
+        } else {
+            lane
+        };
+        let hint = self.not_leader_error(lane);
+        let Some(leader_addr) = hint.leader_addr.clone() else {
+            return Err(anyhow::Error::new(hint).context(format!(
+                "cannot forward {} — no leader is currently known for the {} lane",
+                op.op_name(),
+                lane.wire_name()
+            )));
+        };
+        let payload = serde_json::to_vec(op)
+            .with_context(|| format!("failed encoding forwarded op {}", op.op_name()))?;
+        let channel = engine
+            .pool
+            .get(&leader_addr)
+            .map_err(|e| anyhow!("malformed leader address {leader_addr}: {e}"))?;
+        let secret: tonic::metadata::MetadataValue<tonic::metadata::Ascii> = engine
+            .cluster_secret
+            .parse()
+            .map_err(|_| anyhow!("cluster secret is not valid ascii metadata"))?;
+        let group_id = group.wire_name().to_string();
+        let op_name = op.op_name();
+        let outcome = Self::block_on_engine(engine, async move {
+            let mut client =
+                crate::structs::raft_transport_client::RaftTransportClient::new(channel)
+                    .max_decoding_message_size(
+                        crate::storage::raft::network::RAFT_MAX_MESSAGE_BYTES,
+                    )
+                    .max_encoding_message_size(
+                        crate::storage::raft::network::RAFT_MAX_MESSAGE_BYTES,
+                    );
+            let mut request =
+                tonic::Request::new(crate::structs::RaftLaneRequest { group_id, payload });
+            request.set_timeout(FORWARD_LANE_WRITE_TIMEOUT);
+            request
+                .metadata_mut()
+                .insert(RAFT_CLUSTER_SECRET_METADATA_KEY, secret);
+            client.forward_lane_write(request).await
+        })?;
+        let reply = match outcome {
+            Ok(reply) => reply.into_inner(),
+            Err(status) => {
+                return Err(anyhow::Error::new(hint).context(format!(
+                    "forwarding {op_name} to the {} lane leader at {leader_addr} failed: \
+                     {status}",
+                    lane.wire_name()
+                )));
+            }
+        };
+        let outcome: ForwardOutcome = serde_json::from_slice(&reply.payload)
+            .context("undecodable ForwardLaneWrite reply (mixed manager protocol versions?)")?;
+        match outcome {
+            ForwardOutcome::Ok(value) => Ok(value),
+            ForwardOutcome::NotLeader {
+                lane,
+                leader_name,
+                leader_addr,
+            } => Err(anyhow::Error::new(NotRaftLeader {
+                lane,
+                leader_name,
+                leader_addr,
+            })
+            .context(format!(
+                "forwarded {op_name} but the target no longer leads the lane; retry"
+            ))),
+            ForwardOutcome::Failed(message) => Err(anyhow!(
+                "forwarded {op_name} executed on the lane leader and failed: {message}"
+            )),
         }
     }
 
@@ -1035,26 +1218,25 @@ fn map_server_state(state: ServerState) -> PersistenceRole {
     }
 }
 
-/// Best-effort set of members currently known alive from this node's view:
-/// the node itself, plus — on a leader — every member whose replication
-/// stream has acked at least one entry under this leadership. openraft 0.9
-/// keeps no per-follower heartbeat timestamps, so a member that dies AFTER
-/// acking still counts as alive until leadership changes; the membership
-/// removal guard built on this is therefore deliberately best-effort
-/// (plan §7-C3, JC-29: block rarely).
-fn known_alive_members(
-    metrics: &RaftMetrics<NodeId, BasicNode>,
-) -> std::collections::BTreeSet<NodeId> {
-    let mut alive: std::collections::BTreeSet<NodeId> = [metrics.id].into();
-    if let Some(replication) = &metrics.replication {
-        for (id, matched) in replication {
-            if matched.is_some() {
-                alive.insert(*id);
-            }
-        }
-    }
-    alive
-}
+/// How long the remove-member reachability probe waits for one member's
+/// transport listener to answer a fresh dial. Short: the probe runs inline
+/// in an operator command, and a member that cannot complete a TCP+h2
+/// handshake in this window will not be acking membership entries either.
+const MEMBER_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Ceiling on one lane's membership change inside `remove-member`. A change
+/// whose resulting config lacks a live quorum can NEVER commit (the joint
+/// config needs a majority of the new voter set too), and openraft's
+/// `change_membership` would block forever — the operator command must
+/// instead come back with an actionable error naming the likely cause.
+const MEMBERSHIP_CHANGE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Deadline for one forwarded lane write (plan §8, D2): the transport hop
+/// plus the leader's capture → quorum commit → local apply. Generous next
+/// to a healthy pipeline (millisecond commits) while still bounding a
+/// worker heartbeat RPC blocked behind a wedged lane; on expiry the origin
+/// returns its original typed rejection.
+const FORWARD_LANE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Operator-meaningful name for a raft member: the `name` half of its
 /// `BasicNode.addr` (`"name@host:port"`), falling back to the bare addr or
@@ -1563,6 +1745,11 @@ struct LaneConvergeGovernor {
     verdict_due: Option<Instant>,
     /// The previous tick's log index, to notice a log still catching up.
     prev_log_index: Option<u64>,
+    /// Consecutive polls held on the catching-up signal. Capped by
+    /// [`LANE_CONVERGE_CATCHUP_HOLD_MAX_POLLS`]: log growth cannot tell
+    /// catch-up replay from ordinary replication traffic, so an uncapped
+    /// hold starves convergence on any busy lane.
+    catching_up_holds: u32,
     /// Consecutive stand-downs, which lengthen the next cooldown. A lane
     /// this node keeps failing to take should be tried ever more rarely:
     /// the cluster is telling us the incumbent is the better leader, and
@@ -1585,6 +1772,7 @@ impl LaneConvergeGovernor {
             cooldown_until: None,
             verdict_due: None,
             prev_log_index: None,
+            catching_up_holds: 0,
             stand_downs: 0,
             campaigns: 0,
             stood_down: false,
@@ -1598,6 +1786,7 @@ impl LaneConvergeGovernor {
         self.next_campaign_at = None;
         self.cooldown_until = None;
         self.verdict_due = None;
+        self.catching_up_holds = 0;
         self.stand_downs = 0;
     }
 
@@ -1659,8 +1848,15 @@ impl LaneConvergeGovernor {
     ///
     /// Convergence therefore acts ONLY on a lane that already has a settled
     /// leader elsewhere, where a campaign is an optimization (co-locate the
-    /// leader) rather than a repair, and where losing it costs the cluster
-    /// nothing it did not already have.
+    /// leader) rather than a repair. Losing such a campaign is NOT free:
+    /// the leader lease makes the other voters reject the vote without
+    /// adopting the higher term, but the campaigner's own term rose, so the
+    /// incumbent's next append-entries to it comes back `HigherVote` and
+    /// the incumbent steps down — roughly one election window of lane
+    /// write-unavailability per lost campaign (verified against the
+    /// openraft 0.9.24 source; there is no pre-vote). That cost is exactly
+    /// what the verdict window, exponential backoff and escalating
+    /// stand-downs bound to a small duty cycle.
     fn decide(
         &mut self,
         observation: LaneObservation,
@@ -1694,14 +1890,16 @@ impl LaneConvergeGovernor {
         }
 
         if !leads_anchor {
-            // Not the convergence authority. Drop the in-flight campaign and
-            // the backoff, but KEEP any cooldown: an anchor that flaps is
-            // itself a disruption source, and re-arming on every flap is how
-            // unbounded term inflation comes back.
+            // Not the convergence authority. Drop only the in-flight
+            // campaign; KEEP the loss count, the grown backoff and any
+            // cooldown. An anchor that flaps is itself a disruption source
+            // — resetting the score on every flap meant a flapping anchor
+            // fired an immediate campaign per re-acquisition and could
+            // never accumulate the losses that trigger a stand-down
+            // (adversarial finding, 2026-07-28), so the documented
+            // "backoff → stand-down" ladder never engaged exactly when it
+            // was needed most.
             self.verdict_due = None;
-            self.lost = 0;
-            self.backoff = timing.min_backoff;
-            self.next_campaign_at = None;
             return LaneConvergeAction::Hold(LaneConvergeHold::NotAnchorLeader);
         }
         if observation.led_here {
@@ -1720,12 +1918,30 @@ impl LaneConvergeGovernor {
             }
             self.cooldown_until = None;
         }
-        if self.next_campaign_at.is_some_and(|at| now < at) {
+        // First-campaign spacing: a fresh (or just-reset) schedule waits one
+        // backoff before its first campaign instead of firing on the first
+        // eligible poll. The lane's incumbent was elected moments ago in
+        // the common case (this node just won the anchor after a failover),
+        // and a campaign issued inside the incumbent's first leader lease
+        // is a guaranteed loss — the constant's documentation always
+        // promised this spacing; now decide() actually applies it.
+        let Some(campaign_at) = self.next_campaign_at else {
+            self.next_campaign_at = Some(now + scaled(self.backoff, jitter));
+            return LaneConvergeAction::Hold(LaneConvergeHold::Backoff);
+        };
+        if now < campaign_at {
             return LaneConvergeAction::Hold(LaneConvergeHold::Backoff);
         }
         if catching_up {
-            return LaneConvergeAction::Hold(LaneConvergeHold::CatchingUp);
+            self.catching_up_holds = self.catching_up_holds.saturating_add(1);
+            if self.catching_up_holds <= LANE_CONVERGE_CATCHUP_HOLD_MAX_POLLS {
+                return LaneConvergeAction::Hold(LaneConvergeHold::CatchingUp);
+            }
+            // Held long enough: sustained log growth is ordinary
+            // replication traffic, not catch-up (see the constant's docs).
+            // Fall through and let the election be the judge.
         }
+        self.catching_up_holds = 0;
         self.campaigns += 1;
         self.verdict_due = Some(now + timing.verdict);
         LaneConvergeAction::Campaign
@@ -2055,10 +2271,17 @@ impl EngineJoinHandler {
     /// change already committed — the half-applied membership the anchor
     /// precondition exists to prevent. Any other failure, and expiry of the
     /// window, map to the joiner's leader-hint status unchanged.
+    ///
+    /// `convergence_running` is `lanes.len() > 1`: under `single` topology
+    /// no convergence loop exists, so a `ForwardToLeader` can never resolve
+    /// by waiting — it fails fast with the leader hint instead of stalling
+    /// the joiner for the full convergence window (adversarial finding,
+    /// 2026-07-28).
     async fn membership_with_convergence_retry<T, F, Fut>(
         stage: &'static str,
         lane: Lane,
         deadline: std::time::Instant,
+        convergence_running: bool,
         mut call: F,
     ) -> Result<T, tonic::Status>
     where
@@ -2072,10 +2295,12 @@ impl EngineJoinHandler {
                 Ok(value) => return Ok(value),
                 Err(err) => err,
             };
-            let converging = matches!(
-                &err,
-                RaftError::APIError(ClientWriteError::ForwardToLeader(_))
-            ) && std::time::Instant::now() < deadline;
+            let converging = convergence_running
+                && matches!(
+                    &err,
+                    RaftError::APIError(ClientWriteError::ForwardToLeader(_))
+                )
+                && std::time::Instant::now() < deadline;
             if !converging {
                 return Err(Self::membership_status(stage, lane, err));
             }
@@ -2149,6 +2374,24 @@ fn lane_membership_settled(
     member_id: NodeId,
 ) -> bool {
     membership.get_joint_config().len() == 1 && membership.voter_ids().any(|id| id == member_id)
+}
+
+/// Whether `membership` carries `member_id` as a voter in EVERY config of a
+/// possibly-joint membership — the joint-intersection predicate.
+///
+/// A joint membership `[{a,b}, {a,b,c}]` commits and elects only with a
+/// majority of EACH config, so `a` and `b` are voters under the strictest
+/// rules in force while `c` (present only in the incoming config) is not
+/// yet one. Used for the aggregate `raft status` voter list, where the
+/// stricter [`lane_membership_settled`] (which requires the whole
+/// membership to be uniform) would empty the voter list for EVERYONE the
+/// moment any join enters its joint window.
+fn voter_in_every_config(
+    membership: &openraft::Membership<NodeId, BasicNode>,
+    member_id: NodeId,
+) -> bool {
+    let configs = membership.get_joint_config();
+    !configs.is_empty() && configs.iter().all(|config| config.contains(&member_id))
 }
 
 #[tonic::async_trait]
@@ -2230,10 +2473,15 @@ impl RaftJoinHandler for EngineJoinHandler {
         // has not acquired yet are retried inside the convergence window
         // rather than failing the join outright (JC-40).
         let deadline = std::time::Instant::now() + JOIN_LANE_CONVERGENCE_WAIT;
+        let convergence_running = self.lanes.len() > 1;
         for (lane, raft) in lanes_in_order(&self.lanes) {
-            Self::membership_with_convergence_retry("add-learner", lane, deadline, || {
-                raft.add_learner(member_id, node.clone(), true)
-            })
+            Self::membership_with_convergence_retry(
+                "add-learner",
+                lane,
+                deadline,
+                convergence_running,
+                || raft.add_learner(member_id, node.clone(), true),
+            )
             .await?;
         }
         // Voter-parity check on the RESULTING count (headline control
@@ -2254,11 +2502,17 @@ impl RaftJoinHandler for EngineJoinHandler {
         // that every lane really carries the joiner as a voter before the
         // join reports success.
         for (lane, raft) in lanes_in_order(&self.lanes) {
-            Self::membership_with_convergence_retry("promote", lane, deadline, || {
-                let mut members = BTreeMap::new();
-                members.insert(member_id, node.clone());
-                raft.change_membership(openraft::ChangeMembers::AddVoters(members), false)
-            })
+            Self::membership_with_convergence_retry(
+                "promote",
+                lane,
+                deadline,
+                convergence_running,
+                || {
+                    let mut members = BTreeMap::new();
+                    members.insert(member_id, node.clone());
+                    raft.change_membership(openraft::ChangeMembers::AddVoters(members), false)
+                },
+            )
             .await?;
         }
         self.wait_until_voter_on_every_lane(member_id, deadline)
@@ -2578,37 +2832,55 @@ impl PersistenceDriver for MultiRaftDriver {
                                     lane.wire_name()
                                 )
                             })?;
-                        let upto = raft
-                            .metrics()
-                            .borrow()
-                            .snapshot
-                            .map(|log_id| log_id.index)
-                            .unwrap_or(0);
-                        raft.trigger().purge_log(upto).await.map_err(|e| {
-                            anyhow!(
-                                "failed purging log behind bootstrap seed snapshot on lane {}: {e}",
-                                lane.wire_name()
-                            )
-                        })?;
-                        raft.wait(Some(LEADER_WAIT))
-                            .metrics(
-                                |m| m.purged.map(|p| p.index).unwrap_or(0) >= upto,
-                                "log purged to bootstrap seed snapshot",
-                            )
-                            .await
-                            .map_err(|e| {
+                    }
+                    // The purge is re-issued on any bootstrap start that
+                    // finds a snapshot with a NEVER-PURGED log — not only in
+                    // the same start that built the seed. The two steps are
+                    // separately durable, so a crash between "seed snapshot
+                    // built" and "log purged behind it" used to strand the
+                    // adopted baseline (adversarial finding F1, 2026-07-28):
+                    // the restart saw a snapshot, skipped the whole block,
+                    // and the log still started at index 1 — so a blank
+                    // joiner was served by log REPLAY and silently missed
+                    // every pre-raft row. `purged == 0` is exactly that
+                    // signature: every organic snapshot purges behind itself
+                    // (keeping its catch-up tail), so a mature cluster
+                    // always has `purged > 0` and is never re-purged here
+                    // (which would strip the tail the organic policy keeps).
+                    let metrics = raft.metrics().borrow().clone();
+                    if metrics.current_leader.is_some() {
+                        let snapshot_index =
+                            metrics.snapshot.map(|log_id| log_id.index).unwrap_or(0);
+                        let purged = metrics.purged.map(|p| p.index).unwrap_or(0);
+                        if snapshot_index > 0 && purged == 0 {
+                            let upto = snapshot_index;
+                            raft.trigger().purge_log(upto).await.map_err(|e| {
                                 anyhow!(
-                                    "timed out purging log behind bootstrap seed snapshot on \
+                                    "failed purging log behind bootstrap seed snapshot on \
                                      lane {}: {e}",
                                     lane.wire_name()
                                 )
                             })?;
-                        info!(
-                            lane = lane.wire_name(),
-                            purged_to = upto,
-                            "Bootstrap seed snapshot built: pre-raft state will reach joiners \
-                             via snapshot install"
-                        );
+                            raft.wait(Some(LEADER_WAIT))
+                                .metrics(
+                                    |m| m.purged.map(|p| p.index).unwrap_or(0) >= upto,
+                                    "log purged to bootstrap seed snapshot",
+                                )
+                                .await
+                                .map_err(|e| {
+                                    anyhow!(
+                                        "timed out purging log behind bootstrap seed snapshot \
+                                         on lane {}: {e}",
+                                        lane.wire_name()
+                                    )
+                                })?;
+                            info!(
+                                lane = lane.wire_name(),
+                                purged_to = upto,
+                                "Bootstrap seed snapshot in place: pre-raft state will reach \
+                                 joiners via snapshot install"
+                            );
+                        }
                     }
                 }
                 lanes.insert(lane, raft);
@@ -2640,6 +2912,7 @@ impl PersistenceDriver for MultiRaftDriver {
                 cluster_secret: cluster_secret.clone(),
                 lanes: lanes.clone(),
                 join_handler: Some(join_handler),
+                forward_store: Some(store.forward_executor_clone()),
             })
             .map_err(|_| anyhow!("raft transport registry already populated"))?;
 
@@ -2911,18 +3184,31 @@ impl PersistenceDriver for MultiRaftDriver {
             });
         let metrics = Self::control_metrics(engine)?;
         let membership = metrics.membership_config.membership().clone();
-        // The aggregate voter list means "settled voter on EVERY lane", not
-        // "voter on the anchor lane". Under `lanes` the two differ exactly
-        // while a join is in flight or half-applied, and that is the case
-        // the headline must not paper over: reading the anchor lane alone
-        // reports a full 3-voter cluster while another lane is still a
-        // 2-voter (or joint) group that survives zero failures. Per-lane
-        // detail stays in `lanes`.
+        // The aggregate voter list means "voter in EVERY config of EVERY
+        // lane", not "voter on the anchor lane". Under `lanes` the two
+        // differ exactly while a join is in flight or half-applied, and
+        // that is the case the headline must not paper over: reading the
+        // anchor lane alone reports a full 3-voter cluster while another
+        // lane is still a 2-voter (or joint) group that survives zero
+        // failures. Per-lane detail stays in `lanes`.
+        //
+        // Deliberately the JOINT-INTERSECTION predicate, not
+        // `lane_membership_settled`: during a join's joint window the
+        // settled predicate fails for EVERY member (the whole membership is
+        // joint), so a healthy 3-voter cluster mid-join reported
+        // `voters: []` and everyone as a learner (adversarial finding,
+        // 2026-07-28). A member in every config of a joint membership is a
+        // voter under the strictest quorum either config demands — the same
+        // strictest-config arithmetic the per-lane quorum/survives numbers
+        // use — while the incoming joiner (present only in the new config)
+        // still waits for uniform settlement, preserving the original
+        // no-overcount fix. Join gating and readiness keep the strict
+        // settled predicate.
         let voter_set: std::collections::HashSet<NodeId> = membership
             .voter_ids()
             .filter(|id| {
                 engine.lanes.values().all(|raft| {
-                    lane_membership_settled(
+                    voter_in_every_config(
                         raft.metrics().borrow().membership_config.membership(),
                         *id,
                     )
@@ -3082,6 +3368,41 @@ impl PersistenceDriver for MultiRaftDriver {
                 let target = target.context("remove-member command requires a target")?;
                 let (name, _) = self.resolve_target(target);
                 let member_id = fnv1a64(&name);
+                // Self-removal is refused outright (adversarial finding,
+                // 2026-07-28). The unled-lanes guard below makes the
+                // all-lane leader the only node allowed to run a removal,
+                // so decommissioning that leader would have to be
+                // SELF-removal — and committing the self-excluding config
+                // on the first lane deposes this node, so every later
+                // lane's change fails and the removal half-applies by
+                // construction (removed from some lanes, a voter on the
+                // rest). The supported decommission order is: move
+                // leadership first, then remove the now-follower from the
+                // new leader.
+                //
+                // A SOLE voter removing itself falls through instead: the
+                // two-step recipe is meaningless with no other manager,
+                // and the removal guard below refuses it with the
+                // zero-voters advisory, which is the actionable message.
+                let sole_voter = engine
+                    .lanes
+                    .get(&ANCHOR_LANE)
+                    .map(|raft| {
+                        let m = raft.metrics().borrow().clone();
+                        m.membership_config.membership().voter_ids().count() <= 1
+                    })
+                    .unwrap_or(false);
+                if name == self.node_id && !sole_voter {
+                    bail!(
+                        "refusing to remove this manager ({name}) from the cluster it is \
+                         currently leading: committing a self-excluding membership change \
+                         deposes this node mid-removal and leaves it removed from some lanes \
+                         but not others. Decommission in two steps instead: run \
+                         `legion raft command trigger-election --target <another-manager>` \
+                         until that manager leads every lane (`legion raft status`), then run \
+                         `legion raft command remove-member --target {name}` there"
+                    );
+                }
                 // Removal guard (plan §7-C3, JC-29 — the ONLY hard block):
                 // computed BEFORE anything is issued. Refuses removals that
                 // would leave zero voters or a quorum the currently-known-
@@ -3099,6 +3420,17 @@ impl PersistenceDriver for MultiRaftDriver {
                 // let a removal that is safe there wedge the scheduler or
                 // status lane — a lane whose quorum is gone can never commit
                 // the membership change that would repair it.
+                // Liveness for the feasibility guard is an ACTIVE probe of
+                // each resulting voter's transport listener, not openraft's
+                // replication view (adversarial finding, 2026-07-28: a
+                // member that acked one entry at any point under the
+                // current leadership counted as alive forever, so on a
+                // quiet lane a member dead for hours passed the guard and
+                // the removal wedged the lane in a joint config no quorum
+                // could ever commit). The probe is a fresh dial with a
+                // short timeout, memoized across lanes; this node counts as
+                // alive without dialing itself.
+                let mut probed: HashMap<NodeId, bool> = HashMap::new();
                 let mut unled_lanes: Vec<&'static str> = Vec::new();
                 for (lane, raft) in lanes_in_order(&engine.lanes) {
                     let m = raft.metrics().borrow().clone();
@@ -3116,8 +3448,28 @@ impl PersistenceDriver for MultiRaftDriver {
                         .copied()
                         .filter(|id| *id != member_id)
                         .collect();
-                    let alive = known_alive_members(&m);
-                    let alive_resulting = resulting.intersection(&alive).count() as u64;
+                    let mut alive_resulting = 0u64;
+                    for id in &resulting {
+                        if *id == m.id {
+                            alive_resulting += 1;
+                            continue;
+                        }
+                        let reachable = *probed.entry(*id).or_insert_with(|| {
+                            m.membership_config
+                                .membership()
+                                .get_node(id)
+                                .map(|node| {
+                                    Self::probe_member_reachable(
+                                        engine,
+                                        node_addr_host_port(&node.addr),
+                                    )
+                                })
+                                .unwrap_or(false)
+                        });
+                        if reachable {
+                            alive_resulting += 1;
+                        }
+                    }
                     quorum::removal_guard(&name, resulting.len() as u64, alive_resulting).map_err(
                         |advisory| {
                             if engine.lanes.len() > 1 {
@@ -3151,29 +3503,33 @@ impl PersistenceDriver for MultiRaftDriver {
                 let ids: std::collections::BTreeSet<NodeId> = [member_id].into();
                 for (lane, raft) in lanes_in_order(&engine.lanes) {
                     // Demote/remove as voter first, then drop any learner
-                    // membership entry.
-                    Self::block_on_engine(
+                    // membership entry. Each change is bounded by
+                    // MEMBERSHIP_CHANGE_TIMEOUT: a change whose resulting
+                    // config cannot assemble a live quorum never commits,
+                    // and an unbounded wait would hang the operator command
+                    // while the lane sits joint (the probe above makes this
+                    // unlikely, but the member can die between probe and
+                    // commit).
+                    Self::membership_change_with_timeout(
                         engine,
+                        command,
+                        lane,
+                        &name,
                         raft.change_membership(
                             openraft::ChangeMembers::RemoveVoters(ids.clone()),
                             false,
                         ),
-                    )?
-                    .map_err(|e| {
-                        map_write_error(command, Some(lane.wire_name()), e)
-                            .context(format!("on lane {}", lane.wire_name()))
-                    })?;
-                    Self::block_on_engine(
+                    )?;
+                    Self::membership_change_with_timeout(
                         engine,
+                        command,
+                        lane,
+                        &name,
                         raft.change_membership(
                             openraft::ChangeMembers::RemoveNodes(ids.clone()),
                             false,
                         ),
-                    )?
-                    .map_err(|e| {
-                        map_write_error(command, Some(lane.wire_name()), e)
-                            .context(format!("on lane {}", lane.wire_name()))
-                    })?;
+                    )?;
                 }
                 Self::push_history(
                     &self.history,
@@ -3337,12 +3693,99 @@ mod tests {
             LaneConvergeAction::Hold(LaneConvergeHold::Converged)
         );
         // A lane led elsewhere, log quiescent: this is the one case that
-        // campaigns.
+        // campaigns — after the first-campaign spacing (one backoff), never
+        // on the first eligible poll (the incumbent's leader lease is
+        // typically still live right after a failover).
         let mut governor = LaneConvergeGovernor::new(timing);
         assert_eq!(
             tick(&mut governor, strayed(9), now),
+            LaneConvergeAction::Hold(LaneConvergeHold::Backoff)
+        );
+        assert_eq!(
+            tick(&mut governor, strayed(9), now + timing.min_backoff),
             LaneConvergeAction::Campaign
         );
+    }
+
+    /// The first-campaign spacing the timing constants always documented is
+    /// actually applied: a fresh governor never campaigns before one
+    /// backoff has elapsed, no matter how eligible the lane looks.
+    #[test]
+    fn a_fresh_governor_waits_one_backoff_before_its_first_campaign() {
+        let timing = test_timing();
+        let start = Instant::now();
+        let mut governor = LaneConvergeGovernor::new(timing);
+        let mut first_campaign = None;
+        for step in 0..20u64 {
+            let elapsed = Duration::from_millis(500 * step);
+            if tick(&mut governor, strayed(9), start + elapsed) == LaneConvergeAction::Campaign {
+                first_campaign = Some(elapsed);
+                break;
+            }
+        }
+        let first_campaign = first_campaign.expect("the lane must eventually be campaigned for");
+        assert!(
+            first_campaign >= timing.min_backoff,
+            "campaigned at {first_campaign:?}, inside the {:?} first-campaign spacing",
+            timing.min_backoff
+        );
+    }
+
+    /// An anchor that flaps must not reset the loss ladder: the losses
+    /// accumulated before the flap still count toward the stand-down, and
+    /// re-acquiring the anchor does not fire an immediate campaign.
+    /// (Pre-fix, `NotAnchorLeader` zeroed `lost` and cleared the schedule,
+    /// so a flapping anchor campaigned immediately per re-acquisition and
+    /// no stand-down could ever engage.)
+    #[test]
+    fn anchor_flap_keeps_the_loss_ladder_and_the_spacing() {
+        let timing = test_timing();
+        let start = Instant::now();
+        let mut governor = LaneConvergeGovernor::new(timing);
+        // Drive to the first campaign and score it lost: the schedule now
+        // holds one loss, a grown backoff, and a next-campaign time.
+        let mut first_campaign = None;
+        for step in 0..40u64 {
+            let at = start + Duration::from_millis(500 * step);
+            if tick(&mut governor, strayed(9), at) == LaneConvergeAction::Campaign {
+                first_campaign = Some(at);
+                break;
+            }
+        }
+        let first_campaign = first_campaign.expect("no first campaign");
+        let scored_at = first_campaign + timing.verdict + Duration::from_millis(500);
+        tick(&mut governor, strayed(9), scored_at);
+        assert_eq!(governor.lost, 1, "the campaign must have scored lost");
+        let next_due = governor
+            .next_campaign_at
+            .expect("a lost campaign must schedule the next one");
+        // Flap the anchor away and back while the backoff is still waiting.
+        let flap = scored_at + Duration::from_millis(500);
+        assert!(flap < next_due, "flap must land inside the backoff window");
+        assert_eq!(
+            governor.decide(strayed(9), false, flap, timing, 1.0),
+            LaneConvergeAction::Hold(LaneConvergeHold::NotAnchorLeader)
+        );
+        let back = flap + Duration::from_millis(500);
+        assert!(back < next_due);
+        assert_eq!(
+            tick(&mut governor, strayed(9), back),
+            LaneConvergeAction::Hold(LaneConvergeHold::Backoff),
+            "re-acquiring the anchor must resume the schedule, not restart it"
+        );
+        assert_eq!(governor.lost, 1, "the flap must not reset the loss ladder");
+        // The ladder still completes: keep driving and the lane stands down
+        // after max_campaigns total losses, flap notwithstanding.
+        let mut stood_down = false;
+        for later in 0..600u64 {
+            let at = back + Duration::from_millis(500 * later);
+            tick(&mut governor, strayed(9), at);
+            if governor.take_stood_down() {
+                stood_down = true;
+                break;
+            }
+        }
+        assert!(stood_down, "the stand-down never engaged after the flap");
     }
 
     /// THE invariant: convergence never campaigns into a leaderless lane,
@@ -3375,40 +3818,82 @@ mod tests {
 
     /// A lane whose log is still streaming into this node cannot be won —
     /// this node is behind whoever it replicates from — so no campaign is
-    /// issued until the log goes quiet. This is the only log-currency signal
-    /// openraft 0.9 gives a non-leader.
+    /// issued while the log grows. This is the only log-currency signal
+    /// openraft 0.9 gives a non-leader, and it cannot tell catch-up replay
+    /// from ordinary replication traffic, so the hold is CAPPED (see the
+    /// sustained-traffic test below).
     #[test]
     fn convergence_holds_off_while_this_nodes_lane_log_is_catching_up() {
         let timing = test_timing();
         let start = Instant::now();
         let mut governor = LaneConvergeGovernor::new(timing);
-        // First observation has no predecessor to compare against.
+        // Past the first-campaign spacing with a quiescent log: campaigns.
         assert_eq!(
             tick(&mut governor, strayed(10), start),
+            LaneConvergeAction::Hold(LaneConvergeHold::Backoff)
+        );
+        assert_eq!(
+            tick(&mut governor, strayed(10), start + timing.min_backoff),
             LaneConvergeAction::Campaign
         );
-        let mut governor = LaneConvergeGovernor::new(timing);
+        // Win it, then lose it: the re-armed spacing waits first, then the
+        // growing log holds the campaign off, and a quiescent log releases
+        // it.
         assert_eq!(
-            tick(&mut governor, strayed(10), start),
-            LaneConvergeAction::Campaign
-        );
-        // Win it, then lose it while catching up: the growing log holds the
-        // campaign off, and a quiescent log releases it.
-        assert_eq!(
-            tick(&mut governor, led(11), start + Duration::from_secs(1)),
+            tick(&mut governor, led(11), start + Duration::from_secs(3)),
             LaneConvergeAction::Hold(LaneConvergeHold::Converged)
         );
         assert_eq!(
-            tick(&mut governor, strayed(12), start + Duration::from_secs(2)),
+            tick(&mut governor, strayed(12), start + Duration::from_secs(4)),
+            LaneConvergeAction::Hold(LaneConvergeHold::Backoff)
+        );
+        let eligible = start + Duration::from_secs(4) + timing.min_backoff;
+        assert_eq!(
+            tick(&mut governor, strayed(13), eligible),
             LaneConvergeAction::Hold(LaneConvergeHold::CatchingUp)
         );
         assert_eq!(
-            tick(&mut governor, strayed(13), start + Duration::from_secs(3)),
+            tick(
+                &mut governor,
+                strayed(14),
+                eligible + Duration::from_millis(500)
+            ),
             LaneConvergeAction::Hold(LaneConvergeHold::CatchingUp)
         );
         assert_eq!(
-            tick(&mut governor, strayed(13), start + Duration::from_secs(4)),
+            tick(
+                &mut governor,
+                strayed(14),
+                eligible + Duration::from_secs(1)
+            ),
             LaneConvergeAction::Campaign
+        );
+    }
+
+    /// The catching-up hold is capped: a lane under SUSTAINED write traffic
+    /// grows its log on every poll, and an uncapped hold would starve
+    /// convergence forever — the standing split would become the steady
+    /// state exactly under the load lanes exist for (adversarial finding,
+    /// 2026-07-28). After `LANE_CONVERGE_CATCHUP_HOLD_MAX_POLLS`
+    /// consecutive holds the campaign proceeds and the election is the
+    /// judge.
+    #[test]
+    fn sustained_log_growth_cannot_starve_convergence() {
+        let timing = test_timing();
+        let start = Instant::now();
+        let mut governor = LaneConvergeGovernor::new(timing);
+        let mut campaigned_at_step = None;
+        // A lane led elsewhere whose log grows every single poll, forever.
+        for step in 0..LANE_CONVERGE_CATCHUP_HOLD_MAX_POLLS as u64 + 40 {
+            let at = start + Duration::from_millis(500 * step);
+            if tick(&mut governor, strayed(step), at) == LaneConvergeAction::Campaign {
+                campaigned_at_step = Some(step);
+                break;
+            }
+        }
+        assert!(
+            campaigned_at_step.is_some(),
+            "a busy lane was never campaigned for: convergence starved"
         );
     }
 
@@ -3512,12 +3997,21 @@ mod tests {
         );
         assert!(governor.cooldown_until.is_none());
         assert_eq!(governor.backoff, timing.min_backoff);
-        // Straying again campaigns at once (the log is quiescent).
+        // Straying again re-campaigns after just the first-campaign spacing
+        // (one min backoff) rather than serving out the old cooldown.
         assert_eq!(
             tick(
                 &mut governor,
                 strayed(9),
                 cooled + Duration::from_millis(500)
+            ),
+            LaneConvergeAction::Hold(LaneConvergeHold::Backoff)
+        );
+        assert_eq!(
+            tick(
+                &mut governor,
+                strayed(9),
+                cooled + Duration::from_millis(500) + timing.min_backoff
             ),
             LaneConvergeAction::Campaign
         );
@@ -3559,6 +4053,46 @@ mod tests {
         }
         assert!(scaled(Duration::from_secs(2), 0.75) >= Duration::from_millis(1_500));
         assert!(scaled(Duration::ZERO, 1.0) > Duration::ZERO);
+    }
+
+    /// During a join's joint window the incumbents must keep counting as
+    /// voters (they are voters under the strictest config in force) while
+    /// the incoming member does not — and the strict settled predicate must
+    /// stay false for everyone until the membership is uniform again.
+    #[test]
+    fn joint_membership_voter_predicates() {
+        use std::collections::{BTreeMap, BTreeSet};
+        let node = |name: &str| BasicNode {
+            addr: format!("{name}@127.0.0.1:0"),
+        };
+        let mut nodes = BTreeMap::new();
+        nodes.insert(1u64, node("a"));
+        nodes.insert(2u64, node("b"));
+        nodes.insert(3u64, node("c"));
+        let old_config: BTreeSet<NodeId> = [1, 2].into_iter().collect();
+        let new_config: BTreeSet<NodeId> = [1, 2, 3].into_iter().collect();
+        let joint = openraft::Membership::<NodeId, BasicNode>::new(
+            vec![old_config, new_config.clone()],
+            nodes.clone(),
+        );
+        for id in [1u64, 2, 3] {
+            assert!(
+                !lane_membership_settled(&joint, id),
+                "member {id} must not be SETTLED while the membership is joint"
+            );
+        }
+        assert!(voter_in_every_config(&joint, 1));
+        assert!(voter_in_every_config(&joint, 2));
+        assert!(
+            !voter_in_every_config(&joint, 3),
+            "the incoming member is not yet a voter under the strictest config"
+        );
+
+        let uniform = openraft::Membership::<NodeId, BasicNode>::new(vec![new_config], nodes);
+        for id in [1u64, 2, 3] {
+            assert!(lane_membership_settled(&uniform, id));
+            assert!(voter_in_every_config(&uniform, id));
+        }
     }
 
     #[test]

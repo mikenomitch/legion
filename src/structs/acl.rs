@@ -35,6 +35,10 @@ pub enum AclResource {
     /// Running a declared action against an allocation. `write` runs it;
     /// narrower than `exec` (the command is fixed and server-rendered).
     Action,
+    /// Job templates: `read` lists/fetches them, `write` creates new
+    /// versions and deletes them. Submitting a job *through* a template is
+    /// gated separately, by a `job` rule carrying the `templates` selector.
+    Template,
 }
 
 impl AclResource {
@@ -48,12 +52,13 @@ impl AclResource {
             AclResource::Acl => "acl",
             AclResource::Exec => "exec",
             AclResource::Action => "action",
+            AclResource::Template => "template",
         }
     }
 
     pub fn all() -> &'static [&'static str] {
         &[
-            "job", "node", "kv", "state", "operator", "acl", "exec", "action",
+            "job", "node", "kv", "state", "operator", "acl", "exec", "action", "template",
         ]
     }
 }
@@ -81,7 +86,8 @@ impl AclAction {
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AclRule {
-    /// Resource types: `job`, `node`, `kv`, `state`, `operator`, `acl`, `*`.
+    /// Resource types: `job`, `node`, `kv`, `state`, `operator`, `acl`,
+    /// `exec`, `action`, `template`, `*`.
     pub resources: Vec<String>,
     /// Actions: `read`, `write`, `*`.
     pub actions: Vec<String>,
@@ -105,6 +111,16 @@ pub struct AclRule {
     /// read/write `actions` field above.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action_names: Option<Vec<String>>,
+    /// Glob selectors over job-template names. On `template` rules this
+    /// scopes which templates the rule covers. On `job` rules it scopes the
+    /// rule to requests that involve a matching template: submissions made
+    /// *through* the template (RunJobTemplate/RenderJobTemplate), and reads
+    /// or lifecycle writes of jobs whose latest config *came from* the
+    /// template. Because a rule with a selector never matches a request
+    /// without the attribute, a `job` rule with `templates` grants nothing
+    /// to plain RunJob submissions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub templates: Option<Vec<String>>,
     /// On `exec` rules: when true, the rule also grants exec into host-level
     /// (unsandboxed) kinds. When absent/false, it matches only sandboxed
     /// kinds. Mirrors Nomad's `alloc-exec` vs `alloc-node-exec` split.
@@ -123,6 +139,7 @@ impl AclRule {
             || self.pools.is_some()
             || self.paths.is_some()
             || self.action_names.is_some()
+            || self.templates.is_some()
     }
 }
 
@@ -141,6 +158,13 @@ pub struct AclScope {
     pub path: Option<String>,
     /// Action name, for `action`-resource scopes.
     pub action_name: Option<String>,
+    /// Job-template name. On `template`-resource scopes: the template being
+    /// read or written. On `job` scopes: the template a submission is going
+    /// through (write path) or the template that produced the job's latest
+    /// config (read/lifecycle path). Never populated from provenance on the
+    /// spec-changing write path — that would let a template-scoped identity
+    /// push arbitrary specs to a job its template once created.
+    pub template: Option<String>,
     /// True when the exec target is a host-level (unsandboxed) kind. Only an
     /// `exec` rule with `host: true` matches such a scope.
     pub host: bool,
@@ -206,6 +230,34 @@ impl AclScope {
             action_name: Some(action_name.to_string()),
             ..Default::default()
         }
+    }
+
+    /// Scope for a job template (template CRUD endpoints).
+    pub fn template(name: &str) -> Self {
+        AclScope {
+            template: Some(name.to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// Scope for submitting a job through a template (RunJobTemplate /
+    /// RenderJobTemplate): the rendered job name plus the template it came
+    /// through, so both `names` and `templates` selectors apply.
+    pub fn job_via_template(job: &str, template: &str) -> Self {
+        AclScope {
+            namespace: Some(DEFAULT_NAMESPACE.to_string()),
+            name: Some(job.to_string()),
+            template: Some(template.to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// Attaches a template attribute (a job's stored provenance) to an
+    /// existing scope. Used on read/lifecycle endpoints so `templates`-scoped
+    /// rules cover the jobs their templates created.
+    pub fn with_template(mut self, template: Option<String>) -> Self {
+        self.template = template;
+        self
     }
 }
 
@@ -297,6 +349,7 @@ fn rule_matches(
         && selector_matches(&rule.pools, &scope.pool)
         && selector_matches(&rule.paths, &scope.path)
         && selector_matches(&rule.action_names, &scope.action_name)
+        && selector_matches(&rule.templates, &scope.template)
 }
 
 /// Default-deny evaluation over a flattened rule set.
@@ -454,6 +507,19 @@ impl AclIdentity {
             return true;
         }
         evaluate(&self.rules, resource, action, scope)
+    }
+
+    /// The identity's effective rules as JSON, for self-introspection
+    /// (`WhoAmI.rules_json`). Management tokens (and disabled ACLs) report a
+    /// single wildcard allow; identities with no rules report `None`.
+    pub fn effective_rules_json(&self) -> Option<String> {
+        if self.is_management {
+            return Some(r#"[{"resources":["*"],"actions":["*"]}]"#.to_string());
+        }
+        if self.rules.is_empty() {
+            return None;
+        }
+        serde_json::to_string(&self.rules).ok()
     }
 }
 
@@ -631,6 +697,75 @@ mod acl_rules_test {
             AclResource::Node,
             AclAction::Read,
             &AclScope::pool("default")
+        ));
+    }
+
+    #[test]
+    fn template_selector_scopes_template_resource() {
+        let r = rules(
+            r#"[{"resources": ["template"], "actions": ["read"], "templates": ["render-*"]}]"#,
+        );
+        assert!(evaluate(
+            &r,
+            AclResource::Template,
+            AclAction::Read,
+            &AclScope::template("render-video")
+        ));
+        assert!(!evaluate(
+            &r,
+            AclResource::Template,
+            AclAction::Read,
+            &AclScope::template("deploy")
+        ));
+        // read does not grant write
+        assert!(!evaluate(
+            &r,
+            AclResource::Template,
+            AclAction::Write,
+            &AclScope::template("render-video")
+        ));
+    }
+
+    #[test]
+    fn template_selector_on_job_rules_gates_submission_channel() {
+        let r = rules(r#"[{"resources": ["job"], "actions": ["write"], "templates": ["render"]}]"#);
+        // Submitting through the template is allowed for any rendered name...
+        assert!(evaluate(
+            &r,
+            AclResource::Job,
+            AclAction::Write,
+            &AclScope::job_via_template("render-abc123", "render")
+        ));
+        // ...but a plain RunJob carries no template attribute and is denied.
+        assert!(!evaluate(
+            &r,
+            AclResource::Job,
+            AclAction::Write,
+            &AclScope::job("render-abc123")
+        ));
+        // A read scope carrying the job's provenance matches too.
+        assert!(evaluate(
+            &r,
+            AclResource::Job,
+            AclAction::Write,
+            &AclScope::job("render-abc123").with_template(Some("render".into()))
+        ));
+        // Composes with `names`: both selectors must match.
+        let both = rules(
+            r#"[{"resources": ["job"], "actions": ["write"],
+                 "names": ["render-*"], "templates": ["render"]}]"#,
+        );
+        assert!(evaluate(
+            &both,
+            AclResource::Job,
+            AclAction::Write,
+            &AclScope::job_via_template("render-ok", "render")
+        ));
+        assert!(!evaluate(
+            &both,
+            AclResource::Job,
+            AclAction::Write,
+            &AclScope::job_via_template("web-prod", "render")
         ));
     }
 

@@ -1,5 +1,7 @@
 import { For, Show, createEffect, createMemo, createSignal } from 'solid-js'
+import { AccessGate } from '../components/AccessGate'
 import { managerClient } from '../grpcClient'
+import { canWriteAny } from '../utils/acl'
 import type { SavedStateQuery, StateStoreSchemaObject } from '../gen/legion_pb'
 import { Badge, Button, ConfirmButton, Icon, Note, SectionCard, Spinner, Tabs, checkboxClass, cx, inputClass, textareaClass } from '../components/ui'
 
@@ -99,7 +101,7 @@ function HighlightedText(props: { text: string; term: string; class?: string }) 
   )
 }
 
-export default function StateExplorer() {
+function StateExplorerContent() {
   const [query, setQuery] = createSignal('SELECT name, type FROM sqlite_master ORDER BY name LIMIT 25;')
   const [allowWrite, setAllowWrite] = createSignal(false)
   const [isRunning, setIsRunning] = createSignal(false)
@@ -339,7 +341,7 @@ export default function StateExplorer() {
         <SectionCard title="Saved queries" flush>
           <div class="space-y-2 border-b border-line p-3">
             <input class={inputClass} value={saveName()} onInput={(event) => setSaveName(event.currentTarget.value)} placeholder="weekly rollout report" />
-            <Button class="w-full" onClick={() => void saveQuery()}>Save / overwrite</Button>
+            <Button class="w-full" onClick={() => void saveQuery()} disabled={!canWriteAny('state')}>Save / overwrite</Button>
           </div>
           <div class="max-h-[360px] space-y-1.5 overflow-auto p-2">
             <For each={savedQueries()}>
@@ -366,6 +368,7 @@ export default function StateExplorer() {
                       label="Delete"
                       size="xs"
                       onConfirm={() => void deleteQuery(saved.name)}
+                      disabled={!canWriteAny('state')}
                     />
                   </div>
                   <p class="mt-1 line-clamp-2 font-mono text-2xs text-faint">{saved.sql}</p>
@@ -497,5 +500,15 @@ export default function StateExplorer() {
         </SectionCard>
       </div>
     </div>
+  )
+}
+
+// Permission gate lives here at the page level — never around the router
+// outlet in the layout (see AccessGate).
+export default function StateExplorer() {
+  return (
+    <AccessGate resource="state">
+      <StateExplorerContent />
+    </AccessGate>
   )
 }

@@ -1,0 +1,352 @@
+//! Lane-write forwarding (plan §8, D2 — standing-split resilience).
+//!
+//! A manager that receives a write it cannot propose — it does not lead the
+//! owning lane — forwards the *operation* (name + full arguments) to that
+//! lane's leader over the `RaftTransport.ForwardLaneWrite` RPC, instead of
+//! failing the caller. This exists for writes whose loss cascades and whose
+//! callers cannot chase per-lane leaders:
+//!
+//! - **worker-plane liveness** (heartbeats, health checks, allocation-health
+//!   snapshots): workers dial ONE fixed manager forever; a rejection storm
+//!   marks healthy nodes lost within seconds and self-fences their stateful
+//!   allocations. A heartbeat is *new information* — no reconciler can
+//!   re-derive it — so it must reach the leader, not wait for one;
+//! - **worker failure reports** (`remove_allocation_by_id`,
+//!   `mark_job_failed`, the reschedule eval): swallowed rejections silently
+//!   destroyed the report while the worker believed it delivered;
+//! - **the status checker's cross-lane halves** (`sync_node_availability`):
+//!   a lost node otherwise stays schedulable while its rows are gone.
+//!
+//! Design rules, in order of importance:
+//!
+//! 1. **Forwarded ops carry their full arguments.** The executor never
+//!    derives payload from its own replica, which may lag the origin's —
+//!    the only reads inside these ops are their pre-existing EXISTS guards,
+//!    whose miss is repaired by the next report (the pre-split contract).
+//! 2. **The executor runs the NON-forwarding variant.** If the target lost
+//!    leadership between the origin's hint and the call, the typed
+//!    not-the-leader outcome rides back to the origin — one bounded hop,
+//!    never a forwarding loop.
+//! 3. **Failure surfaces the ORIGINAL typed rejection.** A forward that
+//!    cannot complete (no leader known, unreachable, timeout) returns the
+//!    origin's own `NotRaftLeader`, so callers and their tolerance logic
+//!    see exactly the error surface they saw before forwarding existed.
+//!
+//! Client-plane RPCs deliberately do NOT forward (plan §8, D3): clients
+//! follow the typed leader hint to the control anchor, and every op that
+//! matters to them is anchored there.
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::prelude::*;
+use crate::storage::raft::driver::NotRaftLeader;
+use crate::storage::raft::Lane;
+use crate::storage::store::Store;
+use crate::structs::AllocationHealth;
+
+/// A store write that may be forwarded to its lane's leader. Closed enum:
+/// adding a variant is adding a wire message (serde_json on the manager
+/// plane, versioned by PROTOCOL_VERSION like the rest of the raft
+/// transport), so variants carry stable, explicit fields.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) enum ForwardableLaneWrite {
+    /// `Store::update_node_heartbeat` — status lane.
+    NodeHeartbeat { id: String },
+    /// `Store::update_node_health_checks` — status lane.
+    NodeHealthChecks { id: String, health_checks: String },
+    /// The status half of `Store::mark_node_ready` — status lane.
+    MarkNodeReady { id: String, last_heartbeat: String },
+    /// The status half of `Store::mark_node_lost` — status lane.
+    MarkNodeLost { id: String },
+    /// `Store::upsert_allocation_health_snapshots` — status lane.
+    AllocationHealthSnapshots {
+        node_id: String,
+        snapshots: Vec<AllocationHealth>,
+    },
+    /// `Store::sync_node_availability` (the control half of the mark-ready/
+    /// mark-lost composites) — control lane.
+    SyncNodeAvailability {
+        ids: Vec<String>,
+        availability: String,
+    },
+    /// `Store::mark_job_failed` — control lane.
+    MarkJobFailed { job_id: String },
+    /// `Store::remove_allocation_by_id` — scheduler lane. Returns the
+    /// removed allocation, when one existed.
+    RemoveAllocationById { allocation_id: i64 },
+    /// `Store::enqueue_eval_after_delay` — scheduler lane. Returns the
+    /// enqueued eval.
+    EnqueueEval {
+        kind: String,
+        job_id: Option<String>,
+        job_config_id: Option<String>,
+        node_id: Option<String>,
+        priority: Option<i64>,
+        delay_ms: u64,
+    },
+    /// `Store::seed_keyed_instances` — scheduler lane. Returns the ids
+    /// actually seeded (existing ids in any state are skipped).
+    SeedKeyedInstances {
+        job_id: String,
+        group: String,
+        task_name: String,
+        ids: Vec<String>,
+    },
+    /// `Store::record_volume_mounted` — scheduler lane.
+    RecordVolumeMounted {
+        volume_id: String,
+        node_id: String,
+        mount_path: String,
+        node_local: bool,
+        fs: Option<String>,
+        attrs: std::collections::BTreeMap<String, Value>,
+    },
+    /// `Store::record_volume_error` — scheduler lane.
+    RecordVolumeError { volume_id: String, error: String },
+    /// `Store::mark_volume_destroyed` — scheduler lane.
+    MarkVolumeDestroyed { volume_id: String },
+}
+
+impl ForwardableLaneWrite {
+    /// The lane whose leader must execute this op — the same lane its
+    /// non-forwarding variant proposes on.
+    pub(crate) fn lane(&self) -> Lane {
+        match self {
+            ForwardableLaneWrite::NodeHeartbeat { .. }
+            | ForwardableLaneWrite::NodeHealthChecks { .. }
+            | ForwardableLaneWrite::MarkNodeReady { .. }
+            | ForwardableLaneWrite::MarkNodeLost { .. }
+            | ForwardableLaneWrite::AllocationHealthSnapshots { .. } => Lane::Status,
+            ForwardableLaneWrite::SyncNodeAvailability { .. }
+            | ForwardableLaneWrite::MarkJobFailed { .. } => Lane::Control,
+            ForwardableLaneWrite::RemoveAllocationById { .. }
+            | ForwardableLaneWrite::EnqueueEval { .. }
+            | ForwardableLaneWrite::SeedKeyedInstances { .. }
+            | ForwardableLaneWrite::RecordVolumeMounted { .. }
+            | ForwardableLaneWrite::RecordVolumeError { .. }
+            | ForwardableLaneWrite::MarkVolumeDestroyed { .. } => Lane::Scheduler,
+        }
+    }
+
+    /// Stable name for logs and error contexts.
+    pub(crate) fn op_name(&self) -> &'static str {
+        match self {
+            ForwardableLaneWrite::NodeHeartbeat { .. } => "update_node_heartbeat",
+            ForwardableLaneWrite::NodeHealthChecks { .. } => "update_node_health_checks",
+            ForwardableLaneWrite::MarkNodeReady { .. } => "mark_node_ready",
+            ForwardableLaneWrite::MarkNodeLost { .. } => "mark_node_lost",
+            ForwardableLaneWrite::AllocationHealthSnapshots { .. } => {
+                "upsert_allocation_health_snapshots"
+            }
+            ForwardableLaneWrite::SyncNodeAvailability { .. } => "sync_node_availability",
+            ForwardableLaneWrite::MarkJobFailed { .. } => "mark_job_failed",
+            ForwardableLaneWrite::RemoveAllocationById { .. } => "remove_allocation_by_id",
+            ForwardableLaneWrite::EnqueueEval { .. } => "enqueue_eval",
+            ForwardableLaneWrite::SeedKeyedInstances { .. } => "seed_keyed_instances",
+            ForwardableLaneWrite::RecordVolumeMounted { .. } => "record_volume_mounted",
+            ForwardableLaneWrite::RecordVolumeError { .. } => "record_volume_error",
+            ForwardableLaneWrite::MarkVolumeDestroyed { .. } => "mark_volume_destroyed",
+        }
+    }
+}
+
+/// Wire outcome of a forwarded lane write (the `ForwardLaneWrite` reply
+/// payload).
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) enum ForwardOutcome {
+    /// The op executed on the target; carries its JSON-encoded return value
+    /// (`null` for `()`-returning ops).
+    Ok(Value),
+    /// The target does not lead the lane either; carries ITS leader hint so
+    /// the origin re-raises a fully-typed `NotRaftLeader`.
+    NotLeader {
+        lane: Option<String>,
+        leader_name: Option<String>,
+        leader_addr: Option<String>,
+    },
+    /// The op executed and failed with a real (non-leadership) error.
+    Failed(String),
+}
+
+/// Executes a forwarded op against the local store using the NON-forwarding
+/// variants (rule 2 above), mapping the result onto the wire outcome.
+pub(crate) fn execute(store: &Store, op: ForwardableLaneWrite) -> ForwardOutcome {
+    fn done<T: Serialize>(result: R<T>) -> ForwardOutcome {
+        match result {
+            Ok(value) => match serde_json::to_value(value) {
+                Ok(value) => ForwardOutcome::Ok(value),
+                Err(err) => ForwardOutcome::Failed(format!(
+                    "failed encoding forwarded op return value: {err}"
+                )),
+            },
+            Err(err) => match err.chain().find_map(|c| c.downcast_ref::<NotRaftLeader>()) {
+                Some(not_leader) => ForwardOutcome::NotLeader {
+                    lane: not_leader.lane.clone(),
+                    leader_name: not_leader.leader_name.clone(),
+                    leader_addr: not_leader.leader_addr.clone(),
+                },
+                None => ForwardOutcome::Failed(format!("{err:#}")),
+            },
+        }
+    }
+    match op {
+        ForwardableLaneWrite::NodeHeartbeat { id } => done(store.update_node_heartbeat_local(id)),
+        ForwardableLaneWrite::NodeHealthChecks { id, health_checks } => {
+            done(store.update_node_health_checks_local(&id, &health_checks))
+        }
+        ForwardableLaneWrite::MarkNodeReady { id, last_heartbeat } => {
+            done(store.mark_node_ready_status_local(&id, &last_heartbeat))
+        }
+        ForwardableLaneWrite::MarkNodeLost { id } => done(store.mark_node_lost_status_local(&id)),
+        ForwardableLaneWrite::AllocationHealthSnapshots { node_id, snapshots } => {
+            done(store.upsert_allocation_health_snapshots_local(&node_id, &snapshots))
+        }
+        ForwardableLaneWrite::SyncNodeAvailability { ids, availability } => {
+            done(store.sync_node_availability_local(&ids, &availability))
+        }
+        ForwardableLaneWrite::MarkJobFailed { job_id } => {
+            done(store.mark_job_failed_local(&job_id))
+        }
+        ForwardableLaneWrite::RemoveAllocationById { allocation_id } => {
+            done(store.remove_allocation_by_id_local(allocation_id))
+        }
+        ForwardableLaneWrite::EnqueueEval {
+            kind,
+            job_id,
+            job_config_id,
+            node_id,
+            priority,
+            delay_ms,
+        } => done(store.enqueue_eval_after_delay_local(
+            &kind,
+            job_id.as_deref(),
+            job_config_id.as_deref(),
+            node_id.as_deref(),
+            priority,
+            std::time::Duration::from_millis(delay_ms),
+        )),
+        ForwardableLaneWrite::SeedKeyedInstances {
+            job_id,
+            group,
+            task_name,
+            ids,
+        } => done(store.seed_keyed_instances_local(&job_id, &group, &task_name, &ids)),
+        ForwardableLaneWrite::RecordVolumeMounted {
+            volume_id,
+            node_id,
+            mount_path,
+            node_local,
+            fs,
+            attrs,
+        } => done(store.record_volume_mounted_local(
+            &volume_id,
+            &node_id,
+            &mount_path,
+            node_local,
+            fs.as_deref(),
+            &attrs,
+        )),
+        ForwardableLaneWrite::RecordVolumeError { volume_id, error } => {
+            done(store.record_volume_error_local(&volume_id, &error))
+        }
+        ForwardableLaneWrite::MarkVolumeDestroyed { volume_id } => {
+            done(store.mark_volume_destroyed_local(&volume_id))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The wire enum must round-trip: it is a manager-plane wire format
+    /// (versioned by PROTOCOL_VERSION), so an encode/decode asymmetry is a
+    /// cross-version incident, not a bug fix.
+    #[test]
+    fn forwardable_ops_round_trip_and_map_lanes() {
+        let ops = vec![
+            ForwardableLaneWrite::NodeHeartbeat { id: "n1".into() },
+            ForwardableLaneWrite::NodeHealthChecks {
+                id: "n1".into(),
+                health_checks: "[]".into(),
+            },
+            ForwardableLaneWrite::MarkNodeReady {
+                id: "n1".into(),
+                last_heartbeat: "2026-07-28T00:00:00Z".into(),
+            },
+            ForwardableLaneWrite::AllocationHealthSnapshots {
+                node_id: "n1".into(),
+                snapshots: Vec::new(),
+            },
+            ForwardableLaneWrite::SyncNodeAvailability {
+                ids: vec!["n1".into()],
+                availability: "available".into(),
+            },
+            ForwardableLaneWrite::MarkJobFailed {
+                job_id: "job".into(),
+            },
+            ForwardableLaneWrite::RemoveAllocationById { allocation_id: 7 },
+            ForwardableLaneWrite::EnqueueEval {
+                kind: "job_reschedule".into(),
+                job_id: Some("job".into()),
+                job_config_id: Some("cfg".into()),
+                node_id: None,
+                priority: None,
+                delay_ms: 0,
+            },
+            ForwardableLaneWrite::RecordVolumeMounted {
+                volume_id: "v1".into(),
+                node_id: "n1".into(),
+                mount_path: "/mnt".into(),
+                node_local: true,
+                fs: None,
+                attrs: Default::default(),
+            },
+            ForwardableLaneWrite::RecordVolumeError {
+                volume_id: "v1".into(),
+                error: "boom".into(),
+            },
+            ForwardableLaneWrite::MarkVolumeDestroyed {
+                volume_id: "v1".into(),
+            },
+        ];
+        for op in ops {
+            let bytes = serde_json::to_vec(&op).expect("encode");
+            let decoded: ForwardableLaneWrite = serde_json::from_slice(&bytes).expect("decode");
+            assert_eq!(decoded.lane(), op.lane());
+            assert_eq!(decoded.op_name(), op.op_name());
+        }
+    }
+
+    /// Status-lane ops are the liveness path, control carries the
+    /// availability sync, scheduler carries the failure-report tail — a
+    /// misrouted variant would propose on a lane that rejects it.
+    #[test]
+    fn lanes_are_the_ones_the_local_variants_propose_on() {
+        assert_eq!(
+            ForwardableLaneWrite::NodeHeartbeat { id: String::new() }.lane(),
+            Lane::Status
+        );
+        assert_eq!(
+            ForwardableLaneWrite::SyncNodeAvailability {
+                ids: Vec::new(),
+                availability: String::new()
+            }
+            .lane(),
+            Lane::Control
+        );
+        assert_eq!(
+            ForwardableLaneWrite::EnqueueEval {
+                kind: String::new(),
+                job_id: None,
+                job_config_id: None,
+                node_id: None,
+                priority: None,
+                delay_ms: 0
+            }
+            .lane(),
+            Lane::Scheduler
+        );
+    }
+}

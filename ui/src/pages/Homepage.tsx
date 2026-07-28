@@ -17,14 +17,34 @@ export default function Homepage() {
   })
 
   // +1 because a 0 source is falsy to createResource and would skip the first fetch.
-  const [ledger] = createResource(() => tick() + 1, async () => (await managerClient.getLedger({})).nodes)
+  // The overview is reachable by every identity, so each stat degrades to
+  // empty when its RPC is denied rather than throwing into the page.
+  const [ledger] = createResource(() => tick() + 1, async () => {
+    try {
+      return (await managerClient.getLedger({})).nodes
+    } catch {
+      return []
+    }
+  })
   const [rollouts] = createResource(
     () => tick() + 1,
-    async () => (await managerClient.listRollouts({ activeOnly: true, page: 1, pageSize: 20 })).rollouts,
+    async () => {
+      try {
+        return (await managerClient.listRollouts({ activeOnly: true, page: 1, pageSize: 20 })).rollouts
+      } catch {
+        return []
+      }
+    },
   )
   const [services] = createResource(
     () => tick() + 1,
-    async () => (await managerClient.listServices({})).services,
+    async () => {
+      try {
+        return (await managerClient.listServices({})).services
+      } catch {
+        return []
+      }
+    },
   )
 
   const props = { ledger, rollouts }

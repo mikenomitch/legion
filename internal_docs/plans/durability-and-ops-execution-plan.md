@@ -5,7 +5,7 @@
 > **Status:** EXECUTED (2026-07-23) — all phase-table rows (A-0..A-4,
 > B-0..B-3) are complete; execution-time judgment calls are logged in
 > §JC-16+. Remaining work is the §6 follow-ups (tracked in
-> `docs/NEXT_UP.md`). **Amended 2026-07-28:** §JC-40's co-located lane
+> `internal_docs/NEXT_UP.md`). **Amended 2026-07-28:** §JC-40's co-located lane
 > leadership is corrected from an invariant to a best-effort property; see
 > the "CORRECTION (2026-07-28)" block in that section.
 >
@@ -388,7 +388,9 @@ here and in TASK-LIST.
    layer (multi-raft plan P7, P9–P11).
 3. Worker mTLS / per-node credentials (existing `TODO(worker-authn)`), which
    also upgrades the raft transport auth beyond the shared secret.
-4. Auto-forward writes to the lane leader (today: reject + hint).
+4. Auto-forward writes to the lane leader — **shipped for the worker plane
+   and internal lane halves** (plan §8 D2, 2026-07-28); client-plane RPCs
+   keep reject + hint deliberately (§8 D3).
 5. OTLP metrics push + worker-side `/metrics`.
 6. Raft autopilot (multi-raft plan P12) — speculative, default-off.
 
@@ -492,6 +494,133 @@ where safety demands:
 | **C-3 lanes engine** ✅ | per-lane table-scoped snapshots (JC-37); start-time refusal removed — lanes brings up three groups with per-lane snapshot policy/compaction; apply-side index-skip guard added (JC-38); lane-named leader hints + per-lane status summary (JC-39); daemon leader-gating per lane (JC-40); lanes config example | `tests/raft_lanes.rs` battery (bring-up/per-lane writes, independent elections, lane-scoped snapshot catch-up, cross-lane race convergence); lane snapshot unit tests in `state_machine.rs`/`ownership.rs` |
 | **C-4 voter checks** | config knob, status quorum lines, membership warnings/guards, metrics, docs | voter-parity unit + CLI tests |
 | **C-5 verify + ship** | skeptic pass on lanes claims → harden → docs (multi-raft.md lanes section, default decision) → full gate | gate + skeptic verdicts resolved |
+
+---
+
+## 8. Workstream D — Standing-split resilience (2026-07-28) — EXECUTED
+
+> Status: EXECUTED the same day, alongside the fixes from the four-sweep
+> adversarial verification pass (governor catch-up cap and flap ladder,
+> readyz divergence timer, joint-intersection status voters, remove-member
+> hardening, seed-snapshot purge gate, orphan-sweep grace, plan-fence epoch
+> mirror + apply-time availability check). Judgement calls for all of it:
+> [calls doc](../calls/durability-and-ops-execution-plan_calls.md).
+> Deferred: apply-time resource-total re-validation, idempotency-record
+> atomicity, destroy_job split ordering, eval retry backoff — all in
+> `TODO.md` with context.
+
+JC-40's correction made lane co-location **best effort**: a standing split
+(different managers leading different lanes for minutes — convergence
+stand-downs reach 480 election windows) is a supported steady state. The
+documented cost was "cross-lane composites have no home until convergence".
+The verification pass behind this workstream priced the bill precisely, and
+it is worse than documented, in order:
+
+1. **Worker liveness dies, then takes workloads with it.** Heartbeats are
+   status-lane writes (`update_node_heartbeat`); workers dial ONE manager
+   forever (`worker/daemon.rs::start_heartbeats` — retry loop, no redial,
+   no leader-hint handling). Under a split that puts the status lane away
+   from the manager the workers dial, every heartbeat is rejected: the
+   status-lane leader (elsewhere) watches replicated `last_heartbeat` go
+   stale and marks every affected node lost → eviction/reschedule of
+   healthy workloads; meanwhile each worker's self-fence watchdog kills its
+   stateful allocations locally. A control-plane leadership shape becomes a
+   data-plane outage.
+2. **Job submit has no home** (the documented gap): the control leader
+   rejects the status/scheduler halves, the scheduler leader rejects the
+   control half; `/readyz` 503s and the operator remedy is "wait or
+   restart a manager".
+3. **An `Updated` submit whose rollout creation was rejected is
+   unrecoverable by retry.** The retry's `handle_job_submit` returns
+   `Unchanged`, and no path ever creates the missing rollout;
+   `regenerate_scheduling_evals` then enqueues its `job_submit` fallback,
+   which places the new config at full count — **bypassing canary/staged
+   gating**. (Also reachable in `single` topology by crashing between the
+   submit and the rollout insert, with no manager restart afterwards.)
+
+### D1. Derived-write reconcilers (tolerate + reconcile)
+
+For composite halves that are **pure, idempotent projections of
+already-replicated control state**, rejection stops being an error. The op's
+one non-derivable half (the control write carrying user/operator intent) is
+the operation; the cross-lane halves are projections that any correct node
+can re-derive later — exactly the `regenerate_scheduling_evals` shape JC-41
+already established.
+
+- `handle_job_submit` tolerates a typed `NotRaftLeader` on its status-seed
+  and volume-claim-sync halves (warn + succeed). Everything else still
+  fails loudly.
+- `run_job`'s scheduler-lane tail (`seed_keyed_instances`,
+  `create_rollout_for_update`, `enqueue_eval`) tolerates the typed
+  rejection the same way; the reply message says scheduling is deferred
+  until lane leadership converges.
+- Reconcilers complete the halves on the owning lane's leader, each a
+  cheap missing-rows query, run from the node-status-checker loop:
+  - `seed_missing_task_statuses` (status lane): `task_config ⟕ task_status`
+    → seed `pending` rows.
+  - `sync_missing_task_volume_claims` (scheduler lane): latest config per
+    active job with volume-declaring tasks but no claim rows → run the
+    existing idempotent sync.
+  - `reconcile_missing_rollouts` (scheduler lane, manager layer — it needs
+    `build_rollout_launch_config`): active job whose latest config has a
+    predecessor, no rollout targeting it, no allocations on it, and live
+    allocations on an older config → the acknowledged-update signature →
+    `create_rollout_for_update` + let eval regeneration arm the tick.
+    Runs **immediately before every `regenerate_scheduling_evals` call**
+    (leadership acquisition + divergent-leadership branch) so the
+    `job_submit` fallback can never again bypass a rollout the job
+    deserved, and periodically on the checker cadence so the
+    crash-without-restart case heals without a client retry.
+
+### D2. Lane-write forwarding for worker-plane liveness
+
+A heartbeat is **new information** — nothing can re-derive it — and its
+loss is finding #1. So the worker plane gets the plan's follow-up #4
+(auto-forwarding), scoped to where it is load-bearing:
+
+- New `RaftTransport` RPC `ForwardLaneWrite`: a serde op enum
+  (`ForwardableLaneWrite`) + lane wire name, authenticated by the cluster
+  secret like every transport RPC. The receiving manager executes the named
+  store op locally; if it does not lead the lane either, the typed
+  `NotRaftLeader` (with ITS hint) rides back in the reply payload.
+- The driver resolves the lane leader's address from its own metrics
+  (leader hint) and reuses the shared `ChannelPool`.
+- `Store::update_node_heartbeat` / `update_node_health_checks` /
+  worker-report `task_status`+`allocation_health` upserts fall back to
+  forwarding on a local `NotRaftLeader`. Worker RPC surface unchanged;
+  workers keep dialing one manager.
+- Forwarded ops carry their **full arguments** — the executor never
+  derives payload from its possibly-lagging replica — and stay
+  EXISTS-guarded no-ops when the target's control replica has not seen the
+  node yet (the next heartbeat repairs it, same as the pre-split contract).
+- Registration: the control half must land on the manager the worker
+  dials (reject + hint, unchanged); its status half (`mark_node_ready`)
+  forwards like a heartbeat.
+
+### D3. Non-goals
+
+- No general client-plane auto-forwarding (follow-up #4 for client RPCs
+  stands: reject + leader hint remains the contract).
+- No leader transfer (openraft 0.9 has none); convergence stays JC-40's
+  governor.
+- No relaxation of single-writer table ownership; forwarding proposes on
+  the OWNING lane's leader, it never writes cross-lane.
+- `/readyz` keeps failing on a standing split (it is an abnormal shape an
+  operator should investigate), but its body stops claiming composites
+  "cannot complete on any node" — after D1/D2 the write path degrades
+  (reconcile-latency scheduling, forwarded liveness) instead of dying.
+
+### D4. Verification
+
+- `tests/raft_lanes.rs::lanes_that_settle_on_different_leaders_stay_correct`
+  updated to the new contract: submit **succeeds** on the control leader
+  under a standing scheduler split, reconcilers complete the halves on the
+  lane leaders, and the healed cluster converges byte-identically.
+- New: standing status-lane split with a live heartbeat path — the node is
+  NOT marked lost while heartbeats forward, and the rollout reconciler
+  creates a gated rollout for an update submitted into the split.
+- Reconciler unit tests beside the store methods; forwarding round-trip
+  unit test through two in-process transports.
 
 ---
 

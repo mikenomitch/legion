@@ -117,6 +117,33 @@ harness = false
 name = "eval_critical_path_bench"
 harness = false
 
+# Profile for shipped binaries: `cargo build --profile dist`.
+#
+# Legion is distributed as one binary that is manager, worker, CLI, and MCP
+# server, and it is expected to land on small and edge machines, so binary size
+# is a feature. The stock `--release` profile leaves ~18 MB on the table:
+#
+#   --release            43.7 MB
+#   --profile dist       26.0 MB   (-41%)
+#
+# Roughly half of that is `strip` dropping the symbol tables (__LINKEDIT: 8.9 MB
+# -> 0.3 MB); the other half is fat LTO collapsing dead code and cross-crate
+# duplication across the ~520-crate tree (__TEXT: 33.5 MB -> 24.8 MB).
+#
+# The cost is build time — fat LTO with a single codegen unit cannot parallelize
+# the final link, taking several minutes against about one for `--release`. That
+# is why this is a separate profile: `--release` stays fast for local work, and
+# only release artifacts pay for the smaller binary. Debug builds are unaffected.
+[profile.dist]
+inherits = "release"
+# Collapse dead code and duplicated generics across every crate in the tree.
+lto = "fat"
+# One codegen unit per crate graph: less parallelism, more inlining, smaller code.
+codegen-units = 1
+# Drop symbol tables. Backtraces lose function names; keep the unstripped
+# artifact if you need to symbolize a crash from a shipped build.
+strip = "symbols"
+
 # [[bin]] # Bin to run the HelloWorld gRPC server
 # name = "legion"
 # path = "src/main.rs"

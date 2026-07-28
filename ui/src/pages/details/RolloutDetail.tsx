@@ -1,7 +1,10 @@
 import { A, useParams } from '@solidjs/router'
+import { GetLedgerReply } from '../../gen/legion_pb'
+import { AccessGate } from '../../components/AccessGate'
 import { For, Show, createMemo, createResource, createSignal } from 'solid-js'
 import { Badge, Button, ConfirmButton, Icon, Note, PageHeader, SectionCard, Spinner, StatusBadge, cx, inputClass, linkClass } from '../../components/ui'
 import { managerClient } from '../../grpcClient'
+import { allows, jobScope } from '../../utils/acl'
 import { formatDate } from '../../utils/format'
 import { artifactProgressPercent, parseArtifactStates } from '../../utils/jobspec'
 
@@ -24,7 +27,7 @@ const logLevelTone = (level: string) => {
   return 'text-emerald-300'
 }
 
-export default function RolloutDetail() {
+function RolloutDetailContent() {
   const params = useParams()
   const rolloutId = createMemo(() => BigInt(params.id))
   const [logFilter, setLogFilter] = createSignal('')
@@ -34,7 +37,9 @@ export default function RolloutDetail() {
     const [status, events, ledger] = await Promise.all([
       managerClient.getRolloutStatus({ id: rolloutId() }),
       managerClient.listRolloutEvents({ rolloutId: rolloutId(), limit: 1000 }),
-      managerClient.getLedger({}),
+      // node:read garnish (allocation placement); job-scoped tokens
+      // still get the rest of the page.
+      managerClient.getLedger({}).catch(() => new GetLedgerReply()),
     ])
     const rollout = status.rollout
     const placed = rollout
@@ -107,10 +112,22 @@ export default function RolloutDetail() {
                 actions={
                   <>
                     <Show when={isManualProgression}>
-                      <Button variant="primary" icon="play" onClick={() => void advance()}>Advance</Button>
+                      <Button
+                        variant="primary"
+                        icon="play"
+                        onClick={() => void advance()}
+                        disabled={!allows('job', 'write', jobScope(rollout.jobId))}
+                      >
+                        Advance
+                      </Button>
                     </Show>
                     <Show when={!done}>
-                      <ConfirmButton label="Stop" icon="pause" onConfirm={() => void stop()} />
+                      <ConfirmButton
+                        label="Stop"
+                        icon="pause"
+                        onConfirm={() => void stop()}
+                        disabled={!allows('job', 'write', jobScope(rollout.jobId))}
+                      />
                     </Show>
                   </>
                 }
@@ -216,5 +233,15 @@ export default function RolloutDetail() {
         })()}
       </Show>
     </Show>
+  )
+}
+
+// Permission gate lives here at the page level — never around the router
+// outlet in the layout (see AccessGate).
+export default function RolloutDetail() {
+  return (
+    <AccessGate resource="job">
+      <RolloutDetailContent />
+    </AccessGate>
   )
 }

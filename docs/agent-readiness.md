@@ -69,9 +69,15 @@ Even with `--allow-write`, `legion_state_query` is forced to read-only.
 | `legion_job_logs` | no | Fetch captured task stdout/stderr for a job. |
 | `legion_state_query` | no | Read-only SQL against the state store. |
 | `legion_state_schema` | no | Describe state store tables. |
+| `legion_template_list` | no | List job templates (name, latest version, variable count). |
+| `legion_template_get` | no | One template version: declared variables, source, version history. |
+| `legion_template_render` | no | Dry-run a template: validate variables, return the rendered jobspec without submitting. |
 | `legion_job_run` | **yes** | Submit/update a job from rendered JSON. |
 | `legion_job_stop` | **yes** | Stop a job. |
 | `legion_job_destroy` | **yes** | Destroy a job. |
+| `legion_template_run` | **yes** | Render a template with variables and submit the job (supports `idempotency_key`). |
+| `legion_template_upsert` | **yes** | Store Jsonnet as the next immutable version of a template. |
+| `legion_template_delete` | **yes** | Delete a template and all of its versions (running jobs are unaffected). |
 | `legion_instance_create` | **yes** | Create a keyed-mode stateful instance (never-recycled id; supports `idempotency_key`). |
 | `legion_instance_destroy` | **yes** | Destroy a keyed instance, stop its allocation, drop its storage (supports `idempotency_key`). |
 | `legion_instance_replace` | **yes** | Force-replace an instance's allocation stuck on a LOST node (skips the `onLost.replaceAfter` loss-confirmation gate; split-brain risk if the node is only partitioned; supports `idempotency_key`). |
@@ -131,6 +137,25 @@ legion job validate ./configs/jobs/demo.jsonnet --json
 (`validate_job_config`), so an agent can self-correct before touching the cluster.
 The schema embeds the built-in task-runtime config schemas (`exec`, `container`, …)
 under `taskRuntimes`, derived from the typed Rust structs.
+
+### Job templates: authoring by parameter instead of by spec
+
+When a cluster publishes [job templates](job-templates.md), an agent does not
+have to author a jobspec at all — it discovers the declared variables and
+supplies values:
+
+```bash
+legion template list --json
+legion template get render --json      # declared variables, types, defaults, options
+legion template render render --var scene=demo --json   # dry run: the exact spec that would be submitted
+legion template run render --var scene=demo --idempotency-key run-1 --wait --json
+```
+
+The manager type-checks every value against the declaration and rejects
+unknown keys, so a mistyped variable fails with a specific message
+(`variable 'frames': expected a number, got "many"`) instead of producing a
+subtly wrong job. `template render` is the self-correction loop: it is
+read-only and returns exactly what `template run` would submit.
 
 ## 4a. Wiring workloads together (service discovery + connect)
 
@@ -343,12 +368,15 @@ All client commands and the MCP server honour:
 2. **Observe (read-only)**: `legion state schema`, then `legion state query`,
    `legion job list`, `legion node list`.
 3. **Author + check**: build a jobspec against `legion job schema`, then
-   `legion job validate` it.
-4. **Preview**: `legion job plan` to see placements (dry-run). The `--json`
-   envelope also carries `index_usage` — per task, which scheduling index
-   generated the candidates and why none did
+   `legion job validate` it — or, if a template covers the task,
+   `legion template get <name>` and fill in its declared variables.
+4. **Preview**: `legion job plan` to see placements (dry-run), or
+   `legion template render` to see the spec a template would submit. The
+   `job plan --json` envelope also carries `index_usage` — per task, which
+   scheduling index generated the candidates and why none did
    ([scheduling-indexes.md](scheduling-indexes.md)).
-5. **Apply with a retry-safe key**: `legion job run … --idempotency-key … --wait`.
+5. **Apply with a retry-safe key**: `legion job run … --idempotency-key … --wait`
+   (or `legion template run … --idempotency-key … --wait`).
 6. **Verify**: inspect the `wait` result, `rollout events`, and `state query`.
 
 Prefer read-only operations; treat anything with `mutates: true` /

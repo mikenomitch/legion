@@ -694,6 +694,995 @@ export class RunJobReply extends Message<RunJobReply> {
 }
 
 /**
+ * One declared job-template variable.
+ *
+ * Declared in the template source's `variables` list and used by clients
+ * (UI form generation, CLI coercion) and by the manager for validation.
+ *
+ * @generated from message legion.JobTemplateVariable
+ */
+export class JobTemplateVariable extends Message<JobTemplateVariable> {
+  /**
+   * Variable key. Must match `[a-zA-Z_][a-zA-Z0-9_]*`. The rendered
+   * template receives all declared keys as fields of the single `vars`
+   * object passed to its `job(vars)` function.
+   *
+   * @generated from field: string key = 1;
+   */
+  key = "";
+
+  /**
+   * Variable type. One of: `string`, `text` (multiline string), `number`,
+   * `boolean`, `select` (one of `options`), `multi_select` (list drawn
+   * from `options`), `json` (any JSON value, passed through verbatim).
+   *
+   * @generated from field: string type = 2;
+   */
+  type = "";
+
+  /**
+   * Human-readable label for forms. Defaults to `key` when empty.
+   *
+   * @generated from field: string label = 3;
+   */
+  label = "";
+
+  /**
+   * Optional helper text shown next to the input.
+   *
+   * @generated from field: optional string description = 4;
+   */
+  description?: string;
+
+  /**
+   * Whether a value must be provided at run time. Defaults to true when
+   * the variable has no default, false when it has one. A variable with
+   * `required: false` and no default renders as JSON `null`.
+   *
+   * @generated from field: bool required = 5;
+   */
+  required = false;
+
+  /**
+   * Default value as JSON text, matching `type` (for example `"draft"`,
+   * `24`, `false`, `["a","b"]`). Unset means no default.
+   *
+   * @generated from field: optional string default_json = 6;
+   */
+  defaultJson?: string;
+
+  /**
+   * Allowed values for `select` / `multi_select` types; empty otherwise.
+   *
+   * @generated from field: repeated string options = 7;
+   */
+  options: string[] = [];
+
+  constructor(data?: PartialMessage<JobTemplateVariable>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.JobTemplateVariable";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "key", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "type", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "label", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "description", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 5, name: "required", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 6, name: "default_json", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 7, name: "options", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): JobTemplateVariable {
+    return new JobTemplateVariable().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): JobTemplateVariable {
+    return new JobTemplateVariable().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): JobTemplateVariable {
+    return new JobTemplateVariable().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: JobTemplateVariable | PlainMessage<JobTemplateVariable> | undefined, b: JobTemplateVariable | PlainMessage<JobTemplateVariable> | undefined): boolean {
+    return proto3.util.equals(JobTemplateVariable, a, b);
+  }
+}
+
+/**
+ * Metadata for one stored template version (no source).
+ *
+ * @generated from message legion.JobTemplateVersionInfo
+ */
+export class JobTemplateVersionInfo extends Message<JobTemplateVersionInfo> {
+  /**
+   * Version number, 1-indexed and immutable once written.
+   *
+   * @generated from field: uint32 version = 1;
+   */
+  version = 0;
+
+  /**
+   * RFC3339 creation timestamp.
+   *
+   * @generated from field: string created_at = 2;
+   */
+  createdAt = "";
+
+  /**
+   * Principal that created this version (token name, `user:<name>`, or
+   * empty when ACLs were disabled).
+   *
+   * @generated from field: string created_by = 3;
+   */
+  createdBy = "";
+
+  constructor(data?: PartialMessage<JobTemplateVersionInfo>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.JobTemplateVersionInfo";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "version", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 2, name: "created_at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "created_by", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): JobTemplateVersionInfo {
+    return new JobTemplateVersionInfo().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): JobTemplateVersionInfo {
+    return new JobTemplateVersionInfo().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): JobTemplateVersionInfo {
+    return new JobTemplateVersionInfo().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: JobTemplateVersionInfo | PlainMessage<JobTemplateVersionInfo> | undefined, b: JobTemplateVersionInfo | PlainMessage<JobTemplateVersionInfo> | undefined): boolean {
+    return proto3.util.equals(JobTemplateVersionInfo, a, b);
+  }
+}
+
+/**
+ * One full job template version.
+ *
+ * @generated from message legion.JobTemplate
+ */
+export class JobTemplate extends Message<JobTemplate> {
+  /**
+   * Template name: lowercase alphanumerics and dashes, like a job name.
+   * The name is the template's identity; there is no separate display name.
+   *
+   * @generated from field: string name = 1;
+   */
+  name = "";
+
+  /**
+   * Version number of this document.
+   *
+   * @generated from field: uint32 version = 2;
+   */
+  version = 0;
+
+  /**
+   * Latest version number that exists for this template.
+   *
+   * @generated from field: uint32 latest_version = 3;
+   */
+  latestVersion = 0;
+
+  /**
+   * Optional user-facing description from the template manifest.
+   *
+   * @generated from field: optional string description = 4;
+   */
+  description?: string;
+
+  /**
+   * Raw Jsonnet source of this version.
+   *
+   * @generated from field: string source_jsonnet = 5;
+   */
+  sourceJsonnet = "";
+
+  /**
+   * Declared variables from the manifest, in declaration order.
+   *
+   * @generated from field: repeated legion.JobTemplateVariable variables = 6;
+   */
+  variables: JobTemplateVariable[] = [];
+
+  /**
+   * RFC3339 creation timestamp of this version.
+   *
+   * @generated from field: string created_at = 7;
+   */
+  createdAt = "";
+
+  /**
+   * Principal that created this version.
+   *
+   * @generated from field: string created_by = 8;
+   */
+  createdBy = "";
+
+  constructor(data?: PartialMessage<JobTemplate>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.JobTemplate";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "version", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 3, name: "latest_version", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 4, name: "description", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 5, name: "source_jsonnet", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "variables", kind: "message", T: JobTemplateVariable, repeated: true },
+    { no: 7, name: "created_at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 8, name: "created_by", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): JobTemplate {
+    return new JobTemplate().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): JobTemplate {
+    return new JobTemplate().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): JobTemplate {
+    return new JobTemplate().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: JobTemplate | PlainMessage<JobTemplate> | undefined, b: JobTemplate | PlainMessage<JobTemplate> | undefined): boolean {
+    return proto3.util.equals(JobTemplate, a, b);
+  }
+}
+
+/**
+ * Latest-version summary row for ListJobTemplates.
+ *
+ * @generated from message legion.JobTemplateSummary
+ */
+export class JobTemplateSummary extends Message<JobTemplateSummary> {
+  /**
+   * Template name.
+   *
+   * @generated from field: string name = 1;
+   */
+  name = "";
+
+  /**
+   * Latest version number.
+   *
+   * @generated from field: uint32 latest_version = 2;
+   */
+  latestVersion = 0;
+
+  /**
+   * Description from the latest version.
+   *
+   * @generated from field: optional string description = 3;
+   */
+  description?: string;
+
+  /**
+   * Number of declared variables in the latest version.
+   *
+   * @generated from field: uint32 variable_count = 4;
+   */
+  variableCount = 0;
+
+  /**
+   * RFC3339 timestamp of the latest version's creation.
+   *
+   * @generated from field: string updated_at = 5;
+   */
+  updatedAt = "";
+
+  constructor(data?: PartialMessage<JobTemplateSummary>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.JobTemplateSummary";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "latest_version", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 3, name: "description", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 4, name: "variable_count", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 5, name: "updated_at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): JobTemplateSummary {
+    return new JobTemplateSummary().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): JobTemplateSummary {
+    return new JobTemplateSummary().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): JobTemplateSummary {
+    return new JobTemplateSummary().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: JobTemplateSummary | PlainMessage<JobTemplateSummary> | undefined, b: JobTemplateSummary | PlainMessage<JobTemplateSummary> | undefined): boolean {
+    return proto3.util.equals(JobTemplateSummary, a, b);
+  }
+}
+
+/**
+ * Provenance of a job config that was produced by RunJobTemplate.
+ *
+ * @generated from message legion.JobTemplateProvenance
+ */
+export class JobTemplateProvenance extends Message<JobTemplateProvenance> {
+  /**
+   * Template name.
+   *
+   * @generated from field: string name = 1;
+   */
+  name = "";
+
+  /**
+   * Template version that rendered the config.
+   *
+   * @generated from field: uint32 version = 2;
+   */
+  version = 0;
+
+  constructor(data?: PartialMessage<JobTemplateProvenance>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.JobTemplateProvenance";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "version", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): JobTemplateProvenance {
+    return new JobTemplateProvenance().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): JobTemplateProvenance {
+    return new JobTemplateProvenance().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): JobTemplateProvenance {
+    return new JobTemplateProvenance().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: JobTemplateProvenance | PlainMessage<JobTemplateProvenance> | undefined, b: JobTemplateProvenance | PlainMessage<JobTemplateProvenance> | undefined): boolean {
+    return proto3.util.equals(JobTemplateProvenance, a, b);
+  }
+}
+
+/**
+ * Request payload for UpsertJobTemplate.
+ *
+ * @generated from message legion.UpsertJobTemplateRequest
+ */
+export class UpsertJobTemplateRequest extends Message<UpsertJobTemplateRequest> {
+  /**
+   * Template name. Creating a name that already exists appends the next
+   * version; versions are never overwritten.
+   *
+   * @generated from field: string name = 1;
+   */
+  name = "";
+
+  /**
+   * Full Jsonnet source. Must be self-contained (imports are rejected) and
+   * at most 512 KiB. See JobTemplate for the required document shape.
+   *
+   * @generated from field: string source_jsonnet = 2;
+   */
+  sourceJsonnet = "";
+
+  constructor(data?: PartialMessage<UpsertJobTemplateRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.UpsertJobTemplateRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "source_jsonnet", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): UpsertJobTemplateRequest {
+    return new UpsertJobTemplateRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): UpsertJobTemplateRequest {
+    return new UpsertJobTemplateRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): UpsertJobTemplateRequest {
+    return new UpsertJobTemplateRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: UpsertJobTemplateRequest | PlainMessage<UpsertJobTemplateRequest> | undefined, b: UpsertJobTemplateRequest | PlainMessage<UpsertJobTemplateRequest> | undefined): boolean {
+    return proto3.util.equals(UpsertJobTemplateRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for UpsertJobTemplate.
+ *
+ * @generated from message legion.UpsertJobTemplateReply
+ */
+export class UpsertJobTemplateReply extends Message<UpsertJobTemplateReply> {
+  /**
+   * The stored version.
+   *
+   * @generated from field: legion.JobTemplate template = 1;
+   */
+  template?: JobTemplate;
+
+  constructor(data?: PartialMessage<UpsertJobTemplateReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.UpsertJobTemplateReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "template", kind: "message", T: JobTemplate },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): UpsertJobTemplateReply {
+    return new UpsertJobTemplateReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): UpsertJobTemplateReply {
+    return new UpsertJobTemplateReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): UpsertJobTemplateReply {
+    return new UpsertJobTemplateReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: UpsertJobTemplateReply | PlainMessage<UpsertJobTemplateReply> | undefined, b: UpsertJobTemplateReply | PlainMessage<UpsertJobTemplateReply> | undefined): boolean {
+    return proto3.util.equals(UpsertJobTemplateReply, a, b);
+  }
+}
+
+/**
+ * Request payload for ListJobTemplates.
+ *
+ * @generated from message legion.ListJobTemplatesRequest
+ */
+export class ListJobTemplatesRequest extends Message<ListJobTemplatesRequest> {
+  /**
+   * Optional case-insensitive substring filter over name and description.
+   *
+   * @generated from field: optional string query = 1;
+   */
+  query?: string;
+
+  constructor(data?: PartialMessage<ListJobTemplatesRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListJobTemplatesRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "query", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListJobTemplatesRequest {
+    return new ListJobTemplatesRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListJobTemplatesRequest {
+    return new ListJobTemplatesRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListJobTemplatesRequest {
+    return new ListJobTemplatesRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListJobTemplatesRequest | PlainMessage<ListJobTemplatesRequest> | undefined, b: ListJobTemplatesRequest | PlainMessage<ListJobTemplatesRequest> | undefined): boolean {
+    return proto3.util.equals(ListJobTemplatesRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for ListJobTemplates.
+ *
+ * @generated from message legion.ListJobTemplatesReply
+ */
+export class ListJobTemplatesReply extends Message<ListJobTemplatesReply> {
+  /**
+   * Templates the caller may read, most recently updated first.
+   *
+   * @generated from field: repeated legion.JobTemplateSummary templates = 1;
+   */
+  templates: JobTemplateSummary[] = [];
+
+  constructor(data?: PartialMessage<ListJobTemplatesReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListJobTemplatesReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "templates", kind: "message", T: JobTemplateSummary, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListJobTemplatesReply {
+    return new ListJobTemplatesReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListJobTemplatesReply {
+    return new ListJobTemplatesReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListJobTemplatesReply {
+    return new ListJobTemplatesReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListJobTemplatesReply | PlainMessage<ListJobTemplatesReply> | undefined, b: ListJobTemplatesReply | PlainMessage<ListJobTemplatesReply> | undefined): boolean {
+    return proto3.util.equals(ListJobTemplatesReply, a, b);
+  }
+}
+
+/**
+ * Request payload for GetJobTemplate.
+ *
+ * @generated from message legion.GetJobTemplateRequest
+ */
+export class GetJobTemplateRequest extends Message<GetJobTemplateRequest> {
+  /**
+   * Template name (exact match).
+   *
+   * @generated from field: string name = 1;
+   */
+  name = "";
+
+  /**
+   * Version to fetch. Omit for the latest.
+   *
+   * @generated from field: optional uint32 version = 2;
+   */
+  version?: number;
+
+  constructor(data?: PartialMessage<GetJobTemplateRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetJobTemplateRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "version", kind: "scalar", T: 13 /* ScalarType.UINT32 */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetJobTemplateRequest {
+    return new GetJobTemplateRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetJobTemplateRequest {
+    return new GetJobTemplateRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetJobTemplateRequest {
+    return new GetJobTemplateRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetJobTemplateRequest | PlainMessage<GetJobTemplateRequest> | undefined, b: GetJobTemplateRequest | PlainMessage<GetJobTemplateRequest> | undefined): boolean {
+    return proto3.util.equals(GetJobTemplateRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for GetJobTemplate.
+ *
+ * @generated from message legion.GetJobTemplateReply
+ */
+export class GetJobTemplateReply extends Message<GetJobTemplateReply> {
+  /**
+   * The requested version.
+   *
+   * @generated from field: legion.JobTemplate template = 1;
+   */
+  template?: JobTemplate;
+
+  /**
+   * All stored versions of this template, newest first.
+   *
+   * @generated from field: repeated legion.JobTemplateVersionInfo versions = 2;
+   */
+  versions: JobTemplateVersionInfo[] = [];
+
+  constructor(data?: PartialMessage<GetJobTemplateReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetJobTemplateReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "template", kind: "message", T: JobTemplate },
+    { no: 2, name: "versions", kind: "message", T: JobTemplateVersionInfo, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetJobTemplateReply {
+    return new GetJobTemplateReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetJobTemplateReply {
+    return new GetJobTemplateReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetJobTemplateReply {
+    return new GetJobTemplateReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetJobTemplateReply | PlainMessage<GetJobTemplateReply> | undefined, b: GetJobTemplateReply | PlainMessage<GetJobTemplateReply> | undefined): boolean {
+    return proto3.util.equals(GetJobTemplateReply, a, b);
+  }
+}
+
+/**
+ * Request payload for DeleteJobTemplate.
+ *
+ * @generated from message legion.DeleteJobTemplateRequest
+ */
+export class DeleteJobTemplateRequest extends Message<DeleteJobTemplateRequest> {
+  /**
+   * Template name (exact match). Deletes every version.
+   *
+   * @generated from field: string name = 1;
+   */
+  name = "";
+
+  constructor(data?: PartialMessage<DeleteJobTemplateRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.DeleteJobTemplateRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): DeleteJobTemplateRequest {
+    return new DeleteJobTemplateRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): DeleteJobTemplateRequest {
+    return new DeleteJobTemplateRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): DeleteJobTemplateRequest {
+    return new DeleteJobTemplateRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: DeleteJobTemplateRequest | PlainMessage<DeleteJobTemplateRequest> | undefined, b: DeleteJobTemplateRequest | PlainMessage<DeleteJobTemplateRequest> | undefined): boolean {
+    return proto3.util.equals(DeleteJobTemplateRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for DeleteJobTemplate.
+ *
+ * @generated from message legion.DeleteJobTemplateReply
+ */
+export class DeleteJobTemplateReply extends Message<DeleteJobTemplateReply> {
+  /**
+   * Human-readable status message.
+   *
+   * @generated from field: string message = 1;
+   */
+  message = "";
+
+  constructor(data?: PartialMessage<DeleteJobTemplateReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.DeleteJobTemplateReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): DeleteJobTemplateReply {
+    return new DeleteJobTemplateReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): DeleteJobTemplateReply {
+    return new DeleteJobTemplateReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): DeleteJobTemplateReply {
+    return new DeleteJobTemplateReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: DeleteJobTemplateReply | PlainMessage<DeleteJobTemplateReply> | undefined, b: DeleteJobTemplateReply | PlainMessage<DeleteJobTemplateReply> | undefined): boolean {
+    return proto3.util.equals(DeleteJobTemplateReply, a, b);
+  }
+}
+
+/**
+ * Request payload for RenderJobTemplate.
+ *
+ * @generated from message legion.RenderJobTemplateRequest
+ */
+export class RenderJobTemplateRequest extends Message<RenderJobTemplateRequest> {
+  /**
+   * Template name.
+   *
+   * @generated from field: string name = 1;
+   */
+  name = "";
+
+  /**
+   * Version to render. Omit for the latest.
+   *
+   * @generated from field: optional uint32 version = 2;
+   */
+  version?: number;
+
+  /**
+   * Variable values as a JSON object keyed by variable key, for example
+   * `{"scene": "s3://bucket/x", "frames": 48}`. Values are validated
+   * against the declared types; strings are leniently coerced (`"48"`
+   * satisfies a `number`). At most 64 KiB.
+   *
+   * @generated from field: string variables_json = 3;
+   */
+  variablesJson = "";
+
+  constructor(data?: PartialMessage<RenderJobTemplateRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.RenderJobTemplateRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "version", kind: "scalar", T: 13 /* ScalarType.UINT32 */, opt: true },
+    { no: 3, name: "variables_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RenderJobTemplateRequest {
+    return new RenderJobTemplateRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): RenderJobTemplateRequest {
+    return new RenderJobTemplateRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): RenderJobTemplateRequest {
+    return new RenderJobTemplateRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: RenderJobTemplateRequest | PlainMessage<RenderJobTemplateRequest> | undefined, b: RenderJobTemplateRequest | PlainMessage<RenderJobTemplateRequest> | undefined): boolean {
+    return proto3.util.equals(RenderJobTemplateRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for RenderJobTemplate.
+ *
+ * @generated from message legion.RenderJobTemplateReply
+ */
+export class RenderJobTemplateReply extends Message<RenderJobTemplateReply> {
+  /**
+   * The rendered jobspec as JSON text, exactly what RunJobTemplate would
+   * submit with the same inputs.
+   *
+   * @generated from field: string rendered_jobspec = 1;
+   */
+  renderedJobspec = "";
+
+  /**
+   * Name of the job the rendered spec declares.
+   *
+   * @generated from field: string job_name = 2;
+   */
+  jobName = "";
+
+  constructor(data?: PartialMessage<RenderJobTemplateReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.RenderJobTemplateReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "rendered_jobspec", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "job_name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RenderJobTemplateReply {
+    return new RenderJobTemplateReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): RenderJobTemplateReply {
+    return new RenderJobTemplateReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): RenderJobTemplateReply {
+    return new RenderJobTemplateReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: RenderJobTemplateReply | PlainMessage<RenderJobTemplateReply> | undefined, b: RenderJobTemplateReply | PlainMessage<RenderJobTemplateReply> | undefined): boolean {
+    return proto3.util.equals(RenderJobTemplateReply, a, b);
+  }
+}
+
+/**
+ * Request payload for RunJobTemplate.
+ *
+ * @generated from message legion.RunJobTemplateRequest
+ */
+export class RunJobTemplateRequest extends Message<RunJobTemplateRequest> {
+  /**
+   * Template name.
+   *
+   * @generated from field: string name = 1;
+   */
+  name = "";
+
+  /**
+   * Version to render. Omit for the latest.
+   *
+   * @generated from field: optional uint32 version = 2;
+   */
+  version?: number;
+
+  /**
+   * Variable values as a JSON object keyed by variable key (see
+   * RenderJobTemplateRequest.variables_json).
+   *
+   * @generated from field: string variables_json = 3;
+   */
+  variablesJson = "";
+
+  /**
+   * Optional eval priority override (see RunJobRequest.priority).
+   *
+   * @generated from field: optional int64 priority = 4;
+   */
+  priority?: bigint;
+
+  /**
+   * When true, enqueues a reschedule even when the rendered spec is
+   * unchanged. Default: `false`.
+   *
+   * @generated from field: bool force_reschedule = 5;
+   */
+  forceReschedule = false;
+
+  /**
+   * Optional idempotency key (see RunJobRequest.idempotency_key).
+   *
+   * @generated from field: optional string idempotency_key = 6;
+   */
+  idempotencyKey?: string;
+
+  constructor(data?: PartialMessage<RunJobTemplateRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.RunJobTemplateRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "version", kind: "scalar", T: 13 /* ScalarType.UINT32 */, opt: true },
+    { no: 3, name: "variables_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "priority", kind: "scalar", T: 3 /* ScalarType.INT64 */, opt: true },
+    { no: 5, name: "force_reschedule", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 6, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RunJobTemplateRequest {
+    return new RunJobTemplateRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): RunJobTemplateRequest {
+    return new RunJobTemplateRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): RunJobTemplateRequest {
+    return new RunJobTemplateRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: RunJobTemplateRequest | PlainMessage<RunJobTemplateRequest> | undefined, b: RunJobTemplateRequest | PlainMessage<RunJobTemplateRequest> | undefined): boolean {
+    return proto3.util.equals(RunJobTemplateRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for RunJobTemplate.
+ *
+ * @generated from message legion.RunJobTemplateReply
+ */
+export class RunJobTemplateReply extends Message<RunJobTemplateReply> {
+  /**
+   * Human-readable outcome message (same vocabulary as RunJobReply).
+   *
+   * @generated from field: string message = 1;
+   */
+  message = "";
+
+  /**
+   * True when replayed from a previously recorded idempotent result.
+   *
+   * @generated from field: bool deduplicated = 2;
+   */
+  deduplicated = false;
+
+  /**
+   * Name of the job that was created or updated.
+   *
+   * @generated from field: string job_name = 3;
+   */
+  jobName = "";
+
+  /**
+   * Job config ID produced (or matched, when unchanged) by this run.
+   *
+   * @generated from field: string job_config_id = 4;
+   */
+  jobConfigId = "";
+
+  constructor(data?: PartialMessage<RunJobTemplateReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.RunJobTemplateReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "deduplicated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 3, name: "job_name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "job_config_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RunJobTemplateReply {
+    return new RunJobTemplateReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): RunJobTemplateReply {
+    return new RunJobTemplateReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): RunJobTemplateReply {
+    return new RunJobTemplateReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: RunJobTemplateReply | PlainMessage<RunJobTemplateReply> | undefined, b: RunJobTemplateReply | PlainMessage<RunJobTemplateReply> | undefined): boolean {
+    return proto3.util.equals(RunJobTemplateReply, a, b);
+  }
+}
+
+/**
  * Request payload for GetJobInfo.
  *
  * @generated from message legion.GetJobInfoRequest
@@ -749,6 +1738,14 @@ export class GetJobInfoReply extends Message<GetJobInfoReply> {
    */
   job?: Job;
 
+  /**
+   * Template that rendered the job's latest config, when it was submitted
+   * via RunJobTemplate. Unset for raw RunJob submissions.
+   *
+   * @generated from field: optional legion.JobTemplateProvenance template = 2;
+   */
+  template?: JobTemplateProvenance;
+
   constructor(data?: PartialMessage<GetJobInfoReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -758,6 +1755,7 @@ export class GetJobInfoReply extends Message<GetJobInfoReply> {
   static readonly typeName = "legion.GetJobInfoReply";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "job", kind: "message", T: Job },
+    { no: 2, name: "template", kind: "message", T: JobTemplateProvenance, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetJobInfoReply {
@@ -2046,6 +3044,14 @@ export class JobSpecHistoryItem extends Message<JobSpecHistoryItem> {
    */
   version?: bigint;
 
+  /**
+   * Template that rendered this config, when it was submitted via
+   * RunJobTemplate. Unset for raw RunJob submissions.
+   *
+   * @generated from field: optional legion.JobTemplateProvenance template = 4;
+   */
+  template?: JobTemplateProvenance;
+
   constructor(data?: PartialMessage<JobSpecHistoryItem>) {
     super();
     proto3.util.initPartial(data, this);
@@ -2057,6 +3063,7 @@ export class JobSpecHistoryItem extends Message<JobSpecHistoryItem> {
     { no: 1, name: "config_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 2, name: "created_at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 3, name: "version", kind: "scalar", T: 3 /* ScalarType.INT64 */, opt: true },
+    { no: 4, name: "template", kind: "message", T: JobTemplateProvenance, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): JobSpecHistoryItem {
@@ -11964,6 +12971,20 @@ export class WhoAmIReply extends Message<WhoAmIReply> {
    */
   accessorId?: string;
 
+  /**
+   * The caller's effective ACL rules as a JSON array (the same rule schema
+   * as AclPolicy.rules_json), flattened from every attached policy.
+   *
+   * This is self-introspection: it reveals only what the caller's own
+   * requests would reveal, and it is what lets clients like the UI hide
+   * controls the identity cannot use. Management tokens and disabled ACLs
+   * report `[{"resources":["*"],"actions":["*"]}]`. Unset for anonymous
+   * callers with no anonymous policy.
+   *
+   * @generated from field: optional string rules_json = 9;
+   */
+  rulesJson?: string;
+
   constructor(data?: PartialMessage<WhoAmIReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -11980,6 +13001,7 @@ export class WhoAmIReply extends Message<WhoAmIReply> {
     { no: 6, name: "policies", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
     { no: 7, name: "expires_at", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
     { no: 8, name: "accessor_id", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 9, name: "rules_json", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): WhoAmIReply {
@@ -12315,14 +13337,17 @@ export class AclTokenInfo extends Message<AclTokenInfo> {
  *
  * Rule fields:
  * - `resources`: resource types the rule covers (`job`, `node`, `kv`,
- *   `state`, `operator`, `acl`, or `*`).
+ *   `state`, `operator`, `acl`, `exec`, `action`, `template`, or `*`).
  * - `actions`: `read`, `write`, or `*`.
  * - `effect`: `allow` (default) or `deny`. A matching deny rule always
  *   overrides any allow.
  * - Optional scope selectors (glob lists matched against the request):
  *   `namespaces` (job namespaces), `names` (job names), `pools` (node
- *   pools), `paths` (KV keys). A rule with a selector only matches requests
- *   that carry that attribute.
+ *   pools), `paths` (KV keys), `actionNames` (declared action names),
+ *   `templates` (job-template names). A rule with a selector only matches
+ *   requests that carry that attribute — which is why a `job` rule with
+ *   `templates: ["x"]` grants submission only through template `x` and
+ *   never via raw RunJob.
  *
  * @generated from message legion.AclPolicy
  */

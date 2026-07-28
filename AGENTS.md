@@ -11,6 +11,7 @@
 ## Build, Test, and Development Commands
 - Build crate and plugins: `cargo build` (requires `protoc`).
 - Release build: `cargo build --release`.
+- Shipping build: `cargo build --profile dist` — adds LTO and strips symbols, cutting the binary from ~44 MB to ~26 MB at the cost of a much slower link. Output is `target/dist/legion`. See "Building a shipping binary" in `internal_docs/development.md`.
 - Run tests: `cargo test --all --locked`.
 - Run manager: `cargo run -- start manager -c configs/manager.jsonnet`.
 - Run worker: `cargo run -- join <TOKEN>` or `cargo run -- start worker <TOKEN>`.

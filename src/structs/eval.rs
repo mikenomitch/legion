@@ -188,6 +188,17 @@ impl Eval {
             .map(|rollout| rollout.id);
         match crate::manager::rollout::handle_rollout_tick(self, store) {
             Ok(message) => Ok(message),
+            // A typed NotRaftLeader is a TRANSIENT leadership shape, not a
+            // rollout failure: stamping `failed` here would be permanent
+            // (the released eval's retry finds a terminal rollout and
+            // no-ops), turning one lane blip under divergent lane
+            // leadership into a dead rollout whose job then converges via
+            // the gating-bypassing regeneration path (plan §8). Propagate
+            // it unstamped — `handle_claimed_eval` releases the eval for
+            // retry, and the tick resumes once leadership converges.
+            Err(error) if crate::storage::raft::driver::NotRaftLeader::in_chain(&error) => {
+                Err(error)
+            }
             Err(error) => {
                 if let Some(rollout_id) = rollout_id {
                     let _ = store.update_rollout_status(

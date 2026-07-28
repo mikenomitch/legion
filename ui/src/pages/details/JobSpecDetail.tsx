@@ -1,9 +1,10 @@
 import { useParams } from '@solidjs/router'
+import { AccessGate } from '../../components/AccessGate'
 import { For, Show, createResource } from 'solid-js'
 import { CodeBlock, Note, PageHeader, SectionCard, Spinner } from '../../components/ui'
 import { managerClient } from '../../grpcClient'
 
-export default function JobSpecDetail() {
+function JobSpecDetailContent() {
   const params = useParams()
   const [data] = createResource(() => params.configId, async (raw) => {
     const id = decodeURIComponent(raw)
@@ -26,5 +27,15 @@ export default function JobSpecDetail() {
         </div>
       </Show>
     </Show>
+  )
+}
+
+// Permission gate lives here at the page level — never around the router
+// outlet in the layout (see AccessGate).
+export default function JobSpecDetail() {
+  return (
+    <AccessGate resource="job">
+      <JobSpecDetailContent />
+    </AccessGate>
   )
 }

@@ -1,4 +1,5 @@
 import { A, useParams } from '@solidjs/router'
+import { AccessGate } from '../../components/AccessGate'
 import { For, Show, createMemo, createResource, createSignal, onCleanup, onMount } from 'solid-js'
 import {
   Badge,
@@ -27,7 +28,7 @@ const STATE_COPY: Record<string, string> = {
   destroyed: 'Reclaimed. The row is kept as a tombstone so you can still see where this storage went.',
 }
 
-export default function VolumeDetail() {
+function VolumeDetailContent() {
   const params = useParams()
   const volumeId = createMemo(() => decodeURIComponent(params.id))
   const [tick, setTick] = createSignal(0)
@@ -282,5 +283,15 @@ export default function VolumeDetail() {
         </Show>
       </Show>
     </div>
+  )
+}
+
+// Permission gate lives here at the page level — never around the router
+// outlet in the layout (see AccessGate).
+export default function VolumeDetail() {
+  return (
+    <AccessGate resource="job">
+      <VolumeDetailContent />
+    </AccessGate>
   )
 }

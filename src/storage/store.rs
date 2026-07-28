@@ -28,11 +28,11 @@ use crate::storage::queries::{
 };
 use crate::structs::{
     slot_instance_id, Allocation, AllocationHealth, Eval, Instance, InstanceMode, InstanceState,
-    Job, JobConfig, KvEntry, KvLock, KvValueType, LedgerEntry, ManagerConfigFull,
-    ManagerNodeConfig, Node, NodeMsg, ReplaceAfter, ResolvedOnLostPolicy, Rollout, RolloutConfig,
-    SigningKeyRecord, StatefulConfig, StatefulOnLostConfig, Submission, TaskCheck, TaskConfig,
-    TaskCount, TaskDependency, TaskLifecycle, TaskOnUnhealthyConfig, TaskSchedule, TaskStatusState,
-    Volume, WorkerConfig,
+    Job, JobConfig, JobTemplateProvenance, KvEntry, KvLock, KvValueType, LedgerEntry,
+    ManagerConfigFull, ManagerNodeConfig, Node, NodeMsg, ReplaceAfter, ResolvedOnLostPolicy,
+    Rollout, RolloutConfig, SigningKeyRecord, StatefulConfig, StatefulOnLostConfig, Submission,
+    TaskCheck, TaskConfig, TaskCount, TaskDependency, TaskLifecycle, TaskOnUnhealthyConfig,
+    TaskSchedule, TaskStatusState, Volume, WorkerConfig,
 };
 use crate::util::random_string;
 
@@ -46,7 +46,7 @@ use rusqlite_migration::Migrations;
 use serde::Serialize;
 use serde_json::{from_str, to_string, to_string_pretty, Value};
 use std::collections::hash_map::Entry;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{MutexGuard, OnceLock, RwLock};
@@ -132,6 +132,20 @@ pub struct SchedulingReadModel {
     /// `indexes`. The plan-time `ResourceLedger` clones these instead of
     /// re-parsing every node's JSON per plan.
     pub(crate) node_pools: HashMap<String, ResourcePool>,
+    /// Mirror of `allocation_epoch_partition`, keyed by
+    /// `Store::scope_vector_key`, kept COHERENT with `allocations_by_node`
+    /// (adversarial finding, 2026-07-28 — the plan-fence gap): an epoch
+    /// becomes visible in SQLite at commit, but the allocation cache is
+    /// patched later (after the raft changeset projection, in the worst
+    /// case), so a scheduler that sampled epochs from the DB could see a
+    /// NEW epoch with the OLD cache — phantom capacity that passes the
+    /// plan-apply CAS and oversubscribes the node. The scheduler now
+    /// samples from this mirror instead, and every cache updater maintains
+    /// the invariant `mirror epoch ≤ epoch of the state the cached
+    /// allocations were read from` (epochs are READ before allocations and
+    /// PUBLISHED after them), so a torn view can only make the CAS
+    /// conservative (a spurious reject + retry), never permissive.
+    pub scope_epochs: HashMap<String, i64>,
 }
 
 #[derive(Debug)]
@@ -224,6 +238,15 @@ pub struct Store {
     // see `configure_connection`); remembered so snapshot install reopens
     // the connection with the same durability level.
     durable_sync: bool,
+    // Two-sweep observation grace for the status-lane orphan sweeps
+    // (adversarial finding F2, 2026-07-28): an orphan is only DELETED after
+    // being observed by two consecutive sweeps, so a freshly failed-over
+    // status leader whose control/scheduler replicas still lag cannot
+    // replicate deletions of rows that are only orphans in its stale local
+    // view. Process-local by design — a leadership change starts a fresh
+    // (empty) observation window, which is exactly the protection.
+    node_health_orphan_candidates: Arc<std::sync::Mutex<HashSet<String>>>,
+    allocation_health_orphan_candidates: Arc<std::sync::Mutex<HashSet<i64>>>,
 }
 
 /// Result of [`Store::state_backup`]: where the backup landed, its size,
@@ -338,6 +361,79 @@ pub struct SavedStateQueryRecord {
     pub updated_at: String,
 }
 
+/// One declared variable of a job template, parsed from the template's
+/// manifest at upsert time and stored as JSON in
+/// `job_template_version.variables`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct JobTemplateVariableRecord {
+    pub key: String,
+    #[serde(rename = "type")]
+    pub var_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Defaults to true when `default` is absent, false when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<String>,
+}
+
+impl JobTemplateVariableRecord {
+    /// Effective requiredness: explicit flag, else "no default means required".
+    pub fn is_required(&self) -> bool {
+        self.required.unwrap_or(self.default.is_none())
+    }
+}
+
+/// One stored job template version, plus the template's latest version.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JobTemplateVersionRecord {
+    pub name: String,
+    pub version: u32,
+    pub latest_version: u32,
+    pub description: Option<String>,
+    pub source_jsonnet: String,
+    pub variables: Vec<JobTemplateVariableRecord>,
+    pub created_at: String,
+    pub created_by: String,
+}
+
+/// Latest-version summary row for template listings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JobTemplateSummaryRecord {
+    pub name: String,
+    pub latest_version: u32,
+    pub description: Option<String>,
+    pub variable_count: u32,
+    pub updated_at: String,
+}
+
+/// Version-history metadata (no source).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JobTemplateVersionInfoRecord {
+    pub version: u32,
+    pub created_at: String,
+    pub created_by: String,
+}
+
+/// One row of a job's spec history, including template provenance when the
+/// config was submitted through RunJobTemplate.
+#[derive(Debug, Clone)]
+pub struct JobSpecHistoryRow {
+    pub config_id: String,
+    pub created_at: String,
+    pub version: Option<i64>,
+    pub template: Option<JobTemplateProvenance>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RolloutEventRecord {
@@ -366,11 +462,14 @@ impl JobSubmitOutcome {
 }
 
 pub const CONN_LOCK_ERROR: &str = "Error locking database connection";
+
+/// SQL fragment: the id of the newest `job_config` for the job aliased `j`
+/// in the enclosing query. Shared by the standing-split reconcilers (plan
+/// §8, D1), which all scope themselves to each job's latest config.
+const LATEST_CONFIG_FOR_JOB: &str = "(SELECT jc.id FROM job_config jc \
+     WHERE jc.job_id = j.id ORDER BY jc.created_at DESC LIMIT 1)";
 const READ_ONLY_CONN_POOL_SIZE: usize = 2;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
-// Bound on the bind parameters used per batched `scope_id IN (...)` lookup in
-// `allocation_version_vector_for_candidates`; larger candidate sets are chunked.
-const SCOPE_EPOCH_QUERY_CHUNK: usize = 500;
 // Live subscribers that fall this many events behind must catch up from the
 // scheduler_event table (StreamEvents handles the Lagged case).
 const EVENT_BROADCAST_CAPACITY: usize = 1_024;
@@ -437,6 +536,8 @@ impl Store {
             raft_mode: Arc::new(AtomicBool::new(false)),
             replication: Arc::new(OnceLock::new()),
             durable_sync: raft_enabled,
+            node_health_orphan_candidates: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            allocation_health_orphan_candidates: Arc::new(std::sync::Mutex::new(HashSet::new())),
         };
 
         store.refresh_read_model()?;
@@ -466,6 +567,24 @@ impl Store {
         clone.persistence_driver =
             Arc::new(crate::storage::persistence::LocalDiskPersistenceDriver::new());
         clone.replication = Arc::new(OnceLock::new());
+        clone
+    }
+
+    /// Clone installed in the transport registry as the `ForwardLaneWrite`
+    /// executor (plan §8, D2). Like [`Self::raft_engine_clone`] it holds a
+    /// placeholder persistence driver — the registry is (indirectly) owned
+    /// by the driver, so a real-driver clone would be the reference cycle
+    /// `driver → registry → store → driver` and the engine (with its data
+    /// dir lock) would never drop — but unlike it, the REPLICATION cell is
+    /// shared: the executor must propose forwarded ops through the real
+    /// pipeline. The placeholder driver also makes re-forwarding
+    /// structurally impossible (rule 2 of `raft::forward`): a leadership
+    /// rejection inside the executor cannot resolve a lane leader to
+    /// forward to, so it propagates typed to the origin.
+    pub(crate) fn forward_executor_clone(&self) -> Store {
+        let mut clone = self.clone();
+        clone.persistence_driver =
+            Arc::new(crate::storage::persistence::LocalDiskPersistenceDriver::new());
         clone
     }
 
@@ -959,6 +1078,55 @@ impl Store {
         capture::local_write(self, op, f)
     }
 
+    /// Forward `op` to its lane's leader after a local typed rejection
+    /// (plan §8, D2 — the lane-write forwarding seam). Called by the
+    /// forwarding wrappers around worker-plane and daemon writes whose loss
+    /// cascades (heartbeats → false node-lost + self-fencing; failure
+    /// reports → silent loss; availability sync → lost nodes staying
+    /// schedulable) and whose callers cannot chase per-lane leaders.
+    ///
+    /// The error contract is preserved end to end: every failure path out
+    /// of the forward carries a typed `NotRaftLeader` in its chain EXCEPT a
+    /// real execution failure on the leader, which propagates as itself —
+    /// callers' tolerance logic sees exactly the surface it saw before
+    /// forwarding existed, plus successes it could not have had.
+    fn forward_after_rejection<T: serde::de::DeserializeOwned>(
+        &self,
+        op: crate::storage::raft::forward::ForwardableLaneWrite,
+        original: anyhow::Error,
+    ) -> R<T> {
+        let Some(driver) = self
+            .persistence_driver
+            .as_any()
+            .downcast_ref::<crate::storage::raft::driver::MultiRaftDriver>()
+        else {
+            // Non-raft backends never produce the typed rejection, so this
+            // is defensive: surface what actually happened.
+            return Err(original);
+        };
+        match driver.forward_lane_write(&op) {
+            Ok(value) => {
+                debug!(
+                    op = op.op_name(),
+                    lane = op.lane().wire_name(),
+                    "lane write forwarded to the lane leader"
+                );
+                serde_json::from_value(value).with_context(|| {
+                    format!("undecodable forwarded return value for {}", op.op_name())
+                })
+            }
+            Err(forward_err) => {
+                warn!(
+                    op = op.op_name(),
+                    lane = op.lane().wire_name(),
+                    error = %forward_err,
+                    "lane-write forwarding did not complete"
+                );
+                Err(forward_err)
+            }
+        }
+    }
+
     /// Open a write transaction as a SAVEPOINT (JC-5). `BEGIN` cannot run
     /// inside the capture savepoint, and a top-level SQLite savepoint
     /// behaves exactly like a deferred transaction, so this is the one
@@ -1310,6 +1478,28 @@ impl Store {
 
     fn load_read_model(&self) -> R<SchedulingReadModel> {
         let conn = self.read_connection()?;
+        // Epochs are read BEFORE the allocation snapshot (the mirror's
+        // coherence invariant — see `SchedulingReadModel::scope_epochs`): a
+        // commit landing between the two queries then leaves the mirror
+        // BEHIND the allocations, which the plan-apply CAS resolves as a
+        // conservative reject, never as phantom capacity.
+        let scope_epochs: HashMap<String, i64> = {
+            let mut stmt = conn
+                .prepare("SELECT scope_type, scope_id, epoch FROM allocation_epoch_partition;")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?;
+            let mut epochs = HashMap::new();
+            for row in rows {
+                let (scope_type, scope_id, epoch) = row?;
+                epochs.insert(Self::scope_vector_key(&scope_type, &scope_id), epoch);
+            }
+            epochs
+        };
         let mut nodes_stmt = conn.prepare(GET_NODES.as_str())?;
         let nodes = Self::collect_rows(nodes_stmt.query_map([], |row| self.node_from_row(row))?)?;
 
@@ -1393,6 +1583,7 @@ impl Store {
             task_configs,
             indexes: IndexSet::new(Arc::clone(&self.index_settings)),
             node_pools: HashMap::new(),
+            scope_epochs,
         };
         let id_refs: Vec<&str> = node_ids.iter().map(String::as_str).collect();
         Self::reproject_model_nodes(&mut model, &self.resource_policy, &id_refs);
@@ -1515,60 +1706,80 @@ impl Store {
         Ok(())
     }
 
-    fn cache_add_allocations(&self, allocations: &[Allocation]) -> R<()> {
+    /// Refresh the allocation cache AND the epoch mirror for a set of
+    /// scopes, from committed state, coherently (the plan-fence fix — see
+    /// `SchedulingReadModel::scope_epochs`).
+    ///
+    /// Ordering is the invariant: epochs are READ first, allocations
+    /// second, and both are PUBLISHED under one write-lock acquisition. A
+    /// commit interleaving between the two reads leaves the published
+    /// mirror epoch *behind* the published allocations, which the
+    /// plan-apply CAS resolves as a conservative reject; the reverse
+    /// ordering could publish an epoch *ahead* of the allocations — the
+    /// exact phantom-capacity window this exists to close.
+    fn cache_refresh_allocation_scopes(
+        &self,
+        node_ids: &BTreeSet<String>,
+        job_config_ids: &BTreeSet<String>,
+    ) -> R<()> {
         if capture::in_capture() {
             return Ok(());
         }
-        let mut guard = self.read_model_writer()?;
-        for allocation in allocations {
-            Arc::make_mut(
-                guard
-                    .allocations_by_node
-                    .entry(allocation.node_id.clone())
-                    .or_default(),
-            )
-            .push(allocation.clone());
+        // 1. Epochs first.
+        let mut epochs: Vec<(String, i64)> = Vec::new();
+        for node_id in node_ids {
+            epochs.push((
+                Self::scope_vector_key("node", node_id),
+                self.allocation_epoch_for_scope("node", node_id)?,
+            ));
         }
-        let affected: HashSet<&str> = allocations
-            .iter()
-            .map(|allocation| allocation.node_id.as_str())
-            .collect();
-        let affected: Vec<&str> = affected.into_iter().collect();
+        for job_config_id in job_config_ids {
+            epochs.push((
+                Self::scope_vector_key("job_config", job_config_id),
+                self.allocation_epoch_for_scope("job_config", job_config_id)?,
+            ));
+        }
+        // 2. Allocations second.
+        let mut per_node: Vec<(String, Vec<Allocation>)> = Vec::new();
+        for node_id in node_ids {
+            per_node.push((node_id.clone(), self.allocs_for_node(node_id)?));
+        }
+        // 3. Publish atomically, then re-derive the affected nodes' free
+        // pools and index projections from the refreshed allocations —
+        // inside the same lock, so `node_pools`/`indexes` can never be
+        // observed out of step with `allocations_by_node` (the
+        // plan-snapshot cache's own invariant).
+        let mut guard = self.read_model_writer()?;
+        for (node_id, allocs) in per_node {
+            guard.allocations_by_node.insert(node_id, Arc::new(allocs));
+        }
+        for (key, epoch) in epochs {
+            guard.scope_epochs.insert(key, epoch);
+        }
+        let affected: Vec<&str> = node_ids.iter().map(String::as_str).collect();
         Self::reproject_model_nodes(&mut guard, &self.resource_policy, &affected);
         Ok(())
     }
 
-    fn cache_clear_allocations_for_node(&self, node_id: &str) -> R<()> {
-        if capture::in_capture() {
-            return Ok(());
+    /// Scope sets (nodes + job configs) touched by a batch of allocations.
+    fn allocation_scopes(allocations: &[Allocation]) -> (BTreeSet<String>, BTreeSet<String>) {
+        let mut node_ids = BTreeSet::new();
+        let mut job_config_ids = BTreeSet::new();
+        for allocation in allocations {
+            node_ids.insert(allocation.node_id.clone());
+            job_config_ids.insert(allocation.job_config_id.clone());
         }
-        let mut guard = self.read_model_writer()?;
-        guard
-            .allocations_by_node
-            .insert(node_id.to_string(), Arc::new(Vec::new()));
-        Self::reproject_model_nodes(&mut guard, &self.resource_policy, &[node_id]);
-        Ok(())
+        (node_ids, job_config_ids)
+    }
+
+    fn cache_add_allocations(&self, allocations: &[Allocation]) -> R<()> {
+        let (node_ids, job_config_ids) = Self::allocation_scopes(allocations);
+        self.cache_refresh_allocation_scopes(&node_ids, &job_config_ids)
     }
 
     fn cache_remove_allocations(&self, allocations: &[Allocation]) -> R<()> {
-        if capture::in_capture() {
-            return Ok(());
-        }
-        let mut guard = self.read_model_writer()?;
-        for allocation in allocations {
-            if let Some(node_allocs) = guard.allocations_by_node.get_mut(&allocation.node_id) {
-                if node_allocs.iter().any(|alloc| alloc.id == allocation.id) {
-                    Arc::make_mut(node_allocs).retain(|alloc| alloc.id != allocation.id);
-                }
-            }
-        }
-        let affected: HashSet<&str> = allocations
-            .iter()
-            .map(|allocation| allocation.node_id.as_str())
-            .collect();
-        let affected: Vec<&str> = affected.into_iter().collect();
-        Self::reproject_model_nodes(&mut guard, &self.resource_policy, &affected);
-        Ok(())
+        let (node_ids, job_config_ids) = Self::allocation_scopes(allocations);
+        self.cache_refresh_allocation_scopes(&node_ids, &job_config_ids)
     }
 
     fn cache_set_task_configs_for_job_config(
@@ -1686,16 +1897,24 @@ impl Store {
         job_config_id: &str,
         node_ids: &HashSet<String>,
     ) -> R<BTreeMap<String, i64>> {
+        // Sampled from the epoch MIRROR, not the DB (see
+        // `SchedulingReadModel::scope_epochs`): the DB epoch can be ahead
+        // of the allocation cache the planner reads next, and that pairing
+        // is exactly the phantom-capacity window the plan-apply CAS cannot
+        // catch. A missing mirror entry samples `0`, matching what
+        // `ensure_scope_epoch_tx` seeds; a mirror entry older than the DB
+        // only makes the CAS reject spuriously (retried), never admit.
+        let guard = self.read_model_reader()?;
         let mut versions = BTreeMap::new();
+        let job_key = Self::scope_vector_key("job_config", job_config_id);
         versions.insert(
-            Self::scope_vector_key("job_config", job_config_id),
-            self.allocation_epoch_for_scope("job_config", job_config_id)?,
+            job_key.clone(),
+            guard.scope_epochs.get(&job_key).copied().unwrap_or(0),
         );
         for node_id in node_ids {
-            versions.insert(
-                Self::scope_vector_key("node", node_id),
-                self.allocation_epoch_for_scope("node", node_id)?,
-            );
+            let key = Self::scope_vector_key("node", node_id);
+            let epoch = guard.scope_epochs.get(&key).copied().unwrap_or(0);
+            versions.insert(key, epoch);
         }
         Ok(versions)
     }
@@ -1723,38 +1942,30 @@ impl Store {
         job_config_id: &str,
         node_ids: &[&str],
     ) -> R<BTreeMap<String, i64>> {
+        // Sampled from the epoch MIRROR under one read-lock acquisition,
+        // not from the DB (adversarial finding, 2026-07-28): a commit makes
+        // the DB epoch visible immediately, but the allocation cache the
+        // planner reads next is patched later — under raft, after the whole
+        // changeset projection — so a DB sample could pair a NEW epoch with
+        // the OLD cache and pass the plan-apply CAS against phantom
+        // capacity. The mirror is maintained coherently with the cache
+        // (epochs read before allocations, published after them), so the
+        // only torn pairing it can produce is epoch-behind-cache — a
+        // conservative reject, retried by the eval. Missing entries sample
+        // `0`, matching `ensure_scope_epoch_tx`'s seed for genuinely fresh
+        // scopes; hydration loads every existing epoch row so restart never
+        // leaves a populated scope sampling `0` forever.
+        let guard = self.read_model_reader()?;
         let mut versions = BTreeMap::new();
-        let conn = self.read_connection()?;
-        let job_epoch: Option<i64> = conn
-            .query_row(
-                "SELECT epoch FROM allocation_epoch_partition WHERE scope_type = 'job_config' AND scope_id = ?1;",
-                params![job_config_id],
-                |row| row.get(0),
-            )
-            .optional()?;
+        let job_key = Self::scope_vector_key("job_config", job_config_id);
         versions.insert(
-            Self::scope_vector_key("job_config", job_config_id),
-            job_epoch.unwrap_or(0),
+            job_key.clone(),
+            guard.scope_epochs.get(&job_key).copied().unwrap_or(0),
         );
         for node_id in node_ids {
-            versions.insert(Self::scope_vector_key("node", node_id), 0);
-        }
-        for chunk in node_ids.chunks(SCOPE_EPOCH_QUERY_CHUNK) {
-            let placeholders = std::iter::repeat_n("?", chunk.len())
-                .collect::<Vec<_>>()
-                .join(",");
-            let sql = format!(
-                "SELECT scope_id, epoch FROM allocation_epoch_partition \
-                 WHERE scope_type = 'node' AND scope_id IN ({placeholders});"
-            );
-            let mut stmt = conn.prepare(&sql)?;
-            let rows = stmt.query_map(params_from_iter(chunk.iter()), |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-            })?;
-            for row in rows {
-                let (scope_id, epoch) = row?;
-                versions.insert(Self::scope_vector_key("node", &scope_id), epoch);
-            }
+            let key = Self::scope_vector_key("node", node_id);
+            let epoch = guard.scope_epochs.get(&key).copied().unwrap_or(0);
+            versions.insert(key, epoch);
         }
         Ok(versions)
     }
@@ -1912,13 +2123,59 @@ impl Store {
         let outcome = self.replicated(Lane::Scheduler, "apply_plan_submission", move |s| {
             s.apply_plan_submission_apply(&submission)
         })?;
+        // Self-heal the epoch mirror on rejection: the CAS just proved the
+        // sampler's mirror was behind the database for these scopes (a
+        // competing plan applied, or a write path bumped an epoch without a
+        // cache refresh). Refreshing the rejected scopes — epochs first,
+        // allocations second, like every mirror update — makes the retry
+        // sample fresh state instead of failing on the same stale entries
+        // forever.
+        if let PlanApplyOutcome::Rejected {
+            latest_versions, ..
+        } = &outcome
+        {
+            let mut node_ids = BTreeSet::new();
+            let mut job_config_ids = BTreeSet::new();
+            for key in latest_versions.keys() {
+                match Self::parse_scope_vector_key(key) {
+                    Ok(("node", id)) => {
+                        node_ids.insert(id.to_string());
+                    }
+                    Ok(("job_config", id)) => {
+                        job_config_ids.insert(id.to_string());
+                    }
+                    _ => {}
+                }
+            }
+            self.cache_refresh_allocation_scopes(&node_ids, &job_config_ids)?;
+        }
         // Lifecycle-derived task_status transitions are status-lane writes
         // (plan §7-C2, C-2), so they follow the scheduler-lane apply as a
         // separate single-lane op instead of riding its changeset. Same
         // rows/values as the pre-split in-transaction update
         // (`task_status_for_lifecycle` per placed task).
+        //
+        // Standing-split tolerance (plan §8, D1): the plan is APPLIED at
+        // this point — failing the caller for the status projection would
+        // make every plan-applying eval fail-and-retry after mutating
+        // allocations (the churn loop: a `job_update` retry removes and
+        // re-places the full allocation set every cycle). The statuses are
+        // derivable — the status leader's seed reconciler and the workers'
+        // own status reports converge them — so a typed `NotRaftLeader`
+        // here is warn-and-continue; any other error still fails.
         if let PlanApplyOutcome::Applied(allocations) = &outcome {
-            self.update_task_statuses_for_allocations(allocations)?;
+            if let Err(err) = self.update_task_statuses_for_allocations(allocations) {
+                if !crate::storage::raft::driver::NotRaftLeader::in_chain(&err) {
+                    return Err(err);
+                }
+                warn!(
+                    allocations = allocations.len(),
+                    error = %err,
+                    "status-lane task_status projection deferred: this node does not lead \
+                     the status lane; worker reports and the status leader's reconciler \
+                     will converge the statuses"
+                );
+            }
         }
         Ok(outcome)
     }
@@ -2029,15 +2286,31 @@ impl Store {
                     submission.id
                 )
             })?;
-            if !state
-                .constraints
-                .is_satisfied(node, state.distinct.as_ref())
+            // Availability is re-validated on the FRESH node row, not only
+            // constraints/permit (adversarial finding, 2026-07-28): a
+            // cordon (`set_node_availability`, control lane) or a node loss
+            // landing between the planner's snapshot and this apply bumps
+            // no allocation epoch — the CAS structurally cannot see it — so
+            // without this check a plan placed onto a node the operator
+            // just drained, and nothing ever reconciled the placement away.
+            let unavailable = node.availability != "available";
+            if unavailable
+                || !state
+                    .constraints
+                    .is_satisfied(node, state.distinct.as_ref())
                 || !state.permit.is_permitted(node)
             {
-                let reason = format!(
-                    "Node {} does not satisfy constraints for task {}",
-                    node_id, task_id
-                );
+                let reason = if unavailable {
+                    format!(
+                        "Node {} is {} (cordoned, draining, or lost since the plan snapshot)",
+                        node_id, node.availability
+                    )
+                } else {
+                    format!(
+                        "Node {} does not satisfy constraints for task {}",
+                        node_id, task_id
+                    )
+                };
                 tx.execute(
                     "UPDATE plan_submission SET status = 'rejected', rejection_reason = ?1 WHERE id = ?2;",
                     params![reason, submission.id],
@@ -2748,12 +3021,34 @@ impl Store {
     /// as `insert_node`.
     #[instrument(err, skip_all)]
     pub fn mark_node_ready(&self, id: &str, last_heartbeat: &str) -> R<()> {
+        // Both halves are forwarding wrappers (plan §8, D2): the composite
+        // completes from whichever node runs it — the registration RPC's
+        // manager, or the scheduler-lane leader's node_join eval handler —
+        // regardless of where the status and control leaders sit.
+        match self.mark_node_ready_status_local(id, last_heartbeat) {
+            Err(err) if crate::storage::raft::driver::NotRaftLeader::in_chain(&err) => {
+                self.forward_after_rejection::<()>(
+                    crate::storage::raft::forward::ForwardableLaneWrite::MarkNodeReady {
+                        id: id.to_owned(),
+                        last_heartbeat: last_heartbeat.to_owned(),
+                    },
+                    err,
+                )?;
+            }
+            Err(err) => return Err(err),
+            Ok(()) => {}
+        }
+        self.sync_node_availability(&[id.to_owned()], "available")
+    }
+
+    /// The status half of [`Self::mark_node_ready`], non-forwarding (also
+    /// the `ForwardLaneWrite` executor's entry point).
+    pub(crate) fn mark_node_ready_status_local(&self, id: &str, last_heartbeat: &str) -> R<()> {
         let id_owned = id.to_owned();
         let last_heartbeat = last_heartbeat.to_owned();
         self.replicated(Lane::Status, "mark_node_ready", move |s| {
             s.mark_node_ready_apply(&id_owned, &last_heartbeat)
-        })?;
-        self.sync_node_availability(&[id.to_owned()], "available")
+        })
     }
 
     fn mark_node_ready_apply(&self, id: &str, last_heartbeat: &str) -> R<()> {
@@ -2796,11 +3091,31 @@ impl Store {
     /// drive [`Self::reschedule_allocations_for_lost_node`] separately.
     #[instrument(err, skip_all)]
     pub fn mark_node_lost(&self, id: &str) -> R<()> {
+        // Same forwarding shape as mark_node_ready: the node_drop eval runs
+        // on the scheduler-lane leader, which may lead neither the status
+        // nor the control lane.
+        match self.mark_node_lost_status_local(id) {
+            Err(err) if crate::storage::raft::driver::NotRaftLeader::in_chain(&err) => {
+                self.forward_after_rejection::<()>(
+                    crate::storage::raft::forward::ForwardableLaneWrite::MarkNodeLost {
+                        id: id.to_owned(),
+                    },
+                    err,
+                )?;
+            }
+            Err(err) => return Err(err),
+            Ok(()) => {}
+        }
+        self.sync_node_availability(&[id.to_owned()], "unavailable")
+    }
+
+    /// The status half of [`Self::mark_node_lost`], non-forwarding (also
+    /// the `ForwardLaneWrite` executor's entry point).
+    pub(crate) fn mark_node_lost_status_local(&self, id: &str) -> R<()> {
         let id_owned = id.to_owned();
         self.replicated(Lane::Status, "mark_node_lost", move |s| {
             s.mark_node_lost_apply(&id_owned)
-        })?;
-        self.sync_node_availability(&[id.to_owned()], "unavailable")
+        })
     }
 
     fn mark_node_lost_apply(&self, id: &str) -> R<()> {
@@ -2842,6 +3157,29 @@ impl Store {
     /// ([`Self::set_node_availability`] stays that). No-op for ids that are
     /// not registered, like the writes it replaces.
     fn sync_node_availability(&self, ids: &[String], availability: &str) -> R<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        // Forwarding wrapper (plan §8, D2): this is the control half of the
+        // mark-ready/mark-lost composites, run from the STATUS-lane
+        // leader's checker — under divergent leadership its rejection left
+        // a lost node's `availability` stuck `available`, so the scheduler
+        // kept placing replacements onto a node the manager could no longer
+        // observe.
+        match self.sync_node_availability_local(ids, availability) {
+            Err(err) if crate::storage::raft::driver::NotRaftLeader::in_chain(&err) => self
+                .forward_after_rejection(
+                    crate::storage::raft::forward::ForwardableLaneWrite::SyncNodeAvailability {
+                        ids: ids.to_vec(),
+                        availability: availability.to_owned(),
+                    },
+                    err,
+                ),
+            other => other,
+        }
+    }
+
+    pub(crate) fn sync_node_availability_local(&self, ids: &[String], availability: &str) -> R<()> {
         if ids.is_empty() {
             return Ok(());
         }
@@ -3037,7 +3375,10 @@ impl Store {
         tx.commit()?;
         drop(conn);
 
-        self.cache_clear_allocations_for_node(node_id)?;
+        // Refresh by allocation SCOPES, not just the node: the bump above
+        // advanced the removed allocations' job_config epochs too, and the
+        // epoch mirror must learn them with the cache (plan-fence fix).
+        self.cache_remove_allocations(&allocs)?;
 
         self.events()
             .allocations_removed_from_node(node_id, &allocs);
@@ -3328,6 +3669,16 @@ impl Store {
     /// from `node` — so this is periodic maintenance, run by the
     /// node-status checker on the status-lane leader. Skips the replication
     /// seam entirely when there is nothing to sweep.
+    ///
+    /// **Two-sweep observation grace (adversarial finding F2, 2026-07-28).**
+    /// Orphanhood is judged against this node's LOCAL control-lane replica,
+    /// which can lag: a freshly failed-over status leader may not yet have
+    /// applied recent registrations, and the DELETE it proposes replicates
+    /// to every node — erasing a live `node_health` row (and with it
+    /// `lost_at`, the stateful loss-confirmation clock). A row is therefore
+    /// only deleted after appearing in TWO consecutive sweeps; the
+    /// candidate set is process-local, so a leadership change always starts
+    /// a fresh observation window.
     #[instrument(err, skip_all)]
     pub fn prune_node_health_orphans(&self) -> R<usize> {
         let orphans: Vec<String> = {
@@ -3341,11 +3692,25 @@ impl Store {
             drop(stmt);
             orphans
         };
-        if orphans.is_empty() {
+        let confirmed: Vec<String> = {
+            let mut candidates = self
+                .node_health_orphan_candidates
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let current: HashSet<String> = orphans.into_iter().collect();
+            let confirmed = current
+                .iter()
+                .filter(|id| candidates.contains(*id))
+                .cloned()
+                .collect();
+            *candidates = current;
+            confirmed
+        };
+        if confirmed.is_empty() {
             return Ok(0);
         }
         self.replicated(Lane::Status, "prune_node_health_orphans", move |s| {
-            s.prune_node_health_orphans_apply(&orphans)
+            s.prune_node_health_orphans_apply(&confirmed)
         })
     }
 
@@ -3369,8 +3734,9 @@ impl Store {
     /// status-lane health rows — so removal paths leave the health row
     /// behind. Orphans are harmless while they exist (every reader joins
     /// FROM `allocation`); this periodic status-lane sweep collects them,
-    /// mirroring [`Self::prune_node_health_orphans`]. Skips the replication
-    /// seam entirely when there is nothing to sweep.
+    /// mirroring [`Self::prune_node_health_orphans`] — including its
+    /// two-sweep observation grace (the local scheduler-lane replica this
+    /// sweep judges orphanhood against can lag the same way).
     #[instrument(err, skip_all)]
     pub fn prune_allocation_health_orphans(&self) -> R<usize> {
         let orphans: Vec<i64> = {
@@ -3384,11 +3750,25 @@ impl Store {
             drop(stmt);
             orphans
         };
-        if orphans.is_empty() {
+        let confirmed: Vec<i64> = {
+            let mut candidates = self
+                .allocation_health_orphan_candidates
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let current: HashSet<i64> = orphans.into_iter().collect();
+            let confirmed = current
+                .iter()
+                .filter(|id| candidates.contains(*id))
+                .copied()
+                .collect();
+            *candidates = current;
+            confirmed
+        };
+        if confirmed.is_empty() {
             return Ok(0);
         }
         self.replicated(Lane::Status, "prune_allocation_health_orphans", move |s| {
-            s.prune_allocation_health_orphans_apply(&orphans)
+            s.prune_allocation_health_orphans_apply(&confirmed)
         })
     }
 
@@ -3453,7 +3833,28 @@ impl Store {
     }
 
     #[instrument(err, skip_all)]
+    /// Record a worker heartbeat. Forwarding wrapper (plan §8, D2): a
+    /// heartbeat is new information no reconciler can re-derive, and
+    /// workers dial ONE manager forever — a standing rejection here marks
+    /// healthy nodes lost within seconds and self-fences their stateful
+    /// allocations. When this node does not lead the status lane the write
+    /// is forwarded to the lane leader; the worker's RPC surface is
+    /// unchanged.
     pub fn update_node_heartbeat(&self, id: String) -> R<()> {
+        match self.update_node_heartbeat_local(id.clone()) {
+            Err(err) if crate::storage::raft::driver::NotRaftLeader::in_chain(&err) => self
+                .forward_after_rejection(
+                    crate::storage::raft::forward::ForwardableLaneWrite::NodeHeartbeat { id },
+                    err,
+                ),
+            other => other,
+        }
+    }
+
+    /// The non-forwarding variant, executed locally and by the
+    /// `ForwardLaneWrite` executor (never re-forwards — rule 2 of
+    /// `raft::forward`).
+    pub(crate) fn update_node_heartbeat_local(&self, id: String) -> R<()> {
         self.replicated(Lane::Status, "update_node_heartbeat", move |s| {
             s.update_node_heartbeat_apply(id)
         })
@@ -3495,6 +3896,20 @@ impl Store {
 
     #[instrument(err, skip_all)]
     pub fn update_node_health_checks(&self, id: &str, health_checks: &str) -> R<()> {
+        match self.update_node_health_checks_local(id, health_checks) {
+            Err(err) if crate::storage::raft::driver::NotRaftLeader::in_chain(&err) => self
+                .forward_after_rejection(
+                    crate::storage::raft::forward::ForwardableLaneWrite::NodeHealthChecks {
+                        id: id.to_owned(),
+                        health_checks: health_checks.to_owned(),
+                    },
+                    err,
+                ),
+            other => other,
+        }
+    }
+
+    pub(crate) fn update_node_health_checks_local(&self, id: &str, health_checks: &str) -> R<()> {
         let id = id.to_owned();
         let health_checks = health_checks.to_owned();
         self.replicated(Lane::Status, "update_node_health_checks", move |s| {
@@ -3645,6 +4060,19 @@ impl Store {
 
     #[instrument(err, skip_all)]
     pub fn mark_job_failed(&self, job_id: &str) -> R<()> {
+        match self.mark_job_failed_local(job_id) {
+            Err(err) if crate::storage::raft::driver::NotRaftLeader::in_chain(&err) => self
+                .forward_after_rejection(
+                    crate::storage::raft::forward::ForwardableLaneWrite::MarkJobFailed {
+                        job_id: job_id.to_owned(),
+                    },
+                    err,
+                ),
+            other => other,
+        }
+    }
+
+    pub(crate) fn mark_job_failed_local(&self, job_id: &str) -> R<()> {
         let job_id = job_id.to_owned();
         self.replicated(Lane::Control, "mark_job_failed", move |s| {
             s.mark_job_failed_apply(&job_id)
@@ -4124,11 +4552,11 @@ impl Store {
         Ok(job_id)
     }
 
-    pub fn list_job_spec_history(&self, name: &str) -> R<Vec<(String, String, Option<i64>)>> {
+    pub fn list_job_spec_history(&self, name: &str) -> R<Vec<JobSpecHistoryRow>> {
         let conn = self.read_connection()?;
         let mut stmt = conn.prepare(
             r#"
-            SELECT jc.id, jc.created_at, jc.version
+            SELECT jc.id, jc.created_at, jc.version, jc.meta
             FROM job_config jc
             INNER JOIN job j ON j.id = jc.job_id
             WHERE j.name = ?
@@ -4137,10 +4565,75 @@ impl Store {
         )?;
 
         let rows = stmt.query_map([name], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get::<_, Option<i64>>(2)?))
+            Ok(JobSpecHistoryRow {
+                config_id: row.get(0)?,
+                created_at: row.get(1)?,
+                version: row.get::<_, Option<i64>>(2)?,
+                template: Self::template_provenance_from_meta(row.get::<_, Option<Value>>(3)?),
+            })
         })?;
 
         Self::collect_rows(rows)
+    }
+
+    fn template_provenance_from_meta(meta: Option<Value>) -> Option<JobTemplateProvenance> {
+        meta.as_ref()
+            .and_then(|meta| meta.get("jobTemplate"))
+            .and_then(|value| serde_json::from_value(value.clone()).ok())
+    }
+
+    /// Template provenance of a job's latest config, when it was submitted
+    /// through RunJobTemplate.
+    #[instrument(err, skip_all)]
+    pub fn job_template_provenance(&self, job_name: &str) -> R<Option<JobTemplateProvenance>> {
+        let conn = self.read_connection()?;
+        let meta: Option<Value> = conn
+            .query_row(
+                r#"
+                SELECT jc.meta
+                FROM job_config jc
+                INNER JOIN job j ON j.id = jc.job_id
+                WHERE j.name = ?
+                ORDER BY jc.version DESC
+                LIMIT 1;
+                "#,
+                [job_name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(Self::template_provenance_from_meta(meta))
+    }
+
+    /// Latest-config template provenance for every job, keyed by job name.
+    /// Used to filter list replies for template-scoped identities without a
+    /// per-row query.
+    #[instrument(err, skip_all)]
+    pub fn job_template_provenance_map(&self) -> R<HashMap<String, JobTemplateProvenance>> {
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT j.name, jc.meta
+            FROM job j
+            INNER JOIN job_config jc ON jc.job_id = j.id
+            WHERE jc.version = (
+                SELECT MAX(version) FROM job_config WHERE job_id = j.id
+            );
+            "#,
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                Self::template_provenance_from_meta(row.get::<_, Option<Value>>(1)?),
+            ))
+        })?;
+        let mut map = HashMap::new();
+        for row in rows {
+            let (name, provenance) = row?;
+            if let Some(provenance) = provenance {
+                map.insert(name, provenance);
+            }
+        }
+        Ok(map)
     }
 
     /// Submit a job config. Composite across the lane boundary (plan §7-C2,
@@ -4154,16 +4647,51 @@ impl Store {
     /// single transaction; a crash between the ops leaves task rows whose
     /// missing status simply stays unreported until placement or the first
     /// status write (cross-op atomicity was never promised, §A2).
+    ///
+    /// **Standing-split tolerance (plan §8, D1):** the control half carries
+    /// the operator's intent and MUST commit (a rejection there is the
+    /// caller's typed leader-hint error, unchanged). The status seed and
+    /// the volume-claim sync are idempotent projections of the committed
+    /// control rows, so when this node does not lead those lanes (divergent
+    /// lane leadership, JC-40 best-effort co-location) their typed
+    /// `NotRaftLeader` rejection is tolerated: the submit succeeds, and the
+    /// owning lane's leader completes the half via its reconciler
+    /// ([`Self::seed_missing_task_statuses`] /
+    /// [`Self::sync_missing_task_volume_claims`], run from the
+    /// node-status-checker loop) once the control rows replicate to it.
+    /// Every other error on those halves still fails the submit.
     #[allow(dead_code)]
     pub fn handle_job_submit(
         &self,
         config: &JobConfig,
         subs: &[Submission],
     ) -> R<JobSubmitOutcome> {
+        self.handle_job_submit_inner(config, subs, None)
+    }
+
+    /// Like `handle_job_submit`, stamping the template that rendered this
+    /// config into the config's meta for provenance (spec history, the
+    /// RunJobTemplate collision guard, and template-scoped ACL reads).
+    pub fn handle_job_submit_from_template(
+        &self,
+        config: &JobConfig,
+        subs: &[Submission],
+        template: &JobTemplateProvenance,
+    ) -> R<JobSubmitOutcome> {
+        self.handle_job_submit_inner(config, subs, Some(template))
+    }
+
+    fn handle_job_submit_inner(
+        &self,
+        config: &JobConfig,
+        subs: &[Submission],
+        template: Option<&JobTemplateProvenance>,
+    ) -> R<JobSubmitOutcome> {
         let config = config.clone();
         let subs = subs.to_vec();
+        let template = template.cloned();
         let outcome = self.replicated(Lane::Control, "handle_job_submit", move |s| {
-            s.handle_job_submit_apply(&config, &subs)
+            s.handle_job_submit_apply(&config, &subs, template.as_ref())
         })?;
         // The status half runs for EVERY outcome, `Unchanged` included
         // (JC-40 composite-retry idempotency): if a previous attempt's
@@ -4178,9 +4706,19 @@ impl Store {
         // an empty changeset skips the raft entry entirely (JC-26), so a
         // steady-state resubmit does not even reach the log.
         let job_config_id = outcome.job_config_id().to_string();
-        self.replicated(Lane::Status, "seed_task_statuses", move |s| {
+        if let Err(err) = self.replicated(Lane::Status, "seed_task_statuses", move |s| {
             s.seed_task_statuses_apply(&job_config_id)
-        })?;
+        }) {
+            if !crate::storage::raft::driver::NotRaftLeader::in_chain(&err) {
+                return Err(err);
+            }
+            warn!(
+                job_config_id = outcome.job_config_id(),
+                error = %err,
+                "status-lane seed deferred: this node does not lead the status lane; \
+                 the status leader's reconciler will seed the task rows"
+            );
+        }
         // Scheduler half: the `volume` rows behind the tasks' `volumes[]`
         // claims. `volume` is scheduler-owned (its lifecycle is bound to the
         // scheduler-owned `instance`, and the reclaim reaper drives its state
@@ -4212,9 +4750,19 @@ impl Store {
         // mounts from this table, so a claim that materializes late is still
         // in place before any allocation of the task can mount it.
         let job_config_id = outcome.job_config_id().to_string();
-        self.replicated(Lane::Scheduler, "sync_task_volume_claims", move |s| {
+        if let Err(err) = self.replicated(Lane::Scheduler, "sync_task_volume_claims", move |s| {
             s.sync_task_volume_claims_apply(&job_config_id)
-        })?;
+        }) {
+            if !crate::storage::raft::driver::NotRaftLeader::in_chain(&err) {
+                return Err(err);
+            }
+            warn!(
+                job_config_id = outcome.job_config_id(),
+                error = %err,
+                "scheduler-lane volume-claim sync deferred: this node does not lead the \
+                 scheduler lane; the scheduler leader's reconciler will sync the claims"
+            );
+        }
         Ok(outcome)
     }
 
@@ -4234,10 +4782,70 @@ impl Store {
         Ok(())
     }
 
+    /// Status-lane reconciler for submit seeds deferred under divergent lane
+    /// leadership (plan §8, D1): seed a `pending` `task_status` row for
+    /// every task of every active job's LATEST config that is missing one.
+    /// The submit composite tolerates a status-lane rejection of its seed
+    /// half ([`Self::handle_job_submit`]); this pass, run by the
+    /// node-status-checker loop on the status-lane leader, completes those
+    /// halves once the control rows have replicated here. Idempotent and
+    /// empty in steady state — zero missing rows means an empty changeset,
+    /// which never reaches the raft log (JC-26). Returns how many rows were
+    /// seeded.
+    ///
+    /// Scoped to each job's latest config deliberately: a superseded config
+    /// that never got its seed is dead — placement and status reporting only
+    /// ever act on the latest — so seeding it would create junk `pending`
+    /// rows no view wants.
+    pub fn seed_missing_task_statuses(&self) -> R<u64> {
+        // Cheap read-side probe first, so the steady state costs one query
+        // and no replicated op at all.
+        let missing: i64 = {
+            let conn = self.read_connection()?;
+            conn.query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM task_config tc
+                     INNER JOIN job j ON j.id = tc.job_id
+                     WHERE j.status NOT IN ('stopped', 'failed')
+                       AND tc.job_config_id = {LATEST_CONFIG_FOR_JOB}
+                       AND NOT EXISTS (
+                         SELECT 1 FROM task_status ts WHERE ts.task_config_id = tc.id
+                       );"
+                ),
+                [],
+                |row| row.get(0),
+            )?
+        };
+        if missing == 0 {
+            return Ok(0);
+        }
+        self.replicated(Lane::Status, "seed_missing_task_statuses", move |s| {
+            let conn = s.write_connection()?;
+            let seeded = conn.execute(
+                &format!(
+                    "INSERT INTO task_status
+                         (task_config_id, job_id, job_config_id, status, updated_at)
+                     SELECT tc.id, tc.job_id, tc.job_config_id, ?1, ?2
+                     FROM task_config tc
+                     INNER JOIN job j ON j.id = tc.job_id
+                     WHERE j.status NOT IN ('stopped', 'failed')
+                       AND tc.job_config_id = {LATEST_CONFIG_FOR_JOB}
+                       AND NOT EXISTS (
+                         SELECT 1 FROM task_status ts WHERE ts.task_config_id = tc.id
+                       )
+                     ON CONFLICT(task_config_id) DO NOTHING;"
+                ),
+                params![TaskStatusState::Pending.as_str(), Self::now_rfc3339()?],
+            )?;
+            Ok(seeded as u64)
+        })
+    }
+
     fn handle_job_submit_apply(
         &self,
         config: &JobConfig,
         subs: &[Submission],
+        template: Option<&JobTemplateProvenance>,
     ) -> R<JobSubmitOutcome> {
         let config = self.normalize_job_config(config)?;
         // Note: There is a race condition here with the version
@@ -4285,7 +4893,7 @@ impl Store {
         }?;
 
         let now = time::OffsetDateTime::now_utc();
-        let meta = if config.rollout.is_none() && config.rollout_by_group.is_empty() {
+        let mut meta = if config.rollout.is_none() && config.rollout_by_group.is_empty() {
             json!({})
         } else {
             json!({
@@ -4293,6 +4901,9 @@ impl Store {
                 "rolloutByGroup": config.rollout_by_group,
             })
         };
+        if let Some(template) = template {
+            meta["jobTemplate"] = serde_json::to_value(template)?;
+        }
         let config_params = named_params! {
             ":id": format!("{}-{}", config.name, next_version.to_string()),
             ":name": config.name,
@@ -4820,9 +5431,20 @@ impl Store {
         let kind = draft.kind.clone();
         // Standalone emission replicates as its own (tiny) raft entry; calls
         // made while another capture is active compose into that capture
-        // (JC-13) and cost nothing extra. Emission stays best-effort: a
-        // replication failure is logged and swallowed, never propagated.
-        if let Err(err) = self.replicated(Lane::Status, "emit_event", move |s| {
+        // (JC-13) and cost nothing extra. `scheduler_event` is commutative
+        // (JC-28) — ANY lane may carry the insert — so standalone emission
+        // proposes on a lane this node currently LEADS: pinning it to the
+        // status lane silently dropped every standalone event on a node
+        // that did not lead that lane under divergent lane leadership
+        // (plan §8). The choice only decides whose log carries the entry;
+        // ids stay lane-residued (JC-42) and the journal is id-ordered.
+        // Emission stays best-effort: a replication failure is logged and
+        // swallowed, never propagated.
+        let lane = [Lane::Status, Lane::Control, Lane::Scheduler]
+            .into_iter()
+            .find(|lane| self.is_raft_leader(*lane))
+            .unwrap_or(Lane::Status);
+        if let Err(err) = self.replicated(lane, "emit_event", move |s| {
             s.emit_event_apply(draft);
             Ok(())
         }) {
@@ -4928,6 +5550,13 @@ impl Store {
         let mut alloc_node_ids: HashSet<String> = HashSet::new();
         let mut alloc_reread_ids: HashSet<i64> = HashSet::new();
         let mut task_job_config_ids: HashSet<String> = HashSet::new();
+        // Epoch scopes bumped by this changeset (the plan-fence mirror —
+        // see `SchedulingReadModel::scope_epochs`): the changeset's own
+        // `allocation_epoch_partition` rows name exactly the (scope_type,
+        // scope_id) pairs whose mirror entries must be refreshed with the
+        // allocation cache, coherently.
+        let mut epoch_node_scopes: BTreeSet<String> = BTreeSet::new();
+        let mut epoch_job_scopes: BTreeSet<String> = BTreeSet::new();
         let mut task_reread_ids: HashSet<i64> = HashSet::new();
         let mut event_ids: Vec<i64> = Vec::new();
         let mut eval_touched = false;
@@ -5062,6 +5691,39 @@ impl Store {
                 "eval" => {
                     eval_touched = true;
                 }
+                "allocation_epoch_partition" => {
+                    let type_idx = self.changeset_column_index(
+                        &mut column_cache,
+                        "allocation_epoch_partition",
+                        "scope_type",
+                    )?;
+                    let id_idx = self.changeset_column_index(
+                        &mut column_cache,
+                        "allocation_epoch_partition",
+                        "scope_id",
+                    )?;
+                    // Composite PK (scope_type, scope_id): present in the
+                    // new record of inserts and the old record of updates.
+                    let (scope_type, scope_id) = match action {
+                        Action::SQLITE_INSERT => {
+                            (item.new_value(type_idx).ok(), item.new_value(id_idx).ok())
+                        }
+                        _ => (item.old_value(type_idx).ok(), item.old_value(id_idx).ok()),
+                    };
+                    let scope_type =
+                        scope_type.and_then(|value| value.as_str().ok().map(str::to_owned));
+                    let scope_id =
+                        scope_id.and_then(|value| value.as_str().ok().map(str::to_owned));
+                    match (scope_type.as_deref(), scope_id) {
+                        (Some("node"), Some(id)) => {
+                            epoch_node_scopes.insert(id);
+                        }
+                        (Some("job_config"), Some(id)) => {
+                            epoch_job_scopes.insert(id);
+                        }
+                        _ => {}
+                    }
+                }
                 _ => {}
             }
         }
@@ -5101,13 +5763,16 @@ impl Store {
                 None => self.cache_remove_node(&id)?,
             }
         }
-        for node_id in alloc_node_ids {
-            let allocs = self.allocs_for_node(&node_id)?;
-            let mut guard = self.read_model_writer()?;
-            guard
-                .allocations_by_node
-                .insert(node_id.clone(), Arc::new(allocs));
-            Self::reproject_model_nodes(&mut guard, &self.resource_policy, &[node_id.as_str()]);
+        // Allocation cache + epoch mirror refresh, coherently (the
+        // plan-fence fix): the helper reads epochs before allocations,
+        // publishes both under one lock, and reprojects the affected
+        // nodes' free pools/indexes inside that lock — so a sampler can
+        // never pair a new epoch with a stale cache, and the plan-snapshot
+        // cache never observes pools out of step with allocations.
+        let mut refresh_nodes: BTreeSet<String> = alloc_node_ids.into_iter().collect();
+        refresh_nodes.extend(epoch_node_scopes);
+        if !refresh_nodes.is_empty() || !epoch_job_scopes.is_empty() {
+            self.cache_refresh_allocation_scopes(&refresh_nodes, &epoch_job_scopes)?;
         }
         for job_config_id in task_job_config_ids {
             let tasks = self.get_task_configs_for_job_config(&job_config_id)?;
@@ -6611,6 +7276,27 @@ impl Store {
         if snapshots.is_empty() {
             return Ok(());
         }
+        match self.upsert_allocation_health_snapshots_local(node_id, snapshots) {
+            Err(err) if crate::storage::raft::driver::NotRaftLeader::in_chain(&err) => self
+                .forward_after_rejection(
+                crate::storage::raft::forward::ForwardableLaneWrite::AllocationHealthSnapshots {
+                    node_id: node_id.to_owned(),
+                    snapshots: snapshots.to_vec(),
+                },
+                err,
+            ),
+            other => other,
+        }
+    }
+
+    pub(crate) fn upsert_allocation_health_snapshots_local(
+        &self,
+        node_id: &str,
+        snapshots: &[AllocationHealth],
+    ) -> R<()> {
+        if snapshots.is_empty() {
+            return Ok(());
+        }
         let node_id = node_id.to_owned();
         let snapshots = snapshots.to_vec();
         self.replicated(
@@ -6995,6 +7681,22 @@ impl Store {
 
     #[instrument(err, skip_all)]
     pub fn remove_allocation_by_id(&self, allocation_id: i64) -> R<Option<Allocation>> {
+        match self.remove_allocation_by_id_local(allocation_id) {
+            Err(err) if crate::storage::raft::driver::NotRaftLeader::in_chain(&err) => self
+                .forward_after_rejection(
+                    crate::storage::raft::forward::ForwardableLaneWrite::RemoveAllocationById {
+                        allocation_id,
+                    },
+                    err,
+                ),
+            other => other,
+        }
+    }
+
+    pub(crate) fn remove_allocation_by_id_local(
+        &self,
+        allocation_id: i64,
+    ) -> R<Option<Allocation>> {
         self.replicated(Lane::Scheduler, "remove_allocation_by_id", move |s| {
             s.remove_allocation_by_id_apply(allocation_id)
         })
@@ -7925,6 +8627,35 @@ impl Store {
     /// by this call.
     #[instrument(err, skip_all)]
     pub fn seed_keyed_instances(
+        &self,
+        job_id: &str,
+        group: &str,
+        task_name: &str,
+        ids: &[String],
+    ) -> R<Vec<String>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Forwarding wrapper (plan §8, D2): part of the run_job tail —
+        // keyed seeds must exist before the placement eval plans, and the
+        // eval itself is forwarded to the scheduler leader, so the seeds
+        // must reach it too.
+        match self.seed_keyed_instances_local(job_id, group, task_name, ids) {
+            Err(err) if crate::storage::raft::driver::NotRaftLeader::in_chain(&err) => self
+                .forward_after_rejection(
+                    crate::storage::raft::forward::ForwardableLaneWrite::SeedKeyedInstances {
+                        job_id: job_id.to_owned(),
+                        group: group.to_owned(),
+                        task_name: task_name.to_owned(),
+                        ids: ids.to_vec(),
+                    },
+                    err,
+                ),
+            other => other,
+        }
+    }
+
+    pub(crate) fn seed_keyed_instances_local(
         &self,
         job_id: &str,
         group: &str,
@@ -8966,6 +9697,44 @@ impl Store {
         priority: Option<i64>,
         delay: Duration,
     ) -> R<Eval> {
+        // Forwarding wrapper (plan §8, D2): the enqueue is the scheduler
+        // half of many composites (RPC submit tails, failure-report
+        // reschedules, drain evictions). Regeneration re-derives lost
+        // enqueues eventually; forwarding lands them immediately, from any
+        // node.
+        match self.enqueue_eval_after_delay_local(
+            kind,
+            job_id,
+            job_config_id,
+            node_id,
+            priority,
+            delay,
+        ) {
+            Err(err) if crate::storage::raft::driver::NotRaftLeader::in_chain(&err) => self
+                .forward_after_rejection(
+                    crate::storage::raft::forward::ForwardableLaneWrite::EnqueueEval {
+                        kind: kind.to_owned(),
+                        job_id: job_id.map(str::to_owned),
+                        job_config_id: job_config_id.map(str::to_owned),
+                        node_id: node_id.map(str::to_owned),
+                        priority,
+                        delay_ms: delay.as_millis() as u64,
+                    },
+                    err,
+                ),
+            other => other,
+        }
+    }
+
+    pub(crate) fn enqueue_eval_after_delay_local(
+        &self,
+        kind: &str,
+        job_id: Option<&str>,
+        job_config_id: Option<&str>,
+        node_id: Option<&str>,
+        priority: Option<i64>,
+        delay: Duration,
+    ) -> R<Eval> {
         let kind = kind.to_owned();
         let job_id = job_id.map(str::to_owned);
         let job_config_id = job_config_id.map(str::to_owned);
@@ -9809,6 +10578,199 @@ impl Store {
         Ok(changed > 0)
     }
 
+    fn job_template_version_from_row(
+        row: &Row<'_>,
+    ) -> Result<JobTemplateVersionRecord, RusqliteError> {
+        let variables_json: String = row.get(4)?;
+        let variables: Vec<JobTemplateVariableRecord> = serde_json::from_str(&variables_json)
+            .map_err(|err| {
+                RusqliteError::FromSqlConversionFailure(
+                    4,
+                    rusqlite::types::Type::Text,
+                    Box::new(err),
+                )
+            })?;
+        Ok(JobTemplateVersionRecord {
+            name: row.get(0)?,
+            version: row.get::<_, i64>(1)? as u32,
+            latest_version: row.get::<_, i64>(7)? as u32,
+            description: row.get(3)?,
+            source_jsonnet: row.get(2)?,
+            variables,
+            created_at: row.get(5)?,
+            created_by: row.get(6)?,
+        })
+    }
+
+    /// Stores the next immutable version of a job template, creating the
+    /// template row on first use.
+    #[instrument(err, skip_all)]
+    pub fn upsert_job_template_version(
+        &self,
+        name: &str,
+        description: Option<&str>,
+        source_jsonnet: &str,
+        variables: &[JobTemplateVariableRecord],
+        created_by: &str,
+    ) -> R<JobTemplateVersionRecord> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(anyhow::Error::new(StorageError::InvalidInput {
+                message: "template name must not be empty".to_string(),
+            }));
+        }
+
+        let now = OffsetDateTime::now_utc().format(&Rfc3339)?;
+        let variables_json = serde_json::to_string(variables)?;
+        let mut conn = self.write_connection()?;
+        let tx = conn.transaction()?;
+
+        let current_version: Option<i64> = tx
+            .query_row(
+                "SELECT latest_version FROM job_template WHERE name = ?;",
+                [name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let next_version = current_version.unwrap_or(0) + 1;
+
+        tx.execute(
+            "INSERT INTO job_template (name, latest_version, created_at, updated_at) VALUES (:name, :version, :now, :now) ON CONFLICT(name) DO UPDATE SET latest_version = excluded.latest_version, updated_at = excluded.updated_at;",
+            named_params! {
+                ":name": name,
+                ":version": next_version,
+                ":now": now,
+            },
+        )?;
+        tx.execute(
+            "INSERT INTO job_template_version (template_name, version, description, source_jsonnet, variables, created_by, created_at) VALUES (:name, :version, :description, :source, :variables, :created_by, :now);",
+            named_params! {
+                ":name": name,
+                ":version": next_version,
+                ":description": description,
+                ":source": source_jsonnet,
+                ":variables": variables_json,
+                ":created_by": created_by,
+                ":now": now,
+            },
+        )?;
+        let stored = tx.query_row(
+            "SELECT tv.template_name, tv.version, tv.source_jsonnet, tv.description, tv.variables, tv.created_at, tv.created_by, t.latest_version
+             FROM job_template_version tv
+             INNER JOIN job_template t ON t.name = tv.template_name
+             WHERE tv.template_name = ? AND tv.version = ?;",
+            params![name, next_version],
+            Self::job_template_version_from_row,
+        )?;
+        tx.commit()?;
+        Ok(stored)
+    }
+
+    /// One template version (latest when `version` is `None`).
+    #[instrument(err, skip_all)]
+    pub fn get_job_template_version(
+        &self,
+        name: &str,
+        version: Option<u32>,
+    ) -> R<JobTemplateVersionRecord> {
+        let conn = self.read_connection()?;
+        let base = "SELECT tv.template_name, tv.version, tv.source_jsonnet, tv.description, tv.variables, tv.created_at, tv.created_by, t.latest_version
+             FROM job_template_version tv
+             INNER JOIN job_template t ON t.name = tv.template_name
+             WHERE tv.template_name = ?";
+        let result = match version {
+            Some(version) => conn.query_row(
+                &format!("{base} AND tv.version = ?;"),
+                params![name, i64::from(version)],
+                Self::job_template_version_from_row,
+            ),
+            None => conn.query_row(
+                &format!("{base} AND tv.version = t.latest_version;"),
+                params![name],
+                Self::job_template_version_from_row,
+            ),
+        };
+        result.optional()?.ok_or_else(|| {
+            let wanted = match version {
+                Some(version) => format!("{name} v{version}"),
+                None => name.to_string(),
+            };
+            anyhow::Error::new(StorageError::not_found("job_template", wanted))
+        })
+    }
+
+    /// Version-history metadata for one template, newest first.
+    #[instrument(err, skip_all)]
+    pub fn list_job_template_versions(&self, name: &str) -> R<Vec<JobTemplateVersionInfoRecord>> {
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare(
+            "SELECT version, created_at, created_by FROM job_template_version WHERE template_name = ? ORDER BY version DESC;",
+        )?;
+        let rows = stmt.query_map([name], |row| {
+            Ok(JobTemplateVersionInfoRecord {
+                version: row.get::<_, i64>(0)? as u32,
+                created_at: row.get(1)?,
+                created_by: row.get(2)?,
+            })
+        })?;
+        Self::collect_rows(rows)
+    }
+
+    /// Latest-version summaries of every template, most recently updated
+    /// first. ACL filtering happens in the caller.
+    #[instrument(err, skip_all)]
+    pub fn list_job_templates(&self) -> R<Vec<JobTemplateSummaryRecord>> {
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare(
+            "SELECT t.name, t.latest_version, tv.description, tv.variables, t.updated_at
+             FROM job_template t
+             INNER JOIN job_template_version tv
+                ON tv.template_name = t.name AND tv.version = t.latest_version
+             ORDER BY t.updated_at DESC, t.name ASC;",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let variables_json: String = row.get(3)?;
+            let variables: Vec<JobTemplateVariableRecord> = serde_json::from_str(&variables_json)
+                .map_err(|err| {
+                RusqliteError::FromSqlConversionFailure(
+                    3,
+                    rusqlite::types::Type::Text,
+                    Box::new(err),
+                )
+            })?;
+            Ok(JobTemplateSummaryRecord {
+                name: row.get(0)?,
+                latest_version: row.get::<_, i64>(1)? as u32,
+                description: row.get(2)?,
+                variable_count: variables.len() as u32,
+                updated_at: row.get(4)?,
+            })
+        })?;
+        Self::collect_rows(rows)
+    }
+
+    /// Deletes a template and every stored version.
+    #[instrument(err, skip_all)]
+    pub fn delete_job_template(&self, name: &str) -> R<()> {
+        let mut conn = self.write_connection()?;
+        let tx = conn.transaction()?;
+        // The FK is declared with ON DELETE CASCADE but SQLite only honors it
+        // with foreign_keys=ON, so delete versions explicitly.
+        tx.execute(
+            "DELETE FROM job_template_version WHERE template_name = ?;",
+            [name],
+        )?;
+        let deleted = tx.execute("DELETE FROM job_template WHERE name = ?;", [name])?;
+        tx.commit()?;
+        if deleted == 0 {
+            return Err(anyhow::Error::new(StorageError::not_found(
+                "job_template",
+                name,
+            )));
+        }
+        Ok(())
+    }
+
     #[instrument(err, skip_all)]
     pub fn delete_saved_state_query(&self, name: &str) -> R<()> {
         let name = name.to_owned();
@@ -10105,6 +11067,110 @@ impl Store {
         Ok(())
     }
 
+    /// Scheduler-lane reconciler for volume-claim syncs deferred under
+    /// divergent lane leadership (plan §8, D1): for every active job whose
+    /// LATEST config declares task volumes, upsert any missing `volume`
+    /// claim rows via the same idempotent sync the submit composite runs
+    /// ([`Self::handle_job_submit`] tolerates a scheduler-lane rejection of
+    /// that half). Run by the node-status-checker loop on the
+    /// scheduler-lane leader. Steady state is read-only: a config whose
+    /// claims all exist is skipped before any replicated op. Returns how
+    /// many configs were synced.
+    pub fn sync_missing_task_volume_claims(&self) -> R<u64> {
+        let candidates: Vec<(String, String)> = {
+            let conn = self.read_connection()?;
+            let mut stmt = conn.prepare(&format!(
+                "SELECT j.id, {LATEST_CONFIG_FOR_JOB}
+                 FROM job j
+                 WHERE j.status NOT IN ('stopped', 'failed');"
+            ))?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })?;
+            Self::collect_rows(rows)?
+                .into_iter()
+                .filter_map(|(job, config)| config.map(|config| (job, config)))
+                .collect()
+        };
+        let mut synced = 0u64;
+        for (job_id, job_config_id) in candidates {
+            let tasks = self.get_task_configs_for_job_config(&job_config_id)?;
+            let mut missing = false;
+            {
+                let conn = self.read_connection()?;
+                'tasks: for (_, task) in &tasks {
+                    for claim in &task.volumes {
+                        let id = claim_volume_id(&job_id, &task.group, &task.name, &claim.name);
+                        let exists: bool = conn.query_row(
+                            "SELECT EXISTS(SELECT 1 FROM volume WHERE volume_id = ?1);",
+                            [&id],
+                            |row| row.get(0),
+                        )?;
+                        if !exists {
+                            missing = true;
+                            break 'tasks;
+                        }
+                    }
+                }
+            }
+            if !missing {
+                continue;
+            }
+            let config_id = job_config_id.clone();
+            self.replicated(Lane::Scheduler, "sync_task_volume_claims", move |s| {
+                s.sync_task_volume_claims_apply(&config_id)
+            })?;
+            synced += 1;
+        }
+        Ok(synced)
+    }
+
+    /// Jobs whose latest config carries an acknowledged UPDATE that never
+    /// got its rollout (plan §8, D1): active job, latest config has a
+    /// predecessor, NO rollout row targets the latest config (any state —
+    /// an operator's cancelled rollout must stay cancelled), the latest
+    /// config has no allocations, and an older config still has some. This
+    /// is precisely the signature left by a submit whose scheduler-lane
+    /// rollout creation was rejected under divergent lane leadership, or by
+    /// a crash between the submit and the rollout insert. Returns
+    /// `(job_id, latest_config_id, previous_config_id)` rows; consumed by
+    /// the manager's `reconcile_missing_rollouts` pass on the
+    /// scheduler-lane leader, which runs before every eval regeneration so
+    /// the regeneration's `job_submit` fallback cannot bypass a rollout the
+    /// job deserved.
+    pub fn jobs_with_unrolled_latest_config(&self) -> R<Vec<(String, String, Option<String>)>> {
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT j.id, latest.id, (
+                 SELECT jc2.id FROM job_config jc2
+                 WHERE jc2.job_id = j.id AND jc2.id != latest.id
+                 ORDER BY jc2.created_at DESC LIMIT 1
+             )
+             FROM job j
+             INNER JOIN job_config latest ON latest.id = {LATEST_CONFIG_FOR_JOB}
+             WHERE j.status NOT IN ('stopped', 'failed')
+               AND EXISTS (
+                 SELECT 1 FROM job_config prev
+                 WHERE prev.job_id = j.id AND prev.id != latest.id
+               )
+               AND NOT EXISTS (
+                 SELECT 1 FROM rollout r WHERE r.to_job_config_id = latest.id
+               )
+               AND NOT EXISTS (
+                 SELECT 1 FROM allocation a WHERE a.job_config_id = latest.id
+               )
+               AND EXISTS (
+                 SELECT 1 FROM allocation a
+                 INNER JOIN job_config jc ON jc.id = a.job_config_id
+                 WHERE jc.job_id = j.id AND a.job_config_id != latest.id
+               );"
+        ))?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get::<_, Option<String>>(2)?))
+        })?;
+        Self::collect_rows(rows)
+    }
+
     /// The volume mounts a worker must materialize for one allocation.
     ///
     /// Resolves the task's declarations against the `volume` table so the
@@ -10256,6 +11322,38 @@ impl Store {
         fs: Option<&str>,
         attrs: &BTreeMap<String, Value>,
     ) -> R<()> {
+        // Forwarding wrapper (plan §8, D2): mount confirmations arrive on
+        // the worker's heartbeat and — unlike destroys, which are
+        // re-dispatched every heartbeat — are reported once, so a rejected
+        // write silently lost the node pin and driver attrs.
+        match self
+            .record_volume_mounted_local(volume_id, node_id, mount_path, node_local, fs, attrs)
+        {
+            Err(err) if crate::storage::raft::driver::NotRaftLeader::in_chain(&err) => self
+                .forward_after_rejection(
+                    crate::storage::raft::forward::ForwardableLaneWrite::RecordVolumeMounted {
+                        volume_id: volume_id.to_owned(),
+                        node_id: node_id.to_owned(),
+                        mount_path: mount_path.to_owned(),
+                        node_local,
+                        fs: fs.map(str::to_owned),
+                        attrs: attrs.clone(),
+                    },
+                    err,
+                ),
+            other => other,
+        }
+    }
+
+    pub(crate) fn record_volume_mounted_local(
+        &self,
+        volume_id: &str,
+        node_id: &str,
+        mount_path: &str,
+        node_local: bool,
+        fs: Option<&str>,
+        attrs: &BTreeMap<String, Value>,
+    ) -> R<()> {
         let volume_id = volume_id.to_owned();
         let node_id = node_id.to_owned();
         let mount_path = mount_path.to_owned();
@@ -10315,6 +11413,20 @@ impl Store {
     /// `legion volume list` instead of only in a worker log.
     #[instrument(err, skip_all)]
     pub fn record_volume_error(&self, volume_id: &str, error: &str) -> R<()> {
+        match self.record_volume_error_local(volume_id, error) {
+            Err(err) if crate::storage::raft::driver::NotRaftLeader::in_chain(&err) => self
+                .forward_after_rejection(
+                    crate::storage::raft::forward::ForwardableLaneWrite::RecordVolumeError {
+                        volume_id: volume_id.to_owned(),
+                        error: error.to_owned(),
+                    },
+                    err,
+                ),
+            other => other,
+        }
+    }
+
+    pub(crate) fn record_volume_error_local(&self, volume_id: &str, error: &str) -> R<()> {
         let volume_id = volume_id.to_owned();
         let error = error.to_owned();
         self.replicated(Lane::Scheduler, "record_volume_error", move |s| {
@@ -10413,6 +11525,19 @@ impl Store {
     /// A worker confirmed the driver reclaimed the volume.
     #[instrument(err, skip_all)]
     pub fn mark_volume_destroyed(&self, volume_id: &str) -> R<()> {
+        match self.mark_volume_destroyed_local(volume_id) {
+            Err(err) if crate::storage::raft::driver::NotRaftLeader::in_chain(&err) => self
+                .forward_after_rejection(
+                    crate::storage::raft::forward::ForwardableLaneWrite::MarkVolumeDestroyed {
+                        volume_id: volume_id.to_owned(),
+                    },
+                    err,
+                ),
+            other => other,
+        }
+    }
+
+    pub(crate) fn mark_volume_destroyed_local(&self, volume_id: &str) -> R<()> {
         let volume_id = volume_id.to_owned();
         self.replicated(Lane::Scheduler, "mark_volume_destroyed", move |s| {
             s.mark_volume_destroyed_apply(&volume_id)
@@ -11182,8 +12307,16 @@ mod tests {
         assert_eq!(orphans, 1, "remove_node must not delete status-lane rows");
 
         // ...and the status-lane sweep collects it without touching the
-        // liveness row of a live node.
+        // liveness row of a live node. The FIRST sweep only OBSERVES the
+        // orphan (two-sweep grace, adversarial finding F2: a freshly
+        // failed-over status leader's stale local view must not replicate
+        // deletions of live rows); the second confirms and deletes it.
         store.insert_node(make_node_msg("node-two", "active"))?;
+        assert_eq!(
+            store.prune_node_health_orphans()?,
+            0,
+            "the first sweep must only observe, never delete"
+        );
         assert_eq!(store.prune_node_health_orphans()?, 1);
         let remaining: Vec<String> = {
             let conn = store.read_connection()?;
@@ -13228,7 +14361,13 @@ mod tests {
         assert!(removed.is_some());
         // The allocation_health FK cascade is gone (C-2): the row survives
         // the scheduler-lane removal as a harmless orphan until the
-        // status-lane sweep collects it.
+        // status-lane sweep collects it — on its SECOND observation (the
+        // two-sweep grace, adversarial finding F2).
+        assert_eq!(
+            store.prune_allocation_health_orphans()?,
+            0,
+            "the first sweep must only observe, never delete"
+        );
         assert_eq!(store.prune_allocation_health_orphans()?, 1);
         let health = store.allocation_health_for_allocations(&[allocation.id])?;
         assert!(health.is_empty());
@@ -15290,6 +16429,113 @@ mod tests {
         // But the declared service is still listed (0 endpoints).
         let declared = store.declared_services()?;
         assert!(declared.iter().any(|entry| entry.service == "web"));
+        Ok(())
+    }
+
+    #[test]
+    fn job_template_versions_are_immutable_with_latest_pointer() -> R<()> {
+        let store = setup_store()?;
+        let variables = vec![JobTemplateVariableRecord {
+            key: "replicas".into(),
+            var_type: "number".into(),
+            label: None,
+            description: None,
+            required: None,
+            default: Some(json!(2)),
+            options: vec![],
+        }];
+
+        let v1 = store.upsert_job_template_version(
+            "tpl",
+            Some("first"),
+            "src-v1",
+            &variables,
+            "alice",
+        )?;
+        assert_eq!(v1.version, 1);
+        assert_eq!(v1.latest_version, 1);
+        assert_eq!(v1.created_by, "alice");
+        assert!(!v1.variables[0].is_required());
+
+        let v2 = store.upsert_job_template_version("tpl", Some("second"), "src-v2", &[], "bob")?;
+        assert_eq!(v2.version, 2);
+        assert_eq!(v2.latest_version, 2);
+
+        // Latest fetch returns v2; explicit fetch still returns v1 verbatim.
+        let latest = store.get_job_template_version("tpl", None)?;
+        assert_eq!(latest.version, 2);
+        assert_eq!(latest.source_jsonnet, "src-v2");
+        let pinned = store.get_job_template_version("tpl", Some(1))?;
+        assert_eq!(pinned.source_jsonnet, "src-v1");
+        assert_eq!(pinned.latest_version, 2);
+        assert_eq!(pinned.variables.len(), 1);
+
+        let versions = store.list_job_template_versions("tpl")?;
+        assert_eq!(
+            versions.iter().map(|info| info.version).collect::<Vec<_>>(),
+            vec![2, 1]
+        );
+
+        let summaries = store.list_job_templates()?;
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].latest_version, 2);
+        assert_eq!(summaries[0].description.as_deref(), Some("second"));
+        assert_eq!(summaries[0].variable_count, 0);
+
+        assert!(store.get_job_template_version("tpl", Some(9)).is_err());
+        assert!(store.get_job_template_version("missing", None).is_err());
+
+        store.delete_job_template("tpl")?;
+        assert!(store.get_job_template_version("tpl", None).is_err());
+        assert!(store.list_job_templates()?.is_empty());
+        assert!(store.delete_job_template("tpl").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn template_provenance_rides_job_config_meta() -> R<()> {
+        let store = setup_store()?;
+        let config = JobConfig {
+            name: "tpl-job".into(),
+            rollout: None,
+            rollout_by_group: BTreeMap::new(),
+            tasks: vec![TaskConfig::new("main", "noop")],
+            version: None,
+        };
+        let submission = Submission {
+            path: "template://tpl/1".into(),
+            content: "src".into(),
+            is_primary: true,
+        };
+        let provenance = JobTemplateProvenance {
+            name: "tpl".into(),
+            version: 1,
+        };
+        store.handle_job_submit_from_template(&config, &[submission.clone()], &provenance)?;
+
+        assert_eq!(
+            store.job_template_provenance("tpl-job")?,
+            Some(provenance.clone())
+        );
+        let history = store.list_job_spec_history("tpl-job")?;
+        assert_eq!(history[0].template, Some(provenance.clone()));
+        let map = store.job_template_provenance_map()?;
+        assert_eq!(map.get("tpl-job"), Some(&provenance));
+
+        // A raw resubmit (spec change, no template) clears the latest
+        // provenance while history keeps the older row.
+        let mut updated = config.clone();
+        updated.tasks[0].count = TaskCount {
+            num: 2,
+            ..updated.tasks[0].count.clone()
+        };
+        store.handle_job_submit(&updated, &[submission])?;
+        assert_eq!(store.job_template_provenance("tpl-job")?, None);
+        let history = store.list_job_spec_history("tpl-job")?;
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].template, None);
+        assert_eq!(history[1].template, Some(provenance));
+        assert!(store.job_template_provenance_map()?.is_empty());
         Ok(())
     }
 

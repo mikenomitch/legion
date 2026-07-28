@@ -1,4 +1,5 @@
 import { A, useParams } from '@solidjs/router'
+import { AccessGate } from '../../components/AccessGate'
 import { For, Show, createMemo, createResource, createSignal, onCleanup, onMount } from 'solid-js'
 import { ServiceEndpointsTable, ServiceTags } from '../../components/ServiceEndpoints'
 import {
@@ -30,7 +31,7 @@ const stepClass: Record<DiagnosisLevel, string> = {
   warn: 'text-amber-600 dark:text-amber-400',
 }
 
-export default function ServiceDetail() {
+function ServiceDetailContent() {
   const params = useParams()
   const serviceName = createMemo(() => decodeURIComponent(params.name))
   const [onlyHealthy, setOnlyHealthy] = createSignal(false)
@@ -189,5 +190,15 @@ export default function ServiceDetail() {
         </div>
       </Show>
     </Show>
+  )
+}
+
+// Permission gate lives here at the page level — never around the router
+// outlet in the layout (see AccessGate).
+export default function ServiceDetail() {
+  return (
+    <AccessGate resource="job">
+      <ServiceDetailContent />
+    </AccessGate>
   )
 }

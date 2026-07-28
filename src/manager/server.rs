@@ -9,6 +9,7 @@ use crate::prelude::*;
 
 use crate::manager::acl::{self, Authenticator};
 use crate::manager::dispatcher::build_task_allocation;
+use crate::manager::job_templates;
 use crate::manager::rollout::{
     advance_rollout as advance_rollout_state, sequential_step_fractions,
     step_fractions_for_rollout, stop_rollout as stop_rollout_state,
@@ -19,8 +20,8 @@ use crate::manager::workload_identity::{claims_for_allocation, WorkloadIdentityS
 use crate::storage::errors::StorageError;
 use crate::storage::events::{ArtifactPin, SchedulerEventFilter, SchedulerEventRecord};
 use crate::storage::store::{
-    DestroyInstanceOutcome, JobKvReference, JobSubmitOutcome, StartInstanceOutcome,
-    StopInstanceOutcome, Store,
+    DestroyInstanceOutcome, JobKvReference, JobSubmitOutcome, JobTemplateVersionRecord,
+    StartInstanceOutcome, StopInstanceOutcome, Store,
 };
 use crate::structs::acl::{AclAction, AclIdentity, AclResource, AclScope};
 use crate::structs::manager_server::Manager;
@@ -28,43 +29,47 @@ use crate::structs::{
     validate_keyed_instance_id, worker_client::WorkerClient, AcquireKvLockReply,
     AcquireKvLockRequest, AdvanceRolloutReply, AdvanceRolloutRequest, AllocationHealth,
     AllocationLog, CreateInstanceReply, CreateInstanceRequest, CreateInstancesReply,
-    CreateInstancesRequest, DeleteKvReply, DeleteKvRequest, DeleteSavedStateQueryReply,
-    DeleteSavedStateQueryRequest, DeleteVolumeReply, DeleteVolumeRequest, DestroyInstanceReply,
-    DestroyInstanceRequest, DestroyJobReply, DestroyJobRequest, ExecClientFrame, FailedAllocation,
-    GetAllocationLogsReply, GetAllocationLogsRequest, GetArtifactCredentialReply,
-    GetArtifactCredentialRequest, GetInstanceReply, GetInstanceRequest, GetJobInfoReply,
-    GetJobInfoRequest, GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest,
-    GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest,
-    GetManagerConfigsReply, GetManagerConfigsRequest, GetNodeReply, GetNodeRequest, GetNodesReply,
-    GetNodesRequest, GetObservabilityReply, GetObservabilityRequest, GetRaftJoinTokenReply,
-    GetRaftJoinTokenRequest, GetRaftStatusReply, GetRaftStatusRequest, GetRolloutReply,
-    GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest, GetStateBackupReply,
-    GetStateBackupRequest, GetStateStoreSchemaReply, GetStateStoreSchemaRequest,
-    GetTaskLogsRequest, GetVolumeReply, GetVolumeRequest, HealthCheckReply, HealthCheckRequest,
-    HeartbeatReply, HeartbeatRequest, Instance, InstanceInfo, InstanceMode, InstanceState,
-    IssueNodeIdentityTokenReply, IssueNodeIdentityTokenRequest, IssueRaftCommandReply,
-    IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply, IssueWorkloadIdentityTokenRequest,
-    JobConfig, JobSpecHistoryItem, KvEntry, KvInjectionAction, KvValueType, LedgerNode,
-    ListEventsReply, ListEventsRequest, ListInstancesReply, ListInstancesRequest,
-    ListJobActionsReply, ListJobActionsRequest, ListJobSpecHistoryReply, ListJobSpecHistoryRequest,
-    ListJobsReply, ListJobsRequest, ListKvReply, ListKvRequest, ListRaftHistoryReply,
-    ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply,
-    ListRolloutsRequest, ListSavedStateQueriesReply, ListSavedStateQueriesRequest,
-    ListServicesReply, ListServicesRequest, ListVolumeDriversReply, ListVolumeDriversRequest,
-    ListVolumesReply, ListVolumesRequest, Node, NodeMsg, PatchKvReply, PatchKvRequest,
-    PlanJobReply, PlanJobRequest, PlannedAllocation, PutKvReply, PutKvRequest,
+    CreateInstancesRequest, DeleteJobTemplateReply, DeleteJobTemplateRequest, DeleteKvReply,
+    DeleteKvRequest, DeleteSavedStateQueryReply, DeleteSavedStateQueryRequest, DeleteVolumeReply,
+    DeleteVolumeRequest, DestroyInstanceReply, DestroyInstanceRequest, DestroyJobReply,
+    DestroyJobRequest, ExecClientFrame, FailedAllocation, GetAllocationLogsReply,
+    GetAllocationLogsRequest, GetArtifactCredentialReply, GetArtifactCredentialRequest,
+    GetInstanceReply, GetInstanceRequest, GetJobInfoReply, GetJobInfoRequest,
+    GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest, GetJobTemplateReply,
+    GetJobTemplateRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest,
+    GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest,
+    GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest, GetObservabilityReply,
+    GetObservabilityRequest, GetRaftJoinTokenReply, GetRaftJoinTokenRequest, GetRaftStatusReply,
+    GetRaftStatusRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply,
+    GetRolloutStatusRequest, GetStateBackupReply, GetStateBackupRequest, GetStateStoreSchemaReply,
+    GetStateStoreSchemaRequest, GetTaskLogsRequest, GetVolumeReply, GetVolumeRequest,
+    HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, Instance, InstanceInfo,
+    InstanceMode, InstanceState, IssueNodeIdentityTokenReply, IssueNodeIdentityTokenRequest,
+    IssueRaftCommandReply, IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply,
+    IssueWorkloadIdentityTokenRequest, JobConfig, JobSpecHistoryItem, JobTemplate,
+    JobTemplateProvenance, JobTemplateSummary, JobTemplateVariable, JobTemplateVersionInfo,
+    KvEntry, KvInjectionAction, KvValueType, LedgerNode, ListEventsReply, ListEventsRequest,
+    ListInstancesReply, ListInstancesRequest, ListJobActionsReply, ListJobActionsRequest,
+    ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobTemplatesReply,
+    ListJobTemplatesRequest, ListJobsReply, ListJobsRequest, ListKvReply, ListKvRequest,
+    ListRaftHistoryReply, ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest,
+    ListRolloutsReply, ListRolloutsRequest, ListSavedStateQueriesReply,
+    ListSavedStateQueriesRequest, ListServicesReply, ListServicesRequest, ListVolumeDriversReply,
+    ListVolumeDriversRequest, ListVolumesReply, ListVolumesRequest, Node, NodeMsg, PatchKvReply,
+    PatchKvRequest, PlanJobReply, PlanJobRequest, PlannedAllocation, PutKvReply, PutKvRequest,
     QueryStateStoreReply, QueryStateStoreRequest, RaftHistoryEvent, RaftStatus, ReleaseKvLockReply,
-    ReleaseKvLockRequest, RenewKvLockReply, RenewKvLockRequest, ReplaceInstanceReply,
-    ReplaceInstanceRequest, ResolveServiceReply, ResolveServiceRequest, RestartWorkerReply,
-    RestartWorkerRequest, RolloutAllocationStatus, RolloutEvent, RolloutGroupStatus,
-    RolloutProgression, RolloutReplacement, RunJobReply, RunJobRequest, SavedStateQuery,
-    SchedulerEvent, ServiceEndpoint, ServiceSummary, SetNodeAvailabilityReply,
-    SetNodeAvailabilityRequest, StartInstanceReply, StartInstanceRequest, StopInstanceReply,
-    StopInstanceRequest, StopJobReply, StopJobRequest, StopRolloutReply, StopRolloutRequest,
-    StreamEventsRequest, Submission, TaskConfig, TaskOnUnhealthyConfig, UpdateNodeDynamicReply,
-    UpdateNodeDynamicRequest, UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest,
-    WorkerConfig, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply,
-    WorkerRegisterRequest,
+    ReleaseKvLockRequest, RenderJobTemplateReply, RenderJobTemplateRequest, RenewKvLockReply,
+    RenewKvLockRequest, ReplaceInstanceReply, ReplaceInstanceRequest, ResolveServiceReply,
+    ResolveServiceRequest, RestartWorkerReply, RestartWorkerRequest, RolloutAllocationStatus,
+    RolloutEvent, RolloutGroupStatus, RolloutProgression, RolloutReplacement, RunJobReply,
+    RunJobRequest, RunJobTemplateReply, RunJobTemplateRequest, SavedStateQuery, SchedulerEvent,
+    ServiceEndpoint, ServiceSummary, SetNodeAvailabilityReply, SetNodeAvailabilityRequest,
+    StartInstanceReply, StartInstanceRequest, StopInstanceReply, StopInstanceRequest, StopJobReply,
+    StopJobRequest, StopRolloutReply, StopRolloutRequest, StreamEventsRequest, Submission,
+    TaskConfig, TaskOnUnhealthyConfig, UpdateNodeDynamicReply, UpdateNodeDynamicRequest,
+    UpsertJobTemplateReply, UpsertJobTemplateRequest, UpsertSavedStateQueryReply,
+    UpsertSavedStateQueryRequest, WorkerConfig, WorkerPreRegisterReply, WorkerPreRegisterRequest,
+    WorkerRegisterReply, WorkerRegisterRequest,
 };
 use crate::structs::{
     AuthMethodInfo, BootstrapAclReply, BootstrapAclRequest, CreateAclTokenReply,
@@ -117,6 +122,16 @@ fn map_store_error(action: &str, err: anyhow::Error) -> Status {
     }
 }
 
+/// Whether a mapped store error was the typed raft not-the-leader rejection
+/// (`map_store_error` renders it as `FAILED_PRECONDITION` carrying the
+/// `NotRaftLeader` display text, which this crate owns). Used by RPC tails
+/// that treat exactly that rejection as "deferred to the lane's reconciler"
+/// (plan §8, D1) while every other failure stays an error.
+fn status_is_not_raft_leader(status: &Status) -> bool {
+    status.code() == tonic::Code::FailedPrecondition
+        && status.message().contains("not the raft leader")
+}
+
 /// Outcome of the worker<->manager protocol-version handshake performed at
 /// registration. See [`protocol_compat`] and `docs/upgrades.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,6 +164,49 @@ pub fn protocol_compat(worker_pv: u32, manager_pv: u32) -> VersionCompat {
     } else {
         VersionCompat::Accept
     }
+}
+
+/// Outcome of `submit_rendered_job`, shared by RunJob and RunJobTemplate.
+struct SubmittedJob {
+    message: &'static str,
+    job_name: String,
+    job_config_id: String,
+}
+
+/// Store record -> proto message for one template version.
+fn job_template_to_proto(record: JobTemplateVersionRecord) -> JobTemplate {
+    JobTemplate {
+        name: record.name,
+        version: record.version,
+        latest_version: record.latest_version,
+        description: record.description,
+        source_jsonnet: record.source_jsonnet,
+        variables: record
+            .variables
+            .into_iter()
+            .map(|variable| JobTemplateVariable {
+                required: variable.is_required(),
+                key: variable.key,
+                r#type: variable.var_type,
+                label: variable.label.unwrap_or_default(),
+                description: variable.description,
+                default_json: variable.default.as_ref().map(|value| value.to_string()),
+                options: variable.options,
+            })
+            .collect(),
+        created_at: record.created_at,
+        created_by: record.created_by,
+    }
+}
+
+/// Recorded idempotent outcome for RunJobTemplate. RunJob records a bare
+/// message string; template runs also need the job name and config id to
+/// replay a faithful reply, so they record this JSON envelope instead.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct TemplateRunRecord {
+    message: String,
+    job_name: String,
+    job_config_id: String,
 }
 
 /// Load the latest config of a job that must be runnable for keyed-instance
@@ -995,6 +1053,305 @@ impl ManagerDaemonService {
         self.auth.authenticate(request.metadata(), &self.store)
     }
 
+    /// Job scope for read/lifecycle endpoints, carrying the job's stored
+    /// template provenance so `templates`-scoped rules cover the jobs their
+    /// templates created. Provenance lookup failures degrade to a scope
+    /// without the attribute (fail closed for template-scoped rules).
+    fn job_read_scope(&self, name: &str) -> AclScope {
+        let provenance = self
+            .store
+            .job_template_provenance(name)
+            .unwrap_or_default()
+            .map(|provenance| provenance.name);
+        AclScope::job(name).with_template(provenance)
+    }
+
+    /// Everything RunJob does once it holds a rendered jobspec, shared with
+    /// RunJobTemplate so both submission paths behave identically: KV
+    /// reference resolution, precise ACL enforcement, the template collision
+    /// guard, task validation, artifact admission, persistence (with
+    /// provenance), status clears, KV-ref bookkeeping, keyed-instance
+    /// seeding, and rollout/eval enqueueing.
+    fn submit_rendered_job(
+        &self,
+        identity: &AclIdentity,
+        js: &str,
+        mut subs: Vec<Submission>,
+        priority: i64,
+        force_reschedule: bool,
+        template: Option<&JobTemplateProvenance>,
+    ) -> Result<SubmittedJob, Status> {
+        if !subs.iter().any(|sub| sub.path == "job.rendered.json") {
+            subs.push(Submission {
+                path: "job.rendered.json".into(),
+                content: js.to_string(),
+                is_primary: false,
+            });
+        }
+
+        let (mut config, kv_refs) =
+            resolve_jobspec_kv_references(&self.store, js).map_err(|e| {
+                error!("Error parsing jobspec: {:?}", e);
+                Status::invalid_argument(format!("Error parsing jobspec: {e}"))
+            })?;
+        // On the spec-changing write path the template attribute is only ever
+        // the template the submission is going through — never the job's
+        // stored provenance (that would let a template-scoped identity push
+        // arbitrary specs to a job its template once created).
+        let scope = match template {
+            Some(template) => AclScope::job_via_template(&config.name, &template.name),
+            None => AclScope::job(&config.name),
+        };
+        acl::enforce(identity, AclResource::Job, AclAction::Write, &scope)?;
+
+        if let Some(template) = template {
+            self.enforce_template_collision_guard(identity, &config.name, template)?;
+        }
+
+        validate_job_config(&config).map_err(|e| {
+            error!("Error validating task configs: {:?}", e);
+            Status::invalid_argument(format!("Error validating task configs: {e}"))
+        })?;
+        self.validate_job_volumes(&config).map_err(|e| {
+            error!("Error validating volumes: {:?}", e);
+            Status::invalid_argument(format!("Error validating volumes: {e:#}"))
+        })?;
+        // Artifact admission: desugar/auth/pin. Pin resolution can reach
+        // registries, so it runs as blocking work.
+        let artifact_pins =
+            run_blocking_admission(|| self.normalize_job_artifacts(&mut config, true)).map_err(
+                |e| {
+                    error!("Error normalizing artifacts: {:?}", e);
+                    Status::invalid_argument(format!("Error normalizing artifacts: {e:#}"))
+                },
+            )?;
+        let config = config;
+        let submit_outcome = match template {
+            Some(template) => self
+                .store
+                .handle_job_submit_from_template(&config, &subs, template),
+            None => self.store.handle_job_submit(&config, &subs),
+        }
+        .map_err(|e| map_store_error("Error running job", e))?;
+
+        // Resubmitting revives a previously stopped job: clear the stopped
+        // status so the instance-management RPCs accept it again. Stopped
+        // keyed instances stay stopped — each needs an explicit
+        // `instance start` (see docs/stateful-workloads.md).
+        self.store
+            .clear_job_stopped_status(&config.name)
+            .map_err(|e| map_store_error("Error clearing stopped job status", e))?;
+
+        // A manual `job run` is also the recovery path for a job stuck
+        // `failed` by a missing KV dependency under onChange:none (which never
+        // auto-recovers). Clearing the failed status here re-runs the job's
+        // allocations through the normal submit/eval flow with the latest KV
+        // state (see docs/kv-store.md).
+        self.store
+            .clear_job_failed_status(&config.name)
+            .map_err(|e| map_store_error("Error clearing failed job status", e))?;
+
+        // Pin provenance joins the event stream only when the submit changed
+        // something — unchanged re-submits resolve the same digests and would
+        // spam the stream otherwise.
+        if !matches!(submit_outcome, JobSubmitOutcome::Unchanged { .. }) {
+            self.store
+                .events()
+                .artifact_pinned(&config.name, &artifact_pins);
+        }
+
+        let job_config_id = submit_outcome.job_config_id().to_string();
+        let stored_refs: Vec<JobKvReference> = kv_refs
+            .into_iter()
+            .map(|reference| JobKvReference {
+                job_id: config.name.clone(),
+                job_config_id: job_config_id.clone(),
+                kv_key: reference.key,
+                json_pointer: reference.json_pointer,
+            })
+            .collect();
+        self.store
+            .replace_job_kv_references(&config.name, &stored_refs)
+            .map_err(|e| map_store_error("Error storing kv references", e))?;
+
+        // Seed keyed instances declared via `stateful.initialInstances` now —
+        // after the config is persisted, BEFORE any placement eval is
+        // enqueued — so the seeded rows exist when that eval plans. Ids that
+        // already exist in ANY state (live, stopped, or a terminated
+        // tombstone) are skipped silently: the list is a SEED, not a
+        // reconciled desired set, so resubmits are idempotent, destroyed ids
+        // stay destroyed, and stopped instances stay stopped until an
+        // explicit `instance start`.
+        let mut seeded = 0usize;
+        for task in &config.tasks {
+            let keyed_seed = task.stateful.as_ref().and_then(|stateful| {
+                (stateful.mode == InstanceMode::Keyed)
+                    .then_some(stateful.initial_instances.as_ref())
+                    .flatten()
+            });
+            let Some(ids) = keyed_seed else { continue };
+            seeded += self
+                .store
+                .seed_keyed_instances(&config.name, &task.group, &task.name, ids)
+                .map_err(|e| map_store_error("Error seeding initial instances", e))?
+                .len();
+        }
+
+        let (eval_kind, message) = match submit_outcome {
+            JobSubmitOutcome::Unchanged { .. } => {
+                if force_reschedule {
+                    (
+                        Some("job_update"),
+                        "Job config unchanged; forced reschedule queued",
+                    )
+                } else {
+                    (None, "Job config unchanged; no update needed")
+                }
+            }
+            JobSubmitOutcome::Created { .. } => (Some("job_submit"), "Job submit success"),
+            JobSubmitOutcome::Updated { .. } => {
+                let previous_job_config_id = self
+                    .store
+                    .previous_job_config_id(&job_config_id)
+                    .map_err(|e| map_store_error("Error loading previous job config", e))?;
+                match create_rollout_for_update(
+                    &self.store,
+                    &config.name,
+                    previous_job_config_id.as_deref(),
+                    &job_config_id,
+                    &config,
+                    "Error creating rollout",
+                ) {
+                    Ok(true) => (None, "Rollout created; waiting for manual start"),
+                    Ok(false) => (Some("rollout_tick"), "Rollout started"),
+                    // Standing-split tolerance (plan §8, D1): the update is
+                    // acknowledged (control half committed); the rollout is
+                    // a scheduler-lane projection the scheduler leader's
+                    // `reconcile_missing_rollouts` pass derives from
+                    // replicated state — with full canary/manual gating —
+                    // once the config replicates to it. Failing the RPC
+                    // here would strand the update: the client's retry
+                    // returns `Unchanged`, which never creates a rollout.
+                    Err(status) if status_is_not_raft_leader(&status) => {
+                        warn!(
+                            job = %config.name,
+                            job_config_id,
+                            "rollout creation deferred: this node does not lead the \
+                             scheduler lane; its reconciler will create the rollout"
+                        );
+                        (
+                            None,
+                            "Job update accepted; rollout deferred until raft lane \
+                             leadership converges",
+                        )
+                    }
+                    Err(status) => return Err(status),
+                }
+            }
+        };
+
+        // The enqueue forwards to the scheduler-lane leader when this node
+        // does not lead that lane (plan §8, D2); a residual typed rejection
+        // (leader unknown/unreachable) is tolerated because the eval is
+        // exactly what `regenerate_scheduling_evals` re-derives — the job is
+        // accepted either way, so failing the RPC after the control-lane
+        // commit would only mislead the client into resubmitting.
+        if let Some(kind) = eval_kind {
+            if let Err(e) = self
+                .store
+                .enqueue_eval(
+                    kind,
+                    Some(&config.name),
+                    Some(&job_config_id),
+                    None,
+                    Some(priority),
+                )
+                .map_err(|e| map_store_error("Error running job", e))
+            {
+                if !status_is_not_raft_leader(&e) {
+                    return Err(e);
+                }
+                warn!(
+                    job = %config.name,
+                    job_config_id,
+                    "submit eval enqueue deferred: the scheduler leader's regeneration \
+                     pass will re-derive it"
+                );
+            }
+        } else if seeded > 0 {
+            // An unchanged resubmit normally needs no eval, but if it seeded
+            // rows (possible when a previous submit failed between persisting
+            // the config and seeding), the new instances still need placing.
+            if let Err(e) = self
+                .store
+                .enqueue_eval(
+                    "job_reschedule",
+                    Some(&config.name),
+                    Some(&job_config_id),
+                    None,
+                    Some(priority),
+                )
+                .map_err(|e| map_store_error("Error scheduling seeded instance placement", e))
+            {
+                if !status_is_not_raft_leader(&e) {
+                    return Err(e);
+                }
+                warn!(
+                    job = %config.name,
+                    job_config_id,
+                    "seeded-instance eval enqueue deferred: the scheduler leader's \
+                     regeneration pass will re-derive it"
+                );
+            }
+        }
+
+        Ok(SubmittedJob {
+            message,
+            job_name: config.name.clone(),
+            job_config_id,
+        })
+    }
+
+    /// A template run may only create new jobs or update jobs whose latest
+    /// config came from the same template — unless the caller also holds
+    /// plain `job:write` on the job name. Without this, any template whose
+    /// rendered job name is user-influenced would let a template-only
+    /// identity overwrite unrelated jobs.
+    fn enforce_template_collision_guard(
+        &self,
+        identity: &AclIdentity,
+        job_name: &str,
+        template: &JobTemplateProvenance,
+    ) -> Result<(), Status> {
+        let exists = self
+            .store
+            .get_job_config_optional(job_name)
+            .map_err(|e| map_store_error("Error checking existing job", e))?
+            .is_some();
+        if !exists {
+            return Ok(());
+        }
+        let provenance = self
+            .store
+            .job_template_provenance(job_name)
+            .map_err(|e| map_store_error("Error loading job provenance", e))?;
+        if provenance
+            .as_ref()
+            .is_some_and(|provenance| provenance.name == template.name)
+        {
+            return Ok(());
+        }
+        // Plain job:write (no template attribute) may still update it.
+        if identity.allows(AclResource::Job, AclAction::Write, &AclScope::job(job_name)) {
+            return Ok(());
+        }
+        Err(Status::failed_precondition(format!(
+            "job '{job_name}' already exists and was not created from template \
+             '{}'; updating it through this template requires job:write on the job",
+            template.name
+        )))
+    }
+
     /// Join gate for worker registration: when ACLs are enforced, callers
     /// prove membership with a join token secret unless they already hold a
     /// worker or management credential. Audit-only mode logs failures but
@@ -1479,6 +1836,62 @@ fn remove_stale_allocations_for_new_rollout(
     Ok(())
 }
 
+/// Create the rollouts that acknowledged updates never got (plan §8, D1).
+///
+/// An `Updated` submit whose scheduler-lane rollout creation was rejected
+/// (divergent lane leadership) or lost to a crash leaves a job whose latest
+/// config is acknowledged but will never deploy: the client's retry returns
+/// `Unchanged` — which creates no rollout — and eval regeneration's
+/// `job_submit` fallback would place the new config at FULL count,
+/// bypassing canary/staged gating and `waiting_manual_start`. This pass
+/// runs on the scheduler-lane leader (node-status-checker cadence, and
+/// immediately before every `regenerate_scheduling_evals` call so the
+/// fallback can never outrun it), finds the acknowledged-update signature
+/// via `Store::jobs_with_unrolled_latest_config`, and creates each missing
+/// rollout exactly as `run_job` would have — manual strategies wait for
+/// their operator, automatic ones are armed by the regeneration pass's
+/// rollout branch on the same tick. Returns how many rollouts were created.
+pub(crate) fn reconcile_missing_rollouts(store: &Store) -> anyhow::Result<u64> {
+    let candidates = store.jobs_with_unrolled_latest_config()?;
+    let mut created = 0u64;
+    for (job_id, latest_config_id, previous_config_id) in candidates {
+        let Some(config) = store.get_job_config_optional(&job_id)? else {
+            continue;
+        };
+        // The candidate query keys on each job's latest config; re-check
+        // against the loaded config so a submit racing this pass cannot
+        // create a rollout for a superseded config.
+        if config.id() != latest_config_id {
+            continue;
+        }
+        match create_rollout_for_update(
+            store,
+            &job_id,
+            previous_config_id.as_deref(),
+            &latest_config_id,
+            &config,
+            "Error creating reconciled rollout",
+        ) {
+            Ok(is_manual) => {
+                created += 1;
+                info!(
+                    job_id,
+                    job_config_id = %latest_config_id,
+                    manual = is_manual,
+                    "Created the rollout an acknowledged update was missing"
+                );
+            }
+            Err(status) => warn!(
+                job_id,
+                job_config_id = %latest_config_id,
+                error = %status,
+                "Failed creating missing rollout; will retry next pass"
+            ),
+        }
+    }
+    Ok(created)
+}
+
 fn create_rollout_for_update(
     store: &Store,
     job_id: &str,
@@ -1891,7 +2304,7 @@ impl Manager for ManagerDaemonService {
         )?;
         let inner = request.into_inner();
         let js = inner.parsed_jobspec;
-        let mut subs = inner.submissions;
+        let subs = inner.submissions;
         let priority = inner.priority.unwrap_or(self.store.default_eval_priority);
         let idempotency_key = inner.idempotency_key.unwrap_or_default();
 
@@ -1906,182 +2319,350 @@ impl Manager for ManagerDaemonService {
             }));
         }
 
-        if !subs.iter().any(|sub| sub.path == "job.rendered.json") {
-            subs.push(Submission {
-                path: "job.rendered.json".into(),
-                content: js.clone(),
-                is_primary: false,
+        let submitted =
+            self.submit_rendered_job(&identity, &js, subs, priority, inner.force_reschedule, None)?;
+
+        self.store
+            .idempotency_record(&idempotency_key, "run_job", submitted.message)
+            .map_err(|e| map_store_error("Error recording idempotency", e))?;
+
+        Ok(Response::new(RunJobReply {
+            message: submitted.message.into(),
+            deduplicated: false,
+        }))
+    }
+
+    #[instrument(skip_all)]
+    async fn upsert_job_template(
+        &self,
+        request: Request<UpsertJobTemplateRequest>,
+    ) -> Result<Response<UpsertJobTemplateReply>, Status> {
+        // ACL: coarse template:write gate before touching the body; the
+        // precise name scope is enforced once the name is read.
+        let identity = self.check_acl(
+            &request,
+            AclResource::Template,
+            AclAction::Write,
+            AclScope::any(),
+        )?;
+        let inner = request.into_inner();
+        let name = inner.name.trim().to_string();
+        job_templates::validate_template_name(&name)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        acl::enforce(
+            &identity,
+            AclResource::Template,
+            AclAction::Write,
+            &AclScope::template(&name),
+        )?;
+
+        let manifest =
+            run_blocking_admission(|| job_templates::parse_manifest(&inner.source_jsonnet))
+                .map_err(|e| Status::invalid_argument(e.to_string()))?;
+
+        // When every variable has a default the template is fully renderable
+        // right now — trial-render it so authoring mistakes surface at
+        // upsert instead of at the first submit.
+        if manifest
+            .variables
+            .iter()
+            .all(|variable| variable.default.is_some())
+        {
+            let values = job_templates::resolve_variable_values(&manifest.variables, "{}")
+                .map_err(|e| Status::invalid_argument(e.to_string()))?;
+            let rendered = run_blocking_admission(|| {
+                job_templates::render_with_timeout(&inner.source_jsonnet, &values)
+            })
+            .map_err(|e| {
+                Status::invalid_argument(format!("trial render with defaults failed: {e}"))
+            })?;
+            let config: JobConfig = serde_json::from_str(&rendered).map_err(|e| {
+                Status::invalid_argument(format!(
+                    "trial render with defaults did not produce a valid jobspec: {e}"
+                ))
+            })?;
+            validate_job_config(&config).map_err(|e| {
+                Status::invalid_argument(format!(
+                    "trial render with defaults produced an invalid jobspec: {e}"
+                ))
+            })?;
+        }
+
+        let record = self
+            .store
+            .upsert_job_template_version(
+                &name,
+                manifest.description.as_deref(),
+                &inner.source_jsonnet,
+                &manifest.variables,
+                &identity.principal,
+            )
+            .map_err(|e| map_store_error("Error storing template", e))?;
+        info!(template = %name, version = record.version, "job template version stored");
+
+        Ok(Response::new(UpsertJobTemplateReply {
+            template: Some(job_template_to_proto(record)),
+        }))
+    }
+
+    #[instrument(skip_all)]
+    async fn list_job_templates(
+        &self,
+        request: Request<ListJobTemplatesRequest>,
+    ) -> Result<Response<ListJobTemplatesReply>, Status> {
+        let identity = self.check_acl(
+            &request,
+            AclResource::Template,
+            AclAction::Read,
+            AclScope::any(),
+        )?;
+        let query = normalize_query(request.into_inner().query);
+
+        let mut templates = self
+            .store
+            .list_job_templates()
+            .map_err(|e| map_store_error("Error listing templates", e))?;
+        templates.retain(|template| {
+            identity.allows(
+                AclResource::Template,
+                AclAction::Read,
+                &AclScope::template(&template.name),
+            )
+        });
+        if let Some(query) = query {
+            templates.retain(|template| {
+                template.name.to_lowercase().contains(&query)
+                    || template
+                        .description
+                        .as_deref()
+                        .unwrap_or_default()
+                        .to_lowercase()
+                        .contains(&query)
             });
         }
 
-        let (mut config, kv_refs) =
-            resolve_jobspec_kv_references(&self.store, &js).map_err(|e| {
-                error!("Error parsing jobspec: {:?}", e);
-                Status::invalid_argument(format!("Error parsing jobspec: {e}"))
-            })?;
+        Ok(Response::new(ListJobTemplatesReply {
+            templates: templates
+                .into_iter()
+                .map(|template| JobTemplateSummary {
+                    name: template.name,
+                    latest_version: template.latest_version,
+                    description: template.description,
+                    variable_count: template.variable_count,
+                    updated_at: template.updated_at,
+                })
+                .collect(),
+        }))
+    }
+
+    #[instrument(skip_all)]
+    async fn get_job_template(
+        &self,
+        request: Request<GetJobTemplateRequest>,
+    ) -> Result<Response<GetJobTemplateReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Template,
+            AclAction::Read,
+            AclScope::template(&request.get_ref().name),
+        )?;
+        let inner = request.into_inner();
+
+        let record = self
+            .store
+            .get_job_template_version(&inner.name, inner.version)
+            .map_err(|e| map_store_error("Error loading template", e))?;
+        let versions = self
+            .store
+            .list_job_template_versions(&inner.name)
+            .map_err(|e| map_store_error("Error loading template versions", e))?
+            .into_iter()
+            .map(|info| JobTemplateVersionInfo {
+                version: info.version,
+                created_at: info.created_at,
+                created_by: info.created_by,
+            })
+            .collect();
+
+        Ok(Response::new(GetJobTemplateReply {
+            template: Some(job_template_to_proto(record)),
+            versions,
+        }))
+    }
+
+    #[instrument(skip_all)]
+    async fn delete_job_template(
+        &self,
+        request: Request<DeleteJobTemplateRequest>,
+    ) -> Result<Response<DeleteJobTemplateReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Template,
+            AclAction::Write,
+            AclScope::template(&request.get_ref().name),
+        )?;
+        let name = request.into_inner().name;
+
+        self.store
+            .delete_job_template(&name)
+            .map_err(|e| map_store_error("Error deleting template", e))?;
+        info!(template = %name, "job template deleted");
+
+        Ok(Response::new(DeleteJobTemplateReply {
+            message: format!("Deleted template {name}"),
+        }))
+    }
+
+    #[instrument(skip_all)]
+    async fn render_job_template(
+        &self,
+        request: Request<RenderJobTemplateRequest>,
+    ) -> Result<Response<RenderJobTemplateReply>, Status> {
+        // ACL: coarse job:write gate (template-scoped rules pass the
+        // wildcard check); the precise rendered-name + template scope is
+        // enforced after rendering, before anything is returned.
+        let identity = self.check_acl(
+            &request,
+            AclResource::Job,
+            AclAction::Write,
+            AclScope::any(),
+        )?;
+        let inner = request.into_inner();
+
+        let template = self
+            .store
+            .get_job_template_version(&inner.name, inner.version)
+            .map_err(|e| map_store_error("Error loading template", e))?;
+        let values =
+            job_templates::resolve_variable_values(&template.variables, &inner.variables_json)
+                .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let rendered = run_blocking_admission(|| {
+            job_templates::render_with_timeout(&template.source_jsonnet, &values)
+        })
+        .map_err(|e| Status::invalid_argument(e.to_string()))?;
+
+        let (config, _kv_refs) = resolve_jobspec_kv_references(&self.store, &rendered)
+            .map_err(|e| Status::invalid_argument(format!("rendered jobspec is invalid: {e}")))?;
         acl::enforce(
             &identity,
             AclResource::Job,
             AclAction::Write,
-            &AclScope::job(&config.name),
+            &AclScope::job_via_template(&config.name, &template.name),
         )?;
-
-        let force_reschedule = inner.force_reschedule;
         validate_job_config(&config).map_err(|e| {
-            error!("Error validating task configs: {:?}", e);
-            Status::invalid_argument(format!("Error validating task configs: {e}"))
+            Status::invalid_argument(format!("rendered jobspec failed validation: {e}"))
         })?;
-        self.validate_job_volumes(&config).map_err(|e| {
-            error!("Error validating volumes: {:?}", e);
-            Status::invalid_argument(format!("Error validating volumes: {e:#}"))
-        })?;
-        // Artifact admission: desugar/auth/pin. Pin resolution can reach
-        // registries, so it runs as blocking work.
-        let artifact_pins =
-            run_blocking_admission(|| self.normalize_job_artifacts(&mut config, true)).map_err(
-                |e| {
-                    error!("Error normalizing artifacts: {:?}", e);
-                    Status::invalid_argument(format!("Error normalizing artifacts: {e:#}"))
-                },
-            )?;
-        let config = config;
-        let submit_outcome = self
+
+        Ok(Response::new(RenderJobTemplateReply {
+            rendered_jobspec: rendered,
+            job_name: config.name,
+        }))
+    }
+
+    #[instrument(skip_all)]
+    async fn run_job_template(
+        &self,
+        request: Request<RunJobTemplateRequest>,
+    ) -> Result<Response<RunJobTemplateReply>, Status> {
+        // ACL: coarse job:write gate (template-scoped rules pass the
+        // wildcard check); the precise rendered-name + template scope is
+        // enforced inside submit_rendered_job once the spec exists.
+        let identity = self.check_acl(
+            &request,
+            AclResource::Job,
+            AclAction::Write,
+            AclScope::any(),
+        )?;
+        let inner = request.into_inner();
+        let priority = inner.priority.unwrap_or(self.store.default_eval_priority);
+        let idempotency_key = inner.idempotency_key.unwrap_or_default();
+
+        if let Some(recorded) = self
             .store
-            .handle_job_submit(&config, &subs)
-            .map_err(|e| map_store_error("Error running job", e))?;
-
-        // Resubmitting revives a previously stopped job: clear the stopped
-        // status so the instance-management RPCs accept it again. Stopped
-        // keyed instances stay stopped — each needs an explicit
-        // `instance start` (see docs/stateful-workloads.md).
-        self.store
-            .clear_job_stopped_status(&config.name)
-            .map_err(|e| map_store_error("Error clearing stopped job status", e))?;
-
-        // A manual `job run` is also the recovery path for a job stuck
-        // `failed` by a missing KV dependency under onChange:none (which never
-        // auto-recovers). Clearing the failed status here re-runs the job's
-        // allocations through the normal submit/eval flow with the latest KV
-        // state (see docs/kv-store.md).
-        self.store
-            .clear_job_failed_status(&config.name)
-            .map_err(|e| map_store_error("Error clearing failed job status", e))?;
-
-        // Pin provenance joins the event stream only when the submit changed
-        // something — unchanged re-submits resolve the same digests and would
-        // spam the stream otherwise.
-        if !matches!(submit_outcome, JobSubmitOutcome::Unchanged { .. }) {
-            self.store
-                .events()
-                .artifact_pinned(&config.name, &artifact_pins);
+            .idempotency_lookup(&idempotency_key)
+            .map_err(|e| map_store_error("Error checking idempotency", e))?
+        {
+            let record: TemplateRunRecord =
+                serde_json::from_str(&recorded).unwrap_or(TemplateRunRecord {
+                    message: recorded,
+                    job_name: String::new(),
+                    job_config_id: String::new(),
+                });
+            return Ok(Response::new(RunJobTemplateReply {
+                message: record.message,
+                deduplicated: true,
+                job_name: record.job_name,
+                job_config_id: record.job_config_id,
+            }));
         }
 
-        let job_config_id = submit_outcome.job_config_id().to_string();
-        let stored_refs: Vec<JobKvReference> = kv_refs
-            .into_iter()
-            .map(|reference| JobKvReference {
-                job_id: config.name.clone(),
-                job_config_id: job_config_id.clone(),
-                kv_key: reference.key,
-                json_pointer: reference.json_pointer,
-            })
-            .collect();
-        self.store
-            .replace_job_kv_references(&config.name, &stored_refs)
-            .map_err(|e| map_store_error("Error storing kv references", e))?;
+        let template = self
+            .store
+            .get_job_template_version(&inner.name, inner.version)
+            .map_err(|e| map_store_error("Error loading template", e))?;
+        let values =
+            job_templates::resolve_variable_values(&template.variables, &inner.variables_json)
+                .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let rendered = run_blocking_admission(|| {
+            job_templates::render_with_timeout(&template.source_jsonnet, &values)
+        })
+        .map_err(|e| Status::invalid_argument(e.to_string()))?;
 
-        // Seed keyed instances declared via `stateful.initialInstances` now —
-        // after the config is persisted, BEFORE any placement eval is
-        // enqueued — so the seeded rows exist when that eval plans. Ids that
-        // already exist in ANY state (live, stopped, or a terminated
-        // tombstone) are skipped silently: the list is a SEED, not a
-        // reconciled desired set, so resubmits are idempotent, destroyed ids
-        // stay destroyed, and stopped instances stay stopped until an
-        // explicit `instance start`.
-        let mut seeded = 0usize;
-        for task in &config.tasks {
-            let keyed_seed = task.stateful.as_ref().and_then(|stateful| {
-                (stateful.mode == InstanceMode::Keyed)
-                    .then_some(stateful.initial_instances.as_ref())
-                    .flatten()
-            });
-            let Some(ids) = keyed_seed else { continue };
-            seeded += self
-                .store
-                .seed_keyed_instances(&config.name, &task.group, &task.name, ids)
-                .map_err(|e| map_store_error("Error seeding initial instances", e))?
-                .len();
-        }
-
-        let (eval_kind, message) = match submit_outcome {
-            JobSubmitOutcome::Unchanged { .. } => {
-                if force_reschedule {
-                    (
-                        Some("job_update"),
-                        "Job config unchanged; forced reschedule queued",
-                    )
-                } else {
-                    (None, "Job config unchanged; no update needed")
-                }
-            }
-            JobSubmitOutcome::Created { .. } => (Some("job_submit"), "Job submit success"),
-            JobSubmitOutcome::Updated { .. } => {
-                let previous_job_config_id = self
-                    .store
-                    .previous_job_config_id(&job_config_id)
-                    .map_err(|e| map_store_error("Error loading previous job config", e))?;
-                let is_manual = create_rollout_for_update(
-                    &self.store,
-                    &config.name,
-                    previous_job_config_id.as_deref(),
-                    &job_config_id,
-                    &config,
-                    "Error creating rollout",
-                )?;
-
-                if is_manual {
-                    (None, "Rollout created; waiting for manual start")
-                } else {
-                    (Some("rollout_tick"), "Rollout started")
-                }
-            }
+        // The template source is the primary submission so spec history
+        // shows what was actually run; the resolved variable values ride
+        // along for the audit trail (submit_rendered_job adds the rendered
+        // JSON itself).
+        let subs = vec![
+            Submission {
+                path: format!("template://{}/{}", template.name, template.version),
+                content: template.source_jsonnet.clone(),
+                is_primary: true,
+            },
+            Submission {
+                path: "template.variables.json".into(),
+                content: serde_json::to_string_pretty(&values).unwrap_or_else(|_| "{}".into()),
+                is_primary: false,
+            },
+        ];
+        let provenance = JobTemplateProvenance {
+            name: template.name.clone(),
+            version: template.version,
         };
 
-        if let Some(kind) = eval_kind {
-            self.store
-                .enqueue_eval(
-                    kind,
-                    Some(&config.name),
-                    Some(&job_config_id),
-                    None,
-                    Some(priority),
-                )
-                .map_err(|e| map_store_error("Error running job", e))?;
-        } else if seeded > 0 {
-            // An unchanged resubmit normally needs no eval, but if it seeded
-            // rows (possible when a previous submit failed between persisting
-            // the config and seeding), the new instances still need placing.
-            self.store
-                .enqueue_eval(
-                    "job_reschedule",
-                    Some(&config.name),
-                    Some(&job_config_id),
-                    None,
-                    Some(priority),
-                )
-                .map_err(|e| map_store_error("Error scheduling seeded instance placement", e))?;
-        }
+        let submitted = self.submit_rendered_job(
+            &identity,
+            &rendered,
+            subs,
+            priority,
+            inner.force_reschedule,
+            Some(&provenance),
+        )?;
+        info!(
+            template = %template.name,
+            version = template.version,
+            job = %submitted.job_name,
+            "job submitted from template"
+        );
 
+        let record = TemplateRunRecord {
+            message: submitted.message.to_string(),
+            job_name: submitted.job_name.clone(),
+            job_config_id: submitted.job_config_id.clone(),
+        };
         self.store
-            .idempotency_record(&idempotency_key, "run_job", message)
+            .idempotency_record(
+                &idempotency_key,
+                "run_job_template",
+                &serde_json::to_string(&record).unwrap_or_else(|_| submitted.message.to_string()),
+            )
             .map_err(|e| map_store_error("Error recording idempotency", e))?;
 
-        let reply = RunJobReply {
-            message: message.into(),
+        Ok(Response::new(RunJobTemplateReply {
+            message: submitted.message.into(),
             deduplicated: false,
-        };
-
-        Ok(Response::new(reply))
+            job_name: submitted.job_name,
+            job_config_id: submitted.job_config_id,
+        }))
     }
 
     #[instrument(skip_all)]
@@ -2093,7 +2674,7 @@ impl Manager for ManagerDaemonService {
             &request,
             AclResource::Job,
             AclAction::Read,
-            AclScope::job(&request.get_ref().name),
+            self.job_read_scope(&request.get_ref().name),
         )?;
         let name = request.into_inner().name;
 
@@ -2101,8 +2682,15 @@ impl Manager for ManagerDaemonService {
             .store
             .get_job(&name)
             .map_err(|e| map_store_error("Error getting job", e))?;
+        let template = self
+            .store
+            .job_template_provenance(&name)
+            .map_err(|e| map_store_error("Error loading job provenance", e))?;
 
-        let reply = GetJobInfoReply { job: Some(job) };
+        let reply = GetJobInfoReply {
+            job: Some(job),
+            template,
+        };
 
         Ok(Response::new(reply))
     }
@@ -2660,7 +3248,7 @@ impl Manager for ManagerDaemonService {
             &request,
             AclResource::Job,
             AclAction::Read,
-            AclScope::job(&request.get_ref().name),
+            self.job_read_scope(&request.get_ref().name),
         )?;
         let name = request.into_inner().name;
 
@@ -2697,7 +3285,7 @@ impl Manager for ManagerDaemonService {
             .job_name_for_config(&config_id)
             .map_err(|e| map_store_error("Error resolving job config", e))?;
         let scope = match &job_name {
-            Some(name) => AclScope::job(name),
+            Some(name) => self.job_read_scope(name),
             None => AclScope::any(),
         };
         acl::enforce(&identity, AclResource::Job, AclAction::Read, &scope)?;
@@ -2719,7 +3307,7 @@ impl Manager for ManagerDaemonService {
             &request,
             AclResource::Job,
             AclAction::Read,
-            AclScope::job(&request.get_ref().name),
+            self.job_read_scope(&request.get_ref().name),
         )?;
         let name = request.into_inner().name;
         let items = self
@@ -2727,10 +3315,11 @@ impl Manager for ManagerDaemonService {
             .list_job_spec_history(&name)
             .map_err(|e| map_store_error("Error listing job spec history", e))?
             .into_iter()
-            .map(|(config_id, created_at, version)| JobSpecHistoryItem {
-                config_id,
-                created_at,
-                version,
+            .map(|row| JobSpecHistoryItem {
+                config_id: row.config_id,
+                created_at: row.created_at,
+                version: row.version,
+                template: row.template,
             })
             .collect();
 
@@ -2758,8 +3347,23 @@ impl Manager for ManagerDaemonService {
             .store
             .get_jobs()
             .map_err(|e| map_store_error("Error getting jobs", e))?;
+        // Provenance feeds the `templates` rule selector so template-scoped
+        // identities see the jobs their templates created. One batch query
+        // instead of one per row; management tokens skip it entirely.
+        let provenance = if identity.is_management {
+            HashMap::new()
+        } else {
+            self.store
+                .job_template_provenance_map()
+                .map_err(|e| map_store_error("Error loading job provenance", e))?
+        };
         jobs.retain(|job| {
-            identity.allows(AclResource::Job, AclAction::Read, &AclScope::job(&job.name))
+            let scope = AclScope::job(&job.name).with_template(
+                provenance
+                    .get(&job.name)
+                    .map(|provenance| provenance.name.clone()),
+            );
+            identity.allows(AclResource::Job, AclAction::Read, &scope)
         });
 
         if let Some(query) = query {
@@ -2798,11 +3402,14 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<StopJobRequest>,
     ) -> Result<Response<StopJobReply>, Status> {
+        // Lifecycle write: provenance-aware scope, so template-scoped
+        // identities can stop the jobs their templates created (they cannot
+        // change specs this way — RunJob never carries provenance).
         self.check_acl(
             &request,
             AclResource::Job,
             AclAction::Write,
-            AclScope::job(&request.get_ref().name),
+            self.job_read_scope(&request.get_ref().name),
         )?;
         let inner = request.into_inner();
         let name = inner.name;
@@ -2858,11 +3465,12 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<DestroyJobRequest>,
     ) -> Result<Response<DestroyJobReply>, Status> {
+        // Lifecycle write: provenance-aware scope (see stop_job).
         self.check_acl(
             &request,
             AclResource::Job,
             AclAction::Write,
-            AclScope::job(&request.get_ref().name),
+            self.job_read_scope(&request.get_ref().name),
         )?;
         let inner = request.into_inner();
         let name = inner.name;
@@ -5324,6 +5932,7 @@ impl Manager for ManagerDaemonService {
             policies: identity.policies.clone(),
             expires_at: identity.expires_at.clone(),
             accessor_id: identity.accessor_id.clone(),
+            rules_json: identity.effective_rules_json(),
         }))
     }
 

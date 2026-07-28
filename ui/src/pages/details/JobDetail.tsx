@@ -1,11 +1,13 @@
 import { A, useNavigate, useParams } from '@solidjs/router'
+import { AccessGate } from '../../components/AccessGate'
 import { For, Show, createMemo, createResource, createSignal, onCleanup, onMount } from 'solid-js'
 import { Badge, CodeBlock, ConfirmButton, EmptyState, MonoBadge, Note, PageHeader, SectionCard, Spinner, StatusBadge, TableShell, Tabs, linkClass, tableClass, tdClass, thClass, theadClass, trHoverClass } from '../../components/ui'
 import DagVisualization from '../../components/DagVisualization'
 import { AllocationPorts, ServiceEndpointsTable, ServiceTags } from '../../components/ServiceEndpoints'
-import { InstanceInfo } from '../../gen/legion_pb'
+import { GetLedgerReply, InstanceInfo } from '../../gen/legion_pb'
 import LogViewer from '../../components/LogViewer'
 import { managerClient } from '../../grpcClient'
+import { allows, jobScope } from '../../utils/acl'
 import { allocationHealthLabel, fetchAllocationRuntime, parseAllocNetwork } from '../../utils/allocations'
 import { formatDate, formatRelativeTime } from '../../utils/format'
 import { buildTaskInstancesByName, buildTaskInstancesFromStatuses, extractJobSpecData, topoSortTaskNames, type TaskInstanceSummary } from '../../utils/jobspec'
@@ -15,7 +17,7 @@ import { POLL_INTERVAL_MS } from '../../utils/polling'
 // slash, so the split is unambiguous.
 const volumeIdFromHandle = (handle: string) => handle.slice(handle.indexOf('/') + 1)
 
-export default function JobDetail() {
+function JobDetailContent() {
   const params = useParams()
   const navigate = useNavigate()
   const jobName = createMemo(() => decodeURIComponent(params.id))
@@ -28,7 +30,9 @@ export default function JobDetail() {
   const [jobData] = createResource(jobName, async () => {
     const [jobInfo, ledger, rollouts, spec, specHistory, services] = await Promise.all([
       managerClient.getJobInfo({ name: jobName() }),
-      managerClient.getLedger({}),
+      // node:read garnish (allocation placement); job-scoped tokens
+      // still get the rest of the page.
+      managerClient.getLedger({}).catch(() => new GetLedgerReply()),
       managerClient.listRollouts({ jobId: jobName(), activeOnly: false, page: 1, pageSize: 200 }),
       managerClient.getJobSpec({ name: jobName() }),
       managerClient.listJobSpecHistory({ name: jobName() }),
@@ -60,6 +64,7 @@ export default function JobDetail() {
 
     return {
       job: jobInfo.job,
+      template: jobInfo.template,
       allocations,
       rollouts: rollouts.rollouts,
       activeRollout: rollouts.rollouts.find((rollout) => !['completed', 'failed', 'cancelled', 'completed_incomplete'].includes(rollout.status.toLowerCase())),
@@ -203,9 +208,24 @@ export default function JobDetail() {
               <>
                 <StatusBadge status={jobData()!.job?.status || 'unknown'} />
                 <Badge tone="neutral">{jobData()!.allocations.length} allocation{jobData()!.allocations.length === 1 ? '' : 's'}</Badge>
+                <Show when={jobData()!.template}>
+                  {(template) => (
+                    <A href={`/templates/${encodeURIComponent(template().name)}`}>
+                      <MonoBadge tone="accent" title="Submitted from a job template">
+                        <>template: {template().name} v{template().version}</>
+                      </MonoBadge>
+                    </A>
+                  )}
+                </Show>
               </>
             }
-            actions={<ConfirmButton label="Delete job" onConfirm={() => void destroyJob()} />}
+            actions={
+              <ConfirmButton
+                label="Delete job"
+                onConfirm={() => void destroyJob()}
+                disabled={!allows('job', 'write', jobScope(jobName(), jobData()!.template?.name))}
+              />
+            }
           />
           <Show when={actionMessage()}>
             <div aria-live="polite">
@@ -572,5 +592,15 @@ export default function JobDetail() {
         </div>
       </Show>
     </Show>
+  )
+}
+
+// Permission gate lives here at the page level — never around the router
+// outlet in the layout (see AccessGate).
+export default function JobDetail() {
+  return (
+    <AccessGate resource="job">
+      <JobDetailContent />
+    </AccessGate>
   )
 }

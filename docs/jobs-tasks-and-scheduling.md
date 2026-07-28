@@ -2,6 +2,13 @@
 
 This document describes how jobs are represented and how scheduling behavior works, including edge cases.
 
+Jobs reach the manager either as a rendered spec (`legion job run`, which
+evaluates Jsonnet client-side) or through a
+[job template](job-templates.md), where the cluster stores the spec and the
+submitter supplies typed variables. Both paths converge on the same
+validation, admission, and scheduling described below; templates only
+change how the spec is produced and who is allowed to submit it.
+
 ## Job Spec Shapes
 
 `JobConfig` supports:

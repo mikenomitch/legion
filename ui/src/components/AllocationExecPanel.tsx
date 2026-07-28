@@ -5,6 +5,7 @@
 
 import { For, Show, createResource, createSignal } from 'solid-js'
 import { managerClient } from '../grpcClient'
+import { allows, jobScope } from '../utils/acl'
 import type { JobAction } from '../gen/legion_pb'
 import ExecTerminal from './ExecTerminal'
 import type { ExecStartOptions } from '../lib/execSocket'
@@ -106,7 +107,13 @@ export default function AllocationExecPanel(props: Props) {
                 />
                 Interactive (tty)
               </label>
-              <Button variant="primary" icon="terminal" onClick={launchExec}>
+              <Button
+                variant="primary"
+                icon="terminal"
+                onClick={launchExec}
+                disabled={!allows('exec', 'write', jobScope(props.jobName))}
+                title={allows('exec', 'write', jobScope(props.jobName)) ? undefined : 'Your token cannot exec into allocations'}
+              >
                 Exec
               </Button>
             </div>
@@ -118,7 +125,18 @@ export default function AllocationExecPanel(props: Props) {
               <p class="eyebrow mb-2">Actions</p>
               <div class="space-y-2.5">
                 <For each={actions()}>
-                  {(action) => <ActionForm action={action} onRun={launchAction} />}
+                  {(action) => (
+                    <ActionForm
+                      action={action}
+                      onRun={launchAction}
+                      disabled={
+                        // The server allows an action run via action:write on
+                        // (job, action) OR exec:write on the job.
+                        !allows('action', 'write', { ...jobScope(props.jobName), actionName: action.name }) &&
+                        !allows('exec', 'write', jobScope(props.jobName))
+                      }
+                    />
+                  )}
                 </For>
               </div>
             </div>
@@ -141,6 +159,7 @@ export default function AllocationExecPanel(props: Props) {
 function ActionForm(props: {
   action: JobAction
   onRun: (action: JobAction, params: Record<string, string>) => void
+  disabled?: boolean
 }) {
   const initial: Record<string, string> = {}
   for (const p of props.action.params) initial[p.name] = p.default ?? ''
@@ -161,7 +180,13 @@ function ActionForm(props: {
             <p class="mt-0.5 text-xs text-faint">{props.action.description}</p>
           </Show>
         </div>
-        <Button variant="accent" icon="play" onClick={() => props.onRun(props.action, values())}>
+        <Button
+          variant="accent"
+          icon="play"
+          onClick={() => props.onRun(props.action, values())}
+          disabled={props.disabled}
+          title={props.disabled ? 'Your token cannot run this action' : undefined}
+        >
           Run
         </Button>
       </div>

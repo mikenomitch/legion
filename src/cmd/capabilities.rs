@@ -129,6 +129,56 @@ pub fn catalog() -> Vec<Capability> {
             mutates: true,
             read_only_safe: false,
         },
+        // --- Job templates (see docs/job-templates.md) ---
+        Capability {
+            name: "template.list",
+            cli: "legion template list [-q <TEXT>]",
+            grpc: Some("Manager/ListJobTemplates"),
+            summary: "List cluster-resident job templates (latest-version summaries).",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "template.get",
+            cli: "legion template get <NAME> [--version N] [--source]",
+            grpc: Some("Manager/GetJobTemplate"),
+            summary: "Show one template version: variables, source, and version history.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "template.render",
+            cli: "legion template render <NAME> [--var K=V]...",
+            grpc: Some("Manager/RenderJobTemplate"),
+            summary: "Dry-run a template: validate variables and print the rendered jobspec.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "template.create",
+            cli: "legion template create <NAME> -f <PATH>",
+            grpc: Some("Manager/UpsertJobTemplate"),
+            summary: "Upload a template file as the next immutable version of NAME.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "template.run",
+            cli: "legion template run <NAME> [--var K=V]... [--wait]",
+            grpc: Some("Manager/RunJobTemplate"),
+            summary:
+                "Render a template with variables and submit the job. Supports --idempotency-key.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "template.delete",
+            cli: "legion template delete <NAME>",
+            grpc: Some("Manager/DeleteJobTemplate"),
+            summary: "Delete a template and all of its versions (running jobs keep running).",
+            mutates: true,
+            read_only_safe: false,
+        },
         // --- Stateful instances (keyed mode; see docs/stateful-workloads.md) ---
         Capability {
             name: "instance.list",
