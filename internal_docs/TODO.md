@@ -19,12 +19,10 @@ How to use it:
 
 | PR | What it lands | Notes |
 | --- | --- | --- |
-| [#151](https://github.com/mikenomitch/legion/pull/151) | Job templates: typed parameters, guided UI submission, ACL-gated delegation | Supersedes [#108](https://github.com/mikenomitch/legion/pull/108); needs a plan + calls doc |
-| [#137](https://github.com/mikenomitch/legion/pull/137) | Real Raft persistence (quorum-committed writes), node drain, metrics, version handshake | Deviates from [multi-raft-persistence-plan.md](plans/multi-raft-persistence-plan.md) — changeset replication instead of per-method determinism |
-| [#152](https://github.com/mikenomitch/legion/pull/152) | Fix flaky artifact staging test marker race | Test-only |
+| [#162](https://github.com/mikenomitch/legion/pull/162) | Lanes hardening: worker-write forwarding, split-tolerant submits, adversarial fixes | Plan §8 + calls doc in [durability-and-ops-execution-plan.md](plans/durability-and-ops-execution-plan.md) |
 | [#143](https://github.com/mikenomitch/legion/pull/143) | Note the node-level builtin resource override gap | Docs only; the fix itself is a todo below |
 | [#84](https://github.com/mikenomitch/legion/pull/84) | Instrument DB hot paths, batch task-status updates | Old; rebase or close |
-| [#108](https://github.com/mikenomitch/legion/pull/108) | Versioned job templates | Superseded by #151 — close |
+| [#108](https://github.com/mikenomitch/legion/pull/108) | Versioned job templates | Superseded by [#151](https://github.com/mikenomitch/legion/pull/151) (merged) — close |
 
 ---
 
@@ -33,8 +31,14 @@ How to use it:
 - [ ] Worker groups + taint/toleration equivalent. Node pools exist as an ACL
       and config concept but nothing scheduling-side consumes them.
 - [ ] Priorities and eviction/preemption, with eviction toggled at the pool level
-  - [ ] At least think through fair-share policies — find the 80/20 rather than
-        building a full hierarchical scheduler
+      — [plan](plans/preemption-and-eviction-plan.md) (PLANNED: graceful stop →
+      priority bands → plan-atomic preemption → governance; pool toggle is
+      `schedulerSettings.preemption.disabledPools`)
+  - [x] At least think through fair-share policies — find the 80/20 rather than
+        building a full hierarchical scheduler. Thought through in the plan's
+        prior art + non-goals: the 80/20 is priority bands now, per-namespace
+        band caps later (phase 4); fair-share/hierarchical queues explicitly
+        deferred (Kueue's policy-matrix issue history is the argument against).
 - [ ] Schedule onto the same node as an *existing job*. Soft `same_node_as`
       colocation works within one job spec
       ([scheduler/policy.rs](../src/manager/scheduler/policy.rs)); cross-job
@@ -50,7 +54,28 @@ How to use it:
       eval-mediated eviction that respects stateful move protection
       ([#137](https://github.com/mikenomitch/legion/pull/137))
 - [ ] Fix the slowest bits of the scheduler using the benchmarks in
-      [docs/testing-and-benchmarks.md](../docs/testing-and-benchmarks.md)
+      [docs/testing-and-benchmarks.md](../docs/testing-and-benchmarks.md).
+      Candidate construction is index-served
+      ([docs/scheduling-indexes.md](../docs/scheduling-indexes.md)) and the
+      per-plan snapshot is fixed (Arc'd nodes + cached free pools —
+      [plan](plans/scheduler-plan-snapshot-plan.md), numbers in
+      [benchmarks/scheduler/README.md](../benchmarks/scheduler/README.md)).
+      The allocations map is shared per node the same way
+      (`SharedNodeAllocations`, copy-on-write). No O(cluster) per-plan
+      deep clone remains on the plan path; next candidates would come
+      from fresh profiling, not this list.
+- [ ] Scheduling-index follow-ups deferred from
+      [plan](plans/scheduling-index-plan.md) (see its calls doc):
+      index-served candidates for multi-task **group** co-placement (v1
+      groups still scan — calls entry 10); pluggable index kinds;
+      `count.per` served by partition enumeration; device-set
+      (`ResourceValue::Items`) dims; task-level `index_hint`;
+      incremental orthant enumeration with early termination.
+- [ ] Worker-fingerprinted `disk` as a built-in schedulable resource — the
+      default `fit` index already dims on `resources.disk` and picks it up
+      automatically wherever it exists; today that is only operator-declared
+      `config_attrs.resources.disk` (plan open question, lean yes; also
+      leaned on by the artifact-cache plan's disk accounting).
 - [ ] Add to AGENTS.md that scheduler changes ship with a before/after perf
       benchmark
 - [x] Close the last plan-fencing window (2026-07-28): the scheduler now
@@ -70,7 +95,8 @@ How to use it:
       allocation epoch and is not re-checked at apply — a plan can commit
       placements exceeding the node's new capacity. Ports are apply-safe
       (re-read in the apply tx); resources are the odd one out. Needs
-      ledger reconstruction inside the apply tx, or an epoch bump on
+      ledger reconstruction inside the apply tx (cheaper now that
+      `node_pools` caches free capacity), or an epoch bump on
       resource-affecting node updates (cross-lane under `lanes` — wants a
       plan). Found by the 2026-07-28 adversarial pass.
 - [ ] Volume-pin staleness in planning: pins are read mid-plan-build with
@@ -279,7 +305,14 @@ Plans: [persistence-plan.md](plans/persistence-plan.md), [multi-raft-persistence
         control-first + orphan sweeps, like the submit composite.
 - [x] Loading state back in from a file — `legion state backup` +
       `--restore-from` ([#137](https://github.com/mikenomitch/legion/pull/137))
-- [ ] Cluster federation
+- [ ] **Cluster federation** —
+      [plan](plans/multi-cluster-federation-plan.md) (PLANNED, with a
+      [calls doc](calls/multi-cluster-federation-plan_calls.md)): named
+      clusters in the CLI/UI, symmetric peering (no hub), request
+      forwarding, federated SSO, multi-cluster jobs, standby managers
+      (learners + zone auto-replacement), and an async DR standby cluster
+      with manual promotion and generation fencing. Cross-cluster service
+      discovery deferred to a follow-up plan (see plan §11).
 - [x] Version handshake between manager and worker — protocol version plus
       build-skew reporting, upgrade order in [docs/upgrades.md](../docs/upgrades.md)
       ([#137](https://github.com/mikenomitch/legion/pull/137))
@@ -357,7 +390,22 @@ The Pack/Helm equivalent. Job templates are in flight on
 Each of these should run inside the core binary *and* be splittable into its own
 job, so day 1 is simple and day N is performant. Each needs its own plan.
 
-- [ ] Autoscaler
+- [ ] **Autoscaler** — [plan](plans/autoscaler-plan.md) (PLANNED) ·
+      [calls](calls/autoscaler-plan_calls.md)
+  - [ ] Phase 1 — `legion job scale`: count overrides outside the job version,
+        `job_scale` eval, `scale` ACL resource, resubmit-ownership rules
+  - [ ] Phase 2 — per-allocation CPU/memory usage collection (heartbeat →
+        `allocation_health`), request-vs-usage in CLI/UI
+  - [ ] Phase 3 — task autoscaler MVP: `scaling { min, max, target }` block,
+        in-manager leader-gated evaluator, damping, scale-status surface
+  - [ ] Phase 4 — full `checks` form, Prometheus source, `per-replica`
+        strategy, activation-gated `min: 0`, `headroom`
+  - [ ] Phase 5 — escape-to-job: `legion autoscaler agent`, control-plane
+        identity policy, KV-lock leadership, `LEGION_MANAGER_ADDR` injection
+  - [ ] Phase 6 — node autoscaling: placement-shortfall signal, node groups,
+        exec-ABI providers, drain-based scale-in, `ForgetNode` RPC
+  - [ ] Phase 7 — dylib `metrics`/`strategies` plugin kinds, `ui.link` Apps
+        sidebar section
 - [ ] Ingress proxy / load balancer (also listed under *Networking*)
 - [ ] GitOps helper — deploy to git, job updates automatically
 - [ ] Cert manager (also listed under *Auth, TLS & security*)
@@ -398,11 +446,37 @@ this" work:
 
 - [ ] Legion can be called as a library, not just as a CLI
 
+## UI
+
+docs: [ui-architecture.md](../docs/ui-architecture.md)
+
+Deferred from [ui-jump-hints-plan.md](plans/ui-jump-hints-plan.md):
+
+- [ ] Jump hints past the tenth row — a 20- or 50-row page labels only its first
+      ten, and the rest look unfinished until you know it is deliberate
+- [ ] Jump hints on the Overview dashboard and on detail-page tables; today only
+      the six index pages register rows
+- [ ] Verify the jump-hint chords survive Safari and Firefox. The letters avoid
+      Chromium's reserved set, but "the page wins `⌘`+digit" is asserted from
+      the reserved-key list, not measured
+      ([calls entry 1](calls/ui-jump-hints-plan_calls.md))
+
 ## Cross-cutting
 
 - [ ] **Audit every name decision in depth.** Important, and gets harder the
       longer it waits.
 - [ ] Performance and scale: prove Legion scales better than K8s, and than Nomad
+- [x] **Binary size: ship a `dist` profile.** `cargo build --profile dist` (LTO +
+      `codegen-units = 1` + strip) takes the binary from 43.7 MB to 26.0 MB. See
+      "Building a shipping binary" in [development.md](development.md).
+- [ ] **Re-measure binary size on linux/amd64.** The 26 MB figure is macOS arm64;
+      Go binaries run 7-9% larger on amd64 and Legion has no cross-compile
+      target set up, so the shipping number is probably a bit higher.
+- [ ] **Decide whether the UI ships inside the binary.** `ui/` is served from
+      disk today, so the 26 MB is not comparable to Nomad (150 MB) or k3s
+      (81.5 MB), both of which embed their web assets. Embedding it is the
+      simpler operator story; it costs binary size on workers that never serve
+      a UI.
 
 ---
 
@@ -461,6 +535,19 @@ docs: [scheduler-and-eval-loop.md](../docs/scheduler-and-eval-loop.md), [jobs-ta
       `cached_allocations_by_node`, in one batched query
       (`Store::allocation_version_vector_for_candidates`), and selects the
       affected subset at submit time.
+- [x] **Declarable scheduling indexes** — ad-hoc `partition_by` × `dims`
+      indexes over node attrs and free resources, nearest-fit candidate
+      generation, automatic per-task selection, shadow mode, `job plan`
+      explain output, Prometheus series, and the default-on `fit` index
+      (free cpu/memory/disk by pool) armed above `index_min_nodes` —
+      [plan](plans/scheduling-index-plan.md),
+      [docs/scheduling-indexes.md](../docs/scheduling-indexes.md).
+      Deferred pieces are open items above (group-path candidates, disk
+      fingerprinting, backlog).
+- [x] AGENTS.md now requires before/after benchmark numbers on scheduler
+      changes, and `benches/scheduler_bench.rs` grew a
+      `candidate_construction` group that isolates candidate-set cost
+      (indexes on vs off) across fleet sizes.
 
 ## Task runtimes
 
@@ -611,3 +698,15 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
 - [x] An MCP server (`legion mcp serve`), with mutating tools gated behind
       `--allow-write`
 - [x] Idempotency keys on mutating RPCs; validate/plan/preview paths
+
+## UI
+
+[docs](../docs/ui-architecture.md)
+
+- [x] Keyboard navigation: ⌘K command palette, `j`/`k`/`o` index selection, `u`
+      to go up a level
+- [x] Jump hints — hold ⌘ (Ctrl) to label index rows with digits and sidebar
+      items with letters, then ⌘1 / ⌘⇧B to jump
+      ([plan](plans/ui-jump-hints-plan.md),
+      [calls](calls/ui-jump-hints-plan_calls.md)). Rows past the tenth, the
+      Overview dashboard, and detail-page tables are open items above.

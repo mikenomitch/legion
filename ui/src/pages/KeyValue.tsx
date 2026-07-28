@@ -1,5 +1,7 @@
 import { For, Show, createEffect, createMemo, createSignal } from 'solid-js'
+import { AccessGate } from '../components/AccessGate'
 import { managerClient } from '../grpcClient'
+import { allows } from '../utils/acl'
 import { KvEntry, KvValueType } from '../gen/legion_pb'
 import { Badge, Button, ConfirmButton, EmptyState, Field, Icon, Note, SectionCard, Spinner, cx, inputClass, selectClass, textareaClass } from '../components/ui'
 
@@ -64,7 +66,7 @@ const valueTypeLabel = (valueType: number) => {
   }
 }
 
-export default function KeyValue() {
+function KeyValueContent() {
   const [entries, setEntries] = createSignal<KvEntry[]>([])
   const [loading, setLoading] = createSignal(false)
   const [error, setError] = createSignal<string | null>(null)
@@ -276,7 +278,12 @@ export default function KeyValue() {
           description={selectedEntry() ? <span class="font-mono">{selectedEntry()!.key}</span> : 'Create a key/value entry.'}
           actions={
             <Show when={selectedEntry()}>
-              <ConfirmButton label="Delete" size="xs" onConfirm={() => void handleDelete()} />
+              <ConfirmButton
+                label="Delete"
+                size="xs"
+                onConfirm={() => void handleDelete()}
+                disabled={!allows('kv', 'write', { path: selectedEntry()!.key })}
+              />
             </Show>
           }
         >
@@ -312,7 +319,12 @@ export default function KeyValue() {
             </Field>
 
             <div class="flex flex-wrap items-center gap-3">
-              <Button variant="primary" size="md" onClick={() => void handleSave()}>
+              <Button
+                variant="primary"
+                size="md"
+                onClick={() => void handleSave()}
+                disabled={!allows('kv', 'write', editKey().trim() ? { path: editKey().trim() } : { any: true })}
+              >
                 {selectedEntry() ? 'Save changes' : 'Create entry'}
               </Button>
               <Show when={selectedEntry()}>
@@ -330,12 +342,27 @@ export default function KeyValue() {
                   onInput={(event) => setPatchValue(event.currentTarget.value)}
                   placeholder='[{"op":"replace","path":"/name","value":"new"}]'
                 />
-                <Button onClick={() => void handlePatch()}>Apply patch</Button>
+                <Button
+                  onClick={() => void handlePatch()}
+                  disabled={!allows('kv', 'write', { path: selectedEntry()?.key ?? '' })}
+                >
+                  Apply patch
+                </Button>
               </div>
             </Show>
           </div>
         </SectionCard>
       </div>
     </div>
+  )
+}
+
+// Permission gate lives here at the page level — never around the router
+// outlet in the layout (see AccessGate).
+export default function KeyValue() {
+  return (
+    <AccessGate resource="kv">
+      <KeyValueContent />
+    </AccessGate>
   )
 }

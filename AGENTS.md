@@ -11,6 +11,7 @@
 ## Build, Test, and Development Commands
 - Build crate and plugins: `cargo build` (requires `protoc`).
 - Release build: `cargo build --release`.
+- Shipping build: `cargo build --profile dist` — adds LTO and strips symbols, cutting the binary from ~44 MB to ~26 MB at the cost of a much slower link. Output is `target/dist/legion`. See "Building a shipping binary" in `internal_docs/development.md`.
 - Run tests: `cargo test --all --locked`.
 - Run manager: `cargo run -- start manager -c configs/manager.jsonnet`.
 - Run worker: `cargo run -- join <TOKEN>` or `cargo run -- start worker <TOKEN>`.
@@ -26,6 +27,11 @@
 - Name tests descriptively with `_test` modules/functions.
 - Run full suite via `cargo test --all --locked`; avoid mutating shared fixtures.
 - Always run Rust tests unless the change only touches the front end or documentation.
+- **Scheduler changes ship with before/after benchmark numbers.** Run the
+  relevant `benches/scheduler_bench.rs` groups (e.g.
+  `cargo bench --bench scheduler_bench -- candidate_construction`) on the
+  base branch and on your change, and put both numbers in the PR. See
+  `docs/testing-and-benchmarks.md`.
 
 ## Commit & Pull Request Guidelines
 - Commits: short, imperative summaries (e.g., "Refactor store helpers").
@@ -168,9 +174,10 @@ the code** — not in a follow-up, and not "later".
 ### Plan non-trivial features before building them (required)
 
 Any non-trivial feature gets a plan in `internal_docs/plans/<feature>-plan.md`
-before the code: the problem, the prior art, goals and non-goals, what exists in
-the code today, the proposed design shown as the user-facing surface, phases that
-each ship on their own, the testing plan, and the rollout story.
+before the code: the problem, the prior art, the jobs to be done stated in plain
+language for each persona the feature touches, goals and non-goals, what exists
+in the code today, the proposed design shown as the user-facing surface, phases
+that each ship on their own, the testing plan, and the rollout story.
 
 - **Required** for a new user-facing surface (jobspec block, RPC, CLI verb, env
   var, UI page), a new or reshaped subsystem, a changed default, a security

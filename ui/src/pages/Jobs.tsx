@@ -1,10 +1,11 @@
 import { createEffect, createMemo, createResource, createSignal } from 'solid-js'
+import { AccessGate } from '../components/AccessGate'
 import SharedIndex from '../components/SharedIndex'
 import { managerClient } from '../grpcClient'
 import { debounced } from '../utils/debounce'
 import { formatRelativeTime } from '../utils/format'
 
-export default function Jobs() {
+function JobsContent() {
   const [search, setSearch] = createSignal('')
   const [sort, setSort] = createSignal('created_at:desc')
   const [page, setPage] = createSignal(1)
@@ -17,7 +18,15 @@ export default function Jobs() {
     setPage(1)
   })
 
-  const [ledger] = createResource(async () => (await managerClient.getLedger({})).nodes)
+  // Allocation counts are garnish needing node:read; a job-scoped token
+  // (job:read only) must still get the list, so denial degrades to empty.
+  const [ledger] = createResource(async () => {
+    try {
+      return (await managerClient.getLedger({})).nodes
+    } catch {
+      return []
+    }
+  })
   const jobAllocationCounts = createMemo(() => {
     const map = new Map<string, number>()
     for (const node of ledger() ?? []) {
@@ -72,5 +81,15 @@ export default function Jobs() {
       emptyLabel="No jobs yet"
       emptyHint="Submit a job with `legion job submit <spec>` and it will appear here."
     />
+  )
+}
+
+// Permission gate lives here at the page level — never around the router
+// outlet in the layout (see AccessGate).
+export default function Jobs() {
+  return (
+    <AccessGate resource="job">
+      <JobsContent />
+    </AccessGate>
   )
 }

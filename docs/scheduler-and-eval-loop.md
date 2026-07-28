@@ -127,6 +127,19 @@ If you observe frequent conflict retries, increase this setting modestly and als
 
 Nodes are sorted by ID before planning.
 
+Per task, the candidate set is then built one of two ways:
+
+- **Scan** (the baseline): every available node is tested against the
+  task's constraints, permit, and volume-driver requirements.
+- **Scheduling index** ([scheduling-indexes.md](scheduling-indexes.md)):
+  when the fleet is at or above `schedulerSettings.index_min_nodes` and a
+  declared index binds the task's equality constraints, candidates come
+  from that index — partition shard lookup plus a nearest-fit walk over
+  free resources — and only those are re-verified with the same predicate
+  the scan applies. The scan remains the authoritative fallback (unusable
+  index, empty coverage, or a truncated list running dry), and `job plan`
+  reports which path served each task.
+
 ## Placement Constraints and Scoring
 
 For each task, planner builds:

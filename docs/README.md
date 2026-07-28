@@ -13,6 +13,8 @@ Plans, roadmaps, to-do lists, and development notes live in
   responsibilities, and the manager/worker protocol.
 - [Scheduler and Eval Loop](scheduler-and-eval-loop.md) — the control loop that
   drives placement.
+- [Scheduling Indexes](scheduling-indexes.md) — declarable nearest-fit indexes
+  over node attributes and free resources; how candidate selection scales.
 - [Jobs, Tasks, and Scheduling](jobs-tasks-and-scheduling.md) — job spec shapes,
   placement semantics, and edge cases.
 - [State Store](state-store.md) — manager and worker persistence.
@@ -26,6 +28,8 @@ Plans, roadmaps, to-do lists, and development notes live in
 - [Task Runtime: sandbox](task-runtime-sandbox.md) — OCI images in microVMs for
   untrusted code and agent workspaces.
 - [Task Runtime: noop](task-runtime-noop.md)
+- [Job Templates](job-templates.md) — reusable, versioned job specs with typed
+  variables, guided submission, and template-scoped delegation.
 - [Artifacts](artifacts.md) — declaring, fetching, verifying, and staging inputs.
 - [Stateful Workloads & Instance Identity](stateful-workloads.md) — slot and
   keyed instances, storage handles, fencing.

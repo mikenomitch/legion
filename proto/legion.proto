@@ -75,6 +75,67 @@ service Manager {
   // Lists jobs known by the manager.
   rpc ListJobs (ListJobsRequest) returns (ListJobsReply);
 
+  // === JOB TEMPLATES ===
+  //
+  // Job templates are cluster-resident, immutably versioned Jsonnet
+  // documents with declared, typed variables. Anyone with `template:read`
+  // can browse them; `template:write` creates new versions or deletes them;
+  // submitting a job *through* a template is gated by `job:write` rules
+  // carrying the `templates` scope selector (see AclPolicy), which is how
+  // an operator locks an account down to "may only submit via template X".
+  // Rendering happens on the manager (imports are forbidden; templates are
+  // self-contained), so thin clients like the UI get the same result as the
+  // CLI. See docs/job-templates.md.
+
+  // Creates the next immutable version of a named job template.
+  //
+  // The source must evaluate to an object with an optional `description`,
+  // an optional `variables` list, and a hidden `job(vars)::` function that
+  // returns the jobspec. Invalid manifests are rejected here, not at run
+  // time. When every declared variable has a default, the manager also
+  // trial-renders the template and validates the resulting jobspec.
+  // Requires `template:write` scoped to the template name.
+  rpc UpsertJobTemplate (UpsertJobTemplateRequest) returns (UpsertJobTemplateReply);
+
+  // Lists job templates (latest-version summaries).
+  //
+  // Requires `template:read`; results are filtered to templates the caller
+  // can read.
+  rpc ListJobTemplates (ListJobTemplatesRequest) returns (ListJobTemplatesReply);
+
+  // Returns one job template version (latest when `version` is omitted),
+  // including its source, variable definitions, and version history.
+  // Requires `template:read` scoped to the template name.
+  rpc GetJobTemplate (GetJobTemplateRequest) returns (GetJobTemplateReply);
+
+  // Deletes a job template and all of its versions.
+  //
+  // Jobs already created from the template keep running and keep their
+  // provenance records; only the template itself disappears. Requires
+  // `template:write` scoped to the template name.
+  rpc DeleteJobTemplate (DeleteJobTemplateRequest) returns (DeleteJobTemplateReply);
+
+  // Renders a template with the given variables without submitting.
+  //
+  // The dry-run twin of RunJobTemplate: validates the variables, renders
+  // the jobspec, validates it, and returns it. Mutates nothing. Requires
+  // the same access as RunJobTemplate (`job:write` for the rendered job
+  // name with the template attribute set), so a caller can always preview
+  // exactly what it is allowed to submit.
+  rpc RenderJobTemplate (RenderJobTemplateRequest) returns (RenderJobTemplateReply);
+
+  // Renders a template with the given variables and submits the result as
+  // a job (create or update), stamping template provenance on the config.
+  //
+  // ACL: requires `job:write` for the rendered job name evaluated with the
+  // template attribute set — satisfied either by an ordinary `job:write`
+  // rule or by one scoped with `templates: [...]`. A run that would update
+  // an existing job whose latest config did not come from this template
+  // fails with FAILED_PRECONDITION unless the caller also holds plain
+  // `job:write` on that job name (this stops a template-only identity from
+  // hijacking unrelated jobs when the rendered name is user-influenced).
+  rpc RunJobTemplate (RunJobTemplateRequest) returns (RunJobTemplateReply);
+
   // Creates a keyed-mode stateful instance for a job's keyed task and
   // enqueues placement.
   //
@@ -936,6 +997,230 @@ message RunJobReply {
   bool deduplicated = 2;
 }
 
+// One declared job-template variable.
+//
+// Declared in the template source's `variables` list and used by clients
+// (UI form generation, CLI coercion) and by the manager for validation.
+message JobTemplateVariable {
+  // Variable key. Must match `[a-zA-Z_][a-zA-Z0-9_]*`. The rendered
+  // template receives all declared keys as fields of the single `vars`
+  // object passed to its `job(vars)` function.
+  string key = 1;
+
+  // Variable type. One of: `string`, `text` (multiline string), `number`,
+  // `boolean`, `select` (one of `options`), `multi_select` (list drawn
+  // from `options`), `json` (any JSON value, passed through verbatim).
+  string type = 2;
+
+  // Human-readable label for forms. Defaults to `key` when empty.
+  string label = 3;
+
+  // Optional helper text shown next to the input.
+  optional string description = 4;
+
+  // Whether a value must be provided at run time. Defaults to true when
+  // the variable has no default, false when it has one. A variable with
+  // `required: false` and no default renders as JSON `null`.
+  bool required = 5;
+
+  // Default value as JSON text, matching `type` (for example `"draft"`,
+  // `24`, `false`, `["a","b"]`). Unset means no default.
+  optional string default_json = 6;
+
+  // Allowed values for `select` / `multi_select` types; empty otherwise.
+  repeated string options = 7;
+}
+
+// Metadata for one stored template version (no source).
+message JobTemplateVersionInfo {
+  // Version number, 1-indexed and immutable once written.
+  uint32 version = 1;
+
+  // RFC3339 creation timestamp.
+  string created_at = 2;
+
+  // Principal that created this version (token name, `user:<name>`, or
+  // empty when ACLs were disabled).
+  string created_by = 3;
+}
+
+// One full job template version.
+message JobTemplate {
+  // Template name: lowercase alphanumerics and dashes, like a job name.
+  // The name is the template's identity; there is no separate display name.
+  string name = 1;
+
+  // Version number of this document.
+  uint32 version = 2;
+
+  // Latest version number that exists for this template.
+  uint32 latest_version = 3;
+
+  // Optional user-facing description from the template manifest.
+  optional string description = 4;
+
+  // Raw Jsonnet source of this version.
+  string source_jsonnet = 5;
+
+  // Declared variables from the manifest, in declaration order.
+  repeated JobTemplateVariable variables = 6;
+
+  // RFC3339 creation timestamp of this version.
+  string created_at = 7;
+
+  // Principal that created this version.
+  string created_by = 8;
+}
+
+// Latest-version summary row for ListJobTemplates.
+message JobTemplateSummary {
+  // Template name.
+  string name = 1;
+
+  // Latest version number.
+  uint32 latest_version = 2;
+
+  // Description from the latest version.
+  optional string description = 3;
+
+  // Number of declared variables in the latest version.
+  uint32 variable_count = 4;
+
+  // RFC3339 timestamp of the latest version's creation.
+  string updated_at = 5;
+}
+
+// Provenance of a job config that was produced by RunJobTemplate.
+message JobTemplateProvenance {
+  // Template name.
+  string name = 1;
+
+  // Template version that rendered the config.
+  uint32 version = 2;
+}
+
+// Request payload for UpsertJobTemplate.
+message UpsertJobTemplateRequest {
+  // Template name. Creating a name that already exists appends the next
+  // version; versions are never overwritten.
+  string name = 1;
+
+  // Full Jsonnet source. Must be self-contained (imports are rejected) and
+  // at most 512 KiB. See JobTemplate for the required document shape.
+  string source_jsonnet = 2;
+}
+
+// Reply payload for UpsertJobTemplate.
+message UpsertJobTemplateReply {
+  // The stored version.
+  JobTemplate template = 1;
+}
+
+// Request payload for ListJobTemplates.
+message ListJobTemplatesRequest {
+  // Optional case-insensitive substring filter over name and description.
+  optional string query = 1;
+}
+
+// Reply payload for ListJobTemplates.
+message ListJobTemplatesReply {
+  // Templates the caller may read, most recently updated first.
+  repeated JobTemplateSummary templates = 1;
+}
+
+// Request payload for GetJobTemplate.
+message GetJobTemplateRequest {
+  // Template name (exact match).
+  string name = 1;
+
+  // Version to fetch. Omit for the latest.
+  optional uint32 version = 2;
+}
+
+// Reply payload for GetJobTemplate.
+message GetJobTemplateReply {
+  // The requested version.
+  JobTemplate template = 1;
+
+  // All stored versions of this template, newest first.
+  repeated JobTemplateVersionInfo versions = 2;
+}
+
+// Request payload for DeleteJobTemplate.
+message DeleteJobTemplateRequest {
+  // Template name (exact match). Deletes every version.
+  string name = 1;
+}
+
+// Reply payload for DeleteJobTemplate.
+message DeleteJobTemplateReply {
+  // Human-readable status message.
+  string message = 1;
+}
+
+// Request payload for RenderJobTemplate.
+message RenderJobTemplateRequest {
+  // Template name.
+  string name = 1;
+
+  // Version to render. Omit for the latest.
+  optional uint32 version = 2;
+
+  // Variable values as a JSON object keyed by variable key, for example
+  // `{"scene": "s3://bucket/x", "frames": 48}`. Values are validated
+  // against the declared types; strings are leniently coerced (`"48"`
+  // satisfies a `number`). At most 64 KiB.
+  string variables_json = 3;
+}
+
+// Reply payload for RenderJobTemplate.
+message RenderJobTemplateReply {
+  // The rendered jobspec as JSON text, exactly what RunJobTemplate would
+  // submit with the same inputs.
+  string rendered_jobspec = 1;
+
+  // Name of the job the rendered spec declares.
+  string job_name = 2;
+}
+
+// Request payload for RunJobTemplate.
+message RunJobTemplateRequest {
+  // Template name.
+  string name = 1;
+
+  // Version to render. Omit for the latest.
+  optional uint32 version = 2;
+
+  // Variable values as a JSON object keyed by variable key (see
+  // RenderJobTemplateRequest.variables_json).
+  string variables_json = 3;
+
+  // Optional eval priority override (see RunJobRequest.priority).
+  optional int64 priority = 4;
+
+  // When true, enqueues a reschedule even when the rendered spec is
+  // unchanged. Default: `false`.
+  bool force_reschedule = 5;
+
+  // Optional idempotency key (see RunJobRequest.idempotency_key).
+  optional string idempotency_key = 6;
+}
+
+// Reply payload for RunJobTemplate.
+message RunJobTemplateReply {
+  // Human-readable outcome message (same vocabulary as RunJobReply).
+  string message = 1;
+
+  // True when replayed from a previously recorded idempotent result.
+  bool deduplicated = 2;
+
+  // Name of the job that was created or updated.
+  string job_name = 3;
+
+  // Job config ID produced (or matched, when unchanged) by this run.
+  string job_config_id = 4;
+}
+
 // Request payload for GetJobInfo.
 message GetJobInfoRequest {
   // Job name (also used as job ID in current manager implementation).
@@ -948,6 +1233,10 @@ message GetJobInfoReply {
   //
   // Manager returns NotFound instead of returning this field unset.
   Job job = 1;
+
+  // Template that rendered the job's latest config, when it was submitted
+  // via RunJobTemplate. Unset for raw RunJob submissions.
+  optional JobTemplateProvenance template = 2;
 }
 
 // Request payload for ListRollouts.
@@ -1272,6 +1561,10 @@ message JobSpecHistoryItem {
 
   // Monotonic config version.
   optional int64 version = 3;
+
+  // Template that rendered this config, when it was submitted via
+  // RunJobTemplate. Unset for raw RunJob submissions.
+  optional JobTemplateProvenance template = 4;
 }
 
 // Request payload for ListJobSpecHistory.
@@ -1305,6 +1598,53 @@ message PlanJobReply {
 
   // True when existing config is content-identical to planned config.
   bool same_content = 4;
+
+  // Per-task scheduling-index usage for this plan: which declared index (if
+  // any) generated each task's placement candidates, and why not when none
+  // did. One entry per task the plan considered. See
+  // docs/scheduling-indexes.md for the model.
+  repeated TaskIndexUsage index_usage = 5;
+}
+
+// How candidate construction went for one planned task — the scheduling
+// index's explain record. The scan (a full pass over every available node)
+// remains the authoritative fallback; these fields describe whether and how
+// an index short-circuited it.
+message TaskIndexUsage {
+  // Task the entry describes.
+  string task_name = 1;
+
+  // Name of the index that served candidates (e.g. the built-in "fit"), or
+  // empty when the plain scan ran.
+  string index = 2;
+
+  // "on" when the index generated the candidates, "shadow" when it ran
+  // alongside the authoritative scan for comparison. Empty when no index
+  // participated.
+  string mode = 3;
+
+  // Number of candidate nodes handed to placement scoring.
+  uint32 candidates = 4;
+
+  // True when the candidate list was cut to the per-task budget, keeping the
+  // index's nearest-fit-first order.
+  bool truncated = 5;
+
+  // Times placement exhausted a truncated candidate list and widened back to
+  // the full scan mid-task.
+  uint32 refills = 6;
+
+  // True when the scan ended up serving after the index came up short
+  // (empty coverage, or a truncated list that ran dry).
+  bool fell_back = 7;
+
+  // Shadow mode only: whether the index's candidate set matched the scan's
+  // exactly. Absent outside shadow mode.
+  optional bool shadow_agreement = 8;
+
+  // Why no index served when one might have been expected to — e.g.
+  // "no usable index: gpu needs [region]". Empty otherwise.
+  string reason = 9;
 }
 
 // Planned allocation display item.
@@ -3894,6 +4234,16 @@ message WhoAmIReply {
   //
   // Accessor IDs are safe to log and are the handle used by DeleteAclToken.
   optional string accessor_id = 8;
+
+  // The caller's effective ACL rules as a JSON array (the same rule schema
+  // as AclPolicy.rules_json), flattened from every attached policy.
+  //
+  // This is self-introspection: it reveals only what the caller's own
+  // requests would reveal, and it is what lets clients like the UI hide
+  // controls the identity cannot use. Management tokens and disabled ACLs
+  // report `[{"resources":["*"],"actions":["*"]}]`. Unset for anonymous
+  // callers with no anonymous policy.
+  optional string rules_json = 9;
 }
 
 // Request payload for Login.
@@ -3981,14 +4331,17 @@ message AclTokenInfo {
 //
 // Rule fields:
 // - `resources`: resource types the rule covers (`job`, `node`, `kv`,
-//   `state`, `operator`, `acl`, or `*`).
+//   `state`, `operator`, `acl`, `exec`, `action`, `template`, or `*`).
 // - `actions`: `read`, `write`, or `*`.
 // - `effect`: `allow` (default) or `deny`. A matching deny rule always
 //   overrides any allow.
 // - Optional scope selectors (glob lists matched against the request):
 //   `namespaces` (job namespaces), `names` (job names), `pools` (node
-//   pools), `paths` (KV keys). A rule with a selector only matches requests
-//   that carry that attribute.
+//   pools), `paths` (KV keys), `actionNames` (declared action names),
+//   `templates` (job-template names). A rule with a selector only matches
+//   requests that carry that attribute — which is why a `job` rule with
+//   `templates: ["x"]` grants submission only through template `x` and
+//   never via raw RunJob.
 message AclPolicy {
   // Unique policy name. Tokens reference policies by exact name.
   string name = 1;

@@ -1,4 +1,5 @@
 import { For, Show, createEffect, createMemo, createResource, createSignal, onCleanup } from 'solid-js'
+import { AccessGate } from '../components/AccessGate'
 import { managerClient } from '../grpcClient'
 import { EmptyState, Icon, Note, SectionCard, checkboxClass, cx, inputClass } from '../components/ui'
 import { badgeToneClasses, statusTone } from '../utils/status'
@@ -239,7 +240,7 @@ function SignalCard(props: {
   return <LogSignalRow signal={props.signal} expanded={props.expanded} onToggle={props.onToggle} />
 }
 
-export default function Observability() {
+function ObservabilityContent() {
   const [o11y, o11yActions] = createResource(async () => managerClient.getObservability({ maxLines: 200 }))
   const [liveUpdating, setLiveUpdating] = createSignal(true)
   const [searchTerm, setSearchTerm] = createSignal('')
@@ -349,5 +350,15 @@ export default function Observability() {
         </SectionCard>
       </div>
     </Show>
+  )
+}
+
+// Permission gate lives here at the page level — never around the router
+// outlet in the layout (see AccessGate).
+export default function Observability() {
+  return (
+    <AccessGate resource="operator">
+      <ObservabilityContent />
+    </AccessGate>
   )
 }

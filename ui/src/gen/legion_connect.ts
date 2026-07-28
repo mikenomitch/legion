@@ -3,7 +3,7 @@
 /* eslint-disable */
 // @ts-nocheck
 
-import { AcquireKvLockReply, AcquireKvLockRequest, AdvanceRolloutReply, AdvanceRolloutRequest, BootstrapAclReply, BootstrapAclRequest, CreateAclTokenReply, CreateAclTokenRequest, CreateInstanceReply, CreateInstanceRequest, CreateInstancesReply, CreateInstancesRequest, CreateJoinTokenReply, CreateJoinTokenRequest, DeleteAclPolicyReply, DeleteAclPolicyRequest, DeleteAclTokenReply, DeleteAclTokenRequest, DeleteAclUserReply, DeleteAclUserRequest, DeleteJoinTokenReply, DeleteJoinTokenRequest, DeleteKvReply, DeleteKvRequest, DeleteSavedStateQueryReply, DeleteSavedStateQueryRequest, DeleteVolumeReply, DeleteVolumeRequest, DestroyInstanceReply, DestroyInstanceRequest, DestroyJobReply, DestroyJobRequest, ExecClientFrame, ExecServerFrame, GetAclPolicyReply, GetAclPolicyRequest, GetAllocationLogsReply, GetAllocationLogsRequest, GetArtifactCredentialReply, GetArtifactCredentialRequest, GetAuthMethodsReply, GetAuthMethodsRequest, GetInstanceReply, GetInstanceRequest, GetJobInfoReply, GetJobInfoRequest, GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest, GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest, GetObservabilityReply, GetObservabilityRequest, GetRaftJoinTokenReply, GetRaftJoinTokenRequest, GetRaftStatusReply, GetRaftStatusRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest, GetStateStoreSchemaReply, GetStateStoreSchemaRequest, GetTaskLogsReply, GetTaskLogsRequest, GetVolumeReply, GetVolumeRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, IssueNodeIdentityTokenReply, IssueNodeIdentityTokenRequest, IssueRaftCommandReply, IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply, IssueWorkloadIdentityTokenRequest, ListAclPoliciesReply, ListAclPoliciesRequest, ListAclTokensReply, ListAclTokensRequest, ListAclUsersReply, ListAclUsersRequest, ListEventsReply, ListEventsRequest, ListInstancesReply, ListInstancesRequest, ListJobActionsReply, ListJobActionsRequest, ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobsReply, ListJobsRequest, ListJoinTokensReply, ListJoinTokensRequest, ListKvReply, ListKvRequest, ListRaftHistoryReply, ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply, ListRolloutsRequest, ListSavedStateQueriesReply, ListSavedStateQueriesRequest, ListServicesReply, ListServicesRequest, ListVolumeDriversReply, ListVolumeDriversRequest, ListVolumesReply, ListVolumesRequest, LoginReply, LoginRequest, PatchKvReply, PatchKvRequest, PlanJobReply, PlanJobRequest, PostWorkReply, PostWorkRequest, PutKvReply, PutKvRequest, QueryStateStoreReply, QueryStateStoreRequest, ReleaseKvLockReply, ReleaseKvLockRequest, RenewKvLockReply, RenewKvLockRequest, ReplaceInstanceReply, ReplaceInstanceRequest, ResolveServiceReply, ResolveServiceRequest, RestartWorkerReply, RestartWorkerRequest, RunJobReply, RunJobRequest, SchedulerEvent, StartInstanceReply, StartInstanceRequest, StopInstanceReply, StopInstanceRequest, StopJobReply, StopJobRequest, StopRolloutReply, StopRolloutRequest, StreamEventsRequest, UpdateNodeDynamicReply, UpdateNodeDynamicRequest, UpsertAclPolicyReply, UpsertAclPolicyRequest, UpsertAclUserReply, UpsertAclUserRequest, UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest, WhoAmIReply, WhoAmIRequest, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest } from "./legion_pb.js";
+import { AcquireKvLockReply, AcquireKvLockRequest, AdvanceRolloutReply, AdvanceRolloutRequest, BootstrapAclReply, BootstrapAclRequest, CreateAclTokenReply, CreateAclTokenRequest, CreateInstanceReply, CreateInstanceRequest, CreateInstancesReply, CreateInstancesRequest, CreateJoinTokenReply, CreateJoinTokenRequest, DeleteAclPolicyReply, DeleteAclPolicyRequest, DeleteAclTokenReply, DeleteAclTokenRequest, DeleteAclUserReply, DeleteAclUserRequest, DeleteJobTemplateReply, DeleteJobTemplateRequest, DeleteJoinTokenReply, DeleteJoinTokenRequest, DeleteKvReply, DeleteKvRequest, DeleteSavedStateQueryReply, DeleteSavedStateQueryRequest, DeleteVolumeReply, DeleteVolumeRequest, DestroyInstanceReply, DestroyInstanceRequest, DestroyJobReply, DestroyJobRequest, ExecClientFrame, ExecServerFrame, GetAclPolicyReply, GetAclPolicyRequest, GetAllocationLogsReply, GetAllocationLogsRequest, GetArtifactCredentialReply, GetArtifactCredentialRequest, GetAuthMethodsReply, GetAuthMethodsRequest, GetInstanceReply, GetInstanceRequest, GetJobInfoReply, GetJobInfoRequest, GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest, GetJobTemplateReply, GetJobTemplateRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest, GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest, GetObservabilityReply, GetObservabilityRequest, GetRaftJoinTokenReply, GetRaftJoinTokenRequest, GetRaftStatusReply, GetRaftStatusRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest, GetStateBackupReply, GetStateBackupRequest, GetStateStoreSchemaReply, GetStateStoreSchemaRequest, GetTaskLogsReply, GetTaskLogsRequest, GetVolumeReply, GetVolumeRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, IssueNodeIdentityTokenReply, IssueNodeIdentityTokenRequest, IssueRaftCommandReply, IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply, IssueWorkloadIdentityTokenRequest, JoinRaftClusterReply, JoinRaftClusterRequest, ListAclPoliciesReply, ListAclPoliciesRequest, ListAclTokensReply, ListAclTokensRequest, ListAclUsersReply, ListAclUsersRequest, ListEventsReply, ListEventsRequest, ListInstancesReply, ListInstancesRequest, ListJobActionsReply, ListJobActionsRequest, ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobsReply, ListJobsRequest, ListJobTemplatesReply, ListJobTemplatesRequest, ListJoinTokensReply, ListJoinTokensRequest, ListKvReply, ListKvRequest, ListRaftHistoryReply, ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply, ListRolloutsRequest, ListSavedStateQueriesReply, ListSavedStateQueriesRequest, ListServicesReply, ListServicesRequest, ListVolumeDriversReply, ListVolumeDriversRequest, ListVolumesReply, ListVolumesRequest, LoginReply, LoginRequest, PatchKvReply, PatchKvRequest, PlanJobReply, PlanJobRequest, PostWorkReply, PostWorkRequest, PutKvReply, PutKvRequest, QueryStateStoreReply, QueryStateStoreRequest, RaftLaneReply, RaftLaneRequest, ReleaseKvLockReply, ReleaseKvLockRequest, RenderJobTemplateReply, RenderJobTemplateRequest, RenewKvLockReply, RenewKvLockRequest, ReplaceInstanceReply, ReplaceInstanceRequest, ResolveServiceReply, ResolveServiceRequest, RestartWorkerReply, RestartWorkerRequest, RunJobReply, RunJobRequest, RunJobTemplateReply, RunJobTemplateRequest, SchedulerEvent, SetNodeAvailabilityReply, SetNodeAvailabilityRequest, StartInstanceReply, StartInstanceRequest, StopInstanceReply, StopInstanceRequest, StopJobReply, StopJobRequest, StopRolloutReply, StopRolloutRequest, StreamEventsRequest, UpdateNodeDynamicReply, UpdateNodeDynamicRequest, UpsertAclPolicyReply, UpsertAclPolicyRequest, UpsertAclUserReply, UpsertAclUserRequest, UpsertJobTemplateReply, UpsertJobTemplateRequest, UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest, WhoAmIReply, WhoAmIRequest, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest } from "./legion_pb.js";
 import { MethodKind } from "@bufbuild/protobuf";
 
 /**
@@ -210,6 +210,103 @@ export const Manager = {
       name: "ListJobs",
       I: ListJobsRequest,
       O: ListJobsReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Creates the next immutable version of a named job template.
+     *
+     * The source must evaluate to an object with an optional `description`,
+     * an optional `variables` list, and a hidden `job(vars)::` function that
+     * returns the jobspec. Invalid manifests are rejected here, not at run
+     * time. When every declared variable has a default, the manager also
+     * trial-renders the template and validates the resulting jobspec.
+     * Requires `template:write` scoped to the template name.
+     *
+     * @generated from rpc legion.Manager.UpsertJobTemplate
+     */
+    upsertJobTemplate: {
+      name: "UpsertJobTemplate",
+      I: UpsertJobTemplateRequest,
+      O: UpsertJobTemplateReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Lists job templates (latest-version summaries).
+     *
+     * Requires `template:read`; results are filtered to templates the caller
+     * can read.
+     *
+     * @generated from rpc legion.Manager.ListJobTemplates
+     */
+    listJobTemplates: {
+      name: "ListJobTemplates",
+      I: ListJobTemplatesRequest,
+      O: ListJobTemplatesReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Returns one job template version (latest when `version` is omitted),
+     * including its source, variable definitions, and version history.
+     * Requires `template:read` scoped to the template name.
+     *
+     * @generated from rpc legion.Manager.GetJobTemplate
+     */
+    getJobTemplate: {
+      name: "GetJobTemplate",
+      I: GetJobTemplateRequest,
+      O: GetJobTemplateReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Deletes a job template and all of its versions.
+     *
+     * Jobs already created from the template keep running and keep their
+     * provenance records; only the template itself disappears. Requires
+     * `template:write` scoped to the template name.
+     *
+     * @generated from rpc legion.Manager.DeleteJobTemplate
+     */
+    deleteJobTemplate: {
+      name: "DeleteJobTemplate",
+      I: DeleteJobTemplateRequest,
+      O: DeleteJobTemplateReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Renders a template with the given variables without submitting.
+     *
+     * The dry-run twin of RunJobTemplate: validates the variables, renders
+     * the jobspec, validates it, and returns it. Mutates nothing. Requires
+     * the same access as RunJobTemplate (`job:write` for the rendered job
+     * name with the template attribute set), so a caller can always preview
+     * exactly what it is allowed to submit.
+     *
+     * @generated from rpc legion.Manager.RenderJobTemplate
+     */
+    renderJobTemplate: {
+      name: "RenderJobTemplate",
+      I: RenderJobTemplateRequest,
+      O: RenderJobTemplateReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Renders a template with the given variables and submits the result as
+     * a job (create or update), stamping template provenance on the config.
+     *
+     * ACL: requires `job:write` for the rendered job name evaluated with the
+     * template attribute set — satisfied either by an ordinary `job:write`
+     * rule or by one scoped with `templates: [...]`. A run that would update
+     * an existing job whose latest config did not come from this template
+     * fails with FAILED_PRECONDITION unless the caller also holds plain
+     * `job:write` on that job name (this stops a template-only identity from
+     * hijacking unrelated jobs when the rendered name is user-influenced).
+     *
+     * @generated from rpc legion.Manager.RunJobTemplate
+     */
+    runJobTemplate: {
+      name: "RunJobTemplate",
+      I: RunJobTemplateRequest,
+      O: RunJobTemplateReply,
       kind: MethodKind.Unary,
     },
     /**
@@ -493,7 +590,14 @@ export const Manager = {
     /**
      * Deletes a volume: detaches it from its instance (which will mint a fresh
      * one on its next placement) and queues its storage for the owning worker's
-     * `destroy`. Confirmed asynchronously — the volume sits in `destroying`
+     * `destroy`.
+     *
+     * Refuses with FailedPrecondition while a live allocation is running against
+     * the volume — deleting storage under a running workload is the one mistake
+     * this API must not allow. Stop the workload first (job stop, instance stop,
+     * scale in). `force` overrides the refusal, and the worker still refuses to
+     * run a driver destroy for a volume it currently has mounted, so even a
+     * forced delete only abandons the record. Confirmed asynchronously — the volume sits in `destroying`
      * until the driver reports success, and the manager re-dispatches on every
      * heartbeat until it does, so nothing leaks if a worker dies mid-destroy.
      *
@@ -507,6 +611,8 @@ export const Manager = {
      *
      * Errors:
      * - NotFound: no volume row with this id exists.
+     * - FailedPrecondition: a live allocation is running against the volume and
+     *   `force` was not set.
      *
      * @generated from rpc legion.Manager.DeleteVolume
      */
@@ -666,6 +772,46 @@ export const Manager = {
       kind: MethodKind.Unary,
     },
     /**
+     * Sets a node's scheduling availability: cordon, drain, or uncordon.
+     *
+     * Availability is the schedulability axis of a node, independent of its
+     * health status. Only nodes with availability `"available"` are considered
+     * for new placements; setting any other value excludes the node from all
+     * future scheduling decisions while leaving its status and heartbeats
+     * untouched.
+     *
+     * Three operator flows map onto this RPC:
+     * - Cordon: `availability = "drained"`, `evict = false`. New placements
+     *   stop; existing allocations keep running on the node.
+     * - Drain: `availability = "drained"`, `evict = true`. New placements
+     *   stop, and a `node_drain` evaluation is enqueued that evicts the node's
+     *   existing allocations so the scheduler replaces them elsewhere.
+     *   Stateless allocations are evicted immediately; stateful allocations
+     *   are protected by their `stateful.onLost` policy and are never
+     *   force-moved by a drain (use ReplaceInstance for an operator override).
+     * - Uncordon: `availability = "available"`. The node re-enters the
+     *   scheduling pool; existing allocations elsewhere are not moved back
+     *   automatically.
+     *
+     * The call is level-triggered and idempotent: setting the value a node
+     * already has is a no-op besides the emitted event, and eviction works by
+     * removing allocation rows so the next worker heartbeat reconciles the
+     * desired state.
+     *
+     * Errors:
+     * - NotFound: no node with `node_id` exists.
+     * - InvalidArgument: `availability` is not `"available"` or `"drained"`.
+     * - PermissionDenied: caller lacks `node:write` for the node's pool.
+     *
+     * @generated from rpc legion.Manager.SetNodeAvailability
+     */
+    setNodeAvailability: {
+      name: "SetNodeAvailability",
+      I: SetNodeAvailabilityRequest,
+      O: SetNodeAvailabilityReply,
+      kind: MethodKind.Unary,
+    },
+    /**
      * Retrieves captured task stdout/stderr for a job's allocations.
      *
      * The manager locates the node hosting each allocation and proxies the read
@@ -686,7 +832,7 @@ export const Manager = {
      * proxies the stream to that worker's `Worker.ExecTask`.
      *
      * The first client frame must be an `ExecStart`. Raw commands require
-     * `exec:write` (with `host: true` for host-level kinds); action runs
+     * `exec:write` (with `host: true` for host-level runtimes); action runs
      * require `action:write` (or `exec:write`) and are rendered server-side
      * from the stored job spec.
      *
@@ -791,6 +937,26 @@ export const Manager = {
       name: "GetRaftJoinToken",
       I: GetRaftJoinTokenRequest,
       O: GetRaftJoinTokenReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Writes a consistent point-in-time backup of the manager state store to a
+     * server-side path (`VACUUM INTO` on the live database) and returns where
+     * it landed, its size, and the raft applied index it captures.
+     *
+     * Works in every persistence mode. In raft mode the call is leader-only:
+     * a non-leader returns FAILED_PRECONDITION naming the current leader so
+     * the caller can redial. Restore is an offline operation: start the
+     * manager with `--restore-from <path>` (see docs/upgrades.md).
+     *
+     * Requires `operator:write`.
+     *
+     * @generated from rpc legion.Manager.GetStateBackup
+     */
+    getStateBackup: {
+      name: "GetStateBackup",
+      I: GetStateBackupRequest,
+      O: GetStateBackupReply,
       kind: MethodKind.Unary,
     },
     /**
@@ -1342,6 +1508,117 @@ export const Worker = {
       I: ExecClientFrame,
       O: ExecServerFrame,
       kind: MethodKind.BiDiStreaming,
+    },
+  }
+} as const;
+
+/**
+ * RaftTransport is the internal manager<->manager consensus transport for the
+ * replicated state store (docs/plans/durability-and-ops-execution-plan.md §2).
+ *
+ * This service is NOT part of the public Legion API and is NOT covered by the
+ * Manager-service ACL system (`tests/acl_endpoints.rs` classifies Manager
+ * RPCs only). It is called exclusively by other managers in the same cluster —
+ * never by workers, CLIs, or UIs.
+ *
+ * Wire contract:
+ * - `payload` fields carry opaque, serde-encoded openraft 0.9 protocol types
+ *   (serialized with serde_json — see `src/storage/raft/network.rs` /
+ *   `src/storage/raft/server.rs` for the exact types on each RPC). Their
+ *   layout is an internal detail of the openraft version compiled into the
+ *   manager binary and is versioned by `PROTOCOL_VERSION`
+ *   (`src/constants.rs`) together with the rest of the manager plane:
+ *   managers with incompatible protocol versions must not be mixed in one
+ *   cluster (docs/upgrades.md — managers upgrade first).
+ * - `group_id` selects the raft group ("lane"). Values are the lane wire
+ *   names defined by `Lane` in `src/storage/raft/mod.rs`: "control",
+ *   "scheduler", "status". In the default `single` topology one group
+ *   (the control lane) carries all tables.
+ * - Every RPC must carry the cluster secret in request metadata under
+ *   `x-legion-raft-secret`. The secret is minted at bootstrap and travels
+ *   only inside signed join tokens; requests with a missing or mismatched
+ *   secret are rejected (Unauthenticated / PermissionDenied). Shared-secret
+ *   auth is the documented stopgap (plan JC-7) until manager-plane mTLS
+ *   lands with the worker-authn work.
+ *
+ * @generated from service legion.RaftTransport
+ */
+export const RaftTransport = {
+  typeName: "legion.RaftTransport",
+  methods: {
+    /**
+     * openraft AppendEntries for one group: log replication and leader
+     * heartbeats. The request payload decodes as
+     * `openraft::raft::AppendEntriesRequest<TypeConfig>`; the reply payload
+     * encodes `Result<AppendEntriesResponse, RaftError>` so typed raft errors
+     * (including higher-vote rejections) round-trip to the caller's openraft
+     * core instead of being flattened into gRPC status codes.
+     * ACL: manager-plane internal, authenticated by cluster secret metadata.
+     *
+     * @generated from rpc legion.RaftTransport.AppendEntries
+     */
+    appendEntries: {
+      name: "AppendEntries",
+      I: RaftLaneRequest,
+      O: RaftLaneReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * openraft RequestVote for one group (leader election). Payloads decode as
+     * `VoteRequest` / `Result<VoteResponse, RaftError>`.
+     * ACL: manager-plane internal, authenticated by cluster secret metadata.
+     *
+     * @generated from rpc legion.RaftTransport.Vote
+     */
+    vote: {
+      name: "Vote",
+      I: RaftLaneRequest,
+      O: RaftLaneReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * openraft InstallSnapshot: transfers one snapshot *chunk* for one group.
+     *
+     * This is deliberately a unary RPC with a bytes payload rather than a gRPC
+     * client-streaming call: openraft 0.9's default snapshot transport already
+     * implements chunking (offset + done bookkeeping, bounded by the
+     * `snapshot_max_chunk_size` raft config) and calls this RPC once per
+     * chunk, so wrapping it in a gRPC stream would duplicate the offset/ack
+     * protocol that openraft maintains anyway. Payloads decode as
+     * `InstallSnapshotRequest` (vote, offset, data, done) /
+     * `Result<InstallSnapshotResponse, RaftError<_, InstallSnapshotError>>`.
+     * ACL: manager-plane internal, authenticated by cluster secret metadata.
+     *
+     * @generated from rpc legion.RaftTransport.InstallSnapshot
+     */
+    installSnapshot: {
+      name: "InstallSnapshot",
+      I: RaftLaneRequest,
+      O: RaftLaneReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Adds a new manager to the raft cluster (plan §A4).
+     *
+     * The joining manager presents the signed join token minted by
+     * `legion raft join-token` (which embeds the cluster id, the leader's
+     * advertise address, and the cluster secret) plus its own identity. The
+     * leader validates the token, derives the joiner's deterministic raft id
+     * (`fnv1a64(node_id)` — see `src/storage/raft/types.rs`), adds it as a
+     * learner to every configured group so it catches up via snapshot install,
+     * and later promotes it to voter. The reply reports the assigned raft id
+     * and the current membership of every group so the joiner can seed its
+     * peer table. One token joins all lanes.
+     * ACL: manager-plane internal, authenticated by cluster secret metadata
+     * (the joiner reads the secret out of the join token before calling).
+     *
+     * @generated from rpc legion.RaftTransport.Join
+     */
+    join: {
+      name: "Join",
+      I: JoinRaftClusterRequest,
+      O: JoinRaftClusterReply,
+      kind: MethodKind.Unary,
     },
   }
 } as const;

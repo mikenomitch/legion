@@ -343,6 +343,40 @@ export class WorkerRegisterRequest extends Message<WorkerRegisterRequest> {
    */
   joinToken?: string;
 
+  /**
+   * Semantic build version of the worker binary (its Cargo package version,
+   * e.g. `"0.1.0"`). Informational: recorded into the node's `dynamic_attrs`
+   * (`buildVersion`) so `legion node list` and the UI can surface fleet
+   * version skew. Build-version differences never cause rejection; only
+   * `protocol_version` gates admission.
+   *
+   * Default: empty string (workers built before version reporting existed).
+   *
+   * @generated from field: string build_version = 7;
+   */
+  buildVersion = "";
+
+  /**
+   * Worker<->manager wire-protocol version this worker speaks. Bumped only
+   * for breaking wire-contract changes to worker-plane RPCs.
+   *
+   * Skew policy (rolling upgrades are managers-first, then workers):
+   * - `0` (unset — proto3 default, i.e. a worker built before versioning):
+   *   accepted; the manager logs a warning.
+   * - `1..=<manager's supported version>`: accepted.
+   * - greater than the manager's supported version: rejected with
+   *   `FAILED_PRECONDITION` — the worker was upgraded before the manager.
+   *   Upgrade all managers first, then retry the worker.
+   *
+   * Recorded into the node's `dynamic_attrs` (`protocolVersion`) for fleet
+   * observability.
+   *
+   * Default: `0` (see above).
+   *
+   * @generated from field: uint32 protocol_version = 8;
+   */
+  protocolVersion = 0;
+
   constructor(data?: PartialMessage<WorkerRegisterRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -357,6 +391,8 @@ export class WorkerRegisterRequest extends Message<WorkerRegisterRequest> {
     { no: 4, name: "fingerprint_attrs", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 5, name: "health_checks", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 6, name: "join_token", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 7, name: "build_version", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 8, name: "protocol_version", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): WorkerRegisterRequest {
@@ -401,6 +437,29 @@ export class WorkerRegisterReply extends Message<WorkerRegisterReply> {
    */
   nodeToken?: string;
 
+  /**
+   * Semantic build version of the manager binary that handled this
+   * registration (its Cargo package version, e.g. `"0.1.0"`).
+   * Informational: workers log it after registering and warn when it
+   * differs from their own build version, so operators can spot skew from
+   * worker logs as well as from `legion node list`.
+   *
+   * Empty when the manager predates version reporting.
+   *
+   * @generated from field: string manager_build_version = 3;
+   */
+  managerBuildVersion = "";
+
+  /**
+   * The worker<->manager wire-protocol version this manager supports (see
+   * `WorkerRegisterRequest.protocol_version` for the skew policy). Workers
+   * at or below this version are compatible. `0` means the manager predates
+   * version reporting.
+   *
+   * @generated from field: uint32 manager_protocol_version = 4;
+   */
+  managerProtocolVersion = 0;
+
   constructor(data?: PartialMessage<WorkerRegisterReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -411,6 +470,8 @@ export class WorkerRegisterReply extends Message<WorkerRegisterReply> {
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 2, name: "node_token", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 3, name: "manager_build_version", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "manager_protocol_version", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): WorkerRegisterReply {
@@ -633,6 +694,995 @@ export class RunJobReply extends Message<RunJobReply> {
 }
 
 /**
+ * One declared job-template variable.
+ *
+ * Declared in the template source's `variables` list and used by clients
+ * (UI form generation, CLI coercion) and by the manager for validation.
+ *
+ * @generated from message legion.JobTemplateVariable
+ */
+export class JobTemplateVariable extends Message<JobTemplateVariable> {
+  /**
+   * Variable key. Must match `[a-zA-Z_][a-zA-Z0-9_]*`. The rendered
+   * template receives all declared keys as fields of the single `vars`
+   * object passed to its `job(vars)` function.
+   *
+   * @generated from field: string key = 1;
+   */
+  key = "";
+
+  /**
+   * Variable type. One of: `string`, `text` (multiline string), `number`,
+   * `boolean`, `select` (one of `options`), `multi_select` (list drawn
+   * from `options`), `json` (any JSON value, passed through verbatim).
+   *
+   * @generated from field: string type = 2;
+   */
+  type = "";
+
+  /**
+   * Human-readable label for forms. Defaults to `key` when empty.
+   *
+   * @generated from field: string label = 3;
+   */
+  label = "";
+
+  /**
+   * Optional helper text shown next to the input.
+   *
+   * @generated from field: optional string description = 4;
+   */
+  description?: string;
+
+  /**
+   * Whether a value must be provided at run time. Defaults to true when
+   * the variable has no default, false when it has one. A variable with
+   * `required: false` and no default renders as JSON `null`.
+   *
+   * @generated from field: bool required = 5;
+   */
+  required = false;
+
+  /**
+   * Default value as JSON text, matching `type` (for example `"draft"`,
+   * `24`, `false`, `["a","b"]`). Unset means no default.
+   *
+   * @generated from field: optional string default_json = 6;
+   */
+  defaultJson?: string;
+
+  /**
+   * Allowed values for `select` / `multi_select` types; empty otherwise.
+   *
+   * @generated from field: repeated string options = 7;
+   */
+  options: string[] = [];
+
+  constructor(data?: PartialMessage<JobTemplateVariable>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.JobTemplateVariable";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "key", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "type", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "label", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "description", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 5, name: "required", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 6, name: "default_json", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 7, name: "options", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): JobTemplateVariable {
+    return new JobTemplateVariable().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): JobTemplateVariable {
+    return new JobTemplateVariable().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): JobTemplateVariable {
+    return new JobTemplateVariable().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: JobTemplateVariable | PlainMessage<JobTemplateVariable> | undefined, b: JobTemplateVariable | PlainMessage<JobTemplateVariable> | undefined): boolean {
+    return proto3.util.equals(JobTemplateVariable, a, b);
+  }
+}
+
+/**
+ * Metadata for one stored template version (no source).
+ *
+ * @generated from message legion.JobTemplateVersionInfo
+ */
+export class JobTemplateVersionInfo extends Message<JobTemplateVersionInfo> {
+  /**
+   * Version number, 1-indexed and immutable once written.
+   *
+   * @generated from field: uint32 version = 1;
+   */
+  version = 0;
+
+  /**
+   * RFC3339 creation timestamp.
+   *
+   * @generated from field: string created_at = 2;
+   */
+  createdAt = "";
+
+  /**
+   * Principal that created this version (token name, `user:<name>`, or
+   * empty when ACLs were disabled).
+   *
+   * @generated from field: string created_by = 3;
+   */
+  createdBy = "";
+
+  constructor(data?: PartialMessage<JobTemplateVersionInfo>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.JobTemplateVersionInfo";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "version", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 2, name: "created_at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "created_by", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): JobTemplateVersionInfo {
+    return new JobTemplateVersionInfo().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): JobTemplateVersionInfo {
+    return new JobTemplateVersionInfo().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): JobTemplateVersionInfo {
+    return new JobTemplateVersionInfo().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: JobTemplateVersionInfo | PlainMessage<JobTemplateVersionInfo> | undefined, b: JobTemplateVersionInfo | PlainMessage<JobTemplateVersionInfo> | undefined): boolean {
+    return proto3.util.equals(JobTemplateVersionInfo, a, b);
+  }
+}
+
+/**
+ * One full job template version.
+ *
+ * @generated from message legion.JobTemplate
+ */
+export class JobTemplate extends Message<JobTemplate> {
+  /**
+   * Template name: lowercase alphanumerics and dashes, like a job name.
+   * The name is the template's identity; there is no separate display name.
+   *
+   * @generated from field: string name = 1;
+   */
+  name = "";
+
+  /**
+   * Version number of this document.
+   *
+   * @generated from field: uint32 version = 2;
+   */
+  version = 0;
+
+  /**
+   * Latest version number that exists for this template.
+   *
+   * @generated from field: uint32 latest_version = 3;
+   */
+  latestVersion = 0;
+
+  /**
+   * Optional user-facing description from the template manifest.
+   *
+   * @generated from field: optional string description = 4;
+   */
+  description?: string;
+
+  /**
+   * Raw Jsonnet source of this version.
+   *
+   * @generated from field: string source_jsonnet = 5;
+   */
+  sourceJsonnet = "";
+
+  /**
+   * Declared variables from the manifest, in declaration order.
+   *
+   * @generated from field: repeated legion.JobTemplateVariable variables = 6;
+   */
+  variables: JobTemplateVariable[] = [];
+
+  /**
+   * RFC3339 creation timestamp of this version.
+   *
+   * @generated from field: string created_at = 7;
+   */
+  createdAt = "";
+
+  /**
+   * Principal that created this version.
+   *
+   * @generated from field: string created_by = 8;
+   */
+  createdBy = "";
+
+  constructor(data?: PartialMessage<JobTemplate>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.JobTemplate";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "version", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 3, name: "latest_version", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 4, name: "description", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 5, name: "source_jsonnet", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "variables", kind: "message", T: JobTemplateVariable, repeated: true },
+    { no: 7, name: "created_at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 8, name: "created_by", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): JobTemplate {
+    return new JobTemplate().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): JobTemplate {
+    return new JobTemplate().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): JobTemplate {
+    return new JobTemplate().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: JobTemplate | PlainMessage<JobTemplate> | undefined, b: JobTemplate | PlainMessage<JobTemplate> | undefined): boolean {
+    return proto3.util.equals(JobTemplate, a, b);
+  }
+}
+
+/**
+ * Latest-version summary row for ListJobTemplates.
+ *
+ * @generated from message legion.JobTemplateSummary
+ */
+export class JobTemplateSummary extends Message<JobTemplateSummary> {
+  /**
+   * Template name.
+   *
+   * @generated from field: string name = 1;
+   */
+  name = "";
+
+  /**
+   * Latest version number.
+   *
+   * @generated from field: uint32 latest_version = 2;
+   */
+  latestVersion = 0;
+
+  /**
+   * Description from the latest version.
+   *
+   * @generated from field: optional string description = 3;
+   */
+  description?: string;
+
+  /**
+   * Number of declared variables in the latest version.
+   *
+   * @generated from field: uint32 variable_count = 4;
+   */
+  variableCount = 0;
+
+  /**
+   * RFC3339 timestamp of the latest version's creation.
+   *
+   * @generated from field: string updated_at = 5;
+   */
+  updatedAt = "";
+
+  constructor(data?: PartialMessage<JobTemplateSummary>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.JobTemplateSummary";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "latest_version", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 3, name: "description", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 4, name: "variable_count", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 5, name: "updated_at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): JobTemplateSummary {
+    return new JobTemplateSummary().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): JobTemplateSummary {
+    return new JobTemplateSummary().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): JobTemplateSummary {
+    return new JobTemplateSummary().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: JobTemplateSummary | PlainMessage<JobTemplateSummary> | undefined, b: JobTemplateSummary | PlainMessage<JobTemplateSummary> | undefined): boolean {
+    return proto3.util.equals(JobTemplateSummary, a, b);
+  }
+}
+
+/**
+ * Provenance of a job config that was produced by RunJobTemplate.
+ *
+ * @generated from message legion.JobTemplateProvenance
+ */
+export class JobTemplateProvenance extends Message<JobTemplateProvenance> {
+  /**
+   * Template name.
+   *
+   * @generated from field: string name = 1;
+   */
+  name = "";
+
+  /**
+   * Template version that rendered the config.
+   *
+   * @generated from field: uint32 version = 2;
+   */
+  version = 0;
+
+  constructor(data?: PartialMessage<JobTemplateProvenance>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.JobTemplateProvenance";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "version", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): JobTemplateProvenance {
+    return new JobTemplateProvenance().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): JobTemplateProvenance {
+    return new JobTemplateProvenance().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): JobTemplateProvenance {
+    return new JobTemplateProvenance().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: JobTemplateProvenance | PlainMessage<JobTemplateProvenance> | undefined, b: JobTemplateProvenance | PlainMessage<JobTemplateProvenance> | undefined): boolean {
+    return proto3.util.equals(JobTemplateProvenance, a, b);
+  }
+}
+
+/**
+ * Request payload for UpsertJobTemplate.
+ *
+ * @generated from message legion.UpsertJobTemplateRequest
+ */
+export class UpsertJobTemplateRequest extends Message<UpsertJobTemplateRequest> {
+  /**
+   * Template name. Creating a name that already exists appends the next
+   * version; versions are never overwritten.
+   *
+   * @generated from field: string name = 1;
+   */
+  name = "";
+
+  /**
+   * Full Jsonnet source. Must be self-contained (imports are rejected) and
+   * at most 512 KiB. See JobTemplate for the required document shape.
+   *
+   * @generated from field: string source_jsonnet = 2;
+   */
+  sourceJsonnet = "";
+
+  constructor(data?: PartialMessage<UpsertJobTemplateRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.UpsertJobTemplateRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "source_jsonnet", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): UpsertJobTemplateRequest {
+    return new UpsertJobTemplateRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): UpsertJobTemplateRequest {
+    return new UpsertJobTemplateRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): UpsertJobTemplateRequest {
+    return new UpsertJobTemplateRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: UpsertJobTemplateRequest | PlainMessage<UpsertJobTemplateRequest> | undefined, b: UpsertJobTemplateRequest | PlainMessage<UpsertJobTemplateRequest> | undefined): boolean {
+    return proto3.util.equals(UpsertJobTemplateRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for UpsertJobTemplate.
+ *
+ * @generated from message legion.UpsertJobTemplateReply
+ */
+export class UpsertJobTemplateReply extends Message<UpsertJobTemplateReply> {
+  /**
+   * The stored version.
+   *
+   * @generated from field: legion.JobTemplate template = 1;
+   */
+  template?: JobTemplate;
+
+  constructor(data?: PartialMessage<UpsertJobTemplateReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.UpsertJobTemplateReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "template", kind: "message", T: JobTemplate },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): UpsertJobTemplateReply {
+    return new UpsertJobTemplateReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): UpsertJobTemplateReply {
+    return new UpsertJobTemplateReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): UpsertJobTemplateReply {
+    return new UpsertJobTemplateReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: UpsertJobTemplateReply | PlainMessage<UpsertJobTemplateReply> | undefined, b: UpsertJobTemplateReply | PlainMessage<UpsertJobTemplateReply> | undefined): boolean {
+    return proto3.util.equals(UpsertJobTemplateReply, a, b);
+  }
+}
+
+/**
+ * Request payload for ListJobTemplates.
+ *
+ * @generated from message legion.ListJobTemplatesRequest
+ */
+export class ListJobTemplatesRequest extends Message<ListJobTemplatesRequest> {
+  /**
+   * Optional case-insensitive substring filter over name and description.
+   *
+   * @generated from field: optional string query = 1;
+   */
+  query?: string;
+
+  constructor(data?: PartialMessage<ListJobTemplatesRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListJobTemplatesRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "query", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListJobTemplatesRequest {
+    return new ListJobTemplatesRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListJobTemplatesRequest {
+    return new ListJobTemplatesRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListJobTemplatesRequest {
+    return new ListJobTemplatesRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListJobTemplatesRequest | PlainMessage<ListJobTemplatesRequest> | undefined, b: ListJobTemplatesRequest | PlainMessage<ListJobTemplatesRequest> | undefined): boolean {
+    return proto3.util.equals(ListJobTemplatesRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for ListJobTemplates.
+ *
+ * @generated from message legion.ListJobTemplatesReply
+ */
+export class ListJobTemplatesReply extends Message<ListJobTemplatesReply> {
+  /**
+   * Templates the caller may read, most recently updated first.
+   *
+   * @generated from field: repeated legion.JobTemplateSummary templates = 1;
+   */
+  templates: JobTemplateSummary[] = [];
+
+  constructor(data?: PartialMessage<ListJobTemplatesReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListJobTemplatesReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "templates", kind: "message", T: JobTemplateSummary, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListJobTemplatesReply {
+    return new ListJobTemplatesReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListJobTemplatesReply {
+    return new ListJobTemplatesReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListJobTemplatesReply {
+    return new ListJobTemplatesReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListJobTemplatesReply | PlainMessage<ListJobTemplatesReply> | undefined, b: ListJobTemplatesReply | PlainMessage<ListJobTemplatesReply> | undefined): boolean {
+    return proto3.util.equals(ListJobTemplatesReply, a, b);
+  }
+}
+
+/**
+ * Request payload for GetJobTemplate.
+ *
+ * @generated from message legion.GetJobTemplateRequest
+ */
+export class GetJobTemplateRequest extends Message<GetJobTemplateRequest> {
+  /**
+   * Template name (exact match).
+   *
+   * @generated from field: string name = 1;
+   */
+  name = "";
+
+  /**
+   * Version to fetch. Omit for the latest.
+   *
+   * @generated from field: optional uint32 version = 2;
+   */
+  version?: number;
+
+  constructor(data?: PartialMessage<GetJobTemplateRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetJobTemplateRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "version", kind: "scalar", T: 13 /* ScalarType.UINT32 */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetJobTemplateRequest {
+    return new GetJobTemplateRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetJobTemplateRequest {
+    return new GetJobTemplateRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetJobTemplateRequest {
+    return new GetJobTemplateRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetJobTemplateRequest | PlainMessage<GetJobTemplateRequest> | undefined, b: GetJobTemplateRequest | PlainMessage<GetJobTemplateRequest> | undefined): boolean {
+    return proto3.util.equals(GetJobTemplateRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for GetJobTemplate.
+ *
+ * @generated from message legion.GetJobTemplateReply
+ */
+export class GetJobTemplateReply extends Message<GetJobTemplateReply> {
+  /**
+   * The requested version.
+   *
+   * @generated from field: legion.JobTemplate template = 1;
+   */
+  template?: JobTemplate;
+
+  /**
+   * All stored versions of this template, newest first.
+   *
+   * @generated from field: repeated legion.JobTemplateVersionInfo versions = 2;
+   */
+  versions: JobTemplateVersionInfo[] = [];
+
+  constructor(data?: PartialMessage<GetJobTemplateReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetJobTemplateReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "template", kind: "message", T: JobTemplate },
+    { no: 2, name: "versions", kind: "message", T: JobTemplateVersionInfo, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetJobTemplateReply {
+    return new GetJobTemplateReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetJobTemplateReply {
+    return new GetJobTemplateReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetJobTemplateReply {
+    return new GetJobTemplateReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetJobTemplateReply | PlainMessage<GetJobTemplateReply> | undefined, b: GetJobTemplateReply | PlainMessage<GetJobTemplateReply> | undefined): boolean {
+    return proto3.util.equals(GetJobTemplateReply, a, b);
+  }
+}
+
+/**
+ * Request payload for DeleteJobTemplate.
+ *
+ * @generated from message legion.DeleteJobTemplateRequest
+ */
+export class DeleteJobTemplateRequest extends Message<DeleteJobTemplateRequest> {
+  /**
+   * Template name (exact match). Deletes every version.
+   *
+   * @generated from field: string name = 1;
+   */
+  name = "";
+
+  constructor(data?: PartialMessage<DeleteJobTemplateRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.DeleteJobTemplateRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): DeleteJobTemplateRequest {
+    return new DeleteJobTemplateRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): DeleteJobTemplateRequest {
+    return new DeleteJobTemplateRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): DeleteJobTemplateRequest {
+    return new DeleteJobTemplateRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: DeleteJobTemplateRequest | PlainMessage<DeleteJobTemplateRequest> | undefined, b: DeleteJobTemplateRequest | PlainMessage<DeleteJobTemplateRequest> | undefined): boolean {
+    return proto3.util.equals(DeleteJobTemplateRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for DeleteJobTemplate.
+ *
+ * @generated from message legion.DeleteJobTemplateReply
+ */
+export class DeleteJobTemplateReply extends Message<DeleteJobTemplateReply> {
+  /**
+   * Human-readable status message.
+   *
+   * @generated from field: string message = 1;
+   */
+  message = "";
+
+  constructor(data?: PartialMessage<DeleteJobTemplateReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.DeleteJobTemplateReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): DeleteJobTemplateReply {
+    return new DeleteJobTemplateReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): DeleteJobTemplateReply {
+    return new DeleteJobTemplateReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): DeleteJobTemplateReply {
+    return new DeleteJobTemplateReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: DeleteJobTemplateReply | PlainMessage<DeleteJobTemplateReply> | undefined, b: DeleteJobTemplateReply | PlainMessage<DeleteJobTemplateReply> | undefined): boolean {
+    return proto3.util.equals(DeleteJobTemplateReply, a, b);
+  }
+}
+
+/**
+ * Request payload for RenderJobTemplate.
+ *
+ * @generated from message legion.RenderJobTemplateRequest
+ */
+export class RenderJobTemplateRequest extends Message<RenderJobTemplateRequest> {
+  /**
+   * Template name.
+   *
+   * @generated from field: string name = 1;
+   */
+  name = "";
+
+  /**
+   * Version to render. Omit for the latest.
+   *
+   * @generated from field: optional uint32 version = 2;
+   */
+  version?: number;
+
+  /**
+   * Variable values as a JSON object keyed by variable key, for example
+   * `{"scene": "s3://bucket/x", "frames": 48}`. Values are validated
+   * against the declared types; strings are leniently coerced (`"48"`
+   * satisfies a `number`). At most 64 KiB.
+   *
+   * @generated from field: string variables_json = 3;
+   */
+  variablesJson = "";
+
+  constructor(data?: PartialMessage<RenderJobTemplateRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.RenderJobTemplateRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "version", kind: "scalar", T: 13 /* ScalarType.UINT32 */, opt: true },
+    { no: 3, name: "variables_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RenderJobTemplateRequest {
+    return new RenderJobTemplateRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): RenderJobTemplateRequest {
+    return new RenderJobTemplateRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): RenderJobTemplateRequest {
+    return new RenderJobTemplateRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: RenderJobTemplateRequest | PlainMessage<RenderJobTemplateRequest> | undefined, b: RenderJobTemplateRequest | PlainMessage<RenderJobTemplateRequest> | undefined): boolean {
+    return proto3.util.equals(RenderJobTemplateRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for RenderJobTemplate.
+ *
+ * @generated from message legion.RenderJobTemplateReply
+ */
+export class RenderJobTemplateReply extends Message<RenderJobTemplateReply> {
+  /**
+   * The rendered jobspec as JSON text, exactly what RunJobTemplate would
+   * submit with the same inputs.
+   *
+   * @generated from field: string rendered_jobspec = 1;
+   */
+  renderedJobspec = "";
+
+  /**
+   * Name of the job the rendered spec declares.
+   *
+   * @generated from field: string job_name = 2;
+   */
+  jobName = "";
+
+  constructor(data?: PartialMessage<RenderJobTemplateReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.RenderJobTemplateReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "rendered_jobspec", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "job_name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RenderJobTemplateReply {
+    return new RenderJobTemplateReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): RenderJobTemplateReply {
+    return new RenderJobTemplateReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): RenderJobTemplateReply {
+    return new RenderJobTemplateReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: RenderJobTemplateReply | PlainMessage<RenderJobTemplateReply> | undefined, b: RenderJobTemplateReply | PlainMessage<RenderJobTemplateReply> | undefined): boolean {
+    return proto3.util.equals(RenderJobTemplateReply, a, b);
+  }
+}
+
+/**
+ * Request payload for RunJobTemplate.
+ *
+ * @generated from message legion.RunJobTemplateRequest
+ */
+export class RunJobTemplateRequest extends Message<RunJobTemplateRequest> {
+  /**
+   * Template name.
+   *
+   * @generated from field: string name = 1;
+   */
+  name = "";
+
+  /**
+   * Version to render. Omit for the latest.
+   *
+   * @generated from field: optional uint32 version = 2;
+   */
+  version?: number;
+
+  /**
+   * Variable values as a JSON object keyed by variable key (see
+   * RenderJobTemplateRequest.variables_json).
+   *
+   * @generated from field: string variables_json = 3;
+   */
+  variablesJson = "";
+
+  /**
+   * Optional eval priority override (see RunJobRequest.priority).
+   *
+   * @generated from field: optional int64 priority = 4;
+   */
+  priority?: bigint;
+
+  /**
+   * When true, enqueues a reschedule even when the rendered spec is
+   * unchanged. Default: `false`.
+   *
+   * @generated from field: bool force_reschedule = 5;
+   */
+  forceReschedule = false;
+
+  /**
+   * Optional idempotency key (see RunJobRequest.idempotency_key).
+   *
+   * @generated from field: optional string idempotency_key = 6;
+   */
+  idempotencyKey?: string;
+
+  constructor(data?: PartialMessage<RunJobTemplateRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.RunJobTemplateRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "version", kind: "scalar", T: 13 /* ScalarType.UINT32 */, opt: true },
+    { no: 3, name: "variables_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "priority", kind: "scalar", T: 3 /* ScalarType.INT64 */, opt: true },
+    { no: 5, name: "force_reschedule", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 6, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RunJobTemplateRequest {
+    return new RunJobTemplateRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): RunJobTemplateRequest {
+    return new RunJobTemplateRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): RunJobTemplateRequest {
+    return new RunJobTemplateRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: RunJobTemplateRequest | PlainMessage<RunJobTemplateRequest> | undefined, b: RunJobTemplateRequest | PlainMessage<RunJobTemplateRequest> | undefined): boolean {
+    return proto3.util.equals(RunJobTemplateRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for RunJobTemplate.
+ *
+ * @generated from message legion.RunJobTemplateReply
+ */
+export class RunJobTemplateReply extends Message<RunJobTemplateReply> {
+  /**
+   * Human-readable outcome message (same vocabulary as RunJobReply).
+   *
+   * @generated from field: string message = 1;
+   */
+  message = "";
+
+  /**
+   * True when replayed from a previously recorded idempotent result.
+   *
+   * @generated from field: bool deduplicated = 2;
+   */
+  deduplicated = false;
+
+  /**
+   * Name of the job that was created or updated.
+   *
+   * @generated from field: string job_name = 3;
+   */
+  jobName = "";
+
+  /**
+   * Job config ID produced (or matched, when unchanged) by this run.
+   *
+   * @generated from field: string job_config_id = 4;
+   */
+  jobConfigId = "";
+
+  constructor(data?: PartialMessage<RunJobTemplateReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.RunJobTemplateReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "deduplicated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 3, name: "job_name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "job_config_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RunJobTemplateReply {
+    return new RunJobTemplateReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): RunJobTemplateReply {
+    return new RunJobTemplateReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): RunJobTemplateReply {
+    return new RunJobTemplateReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: RunJobTemplateReply | PlainMessage<RunJobTemplateReply> | undefined, b: RunJobTemplateReply | PlainMessage<RunJobTemplateReply> | undefined): boolean {
+    return proto3.util.equals(RunJobTemplateReply, a, b);
+  }
+}
+
+/**
  * Request payload for GetJobInfo.
  *
  * @generated from message legion.GetJobInfoRequest
@@ -688,6 +1738,14 @@ export class GetJobInfoReply extends Message<GetJobInfoReply> {
    */
   job?: Job;
 
+  /**
+   * Template that rendered the job's latest config, when it was submitted
+   * via RunJobTemplate. Unset for raw RunJob submissions.
+   *
+   * @generated from field: optional legion.JobTemplateProvenance template = 2;
+   */
+  template?: JobTemplateProvenance;
+
   constructor(data?: PartialMessage<GetJobInfoReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -697,6 +1755,7 @@ export class GetJobInfoReply extends Message<GetJobInfoReply> {
   static readonly typeName = "legion.GetJobInfoReply";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "job", kind: "message", T: Job },
+    { no: 2, name: "template", kind: "message", T: JobTemplateProvenance, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetJobInfoReply {
@@ -1985,6 +3044,14 @@ export class JobSpecHistoryItem extends Message<JobSpecHistoryItem> {
    */
   version?: bigint;
 
+  /**
+   * Template that rendered this config, when it was submitted via
+   * RunJobTemplate. Unset for raw RunJob submissions.
+   *
+   * @generated from field: optional legion.JobTemplateProvenance template = 4;
+   */
+  template?: JobTemplateProvenance;
+
   constructor(data?: PartialMessage<JobSpecHistoryItem>) {
     super();
     proto3.util.initPartial(data, this);
@@ -1996,6 +3063,7 @@ export class JobSpecHistoryItem extends Message<JobSpecHistoryItem> {
     { no: 1, name: "config_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 2, name: "created_at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 3, name: "version", kind: "scalar", T: 3 /* ScalarType.INT64 */, opt: true },
+    { no: 4, name: "template", kind: "message", T: JobTemplateProvenance, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): JobSpecHistoryItem {
@@ -2172,6 +3240,16 @@ export class PlanJobReply extends Message<PlanJobReply> {
    */
   sameContent = false;
 
+  /**
+   * Per-task scheduling-index usage for this plan: which declared index (if
+   * any) generated each task's placement candidates, and why not when none
+   * did. One entry per task the plan considered. See
+   * docs/scheduling-indexes.md for the model.
+   *
+   * @generated from field: repeated legion.TaskIndexUsage index_usage = 5;
+   */
+  indexUsage: TaskIndexUsage[] = [];
+
   constructor(data?: PartialMessage<PlanJobReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -2184,6 +3262,7 @@ export class PlanJobReply extends Message<PlanJobReply> {
     { no: 2, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 3, name: "matches_existing", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
     { no: 4, name: "same_content", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 5, name: "index_usage", kind: "message", T: TaskIndexUsage, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): PlanJobReply {
@@ -2200,6 +3279,122 @@ export class PlanJobReply extends Message<PlanJobReply> {
 
   static equals(a: PlanJobReply | PlainMessage<PlanJobReply> | undefined, b: PlanJobReply | PlainMessage<PlanJobReply> | undefined): boolean {
     return proto3.util.equals(PlanJobReply, a, b);
+  }
+}
+
+/**
+ * How candidate construction went for one planned task — the scheduling
+ * index's explain record. The scan (a full pass over every available node)
+ * remains the authoritative fallback; these fields describe whether and how
+ * an index short-circuited it.
+ *
+ * @generated from message legion.TaskIndexUsage
+ */
+export class TaskIndexUsage extends Message<TaskIndexUsage> {
+  /**
+   * Task the entry describes.
+   *
+   * @generated from field: string task_name = 1;
+   */
+  taskName = "";
+
+  /**
+   * Name of the index that served candidates (e.g. the built-in "fit"), or
+   * empty when the plain scan ran.
+   *
+   * @generated from field: string index = 2;
+   */
+  index = "";
+
+  /**
+   * "on" when the index generated the candidates, "shadow" when it ran
+   * alongside the authoritative scan for comparison. Empty when no index
+   * participated.
+   *
+   * @generated from field: string mode = 3;
+   */
+  mode = "";
+
+  /**
+   * Number of candidate nodes handed to placement scoring.
+   *
+   * @generated from field: uint32 candidates = 4;
+   */
+  candidates = 0;
+
+  /**
+   * True when the candidate list was cut to the per-task budget, keeping the
+   * index's nearest-fit-first order.
+   *
+   * @generated from field: bool truncated = 5;
+   */
+  truncated = false;
+
+  /**
+   * Times placement exhausted a truncated candidate list and widened back to
+   * the full scan mid-task.
+   *
+   * @generated from field: uint32 refills = 6;
+   */
+  refills = 0;
+
+  /**
+   * True when the scan ended up serving after the index came up short
+   * (empty coverage, or a truncated list that ran dry).
+   *
+   * @generated from field: bool fell_back = 7;
+   */
+  fellBack = false;
+
+  /**
+   * Shadow mode only: whether the index's candidate set matched the scan's
+   * exactly. Absent outside shadow mode.
+   *
+   * @generated from field: optional bool shadow_agreement = 8;
+   */
+  shadowAgreement?: boolean;
+
+  /**
+   * Why no index served when one might have been expected to — e.g.
+   * "no usable index: gpu needs [region]". Empty otherwise.
+   *
+   * @generated from field: string reason = 9;
+   */
+  reason = "";
+
+  constructor(data?: PartialMessage<TaskIndexUsage>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.TaskIndexUsage";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "task_name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "index", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "mode", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "candidates", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 5, name: "truncated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 6, name: "refills", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 7, name: "fell_back", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 8, name: "shadow_agreement", kind: "scalar", T: 8 /* ScalarType.BOOL */, opt: true },
+    { no: 9, name: "reason", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): TaskIndexUsage {
+    return new TaskIndexUsage().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): TaskIndexUsage {
+    return new TaskIndexUsage().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): TaskIndexUsage {
+    return new TaskIndexUsage().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: TaskIndexUsage | PlainMessage<TaskIndexUsage> | undefined, b: TaskIndexUsage | PlainMessage<TaskIndexUsage> | undefined): boolean {
+    return proto3.util.equals(TaskIndexUsage, a, b);
   }
 }
 
@@ -3610,7 +4805,7 @@ export class VolumeInfo extends Message<VolumeInfo> {
   /**
    * How the volume is handed to its consumer: `filesystem` (a host directory
    * the task reads directly) or `block` (a raw device or disk image the task
-   * attaches — what a microVM kind needs). The same split Kubernetes makes
+   * attaches — what a microVM runtime needs). The same split Kubernetes makes
    * with `volumeMode`, for the same reason. See docs/volumes.md.
    *
    * @generated from field: string volume_mode = 17;
@@ -4118,7 +5313,7 @@ export class VolumeDriverInfo extends Message<VolumeDriverInfo> {
 
   /**
    * Volume modes this driver can serve (`filesystem`, `block`). Admission
-   * intersects this with the task kind's supported modes and the job's
+   * intersects this with the task runtime's supported modes and the job's
    * requested mode, so a mismatch is a submit-time error rather than a task
    * that starts and immediately fails.
    *
@@ -5687,6 +6882,146 @@ export class RestartWorkerReply extends Message<RestartWorkerReply> {
 }
 
 /**
+ * Request payload for SetNodeAvailability.
+ *
+ * @generated from message legion.SetNodeAvailabilityRequest
+ */
+export class SetNodeAvailabilityRequest extends Message<SetNodeAvailabilityRequest> {
+  /**
+   * Node ID whose availability to change.
+   *
+   * @generated from field: string node_id = 1;
+   */
+  nodeId = "";
+
+  /**
+   * Target availability. Supported values:
+   * - `"available"`: the node accepts new placements (uncordon).
+   * - `"drained"`: the node is excluded from all new placements
+   *   (cordon/drain).
+   *
+   * Any other value is rejected with InvalidArgument.
+   *
+   * @generated from field: string availability = 2;
+   */
+  availability = "";
+
+  /**
+   * Whether to evict the node's existing allocations.
+   *
+   * Only meaningful with `availability = "drained"`: `false` cordons the
+   * node (existing allocations keep running), `true` drains it (a
+   * `node_drain` evaluation evicts stateless allocations immediately and
+   * leaves stateful allocations protected by their `stateful.onLost`
+   * policy). Ignored when `availability = "available"`.
+   *
+   * @generated from field: bool evict = 3;
+   */
+  evict = false;
+
+  /**
+   * Optional idempotency key. See `RunJobRequest.idempotency_key`.
+   *
+   * @generated from field: optional string idempotency_key = 4;
+   */
+  idempotencyKey?: string;
+
+  constructor(data?: PartialMessage<SetNodeAvailabilityRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.SetNodeAvailabilityRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "availability", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "evict", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 4, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): SetNodeAvailabilityRequest {
+    return new SetNodeAvailabilityRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): SetNodeAvailabilityRequest {
+    return new SetNodeAvailabilityRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): SetNodeAvailabilityRequest {
+    return new SetNodeAvailabilityRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: SetNodeAvailabilityRequest | PlainMessage<SetNodeAvailabilityRequest> | undefined, b: SetNodeAvailabilityRequest | PlainMessage<SetNodeAvailabilityRequest> | undefined): boolean {
+    return proto3.util.equals(SetNodeAvailabilityRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for SetNodeAvailability.
+ *
+ * @generated from message legion.SetNodeAvailabilityReply
+ */
+export class SetNodeAvailabilityReply extends Message<SetNodeAvailabilityReply> {
+  /**
+   * The node record after the availability change.
+   *
+   * Unset when the reply was replayed from a recorded idempotent result
+   * (see `deduplicated`).
+   *
+   * @generated from field: optional legion.NodeMsg node = 1;
+   */
+  node?: NodeMsg;
+
+  /**
+   * Human-readable status message.
+   *
+   * Current manager reply formats: `"Cordoned node <id>"`,
+   * `"Draining node <id>"`, `"Uncordoned node <id>"`.
+   *
+   * @generated from field: string message = 2;
+   */
+  message = "";
+
+  /**
+   * True when replayed from a recorded result for the request's
+   * `idempotency_key` rather than applied fresh.
+   *
+   * @generated from field: bool deduplicated = 3;
+   */
+  deduplicated = false;
+
+  constructor(data?: PartialMessage<SetNodeAvailabilityReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.SetNodeAvailabilityReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "node", kind: "message", T: NodeMsg, opt: true },
+    { no: 2, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "deduplicated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): SetNodeAvailabilityReply {
+    return new SetNodeAvailabilityReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): SetNodeAvailabilityReply {
+    return new SetNodeAvailabilityReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): SetNodeAvailabilityReply {
+    return new SetNodeAvailabilityReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: SetNodeAvailabilityReply | PlainMessage<SetNodeAvailabilityReply> | undefined, b: SetNodeAvailabilityReply | PlainMessage<SetNodeAvailabilityReply> | undefined): boolean {
+    return proto3.util.equals(SetNodeAvailabilityReply, a, b);
+  }
+}
+
+/**
  * Request payload for GetLedger.
  *
  * Empty request; full ledger is returned.
@@ -6211,7 +7546,18 @@ export class RaftStatus extends Message<RaftStatus> {
   leaseHeld = false;
 
   /**
-   * Current voting members.
+   * Current voting members: managers that are SETTLED voters on every
+   * active lane.
+   *
+   * A raft membership change lands in two steps — a joint configuration
+   * holding the old and the new voter sets, then the uniform new one — and
+   * raft reports an incoming member as a voter from the joint step onwards.
+   * This field deliberately does not: a manager appears here only once every
+   * lane carries it in a UNIFORM membership, so the headline can never
+   * report a fault-tolerant cluster while one lane is still mid-join (a lane
+   * left joint still needs a majority of the OLD voter set). Under
+   * `topology = "lanes"` this is therefore stricter than any single lane's
+   * voter list; per-lane detail is in `lanes`.
    *
    * @generated from field: repeated string voters = 11;
    */
@@ -6254,6 +7600,16 @@ export class RaftStatus extends Message<RaftStatus> {
    */
   raftLibrary = "";
 
+  /**
+   * Per-lane status detail, one entry per active raft group. Topology
+   * `single` reports one entry (the `control` group carrying all tables);
+   * the experimental `lanes` topology reports three. Empty when the engine
+   * has not started.
+   *
+   * @generated from field: repeated legion.RaftLaneStatus lanes = 17;
+   */
+  lanes: RaftLaneStatus[] = [];
+
   constructor(data?: PartialMessage<RaftStatus>) {
     super();
     proto3.util.initPartial(data, this);
@@ -6278,6 +7634,7 @@ export class RaftStatus extends Message<RaftStatus> {
     { no: 14, name: "election_epoch_ms", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
     { no: 15, name: "join_token_ttl_seconds", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
     { no: 16, name: "raft_library", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 17, name: "lanes", kind: "message", T: RaftLaneStatus, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RaftStatus {
@@ -6294,6 +7651,140 @@ export class RaftStatus extends Message<RaftStatus> {
 
   static equals(a: RaftStatus | PlainMessage<RaftStatus> | undefined, b: RaftStatus | PlainMessage<RaftStatus> | undefined): boolean {
     return proto3.util.equals(RaftStatus, a, b);
+  }
+}
+
+/**
+ * Status of one raft group ("lane") on this manager.
+ *
+ * @generated from message legion.RaftLaneStatus
+ */
+export class RaftLaneStatus extends Message<RaftLaneStatus> {
+  /**
+   * Lane wire name: `control`, `scheduler`, or `status`.
+   *
+   * @generated from field: string lane = 1;
+   */
+  lane = "";
+
+  /**
+   * This node's role in the lane's group. Values: `primary`, `standby`,
+   * `candidate`.
+   *
+   * @generated from field: string role = 2;
+   */
+  role = "";
+
+  /**
+   * The lane's current leader, when known.
+   *
+   * @generated from field: optional string leader_id = 3;
+   */
+  leaderId?: string;
+
+  /**
+   * The lane's current raft term.
+   *
+   * @generated from field: uint64 term = 4;
+   */
+  term = protoInt64.zero;
+
+  /**
+   * Latest log index observed locally for this lane.
+   *
+   * @generated from field: uint64 commit_index = 5;
+   */
+  commitIndex = protoInt64.zero;
+
+  /**
+   * Latest applied log index for this lane.
+   *
+   * @generated from field: uint64 applied_index = 6;
+   */
+  appliedIndex = protoInt64.zero;
+
+  /**
+   * Number of voting members of this lane's raft group, as known locally.
+   * While a membership change is in flight this is the UNION across the
+   * joint configuration's voter sets, so read `quorum`/`survives` — not this
+   * count — for what the lane can actually tolerate.
+   *
+   * @generated from field: uint64 voters = 7;
+   */
+  voters = protoInt64.zero;
+
+  /**
+   * Majority (quorum) size required to commit on this lane:
+   * `voters / 2 + 1`. With quorum lost, writes stall but local reads keep
+   * serving. While the lane's membership is JOINT (a change in flight) this
+   * is the largest majority across the joint configuration's voter sets,
+   * because a joint configuration must be agreed by a majority of each.
+   *
+   * @generated from field: uint64 quorum = 8;
+   */
+  quorum = protoInt64.zero;
+
+  /**
+   * Voter failures this lane can survive while still committing:
+   * `(voters - 1) / 2`. Zero for one- and two-voter groups — an even voter
+   * count adds a manager without adding fault tolerance. While the lane's
+   * membership is JOINT this is the SMALLEST such number across the joint
+   * configuration's voter sets: growing `{a,b}` to `{a,b,c}` reports `0`
+   * while the change is in flight, because the lane still needs both `a` and
+   * `b`.
+   *
+   * @generated from field: uint64 survives = 9;
+   */
+  survives = protoInt64.zero;
+
+  /**
+   * Plain-language advisory when this lane's membership is unhealthy: a
+   * membership change still in its JOINT configuration (e.g. "membership
+   * change in flight: this lane is in a JOINT configuration [a, b] +
+   * [a, b, c] and needs a majority of EVERY listed config to commit or
+   * elect …"), even voter parity (e.g. "2 voters need both alive to commit —
+   * this cluster survives zero failures. Use 1, 3, or 5 voters; add one more
+   * manager or remove one.") and/or fewer voters than
+   * `persistence.raft.expectedVoters`. Absent when the lane is healthy.
+   *
+   * @generated from field: optional string warning = 10;
+   */
+  warning?: string;
+
+  constructor(data?: PartialMessage<RaftLaneStatus>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.RaftLaneStatus";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "lane", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "role", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "leader_id", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 4, name: "term", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 5, name: "commit_index", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 6, name: "applied_index", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 7, name: "voters", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 8, name: "quorum", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 9, name: "survives", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 10, name: "warning", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RaftLaneStatus {
+    return new RaftLaneStatus().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): RaftLaneStatus {
+    return new RaftLaneStatus().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): RaftLaneStatus {
+    return new RaftLaneStatus().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: RaftLaneStatus | PlainMessage<RaftLaneStatus> | undefined, b: RaftLaneStatus | PlainMessage<RaftLaneStatus> | undefined): boolean {
+    return proto3.util.equals(RaftLaneStatus, a, b);
   }
 }
 
@@ -6613,6 +8104,22 @@ export class IssueRaftCommandReply extends Message<IssueRaftCommandReply> {
    */
   status?: RaftStatus;
 
+  /**
+   * Plain-language advisory produced by a command that SUCCEEDED but left
+   * the cluster in an ergonomically unhealthy shape — today: a membership
+   * change (`add-voter`, `remove-member`) whose resulting voter count is
+   * even ("2 voters need both alive to commit — this cluster survives zero
+   * failures. Use 1, 3, or 5 voters; add one more manager or remove one.").
+   * The same advisory is WARN-logged on the manager and recorded as a
+   * `membership` event in the raft history. Absent when the command left a
+   * healthy shape. Genuinely unsafe operations (removing the last voter, or
+   * a removal that would leave a quorum the currently-alive members cannot
+   * form) are refused outright instead of warned about.
+   *
+   * @generated from field: optional string warning = 4;
+   */
+  warning?: string;
+
   constructor(data?: PartialMessage<IssueRaftCommandReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -6624,6 +8131,7 @@ export class IssueRaftCommandReply extends Message<IssueRaftCommandReply> {
     { no: 1, name: "command", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 2, name: "event", kind: "message", T: RaftHistoryEvent },
     { no: 3, name: "status", kind: "message", T: RaftStatus },
+    { no: 4, name: "warning", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): IssueRaftCommandReply {
@@ -6740,6 +8248,106 @@ export class GetRaftJoinTokenReply extends Message<GetRaftJoinTokenReply> {
 
   static equals(a: GetRaftJoinTokenReply | PlainMessage<GetRaftJoinTokenReply> | undefined, b: GetRaftJoinTokenReply | PlainMessage<GetRaftJoinTokenReply> | undefined): boolean {
     return proto3.util.equals(GetRaftJoinTokenReply, a, b);
+  }
+}
+
+/**
+ * Request payload for GetStateBackup.
+ *
+ * @generated from message legion.GetStateBackupRequest
+ */
+export class GetStateBackupRequest extends Message<GetStateBackupRequest> {
+  /**
+   * Optional server-side destination path for the backup file. Must not
+   * already exist (`VACUUM INTO` refuses to overwrite). Defaults to a
+   * timestamped file under `<storePath>/backups/`.
+   *
+   * @generated from field: optional string out_path = 1;
+   */
+  outPath?: string;
+
+  constructor(data?: PartialMessage<GetStateBackupRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetStateBackupRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "out_path", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetStateBackupRequest {
+    return new GetStateBackupRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetStateBackupRequest {
+    return new GetStateBackupRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetStateBackupRequest {
+    return new GetStateBackupRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetStateBackupRequest | PlainMessage<GetStateBackupRequest> | undefined, b: GetStateBackupRequest | PlainMessage<GetStateBackupRequest> | undefined): boolean {
+    return proto3.util.equals(GetStateBackupRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for GetStateBackup.
+ *
+ * @generated from message legion.GetStateBackupReply
+ */
+export class GetStateBackupReply extends Message<GetStateBackupReply> {
+  /**
+   * Server-side path of the written backup file.
+   *
+   * @generated from field: string path = 1;
+   */
+  path = "";
+
+  /**
+   * Size of the backup file in bytes.
+   *
+   * @generated from field: uint64 bytes = 2;
+   */
+  bytes = protoInt64.zero;
+
+  /**
+   * Raft applied log index captured in the backup (0 outside raft mode).
+   *
+   * @generated from field: uint64 applied_index = 3;
+   */
+  appliedIndex = protoInt64.zero;
+
+  constructor(data?: PartialMessage<GetStateBackupReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetStateBackupReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "path", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "bytes", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 3, name: "applied_index", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetStateBackupReply {
+    return new GetStateBackupReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetStateBackupReply {
+    return new GetStateBackupReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetStateBackupReply {
+    return new GetStateBackupReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetStateBackupReply | PlainMessage<GetStateBackupReply> | undefined, b: GetStateBackupReply | PlainMessage<GetStateBackupReply> | undefined): boolean {
+    return proto3.util.equals(GetStateBackupReply, a, b);
   }
 }
 
@@ -9318,10 +10926,16 @@ export class UpdateNodeDynamicReply extends Message<UpdateNodeDynamicReply> {
  */
 export class SchedulerEvent extends Message<SchedulerEvent> {
   /**
-   * Monotonically increasing event ID.
+   * Increasing event ID.
    *
    * IDs are assigned by the manager's state store and are never reused, so
    * they double as a resume cursor for `ListEvents`/`StreamEvents`.
+   *
+   * IDs are SPARSE, not consecutive: they are minted from a timestamp plus
+   * the manager's raft write lane (each lane mints in its own stride, so
+   * concurrent lanes can never collide), and pruning removes old ones.
+   * Treat an ID only as an opaque cursor — never as a count, an index, or
+   * something to increment.
    *
    * @generated from field: int64 id = 1;
    */
@@ -9455,7 +11069,8 @@ export class ListEventsRequest extends Message<ListEventsRequest> {
    * Exclusive lower-bound event ID cursor.
    *
    * When set, only events with `id > after_id` are returned (oldest first),
-   * which makes repeated polling gap-free. When omitted, the most recent
+   * so repeated polling never skips an event (IDs themselves are sparse —
+   * see `SchedulerEvent.id`). When omitted, the most recent
    * `limit` events are returned (still ordered oldest-to-newest).
    *
    * @generated from field: optional int64 after_id = 1;
@@ -10989,7 +12604,11 @@ export class TaskAllocation extends Message<TaskAllocation> {
   taskName = "";
 
   /**
-   * Task kind/plugin name.
+   * Name of the task runtime plugin that runs this task (`exec`, `container`,
+   * `noop`, or a third-party plugin under `plugins/tasks/<name>/`). The worker
+   * resolves this against its task-plugin registry and fails the allocation if
+   * no plugin with this name is loadable. Mirrors the jobspec's
+   * `tasks.<name>.runtime` field.
    *
    * @generated from field: string task_runtime = 7;
    */
@@ -11029,7 +12648,7 @@ export class TaskAllocation extends Message<TaskAllocation> {
   /**
    * JSON-encoded list of normalized artifact specs for this task.
    *
-   * This is the post-admission form: kind-implicit artifacts (for example a
+   * This is the post-admission form: runtime-implicit artifacts (for example a
    * container `image`) are already desugared in, `resolve: "pin"` references
    * are already pinned to digests, and cluster-level auth matchers are
    * already applied. Workers stage exactly this list and never re-derive or
@@ -11101,6 +12720,24 @@ export class TaskAllocation extends Message<TaskAllocation> {
    */
   taskVolumes = "";
 
+  /**
+   * JSON-encoded task `resources` block, exactly as declared in the jobspec
+   * (`{"memory": 256, "cores": 1}`). Scheduler-side defaults are NOT folded
+   * in: this is what the job asked for, so a runtime can tell "unset" from
+   * "explicitly requested" and leave its own defaults alone.
+   *
+   * Task runtimes that isolate a workload use this to size it — the `container`
+   * runtime maps `memory` (MiB) and `cores` onto the sandbox's memory/CPU
+   * limits, since a guest that ignores the reservation the scheduler made on
+   * its behalf can overcommit the node. Runtimes that run host processes
+   * (`exec`) ignore it; enforcement there needs cgroups/jobobjects.
+   *
+   * Empty string when the task declares no resources.
+   *
+   * @generated from field: string task_resources = 16;
+   */
+  taskResources = "";
+
   constructor(data?: PartialMessage<TaskAllocation>) {
     super();
     proto3.util.initPartial(data, this);
@@ -11124,6 +12761,7 @@ export class TaskAllocation extends Message<TaskAllocation> {
     { no: 12, name: "task_identities", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 13, name: "self_terminate_after_seconds", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
     { no: 15, name: "task_volumes", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 16, name: "task_resources", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): TaskAllocation {
@@ -11333,6 +12971,20 @@ export class WhoAmIReply extends Message<WhoAmIReply> {
    */
   accessorId?: string;
 
+  /**
+   * The caller's effective ACL rules as a JSON array (the same rule schema
+   * as AclPolicy.rules_json), flattened from every attached policy.
+   *
+   * This is self-introspection: it reveals only what the caller's own
+   * requests would reveal, and it is what lets clients like the UI hide
+   * controls the identity cannot use. Management tokens and disabled ACLs
+   * report `[{"resources":["*"],"actions":["*"]}]`. Unset for anonymous
+   * callers with no anonymous policy.
+   *
+   * @generated from field: optional string rules_json = 9;
+   */
+  rulesJson?: string;
+
   constructor(data?: PartialMessage<WhoAmIReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -11349,6 +13001,7 @@ export class WhoAmIReply extends Message<WhoAmIReply> {
     { no: 6, name: "policies", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
     { no: 7, name: "expires_at", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
     { no: 8, name: "accessor_id", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 9, name: "rules_json", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): WhoAmIReply {
@@ -11684,14 +13337,17 @@ export class AclTokenInfo extends Message<AclTokenInfo> {
  *
  * Rule fields:
  * - `resources`: resource types the rule covers (`job`, `node`, `kv`,
- *   `state`, `operator`, `acl`, or `*`).
+ *   `state`, `operator`, `acl`, `exec`, `action`, `template`, or `*`).
  * - `actions`: `read`, `write`, or `*`.
  * - `effect`: `allow` (default) or `deny`. A matching deny rule always
  *   overrides any allow.
  * - Optional scope selectors (glob lists matched against the request):
  *   `namespaces` (job namespaces), `names` (job names), `pools` (node
- *   pools), `paths` (KV keys). A rule with a selector only matches requests
- *   that carry that attribute.
+ *   pools), `paths` (KV keys), `actionNames` (declared action names),
+ *   `templates` (job-template names). A rule with a selector only matches
+ *   requests that carry that attribute — which is why a `job` rule with
+ *   `templates: ["x"]` grants submission only through template `x` and
+ *   never via raw RunJob.
  *
  * @generated from message legion.AclPolicy
  */
@@ -13181,6 +14837,357 @@ export class DeleteJoinTokenReply extends Message<DeleteJoinTokenReply> {
 
   static equals(a: DeleteJoinTokenReply | PlainMessage<DeleteJoinTokenReply> | undefined, b: DeleteJoinTokenReply | PlainMessage<DeleteJoinTokenReply> | undefined): boolean {
     return proto3.util.equals(DeleteJoinTokenReply, a, b);
+  }
+}
+
+/**
+ * Request envelope for the three openraft protocol RPCs (AppendEntries,
+ * Vote, InstallSnapshot).
+ *
+ * @generated from message legion.RaftLaneRequest
+ */
+export class RaftLaneRequest extends Message<RaftLaneRequest> {
+  /**
+   * Raft group ("lane") wire name: "control", "scheduler", or "status".
+   * Must name a group that is active on the receiving node.
+   *
+   * @generated from field: string group_id = 1;
+   */
+  groupId = "";
+
+  /**
+   * Opaque serde_json-encoded openraft request message. The concrete type
+   * depends on the RPC (see the service comments); the encoding is the
+   * openraft 0.9 serde representation, internal to the manager plane and
+   * versioned by PROTOCOL_VERSION. Binary fields inside it (the changeset
+   * in an entry, an install-snapshot chunk) are base64 strings, not JSON
+   * number arrays — see `storage::raft::types::wire_bytes`.
+   *
+   * @generated from field: bytes payload = 2;
+   */
+  payload = new Uint8Array(0);
+
+  constructor(data?: PartialMessage<RaftLaneRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.RaftLaneRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "group_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "payload", kind: "scalar", T: 12 /* ScalarType.BYTES */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RaftLaneRequest {
+    return new RaftLaneRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): RaftLaneRequest {
+    return new RaftLaneRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): RaftLaneRequest {
+    return new RaftLaneRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: RaftLaneRequest | PlainMessage<RaftLaneRequest> | undefined, b: RaftLaneRequest | PlainMessage<RaftLaneRequest> | undefined): boolean {
+    return proto3.util.equals(RaftLaneRequest, a, b);
+  }
+}
+
+/**
+ * Reply envelope for the three openraft protocol RPCs.
+ *
+ * @generated from message legion.RaftLaneReply
+ */
+export class RaftLaneReply extends Message<RaftLaneReply> {
+  /**
+   * Opaque serde_json-encoded `Result<Reply, RaftError>` (see the service
+   * comments for the concrete type per RPC). Application-level raft errors
+   * travel here; gRPC status codes are reserved for transport/auth/dispatch
+   * failures (unreachable group, bad secret, undecodable payload).
+   *
+   * @generated from field: bytes payload = 1;
+   */
+  payload = new Uint8Array(0);
+
+  constructor(data?: PartialMessage<RaftLaneReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.RaftLaneReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "payload", kind: "scalar", T: 12 /* ScalarType.BYTES */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RaftLaneReply {
+    return new RaftLaneReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): RaftLaneReply {
+    return new RaftLaneReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): RaftLaneReply {
+    return new RaftLaneReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: RaftLaneReply | PlainMessage<RaftLaneReply> | undefined, b: RaftLaneReply | PlainMessage<RaftLaneReply> | undefined): boolean {
+    return proto3.util.equals(RaftLaneReply, a, b);
+  }
+}
+
+/**
+ * Request payload for RaftTransport.Join.
+ *
+ * @generated from message legion.JoinRaftClusterRequest
+ */
+export class JoinRaftClusterRequest extends Message<JoinRaftClusterRequest> {
+  /**
+   * The signed join token minted by `legion raft join-token` on the leader.
+   * Carries cluster id, leader advertise address, and the cluster secret;
+   * the leader re-validates it here so a leaked advertise address alone is
+   * not enough to join.
+   *
+   * @generated from field: string join_token = 1;
+   */
+  joinToken = "";
+
+  /**
+   * The joining manager's string identity (its manager node id/name). The
+   * raft node id used in membership is derived from this deterministically:
+   * `fnv1a64(node_id)`.
+   *
+   * @generated from field: string node_id = 2;
+   */
+  nodeId = "";
+
+  /**
+   * "host:port" the cluster should dial to reach the joining manager's gRPC
+   * listener (the RaftTransport service shares the manager's tonic
+   * listener).
+   *
+   * @generated from field: string advertise_addr = 3;
+   */
+  advertiseAddr = "";
+
+  /**
+   * The joiner's configured raft topology ("single" or "lanes"), so the
+   * leader can refuse a mixed-topology cluster at enrollment (plan JC-43).
+   * A joiner configured differently would enroll into groups it does not
+   * run (or run groups nobody replicates to), which is unrecoverable once
+   * its log advances. Empty means a pre-JC-43 manager, which is only ever
+   * "single".
+   *
+   * @generated from field: string topology = 4;
+   */
+  topology = "";
+
+  constructor(data?: PartialMessage<JoinRaftClusterRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.JoinRaftClusterRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "join_token", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "advertise_addr", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "topology", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): JoinRaftClusterRequest {
+    return new JoinRaftClusterRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): JoinRaftClusterRequest {
+    return new JoinRaftClusterRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): JoinRaftClusterRequest {
+    return new JoinRaftClusterRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: JoinRaftClusterRequest | PlainMessage<JoinRaftClusterRequest> | undefined, b: JoinRaftClusterRequest | PlainMessage<JoinRaftClusterRequest> | undefined): boolean {
+    return proto3.util.equals(JoinRaftClusterRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for RaftTransport.Join.
+ *
+ * @generated from message legion.JoinRaftClusterReply
+ */
+export class JoinRaftClusterReply extends Message<JoinRaftClusterReply> {
+  /**
+   * The raft node id assigned to the joiner: `fnv1a64(request.node_id)`.
+   * Deterministic, so re-joins and restarts always map to the same id.
+   *
+   * @generated from field: uint64 assigned_raft_id = 1;
+   */
+  assignedRaftId = protoInt64.zero;
+
+  /**
+   * The cluster id this membership belongs to (from the join token).
+   *
+   * @generated from field: string cluster_id = 2;
+   */
+  clusterId = "";
+
+  /**
+   * Current membership of every active raft group, so the joiner can seed
+   * its peer table before its first snapshot install.
+   *
+   * @generated from field: repeated legion.RaftGroupMembership groups = 3;
+   */
+  groups: RaftGroupMembership[] = [];
+
+  constructor(data?: PartialMessage<JoinRaftClusterReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.JoinRaftClusterReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "assigned_raft_id", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 2, name: "cluster_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "groups", kind: "message", T: RaftGroupMembership, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): JoinRaftClusterReply {
+    return new JoinRaftClusterReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): JoinRaftClusterReply {
+    return new JoinRaftClusterReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): JoinRaftClusterReply {
+    return new JoinRaftClusterReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: JoinRaftClusterReply | PlainMessage<JoinRaftClusterReply> | undefined, b: JoinRaftClusterReply | PlainMessage<JoinRaftClusterReply> | undefined): boolean {
+    return proto3.util.equals(JoinRaftClusterReply, a, b);
+  }
+}
+
+/**
+ * Membership of one raft group ("lane").
+ *
+ * @generated from message legion.RaftGroupMembership
+ */
+export class RaftGroupMembership extends Message<RaftGroupMembership> {
+  /**
+   * Lane wire name: "control", "scheduler", or "status".
+   *
+   * @generated from field: string group_id = 1;
+   */
+  groupId = "";
+
+  /**
+   * All members currently known to this group (voters and learners).
+   *
+   * @generated from field: repeated legion.RaftMemberInfo members = 2;
+   */
+  members: RaftMemberInfo[] = [];
+
+  constructor(data?: PartialMessage<RaftGroupMembership>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.RaftGroupMembership";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "group_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "members", kind: "message", T: RaftMemberInfo, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RaftGroupMembership {
+    return new RaftGroupMembership().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): RaftGroupMembership {
+    return new RaftGroupMembership().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): RaftGroupMembership {
+    return new RaftGroupMembership().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: RaftGroupMembership | PlainMessage<RaftGroupMembership> | undefined, b: RaftGroupMembership | PlainMessage<RaftGroupMembership> | undefined): boolean {
+    return proto3.util.equals(RaftGroupMembership, a, b);
+  }
+}
+
+/**
+ * One raft group member.
+ *
+ * @generated from message legion.RaftMemberInfo
+ */
+export class RaftMemberInfo extends Message<RaftMemberInfo> {
+  /**
+   * The member's raft node id (`fnv1a64` of its manager string id).
+   *
+   * @generated from field: uint64 raft_id = 1;
+   */
+  raftId = protoInt64.zero;
+
+  /**
+   * The member's manager string id (decoded from the "name@host:port"
+   * openraft BasicNode address — see `src/storage/raft/types.rs`).
+   *
+   * @generated from field: string node_id = 2;
+   */
+  nodeId = "";
+
+  /**
+   * "host:port" of the member's gRPC listener.
+   *
+   * @generated from field: string advertise_addr = 3;
+   */
+  advertiseAddr = "";
+
+  /**
+   * True for voters, false for learners still catching up.
+   *
+   * @generated from field: bool voter = 4;
+   */
+  voter = false;
+
+  constructor(data?: PartialMessage<RaftMemberInfo>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.RaftMemberInfo";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "raft_id", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 2, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "advertise_addr", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "voter", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RaftMemberInfo {
+    return new RaftMemberInfo().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): RaftMemberInfo {
+    return new RaftMemberInfo().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): RaftMemberInfo {
+    return new RaftMemberInfo().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: RaftMemberInfo | PlainMessage<RaftMemberInfo> | undefined, b: RaftMemberInfo | PlainMessage<RaftMemberInfo> | undefined): boolean {
+    return proto3.util.equals(RaftMemberInfo, a, b);
   }
 }
 

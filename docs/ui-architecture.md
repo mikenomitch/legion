@@ -55,6 +55,7 @@ Routes in `App.tsx`:
 - `/` overview dashboard (KPI stat cards, active rollouts, workers and
   allocations tables)
 - `/jobs` (+ `/jobs/:id`, `/jobs/:id/tasks/:taskName`, `/jobs/:id/specs/:configId`)
+- `/templates` (+ `/templates/:name`)
 - `/services` (+ `/services/:name`)
 - `/rollouts` (+ `/rollouts/:id`); `/deployments` redirects here
 - `/nodes` (+ `/nodes/:id`)
@@ -66,6 +67,65 @@ Routes in `App.tsx`:
 A shared layout provides the grouped sidebar nav, a slim topbar
 (breadcrumbs, ⌘K search, theme toggle), and page headers for top-level
 routes; detail pages render their own `PageHeader`.
+
+## Keyboard Navigation
+
+The UI is usable without a mouse. Everything below is global — no setting, no
+mode to enter.
+
+| Keys | What it does |
+| --- | --- |
+| `⌘K` / `Ctrl+K` | Command palette: every page, plus every row of the index you are on, searchable by name |
+| `j` / `k`, `↑` / `↓` | Move the selection down/up the current index |
+| `o` / `Enter` | Open the selected row |
+| `u` | Go up one level (`/jobs/api/tasks/web` → `/jobs/api`) |
+| *hold* `⌘` / `Ctrl` | **Jump hints** — label the rows and the sidebar with the key that opens them |
+| `⌘1` … `⌘9`, `⌘0` | Open the 1st … 10th row of the index |
+| `⌘⇧` + letter | Open the labelled sidebar item |
+
+`j`/`k`/`o` and `u` are ignored while you are typing in a field, and while a
+link or button has keyboard focus — Tab focus wins over the virtual selection.
+
+### Jump hints
+
+Hold `⌘` (`Ctrl` on Windows and Linux) and the UI labels what you can jump to:
+a digit on each of the first ten rows of the index, and a letter on each sidebar
+item. Press the labelled key with the modifier still held. Release it and the
+labels disappear.
+
+```
+Jobs                        ⇧B          ⌘⇧B  → Jobs
+Services                    ⇧S          ⌘⇧S  → Services
+
+1  svc-api      DONE                    ⌘1   → svc-api
+2  svc-web      DONE                    ⌘2   → svc-web
+```
+
+Sidebar hints carry `⇧` because plain `⌘`+letter belongs to the browser and the
+OS (`⌘S`, `⌘W`, `⌘R`). The badge always spells the full chord, so what you read
+is what you press.
+
+Known limitations:
+
+- **Ten rows.** Digits run out after the tenth row; on a 20- or 50-row page the
+  rest carry no hints. Use `⌘K` or the search box for those.
+- **Index pages only.** Jobs, Workers, Rollouts, Managers, Services and Volumes
+  label their rows. The Overview dashboard and the tables inside detail pages
+  do not, and neither do secondary tables (the driver table on Volumes).
+- **Sidebar letters are positional.** They are assigned from the sidebar as
+  rendered, so an item's letter can change when the nav does — most visibly when
+  the manager has observability enabled and an extra item appears.
+- **Collapsed sidebar shows no letters** (there is no room for the badge), but
+  the chords still work.
+- **A browser may keep a chord.** The letters skip the combinations browsers
+  reserve for tabs, windows and devtools, but a browser or extension with its
+  own bindings can still win one; that chord will do the browser's thing
+  instead.
+
+Implementation: `ui/src/utils/jumpHints.ts` holds the visibility signal, the
+letter assignment, and the registry of the current index's rows;
+`ui/src/App.tsx` owns the key handling; pages opt in with `useIndexJumpTargets`
+and the `<JumpHint>` primitive.
 
 ## Data Fetch Pattern
 
@@ -141,6 +201,63 @@ Storage is surfaced wherever the question "where is my data" gets asked
   owning instance, and node.
 - **Worker detail**: volumes materialized on that host, with an explicit note
   that draining or losing the node strands the node-local ones.
+
+## Job Templates
+
+`/templates` lists the cluster's [job templates](job-templates.md);
+`/templates/:name` is where a template is actually used:
+
+- The **run form is generated from the template's declared variables** —
+  text inputs, textareas, number fields, toggles, `<select>`s, option chips
+  for `multi_select`, and a JSON editor for `json` variables. Form state is
+  a single `Record<string, unknown>` seeded from the declared defaults, and
+  it is converted to typed JSON only at submit.
+- **Preview rendered spec** calls `RenderJobTemplate` — the same render the
+  submit would do, so what the user sees is what gets submitted. Editing any
+  value invalidates a stale preview.
+- Submitting links straight to the created job; that job's page shows a
+  `template: <name> v<N>` badge back to the template version that made it.
+- The source editor (new template, new version) renders only for identities
+  holding `template:write`.
+
+## ACL-Aware Rendering
+
+`WhoAmI` returns the caller's effective rules (`rulesJson`), and
+`utils/acl.ts` mirrors the manager's evaluation — same globbing, same
+default-deny, same "a rule with a selector never matches a request without
+that attribute" — behind `allows(resource, action, scope)`.
+
+- **Nav**: an authenticated identity only sees destinations it can read
+  (`ROUTE_RESOURCE` in `utils/acl.ts` maps each top-level route to the
+  resource it needs). An **anonymous** caller keeps the full sidebar — they
+  have not had a chance to authenticate, and an app that hides everything
+  looks broken rather than locked.
+- **Denied pages**: every protected page wraps its own content in
+  `AccessGate`, which swaps in a card naming the missing permission with a
+  login link (anonymous) or a switch-identity link (authenticated). The gate
+  lives at the page level on purpose: wrapping the router's *outlet* in any
+  conditional captures it once and freezes navigation while the URL keeps
+  changing.
+- **Mutating controls** (destroy/stop job, rollout advance/stop, KV
+  save/delete/patch, raft commands, saved-query writes, exec and actions,
+  template publish/delete) render disabled with a title explaining why.
+- **Access page** shows admin tabs only with `acl:read` (worker join needs
+  `node:read`).
+
+Two hard-won rules keep restricted identities from breaking the app:
+
+- **A resource that may be denied must swallow its own rejection.** Reading
+  an errored Solid resource *throws at the read site*; one unguarded
+  `operator:read` probe in the layout used to kill the whole reactive graph
+  — URL changing, page frozen. Garnish RPCs (the ledger on job pages, the
+  o11y probe in the layout, the overview stats) degrade to empty on denial.
+- **`RouteErrorBoundary`** wraps the page area as a last line of defense: a
+  page that still throws gets an error card and a retry, and navigating
+  elsewhere resets it. It renders children unconditionally — it is not a
+  conditional around the outlet.
+
+As everywhere else in the UI, all of this is cosmetic; the manager is the
+only enforcement point.
 
 ## Stateful Workloads
 

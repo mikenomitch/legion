@@ -1,5 +1,6 @@
 import { A } from '@solidjs/router'
 import { Show, createSignal, onCleanup, splitProps, type JSX } from 'solid-js'
+import { jumpHintsVisible } from '../utils/jumpHints'
 import { badgeToneClasses, dotToneClasses, noteToneClasses, statusTone, textToneClasses, type Tone } from '../utils/status'
 
 /*
@@ -51,6 +52,7 @@ const ICON_PATHS: Record<string, string> = {
   externalLink: 'M15 3h6v6 M10 14 21 3 M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6',
   hardDrive: 'M22 12H2 M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z M6 16h.01 M10 16h.01',
   stethoscope: 'M11 2v2a4 4 0 0 1-8 0V2 M7 8v3a6 6 0 0 0 12 0V9 M19 9a2 2 0 1 0 0-4 2 2 0 0 0 0 4z M13 20a3 3 0 1 0 6 0v-3',
+  layoutTemplate: 'M4 3h16a1 1 0 0 1 1 1v5a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z M4 14h7a1 1 0 0 1 1 1v5a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1v-5a1 1 0 0 1 1-1z M17 14h3a1 1 0 0 1 1 1v5a1 1 0 0 1-1 1h-3a1 1 0 0 1-1-1v-5a1 1 0 0 1 1-1z',
 }
 
 export type IconName = keyof typeof ICON_PATHS
@@ -130,6 +132,37 @@ export function MonoBadge(props: { children: JSX.Element; title?: string; tone?:
     <Badge mono tone={props.tone ?? 'accent'} title={props.title} class={cx('rounded', props.class)}>
       {props.children}
     </Badge>
+  )
+}
+
+/**
+ * Opens a left gutter in an index's first column for the hint to sit in, and
+ * closes it again on release. Pair it with `position: relative` on the cell and
+ * an absolutely positioned `<JumpHint>`; goes on the `<th>` too so the header
+ * tracks the column.
+ */
+export const jumpHintGutterClass = () => cx('transition-[padding] duration-100', jumpHintsVisible() && 'pl-9')
+
+/**
+ * The key that jumps to a row or nav item, shown only while the reveal modifier
+ * is held. Renders nothing without a `keys` string, so callers can pass the
+ * hint for a position that has none (rows past the tenth) without a guard.
+ */
+export function JumpHint(props: { keys?: string; class?: string }) {
+  return (
+    <Show when={jumpHintsVisible() && props.keys}>
+      {(keys) => (
+        <kbd
+          aria-hidden="true"
+          class={cx(
+            'inline-flex select-none items-center justify-center rounded border border-brass/40 bg-brass/15 px-1 py-px font-mono text-2xs font-medium leading-none text-brass-strong',
+            props.class,
+          )}
+        >
+          {keys()}
+        </kbd>
+      )}
+    </Show>
   )
 }
 

@@ -1,4 +1,5 @@
 import { useParams } from '@solidjs/router'
+import { AccessGate } from '../../components/AccessGate'
 import { Show, createResource } from 'solid-js'
 import { CodeBlock, Note, PageHeader, SectionCard, Spinner } from '../../components/ui'
 import { managerClient } from '../../grpcClient'
@@ -12,7 +13,7 @@ function prettyJsonLine(line: string): string {
   }
 }
 
-export default function ManagerNodeDetail() {
+function ManagerNodeDetailContent() {
   const params = useParams()
   const [data] = createResource(() => params.id, async (id) => {
     const response = await managerClient.getManagerConfigs({ query: decodeURIComponent(id), page: 1, pageSize: 1 })
@@ -47,5 +48,15 @@ export default function ManagerNodeDetail() {
         </div>
       </Show>
     </Show>
+  )
+}
+
+// Permission gate lives here at the page level — never around the router
+// outlet in the layout (see AccessGate).
+export default function ManagerNodeDetail() {
+  return (
+    <AccessGate resource="operator">
+      <ManagerNodeDetailContent />
+    </AccessGate>
   )
 }

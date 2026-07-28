@@ -1,4 +1,5 @@
 import { For, Show, createMemo, createSignal, onCleanup, onMount } from 'solid-js'
+import { AccessGate } from '../components/AccessGate'
 import type { SchedulerEvent } from '../gen/legion_pb'
 import { managerClient } from '../grpcClient'
 import { formatRelativeTime } from '../utils/format'
@@ -22,7 +23,7 @@ const connectionTone = (state: ConnectionState): Tone => {
 
 const eventCategory = (kind: string): string => kind.split('.')[0] ?? kind
 
-export default function Events() {
+function EventsContent() {
   const [events, setEvents] = createSignal<SchedulerEvent[]>([])
   const [pendingWhilePaused, setPendingWhilePaused] = createSignal<SchedulerEvent[]>([])
   const [paused, setPaused] = createSignal(false)
@@ -250,4 +251,14 @@ const formatMetadata = (metadataJson: string): string => {
   } catch {
     return metadataJson
   }
+}
+
+// Permission gate lives here at the page level — never around the router
+// outlet in the layout (see AccessGate).
+export default function Events() {
+  return (
+    <AccessGate resource="operator">
+      <EventsContent />
+    </AccessGate>
+  )
 }

@@ -1,10 +1,12 @@
 import { A } from '@solidjs/router'
+import { AccessGate } from '../components/AccessGate'
 import { For, Show, createEffect, createMemo, createResource, createSignal, onCleanup, onMount } from 'solid-js'
 import { ServiceTags } from '../components/ServiceEndpoints'
 import {
   Badge,
   EmptyState,
   Icon,
+  JumpHint,
   LoadingRows,
   Note,
   SectionCard,
@@ -12,6 +14,7 @@ import {
   TableShell,
   cx,
   inputClass,
+  jumpHintGutterClass,
   tableClass,
   tdClass,
   thClass,
@@ -20,6 +23,7 @@ import {
 } from '../components/ui'
 import { managerClient } from '../grpcClient'
 import { clearCommandPaletteIndexItems, setCommandPaletteIndexItems } from '../utils/commandPalette'
+import { indexHintKey, useIndexJumpTargets } from '../utils/jumpHints'
 import { POLL_INTERVAL_MS } from '../utils/polling'
 
 // Health of a service as a whole: every endpoint healthy, some, or none.
@@ -35,7 +39,7 @@ const serviceStatus = (healthy: number, total: number) => {
   return healthy === total ? 'healthy' : 'degraded'
 }
 
-export default function Services() {
+function ServicesContent() {
   const [search, setSearch] = createSignal('')
   const [tick, setTick] = createSignal(0)
 
@@ -59,6 +63,8 @@ export default function Services() {
         .includes(query),
     )
   })
+
+  useIndexJumpTargets(() => filtered().map((service) => `/services/${encodeURIComponent(service.service)}`))
 
   // Feed ⌘K so a service can be jumped to by name, like jobs and workers.
   createEffect(() => {
@@ -139,7 +145,7 @@ export default function Services() {
               <table class={tableClass}>
                 <thead class={theadClass}>
                   <tr>
-                    <th class={thClass}>Service</th>
+                    <th class={cx(thClass, jumpHintGutterClass())}>Service</th>
                     <th class={thClass}>Status</th>
                     <th class={thClass}>Endpoints</th>
                     <th class={thClass}>Job / task</th>
@@ -148,9 +154,10 @@ export default function Services() {
                 </thead>
                 <tbody class="divide-y divide-line">
                   <For each={filtered()}>
-                    {(service) => (
+                    {(service, index) => (
                       <tr class={trHoverClass}>
-                        <td class={tdClass}>
+                        <td class={cx(tdClass, 'relative', jumpHintGutterClass())}>
+                          <JumpHint keys={indexHintKey(index())} class="absolute left-3 top-1/2 -translate-y-1/2" />
                           <A href={`/services/${encodeURIComponent(service.service)}`} class="font-medium text-ink hover:text-brass-strong">
                             {service.service}
                           </A>
@@ -188,5 +195,15 @@ export default function Services() {
         </Show>
       </SectionCard>
     </div>
+  )
+}
+
+// Permission gate lives here at the page level — never around the router
+// outlet in the layout (see AccessGate).
+export default function Services() {
+  return (
+    <AccessGate resource="job">
+      <ServicesContent />
+    </AccessGate>
   )
 }

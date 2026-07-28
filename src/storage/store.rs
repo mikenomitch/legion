@@ -3,7 +3,8 @@
 
 use crate::constraints::{ConstraintSet, DistinctTracker, PermitSet};
 use crate::prelude::*;
-use crate::resources::ResourcePolicy;
+use crate::resources::{ResourcePolicy, ResourcePool};
+use crate::scheduling_index::{IndexSet, IndexSettings};
 use crate::storage::errors::StorageError;
 use crate::storage::events::{drafts, EventDraft, SchedulerEventFilter, SchedulerEventRecord};
 use crate::storage::migrations::get_migrations;
@@ -27,11 +28,11 @@ use crate::storage::queries::{
 };
 use crate::structs::{
     slot_instance_id, Allocation, AllocationHealth, Eval, Instance, InstanceMode, InstanceState,
-    Job, JobConfig, KvEntry, KvLock, KvValueType, LedgerEntry, ManagerConfigFull,
-    ManagerNodeConfig, Node, NodeMsg, ReplaceAfter, ResolvedOnLostPolicy, Rollout, RolloutConfig,
-    SigningKeyRecord, StatefulConfig, StatefulOnLostConfig, Submission, TaskCheck, TaskConfig,
-    TaskCount, TaskDependency, TaskLifecycle, TaskOnUnhealthyConfig, TaskSchedule, TaskStatusState,
-    Volume, WorkerConfig,
+    Job, JobConfig, JobTemplateProvenance, KvEntry, KvLock, KvValueType, LedgerEntry,
+    ManagerConfigFull, ManagerNodeConfig, Node, NodeMsg, ReplaceAfter, ResolvedOnLostPolicy,
+    Rollout, RolloutConfig, SigningKeyRecord, StatefulConfig, StatefulOnLostConfig, Submission,
+    TaskCheck, TaskConfig, TaskCount, TaskDependency, TaskLifecycle, TaskOnUnhealthyConfig,
+    TaskSchedule, TaskStatusState, Volume, WorkerConfig,
 };
 use crate::util::random_string;
 
@@ -106,11 +107,31 @@ fn worker_address_host(config_attrs: &Value) -> Option<String> {
     }
 }
 
+/// Allocations per node, each node's vector shared by refcount: a plan's
+/// snapshot bumps refcounts instead of deep-cloning every allocation, and
+/// the few writers copy-on-write via `Arc::make_mut`.
+pub type SharedNodeAllocations = HashMap<String, Arc<Vec<Allocation>>>;
+
 #[derive(Debug, Clone, Default)]
 pub struct SchedulingReadModel {
-    pub nodes: HashMap<String, Node>,
-    pub allocations_by_node: HashMap<String, Vec<Allocation>>,
+    /// Nodes are `Arc`'d so a plan's snapshot is refcount bumps, not deep
+    /// clones of every node's JSON attribute bags. In-place updates go
+    /// through `Arc::make_mut` (copy-on-write while a plan still holds the
+    /// old snapshot).
+    pub nodes: HashMap<String, Arc<Node>>,
+    pub allocations_by_node: SharedNodeAllocations,
     pub task_configs: HashMap<String, Vec<(i64, TaskConfig)>>,
+    /// Declared scheduling indexes over `nodes` (docs/scheduling-indexes.md).
+    /// Maintained by the same write path that mutates `nodes` and
+    /// `allocations_by_node`, so it cannot drift from them; derived state
+    /// only, rebuilt on every full read-model load.
+    pub indexes: IndexSet,
+    /// Free resource capacity per **available** node — fingerprinted
+    /// capacity minus every current allocation's usage — recomputed for the
+    /// affected node by the same reprojection pass that maintains
+    /// `indexes`. The plan-time `ResourceLedger` clones these instead of
+    /// re-parsing every node's JSON per plan.
+    pub(crate) node_pools: HashMap<String, ResourcePool>,
     /// Mirror of `allocation_epoch_partition`, keyed by
     /// `Store::scope_vector_key`, kept COHERENT with `allocations_by_node`
     /// (adversarial finding, 2026-07-28 — the plan-fence gap): an epoch
@@ -155,6 +176,10 @@ pub struct DeclaredService {
     pub meta: BTreeMap<String, String>,
 }
 
+/// What [`Store::plan_capacity_snapshot`] hands the scheduler: current
+/// allocations by node plus the cached free pools, cloned under one guard.
+pub(crate) type PlanCapacityParts = (SharedNodeAllocations, HashMap<String, ResourcePool>);
+
 #[derive(Debug, Clone)]
 pub struct PlanSubmission {
     pub id: i64,
@@ -184,6 +209,9 @@ pub struct Store {
     pub default_eval_priority: i64,
     pub rollout_retention_days: u64,
     pub scheduler_settings: Option<Value>,
+    /// Parsed `schedulerSettings.indexes` / `index_min_nodes` (fails loudly
+    /// at startup on malformed declarations).
+    pub index_settings: Arc<IndexSettings>,
     pub resource_policy: ResourcePolicy,
     persistence_driver: Arc<dyn PersistenceDriver>,
     read_model: Arc<RwLock<SchedulingReadModel>>,
@@ -327,6 +355,79 @@ pub struct SavedStateQueryRecord {
     pub updated_at: String,
 }
 
+/// One declared variable of a job template, parsed from the template's
+/// manifest at upsert time and stored as JSON in
+/// `job_template_version.variables`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct JobTemplateVariableRecord {
+    pub key: String,
+    #[serde(rename = "type")]
+    pub var_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Defaults to true when `default` is absent, false when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<String>,
+}
+
+impl JobTemplateVariableRecord {
+    /// Effective requiredness: explicit flag, else "no default means required".
+    pub fn is_required(&self) -> bool {
+        self.required.unwrap_or(self.default.is_none())
+    }
+}
+
+/// One stored job template version, plus the template's latest version.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JobTemplateVersionRecord {
+    pub name: String,
+    pub version: u32,
+    pub latest_version: u32,
+    pub description: Option<String>,
+    pub source_jsonnet: String,
+    pub variables: Vec<JobTemplateVariableRecord>,
+    pub created_at: String,
+    pub created_by: String,
+}
+
+/// Latest-version summary row for template listings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JobTemplateSummaryRecord {
+    pub name: String,
+    pub latest_version: u32,
+    pub description: Option<String>,
+    pub variable_count: u32,
+    pub updated_at: String,
+}
+
+/// Version-history metadata (no source).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JobTemplateVersionInfoRecord {
+    pub version: u32,
+    pub created_at: String,
+    pub created_by: String,
+}
+
+/// One row of a job's spec history, including template provenance when the
+/// config was submitted through RunJobTemplate.
+#[derive(Debug, Clone)]
+pub struct JobSpecHistoryRow {
+    pub config_id: String,
+    pub created_at: String,
+    pub version: Option<i64>,
+    pub template: Option<JobTemplateProvenance>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RolloutEventRecord {
@@ -406,6 +507,10 @@ impl Store {
         let _migrations = Store::create_initial_tables(&Arc::clone(&write_conn))?;
         let read_conns = Store::create_read_pool(&db_path)?;
         let resource_policy = ResourcePolicy::from_manager_config(config)?;
+        let index_settings = Arc::new(IndexSettings::from_scheduler_settings(
+            config.scheduler_settings.as_ref(),
+            &config.scheduling_policy,
+        )?);
 
         let store = Store {
             write_conn,
@@ -416,6 +521,7 @@ impl Store {
             default_eval_priority: config.default_priority,
             rollout_retention_days: config.rollout_retention_days,
             scheduler_settings: config.scheduler_settings.clone(),
+            index_settings,
             resource_policy,
             persistence_driver,
             read_model: Arc::new(RwLock::new(SchedulingReadModel::default())),
@@ -1448,23 +1554,73 @@ impl Store {
         let mut allocs_stmt = conn.prepare(GET_ALLOCS.as_str())?;
         let allocs =
             Self::collect_rows(allocs_stmt.query_map([], |row| self.allocation_from_row(row))?)?;
-        let mut allocations_by_node: HashMap<String, Vec<Allocation>> = HashMap::new();
+        let mut grouped: HashMap<String, Vec<Allocation>> = HashMap::new();
         for alloc in allocs {
-            allocations_by_node
+            grouped
                 .entry(alloc.node_id.clone())
                 .or_default()
                 .push(alloc);
         }
+        let allocations_by_node: SharedNodeAllocations = grouped
+            .into_iter()
+            .map(|(node_id, allocations)| (node_id, Arc::new(allocations)))
+            .collect();
 
-        Ok(SchedulingReadModel {
+        let node_ids: Vec<String> = nodes.iter().map(|node| node.id.clone()).collect();
+        let mut model = SchedulingReadModel {
             nodes: nodes
                 .into_iter()
-                .map(|node| (node.id.clone(), node))
+                .map(|node| (node.id.clone(), Arc::new(node)))
                 .collect(),
             allocations_by_node,
             task_configs,
+            indexes: IndexSet::new(Arc::clone(&self.index_settings)),
+            node_pools: HashMap::new(),
             scope_epochs,
-        })
+        };
+        let id_refs: Vec<&str> = node_ids.iter().map(String::as_str).collect();
+        Self::reproject_model_nodes(&mut model, &self.resource_policy, &id_refs);
+
+        Ok(model)
+    }
+
+    /// Re-derives `node_ids`' cached state — the free resource pool and the
+    /// scheduling-index projections, both computed from the same pool so
+    /// they cannot disagree. Every read-model mutation that can change
+    /// either — node upserts, availability flips, attribute updates,
+    /// allocation changes — calls this inside the same write lock as the
+    /// mutation, so derived state is never observable out of step with
+    /// `nodes`. Unavailable or deleted nodes lose both.
+    fn reproject_model_nodes(
+        model: &mut SchedulingReadModel,
+        policy: &ResourcePolicy,
+        node_ids: &[&str],
+    ) {
+        if node_ids.is_empty() {
+            return;
+        }
+        let started = Instant::now();
+        for node_id in node_ids {
+            match model.nodes.get(*node_id) {
+                Some(node) if node.availability == "available" => {
+                    let allocations = model
+                        .allocations_by_node
+                        .get(*node_id)
+                        .map(|allocations| allocations.as_slice())
+                        .unwrap_or(&[]);
+                    let pool = ResourcePool::free_for_node(node, allocations, policy);
+                    model.indexes.reindex_node(node, &pool);
+                    model.node_pools.insert((*node_id).to_string(), pool);
+                }
+                _ => {
+                    model.node_pools.remove(*node_id);
+                    model.indexes.remove_node(node_id);
+                }
+            }
+        }
+        crate::manager::telemetry::metrics()
+            .scheduler_index_maintenance_seconds
+            .observe(started.elapsed().as_secs_f64());
     }
 
     pub(crate) fn refresh_read_model(&self) -> R<()> {
@@ -1494,7 +1650,9 @@ impl Store {
             return Ok(());
         }
         let mut guard = self.read_model_writer()?;
-        guard.nodes.insert(node.id.clone(), node);
+        let node_id = node.id.clone();
+        guard.nodes.insert(node_id.clone(), Arc::new(node));
+        Self::reproject_model_nodes(&mut guard, &self.resource_policy, &[node_id.as_str()]);
         Ok(())
     }
 
@@ -1507,7 +1665,8 @@ impl Store {
             .nodes
             .get_mut(node_id)
             .with_context(|| format!("Missing cached node {node_id}"))?;
-        cached.dynamic_attrs = dynamic_attrs;
+        Arc::make_mut(cached).dynamic_attrs = dynamic_attrs;
+        Self::reproject_model_nodes(&mut guard, &self.resource_policy, &[node_id]);
         Ok(())
     }
 
@@ -1518,10 +1677,13 @@ impl Store {
         let mut guard = self.read_model_writer()?;
         for id in ids {
             if let Some(node) = guard.nodes.get_mut(id) {
+                let node = Arc::make_mut(node);
                 node.status = "lost".to_string();
                 node.availability = "unavailable".to_string();
             }
         }
+        let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        Self::reproject_model_nodes(&mut guard, &self.resource_policy, &id_refs);
         Ok(())
     }
 
@@ -1532,6 +1694,8 @@ impl Store {
         let mut guard = self.read_model_writer()?;
         guard.nodes.remove(id);
         guard.allocations_by_node.remove(id);
+        guard.indexes.remove_node(id);
+        guard.node_pools.remove(id);
         Ok(())
     }
 
@@ -1573,14 +1737,20 @@ impl Store {
         for node_id in node_ids {
             per_node.push((node_id.clone(), self.allocs_for_node(node_id)?));
         }
-        // 3. Publish atomically.
+        // 3. Publish atomically, then re-derive the affected nodes' free
+        // pools and index projections from the refreshed allocations —
+        // inside the same lock, so `node_pools`/`indexes` can never be
+        // observed out of step with `allocations_by_node` (the
+        // plan-snapshot cache's own invariant).
         let mut guard = self.read_model_writer()?;
         for (node_id, allocs) in per_node {
-            guard.allocations_by_node.insert(node_id, allocs);
+            guard.allocations_by_node.insert(node_id, Arc::new(allocs));
         }
         for (key, epoch) in epochs {
             guard.scope_epochs.insert(key, epoch);
         }
+        let affected: Vec<&str> = node_ids.iter().map(String::as_str).collect();
+        Self::reproject_model_nodes(&mut guard, &self.resource_policy, &affected);
         Ok(())
     }
 
@@ -1634,12 +1804,81 @@ impl Store {
         Ok(tasks)
     }
 
+    /// Deep-cloned allocations map, for callers that need owned vectors.
+    /// The scheduler snapshots the shared (`Arc`'d) map via
+    /// [`Store::plan_capacity_snapshot`] instead.
     pub fn cached_allocations_by_node(&self) -> R<HashMap<String, Vec<Allocation>>> {
-        Ok(self.read_model_reader()?.allocations_by_node.clone())
+        Ok(self
+            .read_model_reader()?
+            .allocations_by_node
+            .iter()
+            .map(|(node_id, allocations)| (node_id.clone(), Vec::clone(allocations)))
+            .collect())
     }
 
+    /// Deep-cloned node list, for callers that need owned `Node`s. The
+    /// scheduler uses [`Store::available_node_arcs`] instead — per-plan deep
+    /// clones of every node's JSON attributes are exactly the cost the Arc'd
+    /// read model exists to avoid.
     pub fn cached_nodes(&self) -> R<Vec<Node>> {
-        Ok(self.read_model_reader()?.nodes.values().cloned().collect())
+        Ok(self
+            .read_model_reader()?
+            .nodes
+            .values()
+            .map(|node| Node::clone(node))
+            .collect())
+    }
+
+    /// Ids of every available node. For callers that only need membership
+    /// (rollout node gating) — no node payload is cloned.
+    pub fn available_node_ids(&self) -> R<HashSet<String>> {
+        let guard = self.read_model_reader()?;
+        Ok(guard
+            .nodes
+            .values()
+            .filter(|node| node.availability == "available")
+            .map(|node| node.id.clone())
+            .collect())
+    }
+
+    /// The scheduler's per-plan node snapshot: every available node, sorted
+    /// by id, as `Arc`s — one read-lock pass, refcount bumps only.
+    pub fn available_node_arcs(&self) -> R<Vec<Arc<Node>>> {
+        let guard = self.read_model_reader()?;
+        let mut nodes: Vec<Arc<Node>> = guard
+            .nodes
+            .values()
+            .filter(|node| node.availability == "available")
+            .cloned()
+            .collect();
+        nodes.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(nodes)
+    }
+
+    /// The scheduler's per-plan capacity snapshot: current allocations and
+    /// the cached free pools, cloned under ONE read guard so they can never
+    /// disagree with each other. Taken after the plan's epoch sample (the
+    /// fence rule: sample no later than the capacity read), so any mutation
+    /// that lands after this snapshot bumps an epoch the apply-time
+    /// compare-and-set checks.
+    pub(crate) fn plan_capacity_snapshot(&self) -> R<PlanCapacityParts> {
+        let guard = self.read_model_reader()?;
+        Ok((guard.allocations_by_node.clone(), guard.node_pools.clone()))
+    }
+
+    /// Runs one scheduling-index candidate query under the read-model lock
+    /// (docs/scheduling-indexes.md). Cheap: index selection plus one shard
+    /// walk; the caller re-verifies every returned candidate.
+    pub fn scheduling_index_query(
+        &self,
+        bindings: &HashMap<String, Value>,
+        request: &HashMap<String, f64>,
+        budget: Option<usize>,
+    ) -> R<crate::scheduling_index::IndexQueryOutcome> {
+        Ok(self
+            .read_model_reader()?
+            .indexes
+            .query(bindings, request, budget))
     }
 
     pub fn allocation_epoch_for_job_config(&self, job_config_id: &str) -> R<i64> {
@@ -1694,7 +1933,7 @@ impl Store {
     pub fn allocation_version_vector_for_candidates(
         &self,
         job_config_id: &str,
-        node_ids: &[String],
+        node_ids: &[&str],
     ) -> R<BTreeMap<String, i64>> {
         // Sampled from the epoch MIRROR under one read-lock acquisition,
         // not from the DB (adversarial finding, 2026-07-28): a commit makes
@@ -4300,11 +4539,11 @@ impl Store {
         Ok(job_id)
     }
 
-    pub fn list_job_spec_history(&self, name: &str) -> R<Vec<(String, String, Option<i64>)>> {
+    pub fn list_job_spec_history(&self, name: &str) -> R<Vec<JobSpecHistoryRow>> {
         let conn = self.read_connection()?;
         let mut stmt = conn.prepare(
             r#"
-            SELECT jc.id, jc.created_at, jc.version
+            SELECT jc.id, jc.created_at, jc.version, jc.meta
             FROM job_config jc
             INNER JOIN job j ON j.id = jc.job_id
             WHERE j.name = ?
@@ -4313,10 +4552,75 @@ impl Store {
         )?;
 
         let rows = stmt.query_map([name], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get::<_, Option<i64>>(2)?))
+            Ok(JobSpecHistoryRow {
+                config_id: row.get(0)?,
+                created_at: row.get(1)?,
+                version: row.get::<_, Option<i64>>(2)?,
+                template: Self::template_provenance_from_meta(row.get::<_, Option<Value>>(3)?),
+            })
         })?;
 
         Self::collect_rows(rows)
+    }
+
+    fn template_provenance_from_meta(meta: Option<Value>) -> Option<JobTemplateProvenance> {
+        meta.as_ref()
+            .and_then(|meta| meta.get("jobTemplate"))
+            .and_then(|value| serde_json::from_value(value.clone()).ok())
+    }
+
+    /// Template provenance of a job's latest config, when it was submitted
+    /// through RunJobTemplate.
+    #[instrument(err, skip_all)]
+    pub fn job_template_provenance(&self, job_name: &str) -> R<Option<JobTemplateProvenance>> {
+        let conn = self.read_connection()?;
+        let meta: Option<Value> = conn
+            .query_row(
+                r#"
+                SELECT jc.meta
+                FROM job_config jc
+                INNER JOIN job j ON j.id = jc.job_id
+                WHERE j.name = ?
+                ORDER BY jc.version DESC
+                LIMIT 1;
+                "#,
+                [job_name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(Self::template_provenance_from_meta(meta))
+    }
+
+    /// Latest-config template provenance for every job, keyed by job name.
+    /// Used to filter list replies for template-scoped identities without a
+    /// per-row query.
+    #[instrument(err, skip_all)]
+    pub fn job_template_provenance_map(&self) -> R<HashMap<String, JobTemplateProvenance>> {
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT j.name, jc.meta
+            FROM job j
+            INNER JOIN job_config jc ON jc.job_id = j.id
+            WHERE jc.version = (
+                SELECT MAX(version) FROM job_config WHERE job_id = j.id
+            );
+            "#,
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                Self::template_provenance_from_meta(row.get::<_, Option<Value>>(1)?),
+            ))
+        })?;
+        let mut map = HashMap::new();
+        for row in rows {
+            let (name, provenance) = row?;
+            if let Some(provenance) = provenance {
+                map.insert(name, provenance);
+            }
+        }
+        Ok(map)
     }
 
     /// Submit a job config. Composite across the lane boundary (plan §7-C2,
@@ -4349,10 +4653,32 @@ impl Store {
         config: &JobConfig,
         subs: &[Submission],
     ) -> R<JobSubmitOutcome> {
+        self.handle_job_submit_inner(config, subs, None)
+    }
+
+    /// Like `handle_job_submit`, stamping the template that rendered this
+    /// config into the config's meta for provenance (spec history, the
+    /// RunJobTemplate collision guard, and template-scoped ACL reads).
+    pub fn handle_job_submit_from_template(
+        &self,
+        config: &JobConfig,
+        subs: &[Submission],
+        template: &JobTemplateProvenance,
+    ) -> R<JobSubmitOutcome> {
+        self.handle_job_submit_inner(config, subs, Some(template))
+    }
+
+    fn handle_job_submit_inner(
+        &self,
+        config: &JobConfig,
+        subs: &[Submission],
+        template: Option<&JobTemplateProvenance>,
+    ) -> R<JobSubmitOutcome> {
         let config = config.clone();
         let subs = subs.to_vec();
+        let template = template.cloned();
         let outcome = self.replicated(Lane::Control, "handle_job_submit", move |s| {
-            s.handle_job_submit_apply(&config, &subs)
+            s.handle_job_submit_apply(&config, &subs, template.as_ref())
         })?;
         // The status half runs for EVERY outcome, `Unchanged` included
         // (JC-40 composite-retry idempotency): if a previous attempt's
@@ -4506,6 +4832,7 @@ impl Store {
         &self,
         config: &JobConfig,
         subs: &[Submission],
+        template: Option<&JobTemplateProvenance>,
     ) -> R<JobSubmitOutcome> {
         let config = self.normalize_job_config(config)?;
         // Note: There is a race condition here with the version
@@ -4553,7 +4880,7 @@ impl Store {
         }?;
 
         let now = time::OffsetDateTime::now_utc();
-        let meta = if config.rollout.is_none() && config.rollout_by_group.is_empty() {
+        let mut meta = if config.rollout.is_none() && config.rollout_by_group.is_empty() {
             json!({})
         } else {
             json!({
@@ -4561,6 +4888,9 @@ impl Store {
                 "rolloutByGroup": config.rollout_by_group,
             })
         };
+        if let Some(template) = template {
+            meta["jobTemplate"] = serde_json::to_value(template)?;
+        }
         let config_params = named_params! {
             ":id": format!("{}-{}", config.name, next_version.to_string()),
             ":name": config.name,
@@ -5419,9 +5749,11 @@ impl Store {
             }
         }
         // Allocation cache + epoch mirror refresh, coherently (the
-        // plan-fence fix): the helper reads epochs before allocations and
-        // publishes both under one lock, so a sampler can never pair a new
-        // epoch with a stale cache.
+        // plan-fence fix): the helper reads epochs before allocations,
+        // publishes both under one lock, and reprojects the affected
+        // nodes' free pools/indexes inside that lock — so a sampler can
+        // never pair a new epoch with a stale cache, and the plan-snapshot
+        // cache never observes pools out of step with allocations.
         let mut refresh_nodes: BTreeSet<String> = alloc_node_ids.into_iter().collect();
         refresh_nodes.extend(epoch_node_scopes);
         if !refresh_nodes.is_empty() || !epoch_job_scopes.is_empty() {
@@ -10159,6 +10491,199 @@ impl Store {
         Ok(changed > 0)
     }
 
+    fn job_template_version_from_row(
+        row: &Row<'_>,
+    ) -> Result<JobTemplateVersionRecord, RusqliteError> {
+        let variables_json: String = row.get(4)?;
+        let variables: Vec<JobTemplateVariableRecord> = serde_json::from_str(&variables_json)
+            .map_err(|err| {
+                RusqliteError::FromSqlConversionFailure(
+                    4,
+                    rusqlite::types::Type::Text,
+                    Box::new(err),
+                )
+            })?;
+        Ok(JobTemplateVersionRecord {
+            name: row.get(0)?,
+            version: row.get::<_, i64>(1)? as u32,
+            latest_version: row.get::<_, i64>(7)? as u32,
+            description: row.get(3)?,
+            source_jsonnet: row.get(2)?,
+            variables,
+            created_at: row.get(5)?,
+            created_by: row.get(6)?,
+        })
+    }
+
+    /// Stores the next immutable version of a job template, creating the
+    /// template row on first use.
+    #[instrument(err, skip_all)]
+    pub fn upsert_job_template_version(
+        &self,
+        name: &str,
+        description: Option<&str>,
+        source_jsonnet: &str,
+        variables: &[JobTemplateVariableRecord],
+        created_by: &str,
+    ) -> R<JobTemplateVersionRecord> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(anyhow::Error::new(StorageError::InvalidInput {
+                message: "template name must not be empty".to_string(),
+            }));
+        }
+
+        let now = OffsetDateTime::now_utc().format(&Rfc3339)?;
+        let variables_json = serde_json::to_string(variables)?;
+        let mut conn = self.write_connection()?;
+        let tx = conn.transaction()?;
+
+        let current_version: Option<i64> = tx
+            .query_row(
+                "SELECT latest_version FROM job_template WHERE name = ?;",
+                [name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let next_version = current_version.unwrap_or(0) + 1;
+
+        tx.execute(
+            "INSERT INTO job_template (name, latest_version, created_at, updated_at) VALUES (:name, :version, :now, :now) ON CONFLICT(name) DO UPDATE SET latest_version = excluded.latest_version, updated_at = excluded.updated_at;",
+            named_params! {
+                ":name": name,
+                ":version": next_version,
+                ":now": now,
+            },
+        )?;
+        tx.execute(
+            "INSERT INTO job_template_version (template_name, version, description, source_jsonnet, variables, created_by, created_at) VALUES (:name, :version, :description, :source, :variables, :created_by, :now);",
+            named_params! {
+                ":name": name,
+                ":version": next_version,
+                ":description": description,
+                ":source": source_jsonnet,
+                ":variables": variables_json,
+                ":created_by": created_by,
+                ":now": now,
+            },
+        )?;
+        let stored = tx.query_row(
+            "SELECT tv.template_name, tv.version, tv.source_jsonnet, tv.description, tv.variables, tv.created_at, tv.created_by, t.latest_version
+             FROM job_template_version tv
+             INNER JOIN job_template t ON t.name = tv.template_name
+             WHERE tv.template_name = ? AND tv.version = ?;",
+            params![name, next_version],
+            Self::job_template_version_from_row,
+        )?;
+        tx.commit()?;
+        Ok(stored)
+    }
+
+    /// One template version (latest when `version` is `None`).
+    #[instrument(err, skip_all)]
+    pub fn get_job_template_version(
+        &self,
+        name: &str,
+        version: Option<u32>,
+    ) -> R<JobTemplateVersionRecord> {
+        let conn = self.read_connection()?;
+        let base = "SELECT tv.template_name, tv.version, tv.source_jsonnet, tv.description, tv.variables, tv.created_at, tv.created_by, t.latest_version
+             FROM job_template_version tv
+             INNER JOIN job_template t ON t.name = tv.template_name
+             WHERE tv.template_name = ?";
+        let result = match version {
+            Some(version) => conn.query_row(
+                &format!("{base} AND tv.version = ?;"),
+                params![name, i64::from(version)],
+                Self::job_template_version_from_row,
+            ),
+            None => conn.query_row(
+                &format!("{base} AND tv.version = t.latest_version;"),
+                params![name],
+                Self::job_template_version_from_row,
+            ),
+        };
+        result.optional()?.ok_or_else(|| {
+            let wanted = match version {
+                Some(version) => format!("{name} v{version}"),
+                None => name.to_string(),
+            };
+            anyhow::Error::new(StorageError::not_found("job_template", wanted))
+        })
+    }
+
+    /// Version-history metadata for one template, newest first.
+    #[instrument(err, skip_all)]
+    pub fn list_job_template_versions(&self, name: &str) -> R<Vec<JobTemplateVersionInfoRecord>> {
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare(
+            "SELECT version, created_at, created_by FROM job_template_version WHERE template_name = ? ORDER BY version DESC;",
+        )?;
+        let rows = stmt.query_map([name], |row| {
+            Ok(JobTemplateVersionInfoRecord {
+                version: row.get::<_, i64>(0)? as u32,
+                created_at: row.get(1)?,
+                created_by: row.get(2)?,
+            })
+        })?;
+        Self::collect_rows(rows)
+    }
+
+    /// Latest-version summaries of every template, most recently updated
+    /// first. ACL filtering happens in the caller.
+    #[instrument(err, skip_all)]
+    pub fn list_job_templates(&self) -> R<Vec<JobTemplateSummaryRecord>> {
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare(
+            "SELECT t.name, t.latest_version, tv.description, tv.variables, t.updated_at
+             FROM job_template t
+             INNER JOIN job_template_version tv
+                ON tv.template_name = t.name AND tv.version = t.latest_version
+             ORDER BY t.updated_at DESC, t.name ASC;",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let variables_json: String = row.get(3)?;
+            let variables: Vec<JobTemplateVariableRecord> = serde_json::from_str(&variables_json)
+                .map_err(|err| {
+                RusqliteError::FromSqlConversionFailure(
+                    3,
+                    rusqlite::types::Type::Text,
+                    Box::new(err),
+                )
+            })?;
+            Ok(JobTemplateSummaryRecord {
+                name: row.get(0)?,
+                latest_version: row.get::<_, i64>(1)? as u32,
+                description: row.get(2)?,
+                variable_count: variables.len() as u32,
+                updated_at: row.get(4)?,
+            })
+        })?;
+        Self::collect_rows(rows)
+    }
+
+    /// Deletes a template and every stored version.
+    #[instrument(err, skip_all)]
+    pub fn delete_job_template(&self, name: &str) -> R<()> {
+        let mut conn = self.write_connection()?;
+        let tx = conn.transaction()?;
+        // The FK is declared with ON DELETE CASCADE but SQLite only honors it
+        // with foreign_keys=ON, so delete versions explicitly.
+        tx.execute(
+            "DELETE FROM job_template_version WHERE template_name = ?;",
+            [name],
+        )?;
+        let deleted = tx.execute("DELETE FROM job_template WHERE name = ?;", [name])?;
+        tx.commit()?;
+        if deleted == 0 {
+            return Err(anyhow::Error::new(StorageError::not_found(
+                "job_template",
+                name,
+            )));
+        }
+        Ok(())
+    }
+
     #[instrument(err, skip_all)]
     pub fn delete_saved_state_query(&self, name: &str) -> R<()> {
         let name = name.to_owned();
@@ -11490,6 +12015,117 @@ mod tests {
         let node = model.nodes.get("node-one").context("missing cached node")?;
         assert_eq!(node.status, "lost");
         assert_eq!(node.availability, "unavailable");
+
+        Ok(())
+    }
+
+    /// The cached-pool invariant behind `ResourceLedger::from_snapshot`
+    /// (scheduler-plan-snapshot plan): after ANY sequence of read-model
+    /// mutations, every available node's cached pool equals a from-scratch
+    /// `ResourcePool::free_for_node` computation, and only available nodes
+    /// have pools.
+    fn assert_pools_match_scratch(store: &Store) -> R<()> {
+        let model = store.scheduling_read_model()?;
+        for (node_id, node) in &model.nodes {
+            let cached = model.node_pools.get(node_id);
+            if node.availability != "available" {
+                assert!(
+                    cached.is_none(),
+                    "{node_id}: unavailable nodes have no pool"
+                );
+                continue;
+            }
+            let cached = cached.with_context(|| format!("{node_id}: missing cached pool"))?;
+            let allocations = model
+                .allocations_by_node
+                .get(node_id)
+                .map(|allocations| allocations.as_slice())
+                .unwrap_or(&[]);
+            let scratch = crate::resources::ResourcePool::free_for_node(
+                node,
+                allocations,
+                &store.resource_policy,
+            );
+            let amounts = |pool: &crate::resources::ResourcePool| -> Vec<(String, String)> {
+                let mut out: Vec<(String, String)> = pool
+                    .values
+                    .keys()
+                    .map(|name| (name.clone(), format!("{:?}", pool.amount(name))))
+                    .collect();
+                out.sort();
+                out
+            };
+            assert_eq!(
+                amounts(cached),
+                amounts(&scratch),
+                "{node_id}: cached pool drifted from scratch recompute"
+            );
+        }
+        for node_id in model.node_pools.keys() {
+            assert!(
+                model.nodes.contains_key(node_id),
+                "{node_id}: pool for a node that no longer exists"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn cached_node_pools_track_every_mutation() -> R<()> {
+        let store = setup_store()?;
+
+        // Join two nodes, one with fingerprints + custom resources.
+        let mut fingerprinted = make_node_msg("node-pool-a", "active");
+        fingerprinted.fingerprint_attrs = json!({
+            "memory_total": "1073741824",
+            "cpus": { "cpu-1": { "frequency": "1000" } },
+        })
+        .to_string();
+        fingerprinted.config_attrs = json!({ "resources": { "vram": 4096 } }).to_string();
+        store.insert_node(fingerprinted)?;
+        store.insert_node(make_node_msg("node-pool-b", "active"))?;
+        assert_pools_match_scratch(&store)?;
+
+        // Place allocations through the real plan/apply path.
+        let job = JobConfig {
+            name: "pool-prop".into(),
+            tasks: vec![TaskConfig {
+                count: TaskCount::new(2),
+                resources: json!({ "memory": 64, "cpu": 100 }),
+                ..TaskConfig::new("worker", "noop")
+            }],
+            rollout: None,
+            rollout_by_group: Default::default(),
+            version: None,
+        };
+        let submission = Submission {
+            path: "pool-prop.jsonnet".into(),
+            content: "{}".into(),
+            is_primary: true,
+        };
+        store.handle_job_submit(&job, &[submission])?;
+        let job_config_id = store.get_job_config("pool-prop")?.id();
+        let scheduler = crate::manager::scheduler::Scheduler::new(&store)?;
+        let outcome =
+            scheduler.plan_and_apply(&job_config_id, crate::manager::scheduler::PlanMode::Fresh)?;
+        assert!(!outcome.allocations.is_empty());
+        assert_pools_match_scratch(&store)?;
+
+        // Attribute update, drain, uncordon, allocation removal, node loss,
+        // and removal all reproject.
+        let dynamic: Map<String, Value> = [("zone".to_string(), json!("a"))].into_iter().collect();
+        store.update_node_dyamic("node-pool-a", &dynamic)?;
+        assert_pools_match_scratch(&store)?;
+        store.set_node_availability("node-pool-b", "drained")?;
+        assert_pools_match_scratch(&store)?;
+        store.set_node_availability("node-pool-b", "available")?;
+        assert_pools_match_scratch(&store)?;
+        store.remove_allocs_for_job(&store.get_job("pool-prop")?.id)?;
+        assert_pools_match_scratch(&store)?;
+        store.mark_node_lost("node-pool-a")?;
+        assert_pools_match_scratch(&store)?;
+        store.remove_node("node-pool-b")?;
+        assert_pools_match_scratch(&store)?;
 
         Ok(())
     }
@@ -13208,8 +13844,10 @@ mod tests {
         // Nodes that have never held an allocation have no epoch row; the
         // batched read must report the same 0 the per-scope read does, because
         // that is the value `apply_plan_submission` compares against.
-        let sampled =
-            store.allocation_version_vector_for_candidates(&job_config_id, &candidates)?;
+        let sampled = store.allocation_version_vector_for_candidates(
+            &job_config_id,
+            &candidates.iter().map(String::as_str).collect::<Vec<_>>(),
+        )?;
         assert_eq!(sampled.get("node:node-a").copied(), Some(0));
         assert_eq!(sampled.get("node:node-b").copied(), Some(0));
         assert_eq!(
@@ -13232,7 +13870,10 @@ mod tests {
             PlanApplyOutcome::Applied(_)
         ));
 
-        let after = store.allocation_version_vector_for_candidates(&job_config_id, &candidates)?;
+        let after = store.allocation_version_vector_for_candidates(
+            &job_config_id,
+            &candidates.iter().map(String::as_str).collect::<Vec<_>>(),
+        )?;
         let per_scope = store.allocation_version_vector(
             &job_config_id,
             &HashSet::from(["node-a".to_string(), "node-b".to_string()]),
@@ -15595,6 +16236,113 @@ mod tests {
         // But the declared service is still listed (0 endpoints).
         let declared = store.declared_services()?;
         assert!(declared.iter().any(|entry| entry.service == "web"));
+        Ok(())
+    }
+
+    #[test]
+    fn job_template_versions_are_immutable_with_latest_pointer() -> R<()> {
+        let store = setup_store()?;
+        let variables = vec![JobTemplateVariableRecord {
+            key: "replicas".into(),
+            var_type: "number".into(),
+            label: None,
+            description: None,
+            required: None,
+            default: Some(json!(2)),
+            options: vec![],
+        }];
+
+        let v1 = store.upsert_job_template_version(
+            "tpl",
+            Some("first"),
+            "src-v1",
+            &variables,
+            "alice",
+        )?;
+        assert_eq!(v1.version, 1);
+        assert_eq!(v1.latest_version, 1);
+        assert_eq!(v1.created_by, "alice");
+        assert!(!v1.variables[0].is_required());
+
+        let v2 = store.upsert_job_template_version("tpl", Some("second"), "src-v2", &[], "bob")?;
+        assert_eq!(v2.version, 2);
+        assert_eq!(v2.latest_version, 2);
+
+        // Latest fetch returns v2; explicit fetch still returns v1 verbatim.
+        let latest = store.get_job_template_version("tpl", None)?;
+        assert_eq!(latest.version, 2);
+        assert_eq!(latest.source_jsonnet, "src-v2");
+        let pinned = store.get_job_template_version("tpl", Some(1))?;
+        assert_eq!(pinned.source_jsonnet, "src-v1");
+        assert_eq!(pinned.latest_version, 2);
+        assert_eq!(pinned.variables.len(), 1);
+
+        let versions = store.list_job_template_versions("tpl")?;
+        assert_eq!(
+            versions.iter().map(|info| info.version).collect::<Vec<_>>(),
+            vec![2, 1]
+        );
+
+        let summaries = store.list_job_templates()?;
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].latest_version, 2);
+        assert_eq!(summaries[0].description.as_deref(), Some("second"));
+        assert_eq!(summaries[0].variable_count, 0);
+
+        assert!(store.get_job_template_version("tpl", Some(9)).is_err());
+        assert!(store.get_job_template_version("missing", None).is_err());
+
+        store.delete_job_template("tpl")?;
+        assert!(store.get_job_template_version("tpl", None).is_err());
+        assert!(store.list_job_templates()?.is_empty());
+        assert!(store.delete_job_template("tpl").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn template_provenance_rides_job_config_meta() -> R<()> {
+        let store = setup_store()?;
+        let config = JobConfig {
+            name: "tpl-job".into(),
+            rollout: None,
+            rollout_by_group: BTreeMap::new(),
+            tasks: vec![TaskConfig::new("main", "noop")],
+            version: None,
+        };
+        let submission = Submission {
+            path: "template://tpl/1".into(),
+            content: "src".into(),
+            is_primary: true,
+        };
+        let provenance = JobTemplateProvenance {
+            name: "tpl".into(),
+            version: 1,
+        };
+        store.handle_job_submit_from_template(&config, &[submission.clone()], &provenance)?;
+
+        assert_eq!(
+            store.job_template_provenance("tpl-job")?,
+            Some(provenance.clone())
+        );
+        let history = store.list_job_spec_history("tpl-job")?;
+        assert_eq!(history[0].template, Some(provenance.clone()));
+        let map = store.job_template_provenance_map()?;
+        assert_eq!(map.get("tpl-job"), Some(&provenance));
+
+        // A raw resubmit (spec change, no template) clears the latest
+        // provenance while history keeps the older row.
+        let mut updated = config.clone();
+        updated.tasks[0].count = TaskCount {
+            num: 2,
+            ..updated.tasks[0].count.clone()
+        };
+        store.handle_job_submit(&updated, &[submission])?;
+        assert_eq!(store.job_template_provenance("tpl-job")?, None);
+        let history = store.list_job_spec_history("tpl-job")?;
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].template, None);
+        assert_eq!(history[1].template, Some(provenance));
+        assert!(store.job_template_provenance_map()?.is_empty());
         Ok(())
     }
 

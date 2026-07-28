@@ -1,7 +1,8 @@
 import { A, useNavigate } from '@solidjs/router'
 import { createEffect, For, onCleanup, onMount, Show, createSignal, type JSX } from 'solid-js'
 import { clearCommandPaletteIndexItems, setCommandPaletteIndexItems } from '../utils/commandPalette'
-import { Button, EmptyState, Icon, LoadingRows, Note, SectionCard, StatusBadge, cx, inputClass, selectClass, tableClass, tdClass, thClass, theadClass, trHoverClass } from './ui'
+import { JUMP_MODIFIER_LABEL, indexHintKey, useIndexJumpTargets } from '../utils/jumpHints'
+import { Button, EmptyState, Icon, JumpHint, LoadingRows, Note, SectionCard, StatusBadge, cx, inputClass, jumpHintGutterClass, selectClass, tableClass, tdClass, thClass, theadClass, trHoverClass } from './ui'
 import type { Tone } from '../utils/status'
 
 export type IndexSortOption = { label: string; value: string }
@@ -62,6 +63,8 @@ export default function SharedIndex(props: SharedIndexProps) {
       })),
     )
   })
+
+  useIndexJumpTargets(() => props.items.map((item) => item.href))
 
   createEffect(() => {
     const total = props.items.length
@@ -201,7 +204,7 @@ export default function SharedIndex(props: SharedIndexProps) {
                 <table class={tableClass}>
                   <thead class={theadClass}>
                     <tr>
-                      <th class={thClass}>{props.entityLabel.replace(/s$/, '')}</th>
+                      <th class={cx(thClass, jumpHintGutterClass())}>{props.entityLabel.replace(/s$/, '')}</th>
                       <Show when={!props.hideStatus}>
                         <th class={thClass}>Status</th>
                       </Show>
@@ -221,7 +224,8 @@ export default function SharedIndex(props: SharedIndexProps) {
                             navigate(item.href)
                           }}
                         >
-                          <td class={cx(tdClass, 'py-2.5')}>
+                          <td class={cx(tdClass, 'relative py-2.5', jumpHintGutterClass())}>
+                            <JumpHint keys={indexHintKey(index())} class="absolute left-3 top-1/2 -translate-y-1/2" />
                             <A href={item.href} class="font-medium text-ink hover:text-brass-strong">
                               {item.title}
                             </A>
@@ -273,7 +277,9 @@ export default function SharedIndex(props: SharedIndexProps) {
 
       <p class="text-2xs text-faint">
         <kbd class="rounded border border-line bg-surface2 px-1 font-mono">j</kbd>/<kbd class="rounded border border-line bg-surface2 px-1 font-mono">k</kbd> to move ·{' '}
-        <kbd class="rounded border border-line bg-surface2 px-1 font-mono">o</kbd> to open · <kbd class="rounded border border-line bg-surface2 px-1 font-mono">⌘K</kbd> to search everything
+        <kbd class="rounded border border-line bg-surface2 px-1 font-mono">o</kbd> to open ·{' '}
+        <kbd class="rounded border border-line bg-surface2 px-1 font-mono">{JUMP_MODIFIER_LABEL}</kbd> to number the rows ·{' '}
+        <kbd class="rounded border border-line bg-surface2 px-1 font-mono">{JUMP_MODIFIER_LABEL}K</kbd> to search everything
       </p>
     </div>
   )
