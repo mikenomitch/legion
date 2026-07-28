@@ -55,8 +55,10 @@ is hard to write.
    links, and what we take versus reject. This is the section that most often
    changes the design — and the source of the strongest arguments in the
    judgement calls that follow.
-3. **User scenarios.** The two or three flows the design has to serve, written
-   the way the user experiences them, not the way the code will.
+3. **Jobs to be done, by persona.** Who needs this, and what they are trying to
+   get done, in plain language (see below). Follow it with the two or three
+   **user scenarios** the design has to serve, written the way the user
+   experiences them, not the way the code will.
 4. **Goals and non-goals.** Non-goals are load-bearing: they are what stops a
    plan sprawling into seven phases nobody ships.
 5. **Background — what exists today.** Real code recon, citing `src/…:line`. A
@@ -76,6 +78,64 @@ is hard to write.
 11. **Open questions.** Only genuinely open ones, each with your current lean.
 12. **Acceptance criteria.** Per phase, observable — something a reviewer can
     actually check.
+
+## Break the work down into jobs to be done, per persona
+
+Before the design, say who this is for and what they are trying to accomplish.
+Legion is used by several kinds of people (and by agents), and a feature that
+reads as obvious for one of them is often useless or dangerous for another.
+
+Write each job in **simple language, from the persona's point of view**, in the
+form *when \<situation>, I want to \<motivation>, so I can \<outcome>*. No
+Legion vocabulary that the persona would not use themselves, no implementation
+nouns, no gRPC method names. If a job cannot be stated without naming a struct,
+it is a task in the design, not a job to be done.
+
+The persona list is not fixed — pick the ones the feature actually touches, and
+say when one is explicitly out of scope. The usual cast:
+
+- **Cluster operator** — runs the managers and workers, cares about upgrades,
+  quorum, capacity, and blast radius.
+- **Job author / app developer** — writes the jobspec and ships the service,
+  cares about getting a deploy right the first time and debugging it when it
+  is not.
+- **On-call responder** — arrives mid-incident with no context, cares about
+  seeing what broke and stopping the bleeding.
+- **Security / platform admin** — owns tokens, ACLs, namespaces, and what a
+  tenant is allowed to do.
+- **Autonomous agent** — drives the CLI, gRPC, or MCP surface without a human
+  reading the output; cares about structured results, dry-runs, and
+  idempotency (see [`docs/agent-readiness.md`](../../docs/agent-readiness.md)).
+
+For example, on the exec/actions work:
+
+```markdown
+### Jobs to be done
+
+**On-call responder**
+- When a task is failing and the logs do not say why, I want to get a shell
+  inside the exact instance that is broken, so I can look around before I
+  restart it and lose the evidence.
+- When I am handed a runbook step like "flush the cache", I want to run it
+  without being trusted with a root shell, so a 3am mistake cannot take the
+  service down.
+
+**Job author**
+- When I ship a maintenance procedure with my service, I want to hand it to
+  the responder as a named button with typed inputs, so nobody has to
+  remember the command.
+
+**Cluster operator**
+- When someone opens a shell in production, I want it in the audit trail with
+  who, where, and when, so I can answer for it afterwards.
+
+*Not in scope:* the autonomous agent persona — interactive exec is a human
+surface, and agents get the non-interactive one-shot form instead.
+```
+
+Each job should be traceable to something later in the plan: a user scenario, a
+piece of surface, a phase, or an explicit non-goal. A job nothing in the design
+serves is either a missing feature or a persona you should say no to, out loud.
 
 ## Show the surface
 

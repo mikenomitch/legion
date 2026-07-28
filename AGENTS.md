@@ -168,9 +168,10 @@ the code** — not in a follow-up, and not "later".
 ### Plan non-trivial features before building them (required)
 
 Any non-trivial feature gets a plan in `internal_docs/plans/<feature>-plan.md`
-before the code: the problem, the prior art, goals and non-goals, what exists in
-the code today, the proposed design shown as the user-facing surface, phases that
-each ship on their own, the testing plan, and the rollout story.
+before the code: the problem, the prior art, the jobs to be done stated in plain
+language for each persona the feature touches, goals and non-goals, what exists
+in the code today, the proposed design shown as the user-facing surface, phases
+that each ship on their own, the testing plan, and the rollout story.
 
 - **Required** for a new user-facing surface (jobspec block, RPC, CLI verb, env
   var, UI page), a new or reshaped subsystem, a changed default, a security
