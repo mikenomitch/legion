@@ -9,7 +9,9 @@ The UI is a SolidJS single-page app in `ui/` and talks directly to manager gRPC 
 - TailwindCSS
 - Vite build
 - Self-hosted fonts via `@fontsource-variable` (Space Grotesk for display,
-  Inter for text, JetBrains Mono for data) — no CDN requests
+  Inter for text, Fira Code for data) — no CDN requests. The `font-mono`
+  utility disables Fira Code's `liga`/`calt` ligatures so IDs, hashes and log
+  lines render literally.
 
 ## Design System
 
