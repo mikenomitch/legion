@@ -130,6 +130,16 @@ See `proto/legion.proto` for the authoritative message documentation.
   live — it is in the journal, and any cursor read (`--after-id`, a
   reconnect, `ListEvents`) returns it. The journal, not the live tail, is the
   complete record.
+- **ID monotonicity is per manager process, not per wall clock.** The
+  timestamp bits come from the minting leader's clock, and the tie-breaking
+  high-water mark lives in process memory. After a failover to a manager
+  whose clock is behind the old leader's, newly minted IDs can sort BELOW an
+  existing `after_id` cursor until the new leader's clock passes the old
+  one's — a poller holding a high cursor will not see that window's events
+  (they are in the journal, below the cursor). Gap-sensitive consumers
+  should re-read a cursor range after observing a leadership change
+  (`legion raft history`), or treat the journal, queried by time, as the
+  source of truth. Run managers under NTP; the window is the clock skew.
 - The journal is bounded: the newest ~10,000 events are retained and older rows
   are pruned opportunistically during inserts. The stream is an observability
   surface, not an audit log — durable history belongs to the state store

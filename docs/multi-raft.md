@@ -56,7 +56,7 @@ Defaults from `src/structs/config.rs` (`RaftPersistenceConfig::with_defaults`):
 | `peers` | `[]` | Peer managers as `"name=host:port"` entries (the address is the peer's manager gRPC listener, which also serves the raft transport). Informational + name resolution for operator commands; real membership is driven by joins and membership commands. Bare `"name"` entries still parse. |
 | `joinTokenTtlSeconds` | `900` | Lifetime of tokens minted by `legion raft join-token`. |
 | `dataDir` | `.legion/raft` | Root for raft engine state: per-lane log DBs (`<dataDir>/<lane>/log.sqlite`), snapshots (`<dataDir>/<lane>/snapshots/`), the cluster secret file (`<dataDir>/cluster_secret`), and the double-start advisory lock (`lock.sqlite`). |
-| `topology` | `"single"` | `"single"`: one raft group replicates every table (recommended, the only runnable topology today). `"lanes"`: independent control/scheduler/status groups — **currently refused at engine start** (see below). |
+| `topology` | `"single"` | `"single"`: one raft group replicates every table (recommended default). `"lanes"`: three independent control/scheduler/status groups, for clusters whose write load is heavy enough that one group's log becomes a bottleneck (see "Topology: `single` vs `lanes`" below). Fixed at first engine start per data dir (JC-43): switching requires backup → fresh cluster → restore. |
 | `advertiseAddr` | manager `host:port` | `host:port` other managers dial for this manager's raft transport. Wildcard binds (`0.0.0.0`/`::`) are normalized to `127.0.0.1` — set this explicitly for any real multi-node deployment. |
 | `clusterSecret` | minted at bootstrap | Shared secret authenticating manager-plane raft RPCs. When absent it is minted at bootstrap and persisted (mode 0600) to `<dataDir>/cluster_secret`; joiners receive it inside the join token. |
 | `joinToken` | none | Token from `legion raft join-token` used by a new manager to enroll into an existing cluster. |
@@ -305,21 +305,44 @@ guarantees instead:
   non-leader — the authoritative test is the election itself, which is what
   the backoff above scores.
 
-**What divergent leadership costs you.** It is safe, not free:
+**What divergent leadership costs you.** It is safe and it degrades rather
+than dies, but it is not free:
 
-- Composite operations that span the split cannot complete on **any** node
-  until leadership converges. Each half is rejected *before* its capture with
-  the typed non-leader error naming the lane and that lane's leader, so
-  nothing half-applies silently and every retry is idempotent — but a job
-  submit issued while the scheduler lane is led elsewhere fails on the
-  control leader (scheduler half) *and* on the scheduler leader (control
-  half). `/readyz` reports a standing split for exactly this reason: it
-  tolerates ~10s of post-election divergence and then returns `503`.
-- Scheduling work an acknowledged control-plane write would have enqueued is
-  re-derived from replicated state by the scheduler lane's leader on the
-  node-status-checker cadence, so it is delayed rather than lost.
+- **Worker liveness keeps working, by forwarding.** Workers dial one fixed
+  manager; when that manager does not lead the status lane, heartbeat,
+  health-check, allocation-health and failure-report writes are FORWARDED
+  over the authenticated manager plane to the owning lane's leader
+  (`ForwardLaneWrite` on the raft transport), and the worker's RPC succeeds
+  only after the forwarded write commits. The same path keeps a mark-lost's
+  control-lane availability sync working from the status leader, so a lost
+  node cannot keep receiving placements. (This forwarding also covers plain
+  `single`-topology failover: workers pointed at a demoted ex-leader keep
+  heartbeating through it.)
+- **Job submits are accepted by the control leader** and complete
+  asynchronously. The control half — the operator's intent — must commit on
+  the node you submitted to (a non-control-leader still rejects with the
+  typed leader hint). The cross-lane projections (the `task_status` seed,
+  the volume-claim rows, the rollout for an updated job, the scheduling
+  eval) are then completed by the owning lanes' leaders: evals forward
+  immediately, and per-lane reconcilers derive the rest from replicated
+  state on the node-status-checker cadence (default 2s). Until they run,
+  a just-submitted job can briefly show tasks without statuses, and an
+  updated job's rollout can appear a tick late — with its canary/manual
+  gating intact (the reconciler creates the same rollout the submit would
+  have; the eval-regeneration fallback that would bypass gating runs only
+  after it).
+- **Scheduling latency degrades.** Placement runs on the scheduler lane's
+  leader; work that would have been enqueued inline arrives by forwarding
+  or by the reconcile cadence instead.
+- **`legion state backup` is unavailable** until one node leads every lane
+  again (it needs a single authoritative image).
 - Single-lane operations are unaffected: a lane keeps serving under its own
-  leader throughout.
+  leader throughout, and reads are served by every replica.
+- `/readyz` tolerates ~10s of continuously-observed divergence (measured by
+  each manager's own probe, so a rolling restart gets the full grace) and
+  then returns `503` with a per-lane body — a standing split is an abnormal
+  leadership shape an operator should look at even though the write path
+  keeps working.
 
 If a cluster sits split, the fix is the same as for any leadership problem:
 check `legion raft status` per lane, and if one lane's leader is unhealthy,
@@ -424,17 +447,32 @@ Each of these is exercised by an in-process 3-node test in
 | **Full-cluster restart** | Every node recovers from its raft log + state DB; a leader is re-elected and the cluster resumes with all committed state. A restarted member that cannot yet hear the leader (its inbound transport shares the manager listener) proceeds leaderless with a warning and catches up once serving — startup never deadlocks on the election. |
 | **Operator double-start** | The second process fails fast on the `dataDir` advisory lock. |
 | **Wiped `dataDir`, kept state DB** | Startup is refused by the cluster stamp unless `forceNewCluster: true` (deliberate re-stamp). |
+| **Standing lane split** (`lanes` topology; different managers lead different lanes past convergence) | Nothing is lost: worker liveness and reports forward to the owning lane's leader, submits are accepted by the control leader and completed by lane reconcilers within the checker cadence, single-lane ops and reads are unaffected. Costs: scheduling latency, briefly-lagging task statuses/claims/rollouts, no `state backup`, `/readyz` 503 after ~10s as the operator signal. Exercised by `tests/raft_lanes.rs` (standing-split and forwarding tests). |
 
-## Non-leader write redirects
+## Non-leader write redirects and forwarding
 
-Mutating RPCs sent to a non-leader are rejected with
+**Client-plane** mutating RPCs sent to a non-leader are rejected with
 `FAILED_PRECONDITION` and a message naming the current leader (`retry
 against leader mgr-a at 10.0.0.1:4747`); the CLI surfaces it. The
-rejection happens **before** any capture work runs. There is no
-auto-forwarding yet (follow-up #4) — point write clients (`LEGION_ADDR`)
-at the leader. Reads are served by every manager from its local replica.
-The same typed rejection covers leader-only non-proposal operations
-(`legion state backup`).
+rejection happens **before** any capture work runs — point write clients
+(`LEGION_ADDR`) at the leader. Reads are served by every manager from its
+local replica. The same typed rejection covers leader-only non-proposal
+operations (`legion state backup`).
+
+**Worker-plane** writes are different: workers dial one fixed manager and
+cannot chase leader hints, so their writes FORWARD instead of rejecting.
+A manager that receives a heartbeat, health check, allocation-health
+snapshot, failure report, or volume report it cannot propose (it does not
+lead the owning lane — after a failover in `single` topology, or under a
+lane split in `lanes`) sends the operation over the authenticated raft
+transport (`ForwardLaneWrite`, cluster-secret auth, 5s deadline) to the
+lane's leader and answers the worker only after the forwarded write
+commits. Forwarded operations carry their full arguments, the receiver
+executes the non-forwarding variant (a stale hint costs one typed
+rejection, never a forwarding loop), and a forward that cannot complete
+surfaces the original typed rejection. During a rolling upgrade from a
+release without this RPC, a forward to an old manager fails cleanly and
+behavior degrades to the old reject-and-retry.
 
 Scheduling is leader-only by the same mechanism: eval queue state
 replicates everywhere (so a failover resumes the queue), but only the
@@ -469,7 +507,7 @@ churn-medium 174.0 evals/s / p99 7.27 ms, high-fanout 135.0 evals/s /
 p99 10.84 ms — all within SLO, unchanged by the raft work (`local_disk` is
 byte-identical per plan §A2).
 
-### Lane isolation A/B (lanes vs single, 2026-07-24)
+### Lane isolation A/B (lanes vs single, 2026-07-28)
 
 The point of lanes is that saturating one lane must not drag down another.
 Measured by `lanes_vs_single_scheduler_isolation_ab` in
@@ -478,53 +516,68 @@ Measured by `lanes_vs_single_scheduler_isolation_ab` in
 propose→apply latency sampled twice per topology — unloaded, then while 2
 threads saturate the control lane with job-submit bursts and 2 threads
 flood the status lane with heartbeats (200 measured placements per phase,
-debug build, retried-after-leadership-blip samples excluded):
+debug build, retried-after-leadership-blip samples excluded). Three
+consecutive runs on an otherwise idle Apple-Silicon machine, 2026-07-28;
+the representative middle run:
 
 | Topology | Phase | p50 | p99 | Placements/s | Cross-lane load committed (load window) |
 | --- | --- | --- | --- | --- | --- |
-| `single` | baseline | 13.55 ms | 17.54 ms | 73.5 | (none) |
-| `single` | cross-lane load | 37.38 ms | 94.17 ms | 25.2 | 436 submits + 437 heartbeats |
-| `lanes` | baseline | 13.51 ms | 56.40 ms | 62.9 | (none) |
-| `lanes` | cross-lane load | 21.35 ms | 63.04 ms | 40.2 | 5983 submits + 269 heartbeats |
+| `single` | baseline | 1.17 ms | 1.38 ms | 855 | (none) |
+| `single` | cross-lane load | 2.69 ms | 110.45 ms | 129 | 335 submits + 990 heartbeats (1.6 s window) |
+| `lanes` | baseline | 1.13 ms | 1.41 ms | 875 | (none) |
+| `lanes` | cross-lane load | 1.65 ms | 3.37 ms | 548 | 774 submits + 857 heartbeats (0.4 s window) |
 
-Scheduler p99 degradation under cross-lane load: **`single` 5.37×,
-`lanes` 1.12×** — lanes hold scheduler latency essentially flat while the
-same load quintuples the single-group tail. Under `single`, every op
-funnels through one raft group's pipeline, so placements queue behind the
-whole flood; under `lanes` the scheduler group commits independently, and
-the only shared stage left is the per-node capture mutex (captures are
-local SQLite work, ~sub-ms — quorum commit is the dominant cost and it
-parallelizes). The isolation also shows up on the loaded lane itself:
-control-lane submit throughput was ~14× higher under `lanes` (~1200/s vs
-~55/s) because submits no longer queue behind heartbeats and placements.
+Scheduler p99 degradation under cross-lane load, across the three runs:
+**`single` 50–93×, `lanes` 1.6–2.4×**. The same cross-lane flood that
+blows the single-group scheduler tail out to ~100–130 ms leaves the lanes
+scheduler tail essentially flat (2.4–3.4 ms), and lanes retains 4–5× more
+placement throughput under load (543–606/s vs 104–131/s). Under `single`,
+every op funnels through one raft group's pipeline, so placements queue
+behind the whole flood; under `lanes` the scheduler group commits
+independently, and the only shared stage left is the per-node capture
+mutex (captures are local SQLite work, ~sub-ms — quorum commit is the
+dominant cost and it parallelizes). The isolation also shows up on the
+loaded lane itself: control-lane submit throughput was ~9–10× higher
+under `lanes` (~1900/s vs ~200/s) because submits no longer queue behind
+heartbeats and placements.
 
-Honest caveats from the run (debug build, shared CI-class container):
-run-to-run variance is high — the lanes *baseline* p99 (56 ms vs single's
-18 ms) reflects noise from running nine raft cores on shared CPU, not a
-per-op cost (p50s are identical at 13.5 ms), and an earlier run measured
-it at 111 ms with a leadership blip; status-lane heartbeat throughput was
-*lower* under `lanes` in this run (269 vs 437) — the status pipeline
-competes with the much-faster control pipeline for the shared capture
-mutex. The isolation direction (flat scheduler tail under cross-lane
-load) was consistent across every run.
+Honest caveats: debug build, in-process loopback cluster — read the
+ratios, not the absolute numbers (real WAN quorum commits dominate very
+differently). Unloaded baselines are identical between topologies within
+noise, so lanes costs nothing when idle. The isolation direction (flat
+scheduler tail under cross-lane load) was consistent across every run
+on an idle machine, and on earlier shared-CPU CI-class runs (which
+showed the same split at 5.4× vs 1.1× with far noisier absolutes). The
+benchmark itself needs a quiet machine to mean anything: nine raft cores
+share the host, so external CPU load inflates the *baseline* phases and
+can bury the signal entirely — treat a run taken alongside other work as
+invalid rather than as a counter-result.
 
 ## Limitations and follow-ups
 
-In priority order (plan §6):
+In priority order (plan §6, updated 2026-07-28):
 
-1. **`lanes` topology is not runnable** until the `node`/`node_health`
-   table split makes per-lane table ownership disjoint; then flip the
-   default and add per-lane snapshots.
-2. Lane-isolation benchmark, tuning profiles, diagnostics, UI verdict
-   layer.
-2b. **Lane leadership convergence is best effort** (above): a lane whose
-   incumbent this node cannot beat stays where it is, and cross-lane
-   composites are unavailable while that lasts. A real fix needs a
-   leader-transfer API openraft 0.9 does not have.
+1. **`lanes` is opt-in, not the default.** It is runnable, tested (the
+   `tests/raft_lanes.rs` battery plus the standing-split and forwarding
+   tests), and its isolation benefit is measured (above) — but `single`
+   remains the recommended default until lanes has more production
+   mileage. Choose `lanes` when a single group's log demonstrably
+   bottlenecks your write load.
+2. **Lane leadership convergence is best effort** (above): a lane whose
+   incumbent this node cannot beat stays where it is. Since the
+   standing-split resilience work (plan §8), the cost of an unconverged
+   cluster is degraded latency and deferred projections, not lost writes —
+   worker liveness forwards, submits are accepted and reconciled. A real
+   co-location guarantee needs a leader-transfer API openraft 0.9 does not
+   have.
 3. **Transport auth is a shared cluster secret**, not mTLS (JC-7 stopgap,
    consistent with the worker plane's tracked authn gap). Upgrades with
-   the worker-mTLS work.
-4. **No auto-forwarding** of writes from followers (today: reject + hint).
+   the worker-mTLS work. Forwarded lane writes ride the same channel and
+   the same posture.
+4. **Auto-forwarding covers the worker plane and internal lane halves
+   only.** Client-plane RPCs still reject with the leader hint (above) —
+   deliberate: clients can redial, and every client-facing op is anchored
+   on the control leader.
 5. OTLP metrics push + worker-side `/metrics`; of the `legion_raft_*`
    Prometheus prefix only `legion_raft_voters{lane}` /
    `legion_raft_quorum{lane}` are emitted (voter-count checks, plan §7-C3)
@@ -534,7 +587,27 @@ In priority order (plan §6):
 6. Raft autopilot — speculative, default-off.
 
 Also: `step-down`/`transfer-leader` await an openraft with a
-leader-transfer API, and manager count is whatever you join (no enforced
-odd-membership guard) — run 3 or 5.
+leader-transfer API — including for decommissioning the current all-lane
+leader, which `remove-member` refuses as self-removal: move leadership
+first (`trigger-election` on another manager), then remove the
+now-follower from the new leader. Manager count is whatever you join (no
+enforced odd-membership guard) — run 3 or 5.
+
+Two operational sharp edges an operator should know:
+
+- **A replica that hits an apply conflict stops that lane loudly** (the
+  conflict-ABORT policy: divergence is detected, never papered over). The
+  lane's raft core on that node crash-loops on the poisoned entry until
+  the leader's log compaction passes it, after which the node catches up
+  by snapshot install — with default settings that can be thousands of
+  writes later. If a lane on one node is down with a changeset-conflict
+  error in its log, the fast fix is a fresh snapshot on the leader
+  (`legion raft command trigger-election` is NOT it — see
+  docs/raft-operations.md) or restoring the node from backup.
+- **Scheduler-event ids order per process, not per wall clock.** After a
+  failover to a manager whose clock is behind, newly minted event ids can
+  sort below an existing `after_id` cursor until the clock catches up —
+  pollers can miss that window's events live and should re-read by cursor
+  range if gap-sensitive (see docs/event-stream.md).
 
 [openraft]: https://github.com/databendlabs/openraft

@@ -183,4 +183,40 @@ impl RaftTransport for RaftTransportService {
         })?;
         handler.join(request.into_inner()).await.map(Response::new)
     }
+
+    async fn forward_lane_write(
+        &self,
+        request: Request<RaftLaneRequest>,
+    ) -> Result<Response<RaftLaneReply>, Status> {
+        let registry = self.authenticate(&request)?;
+        let store = registry.forward_store.clone().ok_or_else(|| {
+            Status::unimplemented("lane-write forwarding is not available on this manager")
+        })?;
+        let envelope = request.into_inner();
+        let op: crate::storage::raft::forward::ForwardableLaneWrite =
+            serde_json::from_slice(&envelope.payload).map_err(|e| {
+                Status::invalid_argument(format!(
+                    "undecodable ForwardLaneWrite payload (mixed manager protocol versions?): {e}"
+                ))
+            })?;
+        // Sanity: the envelope's lane must be the op's own lane — a mismatch
+        // is a bug on the sending side, not a leadership question.
+        if envelope.group_id != op.lane().wire_name() {
+            return Err(Status::invalid_argument(format!(
+                "ForwardLaneWrite lane mismatch: envelope says `{}`, op `{}` belongs to `{}`",
+                envelope.group_id,
+                op.op_name(),
+                op.lane().wire_name()
+            )));
+        }
+        // The op is blocking store work (capture + quorum commit + local
+        // apply); keep it off the transport's async workers.
+        let outcome =
+            tokio::task::spawn_blocking(move || crate::storage::raft::forward::execute(&store, op))
+                .await
+                .map_err(|e| Status::internal(format!("forwarded lane write panicked: {e}")))?;
+        let payload = serde_json::to_vec(&outcome)
+            .map_err(|e| Status::internal(format!("failed encoding ForwardOutcome: {e}")))?;
+        Ok(Response::new(RaftLaneReply { payload }))
+    }
 }

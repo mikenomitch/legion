@@ -19,12 +19,10 @@ How to use it:
 
 | PR | What it lands | Notes |
 | --- | --- | --- |
-| [#151](https://github.com/mikenomitch/legion/pull/151) | Job templates: typed parameters, guided UI submission, ACL-gated delegation | Supersedes [#108](https://github.com/mikenomitch/legion/pull/108); needs a plan + calls doc |
-| [#137](https://github.com/mikenomitch/legion/pull/137) | Real Raft persistence (quorum-committed writes), node drain, metrics, version handshake | Deviates from [multi-raft-persistence-plan.md](plans/multi-raft-persistence-plan.md) — changeset replication instead of per-method determinism |
-| [#152](https://github.com/mikenomitch/legion/pull/152) | Fix flaky artifact staging test marker race | Test-only |
+| [#162](https://github.com/mikenomitch/legion/pull/162) | Lanes hardening: worker-write forwarding, split-tolerant submits, adversarial fixes | Plan §8 + calls doc in [durability-and-ops-execution-plan.md](plans/durability-and-ops-execution-plan.md) |
 | [#143](https://github.com/mikenomitch/legion/pull/143) | Note the node-level builtin resource override gap | Docs only; the fix itself is a todo below |
 | [#84](https://github.com/mikenomitch/legion/pull/84) | Instrument DB hot paths, batch task-status updates | Old; rebase or close |
-| [#108](https://github.com/mikenomitch/legion/pull/108) | Versioned job templates | Superseded by #151 — close |
+| [#108](https://github.com/mikenomitch/legion/pull/108) | Versioned job templates | Superseded by [#151](https://github.com/mikenomitch/legion/pull/151) (merged) — close |
 
 ---
 
@@ -78,15 +76,40 @@ How to use it:
       automatically wherever it exists; today that is only operator-declared
       `config_attrs.resources.disk` (plan open question, lean yes; also
       leaned on by the artifact-cache plan's disk accounting).
-- [ ] Close the last plan-fencing window: `apply_plan_submission` commits (and
-      so publishes the bumped epoch) *before* it refreshes the read-model
-      allocation cache (`cache_add_allocations`). A plan that samples epochs in
-      that microsecond-wide gap sees the new epoch but the pre-commit cache, so
-      it can still plan against stale capacity and pass the compare-and-set.
-      Uncovered while moving the epoch sample to snapshot time (see Done →
-      Scheduling); the fix is to make the epoch bump and the cache refresh
-      visible atomically, which changes the lock ordering around the write
-      transaction and wants a plan.
+- [ ] Add to AGENTS.md that scheduler changes ship with a before/after perf
+      benchmark
+- [x] Close the last plan-fencing window (2026-07-28): the scheduler now
+      samples epochs from an in-memory mirror kept coherent with the
+      allocation cache (epochs read before allocations, published together
+      under one lock; the raft changeset projection refreshes both from the
+      epoch rows it carries; rejections self-heal the mirror). An
+      adversarial pass showed the old DB-sampled gap was NOT microseconds
+      under raft — it spanned the whole changeset projection — and was a
+      real oversubscription. Plan apply also re-validates node
+      *availability* on the fresh row, closing the cordon/lost race the
+      epoch CAS structurally cannot see.
+      [Calls #4](calls/durability-and-ops-execution-plan_calls.md)
+- [ ] Apply-time re-validation of node resource TOTALS: a worker
+      re-registration that shrinks capacity (or `reservedResources` /
+      `maxAllocations` changes) between plan snapshot and apply bumps no
+      allocation epoch and is not re-checked at apply — a plan can commit
+      placements exceeding the node's new capacity. Ports are apply-safe
+      (re-read in the apply tx); resources are the odd one out. Needs
+      ledger reconstruction inside the apply tx (cheaper now that
+      `node_pools` caches free capacity), or an epoch bump on
+      resource-affecting node updates (cross-lane under `lanes` — wants a
+      plan). Found by the 2026-07-28 adversarial pass.
+- [ ] Volume-pin staleness in planning: pins are read mid-plan-build with
+      no epoch coupling, so a pin invalidated mid-plan (e.g.
+      `volume delete --force`) can still direct a placement; later
+      reconciliation covers it. Low severity, same pass.
+- [ ] A raft-mode CONCURRENT-planning oversubscription test through the
+      real `Scheduler::plan_and_apply` path. The local_disk concurrency
+      test exists (`concurrent_plans_cannot_oversubscribe_a_node`) and the
+      raft batteries exercise plan CAS mechanics, but no test drives two
+      planners against raft's commit-then-project ordering — the exact
+      window the epoch mirror closes. The mirror's coherence is structural,
+      so this is regression insurance, not a known gap.
 
 ## Task runtimes
 
@@ -221,17 +244,65 @@ Plans: [persistence-plan.md](plans/persistence-plan.md), [multi-raft-persistence
         [Plan §JC-40 correction](plans/durability-and-ops-execution-plan.md) ·
         [calls](calls/durability-and-ops-execution-plan_calls.md) ·
         [docs/multi-raft.md](../docs/multi-raft.md)
-  - [ ] **Cross-lane composites have no home while lane leadership is split.**
-        Convergence is best effort, so a cluster can sit with lanes led by
-        different managers; a job submit then fails on the control leader (its
-        scheduler half) and on the scheduler leader (its control half), and
-        `/readyz` returns 503 until it converges. A real fix needs a
-        leader-transfer API openraft 0.9 does not have — the alternative is a
-        cross-lane write forwarder. See
-        [docs/multi-raft.md](../docs/multi-raft.md) § "Lane leadership".
+  - [x] **Standing-split resilience** (2026-07-28, plan §8): a lane split no
+        longer breaks the write path. Worker-plane writes (heartbeats,
+        health, failure/volume reports) and internal lane halves FORWARD to
+        the owning lane's leader over a new `ForwardLaneWrite` transport RPC
+        — this also fixes worker liveness across plain `single`-topology
+        failover, where the pre-fix cascade marked healthy workers lost in
+        ~10s and self-fenced their stateful allocations at ~90s. Job submits
+        are ACCEPTED by the control leader; the deferred projections
+        (status seeds, volume claims, rollouts — with gating preserved —
+        and evals) are completed by per-lane reconcilers on the checker
+        cadence. `/readyz` still 503s on a standing split (operator
+        signal), with an honest body and a restart-safe, flap-proof
+        divergence timer.
+        [Plan §8](plans/durability-and-ops-execution-plan.md) ·
+        [calls #1, #3, #6, #12](calls/durability-and-ops-execution-plan_calls.md) ·
+        [docs/multi-raft.md](../docs/multi-raft.md)
+  - [x] **Adversarial verification pass on lanes v2** (2026-07-28): four
+        skeptic sweeps over the election governor, the split behavior
+        matrix, the snapshot/apply engine, and the plan fence. Confirmed
+        fixes shipped: the catching-up hold is capped (uncapped, it starved
+        convergence on any busy lane — the standing split was the steady
+        state under load); anchor flap no longer resets the campaign loss
+        ladder; first-campaign spacing is enforced; `raft status` counts
+        joint-intersection voters instead of reporting `voters: []`
+        mid-join; remove-member probes reachability, bounds its membership
+        changes, and refuses self-removal (two-step decommission
+        documented); the bootstrap seed-snapshot purge re-arms across a
+        crash; status-lane orphan sweeps need two consecutive observations;
+        standalone events propose on a locally-led lane; `rollout_tick` no
+        longer stamps rollouts `failed` on transient lane errors; the
+        plan-apply status follow-up no longer fails applied plans (the
+        `job_update` 5s churn loop). The engine core (changeset capture,
+        per-lane snapshots, ownership guard, log durability) survived
+        attack — 8 claimed guarantees verified against the openraft 0.9.24
+        source.
+        [Calls #7–#16](calls/durability-and-ops-execution-plan_calls.md)
+  - [x] The lane-isolation benchmark — measured 2026-07-28, three
+        consecutive runs: cross-lane load degrades scheduler p99 50–93×
+        under `single` (to ~100–130ms) vs 1.6–2.4× under `lanes` (2.4–3.4ms
+        — essentially flat), with identical unloaded baselines and 4–5×
+        placement throughput retained. `lanes_vs_single_scheduler_isolation_ab`
+        in [tests/raft_perf_smoke.rs](../tests/raft_perf_smoke.rs);
+        numbers in [docs/multi-raft.md](../docs/multi-raft.md) § "Lane
+        isolation A/B".
   - [ ] Per-lane tuning knobs, bottleneck tracing, Raft health UI
-  - [ ] The 12× lane-isolation benchmark
   - [ ] Speculative: Raft autopilot
+  - [ ] Idempotency records are not atomic with their mutation: an RPC that
+        errors after its mutation but before `idempotency_record` (control
+        lane) re-executes on retry — for server-minted ids
+        (`create_instance`) that duplicates the instance. Fold the record
+        into the mutating op's own capture (it is JC-28 commutative, so any
+        lane may carry it). Found by the 2026-07-28 split inventory.
+  - [ ] Eval NotRaftLeader retries are a flat 5s forever; with the churn
+        loops fixed this only delays split-parked evals, but backoff +
+        jitter would quiet the logs.
+  - [ ] `destroy_job` under a standing split half-applies from the status/
+        scheduler side (cleanups land, control delete rejected) until a
+        retry against the control leader completes it. Consider reordering
+        control-first + orphan sweeps, like the submit composite.
 - [x] Loading state back in from a file — `legion state backup` +
       `--restore-from` ([#137](https://github.com/mikenomitch/legion/pull/137))
 - [ ] **Cluster federation** —

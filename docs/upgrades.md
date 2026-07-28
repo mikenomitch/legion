@@ -82,6 +82,21 @@ pre-versioning workers) in `dynamic_attrs`. The same attributes appear in
 the node ledger and the UI's node views. Workers additionally log the
 manager's build/protocol version after every successful registration.
 
+## Manager-plane skew (raft clusters)
+
+Managers in one raft cluster speak the `RaftTransport` service to each
+other. During a rolling manager upgrade the plane tolerates skew:
+
+- The lane-write forwarding RPC (`ForwardLaneWrite`, added 2026-07-28)
+  degrades cleanly against an older manager: the forward fails with the
+  older side's "unimplemented" status and the caller surfaces the same
+  typed leader-hint rejection it would have produced before forwarding
+  existed. Upgrade managers first (the standard order below) and the
+  window closes.
+- Payloads inside the transport are versioned by `PROTOCOL_VERSION`;
+  undecodable payloads name mixed manager protocol versions in their
+  error.
+
 ## Raft persistence upgrades
 
 ### Enabling raft on an existing manager (local_disk → raft)
@@ -118,12 +133,11 @@ behind each snapshot (a tail of recent entries is retained so
 slightly-behind followers catch up by replay). Bootstrap additionally
 builds a **seed snapshot** of the existing database and compacts the log
 up to it, so a joiner always receives any pre-raft adopted baseline via
-snapshot install rather than incomplete log replay. The `lanes` topology
-is currently **refused at engine start**: per-lane table ownership is not
-yet disjoint (the `node` table is written by two lanes), so independent
-lane groups could apply writes to shared rows in different orders on
-different replicas. It becomes runnable with the planned
-`node`/`node_health` split.
+snapshot install rather than incomplete log replay. Under the `lanes` topology
+the same policy applies **per lane**, with per-lane table-scoped
+snapshots; the topology is fixed at first engine start per data dir, and
+switching (`single` ↔ `lanes`) takes the backup → fresh cluster →
+restore path below (see `docs/multi-raft.md`).
 
 ### Backup and restore
 

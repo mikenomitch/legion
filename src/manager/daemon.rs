@@ -294,6 +294,7 @@ pub async fn run_manager(config: ManagerConfig, run_worker: bool) -> R<()> {
             full_config.persistence.r#type,
             crate::structs::config::PersistenceType::Raft
         ),
+        diverged_since_ms: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
     };
 
     let manager_node = ManagerDaemonService::with_manager_config(store, &full_config)
@@ -730,6 +731,20 @@ async fn start_node_status_checker(store: Store, check_seconds: u64) -> R<()> {
                 ),
                 Err(err) => warn!(error = ?err, "Failed sweeping orphaned allocation_health rows"),
             }
+            // Submit seeds deferred under divergent lane leadership
+            // (plan §8, D1): `handle_job_submit` tolerates a status-lane
+            // rejection of its seed half; this pass completes those seeds
+            // here on the status leader once the control rows replicate.
+            // One cheap read in steady state (zero missing rows short-
+            // circuits before any replicated op).
+            match store.seed_missing_task_statuses() {
+                Ok(0) => {}
+                Ok(seeded) => info!(
+                    seeded,
+                    "Seeded task statuses a deferred submit half was missing"
+                ),
+                Err(err) => warn!(error = ?err, "Failed seeding missing task statuses"),
+            }
         } else if was_status_leader {
             info!("Not the status-lane raft leader; node status checker idling until elected");
             was_status_leader = false;
@@ -746,6 +761,26 @@ async fn start_node_status_checker(store: Store, check_seconds: u64) -> R<()> {
             last_rollout_reconcile = Some(std::time::Instant::now());
             if let Err(err) = store.reconcile_incomplete_rollouts() {
                 warn!(error = ?err, "Failed reconciling completed_incomplete rollouts");
+            }
+            // Rollouts an acknowledged update never got (plan §8, D1):
+            // derived here in EVERY leadership shape, not only under
+            // divergence — the same signature is left by a crash between
+            // the submit and the rollout insert with no restart afterwards,
+            // which no leadership-acquisition hook would ever heal.
+            match crate::manager::server::reconcile_missing_rollouts(&store) {
+                Ok(0) => {}
+                Ok(created) => info!(created, "Created missing rollouts for acknowledged updates"),
+                Err(err) => warn!(error = ?err, "Failed reconciling missing rollouts"),
+            }
+            // Volume-claim syncs deferred by a submit under divergent lane
+            // leadership (plan §8, D1) — read-only in steady state.
+            match store.sync_missing_task_volume_claims() {
+                Ok(0) => {}
+                Ok(synced) => info!(
+                    synced,
+                    "Synced volume claims a deferred submit half was missing"
+                ),
+                Err(err) => warn!(error = ?err, "Failed syncing missing task volume claims"),
             }
         }
 
@@ -769,6 +804,16 @@ async fn start_node_status_checker(store: Store, check_seconds: u64) -> R<()> {
             last_divergent_regen = Some(std::time::Instant::now());
             if let Err(err) = store.prune_stale_evals() {
                 warn!(error = ?err, "Failed pruning stale evals under divergent lane leadership");
+            }
+            // Order matters (plan §8, D1): derive missing rollouts BEFORE
+            // regenerating evals, so the regeneration's `job_submit`
+            // fallback — which bypasses rollout gating — never fires for a
+            // job whose rollout this pass was about to create.
+            if let Err(err) = crate::manager::server::reconcile_missing_rollouts(&store) {
+                warn!(
+                    error = ?err,
+                    "Failed reconciling missing rollouts under divergent lane leadership"
+                );
             }
             match store.regenerate_scheduling_evals() {
                 Ok(enqueued) if enqueued > 0 => info!(
@@ -991,6 +1036,24 @@ async fn start_eval_loop(store: Store, max_threads: usize) -> R<()> {
                         Err(err) => warn!(
                             error = ?err,
                             "Failed requeuing in-flight evals after leadership acquisition"
+                        ),
+                    }
+                    // Missing rollouts are derived BEFORE eval regeneration
+                    // (plan §8, D1): once a job's rollout exists, the
+                    // regeneration pass excludes the job from its blanket
+                    // `job_submit` fallback — which places the new config at
+                    // full count with no canary/manual gating — so the order
+                    // is what preserves rollout semantics for updates whose
+                    // scheduler-lane tail was lost.
+                    match crate::manager::server::reconcile_missing_rollouts(&recovery_store) {
+                        Ok(created) if created > 0 => info!(
+                            created,
+                            "Created missing rollouts after raft leadership acquisition"
+                        ),
+                        Ok(_) => {}
+                        Err(err) => warn!(
+                            error = ?err,
+                            "Failed reconciling missing rollouts after leadership acquisition"
                         ),
                     }
                     match recovery_store.regenerate_scheduling_evals() {
@@ -1562,11 +1625,7 @@ fn handle_claimed_eval(store: &Store, worker_id: usize, eval: &Eval) {
 /// rejection — the divergent-lane-leadership case `handle_claimed_eval`
 /// retries instead of terminally failing.
 fn error_is_not_raft_leader(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        cause
-            .downcast_ref::<crate::storage::raft::driver::NotRaftLeader>()
-            .is_some()
-    })
+    crate::storage::raft::driver::NotRaftLeader::in_chain(error)
 }
 
 #[instrument(err, skip_all)]
