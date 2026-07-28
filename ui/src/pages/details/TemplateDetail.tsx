@@ -1,4 +1,5 @@
 import { A, useNavigate, useParams } from '@solidjs/router'
+import { AccessGate } from '../../components/AccessGate'
 import { For, Show, createEffect, createMemo, createResource, createSignal } from 'solid-js'
 import {
   Badge,
@@ -138,7 +139,7 @@ const VariableInput = (props: {
     case 'select':
       return (
         <select
-          class={selectClass}
+          class={`${selectClass} w-full`}
           value={typeof props.value === 'string' ? props.value : ''}
           onChange={(event) => props.onChange(event.currentTarget.value)}
         >
@@ -193,7 +194,7 @@ const VariableInput = (props: {
   }
 }
 
-export default function TemplateDetail() {
+function TemplateDetailContent() {
   const params = useParams()
   const navigate = useNavigate()
   const templateName = () => decodeURIComponent(params.name)
@@ -383,7 +384,7 @@ export default function TemplateDetail() {
               </SectionCard>
             </Show>
 
-            <div class="grid gap-6 xl:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
+            <div class="grid gap-6 xl:grid-cols-[minmax(0,5fr)_minmax(0,4fr)]">
               <SectionCard
                 title="Run this template"
                 description="Values are validated against the declared types; the manager renders and submits."
@@ -418,7 +419,7 @@ export default function TemplateDetail() {
                               <>
                                 {variable.label || variable.key}
                                 <Show when={variable.required}>
-                                  <span class="ml-1 text-danger" title="Required">*</span>
+                                  <span class="ml-1 text-red-500 dark:text-red-400" title="Required">*</span>
                                 </Show>
                               </>
                             }
@@ -497,5 +498,15 @@ export default function TemplateDetail() {
         )}
       </Show>
     </div>
+  )
+}
+
+// Permission gate lives here at the page level — never around the router
+// outlet in the layout (see AccessGate).
+export default function TemplateDetail() {
+  return (
+    <AccessGate resource="template">
+      <TemplateDetailContent />
+    </AccessGate>
   )
 }

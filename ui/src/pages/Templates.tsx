@@ -1,8 +1,9 @@
 import { Show, createEffect, createMemo, createResource, createSignal } from 'solid-js'
+import { AccessGate } from '../components/AccessGate'
 import SharedIndex from '../components/SharedIndex'
 import { Button, Field, Note, SectionCard, inputClass, textareaClass } from '../components/ui'
 import { managerClient } from '../grpcClient'
-import { allows, canWriteAny } from '../utils/acl'
+import { canWriteAny } from '../utils/acl'
 import { debounced } from '../utils/debounce'
 import { formatRelativeTime } from '../utils/format'
 
@@ -27,7 +28,7 @@ const STARTER_SOURCE = `{
 }
 `
 
-export default function Templates() {
+function TemplatesContent() {
   const [search, setSearch] = createSignal('')
   const [sort, setSort] = createSignal('updated_at:desc')
   const [page, setPage] = createSignal(1)
@@ -55,7 +56,10 @@ export default function Templates() {
     sorted().slice((page() - 1) * pageSize(), page() * pageSize()),
   )
 
-  // New-template editor, shown only to identities holding template:write.
+  // New-template editor: opened from the list header, only for identities
+  // holding template:write. Closed by default — publishing is the rare
+  // action here; browsing and running are the common ones.
+  const [editorOpen, setEditorOpen] = createSignal(false)
   const [newName, setNewName] = createSignal('')
   const [newSource, setNewSource] = createSignal(STARTER_SOURCE)
   const [creating, setCreating] = createSignal(false)
@@ -77,6 +81,7 @@ export default function Templates() {
         stored ? `Stored ${stored.name} v${stored.version}.` : 'Template stored.',
       )
       setNewName('')
+      setEditorOpen(false)
       await refetch()
     } catch (error) {
       setCreateError(errorText(error))
@@ -87,9 +92,58 @@ export default function Templates() {
 
   return (
     <div class="space-y-6">
+      <Show when={editorOpen()}>
+        <SectionCard
+          title="New template"
+          description="One self-contained Jsonnet file: metadata, typed variables, and a hidden job(vars):: function."
+        >
+          <form class="flex flex-col gap-3" onSubmit={createTemplate}>
+            <Field label="Name" hint="Lowercase letters, digits, and dashes.">
+              <input
+                class={inputClass}
+                value={newName()}
+                onInput={(event) => setNewName(event.currentTarget.value)}
+                placeholder="render-video"
+                required
+              />
+            </Field>
+            <Field label="Jsonnet source">
+              <textarea
+                class={`${textareaClass} h-72 font-mono text-xs`}
+                value={newSource()}
+                onInput={(event) => setNewSource(event.currentTarget.value)}
+                spellcheck={false}
+              />
+            </Field>
+            <div class="flex items-center gap-3">
+              <Button type="submit" variant="primary" size="md" disabled={creating()}>
+                {creating() ? 'Publishing…' : 'Publish version'}
+              </Button>
+              <Button type="button" variant="ghost" size="md" onClick={() => setEditorOpen(false)}>
+                Cancel
+              </Button>
+              <Show when={createError()}>
+                <Note tone="danger" class="flex-1">{createError()}</Note>
+              </Show>
+            </div>
+          </form>
+        </SectionCard>
+      </Show>
+
+      <Show when={createNotice()}>
+        <Note tone="ok" onDismiss={() => setCreateNotice('')}>{createNotice()}</Note>
+      </Show>
+
       <SharedIndex
         entityLabel="Templates"
         search={search()}
+        actions={
+          <Show when={canWriteAny('template')}>
+            <Button size="sm" icon="plus" onClick={() => setEditorOpen((open) => !open)}>
+              New template
+            </Button>
+          </Show>
+        }
         onSearch={setSearch}
         sort={sort()}
         onSort={setSort}
@@ -127,43 +181,16 @@ export default function Templates() {
         emptyHint="Publish one with `legion template create <name> -f template.jsonnet` or the editor below."
       />
 
-      <Show when={canWriteAny('template')}>
-        <SectionCard
-          title="New template"
-          description="One self-contained Jsonnet file: metadata, typed variables, and a hidden job(vars):: function."
-        >
-          <form class="flex flex-col gap-3" onSubmit={createTemplate}>
-            <Field label="Name" hint="Lowercase letters, digits, and dashes.">
-              <input
-                class={inputClass}
-                value={newName()}
-                onInput={(event) => setNewName(event.currentTarget.value)}
-                placeholder="render-video"
-                required
-              />
-            </Field>
-            <Field label="Jsonnet source">
-              <textarea
-                class={`${textareaClass} h-72 font-mono text-xs`}
-                value={newSource()}
-                onInput={(event) => setNewSource(event.currentTarget.value)}
-                spellcheck={false}
-              />
-            </Field>
-            <div class="flex items-center gap-3">
-              <Button type="submit" variant="primary" size="md" disabled={creating() || !allows('template', 'write', { template: newName().trim() || undefined, any: !newName().trim() })}>
-                {creating() ? 'Publishing…' : 'Publish version'}
-              </Button>
-              <Show when={createError()}>
-                <Note tone="danger" class="flex-1">{createError()}</Note>
-              </Show>
-              <Show when={createNotice()}>
-                <Note tone="ok" class="flex-1">{createNotice()}</Note>
-              </Show>
-            </div>
-          </form>
-        </SectionCard>
-      </Show>
     </div>
+  )
+}
+
+// Permission gate lives here at the page level — never around the router
+// outlet in the layout (see AccessGate).
+export default function Templates() {
+  return (
+    <AccessGate resource="template">
+      <TemplatesContent />
+    </AccessGate>
   )
 }

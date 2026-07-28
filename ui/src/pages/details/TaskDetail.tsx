@@ -1,4 +1,6 @@
 import { A, useParams } from '@solidjs/router'
+import { GetLedgerReply } from '../../gen/legion_pb'
+import { AccessGate } from '../../components/AccessGate'
 import { For, Show, createMemo, createResource } from 'solid-js'
 import { Badge, DefList, EmptyState, Note, PageHeader, SectionCard, Spinner, StatusBadge, TableShell, linkClass, tableClass, tdClass, thClass, theadClass, trHoverClass } from '../../components/ui'
 import LogViewer from '../../components/LogViewer'
@@ -38,7 +40,7 @@ const artifactProgressLabel = (row: ArtifactStateRow): string | undefined => {
 
 const formatDurationMs = (ms: number): string => (ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${ms}ms`)
 
-export default function TaskDetail() {
+function TaskDetailContent() {
   const params = useParams()
   const jobName = createMemo(() => decodeURIComponent(params.id))
   const taskName = createMemo(() => decodeURIComponent(params.taskName))
@@ -49,7 +51,9 @@ export default function TaskDetail() {
       managerClient.getJobInfo({ name: jobName() }),
       managerClient.listRollouts({ jobId: jobName(), activeOnly: false, page: 1, pageSize: 200 }),
       managerClient.getJobSpec({ name: jobName() }),
-      managerClient.getLedger({}),
+      // node:read garnish (allocation placement); job-scoped tokens
+      // still get the rest of the page.
+      managerClient.getLedger({}).catch(() => new GetLedgerReply()),
       fetchAllocationRuntime(jobName()),
       // Actual volumes rather than the declaration: this page should answer
       // "where is my data and is it healthy", which the spec cannot.
@@ -537,5 +541,15 @@ export default function TaskDetail() {
         </div>
       </Show>
     </Show>
+  )
+}
+
+// Permission gate lives here at the page level — never around the router
+// outlet in the layout (see AccessGate).
+export default function TaskDetail() {
+  return (
+    <AccessGate resource="job">
+      <TaskDetailContent />
+    </AccessGate>
   )
 }

@@ -1,9 +1,10 @@
 import { A, useNavigate, useParams } from '@solidjs/router'
+import { AccessGate } from '../../components/AccessGate'
 import { For, Show, createMemo, createResource, createSignal, onCleanup, onMount } from 'solid-js'
 import { Badge, CodeBlock, ConfirmButton, EmptyState, MonoBadge, Note, PageHeader, SectionCard, Spinner, StatusBadge, TableShell, Tabs, linkClass, tableClass, tdClass, thClass, theadClass, trHoverClass } from '../../components/ui'
 import DagVisualization from '../../components/DagVisualization'
 import { AllocationPorts, ServiceEndpointsTable, ServiceTags } from '../../components/ServiceEndpoints'
-import { InstanceInfo } from '../../gen/legion_pb'
+import { GetLedgerReply, InstanceInfo } from '../../gen/legion_pb'
 import LogViewer from '../../components/LogViewer'
 import { managerClient } from '../../grpcClient'
 import { allows, jobScope } from '../../utils/acl'
@@ -16,7 +17,7 @@ import { POLL_INTERVAL_MS } from '../../utils/polling'
 // slash, so the split is unambiguous.
 const volumeIdFromHandle = (handle: string) => handle.slice(handle.indexOf('/') + 1)
 
-export default function JobDetail() {
+function JobDetailContent() {
   const params = useParams()
   const navigate = useNavigate()
   const jobName = createMemo(() => decodeURIComponent(params.id))
@@ -29,7 +30,9 @@ export default function JobDetail() {
   const [jobData] = createResource(jobName, async () => {
     const [jobInfo, ledger, rollouts, spec, specHistory, services] = await Promise.all([
       managerClient.getJobInfo({ name: jobName() }),
-      managerClient.getLedger({}),
+      // node:read garnish (allocation placement); job-scoped tokens
+      // still get the rest of the page.
+      managerClient.getLedger({}).catch(() => new GetLedgerReply()),
       managerClient.listRollouts({ jobId: jobName(), activeOnly: false, page: 1, pageSize: 200 }),
       managerClient.getJobSpec({ name: jobName() }),
       managerClient.listJobSpecHistory({ name: jobName() }),
@@ -589,5 +592,15 @@ export default function JobDetail() {
         </div>
       </Show>
     </Show>
+  )
+}
+
+// Permission gate lives here at the page level — never around the router
+// outlet in the layout (see AccessGate).
+export default function JobDetail() {
+  return (
+    <AccessGate resource="job">
+      <JobDetailContent />
+    </AccessGate>
   )
 }

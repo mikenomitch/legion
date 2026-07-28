@@ -1,4 +1,5 @@
 import { For, Show, createEffect, createMemo, createSignal } from 'solid-js'
+import { AccessGate } from '../components/AccessGate'
 import { managerClient } from '../grpcClient'
 import { canWriteAny } from '../utils/acl'
 import type { SavedStateQuery, StateStoreSchemaObject } from '../gen/legion_pb'
@@ -100,7 +101,7 @@ function HighlightedText(props: { text: string; term: string; class?: string }) 
   )
 }
 
-export default function StateExplorer() {
+function StateExplorerContent() {
   const [query, setQuery] = createSignal('SELECT name, type FROM sqlite_master ORDER BY name LIMIT 25;')
   const [allowWrite, setAllowWrite] = createSignal(false)
   const [isRunning, setIsRunning] = createSignal(false)
@@ -499,5 +500,15 @@ export default function StateExplorer() {
         </SectionCard>
       </div>
     </div>
+  )
+}
+
+// Permission gate lives here at the page level — never around the router
+// outlet in the layout (see AccessGate).
+export default function StateExplorer() {
+  return (
+    <AccessGate resource="state">
+      <StateExplorerContent />
+    </AccessGate>
   )
 }

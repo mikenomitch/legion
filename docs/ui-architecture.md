@@ -227,20 +227,37 @@ Storage is surfaced wherever the question "where is my data" gets asked
 default-deny, same "a rule with a selector never matches a request without
 that attribute" — behind `allows(resource, action, scope)`.
 
-- **Nav** hides destinations the identity cannot read (`navVisibility` in
-  `App.tsx`); a section whose items all disappear disappears with them.
-- **Mutating controls** (destroy job, rollout advance/stop, KV save/delete/
-  patch, raft commands, saved-query writes, exec and actions, template
-  publish/delete) render disabled with a title explaining why.
+- **Nav**: an authenticated identity only sees destinations it can read
+  (`ROUTE_RESOURCE` in `utils/acl.ts` maps each top-level route to the
+  resource it needs). An **anonymous** caller keeps the full sidebar — they
+  have not had a chance to authenticate, and an app that hides everything
+  looks broken rather than locked.
+- **Denied pages**: every protected page wraps its own content in
+  `AccessGate`, which swaps in a card naming the missing permission with a
+  login link (anonymous) or a switch-identity link (authenticated). The gate
+  lives at the page level on purpose: wrapping the router's *outlet* in any
+  conditional captures it once and freezes navigation while the URL keeps
+  changing.
+- **Mutating controls** (destroy/stop job, rollout advance/stop, KV
+  save/delete/patch, raft commands, saved-query writes, exec and actions,
+  template publish/delete) render disabled with a title explaining why.
 - **Access page** shows admin tabs only with `acl:read` (worker join needs
   `node:read`).
 
-Two rules govern this code. It is **cosmetic**: the manager is the only
-enforcement point, and hiding a control is a UX affordance, not a security
-boundary. And it **fails open** — when ACLs are disabled or in audit-only
-mode, or before the identity probe resolves, everything renders; it fails
-closed only on the definite signal that ACLs are on and the rules do not
-match.
+Two hard-won rules keep restricted identities from breaking the app:
+
+- **A resource that may be denied must swallow its own rejection.** Reading
+  an errored Solid resource *throws at the read site*; one unguarded
+  `operator:read` probe in the layout used to kill the whole reactive graph
+  — URL changing, page frozen. Garnish RPCs (the ledger on job pages, the
+  o11y probe in the layout, the overview stats) degrade to empty on denial.
+- **`RouteErrorBoundary`** wraps the page area as a last line of defense: a
+  page that still throws gets an error card and a retry, and navigating
+  elsewhere resets it. It renders children unconditionally — it is not a
+  conditional around the outlet.
+
+As everywhere else in the UI, all of this is cosmetic; the manager is the
+only enforcement point.
 
 ## Stateful Workloads
 

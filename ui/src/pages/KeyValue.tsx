@@ -1,4 +1,5 @@
 import { For, Show, createEffect, createMemo, createSignal } from 'solid-js'
+import { AccessGate } from '../components/AccessGate'
 import { managerClient } from '../grpcClient'
 import { allows } from '../utils/acl'
 import { KvEntry, KvValueType } from '../gen/legion_pb'
@@ -65,7 +66,7 @@ const valueTypeLabel = (valueType: number) => {
   }
 }
 
-export default function KeyValue() {
+function KeyValueContent() {
   const [entries, setEntries] = createSignal<KvEntry[]>([])
   const [loading, setLoading] = createSignal(false)
   const [error, setError] = createSignal<string | null>(null)
@@ -353,5 +354,15 @@ export default function KeyValue() {
         </SectionCard>
       </div>
     </div>
+  )
+}
+
+// Permission gate lives here at the page level — never around the router
+// outlet in the layout (see AccessGate).
+export default function KeyValue() {
+  return (
+    <AccessGate resource="kv">
+      <KeyValueContent />
+    </AccessGate>
   )
 }

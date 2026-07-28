@@ -1,5 +1,5 @@
 import { A, Navigate, Route, Router, useLocation, useNavigate, type RouteSectionProps } from '@solidjs/router'
-import { For, Show, createEffect, createMemo, createResource, createSignal, on, onCleanup, onMount } from 'solid-js'
+import { ErrorBoundary, For, Show, createEffect, createMemo, createResource, createSignal, on, onCleanup, onMount, type JSX } from 'solid-js'
 import Breadcrumbs from './components/Breadcrumbs'
 import { AclBanner } from './components/AclBanner'
 import { ConnectionGate } from './components/ConnectionGate'
@@ -113,6 +113,46 @@ const BrandMark = (props: { class?: string }) => (
   </svg>
 )
 
+// Last line of defense for the page area: a page that throws (most often an
+// unguarded read of an errored resource) must never take the app down with
+// it — before this existed, one rejected RPC could freeze navigation while
+// the URL kept changing. Renders its children normally (no conditional
+// capture of the outlet) and swaps to the card only when something throws;
+// navigating elsewhere resets it.
+const RouteErrorBoundary = (props: { children: JSX.Element }) => {
+  const location = useLocation()
+  return (
+    <ErrorBoundary
+      fallback={(err, reset) => {
+        createEffect(on(() => location.pathname, reset, { defer: true }))
+        return (
+          <div class="flex justify-center py-12">
+            <div class="w-full max-w-md rounded-lg border border-line bg-surface p-6 text-center shadow-card">
+              <span class="mx-auto flex h-10 w-10 items-center justify-center rounded-full bg-red-500/10 text-red-600 dark:text-red-400">
+                <Icon name="alertTriangle" size={19} />
+              </span>
+              <h2 class="mt-3 font-display text-lg font-semibold text-ink">This page hit an error</h2>
+              <p class="mx-auto mt-1.5 max-w-sm break-words font-mono text-xs text-muted">
+                {err instanceof Error ? err.message : String(err)}
+              </p>
+              <button
+                type="button"
+                class="mt-5 inline-flex items-center gap-2 rounded-md border border-transparent bg-brass px-3.5 py-2 text-sm font-semibold text-canvas transition-colors hover:bg-brass-strong"
+                onClick={reset}
+              >
+                <Icon name="refresh" size={15} />
+                Try again
+              </button>
+            </div>
+          </div>
+        )
+      }}
+    >
+      {props.children}
+    </ErrorBoundary>
+  )
+}
+
 const Layout = (props: RouteSectionProps) => {
   const location = useLocation()
   const navigate = useNavigate()
@@ -125,9 +165,22 @@ const Layout = (props: RouteSectionProps) => {
   const [theme, setTheme] = createSignal<'light' | 'dark'>(resolveInitialTheme())
   // Waits for the connection probe: firing this before we know the manager is
   // reachable just produces a second failure to ignore.
+  // The probe MUST swallow its own failure. GetObservability needs
+  // operator:read; for any identity without it the RPC rejects, and reading
+  // an errored resource THROWS at the read site — which is the navItems()
+  // memo. An exception there takes down the layout's whole reactive graph:
+  // the URL keeps changing while the nav, header, and page freeze. (This is
+  // exactly what restricted tokens hit before ACL-aware rendering existed;
+  // treat "can't ask" the same as "o11y off".)
   const [o11yStatus] = createResource(
     () => connectionStatus() === 'connected',
-    async () => managerClient.getObservability({ maxLines: 1 }),
+    async () => {
+      try {
+        return await managerClient.getObservability({ maxLines: 1 })
+      } catch {
+        return undefined
+      }
+    },
   )
   const [commandPaletteOpen, setCommandPaletteOpen] = createSignal(false)
   const [commandPaletteQuery, setCommandPaletteQuery] = createSignal('')
@@ -813,7 +866,9 @@ const Layout = (props: RouteSectionProps) => {
             <Show when={!isDetailRoute()}>
               <PageHeader title={pageMeta().title} subtitle={pageMeta().subtitle} />
             </Show>
-            <ConnectionGate>{props.children}</ConnectionGate>
+            <ConnectionGate>
+              <RouteErrorBoundary>{props.children}</RouteErrorBoundary>
+            </ConnectionGate>
           </main>
         </div>
       </div>

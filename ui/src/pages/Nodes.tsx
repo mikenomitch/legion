@@ -1,4 +1,5 @@
 import { A } from '@solidjs/router'
+import { AccessGate } from '../components/AccessGate'
 import { Show, createEffect, createMemo, createResource, createSignal } from 'solid-js'
 import SharedIndex from '../components/SharedIndex'
 import { CreateJoinTokenForm } from '../components/acl/AdminPanels'
@@ -8,7 +9,7 @@ import { debounced } from '../utils/debounce'
 import { formatRelativeTime } from '../utils/format'
 import { summarizeHealthChecks } from '../utils/health'
 
-export default function Nodes() {
+function NodesContent() {
   const [search, setSearch] = createSignal('')
   const [sort, setSort] = createSignal('id:asc')
   const [page, setPage] = createSignal(1)
@@ -118,5 +119,15 @@ export default function Nodes() {
         emptyHint="Create a join token above, then run the printed command on the worker host."
       />
     </div>
+  )
+}
+
+// Permission gate lives here at the page level — never around the router
+// outlet in the layout (see AccessGate).
+export default function Nodes() {
+  return (
+    <AccessGate resource="node">
+      <NodesContent />
+    </AccessGate>
   )
 }

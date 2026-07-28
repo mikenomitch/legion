@@ -1,4 +1,5 @@
 import { createEffect, createMemo, createResource, createSignal } from 'solid-js'
+import { AccessGate } from '../components/AccessGate'
 import SharedIndex from '../components/SharedIndex'
 import { checkboxClass } from '../components/ui'
 import { managerClient } from '../grpcClient'
@@ -7,7 +8,7 @@ import { formatRelativeTime } from '../utils/format'
 
 const isActiveStatus = (status: string) => !['completed', 'failed', 'cancelled', 'completed_incomplete'].includes(status.toLowerCase())
 
-export default function Rollouts() {
+function RolloutsContent() {
   const [search, setSearch] = createSignal('')
   const [sort, setSort] = createSignal('updated_at:desc')
   const [page, setPage] = createSignal(1)
@@ -19,7 +20,14 @@ export default function Rollouts() {
     search(); sort(); activeOnly(); setPage(1)
   })
 
-  const [ledger] = createResource(async () => (await managerClient.getLedger({})).nodes)
+  // node:read garnish; degrade for job-scoped tokens (see Jobs.tsx).
+  const [ledger] = createResource(async () => {
+    try {
+      return (await managerClient.getLedger({})).nodes
+    } catch {
+      return []
+    }
+  })
   const placementCounts = createMemo(() => {
     const counts = new Map<string, number>()
     for (const node of ledger() ?? []) {
@@ -87,5 +95,15 @@ export default function Rollouts() {
       emptyLabel="No rollouts yet"
       emptyHint="Rollouts are created automatically when you submit a new version of a running job."
     />
+  )
+}
+
+// Permission gate lives here at the page level — never around the router
+// outlet in the layout (see AccessGate).
+export default function Rollouts() {
+  return (
+    <AccessGate resource="job">
+      <RolloutsContent />
+    </AccessGate>
   )
 }
