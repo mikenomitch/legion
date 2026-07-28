@@ -429,6 +429,69 @@
             },
         },
         {
+            // microVM sandbox (see docs/task-kind-sandbox.md). Same shape as
+            // the container kind plus what a VM needs: guest size and a
+            // kernel. Persistent state is a *block-mode volume*: a guest
+            // kernel attaches a block device, not a host directory, so this
+            // is the one task kind that sets `mode: 'block'` on its storage.
+            name: "microvm",
+            runtime: "sandbox",
+            group: "microvms",
+            stateful: {
+                mode: "slot",
+                storage: {
+                    // Where the guest init mounts the volume. The local-dir
+                    // driver serves a formatted disk image; the worker hands
+                    // it to the kind; the VMM attaches it as /dev/vdb.
+                    path: "/workspace",
+                    mode: "block",
+                    params: { size: "1G", fs: "ext4" },
+                },
+            },
+            config: {
+                image: "alpine:latest",
+                command: ["/bin/sh", "-c", "echo hello from a microVM; sleep 600"],
+                env: {
+                    LEGION_TASK: "sandbox",
+                },
+                // Guest working directory (defaults to the image's).
+                cwd: "/workspace",
+                // Guest sizing; defaults are 1 vCPU / 512 MiB.
+                vcpus: 1,
+                memory_mib: 512,
+                // Writable scratch in the ephemeral root disk, on top of the
+                // image contents (default 256). Anything written outside the
+                // volume mount lives here and dies with the allocation.
+                rootfs_headroom_mib: 256,
+                // "auto" (default) = cloud-hypervisor then firecracker on
+                // Linux+KVM, Apple `container` on macOS. "dev" runs without a
+                // VM (namespaces only on Linux) for machines without KVM.
+                hypervisor: "auto",
+                // Uncompressed guest kernel; falls back to
+                // LEGION_SANDBOX_KERNEL, then /var/lib/legion/kernels/vmlinux.
+                // An ${artifact.<name>} reference works here too.
+                kernel: "/var/lib/legion/kernels/vmlinux",
+                kernel_args: "quiet",
+                network: {
+                    // "none" (default, loopback only) or "tap" with a
+                    // pre-created host TAP device.
+                    mode: "none",
+                },
+            },
+            resources: {
+                cpus: 1,
+                memory: 512,
+            },
+            constraints: {
+                // A microVM needs KVM, so keep these on a Linux pool. On macOS
+                // the kind falls back to Apple `container` dev mode.
+                os: "linux",
+            },
+            affinities: {
+                node_class: "sandbox",
+            },
+        },
+        {
             name: "container",
             count: 1,
             runtime: "container",

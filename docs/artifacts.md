@@ -134,7 +134,8 @@ Enforced at admission (`job run` / `job plan`) **and** by offline
 - `mediaType` is only valid for `oci://` sources.
 - `mode` must be an octal file mode.
 - The task runtime must support artifacts (`supports_artifacts` capability
-  gate). `exec` and `container` do; **`noop` rejects artifact-bearing specs**.
+  gate). `exec`, `container`, and `sandbox` do; **`noop` rejects
+  artifact-bearing specs**.
 - Unknown fields in the object form are rejected.
 
 Two checks need cluster config and therefore run only at admission, not in
@@ -501,6 +502,7 @@ Sources are redacted; errors name auth sources, never values.
 | --- | --- | --- |
 | `exec` | ✅ | File/Tree payloads staged into the task dir; `${artifact.*}` interpolation; `LEGION_ARTIFACT_*` / `LEGION_TASK_DIR` env; `cwd` defaults to the task dir; landlock auto-grants it. |
 | `container` | ✅ (image, behind a flag) | The implicit `image` artifact is consumed as an OCI layout (below). File/tree artifacts stage to the **host** task dir, which an isolated container filesystem cannot see, and worker-injected env is not applied — both deferred until the runtime grows volume plumbing (same limitation as its KV file injection). |
+| `sandbox` | ✅ | The implicit `image` artifact becomes the microVM's root filesystem. File/tree/layer artifacts are copied **into the guest** at `/legion/artifacts/<name>` while the root disk is built, with `LEGION_ARTIFACT_*` and already-interpolated `${artifact.*}` paths rewritten from host staging paths to their in-guest locations (see [task-runtime-sandbox.md](task-runtime-sandbox.md)). |
 | `noop` | ❌ | Artifact-bearing specs rejected at validation/admission. |
 
 New runtimes adopt artifacts through three optional `TaskPlugin` hooks —
@@ -606,6 +608,9 @@ Remember the allowlists: a custom scheme must be added to the cluster's
 - **Cluster auth matcher changes apply at the next submit**, not to
   in-flight jobs (the effective auth is baked into the normalized spec at
   admission). KV credential *value* rotation applies immediately.
+- **The `sandbox` runtime consumes every payload**: the `Image` becomes the
+  guest root filesystem, and File/Tree/Layers are copied into the guest root
+  disk — it builds its own filesystem, so it has somewhere to put them.
 - **Container runtimes consume only the `Image` payload** (macOS imports it into
   Apple `container`; Linux converts it to an OCI runtime bundle), and image
   desugaring is off by default; file/tree artifacts and env referencing inside

@@ -668,6 +668,16 @@ their instance to the node holding the data, so a replacement can never start on
 an empty disk. See **[docs/volumes.md](volumes.md)** for plugins, the driver
 contract, and `legion volume`.
 
+Every task runtime consumes the same machinery — there is no runtime-private
+storage. What differs is the *shape* a runtime takes
+([`volume_mode`](volumes.md#filesystem-mode-vs-block-mode)): `exec` and
+`container` consume a host directory, while the
+[`sandbox` runtime](task-runtime-sandbox.md) declares `mode: 'block'` and is handed
+a formatted disk image its microVM attaches as a virtio-blk device. Either
+way, single-writer safety is the invariant above: a filesystem (or a
+filesystem image) tolerates exactly one writer, and "at most one live
+allocation per instance" is precisely that guarantee.
+
 ## Workload Identity Integration
 
 The instance id is the stable key the OIDC workload identity consumes (see

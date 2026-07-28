@@ -15,12 +15,16 @@ use std::process::{Child, Command};
 mod container;
 mod exec;
 mod exec_session;
+mod microvm;
 mod oci_bundle;
+mod oci_image;
+mod sandbox;
 mod schema_docs;
 
 pub use container::ContainerTaskPlugin;
 pub use exec::ExecTaskPlugin;
 pub use exec_session::{spawn_pipe, spawn_pty, ExecOptions, ExecOutputStreams, ExecSession};
+pub use sandbox::SandboxTaskPlugin;
 pub use schema_docs::{
     builtin_task_plugin_schemas, render_builtin_task_plugin_schemas_markdown,
     validate_builtin_task_plugin_schemas,
@@ -103,6 +107,36 @@ fn open_log_file(path: &std::path::Path) -> R<std::fs::File> {
         .with_context(|| format!("failed to open log file {}", path.display()))
 }
 
+/// Stops a task's tracked process: the child handle when this worker spawned
+/// it, else the recorded pid (a worker restart restores a pid, not a `Child`).
+///
+/// Shared by every runtime whose execution model is "one host process we
+/// spawned" — which, for the microVM runtimes, is the VMM itself: killing it
+/// takes the guest with it.
+pub(crate) fn reap_task_process(
+    allocation_id: i64,
+    task_name: &str,
+    instance: &mut TaskInstance,
+    runtime: &str,
+) {
+    if let Some(mut child) = instance.child.take() {
+        info!(allocation_id, task_name, runtime, "Stopping task process");
+        let _ = child.kill();
+        let _ = child.wait();
+        instance.pid = None;
+    } else if let Some(pid) = instance.pid.take() {
+        info!(
+            allocation_id,
+            task_name, runtime, pid, "Stopping task process by pid"
+        );
+        let mut system = sysinfo::System::new();
+        system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+        if let Some(process) = system.process(sysinfo::Pid::from_u32(pid)) {
+            process.kill();
+        }
+    }
+}
+
 pub(crate) fn derived_schema<T: schemars::JsonSchema>() -> Value {
     serde_json::to_value(schemars::schema_for!(T))
         .expect("derived task plugin schema should serialize")
@@ -123,8 +157,8 @@ pub struct TaskInstance {
     /// `LEGION_TASK_DIR`, `LEGION_ARTIFACT_<NAME>`, `LEGION_VOLUME_<NAME>`).
     /// Runtimes that run host processes apply these at start; runtimes with isolated
     /// filesystems apply the subset that means something inside the sandbox
-    /// (the container runtime applies the volume vars, whose values are already
-    /// in-container destinations).
+    /// (the container and sandbox runtimes apply [`Self::volume_env`], whose
+    /// values are already in-task destinations).
     pub extra_env: std::collections::BTreeMap<String, String>,
     /// Typed staged artifacts (artifact system plan §8), attached before
     /// `prepare()` so plugins consume payloads instead of guessing paths.
@@ -134,13 +168,27 @@ pub struct TaskInstance {
     /// the worker's standard streams.
     pub log_dir: Option<PathBuf>,
     /// Volumes the worker mounted for this allocation before `prepare()` (see
-    /// docs/volumes.md). Kinds with an isolated filesystem turn these into real
-    /// mounts; host-process kinds just read `LEGION_VOLUME_*` from
+    /// docs/volumes.md). Runtimes with an isolated filesystem turn these into
+    /// real mounts; host-process runtimes just read `LEGION_VOLUME_*` from
     /// [`Self::extra_env`], which the worker already filled in.
     pub volumes: Vec<MountedVolume>,
 }
 
-/// One mounted volume, as a task kind sees it.
+impl TaskInstance {
+    /// The `LEGION_VOLUME_<NAME>` / `LEGION_STORAGE_DIR` vars the worker
+    /// injected. For runtimes with an isolated filesystem view the worker
+    /// resolved these to in-task destinations (bind target, guest mount
+    /// path), so — unlike `LEGION_ALLOC_DIR` and friends, which name host
+    /// paths the task cannot see — they are safe to forward inside.
+    pub fn volume_env(&self) -> impl Iterator<Item = (String, String)> + '_ {
+        self.extra_env
+            .iter()
+            .filter(|(key, _)| key.starts_with("LEGION_VOLUME_") || *key == "LEGION_STORAGE_DIR")
+            .map(|(key, value)| (key.clone(), value.clone()))
+    }
+}
+
+/// One mounted volume, as a task runtime sees it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MountedVolume {
     /// Declared volume name (`data`, `models`, …).
@@ -175,6 +223,9 @@ pub struct MountedVolume {
 pub fn runtime_is_host_level(runtime: &str) -> bool {
     match runtime {
         "container" => false,
+        // A sandbox is a VM (or, in dev mode, a container): exec'ing into one
+        // is never host access.
+        "sandbox" => false,
         "exec" => true,
         _ => true,
     }
@@ -246,9 +297,9 @@ pub trait TaskPlugin: Send + Sync {
     /// true get File/Tree payloads with zero further code: the worker core
     /// stages them into the task dir and exposes `${artifact.<name>}` /
     /// `LEGION_ARTIFACT_<NAME>`.
-    /// Volume modes this kind can consume (see docs/volumes.md). Most kinds
-    /// run a process against a directory; a microVM kind attaches a block
-    /// device instead and cannot use a path at all.
+    /// Volume modes this runtime can consume (see docs/volumes.md). Most
+    /// runtimes run a process against a directory; a microVM runtime attaches
+    /// a block device instead and cannot use a path at all.
     ///
     /// Admission intersects this with the plugin's supported modes and the
     /// job's requested mode, so a mismatch is a submit-time error naming all
@@ -718,6 +769,7 @@ fn load_task_plugin(name: &str) -> R<LoadedTaskPlugin> {
     match name {
         "exec" => Ok(LoadedTaskPlugin::new(Box::new(ExecTaskPlugin), None)),
         "container" => Ok(LoadedTaskPlugin::new(Box::new(ContainerTaskPlugin), None)),
+        "sandbox" => Ok(LoadedTaskPlugin::new(Box::new(SandboxTaskPlugin), None)),
         other => {
             let plugin_root = plugin_root_dir();
             let paths = plugin_paths("tasks", other, &plugin_root);
@@ -746,7 +798,7 @@ fn task_plugin_name_to_path(name: &str) -> String {
         .into_owned()
 }
 
-fn validate_schema(schema: &Value, config: &Value) -> R<()> {
+pub(crate) fn validate_schema(schema: &Value, config: &Value) -> R<()> {
     let schema = Box::leak(Box::new(schema.clone()));
     let compiled = JSONSchema::compile(schema).context("Invalid task config schema")?;
     if let Err(errors) = compiled.validate(config) {
@@ -830,6 +882,36 @@ mod tests {
         registry.validate_task_config(&container_task())?;
         assert!(registry.plugin("container").is_some());
         Ok(())
+    }
+
+    fn sandbox_task() -> TaskConfig {
+        // No storage in the runtime config on purpose: a sandbox persists via
+        // `stateful.storage` (a block-mode volume), not a runtime-private
+        // field. See docs/task-runtime-sandbox.md.
+        TaskConfig {
+            config: json!({
+                "image": "alpine",
+                "command": ["/bin/sh", "-c", "sleep 1"],
+            }),
+            ..TaskConfig::new("sandbox-task", "sandbox")
+        }
+    }
+
+    #[test]
+    fn task_registry_loads_sandbox_plugin() -> R<()> {
+        let mut registry = TaskPluginRegistry::new();
+        registry.validate_task_config(&sandbox_task())?;
+        assert!(registry.plugin("sandbox").is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn sandbox_exec_is_never_host_level() {
+        // A sandbox is a VM (or a container in dev mode), so exec into it must
+        // not demand the stronger `host` grant.
+        assert!(!runtime_is_host_level("sandbox"));
+        assert!(!runtime_is_host_level("container"));
+        assert!(runtime_is_host_level("exec"));
     }
 
     #[test]
@@ -1297,6 +1379,36 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_task_accepts_env_identity_but_not_file_delivery() -> R<()> {
+        let config = json!({"image": "alpine", "command": ["/bin/sh", "-c", "sleep 1"]});
+
+        // Env delivery is baked into the guest env file at boot, so it works.
+        let env_identity = WorkloadIdentity {
+            name: "vault".into(),
+            audience: vec!["vault.internal".into()],
+            env: Some("VAULT_TOKEN".into()),
+            change_mode: ChangeMode::Restart,
+            ..Default::default()
+        };
+        validate_job_config(&job_with(TaskConfig {
+            identities: vec![env_identity],
+            config: config.clone(),
+            ..TaskConfig::new("box", "sandbox")
+        }))?;
+
+        // File delivery would have to reach inside a running guest, which
+        // needs an agent the runtime does not have yet.
+        let err = validate_job_config(&job_with(TaskConfig {
+            identities: vec![file_identity("aws")],
+            config,
+            ..TaskConfig::new("box", "sandbox")
+        }))
+        .expect_err("sandbox has no identity file delivery");
+        assert!(err.to_string().contains("identity file delivery"), "{err}");
+        Ok(())
+    }
+
+    #[test]
     fn duplicate_identity_names_rejected_in_job_validation() {
         let task = TaskConfig {
             identities: vec![file_identity("aws"), file_identity("aws")],
@@ -1367,6 +1479,23 @@ mod tests {
             err.to_string().contains("does not support artifacts"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn sandbox_task_accepts_artifacts() -> R<()> {
+        // Unlike a container, a sandbox builds its own root filesystem, so
+        // file/tree artifacts can actually be copied into the guest.
+        let task = TaskConfig {
+            artifacts: vec![
+                ArtifactSpec::from_source("https://releases.example.com/tool.tar.gz").named("tool"),
+            ],
+            config: json!({
+                "image": "alpine",
+                "command": ["${artifact.tool}/run", "--once"],
+            }),
+            ..TaskConfig::new("box", "sandbox")
+        };
+        validate_job_config(&job_with(task))
     }
 
     #[test]

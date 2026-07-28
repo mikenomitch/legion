@@ -351,16 +351,17 @@ that struct with `mode`, `fs`, and `fresh`; nothing else changed.
   `start`. The scheduler knows the target node earlier than that, so mounting
   concurrently with staging is a real start-latency win. Deliberately not
   specified as strictly serial anywhere, so it stays available.
-- **`config.state` desugar.** When the sandbox kind merges, its
-  `config.state: { path, size_mib }` should desugar into a `stateful.storage`
-  claim with `mode: 'block'` — the same trick `container.image` uses to become
-  an implicit artifact. Owning the desugar here means no user jobspec changes on
-  the day volumes ship.
-- **Retention has exactly one owner.** Once a kind's storage is a volume, the
-  kind must stop making retention decisions: `retainOnScaleIn` / `retainOnStop`
-  govern the volume, and the reaper acts on them. A kind that also retains
-  "forever" on its own leaks disks on the node while the volume system believes
-  it reclaimed them — a silent failure, so it is called out here.
+- ~~**`config.state` desugar.**~~ Resolved better than planned: the sandbox
+  kind merged *consuming volumes directly*, and `config.state` was deleted
+  before it ever shipped in a release — so there is nothing to desugar and no
+  jobspec to keep working. The kind rejects a leftover `config.state` at
+  validation with the migration spelled out (`stateful.storage` +
+  `mode: 'block'`), rather than letting the forward-compat flatten silently
+  swallow the field and run without persistence.
+- ~~**Retention has exactly one owner.**~~ Now true in code: the sandbox kind
+  keeps no storage of its own — its `destroy` reclaims only allocation scratch,
+  and volume retention/reclaim is entirely the manager's
+  (`retainOnScaleIn` / `retainOnStop` + the reaper).
 
 ### Deliberately unchanged
 

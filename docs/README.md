@@ -23,6 +23,8 @@ Plans, roadmaps, to-do lists, and development notes live in
 - [Task Runtime Plugins](task-runtime-plugins.md) — the task-runtime plugin contract.
 - [Task Runtime: exec](task-runtime-exec.md)
 - [Task Runtime: container](task-runtime-container.md)
+- [Task Runtime: sandbox](task-runtime-sandbox.md) — OCI images in microVMs for
+  untrusted code and agent workspaces.
 - [Task Runtime: noop](task-runtime-noop.md)
 - [Artifacts](artifacts.md) — declaring, fetching, verifying, and staging inputs.
 - [Stateful Workloads & Instance Identity](stateful-workloads.md) — slot and

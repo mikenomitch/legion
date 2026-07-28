@@ -132,6 +132,8 @@ error against a runtime that does not support it.
 | `exec` | ✅ | ✅ | Runs a sibling host process with the task's env/cwd. **Host-level** — requires the `host` ACL grant. |
 | `container` (Apple `container`) | ✅ | ✅ | `container exec` inside the container's namespaces (sandboxed). |
 | `container` (youki) | ❌ | ❌ | Deferred; reports unsupported. |
+| `sandbox` (microVM) | ❌ | ❌ | Deferred; exec into a guest needs a vsock agent. Reports unsupported rather than failing at session open. |
+| `sandbox` (macOS dev mode) | ✅ | ✅ | `container exec` into the sandbox's VM-backed container. |
 | `noop` / custom plugins | ❌ | ❌ | Opt in by implementing `exec_support()` + `exec()`. |
 
 > **Windows:** interactive PTY uses ConPTY via `portable-pty`. It is expected
@@ -152,7 +154,8 @@ Rule selectors:
 - `names` — job names (glob), as elsewhere.
 - `action_names` — action names (glob), on `action` rules.
 - `host: true` — on `exec` rules, also permits exec into **host-level** runtimes
-  (the `exec` runtime). Without it, an `exec` rule matches only sandboxed runtimes.
+  (the `exec` runtime). Without it, an `exec` rule matches only sandboxed
+  runtimes (`container`, `sandbox`).
 
 ```jsonnet
 [

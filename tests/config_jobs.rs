@@ -200,7 +200,7 @@ fn maximal_job_spec_parse() {
 
     assert_eq!(config.name, "maximal-demo");
     assert_eq!(config.version, Some(1));
-    assert_eq!(config.tasks.len(), 5);
+    assert_eq!(config.tasks.len(), 6);
 
     // The keyed-mode stateful task (sandbox group) round-trips and validates.
     let sandbox = config
@@ -214,6 +214,23 @@ fn maximal_job_spec_parse() {
     sandbox
         .validate_stateful()
         .expect("keyed sandbox task validates");
+
+    // The microVM sandbox task's kind config round-trips through the plugin's
+    // schema (guest sizing, kernel, network), and its persistent state is a
+    // block-mode volume — the shape a guest kernel can actually attach.
+    let microvm = config
+        .tasks
+        .iter()
+        .find(|task| task.name == "microvm")
+        .expect("maximal must declare the sandbox-kind task");
+    assert_eq!(microvm.runtime, "sandbox");
+    let storage = microvm
+        .stateful
+        .as_ref()
+        .and_then(|stateful| stateful.storage.as_ref())
+        .expect("microvm task declares stateful.storage");
+    assert_eq!(storage.path, "/workspace");
+    assert_eq!(storage.volume_mode(), legion::volumes::VolumeMode::Block);
 
     // No stateful task may sit under a createFirst (replace-before-stop)
     // rollout: that would double-bind one instance id + storage handle (see

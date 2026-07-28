@@ -1,12 +1,13 @@
 use crate::prelude::*;
 use crate::structs::{Allocation, TaskConfig};
 use crate::task_plugins::{
-    configure_task_log_capture, derived_schema, oci_bundle, spawn_pipe, spawn_pty,
-    spawn_task_process, ExecOptions, ExecSession, ExecSupport, TaskInstance, TaskPlugin,
+    configure_task_log_capture, derived_schema, oci_bundle, oci_image, reap_task_process,
+    spawn_pipe, spawn_pty, spawn_task_process, ExecOptions, ExecSession, ExecSupport, TaskInstance,
+    TaskPlugin,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 
 fn default_container_env() -> HashMap<String, String> {
@@ -256,67 +257,6 @@ fn remove_stale_container(oci_runtime: &ContainerRuntime, name: &str) {
     let _ = Command::new(program).args(&args).output();
 }
 
-/// Imports a staged OCI layout into Apple `container` so the subsequent `run`
-/// finds the image without a registry pull (tar the layout → `image load`).
-fn apple_load_image(oci_layout: &Path, reference: &str) -> R<()> {
-    let archive_path = oci_layout.with_extension("oci.tar");
-    let archive = std::fs::File::create(&archive_path)
-        .with_context(|| format!("create image archive {}", archive_path.display()))?;
-    let mut builder = tar::Builder::new(archive);
-    builder
-        .append_dir_all(".", oci_layout)
-        .context("archive OCI layout")?;
-    builder.finish().context("finish OCI layout archive")?;
-
-    let output = Command::new(APPLE_CONTAINER_BIN)
-        .args(["image", "load", "--input"])
-        .arg(&archive_path)
-        .output()
-        .context("spawn container image load")?;
-    let _ = std::fs::remove_file(&archive_path);
-    if !output.status.success() {
-        bail!(
-            "container image load failed for {reference}: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    Ok(())
-}
-
-/// Pulls `image` into an on-disk OCI layout via the shared `oci://` fetcher
-/// (anonymous), returning the layout root. Used on Linux when no image artifact
-/// was staged for the task (the runtime cannot pull it itself).
-fn pull_image_layout(image: &str, dest_root: &Path) -> R<PathBuf> {
-    use crate::artifacts::fetcher::{ArtifactFetcher, FetchLimits, FetchRequest, FetchedPayload};
-    use crate::artifacts::fetchers::OciFetcher;
-    use crate::artifacts::stage::ArtifactSink;
-    use crate::structs::{parse_artifact_source, ArtifactSpec};
-
-    let source = ArtifactSpec::oci_image(image).source;
-    let parsed = parse_artifact_source(&source)?;
-    let limits = FetchLimits::default();
-    let request = FetchRequest {
-        scheme: &parsed.scheme,
-        url: &parsed.url,
-        redacted_source: &source,
-        checksum: None,
-        media_type: None,
-        credential: None,
-        limits: &limits,
-    };
-
-    std::fs::create_dir_all(dest_root)
-        .with_context(|| format!("create image dir {}", dest_root.display()))?;
-    let mut sink = ArtifactSink::new(dest_root.to_path_buf(), limits.max_bytes)?;
-    let fetched = OciFetcher::new()
-        .fetch(&request, &mut sink)
-        .with_context(|| format!("pull container image {image}"))?;
-    match fetched.payload {
-        FetchedPayload::Image { oci_layout, .. } => Ok(oci_layout),
-        other => bail!("expected an OCI image payload for {image}, got {other:?}"),
-    }
-}
-
 /// Builds the argv that execs `command` inside the allocation's container.
 fn build_exec_command(
     oci_runtime: &ContainerRuntime,
@@ -337,31 +277,6 @@ fn build_exec_command(
     argv.push(name);
     argv.extend(command.iter().cloned());
     argv
-}
-
-/// The OCI layout recorded on `instance.state` by `consume_artifact` when the
-/// image was staged through the artifact pipeline.
-fn staged_image_layout(instance: &TaskInstance) -> Option<PathBuf> {
-    instance
-        .state
-        .get("artifactImage")
-        .and_then(|image| image.get("ociLayout"))
-        .and_then(Value::as_str)
-        .map(PathBuf::from)
-}
-
-/// The reference of the staged image, recorded alongside its layout. This is
-/// the *pinned* reference the artifact pipeline resolved and imported, so
-/// launching it (instead of the jobspec's tag) is what makes digest pinning
-/// mean anything: a tag can move between the pin and the run.
-fn staged_image_reference(instance: &TaskInstance) -> Option<String> {
-    instance
-        .state
-        .get("artifactImage")
-        .and_then(|image| image.get("reference"))
-        .and_then(Value::as_str)
-        .filter(|reference| !reference.is_empty())
-        .map(str::to_string)
 }
 
 #[derive(Default)]
@@ -482,18 +397,14 @@ impl TaskPlugin for ContainerTaskPlugin {
         } = &staged.payload
         {
             if let ContainerRuntime::AppleContainer = ContainerRuntime::detect()? {
-                apple_load_image(oci_layout, reference)?;
+                oci_image::apple_load_image(oci_layout, reference)?;
             }
-            let record = json!({
-                "ociLayout": oci_layout.display().to_string(),
-                "reference": reference,
-                "digest": staged.digest,
-            });
-            if let Some(state) = instance.state.as_object_mut() {
-                state.insert("artifactImage".into(), record);
-            } else {
-                instance.state = json!({ "artifactImage": record });
-            }
+            oci_image::record_staged_layout(
+                instance,
+                oci_layout,
+                reference,
+                staged.digest.as_deref(),
+            );
         }
         Ok(())
     }
@@ -531,13 +442,9 @@ impl TaskPlugin for ContainerTaskPlugin {
         merged_env.extend(config.env.clone());
         // Volume vars carry the IN-CONTAINER destination (the worker resolved
         // them that way for this kind), so they are meaningful inside the
-        // sandbox — unlike LEGION_ALLOC_DIR and friends, which name host paths
-        // the container cannot see.
-        for (key, value) in &instance.extra_env {
-            if key.starts_with("LEGION_VOLUME_") || key == "LEGION_STORAGE_DIR" {
-                merged_env.insert(key.clone(), value.clone());
-            }
-        }
+        // container — unlike LEGION_ALLOC_DIR and friends, which name host
+        // paths the container cannot see.
+        merged_env.extend(instance.volume_env());
 
         // A container still holding this allocation's name would make `run`
         // fail; restarts and worker crashes both leave one behind.
@@ -551,7 +458,7 @@ impl TaskPlugin for ContainerTaskPlugin {
                 // Without a staged image, the jobspec's own reference is used
                 // and Apple `container` pulls it itself.
                 let image =
-                    staged_image_reference(instance).unwrap_or_else(|| config.image.clone());
+                    oci_image::staged_reference(instance).unwrap_or_else(|| config.image.clone());
                 info!(
                     allocation_id = allocation.id,
                     task_name = %task.name,
@@ -575,16 +482,7 @@ impl TaskPlugin for ContainerTaskPlugin {
                 // layout (from the artifact pipeline if staged, else pull it),
                 // convert it to a bundle, then `run` it.
                 let scratch = work_root(allocation, instance);
-                let pulled_layout = scratch.join("image").join("layout");
-                let layout = match staged_image_layout(instance) {
-                    Some(layout) => layout,
-                    // A previous start of this allocation already pulled the
-                    // layout; reuse it so in-place restarts don't refetch.
-                    // `index.json` is written last by the fetcher, so its
-                    // presence marks a complete pull.
-                    None if pulled_layout.join("index.json").is_file() => pulled_layout,
-                    None => pull_image_layout(&config.image, &scratch.join("image"))?,
-                };
+                let layout = oci_image::resolve_layout(&config.image, instance, &scratch)?;
                 let bundle = scratch.join("bundle");
                 oci_bundle::build_bundle(
                     &layout,
@@ -652,28 +550,7 @@ impl TaskPlugin for ContainerTaskPlugin {
             let _ = Command::new(program).args(&args).output();
         }
 
-        if let Some(mut child) = instance.child.take() {
-            info!(
-                allocation_id = allocation.id,
-                task_name = %task.name,
-                "Stopping container task"
-            );
-            let _ = child.kill();
-            let _ = child.wait();
-            instance.pid = None;
-        } else if let Some(pid) = instance.pid.take() {
-            info!(
-                allocation_id = allocation.id,
-                task_name = %task.name,
-                pid,
-                "Stopping container task by pid"
-            );
-            let mut system = sysinfo::System::new();
-            system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
-            if let Some(process) = system.process(sysinfo::Pid::from_u32(pid)) {
-                process.kill();
-            }
-        }
+        reap_task_process(allocation.id, &task.name, instance, "container");
         Ok(())
     }
 
@@ -984,7 +861,7 @@ mod tests {
             }),
             ..TaskInstance::default()
         };
-        let image = staged_image_reference(&instance).expect("staged reference");
+        let image = oci_image::staged_reference(&instance).expect("staged reference");
         assert_eq!(image, "docker.io/library/alpine@sha256:abc");
 
         let config = ContainerTaskConfig::from_value(&json!({
@@ -1003,22 +880,8 @@ mod tests {
         assert!(!args.contains(&"alpine:latest".to_string()), "{args:?}");
 
         // No staged image: the jobspec's own reference is what runs.
-        assert_eq!(staged_image_reference(&TaskInstance::default()), None);
+        assert_eq!(oci_image::staged_reference(&TaskInstance::default()), None);
         Ok(())
-    }
-
-    #[test]
-    fn staged_image_layout_reads_state() {
-        let mut instance = TaskInstance {
-            state: json!({ "artifactImage": { "ociLayout": "/tmp/x/layout" } }),
-            ..TaskInstance::default()
-        };
-        assert_eq!(
-            staged_image_layout(&instance),
-            Some(PathBuf::from("/tmp/x/layout"))
-        );
-        instance.state = json!({});
-        assert_eq!(staged_image_layout(&instance), None);
     }
 
     fn container_task(name: &str, command: Value) -> TaskConfig {

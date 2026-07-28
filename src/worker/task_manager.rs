@@ -267,6 +267,9 @@ impl WorkerTaskManager {
         if let Err(err) = self.registry.load_plugin("container", true) {
             error!(?err, "Failed to load container task plugin");
         }
+        if let Err(err) = self.registry.load_plugin("sandbox", true) {
+            error!(?err, "Failed to load sandbox task plugin");
+        }
         if let Err(err) = self.registry.load_plugin("noop", true) {
             debug!(?err, "Noop task plugin not available");
         }
@@ -901,8 +904,12 @@ impl WorkerTaskManager {
             .volumes
             .mount_for_allocation(allocation, instance.as_ref(), &specs)?;
 
+        // Runtimes with an isolated filesystem view get volume env values that
+        // are in-task destinations (bind target / guest mount path), because
+        // the host path is unreachable from inside. Host-process runtimes
+        // (exec) get the real host path.
         let in_task_view = task
-            .map(|task| task.runtime == "container")
+            .map(|task| matches!(task.runtime.as_str(), "container" | "sandbox"))
             .unwrap_or(false);
         if let Some(instance) = self.instances.get_mut(&allocation.id) {
             for (key, value) in volume_env(&mounted, in_task_view) {

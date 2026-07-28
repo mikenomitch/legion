@@ -34,6 +34,23 @@ pub fn restrict_dir_to_owner(dir: &std::path::Path) -> crate::util::R<()> {
     Ok(())
 }
 
+/// First match for `name` on `PATH`. A name containing a path separator is
+/// treated as an explicit path and only checked for existence.
+///
+/// The single lookup shared by everything that shells out to discovered
+/// binaries (VMM monitors, `mkfs.*`, `mount`), so availability probes and the
+/// actual invocation can never disagree about what was found.
+pub fn find_on_path(name: &str) -> Option<PathBuf> {
+    if name.contains(std::path::MAIN_SEPARATOR) {
+        let path = PathBuf::from(name);
+        return path.exists().then_some(path);
+    }
+    let path_var = std::env::var_os("PATH")?;
+    std::env::split_paths(&path_var)
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
+}
+
 pub fn plugin_root_dir() -> PathBuf {
     std::env::var("LEGION_PLUGIN_DIR")
         .map(PathBuf::from)

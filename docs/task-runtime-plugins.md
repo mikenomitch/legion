@@ -56,8 +56,13 @@ Per-task state container, passed `&mut` to every hook:
   - optional child process handle
   - optional PID
   - allocation and task directories, injected env, staged artifacts, log dir
+  - `volumes` — the worker-mounted volumes for this allocation (see
+    [docs/volumes.md](volumes.md)): a directory to bind in filesystem mode, a
+    device or disk image to attach in block mode. Persistent data belongs
+    here, never under `alloc_dir` — runtimes consume volumes, they do not
+    invent storage
 
-`TaskInstance` was previously named `TaskInstance`. It was renamed when the task
+`TaskInstance` was previously named `TaskRuntime`. It was renamed when the task
 axis took the word `runtime`, so that a hook signature no longer has two
 different "runtimes" in it. Out-of-tree plugins must rename the type at their
 call sites; the fields and semantics are unchanged.
@@ -67,7 +72,7 @@ call sites; the fields and semantics are unchanged.
 `TaskPluginRegistry` behavior:
 
 - Caches plugins per `runtime`.
-- Loads built-ins for `exec` and `container` directly.
+- Loads built-ins for `exec`, `container`, and `sandbox` directly.
 - Loads other runtimes dynamically from plugin dir.
 
 Dynamic plugin requirements:
@@ -80,7 +85,7 @@ Dynamic plugin requirements:
 
 Worker task manager flow:
 
-1. Load built-ins at startup (`exec`, `container`, optional `noop`).
+1. Load built-ins at startup (`exec`, `container`, `sandbox`, optional `noop`).
 2. On allocation start:
    - resolve plugin by `task.runtime`
    - run `prepare` then `start`
@@ -98,4 +103,5 @@ See per-runtime docs:
 
 - `docs/task-runtime-exec.md`
 - `docs/task-runtime-container.md`
+- `docs/task-runtime-sandbox.md`
 - `docs/task-runtime-noop.md`
