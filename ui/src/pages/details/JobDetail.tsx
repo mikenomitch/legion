@@ -6,6 +6,7 @@ import { AllocationPorts, ServiceEndpointsTable, ServiceTags } from '../../compo
 import { InstanceInfo } from '../../gen/legion_pb'
 import LogViewer from '../../components/LogViewer'
 import { managerClient } from '../../grpcClient'
+import { allows, jobScope } from '../../utils/acl'
 import { allocationHealthLabel, fetchAllocationRuntime, parseAllocNetwork } from '../../utils/allocations'
 import { formatDate, formatRelativeTime } from '../../utils/format'
 import { buildTaskInstancesByName, buildTaskInstancesFromStatuses, extractJobSpecData, topoSortTaskNames, type TaskInstanceSummary } from '../../utils/jobspec'
@@ -60,6 +61,7 @@ export default function JobDetail() {
 
     return {
       job: jobInfo.job,
+      template: jobInfo.template,
       allocations,
       rollouts: rollouts.rollouts,
       activeRollout: rollouts.rollouts.find((rollout) => !['completed', 'failed', 'cancelled', 'completed_incomplete'].includes(rollout.status.toLowerCase())),
@@ -203,9 +205,24 @@ export default function JobDetail() {
               <>
                 <StatusBadge status={jobData()!.job?.status || 'unknown'} />
                 <Badge tone="neutral">{jobData()!.allocations.length} allocation{jobData()!.allocations.length === 1 ? '' : 's'}</Badge>
+                <Show when={jobData()!.template}>
+                  {(template) => (
+                    <A href={`/templates/${encodeURIComponent(template().name)}`}>
+                      <MonoBadge tone="accent" title="Submitted from a job template">
+                        <>template: {template().name} v{template().version}</>
+                      </MonoBadge>
+                    </A>
+                  )}
+                </Show>
               </>
             }
-            actions={<ConfirmButton label="Delete job" onConfirm={() => void destroyJob()} />}
+            actions={
+              <ConfirmButton
+                label="Delete job"
+                onConfirm={() => void destroyJob()}
+                disabled={!allows('job', 'write', jobScope(jobName(), jobData()!.template?.name))}
+              />
+            }
           />
           <Show when={actionMessage()}>
             <div aria-live="polite">

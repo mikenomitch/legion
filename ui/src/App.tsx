@@ -5,6 +5,7 @@ import { AclBanner } from './components/AclBanner'
 import { ConnectionGate } from './components/ConnectionGate'
 import { Icon, JumpHint, PageHeader, cx, type IconName } from './components/ui'
 import { managerClient } from './grpcClient'
+import { canRead } from './utils/acl'
 import { commandPaletteIndexItems } from './utils/commandPalette'
 import { connectionStatus, managerAddress } from './utils/connection'
 import {
@@ -40,6 +41,8 @@ import Observability from './pages/Observability'
 import TestingUtils from './pages/TestingUtils'
 import StateExplorer from './pages/StateExplorer'
 import Raft from './pages/Raft'
+import Templates from './pages/Templates'
+import TemplateDetail from './pages/details/TemplateDetail'
 
 type SidebarItem = {
   kind: 'item'
@@ -67,7 +70,27 @@ type CommandPaletteItem = {
 
 type SidebarNode = SidebarItem | SidebarSection
 
-const detailRoutes = new Set(['jobs', 'nodes', 'manager', 'rollouts', 'services', 'volumes'])
+const detailRoutes = new Set(['jobs', 'nodes', 'manager', 'rollouts', 'services', 'templates', 'volumes'])
+
+// What each nav destination needs from the identity's effective ACL rules
+// (from WhoAmI). Paths not listed are always shown. Cosmetic only — the
+// manager enforces; this just stops the UI offering pages that can only
+// fail. Reactive through `canRead`'s use of the identity signal.
+const navVisibility: Record<string, () => boolean> = {
+  '/jobs': () => canRead('job'),
+  '/services': () => canRead('job'),
+  '/rollouts': () => canRead('job'),
+  '/templates': () => canRead('template'),
+  // Volumes are job-scoped storage, gated under `job` like their RPCs.
+  '/volumes': () => canRead('job'),
+  '/nodes': () => canRead('node'),
+  '/manager': () => canRead('operator'),
+  '/raft': () => canRead('operator'),
+  '/events': () => canRead('operator'),
+  '/kv': () => canRead('kv'),
+  '/state-explorer': () => canRead('state'),
+  '/observability': () => canRead('operator'),
+}
 
 const decodePathSegment = (value: string) => {
   try {
@@ -130,6 +153,7 @@ const Layout = (props: RouteSectionProps) => {
         heading: 'Workloads',
         items: [
           { kind: 'item', label: 'Jobs', path: '/jobs', title: 'Jobs', copy: 'Every job on the cluster and its health.', icon: 'layers' },
+          { kind: 'item', label: 'Templates', path: '/templates', title: 'Templates', copy: 'Reusable job templates with guided parameters.', icon: 'layoutTemplate' },
           { kind: 'item', label: 'Services', path: '/services', title: 'Services', copy: 'Discoverable endpoints and their health.', icon: 'radio' },
           { kind: 'item', label: 'Rollouts', path: '/rollouts', title: 'Rollouts', copy: 'Version rollouts and their progress.', icon: 'rocket' },
           { kind: 'item', label: 'Volumes', path: '/volumes', title: 'Volumes', copy: 'Persistent storage behind stateful tasks.', icon: 'hardDrive' },
@@ -175,7 +199,15 @@ const Layout = (props: RouteSectionProps) => {
       })
     }
 
-    return base
+    // Hide destinations the identity's ACL rules cannot read; drop sections
+    // that end up empty. Direct navigation still works (and fails loudly) —
+    // this only trims what the UI offers.
+    const isVisible = (item: SidebarItem) => navVisibility[item.path]?.() ?? true
+    return base.flatMap<SidebarNode>((entry) => {
+      if (entry.kind === 'item') return isVisible(entry) ? [entry] : []
+      const items = entry.items.filter(isVisible)
+      return items.length > 0 ? [{ ...entry, items }] : []
+    })
   })
 
   const flattenedNavItems = createMemo(() =>
@@ -808,6 +840,8 @@ const AppRoutes = () => {
       <Route path="/raft" component={Raft} />
       <Route path="/manager/:id" component={ManagerNodeDetail} />
       <Route path="/jobs" component={Jobs} />
+      <Route path="/templates" component={Templates} />
+      <Route path="/templates/:name" component={TemplateDetail} />
       <Route path="/jobs/:id" component={JobDetail} />
       <Route path="/jobs/:id/tasks/:taskName" component={TaskDetail} />
       <Route path="/jobs/:id/specs/:configId" component={JobSpecDetail} />

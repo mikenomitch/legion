@@ -2,6 +2,7 @@ import { A, useParams } from '@solidjs/router'
 import { For, Show, createMemo, createResource, createSignal } from 'solid-js'
 import { Badge, Button, ConfirmButton, Icon, Note, PageHeader, SectionCard, Spinner, StatusBadge, cx, inputClass, linkClass } from '../../components/ui'
 import { managerClient } from '../../grpcClient'
+import { allows, jobScope } from '../../utils/acl'
 import { formatDate } from '../../utils/format'
 import { artifactProgressPercent, parseArtifactStates } from '../../utils/jobspec'
 
@@ -107,10 +108,22 @@ export default function RolloutDetail() {
                 actions={
                   <>
                     <Show when={isManualProgression}>
-                      <Button variant="primary" icon="play" onClick={() => void advance()}>Advance</Button>
+                      <Button
+                        variant="primary"
+                        icon="play"
+                        onClick={() => void advance()}
+                        disabled={!allows('job', 'write', jobScope(rollout.jobId))}
+                      >
+                        Advance
+                      </Button>
                     </Show>
                     <Show when={!done}>
-                      <ConfirmButton label="Stop" icon="pause" onConfirm={() => void stop()} />
+                      <ConfirmButton
+                        label="Stop"
+                        icon="pause"
+                        onConfirm={() => void stop()}
+                        disabled={!allows('job', 'write', jobScope(rollout.jobId))}
+                      />
                     </Show>
                   </>
                 }

@@ -1,5 +1,6 @@
 import { For, Show, createMemo, createResource, createSignal } from 'solid-js'
 import { managerClient } from '../grpcClient'
+import { allows } from '../utils/acl'
 import { Badge, Button, CodeBlock, ConfirmButton, DefList, EmptyState, Field, Icon, Note, SectionCard, Spinner, StatusBadge, cx, inputClass } from '../components/ui'
 
 const raftCommands = [
@@ -24,7 +25,7 @@ export default function Raft() {
     await Promise.all([statusActions.refetch(), historyActions.refetch()])
   }
 
-  const canRunCommands = createMemo(() => status()?.status?.enabled ?? false)
+  const canRunCommands = createMemo(() => (status()?.status?.enabled ?? false) && allows('operator', 'write'))
   // Only claim "disabled" once the manager has actually answered.
   const raftDisabled = createMemo(() => status() !== undefined && !status()?.status?.enabled)
 

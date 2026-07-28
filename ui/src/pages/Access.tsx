@@ -1,5 +1,6 @@
 import { For, Show, createMemo, createResource, createSignal } from 'solid-js'
 import { getStoredToken, managerClient, setStoredToken } from '../grpcClient'
+import { canRead } from '../utils/acl'
 import { beginOidcLogin, rememberClientId } from '../utils/oidc'
 import { identityError, managerIdentity, refreshManagerIdentity } from '../utils/connection'
 import { Badge, Button, DefList, Field, Note, SectionCard, Spinner, StatusBadge, Tabs, cx, inputClass, selectClass } from '../components/ui'
@@ -19,6 +20,15 @@ const TABS: { id: Tab; label: string }[] = [
   { id: 'users', label: 'Users' },
   { id: 'workers', label: 'Worker Join' },
 ]
+
+// Admin tabs need acl:read (worker join needs node:read); identity/login is
+// for everyone. Cosmetic — the panels' RPCs are enforced server-side.
+const visibleTabs = () =>
+  TABS.filter((entry) => {
+    if (entry.id === 'identity') return true
+    if (entry.id === 'workers') return canRead('node')
+    return canRead('acl')
+  })
 
 // Access: identity introspection, login (userpass / OIDC / JWT / raw token),
 // and the ACL admin panels.
@@ -114,7 +124,7 @@ export default function Access() {
 
   return (
     <div>
-      <Tabs class="mb-5" tabs={TABS} active={tab()} onChange={(id) => setTab(id as Tab)} />
+      <Tabs class="mb-5" tabs={visibleTabs()} active={tab()} onChange={(id) => setTab(id as Tab)} />
 
       <Show when={tab() === 'identity'}>
         <div class="space-y-4">

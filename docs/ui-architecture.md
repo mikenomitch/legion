@@ -55,6 +55,7 @@ Routes in `App.tsx`:
 - `/` overview dashboard (KPI stat cards, active rollouts, workers and
   allocations tables)
 - `/jobs` (+ `/jobs/:id`, `/jobs/:id/tasks/:taskName`, `/jobs/:id/specs/:configId`)
+- `/templates` (+ `/templates/:name`)
 - `/services` (+ `/services/:name`)
 - `/rollouts` (+ `/rollouts/:id`); `/deployments` redirects here
 - `/nodes` (+ `/nodes/:id`)
@@ -200,6 +201,46 @@ Storage is surfaced wherever the question "where is my data" gets asked
   owning instance, and node.
 - **Worker detail**: volumes materialized on that host, with an explicit note
   that draining or losing the node strands the node-local ones.
+
+## Job Templates
+
+`/templates` lists the cluster's [job templates](job-templates.md);
+`/templates/:name` is where a template is actually used:
+
+- The **run form is generated from the template's declared variables** —
+  text inputs, textareas, number fields, toggles, `<select>`s, option chips
+  for `multi_select`, and a JSON editor for `json` variables. Form state is
+  a single `Record<string, unknown>` seeded from the declared defaults, and
+  it is converted to typed JSON only at submit.
+- **Preview rendered spec** calls `RenderJobTemplate` — the same render the
+  submit would do, so what the user sees is what gets submitted. Editing any
+  value invalidates a stale preview.
+- Submitting links straight to the created job; that job's page shows a
+  `template: <name> v<N>` badge back to the template version that made it.
+- The source editor (new template, new version) renders only for identities
+  holding `template:write`.
+
+## ACL-Aware Rendering
+
+`WhoAmI` returns the caller's effective rules (`rulesJson`), and
+`utils/acl.ts` mirrors the manager's evaluation — same globbing, same
+default-deny, same "a rule with a selector never matches a request without
+that attribute" — behind `allows(resource, action, scope)`.
+
+- **Nav** hides destinations the identity cannot read (`navVisibility` in
+  `App.tsx`); a section whose items all disappear disappears with them.
+- **Mutating controls** (destroy job, rollout advance/stop, KV save/delete/
+  patch, raft commands, saved-query writes, exec and actions, template
+  publish/delete) render disabled with a title explaining why.
+- **Access page** shows admin tabs only with `acl:read` (worker join needs
+  `node:read`).
+
+Two rules govern this code. It is **cosmetic**: the manager is the only
+enforcement point, and hiding a control is a UX affordance, not a security
+boundary. And it **fails open** — when ACLs are disabled or in audit-only
+mode, or before the identity probe resolves, everything renders; it fails
+closed only on the definite signal that ACLs are on and the rules do not
+match.
 
 ## Stateful Workloads
 

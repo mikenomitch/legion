@@ -1,5 +1,6 @@
 import { For, Show, createEffect, createMemo, createSignal } from 'solid-js'
 import { managerClient } from '../grpcClient'
+import { allows } from '../utils/acl'
 import { KvEntry, KvValueType } from '../gen/legion_pb'
 import { Badge, Button, ConfirmButton, EmptyState, Field, Icon, Note, SectionCard, Spinner, cx, inputClass, selectClass, textareaClass } from '../components/ui'
 
@@ -276,7 +277,12 @@ export default function KeyValue() {
           description={selectedEntry() ? <span class="font-mono">{selectedEntry()!.key}</span> : 'Create a key/value entry.'}
           actions={
             <Show when={selectedEntry()}>
-              <ConfirmButton label="Delete" size="xs" onConfirm={() => void handleDelete()} />
+              <ConfirmButton
+                label="Delete"
+                size="xs"
+                onConfirm={() => void handleDelete()}
+                disabled={!allows('kv', 'write', { path: selectedEntry()!.key })}
+              />
             </Show>
           }
         >
@@ -312,7 +318,12 @@ export default function KeyValue() {
             </Field>
 
             <div class="flex flex-wrap items-center gap-3">
-              <Button variant="primary" size="md" onClick={() => void handleSave()}>
+              <Button
+                variant="primary"
+                size="md"
+                onClick={() => void handleSave()}
+                disabled={!allows('kv', 'write', editKey().trim() ? { path: editKey().trim() } : { any: true })}
+              >
                 {selectedEntry() ? 'Save changes' : 'Create entry'}
               </Button>
               <Show when={selectedEntry()}>
@@ -330,7 +341,12 @@ export default function KeyValue() {
                   onInput={(event) => setPatchValue(event.currentTarget.value)}
                   placeholder='[{"op":"replace","path":"/name","value":"new"}]'
                 />
-                <Button onClick={() => void handlePatch()}>Apply patch</Button>
+                <Button
+                  onClick={() => void handlePatch()}
+                  disabled={!allows('kv', 'write', { path: selectedEntry()?.key ?? '' })}
+                >
+                  Apply patch
+                </Button>
               </div>
             </Show>
           </div>

@@ -28,11 +28,11 @@ use crate::storage::queries::{
 };
 use crate::structs::{
     slot_instance_id, Allocation, AllocationHealth, Eval, Instance, InstanceMode, InstanceState,
-    Job, JobConfig, KvEntry, KvLock, KvValueType, LedgerEntry, ManagerConfigFull,
-    ManagerNodeConfig, Node, NodeMsg, ReplaceAfter, ResolvedOnLostPolicy, Rollout, RolloutConfig,
-    SigningKeyRecord, StatefulConfig, StatefulOnLostConfig, Submission, TaskCheck, TaskConfig,
-    TaskCount, TaskDependency, TaskLifecycle, TaskOnUnhealthyConfig, TaskSchedule, TaskStatusState,
-    Volume, WorkerConfig,
+    Job, JobConfig, JobTemplateProvenance, KvEntry, KvLock, KvValueType, LedgerEntry,
+    ManagerConfigFull, ManagerNodeConfig, Node, NodeMsg, ReplaceAfter, ResolvedOnLostPolicy,
+    Rollout, RolloutConfig, SigningKeyRecord, StatefulConfig, StatefulOnLostConfig, Submission,
+    TaskCheck, TaskConfig, TaskCount, TaskDependency, TaskLifecycle, TaskOnUnhealthyConfig,
+    TaskSchedule, TaskStatusState, Volume, WorkerConfig,
 };
 use crate::util::random_string;
 
@@ -330,6 +330,79 @@ pub struct SavedStateQueryRecord {
     pub sql: String,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// One declared variable of a job template, parsed from the template's
+/// manifest at upsert time and stored as JSON in
+/// `job_template_version.variables`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct JobTemplateVariableRecord {
+    pub key: String,
+    #[serde(rename = "type")]
+    pub var_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Defaults to true when `default` is absent, false when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<String>,
+}
+
+impl JobTemplateVariableRecord {
+    /// Effective requiredness: explicit flag, else "no default means required".
+    pub fn is_required(&self) -> bool {
+        self.required.unwrap_or(self.default.is_none())
+    }
+}
+
+/// One stored job template version, plus the template's latest version.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JobTemplateVersionRecord {
+    pub name: String,
+    pub version: u32,
+    pub latest_version: u32,
+    pub description: Option<String>,
+    pub source_jsonnet: String,
+    pub variables: Vec<JobTemplateVariableRecord>,
+    pub created_at: String,
+    pub created_by: String,
+}
+
+/// Latest-version summary row for template listings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JobTemplateSummaryRecord {
+    pub name: String,
+    pub latest_version: u32,
+    pub description: Option<String>,
+    pub variable_count: u32,
+    pub updated_at: String,
+}
+
+/// Version-history metadata (no source).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JobTemplateVersionInfoRecord {
+    pub version: u32,
+    pub created_at: String,
+    pub created_by: String,
+}
+
+/// One row of a job's spec history, including template provenance when the
+/// config was submitted through RunJobTemplate.
+#[derive(Debug, Clone)]
+pub struct JobSpecHistoryRow {
+    pub config_id: String,
+    pub created_at: String,
+    pub version: Option<i64>,
+    pub template: Option<JobTemplateProvenance>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -4111,11 +4184,11 @@ impl Store {
         Ok(job_id)
     }
 
-    pub fn list_job_spec_history(&self, name: &str) -> R<Vec<(String, String, Option<i64>)>> {
+    pub fn list_job_spec_history(&self, name: &str) -> R<Vec<JobSpecHistoryRow>> {
         let conn = self.read_connection()?;
         let mut stmt = conn.prepare(
             r#"
-            SELECT jc.id, jc.created_at, jc.version
+            SELECT jc.id, jc.created_at, jc.version, jc.meta
             FROM job_config jc
             INNER JOIN job j ON j.id = jc.job_id
             WHERE j.name = ?
@@ -4124,10 +4197,75 @@ impl Store {
         )?;
 
         let rows = stmt.query_map([name], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get::<_, Option<i64>>(2)?))
+            Ok(JobSpecHistoryRow {
+                config_id: row.get(0)?,
+                created_at: row.get(1)?,
+                version: row.get::<_, Option<i64>>(2)?,
+                template: Self::template_provenance_from_meta(row.get::<_, Option<Value>>(3)?),
+            })
         })?;
 
         Self::collect_rows(rows)
+    }
+
+    fn template_provenance_from_meta(meta: Option<Value>) -> Option<JobTemplateProvenance> {
+        meta.as_ref()
+            .and_then(|meta| meta.get("jobTemplate"))
+            .and_then(|value| serde_json::from_value(value.clone()).ok())
+    }
+
+    /// Template provenance of a job's latest config, when it was submitted
+    /// through RunJobTemplate.
+    #[instrument(err, skip_all)]
+    pub fn job_template_provenance(&self, job_name: &str) -> R<Option<JobTemplateProvenance>> {
+        let conn = self.read_connection()?;
+        let meta: Option<Value> = conn
+            .query_row(
+                r#"
+                SELECT jc.meta
+                FROM job_config jc
+                INNER JOIN job j ON j.id = jc.job_id
+                WHERE j.name = ?
+                ORDER BY jc.version DESC
+                LIMIT 1;
+                "#,
+                [job_name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(Self::template_provenance_from_meta(meta))
+    }
+
+    /// Latest-config template provenance for every job, keyed by job name.
+    /// Used to filter list replies for template-scoped identities without a
+    /// per-row query.
+    #[instrument(err, skip_all)]
+    pub fn job_template_provenance_map(&self) -> R<HashMap<String, JobTemplateProvenance>> {
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT j.name, jc.meta
+            FROM job j
+            INNER JOIN job_config jc ON jc.job_id = j.id
+            WHERE jc.version = (
+                SELECT MAX(version) FROM job_config WHERE job_id = j.id
+            );
+            "#,
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                Self::template_provenance_from_meta(row.get::<_, Option<Value>>(1)?),
+            ))
+        })?;
+        let mut map = HashMap::new();
+        for row in rows {
+            let (name, provenance) = row?;
+            if let Some(provenance) = provenance {
+                map.insert(name, provenance);
+            }
+        }
+        Ok(map)
     }
 
     /// Submit a job config. Composite across the lane boundary (plan §7-C2,
@@ -4147,10 +4285,32 @@ impl Store {
         config: &JobConfig,
         subs: &[Submission],
     ) -> R<JobSubmitOutcome> {
+        self.handle_job_submit_inner(config, subs, None)
+    }
+
+    /// Like `handle_job_submit`, stamping the template that rendered this
+    /// config into the config's meta for provenance (spec history, the
+    /// RunJobTemplate collision guard, and template-scoped ACL reads).
+    pub fn handle_job_submit_from_template(
+        &self,
+        config: &JobConfig,
+        subs: &[Submission],
+        template: &JobTemplateProvenance,
+    ) -> R<JobSubmitOutcome> {
+        self.handle_job_submit_inner(config, subs, Some(template))
+    }
+
+    fn handle_job_submit_inner(
+        &self,
+        config: &JobConfig,
+        subs: &[Submission],
+        template: Option<&JobTemplateProvenance>,
+    ) -> R<JobSubmitOutcome> {
         let config = config.clone();
         let subs = subs.to_vec();
+        let template = template.cloned();
         let outcome = self.replicated(Lane::Control, "handle_job_submit", move |s| {
-            s.handle_job_submit_apply(&config, &subs)
+            s.handle_job_submit_apply(&config, &subs, template.as_ref())
         })?;
         // The status half runs for EVERY outcome, `Unchanged` included
         // (JC-40 composite-retry idempotency): if a previous attempt's
@@ -4225,6 +4385,7 @@ impl Store {
         &self,
         config: &JobConfig,
         subs: &[Submission],
+        template: Option<&JobTemplateProvenance>,
     ) -> R<JobSubmitOutcome> {
         let config = self.normalize_job_config(config)?;
         // Note: There is a race condition here with the version
@@ -4272,7 +4433,7 @@ impl Store {
         }?;
 
         let now = time::OffsetDateTime::now_utc();
-        let meta = if config.rollout.is_none() && config.rollout_by_group.is_empty() {
+        let mut meta = if config.rollout.is_none() && config.rollout_by_group.is_empty() {
             json!({})
         } else {
             json!({
@@ -4280,6 +4441,9 @@ impl Store {
                 "rolloutByGroup": config.rollout_by_group,
             })
         };
+        if let Some(template) = template {
+            meta["jobTemplate"] = serde_json::to_value(template)?;
+        }
         let config_params = named_params! {
             ":id": format!("{}-{}", config.name, next_version.to_string()),
             ":name": config.name,
@@ -9722,6 +9886,199 @@ impl Store {
         Ok(changed > 0)
     }
 
+    fn job_template_version_from_row(
+        row: &Row<'_>,
+    ) -> Result<JobTemplateVersionRecord, RusqliteError> {
+        let variables_json: String = row.get(4)?;
+        let variables: Vec<JobTemplateVariableRecord> = serde_json::from_str(&variables_json)
+            .map_err(|err| {
+                RusqliteError::FromSqlConversionFailure(
+                    4,
+                    rusqlite::types::Type::Text,
+                    Box::new(err),
+                )
+            })?;
+        Ok(JobTemplateVersionRecord {
+            name: row.get(0)?,
+            version: row.get::<_, i64>(1)? as u32,
+            latest_version: row.get::<_, i64>(7)? as u32,
+            description: row.get(3)?,
+            source_jsonnet: row.get(2)?,
+            variables,
+            created_at: row.get(5)?,
+            created_by: row.get(6)?,
+        })
+    }
+
+    /// Stores the next immutable version of a job template, creating the
+    /// template row on first use.
+    #[instrument(err, skip_all)]
+    pub fn upsert_job_template_version(
+        &self,
+        name: &str,
+        description: Option<&str>,
+        source_jsonnet: &str,
+        variables: &[JobTemplateVariableRecord],
+        created_by: &str,
+    ) -> R<JobTemplateVersionRecord> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(anyhow::Error::new(StorageError::InvalidInput {
+                message: "template name must not be empty".to_string(),
+            }));
+        }
+
+        let now = OffsetDateTime::now_utc().format(&Rfc3339)?;
+        let variables_json = serde_json::to_string(variables)?;
+        let mut conn = self.write_connection()?;
+        let tx = conn.transaction()?;
+
+        let current_version: Option<i64> = tx
+            .query_row(
+                "SELECT latest_version FROM job_template WHERE name = ?;",
+                [name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let next_version = current_version.unwrap_or(0) + 1;
+
+        tx.execute(
+            "INSERT INTO job_template (name, latest_version, created_at, updated_at) VALUES (:name, :version, :now, :now) ON CONFLICT(name) DO UPDATE SET latest_version = excluded.latest_version, updated_at = excluded.updated_at;",
+            named_params! {
+                ":name": name,
+                ":version": next_version,
+                ":now": now,
+            },
+        )?;
+        tx.execute(
+            "INSERT INTO job_template_version (template_name, version, description, source_jsonnet, variables, created_by, created_at) VALUES (:name, :version, :description, :source, :variables, :created_by, :now);",
+            named_params! {
+                ":name": name,
+                ":version": next_version,
+                ":description": description,
+                ":source": source_jsonnet,
+                ":variables": variables_json,
+                ":created_by": created_by,
+                ":now": now,
+            },
+        )?;
+        let stored = tx.query_row(
+            "SELECT tv.template_name, tv.version, tv.source_jsonnet, tv.description, tv.variables, tv.created_at, tv.created_by, t.latest_version
+             FROM job_template_version tv
+             INNER JOIN job_template t ON t.name = tv.template_name
+             WHERE tv.template_name = ? AND tv.version = ?;",
+            params![name, next_version],
+            Self::job_template_version_from_row,
+        )?;
+        tx.commit()?;
+        Ok(stored)
+    }
+
+    /// One template version (latest when `version` is `None`).
+    #[instrument(err, skip_all)]
+    pub fn get_job_template_version(
+        &self,
+        name: &str,
+        version: Option<u32>,
+    ) -> R<JobTemplateVersionRecord> {
+        let conn = self.read_connection()?;
+        let base = "SELECT tv.template_name, tv.version, tv.source_jsonnet, tv.description, tv.variables, tv.created_at, tv.created_by, t.latest_version
+             FROM job_template_version tv
+             INNER JOIN job_template t ON t.name = tv.template_name
+             WHERE tv.template_name = ?";
+        let result = match version {
+            Some(version) => conn.query_row(
+                &format!("{base} AND tv.version = ?;"),
+                params![name, i64::from(version)],
+                Self::job_template_version_from_row,
+            ),
+            None => conn.query_row(
+                &format!("{base} AND tv.version = t.latest_version;"),
+                params![name],
+                Self::job_template_version_from_row,
+            ),
+        };
+        result.optional()?.ok_or_else(|| {
+            let wanted = match version {
+                Some(version) => format!("{name} v{version}"),
+                None => name.to_string(),
+            };
+            anyhow::Error::new(StorageError::not_found("job_template", wanted))
+        })
+    }
+
+    /// Version-history metadata for one template, newest first.
+    #[instrument(err, skip_all)]
+    pub fn list_job_template_versions(&self, name: &str) -> R<Vec<JobTemplateVersionInfoRecord>> {
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare(
+            "SELECT version, created_at, created_by FROM job_template_version WHERE template_name = ? ORDER BY version DESC;",
+        )?;
+        let rows = stmt.query_map([name], |row| {
+            Ok(JobTemplateVersionInfoRecord {
+                version: row.get::<_, i64>(0)? as u32,
+                created_at: row.get(1)?,
+                created_by: row.get(2)?,
+            })
+        })?;
+        Self::collect_rows(rows)
+    }
+
+    /// Latest-version summaries of every template, most recently updated
+    /// first. ACL filtering happens in the caller.
+    #[instrument(err, skip_all)]
+    pub fn list_job_templates(&self) -> R<Vec<JobTemplateSummaryRecord>> {
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare(
+            "SELECT t.name, t.latest_version, tv.description, tv.variables, t.updated_at
+             FROM job_template t
+             INNER JOIN job_template_version tv
+                ON tv.template_name = t.name AND tv.version = t.latest_version
+             ORDER BY t.updated_at DESC, t.name ASC;",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let variables_json: String = row.get(3)?;
+            let variables: Vec<JobTemplateVariableRecord> = serde_json::from_str(&variables_json)
+                .map_err(|err| {
+                RusqliteError::FromSqlConversionFailure(
+                    3,
+                    rusqlite::types::Type::Text,
+                    Box::new(err),
+                )
+            })?;
+            Ok(JobTemplateSummaryRecord {
+                name: row.get(0)?,
+                latest_version: row.get::<_, i64>(1)? as u32,
+                description: row.get(2)?,
+                variable_count: variables.len() as u32,
+                updated_at: row.get(4)?,
+            })
+        })?;
+        Self::collect_rows(rows)
+    }
+
+    /// Deletes a template and every stored version.
+    #[instrument(err, skip_all)]
+    pub fn delete_job_template(&self, name: &str) -> R<()> {
+        let mut conn = self.write_connection()?;
+        let tx = conn.transaction()?;
+        // The FK is declared with ON DELETE CASCADE but SQLite only honors it
+        // with foreign_keys=ON, so delete versions explicitly.
+        tx.execute(
+            "DELETE FROM job_template_version WHERE template_name = ?;",
+            [name],
+        )?;
+        let deleted = tx.execute("DELETE FROM job_template WHERE name = ?;", [name])?;
+        tx.commit()?;
+        if deleted == 0 {
+            return Err(anyhow::Error::new(StorageError::not_found(
+                "job_template",
+                name,
+            )));
+        }
+        Ok(())
+    }
+
     #[instrument(err, skip_all)]
     pub fn delete_saved_state_query(&self, name: &str) -> R<()> {
         let name = name.to_owned();
@@ -15097,6 +15454,113 @@ mod tests {
         // But the declared service is still listed (0 endpoints).
         let declared = store.declared_services()?;
         assert!(declared.iter().any(|entry| entry.service == "web"));
+        Ok(())
+    }
+
+    #[test]
+    fn job_template_versions_are_immutable_with_latest_pointer() -> R<()> {
+        let store = setup_store()?;
+        let variables = vec![JobTemplateVariableRecord {
+            key: "replicas".into(),
+            var_type: "number".into(),
+            label: None,
+            description: None,
+            required: None,
+            default: Some(json!(2)),
+            options: vec![],
+        }];
+
+        let v1 = store.upsert_job_template_version(
+            "tpl",
+            Some("first"),
+            "src-v1",
+            &variables,
+            "alice",
+        )?;
+        assert_eq!(v1.version, 1);
+        assert_eq!(v1.latest_version, 1);
+        assert_eq!(v1.created_by, "alice");
+        assert!(!v1.variables[0].is_required());
+
+        let v2 = store.upsert_job_template_version("tpl", Some("second"), "src-v2", &[], "bob")?;
+        assert_eq!(v2.version, 2);
+        assert_eq!(v2.latest_version, 2);
+
+        // Latest fetch returns v2; explicit fetch still returns v1 verbatim.
+        let latest = store.get_job_template_version("tpl", None)?;
+        assert_eq!(latest.version, 2);
+        assert_eq!(latest.source_jsonnet, "src-v2");
+        let pinned = store.get_job_template_version("tpl", Some(1))?;
+        assert_eq!(pinned.source_jsonnet, "src-v1");
+        assert_eq!(pinned.latest_version, 2);
+        assert_eq!(pinned.variables.len(), 1);
+
+        let versions = store.list_job_template_versions("tpl")?;
+        assert_eq!(
+            versions.iter().map(|info| info.version).collect::<Vec<_>>(),
+            vec![2, 1]
+        );
+
+        let summaries = store.list_job_templates()?;
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].latest_version, 2);
+        assert_eq!(summaries[0].description.as_deref(), Some("second"));
+        assert_eq!(summaries[0].variable_count, 0);
+
+        assert!(store.get_job_template_version("tpl", Some(9)).is_err());
+        assert!(store.get_job_template_version("missing", None).is_err());
+
+        store.delete_job_template("tpl")?;
+        assert!(store.get_job_template_version("tpl", None).is_err());
+        assert!(store.list_job_templates()?.is_empty());
+        assert!(store.delete_job_template("tpl").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn template_provenance_rides_job_config_meta() -> R<()> {
+        let store = setup_store()?;
+        let config = JobConfig {
+            name: "tpl-job".into(),
+            rollout: None,
+            rollout_by_group: BTreeMap::new(),
+            tasks: vec![TaskConfig::new("main", "noop")],
+            version: None,
+        };
+        let submission = Submission {
+            path: "template://tpl/1".into(),
+            content: "src".into(),
+            is_primary: true,
+        };
+        let provenance = JobTemplateProvenance {
+            name: "tpl".into(),
+            version: 1,
+        };
+        store.handle_job_submit_from_template(&config, &[submission.clone()], &provenance)?;
+
+        assert_eq!(
+            store.job_template_provenance("tpl-job")?,
+            Some(provenance.clone())
+        );
+        let history = store.list_job_spec_history("tpl-job")?;
+        assert_eq!(history[0].template, Some(provenance.clone()));
+        let map = store.job_template_provenance_map()?;
+        assert_eq!(map.get("tpl-job"), Some(&provenance));
+
+        // A raw resubmit (spec change, no template) clears the latest
+        // provenance while history keeps the older row.
+        let mut updated = config.clone();
+        updated.tasks[0].count = TaskCount {
+            num: 2,
+            ..updated.tasks[0].count.clone()
+        };
+        store.handle_job_submit(&updated, &[submission])?;
+        assert_eq!(store.job_template_provenance("tpl-job")?, None);
+        let history = store.list_job_spec_history("tpl-job")?;
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].template, None);
+        assert_eq!(history[1].template, Some(provenance));
+        assert!(store.job_template_provenance_map()?.is_empty());
         Ok(())
     }
 
