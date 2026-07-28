@@ -20,6 +20,18 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # The full test build links ~30 debug test binaries against a large
+      # dependency tree and has hit the runner's disk ceiling — the linker
+      # dies with SIGBUS (a write to an mmap'd output page fails once the
+      # filesystem is full). Reclaim the multi-GB preinstalled toolchains
+      # this job never uses before building.
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/.ghcup /usr/local/share/boost \
+            "$AGENT_TOOLSDIRECTORY/CodeQL" || true
+          df -h /
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
