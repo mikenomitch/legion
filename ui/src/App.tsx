@@ -3,10 +3,19 @@ import { For, Show, createEffect, createMemo, createResource, createSignal, on, 
 import Breadcrumbs from './components/Breadcrumbs'
 import { AclBanner } from './components/AclBanner'
 import { ConnectionGate } from './components/ConnectionGate'
-import { Icon, PageHeader, cx, type IconName } from './components/ui'
+import { Icon, JumpHint, PageHeader, cx, type IconName } from './components/ui'
 import { managerClient } from './grpcClient'
 import { commandPaletteIndexItems } from './utils/commandPalette'
 import { connectionStatus, managerAddress } from './utils/connection'
+import {
+  assignNavHintLetters,
+  hasJumpModifier,
+  indexHintPosition,
+  indexJumpTargets,
+  jumpDigitFromEvent,
+  jumpLetterFromEvent,
+  setJumpHintsVisible,
+} from './utils/jumpHints'
 import Access from './pages/Access'
 import OidcCallback from './pages/OidcCallback'
 import Events from './pages/Events'
@@ -171,6 +180,31 @@ const Layout = (props: RouteSectionProps) => {
 
   const flattenedNavItems = createMemo(() =>
     navItems().flatMap((entry) => (entry.kind === 'item' ? [entry] : entry.items)),
+  )
+
+  // Letters are assigned over the flattened nav in render order, so the hints
+  // stay stable as long as the sidebar does — and shift by one item when
+  // Observability appears, which is the honest cost of assigning them from the
+  // live list rather than hard-coding a letter per route.
+  const navHintLetters = createMemo(() => {
+    const items = flattenedNavItems()
+    const letters = assignNavHintLetters(items.map((item) => item.label))
+    return items.map((item, index) => ({ path: item.path, letter: letters[index] }))
+  })
+
+  // The badge spells the whole chord minus the modifier already under the
+  // user's thumb — "⇧O", not "O", so nobody reaches for ⌘O and gets the
+  // browser's file picker.
+  const navHintKeysFor = createMemo(() => {
+    const byPath = new Map(navHintLetters().map((entry) => [entry.path, entry.letter]))
+    return (path: string) => {
+      const letter = byPath.get(path)
+      return letter ? `⇧${letter.toUpperCase()}` : undefined
+    }
+  })
+
+  const navHintTargets = createMemo(
+    () => new Map(navHintLetters().filter((entry) => entry.letter).map((entry) => [entry.letter, entry.path])),
   )
 
   const commandPaletteEntries = createMemo(() => {
@@ -358,11 +392,58 @@ const Layout = (props: RouteSectionProps) => {
     handleCommandPaletteNavigation(event)
   }
 
+  // Hold ⌘ (Ctrl off macOS) to label every index row and sidebar item with the
+  // key that opens it. Both keydown and keyup carry the modifier flags, so one
+  // handler on each covers press and release.
+  const syncJumpHints = (event: KeyboardEvent) => {
+    setJumpHintsVisible(hasJumpModifier(event) && !commandPaletteOpen())
+  }
+
+  // ⌘Tab and friends take focus without ever delivering the keyup, which would
+  // otherwise leave the hints stuck on.
+  const hideJumpHints = () => setJumpHintsVisible(false)
+
+  // Visibility stays a pure function of the modifier, so keeping it held after a
+  // jump simply labels the page you landed on.
+  const onJumpHintKeydown = (event: KeyboardEvent) => {
+    if (commandPaletteOpen() || !hasJumpModifier(event) || event.altKey) return
+
+    // Sidebar items carry Shift because plain ⌘+letter belongs to the browser.
+    if (event.shiftKey) {
+      const letter = jumpLetterFromEvent(event)
+      const path = letter ? navHintTargets().get(letter) : undefined
+      if (!path) return
+      event.preventDefault()
+      navigate(path)
+      return
+    }
+
+    const digit = jumpDigitFromEvent(event)
+    const position = digit ? indexHintPosition(digit) : -1
+    const href = position >= 0 ? indexJumpTargets()[position] : undefined
+    if (!href) return
+    event.preventDefault()
+    navigate(href)
+  }
+
   onMount(() => {
     window.addEventListener('keydown', onGlobalCommandPaletteKeydown)
+    window.addEventListener('keydown', onJumpHintKeydown)
+    window.addEventListener('keydown', syncJumpHints)
+    window.addEventListener('keyup', syncJumpHints)
+    window.addEventListener('blur', hideJumpHints)
     onCleanup(() => {
       window.removeEventListener('keydown', onGlobalCommandPaletteKeydown)
+      window.removeEventListener('keydown', onJumpHintKeydown)
+      window.removeEventListener('keydown', syncJumpHints)
+      window.removeEventListener('keyup', syncJumpHints)
+      window.removeEventListener('blur', hideJumpHints)
     })
+  })
+
+  // ⌘K reveals the hints on its way to opening the palette; drop them once it is.
+  createEffect(() => {
+    if (commandPaletteOpen()) hideJumpHints()
   })
 
   createEffect(() => {
@@ -464,7 +545,12 @@ const Layout = (props: RouteSectionProps) => {
         )}
       />
       <Icon name={itemProps.item.icon} size={15} class={cx(isActiveNavPath(itemProps.item.path) ? 'text-brass' : 'text-faint group-hover:text-muted')} />
-      <Show when={!isNavCollapsed()}>{itemProps.item.label}</Show>
+      <Show when={!isNavCollapsed()}>
+        <span class="truncate">{itemProps.item.label}</span>
+        {/* Collapsed to icons there is nowhere to put the letter, so the hints
+            are an expanded-sidebar affordance; the chord still works. */}
+        <JumpHint keys={navHintKeysFor()(itemProps.item.path)} class="ml-auto" />
+      </Show>
     </A>
   )
 

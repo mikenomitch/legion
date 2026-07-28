@@ -67,6 +67,65 @@ A shared layout provides the grouped sidebar nav, a slim topbar
 (breadcrumbs, ⌘K search, theme toggle), and page headers for top-level
 routes; detail pages render their own `PageHeader`.
 
+## Keyboard Navigation
+
+The UI is usable without a mouse. Everything below is global — no setting, no
+mode to enter.
+
+| Keys | What it does |
+| --- | --- |
+| `⌘K` / `Ctrl+K` | Command palette: every page, plus every row of the index you are on, searchable by name |
+| `j` / `k`, `↑` / `↓` | Move the selection down/up the current index |
+| `o` / `Enter` | Open the selected row |
+| `u` | Go up one level (`/jobs/api/tasks/web` → `/jobs/api`) |
+| *hold* `⌘` / `Ctrl` | **Jump hints** — label the rows and the sidebar with the key that opens them |
+| `⌘1` … `⌘9`, `⌘0` | Open the 1st … 10th row of the index |
+| `⌘⇧` + letter | Open the labelled sidebar item |
+
+`j`/`k`/`o` and `u` are ignored while you are typing in a field, and while a
+link or button has keyboard focus — Tab focus wins over the virtual selection.
+
+### Jump hints
+
+Hold `⌘` (`Ctrl` on Windows and Linux) and the UI labels what you can jump to:
+a digit on each of the first ten rows of the index, and a letter on each sidebar
+item. Press the labelled key with the modifier still held. Release it and the
+labels disappear.
+
+```
+Jobs                        ⇧B          ⌘⇧B  → Jobs
+Services                    ⇧S          ⌘⇧S  → Services
+
+1  svc-api      DONE                    ⌘1   → svc-api
+2  svc-web      DONE                    ⌘2   → svc-web
+```
+
+Sidebar hints carry `⇧` because plain `⌘`+letter belongs to the browser and the
+OS (`⌘S`, `⌘W`, `⌘R`). The badge always spells the full chord, so what you read
+is what you press.
+
+Known limitations:
+
+- **Ten rows.** Digits run out after the tenth row; on a 20- or 50-row page the
+  rest carry no hints. Use `⌘K` or the search box for those.
+- **Index pages only.** Jobs, Workers, Rollouts, Managers, Services and Volumes
+  label their rows. The Overview dashboard and the tables inside detail pages
+  do not, and neither do secondary tables (the driver table on Volumes).
+- **Sidebar letters are positional.** They are assigned from the sidebar as
+  rendered, so an item's letter can change when the nav does — most visibly when
+  the manager has observability enabled and an extra item appears.
+- **Collapsed sidebar shows no letters** (there is no room for the badge), but
+  the chords still work.
+- **A browser may keep a chord.** The letters skip the combinations browsers
+  reserve for tabs, windows and devtools, but a browser or extension with its
+  own bindings can still win one; that chord will do the browser's thing
+  instead.
+
+Implementation: `ui/src/utils/jumpHints.ts` holds the visibility signal, the
+letter assignment, and the registry of the current index's rows;
+`ui/src/App.tsx` owns the key handling; pages opt in with `useIndexJumpTargets`
+and the `<JumpHint>` primitive.
+
 ## Data Fetch Pattern
 
 The app uses `createResource` + polling.

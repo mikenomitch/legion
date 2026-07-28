@@ -4,6 +4,7 @@ import {
   Badge,
   EmptyState,
   Icon,
+  JumpHint,
   LoadingRows,
   Note,
   SectionCard,
@@ -11,6 +12,7 @@ import {
   TableShell,
   cx,
   inputClass,
+  jumpHintGutterClass,
   selectClass,
   tableClass,
   tdClass,
@@ -21,6 +23,7 @@ import {
 import { managerClient } from '../grpcClient'
 import { clearCommandPaletteIndexItems, setCommandPaletteIndexItems } from '../utils/commandPalette'
 import { formatRelativeTime } from '../utils/format'
+import { indexHintKey, useIndexJumpTargets } from '../utils/jumpHints'
 import { POLL_INTERVAL_MS } from '../utils/polling'
 import {
   driverScope,
@@ -63,6 +66,8 @@ export default function Volumes() {
           .includes(query),
       )
   })
+
+  useIndexJumpTargets(() => filtered().map((volume) => `/volumes/${encodeURIComponent(volume.volumeId)}`))
 
   // ⌘K by volume id or by the instance that owns it — both are things you
   // arrive with from a log line.
@@ -181,7 +186,7 @@ export default function Volumes() {
               <table class={tableClass}>
                 <thead class={theadClass}>
                   <tr>
-                    <th class={thClass}>Volume</th>
+                    <th class={cx(thClass, jumpHintGutterClass())}>Volume</th>
                     <th class={thClass}>Driver</th>
                     <th class={thClass}>State</th>
                     <th class={thClass}>Owner</th>
@@ -191,9 +196,10 @@ export default function Volumes() {
                 </thead>
                 <tbody class="divide-y divide-line">
                   <For each={filtered()}>
-                    {(volume) => (
+                    {(volume, index) => (
                       <tr class={trHoverClass}>
-                        <td class={tdClass}>
+                        <td class={cx(tdClass, 'relative', jumpHintGutterClass())}>
+                          <JumpHint keys={indexHintKey(index())} class="absolute left-3 top-1/2 -translate-y-1/2" />
                           <A
                             href={`/volumes/${encodeURIComponent(volume.volumeId)}`}
                             class="font-mono text-xs font-medium text-ink hover:text-brass-strong"
