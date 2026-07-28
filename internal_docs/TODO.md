@@ -33,8 +33,14 @@ How to use it:
 - [ ] Worker groups + taint/toleration equivalent. Node pools exist as an ACL
       and config concept but nothing scheduling-side consumes them.
 - [ ] Priorities and eviction/preemption, with eviction toggled at the pool level
-  - [ ] At least think through fair-share policies — find the 80/20 rather than
-        building a full hierarchical scheduler
+      — [plan](plans/preemption-and-eviction-plan.md) (PLANNED: graceful stop →
+      priority bands → plan-atomic preemption → governance; pool toggle is
+      `schedulerSettings.preemption.disabledPools`)
+  - [x] At least think through fair-share policies — find the 80/20 rather than
+        building a full hierarchical scheduler. Thought through in the plan's
+        prior art + non-goals: the 80/20 is priority bands now, per-namespace
+        band caps later (phase 4); fair-share/hierarchical queues explicitly
+        deferred (Kueue's policy-matrix issue history is the argument against).
 - [ ] Schedule onto the same node as an *existing job*. Soft `same_node_as`
       colocation works within one job spec
       ([scheduler/policy.rs](../src/manager/scheduler/policy.rs)); cross-job
