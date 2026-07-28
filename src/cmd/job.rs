@@ -1445,6 +1445,52 @@ async fn plan_job(arg_matches: &ArgMatches) -> R<()> {
         } else {
             print_table(printable_allocations);
         }
+        // One line per task on how candidates were generated: which
+        // scheduling index served (or why none did). Quiet when there is
+        // nothing to say (indexes unarmed and no reason recorded).
+        let index_lines: Vec<String> = reply
+            .index_usage
+            .iter()
+            .filter_map(|usage| {
+                if usage.index.is_empty() {
+                    if usage.reason.is_empty() {
+                        return None;
+                    }
+                    return Some(format!("{}: scan — {}", usage.task_name, usage.reason));
+                }
+                let mut notes = Vec::new();
+                if usage.truncated {
+                    notes.push("truncated".to_string());
+                }
+                if usage.refills > 0 {
+                    notes.push(format!("refills {}", usage.refills));
+                }
+                if usage.fell_back {
+                    notes.push("fell back to scan".to_string());
+                }
+                if let Some(agreement) = usage.shadow_agreement {
+                    notes.push(format!(
+                        "shadow {}",
+                        if agreement { "agrees" } else { "DISAGREES" }
+                    ));
+                }
+                let notes = if notes.is_empty() {
+                    String::new()
+                } else {
+                    format!("; {}", notes.join(", "))
+                };
+                Some(format!(
+                    "{}: index {} ({} mode, {} candidates{})",
+                    usage.task_name, usage.index, usage.mode, usage.candidates, notes
+                ))
+            })
+            .collect();
+        if !index_lines.is_empty() {
+            println!("Scheduling index:");
+            for line in index_lines {
+                println!("  {line}");
+            }
+        }
     }
 
     Ok(())

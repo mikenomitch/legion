@@ -71,6 +71,29 @@ into a single series with every label set to `"other"`.
   (rejections are optimistic-concurrency epoch conflicts or late constraint
   failures — see docs/scheduler-and-eval-loop.md).
 
+### Scheduling indexes
+
+See [scheduling-indexes.md](scheduling-indexes.md) for the feature these
+instrument.
+
+- **`legion_scheduler_index_queries_total{index, outcome}`** (counter) —
+  candidate queries against the declared scheduling indexes, per planned
+  task. `outcome` is `used` (the index generated the candidates), `shadow`
+  (it ran alongside the authoritative scan), `fell_back` (it returned no
+  eligible candidates and the scan served instead), `refilled` (a truncated
+  candidate list ran dry mid-placement and was widened to the scan), or
+  `unusable` (no index bound the task's constraints; `index` is `none`).
+- **`legion_scheduler_index_candidates{index}`** (histogram) — candidate
+  count handed to placement per index-served task, after re-verification
+  and any truncation.
+- **`legion_scheduler_index_shadow_total{index, result}`** (counter) —
+  shadow-mode comparisons between the index's candidate set and the scan's;
+  `result` is `agree` or `disagree`. Any `disagree` is a bug report waiting
+  to be filed — the scan stayed authoritative, but the index missed nodes.
+- **`legion_scheduler_index_maintenance_seconds`** (histogram) — time spent
+  re-projecting nodes into the indexes on read-model mutations (node
+  upserts, availability changes, allocation changes).
+
 ### Cluster shape
 
 - **`legion_nodes{status}`** (gauge) — registered worker nodes by status

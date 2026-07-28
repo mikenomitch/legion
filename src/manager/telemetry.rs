@@ -52,6 +52,11 @@ const DURATION_BUCKETS: &[f64] = &[
     0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
 ];
 
+/// Bucket bounds for candidate-count histograms (scheduling indexes).
+const COUNT_BUCKETS: &[f64] = &[
+    1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0, 4096.0, 16384.0,
+];
+
 // ---------------------------------------------------------------------------
 // Primitive metric cells
 // ---------------------------------------------------------------------------
@@ -475,6 +480,14 @@ pub struct Metrics {
     pub raft_voters: Arc<GaugeVec>,
     /// `legion_raft_quorum{lane}`
     pub raft_quorum: Arc<GaugeVec>,
+    /// `legion_scheduler_index_queries_total{index,outcome}`
+    pub scheduler_index_queries_total: Arc<CounterVec>,
+    /// `legion_scheduler_index_candidates{index}`
+    pub scheduler_index_candidates: Arc<HistogramVec>,
+    /// `legion_scheduler_index_shadow_total{index,result}`
+    pub scheduler_index_shadow_total: Arc<CounterVec>,
+    /// `legion_scheduler_index_maintenance_seconds`
+    pub scheduler_index_maintenance_seconds: Arc<Histogram>,
     /// Render order for the exposition endpoint.
     families: Vec<Arc<dyn RenderMetric>>,
 }
@@ -571,6 +584,40 @@ impl Metrics {
             series: Series::new(),
         });
 
+        let scheduler_index_queries_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_scheduler_index_queries_total",
+                help: "Scheduling-index candidate queries, by index and outcome (used|shadow|fell_back|refilled|unusable).",
+                labels: &["index", "outcome"],
+            },
+            series: Series::new(),
+        });
+        let scheduler_index_candidates = Arc::new(HistogramVec {
+            meta: FamilyMeta {
+                name: "legion_scheduler_index_candidates",
+                help: "Candidates handed to placement per index-served task.",
+                labels: &["index"],
+            },
+            bounds: COUNT_BUCKETS,
+            series: Series::new(),
+        });
+        let scheduler_index_shadow_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_scheduler_index_shadow_total",
+                help: "Shadow-mode comparisons between index candidates and the scan, by result (agree|disagree).",
+                labels: &["index", "result"],
+            },
+            series: Series::new(),
+        });
+        let scheduler_index_maintenance_seconds = Arc::new(Histogram {
+            meta: FamilyMeta {
+                name: "legion_scheduler_index_maintenance_seconds",
+                help: "Time spent re-projecting nodes into the scheduling indexes on read-model mutations.",
+                labels: &[],
+            },
+            cell: HistogramCell::new(DURATION_BUCKETS),
+        });
+
         let families: Vec<Arc<dyn RenderMetric>> = vec![
             Arc::clone(&allocations) as Arc<dyn RenderMetric>,
             Arc::clone(&eval_queue_depth) as Arc<dyn RenderMetric>,
@@ -582,6 +629,10 @@ impl Metrics {
             Arc::clone(&plan_apply_total) as Arc<dyn RenderMetric>,
             Arc::clone(&raft_quorum) as Arc<dyn RenderMetric>,
             Arc::clone(&raft_voters) as Arc<dyn RenderMetric>,
+            Arc::clone(&scheduler_index_candidates) as Arc<dyn RenderMetric>,
+            Arc::clone(&scheduler_index_maintenance_seconds) as Arc<dyn RenderMetric>,
+            Arc::clone(&scheduler_index_queries_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&scheduler_index_shadow_total) as Arc<dyn RenderMetric>,
             Arc::clone(&store_write_lock_wait_seconds) as Arc<dyn RenderMetric>,
         ];
 
@@ -597,6 +648,10 @@ impl Metrics {
             store_write_lock_wait_seconds,
             raft_voters,
             raft_quorum,
+            scheduler_index_queries_total,
+            scheduler_index_candidates,
+            scheduler_index_shadow_total,
+            scheduler_index_maintenance_seconds,
             families,
         }
     }

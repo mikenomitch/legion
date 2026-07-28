@@ -2535,68 +2535,74 @@ impl Manager for ManagerDaemonService {
             .map(|existing| artifact_pin_diffs(existing, &config))
             .unwrap_or_default();
 
-        let (plan, task_lookup, message, matches_existing, same_content) = match existing_config {
-            Some(existing) if existing.is_same_as(&config) => {
-                let plan = scheduler
-                    .plan_only(&existing.id(), PlanMode::Fresh)
-                    .map_err(|e| {
-                        error!("Error planning job {}: {:?}", existing.name, e);
-                        Status::invalid_argument(format!("Error planning job: {e}"))
-                    })?;
-                let task_configs = self
-                    .store
-                    .get_task_configs_for_job_config(&existing.id())
-                    .map_err(|e| map_store_error("Error getting task configs", e))?;
-                let task_lookup = task_configs
-                    .into_iter()
-                    .map(|(id, task)| (id, task.name))
-                    .collect::<HashMap<_, _>>();
+        let (plan, task_lookup, index_report, message, matches_existing, same_content) =
+            match existing_config {
+                Some(existing) if existing.is_same_as(&config) => {
+                    let (plan, index_report) = scheduler
+                        .plan_only_with_report(&existing.id(), PlanMode::Fresh)
+                        .map_err(|e| {
+                            error!("Error planning job {}: {:?}", existing.name, e);
+                            Status::invalid_argument(format!("Error planning job: {e}"))
+                        })?;
+                    let task_configs =
+                        self.store
+                            .get_task_configs_for_job_config(&existing.id())
+                            .map_err(|e| map_store_error("Error getting task configs", e))?;
+                    let task_lookup = task_configs
+                        .into_iter()
+                        .map(|(id, task)| (id, task.name))
+                        .collect::<HashMap<_, _>>();
 
-                (
-                    plan,
-                    task_lookup,
-                    "Job config unchanged; showing force-reschedule placements".to_string(),
-                    true,
-                    true,
-                )
-            }
-            Some(_existing) => {
-                let PlanConfigOutcome {
-                    allocations,
-                    task_lookup,
-                } = scheduler
-                    .plan_for_config(&config, PlanMode::Fresh, Some(&config.name))
-                    .map_err(|e| {
-                        error!("Error planning updated job {}: {:?}", config.name, e);
-                        Status::invalid_argument(format!("Error planning job: {e}"))
-                    })?;
-                (
-                    allocations,
-                    task_lookup,
-                    "Job config changed; showing updated placements".to_string(),
-                    true,
-                    false,
-                )
-            }
-            None => {
-                let PlanConfigOutcome {
-                    allocations,
-                    task_lookup,
-                } = scheduler
-                    .plan_for_config(&config, PlanMode::Fresh, None)
-                    .map_err(|e| {
-                        error!("Error planning new job {}: {:?}", config.name, e);
-                        Status::invalid_argument(format!("Error planning job: {e}"))
-                    })?;
-                (
-                    allocations,
-                    task_lookup,
-                    "Job config new; showing placements".to_string(),
-                    false,
-                    false,
-                )
-            }
-        };
+                    (
+                        plan,
+                        task_lookup,
+                        index_report,
+                        "Job config unchanged; showing force-reschedule placements".to_string(),
+                        true,
+                        true,
+                    )
+                }
+                Some(_existing) => {
+                    let PlanConfigOutcome {
+                        allocations,
+                        task_lookup,
+                        index_report,
+                    } = scheduler
+                        .plan_for_config(&config, PlanMode::Fresh, Some(&config.name))
+                        .map_err(|e| {
+                            error!("Error planning updated job {}: {:?}", config.name, e);
+                            Status::invalid_argument(format!("Error planning job: {e}"))
+                        })?;
+                    (
+                        allocations,
+                        task_lookup,
+                        index_report,
+                        "Job config changed; showing updated placements".to_string(),
+                        true,
+                        false,
+                    )
+                }
+                None => {
+                    let PlanConfigOutcome {
+                        allocations,
+                        task_lookup,
+                        index_report,
+                    } = scheduler
+                        .plan_for_config(&config, PlanMode::Fresh, None)
+                        .map_err(|e| {
+                            error!("Error planning new job {}: {:?}", config.name, e);
+                            Status::invalid_argument(format!("Error planning job: {e}"))
+                        })?;
+                    (
+                        allocations,
+                        task_lookup,
+                        index_report,
+                        "Job config new; showing placements".to_string(),
+                        false,
+                        false,
+                    )
+                }
+            };
 
         let allocations = plan
             .into_iter()
@@ -2620,11 +2626,27 @@ impl Manager for ManagerDaemonService {
             message.push_str(&note);
         }
 
+        let index_usage = index_report
+            .into_iter()
+            .map(|usage| crate::structs::TaskIndexUsage {
+                task_name: usage.task_name,
+                index: usage.index.unwrap_or_default(),
+                mode: usage.mode.unwrap_or_default().to_string(),
+                candidates: usage.candidates as u32,
+                truncated: usage.truncated,
+                refills: usage.refills,
+                fell_back: usage.fell_back,
+                shadow_agreement: usage.shadow_agreement,
+                reason: usage.reason.unwrap_or_default(),
+            })
+            .collect();
+
         let reply = PlanJobReply {
             allocations,
             message,
             matches_existing,
             same_content,
+            index_usage,
         };
 
         Ok(Response::new(reply))

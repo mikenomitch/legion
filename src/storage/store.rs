@@ -4,6 +4,7 @@
 use crate::constraints::{ConstraintSet, DistinctTracker, PermitSet};
 use crate::prelude::*;
 use crate::resources::ResourcePolicy;
+use crate::scheduling_index::{IndexSet, IndexSettings};
 use crate::storage::errors::StorageError;
 use crate::storage::events::{drafts, EventDraft, SchedulerEventFilter, SchedulerEventRecord};
 use crate::storage::migrations::get_migrations;
@@ -111,6 +112,11 @@ pub struct SchedulingReadModel {
     pub nodes: HashMap<String, Node>,
     pub allocations_by_node: HashMap<String, Vec<Allocation>>,
     pub task_configs: HashMap<String, Vec<(i64, TaskConfig)>>,
+    /// Declared scheduling indexes over `nodes` (docs/scheduling-indexes.md).
+    /// Maintained by the same write path that mutates `nodes` and
+    /// `allocations_by_node`, so it cannot drift from them; derived state
+    /// only, rebuilt on every full read-model load.
+    pub indexes: IndexSet,
 }
 
 #[derive(Debug)]
@@ -170,6 +176,9 @@ pub struct Store {
     pub default_eval_priority: i64,
     pub rollout_retention_days: u64,
     pub scheduler_settings: Option<Value>,
+    /// Parsed `schedulerSettings.indexes` / `index_min_nodes` (fails loudly
+    /// at startup on malformed declarations).
+    pub index_settings: Arc<IndexSettings>,
     pub resource_policy: ResourcePolicy,
     persistence_driver: Arc<dyn PersistenceDriver>,
     read_model: Arc<RwLock<SchedulingReadModel>>,
@@ -380,6 +389,10 @@ impl Store {
         let _migrations = Store::create_initial_tables(&Arc::clone(&write_conn))?;
         let read_conns = Store::create_read_pool(&db_path)?;
         let resource_policy = ResourcePolicy::from_manager_config(config)?;
+        let index_settings = Arc::new(IndexSettings::from_scheduler_settings(
+            config.scheduler_settings.as_ref(),
+            &config.scheduling_policy,
+        )?);
 
         let store = Store {
             write_conn,
@@ -390,6 +403,7 @@ impl Store {
             default_eval_priority: config.default_priority,
             rollout_retention_days: config.rollout_retention_days,
             scheduler_settings: config.scheduler_settings.clone(),
+            index_settings,
             resource_policy,
             persistence_driver,
             read_model: Arc::new(RwLock::new(SchedulingReadModel::default())),
@@ -1339,14 +1353,47 @@ impl Store {
                 .push(alloc);
         }
 
+        let nodes: HashMap<String, Node> = nodes
+            .into_iter()
+            .map(|node| (node.id.clone(), node))
+            .collect();
+        let indexes = IndexSet::build(
+            Arc::clone(&self.index_settings),
+            &nodes,
+            &allocations_by_node,
+            &self.resource_policy,
+        );
+
         Ok(SchedulingReadModel {
-            nodes: nodes
-                .into_iter()
-                .map(|node| (node.id.clone(), node))
-                .collect(),
+            nodes,
             allocations_by_node,
             task_configs,
+            indexes,
         })
+    }
+
+    /// Re-projects `node_ids` into the read model's scheduling indexes.
+    /// Every read-model mutation that can change a node's projection —
+    /// node upserts, availability flips, attribute updates, allocation
+    /// changes — calls this inside the same write lock as the mutation, so
+    /// the indexes can never be observed out of step with `nodes`.
+    fn reindex_model_nodes(
+        model: &mut SchedulingReadModel,
+        policy: &ResourcePolicy,
+        node_ids: &[&str],
+    ) {
+        if model.indexes.settings().indexes.is_empty() || node_ids.is_empty() {
+            return;
+        }
+        let started = Instant::now();
+        for node_id in node_ids {
+            model
+                .indexes
+                .reindex_node(node_id, &model.nodes, &model.allocations_by_node, policy);
+        }
+        crate::manager::telemetry::metrics()
+            .scheduler_index_maintenance_seconds
+            .observe(started.elapsed().as_secs_f64());
     }
 
     pub(crate) fn refresh_read_model(&self) -> R<()> {
@@ -1376,7 +1423,9 @@ impl Store {
             return Ok(());
         }
         let mut guard = self.read_model_writer()?;
-        guard.nodes.insert(node.id.clone(), node);
+        let node_id = node.id.clone();
+        guard.nodes.insert(node_id.clone(), node);
+        Self::reindex_model_nodes(&mut guard, &self.resource_policy, &[node_id.as_str()]);
         Ok(())
     }
 
@@ -1390,6 +1439,7 @@ impl Store {
             .get_mut(node_id)
             .with_context(|| format!("Missing cached node {node_id}"))?;
         cached.dynamic_attrs = dynamic_attrs;
+        Self::reindex_model_nodes(&mut guard, &self.resource_policy, &[node_id]);
         Ok(())
     }
 
@@ -1404,6 +1454,8 @@ impl Store {
                 node.availability = "unavailable".to_string();
             }
         }
+        let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        Self::reindex_model_nodes(&mut guard, &self.resource_policy, &id_refs);
         Ok(())
     }
 
@@ -1414,6 +1466,7 @@ impl Store {
         let mut guard = self.read_model_writer()?;
         guard.nodes.remove(id);
         guard.allocations_by_node.remove(id);
+        guard.indexes.remove_node(id);
         Ok(())
     }
 
@@ -1429,6 +1482,12 @@ impl Store {
                 .or_default()
                 .push(allocation.clone());
         }
+        let affected: HashSet<&str> = allocations
+            .iter()
+            .map(|allocation| allocation.node_id.as_str())
+            .collect();
+        let affected: Vec<&str> = affected.into_iter().collect();
+        Self::reindex_model_nodes(&mut guard, &self.resource_policy, &affected);
         Ok(())
     }
 
@@ -1440,6 +1499,7 @@ impl Store {
         guard
             .allocations_by_node
             .insert(node_id.to_string(), Vec::new());
+        Self::reindex_model_nodes(&mut guard, &self.resource_policy, &[node_id]);
         Ok(())
     }
 
@@ -1453,6 +1513,12 @@ impl Store {
                 node_allocs.retain(|alloc| alloc.id != allocation.id);
             }
         }
+        let affected: HashSet<&str> = allocations
+            .iter()
+            .map(|allocation| allocation.node_id.as_str())
+            .collect();
+        let affected: Vec<&str> = affected.into_iter().collect();
+        Self::reindex_model_nodes(&mut guard, &self.resource_policy, &affected);
         Ok(())
     }
 
@@ -1491,6 +1557,21 @@ impl Store {
 
     pub fn cached_nodes(&self) -> R<Vec<Node>> {
         Ok(self.read_model_reader()?.nodes.values().cloned().collect())
+    }
+
+    /// Runs one scheduling-index candidate query under the read-model lock
+    /// (docs/scheduling-indexes.md). Cheap: index selection plus one shard
+    /// walk; the caller re-verifies every returned candidate.
+    pub fn scheduling_index_query(
+        &self,
+        bindings: &HashMap<String, Value>,
+        request: &HashMap<String, f64>,
+        budget: Option<usize>,
+    ) -> R<crate::scheduling_index::IndexQueryOutcome> {
+        Ok(self
+            .read_model_reader()?
+            .indexes
+            .query(bindings, request, budget))
     }
 
     pub fn allocation_epoch_for_job_config(&self, job_config_id: &str) -> R<i64> {
@@ -4912,7 +4993,8 @@ impl Store {
         for node_id in alloc_node_ids {
             let allocs = self.allocs_for_node(&node_id)?;
             let mut guard = self.read_model_writer()?;
-            guard.allocations_by_node.insert(node_id, allocs);
+            guard.allocations_by_node.insert(node_id.clone(), allocs);
+            Self::reindex_model_nodes(&mut guard, &self.resource_policy, &[node_id.as_str()]);
         }
         for job_config_id in task_job_config_ids {
             let tasks = self.get_task_configs_for_job_config(&job_config_id)?;

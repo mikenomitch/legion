@@ -2,10 +2,17 @@
 
 > **Judgement calls:** [`calls/scheduling-index-plan_calls.md`](../calls/scheduling-index-plan_calls.md)
 
-**Status: PLANNED.** Nothing implemented. Deliberately deferred to a later
-phase or out of v1 entirely: pluggable index kinds, `count.per` partition
-enumeration, device-set (`ResourceValue::Items`) dims, and a task-level
-`index_hint` job-spec field.
+**Status: SHIPPED** (phases 0–3 in one release; public doc
+[`docs/scheduling-indexes.md`](../../docs/scheduling-indexes.md)).
+Deliberately deferred, tracked in `TODO.md`: pluggable index kinds,
+`count.per` partition enumeration, device-set (`ResourceValue::Items`) dims,
+a task-level `index_hint` job-spec field, and index-served candidates for
+**multi-task group** co-placement (groups still scan — execution deviation,
+calls entry 10). Two more execution deviations worth knowing before reading
+on: the default `fit` index shipped `mode: "on"` directly rather than
+through a production shadow soak (calls entry 3), and the equivalence
+property is asserted at candidate-*set* level because placement tie-breaking
+is deliberately random (calls entry 4).
 
 ## Problem Statement
 

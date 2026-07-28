@@ -283,7 +283,10 @@ All client commands and the MCP server honour:
    `legion job list`, `legion node list`.
 3. **Author + check**: build a jobspec against `legion job schema`, then
    `legion job validate` it.
-4. **Preview**: `legion job plan` to see placements (dry-run).
+4. **Preview**: `legion job plan` to see placements (dry-run). The `--json`
+   envelope also carries `index_usage` — per task, which scheduling index
+   generated the candidates and why none did
+   ([scheduling-indexes.md](scheduling-indexes.md)).
 5. **Apply with a retry-safe key**: `legion job run … --idempotency-key … --wait`.
 6. **Verify**: inspect the `wait` result, `rollout events`, and `state query`.
 

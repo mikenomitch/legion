@@ -50,15 +50,23 @@ How to use it:
       eval-mediated eviction that respects stateful move protection
       ([#137](https://github.com/mikenomitch/legion/pull/137))
 - [ ] Fix the slowest bits of the scheduler using the benchmarks in
-      [docs/testing-and-benchmarks.md](../docs/testing-and-benchmarks.md)
-- [ ] **Declarable scheduling indexes** — ad-hoc `partition_by` × `dims`
-      indexes over node attrs and free resources, nearest-fit candidate
-      generation, automatic per-task index selection, default-on `fit`
-      index (cpu/memory/disk) above a node threshold —
-      [plan](plans/scheduling-index-plan.md) (PLANNED; Phase 0 also covers
-      the two benchmark items above)
-- [ ] Add to AGENTS.md that scheduler changes ship with a before/after perf
-      benchmark
+      [docs/testing-and-benchmarks.md](../docs/testing-and-benchmarks.md).
+      Candidate construction is now index-served
+      ([docs/scheduling-indexes.md](../docs/scheduling-indexes.md)); the
+      next known bit is the per-plan full clone of nodes +
+      `allocations_by_node` out of the read model.
+- [ ] Scheduling-index follow-ups deferred from
+      [plan](plans/scheduling-index-plan.md) (see its calls doc):
+      index-served candidates for multi-task **group** co-placement (v1
+      groups still scan — calls entry 10); pluggable index kinds;
+      `count.per` served by partition enumeration; device-set
+      (`ResourceValue::Items`) dims; task-level `index_hint`;
+      incremental orthant enumeration with early termination.
+- [ ] Worker-fingerprinted `disk` as a built-in schedulable resource — the
+      default `fit` index already dims on `resources.disk` and picks it up
+      automatically wherever it exists; today that is only operator-declared
+      `config_attrs.resources.disk` (plan open question, lean yes; also
+      leaned on by the artifact-cache plan's disk accounting).
 - [ ] Close the last plan-fencing window: `apply_plan_submission` commits (and
       so publishes the bumped epoch) *before* it refreshes the read-model
       allocation cache (`cache_add_allocations`). A plan that samples epochs in
@@ -397,6 +405,19 @@ docs: [scheduler-and-eval-loop.md](../docs/scheduler-and-eval-loop.md), [jobs-ta
       `cached_allocations_by_node`, in one batched query
       (`Store::allocation_version_vector_for_candidates`), and selects the
       affected subset at submit time.
+- [x] **Declarable scheduling indexes** — ad-hoc `partition_by` × `dims`
+      indexes over node attrs and free resources, nearest-fit candidate
+      generation, automatic per-task selection, shadow mode, `job plan`
+      explain output, Prometheus series, and the default-on `fit` index
+      (free cpu/memory/disk by pool) armed above `index_min_nodes` —
+      [plan](plans/scheduling-index-plan.md),
+      [docs/scheduling-indexes.md](../docs/scheduling-indexes.md).
+      Deferred pieces are open items above (group-path candidates, disk
+      fingerprinting, backlog).
+- [x] AGENTS.md now requires before/after benchmark numbers on scheduler
+      changes, and `benches/scheduler_bench.rs` grew a
+      `candidate_construction` group that isolates candidate-set cost
+      (indexes on vs off) across fleet sizes.
 
 ## Task runtimes
 

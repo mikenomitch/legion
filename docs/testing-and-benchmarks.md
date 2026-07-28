@@ -44,6 +44,11 @@ What they measure:
 - `scheduler_bench`: scheduler planning/apply throughput across a scale matrix.
   - Policies tested: `bin_pack`, `spread`.
   - Scale dimensions: node counts 10 -> 100,000; allocation counts 10 -> 100,000.
+  - `candidate_construction` group: isolates per-task candidate-set cost
+    (constraints over a 16-region heterogeneous fleet) with scheduling
+    indexes off vs on ([scheduling-indexes.md](scheduling-indexes.md)), at
+    1k/5k/10k nodes. Scheduler changes ship with before/after numbers from
+    this group (see AGENTS.md).
 - `eval_critical_path_bench`: end-to-end enqueue -> claim -> apply -> complete
   latency under 1/4/8 concurrent eval workers (write-lock contention).
 

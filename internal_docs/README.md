@@ -59,7 +59,7 @@ When one is required and what goes in it:
 | [kv-reactive-task-updates-plan.md](plans/kv-reactive-task-updates-plan.md) | shipped |
 | [persistence-plan.md](plans/persistence-plan.md) | phases 0–1, 3 done |
 | [multi-raft-persistence-plan.md](plans/multi-raft-persistence-plan.md) | planned |
-| [scheduling-index-plan.md](plans/scheduling-index-plan.md) | planned |
+| [scheduling-index-plan.md](plans/scheduling-index-plan.md) | shipped (phases 0–3; group-path + backlog deferred) |
 | [service-discovery-final-plan.md](plans/service-discovery-final-plan.md) | authoritative; v1 in progress |
 | [service-discovery-plan.md](plans/service-discovery-plan.md) | superseded (rationale + full mesh design) |
 | [service-discovery-mesh-and-config.md](plans/service-discovery-mesh-and-config.md) | superseded (cookbook + mesh extensions) |

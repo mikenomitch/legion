@@ -13,6 +13,7 @@ use rand::{rngs::StdRng, SeedableRng};
 use crate::constraints::{AffinitySet, ConstraintSet, DistinctTracker, PermitSet};
 use crate::prelude::*;
 use crate::resources::ResourcePolicy;
+use crate::scheduling_index::{IndexMode, IndexQueryOutcome};
 use crate::storage::errors::StorageError;
 use crate::storage::store::{PlanApplyOutcome, Store};
 use crate::structs::{
@@ -60,6 +61,51 @@ pub struct PlanOutcome {
     pub deltas: Vec<LedgerDelta>,
 }
 
+/// How candidate construction went for one planned task — the scheduling
+/// index's explain record, surfaced by `job plan` (docs/scheduling-indexes.md).
+#[derive(Debug, Clone)]
+pub struct TaskIndexUsage {
+    pub task_name: String,
+    /// The index that served candidates, `None` when the scan ran instead.
+    pub index: Option<String>,
+    /// `"on"` or `"shadow"` when an index participated.
+    pub mode: Option<&'static str>,
+    /// Candidate count handed to placement.
+    pub candidates: usize,
+    /// True when the candidate list was cut to the budget (fit-best-first).
+    pub truncated: bool,
+    /// Times placement exhausted truncated candidates and widened to a scan.
+    pub refills: u32,
+    /// True when the scan had to serve after the index came up short.
+    pub fell_back: bool,
+    /// Shadow mode only: did the index's candidate set match the scan's?
+    pub shadow_agreement: Option<bool>,
+    /// Why no index served, when one was expected to (`None` otherwise).
+    pub reason: Option<String>,
+}
+
+impl TaskIndexUsage {
+    fn scan(task_name: &str) -> Self {
+        TaskIndexUsage {
+            task_name: task_name.to_string(),
+            index: None,
+            mode: None,
+            candidates: 0,
+            truncated: false,
+            refills: 0,
+            fell_back: false,
+            shadow_agreement: None,
+            reason: None,
+        }
+    }
+}
+
+/// `build_plan`'s result: the placements plus the per-task index report.
+struct BuiltPlan {
+    placements: Vec<PlannedAllocation>,
+    index_report: Vec<TaskIndexUsage>,
+}
+
 #[derive(Debug, Clone, Copy)]
 enum NodesConsidered {
     Count(u64),
@@ -95,6 +141,7 @@ struct TaskPlan<'a> {
     task_request: ResourceRequest,
     base_eligible: Vec<&'a Node>,
     distinct_tracker: Option<DistinctTracker>,
+    index_usage: TaskIndexUsage,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -420,6 +467,8 @@ pub struct Scheduler<'a> {
 pub struct PlanConfigOutcome {
     pub allocations: Vec<PlannedAllocation>,
     pub task_lookup: HashMap<i64, String>,
+    /// Per-task scheduling-index usage (docs/scheduling-indexes.md).
+    pub index_report: Vec<TaskIndexUsage>,
 }
 
 impl<'a> Scheduler<'a> {
@@ -435,6 +484,17 @@ impl<'a> Scheduler<'a> {
 
     #[instrument(skip_all)]
     pub fn plan_only(&self, job_config_id: &str, mode: PlanMode) -> R<Vec<PlannedAllocation>> {
+        Ok(self.plan_only_with_report(job_config_id, mode)?.0)
+    }
+
+    /// `plan_only`, additionally returning the per-task scheduling-index
+    /// usage report for the `job plan` explain surface.
+    #[instrument(skip_all)]
+    pub fn plan_only_with_report(
+        &self,
+        job_config_id: &str,
+        mode: PlanMode,
+    ) -> R<(Vec<PlannedAllocation>, Vec<TaskIndexUsage>)> {
         let started = std::time::Instant::now();
         let mode_label = mode.as_str();
         info!(%job_config_id, mode = mode_label, "Starting scheduler plan_only");
@@ -467,7 +527,10 @@ impl<'a> Scheduler<'a> {
             &allocations_by_node,
         );
 
-        let plan = self.build_plan(
+        let BuiltPlan {
+            placements,
+            index_report,
+        } = self.build_plan(
             job_config_id,
             nodes,
             tasks,
@@ -480,11 +543,11 @@ impl<'a> Scheduler<'a> {
         info!(
             %job_config_id,
             mode = mode_label,
-            planned_allocations = plan.len(),
+            planned_allocations = placements.len(),
             elapsed_ms = started.elapsed().as_millis() as u64,
             "Completed scheduler plan_only"
         );
-        Ok(plan)
+        Ok((placements, index_report))
     }
 
     #[instrument(skip_all)]
@@ -531,7 +594,10 @@ impl<'a> Scheduler<'a> {
             &allocations_by_node,
         );
 
-        let allocations = self.build_plan(
+        let BuiltPlan {
+            placements,
+            index_report,
+        } = self.build_plan(
             &job_config.id(),
             nodes,
             tasks,
@@ -545,14 +611,15 @@ impl<'a> Scheduler<'a> {
             job_id = %job_config.name,
             job_config_id = %job_config.id(),
             mode = mode_label,
-            planned_allocations = allocations.len(),
+            planned_allocations = placements.len(),
             elapsed_ms = started.elapsed().as_millis() as u64,
             "Completed scheduler plan_for_config"
         );
 
         Ok(PlanConfigOutcome {
-            allocations,
+            allocations: placements,
             task_lookup,
+            index_report,
         })
     }
 
@@ -681,7 +748,10 @@ impl<'a> Scheduler<'a> {
         );
 
         let build_started = std::time::Instant::now();
-        let placements = self.build_plan(
+        let BuiltPlan {
+            placements,
+            index_report,
+        } = self.build_plan(
             job_config_id,
             nodes,
             tasks,
@@ -691,10 +761,16 @@ impl<'a> Scheduler<'a> {
             mode.clone(),
             task_targets,
         )?;
+        let indexed_tasks = index_report
+            .iter()
+            .filter(|usage| usage.index.is_some())
+            .count();
         debug!(
             %job_config_id,
             mode = mode.as_str(),
             placement_count = placements.len(),
+            indexed_tasks,
+            planned_tasks = index_report.len(),
             build_plan_ms = build_started.elapsed().as_millis() as u64,
             "Scheduler build_plan completed"
         );
@@ -903,10 +979,14 @@ impl<'a> Scheduler<'a> {
         allocations_by_node: &HashMap<String, Vec<Allocation>>,
         mode: PlanMode,
         task_targets: Option<&HashMap<i64, u32>>,
-    ) -> R<Vec<PlannedAllocation>> {
+    ) -> R<BuiltPlan> {
         tasks.sort_by_key(|a| a.0);
 
         let mut placements = Vec::new();
+        let mut index_report: Vec<TaskIndexUsage> = Vec::new();
+        // Indexes arm only above the configured node threshold; below it the
+        // scan is cheaper than any bookkeeping (docs/scheduling-indexes.md).
+        let index_armed = self.store.index_settings.armed_for(nodes.len());
         let mut planned: HashMap<String, usize> = HashMap::new();
         let weights = self.scheduler_weights()?;
         let nodes_considered_setting = self.nodes_considered_setting()?;
@@ -1066,13 +1146,17 @@ impl<'a> Scheduler<'a> {
                 continue;
             }
 
-            let mut plan = Self::build_task_plan(
+            let in_multi_task_group = group_sizes.get(&task_config.group).copied().unwrap_or(0) > 1;
+            let mut plan = self.build_task_plan(
                 task_id,
                 &task_config,
                 &nodes,
                 resource_policy,
                 allocations_by_node,
                 &node_lookup,
+                needed,
+                index_armed,
+                in_multi_task_group,
             )?;
 
             let base_eligible = plan.base_eligible.clone();
@@ -1206,18 +1290,205 @@ impl<'a> Scheduler<'a> {
                     &mut group_assignments,
                 )?;
             }
+            index_report.push(plan.index_usage.clone());
         }
 
-        Ok(placements)
+        Ok(BuiltPlan {
+            placements,
+            index_report,
+        })
+    }
+
+    /// Budget for a truncated (index-served) candidate list: a generous
+    /// multiple of what the task still needs, floored so small counts still
+    /// see real choice before scoring.
+    fn candidate_budget(needed: u32) -> usize {
+        (needed as usize).saturating_mul(8).max(64)
+    }
+
+    /// Today's authoritative candidate filter: constraints, permit, and
+    /// volume-driver support over every available node. The permanent
+    /// fallback the scheduling index is measured against.
+    fn scan_base_eligible<'b>(
+        nodes: impl IntoIterator<Item = &'b Node>,
+        constraint_set: &ConstraintSet,
+        permit_set: &PermitSet,
+        required_drivers: &std::collections::BTreeSet<String>,
+    ) -> Vec<&'b Node> {
+        nodes
+            .into_iter()
+            .filter(|node| {
+                constraint_set.is_satisfied(node, None)
+                    && permit_set.is_permitted(node)
+                    && node_provides_volume_drivers(node, required_drivers)
+            })
+            .collect()
+    }
+
+    /// Candidate construction through the scheduling index
+    /// (docs/scheduling-indexes.md). Every index candidate is re-verified
+    /// with exactly the scan's predicate, so a stale or wrong index costs
+    /// coverage, never correctness — and empty coverage falls straight back
+    /// to the scan. Untruncated results are re-sorted by node id so
+    /// index-served planning is byte-identical to scan planning; truncation
+    /// keeps the index's nearest-fit-first order.
+    fn indexed_base_eligible<'b>(
+        &self,
+        nodes: &'b [Node],
+        node_lookup: &HashMap<&'b str, &'b Node>,
+        constraint_set: &ConstraintSet,
+        permit_set: &PermitSet,
+        task_request: &ResourceRequest,
+        required_drivers: &std::collections::BTreeSet<String>,
+        needed: u32,
+        allow_truncation: bool,
+        usage: &mut TaskIndexUsage,
+    ) -> R<Vec<&'b Node>> {
+        let metrics = crate::manager::telemetry::metrics();
+
+        // Partition bindings: the task's `=` constraints plus the pool its
+        // permit pins. A `pool` partition key always means the node's pool
+        // column, so only the permit may bind it.
+        let mut bindings = constraint_set.equality_bindings();
+        bindings.remove("pool");
+        if let Some(pool) = permit_set.pool_binding() {
+            bindings.insert("pool".to_string(), pool.clone());
+        }
+        let request_amounts: HashMap<String, f64> = task_request
+            .values
+            .iter()
+            .filter_map(|(name, value)| match value {
+                ResourceValue::Amount(amount) => Some((name.clone(), *amount)),
+                ResourceValue::Items(_) => None,
+            })
+            .collect();
+
+        let candidates =
+            match self
+                .store
+                .scheduling_index_query(&bindings, &request_amounts, None)?
+            {
+                IndexQueryOutcome::Disabled => {
+                    return Ok(Self::scan_base_eligible(
+                        nodes,
+                        constraint_set,
+                        permit_set,
+                        required_drivers,
+                    ));
+                }
+                IndexQueryOutcome::Unusable { reason } => {
+                    metrics
+                        .scheduler_index_queries_total
+                        .inc(&["none", "unusable"]);
+                    usage.reason = Some(reason);
+                    return Ok(Self::scan_base_eligible(
+                        nodes,
+                        constraint_set,
+                        permit_set,
+                        required_drivers,
+                    ));
+                }
+                IndexQueryOutcome::Candidates(candidates) => candidates,
+            };
+
+        let mut verified: Vec<&'b Node> = candidates
+            .node_ids
+            .iter()
+            .filter_map(|id| node_lookup.get(id.as_str()).copied())
+            .filter(|node| {
+                constraint_set.is_satisfied(node, None)
+                    && permit_set.is_permitted(node)
+                    && node_provides_volume_drivers(node, required_drivers)
+            })
+            .collect();
+
+        if candidates.mode == IndexMode::Shadow {
+            // The scan stays authoritative; the index runs alongside and any
+            // node it missed is a disagreement worth shouting about.
+            let scan =
+                Self::scan_base_eligible(nodes, constraint_set, permit_set, required_drivers);
+            let scan_ids: HashSet<&str> = scan.iter().map(|node| node.id.as_str()).collect();
+            let index_ids: HashSet<&str> = verified.iter().map(|node| node.id.as_str()).collect();
+            let agreement = scan_ids == index_ids;
+            usage.index = Some(candidates.index.clone());
+            usage.mode = Some(IndexMode::Shadow.as_str());
+            usage.shadow_agreement = Some(agreement);
+            metrics
+                .scheduler_index_queries_total
+                .inc(&[candidates.index.as_str(), "shadow"]);
+            metrics.scheduler_index_shadow_total.inc(&[
+                candidates.index.as_str(),
+                if agreement { "agree" } else { "disagree" },
+            ]);
+            if !agreement {
+                let missing: Vec<&&str> = scan_ids.difference(&index_ids).take(3).collect();
+                warn!(
+                    index = %candidates.index,
+                    scan_count = scan_ids.len(),
+                    index_count = index_ids.len(),
+                    missing_sample = ?missing,
+                    "Scheduling index shadow disagreement: index candidates diverge from the scan"
+                );
+            }
+            return Ok(scan);
+        }
+
+        if verified.is_empty() {
+            // Either nothing matches (the scan agrees and this plan fails
+            // with the usual diagnostic) or the index under-covered; one
+            // scan on the empty path tells them apart and keeps the scan's
+            // answer authoritative either way.
+            let scan =
+                Self::scan_base_eligible(nodes, constraint_set, permit_set, required_drivers);
+            usage.index = Some(candidates.index.clone());
+            usage.mode = Some(IndexMode::On.as_str());
+            if scan.is_empty() {
+                metrics
+                    .scheduler_index_queries_total
+                    .inc(&[candidates.index.as_str(), "used"]);
+            } else {
+                usage.fell_back = true;
+                metrics
+                    .scheduler_index_queries_total
+                    .inc(&[candidates.index.as_str(), "fell_back"]);
+                warn!(
+                    index = %candidates.index,
+                    scan_count = scan.len(),
+                    "Scheduling index found no eligible candidates but the scan did; using the scan"
+                );
+            }
+            return Ok(scan);
+        }
+
+        usage.index = Some(candidates.index.clone());
+        usage.mode = Some(IndexMode::On.as_str());
+        metrics
+            .scheduler_index_queries_total
+            .inc(&[candidates.index.as_str(), "used"]);
+        let budget = Self::candidate_budget(needed);
+        if allow_truncation && verified.len() > budget {
+            verified.truncate(budget);
+            usage.truncated = true;
+        } else {
+            verified.sort_by(|a, b| a.id.cmp(&b.id));
+        }
+        metrics
+            .scheduler_index_candidates
+            .observe(&[candidates.index.as_str()], verified.len() as f64);
+        Ok(verified)
     }
 
     fn build_task_plan<'b>(
+        &self,
         task_id: i64,
         task_config: &'b TaskConfig,
         nodes: &'b [Node],
         resource_policy: &ResourcePolicy,
         allocations_by_node: &HashMap<String, Vec<Allocation>>,
         node_lookup: &HashMap<&'b str, &'b Node>,
+        needed: u32,
+        index_armed: bool,
+        in_multi_task_group: bool,
     ) -> R<TaskPlan<'b>> {
         let task_resources =
             resource_policy.normalize_task_resources(&task_config.resources, true)?;
@@ -1241,14 +1512,34 @@ impl<'a> Scheduler<'a> {
         // task, so filter it out here rather than letting the task start and
         // fail at mount time.
         let required_drivers = task_config.required_volume_drivers();
-        let base_eligible = nodes
-            .iter()
-            .filter(|node| {
-                constraint_set.is_satisfied(node, None)
-                    && permit_set.is_permitted(node)
-                    && node_provides_volume_drivers(node, &required_drivers)
-            })
-            .collect::<Vec<_>>();
+
+        let mut index_usage = TaskIndexUsage::scan(&task_config.name);
+        // Truncating candidates is only safe when nothing downstream needs
+        // the full set: `count.per` targets every attribute group, `distinct`
+        // constraints need diversity, volume-pinned tasks need their exact
+        // node, and multi-task groups place from their own candidate sets.
+        let allow_truncation = index_armed
+            && task_config.count.per.is_none()
+            && constraint_set.distinct_keys().is_empty()
+            && task_config.volumes.is_empty()
+            && !in_multi_task_group;
+
+        let base_eligible = if index_armed {
+            self.indexed_base_eligible(
+                nodes,
+                node_lookup,
+                &constraint_set,
+                &permit_set,
+                &task_request,
+                &required_drivers,
+                needed,
+                allow_truncation,
+                &mut index_usage,
+            )?
+        } else {
+            Self::scan_base_eligible(nodes, &constraint_set, &permit_set, &required_drivers)
+        };
+        index_usage.candidates = base_eligible.len();
         if base_eligible.is_empty() && !required_drivers.is_empty() {
             let missing = required_drivers
                 .iter()
@@ -1277,6 +1568,7 @@ impl<'a> Scheduler<'a> {
             task_request,
             base_eligible,
             distinct_tracker,
+            index_usage,
         })
     }
 
@@ -1303,8 +1595,10 @@ impl<'a> Scheduler<'a> {
         group_key: Option<&GroupKey>,
         group_assignments: &mut HashMap<GroupKey, String>,
     ) -> R<()> {
+        // Owned so the truncated-index refill below can widen it mid-task.
+        let mut candidates: Vec<&'b Node> = candidates.to_vec();
         let mut scoring_cache = PlanScoringCache::from_plan(
-            candidates,
+            &candidates,
             task_id,
             task_config,
             &plan.affinity_set,
@@ -1343,13 +1637,65 @@ impl<'a> Scheduler<'a> {
         let mut planned_local_bytes: HashMap<String, u64> = HashMap::new();
 
         for _ in 0..count {
-            let eligible = Self::eligible_nodes(
-                candidates,
+            let mut eligible = Self::eligible_nodes(
+                &candidates,
                 &plan.constraint_set,
                 &plan.permit_set,
                 plan.distinct_tracker.as_ref(),
                 &scoring_cache,
             );
+
+            // A truncated (index-served) candidate list can run dry while the
+            // fleet still has room. Widen once to the authoritative scan and
+            // continue — only the single-task path truncates, so group
+            // pinning is never disturbed.
+            if eligible.is_empty() && plan.index_usage.truncated && group_key.is_none() {
+                let required_drivers = task_config.required_volume_drivers();
+                let mut widened = Self::scan_base_eligible(
+                    node_lookup.values().copied(),
+                    &plan.constraint_set,
+                    &plan.permit_set,
+                    &required_drivers,
+                );
+                widened.sort_by(|a, b| a.id.cmp(&b.id));
+                debug!(
+                    task = %task_config.name,
+                    truncated_count = candidates.len(),
+                    widened_count = widened.len(),
+                    "Scheduling index candidates exhausted; refilling from full scan"
+                );
+                plan.index_usage.truncated = false;
+                plan.index_usage.refills += 1;
+                plan.index_usage.fell_back = true;
+                crate::manager::telemetry::metrics()
+                    .scheduler_index_queries_total
+                    .inc(&[
+                        plan.index_usage.index.as_deref().unwrap_or("none"),
+                        "refilled",
+                    ]);
+                candidates = widened;
+                scoring_cache = PlanScoringCache::from_plan(
+                    &candidates,
+                    task_id,
+                    task_config,
+                    &plan.affinity_set,
+                    job_config_id,
+                    allocations_by_node,
+                    task_name_to_id,
+                    task_id_to_group,
+                    planned_task_allocations,
+                    planned,
+                    resource_ledger,
+                    &plan.task_request,
+                );
+                eligible = Self::eligible_nodes(
+                    &candidates,
+                    &plan.constraint_set,
+                    &plan.permit_set,
+                    plan.distinct_tracker.as_ref(),
+                    &scoring_cache,
+                );
+            }
 
             if eligible.is_empty() {
                 bail!(
@@ -2464,6 +2810,45 @@ impl ResourceLedger {
     }
 }
 
+/// Free amounts (capacity minus allocation usage) per resource name for one
+/// node — the scheduling index's view of `resources.*` dims. Amount-typed
+/// resources only; device sets (`Items`) stay the ledger's business. Lenient
+/// where the ledger is strict: a node or allocation whose resources fail to
+/// parse contributes nothing rather than erroring, because the index only
+/// proposes candidates and the ledger re-verifies fit either way.
+pub(crate) fn node_free_resource_amounts(
+    node: &Node,
+    allocations: &[Allocation],
+    policy: &ResourcePolicy,
+) -> HashMap<String, f64> {
+    let Ok(pool) = ResourcePool::from_node(node) else {
+        debug!(node_id = %node.id, "Node resources failed to parse; index projects zero free");
+        return HashMap::new();
+    };
+    let mut free: HashMap<String, f64> = pool
+        .values
+        .iter()
+        .filter_map(|(name, value)| match value {
+            ResourceValue::Amount(amount) => Some((name.clone(), *amount)),
+            ResourceValue::Items(_) => None,
+        })
+        .collect();
+    for allocation in allocations {
+        let Ok(normalized) = policy.normalize_task_resources(&allocation.resources, false) else {
+            continue;
+        };
+        let Ok(request) = ResourceRequest::from_value(&normalized) else {
+            continue;
+        };
+        for (name, demand) in &request.values {
+            if let ResourceValue::Amount(amount) = demand {
+                *free.entry(name.clone()).or_insert(0.0) -= amount;
+            }
+        }
+    }
+    free
+}
+
 impl ResourcePool {
     fn from_node(node: &Node) -> R<Self> {
         let mut values = HashMap::new();
@@ -2823,6 +3208,81 @@ mod tests {
     fn insert_test_nodes(store: &Store) -> R<()> {
         store.insert_node(make_node_msg("node-a", json!({ "tier": "edge" })))?;
         store.insert_node(make_node_msg("node-b", json!({ "role": "db" })))?;
+
+        Ok(())
+    }
+
+    /// The scheduling-index equivalence property on the `on` path, asserted
+    /// directly: untruncated index-served candidates are the scan's set in
+    /// the scan's (by-id) order, across constraint shapes. Shadow mode
+    /// asserts the same live comparison in the integration suite; this pins
+    /// the mode that actually serves.
+    #[test]
+    fn indexed_candidates_equal_scan_candidates_untruncated() -> R<()> {
+        let store = setup_store_with_scheduler(
+            "bin_pack",
+            Some(json!({
+                "index_min_nodes": 1,
+                "indexes": {
+                    "fit": false,
+                    "topo": ["pool", "region"],
+                },
+            })),
+        )?;
+        for idx in 0..40 {
+            store.insert_node(make_node_msg(
+                &format!("node-{idx:02}"),
+                json!({
+                    "region": format!("region-{}", idx % 4),
+                    "tier": if idx % 2 == 0 { "web" } else { "batch" },
+                }),
+            ))?;
+        }
+        let scheduler = Scheduler::new(&store)?;
+        let mut nodes: Vec<Node> = store.cached_nodes()?;
+        nodes.sort_by(|a, b| a.id.cmp(&b.id));
+        let node_lookup: HashMap<&str, &Node> =
+            nodes.iter().map(|node| (node.id.as_str(), node)).collect();
+        let no_drivers = std::collections::BTreeSet::new();
+        let request = ResourceRequest::from_value(&json!({ "memory": 64 }))?;
+
+        for constraints in [
+            json!({ "region": "region-1" }),
+            json!({ "region": "region-2", "tier": "web" }),
+            json!([
+                { "key": "region", "value": "region-3" },
+                { "key": "tier", "operator": "matches", "value": "^b" },
+            ]),
+        ] {
+            let constraint_set = ConstraintSet::new(&constraints)?;
+            let permit_set = PermitSet::new(&Value::Null)?;
+            let scan = Scheduler::scan_base_eligible(
+                nodes.iter(),
+                &constraint_set,
+                &permit_set,
+                &no_drivers,
+            );
+            let mut usage = TaskIndexUsage::scan("prop");
+            let indexed = scheduler.indexed_base_eligible(
+                &nodes,
+                &node_lookup,
+                &constraint_set,
+                &permit_set,
+                &request,
+                &no_drivers,
+                2,
+                false,
+                &mut usage,
+            )?;
+            assert_eq!(usage.index.as_deref(), Some("topo"), "{constraints}");
+            let scan_ids: Vec<&str> = scan.iter().map(|node| node.id.as_str()).collect();
+            let indexed_ids: Vec<&str> = indexed.iter().map(|node| node.id.as_str()).collect();
+            assert!(!scan_ids.is_empty(), "test data must match {constraints}");
+            assert_eq!(
+                indexed_ids, scan_ids,
+                "index-served candidates must equal the scan for {constraints}"
+            );
+        }
 
         Ok(())
     }
