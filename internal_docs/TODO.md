@@ -51,6 +51,12 @@ How to use it:
       ([#137](https://github.com/mikenomitch/legion/pull/137))
 - [ ] Fix the slowest bits of the scheduler using the benchmarks in
       [docs/testing-and-benchmarks.md](../docs/testing-and-benchmarks.md)
+- [ ] **Declarable scheduling indexes** — ad-hoc `partition_by` × `dims`
+      indexes over node attrs and free resources, nearest-fit candidate
+      generation, automatic per-task index selection, default-on `fit`
+      index (cpu/memory/disk) above a node threshold —
+      [plan](plans/scheduling-index-plan.md) (PLANNED; Phase 0 also covers
+      the two benchmark items above)
 - [ ] Add to AGENTS.md that scheduler changes ship with a before/after perf
       benchmark
 - [ ] Close the last plan-fencing window: `apply_plan_submission` commits (and
