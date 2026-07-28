@@ -186,6 +186,15 @@ fn wait_until(timeout: Duration, mut check: impl FnMut() -> bool) -> bool {
     false
 }
 
+/// The fixture script creates `marker` and then writes into it as separate
+/// steps, so waiting on existence alone can observe a still-empty file. Wait
+/// on the contents instead.
+fn marker_written(marker: &Path) -> bool {
+    std::fs::read_to_string(marker)
+        .map(|s| s.trim() == "staged-ok")
+        .unwrap_or(false)
+}
+
 /// S1 end to end: an exec task fetches a release tarball over HTTP, the
 /// archive unpacks into the task directory, `${artifact.tool}` resolves to
 /// the staged path, the process runs from the task dir, and destroy cleans
@@ -208,11 +217,10 @@ fn exec_task_stages_http_artifact_and_runs_from_task_dir() -> R<()> {
     // exec cwd defaults there.
     let marker = task_dir.join("marker");
     assert!(
-        wait_until(Duration::from_secs(15), || marker.is_file()),
+        wait_until(Duration::from_secs(15), || marker_written(&marker)),
         "marker not written; staging or start failed: {:?}",
         manager.lock().unwrap().allocation_health_snapshot()
     );
-    assert_eq!(std::fs::read_to_string(&marker)?.trim(), "staged-ok");
     assert!(task_dir.join("tool/run.sh").is_file(), "archive unpacked");
     assert!(!task_dir.join(".staging").exists(), "staging temp cleaned");
 
@@ -712,7 +720,7 @@ fn worker_restart_reuses_staged_artifacts() -> R<()> {
         let manager = worker_manager(&temp_dir);
         launch_task_allocation(&manager, &allocation)?;
         assert!(
-            wait_until(Duration::from_secs(15), || marker.is_file()),
+            wait_until(Duration::from_secs(15), || marker_written(&marker)),
             "first launch failed: {:?}",
             manager.lock().unwrap().allocation_health_snapshot()
         );
@@ -732,7 +740,7 @@ fn worker_restart_reuses_staged_artifacts() -> R<()> {
     let restarted = worker_manager(&temp_dir);
     launch_task_allocation(&restarted, &allocation)?;
     assert!(
-        wait_until(Duration::from_secs(15), || marker.is_file()),
+        wait_until(Duration::from_secs(15), || marker_written(&marker)),
         "relaunch after restart failed (artifacts should be reused): {:?}",
         restarted.lock().unwrap().allocation_health_snapshot()
     );
@@ -768,7 +776,7 @@ fn redispatch_with_unchanged_artifacts_reuses_staging() -> R<()> {
 
     launch_task_allocation(&manager, &allocation)?;
     assert!(
-        wait_until(Duration::from_secs(15), || marker.is_file()),
+        wait_until(Duration::from_secs(15), || marker_written(&marker)),
         "first launch failed"
     );
     server.join().ok();
@@ -786,7 +794,7 @@ fn redispatch_with_unchanged_artifacts_reuses_staging() -> R<()> {
     );
     launch_task_allocation(&manager, &updated)?;
     assert!(
-        wait_until(Duration::from_secs(15), || marker.is_file()),
+        wait_until(Duration::from_secs(15), || marker_written(&marker)),
         "re-dispatch failed (artifacts should be reused): {:?}",
         manager.lock().unwrap().allocation_health_snapshot()
     );
