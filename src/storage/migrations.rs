@@ -458,8 +458,12 @@ pub fn get_migrations() -> Migrations<'static> {
         // path), where every extra b-tree update lengthens the serialized
         // critical section. The table is pruned to ~10k rows, so filtered
         // list queries scan it in ~1ms, and cursor queries use the rowid PK.
-        // Plain INTEGER PRIMARY KEY stays monotonic because pruning only ever
-        // removes the oldest rows, never the newest.
+        // Ids are assigned explicitly by `Store::next_scheduler_event_id`
+        // (unix-ms high bits + per-process sequence + the minting raft
+        // lane's stride residue in the low bits) so they are globally
+        // unique across raft lanes/nodes (the JC-28 commutative-class
+        // requirement, made structural by JC-42) while still sorting
+        // ~chronologically for the id-cursor list/stream/prune paths.
         M::up(
             "CREATE TABLE IF NOT EXISTS scheduler_event (
             id INTEGER PRIMARY KEY,
@@ -609,7 +613,274 @@ pub fn get_migrations() -> Migrations<'static> {
         // with no operator action.
         M::up("ALTER TABLE task_config RENAME COLUMN kind TO runtime;")
             .down("ALTER TABLE task_config RENAME COLUMN runtime TO kind;"),
-    ])
+        // Raft applied-state marker (durability plan §A5, phase A-1): one row
+        // per lane recording the last applied log id and the last applied
+        // membership (both serde_json blobs of the openraft types). Written
+        // by the raft state machine INSIDE the same transaction as the
+        // changeset it describes, so applied index and data commit atomically
+        // and can never diverge — this is what makes crash recovery resume
+        // from exactly the right log position. Absent row == blank slate
+        // (applied_state None/default). Never touched by capture-mode
+        // mutations, so it never rides a changeset itself.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS raft_applied (
+            lane TEXT PRIMARY KEY,
+            last_applied BLOB,
+            membership BLOB
+        )",
+        )
+        .down("DROP TABLE IF EXISTS raft_applied;"),
+        // Node-local raft cluster identity stamp: written once at first raft
+        // engine start (key `cluster_id`), checked on every later start so a
+        // manager whose raft data_dir (cluster secret included) was wiped
+        // cannot silently bootstrap a NEW cluster over an EXISTING cluster's
+        // state DB and split-brain against its surviving members. Every
+        // member independently writes the same derived id, so replicas stay
+        // content-identical; never touched by capture-mode mutations.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS raft_cluster (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )",
+        )
+        .down("DROP TABLE IF EXISTS raft_cluster;"),
+        // Rebuild `eval` WITHOUT its foreign keys to `job` / `job_config` /
+        // `node` (plan §7-C2). Originally this was because JC-27 made the
+        // queue node-local; JC-41 put it back in raft on the SCHEDULER lane
+        // and the FKs still stay gone, for the JC-32 reason: those three
+        // parents are CONTROL-lane tables, so a `DELETE FROM job` would
+        // cascade scheduler-lane eval rows into a control changeset — a
+        // single-writer ownership violation the capture-time guard rejects,
+        // which would make `job destroy` fail outright.
+        //
+        // Evals therefore reference job/job_config/node ADVISORILY. Stale
+        // references are absorbed without a retry loop: `prune_stale_evals`
+        // drops rows whose config is superseded or gone at leadership
+        // acquisition, `claim_eval` sweeps superseded same-scope siblings,
+        // and anything left simply fails in its handler — and a failed eval
+        // is terminal (status `failed`, never re-claimed), so a dangling
+        // reference cannot spin. (insert_eval historically toggled
+        // foreign_keys OFF around its insert precisely because these FKs
+        // were already too strict — e.g. node evals for not-yet-registered
+        // nodes.)
+        M::up(
+            "CREATE TABLE eval_local (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            status STRING NOT NULL,
+            type STRING NOT NULL,
+            job_id STRING,
+            job_config_id STRING,
+            node_id STRING,
+            priority INTEGER NOT NULL,
+            ready_at TIMESTAMP NOT NULL DEFAULT '1970-01-01T00:00:00Z'
+        );
+        INSERT INTO eval_local (id, status, type, job_id, job_config_id, node_id, priority, ready_at)
+            SELECT id, status, type, job_id, job_config_id, node_id, priority, ready_at FROM eval;
+        DROP TABLE eval;
+        ALTER TABLE eval_local RENAME TO eval;
+        CREATE INDEX IF NOT EXISTS idx_eval_status_priority_id ON eval(status, priority DESC, id ASC);
+        CREATE INDEX IF NOT EXISTS idx_eval_status_ready_priority_id ON eval(status, ready_at, priority DESC, id ASC);
+        CREATE INDEX IF NOT EXISTS idx_eval_status_job_id ON eval(status, job_id);
+        CREATE INDEX IF NOT EXISTS idx_eval_status_node_id ON eval(status, node_id);",
+        )
+        .down(""),
+        // The node/node_health split (plan §7-C2, phase C-1): liveness —
+        // worker-reported `status`, `last_heartbeat`, `lost_at`,
+        // `health_checks` — moves to `node_health`, single-written by the
+        // STATUS raft lane, while `node` keeps identity/pool/attrs plus
+        // `availability` (the operator/control axis), single-written by the
+        // CONTROL lane. This is what makes per-lane snapshots sound: every
+        // table now has exactly one writing lane.
+        //
+        // Deliberately NO foreign key from node_health to node: a control-
+        // lane `DELETE FROM node` must never cascade status-lane rows into
+        // its changeset. A node_health row orphaned by node removal is
+        // harmless (all hydration LEFT JOINs from `node`) and is swept by
+        // the status lane (`prune_node_health_orphans`).
+        //
+        // Existing liveness values are copied over, then the moved columns
+        // are dropped (bundled SQLite is 3.46; ALTER ... DROP COLUMN works
+        // and none of the dropped columns is indexed or referenced).
+        M::up(
+            "CREATE TABLE IF NOT EXISTS node_health (
+            node_id STRING PRIMARY KEY,
+            status STRING NOT NULL,
+            last_heartbeat TIMESTAMP NOT NULL,
+            lost_at TIMESTAMP,
+            health_checks JSONB NOT NULL
+        );
+        INSERT INTO node_health (node_id, status, last_heartbeat, lost_at, health_checks)
+            SELECT id, status, last_heartbeat, lost_at, health_checks FROM node;
+        ALTER TABLE node DROP COLUMN status;
+        ALTER TABLE node DROP COLUMN last_heartbeat;
+        ALTER TABLE node DROP COLUMN lost_at;
+        ALTER TABLE node DROP COLUMN health_checks;",
+        )
+        .down(
+            "ALTER TABLE node ADD COLUMN status STRING NOT NULL DEFAULT 'active';
+        ALTER TABLE node ADD COLUMN last_heartbeat TIMESTAMP NOT NULL DEFAULT '';
+        ALTER TABLE node ADD COLUMN lost_at TIMESTAMP;
+        ALTER TABLE node ADD COLUMN health_checks JSONB NOT NULL DEFAULT '{}';
+        UPDATE node SET
+            status = COALESCE((SELECT h.status FROM node_health h WHERE h.node_id = node.id), 'active'),
+            last_heartbeat = COALESCE((SELECT h.last_heartbeat FROM node_health h WHERE h.node_id = node.id), ''),
+            lost_at = (SELECT h.lost_at FROM node_health h WHERE h.node_id = node.id),
+            health_checks = COALESCE((SELECT h.health_checks FROM node_health h WHERE h.node_id = node.id), '{}');
+        DROP TABLE IF EXISTS node_health;",
+        ),
+        // Cross-lane FK removal (plan §7-C2, phase C-2): with single-writer
+        // lane ownership, a replicated op's changeset must touch only its
+        // own lane's tables — but `ON DELETE CASCADE` from a control-lane
+        // parent (job/job_config/task_config/node) into scheduler/status
+        // children (allocation/instance/rollout/task_status/
+        // allocation_health/rollout_event) captured foreign-lane rows into
+        // control changesets (and allocation deletes cascaded status-lane
+        // allocation_health rows into scheduler changesets). Same fix shape
+        // as the C-0 eval rebuild and the C-1 node_health table: rebuild the
+        // six tables WITHOUT cross-lane foreign keys. Deletion becomes
+        // explicit, performed by each table's owning lane (destroy_job's
+        // status/scheduler cleanup ops, prune_rollouts' rollout_event
+        // delete, remove_node's remove_allocs_for_node pass) plus orphan
+        // sweeps (`prune_allocation_health_orphans`, mirroring
+        // `prune_node_health_orphans`). Referential integrity that inserts
+        // relied on is preserved by reads: every insert path resolves its
+        // parent row first (task_config/job_config lookups, EXISTS guards).
+        //
+        // Rebuild order matters under `foreign_keys = ON`: children whose
+        // FKs point at other rebuilt tables (allocation_health -> allocation,
+        // rollout_event -> rollout) go FIRST, so the later `DROP TABLE` of
+        // their old parents finds no FK-bearing children (SQLite's implicit
+        // DELETE-on-DROP would otherwise cascade into — and wipe — them).
+        //
+        // Empty down, like the eval rebuild: the original creations'
+        // `DROP TABLE IF EXISTS` downs remove the rebuilt tables on the way
+        // to version 0.
+        M::up(
+            "CREATE TABLE allocation_health_ownerlane (
+            allocation_id INTEGER PRIMARY KEY,
+            node_id STRING NOT NULL,
+            healthy INTEGER NOT NULL,
+            status STRING NOT NULL,
+            updated_at TIMESTAMP NOT NULL,
+            artifact_states TEXT
+        );
+        INSERT INTO allocation_health_ownerlane (allocation_id, node_id, healthy, status, updated_at, artifact_states)
+            SELECT allocation_id, node_id, healthy, status, updated_at, artifact_states FROM allocation_health;
+        DROP TABLE allocation_health;
+        ALTER TABLE allocation_health_ownerlane RENAME TO allocation_health;
+        CREATE INDEX IF NOT EXISTS idx_allocation_health_node_id ON allocation_health(node_id);
+
+        CREATE TABLE rollout_event_ownerlane (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            rollout_id INTEGER NOT NULL,
+            job_id STRING NOT NULL,
+            group_name STRING,
+            level STRING NOT NULL,
+            message STRING NOT NULL,
+            metadata_json JSONB NOT NULL DEFAULT '{}',
+            created_at TIMESTAMP NOT NULL
+        );
+        INSERT INTO rollout_event_ownerlane (id, rollout_id, job_id, group_name, level, message, metadata_json, created_at)
+            SELECT id, rollout_id, job_id, group_name, level, message, metadata_json, created_at FROM rollout_event;
+        DROP TABLE rollout_event;
+        ALTER TABLE rollout_event_ownerlane RENAME TO rollout_event;
+        CREATE INDEX IF NOT EXISTS idx_rollout_event_rollout_created ON rollout_event(rollout_id, created_at ASC, id ASC);
+        CREATE INDEX IF NOT EXISTS idx_rollout_event_job_created ON rollout_event(job_id, created_at DESC, id DESC);
+
+        CREATE TABLE task_status_ownerlane (
+            task_config_id INTEGER PRIMARY KEY,
+            job_id STRING NOT NULL,
+            job_config_id STRING NOT NULL,
+            status STRING NOT NULL,
+            updated_at TIMESTAMP NOT NULL
+        );
+        INSERT INTO task_status_ownerlane (task_config_id, job_id, job_config_id, status, updated_at)
+            SELECT task_config_id, job_id, job_config_id, status, updated_at FROM task_status;
+        DROP TABLE task_status;
+        ALTER TABLE task_status_ownerlane RENAME TO task_status;
+        CREATE INDEX IF NOT EXISTS idx_task_status_job_config_id ON task_status(job_config_id);
+        CREATE INDEX IF NOT EXISTS idx_task_status_task_config_id ON task_status(task_config_id);
+
+        CREATE TABLE instance_ownerlane (
+            instance_id STRING PRIMARY KEY,
+            job_id STRING NOT NULL,
+            group_name STRING NOT NULL,
+            task_name STRING NOT NULL,
+            mode STRING NOT NULL,
+            state STRING NOT NULL,
+            slot_index INTEGER,
+            current_alloc_id INTEGER,
+            storage_handle STRING,
+            created_at TIMESTAMP NOT NULL,
+            updated_at TIMESTAMP NOT NULL
+        );
+        INSERT INTO instance_ownerlane (instance_id, job_id, group_name, task_name, mode, state, slot_index, current_alloc_id, storage_handle, created_at, updated_at)
+            SELECT instance_id, job_id, group_name, task_name, mode, state, slot_index, current_alloc_id, storage_handle, created_at, updated_at FROM instance;
+        DROP TABLE instance;
+        ALTER TABLE instance_ownerlane RENAME TO instance;
+        CREATE INDEX IF NOT EXISTS idx_instance_job_group ON instance(job_id, group_name);
+
+        CREATE TABLE rollout_ownerlane (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id STRING NOT NULL,
+            from_job_config_id STRING,
+            to_job_config_id STRING NOT NULL,
+            status STRING NOT NULL,
+            incomplete INTEGER NOT NULL DEFAULT 0,
+            message STRING NOT NULL DEFAULT '',
+            strategy STRING,
+            progression STRING,
+            replacement STRING,
+            in_place INTEGER,
+            config_json JSONB NOT NULL DEFAULT '{}',
+            created_at TIMESTAMP NOT NULL,
+            updated_at TIMESTAMP NOT NULL,
+            completed_at TIMESTAMP
+        );
+        INSERT INTO rollout_ownerlane (id, job_id, from_job_config_id, to_job_config_id, status, incomplete, message, strategy, progression, replacement, in_place, config_json, created_at, updated_at, completed_at)
+            SELECT id, job_id, from_job_config_id, to_job_config_id, status, incomplete, message, strategy, progression, replacement, in_place, config_json, created_at, updated_at, completed_at FROM rollout;
+        DROP TABLE rollout;
+        ALTER TABLE rollout_ownerlane RENAME TO rollout;
+        CREATE INDEX IF NOT EXISTS idx_rollout_job_id ON rollout(job_id);
+        CREATE INDEX IF NOT EXISTS idx_rollout_status ON rollout(status);
+        CREATE INDEX IF NOT EXISTS idx_rollout_job_status_created ON rollout(job_id, status, created_at DESC);
+
+        CREATE TABLE allocation_ownerlane (
+            id INTEGER PRIMARY KEY,
+            status STRING NOT NULL,
+            resources JSONB NOT NULL,
+            node_id STRING NOT NULL,
+            job_config_id STRING NOT NULL,
+            task_config_id INTEGER NOT NULL,
+            network JSONB,
+            instance_id STRING
+        );
+        INSERT INTO allocation_ownerlane (id, status, resources, node_id, job_config_id, task_config_id, network, instance_id)
+            SELECT id, status, resources, node_id, job_config_id, task_config_id, network, instance_id FROM allocation;
+        DROP TABLE allocation;
+        ALTER TABLE allocation_ownerlane RENAME TO allocation;
+        CREATE INDEX IF NOT EXISTS idx_allocation_task_config_id ON allocation(task_config_id);
+        CREATE INDEX IF NOT EXISTS idx_allocation_job_config_id ON allocation(job_config_id);
+        CREATE INDEX IF NOT EXISTS idx_allocation_node_id ON allocation(node_id);
+        CREATE INDEX IF NOT EXISTS idx_allocation_instance_id ON allocation(instance_id);",
+        )
+        .down(""),
+        // Replicated restart intent (JC-27 failover regeneration): a
+        // KV-triggered restart of an UNCHANGED job config leaves no trace in
+        // replicated state (the restart itself is a leader-local job_update
+        // eval), so a failover silently dropped it. The marker is stamped by
+        // the control-lane `request_job_restart` op when the restart is
+        // acknowledged and cleared by the job_update eval before it
+        // executes; `regenerate_scheduling_evals` re-enqueues job_update for
+        // any job whose marker is still set.
+        M::up("ALTER TABLE job ADD COLUMN restart_requested_at TIMESTAMP;").down(""),
+        // Replicated drain-eviction intent (JC-27 failover regeneration):
+        // `node drain --evict` was only distinguishable from a plain cordon
+        // by the leader-local node_drain eval, so failover regeneration
+        // evicted EVERY drained node. Set by `set_node_availability` when
+        // the operator asked for eviction; cleared whenever availability
+        // leaves 'drained'.
+        M::up("ALTER TABLE node ADD COLUMN drain_evict INTEGER NOT NULL DEFAULT 0;").down(""),    ])
 }
 
 #[cfg(test)]
@@ -625,9 +896,36 @@ mod migrations_test {
         let mut conn = Connection::open_in_memory()?;
         migrations.to_latest(&mut conn)?;
 
-        // Step back over the rename to reconstruct a pre-rename database.
+        // Reconstruct a pre-rename database by migrating UP to the last
+        // version that still exposes `kind`, on a fresh connection. Stepping
+        // DOWN is not viable: additive `ALTER TABLE` migrations carry no-op
+        // `.down("")`, so a down-then-up walk re-runs them and fails with
+        // "duplicate column". Searching for the rename (instead of assuming
+        // it is the last migration) keeps this test valid as migrations are
+        // appended after it.
         let latest: u32 = conn.query_row("PRAGMA user_version;", [], |row| row.get(0))?;
-        migrations.to_version(&mut conn, (latest - 1) as usize)?;
+        let has_kind_column = |conn: &Connection| -> anyhow::Result<bool> {
+            let mut stmt = conn.prepare("PRAGMA table_info(task_config);")?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                if row.get::<_, String>(1)? == "kind" {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        };
+        let mut pre_rename_version = None;
+        for version in 1..=latest as usize {
+            let mut probe = Connection::open_in_memory()?;
+            migrations.to_version(&mut probe, version)?;
+            if has_kind_column(&probe)? {
+                pre_rename_version = Some(version);
+            }
+        }
+        let pre_rename_version =
+            pre_rename_version.expect("no migration version exposes the pre-rename `kind` column");
+        let mut conn = Connection::open_in_memory()?;
+        migrations.to_version(&mut conn, pre_rename_version)?;
 
         conn.execute(
             "INSERT INTO job (id, name, status, created_at)

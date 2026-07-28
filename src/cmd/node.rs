@@ -3,8 +3,17 @@ use crate::cmd::output::{self, OutputFormat};
 use crate::prelude::*;
 use crate::structs::{
     GetNodeRequest, GetNodesRequest, Node, NodePrint, RestartWorkerRequest,
-    UpdateNodeDynamicRequest,
+    SetNodeAvailabilityRequest, UpdateNodeDynamicRequest,
 };
+
+/// Optional idempotency key for mutating node operations; the manager
+/// deduplicates retried requests carrying the same key.
+fn idempotency_arg() -> Arg {
+    Arg::new("idempotency-key")
+        .long("idempotency-key")
+        .value_name("KEY")
+        .help("Deduplicate retries of this mutating request (safe for agent retries)")
+}
 
 pub fn config() -> Command {
     let get_nodes_cmd = Command::new("list").about("List nodes").arg(json_flag());
@@ -54,6 +63,47 @@ pub fn config() -> Command {
         )
         .arg(json_flag());
 
+    let cordon_node_cmd = Command::new("cordon")
+        .about("Mark a node unschedulable; existing allocations keep running")
+        .arg(
+            Arg::new("id")
+                .value_name("ID")
+                .help("Identifier of the node to cordon")
+                .required(true),
+        )
+        .arg(idempotency_arg())
+        .arg(json_flag());
+
+    let drain_node_cmd = Command::new("drain")
+        .about(
+            "\
+        Mark a node unschedulable and evict its allocations\n\
+        \n\
+        Stateless allocations are moved to other nodes immediately. Stateful\n\
+        allocations are protected by their stateful.onLost policy and stay on\n\
+        the node (use `legion instance replace` to force-move one).\
+        ",
+        )
+        .arg(
+            Arg::new("id")
+                .value_name("ID")
+                .help("Identifier of the node to drain")
+                .required(true),
+        )
+        .arg(idempotency_arg())
+        .arg(json_flag());
+
+    let uncordon_node_cmd = Command::new("uncordon")
+        .about("Restore a cordoned/drained node to the scheduling pool")
+        .arg(
+            Arg::new("id")
+                .value_name("ID")
+                .help("Identifier of the node to uncordon")
+                .required(true),
+        )
+        .arg(idempotency_arg())
+        .arg(json_flag());
+
     Command::new("node")
         .about("Interact with nodes")
         .subcommand_required(true)
@@ -62,6 +112,9 @@ pub fn config() -> Command {
         .subcommand(update_node_cmd)
         .subcommand(node_info_cmd)
         .subcommand(restart_node_cmd)
+        .subcommand(cordon_node_cmd)
+        .subcommand(drain_node_cmd)
+        .subcommand(uncordon_node_cmd)
 }
 
 #[instrument(err, skip_all)]
@@ -123,6 +176,24 @@ pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
 
             let format = OutputFormat::from_matches(arg_matches);
             restart_node(id.to_string(), format).await
+        }
+        Some((command @ ("cordon" | "drain" | "uncordon"), arg_matches)) => {
+            let id = arg_matches
+                .get_one::<String>("id")
+                .context("Must provide id")?;
+            let idempotency_key = arg_matches.get_one::<String>("idempotency-key").cloned();
+
+            // cordon = unschedulable, keep allocations; drain = unschedulable
+            // + evict; uncordon = schedulable again.
+            let (availability, evict) = match command {
+                "cordon" => ("drained", false),
+                "drain" => ("drained", true),
+                _ => ("available", false),
+            };
+
+            let format = OutputFormat::from_matches(arg_matches);
+            set_node_availability(id.to_string(), availability, evict, idempotency_key, format)
+                .await
         }
         _ => unreachable!(),
     }
@@ -229,6 +300,42 @@ async fn restart_node(node_id: String, format: OutputFormat) -> R<()> {
     Ok(())
 }
 
+#[instrument(err, skip_all)]
+async fn set_node_availability(
+    node_id: String,
+    availability: &str,
+    evict: bool,
+    idempotency_key: Option<String>,
+    format: OutputFormat,
+) -> R<()> {
+    let mut client = connect_manager_client().await?;
+    let request = tonic::Request::new(SetNodeAvailabilityRequest {
+        node_id,
+        availability: availability.to_string(),
+        evict,
+        idempotency_key,
+    });
+    let reply = output::resolve(
+        format,
+        "failed to set node availability",
+        client.set_node_availability(request).await,
+    )?
+    .into_inner();
+    let node = reply.node.map(Node::from);
+
+    if format.is_json() {
+        output::print_success(&json!({
+            "message": reply.message,
+            "deduplicated": reply.deduplicated,
+            "node": node,
+        }));
+    } else {
+        println!("{}", reply.message);
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -240,6 +347,29 @@ mod tests {
         assert_eq!(subcommand, "restart");
         let id = args.get_one::<String>("id").context("Missing id")?;
         assert_eq!(id, "node-1");
+        Ok(())
+    }
+
+    #[test]
+    fn node_cordon_drain_uncordon_commands_parse() -> R<()> {
+        for command in ["cordon", "drain", "uncordon"] {
+            let matches = config().try_get_matches_from([
+                "node",
+                command,
+                "node-1",
+                "--idempotency-key",
+                "key-1",
+                "--json",
+            ])?;
+            let (subcommand, args) = matches.subcommand().context("Missing subcommand")?;
+            assert_eq!(subcommand, command);
+            let id = args.get_one::<String>("id").context("Missing id")?;
+            assert_eq!(id, "node-1");
+            let key = args
+                .get_one::<String>("idempotency-key")
+                .context("Missing idempotency key")?;
+            assert_eq!(key, "key-1");
+        }
         Ok(())
     }
 }

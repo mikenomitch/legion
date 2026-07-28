@@ -40,7 +40,12 @@ Write operations update both DB and cache.
 
 Main tables (see migrations):
 
-- `node`, `worker_type`
+- `node` (identity/pool/attrs/availability), `node_health` (liveness:
+  status, last heartbeat, lost-at marker, health checks — split out so the
+  raft status lane is the table's single writer; readers hydrate `Node` via
+  a `node ⟕ node_health` join, and a node that has not heartbeated yet
+  hydrates registration defaults)
+- `worker_type`
 - `job`, `job_config`, `task_config`, `task_status`, `job_update`
 - `allocation`
 - `eval`
@@ -83,7 +88,41 @@ Workers have a separate local JSON state file (`WorkerStateStore`):
 
 This store is local worker runtime state, not shared cluster state.
 
+## Persistence Modes
+
+Everything above describes the store in every mode; `persistence.type`
+selects how durable the writes are:
+
+- **`local_disk`** (default): local SQLite only, exactly as described above.
+- **`streaming`**: Litestream-style WAL shipping to object storage with
+  lease-fenced failover — see `docs/persistence-streaming.md`.
+- **`raft`**: **real quorum-replicated writes.** Every mutating store
+  method routes through `Store::replicated()`: its row-level effects are
+  captured as a SQLite session changeset on the leader (and rolled back
+  locally), committed through openraft, and applied byte-identically on
+  every manager — replicas cannot diverge. The read-model cache and event
+  stream are projected from the committed changeset at apply time, so
+  followers get both for free and nothing is visible before quorum commit.
+  In raft mode, `write_connection()` outside the capture/apply paths fails
+  loudly (a runtime bypass guard), so no code path can mutate state
+  without replicating it. Snapshots, log compaction, membership, and
+  backup/restore are all implemented — see `docs/multi-raft.md` and
+  `docs/raft-operations.md`.
+
+Server-side backups exist in every mode: `legion state backup` (a
+`VACUUM INTO` copy plus the raft applied index) and
+`legion start manager --restore-from <backup>` — see `docs/upgrades.md`.
+
 ## What Is Not Implemented Yet
 
-For streaming persistence mode (Litestream + object-storage lease failover), see `docs/persistence-streaming.md`.
-Legion now supports a Raft control-plane mode for leader election, failover operations, membership commands, and join-token workflows. Durable replicated manager state-machine writes are still planned; current manager data remains local SQLite until the Raft apply path is completed.
+- Raft `topology: 'lanes'` (independent per-domain raft groups) is built
+  and tested as scaffolding but **refused at engine start**. The
+  `node`/`node_health` split (the table-ownership prerequisite) has landed;
+  the remaining work is the composite-op lane split and per-lane
+  table-scoped snapshots (plan §7, phases C-2/C-3).
+- Non-leader writes are rejected with a leader hint, not auto-forwarded.
+- Raft transport auth is a shared cluster secret (mTLS pending); of the
+  `legion_raft_*` metrics series only the voters/quorum gauges are emitted,
+  the rest is reserved but not yet emitted.
+- Key-range sharding, cross-region topologies, and parallel scheduler
+  planning across managers remain future work.

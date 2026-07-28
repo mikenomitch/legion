@@ -393,6 +393,39 @@ pub mod drafts {
         .meta(json!({ "reason": "heartbeat" }))
     }
 
+    /// `node.cordoned` — a node's availability was set to `drained`, so it
+    /// no longer receives new placements (existing allocations untouched
+    /// until a drain evicts them).
+    pub fn node_cordoned(node_id: &str) -> EventDraft {
+        EventDraft::info(
+            "node.cordoned",
+            format!("Node {node_id} cordoned (no new placements)"),
+        )
+        .node(node_id)
+    }
+
+    /// `node.uncordoned` — a node's availability was restored to
+    /// `available`, so it re-entered the scheduling pool.
+    pub fn node_uncordoned(node_id: &str) -> EventDraft {
+        EventDraft::info(
+            "node.uncordoned",
+            format!("Node {node_id} uncordoned (schedulable again)"),
+        )
+        .node(node_id)
+    }
+
+    /// `node.drained` — a drain pass evicted a drained node's allocations
+    /// for replacement elsewhere. Stateful allocations protected by their
+    /// `onLost` policy stay behind and are counted in `held`.
+    pub fn node_drained(node_id: &str, evicted: usize, held: usize) -> EventDraft {
+        EventDraft::info(
+            "node.drained",
+            format!("Node {node_id} drained: {evicted} allocation(s) evicted, {held} held"),
+        )
+        .node(node_id)
+        .meta(json!({ "evicted": evicted, "held": held }))
+    }
+
     /// `job.submitted` / `job.updated` — a job config was written. `None` for
     /// unchanged outcomes (nothing happened worth streaming).
     pub fn job_submit_outcome(
@@ -807,6 +840,18 @@ impl EventRecorder<'_> {
 
     pub fn node_lost_after_missed_heartbeats(self, node_id: &str) {
         self.emit(drafts::node_lost_after_missed_heartbeats(node_id));
+    }
+
+    pub fn node_cordoned(self, node_id: &str) {
+        self.emit(drafts::node_cordoned(node_id));
+    }
+
+    pub fn node_uncordoned(self, node_id: &str) {
+        self.emit(drafts::node_uncordoned(node_id));
+    }
+
+    pub fn node_drained(self, node_id: &str, evicted: usize, held: usize) {
+        self.emit(drafts::node_drained(node_id, evicted, held));
     }
 
     pub fn job_stopped(self, job_id: &str) {

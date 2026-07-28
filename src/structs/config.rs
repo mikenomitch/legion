@@ -101,6 +101,61 @@ pub struct ManagerConfig {
     /// Exec/actions settings (see docs/exec-and-actions.md).
     #[serde(default)]
     pub exec: Option<ExecConfig>,
+    /// Telemetry listener settings (/metrics, /healthz, /readyz — see
+    /// docs/metrics.md).
+    #[serde(default)]
+    pub telemetry: Option<TelemetryConfig>,
+}
+
+/// Telemetry configuration: the manager's Prometheus metrics + health-probe
+/// HTTP listener. Enabled by default; it serves only read-only operational
+/// data (no secrets), but a hardened site can disable it or move the port.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct TelemetryConfig {
+    /// Master switch for the telemetry listener. Default: true.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// Port the listener binds (on `server.host`). Default: `server.port + 2`
+    /// (the exec WebSocket holds `+ 1`).
+    pub port: Option<u64>,
+}
+
+/// Resolved telemetry configuration. `port: None` means "derive from
+/// `server.port + 2` at spawn time" — the default is not baked in here
+/// because the server port itself is configurable.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct TelemetryConfigFull {
+    pub enabled: bool,
+    pub port: Option<u64>,
+}
+
+impl Default for TelemetryConfigFull {
+    fn default() -> Self {
+        TelemetryConfigFull {
+            enabled: true,
+            port: None,
+        }
+    }
+}
+
+impl TelemetryConfig {
+    pub fn with_defaults(&self) -> TelemetryConfigFull {
+        TelemetryConfigFull {
+            enabled: self.enabled.unwrap_or(true),
+            port: self.port,
+        }
+    }
+}
+
+impl From<TelemetryConfigFull> for TelemetryConfig {
+    fn from(val: TelemetryConfigFull) -> Self {
+        TelemetryConfig {
+            enabled: Some(val.enabled),
+            port: val.port,
+        }
+    }
 }
 
 /// Exec/actions configuration. Enabled by default (exec is still per-caller
@@ -540,10 +595,150 @@ pub struct PersistenceConfig {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct RaftPersistenceConfig {
+    /// Stable string identity of this manager inside the raft cluster.
+    /// Defaults to the manager's `host:port` id. The numeric raft node id is
+    /// derived from it deterministically (`fnv1a64(nodeId)`), so it must be
+    /// unique per manager and stable across restarts.
     pub node_id: Option<String>,
+    /// `true` on the *first* manager of a new cluster only: it initializes
+    /// the raft group(s) with itself as the sole voter. Safe across restarts
+    /// (re-initialization of an existing cluster is a swallowed no-op).
     pub bootstrap: Option<bool>,
+    /// Peer managers as `"name=host:port"` entries (the address is the
+    /// peer's manager gRPC listener, which also serves the raft transport).
+    /// Bare `"name"` entries are still accepted for config compatibility;
+    /// such peers can only be targeted by raft commands that do not need an
+    /// address (their address is otherwise learned from replicated
+    /// membership).
     pub peers: Option<Vec<String>>,
+    /// Lifetime of minted `legion raft join-token` tokens, seconds.
     pub join_token_ttl_seconds: Option<u64>,
+    /// Root directory for raft engine state: per-lane log databases
+    /// (`<dataDir>/<lane>/log.sqlite`), the cluster identity file
+    /// (`<dataDir>/cluster_secret`), and the topology stamp
+    /// (`<dataDir>/topology.json`, JC-43). Default: `.legion/raft`.
+    pub data_dir: Option<String>,
+    /// Raft group topology: `"single"` (default — one group replicates every
+    /// table) or `"lanes"` (three independent raft groups: control /
+    /// scheduler / status, each electing its own leader and snapshotting
+    /// its own tables). `"lanes"` is runnable since the single-writer
+    /// table-ownership work landed (plan §7-C2/C-3): every table has
+    /// exactly one writing lane, enforced at capture time, and each lane's
+    /// snapshot covers only its owned tables. The topology is fixed at
+    /// first engine start for the cluster's lifetime — there is no
+    /// migration between topologies, and this is ENFORCED (plan JC-43):
+    /// first start records `{topology, lanes}` in
+    /// `<dataDir>/topology.json`, every later start must match, and a
+    /// joiner presenting a different topology is refused at enrollment.
+    /// Changing it means backup → empty raft data dir → restore into a
+    /// fresh bootstrap.
+    pub topology: Option<String>,
+    /// `"host:port"` other managers dial to reach this manager's raft
+    /// transport. Defaults to the manager server `host:port` (with
+    /// `0.0.0.0`/`::` normalized to `127.0.0.1` — set this explicitly for
+    /// any real multi-node deployment).
+    pub advertise_addr: Option<String>,
+    /// Shared secret authenticating manager-plane raft RPCs (plan JC-7).
+    /// When absent it is minted at bootstrap and persisted to
+    /// `<dataDir>/cluster_secret`; joining nodes receive it inside the join
+    /// token.
+    pub cluster_secret: Option<String>,
+    /// Join token (from `legion raft join-token` on the leader) used by a
+    /// new manager to join an existing cluster (phase A-2 wiring).
+    pub join_token: Option<String>,
+    /// The number of voting managers this cluster is SUPPOSED to have (1, 3,
+    /// or 5). Optional and purely ergonomic: `legion raft status` warns when
+    /// the observed voter count is below it, and config load warns when it
+    /// is even ("2 voters need both alive to commit — this cluster survives
+    /// zero failures"). `0` is rejected at load. Membership itself is driven
+    /// by joins and operator commands, never by this knob.
+    pub expected_voters: Option<u32>,
+    /// Log entries between snapshots (compaction threshold, default 10000,
+    /// applied PER RAFT GROUP). A snapshot is built every this-many applied
+    /// entries and the raft log is purged behind it (a tail of
+    /// `snapshotEntries / 2`, capped at 1000, is kept for cheap follower
+    /// catch-up). `single` topology builds whole-DB `VACUUM INTO` images;
+    /// `lanes` topology builds per-lane table-scoped dumps with the same
+    /// policy per lane.
+    pub snapshot_entries: Option<u64>,
+    /// Explicit override for re-stamping a state DB onto a NEW raft cluster
+    /// identity. The state DB is stamped with its cluster id at first engine
+    /// start; a later start whose derived cluster id differs (e.g. the raft
+    /// dataDir — cluster secret included — was wiped and `bootstrap=true`
+    /// minted a fresh one) is refused, because bootstrapping a new cluster
+    /// over an existing cluster's data split-brains against any surviving
+    /// members. Set `true` only when the old cluster is fully retired.
+    pub force_new_cluster: Option<bool>,
+    /// How often a leader sends heartbeats (append-entries) to every
+    /// follower, milliseconds. Default
+    /// [`DEF_RAFT_HEARTBEAT_INTERVAL_MS`].
+    ///
+    /// This is the clock the whole failover story is built on: a follower
+    /// only learns the leader is alive by receiving one, so the heartbeat
+    /// interval sets the FLOOR on how fast a dead leader can be noticed,
+    /// and — because openraft reuses it as the append-entries RPC deadline
+    /// — it also bounds how long a single replication batch may take. A
+    /// batch that cannot be encoded, shipped and acked inside the interval
+    /// is reported as an unreachable peer, so the interval and
+    /// `MAX_PAYLOAD_ENTRIES` (see `storage::raft::driver`) are a matched
+    /// pair.
+    ///
+    /// **Lower** = faster failure detection, more constant RPC traffic and
+    /// less tolerance for a slow round trip. **Higher** = quieter,
+    /// steadier clusters that take proportionally longer to notice a dead
+    /// leader.
+    ///
+    /// Raise this (together with the election window below) when heartbeats
+    /// cannot reliably complete a round trip inside the default:
+    /// CPU-starved or heavily loaded managers, WAN / cross-region links,
+    /// virtualised or otherwise noisy hosts where the scheduler can stall a
+    /// process for hundreds of milliseconds, and CI runners — especially
+    /// in-process multi-node test harnesses on few cores in a debug build,
+    /// where several raft nodes contend for the same CPU and a missed
+    /// heartbeat is a scheduling artifact rather than a real failure.
+    pub heartbeat_interval_ms: Option<u64>,
+    /// Lower bound of the randomized election timeout, milliseconds.
+    /// Default [`DEF_RAFT_ELECTION_TIMEOUT_MIN_MS`].
+    ///
+    /// A follower that has heard nothing from a leader for a random
+    /// duration drawn from `[electionTimeoutMinMs, electionTimeoutMaxMs)`
+    /// campaigns to replace it. The *minimum* is the stability knob: it
+    /// must sit comfortably above `heartbeatIntervalMs` so that a couple of
+    /// merely slow or dropped heartbeats never look like a dead leader. Set
+    /// it too close to the heartbeat interval and the cluster FLAPS —
+    /// followers time out under transient load, campaign, split the vote,
+    /// and the term climbs while no leader ever holds power long enough to
+    /// commit anything. Config load rejects that arrangement outright (see
+    /// `storage::raft::quorum::validate_raft_config`).
+    ///
+    /// The randomized *width* between min and max is what breaks up split
+    /// votes: candidates wake at different times, so one reliably gets its
+    /// ballot in first. Keep a real gap between the two.
+    ///
+    /// Raise this in the same situations as `heartbeatIntervalMs` — loaded
+    /// managers, WAN links, virtualised or noisy hosts, and CI — and keep
+    /// the ratio to the heartbeat interval intact when you do.
+    pub election_timeout_min_ms: Option<u64>,
+    /// Upper bound of the randomized election timeout, milliseconds.
+    /// Default [`DEF_RAFT_ELECTION_TIMEOUT_MAX_MS`]. Must be strictly
+    /// greater than `electionTimeoutMinMs`.
+    ///
+    /// Together with the minimum this bounds worst-case failover: a dead
+    /// leader is replaced within roughly one election timeout plus a
+    /// round trip. It is ALSO the follower *leader-lease* duration — a
+    /// follower will not grant its vote to a new candidate while it still
+    /// believes the current leader's lease is live. That makes this knob
+    /// cut both ways: a larger maximum buys stability under load, but it
+    /// slows every DELIBERATE leadership move (`trigger_lane_election`,
+    /// the daemon's lane-convergence loop) by the same proportion, since
+    /// those must wait out the incumbent's lease. Prefer widening the
+    /// window over inflating it: keep the maximum a small multiple of the
+    /// minimum (the default is 2x) rather than pushing it to seconds.
+    ///
+    /// Raise it, with the two knobs above, for loaded managers, WAN links,
+    /// virtualised or noisy hosts, and CI — and expect lane convergence and
+    /// deliberate failovers to take correspondingly longer.
+    pub election_timeout_max_ms: Option<u64>,
 }
 
 impl Default for RaftPersistenceConfig {
@@ -553,9 +748,52 @@ impl Default for RaftPersistenceConfig {
             bootstrap: Some(false),
             peers: Some(Vec::new()),
             join_token_ttl_seconds: Some(900),
+            data_dir: None,
+            topology: None,
+            advertise_addr: None,
+            cluster_secret: None,
+            join_token: None,
+            expected_voters: None,
+            snapshot_entries: None,
+            force_new_cluster: Some(false),
+            heartbeat_interval_ms: None,
+            election_timeout_min_ms: None,
+            election_timeout_max_ms: None,
         }
     }
 }
+
+/// Default root directory for raft engine state (logs + cluster identity).
+pub const DEF_RAFT_DATA_DIR: &str = ".legion/raft";
+/// Default raft topology: one group carries every lane (plan JC-2).
+pub const DEF_RAFT_TOPOLOGY: &str = "single";
+/// Default snapshot/compaction threshold: applied log entries between
+/// whole-DB snapshots in `single` topology (plan §A5).
+pub const DEF_RAFT_SNAPSHOT_ENTRIES: u64 = 10_000;
+
+/// Default leader heartbeat interval (`raft.heartbeatIntervalMs`).
+///
+/// 250 ms gives a worst-case `MAX_PAYLOAD_ENTRIES` batch ~2.5x headroom in
+/// a debug build, since openraft reuses the heartbeat interval as the
+/// append-entries deadline. See the field docs on
+/// [`RaftPersistenceConfig::heartbeat_interval_ms`].
+pub const DEF_RAFT_HEARTBEAT_INTERVAL_MS: u64 = 250;
+/// Default lower bound of the randomized election timeout
+/// (`raft.electionTimeoutMinMs`).
+///
+/// The election window is kept as TIGHT as the heartbeat interval allows
+/// (600-1200 ms, ~2.5-5x the heartbeat) rather than scaled up
+/// proportionally, because openraft derives the follower *leader lease*
+/// from `election_timeout_max`: a live leader refreshes the lease on every
+/// heartbeat, so a larger max makes every deliberate leadership move take
+/// proportionally longer to win. Failover still completes in ~1s, in the
+/// range of Consul's and etcd's defaults and far below any
+/// operator-visible timeout.
+pub const DEF_RAFT_ELECTION_TIMEOUT_MIN_MS: u64 = 600;
+/// Default upper bound of the randomized election timeout
+/// (`raft.electionTimeoutMaxMs`). See
+/// [`DEF_RAFT_ELECTION_TIMEOUT_MIN_MS`].
+pub const DEF_RAFT_ELECTION_TIMEOUT_MAX_MS: u64 = 1200;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 #[serde(rename_all = "camelCase")]
@@ -651,6 +889,8 @@ pub struct ManagerConfigFull {
     pub artifacts: ArtifactsManagerConfigFull,
     #[serde(default)]
     pub exec: ExecConfigFull,
+    #[serde(default)]
+    pub telemetry: TelemetryConfigFull,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -677,13 +917,54 @@ pub struct StreamingPersistenceConfigFull {
     pub lease: StreamingLeaseConfigFull,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct RaftPersistenceConfigFull {
     pub node_id: String,
     pub bootstrap: bool,
     pub peers: Vec<String>,
     pub join_token_ttl_seconds: u64,
+    pub data_dir: String,
+    pub topology: String,
+    pub advertise_addr: Option<String>,
+    pub cluster_secret: Option<String>,
+    pub join_token: Option<String>,
+    /// Expected voting-manager count (ergonomic warnings only); stays
+    /// optional in the Full config — unset means "no expectation declared".
+    pub expected_voters: Option<u32>,
+    pub snapshot_entries: u64,
+    pub force_new_cluster: bool,
+    /// Leader heartbeat interval, ms. See
+    /// [`RaftPersistenceConfig::heartbeat_interval_ms`].
+    pub heartbeat_interval_ms: u64,
+    /// Randomized election timeout, lower bound, ms. See
+    /// [`RaftPersistenceConfig::election_timeout_min_ms`].
+    pub election_timeout_min_ms: u64,
+    /// Randomized election timeout, upper bound, ms. See
+    /// [`RaftPersistenceConfig::election_timeout_max_ms`].
+    pub election_timeout_max_ms: u64,
+}
+
+impl Default for RaftPersistenceConfigFull {
+    fn default() -> Self {
+        Self {
+            node_id: String::new(),
+            bootstrap: false,
+            peers: Vec::new(),
+            join_token_ttl_seconds: 900,
+            data_dir: DEF_RAFT_DATA_DIR.to_string(),
+            topology: DEF_RAFT_TOPOLOGY.to_string(),
+            advertise_addr: None,
+            cluster_secret: None,
+            join_token: None,
+            expected_voters: None,
+            snapshot_entries: DEF_RAFT_SNAPSHOT_ENTRIES,
+            force_new_cluster: false,
+            heartbeat_interval_ms: DEF_RAFT_HEARTBEAT_INTERVAL_MS,
+            election_timeout_min_ms: DEF_RAFT_ELECTION_TIMEOUT_MIN_MS,
+            election_timeout_max_ms: DEF_RAFT_ELECTION_TIMEOUT_MAX_MS,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -757,6 +1038,7 @@ impl From<ManagerConfigFull> for ManagerConfig {
             exec: Some(ExecConfig {
                 enabled: Some(val.exec.enabled),
             }),
+            telemetry: Some(val.telemetry.into()),
         }
     }
 }
@@ -818,6 +1100,11 @@ impl ManagerConfig {
                 .as_ref()
                 .map(ExecConfig::with_defaults)
                 .unwrap_or_default(),
+            telemetry: self
+                .telemetry
+                .as_ref()
+                .map(TelemetryConfig::with_defaults)
+                .unwrap_or_default(),
         }
     }
 }
@@ -842,6 +1129,7 @@ impl Default for ManagerConfigFull {
             acl: AclConfigFull::default(),
             artifacts: ArtifactsManagerConfigFull::default(),
             exec: ExecConfigFull::default(),
+            telemetry: TelemetryConfigFull::default(),
         }
     }
 }
@@ -908,6 +1196,29 @@ impl RaftPersistenceConfig {
             bootstrap: self.bootstrap.unwrap_or(false),
             peers: self.peers.clone().unwrap_or_default(),
             join_token_ttl_seconds: self.join_token_ttl_seconds.unwrap_or(900),
+            data_dir: self
+                .data_dir
+                .clone()
+                .unwrap_or_else(|| DEF_RAFT_DATA_DIR.to_string()),
+            topology: self
+                .topology
+                .clone()
+                .unwrap_or_else(|| DEF_RAFT_TOPOLOGY.to_string()),
+            advertise_addr: self.advertise_addr.clone(),
+            cluster_secret: self.cluster_secret.clone(),
+            join_token: self.join_token.clone(),
+            expected_voters: self.expected_voters,
+            snapshot_entries: self.snapshot_entries.unwrap_or(DEF_RAFT_SNAPSHOT_ENTRIES),
+            force_new_cluster: self.force_new_cluster.unwrap_or(false),
+            heartbeat_interval_ms: self
+                .heartbeat_interval_ms
+                .unwrap_or(DEF_RAFT_HEARTBEAT_INTERVAL_MS),
+            election_timeout_min_ms: self
+                .election_timeout_min_ms
+                .unwrap_or(DEF_RAFT_ELECTION_TIMEOUT_MIN_MS),
+            election_timeout_max_ms: self
+                .election_timeout_max_ms
+                .unwrap_or(DEF_RAFT_ELECTION_TIMEOUT_MAX_MS),
         }
     }
 }
@@ -998,6 +1309,17 @@ impl From<RaftPersistenceConfigFull> for RaftPersistenceConfig {
             bootstrap: Some(value.bootstrap),
             peers: Some(value.peers),
             join_token_ttl_seconds: Some(value.join_token_ttl_seconds),
+            data_dir: Some(value.data_dir),
+            topology: Some(value.topology),
+            advertise_addr: value.advertise_addr,
+            cluster_secret: value.cluster_secret,
+            join_token: value.join_token,
+            expected_voters: value.expected_voters,
+            snapshot_entries: Some(value.snapshot_entries),
+            force_new_cluster: Some(value.force_new_cluster),
+            heartbeat_interval_ms: Some(value.heartbeat_interval_ms),
+            election_timeout_min_ms: Some(value.election_timeout_min_ms),
+            election_timeout_max_ms: Some(value.election_timeout_max_ms),
         }
     }
 }

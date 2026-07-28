@@ -1,3 +1,15 @@
+// === Protocol ===
+// The worker<->manager wire-protocol version, exchanged during worker
+// registration (`WorkerRegister`). Bump this ONLY for breaking wire-contract
+// changes to worker-plane RPCs (registration, heartbeats, health checks,
+// work dispatch): removed/renamed fields, changed field semantics, or new
+// required behavior an old peer cannot satisfy. Additive, backwards-compatible
+// fields do NOT bump this. Managers accept workers at or below their own
+// version (workers reporting 0 are pre-versioning builds and are accepted
+// with a warning); they reject newer workers so operators upgrade managers
+// before workers. See docs/upgrades.md for the full skew policy.
+pub const PROTOCOL_VERSION: u32 = 1;
+
 // === Manager ===
 pub const DEF_CONFIG_PATH: &str = "./configs/manager.jsonnet";
 

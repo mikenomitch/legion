@@ -375,16 +375,20 @@ Implementation shape:
   - expose health/lag into `PersistenceStatus`
 - Revisit native Rust implementation only if operational constraints later require deeper embedding.
 
-## Phase 2: Raft tech preview
+## Phase 2: Raft tech preview ✅ Superseded/Done (2026-07-23)
 
-- Implement command-replicated writes for a subset of APIs. *(in progress separately)*
-- Add cluster bootstrap/join/member commands.
-- Add observability: leader, term, lag, apply latency.
+- [x] Replicated writes — for **all** store APIs, not a subset (changeset
+      replication; see "Remaining GA work" below).
+- [x] Cluster bootstrap/join/member commands.
+- [x] Observability: leader, term, indexes, history (Prometheus
+      `legion_raft_*` series still reserved).
 
 Exit criteria:
 
-- deterministic apply tests pass under network partitions
-- crash/restart + snapshot restore validated
+- [x] deterministic apply tests pass under network partitions
+      (`tests/raft_durability.rs`)
+- [x] crash/restart + snapshot restore validated
+      (`tests/raft_snapshot_recovery.rs`)
 
 ## Phase 3: Raft GA (control-plane operations) ✅ Done (2026-03-20)
 
@@ -395,10 +399,33 @@ Exit criteria:
 
 ### Remaining GA work (store replication path)
 
-- [ ] Cover all mutating store operations with committed Raft apply.
-- [ ] Snapshot/compaction pipeline for SQLite state-machine replication.
-- [ ] Rolling-upgrade and migration hardening for mixed persistence modes.
-- [ ] Durability/partition/fault-injection test matrix for replicated writes.
+> Status 2026-07-23: the store replication path is **implemented** by the
+> real raft engine (`src/storage/raft/`), executed per
+> [docs/plans/durability-and-ops-execution-plan.md](plans/durability-and-ops-execution-plan.md).
+> One deliberate deviation from this plan's §"Best way to do Raft with
+> SQLite": instead of typed `StoreOpEnvelope` command replication, the
+> engine replicates **SQLite session changesets** (the exact row-level
+> effects of each mutation), which makes determinism structural rather
+> than audited per method (plan JC-1). Operator docs: `docs/multi-raft.md`.
+
+- [x] Cover all mutating store operations with committed Raft apply
+      (every mutating method routes through `Store::replicated()`; a
+      runtime guard rejects bypassing writes in raft mode).
+- [x] Snapshot/compaction pipeline for SQLite state-machine replication
+      (`VACUUM INTO` whole-DB snapshots every `raft.snapshotEntries`,
+      log purge behind them, snapshot-install catch-up).
+- [x] Rolling-upgrade and migration hardening — for the supported paths:
+      `local_disk`/simulated-raft → raft adopts the existing DB at
+      bootstrap (with a seed snapshot for joiners); backup/restore seeds a
+      fresh cluster; rollback to `local_disk` is documented. Mixed-mode
+      clusters (old simulated raft + real raft) are deliberately
+      unsupported (fresh-bootstrap rule, `docs/upgrades.md`).
+- [x] Durability/partition/fault-injection test matrix for replicated
+      writes (`tests/raft_durability.rs`: divergence-under-interleaving,
+      leader loss mid-burst, minority partition, any-single-node loss;
+      `tests/raft_snapshot_recovery.rs`: crash/restart + laggard
+      snapshot catch-up; `tests/raft_upgrade_bootstrap.rs`,
+      `tests/raft_cascade_delete.rs`).
 - [ ] Parallelize scheduler planning across manager nodes with Raft-fenced plan ownership so multiple managers can compute placement decisions concurrently without double-apply.
 
 ---

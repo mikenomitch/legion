@@ -1,28 +1,65 @@
 # Observability: Current State
 
-This document describes what observability exists today.
+This document describes what observability exists today and where each piece is
+documented in depth.
 
 ## Logging and Tracing Setup
 
-`init_tracing()` configures two `tracing_subscriber` layers:
+`init_tracing()` / `init_tracing_with_options()` (`src/tracing_util.rs`)
+configure the `tracing_subscriber` stack:
 
-- pretty stdout logs
-- JSON file logs (daily rolling under `./logs/events.log.<date>`)
+- Pretty console logs (stdout, or stderr for stdio protocol servers like
+  `legion mcp serve`).
+- JSON file logs, daily rolling under `./logs/events.log.<date>`.
+- `EnvFilter` from the environment (default `info`), so log verbosity is
+  controlled with standard `RUST_LOG`-style tracing filters.
+- With `--o11y`, an additional JSON span layer (span new/close events) writes
+  daily-rolling files under `./traces/spans.json.<date>`.
 
-`EnvFilter::from_default_env()` is enabled, so log verbosity can be controlled with standard tracing env filters.
+Retention is pruned at startup: 7 days for `./logs`, 3 days for `./traces`.
 
-## OTEL Status
+## OTLP Trace Export (OpenTelemetry)
 
-There is an explicit note in code that the current file JSON layer is not yet a real OTEL export pipeline.
+Legion's own control-plane spans can be exported over **OTLP/HTTP** to any
+OpenTelemetry backend (Tempo, Jaeger, Honeycomb, an OTel Collector, …). This
+is implemented in `src/otel.rs` and wired into the subscriber stack in
+`src/tracing_util.rs`. It is opt-in via the standard OpenTelemetry env vars
+(`OTEL_EXPORTER_OTLP_ENDPOINT`, default `http://localhost:4318`;
+`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`; `OTEL_SERVICE_NAME`; or `LEGION_OTLP=1`
+to force the default endpoint) and is limited to long-running servers
+(`legion start manager` / `legion start worker`) — short CLI invocations never
+spin up an exporter.
 
-Current state:
+Full configuration reference: the "OpenTelemetry traces for Legion itself"
+section of [docs/logging.md](logging.md).
 
-- OTEL-compatible/standardized export pipeline is not complete.
-- Traces are not shipped to a backend by default.
+## Metrics and Health Probes
+
+The manager serves a dedicated telemetry HTTP listener
+(`src/manager/telemetry.rs`, default port `server.port + 2`):
+
+- `GET /metrics` — Prometheus text exposition (`legion_*` families: gRPC
+  request counts/latency, evals, plan applies, heartbeats, nodes, events, …).
+- `GET /healthz` — liveness probe.
+- `GET /readyz` — readiness probe (store read probe; raft leader known when in
+  raft mode).
+
+Full reference: [docs/metrics.md](metrics.md).
+
+## Event Stream
+
+Cluster lifecycle events (jobs, nodes, rollouts, drains, …) are journaled and
+streamable via `ListEvents`/`StreamEvents`, the CLI, MCP, and the UI. See
+[docs/event-stream.md](event-stream.md).
+
+## Task Logs
+
+Task stdout/stderr capture, rotation, size caps, disk sweep, and the CLI/UI
+log surfaces are documented in [docs/logging.md](logging.md).
 
 ## Runtime Health Signals
 
-The system currently records operational health in these places:
+The system records operational health in these places:
 
 - Node heartbeat and node health check payloads on manager.
 - Allocation health snapshots (`allocation_health` table) reported from workers.
@@ -36,17 +73,37 @@ These are used by the UI rollout and node views.
 - Rollout event log and allocation health overlays.
 - Relative timestamps and statuses for jobs/nodes/rollouts.
 
-## Gaps (From Task List)
+## Raft persistence observability
 
-Planned but not yet complete:
+When manager persistence is configured as `raft` (real quorum-replicated
+writes — `docs/multi-raft.md`), the engine's live metrics stream backs:
 
-- Scheduler-focused tracing depth improvements.
-- First-class trace viewer in UI.
-- Broader metrics/perf instrumentation.
-- Event-stream and log UX improvements.
+- `GetRaftStatus` / `legion raft status` / the UI Raft page: role, current
+  leader, term, commit/applied indexes, voters/learners, and per-lane
+  detail when more than one raft group is active.
+- `ListRaftHistory` / `legion raft history`: real transitions (elections,
+  role changes, membership changes, join-token issuance) plus
+  actor-attributed operator commands.
+- `/readyz`: in raft mode readiness additionally requires a known leader —
+  under `topology = "lanes"`, on every lane, and the same manager on all of
+  them once a ~10s post-election grace window has passed (lane leadership is
+  co-located; see docs/metrics.md).
 
+Of the `legion_raft_*` Prometheus prefix, `legion_raft_voters{lane}` and
+`legion_raft_quorum{lane}` are emitted (voter-count checks); the rest
+(term, indexes, apply lag, …) is **reserved but not yet emitted** — see the
+Gaps list and `docs/metrics.md`.
 
+## Gaps
 
-## Raft control-plane observability
+Honest list of what does **not** exist yet:
 
-When manager persistence is configured as `raft`, observability includes raft role/leader/term and operator event history (elections, transfers, membership changes, join-token issuance). These signals are available via gRPC (`GetRaftStatus`, `ListRaftHistory`) and the UI Raft page.
+- No first-class trace viewer in the UI (`--o11y` span files and OTLP export
+  to an external backend are the current options).
+- No worker-side metrics endpoint — `/metrics` and the health probes are
+  manager-only.
+- OTLP **metrics** push is not implemented — metrics are pull-model Prometheus
+  only; only traces go out over OTLP.
+- Most reserved `legion_raft_*` metric series are not emitted yet (only
+  the voters/quorum gauges are) — deeper raft observability is
+  status/history RPCs + `/readyz`, not `/metrics`.
