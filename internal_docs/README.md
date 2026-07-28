@@ -70,6 +70,7 @@ When one is required and what goes in it:
 | [service-discovery-critique.md](plans/service-discovery-critique.md) | superseded (self-critique) |
 | [stateful-workloads-and-instance-identity-plan.md](plans/stateful-workloads-and-instance-identity-plan.md) | shipped |
 | [task-runtime-rename-plan.md](plans/task-runtime-rename-plan.md) | shipped |
+| [ui-jump-hints-plan.md](plans/ui-jump-hints-plan.md) | shipped |
 | [workload-identity-oidc-plan.md](plans/workload-identity-oidc-plan.md) | shipped (task identities) |
 | [volume-plugin-system-plan.md](plans/volume-plugin-system-plan.md) | shipped (v1; CSI bridge + snapshot/clone deferred) |
 | [sandbox-snapshots-and-fast-start-plan.md](plans/sandbox-snapshots-and-fast-start-plan.md) | planned (§0 convergence shipped with the sandbox kind) |

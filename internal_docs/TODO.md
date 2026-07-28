@@ -375,6 +375,21 @@ this" work:
 
 - [ ] Legion can be called as a library, not just as a CLI
 
+## UI
+
+docs: [ui-architecture.md](../docs/ui-architecture.md)
+
+Deferred from [ui-jump-hints-plan.md](plans/ui-jump-hints-plan.md):
+
+- [ ] Jump hints past the tenth row — a 20- or 50-row page labels only its first
+      ten, and the rest look unfinished until you know it is deliberate
+- [ ] Jump hints on the Overview dashboard and on detail-page tables; today only
+      the six index pages register rows
+- [ ] Verify the jump-hint chords survive Safari and Firefox. The letters avoid
+      Chromium's reserved set, but "the page wins `⌘`+digit" is asserted from
+      the reserved-key list, not measured
+      ([calls entry 1](calls/ui-jump-hints-plan_calls.md))
+
 ## Cross-cutting
 
 - [ ] **Audit every name decision in depth.** Important, and gets harder the
@@ -601,3 +616,15 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
 - [x] An MCP server (`legion mcp serve`), with mutating tools gated behind
       `--allow-write`
 - [x] Idempotency keys on mutating RPCs; validate/plan/preview paths
+
+## UI
+
+[docs](../docs/ui-architecture.md)
+
+- [x] Keyboard navigation: ⌘K command palette, `j`/`k`/`o` index selection, `u`
+      to go up a level
+- [x] Jump hints — hold ⌘ (Ctrl) to label index rows with digits and sidebar
+      items with letters, then ⌘1 / ⌘⇧B to jump
+      ([plan](plans/ui-jump-hints-plan.md),
+      [calls](calls/ui-jump-hints-plan_calls.md)). Rows past the tenth, the
+      Overview dashboard, and detail-page tables are open items above.

@@ -1,5 +1,6 @@
 import { A } from '@solidjs/router'
 import { Show, createSignal, onCleanup, splitProps, type JSX } from 'solid-js'
+import { jumpHintsVisible } from '../utils/jumpHints'
 import { badgeToneClasses, dotToneClasses, noteToneClasses, statusTone, textToneClasses, type Tone } from '../utils/status'
 
 /*
@@ -130,6 +131,37 @@ export function MonoBadge(props: { children: JSX.Element; title?: string; tone?:
     <Badge mono tone={props.tone ?? 'accent'} title={props.title} class={cx('rounded', props.class)}>
       {props.children}
     </Badge>
+  )
+}
+
+/**
+ * Opens a left gutter in an index's first column for the hint to sit in, and
+ * closes it again on release. Pair it with `position: relative` on the cell and
+ * an absolutely positioned `<JumpHint>`; goes on the `<th>` too so the header
+ * tracks the column.
+ */
+export const jumpHintGutterClass = () => cx('transition-[padding] duration-100', jumpHintsVisible() && 'pl-9')
+
+/**
+ * The key that jumps to a row or nav item, shown only while the reveal modifier
+ * is held. Renders nothing without a `keys` string, so callers can pass the
+ * hint for a position that has none (rows past the tenth) without a guard.
+ */
+export function JumpHint(props: { keys?: string; class?: string }) {
+  return (
+    <Show when={jumpHintsVisible() && props.keys}>
+      {(keys) => (
+        <kbd
+          aria-hidden="true"
+          class={cx(
+            'inline-flex select-none items-center justify-center rounded border border-brass/40 bg-brass/15 px-1 py-px font-mono text-2xs font-medium leading-none text-brass-strong',
+            props.class,
+          )}
+        >
+          {keys()}
+        </kbd>
+      )}
+    </Show>
   )
 }
 
