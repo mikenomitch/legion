@@ -153,8 +153,8 @@ const parseRules = (rulesJson: string | undefined): AclRule[] | null => {
  *
  * Fails OPEN when ACLs are disabled, in audit-only mode, or when the
  * identity has not resolved yet (a transient probe failure must not brick
- * the UI — the server still enforces). Fails CLOSED only on the definite
- * signal: ACLs enabled and the identity carries no matching rules.
+ * the UI). Fails CLOSED on the definite signal: a resolved identity whose
+ * rules do not match. The server enforces regardless.
  */
 export const allows = (
   resource: AclResource,
@@ -165,9 +165,37 @@ export const allows = (
   if (!identity) return true
   if (!identity.aclEnabled || identity.auditOnly) return true
   if (identity.tokenType === 'management') return true
+
   const rules = parseRules(identity.rulesJson)
   if (!rules) return false
   return evaluateRules(rules, resource, action, scope)
+}
+
+/** True when the caller presented no credential (and ACLs are on). */
+export const isAnonymous = (): boolean => {
+  const identity = managerIdentity()
+  return Boolean(identity?.aclEnabled) && identity?.source === 'anonymous'
+}
+
+/**
+ * The resource a top-level route needs `read` on, used to decide which
+ * sidebar destinations to offer. Routes absent from this map need no
+ * particular permission.
+ */
+export const ROUTE_RESOURCE: Record<string, AclResource> = {
+  '/jobs': 'job',
+  '/services': 'job',
+  '/rollouts': 'job',
+  // Volumes are job-scoped storage, gated under `job` like their RPCs.
+  '/volumes': 'job',
+  '/templates': 'template',
+  '/nodes': 'node',
+  '/manager': 'operator',
+  '/raft': 'operator',
+  '/events': 'operator',
+  '/observability': 'operator',
+  '/kv': 'kv',
+  '/state-explorer': 'state',
 }
 
 /** Nav-level check: could the identity read any instance of `resource`? */

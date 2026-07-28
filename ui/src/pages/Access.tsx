@@ -30,6 +30,9 @@ const visibleTabs = () =>
     return canRead('acl')
   })
 
+/** The control a message belongs to, so it renders where it was triggered. */
+type FeedbackSource = 'identity' | 'userpass' | 'jwt' | 'sso' | 'token'
+
 // Access: identity introspection, login (userpass / OIDC / JWT / raw token),
 // and the ACL admin panels.
 export default function Access() {
@@ -46,60 +49,85 @@ export default function Access() {
   const [jwtMethod, setJwtMethod] = createSignal('')
   const [error, setError] = createSignal<string | null>(null)
   const [notice, setNotice] = createSignal<string | null>(null)
+  // Which control produced the current message. The login forms sit well
+  // below the identity card, so rendering every result up there reads as
+  // "nothing happened" when you press a button further down the page.
+  const [feedbackFrom, setFeedbackFrom] = createSignal<FeedbackSource>('identity')
+
+  const report = (source: FeedbackSource, result: { error?: string; notice?: string }) => {
+    setFeedbackFrom(source)
+    setError(result.error ?? null)
+    setNotice(result.notice ?? null)
+  }
+
+  const failed = (source: FeedbackSource, err: unknown) =>
+    report(source, { error: err instanceof Error ? err.message : String(err) })
+
+  /** Messages for one control; renders nothing for the others. */
+  const Feedback = (props: { source: FeedbackSource }) => (
+    <Show when={feedbackFrom() === props.source}>
+      <Show when={notice()}>
+        <Note tone="ok" class="mt-3" onDismiss={() => setNotice(null)}>{notice()}</Note>
+      </Show>
+      <Show when={error()}>
+        <Note tone="danger" class="mt-3" onDismiss={() => setError(null)}>{error()}</Note>
+      </Show>
+    </Show>
+  )
 
   const hasStoredToken = () => getStoredToken() != null
   const oidcMethods = createMemo(() => (methods() ?? []).filter((m) => m.kind === 'oidc'))
   const jwtMethods = createMemo(() => (methods() ?? []).filter((m) => m.kind === 'jwt' || m.kind === 'webhook' || m.kind === 'custom'))
 
-  const applyToken = (secret: string, message: string) => {
+  const applyToken = (source: FeedbackSource, secret: string, message: string) => {
     setStoredToken(secret)
     setTokenInput('')
     setPassword('')
     setJwtInput('')
-    setError(null)
-    setNotice(message)
+    report(source, { notice: message })
     void refetch()
   }
 
   const saveToken = () => {
-    if (tokenInput().trim().length === 0) return
-    applyToken(tokenInput(), 'Token saved for this browser.')
+    if (tokenInput().trim().length === 0) {
+      report('token', { error: 'Paste a token secret first.' })
+      return
+    }
+    applyToken('token', tokenInput(), 'Token saved for this browser.')
   }
 
   const loginUserpass = async (event: Event) => {
     event.preventDefault()
-    setError(null)
-    setNotice(null)
+    report('userpass', {})
     try {
       const reply = await managerClient.login({
         method: 'userpass',
         username: username(),
         password: password(),
       })
-      applyToken(reply.secret, `Logged in as ${reply.token?.name ?? username()}.`)
+      applyToken('userpass', reply.secret, `Logged in as ${reply.token?.name ?? username()}.`)
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err))
+      failed('userpass', err)
     }
   }
 
   const loginJwt = async (event: Event) => {
     event.preventDefault()
-    setError(null)
-    setNotice(null)
+    report('jwt', {})
     try {
       const reply = await managerClient.login({ method: jwtMethod(), jwt: jwtInput() })
-      applyToken(reply.secret, `Logged in via ${jwtMethod()}.`)
+      applyToken('jwt', reply.secret, `Logged in via ${jwtMethod()}.`)
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err))
+      failed('jwt', err)
     }
   }
 
   const loginOidc = async (methodName: string) => {
-    setError(null)
+    report('sso', {})
     const method = oidcMethods().find((m) => m.name === methodName)
     if (!method) return
     if (!method.oidcIssuer || !method.oidcClientId) {
-      setError(`auth method ${methodName} is missing its issuer or oidcClientId`)
+      report('sso', { error: `auth method ${methodName} is missing its issuer or oidcClientId` })
       return
     }
     try {
@@ -111,14 +139,13 @@ export default function Access() {
         scopes: method.oidcScopes,
       })
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err))
+      failed('sso', err)
     }
   }
 
   const logout = () => {
     setStoredToken(null)
-    setNotice('Token removed.')
-    setError(null)
+    report('identity', { notice: 'Token removed.' })
     void refetch()
   }
 
@@ -184,12 +211,7 @@ export default function Access() {
                 />
               )}
             </Show>
-            <Show when={notice()}>
-              <Note tone="ok" class="mt-3" onDismiss={() => setNotice(null)}>{notice()}</Note>
-            </Show>
-            <Show when={error()}>
-              <Note tone="danger" class="mt-3" onDismiss={() => setError(null)}>{error()}</Note>
-            </Show>
+            <Feedback source="identity" />
           </SectionCard>
 
           <Show when={oidcMethods().length > 0}>
@@ -206,6 +228,7 @@ export default function Access() {
                   )}
                 </For>
               </div>
+              <Feedback source="sso" />
             </SectionCard>
           </Show>
 
@@ -232,6 +255,7 @@ export default function Access() {
                 <Button type="submit" variant="primary" size="md" class="self-start">
                   Log in
                 </Button>
+                <Feedback source="userpass" />
               </form>
             </SectionCard>
 

@@ -5,7 +5,7 @@ import { AclBanner } from './components/AclBanner'
 import { ConnectionGate } from './components/ConnectionGate'
 import { Icon, JumpHint, PageHeader, cx, type IconName } from './components/ui'
 import { managerClient } from './grpcClient'
-import { canRead } from './utils/acl'
+import { ROUTE_RESOURCE, canRead, isAnonymous } from './utils/acl'
 import { commandPaletteIndexItems } from './utils/commandPalette'
 import { connectionStatus, managerAddress } from './utils/connection'
 import {
@@ -72,24 +72,15 @@ type SidebarNode = SidebarItem | SidebarSection
 
 const detailRoutes = new Set(['jobs', 'nodes', 'manager', 'rollouts', 'services', 'templates', 'volumes'])
 
-// What each nav destination needs from the identity's effective ACL rules
-// (from WhoAmI). Paths not listed are always shown. Cosmetic only — the
-// manager enforces; this just stops the UI offering pages that can only
-// fail. Reactive through `canRead`'s use of the identity signal.
-const navVisibility: Record<string, () => boolean> = {
-  '/jobs': () => canRead('job'),
-  '/services': () => canRead('job'),
-  '/rollouts': () => canRead('job'),
-  '/templates': () => canRead('template'),
-  // Volumes are job-scoped storage, gated under `job` like their RPCs.
-  '/volumes': () => canRead('job'),
-  '/nodes': () => canRead('node'),
-  '/manager': () => canRead('operator'),
-  '/raft': () => canRead('operator'),
-  '/events': () => canRead('operator'),
-  '/kv': () => canRead('kv'),
-  '/state-explorer': () => canRead('state'),
-  '/observability': () => canRead('operator'),
+// Anonymous callers keep the whole sidebar: they have not had a chance to
+// authenticate, and an app that hides every destination looks broken rather
+// than locked. Clicking through lands on AccessDenied, which says why and
+// links to login. A caller who IS authenticated only sees what their rules
+// allow. Cosmetic — the manager enforces regardless.
+const isNavVisible = (path: string): boolean => {
+  const resource = ROUTE_RESOURCE[path]
+  if (!resource) return true
+  return canRead(resource) || isAnonymous()
 }
 
 const decodePathSegment = (value: string) => {
@@ -202,7 +193,7 @@ const Layout = (props: RouteSectionProps) => {
     // Hide destinations the identity's ACL rules cannot read; drop sections
     // that end up empty. Direct navigation still works (and fails loudly) —
     // this only trims what the UI offers.
-    const isVisible = (item: SidebarItem) => navVisibility[item.path]?.() ?? true
+    const isVisible = (item: SidebarItem) => isNavVisible(item.path)
     return base.flatMap<SidebarNode>((entry) => {
       if (entry.kind === 'item') return isVisible(entry) ? [entry] : []
       const items = entry.items.filter(isVisible)
