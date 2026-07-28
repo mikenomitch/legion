@@ -206,6 +206,59 @@ lose victims. **Reject (for v1):** whole-workload/gang victim grain (Legion
 has no gang admission — allocations are the natural unit here), fair-share
 reclaim, and any policy matrix with more than one preemption semantic.
 
+## Jobs to Be Done
+
+**On-call responder**
+
+- When production is degrading and the cluster is full of less-important
+  work, I want to scale or deploy the critical service without first hunting
+  down whose jobs to kill, so I can stop the bleeding in minutes, not after a
+  capacity negotiation.
+- When an allocation of my service disappeared, I want to see what displaced
+  it, when, and on whose behalf, so I can tell an incident from expected
+  behavior at a glance.
+
+**Job author / app developer**
+
+- When I run work that matters less than production, I want to say so once in
+  the job file, so the platform can borrow my capacity without me being paged
+  about it.
+- When my work gets displaced, I want it to come back on its own once there
+  is room, so a temporary squeeze does not become a silent outage of my
+  pipeline.
+- When the platform stops my task for any reason, I want a warning and a few
+  seconds to flush, checkpoint, or drain connections, so a routine stop never
+  corrupts my data.
+- When I donate capacity, I want to keep a floor under my service, so being
+  helpful cannot mean being wiped out entirely.
+
+**Cluster operator**
+
+- When teams share one cluster, I want important work to win contention by
+  policy rather than by timing or by who I stopped manually, so I can run the
+  cluster hotter without hand-managing capacity.
+- When I am not yet sure I trust displacement, I want to watch what *would*
+  have been displaced before turning it on, and to exempt specific pools
+  entirely, so I can adopt it with a small blast radius.
+- When I drain a node for maintenance, I want application protections to slow
+  nothing down past my deadline, so an upgrade can never be held hostage by a
+  misconfigured job.
+
+**Security / platform admin**
+
+- When anyone can mark their own work as most important, importance means
+  nothing — I want claiming the top level to require a permission I control,
+  so priority stays a policy tool instead of an arms race.
+
+**Autonomous agent**
+
+- When I am about to submit work that could displace something, I want a
+  dry-run that names the exact victims first, so I can decide (or ask) before
+  causing disruption.
+- When my task is told to stop, I want the reason and the deadline in a file
+  I can parse, not just a signal, so I can react programmatically —
+  checkpoint, hand off, or exit clean.
+
 ## User Scenarios
 
 **S1 — Urgent capacity on a full cluster.** A cluster runs a fleet of
