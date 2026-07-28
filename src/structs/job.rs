@@ -3798,7 +3798,7 @@ mod tests {
         let spec = serde_json::json!({
             "name": "demo",
             "task": {
-                "kind": "exec",
+                "runtime": "exec",
                 "connect": {
                     "upstreams": [
                         { "service": "db" },
@@ -3831,7 +3831,7 @@ mod tests {
         let spec = serde_json::json!({
             "name": "demo",
             "task": {
-                "kind": "exec",
+                "runtime": "exec",
                 "connect": { "upstreams": [{ "service": "cache", "localPort": 6379 }] },
                 "service": { "port": 6379 }
             }
@@ -3849,7 +3849,7 @@ mod tests {
 
     #[test]
     fn tasks_without_connect_stay_unchanged() -> R<()> {
-        let spec = serde_json::json!({ "name": "demo", "task": { "kind": "exec" } });
+        let spec = serde_json::json!({ "name": "demo", "task": { "runtime": "exec" } });
         let config: JobConfig = serde_json::from_value(spec)?;
         assert!(config.tasks[0].connect.is_none());
         config.tasks[0].validate_connect()?;
