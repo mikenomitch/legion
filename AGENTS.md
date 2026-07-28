@@ -113,7 +113,12 @@ the MCP server). Keep these surfaces agent-friendly when contributing. See
 - **Prefer read-only-by-default and dry-runs.** Anything that can offer a
   validate/plan/preview path (like `job validate` / `job plan`) should, so agents
   can self-correct before mutating the cluster.
-- **Document new agent surfaces** in `docs/agent-readiness.md`.
+- **Document new agent surfaces** in `docs/agent-readiness.md`. That file is
+  structured so parallel branches do not collide in it: the MCP tool table is
+  alphabetical within its read-only/mutating groups, and the workflow section
+  keeps its six steps generic while each submission surface owns an appendable
+  `### Submitting …` subsection. Add a row or a subsection; do not amend the
+  shared steps.
 
 ## Documentation
 

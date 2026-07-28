@@ -46,39 +46,44 @@ server with command `legion` and args `["mcp", "serve"]`. The server honours
 Read-only tools are always available; mutating tools require `--allow-write`.
 Even with `--allow-write`, `legion_state_query` is forced to read-only.
 
+Rows are grouped read-only first, then mutating, and **alphabetical by
+tool name within each group**. Keep it that way: a new tool then lands on
+its own line far from anything else in flight, which is what stops two
+branches colliding here.
+
 | Tool | Mutates | Purpose |
 | --- | --- | --- |
+| `legion_acl_whoami` | no | ACL status + caller identity (diagnose PermissionDenied). |
 | `legion_capabilities` | no | List the operation catalog. |
-| `legion_job_list` | no | List jobs. |
+| `legion_events` | no | List scheduler events; poll with `after_id` to tail. |
+| `legion_instance_get` | no | Inspect one stateful instance. |
+| `legion_instance_list` | no | List a job's stateful instances (slot + keyed). |
 | `legion_job_info` | no | Inspect one job. |
-| `legion_job_spec` | no | Fetch a job's source submissions. |
+| `legion_job_list` | no | List jobs. |
+| `legion_job_logs` | no | Fetch captured task stdout/stderr for a job. |
 | `legion_job_schema` | no | JSON Schema for jobspecs + task runtimes. |
+| `legion_job_spec` | no | Fetch a job's source submissions. |
 | `legion_job_validate` | no | Validate a rendered jobspec (JSON). |
+| `legion_node_list` | no | List worker nodes. |
 | `legion_rollout_list` | no | List rollouts. |
 | `legion_rollout_status` | no | Rollout progress + allocation health. |
-| `legion_instance_list` | no | List a job's stateful instances (slot + keyed). |
-| `legion_instance_get` | no | Inspect one stateful instance. |
-| `legion_volume_list` | no | List volumes — the storage behind stateful instances. Filters by job/node/plugin/instance/state. |
-| `legion_volume_get` | no | Inspect one volume: plugin, params, node pin, mount path, last driver error. |
-| `legion_volume_drivers` | no | Volume plugins installed across the cluster and which nodes can use them. Answers "why was my job rejected for plugin X". |
-| `legion_node_list` | no | List worker nodes. |
-| `legion_acl_whoami` | no | ACL status + caller identity (diagnose PermissionDenied). |
-| `legion_events` | no | List scheduler events; poll with `after_id` to tail. |
-| `legion_job_logs` | no | Fetch captured task stdout/stderr for a job. |
 | `legion_state_query` | no | Read-only SQL against the state store. |
 | `legion_state_schema` | no | Describe state store tables. |
-| `legion_template_list` | no | List job templates (name, latest version, variable count). |
 | `legion_template_get` | no | One template version: declared variables, source, version history. |
+| `legion_template_list` | no | List job templates (name, latest version, variable count). |
 | `legion_template_render` | no | Dry-run a template: validate variables, return the rendered jobspec without submitting. |
-| `legion_job_run` | **yes** | Submit/update a job from rendered JSON. |
-| `legion_job_stop` | **yes** | Stop a job. |
-| `legion_job_destroy` | **yes** | Destroy a job. |
-| `legion_template_run` | **yes** | Render a template with variables and submit the job (supports `idempotency_key`). |
-| `legion_template_upsert` | **yes** | Store Jsonnet as the next immutable version of a template. |
-| `legion_template_delete` | **yes** | Delete a template and all of its versions (running jobs are unaffected). |
+| `legion_volume_drivers` | no | Volume plugins installed across the cluster and which nodes can use them. Answers "why was my job rejected for plugin X". |
+| `legion_volume_get` | no | Inspect one volume: plugin, params, node pin, mount path, last driver error. |
+| `legion_volume_list` | no | List volumes — the storage behind stateful instances. Filters by job/node/plugin/instance/state. |
 | `legion_instance_create` | **yes** | Create a keyed-mode stateful instance (never-recycled id; supports `idempotency_key`). |
 | `legion_instance_destroy` | **yes** | Destroy a keyed instance, stop its allocation, drop its storage (supports `idempotency_key`). |
 | `legion_instance_replace` | **yes** | Force-replace an instance's allocation stuck on a LOST node (skips the `onLost.replaceAfter` loss-confirmation gate; split-brain risk if the node is only partitioned; supports `idempotency_key`). |
+| `legion_job_destroy` | **yes** | Destroy a job. |
+| `legion_job_run` | **yes** | Submit/update a job from rendered JSON. |
+| `legion_job_stop` | **yes** | Stop a job. |
+| `legion_template_delete` | **yes** | Delete a template and all of its versions (running jobs are unaffected). |
+| `legion_template_run` | **yes** | Render a template with variables and submit the job (supports `idempotency_key`). |
+| `legion_template_upsert` | **yes** | Store Jsonnet as the next immutable version of a template. |
 | `legion_volume_delete` | **yes** | Delete a volume and reclaim its storage. DESTROYS DATA; `force: true` tombstones without driver confirmation for a node that is gone for good (supports `idempotency_key`). |
 
 Tool errors are returned in-band (`result.isError = true` with a text payload),
@@ -138,22 +143,13 @@ under `taskRuntimes`, derived from the typed Rust structs.
 
 ### Job templates: authoring by parameter instead of by spec
 
-When a cluster publishes [job templates](job-templates.md), an agent does not
-have to author a jobspec at all — it discovers the declared variables and
-supplies values:
-
-```bash
-legion template list --json
-legion template get render --json      # declared variables, types, defaults, options
-legion template render render --var scene=demo --json   # dry run: the exact spec that would be submitted
-legion template run render --var scene=demo --idempotency-key run-1 --wait --json
-```
-
-The manager type-checks every value against the declaration and rejects
-unknown keys, so a mistyped variable fails with a specific message
+When a cluster publishes [job templates](job-templates.md), there is no spec to
+author: the agent reads the template's declared variables and supplies values.
+The manager type-checks every value against the declaration and rejects unknown
+keys, so a mistyped variable fails with a specific message
 (`variable 'frames': expected a number, got "many"`) instead of producing a
-subtly wrong job. `template render` is the self-correction loop: it is
-read-only and returns exactly what `template run` would submit.
+subtly wrong job. The command sequence is in
+[the workflow section](#submitting-through-a-job-template).
 
 ## 5. Idempotency keys
 
@@ -303,23 +299,50 @@ All client commands and the MCP server honour:
 
 ## Recommended agent workflow
 
-1. **Discover**: `legion capabilities --json` (or MCP `tools/list`).
-2. **Observe (read-only)**: `legion state schema`, then `legion state query`,
-   `legion job list`, `legion node list`.
-3. **Author + check**: build a jobspec against `legion job schema`, then
-   `legion job validate` it — or, if a template covers the task,
-   `legion template get <name>` and fill in its declared variables.
-4. **Preview**: `legion job plan` to see placements (dry-run), or
-   `legion template render` to see the spec a template would submit. The
-   `job plan --json` envelope also carries `index_usage` — per task, which
-   scheduling index generated the candidates and why none did
-   ([scheduling-indexes.md](scheduling-indexes.md)).
-5. **Apply with a retry-safe key**: `legion job run … --idempotency-key … --wait`
-   (or `legion template run … --idempotency-key … --wait`).
-6. **Verify**: inspect the `wait` result, `rollout events`, and `state query`.
+Every submission surface runs the same loop:
+
+1. **Discover** what this cluster can do.
+2. **Observe**, read-only, before touching anything.
+3. **Author** the thing you intend to submit, and check it locally.
+4. **Preview** the effect without applying it.
+5. **Apply** with a retry-safe idempotency key, and wait.
+6. **Verify** the outcome from the cluster's own state.
 
 Prefer read-only operations; treat anything with `mutates: true` /
 `readOnlySafe: false` as requiring confirmation.
+
+Steps 1, 2, and 6 are surface-independent:
+
+- **Discover**: `legion capabilities --json`, or MCP `tools/list`.
+- **Observe**: `legion state schema`, then `legion state query`,
+  `legion job list`, `legion node list`.
+- **Verify**: the `wait` result, then `legion events list` and
+  `legion state query`.
+
+Steps 3–5 depend on what you are submitting. **Each surface owns the
+subsection below; add a new one rather than editing an existing one.**
+
+### Submitting a raw jobspec
+
+- **Author**: build against `legion job schema --json`, then
+  `legion job validate <path> --json` — the same validation the manager runs
+  on submit, so an agent can self-correct before touching the cluster.
+- **Preview**: `legion job plan <path> --json`. The envelope also carries
+  `index_usage` — per task, which scheduling index generated the candidates
+  and why none did ([scheduling-indexes.md](scheduling-indexes.md)).
+- **Apply**: `legion job run <path> --idempotency-key <key> --wait`.
+
+### Submitting through a job template
+
+- **Author**: `legion template list --json` to find one, then
+  `legion template get <name> --json` for its declared variables, types,
+  defaults, and options. There is no spec to write — you supply values.
+- **Preview**: `legion template render <name> --var k=v --json` returns
+  exactly the spec `template run` would submit, which makes it the
+  self-correction loop for parameterised submission.
+- **Apply**: `legion template run <name> --var k=v --idempotency-key <key> --wait`.
+- The resulting job records which template and version produced it; see
+  [job-templates.md](job-templates.md).
 
 ## Status / roadmap
 
