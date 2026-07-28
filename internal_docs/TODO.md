@@ -53,6 +53,15 @@ How to use it:
       [docs/testing-and-benchmarks.md](../docs/testing-and-benchmarks.md)
 - [ ] Add to AGENTS.md that scheduler changes ship with a before/after perf
       benchmark
+- [ ] Close the last plan-fencing window: `apply_plan_submission` commits (and
+      so publishes the bumped epoch) *before* it refreshes the read-model
+      allocation cache (`cache_add_allocations`). A plan that samples epochs in
+      that microsecond-wide gap sees the new epoch but the pre-commit cache, so
+      it can still plan against stale capacity and pass the compare-and-set.
+      Uncovered while moving the epoch sample to snapshot time (see Done →
+      Scheduling); the fix is to make the epoch bump and the cache refresh
+      visible atomically, which changes the lock ordering around the write
+      transaction and wants a plan.
 
 ## Task runtimes
 
@@ -351,6 +360,16 @@ docs: [scheduler-and-eval-loop.md](../docs/scheduler-and-eval-loop.md), [jobs-ta
       after N times forces a reschedule
 - [x] Dynamic metadata: a node attribute change re-evaluates affected jobs
       (`UpdateNodeDynamic` enqueues evals)
+- [x] Plan epochs are sampled at *snapshot* time, not after planning. The
+      version vector used to fence a plan submission was read after
+      `build_plan`, so a competing plan that applied in between was already
+      counted in the epoch and the compare-and-set passed against stale
+      capacity — an intermittent node oversubscription
+      (`concurrent_plans_cannot_oversubscribe_a_node`). The scheduler now
+      samples every candidate node's epoch before it reads
+      `cached_allocations_by_node`, in one batched query
+      (`Store::allocation_version_vector_for_candidates`), and selects the
+      affected subset at submit time.
 
 ## Task runtimes
 

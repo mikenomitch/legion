@@ -334,6 +334,9 @@ impl JobSubmitOutcome {
 pub const CONN_LOCK_ERROR: &str = "Error locking database connection";
 const READ_ONLY_CONN_POOL_SIZE: usize = 2;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+// Bound on the bind parameters used per batched `scope_id IN (...)` lookup in
+// `allocation_version_vector_for_candidates`; larger candidate sets are chunked.
+const SCOPE_EPOCH_QUERY_CHUNK: usize = 500;
 // Live subscribers that fall this many events behind must catch up from the
 // scheduler_event table (StreamEvents handles the Lagged case).
 const EVENT_BROADCAST_CAPACITY: usize = 1_024;
@@ -1488,6 +1491,65 @@ impl Store {
                 Self::scope_vector_key("node", node_id),
                 self.allocation_epoch_for_scope("node", node_id)?,
             );
+        }
+        Ok(versions)
+    }
+
+    /// Batched version vector for a whole *candidate* node set.
+    ///
+    /// The scheduler has to sample the optimistic-concurrency epochs before it
+    /// reads the capacity snapshot it plans against (see
+    /// `Scheduler::plan_and_apply_internal`), and at that point every node it
+    /// might place on is a candidate — the affected subset is only known after
+    /// planning. Sampling those per node with
+    /// [`Self::allocation_epoch_for_scope`] would be one query per node on the
+    /// scheduler hot path, so this issues a single query per chunk of node ids
+    /// instead.
+    ///
+    /// Keys match [`Self::allocation_version_vector`] (`job_config:<id>`,
+    /// `node:<id>`) so callers can select the affected subset out of the result
+    /// without re-reading. Nodes with no epoch row yet default to `0`, which is
+    /// the same value [`Self::allocation_epoch_for_scope`] reports and the same
+    /// value `ensure_scope_epoch_tx` seeds when `apply_plan_submission`
+    /// compares — so a first-ever allocation on a fresh node still bumps `0 ->
+    /// 1` and still rejects a competing plan that sampled `0`.
+    pub fn allocation_version_vector_for_candidates(
+        &self,
+        job_config_id: &str,
+        node_ids: &[String],
+    ) -> R<BTreeMap<String, i64>> {
+        let mut versions = BTreeMap::new();
+        let conn = self.read_connection()?;
+        let job_epoch: Option<i64> = conn
+            .query_row(
+                "SELECT epoch FROM allocation_epoch_partition WHERE scope_type = 'job_config' AND scope_id = ?1;",
+                params![job_config_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        versions.insert(
+            Self::scope_vector_key("job_config", job_config_id),
+            job_epoch.unwrap_or(0),
+        );
+        for node_id in node_ids {
+            versions.insert(Self::scope_vector_key("node", node_id), 0);
+        }
+        for chunk in node_ids.chunks(SCOPE_EPOCH_QUERY_CHUNK) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT scope_id, epoch FROM allocation_epoch_partition \
+                 WHERE scope_type = 'node' AND scope_id IN ({placeholders});"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(params_from_iter(chunk.iter()), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?;
+            for row in rows {
+                let (scope_id, epoch) = row?;
+                versions.insert(Self::scope_vector_key("node", &scope_id), epoch);
+            }
         }
         Ok(versions)
     }
@@ -12304,6 +12366,71 @@ mod tests {
 
         assert_eq!(v1_after, v1_before + 1);
         assert_eq!(v2_after, v2_before + 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn candidate_version_vector_matches_per_scope_reads_test() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "ready"))?;
+        store.insert_node(make_node_msg("node-b", "ready"))?;
+
+        let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "job-candidates".into(),
+            tasks: vec![TaskConfig::new("task", "noop")],
+            version: None,
+        };
+        store.handle_job_submit(
+            &job,
+            &[Submission {
+                path: "job.jsonnet".into(),
+                content: "job".into(),
+                is_primary: true,
+            }],
+        )?;
+        let job_config_id = store.get_job_config("job-candidates")?.id();
+        let task_id = task_id_for(&store, "task", "job-candidates")?;
+
+        let candidates = vec!["node-a".to_string(), "node-b".to_string()];
+
+        // Nodes that have never held an allocation have no epoch row; the
+        // batched read must report the same 0 the per-scope read does, because
+        // that is the value `apply_plan_submission` compares against.
+        let sampled =
+            store.allocation_version_vector_for_candidates(&job_config_id, &candidates)?;
+        assert_eq!(sampled.get("node:node-a").copied(), Some(0));
+        assert_eq!(sampled.get("node:node-b").copied(), Some(0));
+        assert_eq!(
+            sampled.get(&format!("job_config:{job_config_id}")).copied(),
+            Some(0)
+        );
+
+        // A plan sampled on the fresh node applies, bumping node-a only.
+        let submission = store.insert_plan_submission(
+            &job_config_id,
+            "fresh",
+            &[("node-a".to_string(), task_id)],
+            &store.allocation_version_vector(
+                &job_config_id,
+                &HashSet::from(["node-a".to_string()]),
+            )?,
+        )?;
+        assert!(matches!(
+            store.apply_plan_submission(&submission)?,
+            PlanApplyOutcome::Applied(_)
+        ));
+
+        let after = store.allocation_version_vector_for_candidates(&job_config_id, &candidates)?;
+        let per_scope = store.allocation_version_vector(
+            &job_config_id,
+            &HashSet::from(["node-a".to_string(), "node-b".to_string()]),
+        )?;
+        assert_eq!(after, per_scope, "batched read must match per-scope reads");
+        assert_eq!(after.get("node:node-a").copied(), Some(1));
+        assert_eq!(after.get("node:node-b").copied(), Some(0));
 
         Ok(())
     }

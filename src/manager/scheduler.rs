@@ -2,7 +2,7 @@
 // epochs, …) by design; bundling them into structs would not improve clarity.
 #![allow(clippy::too_many_arguments)]
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use serde_json::Value;
 
@@ -607,6 +607,34 @@ impl<'a> Scheduler<'a> {
             bail!("No nodes available to place allocations");
         }
 
+        // Optimistic-concurrency fence, sampled HERE — before the capacity
+        // snapshot below (`cached_allocations_by_node`) that `build_plan`
+        // places against.
+        //
+        // Every transaction that mutates a scope's allocations bumps that
+        // scope's epoch (`bump_epochs_for_allocations_tx`), and
+        // `apply_plan_submission` re-reads these epochs inside its write
+        // transaction and refuses the plan if any of them moved. So what the
+        // epochs fence is: "nothing changed the allocations I planned against
+        // between the moment I read them and the moment I write". That only
+        // holds if the sample is taken no later than the capacity read. If it
+        // were taken after planning (as it once was), a competing plan that
+        // applied in the window between the capacity read and the sample would
+        // already have bumped the epoch, so this plan would sample the
+        // *post-bump* value, pass the compare-and-set, and commit placements
+        // computed against capacity that no longer exists — oversubscribing the
+        // node. Sampling first makes that case fail the compare-and-set
+        // instead, and the caller retries against a fresh snapshot.
+        //
+        // The affected node set is only known after planning, so sample every
+        // candidate node now and select the affected subset at submit time —
+        // never re-read. That is one batched query rather than one per node;
+        // see `Store::allocation_version_vector_for_candidates`.
+        let candidate_node_ids: Vec<String> = nodes.iter().map(|node| node.id.clone()).collect();
+        let candidate_versions = self
+            .store
+            .allocation_version_vector_for_candidates(job_config_id, &candidate_node_ids)?;
+
         let all_tasks = self
             .store
             .cached_task_configs_for_job_config(job_config_id)?;
@@ -686,9 +714,10 @@ impl<'a> Scheduler<'a> {
             .iter()
             .map(|placement| placement.node_id.clone())
             .collect::<HashSet<_>>();
-        let expected_versions = self
-            .store
-            .allocation_version_vector(job_config_id, &affected_nodes)?;
+        // Select from the pre-planning sample; re-reading here would reopen the
+        // race the sample above exists to close.
+        let expected_versions =
+            Self::expected_versions_for(job_config_id, &candidate_versions, &affected_nodes);
         let submission = self.store.insert_plan_submission(
             job_config_id,
             mode.as_str(),
@@ -740,6 +769,36 @@ impl<'a> Scheduler<'a> {
             "Completed scheduler plan_and_apply"
         );
         Ok(outcome)
+    }
+
+    /// Narrow the pre-planning candidate sample down to the scopes this plan
+    /// actually touches: the job config plus the nodes it placed on.
+    ///
+    /// A node missing from the sample (it was not a planning candidate, which
+    /// `build_plan` never produces) falls back to `0` — the same default a
+    /// never-allocated scope has, so the compare-and-set stays conservative and
+    /// rejects rather than admits.
+    fn expected_versions_for(
+        job_config_id: &str,
+        candidate_versions: &BTreeMap<String, i64>,
+        affected_nodes: &HashSet<String>,
+    ) -> BTreeMap<String, i64> {
+        let mut expected = BTreeMap::new();
+        let job_key = format!("job_config:{job_config_id}");
+        let job_epoch = candidate_versions
+            .get(&job_key)
+            .copied()
+            .unwrap_or_default();
+        expected.insert(job_key, job_epoch);
+        for node_id in affected_nodes {
+            let node_key = format!("node:{node_id}");
+            let epoch = candidate_versions
+                .get(&node_key)
+                .copied()
+                .unwrap_or_default();
+            expected.insert(node_key, epoch);
+        }
+        expected
     }
 
     fn existing_alloc_counts_by_task(
