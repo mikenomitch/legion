@@ -7,6 +7,7 @@
 use crate::prelude::*;
 use crate::storage::errors::StorageError;
 use crate::storage::store::Store;
+use crate::storage::Lane;
 use crate::structs::acl::parse_rules;
 use crate::structs::{AclPolicy, AclTokenInfo, AclUser};
 
@@ -137,6 +138,20 @@ impl Store {
         description: &str,
         rules_json: &str,
     ) -> R<AclPolicy> {
+        let name = name.to_owned();
+        let description = description.to_owned();
+        let rules_json = rules_json.to_owned();
+        self.replicated(Lane::Control, "upsert_acl_policy", move |s| {
+            s.upsert_acl_policy_apply(&name, &description, &rules_json)
+        })
+    }
+
+    fn upsert_acl_policy_apply(
+        &self,
+        name: &str,
+        description: &str,
+        rules_json: &str,
+    ) -> R<AclPolicy> {
         let name = name.trim();
         if name.is_empty() {
             return Err(invalid_input("policy name must not be empty".into()));
@@ -191,6 +206,13 @@ impl Store {
 
     #[instrument(err, skip_all, fields(policy = name))]
     pub fn delete_acl_policy(&self, name: &str) -> R<()> {
+        let name = name.to_owned();
+        self.replicated(Lane::Control, "delete_acl_policy", move |s| {
+            s.delete_acl_policy_apply(&name)
+        })
+    }
+
+    fn delete_acl_policy_apply(&self, name: &str) -> R<()> {
         let conn = self.write_connection()?;
         let deleted = conn.execute("DELETE FROM acl_policy WHERE name = ?;", [name])?;
         if deleted == 0 {
@@ -248,6 +270,13 @@ impl Store {
 
     #[instrument(err, skip_all, fields(accessor_id = record.accessor_id, name = record.name))]
     pub fn insert_acl_token(&self, record: &AclTokenRecord) -> R<()> {
+        let record = record.clone();
+        self.replicated(Lane::Control, "insert_acl_token", move |s| {
+            s.insert_acl_token_apply(&record)
+        })
+    }
+
+    fn insert_acl_token_apply(&self, record: &AclTokenRecord) -> R<()> {
         let conn = self.write_connection()?;
         conn.execute(
             "INSERT INTO acl_token (accessor_id, secret_hash, name, token_type, policies, expires_at, created_at)
@@ -271,8 +300,15 @@ impl Store {
     /// calls cannot both succeed.
     #[instrument(err, skip_all)]
     pub fn bootstrap_acl_token(&self, record: &AclTokenRecord) -> R<bool> {
+        let record = record.clone();
+        self.replicated(Lane::Control, "bootstrap_acl_token", move |s| {
+            s.bootstrap_acl_token_apply(&record)
+        })
+    }
+
+    fn bootstrap_acl_token_apply(&self, record: &AclTokenRecord) -> R<bool> {
         let mut conn = self.write_connection()?;
-        let tx = conn.transaction()?;
+        let tx = Self::write_tx(&mut conn)?;
         let existing: i64 = tx.query_row(
             "SELECT COUNT(*) FROM acl_token WHERE token_type = 'management';",
             [],
@@ -326,6 +362,13 @@ impl Store {
 
     #[instrument(err, skip_all, fields(accessor_id))]
     pub fn delete_acl_token(&self, accessor_id: &str) -> R<()> {
+        let accessor_id = accessor_id.to_owned();
+        self.replicated(Lane::Control, "delete_acl_token", move |s| {
+            s.delete_acl_token_apply(&accessor_id)
+        })
+    }
+
+    fn delete_acl_token_apply(&self, accessor_id: &str) -> R<()> {
         let conn = self.write_connection()?;
         let deleted = conn.execute(
             "DELETE FROM acl_token WHERE accessor_id = ?;",
@@ -369,6 +412,13 @@ impl Store {
 
     #[instrument(err, skip_all, fields(id = record.id, worker_type = record.worker_type))]
     pub fn insert_join_token(&self, record: &JoinTokenRecord) -> R<()> {
+        let record = record.clone();
+        self.replicated(Lane::Control, "insert_join_token", move |s| {
+            s.insert_join_token_apply(&record)
+        })
+    }
+
+    fn insert_join_token_apply(&self, record: &JoinTokenRecord) -> R<()> {
         let conn = self.write_connection()?;
         conn.execute(
             "INSERT INTO join_token (id, secret_hash, worker_type, description, expires_at, created_at)
@@ -413,6 +463,13 @@ impl Store {
 
     #[instrument(err, skip_all, fields(id))]
     pub fn delete_join_token(&self, id: &str) -> R<()> {
+        let id = id.to_owned();
+        self.replicated(Lane::Control, "delete_join_token", move |s| {
+            s.delete_join_token_apply(&id)
+        })
+    }
+
+    fn delete_join_token_apply(&self, id: &str) -> R<()> {
         let conn = self.write_connection()?;
         let deleted = conn.execute("DELETE FROM join_token WHERE id = ?;", [id])?;
         if deleted == 0 {
@@ -430,6 +487,12 @@ impl Store {
     /// keeps the tables (and `legion acl token list`) tidy.
     #[instrument(err, skip_all)]
     pub fn prune_expired_credentials(&self) -> R<(usize, usize)> {
+        self.replicated(Lane::Control, "prune_expired_credentials", move |s| {
+            s.prune_expired_credentials_apply()
+        })
+    }
+
+    fn prune_expired_credentials_apply(&self) -> R<(usize, usize)> {
         let now = OffsetDateTime::now_utc().format(&Rfc3339)?;
         let conn = self.write_connection()?;
         let acl_tokens = conn.execute(
@@ -446,6 +509,13 @@ impl Store {
     /// Revokes any node tokens previously minted for `node_id` (used to
     /// rotate the credential when a worker re-registers).
     pub fn delete_node_tokens(&self, node_id: &str) -> R<usize> {
+        let node_id = node_id.to_owned();
+        self.replicated(Lane::Control, "delete_node_tokens", move |s| {
+            s.delete_node_tokens_apply(&node_id)
+        })
+    }
+
+    fn delete_node_tokens_apply(&self, node_id: &str) -> R<usize> {
         let conn = self.write_connection()?;
         let deleted = conn.execute(
             "DELETE FROM acl_token WHERE token_type = 'worker' AND name = ?;",
@@ -473,6 +543,20 @@ impl Store {
         password_hash: Option<&str>,
         policies: &[String],
     ) -> R<AclUserRecord> {
+        let username = username.to_owned();
+        let password_hash = password_hash.map(str::to_owned);
+        let policies = policies.to_vec();
+        self.replicated(Lane::Control, "upsert_acl_user", move |s| {
+            s.upsert_acl_user_apply(&username, password_hash.as_deref(), &policies)
+        })
+    }
+
+    fn upsert_acl_user_apply(
+        &self,
+        username: &str,
+        password_hash: Option<&str>,
+        policies: &[String],
+    ) -> R<AclUserRecord> {
         let username = username.trim();
         if username.is_empty() {
             return Err(invalid_input("username must not be empty".into()));
@@ -481,7 +565,7 @@ impl Store {
         let now = OffsetDateTime::now_utc().format(&Rfc3339)?;
         let policies_json = serde_json::to_string(policies)?;
         let mut conn = self.write_connection()?;
-        let tx = conn.transaction()?;
+        let tx = Self::write_tx(&mut conn)?;
 
         let existing_hash: Option<String> = tx
             .query_row(
@@ -546,6 +630,13 @@ impl Store {
 
     #[instrument(err, skip_all, fields(username))]
     pub fn delete_acl_user(&self, username: &str) -> R<()> {
+        let username = username.to_owned();
+        self.replicated(Lane::Control, "delete_acl_user", move |s| {
+            s.delete_acl_user_apply(&username)
+        })
+    }
+
+    fn delete_acl_user_apply(&self, username: &str) -> R<()> {
         let conn = self.write_connection()?;
         let deleted = conn.execute("DELETE FROM acl_user WHERE username = ?;", [username])?;
         if deleted == 0 {

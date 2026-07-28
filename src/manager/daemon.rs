@@ -32,6 +32,23 @@ const IDLE_WAIT_CAP: Duration = Duration::from_secs(300);
 // Exponential backoff is reserved for true error paths (claim failures).
 const ERROR_BACKOFF_MIN: Duration = Duration::from_secs(1);
 const ERROR_BACKOFF_MAX: Duration = Duration::from_secs(30);
+// How often a raft non-leader re-checks lane leadership before acting
+// (eval workers, node status checker). Bounds the takeover delay after a
+// leadership change to "a few seconds" (plan JC-15).
+const LEADER_POLL_INTERVAL: Duration = Duration::from_secs(1);
+// Delay before re-running an eval whose handler hit a foreign-lane
+// NotRaftLeader rejection (divergent lane leadership) — long enough for the
+// engine's JC-40 lane-convergence loop (or an election) to move leadership,
+// short enough that acknowledged work is not parked for long.
+const EVAL_NOT_LEADER_RETRY_DELAY: Duration = Duration::from_secs(5);
+// Boot-path startup writes (config load, UI seed, manager-config upsert) are
+// composites that can touch two lanes. Under `lanes` topology a node that
+// leads the control lane may not (yet) lead the status/scheduler lane, so the
+// second half is rejected with a transient NotRaftLeader until the JC-40
+// convergence loop finishes acquiring the other lanes — a few seconds at
+// most. Retry across that window instead of failing manager startup.
+const STARTUP_WRITE_ATTEMPTS: usize = 20;
+const STARTUP_WRITE_RETRY_DELAY: Duration = Duration::from_millis(500);
 
 #[instrument(err, skip_all)]
 pub async fn run_manager(config: ManagerConfig, run_worker: bool) -> R<()> {
@@ -56,12 +73,90 @@ pub async fn run_manager(config: ManagerConfig, run_worker: bool) -> R<()> {
     )?;
     let manager_node_id = format!("{}:{}", full_config.server.host, full_config.server.port);
     let store = Store::start_storage(&full_config)?;
-    if let Err(err) = store.prune_rollouts() {
-        warn!(error = ?err, "Failed pruning retained rollout history");
+    // Startup-time mutations are leader-only in raft mode (they replicate
+    // like any other write; a follower would be rejected with a leader hint
+    // anyway) — and leadership is PER LANE: under `lanes` topology a node
+    // can lead some lanes and not others, so each startup write gates on
+    // the lane it proposes to. Config/seed/manager-config writes are
+    // control-lane ops; rollout pruning is a scheduler-lane op (C-2 rollout
+    // consolidation). A single-node bootstrap has already elected itself on
+    // every lane inside `start_storage`, so the common path runs them
+    // unchanged; a follower joining an existing cluster skips them — the
+    // lane's leader performed them and this node receives the effects
+    // through replication. (`is_raft_leader` is always true for non-raft
+    // backends.)
+    let is_control_leader = store.is_raft_leader(crate::storage::Lane::Control);
+    let is_scheduler_leader = store.is_raft_leader(crate::storage::Lane::Scheduler);
+    if is_control_leader {
+        // Each of these is retried while it fails with a transient
+        // cross-lane leader rejection, and warns (rather than aborting the
+        // manager) if leadership never converges — see `startup_write`.
+        startup_write("load initial config data", || {
+            load_initial_data(&store, &config)
+        })
+        .await?;
+        startup_write("seed UI test data", || async { seed_ui_test_data(&store) }).await?;
+        startup_write("upsert manager config", || async {
+            store.upsert_manager_config(&manager_node_id, &full_config)
+        })
+        .await?;
+    } else {
+        info!("Skipping control-lane startup writes on raft non-leader manager");
     }
-    load_initial_data(&store, &config).await?;
-    seed_ui_test_data(&store)?;
-    store.upsert_manager_config(&manager_node_id, &full_config)?;
+    if is_scheduler_leader {
+        if let Err(err) = store.prune_rollouts() {
+            warn!(error = ?err, "Failed pruning retained rollout history");
+        }
+    } else {
+        info!("Skipping scheduler-lane startup writes (rollout prune) on raft non-leader manager");
+    }
+    // Raft mode: the roles sampled above are snapshots, not promises. A node
+    // that boots as non-leader (or leaderless — a full-cluster restart leaves
+    // EVERY member sampling non-leader) can win an election seconds later
+    // and would otherwise never run the leader-only startup writes: config
+    // jobs/worker-types would not load, rollout history would not prune, the
+    // manager config row would go stale. Re-run them on every leadership
+    // ACQUISITION — tracked independently per lane, because control and
+    // scheduler leadership can move separately under `lanes` topology.
+    if store.raft_status().is_some() {
+        let watch_store = store.clone();
+        let watch_config = config.clone();
+        let watch_full_config = full_config.clone();
+        let watch_node_id = manager_node_id.clone();
+        let mut was_control_leader = is_control_leader;
+        let mut was_scheduler_leader = is_scheduler_leader;
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(LEADER_POLL_INTERVAL).await;
+                let control_leader = watch_store.is_raft_leader(crate::storage::Lane::Control);
+                if leadership_acquired(was_control_leader, control_leader) {
+                    info!(
+                        "Raft control-lane leadership acquired; running leader-only startup writes"
+                    );
+                    if let Err(err) = load_initial_data(&watch_store, &watch_config).await {
+                        warn!(error = ?err, "Failed loading initial config data after leadership acquisition");
+                    }
+                    if let Err(err) = seed_ui_test_data(&watch_store) {
+                        warn!(error = ?err, "Failed seeding UI test data after leadership acquisition");
+                    }
+                    if let Err(err) =
+                        watch_store.upsert_manager_config(&watch_node_id, &watch_full_config)
+                    {
+                        warn!(error = ?err, "Failed upserting manager config after leadership acquisition");
+                    }
+                }
+                was_control_leader = control_leader;
+                let scheduler_leader = watch_store.is_raft_leader(crate::storage::Lane::Scheduler);
+                if leadership_acquired(was_scheduler_leader, scheduler_leader) {
+                    info!("Raft scheduler-lane leadership acquired; pruning rollout history");
+                    if let Err(err) = watch_store.prune_rollouts() {
+                        warn!(error = ?err, "Failed pruning retained rollout history");
+                    }
+                }
+                was_scheduler_leader = scheduler_leader;
+            }
+        });
+    }
 
     let store_copy_a = store.clone();
 
@@ -185,6 +280,22 @@ pub async fn run_manager(config: ManagerConfig, run_worker: bool) -> R<()> {
         auth: authenticator.clone(),
     };
 
+    // Manager-plane raft transport shares this tonic listener. The service
+    // is mounted unconditionally around the store's registry cell: in raft
+    // mode the engine has already populated it (start_storage); otherwise it
+    // stays empty and every raft RPC answers Unavailable.
+    let raft_transport_service = store.raft_transport_server();
+
+    // Telemetry listener state (metrics + health probes). Cloned here for the
+    // same reason as the exec state: the gRPC service takes the store below.
+    let telemetry_state = crate::manager::telemetry::TelemetryState {
+        store: store.clone(),
+        raft_required: matches!(
+            full_config.persistence.r#type,
+            crate::structs::config::PersistenceType::Raft
+        ),
+    };
+
     let manager_node = ManagerDaemonService::with_manager_config(store, &full_config)
         .with_workload_identity(workload_identity_state.clone())
         .with_kv_debounce(Duration::from_millis(full_config.kv_debounce_ms))
@@ -216,6 +327,28 @@ pub async fn run_manager(config: ManagerConfig, run_worker: bool) -> R<()> {
         );
     }
 
+    // Telemetry listener on `server.port + 2` by convention (the exec
+    // WebSocket holds `+ 1`); `telemetry.port` overrides.
+    if full_config.telemetry.enabled {
+        let telemetry_port = full_config
+            .telemetry
+            .port
+            .unwrap_or(full_config.server.port + 2);
+        let telemetry_addr: std::net::SocketAddr =
+            format!("{}:{}", full_config.server.host, telemetry_port).parse()?;
+        tokio::spawn(async move {
+            if let Err(err) =
+                crate::manager::telemetry::serve_telemetry(telemetry_addr, telemetry_state).await
+            {
+                tracing::error!(error = ?err, "telemetry listener exited");
+            }
+        });
+    } else {
+        info!(
+            "Telemetry is disabled (telemetry.enabled=false); /metrics and health probes are off"
+        );
+    }
+
     let tls_identity = load_server_tls_identity(&full_config.server.tls)?;
     let server_builder = match tls_identity {
         Some(identity) => {
@@ -242,12 +375,16 @@ pub async fn run_manager(config: ManagerConfig, run_worker: bool) -> R<()> {
     // The OIDC layer sits outermost so generic HTTP clients (AWS/GCP/Vault)
     // can GET the discovery document and JWKS on this listener; with workload
     // identity disabled it is a pure passthrough and mounts no routes.
+    // The metrics layer sits innermost (after grpc-web translation) so the
+    // method label reflects the real gRPC route for browser calls too.
     let start_server_fut = server_builder
         .accept_http1(true)
         .layer(OidcHttpLayer::new(workload_identity_state.clone()))
         .layer(cors)
         .layer(GrpcWebLayer::new())
+        .layer(crate::manager::telemetry::GrpcMetricsLayer)
         .add_service(manager_service)
+        .add_service(raft_transport_service)
         .serve(addr);
 
     println!("Manager node starting on {addr}");
@@ -328,6 +465,71 @@ async fn start_workload_identity_rotation(
         }
         tokio::time::sleep(interval).await;
     }
+}
+
+/// Run one boot-path startup write, absorbing the transient half of raft
+/// leadership (adversarial finding, 2026-07-25: a cross-lane composite
+/// rejected on the boot path aborted the whole manager — the
+/// `LEGION_SEED_UI_DATA` seed writes `node` on the control lane and
+/// `node_health` on the status lane, so a node that leads control but has
+/// not yet acquired status fails the second half).
+///
+/// A `NotRaftLeader` rejection is retried across the JC-40 convergence
+/// window; if leadership still has not converged the manager WARNS and
+/// carries on (the work is idempotent and the leadership-acquisition
+/// watcher re-runs it on the next transition, and none of it is required
+/// for the manager to serve). Every other error is returned unchanged —
+/// a malformed config job must still stop startup loudly.
+async fn startup_write<F, Fut>(label: &str, attempt: F) -> R<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = R<()>>,
+{
+    startup_write_with(
+        label,
+        STARTUP_WRITE_ATTEMPTS,
+        STARTUP_WRITE_RETRY_DELAY,
+        attempt,
+    )
+    .await
+}
+
+/// [`startup_write`] with an explicit retry budget, so the unit test can
+/// exercise the policy without waiting out the production window.
+async fn startup_write_with<F, Fut>(
+    label: &str,
+    attempts: usize,
+    delay: Duration,
+    mut attempt: F,
+) -> R<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = R<()>>,
+{
+    for attempt_number in 1..=attempts {
+        match attempt().await {
+            Ok(()) => return Ok(()),
+            Err(err) if error_is_not_raft_leader(&err) => {
+                if attempt_number == attempts {
+                    warn!(
+                        error = ?err,
+                        "Startup write '{label}' still hit a foreign-lane leader rejection after \
+                         {attempts} attempts; continuing without it (it re-runs on the next \
+                         leadership acquisition)"
+                    );
+                    return Ok(());
+                }
+                debug!(
+                    attempt = attempt_number,
+                    "Startup write '{label}' hit a foreign-lane leader rejection; retrying while \
+                     lane leadership converges"
+                );
+                tokio::time::sleep(delay).await;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
 }
 
 fn should_seed_ui_test_data() -> bool {
@@ -465,34 +667,206 @@ fn load_server_tls_identity(tls: &TlsConfigFull) -> R<Option<Identity>> {
 async fn start_node_status_checker(store: Store, check_seconds: u64) -> R<()> {
     info!("Beginning node status checker loop");
     let started_at = std::time::Instant::now();
+    let check_interval = Duration::from_secs(check_seconds);
+    let mut was_status_leader = true;
+    // Rollout reconciliation piggybacks on this loop but gates on the
+    // SCHEDULER lane (C-2 rollout consolidation) — under `lanes` topology
+    // the status and scheduler leaders can be different nodes, so it runs
+    // on its own cadence timer instead of inside the status-leader branch.
+    let mut last_rollout_reconcile: Option<std::time::Instant> = None;
+    // Divergent-leadership safety net (adversarial findings, 2026-07-24):
+    // periodic eval regeneration on the scheduler leader while it does NOT
+    // lead every lane. A no-op in `single` topology and while one node
+    // leads all lanes — which, with JC-40 convergence running in the
+    // engine, is the steady state.
+    let mut last_divergent_regen: Option<std::time::Instant> = None;
     loop {
-        let node_ids_to_update =
-            nodes_to_mark_lost(store.get_node_ids_and_heartbeats()?, started_at.elapsed());
+        // Leader-only actions (raft mode, per lane): only the STATUS-lane
+        // leader may mark nodes lost / sweep health orphans; non-leaders
+        // idle on a short poll and take over within a few seconds of a
+        // leadership change (JC-15). Non-raft backends always report
+        // leadership here.
+        let status_leader = store.is_raft_leader(crate::storage::Lane::Status);
+        if status_leader {
+            if !was_status_leader {
+                info!("Raft status-lane leadership acquired; node status checker resuming");
+                was_status_leader = true;
+            }
+            let node_ids_to_update =
+                nodes_to_mark_lost(store.get_node_ids_and_heartbeats()?, started_at.elapsed());
 
-        store.mark_nodes_as_lost(&node_ids_to_update)?;
-        // Stateful allocations on lost nodes are gated behind their
-        // onLost.replaceAfter loss-confirmation window (see
-        // docs/stateful-workloads.md "Node loss and fencing"). Re-run the
-        // reschedule path for still-lost nodes every tick so replacement
-        // proceeds automatically once a window elapses — no operator action
-        // needed.
-        store.recheck_lost_nodes();
-        if let Err(err) = store.reconcile_incomplete_rollouts() {
-            warn!(error = ?err, "Failed reconciling completed_incomplete rollouts");
+            // Warn-and-continue rather than `?`: under `lanes` topology the
+            // status-lane leader may not lead the control lane, and the
+            // composite's control half (`sync_node_availability`) is then
+            // rejected with that lane's leader hint. The checker must keep
+            // ticking — the mark is retried every tick until it lands.
+            if let Err(err) = store.mark_nodes_as_lost(&node_ids_to_update) {
+                warn!(error = ?err, "Failed marking nodes lost; will retry next tick");
+            }
+            // Stateful allocations on lost nodes are gated behind their
+            // onLost.replaceAfter loss-confirmation window (see
+            // docs/stateful-workloads.md "Node loss and fencing"). Re-run the
+            // reschedule path for still-lost nodes every tick so replacement
+            // proceeds automatically once a window elapses — no operator
+            // action needed.
+            store.recheck_lost_nodes();
+            // node_health rows orphaned by node removal (`remove_node` is a
+            // control-lane op and must not delete status-lane rows — plan
+            // §7-C2, C-1) are swept here on the status-lane leader. Harmless
+            // while they exist, so failures only delay the sweep.
+            match store.prune_node_health_orphans() {
+                Ok(0) => {}
+                Ok(swept) => info!(swept, "Swept node_health rows orphaned by node removal"),
+                Err(err) => warn!(error = ?err, "Failed sweeping orphaned node_health rows"),
+            }
+            // Same shape for allocation_health rows orphaned by allocation
+            // removal (the C-2 cross-lane FK removal replaced the cascade
+            // with this status-lane sweep).
+            match store.prune_allocation_health_orphans() {
+                Ok(0) => {}
+                Ok(swept) => info!(
+                    swept,
+                    "Swept allocation_health rows orphaned by allocation removal"
+                ),
+                Err(err) => warn!(error = ?err, "Failed sweeping orphaned allocation_health rows"),
+            }
+        } else if was_status_leader {
+            info!("Not the status-lane raft leader; node status checker idling until elected");
+            was_status_leader = false;
         }
+
+        // Scheduler-lane piggyback: rollout reconciliation runs wherever the
+        // SCHEDULER lane is led, on the checker cadence — even when this
+        // node does not lead the status lane (the two leaderships are
+        // independent under `lanes` topology).
+        let scheduler_leader = store.is_raft_leader(crate::storage::Lane::Scheduler);
+        if scheduler_leader
+            && last_rollout_reconcile.is_none_or(|at| at.elapsed() >= check_interval)
+        {
+            last_rollout_reconcile = Some(std::time::Instant::now());
+            if let Err(err) = store.reconcile_incomplete_rollouts() {
+                warn!(error = ?err, "Failed reconciling completed_incomplete rollouts");
+            }
+        }
+
+        // Divergent-leadership eval safety net (JC-41 × lanes): a composite
+        // acked on the control/status leader must issue its eval as a
+        // SEPARATE scheduler-lane op, which that node cannot propose when a
+        // different node leads the scheduler lane — the enqueue is cleanly
+        // rejected and the work would otherwise never be scheduled (job
+        // submits acked but never placed; lost nodes never rescheduled).
+        // While this node leads the scheduler lane but NOT every lane,
+        // periodically re-derive that work from replicated state (the same
+        // idempotent pass the leadership-acquisition hook runs). Quiet in
+        // steady state: JC-40 converges leadership, so the enqueue lands on
+        // the same node and this branch never runs.
+        let leads_every_lane = store.is_raft_leader(crate::storage::Lane::Control)
+            && store.is_raft_leader(crate::storage::Lane::Status);
+        if scheduler_leader
+            && !leads_every_lane
+            && last_divergent_regen.is_none_or(|at| at.elapsed() >= check_interval)
+        {
+            last_divergent_regen = Some(std::time::Instant::now());
+            if let Err(err) = store.prune_stale_evals() {
+                warn!(error = ?err, "Failed pruning stale evals under divergent lane leadership");
+            }
+            match store.regenerate_scheduling_evals() {
+                Ok(enqueued) if enqueued > 0 => info!(
+                    enqueued,
+                    "Regenerated scheduling evals under divergent lane leadership"
+                ),
+                Ok(_) => {}
+                Err(err) => warn!(
+                    error = ?err,
+                    "Failed regenerating scheduling evals under divergent lane leadership"
+                ),
+            }
+        }
+
+        // Lane-leadership convergence itself is NOT here: it is an engine
+        // lifecycle property now (JC-40 — `raft::driver::
+        // lane_convergence_loop`, started with the engine on every node
+        // running a multi-lane topology, anchored on the control lane).
+        // Keeping it in this loop would have left every store that does not
+        // run the manager daemon (embedded uses, the raft test batteries)
+        // with permanently divergent lane leadership, and would have tied
+        // convergence latency to the node-status-checker cadence.
+
         // Volumes whose instance no longer references them (keyed destroy,
         // scale-in without retention, job destroy) are queued for reclaim.
         // One reconciling rule covers every way a handle can be dropped, so no
         // code path can forget to free storage (see docs/volumes.md).
-        match store.reap_orphaned_volumes() {
-            Ok(orphans) => {
-                for volume in orphans {
-                    store.events().volume_reclaiming(&volume);
+        // Leader-gated like the other reconciliation passes: it mutates
+        // replicated state, so on a follower it would only ever be rejected
+        // with a leader hint.
+        if scheduler_leader {
+            match store.reap_orphaned_volumes() {
+                Ok(orphans) => {
+                    for volume in orphans {
+                        store.events().volume_reclaiming(&volume);
+                    }
                 }
+                Err(err) => warn!(error = ?err, "Failed reaping orphaned volumes"),
             }
-            Err(err) => warn!(error = ?err, "Failed reaping orphaned volumes"),
         }
-        tokio::time::sleep(tokio::time::Duration::from_secs(check_seconds)).await;
+
+        // Gauges are read-only over this node's replica; keep them fresh so
+        // scraping a follower's /metrics is not frozen.
+        refresh_cluster_gauges(&store);
+        let sleep_for = if status_leader {
+            check_interval
+        } else {
+            LEADER_POLL_INTERVAL
+        };
+        tokio::time::sleep(sleep_for).await;
+    }
+}
+
+/// Whether this poll observed a leadership ACQUISITION — the false→true
+/// transition on which the leader-only recovery writes (eval requeue,
+/// initial-data load, manager-config upsert, rollout prune) must re-run.
+/// A node that stays leader (true→true) must not re-run them every poll,
+/// and losing leadership triggers nothing.
+fn leadership_acquired(was_leader: bool, is_leader: bool) -> bool {
+    is_leader && !was_leader
+}
+
+/// Refreshes the cheap cluster-shape gauges (`legion_nodes{status}`,
+/// `legion_allocations`) — piggybacked on the node-status-checker tick so no
+/// extra loop or per-write bookkeeping is needed.
+fn refresh_cluster_gauges(store: &Store) {
+    let telemetry = crate::manager::telemetry::metrics();
+    match store.node_status_counts() {
+        Ok(counts) => {
+            let entries: Vec<(Vec<String>, i64)> = counts
+                .into_iter()
+                .map(|(status, count)| (vec![status], count))
+                .collect();
+            telemetry.nodes.set_all(&entries);
+        }
+        Err(err) => debug!(error = ?err, "Failed refreshing node status gauge"),
+    }
+    match store.allocation_count() {
+        Ok(count) => telemetry.allocations.set(count),
+        Err(err) => debug!(error = ?err, "Failed refreshing allocation gauge"),
+    }
+    // Raft quorum shape (plan §7-C3): `legion_raft_voters{lane}` /
+    // `legion_raft_quorum{lane}` from the local metrics view — cheap watch
+    // borrows, present on leaders and followers alike. Non-raft backends
+    // report no status and leave the families empty.
+    if let Some(status) = store.raft_status() {
+        let voters: Vec<(Vec<String>, i64)> = status
+            .lanes
+            .iter()
+            .map(|lane| (vec![lane.lane.clone()], lane.voters as i64))
+            .collect();
+        let quorum: Vec<(Vec<String>, i64)> = status
+            .lanes
+            .iter()
+            .map(|lane| (vec![lane.lane.clone()], lane.quorum as i64))
+            .collect();
+        telemetry.raft_voters.set_all(&voters);
+        telemetry.raft_quorum.set_all(&quorum);
     }
 }
 
@@ -542,12 +916,100 @@ async fn start_eval_loop(store: Store, max_threads: usize) -> R<()> {
     let max_threads = max_threads.max(1);
     info!(max_threads, "Beginning eval loop");
 
-    let requeued = store.requeue_in_flight_evals()?;
-    if requeued > 0 {
-        warn!(requeued, "Recovered stale in-flight evals at startup");
-        store.events().scheduler_recovered(requeued);
+    // Leader-only startup recovery (raft mode): the requeue/prune are
+    // themselves replicated scheduler-lane ops (JC-41), so only the
+    // SCHEDULER lane's leader may run them — a follower would just be
+    // rejected, and it has no eval worker to feed anyway. A follower that
+    // wins a later election recovers through the leadership-acquisition
+    // hook below.
+    let is_raft_follower = !store.is_raft_leader(crate::storage::Lane::Scheduler);
+    if is_raft_follower {
+        info!("Skipping in-flight eval requeue on raft non-leader manager");
+    } else {
+        // Stale rows referencing superseded configs are dropped BEFORE the
+        // requeue: reviving them would execute old-config work and suppress
+        // regeneration for the same jobs (see Store::prune_stale_evals).
+        let pruned = store.prune_stale_evals()?;
+        if pruned > 0 {
+            warn!(
+                pruned,
+                "Dropped stale evals for superseded job configs at startup"
+            );
+        }
+        let requeued = store.requeue_in_flight_evals()?;
+        if requeued > 0 {
+            warn!(requeued, "Recovered stale in-flight evals at startup");
+            store.events().scheduler_recovered(requeued);
+        }
+        store.events().scheduler_started(max_threads);
     }
-    store.events().scheduler_started(max_threads);
+    // Raft mode: queue recovery must survive leader FAILOVER, not just
+    // process startup. The eval queue is REPLICATED (plan §7-C2, JC-41), so
+    // a newly elected leader already HOLDS the failed leader's pending work
+    // — that is what makes an acknowledged `job stop` or a mid-flight
+    // rollout survive (tests/raft_eval_failover.rs). What the new leader
+    // still has to do on acquisition is (1) drop rows a later replicated
+    // write superseded (`prune_stale_evals`), (2) requeue evals the old
+    // leader had CLAIMED but not completed — they are `in_flight` in
+    // replicated state and nothing else would ever release them — and (3)
+    // run `regenerate_scheduling_evals` as belt-and-braces reconciliation
+    // for work whose enqueue op never landed. Every regenerated eval is an
+    // idempotent pass, so re-doing finished work is safe.
+    if store.raft_status().is_some() {
+        let recovery_store = store.clone();
+        let mut was_leader = !is_raft_follower;
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(LEADER_POLL_INTERVAL).await;
+                let is_leader = recovery_store.is_raft_leader(crate::storage::Lane::Scheduler);
+                if leadership_acquired(was_leader, is_leader) {
+                    // Drop stale local rows (superseded configs) BEFORE the
+                    // requeue: a previous leadership stint's queue must not
+                    // execute old-config work or suppress regeneration
+                    // (Store::prune_stale_evals).
+                    match recovery_store.prune_stale_evals() {
+                        Ok(pruned) if pruned > 0 => warn!(
+                            pruned,
+                            "Dropped stale evals for superseded job configs on leadership \
+                             acquisition"
+                        ),
+                        Ok(_) => {}
+                        Err(err) => warn!(
+                            error = ?err,
+                            "Failed pruning stale evals after leadership acquisition"
+                        ),
+                    }
+                    match recovery_store.requeue_in_flight_evals() {
+                        Ok(requeued) if requeued > 0 => {
+                            warn!(
+                                requeued,
+                                "Recovered stale in-flight evals after raft leadership acquisition"
+                            );
+                            recovery_store.events().scheduler_recovered(requeued);
+                        }
+                        Ok(_) => {}
+                        Err(err) => warn!(
+                            error = ?err,
+                            "Failed requeuing in-flight evals after leadership acquisition"
+                        ),
+                    }
+                    match recovery_store.regenerate_scheduling_evals() {
+                        Ok(enqueued) if enqueued > 0 => info!(
+                            enqueued,
+                            "Reconciled pending scheduling evals after raft leadership \
+                             acquisition (belt-and-braces, plan §7-C2 JC-41)"
+                        ),
+                        Ok(_) => {}
+                        Err(err) => warn!(
+                            error = ?err,
+                            "Failed regenerating scheduling evals after leadership acquisition"
+                        ),
+                    }
+                }
+                was_leader = is_leader;
+            }
+        });
+    }
 
     let mut join_set = JoinSet::new();
     for worker_id in 0..max_threads {
@@ -602,7 +1064,31 @@ async fn eval_worker_loop(store: Store, notifier: Arc<Notify>, worker_id: usize)
     info!(worker_id, "Eval worker started");
 
     let mut error_backoff = ERROR_BACKOFF_MIN;
+    let mut was_leader = true;
     loop {
+        // Leader-only scheduling (raft mode, JC-41): the eval queue is
+        // REPLICATED — followers hold every eval row but never ACT on the
+        // queue, and every claim/complete is itself a scheduler-lane raft op
+        // that only the leader may propose. Followers idle on a short poll
+        // and take over within a few seconds of a leadership change, at
+        // which point they inherit the real pending queue (the acquisition
+        // hook below only reconciles). Non-raft backends always report
+        // leadership here.
+        if !store.is_raft_leader(crate::storage::Lane::Scheduler) {
+            if was_leader {
+                info!(
+                    worker_id,
+                    "Not the raft leader; eval worker idling until elected"
+                );
+                was_leader = false;
+            }
+            tokio::time::sleep(LEADER_POLL_INTERVAL).await;
+            continue;
+        }
+        if !was_leader {
+            info!(worker_id, "Raft leadership acquired; eval worker resuming");
+            was_leader = true;
+        }
         let claim_started = std::time::Instant::now();
         match store.claim_eval() {
             Ok(Some(eval)) => {
@@ -676,6 +1162,95 @@ mod tests {
     use super::*;
     use crate::structs::ManagerConfigFull;
     use tempfile::Builder;
+
+    /// Adversarial regression (leader-only startup writes): the recovery
+    /// writes must re-run exactly on leadership ACQUISITION — a node that
+    /// boots as follower (or leaderless after a full-cluster restart) and
+    /// wins an election later would otherwise never requeue in-flight evals
+    /// or load config data.
+    #[test]
+    fn leadership_acquired_fires_only_on_false_to_true() {
+        assert!(leadership_acquired(false, true));
+        assert!(!leadership_acquired(true, true));
+        assert!(!leadership_acquired(true, false));
+        assert!(!leadership_acquired(false, false));
+    }
+
+    /// Adversarial regression (dropped acknowledged work): a NotRaftLeader
+    /// anywhere in an eval error's chain is retried, anything else fails
+    /// terminally.
+    #[test]
+    fn not_raft_leader_errors_are_detected_through_the_chain() {
+        let not_leader = anyhow::Error::new(crate::storage::raft::driver::NotRaftLeader {
+            lane: Some("status".into()),
+            leader_name: Some("mgr-b".into()),
+            leader_addr: Some("10.0.0.2:4646".into()),
+        })
+        .context(
+            "raft op update_task_statuses_for_allocations must run on the status lane's leader",
+        )
+        .context("scheduling follow-up failed");
+        assert!(error_is_not_raft_leader(&not_leader));
+        assert!(!error_is_not_raft_leader(&anyhow!("plain failure")));
+    }
+
+    /// Adversarial regression (2026-07-25, boot path): a startup write whose
+    /// cross-lane half is rejected while lane leadership converges must be
+    /// RETRIED, not abort the manager — while a genuine error (a malformed
+    /// config job) must still propagate.
+    #[tokio::test]
+    async fn startup_writes_retry_transient_lane_rejections_but_not_real_errors() -> R<()> {
+        const TEST_ATTEMPTS: usize = 4;
+        const TEST_DELAY: Duration = Duration::from_millis(1);
+
+        fn not_leader() -> anyhow::Error {
+            anyhow::Error::new(crate::storage::raft::driver::NotRaftLeader {
+                lane: Some("status".into()),
+                leader_name: Some("mgr-b".into()),
+                leader_addr: Some("10.0.0.2:4646".into()),
+            })
+            .context("raft op seed_ui_test_data must run on the status lane's leader")
+        }
+
+        // Converges on the third attempt: the composite succeeds and startup
+        // continues.
+        let mut attempts = 0;
+        startup_write_with("converging write", TEST_ATTEMPTS, TEST_DELAY, || {
+            attempts += 1;
+            let attempt = attempts;
+            async move {
+                if attempt < 3 {
+                    Err(not_leader())
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await?;
+        assert_eq!(attempts, 3, "must retry until leadership converges");
+
+        // Never converges: warn and continue rather than abort the manager.
+        let mut attempts = 0;
+        startup_write_with("never-converging write", TEST_ATTEMPTS, TEST_DELAY, || {
+            attempts += 1;
+            async { Err(not_leader()) }
+        })
+        .await
+        .expect("a standing lane split must not abort manager startup");
+        assert_eq!(attempts, TEST_ATTEMPTS);
+
+        // A real failure still stops startup, and is not retried.
+        let mut attempts = 0;
+        let err = startup_write_with("bad config", TEST_ATTEMPTS, TEST_DELAY, || {
+            attempts += 1;
+            async { Err(anyhow!("job config is malformed")) }
+        })
+        .await
+        .expect_err("non-transient startup errors must still abort");
+        assert!(format!("{err:#}").contains("malformed"), "{err:#}");
+        assert_eq!(attempts, 1, "a real error must not be retried");
+        Ok(())
+    }
 
     fn setup_store() -> R<Store> {
         let store_dir = Builder::new()
@@ -801,6 +1376,12 @@ mod tests {
         );
         assert_eq!(to_mark, vec!["node-1".to_string()]);
         store.mark_nodes_as_lost(&to_mark)?;
+        // The reschedule tail is eval-mediated since C-2: pump the queue
+        // the way the daemon's eval worker would.
+        while let Some(eval) = store.claim_eval()? {
+            eval.handle(&store)?;
+            store.complete_eval(&eval.id, true)?;
+        }
         assert_eq!(store.get_node("node-1")?.status, "lost");
         assert!(
             store.allocs_for_node("node-1")?.is_empty(),
@@ -922,7 +1503,11 @@ fn handle_claimed_eval(store: &Store, worker_id: usize, eval: &Eval) {
         kind = %eval.kind,
         "Dispatching claimed eval"
     );
-    match eval.handle(store) {
+    let result = eval.handle(store);
+    crate::manager::telemetry::metrics()
+        .evals_processed_total
+        .inc(&[&eval.kind, if result.is_ok() { "ok" } else { "error" }]);
+    match result {
         Ok(message) => {
             info!(
                 worker_id,
@@ -934,6 +1519,28 @@ fn handle_claimed_eval(store: &Store, worker_id: usize, eval: &Eval) {
             let completed = drafts::eval_completed(eval, &message, started.elapsed());
             if let Err(e) = store.complete_eval_with_event(&eval.id, true, completed) {
                 error!(worker_id, "Error completing eval {}: {:?}", eval.id, e);
+            }
+        }
+        // A NotRaftLeader rejection means a cross-lane half of the eval's
+        // work hit a lane this node does not lead (divergent per-lane
+        // leadership under `lanes` topology) — the eval itself is fine and
+        // MUST run again, or acknowledged work is silently dropped (failed
+        // evals are never retried). Release it back to pending with a delay
+        // instead of terminally failing it.
+        Err(e) if error_is_not_raft_leader(&e) => {
+            warn!(
+                worker_id,
+                eval_id = %eval.id,
+                kind = %eval.kind,
+                "Eval hit a foreign-lane leader rejection; releasing for retry: {e:#}"
+            );
+            if let Err(release_err) =
+                store.release_eval_for_retry(&eval.id, EVAL_NOT_LEADER_RETRY_DELAY)
+            {
+                error!(
+                    worker_id,
+                    "Error releasing eval {} for retry: {:?}", eval.id, release_err
+                );
             }
         }
         Err(e) => {
@@ -949,6 +1556,17 @@ fn handle_claimed_eval(store: &Store, worker_id: usize, eval: &Eval) {
             }
         }
     }
+}
+
+/// Whether an eval-handler error is (or wraps) a raft `NotRaftLeader`
+/// rejection — the divergent-lane-leadership case `handle_claimed_eval`
+/// retries instead of terminally failing.
+fn error_is_not_raft_leader(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<crate::storage::raft::driver::NotRaftLeader>()
+            .is_some()
+    })
 }
 
 #[instrument(err, skip_all)]

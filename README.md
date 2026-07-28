@@ -59,5 +59,5 @@ It aims to be differentiated from the above based on the following:
   - OTEL compliant tracing, logs, and metrics
   - Well-documented GRPC interface
   - Jsonnet configuration language for simple and DRY job specifications
-  - Raft is optional. Making life simpler
+  - Raft is optional. Making life simpler — plain local SQLite by default, real quorum-replicated manager state (`persistence.type: raft`) when you need HA ([docs/multi-raft.md](docs/multi-raft.md))
   - Can easily be used as a library

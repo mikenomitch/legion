@@ -2,7 +2,8 @@ use crate::cmd::helpers::{connect_manager_client, json_flag, print_table};
 use crate::cmd::output::{self, OutputFormat};
 use crate::prelude::*;
 use crate::structs::{
-    GetStateStoreSchemaRequest, QueryStateStoreRequest, UpsertSavedStateQueryRequest,
+    GetStateBackupRequest, GetStateStoreSchemaRequest, QueryStateStoreRequest,
+    UpsertSavedStateQueryRequest,
 };
 use tabled::Tabled;
 
@@ -27,7 +28,11 @@ pub const AGENT_SAVED_QUERIES: &[(&str, &str)] = &[
     ),
     (
         "agent:node-capacity",
-        "SELECT id AS node, pool, status, availability, last_heartbeat FROM node ORDER BY id;",
+        // Liveness (status/heartbeat) lives in node_health; `node` keeps
+        // identity/pool/availability (plan §7-C2 node split).
+        "SELECT node.id AS node, node.pool, COALESCE(nh.status, 'active') AS status, \
+         node.availability, COALESCE(nh.last_heartbeat, '') AS last_heartbeat \
+         FROM node LEFT JOIN node_health nh ON nh.node_id = node.id ORDER BY node.id;",
     ),
     (
         "agent:active-rollouts",
@@ -59,7 +64,11 @@ pub fn config() -> Command {
         .arg(
             Arg::new("allow-write")
                 .long("allow-write")
-                .help("Allow write/mutating SQL statements")
+                .help(
+                    "Allow row-mutating SQL statements (INSERT/UPDATE/DELETE). In raft mode \
+                     schema changes (DDL) are refused: replication carries row changes only, \
+                     so a DDL statement would apply on one node — ship it as a migration",
+                )
                 .action(ArgAction::SetTrue),
         )
         .arg(json_flag());
@@ -72,6 +81,29 @@ pub fn config() -> Command {
         .about("Install the curated library of agent introspection queries")
         .arg(json_flag());
 
+    let backup_cmd = Command::new("backup")
+        .about(
+            "Write a consistent server-side backup of the state store (VACUUM INTO; \
+             all-lane-leader-only in raft mode)",
+        )
+        .long_about(
+            "Write a consistent server-side backup of the state store (VACUUM INTO).\n\n\
+             The backup is a point-in-time image of THIS node's applied state — the whole \
+             database, every lane's tables, as of one wall-clock moment. It is NOT a \
+             cluster-wide snapshot at a single raft index: under `topology: lanes` the groups \
+             apply independently, so the image sits at a different applied index per lane and \
+             the reported applied index is the highest across them. That is what restore \
+             consumes: `legion start manager --restore-from <path>` seeds a FRESH cluster from \
+             the file (see docs/multi-raft.md and docs/upgrades.md).\n\n\
+             In raft mode the command runs only on the node that leads every lane (leadership \
+             is co-located); anywhere else it fails with the leader's address.",
+        )
+        .arg(Arg::new("out").long("out").value_name("PATH").help(
+            "Server-side destination path (must not exist; defaults to a timestamped \
+                     file under <storePath>/backups/)",
+        ))
+        .arg(json_flag());
+
     Command::new("state")
         .about("Inspect the manager state store")
         .subcommand_required(true)
@@ -79,6 +111,7 @@ pub fn config() -> Command {
         .subcommand(query_cmd)
         .subcommand(schema_cmd)
         .subcommand(seed_cmd)
+        .subcommand(backup_cmd)
 }
 
 #[derive(Tabled)]
@@ -110,8 +143,44 @@ pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
             let format = OutputFormat::from_matches(args);
             seed_queries(format).await
         }
+        Some(("backup", args)) => {
+            let out = args.get_one::<String>("out").cloned();
+            let format = OutputFormat::from_matches(args);
+            run_backup(out, format).await
+        }
         _ => unreachable!(),
     }
+}
+
+/// Ask the manager to write a server-side state backup (`VACUUM INTO`).
+async fn run_backup(out: Option<String>, format: OutputFormat) -> R<()> {
+    let mut client = connect_manager_client().await?;
+    let response = output::resolve(
+        format,
+        "failed to create state backup",
+        client
+            .get_state_backup(tonic::Request::new(GetStateBackupRequest { out_path: out }))
+            .await,
+    )?
+    .into_inner();
+
+    if format.is_json() {
+        output::print_success(&json!({
+            "path": response.path,
+            "bytes": response.bytes,
+            "appliedIndex": response.applied_index,
+        }));
+        return Ok(());
+    }
+
+    println!(
+        "Backup written on the manager host (point-in-time image of this node's applied state):"
+    );
+    println!("  path:          {}", response.path);
+    println!("  bytes:         {}", response.bytes);
+    println!("  applied index: {}", response.applied_index);
+    println!("Restore with: legion start manager --restore-from <path> (see docs/upgrades.md)");
+    Ok(())
 }
 
 /// Install the curated agent introspection query library into the manager.

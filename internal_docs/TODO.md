@@ -46,12 +46,22 @@ How to use it:
       an override replace the fingerprinted value or act as a second ceiling, and
       how does it compose with `reservedResources`? Either way an ignored key
       should warn or fail validation.
-- [ ] Node drain as a first-class operation (in flight on
-      [#137](https://github.com/mikenomitch/legion/pull/137))
+- [x] Node drain as a first-class operation — `legion node cordon|drain|uncordon`,
+      eval-mediated eviction that respects stateful move protection
+      ([#137](https://github.com/mikenomitch/legion/pull/137))
 - [ ] Fix the slowest bits of the scheduler using the benchmarks in
       [docs/testing-and-benchmarks.md](../docs/testing-and-benchmarks.md)
 - [ ] Add to AGENTS.md that scheduler changes ship with a before/after perf
       benchmark
+- [ ] Close the last plan-fencing window: `apply_plan_submission` commits (and
+      so publishes the bumped epoch) *before* it refreshes the read-model
+      allocation cache (`cache_add_allocations`). A plan that samples epochs in
+      that microsecond-wide gap sees the new epoch but the pre-commit cache, so
+      it can still plan against stale capacity and pass the compare-and-set.
+      Uncovered while moving the epoch sample to snapshot time (see Done →
+      Scheduling); the fix is to make the epoch bump and the cache refresh
+      visible atomically, which changes the lock ordering around the write
+      transaction and wants a plan.
 
 ## Task runtimes
 
@@ -163,20 +173,46 @@ No plan yet — this needs one before any code.
 
 Plans: [persistence-plan.md](plans/persistence-plan.md), [multi-raft-persistence-plan.md](plans/multi-raft-persistence-plan.md) · docs: [state-store.md](../docs/state-store.md), [raft-operations.md](../docs/raft-operations.md), [persistence-streaming.md](../docs/persistence-streaming.md)
 
-- [ ] **Real Raft persistence** — quorum-committed writes, per-lane log stores,
-      snapshots/compaction, real membership. In flight on
-      [#137](https://github.com/mikenomitch/legion/pull/137); reconcile that PR's
-      changeset-replication approach back into
-      [multi-raft-persistence-plan.md](plans/multi-raft-persistence-plan.md), which
-      still describes the un-built design.
-  - [ ] Multi-raft lanes (control / scheduler / status) + lane routing
+- [x] **Real Raft persistence** — quorum-committed writes, per-lane log stores,
+      snapshots/compaction, real membership
+      ([#137](https://github.com/mikenomitch/legion/pull/137)). Ships
+      changeset replication rather than the per-method determinism audit in
+      [multi-raft-persistence-plan.md](plans/multi-raft-persistence-plan.md);
+      the as-built design and its judgement calls are in
+      [durability-and-ops-execution-plan.md](plans/durability-and-ops-execution-plan.md).
+  - [x] Multi-raft lanes (control / scheduler / status) + lane routing —
+        single-writer table ownership enforced at capture time, co-located
+        lane leadership, per-lane snapshots
+  - [x] **Lane-leadership convergence is bounded and cannot break a lane**
+        (2026-07-28). The JC-40 loop campaigned for LEADERLESS lanes, which
+        bypasses openraft's own election policy and restarts the node's
+        candidacy faster than an election can finish — 132 terms in 210s on a
+        2-core runner with the lane never electing. It now campaigns only for
+        a lane led elsewhere, with per-lane exponential backoff and escalating
+        stand-downs, and co-location is documented as BEST EFFORT rather than
+        an invariant. Also fixed the root cause the livelock was hiding: a
+        joiner counted as a voter while its lane membership was still JOINT,
+        so bring-up looked complete mid-join.
+        [Plan §JC-40 correction](plans/durability-and-ops-execution-plan.md) ·
+        [calls](calls/durability-and-ops-execution-plan_calls.md) ·
+        [docs/multi-raft.md](../docs/multi-raft.md)
+  - [ ] **Cross-lane composites have no home while lane leadership is split.**
+        Convergence is best effort, so a cluster can sit with lanes led by
+        different managers; a job submit then fails on the control leader (its
+        scheduler half) and on the scheduler leader (its control half), and
+        `/readyz` returns 503 until it converges. A real fix needs a
+        leader-transfer API openraft 0.9 does not have — the alternative is a
+        cross-lane write forwarder. See
+        [docs/multi-raft.md](../docs/multi-raft.md) § "Lane leadership".
   - [ ] Per-lane tuning knobs, bottleneck tracing, Raft health UI
   - [ ] The 12× lane-isolation benchmark
   - [ ] Speculative: Raft autopilot
-- [ ] Loading state back in from a file (restore/import path)
+- [x] Loading state back in from a file — `legion state backup` +
+      `--restore-from` ([#137](https://github.com/mikenomitch/legion/pull/137))
 - [ ] Cluster federation
-- [ ] Version handshake between manager and worker (in flight on
-      [#137](https://github.com/mikenomitch/legion/pull/137))
+- [x] Version handshake between manager and worker — protocol version plus
+      build-skew reporting, upgrade order in [docs/upgrades.md](../docs/upgrades.md)
+      ([#137](https://github.com/mikenomitch/legion/pull/137))
 - [ ] **Node configuration jobs** — like sysbatch, but also runs on join and can
       add dynamic node metadata (CNI setup, volumes, artifacts, Ansible-shaped
       work). Needs a plan.
@@ -223,10 +259,12 @@ Plan: [auth-acl-plan.md](plans/auth-acl-plan.md) · docs: [auth-and-acls.md](../
 docs: [observability.md](../docs/observability.md), [logging.md](../docs/logging.md), [event-stream.md](../docs/event-stream.md)
 
 - [ ] A trace viewer in the UI (make it dev-only at first)
-- [ ] Broader metrics instrumentation and a metrics endpoint (partly in flight on
-      [#137](https://github.com/mikenomitch/legion/pull/137))
-- [ ] Refresh [docs/observability.md](../docs/observability.md) — it still says
-      OTLP export doesn't exist, but [src/otel.rs](../src/otel.rs) ships it
+- [x] Metrics endpoint and health probes — Prometheus `/metrics`, `/healthz`,
+      `/readyz` ([docs/metrics.md](../docs/metrics.md), [#137](https://github.com/mikenomitch/legion/pull/137)).
+      Broader instrumentation (worker-side metrics, OTLP metric push) still open.
+- [x] Refresh [docs/observability.md](../docs/observability.md) — corrected; it
+      had claimed OTLP export did not exist while [src/otel.rs](../src/otel.rs)
+      ships it ([#137](https://github.com/mikenomitch/legion/pull/137))
 
 ## Templates, registry & packaging
 
@@ -343,6 +381,16 @@ docs: [scheduler-and-eval-loop.md](../docs/scheduler-and-eval-loop.md), [jobs-ta
       after N times forces a reschedule
 - [x] Dynamic metadata: a node attribute change re-evaluates affected jobs
       (`UpdateNodeDynamic` enqueues evals)
+- [x] Plan epochs are sampled at *snapshot* time, not after planning. The
+      version vector used to fence a plan submission was read after
+      `build_plan`, so a competing plan that applied in between was already
+      counted in the epoch and the compare-and-set passed against stale
+      capacity — an intermittent node oversubscription
+      (`concurrent_plans_cannot_oversubscribe_a_node`). The scheduler now
+      samples every candidate node's epoch before it reads
+      `cached_allocations_by_node`, in one batched query
+      (`Store::allocation_version_vector_for_candidates`), and selects the
+      affected subset at submit time.
 
 ## Task runtimes
 

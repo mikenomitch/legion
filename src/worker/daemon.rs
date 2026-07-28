@@ -712,6 +712,7 @@ async fn register_self(
 ) -> R<()> {
     let mut c2 = client.clone();
 
+    let build_version = env!("CARGO_PKG_VERSION");
     let req = tonic::Request::new(WorkerRegisterRequest {
         name: registration.name.clone(),
         config_attrs: registration.config_attrs.clone(),
@@ -719,6 +720,8 @@ async fn register_self(
         health_checks: registration.health_checks.clone(),
         pool: registration.pool.clone(),
         join_token: credentials.join_secret.clone(),
+        build_version: build_version.to_string(),
+        protocol_version: PROTOCOL_VERSION,
     });
 
     let response = c2.worker_register(req).await?;
@@ -727,6 +730,24 @@ async fn register_self(
         info!(worker = %registration.name, "Received node token from manager");
     }
     credentials.store_node_token(reply.node_token);
+
+    info!(
+        worker = %registration.name,
+        manager_build_version = %reply.manager_build_version,
+        manager_protocol_version = reply.manager_protocol_version,
+        worker_build_version = %build_version,
+        worker_protocol_version = PROTOCOL_VERSION,
+        "Registered with manager"
+    );
+    if reply.manager_build_version != build_version {
+        warn!(
+            worker = %registration.name,
+            manager_build_version = %reply.manager_build_version,
+            worker_build_version = %build_version,
+            "Manager and worker build versions differ; align versions when \
+             convenient (see docs/upgrades.md)"
+        );
+    }
 
     Ok(())
 }

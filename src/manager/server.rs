@@ -38,31 +38,33 @@ use crate::structs::{
     GetManagerConfigsReply, GetManagerConfigsRequest, GetNodeReply, GetNodeRequest, GetNodesReply,
     GetNodesRequest, GetObservabilityReply, GetObservabilityRequest, GetRaftJoinTokenReply,
     GetRaftJoinTokenRequest, GetRaftStatusReply, GetRaftStatusRequest, GetRolloutReply,
-    GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest, GetStateStoreSchemaReply,
-    GetStateStoreSchemaRequest, GetTaskLogsRequest, GetVolumeReply, GetVolumeRequest,
-    HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, Instance, InstanceInfo,
-    InstanceMode, InstanceState, IssueNodeIdentityTokenReply, IssueNodeIdentityTokenRequest,
-    IssueRaftCommandReply, IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply,
-    IssueWorkloadIdentityTokenRequest, JobConfig, JobSpecHistoryItem, KvEntry, KvInjectionAction,
-    KvValueType, LedgerNode, ListEventsReply, ListEventsRequest, ListInstancesReply,
-    ListInstancesRequest, ListJobActionsReply, ListJobActionsRequest, ListJobSpecHistoryReply,
-    ListJobSpecHistoryRequest, ListJobsReply, ListJobsRequest, ListKvReply, ListKvRequest,
-    ListRaftHistoryReply, ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest,
-    ListRolloutsReply, ListRolloutsRequest, ListSavedStateQueriesReply,
-    ListSavedStateQueriesRequest, ListServicesReply, ListServicesRequest, ListVolumeDriversReply,
-    ListVolumeDriversRequest, ListVolumesReply, ListVolumesRequest, Node, NodeMsg, PatchKvReply,
-    PatchKvRequest, PlanJobReply, PlanJobRequest, PlannedAllocation, PutKvReply, PutKvRequest,
+    GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest, GetStateBackupReply,
+    GetStateBackupRequest, GetStateStoreSchemaReply, GetStateStoreSchemaRequest,
+    GetTaskLogsRequest, GetVolumeReply, GetVolumeRequest, HealthCheckReply, HealthCheckRequest,
+    HeartbeatReply, HeartbeatRequest, Instance, InstanceInfo, InstanceMode, InstanceState,
+    IssueNodeIdentityTokenReply, IssueNodeIdentityTokenRequest, IssueRaftCommandReply,
+    IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply, IssueWorkloadIdentityTokenRequest,
+    JobConfig, JobSpecHistoryItem, KvEntry, KvInjectionAction, KvValueType, LedgerNode,
+    ListEventsReply, ListEventsRequest, ListInstancesReply, ListInstancesRequest,
+    ListJobActionsReply, ListJobActionsRequest, ListJobSpecHistoryReply, ListJobSpecHistoryRequest,
+    ListJobsReply, ListJobsRequest, ListKvReply, ListKvRequest, ListRaftHistoryReply,
+    ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply,
+    ListRolloutsRequest, ListSavedStateQueriesReply, ListSavedStateQueriesRequest,
+    ListServicesReply, ListServicesRequest, ListVolumeDriversReply, ListVolumeDriversRequest,
+    ListVolumesReply, ListVolumesRequest, Node, NodeMsg, PatchKvReply, PatchKvRequest,
+    PlanJobReply, PlanJobRequest, PlannedAllocation, PutKvReply, PutKvRequest,
     QueryStateStoreReply, QueryStateStoreRequest, RaftHistoryEvent, RaftStatus, ReleaseKvLockReply,
     ReleaseKvLockRequest, RenewKvLockReply, RenewKvLockRequest, ReplaceInstanceReply,
     ReplaceInstanceRequest, ResolveServiceReply, ResolveServiceRequest, RestartWorkerReply,
     RestartWorkerRequest, RolloutAllocationStatus, RolloutEvent, RolloutGroupStatus,
     RolloutProgression, RolloutReplacement, RunJobReply, RunJobRequest, SavedStateQuery,
-    SchedulerEvent, ServiceEndpoint, ServiceSummary, StartInstanceReply, StartInstanceRequest,
-    StopInstanceReply, StopInstanceRequest, StopJobReply, StopJobRequest, StopRolloutReply,
-    StopRolloutRequest, StreamEventsRequest, Submission, TaskConfig, TaskOnUnhealthyConfig,
-    UpdateNodeDynamicReply, UpdateNodeDynamicRequest, UpsertSavedStateQueryReply,
-    UpsertSavedStateQueryRequest, WorkerConfig, WorkerPreRegisterReply, WorkerPreRegisterRequest,
-    WorkerRegisterReply, WorkerRegisterRequest,
+    SchedulerEvent, ServiceEndpoint, ServiceSummary, SetNodeAvailabilityReply,
+    SetNodeAvailabilityRequest, StartInstanceReply, StartInstanceRequest, StopInstanceReply,
+    StopInstanceRequest, StopJobReply, StopJobRequest, StopRolloutReply, StopRolloutRequest,
+    StreamEventsRequest, Submission, TaskConfig, TaskOnUnhealthyConfig, UpdateNodeDynamicReply,
+    UpdateNodeDynamicRequest, UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest,
+    WorkerConfig, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply,
+    WorkerRegisterRequest,
 };
 use crate::structs::{
     AuthMethodInfo, BootstrapAclReply, BootstrapAclRequest, CreateAclTokenReply,
@@ -86,6 +88,17 @@ use tonic::{Request, Response, Status, Streaming};
 fn map_store_error(action: &str, err: anyhow::Error) -> Status {
     error!("{action}: {:?}", err);
 
+    // A write proposed on a raft non-leader: FAILED_PRECONDITION with the
+    // leader name+address in the message so callers can redial (plan §A4,
+    // JC-4). Checked before the storage-error classes because the raft
+    // pipeline wraps the typed error in context.
+    if let Some(not_leader) = err
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<crate::storage::raft::driver::NotRaftLeader>())
+    {
+        return Status::failed_precondition(format!("{action}: {not_leader}"));
+    }
+
     let Some(storage_error) = StorageError::from_anyhow(&err) else {
         return Status::internal(action);
     };
@@ -101,6 +114,40 @@ fn map_store_error(action: &str, err: anyhow::Error) -> Status {
         StorageError::DatabaseCorrupt
         | StorageError::DatabaseIo { .. }
         | StorageError::Sqlite { .. } => Status::internal(message),
+    }
+}
+
+/// Outcome of the worker<->manager protocol-version handshake performed at
+/// registration. See [`protocol_compat`] and `docs/upgrades.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VersionCompat {
+    /// Worker speaks a protocol version this manager supports.
+    Accept,
+    /// Worker reported `0`: a pre-versioning build (proto3 decodes a missing
+    /// field as `0`). Admitted so rolling upgrades from releases that predate
+    /// the handshake keep working, but worth a warning in the logs.
+    AcceptWithWarn,
+    /// Worker speaks a protocol version newer than this manager supports —
+    /// the worker was upgraded before the manager (wrong order). Reject with
+    /// FAILED_PRECONDITION; the operator must upgrade managers first.
+    Reject,
+}
+
+/// Pure protocol-compatibility decision for worker registration.
+///
+/// Policy (managers are upgraded first, then workers — see docs/upgrades.md):
+/// - `worker_pv == 0`: pre-versioning worker, accept with a warning.
+/// - `worker_pv <= manager_pv`: accept (managers stay compatible with all
+///   protocol versions up to their own).
+/// - `worker_pv > manager_pv`: reject — the manager cannot guarantee it
+///   satisfies a contract newer than it knows about.
+pub fn protocol_compat(worker_pv: u32, manager_pv: u32) -> VersionCompat {
+    if worker_pv == 0 {
+        VersionCompat::AcceptWithWarn
+    } else if worker_pv > manager_pv {
+        VersionCompat::Reject
+    } else {
+        VersionCompat::Accept
     }
 }
 
@@ -217,6 +264,22 @@ fn map_raft_status(status: crate::storage::persistence::RaftStatus) -> RaftStatu
         election_epoch_ms: status.election_epoch_ms,
         join_token_ttl_seconds: status.join_token_ttl_seconds,
         raft_library: status.raft_library,
+        lanes: status
+            .lanes
+            .into_iter()
+            .map(|lane| crate::structs::RaftLaneStatus {
+                lane: lane.lane,
+                role: lane.role.as_str().to_string(),
+                leader_id: lane.leader_id,
+                term: lane.term,
+                commit_index: lane.commit_index,
+                applied_index: lane.applied_index,
+                voters: lane.voters,
+                quorum: lane.quorum,
+                survives: lane.survives,
+                warning: lane.warning,
+            })
+            .collect(),
     }
 }
 
@@ -1736,6 +1799,14 @@ fn reconcile_kv_changes(store: &Store, changes: &[(String, bool)]) -> Result<(),
                 store
                     .clear_job_failed_status(&job_id)
                     .map_err(|e| map_store_error("Error clearing failed job status", e))?;
+                // Persist the restart intent in REPLICATED state before the
+                // ack: the job_update eval below is leader-local and dies
+                // with the leader, and an unchanged-config restart leaves no
+                // other replicated trace for the failover regeneration pass
+                // to find (see Store::request_job_restart).
+                store
+                    .request_job_restart(&job_id)
+                    .map_err(|e| map_store_error("Error recording restart intent", e))?;
                 store
                     .enqueue_eval(
                         "job_update",
@@ -3852,6 +3923,7 @@ impl Manager for ManagerDaemonService {
         // registration (or a management token) when ACLs are enforced.
         let identity = self.authenticate_acl(&request)?;
         acl::enforce_worker_plane(&identity)?;
+        crate::manager::telemetry::metrics().heartbeats_total.inc();
         let req = request.into_inner();
         let id = req.id;
 
@@ -3968,8 +4040,45 @@ impl Manager for ManagerDaemonService {
         let identity = self.authenticate_acl(&request)?;
         self.verify_join_for_registration(&identity, request.get_ref().join_token.as_deref())?;
         let request = request.into_inner();
-        let dynamic_attrs = json!({}).to_string();
         let node_id = request.name.clone();
+
+        // Protocol-version handshake (see docs/upgrades.md): accept workers
+        // at or below our protocol version, warn on pre-versioning workers
+        // (proto3 decodes a missing field as 0), reject newer workers so the
+        // managers-first upgrade order is enforced.
+        match protocol_compat(request.protocol_version, PROTOCOL_VERSION) {
+            VersionCompat::Accept => {}
+            VersionCompat::AcceptWithWarn => {
+                warn!(
+                    node_id = %node_id,
+                    manager_protocol_version = PROTOCOL_VERSION,
+                    "Worker registered without a protocol version (pre-versioning build); \
+                     accepting for rolling-upgrade compatibility — upgrade this worker"
+                );
+            }
+            VersionCompat::Reject => {
+                return Err(Status::failed_precondition(format!(
+                    "worker {node_id} speaks protocol version {} but this manager only \
+                     supports up to {}: the worker was upgraded before the manager. \
+                     Upgrade all managers first, then re-join the worker \
+                     (see docs/upgrades.md)",
+                    request.protocol_version, PROTOCOL_VERSION
+                )));
+            }
+        }
+
+        // Seed the node's dynamic attrs with its versions so `legion node
+        // list` and the UI expose fleet skew. An empty build version means a
+        // worker built before version reporting existed.
+        let dynamic_attrs = json!({
+            "buildVersion": if request.build_version.is_empty() {
+                "unknown"
+            } else {
+                request.build_version.as_str()
+            },
+            "protocolVersion": request.protocol_version,
+        })
+        .to_string();
 
         let node_msg = NodeMsg {
             id: request.name,
@@ -3995,9 +4104,18 @@ impl Manager for ManagerDaemonService {
             None
         };
 
+        info!(
+            node_id = %node_id,
+            worker_build_version = %request.build_version,
+            worker_protocol_version = request.protocol_version,
+            "Worker registered"
+        );
+
         let reply = WorkerRegisterReply {
             message: "Worker registered".into(),
             node_token,
+            manager_build_version: env!("CARGO_PKG_VERSION").to_string(),
+            manager_protocol_version: PROTOCOL_VERSION,
         };
 
         Ok(Response::new(reply))
@@ -4131,6 +4249,91 @@ impl Manager for ManagerDaemonService {
         };
 
         Ok(Response::new(reply))
+    }
+
+    /// Cordon / drain / uncordon a node. See the proto comments on
+    /// `SetNodeAvailability` for the full contract.
+    #[instrument(skip_all)]
+    async fn set_node_availability(
+        &self,
+        request: Request<SetNodeAvailabilityRequest>,
+    ) -> Result<Response<SetNodeAvailabilityReply>, Status> {
+        // Coarse gate before the node lookup ("check before you fetch");
+        // the precise pool scope is enforced after the node is loaded.
+        let identity = self.check_acl(
+            &request,
+            AclResource::Node,
+            AclAction::Write,
+            AclScope::any(),
+        )?;
+        let inner = request.into_inner();
+        let node_id = inner.node_id;
+        let availability = inner.availability;
+        let evict = inner.evict;
+        let idempotency_key = inner.idempotency_key.unwrap_or_default();
+
+        if availability != "available" && availability != "drained" {
+            return Err(Status::invalid_argument(format!(
+                "invalid availability {availability:?}: expected \"available\" or \"drained\""
+            )));
+        }
+
+        if let Some(message) = self
+            .store
+            .idempotency_lookup(&idempotency_key)
+            .map_err(|e| map_store_error("Error checking idempotency", e))?
+        {
+            return Ok(Response::new(SetNodeAvailabilityReply {
+                node: None,
+                message,
+                deduplicated: true,
+            }));
+        }
+
+        let node = self
+            .store
+            .get_node(&node_id)
+            .map_err(|e| map_store_error("Error setting node availability", e))?;
+        acl::enforce(
+            &identity,
+            AclResource::Node,
+            AclAction::Write,
+            &AclScope::pool(&node.pool),
+        )?;
+
+        // The evict intent rides the replicated write so failover
+        // regeneration can tell an evicting drain from a plain cordon
+        // (Store::set_node_availability_with_evict).
+        let node = self
+            .store
+            .set_node_availability_with_evict(&node_id, &availability, evict)
+            .map_err(|e| map_store_error("Error setting node availability", e))?;
+
+        let draining = evict && availability == "drained";
+        if draining {
+            self.store
+                .enqueue_eval("node_drain", None, None, Some(&node_id), None)
+                .map_err(|e| map_store_error("Error enqueueing drain eval", e))?;
+        }
+
+        let message = if availability == "available" {
+            format!("Uncordoned node {node_id}")
+        } else if draining {
+            format!("Draining node {node_id}")
+        } else {
+            format!("Cordoned node {node_id}")
+        };
+        info!(%node_id, %availability, evict, "Node availability changed");
+
+        self.store
+            .idempotency_record(&idempotency_key, "set_node_availability", &message)
+            .map_err(|e| map_store_error("Error recording idempotency", e))?;
+
+        Ok(Response::new(SetNodeAvailabilityReply {
+            node: Some(node.into()),
+            message,
+            deduplicated: false,
+        }))
     }
 
     #[instrument(skip_all)]
@@ -4410,6 +4613,7 @@ impl Manager for ManagerDaemonService {
                 election_epoch_ms: 0,
                 join_token_ttl_seconds: 0,
                 raft_library: String::new(),
+                lanes: Vec::new(),
             });
         Ok(Response::new(GetRaftStatusReply {
             status: Some(status),
@@ -4450,10 +4654,9 @@ impl Manager for ManagerDaemonService {
         )?;
         let req = request.into_inner();
         let actor = req.actor.unwrap_or_else(|| "api".to_string());
-        let event = self
+        let outcome = self
             .store
             .issue_raft_command(&req.command, req.target_node_id.as_deref(), &actor)
-            .map(map_raft_event)
             .map_err(|e| map_store_error("Error issuing raft command", e))?;
         let status = self
             .store
@@ -4462,8 +4665,9 @@ impl Manager for ManagerDaemonService {
             .ok_or_else(|| Status::failed_precondition("raft backend is not enabled"))?;
         Ok(Response::new(IssueRaftCommandReply {
             command: req.command,
-            event: Some(event),
+            event: Some(map_raft_event(outcome.event)),
             status: Some(status),
+            warning: outcome.warning,
         }))
     }
 
@@ -4495,6 +4699,35 @@ impl Manager for ManagerDaemonService {
             token,
             expires_at,
             status: Some(status),
+        }))
+    }
+
+    #[instrument(skip_all)]
+    async fn get_state_backup(
+        &self,
+        request: Request<GetStateBackupRequest>,
+    ) -> Result<Response<GetStateBackupReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Operator,
+            AclAction::Write,
+            AclScope::none(),
+        )?;
+        let req = request.into_inner();
+        let out = req.out_path.as_ref().map(std::path::Path::new);
+        // All-lane-leader-only in raft mode (the image spans every lane's
+        // tables; JC-40 co-locates leadership so this is one node):
+        // `state_backup` returns the typed NotRaftLeader error, which
+        // map_store_error turns into FAILED_PRECONDITION with the leader
+        // hint (plan §A4/§A5).
+        let info = self
+            .store
+            .state_backup(out)
+            .map_err(|e| map_store_error("Error creating state backup", e))?;
+        Ok(Response::new(GetStateBackupReply {
+            path: info.path.display().to_string(),
+            bytes: info.bytes,
+            applied_index: info.applied_index,
         }))
     }
 
@@ -6146,6 +6379,15 @@ fn build_desired_allocations(
 /// is recorded on the row so `legion volume list` explains a stuck volume.
 /// Failures here are logged, never fatal to the heartbeat — a wedged volume
 /// must not stop a node from reporting its allocations.
+///
+/// All three writes are SCHEDULER-lane replicated ops (`volume` is
+/// scheduler-owned, see `storage::raft::ownership`) called from a worker-plane
+/// RPC. On a follower they therefore return the typed `NotRaftLeader` error
+/// with that lane's leader hint; the warn-and-continue below is deliberately
+/// what handles it. Nothing is lost: the worker re-reports on its next
+/// heartbeat, and the reclaim reaper re-dispatches `destroying` volumes until
+/// a destroy is confirmed, so the state machine converges once the report
+/// reaches the lane's leader.
 fn apply_volume_reports(store: &Store, node_id: &str, reports: &[crate::structs::VolumeReport]) {
     for report in reports {
         if !report.ok {
@@ -6334,6 +6576,64 @@ mod tests {
         let store = Store::start_storage(&store_config)?;
         store.reset_all_tables()?;
         Ok(store)
+    }
+
+    /// A raft non-leader rejection maps to FAILED_PRECONDITION with the
+    /// leader's name and address in the message (plan §A4, JC-4) — even
+    /// when the typed error is buried under pipeline context, as the raft
+    /// driver produces it.
+    #[test]
+    fn map_store_error_surfaces_raft_leader_hint() {
+        let err = anyhow::Error::new(crate::storage::raft::driver::NotRaftLeader {
+            lane: None,
+            leader_name: Some("mgr-b".to_string()),
+            leader_addr: Some("10.0.0.2:4747".to_string()),
+        })
+        .context("raft op stop_job must run on the leader");
+        let status = map_store_error("Error stopping job", err);
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert!(status.message().contains("not the raft leader"));
+        assert!(status.message().contains("mgr-b"));
+        assert!(status.message().contains("10.0.0.2:4747"));
+
+        // Under `lanes` topology the hint names WHICH lane's leader to
+        // contact — different lanes can have different leaders.
+        let err = anyhow::Error::new(crate::storage::raft::driver::NotRaftLeader {
+            lane: Some("status".to_string()),
+            leader_name: Some("mgr-c".to_string()),
+            leader_addr: Some("10.0.0.3:4747".to_string()),
+        })
+        .context("raft op mark_nodes_as_lost must run on the status lane's leader");
+        let status = map_store_error("Error marking nodes lost", err);
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert!(status.message().contains("for the status lane"));
+        assert!(status.message().contains("mgr-c"));
+        assert!(status.message().contains("10.0.0.3:4747"));
+    }
+
+    /// Table-test for the pure protocol-compat decision used by
+    /// `worker_register` (see docs/upgrades.md for the policy).
+    #[test]
+    fn protocol_compat_decision_table() {
+        use super::VersionCompat::*;
+        let cases = [
+            // (worker_pv, manager_pv, expected)
+            (0, 1, AcceptWithWarn), // pre-versioning worker: rolling upgrade
+            (0, 0, AcceptWithWarn), // both pre-versioning (unreachable today)
+            (1, 1, Accept),         // exact match
+            (1, 2, Accept),         // older worker, newer manager: fine
+            (1, u32::MAX, Accept),  // arbitrarily newer manager
+            (2, 1, Reject),         // worker upgraded before manager
+            (u32::MAX, 1, Reject),  // absurdly new worker
+            (1, 0, Reject),         // versioned worker, pre-versioning manager
+        ];
+        for (worker_pv, manager_pv, expected) in cases {
+            assert_eq!(
+                protocol_compat(worker_pv, manager_pv),
+                expected,
+                "protocol_compat({worker_pv}, {manager_pv})"
+            );
+        }
     }
 
     #[test]
@@ -6778,6 +7078,12 @@ mod tests {
         let allocation = submit_and_place_stateful_task(&store, "fence-job")?;
         let instance_id = allocation.instance_id.clone().context("instance bound")?;
         store.mark_nodes_as_lost(&["node-1".to_string()])?;
+        // Pump the C-2 eval-mediated reschedule tail so the gating below is
+        // exercised by the real lost-node pass, not by an unprocessed queue.
+        while let Some(eval) = store.claim_eval()? {
+            eval.handle(&store)?;
+            store.complete_eval(&eval.id, true)?;
+        }
         // Gated: still on the lost node.
         assert_eq!(store.allocs_for_node("node-1")?.len(), 1);
 
@@ -6863,6 +7169,12 @@ mod tests {
 
         // Lost node, gated allocation: the diagnostic explains the wait.
         store.mark_nodes_as_lost(&["node-1".to_string()])?;
+        // Pump the C-2 eval-mediated reschedule tail so the gating below is
+        // exercised by the real lost-node pass, not by an unprocessed queue.
+        while let Some(eval) = store.claim_eval()? {
+            eval.handle(&store)?;
+            store.complete_eval(&eval.id, true)?;
+        }
         let reply = manager
             .get_instance(tonic::Request::new(GetInstanceRequest {
                 instance_id: instance_id.clone(),

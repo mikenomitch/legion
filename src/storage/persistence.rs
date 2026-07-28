@@ -1,22 +1,21 @@
 use crate::prelude::*;
+use crate::storage::raft::driver::MultiRaftDriver;
+use crate::storage::store::Store;
 use crate::structs::{
-    PersistenceConfigFull, PersistenceType, RaftPersistenceConfigFull, StreamingLeaseProvider,
+    PersistenceConfigFull, PersistenceType, StreamingLeaseProvider,
     StreamingObjectStorageLeaseConfigFull, StreamingPersistenceConfigFull,
 };
 
 use object_store::aws::AmazonS3Builder;
 use object_store::ObjectStore;
-use openraft::Config as OpenRaftConfig;
 use rustyriver::replica_url::parse_replica_url_with_query;
 use rustyriver::{
     Db, FileReplicaClient, Lease, Leaser, ObjectStoreClient, ObjectStoreConfig, Replica,
     ReplicaClient, S3Leaser,
 };
-use std::collections::VecDeque;
 use std::fmt::Debug;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration as StdDuration;
-use time::{Duration as TimeDuration, OffsetDateTime};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PersistenceRole {
@@ -70,6 +69,42 @@ pub struct RaftStatus {
     pub election_epoch_ms: i64,
     pub join_token_ttl_seconds: u64,
     pub raft_library: String,
+    /// Per-lane detail, one entry per active raft group (`single` topology:
+    /// one `control` entry; `lanes` topology: three). Empty before the
+    /// engine starts.
+    pub lanes: Vec<RaftLaneStatus>,
+}
+
+/// Status of one raft group ("lane") on this manager.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RaftLaneStatus {
+    pub lane: String,
+    pub role: PersistenceRole,
+    pub leader_id: Option<String>,
+    pub term: u64,
+    pub commit_index: u64,
+    pub applied_index: u64,
+    /// Voting members of this lane's group, as known locally.
+    pub voters: u64,
+    /// Majority size required to commit on this lane (`voters / 2 + 1`).
+    pub quorum: u64,
+    /// Voter failures this lane survives while still committing
+    /// (`(voters - 1) / 2`).
+    pub survives: u64,
+    /// Plain-language advisory when the voter count is even or below
+    /// `raft.expectedVoters` (plan §7-C3, JC-29); `None` when healthy.
+    pub warning: Option<String>,
+}
+
+/// Result of an operator raft command: the audit event it recorded, plus an
+/// optional plain-language quorum advisory (e.g. a membership change that
+/// left the cluster at an even voter count — JC-29 warns loudly instead of
+/// blocking). The warning travels through `IssueRaftCommandReply.warning`
+/// so the CLI/UI print it on the command's own output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RaftCommandOutcome {
+    pub event: RaftHistoryEvent,
+    pub warning: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,7 +122,20 @@ pub struct RaftHistoryEvent {
 pub trait PersistenceDriver: Send + Sync + Debug {
     fn start(&self) -> R<()>;
 
+    /// Start the driver with access to the (migrated) store. The raft driver
+    /// overrides this — its engine needs the state DB for its state machines
+    /// and installs the replication pipeline onto the store — and is called
+    /// by `Store::start_storage` *after* migrations but *before* the manager
+    /// serves traffic. Other backends fall back to [`Self::start`].
+    fn start_engine(&self, _store: &Store) -> R<()> {
+        self.start()
+    }
+
     fn status(&self) -> PersistenceStatus;
+
+    /// Concrete-type escape hatch (e.g. to reach the raft driver's transport
+    /// registry from the daemon wiring).
+    fn as_any(&self) -> &dyn std::any::Any;
 
     fn raft_status(&self) -> Option<RaftStatus> {
         None
@@ -102,7 +150,7 @@ pub trait PersistenceDriver: Send + Sync + Debug {
         _command: &str,
         _target: Option<&str>,
         _actor: &str,
-    ) -> R<RaftHistoryEvent> {
+    ) -> R<RaftCommandOutcome> {
         bail!("raft backend is not enabled")
     }
 
@@ -127,6 +175,10 @@ impl PersistenceDriver for LocalDiskPersistenceDriver {
 
     fn status(&self) -> PersistenceStatus {
         PersistenceStatus::local_disk_primary()
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 
@@ -289,6 +341,10 @@ impl PersistenceDriver for StreamingPersistenceDriver {
             },
             lease_held,
         }
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 
@@ -515,336 +571,10 @@ async fn object_storage_lease_loop(
     Ok(())
 }
 
-#[derive(Debug)]
-pub struct RaftPersistenceDriver {
-    state: Arc<Mutex<RaftState>>,
-    _raft_config: OpenRaftConfig,
-}
-
-#[derive(Debug)]
-struct RaftState {
-    node_id: String,
-    cluster_id: String,
-    role: PersistenceRole,
-    leader_id: Option<String>,
-    term: u64,
-    commit_index: u64,
-    applied_index: u64,
-    voters: Vec<String>,
-    learners: Vec<String>,
-    peers: Vec<String>,
-    election_epoch_ms: i64,
-    join_token_ttl_seconds: u64,
-    history: VecDeque<RaftHistoryEvent>,
-    next_event_id: u64,
-}
-
-impl RaftPersistenceDriver {
-    pub fn new(node_id: String, raft: &RaftPersistenceConfigFull) -> Self {
-        let mut voters = raft.peers.clone();
-        if !voters.iter().any(|peer| peer == &node_id) {
-            voters.push(node_id.clone());
-        }
-        voters.sort();
-        voters.dedup();
-        let now = OffsetDateTime::now_utc();
-
-        Self {
-            state: Arc::new(Mutex::new(RaftState {
-                node_id: node_id.clone(),
-                cluster_id: format!("legion-raft-{node_id}"),
-                role: if raft.bootstrap {
-                    PersistenceRole::Primary
-                } else {
-                    PersistenceRole::Standby
-                },
-                leader_id: if raft.bootstrap {
-                    Some(node_id.clone())
-                } else {
-                    None
-                },
-                term: 1,
-                commit_index: 0,
-                applied_index: 0,
-                peers: voters.clone(),
-                voters,
-                learners: Vec::new(),
-                election_epoch_ms: (now.unix_timestamp_nanos() / 1_000_000) as i64,
-                join_token_ttl_seconds: raft.join_token_ttl_seconds,
-                history: VecDeque::with_capacity(512),
-                next_event_id: 1,
-            })),
-            _raft_config: OpenRaftConfig::default(),
-        }
-    }
-
-    fn push_event(
-        state: &mut RaftState,
-        event_type: &str,
-        message: String,
-        actor: &str,
-        target: Option<String>,
-    ) -> RaftHistoryEvent {
-        let event = RaftHistoryEvent {
-            event_id: state.next_event_id,
-            event_type: event_type.to_string(),
-            message,
-            actor: actor.to_string(),
-            target,
-            term: state.term,
-            leader_id: state.leader_id.clone(),
-            created_at: OffsetDateTime::now_utc()
-                .format(&time::format_description::well_known::Rfc3339)
-                .unwrap_or_else(|_| "unknown".to_string()),
-        };
-        state.next_event_id += 1;
-        if state.history.len() == 512 {
-            state.history.pop_front();
-        }
-        state.history.push_back(event.clone());
-        event
-    }
-
-    fn choose_new_leader(state: &RaftState) -> Option<String> {
-        state
-            .voters
-            .iter()
-            .find(|member| member.as_str() != state.node_id)
-            .cloned()
-            .or_else(|| Some(state.node_id.clone()))
-    }
-}
-
-impl PersistenceDriver for RaftPersistenceDriver {
-    fn start(&self) -> R<()> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| anyhow!("Error locking raft state"))?;
-        let mode = match state.role {
-            PersistenceRole::Primary => "primary bootstrap",
-            PersistenceRole::Standby => "standby join",
-            PersistenceRole::Candidate => "candidate",
-        };
-        let node_id = state.node_id.clone();
-        Self::push_event(
-            &mut state,
-            "startup",
-            format!("Raft node {node_id} started in {mode} mode"),
-            "system",
-            None,
-        );
-        info!(node_id = %state.node_id, role = state.role.as_str(), "Started raft persistence driver");
-        Ok(())
-    }
-
-    fn status(&self) -> PersistenceStatus {
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| anyhow!("Error locking raft state"))
-            .expect("raft state lock poisoned");
-        PersistenceStatus {
-            backend: "raft".to_string(),
-            role: state.role,
-            lease_held: state.role == PersistenceRole::Primary,
-        }
-    }
-
-    fn raft_status(&self) -> Option<RaftStatus> {
-        let state = self.state.lock().ok()?;
-        Some(RaftStatus {
-            enabled: true,
-            backend: "raft".to_string(),
-            node_id: state.node_id.clone(),
-            cluster_id: state.cluster_id.clone(),
-            role: state.role,
-            leader_id: state.leader_id.clone(),
-            term: state.term,
-            commit_index: state.commit_index,
-            applied_index: state.applied_index,
-            lease_held: state.role == PersistenceRole::Primary,
-            voters: state.voters.clone(),
-            learners: state.learners.clone(),
-            peers: state.peers.clone(),
-            election_epoch_ms: state.election_epoch_ms,
-            join_token_ttl_seconds: state.join_token_ttl_seconds,
-            raft_library: "openraft".to_string(),
-        })
-    }
-
-    fn raft_history(&self, limit: usize) -> Vec<RaftHistoryEvent> {
-        let Ok(state) = self.state.lock() else {
-            return Vec::new();
-        };
-        state
-            .history
-            .iter()
-            .rev()
-            .take(limit.clamp(1, 500))
-            .cloned()
-            .collect()
-    }
-
-    fn issue_raft_command(
-        &self,
-        command: &str,
-        target: Option<&str>,
-        actor: &str,
-    ) -> R<RaftHistoryEvent> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| anyhow!("Error locking raft state"))?;
-
-        let target_owned = target.map(str::to_string);
-        let event = match command {
-            "trigger-election" => {
-                state.term += 1;
-                state.role = PersistenceRole::Primary;
-                state.leader_id = Some(state.node_id.clone());
-                state.commit_index += 1;
-                state.applied_index = state.commit_index;
-                state.election_epoch_ms =
-                    (OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64;
-                let node_id = state.node_id.clone();
-                let term = state.term;
-                Self::push_event(
-                    &mut state,
-                    "election",
-                    format!(
-                        "Manual election triggered by {actor}; {} became leader for term {}",
-                        node_id, term
-                    ),
-                    actor,
-                    target_owned,
-                )
-            }
-            "step-down" => {
-                state.term += 1;
-                state.role = PersistenceRole::Standby;
-                state.leader_id = Self::choose_new_leader(&state);
-                state.election_epoch_ms =
-                    (OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64;
-                let leader = state
-                    .leader_id
-                    .clone()
-                    .unwrap_or_else(|| "none".to_string());
-                Self::push_event(
-                    &mut state,
-                    "failover",
-                    format!(
-                        "Leader step-down requested by {actor}; new leader: {}",
-                        leader
-                    ),
-                    actor,
-                    target_owned,
-                )
-            }
-            "transfer-leader" => {
-                let target = target.context("transfer-leader command requires target node id")?;
-                if !state.voters.iter().any(|member| member == target) {
-                    bail!("target node {target} is not a raft voter");
-                }
-                state.term += 1;
-                state.leader_id = Some(target.to_string());
-                state.role = if target == state.node_id {
-                    PersistenceRole::Primary
-                } else {
-                    PersistenceRole::Standby
-                };
-                state.election_epoch_ms =
-                    (OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64;
-                Self::push_event(
-                    &mut state,
-                    "leadership_transfer",
-                    format!("Leadership transferred to {target} by {actor}"),
-                    actor,
-                    Some(target.to_string()),
-                )
-            }
-            "add-voter" => {
-                let target = target.context("add-voter command requires target node id")?;
-                if !state.voters.iter().any(|member| member == target) {
-                    state.voters.push(target.to_string());
-                    state.voters.sort();
-                }
-                Self::push_event(
-                    &mut state,
-                    "membership",
-                    format!("Added voter {target}"),
-                    actor,
-                    Some(target.to_string()),
-                )
-            }
-            "add-learner" => {
-                let target = target.context("add-learner command requires target node id")?;
-                if !state.learners.iter().any(|member| member == target) {
-                    state.learners.push(target.to_string());
-                    state.learners.sort();
-                }
-                Self::push_event(
-                    &mut state,
-                    "membership",
-                    format!("Added learner {target}"),
-                    actor,
-                    Some(target.to_string()),
-                )
-            }
-            "remove-member" => {
-                let target = target.context("remove-member command requires target node id")?;
-                state.voters.retain(|member| member != target);
-                state.learners.retain(|member| member != target);
-                state.peers.retain(|member| member != target);
-                if state.leader_id.as_deref() == Some(target) {
-                    state.leader_id = Self::choose_new_leader(&state);
-                    state.role = if state.leader_id.as_deref() == Some(state.node_id.as_str()) {
-                        PersistenceRole::Primary
-                    } else {
-                        PersistenceRole::Standby
-                    };
-                }
-                Self::push_event(
-                    &mut state,
-                    "membership",
-                    format!("Removed raft member {target}"),
-                    actor,
-                    Some(target.to_string()),
-                )
-            }
-            other => bail!("unsupported raft command: {other}"),
-        };
-
-        info!(command, actor, target = ?target, role = state.role.as_str(), term = state.term, "Applied raft command");
-        Ok(event)
-    }
-
-    fn issue_raft_join_token(&self, actor: &str) -> R<(String, String)> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| anyhow!("Error locking raft state"))?;
-        let expires_at =
-            OffsetDateTime::now_utc() + TimeDuration::seconds(state.join_token_ttl_seconds as i64);
-        let token = format!(
-            "raft:{}:{}:{}",
-            state.cluster_id,
-            state.node_id,
-            expires_at.unix_timestamp()
-        );
-        let expires = expires_at.format(&time::format_description::well_known::Rfc3339)?;
-        let ttl = state.join_token_ttl_seconds;
-        let _ = Self::push_event(
-            &mut state,
-            "join_token",
-            format!("Issued raft join token (ttl={}s)", ttl),
-            actor,
-            None,
-        );
-        Ok((token, expires))
-    }
-}
-
+/// Builds the persistence driver for the configured backend. The raft
+/// driver is only *constructed* here — its engine starts later via
+/// [`PersistenceDriver::start_engine`], once `Store::start_storage` has run
+/// migrations (the engine's state machines need the migrated DB).
 pub fn build_persistence_driver(
     config: &PersistenceConfigFull,
     db_path: std::path::PathBuf,
@@ -862,7 +592,7 @@ pub fn build_persistence_driver(
             } else {
                 config.raft.node_id.clone()
             };
-            Arc::new(RaftPersistenceDriver::new(node_id, &config.raft))
+            Arc::new(MultiRaftDriver::new(node_id, manager_node_id, &config.raft))
         }
     }
 }
@@ -892,25 +622,46 @@ mod tests {
         assert!(!status.lease_held);
     }
 
+    // Real-driver bootstrap status: a single-node raft store on a tempdir
+    // elects itself and reports leader status through the driver. The full
+    // propose->commit->apply path is covered by tests/raft_apply_roundtrip.rs.
     #[test]
     fn raft_status_reports_bootstrap_node() {
-        let raft = RaftPersistenceConfigFull {
-            node_id: "mgr-a".to_string(),
-            bootstrap: true,
-            peers: vec!["mgr-a".to_string(), "mgr-b".to_string()],
-            join_token_ttl_seconds: 900,
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = crate::structs::ManagerConfigFull {
+            store_path: dir.path().join("store").to_str().unwrap().to_string(),
+            ..Default::default()
         };
-        let d = RaftPersistenceDriver::new("mgr-a".to_string(), &raft);
-        d.start().unwrap();
+        config.persistence.r#type = PersistenceType::Raft;
+        config.persistence.raft.bootstrap = true;
+        config.persistence.raft.node_id = "mgr-a".to_string();
+        config.persistence.raft.data_dir = dir.path().join("raft").to_str().unwrap().to_string();
+        config.persistence.raft.peers = vec!["mgr-b=127.0.0.1:9999".to_string()];
 
-        let status = d.raft_status().unwrap();
+        let store = Store::start_storage(&config).unwrap();
+        let status = store.raft_status().unwrap();
         assert!(status.enabled);
+        assert_eq!(status.backend, "raft");
+        assert_eq!(status.raft_library, "openraft-0.9");
         assert_eq!(status.node_id, "mgr-a");
         assert_eq!(status.role, PersistenceRole::Primary);
-        assert_eq!(
-            status.voters,
-            vec!["mgr-a".to_string(), "mgr-b".to_string()]
-        );
+        assert_eq!(status.leader_id.as_deref(), Some("mgr-a"));
+        assert_eq!(status.voters, vec!["mgr-a".to_string()]);
+        assert_eq!(status.peers, vec!["mgr-b".to_string()]);
+        assert!(status.term >= 1);
+        assert!(!status.cluster_id.is_empty());
+        // Per-lane quorum math (plan §7-C3): one voter, quorum 1, survives
+        // nothing, and no parity/expectation warning.
+        let lane = status
+            .lanes
+            .first()
+            .expect("single topology reports the control lane");
+        assert_eq!(lane.voters, 1);
+        assert_eq!(lane.quorum, 1);
+        assert_eq!(lane.survives, 0);
+        assert!(lane.warning.is_none(), "warning: {:?}", lane.warning);
+        // The cluster secret was minted and persisted at bootstrap.
+        assert!(dir.path().join("raft/cluster_secret").exists());
     }
 
     #[test]

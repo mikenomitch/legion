@@ -290,6 +290,34 @@ pub fn catalog() -> Vec<Capability> {
             read_only_safe: true,
         },
         Capability {
+            name: "node.cordon",
+            cli: "legion node cordon <ID>",
+            grpc: Some("Manager/SetNodeAvailability"),
+            summary: "Mark a node unschedulable; existing allocations keep running. \
+                 Supports --idempotency-key.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "node.drain",
+            cli: "legion node drain <ID>",
+            grpc: Some("Manager/SetNodeAvailability"),
+            summary: "Mark a node unschedulable and evict its allocations (stateless move \
+                 immediately; stateful stay protected by their onLost policy). Supports \
+                 --idempotency-key.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "node.uncordon",
+            cli: "legion node uncordon <ID>",
+            grpc: Some("Manager/SetNodeAvailability"),
+            summary: "Restore a cordoned/drained node to the scheduling pool. \
+                 Supports --idempotency-key.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
             name: "node.join-token.create",
             cli: "legion join-token create",
             grpc: Some("Manager/CreateJoinToken"),
@@ -352,6 +380,17 @@ pub fn catalog() -> Vec<Capability> {
             cli: "legion state seed-queries",
             grpc: Some("Manager/UpsertSavedStateQuery"),
             summary: "Install the curated library of agent introspection queries.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "state.backup",
+            cli: "legion state backup [--out <PATH>]",
+            grpc: Some("Manager/GetStateBackup"),
+            summary: "Write a consistent server-side backup file of the state store: a \
+                 point-in-time image of that node's applied state (VACUUM INTO; runs only on \
+                 the node leading every raft lane, not a cluster-wide snapshot at one index). \
+                 Restore via `legion start manager --restore-from <path>`.",
             mutates: true,
             read_only_safe: false,
         },

@@ -174,6 +174,45 @@ Two paths exist:
   and retried on the next tick rather than force-placed.
 - `node_drop` eval path does equivalent reconciliation.
 
+## Cordon and Drain
+
+Nodes have two independent axes: `status` (ready/active/lost — health) and
+`availability` (available/drained — schedulability). The scheduler's single
+placement chokepoint (`Scheduler::available_nodes`) and the store's reconcile
+path only consider nodes with `availability == "available"`, so flipping
+availability excludes a node from **all** new placements without touching its
+health, heartbeats, or running allocations.
+
+The `SetNodeAvailability` RPC (CLI: `legion node cordon|drain|uncordon <ID>`,
+MCP: `legion_node_drain`) drives three operator flows:
+
+- **Cordon** (`availability: "drained"`, `evict: false`): the node stops
+  receiving new placements; existing allocations keep running. Emits
+  `node.cordoned`.
+- **Drain** (`availability: "drained"`, `evict: true`): cordon plus a
+  `node_drain` eval that evicts the node's existing allocations
+  (`Store::reschedule_allocations_for_drained_node`):
+  - Stateless allocations are removed immediately and the affected job
+    configs reconciled onto the remaining available nodes. Because the node
+    is alive and heartbeating, the next heartbeat reply shrinks its desired
+    set and the worker stops the tasks cleanly — none of the lost-node
+    loss-confirmation delay applies.
+  - Stateful allocations run through the same protection gate as node loss
+    (`stateful.onLost`). A drained-but-alive node has no `lost_at`, so its
+    loss duration is unknown and every stateful allocation is **held**: a
+    drain never force-moves protected state. Held allocations keep running
+    on the drained node until the node is actually lost (the lost-node
+    recheck sweep then applies `onLost.replaceAfter` as usual) or an
+    operator moves them explicitly with `legion instance replace`.
+  - Emits `node.drained` with evicted/held counts.
+- **Uncordon** (`availability: "available"`): the node re-enters the
+  scheduling pool. Existing allocations elsewhere are not moved back
+  automatically; the next reschedule/reconcile may use the node. Emits
+  `node.uncordoned`.
+
+The RPC is idempotent (optional `idempotency_key`), returns NotFound for
+unknown nodes, and requires `node:write` on the node's pool.
+
 ## Dynamic Node Attr Update
 
 `update_node_dynamic`:

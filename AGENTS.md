@@ -249,7 +249,11 @@ knowingly accepted a limitation or trade-off.
   `docs/service-discovery.md`, `docs/exec-and-actions.md`, `docs/rollouts.md`
 - `docs/logging.md`, `docs/observability.md`, `docs/event-stream.md`,
   `docs/ui-architecture.md`
-- `docs/persistence-streaming.md`, `docs/raft-operations.md`
+- `docs/persistence-streaming.md`, `docs/raft-operations.md`,
+  `docs/multi-raft.md` — the replicated (raft) manager store: topologies,
+  lanes, snapshots, backup/restore, quorum guidance
+- `docs/metrics.md` — the Prometheus endpoint and health probes
+- `docs/upgrades.md` — version-skew policy, upgrade order, raft data-dir rules
 - `docs/testing-and-benchmarks.md`, `docs/codebase-conventions.md`
 - `docs/agent-readiness.md` — the agent-facing surfaces (MCP, structured output,
   capabilities, validate/schema, idempotency, wait, saved queries)

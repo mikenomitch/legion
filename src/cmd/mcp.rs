@@ -31,8 +31,8 @@ use crate::structs::{
     GetLedgerRequest, GetNodesRequest, GetRolloutStatusRequest, GetStateStoreSchemaRequest,
     GetVolumeRequest, JobConfig, ListEventsRequest, ListInstancesRequest, ListJobActionsRequest,
     ListJobsRequest, ListRolloutsRequest, ListVolumeDriversRequest, ListVolumesRequest,
-    QueryStateStoreRequest, ReplaceInstanceRequest, RunJobRequest, StartInstanceRequest,
-    StopInstanceRequest, StopJobRequest,
+    QueryStateStoreRequest, ReplaceInstanceRequest, RunJobRequest, SetNodeAvailabilityRequest,
+    StartInstanceRequest, StopInstanceRequest, StopJobRequest,
 };
 use crate::task_plugins::validate_job_config;
 use serde::Serialize;
@@ -237,6 +237,21 @@ fn tool_defs() -> Vec<ToolDef> {
             description: "List worker nodes and their health.",
             input_schema: empty_schema,
             mutates: false,
+        },
+        ToolDef {
+            name: "legion_node_drain",
+            description: "Cordon, drain, or uncordon a worker node. cordon = stop new placements (existing allocations keep running); drain = cordon + evict allocations (stateless move immediately, stateful stay protected by their stateful.onLost policy); uncordon = make the node schedulable again. Mutating.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "string", "description": "Node ID." },
+                    "mode": { "type": "string", "enum": ["cordon", "drain", "uncordon"], "description": "cordon: unschedulable, keep allocations. drain: unschedulable + evict. uncordon: schedulable again." },
+                    "idempotency_key": { "type": "string", "description": "Optional key to dedupe retries." }
+                },
+                "required": ["node_id", "mode"],
+                "additionalProperties": false
+            }),
+            mutates: true,
         },
         ToolDef {
             name: "legion_acl_whoami",
@@ -619,6 +634,29 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
         "legion_node_list" => {
             let mut client = connect().await?;
             grpc(client.get_nodes(GetNodesRequest::default())).await
+        }
+        "legion_node_drain" => {
+            let node_id = str_arg(&args, "node_id")?;
+            let mode = str_arg(&args, "mode")?;
+            let (availability, evict) = match mode.as_str() {
+                "cordon" => ("drained", false),
+                "drain" => ("drained", true),
+                "uncordon" => ("available", false),
+                other => {
+                    return Err(format!(
+                        "invalid mode {other:?}: expected cordon, drain, or uncordon"
+                    ))
+                }
+            };
+            let idempotency_key = opt_str_arg(&args, "idempotency_key");
+            let mut client = connect().await?;
+            grpc(client.set_node_availability(SetNodeAvailabilityRequest {
+                node_id,
+                availability: availability.to_string(),
+                evict,
+                idempotency_key,
+            }))
+            .await
         }
         "legion_acl_whoami" => {
             let mut client = connect().await?;

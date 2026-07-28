@@ -11,6 +11,9 @@ use crate::storage::persistence::{
     build_persistence_driver, PersistenceDriver, PersistenceRole, PersistenceStatus,
     RaftHistoryEvent, RaftStatus,
 };
+use crate::storage::raft::{capture, ReplicatedOp, ReplicationHandle};
+use crate::storage::Lane;
+
 use crate::storage::queries::{
     DELETE_SIGNING_KEY, GET_ALLOCATION_BY_ID, GET_ALLOCS, GET_ALLOCS_FOR_JOB,
     GET_ALLOCS_FOR_JOB_CONFIG, GET_ALLOCS_FOR_NODE, GET_EVALS, GET_INSTANCE, GET_INSTANCES_FOR_JOB,
@@ -18,8 +21,9 @@ use crate::storage::queries::{
     GET_MANAGER_CONFIGS, GET_NEXT_EVAL, GET_NODE, GET_NODES, GET_SIGNING_KEYS,
     GET_TASK_FOR_JOB_CONIFG, GET_WORKER_TYPE, INSERT_ALLOCATION, INSERT_EVAL, INSERT_JOB,
     INSERT_JOB_CONFIG, INSERT_JOB_CONFIG_SUBMISSION, INSERT_JOB_UPDATE, INSERT_NODE,
-    INSERT_SIGNING_KEY, INSERT_SUBMISSION, INSERT_TASK, INSERT_WORKER_TYPE, NODE_ATTRS,
-    UPDATE_SIGNING_KEY_STATE, UPSERT_INSTANCE, UPSERT_MANAGER_CONFIG,
+    INSERT_SIGNING_KEY, INSERT_SUBMISSION, INSERT_TASK, INSERT_WORKER_TYPE, NODE_JOINED_ATTRS,
+    NODE_JOINED_FROM, SEED_NODE_HEALTH, UPDATE_SIGNING_KEY_STATE, UPSERT_INSTANCE,
+    UPSERT_MANAGER_CONFIG,
 };
 use crate::structs::{
     slot_instance_id, Allocation, AllocationHealth, Eval, Instance, InstanceMode, InstanceState,
@@ -35,17 +39,16 @@ use lazy_static::lazy_static;
 use rand::{thread_rng, Rng};
 use rusqlite::{
     named_params, params, params_from_iter, types::ValueRef, Connection, Error as RusqliteError,
-    OpenFlags, OptionalExtension, Row, Transaction,
+    OpenFlags, OptionalExtension, Row,
 };
 use rusqlite_migration::Migrations;
 use serde::Serialize;
 use serde_json::{from_str, to_string, to_string_pretty, Value};
-use serde_rusqlite::to_params_named;
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{MutexGuard, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{MutexGuard, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 use time::format_description::well_known::Rfc3339;
 use time::macros::format_description;
@@ -124,7 +127,6 @@ struct AllocationTaskState {
     distinct: Option<DistinctTracker>,
     job_config_id: String,
     resources: Value,
-    lifecycle: TaskLifecycle,
     network_raw: Option<String>,
 }
 
@@ -159,6 +161,10 @@ pub enum PlanApplyOutcome {
 pub struct Store {
     pub write_conn: MemSafeConn,
     pub read_conns: Arc<Vec<MemSafeConn>>,
+    // Filesystem path of the state database (`<storePath>/store.sqlite`).
+    // Needed by snapshot install (atomic DB swap + connection reopen) and by
+    // `state_backup`'s default destination (plan §A5).
+    db_path: Arc<std::path::PathBuf>,
     pub read_index: Arc<AtomicUsize>,
     pub scheduling_policy: String,
     pub default_eval_priority: i64,
@@ -172,6 +178,27 @@ pub struct Store {
     // Live fan-out of scheduler events to StreamEvents subscribers. Persisted
     // history lives in the scheduler_event table; this only carries new events.
     event_tx: broadcast::Sender<SchedulerEventRecord>,
+    // True once the raft engine has started (set via `set_raft_mode`). While
+    // set, `write_connection` refuses callers that are neither capturing nor
+    // applying a changeset — any unclassified write path fails loudly instead
+    // of silently diverging replicas (JC-14).
+    raft_mode: Arc<AtomicBool>,
+    // Replication pipeline handle, installed by the raft engine at start
+    // (phase A-1). Until it is set, `replicated()` in raft mode errors.
+    replication: Arc<OnceLock<ReplicationHandle>>,
+    // Whether the write connection runs at `synchronous = FULL` (raft mode —
+    // see `configure_connection`); remembered so snapshot install reopens
+    // the connection with the same durability level.
+    durable_sync: bool,
+}
+
+/// Result of [`Store::state_backup`]: where the backup landed, its size,
+/// and the raft applied index it captures (0 outside raft mode).
+#[derive(Debug, Clone)]
+pub struct StateBackupInfo {
+    pub path: std::path::PathBuf,
+    pub bytes: u64,
+    pub applied_index: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -307,6 +334,9 @@ impl JobSubmitOutcome {
 pub const CONN_LOCK_ERROR: &str = "Error locking database connection";
 const READ_ONLY_CONN_POOL_SIZE: usize = 2;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+// Bound on the bind parameters used per batched `scope_id IN (...)` lookup in
+// `allocation_version_vector_for_candidates`; larger candidate sets are chunked.
+const SCOPE_EPOCH_QUERY_CHUNK: usize = 500;
 // Live subscribers that fall this many events behind must catch up from the
 // scheduler_event table (StreamEvents handles the Lagged case).
 const EVENT_BROADCAST_CAPACITY: usize = 1_024;
@@ -314,6 +344,12 @@ const EVENT_BROADCAST_CAPACITY: usize = 1_024;
 const EVENT_RETAINED_ROWS: i64 = 10_000;
 // Prune once every N inserts to keep the hot emit path cheap.
 const EVENT_PRUNE_INTERVAL: i64 = 256;
+// Middle bits of a scheduler_event id carrying the per-process sequence:
+// the high bits carry unix milliseconds and the low `Lane::ID_STRIDE_BITS`
+// carry the minting lane's residue (see `next_scheduler_event_id`).
+// 18 + 3 bits below the millisecond field keeps ids inside i64 until the
+// 22nd century (i64::MAX >> 21 ms ≈ year 2109).
+const EVENT_ID_SEQ_BITS: u32 = 18;
 
 // NOTE: This will become a general interface for all storage backends
 impl Store {
@@ -323,9 +359,24 @@ impl Store {
         let manager_node_id = format!("{}:{}", config.server.host, config.server.port);
         let persistence_driver: Arc<dyn PersistenceDriver> =
             build_persistence_driver(&config.persistence, db_path.clone(), &manager_node_id);
-        persistence_driver.start()?;
+        let raft_enabled = matches!(
+            config.persistence.r#type,
+            crate::structs::config::PersistenceType::Raft
+        );
+        // Voter-count config validation (plan §7-C3): `expectedVoters = 0`
+        // fails the load; even expectations / even peer lists log the parity
+        // advisory once per process and proceed.
+        if raft_enabled {
+            crate::storage::raft::quorum::validate_raft_config(&config.persistence.raft)?;
+        }
+        // The raft engine needs the migrated store (its state machines apply
+        // into it), so its start is deferred to `start_engine` below;
+        // local_disk/streaming start exactly where they always did.
+        if !raft_enabled {
+            persistence_driver.start()?;
+        }
 
-        let write_conn = Store::create_write_conn(&db_path)?;
+        let write_conn = Store::create_write_conn(&db_path, raft_enabled)?;
         let _migrations = Store::create_initial_tables(&Arc::clone(&write_conn))?;
         let read_conns = Store::create_read_pool(&db_path)?;
         let resource_policy = ResourcePolicy::from_manager_config(config)?;
@@ -333,6 +384,7 @@ impl Store {
         let store = Store {
             write_conn,
             read_conns: Arc::new(read_conns),
+            db_path: Arc::new(db_path.clone()),
             read_index: Arc::new(AtomicUsize::new(0)),
             scheduling_policy: config.scheduling_policy.clone(),
             default_eval_priority: config.default_priority,
@@ -343,11 +395,53 @@ impl Store {
             read_model: Arc::new(RwLock::new(SchedulingReadModel::default())),
             eval_notify: Arc::new(Notify::new()),
             event_tx: broadcast::channel(EVENT_BROADCAST_CAPACITY).0,
+            raft_mode: Arc::new(AtomicBool::new(false)),
+            replication: Arc::new(OnceLock::new()),
+            durable_sync: raft_enabled,
         };
 
         store.refresh_read_model()?;
 
+        // Raft mode: start the engine AFTER migrations (the state machines
+        // apply into the migrated DB) and BEFORE this store is handed to
+        // anything serving traffic. `start_engine` installs the replication
+        // pipeline and arms the raft-mode write guard; startup-time writes
+        // that follow (requeue, manager-config upsert, seeds) run through
+        // replication and are gated to the leader by the daemon.
+        if raft_enabled {
+            store.persistence_driver.clone().start_engine(&store)?;
+        }
+
         Ok(store)
+    }
+
+    /// Clone handed to the raft engine (state machines, pipeline threads):
+    /// shares the database connections, read model, event broadcast, eval
+    /// notify, and the raft-mode flag with this store, but holds a
+    /// placeholder persistence driver and a fresh (never-populated)
+    /// replication cell. This breaks the reference cycle engine-owned store
+    /// clones would otherwise create (engine → store → driver → engine), so
+    /// dropping the last real store shuts the engine down.
+    pub(crate) fn raft_engine_clone(&self) -> Store {
+        let mut clone = self.clone();
+        clone.persistence_driver =
+            Arc::new(crate::storage::persistence::LocalDiskPersistenceDriver::new());
+        clone.replication = Arc::new(OnceLock::new());
+        clone
+    }
+
+    /// The registry cell the `RaftTransport` tonic service dispatches
+    /// through. For non-raft backends this is a fresh, never-populated cell:
+    /// the mounted service then answers `Unavailable`, which peers treat as
+    /// "engine not started here".
+    pub(crate) fn raft_transport_registry_cell(
+        &self,
+    ) -> Arc<OnceLock<crate::storage::raft::RaftTransportRegistry>> {
+        self.persistence_driver
+            .as_any()
+            .downcast_ref::<crate::storage::raft::driver::MultiRaftDriver>()
+            .map(|driver| driver.transport_registry_cell())
+            .unwrap_or_default()
     }
 
     pub fn persistence_status(&self) -> PersistenceStatus {
@@ -362,6 +456,226 @@ impl Store {
         self.persistence_driver.raft_status()
     }
 
+    /// Whether this manager may ACT for `lane` right now: in raft mode, true
+    /// only while this node leads the raft group carrying the lane (a cheap
+    /// metrics-watch probe, no I/O); in every other persistence mode, always
+    /// true. The daemon's scheduling loops (eval workers, node status
+    /// checker) poll this so followers idle and take over within a poll
+    /// interval of a leadership change (plan JC-15).
+    pub(crate) fn is_raft_leader(&self, lane: Lane) -> bool {
+        match self
+            .persistence_driver
+            .as_any()
+            .downcast_ref::<crate::storage::raft::driver::MultiRaftDriver>()
+        {
+            Some(driver) => driver.is_leader(lane),
+            None => true,
+        }
+    }
+
+    /// The tonic service serving this store's manager-plane raft transport
+    /// (`RaftTransport` in `proto/legion.proto`). The daemon mounts it on
+    /// the manager listener; in-process multi-node tests mount it on their
+    /// own ephemeral listeners. For non-raft backends the service's registry
+    /// cell is never populated, so every RPC answers `Unavailable`.
+    pub fn raft_transport_server(
+        &self,
+    ) -> crate::structs::raft_transport_server::RaftTransportServer<
+        crate::storage::raft::server::RaftTransportService,
+    > {
+        crate::structs::raft_transport_server::RaftTransportServer::new(
+            crate::storage::raft::server::RaftTransportService::new(
+                self.raft_transport_registry_cell(),
+            ),
+        )
+        // Raise tonic's 4 MiB default: openraft snapshot chunks and
+        // append-entries batches are serde_json-encoded (~4x byte blowup)
+        // and must never be rejected for size, or the peer hot-retries the
+        // oversized message forever (see raft::network::RAFT_MAX_MESSAGE_BYTES).
+        .max_decoding_message_size(crate::storage::raft::network::RAFT_MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(crate::storage::raft::network::RAFT_MAX_MESSAGE_BYTES)
+    }
+
+    /// Partition test hook (in-process durability tests only — not an
+    /// operator surface): while blocked, every outbound raft transport RPC
+    /// from this node fails as unreachable before dialing. Paired with
+    /// dropping the node's inbound transport listener this fully isolates
+    /// the node from its peers — the in-process equivalent of yanking its
+    /// network cable (`tests/raft_durability.rs`). Errors on non-raft
+    /// backends and before the raft engine has started.
+    pub fn raft_set_outbound_blocked(&self, blocked: bool) -> R<()> {
+        self.persistence_driver
+            .as_any()
+            .downcast_ref::<crate::storage::raft::driver::MultiRaftDriver>()
+            .context("raft_set_outbound_blocked requires the raft persistence backend")?
+            .set_outbound_blocked(blocked)
+    }
+
+    /// Deterministic fingerprint of this replica's replicated state: every
+    /// user table except the ones that legitimately differ between healthy
+    /// replicas (plan §7-C2):
+    ///
+    /// - `raft_applied` (applied marker legitimately lags on followers) and
+    ///   `raft_cluster` (node-local identity stamp) — raft bookkeeping,
+    ///   never replicated;
+    /// - `scheduler_event` / `idempotency_record` — commutative tables
+    ///   pruned locally per node (JC-28), so their retained windows differ.
+    ///
+    /// `eval` is deliberately INCLUDED again (JC-41 reverses JC-27): the
+    /// queue is replicated scheduler-lane state, so replicas that disagree
+    /// about pending work have diverged — exactly what this fingerprint
+    /// exists to catch.
+    ///
+    /// Rows are ordered by every column. Two replicas that converged
+    /// report identical hashes. Used by the raft convergence/determinism
+    /// tests and usable for operator replica comparison.
+    pub fn state_content_hash(&self) -> R<String> {
+        let tables: Vec<String> = {
+            let conn = self.read_connection()?;
+            let mut stmt = conn.prepare(
+                "SELECT name FROM sqlite_master
+                 WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+                   AND name NOT IN ('raft_applied', 'raft_cluster',
+                                    'scheduler_event', 'idempotency_record')
+                 ORDER BY name;",
+            )?;
+            let rows = stmt.query_map([], |row| row.get(0))?;
+            Self::collect_rows(rows)?
+        };
+        let refs: Vec<&str> = tables.iter().map(String::as_str).collect();
+        self.state_content_hash_for_tables(&refs)
+    }
+
+    /// [`Store::state_content_hash`] restricted to an explicit table list —
+    /// lets tests fingerprint one raft lane's table group at a time (plan
+    /// §7-C3: a lane's snapshot install must converge its own tables and
+    /// leave sibling lanes' groups untouched). Tables missing from the
+    /// schema are an error, not silently skipped.
+    pub fn state_content_hash_for_tables(&self, tables: &[&str]) -> R<String> {
+        let mut tables: Vec<&str> = tables.to_vec();
+        tables.sort_unstable();
+        let conn = self.read_connection()?;
+        let mut content = String::new();
+        for table in &tables {
+            // Order by every column ordinal so the fingerprint is
+            // independent of physical row order (WITHOUT ROWID tables and
+            // vacuumed tables included).
+            let cols = {
+                let stmt = conn.prepare(&format!("SELECT * FROM \"{table}\" LIMIT 0;"))?;
+                stmt.column_count()
+            };
+            let order: Vec<String> = (1..=cols).map(|i| i.to_string()).collect();
+            let mut stmt = conn.prepare(&format!(
+                "SELECT * FROM \"{table}\" ORDER BY {};",
+                order.join(", ")
+            ))?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                content.push_str(table);
+                content.push(':');
+                for i in 0..cols {
+                    let value: rusqlite::types::Value = row.get(i)?;
+                    content.push_str(&format!("{value:?}|"));
+                }
+                content.push('\n');
+            }
+        }
+        Ok(format!(
+            "{:016x}",
+            crate::storage::raft::types::fnv1a64(&content)
+        ))
+    }
+
+    /// The tables a raft lane single-writes, by lane wire name (`control` /
+    /// `scheduler` / `status`) — the table groups of plan §7-C2. Public so
+    /// integration tests can fingerprint per lane via
+    /// [`Store::state_content_hash_for_tables`]. The commutative tables
+    /// (`scheduler_event`, `idempotency_record`) are excluded for the same
+    /// reason [`Store::state_content_hash`] excludes them: their locally
+    /// pruned retention windows legitimately differ between healthy
+    /// replicas (JC-28).
+    pub fn raft_lane_table_group(lane: &str) -> R<Vec<&'static str>> {
+        let lane = crate::storage::raft::Lane::from_wire_name(lane)
+            .with_context(|| format!("unknown raft lane `{lane}`"))?;
+        Ok(
+            crate::storage::raft::ownership::snapshot_tables_for_lane(lane)
+                .into_iter()
+                .filter(|table| {
+                    crate::storage::raft::ownership::owner_lane(table)
+                        != Some(crate::storage::raft::ownership::Owner::Commutative)
+                })
+                .collect(),
+        )
+    }
+
+    /// Test hook (lanes battery): trigger an election for ONE lane's raft
+    /// group on this node, by lane wire name. The operator surface
+    /// (`raft command trigger-election`) elects every lane at once; proving
+    /// elections are independent requires moving a single lane's
+    /// leadership. Errors on non-raft backends, before engine start, and
+    /// for lanes the topology does not run.
+    pub fn raft_trigger_lane_election(&self, lane: &str) -> R<()> {
+        let lane = crate::storage::raft::Lane::from_wire_name(lane)
+            .with_context(|| format!("unknown raft lane `{lane}`"))?;
+        self.persistence_driver
+            .as_any()
+            .downcast_ref::<crate::storage::raft::driver::MultiRaftDriver>()
+            .context("raft_trigger_lane_election requires the raft persistence backend")?
+            .trigger_lane_election(lane)
+    }
+
+    /// Test hook (lanes battery): pause/resume this node's JC-40
+    /// anchor-lane convergence loop. Production never calls it — the
+    /// leadership-INDEPENDENCE test needs to hold the three lanes under
+    /// DIFFERENT leaders long enough to assert on that state, and the
+    /// control leader's convergence campaigns would pull them back
+    /// (which is, in production, the whole point). Errors on non-raft
+    /// backends; a no-op under `single` topology, where no convergence loop
+    /// runs.
+    pub fn raft_set_lane_convergence(&self, enabled: bool) -> R<()> {
+        self.persistence_driver
+            .as_any()
+            .downcast_ref::<crate::storage::raft::driver::MultiRaftDriver>()
+            .context("raft_set_lane_convergence requires the raft persistence backend")?
+            .set_lane_convergence(enabled);
+        Ok(())
+    }
+
+    /// Test hook (lanes battery): how many JC-40 convergence campaigns this
+    /// node has issued for `lane` since its engine started.
+    ///
+    /// Convergence is best-effort and its campaigns bump raft terms, so the
+    /// battery asserts the BOUND on them directly (a handful per cooldown
+    /// window, per lane) rather than inferring it from term numbers, which
+    /// also move for reasons convergence does not control. Errors on
+    /// non-raft backends and for an unknown lane name; always `0` under
+    /// `single` topology and for the anchor lane, which is never campaigned
+    /// for.
+    pub fn raft_lane_campaigns(&self, lane: &str) -> R<u64> {
+        let lane = crate::storage::Lane::from_wire_name(lane)
+            .with_context(|| format!("unknown raft lane `{lane}`"))?;
+        Ok(self
+            .persistence_driver
+            .as_any()
+            .downcast_ref::<crate::storage::raft::driver::MultiRaftDriver>()
+            .context("raft_lane_campaigns requires the raft persistence backend")?
+            .lane_campaigns(lane))
+    }
+
+    /// Test hook (lanes durability battery): process-global count of
+    /// capture-time single-writer ownership-guard violations (JC-26) since
+    /// process start — every changeset the guard found touching a table
+    /// outside its op's lane, whether the op was then rejected (enforcing,
+    /// the only live path since C-2) or warned away (the dormant grace
+    /// path). The durability tests assert their whole workload leaves this
+    /// counter untouched: zero must mean "nothing ever tripped the guard",
+    /// not "trips were retried into silence". Process-global on purpose —
+    /// in-process multi-node clusters share it, so one assertion covers
+    /// every node.
+    pub fn raft_ownership_guard_violations() -> u64 {
+        crate::storage::raft::ownership::violation_count()
+    }
+
     pub fn raft_history(&self, limit: usize) -> Vec<RaftHistoryEvent> {
         self.persistence_driver.raft_history(limit)
     }
@@ -371,13 +685,35 @@ impl Store {
         command: &str,
         target: Option<&str>,
         actor: &str,
-    ) -> R<RaftHistoryEvent> {
+    ) -> R<crate::storage::persistence::RaftCommandOutcome> {
         self.persistence_driver
             .issue_raft_command(command, target, actor)
     }
 
     pub fn issue_raft_join_token(&self, actor: &str) -> R<(String, String)> {
         self.persistence_driver.issue_raft_join_token(actor)
+    }
+
+    /// Node counts grouped by status (`active`, `lost`, ...) for the
+    /// `legion_nodes{status}` gauge. One indexed aggregate on a read
+    /// connection — cheap enough for the node-status-checker tick.
+    pub fn node_status_counts(&self) -> R<Vec<(String, i64)>> {
+        let conn = self.read_connection()?;
+        // Liveness lives in node_health (plan §7-C2); a node without a
+        // health row hydrates the registration default 'active'.
+        let mut stmt = conn.prepare(
+            "SELECT COALESCE(node_health.status, 'active') AS status, COUNT(*)
+             FROM node LEFT JOIN node_health ON node_health.node_id = node.id
+             GROUP BY 1;",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Self::collect_rows(rows)
+    }
+
+    /// Total live allocations, for the `legion_allocations` gauge.
+    pub fn allocation_count(&self) -> R<i64> {
+        let conn = self.read_connection()?;
+        Ok(conn.query_row("SELECT COUNT(*) FROM allocation;", [], |row| row.get(0))?)
     }
 
     #[instrument(err, skip_all)]
@@ -401,10 +737,10 @@ impl Store {
     }
 
     #[instrument(err, skip_all)]
-    fn create_write_conn(db_path: &Path) -> R<MemSafeConn> {
+    fn create_write_conn(db_path: &Path, durable_sync: bool) -> R<MemSafeConn> {
         let final_path = db_path.to_str().context("Error parsing store path")?;
         let conn = Connection::open(final_path)?;
-        Self::configure_connection(&conn, false)?;
+        Self::configure_connection(&conn, false, durable_sync)?;
         Ok(Arc::new(Mutex::new(conn)))
     }
 
@@ -412,17 +748,27 @@ impl Store {
     fn create_readonly_conn(db_path: &Path) -> R<MemSafeConn> {
         let final_path = db_path.to_str().context("Error parsing store path")?;
         let conn = Connection::open_with_flags(final_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        Self::configure_connection(&conn, true)?;
+        Self::configure_connection(&conn, true, false)?;
         conn.pragma_update(None, "query_only", "ON")?;
         Ok(Arc::new(Mutex::new(conn)))
     }
 
-    fn configure_connection(conn: &Connection, read_only: bool) -> R<()> {
+    /// `durable_sync` (raft mode) runs the write connection at
+    /// `synchronous = FULL` instead of `NORMAL`. Raft purges its log behind
+    /// snapshots, so the "state is recoverable from the log" argument that
+    /// justifies NORMAL for local_disk does not hold past the purge horizon:
+    /// after a power loss, an applied marker that regressed below
+    /// `last_purged_log_id` (WAL not yet checkpointed) would make openraft's
+    /// startup reapply fail permanently — a bricked node. FULL makes every
+    /// applied entry fsync before it is acknowledged, so the marker can
+    /// never regress past durable state.
+    fn configure_connection(conn: &Connection, read_only: bool, durable_sync: bool) -> R<()> {
         conn.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
 
         if !read_only {
             conn.pragma_update(None, "journal_mode", "WAL")?;
-            conn.pragma_update(None, "synchronous", "NORMAL")?;
+            let synchronous = if durable_sync { "FULL" } else { "NORMAL" };
+            conn.pragma_update(None, "synchronous", synchronous)?;
         }
 
         conn.pragma_update(None, "foreign_keys", "ON")?;
@@ -467,16 +813,441 @@ impl Store {
     ) -> R<MutexGuard<'a, Connection>> {
         let lock_wait_started = Instant::now();
         let guard = conn.lock().map_err(|_| anyhow!(CONN_LOCK_ERROR))?;
+        let waited = lock_wait_started.elapsed();
+        if connection_kind == "write" {
+            crate::manager::telemetry::metrics()
+                .store_write_lock_wait_seconds
+                .observe(waited.as_secs_f64());
+        }
         debug!(
             connection_kind,
-            lock_wait_ms = lock_wait_started.elapsed().as_millis(),
+            lock_wait_ms = waited.as_millis(),
             "Acquired sqlite connection lock"
         );
         Ok(guard)
     }
 
     pub(crate) fn write_connection(&self) -> R<MutexGuard<'_, Connection>> {
+        // Raft-mode bypass guard (JC-14): every mutation must flow through
+        // `replicated()` (which captures on the pipeline thread), the raft
+        // apply path, or the scoped `local_write` seam for node-local
+        // maintenance (JC-28 journal pruning; the eval queue left this seam
+        // with JC-41). A write-connection grab from any other context is
+        // an unclassified write path — fail it loudly instead of letting it
+        // mutate this replica alone.
+        if self.raft_mode.load(Ordering::Acquire)
+            && !capture::in_capture()
+            && !capture::in_apply()
+            && !capture::in_local_write()
+        {
+            return Err(anyhow!(
+                "write_connection called outside capture/apply/local-write in raft mode: route \
+                 this mutation through Store::replicated() so it reaches quorum before applying \
+                 (or Store::local_write for node-local maintenance — plan §7-C2)"
+            ));
+        }
         Self::lock_conn(&self.write_conn, "write")
+    }
+
+    /// Whether the raft engine has taken ownership of the write path.
+    pub(crate) fn raft_mode(&self) -> bool {
+        self.raft_mode.load(Ordering::Acquire)
+    }
+
+    /// Flip the store into (or out of) raft mode. Called by the raft engine
+    /// once startup-time writes (migrations, manager-config upsert) have
+    /// completed; from then on the `write_connection` bypass guard is armed.
+    /// The eval-queue recovery the daemon runs at startup happens AFTER this
+    /// flip and goes through the scheduler lane like any other eval write
+    /// (JC-41).
+    pub(crate) fn set_raft_mode(&self, enabled: bool) {
+        self.raft_mode.store(enabled, Ordering::Release);
+    }
+
+    /// Install the replication pipeline handle. One-shot: the engine sets it
+    /// exactly once at start; a second call is a startup-sequencing bug.
+    pub(crate) fn set_replication_handle(&self, handle: ReplicationHandle) -> R<()> {
+        self.replication
+            .set(handle)
+            .map_err(|_| anyhow!("raft replication pipeline handle already installed"))
+    }
+
+    /// The replication seam every public mutating store method routes
+    /// through (plan §2, JC-1/JC-12/JC-13):
+    ///
+    /// - `local_disk`/`streaming` mode: run `f(self)` inline — semantics are
+    ///   byte-identical to the pre-raft store.
+    /// - Inside an active capture on this thread: run `f(self)` inline, so
+    ///   nested public-method calls compose into the outer capture and a
+    ///   composite operation produces ONE atomic raft entry (JC-13).
+    /// - Raft mode: hand `(lane, op, f)` to the replication pipeline, which
+    ///   captures `f`'s row effects on its thread, proposes them via raft,
+    ///   and unblocks this caller with `f`'s return value after local apply.
+    pub(crate) fn replicated<T: Send + 'static>(
+        &self,
+        lane: Lane,
+        op: &'static str,
+        f: impl FnOnce(&Store) -> R<T> + Send + 'static,
+    ) -> R<T> {
+        if capture::in_capture() || !self.raft_mode() {
+            return f(self);
+        }
+
+        let Some(handle) = self.replication.get() else {
+            return Err(anyhow!(
+                "raft replication pipeline not started (op {op}, lane {lane:?})"
+            ));
+        };
+        let erased: ReplicatedOp = Box::new(move |store: &Store| {
+            f(store).map(|value| Box::new(value) as Box<dyn std::any::Any + Send>)
+        });
+        let boxed = (handle.submit)(lane, op, erased)?;
+        boxed
+            .downcast::<T>()
+            .map(|value| *value)
+            .map_err(|_| anyhow!("replicated op {op} returned a value of an unexpected type"))
+    }
+
+    /// A scoped LOCAL write (plan §7-C2): committed to this node's
+    /// database only, never replicated. The ONLY legal write path for
+    /// local-only tables (a class JC-41 emptied — the eval queue is
+    /// replicated again) and for local pruning of
+    /// commutative tables (JC-28, the one live caller); in debug builds (raft mode) the write's
+    /// changes are asserted to stay inside that scope, so an exempt path
+    /// can never silently grow. See `capture::local_write` for the locking
+    /// and assertion details.
+    pub(crate) fn local_write<T>(&self, op: &'static str, f: impl FnOnce(&Store) -> R<T>) -> R<T> {
+        capture::local_write(self, op, f)
+    }
+
+    /// Open a write transaction as a SAVEPOINT (JC-5). `BEGIN` cannot run
+    /// inside the capture savepoint, and a top-level SQLite savepoint
+    /// behaves exactly like a deferred transaction, so this is the one
+    /// mechanical replacement for every `conn.transaction()` call site.
+    /// `Savepoint` derefs to `Connection` and rolls back on drop unless
+    /// `commit()` is called — the same contract `Transaction` had.
+    pub(crate) fn write_tx(conn: &mut Connection) -> R<rusqlite::Savepoint<'_>> {
+        Ok(rusqlite::Savepoint::new(conn)?)
+    }
+
+    // ── snapshots / backup / restore (plan §A5, phase A-3) ───────────────
+
+    /// Filesystem path of this store's state database.
+    pub(crate) fn state_db_path(&self) -> &std::path::Path {
+        &self.db_path
+    }
+
+    /// Highest applied raft log index recorded in `raft_applied` on `conn`
+    /// (max across lanes; `0` when nothing was ever applied — including
+    /// non-raft stores, whose table is empty).
+    fn max_applied_index_on(conn: &Connection) -> R<u64> {
+        let mut stmt = conn.prepare("SELECT last_applied FROM raft_applied;")?;
+        let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+        let mut max_index = 0u64;
+        for row in rows {
+            let bytes = row?;
+            let log_id: openraft::LogId<u64> = serde_json::from_slice(&bytes)
+                .context("failed decoding raft_applied last_applied")?;
+            max_index = max_index.max(log_id.index);
+        }
+        Ok(max_index)
+    }
+
+    /// Write a consistent point-in-time backup of the state database to
+    /// `out` (or a timestamped default under `<storePath>/backups/`) via
+    /// `VACUUM INTO`, and return where it landed, its size, and the raft
+    /// applied index it captures (plan §A5).
+    ///
+    /// **What this is, precisely.** The image is a transactionally
+    /// consistent copy of THIS node's applied state at one wall-clock
+    /// moment — the whole database file, every lane's tables. It is not a
+    /// cluster-wide snapshot at one raft index: under `lanes` the three
+    /// groups apply independently, so the image sits at a different applied
+    /// index per lane, and `applied_index` in the reply is the MAX across
+    /// lanes (a progress marker, not a cut). That is exactly what restore
+    /// consumes — `--restore-from` seeds a FRESH cluster from this file
+    /// (JC-27 clears the cluster stamp), it never rejoins a running one —
+    /// so a per-node point-in-time image is the right and only meaningful
+    /// artifact. Documented for operators in `docs/multi-raft.md`.
+    ///
+    /// Works in every persistence mode. In raft mode it requires leadership
+    /// of EVERY lane: a node missing any lane's leadership returns the typed
+    /// [`NotRaftLeader`] error for that lane (with its leader hint) so the
+    /// RPC layer maps it to `FAILED_PRECONDITION`. A follower's DB is a
+    /// valid replica, but "the backup" should be the authoritative line of
+    /// history for all of it — and since JC-40 co-locates lane leadership on
+    /// one node, requiring all lanes costs nothing in steady state while
+    /// refusing the one case where a single-lane check would have lied: a
+    /// node that leads `control` but lags on another lane, whose image would
+    /// be the freshest for one lane and stale for the others.
+    /// (Under `single`, every lane maps to the one group, so this is the
+    /// same check it always was.)
+    ///
+    /// The vacuum runs under [`capture::exclusive_state_access`]: the
+    /// capture mutex plus the held write-connection guard guarantee the
+    /// image is a transactionally consistent snapshot with no capture
+    /// savepoint or half-applied changeset in it.
+    ///
+    /// [`NotRaftLeader`]: crate::storage::raft::driver::NotRaftLeader
+    pub fn state_backup(&self, out: Option<&std::path::Path>) -> R<StateBackupInfo> {
+        if self.raft_mode() {
+            if let Some(driver) = self
+                .persistence_driver
+                .as_any()
+                .downcast_ref::<crate::storage::raft::driver::MultiRaftDriver>()
+            {
+                // All-lane leadership (JC-40 co-location): the image spans
+                // every lane's tables, so it must come from the node that
+                // leads every lane.
+                for lane in Lane::ALL {
+                    if !driver.is_leader(lane) {
+                        return Err(anyhow::Error::new(driver.not_leader_error(lane)).context(
+                            "state backup must run on the node that leads every raft lane (the \
+                             image covers all lanes' tables)",
+                        ));
+                    }
+                }
+            }
+        }
+
+        let dest = match out {
+            Some(path) => path.to_path_buf(),
+            None => {
+                let dir = self
+                    .db_path
+                    .parent()
+                    .context("state db path has no parent directory")?
+                    .join("backups");
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
+                dir.join(format!("legion-state-backup-{nanos}.sqlite"))
+            }
+        };
+        if dest.exists() {
+            bail!(
+                "backup destination {} already exists (VACUUM INTO refuses to overwrite); \
+                 pass a fresh path",
+                dest.display()
+            );
+        }
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("failed creating backup directory {}", parent.display())
+            })?;
+        }
+        let dest_str = dest
+            .to_str()
+            .context("backup destination path is not utf-8")?
+            .to_string();
+
+        let applied_index = capture::exclusive_state_access(self, |conn| {
+            // Applied index and image are read under the same exclusive
+            // connection guard, so they describe the same state.
+            let applied_index = Self::max_applied_index_on(conn)?;
+            conn.execute("VACUUM INTO ?1;", [&dest_str])
+                .with_context(|| format!("failed running VACUUM INTO {}", dest.display()))?;
+            Ok(applied_index)
+        })?;
+        let bytes = std::fs::metadata(&dest)
+            .with_context(|| format!("backup file {} missing after vacuum", dest.display()))?
+            .len();
+        info!(
+            path = %dest.display(),
+            bytes,
+            applied_index,
+            "Wrote state store backup"
+        );
+        Ok(StateBackupInfo {
+            path: dest,
+            bytes,
+            applied_index,
+        })
+    }
+
+    /// Copy `backup` into place as `<store_path>/store.sqlite` — the
+    /// `--restore-from` path on `legion start manager` (plan §A5). Runs
+    /// BEFORE `start_storage`; refuses to overwrite an existing state DB
+    /// unless `force` is set.
+    ///
+    /// The copied database's `raft_applied` rows are cleared: a restore
+    /// seeds a *fresh* cluster (or a fresh local_disk store) from the
+    /// backup's contents, and stale applied/membership markers from the
+    /// backup's original cluster would otherwise make the new raft engine
+    /// believe it had applied logs (and had members) it has never seen.
+    /// The `raft_cluster` identity stamp is cleared for the same reason: a
+    /// backup taken on a raft cluster carries the OLD cluster's stamp, and
+    /// leaving it in place would make the documented restore flow (restore
+    /// onto a fresh bootstrap node) trip the re-bootstrap refusal in
+    /// `check_cluster_stamp`. Clearing it here is sound because
+    /// `--restore-from` is an explicit operator action whose meaning IS
+    /// "seed a fresh cluster from these contents" — the accidental-wipe
+    /// path the stamp protects against never goes through a restore.
+    /// With both cleared, raft bootstrap adopts the DB contents as its
+    /// initial state and stamps its own identity — the documented
+    /// `docs/upgrades.md` upgrade path.
+    pub fn restore_from_backup(
+        store_path: &str,
+        backup: &std::path::Path,
+        force: bool,
+    ) -> R<std::path::PathBuf> {
+        let db_path = Self::db_path(store_path)?;
+        if db_path.exists() && !force {
+            bail!(
+                "refusing to restore over existing state at {}: move it aside or pass \
+                 --force-restore to overwrite",
+                db_path.display()
+            );
+        }
+        // Validate the backup is a SQLite database before touching anything.
+        let header = std::fs::read(backup)
+            .with_context(|| format!("failed reading backup {}", backup.display()))?;
+        if !header.starts_with(b"SQLite format 3\0") {
+            bail!(
+                "{} is not a SQLite database (expected a file produced by `legion state backup`)",
+                backup.display()
+            );
+        }
+
+        // Stage next to the destination so the final rename is atomic on the
+        // same filesystem: a kill mid-restore leaves either no store.sqlite
+        // (restore re-runnable) or a complete one.
+        let staged = db_path.with_extension("restore-tmp");
+        let _ = std::fs::remove_file(&staged);
+        std::fs::copy(backup, &staged)
+            .with_context(|| format!("failed copying backup to {}", staged.display()))?;
+        {
+            let conn = Connection::open(&staged)
+                .with_context(|| format!("failed opening staged restore {}", staged.display()))?;
+            // Older backups predate these tables; ignore their absence.
+            for table in ["raft_applied", "raft_cluster"] {
+                match conn.execute(&format!("DELETE FROM {table};"), []) {
+                    Ok(_) => {}
+                    Err(rusqlite::Error::SqliteFailure(_, Some(ref msg)))
+                        if msg.contains("no such table") => {}
+                    Err(e) => {
+                        return Err(e).with_context(|| {
+                            format!("failed clearing {table} in restored state db")
+                        })
+                    }
+                }
+            }
+        }
+        let staged_file = std::fs::File::open(&staged)?;
+        staged_file.sync_all()?;
+        drop(staged_file);
+        // Discard any stale WAL/SHM sidecars of the DB being replaced —
+        // they belong to the old file and must never be recovered into the
+        // restored one.
+        let _ = std::fs::remove_file(db_path.with_extension("sqlite-wal"));
+        let _ = std::fs::remove_file(db_path.with_extension("sqlite-shm"));
+        std::fs::rename(&staged, &db_path).with_context(|| {
+            format!("failed installing restored state db {}", db_path.display())
+        })?;
+        info!(
+            backup = %backup.display(),
+            path = %db_path.display(),
+            "Restored state store from backup"
+        );
+        Ok(db_path)
+    }
+
+    /// Atomically replace the state database with `new_db` and reopen every
+    /// connection — the snapshot-install hook (plan §A5). `new_db` must be a
+    /// complete, fsynced SQLite database on the same filesystem as the state
+    /// DB's directory is reachable from (it is `rename(2)`d into place).
+    ///
+    /// # Crash safety (the "either old or new" proof)
+    ///
+    /// Ordered steps, with what a kill after each leaves on disk:
+    ///
+    /// 1. **Close every connection** (read pool first, write conn last).
+    ///    Closing the last connection makes SQLite checkpoint the WAL into
+    ///    the main file and remove `-wal`; any leftover sidecars are
+    ///    deleted explicitly. Kill here → `store.sqlite` is the OLD
+    ///    database, transactionally consistent, whose internal
+    ///    `raft_applied` matches its data (they always commit atomically).
+    /// 2. **`rename(new_db, store.sqlite)`** — atomic on POSIX. Kill
+    ///    before → old DB (case 1); kill after → `store.sqlite` is the NEW
+    ///    database, whose `raft_applied` was written into the file (with
+    ///    the snapshot's meta) *before* this function was called. There is
+    ///    no intermediate state: the WAL sidecars were removed before the
+    ///    rename, so a restart can never replay old-WAL frames into the
+    ///    new file.
+    /// 3. **Reopen + rebuild.** Kill here → same as "after rename": the
+    ///    restart path opens `store.sqlite`, reads `raft_applied`, and
+    ///    resumes from exactly the applied index the surviving file
+    ///    reports — openraft replays or re-installs from there.
+    ///
+    /// In every case `store.sqlite` is one consistent database whose
+    /// applied marker matches its contents, which is all recovery needs.
+    pub(crate) fn install_state_db(&self, new_db: &std::path::Path) -> R<()> {
+        // Exclude captures for the whole swap: a capture holds an open
+        // savepoint on the write connection between statements, and a
+        // committed-changeset apply serializes on the connection guard we
+        // hold below.
+        let _captures = capture::capture_exclusion()?;
+
+        // Hold every connection guard simultaneously (write first, then the
+        // read pool — the one fixed acquisition order for multi-connection
+        // holds) so no statement can run against a half-swapped store.
+        let mut write_guard = Self::lock_conn(&self.write_conn, "install")?;
+        let mut read_guards: Vec<MutexGuard<'_, Connection>> = Vec::new();
+        for conn in self.read_conns.iter() {
+            read_guards.push(Self::lock_conn(conn, "install")?);
+        }
+
+        // Step 1: close the old connections (readers first; the write
+        // connection closes last so SQLite's last-close WAL checkpoint runs
+        // against the old file). The placeholder in-memory connections keep
+        // the mutexes valid if any later step fails.
+        for guard in read_guards.iter_mut() {
+            let old = std::mem::replace(&mut **guard, Connection::open_in_memory()?);
+            drop(old);
+        }
+        let old = std::mem::replace(&mut *write_guard, Connection::open_in_memory()?);
+        drop(old);
+        let wal = self.db_path.with_extension("sqlite-wal");
+        let shm = self.db_path.with_extension("sqlite-shm");
+        let _ = std::fs::remove_file(&wal);
+        let _ = std::fs::remove_file(&shm);
+
+        // Step 2: the atomic swap.
+        std::fs::rename(new_db, &*self.db_path).with_context(|| {
+            format!(
+                "failed renaming snapshot {} over state db {}",
+                new_db.display(),
+                self.db_path.display()
+            )
+        })?;
+        // Make the rename itself durable before anyone builds on it.
+        #[cfg(unix)]
+        if let Some(parent) = self.db_path.parent() {
+            if let Ok(dir) = std::fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
+
+        // Step 3: reopen against the new file.
+        let new_write = Connection::open(&*self.db_path)?;
+        Self::configure_connection(&new_write, false, self.durable_sync)?;
+        *write_guard = new_write;
+        for guard in read_guards.iter_mut() {
+            let conn =
+                Connection::open_with_flags(&*self.db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+            Self::configure_connection(&conn, true, false)?;
+            conn.pragma_update(None, "query_only", "ON")?;
+            **guard = conn;
+        }
+        drop(read_guards);
+        drop(write_guard);
+
+        // The read model caches rows from the replaced database; rebuild it
+        // from the installed one.
+        self.refresh_read_model()?;
+        info!(path = %self.db_path.display(), "Installed replacement state database");
+        Ok(())
     }
 
     pub(crate) fn read_connection(&self) -> R<MutexGuard<'_, Connection>> {
@@ -578,7 +1349,13 @@ impl Store {
         })
     }
 
-    fn refresh_read_model(&self) -> R<()> {
+    pub(crate) fn refresh_read_model(&self) -> R<()> {
+        // During capture the mutation is uncommitted (and will be rolled
+        // back); reloading would cache pre-mutation state and the apply-time
+        // projection rebuilds the affected entries anyway (JC-11).
+        if capture::in_capture() {
+            return Ok(());
+        }
         let model = self.load_read_model()?;
         let mut guard = self.read_model_writer()?;
         *guard = model;
@@ -589,13 +1366,24 @@ impl Store {
         Ok(self.read_model_reader()?.clone())
     }
 
+    // NOTE on the `capture::in_capture()` early-returns below: read-model
+    // cache mutations are side effects of uncommitted state while a
+    // changeset capture is active, so they are suppressed during capture and
+    // re-projected from the committed changeset at apply time on every
+    // replica — see `project_changeset_side_effects` (JC-11).
     fn cache_node(&self, node: Node) -> R<()> {
+        if capture::in_capture() {
+            return Ok(());
+        }
         let mut guard = self.read_model_writer()?;
         guard.nodes.insert(node.id.clone(), node);
         Ok(())
     }
 
     fn cache_node_dynamic_attrs(&self, node_id: &str, dynamic_attrs: Value) -> R<()> {
+        if capture::in_capture() {
+            return Ok(());
+        }
         let mut guard = self.read_model_writer()?;
         let cached = guard
             .nodes
@@ -606,6 +1394,9 @@ impl Store {
     }
 
     fn cache_nodes_lost(&self, ids: &[String]) -> R<()> {
+        if capture::in_capture() {
+            return Ok(());
+        }
         let mut guard = self.read_model_writer()?;
         for id in ids {
             if let Some(node) = guard.nodes.get_mut(id) {
@@ -617,6 +1408,9 @@ impl Store {
     }
 
     fn cache_remove_node(&self, id: &str) -> R<()> {
+        if capture::in_capture() {
+            return Ok(());
+        }
         let mut guard = self.read_model_writer()?;
         guard.nodes.remove(id);
         guard.allocations_by_node.remove(id);
@@ -624,6 +1418,9 @@ impl Store {
     }
 
     fn cache_add_allocations(&self, allocations: &[Allocation]) -> R<()> {
+        if capture::in_capture() {
+            return Ok(());
+        }
         let mut guard = self.read_model_writer()?;
         for allocation in allocations {
             guard
@@ -636,6 +1433,9 @@ impl Store {
     }
 
     fn cache_clear_allocations_for_node(&self, node_id: &str) -> R<()> {
+        if capture::in_capture() {
+            return Ok(());
+        }
         let mut guard = self.read_model_writer()?;
         guard
             .allocations_by_node
@@ -644,6 +1444,9 @@ impl Store {
     }
 
     fn cache_remove_allocations(&self, allocations: &[Allocation]) -> R<()> {
+        if capture::in_capture() {
+            return Ok(());
+        }
         let mut guard = self.read_model_writer()?;
         for allocation in allocations {
             if let Some(node_allocs) = guard.allocations_by_node.get_mut(&allocation.node_id) {
@@ -658,6 +1461,9 @@ impl Store {
         job_config_id: &str,
         tasks: Vec<(i64, TaskConfig)>,
     ) -> R<()> {
+        if capture::in_capture() {
+            return Ok(());
+        }
         let mut guard = self.read_model_writer()?;
         guard.task_configs.insert(job_config_id.to_string(), tasks);
         Ok(())
@@ -710,6 +1516,65 @@ impl Store {
         Ok(versions)
     }
 
+    /// Batched version vector for a whole *candidate* node set.
+    ///
+    /// The scheduler has to sample the optimistic-concurrency epochs before it
+    /// reads the capacity snapshot it plans against (see
+    /// `Scheduler::plan_and_apply_internal`), and at that point every node it
+    /// might place on is a candidate — the affected subset is only known after
+    /// planning. Sampling those per node with
+    /// [`Self::allocation_epoch_for_scope`] would be one query per node on the
+    /// scheduler hot path, so this issues a single query per chunk of node ids
+    /// instead.
+    ///
+    /// Keys match [`Self::allocation_version_vector`] (`job_config:<id>`,
+    /// `node:<id>`) so callers can select the affected subset out of the result
+    /// without re-reading. Nodes with no epoch row yet default to `0`, which is
+    /// the same value [`Self::allocation_epoch_for_scope`] reports and the same
+    /// value `ensure_scope_epoch_tx` seeds when `apply_plan_submission`
+    /// compares — so a first-ever allocation on a fresh node still bumps `0 ->
+    /// 1` and still rejects a competing plan that sampled `0`.
+    pub fn allocation_version_vector_for_candidates(
+        &self,
+        job_config_id: &str,
+        node_ids: &[String],
+    ) -> R<BTreeMap<String, i64>> {
+        let mut versions = BTreeMap::new();
+        let conn = self.read_connection()?;
+        let job_epoch: Option<i64> = conn
+            .query_row(
+                "SELECT epoch FROM allocation_epoch_partition WHERE scope_type = 'job_config' AND scope_id = ?1;",
+                params![job_config_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        versions.insert(
+            Self::scope_vector_key("job_config", job_config_id),
+            job_epoch.unwrap_or(0),
+        );
+        for node_id in node_ids {
+            versions.insert(Self::scope_vector_key("node", node_id), 0);
+        }
+        for chunk in node_ids.chunks(SCOPE_EPOCH_QUERY_CHUNK) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT scope_id, epoch FROM allocation_epoch_partition \
+                 WHERE scope_type = 'node' AND scope_id IN ({placeholders});"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(params_from_iter(chunk.iter()), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?;
+            for row in rows {
+                let (scope_id, epoch) = row?;
+                versions.insert(Self::scope_vector_key("node", &scope_id), epoch);
+            }
+        }
+        Ok(versions)
+    }
+
     fn allocation_epoch_for_scope(&self, scope_type: &str, scope_id: &str) -> R<i64> {
         let conn = self.read_connection()?;
         let epoch: Option<i64> = conn
@@ -733,12 +1598,7 @@ impl Store {
         Ok((scope_type, scope_id))
     }
 
-    fn ensure_scope_epoch_tx(
-        &self,
-        tx: &Transaction<'_>,
-        scope_type: &str,
-        scope_id: &str,
-    ) -> R<()> {
+    fn ensure_scope_epoch_tx(&self, tx: &Connection, scope_type: &str, scope_id: &str) -> R<()> {
         tx.execute(
             "INSERT OR IGNORE INTO allocation_epoch_partition(scope_type, scope_id, epoch) VALUES (?1, ?2, 0);",
             params![scope_type, scope_id],
@@ -746,7 +1606,7 @@ impl Store {
         Ok(())
     }
 
-    fn scope_epoch_tx(&self, tx: &Transaction<'_>, scope_type: &str, scope_id: &str) -> R<i64> {
+    fn scope_epoch_tx(&self, tx: &Connection, scope_type: &str, scope_id: &str) -> R<i64> {
         self.ensure_scope_epoch_tx(tx, scope_type, scope_id)?;
         let epoch = tx.query_row(
             "SELECT epoch FROM allocation_epoch_partition WHERE scope_type = ?1 AND scope_id = ?2;",
@@ -758,7 +1618,7 @@ impl Store {
 
     fn scope_vector_epochs_tx(
         &self,
-        tx: &Transaction<'_>,
+        tx: &Connection,
         scopes: &BTreeMap<String, i64>,
     ) -> R<BTreeMap<String, i64>> {
         let mut latest = BTreeMap::new();
@@ -770,12 +1630,7 @@ impl Store {
         Ok(latest)
     }
 
-    fn bump_scope_epoch_tx(
-        &self,
-        tx: &Transaction<'_>,
-        scope_type: &str,
-        scope_id: &str,
-    ) -> R<i64> {
+    fn bump_scope_epoch_tx(&self, tx: &Connection, scope_type: &str, scope_id: &str) -> R<i64> {
         self.ensure_scope_epoch_tx(tx, scope_type, scope_id)?;
         tx.execute(
             "UPDATE allocation_epoch_partition SET epoch = epoch + 1 WHERE scope_type = ?1 AND scope_id = ?2;",
@@ -784,13 +1639,13 @@ impl Store {
         self.scope_epoch_tx(tx, scope_type, scope_id)
     }
 
-    fn bump_job_config_epoch_tx(&self, tx: &Transaction<'_>, job_config_id: &str) -> R<i64> {
+    fn bump_job_config_epoch_tx(&self, tx: &Connection, job_config_id: &str) -> R<i64> {
         self.bump_scope_epoch_tx(tx, "job_config", job_config_id)
     }
 
     fn bump_job_config_epochs_tx(
         &self,
-        tx: &Transaction<'_>,
+        tx: &Connection,
         job_config_ids: &HashSet<String>,
     ) -> R<()> {
         for job_config_id in job_config_ids {
@@ -801,11 +1656,7 @@ impl Store {
 
     // IMPORTANT: any transaction that mutates allocation rows must call this
     // (or bump_job_config_epoch_tx) before commit so stale plans are rejected.
-    fn bump_epochs_for_allocations_tx(
-        &self,
-        tx: &Transaction<'_>,
-        allocations: &[Allocation],
-    ) -> R<()> {
+    fn bump_epochs_for_allocations_tx(&self, tx: &Connection, allocations: &[Allocation]) -> R<()> {
         let job_config_ids: HashSet<String> = allocations
             .iter()
             .map(|alloc| alloc.job_config_id.clone())
@@ -823,6 +1674,22 @@ impl Store {
     }
 
     pub fn insert_plan_submission(
+        &self,
+        job_config_id: &str,
+        mode: &str,
+        placements: &[(String, i64)],
+        expected_versions: &BTreeMap<String, i64>,
+    ) -> R<PlanSubmission> {
+        let job_config_id = job_config_id.to_owned();
+        let mode = mode.to_owned();
+        let placements = placements.to_vec();
+        let expected_versions = expected_versions.clone();
+        self.replicated(Lane::Scheduler, "insert_plan_submission", move |s| {
+            s.insert_plan_submission_apply(&job_config_id, &mode, &placements, &expected_versions)
+        })
+    }
+
+    fn insert_plan_submission_apply(
         &self,
         job_config_id: &str,
         mode: &str,
@@ -857,6 +1724,22 @@ impl Store {
     }
 
     pub fn apply_plan_submission(&self, submission: &PlanSubmission) -> R<PlanApplyOutcome> {
+        let submission = submission.clone();
+        let outcome = self.replicated(Lane::Scheduler, "apply_plan_submission", move |s| {
+            s.apply_plan_submission_apply(&submission)
+        })?;
+        // Lifecycle-derived task_status transitions are status-lane writes
+        // (plan §7-C2, C-2), so they follow the scheduler-lane apply as a
+        // separate single-lane op instead of riding its changeset. Same
+        // rows/values as the pre-split in-transaction update
+        // (`task_status_for_lifecycle` per placed task).
+        if let PlanApplyOutcome::Applied(allocations) = &outcome {
+            self.update_task_statuses_for_allocations(allocations)?;
+        }
+        Ok(outcome)
+    }
+
+    fn apply_plan_submission_apply(&self, submission: &PlanSubmission) -> R<PlanApplyOutcome> {
         let tx_started = Instant::now();
         debug!(
             submission_id = submission.id,
@@ -865,7 +1748,7 @@ impl Store {
             "Applying plan submission"
         );
         let mut conn = self.write_connection()?;
-        let tx = conn.transaction()?;
+        let tx = Self::write_tx(&mut conn)?;
 
         let latest_versions = self.scope_vector_epochs_tx(&tx, &submission.expected_versions)?;
         if latest_versions != submission.expected_versions {
@@ -906,6 +1789,9 @@ impl Store {
                 duration_ms = tx_started.elapsed().as_millis() as u64,
                 "Rejected plan submission due to stale version vector"
             );
+            crate::manager::telemetry::metrics()
+                .plan_apply_total
+                .inc(&["rejected"]);
             return Ok(PlanApplyOutcome::Rejected {
                 reason,
                 latest_versions,
@@ -931,7 +1817,7 @@ impl Store {
                 .collect::<Vec<_>>()
                 .join(",");
             let sql = format!(
-                "SELECT id, pool, status, availability, config_attrs, fingerprint_attrs, dynamic_attrs, health_checks, last_heartbeat FROM node WHERE id IN ({placeholders});"
+                "SELECT {NODE_JOINED_ATTRS} {NODE_JOINED_FROM} WHERE node.id IN ({placeholders});"
             );
             let mut stmt = tx.prepare(&sql)?;
             let rows = stmt.query_map(params_from_iter(node_ids.iter()), |row| {
@@ -944,7 +1830,6 @@ impl Store {
         }
 
         let mut allocations = Vec::new();
-        let mut task_status_updates: HashMap<i64, TaskStatusState> = HashMap::new();
         let mut task_states: HashMap<i64, AllocationTaskState> = HashMap::new();
         for (node_id, task_id) in &placements {
             let state = match task_states.entry(*task_id) {
@@ -987,6 +1872,9 @@ impl Store {
                     duration_ms = tx_started.elapsed().as_millis() as u64,
                     "Rejected plan submission after validation during apply"
                 );
+                crate::manager::telemetry::metrics()
+                    .plan_apply_total
+                    .inc(&["rejected"]);
                 return Ok(PlanApplyOutcome::Rejected {
                     reason,
                     latest_versions,
@@ -1007,14 +1895,10 @@ impl Store {
                 &state.resources,
                 network.as_ref(),
             )?;
-            task_status_updates
-                .entry(*task_id)
-                .or_insert_with(|| Self::task_status_for_lifecycle(&state.lifecycle));
             allocations.push(allocation);
         }
 
         if !allocations.is_empty() {
-            self.apply_task_status_updates_tx(&tx, &task_status_updates)?;
             self.bump_epochs_for_allocations_tx(&tx, &allocations)?;
         }
 
@@ -1036,6 +1920,9 @@ impl Store {
         );
 
         self.cache_add_allocations(&allocations)?;
+        crate::manager::telemetry::metrics()
+            .plan_apply_total
+            .inc(&["applied"]);
 
         Ok(PlanApplyOutcome::Applied(allocations))
     }
@@ -1108,22 +1995,6 @@ impl Store {
         Self::sortable_timestamp(OffsetDateTime::now_utc())
     }
 
-    fn insert_task_statuses(
-        tx: &Transaction<'_>,
-        task_ids: &[i64],
-        job_id: &str,
-        job_config_id: &str,
-    ) -> R<()> {
-        let now = Self::now_rfc3339()?;
-        for task_id in task_ids {
-            tx.execute(
-                "INSERT INTO task_status (task_config_id, job_id, job_config_id, status, updated_at) VALUES (?, ?, ?, ?, ?);",
-                params![task_id, job_id, job_config_id, TaskStatusState::Pending.as_str(), now],
-            )?;
-        }
-        Ok(())
-    }
-
     fn parse_rfc3339(value: &str) -> R<OffsetDateTime> {
         Ok(OffsetDateTime::parse(value, &Rfc3339)?)
     }
@@ -1134,7 +2005,7 @@ impl Store {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
     }
 
-    fn load_kv_lock_tx(&self, tx: &Transaction<'_>, key: &str) -> R<Option<KvLock>> {
+    fn load_kv_lock_tx(&self, tx: &Connection, key: &str) -> R<Option<KvLock>> {
         let lock = tx
             .query_row(
                 "SELECT key, lock_id, owner, acquired_at, expires_at FROM kv_lock WHERE key = ?;",
@@ -1156,7 +2027,7 @@ impl Store {
         Self::collect_rows(rows)
     }
 
-    fn enforce_kv_lock(&self, tx: &Transaction<'_>, key: &str, lock_id: Option<&str>) -> R<()> {
+    fn enforce_kv_lock(&self, tx: &Connection, key: &str, lock_id: Option<&str>) -> R<()> {
         let Some(lock) = self.load_kv_lock_tx(tx, key)? else {
             return Ok(());
         };
@@ -1603,6 +2474,14 @@ impl Store {
 
     #[instrument(err, skip_all)]
     pub fn upsert_manager_config(&self, node_id: &str, config: &ManagerConfigFull) -> R<()> {
+        let node_id = node_id.to_owned();
+        let config = config.clone();
+        self.replicated(Lane::Control, "upsert_manager_config", move |s| {
+            s.upsert_manager_config_apply(&node_id, &config)
+        })
+    }
+
+    fn upsert_manager_config_apply(&self, node_id: &str, config: &ManagerConfigFull) -> R<()> {
         let fmt = format_description!(
             "[year]-[month]-[day] [hour]:[minute]:[second] [offset_hour \
                  sign:mandatory]:[offset_minute]:[offset_second]"
@@ -1670,23 +2549,41 @@ impl Store {
         Self::collect_rows(rows)
     }
 
+    /// Mark a node's liveness ready. Composite across the lane boundary of
+    /// the node/node_health split (plan §7-C2, C-2): the STATUS lane upserts
+    /// the `node_health` liveness row, then the CONTROL lane flips the
+    /// schedulability axis (`node.availability`) back to `available` —
+    /// `node` is control-owned, so the flip must not ride the status op's
+    /// changeset. Two single-lane raft entries, same JC-30 composite shape
+    /// as `insert_node`.
     #[instrument(err, skip_all)]
     pub fn mark_node_ready(&self, id: &str, last_heartbeat: &str) -> R<()> {
+        let id_owned = id.to_owned();
+        let last_heartbeat = last_heartbeat.to_owned();
+        self.replicated(Lane::Status, "mark_node_ready", move |s| {
+            s.mark_node_ready_apply(&id_owned, &last_heartbeat)
+        })?;
+        self.sync_node_availability(&[id.to_owned()], "available")
+    }
+
+    fn mark_node_ready_apply(&self, id: &str, last_heartbeat: &str) -> R<()> {
         let conn = self.write_connection()?;
         // A ready node is by definition not lost: clear lost_at so the
         // node-loss confirmation gate stops counting (its gated allocations
-        // keep running, bound to their instances).
+        // keep running, bound to their instances). Liveness upserts into
+        // node_health (plan §7-C2, C-1) — the EXISTS guard keeps a ready
+        // mark for an unregistered node a no-op, like the pre-split UPDATE.
         let sql = r#"
-        UPDATE node
-        SET status = :status, availability = :availability, last_heartbeat = :last_heartbeat,
-            lost_at = NULL
-        WHERE id = :id;
+        INSERT INTO node_health (node_id, status, last_heartbeat, lost_at, health_checks)
+        SELECT :id, :status, :last_heartbeat, NULL, '{}'
+        WHERE EXISTS (SELECT 1 FROM node WHERE id = :id)
+        ON CONFLICT(node_id) DO UPDATE SET
+            status = excluded.status, last_heartbeat = excluded.last_heartbeat, lost_at = NULL;
         "#;
 
         let params = named_params! {
             ":id": id,
             ":status": "ready",
-            ":availability": "available",
             ":last_heartbeat": last_heartbeat,
         };
 
@@ -1701,23 +2598,39 @@ impl Store {
         Ok(())
     }
 
+    /// Mark a node's liveness lost. Same status-then-control composite shape
+    /// as [`Self::mark_node_ready`] (plan §7-C2, C-2): liveness rides the
+    /// status lane, the `node.availability` flip rides the control lane.
+    /// The reschedule tail is NOT here — callers that need it (the node
+    /// monitor via [`Self::mark_nodes_as_lost`], the `node_drop` eval)
+    /// drive [`Self::reschedule_allocations_for_lost_node`] separately.
     #[instrument(err, skip_all)]
     pub fn mark_node_lost(&self, id: &str) -> R<()> {
+        let id_owned = id.to_owned();
+        self.replicated(Lane::Status, "mark_node_lost", move |s| {
+            s.mark_node_lost_apply(&id_owned)
+        })?;
+        self.sync_node_availability(&[id.to_owned()], "unavailable")
+    }
+
+    fn mark_node_lost_apply(&self, id: &str) -> R<()> {
         let conn = self.write_connection()?;
-        // lost_at is set once (COALESCE) so repeated marks never push the
-        // loss-confirmation clock back; it is cleared when the node
-        // heartbeats again or re-registers.
+        // lost_at is set once (COALESCE on the conflict path) so repeated
+        // marks never push the loss-confirmation clock back; it is cleared
+        // when the node heartbeats again or re-registers. Liveness upserts
+        // into node_health (plan §7-C2, C-1), guarded on node existence.
         let sql = r#"
-        UPDATE node
-        SET status = :status, availability = :availability,
-            lost_at = COALESCE(lost_at, :lost_at)
-        WHERE id = :id;
+        INSERT INTO node_health (node_id, status, last_heartbeat, lost_at, health_checks)
+        SELECT :id, :status, '', :lost_at, '{}'
+        WHERE EXISTS (SELECT 1 FROM node WHERE id = :id)
+        ON CONFLICT(node_id) DO UPDATE SET
+            status = excluded.status,
+            lost_at = COALESCE(node_health.lost_at, excluded.lost_at);
         "#;
 
         let params = named_params! {
             ":id": id,
             ":status": "lost",
-            ":availability": "unavailable",
             ":lost_at": Self::now_rfc3339()?,
         };
 
@@ -1732,8 +2645,194 @@ impl Store {
         Ok(())
     }
 
+    /// Control-lane half of the status composites (plan §7-C2, C-2): set
+    /// `node.availability` for a batch of nodes WITHOUT events or
+    /// validation — this is the internal schedulability sync that
+    /// mark-ready/lost perform, not the operator cordon/drain verb
+    /// ([`Self::set_node_availability`] stays that). No-op for ids that are
+    /// not registered, like the writes it replaces.
+    fn sync_node_availability(&self, ids: &[String], availability: &str) -> R<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let ids = ids.to_vec();
+        let availability = availability.to_owned();
+        self.replicated(Lane::Control, "sync_node_availability", move |s| {
+            s.sync_node_availability_apply(&ids, &availability)
+        })
+    }
+
+    fn sync_node_availability_apply(&self, ids: &[String], availability: &str) -> R<()> {
+        {
+            let conn = self.write_connection()?;
+            let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+            // Leaving 'drained' also clears the drain-eviction intent flag
+            // (the sync paths never SET 'drained', only ready/lost flips).
+            let sql = format!(
+                "UPDATE node SET availability = ?1,
+                        drain_evict = CASE WHEN ?1 = 'drained' THEN drain_evict ELSE 0 END
+                 WHERE id IN ({placeholders});"
+            );
+            let mut params: Vec<&dyn rusqlite::ToSql> = vec![&availability];
+            for id in ids {
+                params.push(id);
+            }
+            conn.execute(&sql, params.as_slice())?;
+        }
+        for id in ids {
+            // Unregistered ids updated nothing; skip them in the cache too.
+            if let Ok(node) = self.get_node(id) {
+                self.cache_node(node)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Set ONLY the node's scheduling availability, leaving status,
+    /// heartbeat, and `lost_at` untouched. Valid values: `"available"` |
+    /// `"drained"`.
+    ///
+    /// This is the cordon/uncordon primitive: the scheduler's single
+    /// placement chokepoint (`Scheduler::available_nodes`) and the store's
+    /// reconcile path both filter on `availability == "available"`, so
+    /// `"drained"` excludes the node from all new placements while its
+    /// existing allocations keep running. Emits `node.cordoned` /
+    /// `node.uncordoned`. Idempotent.
+    #[instrument(err, skip_all)]
+    pub fn set_node_availability(&self, id: &str, availability: &str) -> R<Node> {
+        self.set_node_availability_with_evict(id, availability, false)
+    }
+
+    /// [`Self::set_node_availability`] carrying the operator's EVICT intent
+    /// as replicated state (JC-27 failover regeneration): `drain --evict`
+    /// used to be distinguishable from a plain cordon only by the
+    /// leader-local `node_drain` eval, so post-failover regeneration evicted
+    /// every drained node — including no-evict cordons. The flag is set only
+    /// for an evicting drain and cleared whenever availability leaves
+    /// `drained`; [`Self::regenerate_scheduling_evals`] regenerates
+    /// `node_drain` only for nodes with the flag set.
+    #[instrument(err, skip_all)]
+    pub fn set_node_availability_with_evict(
+        &self,
+        id: &str,
+        availability: &str,
+        evict: bool,
+    ) -> R<Node> {
+        let id = id.to_owned();
+        let availability = availability.to_owned();
+        self.replicated(Lane::Control, "set_node_availability", move |s| {
+            s.set_node_availability_apply(&id, &availability, evict)
+        })
+    }
+
+    fn set_node_availability_apply(&self, id: &str, availability: &str, evict: bool) -> R<Node> {
+        if availability != "available" && availability != "drained" {
+            return Err(anyhow::Error::new(StorageError::InvalidInput {
+                message: format!(
+                    "invalid availability {availability:?}: expected \"available\" or \"drained\""
+                ),
+            }));
+        }
+
+        let conn = self.write_connection()?;
+        conn.execute(
+            "UPDATE node SET availability = :availability, drain_evict = :drain_evict
+             WHERE id = :id;",
+            named_params! {
+                ":id": id,
+                ":availability": availability,
+                ":drain_evict": (availability == "drained" && evict) as i64,
+            },
+        )?;
+        drop(conn);
+
+        // A missing node updated zero rows above; surface it as NotFound.
+        let node = self.get_node(id)?;
+        self.cache_node(node.clone())?;
+
+        if availability == "drained" {
+            self.events().node_cordoned(id);
+        } else {
+            self.events().node_uncordoned(id);
+        }
+
+        Ok(node)
+    }
+
+    /// Free a drained node's allocations for replacement elsewhere —
+    /// drain's counterpart to
+    /// [`Self::reschedule_allocations_for_lost_node`]:
+    ///
+    /// - Stateless allocations are removed immediately. The node is alive
+    ///   and heartbeating, so the next heartbeat reply shrinks its desired
+    ///   set and the worker stops the tasks cleanly — the loss-confirmation
+    ///   delay of the lost-node path does not apply.
+    /// - Stateful allocations run through the exact same protection gate as
+    ///   the lost-node path ([`Self::lost_allocation_replaceable`]). A
+    ///   drained-but-alive node has no `lost_at`, so the loss duration is
+    ///   `None` and every stateful allocation is held: a drain never
+    ///   force-moves protected state. Held allocations keep running on the
+    ///   drained node until the node is actually lost (at which point
+    ///   [`Self::recheck_lost_nodes`] takes over) or an operator replaces
+    ///   them explicitly (`ReplaceInstance`).
+    ///
+    /// Emits `node.drained` with evicted/held counts. Idempotent — a repeat
+    /// drain finds nothing removable and records an event with `evicted: 0`.
+    /// Since C-2 this is a wrapper-level composition of single-purpose
+    /// scheduler-lane ops (`remove_allocations`, then one
+    /// `reconcile_job_config_allocations` per affected config) rather than
+    /// one composite capture: a capture's reads go through the read pool
+    /// and see only COMMITTED state, so a reconcile composed into the same
+    /// capture as the eviction could not observe the eviction and placed
+    /// nothing (latent raft-mode bug, exposed by
+    /// tests/raft_ownership_guard.rs). Sequencing the ops lets each read
+    /// its predecessor's committed effects; a crash mid-sequence is healed
+    /// by the idempotent drain eval re-running the pass.
+    #[instrument(err, skip_all)]
+    pub fn reschedule_allocations_for_drained_node(&self, node_id: &str) -> R<()> {
+        let allocs = self.allocs_for_node(node_id)?;
+        if allocs.is_empty() {
+            self.events().node_drained(node_id, 0, 0);
+            return Ok(());
+        }
+
+        let lost_for = self.node_lost_for(node_id)?;
+        let mut removable = Vec::new();
+        let mut held = 0usize;
+        for alloc in allocs {
+            if self.lost_allocation_replaceable(&alloc, lost_for)? {
+                removable.push(alloc);
+            } else {
+                held += 1;
+                info!(
+                    allocation_id = alloc.id,
+                    %node_id,
+                    instance_id = alloc.instance_id.as_deref().unwrap_or_default(),
+                    "Holding stateful allocation on drained node (protected by onLost policy)"
+                );
+            }
+        }
+
+        let evicted = removable.len();
+        let affected_job_configs = self.remove_allocations(&removable)?;
+        for job_config_id in affected_job_configs {
+            self.reconcile_job_config_allocations(&job_config_id)?;
+        }
+
+        self.events().node_drained(node_id, evicted, held);
+
+        Ok(())
+    }
+
     #[instrument(err, skip_all)]
     pub fn remove_allocs_for_node(&self, node_id: &str) -> R<Vec<Allocation>> {
+        let node_id = node_id.to_owned();
+        self.replicated(Lane::Scheduler, "remove_allocs_for_node", move |s| {
+            s.remove_allocs_for_node_apply(&node_id)
+        })
+    }
+
+    fn remove_allocs_for_node_apply(&self, node_id: &str) -> R<Vec<Allocation>> {
         let allocs = self.allocs_for_node(node_id)?;
 
         if allocs.is_empty() {
@@ -1741,7 +2840,7 @@ impl Store {
         }
 
         let mut conn = self.write_connection()?;
-        let tx = conn.transaction()?;
+        let tx = Self::write_tx(&mut conn)?;
         tx.execute("DELETE FROM allocation WHERE node_id = ?;", [node_id])?;
         self.release_instance_bindings_tx(&tx, &allocs)?;
         self.bump_epochs_for_allocations_tx(&tx, &allocs)?;
@@ -1756,10 +2855,28 @@ impl Store {
         Ok(allocs)
     }
 
+    /// Remove a node. Composite across lane boundaries (plan §7-C2, C-2):
+    /// the SCHEDULER lane removes the node's allocations first (the
+    /// `allocation.node_id` FK cascade is gone — a control-lane node delete
+    /// must not carry scheduler-lane rows), then the CONTROL lane deletes
+    /// the `node` row. `node_health`/`allocation_health` rows left behind
+    /// are harmless orphans (every reader hydrates FROM `node`/
+    /// `allocation`) swept by the status lane
+    /// ([`Self::prune_node_health_orphans`] /
+    /// [`Self::prune_allocation_health_orphans`]).
     #[instrument(err, skip_all)]
     pub fn remove_node(&self, id: &str) -> R<()> {
+        self.remove_allocs_for_node(id)?;
+        let id = id.to_owned();
+        self.replicated(Lane::Control, "remove_node", move |s| {
+            s.remove_node_apply(&id)
+        })
+    }
+
+    fn remove_node_apply(&self, id: &str) -> R<()> {
         let conn = self.write_connection()?;
         conn.execute("DELETE FROM node WHERE id = ?;", [id])?;
+        drop(conn);
 
         self.cache_remove_node(id)?;
 
@@ -1769,7 +2886,13 @@ impl Store {
     #[instrument(err, skip_all)]
     pub fn get_node_ids_and_heartbeats(&self) -> R<Vec<(String, String)>> {
         let conn = self.read_connection()?;
-        let sql = "SELECT id, last_heartbeat FROM node WHERE status = 'active'";
+        // Anchored on `node` (a node_health row orphaned by node removal
+        // must not resurrect a ghost); a registered node without a health
+        // row hydrates the registration defaults, exactly as before the
+        // split (status 'active', empty heartbeat).
+        let sql = "SELECT node.id, COALESCE(node_health.last_heartbeat, '')
+                   FROM node LEFT JOIN node_health ON node_health.node_id = node.id
+                   WHERE COALESCE(node_health.status, 'active') = 'active'";
         let mut stmt = conn.prepare(sql)?;
         let nodes_id_and_hb =
             Self::collect_rows(stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?)?;
@@ -1777,24 +2900,47 @@ impl Store {
         Ok(nodes_id_and_hb)
     }
 
+    /// Mark a batch of nodes lost after missed heartbeats. Composite across
+    /// lane boundaries (plan §7-C2, C-2): the STATUS lane records liveness
+    /// (`node_health`), the CONTROL lane flips `node.availability`, and the
+    /// reschedule tail moves behind a `node_lost_reschedule` eval — the
+    /// eval handler (scheduler lane) runs
+    /// [`Self::reschedule_allocations_for_lost_node`], which owns the
+    /// stateful-protection gates. The enqueue is its OWN scheduler-lane op,
+    /// issued after the status half commits (JC-41 × JC-33 — an eval written
+    /// inside this status capture would be a foreign-lane write the
+    /// ownership guard rejects), and deduped per node while one is pending.
     #[instrument(err, skip_all)]
     pub fn mark_nodes_as_lost(&self, ids: &[String]) -> R<()> {
         if ids.is_empty() {
             return Ok(());
         }
+        let ids_owned = ids.to_vec();
+        self.replicated(Lane::Status, "mark_nodes_as_lost", move |s| {
+            s.mark_nodes_as_lost_apply(&ids_owned)
+        })?;
+        self.sync_node_availability(ids, "unavailable")?;
+        for node_id in ids {
+            self.enqueue_lost_node_reschedule(node_id)?;
+        }
+        Ok(())
+    }
 
+    fn mark_nodes_as_lost_apply(&self, ids: &[String]) -> R<()> {
         {
             let conn = self.write_connection()?;
             let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
             // See mark_node_lost: lost_at is set once and never refreshed
-            // while the node stays lost.
+            // while the node stays lost. Liveness upserts into node_health
+            // (plan §7-C2, C-1); selecting FROM node keeps unregistered ids
+            // a no-op, like the pre-split UPDATE.
+            let now = Self::now_rfc3339()?;
             let sql = format!(
-                "UPDATE node SET status = 'lost', availability = 'unavailable', \
-                 lost_at = COALESCE(lost_at, '{}') WHERE id IN ({})",
-                Self::now_rfc3339()?,
-                placeholders
+                "INSERT INTO node_health (node_id, status, last_heartbeat, lost_at, health_checks) \
+                 SELECT id, 'lost', '', '{now}', '{{}}' FROM node WHERE id IN ({placeholders}) \
+                 ON CONFLICT(node_id) DO UPDATE SET status = 'lost', \
+                 lost_at = COALESCE(node_health.lost_at, excluded.lost_at)"
             );
-
             let mut stmt = conn.prepare(&sql)?;
             stmt.execute(params_from_iter(ids))?;
         }
@@ -1805,20 +2951,31 @@ impl Store {
             self.events().node_lost_after_missed_heartbeats(node_id);
         }
 
-        // Per-node, log-and-continue: a job that currently has nowhere to go
-        // (cluster at capacity, unsatisfiable constraints) must not stop the
-        // other lost nodes from being drained, nor abort the caller's
-        // node-status sweep. `recheck_lost_nodes` retries every tick.
-        for node_id in ids {
-            if let Err(err) = self.reschedule_allocations_for_lost_node(node_id) {
-                warn!(
-                    %node_id,
-                    error = ?err,
-                    "Failed rescheduling allocations off lost node"
-                );
-            }
+        Ok(())
+    }
+    /// Enqueue the scheduler-lane reschedule pass for a lost node as its own
+    /// scheduler-lane eval op (plan §7-C2, C-2), skipping the enqueue while one is
+    /// already pending/in-flight for the node (the monitor re-drives every
+    /// tick, so a completed pass is re-enqueued on the next tick until the
+    /// node recovers or nothing is left to free — the recheck-loop
+    /// behavior, now eval-shaped).
+    fn enqueue_lost_node_reschedule(&self, node_id: &str) -> R<()> {
+        let already_queued: bool = {
+            let conn = self.read_connection()?;
+            conn.query_row(
+                "SELECT EXISTS (
+                     SELECT 1 FROM eval
+                     WHERE status IN ('pending', 'in_flight')
+                       AND type = 'node_lost_reschedule' AND node_id = ?1
+                 );",
+                [node_id],
+                |row| row.get(0),
+            )?
+        };
+        if already_queued {
+            return Ok(());
         }
-
+        self.enqueue_eval("node_lost_reschedule", None, None, Some(node_id), None)?;
         Ok(())
     }
 
@@ -1829,9 +2986,11 @@ impl Store {
     pub fn node_lost_at(&self, node_id: &str) -> R<Option<String>> {
         let conn = self.read_connection()?;
         let lost_at: Option<String> = conn
-            .query_row("SELECT lost_at FROM node WHERE id = ?;", [node_id], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT lost_at FROM node_health WHERE node_id = ?;",
+                [node_id],
+                |row| row.get(0),
+            )
             .optional()?
             .flatten();
         Ok(lost_at)
@@ -1842,29 +3001,51 @@ impl Store {
     /// `replaceAfter` threshold can be exercised without real waiting.
     #[instrument(err, skip_all)]
     pub fn set_node_lost_at(&self, node_id: &str, lost_at: &str) -> R<()> {
+        let node_id = node_id.to_owned();
+        let lost_at = lost_at.to_owned();
+        self.replicated(Lane::Status, "set_node_lost_at", move |s| {
+            s.set_node_lost_at_apply(&node_id, &lost_at)
+        })
+    }
+
+    fn set_node_lost_at_apply(&self, node_id: &str, lost_at: &str) -> R<()> {
         let conn = self.write_connection()?;
+        // Upsert so the helper works even for a node that never wrote a
+        // node_health row; status defaults to the hydration default so the
+        // insert path changes nothing else observable.
         conn.execute(
-            "UPDATE node SET lost_at = ? WHERE id = ?;",
+            "INSERT INTO node_health (node_id, status, last_heartbeat, lost_at, health_checks)
+             SELECT ?2, 'active', '', ?1, '{}' WHERE EXISTS (SELECT 1 FROM node WHERE id = ?2)
+             ON CONFLICT(node_id) DO UPDATE SET lost_at = excluded.lost_at;",
             params![lost_at, node_id],
         )?;
         Ok(())
     }
 
-    /// Ids of all nodes currently marked lost.
+    /// Ids of all nodes currently marked lost. Anchored on `node` so an
+    /// orphaned node_health row (node removed) never resurrects a ghost.
     #[instrument(err, skip_all)]
     pub fn lost_node_ids(&self) -> R<Vec<String>> {
         let conn = self.read_connection()?;
-        let mut stmt = conn.prepare("SELECT id FROM node WHERE status = 'lost';")?;
+        let mut stmt = conn.prepare(
+            "SELECT node.id FROM node
+             INNER JOIN node_health ON node_health.node_id = node.id
+             WHERE node_health.status = 'lost';",
+        )?;
         let ids = Self::collect_rows(stmt.query_map([], |row| row.get(0))?)?;
         Ok(ids)
     }
 
-    /// Re-run the lost-node reschedule path for every node still marked
+    /// Re-drive the lost-node reschedule path for every node still marked
     /// lost, so stateful allocations whose `onLost.replaceAfter` threshold
     /// has since elapsed get replaced WITHOUT operator action. Called by the
     /// manager's node-status monitor on every tick (the same loop that marks
-    /// nodes lost); errors are logged per node so one wedged job cannot
-    /// stall the sweep.
+    /// nodes lost). Since C-2 this enqueues the per-node
+    /// `node_lost_reschedule` eval (deduped while one is pending) instead of
+    /// running the scheduler-lane reschedule inline from a status-lane
+    /// context (plan §7-C2); the eval handler performs the actual pass.
+    /// Errors are logged per node so one wedged enqueue cannot stall the
+    /// sweep.
     #[instrument(skip_all)]
     pub fn recheck_lost_nodes(&self) {
         let node_ids = match self.lost_node_ids() {
@@ -1875,31 +3056,55 @@ impl Store {
             }
         };
         for node_id in node_ids {
-            if let Err(err) = self.reschedule_allocations_for_lost_node(&node_id) {
+            if let Err(err) = self.enqueue_lost_node_reschedule(&node_id) {
                 warn!(
                     %node_id,
                     error = ?err,
-                    "Failed rechecking lost node for confirmed-loss replacements"
+                    "Failed enqueueing lost-node reschedule eval"
                 );
             }
         }
     }
 
+    /// Register (or re-register) a node. Composite across the lane boundary
+    /// of the node/node_health split (plan §7-C2, C-1): the CONTROL lane
+    /// records identity/pool/attrs/availability in `node`, then the STATUS
+    /// lane seeds the `node_health` liveness row (INSERT OR REPLACE — a
+    /// re-registering node is by definition not lost, so a stale `lost_at`
+    /// resets). Two single-lane raft entries; cross-lane atomicity was
+    /// never promised (§A2), and a crash between them leaves a node row
+    /// whose missing health row hydrates the same defaults registration
+    /// seeds, until the worker's first heartbeat/health-check upserts it.
     #[instrument(err, skip_all)]
     pub fn insert_node(&self, node: NodeMsg) -> R<Node> {
-        let conn = self.write_connection()?;
-        // TODO:
-        // Its not ideal that I am using NodeMsg here
-        // I get an error about serializing Map, and the simplest
-        // way around it is to just use the node message when using
-        // to_params_named, as its already a string
+        let seed = node.clone();
+        let registered = self.replicated(Lane::Control, "insert_node", move |s| {
+            s.insert_node_apply(node)
+        })?;
+        self.replicated(Lane::Status, "seed_node_health", move |s| {
+            s.seed_node_health_apply(&seed)
+        })?;
+        Ok(registered)
+    }
 
-        let node = conn.query_row(
-            &INSERT_NODE,
-            to_params_named(node)?.to_slice().as_slice(),
-            |row| self.node_from_row(row),
+    fn insert_node_apply(&self, node: NodeMsg) -> R<Node> {
+        let conn = self.write_connection()?;
+        conn.execute(
+            INSERT_NODE,
+            named_params! {
+                ":id": node.id,
+                ":pool": node.pool,
+                ":availability": node.availability,
+                ":config_attrs": node.config_attrs,
+                ":fingerprint_attrs": node.fingerprint_attrs,
+                ":dynamic_attrs": node.dynamic_attrs,
+            },
         )?;
         drop(conn);
+
+        // The stored row IS the message's contents (liveness included once
+        // the status-lane seed lands), so hydrate the returned Node from it.
+        let node = Node::from(node);
 
         self.cache_node(node.clone())?;
 
@@ -1908,8 +3113,122 @@ impl Store {
         Ok(node)
     }
 
+    fn seed_node_health_apply(&self, node: &NodeMsg) -> R<()> {
+        let conn = self.write_connection()?;
+        conn.execute(
+            SEED_NODE_HEALTH,
+            named_params! {
+                ":id": node.id,
+                ":status": node.status,
+                ":last_heartbeat": node.last_heartbeat,
+                ":health_checks": node.health_checks,
+            },
+        )?;
+        drop(conn);
+
+        let node = self.get_node(&node.id)?;
+        self.cache_node(node)?;
+
+        Ok(())
+    }
+
+    /// Sweep `node_health` rows orphaned by node removal (`remove_node` is
+    /// a control-lane op and must not delete status-lane rows, plan §7-C2).
+    /// Orphans are harmless while they exist — every hydration LEFT JOINs
+    /// from `node` — so this is periodic maintenance, run by the
+    /// node-status checker on the status-lane leader. Skips the replication
+    /// seam entirely when there is nothing to sweep.
+    #[instrument(err, skip_all)]
+    pub fn prune_node_health_orphans(&self) -> R<usize> {
+        let orphans: Vec<String> = {
+            let conn = self.read_connection()?;
+            let mut stmt = conn.prepare(
+                "SELECT node_health.node_id FROM node_health
+                 LEFT JOIN node ON node.id = node_health.node_id
+                 WHERE node.id IS NULL;",
+            )?;
+            let orphans = Self::collect_rows(stmt.query_map([], |row| row.get(0))?)?;
+            drop(stmt);
+            orphans
+        };
+        if orphans.is_empty() {
+            return Ok(0);
+        }
+        self.replicated(Lane::Status, "prune_node_health_orphans", move |s| {
+            s.prune_node_health_orphans_apply(&orphans)
+        })
+    }
+
+    fn prune_node_health_orphans_apply(&self, ids: &[String]) -> R<usize> {
+        let conn = self.write_connection()?;
+        let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+        // Re-check orphanhood inside the write so a node that re-registered
+        // between the read and this apply keeps its fresh health row.
+        let sql = format!(
+            "DELETE FROM node_health WHERE node_id IN ({placeholders})
+             AND NOT EXISTS (SELECT 1 FROM node WHERE node.id = node_health.node_id);"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let swept = stmt.execute(params_from_iter(ids))?;
+        Ok(swept)
+    }
+
+    /// Sweep `allocation_health` rows orphaned by allocation removal
+    /// (plan §7-C2, C-2): the `allocation_health.allocation_id` FK cascade
+    /// is gone — scheduler-lane allocation deletes must not carry
+    /// status-lane health rows — so removal paths leave the health row
+    /// behind. Orphans are harmless while they exist (every reader joins
+    /// FROM `allocation`); this periodic status-lane sweep collects them,
+    /// mirroring [`Self::prune_node_health_orphans`]. Skips the replication
+    /// seam entirely when there is nothing to sweep.
+    #[instrument(err, skip_all)]
+    pub fn prune_allocation_health_orphans(&self) -> R<usize> {
+        let orphans: Vec<i64> = {
+            let conn = self.read_connection()?;
+            let mut stmt = conn.prepare(
+                "SELECT allocation_health.allocation_id FROM allocation_health
+                 LEFT JOIN allocation ON allocation.id = allocation_health.allocation_id
+                 WHERE allocation.id IS NULL;",
+            )?;
+            let orphans = Self::collect_rows(stmt.query_map([], |row| row.get(0))?)?;
+            drop(stmt);
+            orphans
+        };
+        if orphans.is_empty() {
+            return Ok(0);
+        }
+        self.replicated(Lane::Status, "prune_allocation_health_orphans", move |s| {
+            s.prune_allocation_health_orphans_apply(&orphans)
+        })
+    }
+
+    fn prune_allocation_health_orphans_apply(&self, ids: &[i64]) -> R<usize> {
+        let conn = self.write_connection()?;
+        let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+        // Re-check orphanhood inside the write so an allocation id reused
+        // between the read and this apply keeps its fresh health row.
+        let sql = format!(
+            "DELETE FROM allocation_health WHERE allocation_id IN ({placeholders})
+             AND NOT EXISTS (
+                 SELECT 1 FROM allocation
+                 WHERE allocation.id = allocation_health.allocation_id
+             );"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let swept = stmt.execute(params_from_iter(ids))?;
+        Ok(swept)
+    }
+
     #[instrument(err, skip_all)]
     pub fn update_node_dyamic(&self, id: &str, dynamic_diff: &Map<String, Value>) -> R<Node> {
+        let id = id.to_owned();
+        let dynamic_diff = dynamic_diff.clone();
+        self.replicated(Lane::Control, "update_node_dyamic", move |s| {
+            s.update_node_dyamic_apply(&id, &dynamic_diff)
+        })
+    }
+
+    fn update_node_dyamic_apply(&self, id: &str, dynamic_diff: &Map<String, Value>) -> R<Node> {
         let node = self.get_node(id)?;
         let default_map = Map::new();
 
@@ -1924,21 +3243,17 @@ impl Store {
 
         let conn = self.write_connection()?;
 
-        let update_sql = format!(
-            r#"
-        UPDATE node
-        SET dynamic_attrs = :dynamic_attrs
-        WHERE id IN (:id)
-        RETURNING {NODE_ATTRS};
-        "#
-        );
+        conn.execute(
+            "UPDATE node SET dynamic_attrs = :dynamic_attrs WHERE id = :id;",
+            named_params! {
+                ":id": id,
+                ":dynamic_attrs": res_as_string,
+            },
+        )?;
 
-        let params = named_params! {
-            ":id": id,
-            ":dynamic_attrs": res_as_string,
-        };
-
-        let mut node = conn.query_row(&update_sql, params, |row| self.node_from_row(row))?;
+        // Hydrate the joined row on the write connection so the update just
+        // made is visible even inside a capture savepoint.
+        let mut node = conn.query_row(&GET_NODE, [id], |row| self.node_from_row(row))?;
         let dynamic_attrs = Value::Object(res);
         node.dynamic_attrs = dynamic_attrs.clone();
 
@@ -1949,13 +3264,25 @@ impl Store {
 
     #[instrument(err, skip_all)]
     pub fn update_node_heartbeat(&self, id: String) -> R<()> {
+        self.replicated(Lane::Status, "update_node_heartbeat", move |s| {
+            s.update_node_heartbeat_apply(id)
+        })
+    }
+
+    fn update_node_heartbeat_apply(&self, id: String) -> R<()> {
         let timestamp_now = OffsetDateTime::now_utc().format(&Rfc3339)?;
 
         let conn = self.write_connection()?;
+        // Heartbeats upsert node_health (plan §7-C2, C-1): the first
+        // heartbeat after a registration whose seed was lost creates the
+        // row; the EXISTS guard keeps heartbeats from unregistered nodes a
+        // no-op, like the pre-split UPDATE.
         let sql = r#"
-        UPDATE node
-        SET last_heartbeat = :ts, status = 'active', lost_at = NULL
-        WHERE id = :id;
+        INSERT INTO node_health (node_id, status, last_heartbeat, lost_at, health_checks)
+        SELECT :id, 'active', :ts, NULL, '{}'
+        WHERE EXISTS (SELECT 1 FROM node WHERE id = :id)
+        ON CONFLICT(node_id) DO UPDATE SET
+            last_heartbeat = excluded.last_heartbeat, status = 'active', lost_at = NULL;
 "#;
         info!(
             "Updating heartbeat for node {} with TS: {}",
@@ -1978,11 +3305,23 @@ impl Store {
 
     #[instrument(err, skip_all)]
     pub fn update_node_health_checks(&self, id: &str, health_checks: &str) -> R<()> {
+        let id = id.to_owned();
+        let health_checks = health_checks.to_owned();
+        self.replicated(Lane::Status, "update_node_health_checks", move |s| {
+            s.update_node_health_checks_apply(&id, &health_checks)
+        })
+    }
+
+    fn update_node_health_checks_apply(&self, id: &str, health_checks: &str) -> R<()> {
         let conn = self.write_connection()?;
+        // See update_node_heartbeat_apply: liveness upserts into
+        // node_health; the insert path's other columns are the hydration
+        // defaults, so creating the row changes nothing else observable.
         let sql = r#"
-        UPDATE node
-        SET health_checks = :health_checks
-        WHERE id = :id;
+        INSERT INTO node_health (node_id, status, last_heartbeat, lost_at, health_checks)
+        SELECT :id, 'active', '', NULL, :health_checks
+        WHERE EXISTS (SELECT 1 FROM node WHERE id = :id)
+        ON CONFLICT(node_id) DO UPDATE SET health_checks = excluded.health_checks;
 "#;
 
         let params = named_params! {
@@ -2022,6 +3361,13 @@ impl Store {
 
     #[instrument(err, skip_all)]
     pub fn insert_worker_type(&self, config: &WorkerConfig) -> R<WorkerConfig> {
+        let config = config.clone();
+        self.replicated(Lane::Control, "insert_worker_type", move |s| {
+            s.insert_worker_type_apply(&config)
+        })
+    }
+
+    fn insert_worker_type_apply(&self, config: &WorkerConfig) -> R<WorkerConfig> {
         let conn = self.write_connection()?;
         let node_checks_to_save = config.additional_node_checks.join(",");
         let attrs_to_save = serde_json::to_string(&config.attributes)?;
@@ -2084,6 +3430,11 @@ impl Store {
 
     #[instrument(err, skip_all)]
     pub fn stop_job(&self, name: &str) -> R<()> {
+        let name = name.to_owned();
+        self.replicated(Lane::Control, "stop_job", move |s| s.stop_job_apply(&name))
+    }
+
+    fn stop_job_apply(&self, name: &str) -> R<()> {
         let conn = self.write_connection()?;
         let sql = r#"
         UPDATE job
@@ -2104,6 +3455,13 @@ impl Store {
 
     #[instrument(err, skip_all)]
     pub fn mark_job_failed(&self, job_id: &str) -> R<()> {
+        let job_id = job_id.to_owned();
+        self.replicated(Lane::Control, "mark_job_failed", move |s| {
+            s.mark_job_failed_apply(&job_id)
+        })
+    }
+
+    fn mark_job_failed_apply(&self, job_id: &str) -> R<()> {
         let conn = self.write_connection()?;
         let sql = r#"
         UPDATE job
@@ -2141,9 +3499,40 @@ impl Store {
         reason: &str,
         impacted_tasks: Option<&[String]>,
     ) -> R<()> {
+        // Composite across the lane boundary (plan §7-C2, C-2): the job
+        // status flip is control-lane, the allocation status stamps are
+        // scheduler-lane, so they are two single-lane replicated ops (the
+        // JC-30 composite shape) instead of one cross-lane transaction.
+        let job_id_owned = job_id.to_owned();
+        self.replicated(Lane::Control, "mark_job_failed_for_kv", move |s| {
+            s.mark_job_failed_for_kv_apply(&job_id_owned)
+        })?;
+        let job_id = job_id.to_owned();
+        let reason = reason.to_owned();
+        let impacted_tasks = impacted_tasks.map(<[String]>::to_vec);
+        self.replicated(
+            Lane::Scheduler,
+            "stamp_allocations_failed_for_kv",
+            move |s| {
+                s.stamp_allocations_failed_for_kv_apply(&job_id, &reason, impacted_tasks.as_deref())
+            },
+        )
+    }
+
+    fn mark_job_failed_for_kv_apply(&self, job_id: &str) -> R<()> {
+        let conn = self.write_connection()?;
+        conn.execute("UPDATE job SET status = 'failed' WHERE id = ?;", [job_id])?;
+        Ok(())
+    }
+
+    fn stamp_allocations_failed_for_kv_apply(
+        &self,
+        job_id: &str,
+        reason: &str,
+        impacted_tasks: Option<&[String]>,
+    ) -> R<()> {
         let mut conn = self.write_connection()?;
-        let tx = conn.transaction()?;
-        tx.execute("UPDATE job SET status = 'failed' WHERE id = ?;", [job_id])?;
+        let tx = Self::write_tx(&mut conn)?;
         let stamp = format!("failed:{reason}");
         match impacted_tasks {
             Some(tasks) if !tasks.is_empty() => {
@@ -2195,6 +3584,13 @@ impl Store {
     /// not currently failed. Returns whether a row was updated.
     #[instrument(err, skip(self))]
     pub fn clear_job_failed_status(&self, job_id: &str) -> R<bool> {
+        let job_id = job_id.to_owned();
+        self.replicated(Lane::Control, "clear_job_failed_status", move |s| {
+            s.clear_job_failed_status_apply(&job_id)
+        })
+    }
+
+    fn clear_job_failed_status_apply(&self, job_id: &str) -> R<bool> {
         let conn = self.write_connection()?;
         let updated = conn.execute(
             "UPDATE job SET status = 'done' WHERE id = ?1 AND status = 'failed';",
@@ -2212,6 +3608,13 @@ impl Store {
     /// Returns whether a row was updated.
     #[instrument(err, skip(self))]
     pub fn clear_job_stopped_status(&self, job_id: &str) -> R<bool> {
+        let job_id = job_id.to_owned();
+        self.replicated(Lane::Control, "clear_job_stopped_status", move |s| {
+            s.clear_job_stopped_status_apply(&job_id)
+        })
+    }
+
+    fn clear_job_stopped_status_apply(&self, job_id: &str) -> R<bool> {
         let conn = self.write_connection()?;
         let updated = conn.execute(
             "UPDATE job SET status = 'done' WHERE id = ?1 AND status = 'stopped';",
@@ -2220,10 +3623,130 @@ impl Store {
         Ok(updated > 0)
     }
 
+    /// Record REPLICATED restart intent for a job (JC-27 failover
+    /// regeneration): a KV-triggered restart of an unchanged config is
+    /// otherwise represented only by a leader-local `job_update` eval, which
+    /// dies with the leader — the acknowledged restart would silently never
+    /// happen. The marker survives failover in replicated state;
+    /// [`Self::regenerate_scheduling_evals`] re-enqueues `job_update` for
+    /// any job whose marker is still set, and the eval clears it (via
+    /// [`Self::clear_job_restart_request`]) before executing the restart.
+    #[instrument(err, skip(self))]
+    pub fn request_job_restart(&self, job_id: &str) -> R<()> {
+        let job_id = job_id.to_owned();
+        self.replicated(Lane::Control, "request_job_restart", move |s| {
+            let conn = s.write_connection()?;
+            conn.execute(
+                "UPDATE job SET restart_requested_at = ?2 WHERE id = ?1;",
+                params![job_id, Self::now_rfc3339()?],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Clear the replicated restart marker (see
+    /// [`Self::request_job_restart`]). Idempotent: clearing an unset marker
+    /// touches no rows, so in raft mode the empty capture skips the raft
+    /// entry entirely (JC-26).
+    #[instrument(err, skip(self))]
+    pub fn clear_job_restart_request(&self, job_id: &str) -> R<()> {
+        let job_id = job_id.to_owned();
+        self.replicated(Lane::Control, "clear_job_restart_request", move |s| {
+            let conn = s.write_connection()?;
+            conn.execute(
+                "UPDATE job SET restart_requested_at = NULL
+                 WHERE id = ?1 AND restart_requested_at IS NOT NULL;",
+                [job_id],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Destroy a stopped job. Composite across all three lanes (plan §7-C2,
+    /// C-2 — the Nomad deregister shape, executed inline): with the
+    /// cross-lane FK cascades gone, each lane deletes its own tables in
+    /// sequence — STATUS clears `task_status`/`allocation_health`,
+    /// SCHEDULER clears `allocation`/`instance`/`rollout`/`rollout_event`,
+    /// then CONTROL deletes the `job` row (cascading only control-lane
+    /// children) and emits the event. Cross-op atomicity was never promised
+    /// (§A2): a crash mid-sequence leaves a stopped job with some children
+    /// already cleared, and re-running destroy finishes the remainder.
     #[instrument(err, skip_all)]
     pub fn destroy_job(&self, name: &str) -> R<()> {
+        // Validate first (same checks the control op re-runs in its own
+        // transaction) so a bad request deletes nothing from any lane.
+        let job = {
+            let conn = self.read_connection()?;
+            conn.query_row(&GET_JOB, [name], |row| self.job_from_row(row))?
+        };
+        if job.status != "stopped" {
+            bail!("Job must be stopped before it can be destroyed");
+        }
+
+        let job_id = job.id;
+        let status_job_id = job_id.clone();
+        self.replicated(Lane::Status, "destroy_job_status_cleanup", move |s| {
+            s.destroy_job_status_cleanup_apply(&status_job_id)
+        })?;
+        let scheduler_job_id = job_id.clone();
+        self.replicated(Lane::Scheduler, "destroy_job_scheduler_cleanup", move |s| {
+            s.destroy_job_scheduler_cleanup_apply(&scheduler_job_id)
+        })?;
+        let name = name.to_owned();
+        self.replicated(Lane::Control, "destroy_job", move |s| {
+            s.destroy_job_apply(&name)
+        })
+    }
+
+    /// Status-lane share of a job destroy: worker-reported state for the
+    /// job's tasks and allocations.
+    fn destroy_job_status_cleanup_apply(&self, job_id: &str) -> R<()> {
         let mut conn = self.write_connection()?;
-        let tx = conn.transaction()?;
+        let tx = Self::write_tx(&mut conn)?;
+        tx.execute(
+            "DELETE FROM allocation_health WHERE allocation_id IN (
+                 SELECT a.id FROM allocation a
+                 INNER JOIN job_config jc ON jc.id = a.job_config_id
+                 WHERE jc.job_id = ?1
+             );",
+            [job_id],
+        )?;
+        tx.execute("DELETE FROM task_status WHERE job_id = ?1;", [job_id])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Scheduler-lane share of a job destroy: allocations (with epoch bumps
+    /// so any queued plan for the config is CAS-rejected), instances
+    /// (destroy is the one path that erases keyed instance rows), and the
+    /// job's rollouts + rollout events.
+    fn destroy_job_scheduler_cleanup_apply(&self, job_id: &str) -> R<()> {
+        let allocs = self.allocs_for_job(job_id)?;
+        let mut conn = self.write_connection()?;
+        let tx = Self::write_tx(&mut conn)?;
+        tx.execute(
+            "DELETE FROM allocation WHERE job_config_id IN (
+                 SELECT id FROM job_config WHERE job_id = ?1
+             );",
+            [job_id],
+        )?;
+        tx.execute("DELETE FROM instance WHERE job_id = ?1;", [job_id])?;
+        tx.execute("DELETE FROM rollout_event WHERE job_id = ?1;", [job_id])?;
+        tx.execute("DELETE FROM rollout WHERE job_id = ?1;", [job_id])?;
+        if !allocs.is_empty() {
+            self.bump_epochs_for_allocations_tx(&tx, &allocs)?;
+        }
+        tx.commit()?;
+        drop(conn);
+        if !allocs.is_empty() {
+            self.cache_remove_allocations(&allocs)?;
+        }
+        Ok(())
+    }
+
+    fn destroy_job_apply(&self, name: &str) -> R<()> {
+        let mut conn = self.write_connection()?;
+        let tx = Self::write_tx(&mut conn)?;
 
         let job = tx.query_row(&GET_JOB, [name], |row| self.job_from_row(row))?;
         if job.status != "stopped" {
@@ -2430,8 +3953,98 @@ impl Store {
         Self::collect_rows(rows)
     }
 
+    /// Submit a job config. Composite across the lane boundary (plan §7-C2,
+    /// C-2): the CONTROL lane writes the job/config/submission tables, then
+    /// the STATUS lane seeds the initial `task_status` rows (its own
+    /// table's first write for the new config, `pending` until the first
+    /// real status report upserts), then the SCHEDULER lane upserts the
+    /// `volume` rows behind the tasks' `volumes[]` claims. All three run
+    /// before this method returns, so task list/status views — and
+    /// `legion volume list` — observe the same states as the pre-split
+    /// single transaction; a crash between the ops leaves task rows whose
+    /// missing status simply stays unreported until placement or the first
+    /// status write (cross-op atomicity was never promised, §A2).
     #[allow(dead_code)]
     pub fn handle_job_submit(
+        &self,
+        config: &JobConfig,
+        subs: &[Submission],
+    ) -> R<JobSubmitOutcome> {
+        let config = config.clone();
+        let subs = subs.to_vec();
+        let outcome = self.replicated(Lane::Control, "handle_job_submit", move |s| {
+            s.handle_job_submit_apply(&config, &subs)
+        })?;
+        // The status half runs for EVERY outcome, `Unchanged` included
+        // (JC-40 composite-retry idempotency): if a previous attempt's
+        // control half committed and its status half was rejected — the
+        // node did not lead the status lane yet while lane leadership was
+        // converging — the client's retry re-submits the identical config
+        // and gets `Unchanged` back. Skipping the seed there would leave the
+        // composite permanently half-applied, with no later write to fix it
+        // (the config is already stored, so no submit ever reports
+        // Created/Updated for it again). Seeding is `ON CONFLICT DO
+        // NOTHING`, so the repeat costs one no-op statement — and under raft
+        // an empty changeset skips the raft entry entirely (JC-26), so a
+        // steady-state resubmit does not even reach the log.
+        let job_config_id = outcome.job_config_id().to_string();
+        self.replicated(Lane::Status, "seed_task_statuses", move |s| {
+            s.seed_task_statuses_apply(&job_config_id)
+        })?;
+        // Scheduler half: the `volume` rows behind the tasks' `volumes[]`
+        // claims. `volume` is scheduler-owned (its lifecycle is bound to the
+        // scheduler-owned `instance`, and the reclaim reaper drives its state
+        // machine), so writing it from the control capture above is exactly
+        // the cross-lane contamination the capture-time guard rejects — job
+        // submit would fail outright in raft mode. It runs here instead, as
+        // its own sequential op (JC-33's wrapper-sequential shape), reading
+        // the task rows the control half just COMMITTED (a capture's reads see
+        // committed state only, JC-35 — composing it into the control capture
+        // could not have seen them anyway).
+        //
+        // Behavior main intended is preserved: the claims exist from submit,
+        // before anything is placed, so `legion volume list` shows what a job
+        // asked for; and the upsert refreshes driver/params/mode without
+        // disturbing a live volume's node pin or state.
+        //
+        // Runs for EVERY outcome, `Unchanged` included, for the same
+        // composite-retry reason as the status seed above (JC-40): a retry
+        // after a rejected scheduler half re-submits the identical config and
+        // reports `Unchanged`, and skipping the sync there would leave the
+        // composite half-applied forever. If this op fails, the control half
+        // stays committed and uncorrupted — the job simply has no claim rows
+        // yet — and a retry converges because the sync is idempotent by
+        // construction: a claim id is a pure function of
+        // `(job, group, task, name)` (`claim_volume_id`), so a re-run lands on
+        // the same rows and the `ON CONFLICT DO UPDATE` writes the same
+        // driver/params/read_only/volume_mode values it would have written the
+        // first time (only `updated_at` advances). Placement re-derives its
+        // mounts from this table, so a claim that materializes late is still
+        // in place before any allocation of the task can mount it.
+        let job_config_id = outcome.job_config_id().to_string();
+        self.replicated(Lane::Scheduler, "sync_task_volume_claims", move |s| {
+            s.sync_task_volume_claims_apply(&job_config_id)
+        })?;
+        Ok(outcome)
+    }
+
+    /// Status-lane seed of the submit composite: one `pending` row per task
+    /// config of the just-written job config (task identity comes from the
+    /// control-lane rows, read here).
+    fn seed_task_statuses_apply(&self, job_config_id: &str) -> R<()> {
+        let conn = self.write_connection()?;
+        let now = Self::now_rfc3339()?;
+        conn.execute(
+            "INSERT INTO task_status (task_config_id, job_id, job_config_id, status, updated_at)
+             SELECT id, job_id, job_config_id, ?2, ?3
+             FROM task_config WHERE job_config_id = ?1
+             ON CONFLICT(task_config_id) DO NOTHING;",
+            params![job_config_id, TaskStatusState::Pending.as_str(), now],
+        )?;
+        Ok(())
+    }
+
+    fn handle_job_submit_apply(
         &self,
         config: &JobConfig,
         subs: &[Submission],
@@ -2460,7 +4073,7 @@ impl Store {
 
         let mut conn = self.write_connection()?;
         let now = OffsetDateTime::now_utc().unix_timestamp();
-        let tx = conn.transaction()?;
+        let tx = Self::write_tx(&mut conn)?;
 
         let get_job_res = tx.query_row(&GET_JOB, [config.name.clone()], |row| {
             self.job_from_row(row)
@@ -2515,7 +4128,6 @@ impl Store {
                 ))
             })?;
 
-        let mut task_ids = Vec::new();
         for t in &config.tasks {
             let checks = serde_json::to_string(&t.checks)?;
             let on_unhealthy = serde_json::to_string(&t.on_unhealthy)?;
@@ -2578,11 +4190,11 @@ impl Store {
             };
 
             let task_id: i64 = tx.query_row(&INSERT_TASK, task_params, |row| row.get(0))?;
-            // Claim rows exist from submit so `legion volume list` shows what a
-            // job asked for before anything is placed, and a resubmit refreshes
-            // params without disturbing a live volume's pin.
-            self.sync_task_volume_claims_tx(&tx, &job.id, t)?;
-            task_ids.push(task_id);
+            // The `volume` claim rows behind `t.volumes` are written by the
+            // SCHEDULER-lane half of this composite (`sync_task_volume_claims`,
+            // plan §7-C2 / JC-33) — `volume` is scheduler-owned and must not
+            // ride this control-lane changeset.
+            let _ = task_id;
         }
 
         for s in subs {
@@ -2615,7 +4227,10 @@ impl Store {
 
         tx.execute(&INSERT_JOB_UPDATE, job_update_params)?;
 
-        Self::insert_task_statuses(&tx, &task_ids, &job.id, &job_config_id)?;
+        // Initial task_status rows are seeded by the status-lane half of
+        // the submit composite (`seed_task_statuses`, plan §7-C2, C-2) —
+        // task_status is status-owned and must not ride this control-lane
+        // changeset.
 
         let outcome = if was_update {
             JobSubmitOutcome::Updated { job_config_id }
@@ -2672,6 +4287,41 @@ impl Store {
 
     #[instrument(err, skip_all)]
     pub fn create_rollout(
+        &self,
+        job_id: &str,
+        from_job_config_id: Option<&str>,
+        to_job_config_id: &str,
+        status: &str,
+        strategy: Option<&str>,
+        progression: Option<&str>,
+        replacement: Option<&str>,
+        in_place: Option<bool>,
+        config_json: &str,
+    ) -> R<Rollout> {
+        let job_id = job_id.to_owned();
+        let from_job_config_id = from_job_config_id.map(str::to_owned);
+        let to_job_config_id = to_job_config_id.to_owned();
+        let status = status.to_owned();
+        let strategy = strategy.map(str::to_owned);
+        let progression = progression.map(str::to_owned);
+        let replacement = replacement.map(str::to_owned);
+        let config_json = config_json.to_owned();
+        self.replicated(Lane::Scheduler, "create_rollout", move |s| {
+            s.create_rollout_apply(
+                &job_id,
+                from_job_config_id.as_deref(),
+                &to_job_config_id,
+                &status,
+                strategy.as_deref(),
+                progression.as_deref(),
+                replacement.as_deref(),
+                in_place,
+                &config_json,
+            )
+        })
+    }
+
+    fn create_rollout_apply(
         &self,
         job_id: &str,
         from_job_config_id: Option<&str>,
@@ -2795,6 +4445,20 @@ impl Store {
         incomplete: bool,
         message: Option<&str>,
     ) -> R<()> {
+        let status = status.to_owned();
+        let message = message.map(str::to_owned);
+        self.replicated(Lane::Scheduler, "update_rollout_status", move |s| {
+            s.update_rollout_status_apply(rollout_id, &status, incomplete, message.as_deref())
+        })
+    }
+
+    fn update_rollout_status_apply(
+        &self,
+        rollout_id: i64,
+        status: &str,
+        incomplete: bool,
+        message: Option<&str>,
+    ) -> R<()> {
         let conn = self.write_connection()?;
         let now = Self::now_rfc3339()?;
         let completed_at = match status {
@@ -2821,6 +4485,13 @@ impl Store {
 
     #[instrument(err, skip_all)]
     pub fn update_rollout_config_json(&self, rollout_id: i64, config_json: &str) -> R<()> {
+        let config_json = config_json.to_owned();
+        self.replicated(Lane::Scheduler, "update_rollout_config_json", move |s| {
+            s.update_rollout_config_json_apply(rollout_id, &config_json)
+        })
+    }
+
+    fn update_rollout_config_json_apply(&self, rollout_id: i64, config_json: &str) -> R<()> {
         let conn = self.write_connection()?;
         let now = Self::now_rfc3339()?;
         conn.execute(
@@ -2835,6 +4506,32 @@ impl Store {
 
     #[instrument(err, skip_all)]
     pub fn append_rollout_event(
+        &self,
+        rollout_id: i64,
+        job_id: &str,
+        group_name: Option<&str>,
+        level: &str,
+        message: &str,
+        metadata_json: Option<&str>,
+    ) -> R<RolloutEventRecord> {
+        let job_id = job_id.to_owned();
+        let group_name = group_name.map(str::to_owned);
+        let level = level.to_owned();
+        let message = message.to_owned();
+        let metadata_json = metadata_json.map(str::to_owned);
+        self.replicated(Lane::Scheduler, "append_rollout_event", move |s| {
+            s.append_rollout_event_apply(
+                rollout_id,
+                &job_id,
+                group_name.as_deref(),
+                &level,
+                &message,
+                metadata_json.as_deref(),
+            )
+        })
+    }
+
+    fn append_rollout_event_apply(
         &self,
         rollout_id: i64,
         job_id: &str,
@@ -2928,6 +4625,20 @@ impl Store {
     /// because the event journal could not be written, so errors are logged
     /// and swallowed here.
     pub fn emit_event(&self, draft: EventDraft) {
+        let kind = draft.kind.clone();
+        // Standalone emission replicates as its own (tiny) raft entry; calls
+        // made while another capture is active compose into that capture
+        // (JC-13) and cost nothing extra. Emission stays best-effort: a
+        // replication failure is logged and swallowed, never propagated.
+        if let Err(err) = self.replicated(Lane::Status, "emit_event", move |s| {
+            s.emit_event_apply(draft);
+            Ok(())
+        }) {
+            warn!(%kind, error = ?err, "Failed replicating scheduler event");
+        }
+    }
+
+    fn emit_event_apply(&self, draft: EventDraft) {
         let conn = match self.write_connection() {
             Ok(conn) => conn,
             Err(err) => {
@@ -2973,10 +4684,433 @@ impl Store {
     /// committed. Call while still holding the write guard the event was
     /// staged under, so subscribers observe events in strict ID order.
     fn publish_staged(&self, event: Option<SchedulerEventRecord>) {
+        // During changeset capture the event ROW was staged (it rides the
+        // changeset and commits with the mutation on every replica), but the
+        // broadcast must wait for quorum commit: it is re-published from the
+        // committed changeset at apply time (JC-11). Broadcasting here would
+        // leak an uncommitted — and locally rolled-back — event.
+        if capture::in_capture() {
+            return;
+        }
         if let Some(event) = event {
             // send only fails when there are no live subscribers; fine.
             let _ = self.event_tx.send(event);
         }
+    }
+
+    /// Project the side effects of a committed, just-applied changeset:
+    /// re-emitting exactly what was suppressed while the changeset was being
+    /// captured (JC-11). Runs on EVERY replica after
+    /// `capture::apply_changeset` commits, which is how followers get read
+    /// models, live event streams, and eval wakes at all.
+    ///
+    /// - `node` / `node_health` rows: re-read each touched node's joined
+    ///   hydration row and patch the cache (or drop it when the node row
+    ///   was deleted) — a node_health change patches the cached Node's
+    ///   liveness fields;
+    /// - `allocation` rows: refresh the per-node allocation lists that were
+    ///   touched;
+    /// - `task_config` rows: refresh the owning job config's cached task
+    ///   list;
+    /// - `scheduler_event` inserts: publish the committed rows to live
+    ///   `StreamEvents` subscribers, in id order;
+    /// - `eval` rows: wake the eval workers.
+    ///
+    /// Correct-over-clever: values not present in an UPDATE record (sessions
+    /// omit unchanged non-PK columns) are recovered by re-reading the row by
+    /// primary key, and cache patches re-read from the DB rather than
+    /// decoding full rows out of the changeset.
+    #[allow(dead_code)] // called from capture::apply_changeset (A-0 tests) and the A-1 state machine
+    pub(crate) fn project_changeset_side_effects(&self, bytes: &[u8]) -> R<()> {
+        use fallible_streaming_iterator::FallibleStreamingIterator;
+        use rusqlite::hooks::Action;
+        use rusqlite::session::ChangesetIter;
+
+        if bytes.is_empty() {
+            return Ok(());
+        }
+
+        // What the scan below collects; resolved against the (committed) DB
+        // after the iteration so each affected cache entry is refreshed once.
+        let mut node_ids: HashSet<String> = HashSet::new();
+        let mut alloc_node_ids: HashSet<String> = HashSet::new();
+        let mut alloc_reread_ids: HashSet<i64> = HashSet::new();
+        let mut task_job_config_ids: HashSet<String> = HashSet::new();
+        let mut task_reread_ids: HashSet<i64> = HashSet::new();
+        let mut event_ids: Vec<i64> = Vec::new();
+        let mut eval_touched = false;
+
+        // Column positions come from the live schema (changeset records use
+        // the table's declared column order), so this cannot drift from
+        // migrations.
+        let mut column_cache: HashMap<String, Vec<String>> = HashMap::new();
+
+        let reader: &mut dyn std::io::Read = &mut &*bytes;
+        let mut iter = ChangesetIter::start_strm(&reader)
+            .context("failed opening changeset iterator for side-effect projection")?;
+        while let Some(item) = iter
+            .next()
+            .context("failed iterating changeset for side-effect projection")?
+        {
+            let op = item.op()?;
+            let table = op.table_name().to_string();
+            let action = op.code();
+            match table.as_str() {
+                "node" | "node_health" => {
+                    // A node_health change patches the SAME cached Node —
+                    // liveness hydrates from the node ⟕ node_health join
+                    // (plan §7-C2, C-1) — so both tables funnel into one
+                    // re-read of the joined row by node id.
+                    let pk_column = if table == "node" { "id" } else { "node_id" };
+                    let idx = self.changeset_column_index(&mut column_cache, &table, pk_column)?;
+                    // The PK is present in the insert's new record and in the
+                    // old record of updates/deletes.
+                    let id = match action {
+                        Action::SQLITE_INSERT => item.new_value(idx).ok(),
+                        _ => item.old_value(idx).ok(),
+                    };
+                    if let Some(id) = id.and_then(|value| value.as_str().ok().map(str::to_owned)) {
+                        node_ids.insert(id);
+                    }
+                }
+                "allocation" => {
+                    let node_idx =
+                        self.changeset_column_index(&mut column_cache, "allocation", "node_id")?;
+                    match action {
+                        Action::SQLITE_INSERT => {
+                            if let Ok(value) = item.new_value(node_idx) {
+                                if let Ok(node_id) = value.as_str() {
+                                    alloc_node_ids.insert(node_id.to_owned());
+                                }
+                            }
+                        }
+                        Action::SQLITE_DELETE => {
+                            if let Ok(value) = item.old_value(node_idx) {
+                                if let Ok(node_id) = value.as_str() {
+                                    alloc_node_ids.insert(node_id.to_owned());
+                                }
+                            }
+                        }
+                        _ => {
+                            // UPDATE: unchanged columns are absent from the
+                            // record. Collect whichever sides are present; if
+                            // node_id itself did not change, fall back to
+                            // re-reading the row by PK.
+                            let mut found = false;
+                            for value in [item.old_value(node_idx), item.new_value(node_idx)]
+                                .into_iter()
+                                .flatten()
+                            {
+                                if let Ok(node_id) = value.as_str() {
+                                    alloc_node_ids.insert(node_id.to_owned());
+                                    found = true;
+                                }
+                            }
+                            if !found {
+                                let id_idx = self.changeset_column_index(
+                                    &mut column_cache,
+                                    "allocation",
+                                    "id",
+                                )?;
+                                if let Some(id) =
+                                    item.old_value(id_idx).ok().and_then(|v| v.as_i64().ok())
+                                {
+                                    alloc_reread_ids.insert(id);
+                                }
+                            }
+                        }
+                    }
+                }
+                "task_config" => {
+                    let jc_idx = self.changeset_column_index(
+                        &mut column_cache,
+                        "task_config",
+                        "job_config_id",
+                    )?;
+                    let jc = match action {
+                        Action::SQLITE_INSERT => item.new_value(jc_idx).ok(),
+                        Action::SQLITE_DELETE => item.old_value(jc_idx).ok(),
+                        _ => item
+                            .old_value(jc_idx)
+                            .ok()
+                            .or_else(|| item.new_value(jc_idx).ok()),
+                    };
+                    match jc.and_then(|value| value.as_str().ok().map(str::to_owned)) {
+                        Some(jc) => {
+                            task_job_config_ids.insert(jc);
+                        }
+                        None => {
+                            let id_idx = self.changeset_column_index(
+                                &mut column_cache,
+                                "task_config",
+                                "id",
+                            )?;
+                            if let Some(id) =
+                                item.old_value(id_idx).ok().and_then(|v| v.as_i64().ok())
+                            {
+                                task_reread_ids.insert(id);
+                            }
+                        }
+                    }
+                }
+                "scheduler_event" => {
+                    // Only inserts publish; deletes are journal pruning.
+                    if action == Action::SQLITE_INSERT {
+                        let id_idx = self.changeset_column_index(
+                            &mut column_cache,
+                            "scheduler_event",
+                            "id",
+                        )?;
+                        if let Some(id) = item.new_value(id_idx).ok().and_then(|v| v.as_i64().ok())
+                        {
+                            event_ids.push(id);
+                        }
+                    }
+                }
+                "eval" => {
+                    eval_touched = true;
+                }
+                _ => {}
+            }
+        }
+        drop(iter);
+
+        // Resolve rows whose owning scope was not carried by the update
+        // record.
+        for id in alloc_reread_ids {
+            if let Some(allocation) = self.get_allocation_by_id(id)? {
+                alloc_node_ids.insert(allocation.node_id);
+            }
+        }
+        for id in task_reread_ids {
+            let conn = self.read_connection()?;
+            let jc: Option<String> = conn
+                .query_row(
+                    "SELECT job_config_id FROM task_config WHERE id = ?;",
+                    [id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            drop(conn);
+            if let Some(jc) = jc {
+                task_job_config_ids.insert(jc);
+            }
+        }
+
+        // Patch the read model from committed state.
+        for id in node_ids {
+            let node = {
+                let conn = self.read_connection()?;
+                conn.query_row(&GET_NODE, [id.as_str()], |row| self.node_from_row(row))
+                    .optional()?
+            };
+            match node {
+                Some(node) => self.cache_node(node)?,
+                None => self.cache_remove_node(&id)?,
+            }
+        }
+        for node_id in alloc_node_ids {
+            let allocs = self.allocs_for_node(&node_id)?;
+            let mut guard = self.read_model_writer()?;
+            guard.allocations_by_node.insert(node_id, allocs);
+        }
+        for job_config_id in task_job_config_ids {
+            let tasks = self.get_task_configs_for_job_config(&job_config_id)?;
+            self.cache_set_task_configs_for_job_config(&job_config_id, tasks)?;
+        }
+
+        // Publish committed scheduler events in id order.
+        event_ids.sort_unstable();
+        for &id in &event_ids {
+            let record = {
+                let conn = self.read_connection()?;
+                conn.query_row(
+                    "SELECT id, kind, level, job_id, node_id, eval_id, allocation_id, \
+                     rollout_id, message, metadata_json, created_at \
+                     FROM scheduler_event WHERE id = ?;",
+                    [id],
+                    |row| self.scheduler_event_from_row(row),
+                )
+                .optional()?
+            };
+            self.publish_staged(record);
+        }
+
+        // Local journal maintenance (JC-28): commutative-table pruning left
+        // raft, so each replica prunes its own journal here — the same
+        // boundary condition `insert_event` uses opportunistically outside
+        // capture. Best-effort: a failed prune only delays pruning.
+        if event_ids
+            .iter()
+            .any(|id| Self::event_id_triggers_prune(*id))
+        {
+            if let Err(err) = self.prune_scheduler_events_local() {
+                warn!(error = ?err, "Failed pruning local scheduler event journal");
+            }
+        }
+
+        if eval_touched {
+            self.eval_notify.notify_waiters();
+        }
+
+        Ok(())
+    }
+
+    /// Prune this node's scheduler-event journal down to the newest
+    /// [`EVENT_RETAINED_ROWS`] rows, as a LOCAL write outside raft (JC-28:
+    /// commutative tables replicate INSERTs only; each node maintains its
+    /// own journal). Keeps `docs/event-stream.md`'s bounded-journal promise
+    /// in raft mode, where `insert_event`'s opportunistic prune is
+    /// suppressed under capture. Count-based (not id-distance) because ids
+    /// are time-prefixed and sparse (`next_scheduler_event_id`).
+    fn prune_scheduler_events_local(&self) -> R<()> {
+        self.local_write("prune_scheduler_events", |s| {
+            let conn = s.write_connection()?;
+            Self::prune_event_journal_on(&conn)?;
+            Ok(())
+        })
+    }
+
+    /// The journal prune statement itself: delete everything older than the
+    /// newest [`EVENT_RETAINED_ROWS`] rows (by id, which sorts
+    /// ~chronologically). A journal at or under the retention size deletes
+    /// nothing.
+    fn prune_event_journal_on(conn: &Connection) -> R<()> {
+        conn.execute(
+            "DELETE FROM scheduler_event WHERE id < (
+                 SELECT COALESCE(MIN(id), 0) FROM (
+                     SELECT id FROM scheduler_event ORDER BY id DESC LIMIT ?1
+                 )
+             );",
+            [EVENT_RETAINED_ROWS],
+        )?;
+        Ok(())
+    }
+
+    /// Index of `column` within `table`'s declared column order (which is
+    /// also the changeset record order), resolved once per table per
+    /// projection via `PRAGMA table_info`.
+    #[allow(dead_code)] // see project_changeset_side_effects
+    fn changeset_column_index(
+        &self,
+        cache: &mut HashMap<String, Vec<String>>,
+        table: &str,
+        column: &str,
+    ) -> R<usize> {
+        if !cache.contains_key(table) {
+            let conn = self.read_connection()?;
+            let mut stmt = conn.prepare(&format!("PRAGMA table_info({table});"))?;
+            let columns: Vec<String> =
+                Self::collect_rows(stmt.query_map([], |row| row.get::<_, String>(1))?)?;
+            drop(stmt);
+            drop(conn);
+            cache.insert(table.to_string(), columns);
+        }
+        cache[table]
+            .iter()
+            .position(|name| name == column)
+            .with_context(|| format!("column {column} not found in table {table}"))
+    }
+
+    /// The id residue commutative-table ids minted on this thread must
+    /// carry: the active capture's lane (JC-42), or [`Lane::Control`]'s
+    /// residue (`0`) outside any capture — `local_disk` mode and every
+    /// non-raft caller, where no second lane is minting concurrently, so
+    /// their ids are unchanged in shape from the un-strided scheme.
+    fn event_id_residue() -> i64 {
+        capture::current_capture_lane()
+            .unwrap_or(Lane::Control)
+            .id_residue()
+    }
+
+    /// A globally-unique, roughly time-ordered `scheduler_event` id:
+    /// unix milliseconds in the high bits, a per-process sequence (seeded
+    /// from a random value at first use) in the next [`EVENT_ID_SEQ_BITS`]
+    /// bits, and the minting lane's residue in the low
+    /// [`Lane::ID_STRIDE_BITS`] bits — so `id % Lane::ID_STRIDE` is always
+    /// this lane's [`Lane::id_residue`].
+    ///
+    /// This is what makes the JC-28 commutative-class premise ("insert-only
+    /// tables with globally-unique PKs") actually true for the event
+    /// journal. The original implicit-rowid insert assigned `max(id) + 1` on
+    /// the PROPOSING node, so two lanes staging events from the same base
+    /// state minted the SAME id with different content; the OMIT conflict
+    /// policy then kept whichever lane's entry applied first — an
+    /// order-dependent, per-replica outcome, i.e. silent divergence
+    /// invisible to the content hash (adversarial finding, 2026-07-24).
+    ///
+    /// Two properties, from two independent mechanisms:
+    ///
+    /// - **Never collides across lanes**, structurally: the lanes' residue
+    ///   classes are disjoint, so no pair of ids minted on different lanes
+    ///   can ever be equal, whatever their clocks and sequences do (JC-42).
+    /// - **Strictly increasing per lane**, within a process: the timestamp
+    ///   dominates the sequence, and a per-residue high-water mark bumps by
+    ///   a full stride whenever the clock is not ahead (clock skew
+    ///   backwards, or two ids inside the same millisecond after a sequence
+    ///   wrap), so the minted value never repeats or regresses.
+    ///
+    /// The residual same-lane hazard is two PROCESSES minting for the same
+    /// lane in the same millisecond with the same sequence bits (~4e-6 per
+    /// same-millisecond pair, from the random per-process seed) — reachable
+    /// only across a leader failover, resolved locally by the PK-conflict
+    /// retry in [`Store::insert_event`], and harmless for an advisory
+    /// journal. Ids remain ~chronological, which is what the id-cursor
+    /// list/stream/prune semantics need (they never needed density — see
+    /// `docs/event-stream.md`).
+    ///
+    /// Upgrade-safe by arithmetic: making room for the residue moved the
+    /// millisecond field one bit LEFT, so every id this mints is above every
+    /// id either earlier scheme produced (`ms << 20 | seq`, and the original
+    /// `max(id) + 1`) for the same instant — an existing journal's cursor
+    /// never has to go backwards.
+    fn next_scheduler_event_id() -> i64 {
+        use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+        static SEQ: std::sync::OnceLock<AtomicU64> = std::sync::OnceLock::new();
+        /// Per-residue high-water mark enforcing strict monotonicity per
+        /// lane (see above). One slot per possible residue.
+        static LAST: [AtomicI64; Lane::ID_STRIDE as usize] =
+            [const { AtomicI64::new(0) }; Lane::ID_STRIDE as usize];
+
+        let residue = Self::event_id_residue();
+        let seq = SEQ.get_or_init(|| AtomicU64::new(rand::random::<u64>()));
+        let sequence = seq.fetch_add(1, Ordering::Relaxed) & ((1u64 << EVENT_ID_SEQ_BITS) - 1);
+        let ms = (OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64;
+        let candidate = (ms << (EVENT_ID_SEQ_BITS + Lane::ID_STRIDE_BITS))
+            | ((sequence as i64) << Lane::ID_STRIDE_BITS)
+            | residue;
+
+        let slot = &LAST[residue as usize];
+        let mut previous = slot.load(Ordering::Relaxed);
+        loop {
+            // Advancing by a whole stride keeps the residue (and therefore
+            // the lane disjointness) intact.
+            let next = if candidate > previous {
+                candidate
+            } else {
+                previous + Lane::ID_STRIDE
+            };
+            match slot.compare_exchange_weak(previous, next, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => return next,
+                Err(actual) => previous = actual,
+            }
+        }
+    }
+
+    /// Whether an event id lands on the opportunistic journal-prune
+    /// boundary (roughly one insert in [`EVENT_PRUNE_INTERVAL`]).
+    ///
+    /// The lane residue is divided out FIRST. Testing `id %
+    /// EVENT_PRUNE_INTERVAL == 0` directly would be satisfiable only by ids
+    /// divisible by [`Lane::ID_STRIDE`] (the interval is a multiple of the
+    /// stride), i.e. only ever by the control lane — every other lane's
+    /// events would never trigger a prune, and a cluster whose journal is
+    /// dominated by status/scheduler events would grow unbounded on the
+    /// nodes applying them. Shifting the residue out first makes the
+    /// boundary the per-lane sequence, so every lane triggers at the same
+    /// rate (JC-42).
+    fn event_id_triggers_prune(id: i64) -> bool {
+        (id / Lane::ID_STRIDE) % EVENT_PRUNE_INTERVAL == 0
     }
 
     fn insert_event(&self, conn: &Connection, draft: &EventDraft) -> R<SchedulerEventRecord> {
@@ -2987,33 +5121,54 @@ impl Store {
             json!({ "value": draft.metadata }).to_string()
         };
 
-        conn.execute(
-            "INSERT INTO scheduler_event (
-                kind, level, job_id, node_id, eval_id, allocation_id, rollout_id,
-                message, metadata_json, created_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10);",
-            params![
-                draft.kind,
-                draft.level,
-                draft.job_id,
-                draft.node_id,
-                draft.eval_id,
-                draft.allocation_id,
-                draft.rollout_id,
-                draft.message,
-                metadata_json,
-                created_at
-            ],
-        )?;
-        // Safe under the held write-connection guard: nothing can insert
-        // between the statement above and this read.
-        let id = conn.last_insert_rowid();
+        // Explicit globally-unique id (never the implicit rowid — see
+        // `next_scheduler_event_id`). A local PK collision (same ms + same
+        // low bits from an earlier process run) is retried with a fresh id.
+        let mut id = Self::next_scheduler_event_id();
+        let mut attempts = 0u32;
+        loop {
+            let inserted = conn.execute(
+                "INSERT INTO scheduler_event (
+                    id, kind, level, job_id, node_id, eval_id, allocation_id, rollout_id,
+                    message, metadata_json, created_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11);",
+                params![
+                    id,
+                    draft.kind,
+                    draft.level,
+                    draft.job_id,
+                    draft.node_id,
+                    draft.eval_id,
+                    draft.allocation_id,
+                    draft.rollout_id,
+                    draft.message,
+                    metadata_json,
+                    created_at
+                ],
+            );
+            match inserted {
+                Ok(_) => break,
+                Err(RusqliteError::SqliteFailure(e, _))
+                    if e.code == rusqlite::ErrorCode::ConstraintViolation && attempts < 8 =>
+                {
+                    attempts += 1;
+                    id = Self::next_scheduler_event_id();
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
 
-        if id % EVENT_PRUNE_INTERVAL == 0 {
-            conn.execute(
-                "DELETE FROM scheduler_event WHERE id <= ?1;",
-                [id - EVENT_RETAINED_ROWS],
-            )?;
+        // Opportunistic journal pruning — but never inside a capture:
+        // `scheduler_event` is commutative (JC-28), so only its INSERTs may
+        // ride a changeset; pruning is per-node local maintenance. In raft
+        // mode every insert here runs under capture, and each replica
+        // prunes its own journal from the committed changeset instead
+        // (`project_changeset_side_effects` → `prune_scheduler_events_local`).
+        // The prune keeps the newest EVENT_RETAINED_ROWS rows by COUNT (ids
+        // are time-prefixed and lane-strided, not dense, so an id-distance
+        // window would be meaningless).
+        if Self::event_id_triggers_prune(id) && !capture::in_capture() {
+            Self::prune_event_journal_on(conn)?;
         }
 
         Ok(SchedulerEventRecord {
@@ -3140,16 +5295,33 @@ impl Store {
 
     #[instrument(err, skip_all)]
     pub fn prune_rollouts(&self) -> R<u64> {
-        let conn = self.write_connection()?;
+        self.replicated(Lane::Scheduler, "prune_rollouts", move |s| {
+            s.prune_rollouts_apply()
+        })
+    }
+
+    fn prune_rollouts_apply(&self) -> R<u64> {
+        let mut conn = self.write_connection()?;
         let cutoff =
             OffsetDateTime::now_utc() - TimeDuration::days(self.rollout_retention_days as i64);
         let cutoff = cutoff
             .format(&Rfc3339)
             .context("failed to format rollout retention cutoff")?;
-        let changed = conn.execute(
-            "DELETE FROM rollout WHERE completed_at IS NOT NULL AND completed_at < ?;",
-            [cutoff],
+        let tx = Self::write_tx(&mut conn)?;
+        // The rollout_event FK cascade is gone (C-2 cross-lane FK removal);
+        // both tables are scheduler-owned, so the retention delete clears
+        // the events explicitly in the same transaction.
+        tx.execute(
+            "DELETE FROM rollout_event WHERE rollout_id IN (
+                 SELECT id FROM rollout WHERE completed_at IS NOT NULL AND completed_at < ?1
+             );",
+            [cutoff.as_str()],
         )?;
+        let changed = tx.execute(
+            "DELETE FROM rollout WHERE completed_at IS NOT NULL AND completed_at < ?1;",
+            [cutoff.as_str()],
+        )?;
+        tx.commit()?;
         Ok(changed as u64)
     }
 
@@ -3185,6 +5357,22 @@ impl Store {
         from_job_config_id: &str,
         to_job_config_id: &str,
     ) -> R<Vec<Allocation>> {
+        let from_job_config_id = from_job_config_id.to_owned();
+        let to_job_config_id = to_job_config_id.to_owned();
+        self.replicated(
+            Lane::Scheduler,
+            "migrate_allocations_to_job_config",
+            move |s| {
+                s.migrate_allocations_to_job_config_apply(&from_job_config_id, &to_job_config_id)
+            },
+        )
+    }
+
+    fn migrate_allocations_to_job_config_apply(
+        &self,
+        from_job_config_id: &str,
+        to_job_config_id: &str,
+    ) -> R<Vec<Allocation>> {
         let from_tasks = self.get_task_configs_for_job_config(from_job_config_id)?;
         let to_tasks = self.get_task_configs_for_job_config(to_job_config_id)?;
         let to_map = to_tasks
@@ -3207,7 +5395,7 @@ impl Store {
         }
 
         let mut conn = self.write_connection()?;
-        let tx = conn.transaction()?;
+        let tx = Self::write_tx(&mut conn)?;
         for allocation in &allocations {
             let new_task_id = task_id_map
                 .get(&allocation.task_config_id)
@@ -3333,6 +5521,12 @@ impl Store {
     }
 
     pub fn set_task_status(&self, task_config_id: i64, status: TaskStatusState) -> R<()> {
+        self.replicated(Lane::Status, "set_task_status", move |s| {
+            s.set_task_status_apply(task_config_id, status)
+        })
+    }
+
+    fn set_task_status_apply(&self, task_config_id: i64, status: TaskStatusState) -> R<()> {
         let conn = self.write_connection()?;
         let now = Self::now_rfc3339()?;
         conn.execute(
@@ -3351,7 +5545,7 @@ impl Store {
 
     fn apply_task_status_updates_tx(
         &self,
-        tx: &Transaction<'_>,
+        tx: &Connection,
         updates: &HashMap<i64, TaskStatusState>,
     ) -> R<()> {
         if updates.is_empty() {
@@ -3372,10 +5566,18 @@ impl Store {
         if allocations.is_empty() {
             return Ok(false);
         }
+        let allocations = allocations.to_vec();
+        self.replicated(
+            Lane::Status,
+            "update_task_statuses_for_allocations",
+            move |s| s.update_task_statuses_for_allocations_apply(&allocations),
+        )
+    }
 
+    fn update_task_statuses_for_allocations_apply(&self, allocations: &[Allocation]) -> R<bool> {
         let tx_started = Instant::now();
         let mut conn = self.write_connection()?;
-        let tx = conn.transaction()?;
+        let tx = Self::write_tx(&mut conn)?;
         let mut task_cache: HashMap<String, HashMap<i64, TaskConfig>> = HashMap::new();
         let mut updates: HashMap<i64, TaskStatusState> = HashMap::new();
 
@@ -3417,8 +5619,15 @@ impl Store {
 
     #[instrument(err, skip_all)]
     pub fn place_alloc(&self, node_id: &str, task_id: i64) -> R<Allocation> {
+        let node_id = node_id.to_owned();
+        self.replicated(Lane::Scheduler, "place_alloc", move |s| {
+            s.place_alloc_apply(&node_id, task_id)
+        })
+    }
+
+    fn place_alloc_apply(&self, node_id: &str, task_id: i64) -> R<Allocation> {
         let mut conn = self.write_connection()?;
-        let tx = conn.transaction()?;
+        let tx = Self::write_tx(&mut conn)?;
         let allocation = self.insert_allocation(&tx, node_id, task_id)?;
         self.bump_epochs_for_allocations_tx(&tx, std::slice::from_ref(&allocation))?;
         tx.commit()?;
@@ -3430,12 +5639,7 @@ impl Store {
 
     // NOTE: this helper only inserts allocation rows; callers must bump
     // job-config epochs for affected configs before committing the tx.
-    fn insert_allocation(
-        &self,
-        tx: &Transaction<'_>,
-        node_id: &str,
-        task_id: i64,
-    ) -> R<Allocation> {
+    fn insert_allocation(&self, tx: &Connection, node_id: &str, task_id: i64) -> R<Allocation> {
         // This helper writes a single allocation row. Callers mutating allocation state
         // must call bump_epochs_for_allocations_tx (or bump_job_config_epoch_tx)
         // in the same transaction before commit.
@@ -3463,7 +5667,7 @@ impl Store {
     /// collide. Static port conflicts fail placement with a node-scoped error.
     fn assign_allocation_network(
         &self,
-        tx: &Transaction<'_>,
+        tx: &Connection,
         node_id: &str,
         task_id: i64,
         network_raw: Option<String>,
@@ -3504,7 +5708,7 @@ impl Store {
 
     fn insert_allocation_with_data(
         &self,
-        tx: &Transaction<'_>,
+        tx: &Connection,
         node_id: &str,
         task_id: i64,
         job_config_id: &str,
@@ -3559,7 +5763,7 @@ impl Store {
     ///   correct — a rescheduling instance is simply the unbound one.
     fn assign_stateful_instance_tx(
         &self,
-        tx: &Transaction<'_>,
+        tx: &Connection,
         task_id: i64,
         node_id: &str,
     ) -> R<Option<String>> {
@@ -3761,7 +5965,7 @@ impl Store {
     /// sandbox*.
     fn assign_keyed_instance_tx(
         &self,
-        tx: &Transaction<'_>,
+        tx: &Connection,
         task_id: i64,
         job_id: &str,
         group: &str,
@@ -3840,7 +6044,7 @@ impl Store {
     /// stopped instance back to `rescheduling` (nor can a later, unrelated
     /// allocation death resurrect it). Must run in the same transaction as
     /// the deletion, before commit.
-    fn release_instance_bindings_tx(&self, tx: &Transaction<'_>, removed: &[Allocation]) -> R<()> {
+    fn release_instance_bindings_tx(&self, tx: &Connection, removed: &[Allocation]) -> R<()> {
         let instance_ids: HashSet<&str> = removed
             .iter()
             .filter_map(|alloc| alloc.instance_id.as_deref())
@@ -3918,7 +6122,7 @@ impl Store {
     /// desired range, plus the effective storage retention policy. Keyed
     /// instances are always "still desired" here — their lifecycle is owned by
     /// the management API (DestroyInstance), never by allocation churn.
-    fn slot_still_desired_tx(&self, tx: &Transaction<'_>, instance: &Instance) -> R<(bool, bool)> {
+    fn slot_still_desired_tx(&self, tx: &Connection, instance: &Instance) -> R<(bool, bool)> {
         let (InstanceMode::Slot, Some(slot)) = (instance.mode, instance.slot_index) else {
             return Ok((true, true));
         };
@@ -3952,7 +6156,7 @@ impl Store {
 
     fn load_allocation_constraints(
         &self,
-        tx: &Transaction<'_>,
+        tx: &Connection,
         task_id: i64,
     ) -> R<AllocationConstraintState> {
         let (constraints, permit): (Value, Value) = tx.query_row(
@@ -3969,10 +6173,12 @@ impl Store {
             None
         } else {
             let mut tracker = DistinctTracker::new(&distinct_keys);
-            let sql = "SELECT node.id, node.pool, node.status, node.availability, \
-                node.config_attrs, node.fingerprint_attrs, node.dynamic_attrs, \
-                node.health_checks, node.last_heartbeat \
+            let sql = "SELECT node.id, node.pool, COALESCE(node_health.status, 'active'), \
+                node.availability, node.config_attrs, node.fingerprint_attrs, \
+                node.dynamic_attrs, COALESCE(node_health.health_checks, '{}'), \
+                COALESCE(node_health.last_heartbeat, '') \
                 FROM node INNER JOIN allocation ON allocation.node_id = node.id \
+                LEFT JOIN node_health ON node_health.node_id = node.id \
                 WHERE allocation.task_config_id = ?;";
             let mut stmt = tx.prepare(sql)?;
             let rows = stmt.query_map([task_id], |row| self.node_from_row(row))?;
@@ -3989,20 +6195,15 @@ impl Store {
         })
     }
 
-    fn load_allocation_task_state(
-        &self,
-        tx: &Transaction<'_>,
-        task_id: i64,
-    ) -> R<AllocationTaskState> {
-        let (job_config_id, resources, constraints, permit, lifecycle, network_raw): (
+    fn load_allocation_task_state(&self, tx: &Connection, task_id: i64) -> R<AllocationTaskState> {
+        let (job_config_id, resources, constraints, permit, network_raw): (
             String,
             Value,
             Value,
             Value,
-            String,
             Option<String>,
         ) = tx.query_row(
-            "SELECT job_config_id, resources, constraints, permit, lifecycle, network FROM task_config WHERE id = ?;",
+            "SELECT job_config_id, resources, constraints, permit, network FROM task_config WHERE id = ?;",
             [task_id],
             |row| {
                 Ok((
@@ -4011,7 +6212,6 @@ impl Store {
                     row.get(2)?,
                     row.get(3)?,
                     row.get(4)?,
-                    row.get(5)?,
                 ))
             },
         )?;
@@ -4025,10 +6225,12 @@ impl Store {
             None
         } else {
             let mut tracker = DistinctTracker::new(&distinct_keys);
-            let sql = "SELECT node.id, node.pool, node.status, node.availability, \
-                node.config_attrs, node.fingerprint_attrs, node.dynamic_attrs, \
-                node.health_checks, node.last_heartbeat \
+            let sql = "SELECT node.id, node.pool, COALESCE(node_health.status, 'active'), \
+                node.availability, node.config_attrs, node.fingerprint_attrs, \
+                node.dynamic_attrs, COALESCE(node_health.health_checks, '{}'), \
+                COALESCE(node_health.last_heartbeat, '') \
                 FROM node INNER JOIN allocation ON allocation.node_id = node.id \
+                LEFT JOIN node_health ON node_health.node_id = node.id \
                 WHERE allocation.task_config_id = ?;";
             let mut stmt = tx.prepare(sql)?;
             let rows = stmt.query_map([task_id], |row| self.node_from_row(row))?;
@@ -4044,7 +6246,6 @@ impl Store {
             distinct,
             job_config_id,
             resources,
-            lifecycle: lifecycle.parse().map_err(|err: String| anyhow!(err))?,
             network_raw,
         })
     }
@@ -4054,9 +6255,15 @@ impl Store {
         if placements.is_empty() {
             return Ok(Vec::new());
         }
+        let placements = placements.to_vec();
+        self.replicated(Lane::Scheduler, "apply_allocation_plan", move |s| {
+            s.apply_allocation_plan_apply(&placements)
+        })
+    }
 
+    fn apply_allocation_plan_apply(&self, placements: &[(String, i64)]) -> R<Vec<Allocation>> {
         let mut conn = self.write_connection()?;
-        let tx = conn.transaction()?;
+        let tx = Self::write_tx(&mut conn)?;
         let mut allocations = Vec::new();
 
         let mut constraint_states: HashMap<i64, AllocationConstraintState> = HashMap::new();
@@ -4172,9 +6379,22 @@ impl Store {
         if snapshots.is_empty() {
             return Ok(());
         }
+        let node_id = node_id.to_owned();
+        let snapshots = snapshots.to_vec();
+        self.replicated(
+            Lane::Status,
+            "upsert_allocation_health_snapshots",
+            move |s| s.upsert_allocation_health_snapshots_apply(&node_id, &snapshots),
+        )
+    }
 
+    fn upsert_allocation_health_snapshots_apply(
+        &self,
+        node_id: &str,
+        snapshots: &[AllocationHealth],
+    ) -> R<()> {
         let mut conn = self.write_connection()?;
-        let tx = conn.transaction()?;
+        let tx = Self::write_tx(&mut conn)?;
         let now = Self::now_rfc3339()?;
         let mut staged_events = Vec::new();
         for snapshot in snapshots {
@@ -4276,6 +6496,17 @@ impl Store {
         Ok(job_id)
     }
 
+    /// Re-run the reconcile pass for every job config whose rollout is
+    /// incomplete.
+    ///
+    /// A wrapper-level SEQUENCE, not a capture (JC-33/JC-35): each
+    /// [`Self::reconcile_job_config_allocations`] below is itself a sequence
+    /// of replicated ops that must read its predecessor's committed effects,
+    /// and one of them writes the status-owned `task_status`. Composing them
+    /// into a single scheduler capture would both blind the scheduler's reads
+    /// and put a status-lane write inside a scheduler changeset, which the
+    /// capture-time ownership guard rejects. Every pass is an idempotent
+    /// convergence step, so no cross-op atomicity is needed.
     #[instrument(err, skip_all)]
     pub fn reconcile_incomplete_rollouts(&self) -> R<u64> {
         let mut reconciled = 0_u64;
@@ -4337,11 +6568,14 @@ impl Store {
             "SELECT tc.name, tc.service, tc.job_id,
                     a.id, a.node_id, a.network,
                     ah.healthy, ah.status,
-                    n.status, n.config_attrs
+                    CASE WHEN n.id IS NULL THEN NULL
+                         ELSE COALESCE(nh.status, 'active') END,
+                    n.config_attrs
              FROM task_config tc
              INNER JOIN allocation a ON a.task_config_id = tc.id
              LEFT JOIN allocation_health ah ON ah.allocation_id = a.id
              LEFT JOIN node n ON n.id = a.node_id
+             LEFT JOIN node_health nh ON nh.node_id = n.id
              WHERE tc.service IS NOT NULL;",
         )?;
 
@@ -4494,13 +6728,19 @@ impl Store {
 
     #[instrument(err, skip_all)]
     pub fn remove_allocation_by_id(&self, allocation_id: i64) -> R<Option<Allocation>> {
+        self.replicated(Lane::Scheduler, "remove_allocation_by_id", move |s| {
+            s.remove_allocation_by_id_apply(allocation_id)
+        })
+    }
+
+    fn remove_allocation_by_id_apply(&self, allocation_id: i64) -> R<Option<Allocation>> {
         let allocation = self.get_allocation_by_id(allocation_id)?;
         let Some(allocation) = allocation else {
             return Ok(None);
         };
 
         let mut conn = self.write_connection()?;
-        let tx = conn.transaction()?;
+        let tx = Self::write_tx(&mut conn)?;
         tx.execute("DELETE FROM allocation WHERE id = ?;", [allocation_id])?;
         self.release_instance_bindings_tx(&tx, std::slice::from_ref(&allocation))?;
         self.bump_job_config_epoch_tx(&tx, &allocation.job_config_id)?;
@@ -4542,9 +6782,16 @@ impl Store {
 
     #[instrument(err, skip_all)]
     pub fn remove_allocs_for_job(&self, job_id: &str) -> R<()> {
+        let job_id = job_id.to_owned();
+        self.replicated(Lane::Scheduler, "remove_allocs_for_job", move |s| {
+            s.remove_allocs_for_job_apply(&job_id)
+        })
+    }
+
+    fn remove_allocs_for_job_apply(&self, job_id: &str) -> R<()> {
         let allocations = self.allocs_for_job(job_id)?;
         let mut conn = self.write_connection()?;
-        let tx = conn.transaction()?;
+        let tx = Self::write_tx(&mut conn)?;
         let sql = r#"
         DELETE FROM allocation
         WHERE job_config_id IN (
@@ -4570,13 +6817,20 @@ impl Store {
 
     #[instrument(err, skip_all)]
     pub fn remove_allocs_for_job_config(&self, job_config_id: &str) -> R<Vec<Allocation>> {
+        let job_config_id = job_config_id.to_owned();
+        self.replicated(Lane::Scheduler, "remove_allocs_for_job_config", move |s| {
+            s.remove_allocs_for_job_config_apply(&job_config_id)
+        })
+    }
+
+    fn remove_allocs_for_job_config_apply(&self, job_config_id: &str) -> R<Vec<Allocation>> {
         let allocations = self.allocs_for_job_config(job_config_id)?;
         if allocations.is_empty() {
             return Ok(Vec::new());
         }
 
         let mut conn = self.write_connection()?;
-        let tx = conn.transaction()?;
+        let tx = Self::write_tx(&mut conn)?;
         tx.execute(
             "DELETE FROM allocation WHERE job_config_id = ?;",
             [job_config_id],
@@ -4601,6 +6855,19 @@ impl Store {
     /// join have to honor node capacity, distinct constraints, group
     /// co-location and stateful instance counts exactly like every other
     /// placement path, and be scored by the configured policy.
+    ///
+    /// Deliberately NOT a capture of its own (JC-33/JC-35). `plan_and_apply`
+    /// is already a SEQUENCE of replicated ops — `insert_plan_submission` and
+    /// `apply_plan_submission` on the scheduler lane, plus the latter's
+    /// status-lane `update_task_statuses_for_allocations` follow-up. Wrapping
+    /// the sequence in one scheduler capture would compose that status write
+    /// into the scheduler changeset, which the capture-time ownership guard
+    /// rejects (JC-26), and it would blind the planner: a capture's reads go
+    /// through the read pool and see only COMMITTED state, so the plan could
+    /// not observe the eviction that preceded it. Each step is idempotent —
+    /// the plan submission carries an epoch CAS, so a replay after a crash
+    /// mid-sequence is rejected rather than double-placing, and the next
+    /// reconcile pass converges.
     #[instrument(err, skip_all)]
     pub fn reconcile_job_config_allocations(&self, job_config_id: &str) -> R<()> {
         if self
@@ -4646,6 +6913,12 @@ impl Store {
     /// The node-status monitor re-runs this method every tick (see
     /// [`Self::recheck_lost_nodes`]), so replacement proceeds automatically
     /// once the threshold elapses. Idempotent.
+    /// Since C-2 this is a wrapper-level composition of single-purpose
+    /// scheduler-lane ops (see
+    /// [`Self::reschedule_allocations_for_drained_node`] for why the
+    /// removal and the reconcile must not share one capture). A crash
+    /// between them is healed by the node monitor re-enqueueing the
+    /// `node_lost_reschedule` eval every tick.
     #[instrument(err, skip_all)]
     pub fn reschedule_allocations_for_lost_node(&self, node_id: &str) -> R<()> {
         let allocs = self.allocs_for_node(node_id)?;
@@ -4763,9 +7036,15 @@ impl Store {
         if allocs.is_empty() {
             return Ok(HashSet::new());
         }
+        let allocs = allocs.to_vec();
+        self.replicated(Lane::Scheduler, "remove_allocations", move |s| {
+            s.remove_allocations_apply(&allocs)
+        })
+    }
 
+    fn remove_allocations_apply(&self, allocs: &[Allocation]) -> R<HashSet<String>> {
         let mut conn = self.write_connection()?;
-        let tx = conn.transaction()?;
+        let tx = Self::write_tx(&mut conn)?;
         for alloc in allocs {
             tx.execute("DELETE FROM allocation WHERE id = ?;", [alloc.id])?;
         }
@@ -4781,6 +7060,10 @@ impl Store {
             .collect())
     }
 
+    /// Since C-2 each per-config reconcile is its own scheduler-lane op
+    /// (see [`Self::reschedule_allocations_for_drained_node`] for the
+    /// capture-visibility rationale); every pass is an idempotent
+    /// convergence step, so no cross-op atomicity is needed.
     #[instrument(err, skip_all)]
     pub fn reschedule_allocations_for_new_node(&self) -> R<()> {
         let mut job_config_ids = self.job_config_ids_with_count_per()?;
@@ -4860,6 +7143,13 @@ impl Store {
     /// Persist a freshly generated signing key.
     #[instrument(err, skip_all, fields(kid = %record.kid, state = %record.state))]
     pub fn insert_signing_key(&self, record: &SigningKeyRecord) -> R<()> {
+        let record = record.clone();
+        self.replicated(Lane::Control, "insert_signing_key", move |s| {
+            s.insert_signing_key_apply(&record)
+        })
+    }
+
+    fn insert_signing_key_apply(&self, record: &SigningKeyRecord) -> R<()> {
         let conn = self.write_connection()?;
         conn.execute(
             &INSERT_SIGNING_KEY,
@@ -4894,6 +7184,19 @@ impl Store {
         state: &str,
         not_after: Option<u64>,
     ) -> R<()> {
+        let kid = kid.to_owned();
+        let state = state.to_owned();
+        self.replicated(Lane::Control, "update_signing_key_state", move |s| {
+            s.update_signing_key_state_apply(&kid, &state, not_after)
+        })
+    }
+
+    fn update_signing_key_state_apply(
+        &self,
+        kid: &str,
+        state: &str,
+        not_after: Option<u64>,
+    ) -> R<()> {
         let conn = self.write_connection()?;
         let updated = conn.execute(
             &UPDATE_SIGNING_KEY_STATE,
@@ -4913,6 +7216,13 @@ impl Store {
     /// for audit; this exists for operator cleanup.
     #[instrument(err, skip_all, fields(kid = %kid))]
     pub fn delete_signing_key(&self, kid: &str) -> R<()> {
+        let kid = kid.to_owned();
+        self.replicated(Lane::Control, "delete_signing_key", move |s| {
+            s.delete_signing_key_apply(&kid)
+        })
+    }
+
+    fn delete_signing_key_apply(&self, kid: &str) -> R<()> {
         let conn = self.write_connection()?;
         conn.execute(&DELETE_SIGNING_KEY, named_params! { ":kid": kid })?;
         Ok(())
@@ -4922,6 +7232,13 @@ impl Store {
     /// never deleted — the never-recycle guarantee depends on them remaining).
     #[instrument(err, skip_all)]
     pub fn upsert_instance(&self, instance: &Instance) -> R<Instance> {
+        let instance = instance.clone();
+        self.replicated(Lane::Scheduler, "upsert_instance", move |s| {
+            s.upsert_instance_apply(&instance)
+        })
+    }
+
+    fn upsert_instance_apply(&self, instance: &Instance) -> R<Instance> {
         let now = Self::now_rfc3339()?;
         let created_at = if instance.created_at.is_empty() {
             now.clone()
@@ -4959,6 +7276,21 @@ impl Store {
         task_name: &str,
         slot: u32,
     ) -> R<Instance> {
+        let job_id = job_id.to_owned();
+        let group = group.to_owned();
+        let task_name = task_name.to_owned();
+        self.replicated(Lane::Scheduler, "get_or_create_slot_instance", move |s| {
+            s.get_or_create_slot_instance_apply(&job_id, &group, &task_name, slot)
+        })
+    }
+
+    fn get_or_create_slot_instance_apply(
+        &self,
+        job_id: &str,
+        group: &str,
+        task_name: &str,
+        slot: u32,
+    ) -> R<Instance> {
         let instance_id = slot_instance_id(job_id, group, slot);
         if let Some(existing) = self.get_instance(&instance_id)? {
             return Ok(existing);
@@ -4987,6 +7319,17 @@ impl Store {
         instance_id: &str,
         current_alloc_id: Option<i64>,
     ) -> R<()> {
+        let instance_id = instance_id.to_owned();
+        self.replicated(Lane::Scheduler, "set_instance_current_alloc", move |s| {
+            s.set_instance_current_alloc_apply(&instance_id, current_alloc_id)
+        })
+    }
+
+    fn set_instance_current_alloc_apply(
+        &self,
+        instance_id: &str,
+        current_alloc_id: Option<i64>,
+    ) -> R<()> {
         let now = Self::now_rfc3339()?;
         let conn = self.write_connection()?;
         let updated = conn.execute(
@@ -5002,6 +7345,13 @@ impl Store {
     /// Transition an instance's lifecycle state.
     #[instrument(err, skip_all)]
     pub fn set_instance_state(&self, instance_id: &str, state: InstanceState) -> R<()> {
+        let instance_id = instance_id.to_owned();
+        self.replicated(Lane::Scheduler, "set_instance_state", move |s| {
+            s.set_instance_state_apply(&instance_id, state)
+        })
+    }
+
+    fn set_instance_state_apply(&self, instance_id: &str, state: InstanceState) -> R<()> {
         let now = Self::now_rfc3339()?;
         let conn = self.write_connection()?;
         let updated = conn.execute(
@@ -5040,9 +7390,16 @@ impl Store {
     /// Idempotent: already-stopped/terminated rows are untouched.
     #[instrument(err, skip_all)]
     pub fn stop_instances_for_job(&self, job_id: &str) -> R<u64> {
+        let job_id = job_id.to_owned();
+        self.replicated(Lane::Scheduler, "stop_instances_for_job", move |s| {
+            s.stop_instances_for_job_apply(&job_id)
+        })
+    }
+
+    fn stop_instances_for_job_apply(&self, job_id: &str) -> R<u64> {
         let now = Self::now_rfc3339()?;
         let mut conn = self.write_connection()?;
-        let tx = conn.transaction()?;
+        let tx = Self::write_tx(&mut conn)?;
 
         // Resolve the per-task job-stop retention policy from the LATEST job
         // config version (mirroring how `slot_still_desired_tx` resolves the
@@ -5106,7 +7463,7 @@ impl Store {
     }
 
     /// Whether ANY instance row (live, stopped, or tombstone) owns this id.
-    fn instance_id_exists_tx(tx: &Transaction<'_>, id: &str) -> R<bool> {
+    fn instance_id_exists_tx(tx: &Connection, id: &str) -> R<bool> {
         let found: Option<i64> = tx
             .query_row(
                 "SELECT 1 FROM instance WHERE instance_id = ?;",
@@ -5127,11 +7484,7 @@ impl Store {
     /// the slot binds, see `assign_stateful_instance_tx`). Checks every job
     /// config version's slot tasks so a not-yet-current (or future) slot can't
     /// be aliased either.
-    fn keyed_id_collides_with_slot_pattern_tx(
-        tx: &Transaction<'_>,
-        job_id: &str,
-        id: &str,
-    ) -> R<bool> {
+    fn keyed_id_collides_with_slot_pattern_tx(tx: &Connection, job_id: &str, id: &str) -> R<bool> {
         let mut stmt = tx.prepare(
             "SELECT DISTINCT group_name, count FROM task_config \
              WHERE job_id = ?1 AND stateful IS NOT NULL \
@@ -5155,7 +7508,7 @@ impl Store {
     /// paths so both apply identical rules.
     fn insert_keyed_instance_tx(
         &self,
-        tx: &Transaction<'_>,
+        tx: &Connection,
         job_id: &str,
         group: &str,
         task_name: &str,
@@ -5219,8 +7572,24 @@ impl Store {
         task_name: &str,
         requested_id: Option<&str>,
     ) -> R<Instance> {
+        let job_id = job_id.to_owned();
+        let group = group.to_owned();
+        let task_name = task_name.to_owned();
+        let requested_id = requested_id.map(str::to_owned);
+        self.replicated(Lane::Scheduler, "create_keyed_instance", move |s| {
+            s.create_keyed_instance_apply(&job_id, &group, &task_name, requested_id.as_deref())
+        })
+    }
+
+    fn create_keyed_instance_apply(
+        &self,
+        job_id: &str,
+        group: &str,
+        task_name: &str,
+        requested_id: Option<&str>,
+    ) -> R<Instance> {
         let mut conn = self.write_connection()?;
-        let tx = conn.transaction()?;
+        let tx = Self::write_tx(&mut conn)?;
         let instance_id =
             self.insert_keyed_instance_tx(&tx, job_id, group, task_name, requested_id)?;
         let instance = tx.query_row(&GET_INSTANCE, [instance_id.as_str()], |row| {
@@ -5247,8 +7616,25 @@ impl Store {
         requested_ids: &[String],
         mint_count: u32,
     ) -> R<Vec<String>> {
+        let job_id = job_id.to_owned();
+        let group = group.to_owned();
+        let task_name = task_name.to_owned();
+        let requested_ids = requested_ids.to_vec();
+        self.replicated(Lane::Scheduler, "create_keyed_instances", move |s| {
+            s.create_keyed_instances_apply(&job_id, &group, &task_name, &requested_ids, mint_count)
+        })
+    }
+
+    fn create_keyed_instances_apply(
+        &self,
+        job_id: &str,
+        group: &str,
+        task_name: &str,
+        requested_ids: &[String],
+        mint_count: u32,
+    ) -> R<Vec<String>> {
         let mut conn = self.write_connection()?;
-        let tx = conn.transaction()?;
+        let tx = Self::write_tx(&mut conn)?;
         let mut created = Vec::with_capacity(requested_ids.len() + mint_count as usize);
         for id in requested_ids {
             created.push(self.insert_keyed_instance_tx(&tx, job_id, group, task_name, Some(id))?);
@@ -5281,9 +7667,25 @@ impl Store {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
+        let job_id = job_id.to_owned();
+        let group = group.to_owned();
+        let task_name = task_name.to_owned();
+        let ids = ids.to_vec();
+        self.replicated(Lane::Scheduler, "seed_keyed_instances", move |s| {
+            s.seed_keyed_instances_apply(&job_id, &group, &task_name, &ids)
+        })
+    }
+
+    fn seed_keyed_instances_apply(
+        &self,
+        job_id: &str,
+        group: &str,
+        task_name: &str,
+        ids: &[String],
+    ) -> R<Vec<String>> {
         let now = Self::now_rfc3339()?;
         let mut conn = self.write_connection()?;
-        let tx = conn.transaction()?;
+        let tx = Self::write_tx(&mut conn)?;
         let mut created = Vec::new();
         for id in ids {
             let inserted = tx.execute(
@@ -5324,6 +7726,13 @@ impl Store {
     /// `count.num`.
     #[instrument(err, skip_all)]
     pub fn destroy_keyed_instance(&self, instance_id: &str) -> R<DestroyInstanceOutcome> {
+        let instance_id = instance_id.to_owned();
+        self.replicated(Lane::Scheduler, "destroy_keyed_instance", move |s| {
+            s.destroy_keyed_instance_apply(&instance_id)
+        })
+    }
+
+    fn destroy_keyed_instance_apply(&self, instance_id: &str) -> R<DestroyInstanceOutcome> {
         let instance = self
             .get_instance(instance_id)?
             .ok_or_else(|| StorageError::not_found("instance", instance_id))?;
@@ -5341,7 +7750,7 @@ impl Store {
 
         let now = Self::now_rfc3339()?;
         let mut conn = self.write_connection()?;
-        let tx = conn.transaction()?;
+        let tx = Self::write_tx(&mut conn)?;
 
         // Stop the instance's allocation(s) through the normal removal path
         // (delete row + epoch bump + cache eviction); the worker stops the
@@ -5405,6 +7814,13 @@ impl Store {
     /// terminated case to surface FailedPrecondition.
     #[instrument(err, skip_all)]
     pub fn stop_keyed_instance(&self, instance_id: &str) -> R<StopInstanceOutcome> {
+        let instance_id = instance_id.to_owned();
+        self.replicated(Lane::Scheduler, "stop_keyed_instance", move |s| {
+            s.stop_keyed_instance_apply(&instance_id)
+        })
+    }
+
+    fn stop_keyed_instance_apply(&self, instance_id: &str) -> R<StopInstanceOutcome> {
         let instance = self
             .get_instance(instance_id)?
             .ok_or_else(|| StorageError::not_found("instance", instance_id))?;
@@ -5429,7 +7845,7 @@ impl Store {
 
         let now = Self::now_rfc3339()?;
         let mut conn = self.write_connection()?;
-        let tx = conn.transaction()?;
+        let tx = Self::write_tx(&mut conn)?;
 
         // Stop the instance's allocation(s) through the normal removal path
         // (delete row + epoch bump + cache eviction); the worker stops the
@@ -5487,6 +7903,13 @@ impl Store {
     /// terminated case to surface FailedPrecondition.
     #[instrument(err, skip_all)]
     pub fn start_keyed_instance(&self, instance_id: &str) -> R<StartInstanceOutcome> {
+        let instance_id = instance_id.to_owned();
+        self.replicated(Lane::Scheduler, "start_keyed_instance", move |s| {
+            s.start_keyed_instance_apply(&instance_id)
+        })
+    }
+
+    fn start_keyed_instance_apply(&self, instance_id: &str) -> R<StartInstanceOutcome> {
         let instance = self
             .get_instance(instance_id)?
             .ok_or_else(|| StorageError::not_found("instance", instance_id))?;
@@ -5608,11 +8031,45 @@ impl Store {
     // EVALS
     //
 
+    // The eval queue is REPLICATED state owned by the scheduler lane
+    // (plan §7-C2, JC-41 — reversing JC-27). JC-27 took evals out of raft on
+    // the premise that they are derived, regenerable work; the adversarial
+    // pass disproved it. An acknowledged `job stop`'s allocation teardown, a
+    // mid-flight rollout tick, a config update's previous-version cleanup
+    // and a KV-triggered restart each ride an eval whose loss is permanent
+    // and user-visible, and `regenerate_scheduling_evals` cannot reconstruct
+    // operator intent that was never persisted. So every eval mutation is a
+    // `replicated(Lane::Scheduler, …)` op again: followers hold the queue,
+    // a new leader inherits it, and only the *processing* loop is
+    // leader-gated.
+    //
+    // Composite shape (JC-33): an op on ANOTHER lane that needs an eval
+    // enqueues it as its own sequential scheduler-lane op AFTER its own op
+    // commits — never from inside its capture, where the capture-time
+    // ownership guard would reject the foreign-lane write (that rejection is
+    // the wall keeping this rule true; see
+    // `ownership::guard_rejects_commutative_mutations_and_foreign_lane_eval_writes`).
+    //
+    // Cross-lane FKs stay REMOVED (see the `eval_local` rebuild in
+    // migrations.rs): a control-lane `DELETE FROM job` must not cascade into
+    // this scheduler-lane table. Evals therefore reference job/job_config/
+    // node advisorily. Stale references are absorbed at claim time
+    // (`claim_eval_apply` sweeps superseded siblings; `prune_stale_evals`
+    // drops rows for superseded/missing configs at leadership acquisition)
+    // or by the handler failing — and a failed eval is terminal
+    // (`complete_eval(.., false)` sets status `failed`, which the claim
+    // query never selects), so a dangling reference cannot spin.
+
     #[instrument(err, skip_all)]
     pub fn insert_eval(&self, eval: &Eval) -> R<()> {
-        let conn = self.write_connection()?;
+        let eval = eval.clone();
+        self.replicated(Lane::Scheduler, "insert_eval", move |s| {
+            s.insert_eval_apply(&eval)
+        })
+    }
 
-        conn.execute("PRAGMA foreign_keys = OFF;", [])?;
+    fn insert_eval_apply(&self, eval: &Eval) -> R<()> {
+        let conn = self.write_connection()?;
 
         let params = named_params! {
             ":id": eval.id,
@@ -5626,13 +8083,20 @@ impl Store {
         };
 
         conn.execute(&INSERT_EVAL, params)?;
-        conn.execute("PRAGMA foreign_keys = ON;", [])?;
 
         Ok(())
     }
 
     #[instrument(err, skip_all)]
     pub fn set_eval_status(&self, id: &str, status: &str) -> R<()> {
+        let id = id.to_owned();
+        let status = status.to_owned();
+        self.replicated(Lane::Scheduler, "set_eval_status", move |s| {
+            s.set_eval_status_apply(&id, &status)
+        })
+    }
+
+    fn set_eval_status_apply(&self, id: &str, status: &str) -> R<()> {
         let conn = self.write_connection()?;
         conn.execute("UPDATE eval SET status = ? WHERE id = ?;", [status, id])?;
 
@@ -5663,9 +8127,13 @@ impl Store {
 
     #[instrument(err, skip_all)]
     pub fn claim_eval(&self) -> R<Option<Eval>> {
+        self.replicated(Lane::Scheduler, "claim_eval", move |s| s.claim_eval_apply())
+    }
+
+    fn claim_eval_apply(&self) -> R<Option<Eval>> {
         let tx_started = Instant::now();
         let mut conn = self.write_connection()?;
-        let tx = conn.transaction()?;
+        let tx = Self::write_tx(&mut conn)?;
 
         let eval = tx
             .query_row(
@@ -5725,7 +8193,14 @@ impl Store {
             },
         )?;
 
+        // Cheapest accurate point for the queue-depth gauge: the claim (and
+        // its superseded-eval sweep) just changed the pending count, and the
+        // eval table is small enough that COUNT inside the open tx is cheap.
+        let pending = Self::pending_eval_count_tx(&tx)?;
         tx.commit()?;
+        crate::manager::telemetry::metrics()
+            .eval_queue_depth
+            .set(pending);
         info!(
             eval_id = eval.id,
             eval_kind = %eval.kind,
@@ -5771,28 +8246,358 @@ impl Store {
 
     #[instrument(err, skip_all)]
     pub fn requeue_in_flight_evals(&self) -> R<u64> {
+        self.replicated(Lane::Scheduler, "requeue_in_flight_evals", move |s| {
+            s.requeue_in_flight_evals_apply()
+        })
+    }
+
+    fn requeue_in_flight_evals_apply(&self) -> R<u64> {
         let conn = self.write_connection()?;
         let updated = conn.execute(
             "UPDATE eval SET status = 'pending' WHERE status = 'in_flight';",
             [],
         )?;
 
-        if updated > 0 {
-            // Startup recovery moved work from in_flight->pending; wake all waiters.
+        let pending = Self::pending_eval_count_tx(&conn)?;
+        drop(conn);
+        crate::manager::telemetry::metrics()
+            .eval_queue_depth
+            .set(pending);
+
+        if updated > 0 && !capture::in_capture() {
+            // Recovery moved work from in_flight->pending; wake all waiters.
+            // Under capture the rows are not committed yet, so the wake is
+            // deferred to apply time — `project_changeset_side_effects`
+            // notifies on any eval change, on every replica (JC-11/JC-41).
             self.eval_notify.notify_waiters();
         }
 
         Ok(updated as u64)
     }
 
+    /// Belt-and-braces reconciliation of pending scheduling work
+    /// (plan §7-C2, JC-41).
+    ///
+    /// This pass is **no longer load-bearing for durability**. Under JC-27
+    /// it was: evals were node-local, so a failover lost the whole queue and
+    /// this hook had to reconstruct it — which it provably could not do for
+    /// work whose intent was never persisted (an acknowledged `job stop`'s
+    /// teardown, a mid-flight rollout tick, a KV restart). JC-41 put the
+    /// queue back in raft, so a new leader INHERITS the real pending work
+    /// and this pass only closes gaps that replicated state can genuinely
+    /// re-derive: an eval that was never enqueued because the enqueue op
+    /// itself was rejected/lost (a control-lane op acked on a node that did
+    /// not lead the scheduler lane), or one dropped by
+    /// [`Self::prune_stale_evals`] as superseded.
+    ///
+    /// Every regenerated eval is an idempotent convergence step, and scopes
+    /// that already have a pending/in-flight eval are skipped — so it is
+    /// safe to run on every leadership acquisition and periodically.
+    /// Per scope (adversarial hardening, 2026-07-24 — the original pass
+    /// regenerated only `job_reschedule`/`node_drain`/
+    /// `node_lost_reschedule` and silently dropped stop tails, rollout
+    /// ticks, config-update cleanups, KV restarts, and no-evict drains):
+    ///
+    /// - a `rollout_tick` eval for every rollout that is neither terminal
+    ///   nor waiting on an operator (the tick chain re-arms itself via a
+    ///   delayed eval — replicated since JC-41, so this only matters if the
+    ///   re-arm never landed); jobs with any live rollout are EXCLUDED from the blanket
+    ///   reschedule below — a plain `job_reschedule` would place the
+    ///   rollout's to_config at full desired count, bypassing canary/staged
+    ///   gating;
+    /// - for every other active job: `job_update` when a replicated restart
+    ///   marker is set ([`Self::request_job_restart`]); `job_submit` when a
+    ///   superseded config still has live allocations and the latest has
+    ///   none (the lost submit tail — the handler migrates or
+    ///   places-then-removes exactly as the lost eval would have);
+    ///   otherwise finish any half-done config-update cleanup right here
+    ///   (migrate schedule-equivalent stale allocations, remove the rest)
+    ///   and enqueue `job_reschedule` (a no-op when nothing is missing);
+    /// - a `job_stop` eval for every STOPPED job that still has allocations
+    ///   or live instance rows (the acknowledged stop's teardown tail;
+    ///   JC-41 makes the eval itself survive failover, this is the second
+    ///   line of defence);
+    /// - a `node_drain` eval for every node still marked drained WITH the
+    ///   replicated `drain_evict` intent. This is the over-execution fix
+    ///   (JC-41): `availability = 'drained'` alone cannot distinguish
+    ///   `node drain --evict` from a plain cordon, so regenerating on
+    ///   availability evicted allocations off nodes an operator had only
+    ///   cordoned. The intent is now persisted by
+    ///   [`Self::set_node_availability_with_evict`] and cleared whenever
+    ///   availability leaves `drained`, so a cordon-only node is never
+    ///   evicted by reconciliation (JC-16);
+    /// - a `node_lost_reschedule` eval for every node still marked lost
+    ///   (the C-2 eval-mediated reschedule tail; the node monitor also
+    ///   re-enqueues it every tick, so this only closes the gap until the
+    ///   monitor's first post-failover pass).
+    ///
+    /// Scopes that already have a pending/in-flight eval are skipped.
+    /// Returns how many evals were enqueued. Also safe to run outside
+    /// failover (and it runs periodically on the scheduler-lane leader
+    /// under divergent lane leadership): every regenerated eval is an
+    /// idempotent reconciliation pass.
+    pub fn regenerate_scheduling_evals(&self) -> R<u64> {
+        const TERMINAL_ROLLOUTS: &str =
+            "('completed', 'failed', 'cancelled', 'completed_incomplete')";
+        const OPERATOR_WAIT_ROLLOUTS: &str =
+            "('waiting_manual_start', 'waiting_manual_advance', 'paused')";
+
+        let mut enqueued = 0u64;
+
+        // Mid-flight rollouts: re-arm the tick chain.
+        let rollout_targets: Vec<(String, String)> = {
+            let conn = self.read_connection()?;
+            let mut stmt = conn.prepare(&format!(
+                "SELECT r.job_id, r.to_job_config_id FROM rollout r
+                 WHERE r.status NOT IN {TERMINAL_ROLLOUTS}
+                   AND r.status NOT IN {OPERATOR_WAIT_ROLLOUTS}
+                   AND NOT EXISTS (
+                     SELECT 1 FROM eval e
+                     WHERE e.status IN ('pending', 'in_flight') AND e.job_id = r.job_id
+                   );"
+            ))?;
+            let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            Self::collect_rows(rows)?
+        };
+        for (job_id, to_config) in rollout_targets {
+            self.enqueue_eval("rollout_tick", Some(&job_id), Some(&to_config), None, None)?;
+            enqueued += 1;
+        }
+
+        // Active jobs without a live rollout.
+        let job_targets: Vec<(String, Option<String>, bool)> = {
+            let conn = self.read_connection()?;
+            let mut stmt = conn.prepare(&format!(
+                "SELECT j.id, (
+                     SELECT jc.id FROM job_config jc
+                     WHERE jc.job_id = j.id
+                     ORDER BY jc.created_at DESC
+                     LIMIT 1
+                 ) AS job_config_id,
+                 j.restart_requested_at IS NOT NULL
+                 FROM job j
+                 WHERE j.status NOT IN ('stopped', 'failed')
+                   AND NOT EXISTS (
+                     SELECT 1 FROM eval e
+                     WHERE e.status IN ('pending', 'in_flight') AND e.job_id = j.id
+                   )
+                   AND NOT EXISTS (
+                     SELECT 1 FROM rollout r
+                     WHERE r.job_id = j.id AND r.status NOT IN {TERMINAL_ROLLOUTS}
+                   );"
+            ))?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get::<_, bool>(2)?))
+            })?;
+            Self::collect_rows(rows)?
+        };
+        for (job_id, latest_config, restart_requested) in job_targets {
+            let Some(latest_config) = latest_config else {
+                continue;
+            };
+            let kind = if restart_requested {
+                // A KV-triggered restart was acknowledged but its
+                // leader-local job_update eval died: regenerate it (the
+                // handler clears the marker before restarting).
+                "job_update"
+            } else {
+                let stale_configs: Vec<String> = {
+                    let conn = self.read_connection()?;
+                    let mut stmt = conn.prepare(
+                        "SELECT DISTINCT a.job_config_id FROM allocation a
+                         INNER JOIN job_config jc ON jc.id = a.job_config_id
+                         WHERE jc.job_id = ?1 AND a.job_config_id != ?2;",
+                    )?;
+                    let rows = stmt.query_map(params![job_id, latest_config], |row| row.get(0))?;
+                    Self::collect_rows(rows)?
+                };
+                if stale_configs.is_empty() {
+                    "job_reschedule"
+                } else {
+                    let latest_count: i64 = {
+                        let conn = self.read_connection()?;
+                        conn.query_row(
+                            "SELECT COUNT(*) FROM allocation WHERE job_config_id = ?1;",
+                            [&latest_config],
+                            |row| row.get(0),
+                        )?
+                    };
+                    if latest_count == 0 {
+                        // The acknowledged submit's eval was lost whole:
+                        // job_submit replays it (migrate-or-place, THEN
+                        // remove the predecessor — no avoidable downtime).
+                        "job_submit"
+                    } else {
+                        // The submit partially ran (latest placed, stale
+                        // cleanup lost): finish the cleanup here, then
+                        // converge counts.
+                        for stale in &stale_configs {
+                            if self.job_configs_schedule_equivalent(stale, &latest_config)? {
+                                self.migrate_allocations_to_job_config(stale, &latest_config)?;
+                            } else {
+                                self.remove_allocs_for_job_config(stale)?;
+                            }
+                        }
+                        "job_reschedule"
+                    }
+                }
+            };
+            self.enqueue_eval(kind, Some(&job_id), Some(&latest_config), None, None)?;
+            enqueued += 1;
+        }
+
+        // Stopped jobs whose teardown tail was lost with the old leader.
+        let stop_targets: Vec<(String, Option<String>)> = {
+            let conn = self.read_connection()?;
+            let mut stmt = conn.prepare(
+                "SELECT j.id, (
+                     SELECT jc.id FROM job_config jc
+                     WHERE jc.job_id = j.id
+                     ORDER BY jc.created_at DESC
+                     LIMIT 1
+                 ) AS job_config_id
+                 FROM job j
+                 WHERE j.status = 'stopped'
+                   AND NOT EXISTS (
+                     SELECT 1 FROM eval e
+                     WHERE e.status IN ('pending', 'in_flight') AND e.job_id = j.id
+                   )
+                   AND (
+                     EXISTS (
+                       SELECT 1 FROM allocation a
+                       INNER JOIN job_config jc ON jc.id = a.job_config_id
+                       WHERE jc.job_id = j.id
+                     )
+                     OR EXISTS (
+                       SELECT 1 FROM instance i
+                       WHERE i.job_id = j.id AND i.state NOT IN ('stopped', 'terminated')
+                     )
+                   );",
+            )?;
+            let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            Self::collect_rows(rows)?
+        };
+        for (job_id, job_config_id) in stop_targets {
+            self.enqueue_eval(
+                "job_stop",
+                Some(&job_id),
+                job_config_id.as_deref(),
+                None,
+                None,
+            )?;
+            enqueued += 1;
+        }
+
+        let drained_nodes: Vec<String> = {
+            let conn = self.read_connection()?;
+            let mut stmt = conn.prepare(
+                "SELECT n.id FROM node n
+                 WHERE n.availability = 'drained' AND n.drain_evict = 1
+                   AND NOT EXISTS (
+                     SELECT 1 FROM eval e
+                     WHERE e.status IN ('pending', 'in_flight')
+                       AND e.type = 'node_drain' AND e.node_id = n.id
+                   );",
+            )?;
+            let nodes = Self::collect_rows(stmt.query_map([], |row| row.get(0))?)?;
+            drop(stmt);
+            nodes
+        };
+        let lost_nodes: Vec<String> = {
+            let conn = self.read_connection()?;
+            let mut stmt = conn.prepare(
+                "SELECT n.id FROM node n
+                 INNER JOIN node_health nh ON nh.node_id = n.id
+                 WHERE nh.status = 'lost'
+                   AND NOT EXISTS (
+                     SELECT 1 FROM eval e
+                     WHERE e.status IN ('pending', 'in_flight')
+                       AND e.type = 'node_lost_reschedule' AND e.node_id = n.id
+                   );",
+            )?;
+            let nodes = Self::collect_rows(stmt.query_map([], |row| row.get(0))?)?;
+            drop(stmt);
+            nodes
+        };
+        for node_id in drained_nodes {
+            self.enqueue_eval("node_drain", None, None, Some(&node_id), None)?;
+            enqueued += 1;
+        }
+        for node_id in lost_nodes {
+            self.enqueue_eval("node_lost_reschedule", None, None, Some(&node_id), None)?;
+            enqueued += 1;
+        }
+        Ok(enqueued)
+    }
+
+    /// Drop eval rows that reference a SUPERSEDED job config (or one that no
+    /// longer exists), called on leadership acquisition BEFORE the stale
+    /// `in_flight` requeue (adversarial finding, 2026-07-24): rows from a
+    /// previous leadership stint would otherwise (a) execute against an old
+    /// config — placing old-version allocations nothing cleans up — and (b)
+    /// suppress regeneration for the same job (the regeneration queries skip
+    /// any job with a pending eval).
+    ///
+    /// Dropping such a row is safe *because of what it selects*, not because
+    /// evals are disposable (JC-41): the row's config has already been
+    /// superseded or destroyed by a later replicated write, so whatever work
+    /// it described is either obsolete or re-derivable from the current
+    /// config. It is a replicated scheduler-lane op like every other eval
+    /// mutation, so the queue stays identical on every replica. Returns how
+    /// many rows were dropped.
+    pub fn prune_stale_evals(&self) -> R<u64> {
+        self.replicated(Lane::Scheduler, "prune_stale_evals", move |s| {
+            s.prune_stale_evals_apply()
+        })
+    }
+
+    fn prune_stale_evals_apply(&self) -> R<u64> {
+        let conn = self.write_connection()?;
+        let removed = conn.execute(
+            "DELETE FROM eval
+                 WHERE job_config_id IS NOT NULL AND job_config_id != ''
+                   AND (
+                     NOT EXISTS (
+                       SELECT 1 FROM job_config mine WHERE mine.id = eval.job_config_id
+                     )
+                     OR EXISTS (
+                       SELECT 1 FROM job_config mine
+                       INNER JOIN job_config newer ON newer.job_id = mine.job_id
+                       WHERE mine.id = eval.job_config_id
+                         AND newer.created_at > mine.created_at
+                     )
+                   );",
+            [],
+        )?;
+        Ok(removed as u64)
+    }
+
+    /// Pending (unclaimed) eval count, used to keep the
+    /// `legion_eval_queue_depth` gauge accurate at the points where the
+    /// pending set changes (enqueue, claim, startup requeue).
+    fn pending_eval_count_tx(conn: &Connection) -> R<i64> {
+        Ok(conn.query_row(
+            "SELECT COUNT(*) FROM eval WHERE status = 'pending';",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
     #[instrument(err, skip_all)]
     pub fn complete_eval(&self, eval_id: &str, succeeded: bool) -> R<()> {
-        self.complete_eval_impl(eval_id, succeeded, None)
+        let eval_id = eval_id.to_owned();
+        self.replicated(Lane::Scheduler, "complete_eval", move |s| {
+            s.complete_eval_impl(&eval_id, succeeded, None)
+        })
     }
 
     /// Complete an eval and record its lifecycle event (`eval.completed` /
-    /// `eval.failed`, built via `drafts`) in the same transaction, so the
-    /// event costs no extra lock acquisition on the eval critical path.
+    /// `eval.failed`, built via `drafts`) in ONE scheduler-lane op: the
+    /// completion and its event ride the same changeset, so a replica can
+    /// never show an `eval.failed` event for a row that is still in flight
+    /// (`scheduler_event` is commutative — INSERT from any lane is legal,
+    /// JC-28). Restored with JC-41: while the queue was node-local the two
+    /// halves had to be separate writes.
     #[instrument(err, skip_all)]
     pub fn complete_eval_with_event(
         &self,
@@ -5800,7 +8605,43 @@ impl Store {
         succeeded: bool,
         event: EventDraft,
     ) -> R<()> {
-        self.complete_eval_impl(eval_id, succeeded, Some(event))
+        let eval_id = eval_id.to_owned();
+        self.replicated(Lane::Scheduler, "complete_eval_with_event", move |s| {
+            s.complete_eval_impl(&eval_id, succeeded, Some(event))
+        })
+    }
+
+    /// Put a claimed (in-flight) eval back on the pending queue with a
+    /// delay, instead of terminally failing it. Used when an eval's handler
+    /// hit a `NotRaftLeader` rejection on a FOREIGN lane (divergent lane
+    /// leadership under `lanes` topology): the eval's own work is fine —
+    /// only a cross-lane half was rejected — and marking it failed would
+    /// drop acknowledged work forever, because failed evals are never
+    /// retried and their side effects (e.g. the job_submit prev-config
+    /// cleanup) never happen (adversarial finding, 2026-07-24).
+    ///
+    /// The release itself proposes on the scheduler lane — the lane this
+    /// node must already lead to have claimed the eval — so the retry is
+    /// durable: a crash between the rejection and the retry leaves the row
+    /// `in_flight`, which the next leader's `requeue_in_flight_evals`
+    /// recovers.
+    #[instrument(err, skip(self))]
+    pub fn release_eval_for_retry(&self, eval_id: &str, delay: Duration) -> R<()> {
+        let eval_id = eval_id.to_owned();
+        self.replicated(Lane::Scheduler, "release_eval_for_retry", move |s| {
+            s.release_eval_for_retry_apply(&eval_id, delay)
+        })
+    }
+
+    fn release_eval_for_retry_apply(&self, eval_id: &str, delay: Duration) -> R<()> {
+        let ready_at =
+            (OffsetDateTime::now_utc() + time::Duration::try_from(delay)?).format(&Rfc3339)?;
+        let conn = self.write_connection()?;
+        conn.execute(
+            "UPDATE eval SET status = 'pending', ready_at = ?2 WHERE id = ?1;",
+            params![eval_id, ready_at],
+        )?;
+        Ok(())
     }
 
     fn complete_eval_impl(
@@ -5811,7 +8652,7 @@ impl Store {
     ) -> R<()> {
         let tx_started = Instant::now();
         let mut conn: MutexGuard<'_, Connection> = self.write_connection()?;
-        let tx = conn.transaction()?;
+        let tx = Self::write_tx(&mut conn)?;
 
         if succeeded {
             tx.execute("DELETE FROM eval WHERE id = ?;", [eval_id])?;
@@ -5858,8 +8699,33 @@ impl Store {
         priority: Option<i64>,
         delay: Duration,
     ) -> R<Eval> {
+        let kind = kind.to_owned();
+        let job_id = job_id.map(str::to_owned);
+        let job_config_id = job_config_id.map(str::to_owned);
+        let node_id = node_id.map(str::to_owned);
+        self.replicated(Lane::Scheduler, "enqueue_eval_after_delay", move |s| {
+            s.enqueue_eval_after_delay_apply(
+                &kind,
+                job_id.as_deref(),
+                job_config_id.as_deref(),
+                node_id.as_deref(),
+                priority,
+                delay,
+            )
+        })
+    }
+
+    fn enqueue_eval_after_delay_apply(
+        &self,
+        kind: &str,
+        job_id: Option<&str>,
+        job_config_id: Option<&str>,
+        node_id: Option<&str>,
+        priority: Option<i64>,
+        delay: Duration,
+    ) -> R<Eval> {
         let mut conn = self.write_connection()?;
-        let tx = conn.transaction()?;
+        let tx = Self::write_tx(&mut conn)?;
 
         let job_id_value = job_id
             .filter(|value| !value.trim().is_empty())
@@ -5898,13 +8764,25 @@ impl Store {
             priority: priority.unwrap_or(self.default_eval_priority),
         };
 
+        // The `eval.enqueued` event rides the SAME transaction as the eval
+        // row (JC-41): `scheduler_event` is commutative, so a scheduler-lane
+        // INSERT is legal, and the row and its event replicate together.
         let enqueue_event = self.stage_event_locked(&tx, drafts::eval_enqueued(&eval, delay));
+        // See `pending_eval_count_tx`: the insert just grew the pending set,
+        // so refresh the queue-depth gauge while the tx is still open.
+        let pending = Self::pending_eval_count_tx(&tx)?;
         tx.commit()?;
         self.publish_staged(enqueue_event);
         drop(conn);
+        crate::manager::telemetry::metrics()
+            .eval_queue_depth
+            .set(pending);
 
-        if delay.is_zero() {
-            // Zero-delay evals are immediately claimable, so wake one sleeping worker.
+        if delay.is_zero() && !capture::in_capture() {
+            // Zero-delay evals are immediately claimable, so wake one
+            // sleeping worker. Under capture the row is uncommitted; the
+            // wake happens at apply time from the committed changeset
+            // (`project_changeset_side_effects`), on every replica.
             self.eval_notify.notify_one();
         }
 
@@ -5924,11 +8802,33 @@ impl Store {
         expected_version: Option<i64>,
         lock_id: Option<&str>,
     ) -> R<KvEntry> {
+        let key = key.to_owned();
+        let value = value.to_owned();
+        let lock_id = lock_id.map(str::to_owned);
+        self.replicated(Lane::Control, "put_kv", move |s| {
+            s.put_kv_apply(
+                &key,
+                &value,
+                value_type,
+                expected_version,
+                lock_id.as_deref(),
+            )
+        })
+    }
+
+    fn put_kv_apply(
+        &self,
+        key: &str,
+        value: &str,
+        value_type: KvValueType,
+        expected_version: Option<i64>,
+        lock_id: Option<&str>,
+    ) -> R<KvEntry> {
         Self::ensure_kv_key(key)?;
         let normalized_value = Self::normalize_kv_value(value, value_type)?;
 
         let mut conn = self.write_connection()?;
-        let tx = conn.transaction()?;
+        let tx = Self::write_tx(&mut conn)?;
         self.enforce_kv_lock(&tx, key, lock_id)?;
 
         let existing = tx
@@ -6043,9 +8943,22 @@ impl Store {
         expected_version: Option<i64>,
         lock_id: Option<&str>,
     ) -> R<()> {
+        let key = key.to_owned();
+        let lock_id = lock_id.map(str::to_owned);
+        self.replicated(Lane::Control, "delete_kv", move |s| {
+            s.delete_kv_apply(&key, expected_version, lock_id.as_deref())
+        })
+    }
+
+    fn delete_kv_apply(
+        &self,
+        key: &str,
+        expected_version: Option<i64>,
+        lock_id: Option<&str>,
+    ) -> R<()> {
         Self::ensure_kv_key(key)?;
         let mut conn = self.write_connection()?;
-        let tx = conn.transaction()?;
+        let tx = Self::write_tx(&mut conn)?;
         self.enforce_kv_lock(&tx, key, lock_id)?;
 
         let existing = tx
@@ -6085,9 +8998,24 @@ impl Store {
         expected_version: Option<i64>,
         lock_id: Option<&str>,
     ) -> R<KvEntry> {
+        let key = key.to_owned();
+        let patch_json = patch_json.to_owned();
+        let lock_id = lock_id.map(str::to_owned);
+        self.replicated(Lane::Control, "patch_kv", move |s| {
+            s.patch_kv_apply(&key, &patch_json, expected_version, lock_id.as_deref())
+        })
+    }
+
+    fn patch_kv_apply(
+        &self,
+        key: &str,
+        patch_json: &str,
+        expected_version: Option<i64>,
+        lock_id: Option<&str>,
+    ) -> R<KvEntry> {
         Self::ensure_kv_key(key)?;
         let mut conn = self.write_connection()?;
-        let tx = conn.transaction()?;
+        let tx = Self::write_tx(&mut conn)?;
         self.enforce_kv_lock(&tx, key, lock_id)?;
 
         let mut entry = tx
@@ -6164,6 +9092,28 @@ impl Store {
         ttl_seconds: i64,
         force: bool,
     ) -> R<KvLock> {
+        let key = key.to_owned();
+        let lock_id = lock_id.map(str::to_owned);
+        let owner = owner.map(str::to_owned);
+        self.replicated(Lane::Control, "acquire_kv_lock", move |s| {
+            s.acquire_kv_lock_apply(
+                &key,
+                lock_id.as_deref(),
+                owner.as_deref(),
+                ttl_seconds,
+                force,
+            )
+        })
+    }
+
+    fn acquire_kv_lock_apply(
+        &self,
+        key: &str,
+        lock_id: Option<&str>,
+        owner: Option<&str>,
+        ttl_seconds: i64,
+        force: bool,
+    ) -> R<KvLock> {
         Self::ensure_kv_key(key)?;
         if ttl_seconds <= 0 {
             return Err(anyhow::Error::new(StorageError::InvalidInput {
@@ -6172,7 +9122,7 @@ impl Store {
         }
 
         let mut conn = self.write_connection()?;
-        let tx = conn.transaction()?;
+        let tx = Self::write_tx(&mut conn)?;
         let now = OffsetDateTime::now_utc();
         let expires_at = now + time::Duration::seconds(ttl_seconds);
         let lock_id_value = lock_id
@@ -6219,6 +9169,14 @@ impl Store {
 
     #[instrument(err, skip_all)]
     pub fn renew_kv_lock(&self, key: &str, lock_id: &str, ttl_seconds: i64) -> R<KvLock> {
+        let key = key.to_owned();
+        let lock_id = lock_id.to_owned();
+        self.replicated(Lane::Control, "renew_kv_lock", move |s| {
+            s.renew_kv_lock_apply(&key, &lock_id, ttl_seconds)
+        })
+    }
+
+    fn renew_kv_lock_apply(&self, key: &str, lock_id: &str, ttl_seconds: i64) -> R<KvLock> {
         Self::ensure_kv_key(key)?;
         if ttl_seconds <= 0 {
             return Err(anyhow::Error::new(StorageError::InvalidInput {
@@ -6227,7 +9185,7 @@ impl Store {
         }
 
         let mut conn = self.write_connection()?;
-        let tx = conn.transaction()?;
+        let tx = Self::write_tx(&mut conn)?;
         let Some(mut lock) = self.load_kv_lock_tx(&tx, key)? else {
             return Err(anyhow::Error::new(StorageError::not_found("kv lock", key)));
         };
@@ -6264,9 +9222,17 @@ impl Store {
 
     #[instrument(err, skip_all)]
     pub fn release_kv_lock(&self, key: &str, lock_id: &str) -> R<()> {
+        let key = key.to_owned();
+        let lock_id = lock_id.to_owned();
+        self.replicated(Lane::Control, "release_kv_lock", move |s| {
+            s.release_kv_lock_apply(&key, &lock_id)
+        })
+    }
+
+    fn release_kv_lock_apply(&self, key: &str, lock_id: &str) -> R<()> {
         Self::ensure_kv_key(key)?;
         let mut conn = self.write_connection()?;
-        let tx = conn.transaction()?;
+        let tx = Self::write_tx(&mut conn)?;
         let Some(lock) = self.load_kv_lock_tx(&tx, key)? else {
             return Err(anyhow::Error::new(StorageError::not_found("kv lock", key)));
         };
@@ -6285,9 +9251,16 @@ impl Store {
 
     #[instrument(err, skip_all)]
     pub fn get_kv_lock(&self, key: &str) -> R<Option<KvLock>> {
+        let key = key.to_owned();
+        self.replicated(Lane::Control, "get_kv_lock", move |s| {
+            s.get_kv_lock_apply(&key)
+        })
+    }
+
+    fn get_kv_lock_apply(&self, key: &str) -> R<Option<KvLock>> {
         Self::ensure_kv_key(key)?;
         let mut conn = self.write_connection()?;
-        let tx = conn.transaction()?;
+        let tx = Self::write_tx(&mut conn)?;
         let lock = self.load_kv_lock_tx(&tx, key)?;
         let Some(lock) = lock else {
             tx.commit()?;
@@ -6370,15 +9343,41 @@ impl Store {
             });
         }
 
-        let conn = if allow_write {
-            self.write_connection()?
-        } else {
-            self.read_connection()?
-        };
-        let affected_rows = conn.execute(trimmed, [])? as u64;
+        // Non-query statements reach here only with `allow_write` (the
+        // read-only check above rejected them otherwise): this is the one
+        // mutating entry of `query_state_store`, so only it is replicated.
+        //
+        // …but raft replicates ROW changes captured as SQLite session
+        // changesets, and a session records no schema changes at all. In
+        // raft mode a DDL statement would therefore run on this node and
+        // reach no other — and, because JC-26 skips proposing an empty
+        // changeset, it would be reported back as a success that never
+        // replicated (adversarial finding, 2026-07-25: the seam lied). Fail
+        // loudly with the actionable alternative instead.
+        if self.raft_mode() && !Self::is_row_mutating_statement(&statement_type) {
+            return Err(anyhow::Error::new(StorageError::InvalidInput {
+                message: format!(
+                    "statement type '{statement_type}' cannot be executed in raft mode: raft \
+                     replicates row changes captured as SQLite session changesets, which do not \
+                     include schema changes, so this statement would apply on this node only and \
+                     diverge it from the cluster. Schema changes must ship as a migration in \
+                     src/storage/migrations.rs (every node runs them at startup); \
+                     INSERT/UPDATE/DELETE statements are replicated normally"
+                ),
+            }));
+        }
+        let sql = trimmed.to_owned();
+        self.replicated(Lane::Control, "query_state_store", move |s| {
+            s.query_state_store_apply(&sql, &statement_type)
+        })
+    }
+
+    fn query_state_store_apply(&self, sql: &str, statement_type: &str) -> R<StateStoreQueryResult> {
+        let conn = self.write_connection()?;
+        let affected_rows = conn.execute(sql, [])? as u64;
 
         Ok(StateStoreQueryResult {
-            statement_type,
+            statement_type: statement_type.to_owned(),
             columns: Vec::new(),
             rows: Vec::new(),
             affected_rows,
@@ -6439,6 +9438,14 @@ impl Store {
 
     #[instrument(err, skip_all)]
     pub fn upsert_saved_state_query(&self, name: &str, sql: &str) -> R<SavedStateQueryRecord> {
+        let name = name.to_owned();
+        let sql = sql.to_owned();
+        self.replicated(Lane::Control, "upsert_saved_state_query", move |s| {
+            s.upsert_saved_state_query_apply(&name, &sql)
+        })
+    }
+
+    fn upsert_saved_state_query_apply(&self, name: &str, sql: &str) -> R<SavedStateQueryRecord> {
         let name = name.trim();
         let sql = sql.trim();
         if name.is_empty() {
@@ -6454,7 +9461,7 @@ impl Store {
 
         let now = OffsetDateTime::now_utc().format(&Rfc3339)?;
         let mut conn = self.write_connection()?;
-        let tx = conn.transaction()?;
+        let tx = Self::write_tx(&mut conn)?;
         tx.execute(
             "INSERT INTO saved_state_query (name, sql, created_at, updated_at) VALUES (:name, :sql, :now, :now) ON CONFLICT(name) DO UPDATE SET sql = excluded.sql, updated_at = excluded.updated_at;",
             named_params! {
@@ -6508,6 +9515,15 @@ impl Store {
     /// `false` when a record already existed (the caller raced another request
     /// carrying the same key). An empty key is a no-op and returns `true`.
     pub fn idempotency_record(&self, key: &str, operation: &str, message: &str) -> R<bool> {
+        let key = key.to_owned();
+        let operation = operation.to_owned();
+        let message = message.to_owned();
+        self.replicated(Lane::Control, "idempotency_record", move |s| {
+            s.idempotency_record_apply(&key, &operation, &message)
+        })
+    }
+
+    fn idempotency_record_apply(&self, key: &str, operation: &str, message: &str) -> R<bool> {
         let key = key.trim();
         if key.is_empty() {
             return Ok(true);
@@ -6528,6 +9544,13 @@ impl Store {
 
     #[instrument(err, skip_all)]
     pub fn delete_saved_state_query(&self, name: &str) -> R<()> {
+        let name = name.to_owned();
+        self.replicated(Lane::Control, "delete_saved_state_query", move |s| {
+            s.delete_saved_state_query_apply(&name)
+        })
+    }
+
+    fn delete_saved_state_query_apply(&self, name: &str) -> R<()> {
         let name = name.trim();
         if name.is_empty() {
             return Err(anyhow::Error::new(StorageError::InvalidInput {
@@ -6562,10 +9585,26 @@ impl Store {
         Self::is_query_statement(statement_type)
     }
 
+    /// Whether a statement mutates ROWS (and is therefore representable as a
+    /// session changeset, i.e. replicable). Everything else that is not a
+    /// query — DDL, `VACUUM`, `ATTACH`, … — changes state a changeset cannot
+    /// carry, which `query_state_store` refuses in raft mode.
+    fn is_row_mutating_statement(statement_type: &str) -> bool {
+        matches!(statement_type, "INSERT" | "UPDATE" | "DELETE" | "REPLACE")
+    }
+
     #[instrument(err, skip_all)]
     pub fn replace_job_kv_references(&self, job_id: &str, refs: &[JobKvReference]) -> R<()> {
+        let job_id = job_id.to_owned();
+        let refs = refs.to_vec();
+        self.replicated(Lane::Control, "replace_job_kv_references", move |s| {
+            s.replace_job_kv_references_apply(&job_id, &refs)
+        })
+    }
+
+    fn replace_job_kv_references_apply(&self, job_id: &str, refs: &[JobKvReference]) -> R<()> {
         let mut conn = self.write_connection()?;
-        let tx = conn.transaction()?;
+        let tx = Self::write_tx(&mut conn)?;
         tx.execute("DELETE FROM job_kv_reference WHERE job_id = ?;", [job_id])?;
         for reference in refs {
             tx.execute(
@@ -6653,7 +9692,7 @@ impl Store {
     /// Returns `None` for tasks that declare no `stateful.storage`.
     fn mint_instance_volume_tx(
         &self,
-        tx: &Transaction<'_>,
+        tx: &Connection,
         instance_id: &str,
         job_id: &str,
         task_name: &str,
@@ -6720,7 +9759,7 @@ impl Store {
     /// `legion volume delete` does.
     fn sync_task_volume_claims_tx(
         &self,
-        tx: &Transaction<'_>,
+        tx: &Connection,
         job_id: &str,
         task: &TaskConfig,
     ) -> R<()> {
@@ -6762,6 +9801,40 @@ impl Store {
                 ],
             )?;
         }
+        Ok(())
+    }
+
+    /// Scheduler-lane half of the submit composite (plan §7-C2 / JC-33):
+    /// upsert the `volume` claim rows for every task of `job_config_id`.
+    ///
+    /// Split out of `handle_job_submit_apply` because `volume` is
+    /// scheduler-owned while job submit proposes on the control lane — see
+    /// the sequencing rationale on [`Store::handle_job_submit`]. Task
+    /// identity comes from the control-lane rows the first half committed,
+    /// read here.
+    ///
+    /// Idempotent: claim ids are a pure function of
+    /// `(job, group, task, name)`, so re-running upserts the same rows with
+    /// the same values, and a retry after a failed attempt converges.
+    fn sync_task_volume_claims_apply(&self, job_config_id: &str) -> R<()> {
+        let Some(job_id) = self.job_id_for_job_config(job_config_id)? else {
+            // The config vanished between the halves (a destroy raced the
+            // submit); there is nothing to claim storage for.
+            return Ok(());
+        };
+        let tasks = self.get_task_configs_for_job_config(job_config_id)?;
+        if tasks.iter().all(|(_, task)| task.volumes.is_empty()) {
+            // No claims: skip the write entirely so a submit of a
+            // volume-less job produces an empty changeset (JC-26 keeps it
+            // off the raft log).
+            return Ok(());
+        }
+        let mut conn = self.write_connection()?;
+        let tx = Self::write_tx(&mut conn)?;
+        for (_, task) in &tasks {
+            self.sync_task_volume_claims_tx(&tx, &job_id, task)?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -6830,7 +9903,7 @@ impl Store {
 
     /// Whether any node advertises `driver` as node-local. Unknown drivers are
     /// treated as node-local (see [`Self::mint_instance_volume_tx`]).
-    fn driver_is_node_local_tx(&self, tx: &Transaction<'_>, driver: &str) -> R<bool> {
+    fn driver_is_node_local_tx(&self, tx: &Connection, driver: &str) -> R<bool> {
         let mut stmt = tx.prepare("SELECT fingerprint_attrs FROM node;")?;
         let rows = stmt.query_map([], |row| row.get::<_, Value>(0))?;
         for row in rows {
@@ -6916,6 +9989,32 @@ impl Store {
         fs: Option<&str>,
         attrs: &BTreeMap<String, Value>,
     ) -> R<()> {
+        let volume_id = volume_id.to_owned();
+        let node_id = node_id.to_owned();
+        let mount_path = mount_path.to_owned();
+        let fs = fs.map(str::to_owned);
+        let attrs = attrs.clone();
+        self.replicated(Lane::Scheduler, "record_volume_mounted", move |s| {
+            s.record_volume_mounted_apply(
+                &volume_id,
+                &node_id,
+                &mount_path,
+                node_local,
+                fs.as_deref(),
+                &attrs,
+            )
+        })
+    }
+
+    fn record_volume_mounted_apply(
+        &self,
+        volume_id: &str,
+        node_id: &str,
+        mount_path: &str,
+        node_local: bool,
+        fs: Option<&str>,
+        attrs: &BTreeMap<String, Value>,
+    ) -> R<()> {
         let conn = self.write_connection()?;
         let now = Self::now_rfc3339()?;
         let attrs_json = serde_json::to_string(attrs)?;
@@ -6949,6 +10048,14 @@ impl Store {
     /// `legion volume list` instead of only in a worker log.
     #[instrument(err, skip_all)]
     pub fn record_volume_error(&self, volume_id: &str, error: &str) -> R<()> {
+        let volume_id = volume_id.to_owned();
+        let error = error.to_owned();
+        self.replicated(Lane::Scheduler, "record_volume_error", move |s| {
+            s.record_volume_error_apply(&volume_id, &error)
+        })
+    }
+
+    fn record_volume_error_apply(&self, volume_id: &str, error: &str) -> R<()> {
         let conn = self.write_connection()?;
         let now = Self::now_rfc3339()?;
         conn.execute(
@@ -6969,8 +10076,14 @@ impl Store {
     /// Returns the volumes newly marked, for event emission.
     #[instrument(err, skip_all)]
     pub fn reap_orphaned_volumes(&self) -> R<Vec<Volume>> {
+        self.replicated(Lane::Scheduler, "reap_orphaned_volumes", |s| {
+            s.reap_orphaned_volumes_apply()
+        })
+    }
+
+    fn reap_orphaned_volumes_apply(&self) -> R<Vec<Volume>> {
         let mut conn = self.write_connection()?;
-        let tx = conn.transaction()?;
+        let tx = Self::write_tx(&mut conn)?;
         let now = Self::now_rfc3339()?;
         let orphans: Vec<Volume> = {
             let mut stmt = tx.prepare(&format!(
@@ -7033,6 +10146,13 @@ impl Store {
     /// A worker confirmed the driver reclaimed the volume.
     #[instrument(err, skip_all)]
     pub fn mark_volume_destroyed(&self, volume_id: &str) -> R<()> {
+        let volume_id = volume_id.to_owned();
+        self.replicated(Lane::Scheduler, "mark_volume_destroyed", move |s| {
+            s.mark_volume_destroyed_apply(&volume_id)
+        })
+    }
+
+    fn mark_volume_destroyed_apply(&self, volume_id: &str) -> R<()> {
         let conn = self.write_connection()?;
         let now = Self::now_rfc3339()?;
         conn.execute(
@@ -7102,8 +10222,18 @@ impl Store {
     /// not the default.
     #[instrument(err, skip_all)]
     pub fn delete_volume(&self, volume_id: &str, force: bool) -> R<Volume> {
+        let volume_id = volume_id.to_owned();
+        self.replicated(Lane::Scheduler, "delete_volume", move |s| {
+            s.delete_volume_apply(&volume_id, force)
+        })
+    }
+
+    /// Detaching `instance.storage_handle` here is legal in the same capture:
+    /// `instance` is scheduler-owned too, so the detach and the volume state
+    /// flip stay one atomic op.
+    fn delete_volume_apply(&self, volume_id: &str, force: bool) -> R<Volume> {
         let mut conn = self.write_connection()?;
-        let tx = conn.transaction()?;
+        let tx = Self::write_tx(&mut conn)?;
         let volume: Volume = tx
             .query_row(VOLUME_SELECT.as_str(), [volume_id], |row| {
                 self.volume_from_row(row)
@@ -7128,11 +10258,19 @@ impl Store {
              WHERE volume_id = ?3;",
             params![state, now, volume_id],
         )?;
+        // Re-read through the TRANSACTION, not `get_volume`: inside a raft
+        // capture the read pool still sees pre-capture state (JC-35), so a
+        // post-commit read would return the row as it was before the flip.
+        let deleted: Volume = tx
+            .query_row(VOLUME_SELECT.as_str(), [volume_id], |row| {
+                self.volume_from_row(row)
+            })
+            .optional()?
+            .with_context(|| format!("volume {volume_id} vanished during delete"))?;
         tx.commit()?;
 
         warn!(volume_id, force, "Operator requested volume deletion");
-        self.get_volume(volume_id)?
-            .with_context(|| format!("volume {volume_id} vanished during delete"))
+        Ok(deleted)
     }
 
     /// Node pins for the instances of `task_id` that are awaiting placement.
@@ -7168,11 +10306,7 @@ impl Store {
     /// The node a specific instance's volume is pinned to, if any. Used by the
     /// allocation binder to pair an allocation with the instance whose data
     /// already lives on the node it landed on.
-    fn pinned_node_for_instance_tx(
-        &self,
-        tx: &Transaction<'_>,
-        instance_id: &str,
-    ) -> R<Option<String>> {
+    fn pinned_node_for_instance_tx(&self, tx: &Connection, instance_id: &str) -> R<Option<String>> {
         let node_id = tx
             .query_row(
                 "SELECT volume.node_id FROM volume \
@@ -7197,7 +10331,14 @@ impl Store {
     #[instrument(err, skip_all)]
     pub fn cluster_volume_drivers(&self) -> R<BTreeMap<String, ClusterVolumeDriver>> {
         let conn = self.read_connection()?;
-        let mut stmt = conn.prepare("SELECT id, status, fingerprint_attrs FROM node;")?;
+        // Liveness lives in `node_health` since the phase C-1 node split
+        // (plan §7-C2): `node` keeps identity/attrs, so `status` has to be
+        // joined in — and a node registered but not yet heartbeated has no
+        // health row at all, which reads as `active` like everywhere else.
+        let mut stmt = conn.prepare(
+            "SELECT node.id, COALESCE(node_health.status, 'active'), node.fingerprint_attrs \
+             FROM node LEFT JOIN node_health ON node_health.node_id = node.id;",
+        )?;
         let rows = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -7353,6 +10494,43 @@ mod tests {
     use crate::manager::scheduler::{PlanMode, Scheduler};
     use rusqlite::params;
     use tempfile::Builder;
+
+    /// Adversarial regression (durability past the purge horizon): in raft
+    /// mode the state DB must run `synchronous = FULL` — raft purges its log
+    /// behind snapshots, so a power loss regressing the applied marker below
+    /// `last_purged_log_id` (possible under NORMAL until a WAL checkpoint)
+    /// would brick the node at startup reapply. local_disk keeps NORMAL.
+    #[test]
+    fn durable_sync_runs_write_connection_at_synchronous_full() -> R<()> {
+        let dir = tempfile::tempdir()?;
+
+        let normal = Connection::open(dir.path().join("normal.sqlite"))?;
+        Store::configure_connection(&normal, false, false)?;
+        let level: i64 = normal.query_row("PRAGMA synchronous;", [], |r| r.get(0))?;
+        assert_eq!(level, 1, "local_disk keeps synchronous=NORMAL");
+
+        let full = Connection::open(dir.path().join("full.sqlite"))?;
+        Store::configure_connection(&full, false, true)?;
+        let level: i64 = full.query_row("PRAGMA synchronous;", [], |r| r.get(0))?;
+        assert_eq!(
+            level, 2,
+            "raft-mode write connections must run synchronous=FULL so the applied marker \
+             never regresses past the purged log horizon on power loss"
+        );
+        Ok(())
+    }
+
+    /// Drain and handle every currently claimable eval. The C-2 composite
+    /// splits enqueue their scheduler-lane tails (e.g.
+    /// `node_lost_reschedule`) as local evals; store-level tests pump the
+    /// queue here, standing in for the daemon's eval worker.
+    fn run_pending_evals(store: &Store) -> R<()> {
+        while let Some(eval) = store.claim_eval()? {
+            eval.handle(store)?;
+            store.complete_eval(&eval.id, true)?;
+        }
+        Ok(())
+    }
 
     fn setup_store() -> R<Store> {
         let store_dir = Builder::new()
@@ -7533,6 +10711,99 @@ mod tests {
         assert_eq!(node.status, "lost");
         assert_eq!(node.availability, "unavailable");
 
+        Ok(())
+    }
+
+    /// Phase C-1 (plan §7-C2): the node/node_health split's row lifecycle.
+    /// Registration seeds both halves (control seeds `node`, status seeds
+    /// `node_health`); a missing liveness row hydrates the registration
+    /// defaults; a heartbeat (re)creates the row via upsert; node removal
+    /// (control-lane) orphans the liveness row, which the status-lane
+    /// sweep collects.
+    #[test]
+    fn node_health_row_lifecycle_across_the_split() -> R<()> {
+        let store = setup_store()?;
+
+        store.insert_node(make_node_msg("node-one", "active"))?;
+        let (status, heartbeat): (String, String) = {
+            let conn = store.read_connection()?;
+            conn.query_row(
+                "SELECT status, last_heartbeat FROM node_health WHERE node_id = 'node-one';",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?
+        };
+        assert_eq!(status, "active");
+        assert_eq!(heartbeat, "2023-01-01 00:00:00 +00:00:00");
+
+        // A node row WITHOUT a node_health row (a crash between
+        // registration's control and status ops) hydrates the registration
+        // defaults instead of failing.
+        {
+            let conn = store.write_connection()?;
+            conn.execute("DELETE FROM node_health WHERE node_id = 'node-one';", [])?;
+        }
+        let node = store.get_node("node-one")?;
+        assert_eq!(node.status, "active");
+        assert_eq!(node.last_heartbeat, "");
+        assert_eq!(node.health_checks, json!({}));
+        assert_eq!(store.node_lost_at("node-one")?, None);
+        // The defaults keep the node visible to the lost-checker feed...
+        assert_eq!(
+            store.get_node_ids_and_heartbeats()?,
+            vec![("node-one".to_string(), String::new())]
+        );
+
+        // ...and the first heartbeat (an upsert) creates the row again.
+        store.update_node_heartbeat("node-one".to_string())?;
+        let recreated: i64 = {
+            let conn = store.read_connection()?;
+            conn.query_row(
+                "SELECT COUNT(*) FROM node_health WHERE node_id = 'node-one' AND status = 'active' AND last_heartbeat != '';",
+                [],
+                |row| row.get(0),
+            )?
+        };
+        assert_eq!(recreated, 1, "heartbeat must upsert the liveness row");
+
+        // Liveness writes for unregistered nodes stay no-ops (no row is
+        // invented for a node that never registered).
+        assert!(store.update_node_heartbeat("ghost".to_string()).is_err());
+        let ghosts: i64 = {
+            let conn = store.read_connection()?;
+            conn.query_row(
+                "SELECT COUNT(*) FROM node_health WHERE node_id = 'ghost';",
+                [],
+                |row| row.get(0),
+            )?
+        };
+        assert_eq!(ghosts, 0);
+
+        // Node removal is control-lane only: the node row goes, the
+        // liveness row is orphaned — invisible to every hydration path...
+        store.remove_node("node-one")?;
+        assert!(store.get_node("node-one").is_err());
+        assert!(store.get_node_ids_and_heartbeats()?.is_empty());
+        assert!(store.lost_node_ids()?.is_empty());
+        let orphans: i64 = {
+            let conn = store.read_connection()?;
+            conn.query_row("SELECT COUNT(*) FROM node_health;", [], |row| row.get(0))?
+        };
+        assert_eq!(orphans, 1, "remove_node must not delete status-lane rows");
+
+        // ...and the status-lane sweep collects it without touching the
+        // liveness row of a live node.
+        store.insert_node(make_node_msg("node-two", "active"))?;
+        assert_eq!(store.prune_node_health_orphans()?, 1);
+        let remaining: Vec<String> = {
+            let conn = store.read_connection()?;
+            let mut stmt = conn.prepare("SELECT node_id FROM node_health ORDER BY node_id;")?;
+            let rows = Store::collect_rows(stmt.query_map([], |row| row.get(0))?)?;
+            drop(stmt);
+            rows
+        };
+        assert_eq!(remaining, vec!["node-two".to_string()]);
+        assert_eq!(store.prune_node_health_orphans()?, 0, "sweep is idempotent");
         Ok(())
     }
 
@@ -7829,6 +11100,7 @@ mod tests {
         store.insert_node(make_node_msg("node-two", "active"))?;
 
         store.mark_nodes_as_lost(&["node-one".to_string()])?;
+        run_pending_evals(&store)?;
 
         let node_one = store.get_node("node-one")?;
         assert_eq!(node_one.status, "lost");
@@ -7884,6 +11156,7 @@ mod tests {
         store.place_alloc("node-one", task_id)?;
 
         store.mark_nodes_as_lost(&["node-one".to_string()])?;
+        run_pending_evals(&store)?;
 
         let node_one_allocs = store.allocs_for_node("node-one")?;
         let node_two_allocs = store.allocs_for_node("node-two")?;
@@ -7957,6 +11230,7 @@ mod tests {
 
         // Node just lost: well inside the default 180s replaceAfter window.
         store.mark_nodes_as_lost(&["node-one".to_string()])?;
+        run_pending_evals(&store)?;
 
         // NOT freed: the allocation row stays on the lost node, the instance
         // stays active and bound, and nothing was placed elsewhere.
@@ -7971,6 +11245,7 @@ mod tests {
         // Re-running the sweep (the monitor tick) is idempotent while the
         // threshold has not elapsed.
         store.recheck_lost_nodes();
+        run_pending_evals(&store)?;
         assert_eq!(store.allocs_for_node("node-one")?.len(), 1);
         assert!(store.allocs_for_node("node-two")?.is_empty());
         Ok(())
@@ -7998,6 +11273,7 @@ mod tests {
         assert!(original_handle.is_some());
 
         store.mark_nodes_as_lost(&["node-one".to_string()])?;
+        run_pending_evals(&store)?;
         // Held while inside the window...
         assert_eq!(store.allocs_for_node("node-one")?.len(), 1);
 
@@ -8005,6 +11281,7 @@ mod tests {
         // and run the monitor sweep.
         store.set_node_lost_at("node-one", &backdated_rfc3339(10)?)?;
         store.recheck_lost_nodes();
+        run_pending_evals(&store)?;
 
         assert!(store.allocs_for_node("node-one")?.is_empty());
         let replacements = store.allocs_for_node("node-two")?;
@@ -8035,15 +11312,18 @@ mod tests {
         let instance_id = alloc.instance_id.clone().context("instance bound")?;
 
         store.mark_nodes_as_lost(&["node-one".to_string()])?;
+        run_pending_evals(&store)?;
         // Even an ancient loss never auto-replaces with "never".
         store.set_node_lost_at("node-one", &backdated_rfc3339(60 * 24)?)?;
         store.recheck_lost_nodes();
+        run_pending_evals(&store)?;
         assert_eq!(store.allocs_for_node("node-one")?.len(), 1);
         assert!(store.allocs_for_node("node-two")?.is_empty());
 
         // The node returning is what frees it: binding intact, no churn.
         store.update_node_heartbeat("node-one".into())?;
         store.recheck_lost_nodes();
+        run_pending_evals(&store)?;
         let kept = store.allocs_for_node("node-one")?;
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].id, alloc.id);
@@ -8066,6 +11346,7 @@ mod tests {
         let instance_id = alloc.instance_id.clone().context("instance bound")?;
 
         store.mark_nodes_as_lost(&["node-one".to_string()])?;
+        run_pending_evals(&store)?;
         assert!(store.node_lost_at("node-one")?.is_some());
 
         // Node heartbeats again BEFORE the threshold: lost_at clears and the
@@ -8074,6 +11355,7 @@ mod tests {
         store.update_node_heartbeat("node-one".into())?;
         assert_eq!(store.node_lost_at("node-one")?, None);
         store.recheck_lost_nodes();
+        run_pending_evals(&store)?;
 
         let kept = store.allocs_for_node("node-one")?;
         assert_eq!(kept.len(), 1);
@@ -8103,6 +11385,7 @@ mod tests {
         let db_alloc = store.place_alloc("node-one", db_task)?;
 
         store.mark_nodes_as_lost(&["node-one".to_string()])?;
+        run_pending_evals(&store)?;
 
         // Stateless web: replaced eagerly on node-two. Stateful db: held on
         // the lost node pending loss confirmation.
@@ -9109,6 +12392,71 @@ mod tests {
     }
 
     #[test]
+    fn candidate_version_vector_matches_per_scope_reads_test() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "ready"))?;
+        store.insert_node(make_node_msg("node-b", "ready"))?;
+
+        let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "job-candidates".into(),
+            tasks: vec![TaskConfig::new("task", "noop")],
+            version: None,
+        };
+        store.handle_job_submit(
+            &job,
+            &[Submission {
+                path: "job.jsonnet".into(),
+                content: "job".into(),
+                is_primary: true,
+            }],
+        )?;
+        let job_config_id = store.get_job_config("job-candidates")?.id();
+        let task_id = task_id_for(&store, "task", "job-candidates")?;
+
+        let candidates = vec!["node-a".to_string(), "node-b".to_string()];
+
+        // Nodes that have never held an allocation have no epoch row; the
+        // batched read must report the same 0 the per-scope read does, because
+        // that is the value `apply_plan_submission` compares against.
+        let sampled =
+            store.allocation_version_vector_for_candidates(&job_config_id, &candidates)?;
+        assert_eq!(sampled.get("node:node-a").copied(), Some(0));
+        assert_eq!(sampled.get("node:node-b").copied(), Some(0));
+        assert_eq!(
+            sampled.get(&format!("job_config:{job_config_id}")).copied(),
+            Some(0)
+        );
+
+        // A plan sampled on the fresh node applies, bumping node-a only.
+        let submission = store.insert_plan_submission(
+            &job_config_id,
+            "fresh",
+            &[("node-a".to_string(), task_id)],
+            &store.allocation_version_vector(
+                &job_config_id,
+                &HashSet::from(["node-a".to_string()]),
+            )?,
+        )?;
+        assert!(matches!(
+            store.apply_plan_submission(&submission)?,
+            PlanApplyOutcome::Applied(_)
+        ));
+
+        let after = store.allocation_version_vector_for_candidates(&job_config_id, &candidates)?;
+        let per_scope = store.allocation_version_vector(
+            &job_config_id,
+            &HashSet::from(["node-a".to_string(), "node-b".to_string()]),
+        )?;
+        assert_eq!(after, per_scope, "batched read must match per-scope reads");
+        assert_eq!(after.get("node:node-a").copied(), Some(1));
+        assert_eq!(after.get("node:node-b").copied(), Some(0));
+
+        Ok(())
+    }
+
+    #[test]
     fn plan_submission_rejects_stale_epoch_for_same_job_config() -> R<()> {
         let store = setup_store()?;
         store.insert_node(make_node_msg("node-a", "ready"))?;
@@ -9483,8 +12831,17 @@ mod tests {
 
         let removed = store.remove_allocation_by_id(allocation.id)?;
         assert!(removed.is_some());
+        // The allocation_health FK cascade is gone (C-2): the row survives
+        // the scheduler-lane removal as a harmless orphan until the
+        // status-lane sweep collects it.
+        assert_eq!(store.prune_allocation_health_orphans()?, 1);
         let health = store.allocation_health_for_allocations(&[allocation.id])?;
         assert!(health.is_empty());
+        assert_eq!(
+            store.prune_allocation_health_orphans()?,
+            0,
+            "sweep is idempotent"
+        );
 
         Ok(())
     }
@@ -9605,7 +12962,7 @@ mod tests {
     }
 
     #[test]
-    fn complete_eval_with_event_records_event_atomically() -> R<()> {
+    fn complete_eval_with_event_records_event() -> R<()> {
         let store = setup_store()?;
         let eval = store.enqueue_eval("job_submit", None, None, None, None)?;
         let claimed = store.claim_eval()?.context("eval should be claimable")?;
@@ -11465,6 +14822,634 @@ mod tests {
         assert_eq!(network.ports.len(), 1);
         assert_eq!(network.ports[0].name, "redis");
         assert_eq!(network.ports[0].static_port, Some(6379));
+        Ok(())
+    }
+
+    //
+    // Raft capture seam (phase A-0) — see src/storage/raft/.
+    //
+
+    use crate::storage::raft::capture as raft_capture;
+
+    fn kv_value(store: &Store, key: &str) -> R<Option<String>> {
+        Ok(store.get_kv(key)?.map(|entry| entry.value))
+    }
+
+    #[test]
+    fn capture_mutation_rolls_back_and_apply_reproduces_on_a_second_store() -> R<()> {
+        let src = setup_store()?;
+        let dst = setup_store()?;
+
+        let (entry, changeset) = raft_capture::capture_mutation(&src, Lane::Control, |s| {
+            s.put_kv("cfg/db", "postgres://one", KvValueType::String, None, None)
+        })?;
+        assert_eq!(entry.version, 1, "closure return value survives capture");
+        assert!(!changeset.is_empty(), "changeset captured");
+
+        // The proposer's DB is untouched: the capture savepoint rolled back.
+        assert_eq!(kv_value(&src, "cfg/db")?, None, "source rolled back");
+
+        // Apply on both replicas: identical row effects, including versions.
+        raft_capture::apply_changeset(&dst, &changeset)?;
+        raft_capture::apply_changeset(&src, &changeset)?;
+        assert_eq!(kv_value(&dst, "cfg/db")?.as_deref(), Some("postgres://one"));
+        assert_eq!(kv_value(&src, "cfg/db")?.as_deref(), Some("postgres://one"));
+        assert_eq!(dst.get_kv("cfg/db")?.map(|e| e.version), Some(1));
+        Ok(())
+    }
+
+    #[test]
+    fn capture_error_still_rolls_back_and_captures_nothing() -> R<()> {
+        let store = setup_store()?;
+        store.put_kv("locked", "v1", KvValueType::String, None, None)?;
+
+        let result = raft_capture::capture_mutation(&store, Lane::Control, |s| {
+            // Writes, then fails the version check — the whole capture must
+            // vanish.
+            s.put_kv("other", "x", KvValueType::String, None, None)?;
+            s.put_kv("locked", "v2", KvValueType::String, Some(99), None)
+        });
+        assert!(result.is_err(), "closure error propagates");
+        assert_eq!(
+            kv_value(&store, "other")?,
+            None,
+            "partial write rolled back"
+        );
+        assert_eq!(kv_value(&store, "locked")?.as_deref(), Some("v1"));
+        Ok(())
+    }
+
+    #[test]
+    fn nested_replicated_calls_compose_into_one_changeset() -> R<()> {
+        let src = setup_store()?;
+        let dst = setup_store()?;
+
+        // Both put_kv calls are public replicated methods; inside an active
+        // capture they must run inline (JC-13) and land in ONE changeset.
+        let ((), changeset) = raft_capture::capture_mutation(&src, Lane::Control, |s| {
+            s.put_kv("a", "1", KvValueType::String, None, None)?;
+            s.put_kv("b", "2", KvValueType::String, None, None)?;
+            Ok(())
+        })?;
+        assert_eq!(kv_value(&src, "a")?, None);
+        assert_eq!(kv_value(&src, "b")?, None);
+
+        raft_capture::apply_changeset(&dst, &changeset)?;
+        assert_eq!(kv_value(&dst, "a")?.as_deref(), Some("1"));
+        assert_eq!(kv_value(&dst, "b")?.as_deref(), Some("2"));
+        Ok(())
+    }
+
+    #[test]
+    fn apply_projects_read_model_and_event_side_effects() -> R<()> {
+        let src = setup_store()?;
+        let dst = setup_store()?;
+        // Identical seed state on both replicas (same rows, same rowids).
+        src.insert_node(make_node_msg("node-a", "active"))?;
+        dst.insert_node(make_node_msg("node-a", "active"))?;
+
+        let mut src_events = src.subscribe_events();
+        let mut dst_events = dst.subscribe_events();
+
+        let ((), changeset) = raft_capture::capture_mutation(&src, Lane::Control, |s| {
+            s.mark_node_ready("node-a", "2026-01-01T00:00:00Z")?;
+            Ok(())
+        })?;
+
+        // Suppression during capture: no broadcast, no cache patch, and the
+        // rows themselves rolled back on the proposer.
+        assert!(src_events.try_recv().is_err(), "no event before commit");
+        let src_node = src.get_node("node-a")?;
+        assert_eq!(src_node.status, "active", "node row rolled back");
+        let cached = src.cached_nodes()?;
+        assert_eq!(cached[0].status, "active", "read model not touched");
+
+        raft_capture::apply_changeset(&dst, &changeset)?;
+
+        // Data applied...
+        assert_eq!(dst.get_node("node-a")?.status, "ready");
+        // ...read model projected from the changeset...
+        let dst_cached = dst.cached_nodes()?;
+        assert_eq!(dst_cached.len(), 1);
+        assert_eq!(dst_cached[0].status, "ready");
+        assert_eq!(dst_cached[0].last_heartbeat, "2026-01-01T00:00:00Z");
+        // ...and the staged events broadcast at apply time, in id order.
+        let kinds: Vec<String> = std::iter::from_fn(|| dst_events.try_recv().ok())
+            .map(|event| event.kind)
+            .collect();
+        assert_eq!(kinds, vec!["node.ready"]);
+        Ok(())
+    }
+
+    /// JC-41 (reversing JC-27): eval writes are ordinary REPLICATED
+    /// scheduler-lane ops. An enqueue captured on the scheduler lane rides
+    /// that lane's changeset and passes the ownership guard; the same
+    /// enqueue composed into a control-lane capture is a foreign-lane write
+    /// the guard rejects — which is exactly what forces cross-lane
+    /// composites to enqueue as their own sequential scheduler op after
+    /// their own op commits (JC-33's wrapper-sequential shape).
+    #[test]
+    fn eval_queue_writes_are_scheduler_lane_replicated_ops() -> R<()> {
+        use crate::storage::raft::ownership;
+
+        let store = setup_store()?;
+
+        let (eval, changeset) = raft_capture::capture_mutation(&store, Lane::Scheduler, |s| {
+            s.enqueue_eval("job_submit", Some("captured-job"), None, None, None)
+        })?;
+        assert_eq!(eval.kind, "job_submit");
+        let mut saw_eval_row = false;
+        {
+            use fallible_streaming_iterator::FallibleStreamingIterator;
+            use rusqlite::session::ChangesetIter;
+            let reader: &mut dyn std::io::Read = &mut &*changeset;
+            let mut iter = ChangesetIter::start_strm(&reader)?;
+            while let Some(item) = iter.next()? {
+                if item.op()?.table_name() == "eval" {
+                    saw_eval_row = true;
+                }
+            }
+        }
+        assert!(
+            saw_eval_row,
+            "the eval row must ride the scheduler lane's changeset (JC-41) — without it a \
+             follower cannot inherit acknowledged work"
+        );
+        ownership::verify_changeset_ownership("test_eval_own", Lane::Scheduler, false, &changeset)?;
+
+        // The capture above rolled back, so nothing persisted.
+        assert!(store.get_evals()?.is_empty());
+
+        // Composed into a control-lane capture, the same enqueue is a
+        // foreign-lane write.
+        let ((), control_changeset) = raft_capture::capture_mutation(&store, Lane::Control, |s| {
+            s.put_kv("evals/foreign", "yes", KvValueType::String, None, None)?;
+            s.enqueue_eval("job_submit", Some("foreign-job"), None, None, None)?;
+            Ok(())
+        })?;
+        let err = ownership::verify_changeset_ownership(
+            "test_eval_foreign",
+            Lane::Control,
+            false,
+            &control_changeset,
+        )
+        .expect_err("an eval enqueued inside a control capture must be rejected");
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("eval"), "{rendered}");
+        assert!(rendered.contains("scheduler"), "{rendered}");
+        Ok(())
+    }
+
+    /// The replica content hash covers replicated tables and excludes only
+    /// what legitimately differs between healthy replicas: raft bookkeeping
+    /// and the locally-pruned commutative tables (`scheduler_event`,
+    /// `idempotency_record`, JC-28). `eval` is INCLUDED again (JC-41) —
+    /// replicas that disagree about pending work have diverged.
+    #[test]
+    fn content_hash_ignores_commutative_tables_but_covers_evals() -> R<()> {
+        let store = setup_store()?;
+        store.put_kv("hash/base", "v", KvValueType::String, None, None)?;
+        // Flush the events staged by the write above so the baseline hash
+        // is taken with a quiet journal.
+        let baseline = store.state_content_hash()?;
+
+        store.emit_event(EventDraft::info("test.kind", "local divergence"));
+        assert!(store.idempotency_record("hash-key", "op", "message")?);
+
+        assert_eq!(
+            store.state_content_hash()?,
+            baseline,
+            "scheduler_event/idempotency_record rows must not change the replica hash"
+        );
+
+        let eval = store.enqueue_eval("job_submit", None, None, None, None)?;
+        let with_eval = store.state_content_hash()?;
+        assert_ne!(
+            with_eval, baseline,
+            "the eval queue is replicated state (JC-41): a pending eval MUST change the hash, \
+             or replicas could silently disagree about acknowledged work"
+        );
+        store.complete_eval(&eval.id, true)?;
+        assert_eq!(
+            store.state_content_hash()?,
+            baseline,
+            "completing the eval returns the queue — and the hash — to its baseline"
+        );
+
+        store.put_kv("hash/other", "v2", KvValueType::String, None, None)?;
+        assert_ne!(
+            store.state_content_hash()?,
+            baseline,
+            "replicated rows must still change the hash"
+        );
+        Ok(())
+    }
+
+    /// JC-28: journal pruning is local maintenance. Under capture the
+    /// opportunistic prune is suppressed (the changeset stays INSERT-only)
+    /// and each replica prunes its own journal when projecting the
+    /// committed changeset.
+    #[test]
+    fn event_journal_prunes_locally_at_apply_time() -> R<()> {
+        let src = setup_store()?;
+        let dst = setup_store()?;
+        // Fill the destination's journal to exactly the retention size, so
+        // one more applied event pushes the oldest row (id 1) out of the
+        // count-based retained window.
+        {
+            let conn = dst.write_connection()?;
+            conn.execute(
+                "WITH RECURSIVE seq(n) AS (
+                     SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < ?1
+                 )
+                 INSERT INTO scheduler_event (id, kind, level, message, metadata_json, created_at)
+                 SELECT n, 'old.kind', 'info', 'stale', '{}', '2026-01-01T00:00:00Z' FROM seq;",
+                [EVENT_RETAINED_ROWS],
+            )?;
+        }
+
+        // Capture an event insert whose id lands exactly on the prune
+        // boundary (`Store::event_id_triggers_prune`, which divides the lane
+        // residue out first — JC-42) and sorts above every seeded row.
+        let stride = Lane::ID_STRIDE;
+        let period = stride * EVENT_PRUNE_INTERVAL;
+        let boundary_id = EVENT_RETAINED_ROWS + period - EVENT_RETAINED_ROWS.rem_euclid(period);
+        assert!(Store::event_id_triggers_prune(boundary_id));
+        let ((), changeset) = raft_capture::capture_mutation(&src, Lane::Control, |s| {
+            let conn = s.write_connection()?;
+            conn.execute(
+                "INSERT INTO scheduler_event (id, kind, level, message, metadata_json, created_at)
+                 VALUES (?1, 'new.kind', 'info', 'boundary', '{}', '2026-01-01T00:00:00Z');",
+                [boundary_id],
+            )?;
+            Ok(())
+        })?;
+        // The capture recorded ONLY the insert (no DELETE prune rode along).
+        {
+            use fallible_streaming_iterator::FallibleStreamingIterator;
+            use rusqlite::hooks::Action;
+            use rusqlite::session::ChangesetIter;
+            let reader: &mut dyn std::io::Read = &mut &*changeset;
+            let mut iter = ChangesetIter::start_strm(&reader)?;
+            while let Some(item) = iter.next()? {
+                assert_eq!(item.op()?.code(), Action::SQLITE_INSERT);
+            }
+        }
+
+        raft_capture::apply_changeset(&dst, &changeset)?;
+        let (stale, boundary): (i64, i64) = {
+            let conn = dst.read_connection()?;
+            (
+                conn.query_row(
+                    "SELECT COUNT(*) FROM scheduler_event WHERE id = 1;",
+                    [],
+                    |r| r.get(0),
+                )?,
+                conn.query_row(
+                    "SELECT COUNT(*) FROM scheduler_event WHERE id = ?1;",
+                    [boundary_id],
+                    |r| r.get(0),
+                )?,
+            )
+        };
+        assert_eq!(boundary, 1, "committed event applied");
+        assert_eq!(stale, 0, "replica pruned its own journal at apply time");
+        Ok(())
+    }
+
+    /// JC-42: the opportunistic prune boundary must not systematically
+    /// favor one lane. With lane-strided ids the pre-JC-42 test
+    /// (`id % EVENT_PRUNE_INTERVAL == 0`) is satisfiable ONLY by ids
+    /// divisible by the stride — i.e. only ever by the control lane — so a
+    /// cluster whose journal is dominated by status/scheduler events would
+    /// never prune on the nodes applying them. Dividing the residue out
+    /// first gives every lane the same boundary rate.
+    #[test]
+    fn prune_boundary_fires_at_the_same_rate_on_every_lane() {
+        const PERIODS: i64 = 4;
+        for lane in Lane::ALL {
+            // Consecutive ids as one lane actually mints them: consecutive
+            // sequence values, all inside the lane's residue class.
+            let ids: Vec<i64> = (0..PERIODS * EVENT_PRUNE_INTERVAL)
+                .map(|sequence| sequence * Lane::ID_STRIDE + lane.id_residue())
+                .collect();
+            let hits = ids
+                .iter()
+                .filter(|id| Store::event_id_triggers_prune(**id))
+                .count() as i64;
+            assert_eq!(
+                hits,
+                PERIODS,
+                "the {} lane must reach the prune boundary once per {EVENT_PRUNE_INTERVAL} \
+                 events, like every other lane",
+                lane.wire_name()
+            );
+
+            // Regression guard: the naive rule this replaced.
+            let naive = ids
+                .iter()
+                .filter(|id| *id % EVENT_PRUNE_INTERVAL == 0)
+                .count();
+            if lane == Lane::Control {
+                assert!(naive > 0);
+            } else {
+                assert_eq!(
+                    naive,
+                    0,
+                    "the naive `id % EVENT_PRUNE_INTERVAL` boundary is unreachable from the {} \
+                     lane — that is the bug event_id_triggers_prune exists to prevent",
+                    lane.wire_name()
+                );
+            }
+        }
+    }
+
+    /// JC-42, the cursor + publication contract with interleaved lanes: a
+    /// replica applying events from all three lanes must still expose them
+    /// as ONE `after_id`-walkable stream (every event returned exactly
+    /// once, ids strictly increasing) and publish them to live subscribers
+    /// in id order. Strided ids are sparse and interleave across lanes, so
+    /// this is the property `ListEvents`/`StreamEvents` actually rely on —
+    /// density was never part of it.
+    #[test]
+    fn strided_ids_from_every_lane_walk_a_single_cursor_exactly_once() -> R<()> {
+        let store = setup_store()?;
+        let mut subscriber = store.subscribe_events();
+
+        // Round-robin the lanes, the way three lane leaders on one node
+        // interleave their commits.
+        let mut emitted = 0usize;
+        for round in 0..4 {
+            for lane in Lane::ALL {
+                let ((), changeset) = raft_capture::capture_mutation(&store, lane, |s| {
+                    s.emit_event(EventDraft::info(
+                        "probe.interleaved",
+                        format!("{} round {round}", lane.wire_name()),
+                    ));
+                    Ok(())
+                })?;
+                raft_capture::apply_changeset(&store, &changeset)?;
+                emitted += 1;
+            }
+        }
+
+        // Walk the journal with a small limit, as a poller does.
+        let mut cursor = 0i64;
+        let mut walked: Vec<i64> = Vec::new();
+        loop {
+            let batch = store.list_scheduler_events(&SchedulerEventFilter {
+                after_id: Some(cursor),
+                limit: Some(2),
+                ..Default::default()
+            })?;
+            if batch.is_empty() {
+                break;
+            }
+            for event in batch {
+                assert!(
+                    event.id > cursor,
+                    "the cursor must advance strictly: {} after {cursor}",
+                    event.id
+                );
+                cursor = event.id;
+                walked.push(event.id);
+            }
+        }
+        assert_eq!(
+            walked.len(),
+            emitted,
+            "cursor walk visited every event once"
+        );
+        let unique: std::collections::BTreeSet<i64> = walked.iter().copied().collect();
+        assert_eq!(unique.len(), walked.len(), "no event was visited twice");
+        for lane in Lane::ALL {
+            assert_eq!(
+                walked
+                    .iter()
+                    .filter(|id| id.rem_euclid(Lane::ID_STRIDE) == lane.id_residue())
+                    .count(),
+                4,
+                "the {} lane's events must all be present",
+                lane.wire_name()
+            );
+        }
+
+        // The publication path (apply → project → broadcast) delivered the
+        // same events, in increasing id order — what the StreamEvents
+        // lag/backfill dedupe (`event.id <= last_sent`) depends on.
+        let mut published: Vec<i64> = Vec::new();
+        while let Ok(event) = subscriber.try_recv() {
+            published.push(event.id);
+        }
+        assert_eq!(
+            published, walked,
+            "live publication order must match id order"
+        );
+        Ok(())
+    }
+
+    /// JC-42 end-to-end through the public emit path: ids minted outside
+    /// any capture (`local_disk` mode, i.e. every non-raft caller) keep the
+    /// control lane's residue, stay strictly increasing, and remain usable
+    /// as `after_id` cursors.
+    #[test]
+    fn locally_emitted_event_ids_are_strided_and_increasing() -> R<()> {
+        let store = setup_store()?;
+        for index in 0..16 {
+            store.emit_event(EventDraft::info("test.kind", format!("event {index}")));
+        }
+        let events = store.list_scheduler_events(&SchedulerEventFilter::default())?;
+        assert_eq!(events.len(), 16);
+        assert!(events.windows(2).all(|pair| pair[0].id < pair[1].id));
+        for event in &events {
+            assert_eq!(
+                event.id.rem_euclid(Lane::ID_STRIDE),
+                Lane::Control.id_residue(),
+                "ids minted outside a capture use the control residue: {}",
+                event.id
+            );
+        }
+        // The cursor contract is ordering, not density: `after_id` returns
+        // exactly the events above it even though ids are sparse.
+        let after = store.list_scheduler_events(&SchedulerEventFilter {
+            after_id: Some(events[3].id),
+            ..Default::default()
+        })?;
+        assert_eq!(after.len(), 12);
+        assert_eq!(after[0].id, events[4].id);
+        Ok(())
+    }
+
+    #[test]
+    fn allocation_changes_project_per_node_allocation_lists() -> R<()> {
+        let src = setup_store()?;
+        let dst = setup_store()?;
+        for store in [&src, &dst] {
+            store.insert_node(make_node_msg("node-a", "ready"))?;
+            let job = JobConfig {
+                rollout: None,
+                rollout_by_group: Default::default(),
+                name: "proj-demo".into(),
+                tasks: vec![task("web")],
+                version: None,
+            };
+            store.handle_job_submit(
+                &job,
+                &[Submission {
+                    path: "job.jsonnet".into(),
+                    content: "job".into(),
+                    is_primary: true,
+                }],
+            )?;
+        }
+        let task_id = task_id_for(&src, "web", "proj-demo")?;
+
+        let (allocation, changeset) = raft_capture::capture_mutation(&src, Lane::Control, |s| {
+            s.place_alloc("node-a", task_id)
+        })?;
+        assert_eq!(allocation.node_id, "node-a");
+        assert!(
+            src.cached_allocations_by_node()?
+                .get("node-a")
+                .map_or(true, |allocs| allocs.is_empty()),
+            "no allocation cached during capture"
+        );
+
+        raft_capture::apply_changeset(&dst, &changeset)?;
+        let by_node = dst.cached_allocations_by_node()?;
+        let allocs = by_node.get("node-a").context("node-a allocations")?;
+        assert_eq!(allocs.len(), 1);
+        assert_eq!(
+            allocs[0].id, allocation.id,
+            "leader-assigned rowid replicated"
+        );
+        Ok(())
+    }
+
+    /// JC-40 composite-retry idempotency: when the status half of the
+    /// submit composite is lost (rejected on a node that did not lead the
+    /// status lane yet), the client's retry re-submits the identical config
+    /// — which reports `Unchanged` — and must still reseed the task-status
+    /// rows. Otherwise the composite stays half-applied forever, since no
+    /// later submit of that config ever reports Created/Updated again.
+    #[test]
+    fn an_unchanged_resubmit_reseeds_missing_task_statuses() -> R<()> {
+        let store = setup_store()?;
+        let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "reseed-demo".into(),
+            tasks: vec![task("web")],
+            version: None,
+        };
+        let subs = [Submission {
+            path: "job.jsonnet".into(),
+            content: "job".into(),
+            is_primary: true,
+        }];
+        let outcome = store.handle_job_submit(&job, &subs)?;
+        let job_config_id = outcome.job_config_id().to_string();
+        assert_eq!(
+            store.task_statuses_for_job_config(&job_config_id)?.len(),
+            1,
+            "the first submit seeds the status rows"
+        );
+
+        // Simulate the lost status half: drop the rows the status-lane op
+        // would have written.
+        store.write_connection()?.execute(
+            "DELETE FROM task_status WHERE job_config_id = ?1;",
+            [&job_config_id],
+        )?;
+        assert!(store
+            .task_statuses_for_job_config(&job_config_id)?
+            .is_empty());
+
+        // The client-style retry: same config, so the control half is a
+        // no-op and reports Unchanged.
+        let retry = store.handle_job_submit(&job, &subs)?;
+        assert!(
+            matches!(retry, JobSubmitOutcome::Unchanged { .. }),
+            "an identical resubmit must report Unchanged: {retry:?}"
+        );
+        assert_eq!(
+            store.task_statuses_for_job_config(&job_config_id)?.len(),
+            1,
+            "the retry must reseed the missing status rows"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn raft_mode_write_connection_guard_blocks_unclassified_writes() -> R<()> {
+        let store = setup_store()?;
+        store.set_raft_mode(true);
+
+        // Outside capture/apply: loud error.
+        let err = store.write_connection().err().context("guard must trip")?;
+        assert!(
+            err.to_string().contains("raft mode"),
+            "unexpected guard error: {err}"
+        );
+        // Public mutators route to the (not yet started) pipeline.
+        let err = store
+            .stop_job("nope")
+            .err()
+            .context("must not run inline")?;
+        assert!(
+            err.to_string().contains("replication pipeline not started"),
+            "unexpected replicated error: {err}"
+        );
+
+        // Inside a capture the write connection is allowed...
+        let ((), changeset) = raft_capture::capture_mutation(&store, Lane::Control, |s| {
+            s.put_kv("k", "v", KvValueType::String, None, None)?;
+            Ok(())
+        })?;
+        // ...and so is the apply path.
+        raft_capture::apply_changeset(&store, &changeset)?;
+        assert_eq!(kv_value(&store, "k")?.as_deref(), Some("v"));
+
+        store.set_raft_mode(false);
+        assert!(store.write_connection().is_ok(), "guard disarms");
+        Ok(())
+    }
+
+    /// Adversarial regression (2026-07-25): `query_state_store --allow-write`
+    /// used to report success for DDL in raft mode while replicating
+    /// nothing (SQLite sessions do not capture schema changes, and the
+    /// resulting empty changeset is skipped before proposal). It must fail
+    /// loudly and point at migrations; row DML is still accepted.
+    #[test]
+    fn raft_mode_refuses_unreplicable_ddl_through_the_query_seam() -> R<()> {
+        let store = setup_store()?;
+
+        // local_disk mode: unchanged behavior — DDL runs inline.
+        store.query_state_store("CREATE TABLE local_only_ddl (id INTEGER);", true)?;
+
+        store.set_raft_mode(true);
+        let err = store
+            .query_state_store("CREATE TABLE raft_ddl (id INTEGER);", true)
+            .err()
+            .context("DDL must be refused in raft mode")?;
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("CREATE"), "{rendered}");
+        assert!(rendered.contains("migration"), "{rendered}");
+
+        // Row DML is replicable and still routes to the pipeline (which is
+        // not started in this unit test — proving it got past the DDL gate).
+        let err = store
+            .query_state_store("DELETE FROM kv_entry WHERE key = 'nope';", true)
+            .err()
+            .context("DML must reach the replication pipeline")?;
+        assert!(
+            format!("{err:#}").contains("replication pipeline not started"),
+            "{err:#}"
+        );
+
+        // Reads are unaffected.
+        store.query_state_store("SELECT 1;", false)?;
+        store.set_raft_mode(false);
         Ok(())
     }
 }
