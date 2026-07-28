@@ -209,7 +209,14 @@ Plans: [persistence-plan.md](plans/persistence-plan.md), [multi-raft-persistence
   - [ ] Speculative: Raft autopilot
 - [x] Loading state back in from a file — `legion state backup` +
       `--restore-from` ([#137](https://github.com/mikenomitch/legion/pull/137))
-- [ ] Cluster federation
+- [ ] **Cluster federation** —
+      [plan](plans/multi-cluster-federation-plan.md) (PLANNED, with a
+      [calls doc](calls/multi-cluster-federation-plan_calls.md)): named
+      clusters in the CLI/UI, symmetric peering (no hub), request
+      forwarding, federated SSO, multi-cluster jobs, standby managers
+      (learners + zone auto-replacement), and an async DR standby cluster
+      with manual promotion and generation fencing. Cross-cluster service
+      discovery deferred to a follow-up plan (see plan §11).
 - [x] Version handshake between manager and worker — protocol version plus
       build-skew reporting, upgrade order in [docs/upgrades.md](../docs/upgrades.md)
       ([#137](https://github.com/mikenomitch/legion/pull/137))

@@ -59,6 +59,7 @@ When one is required and what goes in it:
 | [durability-and-ops-execution-plan.md](plans/durability-and-ops-execution-plan.md) | executed (workstreams A/B); lanes topology experimental |
 | [kv-reactive-task-updates-plan.md](plans/kv-reactive-task-updates-plan.md) | shipped |
 | [persistence-plan.md](plans/persistence-plan.md) | phases 0–1, 3 done |
+| [multi-cluster-federation-plan.md](plans/multi-cluster-federation-plan.md) | planned |
 | [multi-raft-persistence-plan.md](plans/multi-raft-persistence-plan.md) | planned |
 | [service-discovery-final-plan.md](plans/service-discovery-final-plan.md) | authoritative; v1 in progress |
 | [service-discovery-plan.md](plans/service-discovery-plan.md) | superseded (rationale + full mesh design) |
@@ -91,6 +92,7 @@ by project impact. The full template and a worked example:
 - [container-task-kind-macos_calls.md](calls/container-task-kind-macos_calls.md)
 - [exec-and-actions-plan_calls.md](calls/exec-and-actions-plan_calls.md)
 - [kv-reactive-task-updates-plan_calls.md](calls/kv-reactive-task-updates-plan_calls.md)
+- [multi-cluster-federation-plan_calls.md](calls/multi-cluster-federation-plan_calls.md)
 - [multi-raft-persistence-plan_calls.md](calls/multi-raft-persistence-plan_calls.md)
 - [persistence-plan_calls.md](calls/persistence-plan_calls.md)
 - [service-discovery-final-plan_calls.md](calls/service-discovery-final-plan_calls.md)
