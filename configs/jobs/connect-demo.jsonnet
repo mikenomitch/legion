@@ -19,7 +19,7 @@
             name: "web",
             // Two allocations, so the balancing is actually observable.
             count: 2,
-            kind: "exec",
+            runtime: "exec",
             lifecycle: "service",
             config: {
                 // Serve a one-line index.html naming this allocation, so the
@@ -63,7 +63,7 @@
         },
         {
             name: "client",
-            kind: "exec",
+            runtime: "exec",
             lifecycle: "service",
             // The whole consumer-side surface: one upstream, one env var.
             connect: {

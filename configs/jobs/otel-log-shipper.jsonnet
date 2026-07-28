@@ -23,7 +23,7 @@
 //   3. If you point workers at an absolute LEGION_WORKER_STATE_PATH, set `cwd`
 //      on the task (or make the include glob absolute) so the collector can find
 //      the files.
-//   4. Container task kind cannot do this: it has no host volume mounts, so a
+//   4. Container task runtime cannot do this: it has no host volume mounts, so a
 //      containerized collector cannot read the node's log files. Use `exec`.
 
 local otlpEndpoint = 'http://localhost:4318';  // <-- EDIT: your OTLP logs backend
@@ -72,7 +72,7 @@ local collectorConfig = |||
   name: 'otel-log-shipper',
   task: {
     name: 'otel-collector',
-    kind: 'exec',
+    runtime: 'exec',
     lifecycle: 'service',
     count: { num: 1, per: 'id' },  // one allocation per node
     config: {

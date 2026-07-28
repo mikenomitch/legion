@@ -79,7 +79,7 @@ pub fn config() -> Command {
         .args(jsonnet_var_args());
 
     let schema_cmd = Command::new("schema")
-        .about("Emit the JSON Schema for jobspecs and built-in task kinds")
+        .about("Emit the JSON Schema for jobspecs and built-in task runtimes")
         .arg(json_flag());
 
     let wait_cmd = Command::new("wait")
@@ -478,7 +478,11 @@ async fn validate_job(arg_matches: &ArgMatches) -> R<()> {
             format,
             CliError::local(
                 "InvalidArgument",
-                format!("jobspec failed validation: {err}"),
+                // `{err:#}` so the whole context chain survives. Plain `{err}`
+                // prints only the outermost frame — "task web config invalid" —
+                // and drops the runtime's actual reason, which is the only part
+                // that tells the user what to change.
+                format!("jobspec failed validation: {err:#}"),
                 None,
             ),
         ));
@@ -524,11 +528,11 @@ async fn job_schema(arg_matches: &ArgMatches) -> R<()> {
 }
 
 /// Assemble the jobspec JSON Schema: a documented top-level envelope plus the
-/// live, per-kind task config schemas derived from the built-in plugins.
+/// live, per-runtime task config schemas derived from the built-in plugins.
 pub(crate) fn build_jobspec_schema() -> Value {
-    let mut task_kinds = serde_json::Map::new();
+    let mut task_runtimes = serde_json::Map::new();
     for plugin in builtin_task_plugin_schemas() {
-        task_kinds.insert(plugin.name, plugin.schema);
+        task_runtimes.insert(plugin.name, plugin.schema);
     }
 
     json!({
@@ -536,7 +540,7 @@ pub(crate) fn build_jobspec_schema() -> Value {
         "title": "Legion Jobspec",
         "description": "A Legion job specification (the JSON a jsonnet jobspec renders to). \
             A job has a name and one or more tasks (use `task` for a single task or `tasks` for many). \
-            Each task's `config` object is validated against the schema for its `kind` under `taskKinds`.",
+            Each task's `config` object is validated against the schema for its `runtime` under `taskRuntimes`.",
         "type": "object",
         "required": ["name"],
         "properties": {
@@ -554,10 +558,10 @@ pub(crate) fn build_jobspec_schema() -> Value {
         "$defs": {
             "task": {
                 "type": "object",
-                "required": ["kind"],
+                "required": ["runtime"],
                 "properties": {
                     "name": { "type": "string", "description": "Task name (unique within the job)." },
-                    "kind": { "type": "string", "description": "Task kind/plugin (e.g. exec, container, noop)." },
+                    "runtime": { "type": "string", "description": "Task runtime plugin that runs this task (e.g. exec, container, noop)." },
                     "group": { "type": "string", "description": "Task group; tasks in a group are placed together." },
                     "lifecycle": { "type": "string", "enum": ["service", "batch", "sidecar"], "description": "Task lifecycle." },
                     "count": {
@@ -570,7 +574,7 @@ pub(crate) fn build_jobspec_schema() -> Value {
                             }}
                         ]
                     },
-                    "config": { "type": "object", "description": "Kind-specific config; validated against taskKinds[kind]." },
+                    "config": { "type": "object", "description": "Runtime-specific config; validated against taskRuntimes[runtime]." },
                     "dependsOn": {
                         "type": "array",
                         "items": { "type": "object", "required": ["task"], "properties": {
@@ -591,7 +595,7 @@ pub(crate) fn build_jobspec_schema() -> Value {
                 }
             }
         },
-        "taskKinds": task_kinds
+        "taskRuntimes": task_runtimes
     })
 }
 
@@ -1232,14 +1236,16 @@ mod tests {
     }
 
     #[test]
-    fn jobspec_schema_embeds_task_kinds() {
+    fn jobspec_schema_embeds_task_runtimes() {
         let schema = build_jobspec_schema();
         assert_eq!(schema["title"], "Legion Jobspec");
-        let kinds = schema["taskKinds"].as_object().expect("taskKinds object");
-        // Built-in kinds must be present and carry real derived schemas.
-        assert!(kinds.contains_key("exec"));
-        assert!(kinds.contains_key("container"));
-        assert!(kinds["exec"]["properties"].is_object());
+        let runtimes = schema["taskRuntimes"]
+            .as_object()
+            .expect("taskRuntimes object");
+        // Built-in runtimes must be present and carry real derived schemas.
+        assert!(runtimes.contains_key("exec"));
+        assert!(runtimes.contains_key("container"));
+        assert!(runtimes["exec"]["properties"].is_object());
     }
 
     #[test]
@@ -1275,7 +1281,7 @@ mod tests {
             {
               name: std.extVar("job_name"),
               task: {
-                kind: "noop",
+                runtime: "noop",
               },
             }
             "#,
@@ -1438,6 +1444,52 @@ async fn plan_job(arg_matches: &ArgMatches) -> R<()> {
             println!("No allocations planned");
         } else {
             print_table(printable_allocations);
+        }
+        // One line per task on how candidates were generated: which
+        // scheduling index served (or why none did). Quiet when there is
+        // nothing to say (indexes unarmed and no reason recorded).
+        let index_lines: Vec<String> = reply
+            .index_usage
+            .iter()
+            .filter_map(|usage| {
+                if usage.index.is_empty() {
+                    if usage.reason.is_empty() {
+                        return None;
+                    }
+                    return Some(format!("{}: scan — {}", usage.task_name, usage.reason));
+                }
+                let mut notes = Vec::new();
+                if usage.truncated {
+                    notes.push("truncated".to_string());
+                }
+                if usage.refills > 0 {
+                    notes.push(format!("refills {}", usage.refills));
+                }
+                if usage.fell_back {
+                    notes.push("fell back to scan".to_string());
+                }
+                if let Some(agreement) = usage.shadow_agreement {
+                    notes.push(format!(
+                        "shadow {}",
+                        if agreement { "agrees" } else { "DISAGREES" }
+                    ));
+                }
+                let notes = if notes.is_empty() {
+                    String::new()
+                } else {
+                    format!("; {}", notes.join(", "))
+                };
+                Some(format!(
+                    "{}: index {} ({} mode, {} candidates{})",
+                    usage.task_name, usage.index, usage.mode, usage.candidates, notes
+                ))
+            })
+            .collect();
+        if !index_lines.is_empty() {
+            println!("Scheduling index:");
+            for line in index_lines {
+                println!("  {line}");
+            }
         }
     }
 

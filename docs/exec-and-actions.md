@@ -7,11 +7,11 @@ both the CLI and the web UI. Access is gated by two ACL resources (`exec` and
 full shell access.
 
 Design rationale and the alternatives considered live in
-[docs/plans/exec-and-actions-plan.md](plans/exec-and-actions-plan.md).
+[internal_docs/plans/exec-and-actions-plan.md](../internal_docs/plans/exec-and-actions-plan.md).
 
 - [Exec](#exec)
 - [Actions](#actions)
-- [Which task kinds support exec](#which-task-kinds-support-exec)
+- [Which task runtimes support exec](#which-task-runtimes-support-exec)
 - [ACLs](#acls)
 - [Agents (MCP)](#agents-mcp)
 - [Disabling exec](#disabling-exec)
@@ -62,7 +62,7 @@ Add an `actions` array to a task in the job spec:
   name: 'web',
   task: {
     name: 'api',
-    kind: 'container',
+    runtime: 'container',
     config: { image: 'ghcr.io/acme/api:1.4', command: ['/srv/api'] },
     actions: [
       {
@@ -122,16 +122,18 @@ In the **UI**, the same **Exec & Actions** panel renders each action with a
 form generated from its parameter schema (enum → dropdown, int/string →
 validated input); *Run* streams output into the terminal with an exit code.
 
-## Which task kinds support exec
+## Which task runtimes support exec
 
-Each task kind declares its exec support; `legion exec` fails fast with a clear
-error against a kind that does not support it.
+Each task runtime declares its exec support; `legion exec` fails fast with a clear
+error against a runtime that does not support it.
 
 | Kind | Exec | Interactive (tty) | Notes |
 | --- | --- | --- | --- |
 | `exec` | ✅ | ✅ | Runs a sibling host process with the task's env/cwd. **Host-level** — requires the `host` ACL grant. |
 | `container` (Apple `container`) | ✅ | ✅ | `container exec` inside the container's namespaces (sandboxed). |
 | `container` (youki) | ❌ | ❌ | Deferred; reports unsupported. |
+| `sandbox` (microVM) | ❌ | ❌ | Deferred; exec into a guest needs a vsock agent. Reports unsupported rather than failing at session open. |
+| `sandbox` (macOS dev mode) | ✅ | ✅ | `container exec` into the sandbox's VM-backed container. |
 | `noop` / custom plugins | ❌ | ❌ | Opt in by implementing `exec_support()` + `exec()`. |
 
 > **Windows:** interactive PTY uses ConPTY via `portable-pty`. It is expected
@@ -151,8 +153,9 @@ Rule selectors:
 
 - `names` — job names (glob), as elsewhere.
 - `action_names` — action names (glob), on `action` rules.
-- `host: true` — on `exec` rules, also permits exec into **host-level** kinds
-  (the `exec` kind). Without it, an `exec` rule matches only sandboxed kinds.
+- `host: true` — on `exec` rules, also permits exec into **host-level** runtimes
+  (the `exec` runtime). Without it, an `exec` rule matches only sandboxed
+  runtimes (`container`, `sandbox`).
 
 ```jsonnet
 [

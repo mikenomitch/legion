@@ -26,6 +26,11 @@
 - Name tests descriptively with `_test` modules/functions.
 - Run full suite via `cargo test --all --locked`; avoid mutating shared fixtures.
 - Always run Rust tests unless the change only touches the front end or documentation.
+- **Scheduler changes ship with before/after benchmark numbers.** Run the
+  relevant `benches/scheduler_bench.rs` groups (e.g.
+  `cargo bench --bench scheduler_bench -- candidate_construction`) on the
+  base branch and on your change, and put both numbers in the PR. See
+  `docs/testing-and-benchmarks.md`.
 
 ## Commit & Pull Request Guidelines
 - Commits: short, imperative summaries (e.g., "Refactor store helpers").
@@ -70,7 +75,7 @@ Every Manager gRPC endpoint must enforce ACLs. When you add an RPC:
   missing `check_acl` calls in the handlers; never silence the test by
   classifying an unprotected endpoint as `Open`.
 - Never log token secrets; log accessor IDs. See `docs/auth-and-acls.md` and
-  `docs/plans/auth-acl-plan.md` for the model and roadmap.
+  `internal_docs/plans/auth-acl-plan.md` for the model and roadmap.
 
 ## Tracing Guidance
 - Use `#[instrument]` on async or queue/loop boundaries (RPC handlers, scheduler entrypoints, eval worker loops).
@@ -109,28 +114,152 @@ the MCP server). Keep these surfaces agent-friendly when contributing. See
   can self-correct before mutating the cluster.
 - **Document new agent surfaces** in `docs/agent-readiness.md`.
 
-## Docs, Plan, and To Dos
-- Docs, Plan, and To Dos live in `docs/`
-- `docs/agent-readiness.md` describes the agent-facing surfaces (MCP, structured
-  output, capabilities, validate/schema, idempotency, wait, saved queries)
-- `docs/NEXT_UP.md` contains the immediate todos for the current task that the human developer is working on
-- `docs/TASK-LIST.md` contains a higher-level To Do list
-- `docs/differentiators.md` contains a list of reasons that legion is different from K8s and Nomad
-- Every gRPC method and every request/response attribute must be documented with in-depth, public-facing proto comments in `proto/legion.proto` and treated as the source of truth for API behavior.
-- Architecture and behavior docs:
-  - `docs/architecture-managers-workers.md`
-  - `docs/plugin-system.md`
-  - `docs/scheduler-and-eval-loop.md`
-  - `docs/jobs-tasks-and-scheduling.md`
-  - `docs/task-kind-plugins.md`
-  - `docs/task-kind-exec.md`
-  - `docs/task-kind-container.md`
-  - `docs/task-kind-noop.md`
-  - `docs/state-store.md`
-  - `docs/observability.md`
-  - `docs/ui-architecture.md`
-  - `docs/kv-store.md`
-  - `docs/auth-and-acls.md`
-  - `docs/testing-and-benchmarks.md`
-  - `docs/codebase-conventions.md`
-  - `docs/agent-readiness.md`
+## Documentation
+
+Legion keeps **two** documentation trees. Every new document goes in exactly one
+of them; when in doubt, ask "would I be happy for a prospective user to read
+this?"
+
+- **`docs/` — public.** Written for people using, operating, or evaluating
+  Legion, and for contributors reading the code. Architecture, behavior, API,
+  and operational reference all belong here. This is a technical product, so
+  deeply technical material is welcome in public docs — it just has to be *fit
+  for a public audience*: accurate, finished, and self-contained, with no
+  to-do lists, scratch notes, private roadmaps, or promises of unshipped work.
+  The index is [`docs/README.md`](docs/README.md).
+- **`internal_docs/` — internal.** Anything that is a *plan*, a *to do*, or a
+  *development note*: design plans and proposals, task lists, milestones,
+  roadmaps, competitive gap analyses, library-evaluation research, migration
+  write-ups, and assorted dev notes. The index is
+  [`internal_docs/README.md`](internal_docs/README.md).
+  - `internal_docs/plans/` — design plans and proposals; how to write one is in
+    [`plans/README.md`](internal_docs/plans/README.md).
+  - `internal_docs/calls/` — judgement-call records, one per plan; the template
+    is in [`calls/README.md`](internal_docs/calls/README.md).
+  - `internal_docs/TODO.md` — the higher-level To Do list; open work grouped by
+    area at the top, shipped work in the Done section at the bottom.
+  - `internal_docs/differentiators.md` — why Legion differs from K8s and Nomad.
+  - `internal_docs/development.md` — running locally, Linux worker containers,
+    CI notes.
+  - `internal_docs/NEXT_UP.md` — when present, the immediate todos for whatever
+    the human developer is working on right now.
+
+Moving a document between trees is a normal thing to do — a plan that has fully
+shipped often deserves a rewritten public counterpart in `docs/`, while the plan
+itself stays in `internal_docs/plans/`.
+
+### Keep `internal_docs/TODO.md` current (required)
+
+`internal_docs/TODO.md` is only useful if it describes the project as it is right
+now. When you finish work that appears there, update it **in the same change as
+the code** — not in a follow-up, and not "later".
+
+- **Check the item off and move it to the Done section.** Done entries keep the
+  same grouping, and gain a link to the plan and the public doc that now cover
+  the feature.
+- **Only check off what actually shipped.** If you did three of an item's five
+  sub-items, check those three and leave the rest open. Half-done work that reads
+  as finished is the failure mode this rule exists to prevent.
+- **Add what the work uncovered.** Anything you deliberately deferred, knowingly
+  left broken, or discovered along the way becomes a new open item, in the group
+  it belongs to, with a sentence of context and a link to the plan section or
+  code that explains it. This is the same information as the plan's deferred list
+  and the judgement-calls doc — TODO.md is where it stays visible.
+- **Link the PR** on anything that is in flight rather than merged, and keep the
+  "In flight (open PRs)" table at the top honest.
+- If the work has no entry yet and was not trivial, add one and check it off, so
+  the Done section stays a real record of what exists.
+
+### Plan non-trivial features before building them (required)
+
+Any non-trivial feature gets a plan in `internal_docs/plans/<feature>-plan.md`
+before the code: the problem, the prior art, the jobs to be done stated in plain
+language for each persona the feature touches, goals and non-goals, what exists
+in the code today, the proposed design shown as the user-facing surface, phases
+that each ship on their own, the testing plan, and the rollout story.
+
+- **Required** for a new user-facing surface (jobspec block, RPC, CLI verb, env
+  var, UI page), a new or reshaped subsystem, a changed default, a security
+  boundary, an on-disk/wire format change, or anything needing a migration.
+  **Not required** for bug fixes, behavior-preserving refactors, or doc-only
+  work.
+- **Keep the status honest at the top** (`PLANNED` / `IN EXECUTION` / `SHIPPED` /
+  `SUPERSEDED`), and name what was deliberately deferred. Never silently rewrite
+  a superseded plan — head it with which document wins now.
+- **Register it** in the plan table in `internal_docs/README.md`, and link its
+  judgement-calls doc from the title.
+- **The plan is not the public doc.** When the feature ships, its `docs/` page
+  must stand on its own; the plan stays as history.
+- The full structure is in
+  [`internal_docs/plans/README.md`](internal_docs/plans/README.md).
+
+### All new features must be well documented (required)
+
+A feature is not finished until its documentation is. For every new feature or
+material change to an existing one:
+
+- **Write or update the public page in `docs/`.** It must cover what the feature
+  is and why it exists, the job-spec / config / CLI surface with a working
+  example, the defaults, the failure modes and their diagnostics, and the
+  interaction with anything adjacent. New surfaces get their own page; extensions
+  go in the existing page.
+- **Update every doc the change touches**, not just the main one: task-runtime
+  capability tables, `docs/agent-readiness.md` for new agent surfaces,
+  `README.md`'s doc list and `docs/README.md`'s index for a new page.
+- **Every gRPC method and every request/response attribute** must be documented
+  with in-depth, public-facing proto comments in `proto/legion.proto` — that file
+  is the source of truth for API behavior.
+- **Every new job-config field** goes into `configs/jobs/maximal.jsonnet`.
+- Document what is *not* done as honestly as what is: unimplemented parts,
+  platform gaps, and known limitations belong in the public doc rather than in a
+  reader's bug report.
+
+### Record judgement calls for any non-trivial feature (required)
+
+On any non-trivial feature, write down the judgement calls you made in a document
+in `internal_docs/calls/`. A judgement call is anywhere you interpreted an
+ambiguous request, chose between real alternatives, deviated from the plan, or
+knowingly accepted a limitation or trade-off.
+
+- **Name the file after the plan** it belongs to, with `_calls` appended:
+  `internal_docs/plans/<plan-name>.md` →
+  `internal_docs/calls/<plan-name>_calls.md`. If the work has no plan, name it
+  after the feature (`<feature>_calls.md`).
+- **One entry per call**, each stating *the call*, *the alternative(s)* that were
+  genuinely on the table, *the trade-off* it costs, and *why* it won — tied to a
+  core product goal (simplicity/ease, extensibility, performance) where it can
+  be. Show the user-facing surface (jobspec, CLI, error message, env var)
+  whenever the call is visible to a user.
+- **Rank entries by project impact, highest first**; the entry number is its
+  rank. Insert new entries at their rank rather than appending, and fix any
+  citation of an entry by number.
+- The full template and a worked example are in
+  [`internal_docs/calls/README.md`](internal_docs/calls/README.md).
+- **Append to the existing file** when a plan already has one; never start a
+  second calls file for the same plan.
+- **Link it from the plan** with a `> **Judgement calls:** …` line under the
+  title.
+- Judgement calls are internal by definition — they never go in `docs/`. Anything
+  in them a *user* needs to know (a limitation, a default, a rejected shape they
+  might expect) must also be stated in the public doc.
+
+### Key public docs
+
+- `docs/architecture-managers-workers.md`, `docs/scheduler-and-eval-loop.md`,
+  `docs/jobs-tasks-and-scheduling.md`, `docs/state-store.md`
+- `docs/plugin-system.md`, `docs/task-runtime-plugins.md`, `docs/task-runtime-exec.md`,
+  `docs/task-runtime-container.md`, `docs/task-runtime-noop.md`,
+  `docs/rollout-strategy-plugins.md`
+- `docs/artifacts.md`, `docs/kv-store.md`, `docs/auth-and-acls.md`,
+  `docs/workload-identity.md`, `docs/stateful-workloads.md`,
+  `docs/service-discovery.md`, `docs/exec-and-actions.md`, `docs/rollouts.md`
+- `docs/logging.md`, `docs/observability.md`, `docs/event-stream.md`,
+  `docs/ui-architecture.md`
+- `docs/persistence-streaming.md`, `docs/raft-operations.md`,
+  `docs/multi-raft.md` — the replicated (raft) manager store: topologies,
+  lanes, snapshots, backup/restore, quorum guidance
+- `docs/metrics.md` — the Prometheus endpoint and health probes
+- `docs/upgrades.md` — version-skew policy, upgrade order, raft data-dir rules
+- `docs/testing-and-benchmarks.md`, `docs/codebase-conventions.md`
+- `docs/agent-readiness.md` — the agent-facing surfaces (MCP, structured output,
+  capabilities, validate/schema, idempotency, wait, saved queries)

@@ -70,7 +70,7 @@ pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
                 status.backend,
                 status.node_id,
                 status.role,
-                status.leader_id.unwrap_or_else(|| "-".to_string()),
+                status.leader_id.as_deref().unwrap_or("-"),
                 status.term,
                 status.commit_index,
                 status.applied_index
@@ -80,6 +80,32 @@ pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
                 status.voters.join(","),
                 status.learners.join(",")
             );
+            // Per-lane quorum health (plan §7-C3): rendered in BOTH
+            // topologies — in `single` the one control group's line reads
+            // without a lane prefix. The ⚠ advisory appears when the voter
+            // count is even or below raft.expectedVoters.
+            for line in quorum_lines(&status) {
+                println!("{line}");
+            }
+            // Per-lane detail matters when more than one raft group is
+            // active (the `lanes` topology, where each lane elects its own
+            // leader); `single` topology has one group whose numbers are
+            // the headline lines above. When lanes disagree on a leader,
+            // the headline leader column above already summarizes them
+            // per lane (`control=…,scheduler=…,status=…`).
+            if status.lanes.len() > 1 {
+                for lane in &status.lanes {
+                    println!(
+                        "lane={} role={} leader={} term={} commit={} applied={}",
+                        lane.lane,
+                        lane.role,
+                        lane.leader_id.as_deref().unwrap_or("-"),
+                        lane.term,
+                        lane.commit_index,
+                        lane.applied_index
+                    );
+                }
+            }
         }
         Some(("history", args)) => {
             let limit = args.get_one::<u32>("limit").copied().unwrap_or(25);
@@ -131,6 +157,11 @@ pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
                 status.term,
                 event.message,
             );
+            // Quorum/parity advisory produced by the command (JC-29: the
+            // command succeeded; the warning is ergonomic, not an error).
+            if let Some(warning) = &reply.warning {
+                println!("⚠ {warning}");
+            }
         }
         Some(("join-token", args)) => {
             let actor = args
@@ -148,4 +179,109 @@ pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
         _ => {}
     }
     Ok(())
+}
+
+/// The per-lane quorum lines of `legion raft status` (plan §7-C3): one line
+/// per active raft group — `voters N (quorum Q) — survives F failure(s)` —
+/// with a `⚠` + the plain-language advisory appended when the manager
+/// reports one (a membership change still in its joint configuration, an
+/// even voter count, or fewer voters than `raft.expectedVoters`). Under `single` topology the one control group's
+/// line carries no lane prefix; under `lanes` each line names its lane.
+fn quorum_lines(status: &crate::structs::RaftStatus) -> Vec<String> {
+    status
+        .lanes
+        .iter()
+        .map(|lane| {
+            let prefix = if status.lanes.len() > 1 {
+                format!("lane {}: ", lane.lane)
+            } else {
+                String::new()
+            };
+            let mut line = format!(
+                "{prefix}voters {} (quorum {}) — survives {} failure(s)",
+                lane.voters, lane.quorum, lane.survives
+            );
+            if let Some(warning) = &lane.warning {
+                line.push_str(&format!(" ⚠ {warning}"));
+            }
+            line
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::structs::{RaftLaneStatus, RaftStatus};
+
+    fn lane(name: &str, voters: u64, warning: Option<&str>) -> RaftLaneStatus {
+        RaftLaneStatus {
+            lane: name.to_string(),
+            role: "primary".to_string(),
+            leader_id: Some("mgr-a".to_string()),
+            term: 1,
+            commit_index: 1,
+            applied_index: 1,
+            voters,
+            quorum: voters / 2 + 1,
+            survives: (voters - 1) / 2,
+            warning: warning.map(str::to_string),
+        }
+    }
+
+    fn status_with_lanes(lanes: Vec<RaftLaneStatus>) -> RaftStatus {
+        RaftStatus {
+            enabled: true,
+            backend: "raft".to_string(),
+            node_id: "mgr-a".to_string(),
+            cluster_id: "legion-raft-test".to_string(),
+            role: "primary".to_string(),
+            leader_id: Some("mgr-a".to_string()),
+            term: 1,
+            commit_index: 1,
+            applied_index: 1,
+            lease_held: true,
+            voters: vec!["mgr-a".to_string()],
+            learners: Vec::new(),
+            peers: Vec::new(),
+            election_epoch_ms: 0,
+            join_token_ttl_seconds: 900,
+            raft_library: "openraft-0.9".to_string(),
+            lanes,
+        }
+    }
+
+    /// `single` topology: one unprefixed quorum line, healthy 3-voter shape.
+    #[test]
+    fn quorum_line_renders_for_single_topology() {
+        let status = status_with_lanes(vec![lane("control", 3, None)]);
+        let lines = quorum_lines(&status);
+        assert_eq!(lines, vec!["voters 3 (quorum 2) — survives 1 failure(s)"]);
+    }
+
+    /// `lanes` topology: one prefixed line per lane, with the ⚠ advisory on
+    /// an even-voter lane.
+    #[test]
+    fn quorum_lines_render_for_lanes_topology_with_warning() {
+        let advisory = "2 voters need both alive to commit — this cluster survives zero \
+                        failures. Use 1, 3, or 5 voters; add one more manager or remove one.";
+        let status = status_with_lanes(vec![
+            lane("control", 2, Some(advisory)),
+            lane("scheduler", 2, Some(advisory)),
+            lane("status", 2, Some(advisory)),
+        ]);
+        let lines = quorum_lines(&status);
+        assert_eq!(lines.len(), 3);
+        assert!(
+            lines[0].starts_with("lane control: voters 2 (quorum 2) — survives 0 failure(s)"),
+            "{}",
+            lines[0]
+        );
+        for line in &lines {
+            assert!(line.contains("⚠"), "{line}");
+            assert!(line.contains("Use 1, 3, or 5 voters"), "{line}");
+        }
+        assert!(lines[1].starts_with("lane scheduler: "), "{}", lines[1]);
+        assert!(lines[2].starts_with("lane status: "), "{}", lines[2]);
+    }
 }

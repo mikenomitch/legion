@@ -4,7 +4,7 @@
 //! payload — fetches tokens from the manager (`IssueWorkloadIdentityToken`)
 //! and materializes them for the task:
 //!
-//! - **env delivery**: the token is injected into the task's kind-config
+//! - **env delivery**: the token is injected into the task’s runtime config
 //!   `env` map before start (same mechanism as the manager's
 //!   `LEGION_INSTANCE_*` injection, but performed worker-side so token bytes
 //!   never transit the scheduler). Because a live process's environment is
@@ -193,7 +193,7 @@ impl WorkerIdentityManager {
                 // Companion var so a `changeMode: signal` handler can re-read
                 // the refreshed token from the backing file (env itself cannot
                 // change). Pointless for `restart` (the relaunch re-injects the
-                // fresh token directly into env) and for kinds whose filesystem
+                // fresh token directly into env) and for runtimes whose filesystem
                 // the host path doesn't reach — so only emit it when a signal
                 // handler would actually use it.
                 if identity.change_mode == ChangeMode::Signal {
@@ -485,7 +485,7 @@ fn write_token_tmp(tmp: &Path, token: &str, mode: u32) -> R<()> {
     Ok(())
 }
 
-/// Inject env vars into a JSON-encoded task kind config (the same `env` map
+/// Inject env vars into a JSON-encoded task runtime config (the same `env` map
 /// the manager's `LEGION_INSTANCE_*` injection uses). Values are written into
 /// the config string, never logged.
 fn inject_env(task_config_json: &mut String, vars: &[(String, String)]) -> R<()> {
@@ -889,19 +889,21 @@ mod tests {
 
         let manager = Arc::new(WorkerIdentityManager::new(FakeIssuer::new(900)));
         let mut allocation = TaskAllocation {
+            task_volumes: String::new(),
             allocation_id: 7,
             job_id: "job".into(),
             job_config_id: "jc".into(),
             node_id: "node-1".into(),
             task_config_id: 1,
             task_name: "api".into(),
-            task_kind: "exec".into(),
+            task_runtime: "exec".into(),
             task_config: json!({"command": ["sleep", "1"]}).to_string(),
             task_checks: String::new(),
             task_on_unhealthy: String::new(),
             task_identities: serde_json::to_string(&identities)?,
             self_terminate_after_seconds: 0,
             task_artifacts: String::new(),
+            task_resources: String::new(),
 
             network: String::new(),
             task_connect: String::new(),
@@ -949,19 +951,21 @@ mod tests {
             ..Default::default()
         }];
         let mut allocation = TaskAllocation {
+            task_volumes: String::new(),
             allocation_id: 8,
             job_id: "job".into(),
             job_config_id: "jc".into(),
             node_id: "node-1".into(),
             task_config_id: 1,
             task_name: "api".into(),
-            task_kind: "exec".into(),
+            task_runtime: "exec".into(),
             task_config: json!({"command": ["true"]}).to_string(),
             task_checks: String::new(),
             task_on_unhealthy: String::new(),
             task_identities: serde_json::to_string(&identities)?,
             self_terminate_after_seconds: 0,
             task_artifacts: String::new(),
+            task_resources: String::new(),
 
             network: String::new(),
             task_connect: String::new(),

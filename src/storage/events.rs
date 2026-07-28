@@ -393,6 +393,39 @@ pub mod drafts {
         .meta(json!({ "reason": "heartbeat" }))
     }
 
+    /// `node.cordoned` — a node's availability was set to `drained`, so it
+    /// no longer receives new placements (existing allocations untouched
+    /// until a drain evicts them).
+    pub fn node_cordoned(node_id: &str) -> EventDraft {
+        EventDraft::info(
+            "node.cordoned",
+            format!("Node {node_id} cordoned (no new placements)"),
+        )
+        .node(node_id)
+    }
+
+    /// `node.uncordoned` — a node's availability was restored to
+    /// `available`, so it re-entered the scheduling pool.
+    pub fn node_uncordoned(node_id: &str) -> EventDraft {
+        EventDraft::info(
+            "node.uncordoned",
+            format!("Node {node_id} uncordoned (schedulable again)"),
+        )
+        .node(node_id)
+    }
+
+    /// `node.drained` — a drain pass evicted a drained node's allocations
+    /// for replacement elsewhere. Stateful allocations protected by their
+    /// `onLost` policy stay behind and are counted in `held`.
+    pub fn node_drained(node_id: &str, evicted: usize, held: usize) -> EventDraft {
+        EventDraft::info(
+            "node.drained",
+            format!("Node {node_id} drained: {evicted} allocation(s) evicted, {held} held"),
+        )
+        .node(node_id)
+        .meta(json!({ "evicted": evicted, "held": held }))
+    }
+
     /// `job.submitted` / `job.updated` — a job config was written. `None` for
     /// unchanged outcomes (nothing happened worth streaming).
     pub fn job_submit_outcome(
@@ -533,6 +566,87 @@ pub mod drafts {
             "error": row.error,
             "attempts": row.attempts,
         }))
+    }
+
+    /// `volume.mounted` — a worker materialized a volume at a host path. For
+    /// a node-local volume this is also the moment its instance becomes pinned
+    /// to that node.
+    pub fn volume_mounted(
+        volume: &crate::structs::Volume,
+        node_id: &str,
+        path: &str,
+    ) -> EventDraft {
+        let mut draft = EventDraft::info(
+            "volume.mounted",
+            format!(
+                "Volume {} ({}) mounted on {node_id} at {path}",
+                volume.volume_id, volume.driver
+            ),
+        )
+        .node(node_id)
+        .meta(json!({
+            "volumeId": volume.volume_id,
+            "driver": volume.driver,
+            "name": volume.name,
+            "instanceId": volume.instance_id,
+            "nodeLocal": volume.node_local,
+            "mountPath": path,
+        }));
+        if let Some(job_id) = volume.job_id.as_deref() {
+            draft = draft.job(job_id);
+        }
+        draft
+    }
+
+    /// `volume.failed` — a driver operation failed. Surfaced as a warning, not
+    /// an error: the allocation's own failure event carries the fatal signal,
+    /// and reclaim failures are retried.
+    pub fn volume_failed(volume_id: &str, driver: &str, node_id: &str, error: &str) -> EventDraft {
+        EventDraft::warn(
+            "volume.failed",
+            format!("Volume {volume_id} ({driver}) failed on {node_id}: {error}"),
+        )
+        .node(node_id)
+        .meta(json!({
+            "volumeId": volume_id,
+            "driver": driver,
+            "error": error,
+        }))
+    }
+
+    /// `volume.reclaiming` — the volume's instance no longer references it, so
+    /// its storage is queued for the driver's `destroy`.
+    pub fn volume_reclaiming(volume: &crate::structs::Volume) -> EventDraft {
+        let mut draft = EventDraft::info(
+            "volume.reclaiming",
+            format!(
+                "Volume {} ({}) queued for reclamation",
+                volume.volume_id, volume.driver
+            ),
+        )
+        .meta(json!({
+            "volumeId": volume.volume_id,
+            "driver": volume.driver,
+            "instanceId": volume.instance_id,
+            "nodeId": volume.node_id,
+        }));
+        if let Some(job_id) = volume.job_id.as_deref() {
+            draft = draft.job(job_id);
+        }
+        if let Some(node_id) = volume.node_id.as_deref() {
+            draft = draft.node(node_id);
+        }
+        draft
+    }
+
+    /// `volume.destroyed` — a driver confirmed the storage is gone.
+    pub fn volume_destroyed(volume_id: &str, driver: &str, node_id: &str) -> EventDraft {
+        EventDraft::info(
+            "volume.destroyed",
+            format!("Volume {volume_id} ({driver}) destroyed on {node_id}"),
+        )
+        .node(node_id)
+        .meta(json!({ "volumeId": volume_id, "driver": driver }))
     }
 
     /// `artifact.pinned` — mutable references were pinned to digests at
@@ -728,6 +842,18 @@ impl EventRecorder<'_> {
         self.emit(drafts::node_lost_after_missed_heartbeats(node_id));
     }
 
+    pub fn node_cordoned(self, node_id: &str) {
+        self.emit(drafts::node_cordoned(node_id));
+    }
+
+    pub fn node_uncordoned(self, node_id: &str) {
+        self.emit(drafts::node_uncordoned(node_id));
+    }
+
+    pub fn node_drained(self, node_id: &str, evicted: usize, held: usize) {
+        self.emit(drafts::node_drained(node_id, evicted, held));
+    }
+
     pub fn job_stopped(self, job_id: &str) {
         self.emit(drafts::job_stopped(job_id));
     }
@@ -778,6 +904,22 @@ impl EventRecorder<'_> {
 
     pub fn artifact_pinned(self, job_id: &str, pins: &[ArtifactPin]) {
         self.emit_opt(drafts::artifact_pinned(job_id, pins));
+    }
+
+    pub fn volume_mounted(self, volume: &crate::structs::Volume, node_id: &str, path: &str) {
+        self.emit(drafts::volume_mounted(volume, node_id, path));
+    }
+
+    pub fn volume_failed(self, volume_id: &str, driver: &str, node_id: &str, error: &str) {
+        self.emit(drafts::volume_failed(volume_id, driver, node_id, error));
+    }
+
+    pub fn volume_reclaiming(self, volume: &crate::structs::Volume) {
+        self.emit(drafts::volume_reclaiming(volume));
+    }
+
+    pub fn volume_destroyed(self, volume_id: &str, driver: &str, node_id: &str) {
+        self.emit(drafts::volume_destroyed(volume_id, driver, node_id));
     }
 }
 

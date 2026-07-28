@@ -29,17 +29,18 @@ use crate::structs::{
     AcquireKvLockRequest, AdvanceRolloutReply, AdvanceRolloutRequest, AllocationHealth,
     AllocationLog, CreateInstanceReply, CreateInstanceRequest, CreateInstancesReply,
     CreateInstancesRequest, DeleteKvReply, DeleteKvRequest, DeleteSavedStateQueryReply,
-    DeleteSavedStateQueryRequest, DestroyInstanceReply, DestroyInstanceRequest, DestroyJobReply,
-    DestroyJobRequest, ExecClientFrame, FailedAllocation, GetAllocationLogsReply,
-    GetAllocationLogsRequest, GetArtifactCredentialReply, GetArtifactCredentialRequest,
-    GetInstanceReply, GetInstanceRequest, GetJobInfoReply, GetJobInfoRequest,
-    GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest, GetKvLockReply,
-    GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest,
+    DeleteSavedStateQueryRequest, DeleteVolumeReply, DeleteVolumeRequest, DestroyInstanceReply,
+    DestroyInstanceRequest, DestroyJobReply, DestroyJobRequest, ExecClientFrame, FailedAllocation,
+    GetAllocationLogsReply, GetAllocationLogsRequest, GetArtifactCredentialReply,
+    GetArtifactCredentialRequest, GetInstanceReply, GetInstanceRequest, GetJobInfoReply,
+    GetJobInfoRequest, GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest,
+    GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest,
     GetManagerConfigsReply, GetManagerConfigsRequest, GetNodeReply, GetNodeRequest, GetNodesReply,
     GetNodesRequest, GetObservabilityReply, GetObservabilityRequest, GetRaftJoinTokenReply,
     GetRaftJoinTokenRequest, GetRaftStatusReply, GetRaftStatusRequest, GetRolloutReply,
-    GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest, GetStateStoreSchemaReply,
-    GetStateStoreSchemaRequest, GetTaskLogsRequest, HealthCheckReply, HealthCheckRequest,
+    GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest, GetStateBackupReply,
+    GetStateBackupRequest, GetStateStoreSchemaReply, GetStateStoreSchemaRequest,
+    GetTaskLogsRequest, GetVolumeReply, GetVolumeRequest, HealthCheckReply, HealthCheckRequest,
     HeartbeatReply, HeartbeatRequest, Instance, InstanceInfo, InstanceMode, InstanceState,
     IssueNodeIdentityTokenReply, IssueNodeIdentityTokenRequest, IssueRaftCommandReply,
     IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply, IssueWorkloadIdentityTokenRequest,
@@ -49,19 +50,21 @@ use crate::structs::{
     ListJobsReply, ListJobsRequest, ListKvReply, ListKvRequest, ListRaftHistoryReply,
     ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply,
     ListRolloutsRequest, ListSavedStateQueriesReply, ListSavedStateQueriesRequest,
-    ListServicesReply, ListServicesRequest, Node, NodeMsg, PatchKvReply, PatchKvRequest,
+    ListServicesReply, ListServicesRequest, ListVolumeDriversReply, ListVolumeDriversRequest,
+    ListVolumesReply, ListVolumesRequest, Node, NodeMsg, PatchKvReply, PatchKvRequest,
     PlanJobReply, PlanJobRequest, PlannedAllocation, PutKvReply, PutKvRequest,
     QueryStateStoreReply, QueryStateStoreRequest, RaftHistoryEvent, RaftStatus, ReleaseKvLockReply,
     ReleaseKvLockRequest, RenewKvLockReply, RenewKvLockRequest, ReplaceInstanceReply,
     ReplaceInstanceRequest, ResolveServiceReply, ResolveServiceRequest, RestartWorkerReply,
     RestartWorkerRequest, RolloutAllocationStatus, RolloutEvent, RolloutGroupStatus,
     RolloutProgression, RolloutReplacement, RunJobReply, RunJobRequest, SavedStateQuery,
-    SchedulerEvent, ServiceEndpoint, ServiceSummary, StartInstanceReply, StartInstanceRequest,
-    StopInstanceReply, StopInstanceRequest, StopJobReply, StopJobRequest, StopRolloutReply,
-    StopRolloutRequest, StreamEventsRequest, Submission, TaskConfig, TaskOnUnhealthyConfig,
-    UpdateNodeDynamicReply, UpdateNodeDynamicRequest, UpsertSavedStateQueryReply,
-    UpsertSavedStateQueryRequest, WorkerConfig, WorkerPreRegisterReply, WorkerPreRegisterRequest,
-    WorkerRegisterReply, WorkerRegisterRequest,
+    SchedulerEvent, ServiceEndpoint, ServiceSummary, SetNodeAvailabilityReply,
+    SetNodeAvailabilityRequest, StartInstanceReply, StartInstanceRequest, StopInstanceReply,
+    StopInstanceRequest, StopJobReply, StopJobRequest, StopRolloutReply, StopRolloutRequest,
+    StreamEventsRequest, Submission, TaskConfig, TaskOnUnhealthyConfig, UpdateNodeDynamicReply,
+    UpdateNodeDynamicRequest, UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest,
+    WorkerConfig, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply,
+    WorkerRegisterRequest,
 };
 use crate::structs::{
     AuthMethodInfo, BootstrapAclReply, BootstrapAclRequest, CreateAclTokenReply,
@@ -85,6 +88,17 @@ use tonic::{Request, Response, Status, Streaming};
 fn map_store_error(action: &str, err: anyhow::Error) -> Status {
     error!("{action}: {:?}", err);
 
+    // A write proposed on a raft non-leader: FAILED_PRECONDITION with the
+    // leader name+address in the message so callers can redial (plan §A4,
+    // JC-4). Checked before the storage-error classes because the raft
+    // pipeline wraps the typed error in context.
+    if let Some(not_leader) = err
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<crate::storage::raft::driver::NotRaftLeader>())
+    {
+        return Status::failed_precondition(format!("{action}: {not_leader}"));
+    }
+
     let Some(storage_error) = StorageError::from_anyhow(&err) else {
         return Status::internal(action);
     };
@@ -100,6 +114,40 @@ fn map_store_error(action: &str, err: anyhow::Error) -> Status {
         StorageError::DatabaseCorrupt
         | StorageError::DatabaseIo { .. }
         | StorageError::Sqlite { .. } => Status::internal(message),
+    }
+}
+
+/// Outcome of the worker<->manager protocol-version handshake performed at
+/// registration. See [`protocol_compat`] and `docs/upgrades.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VersionCompat {
+    /// Worker speaks a protocol version this manager supports.
+    Accept,
+    /// Worker reported `0`: a pre-versioning build (proto3 decodes a missing
+    /// field as `0`). Admitted so rolling upgrades from releases that predate
+    /// the handshake keep working, but worth a warning in the logs.
+    AcceptWithWarn,
+    /// Worker speaks a protocol version newer than this manager supports —
+    /// the worker was upgraded before the manager (wrong order). Reject with
+    /// FAILED_PRECONDITION; the operator must upgrade managers first.
+    Reject,
+}
+
+/// Pure protocol-compatibility decision for worker registration.
+///
+/// Policy (managers are upgraded first, then workers — see docs/upgrades.md):
+/// - `worker_pv == 0`: pre-versioning worker, accept with a warning.
+/// - `worker_pv <= manager_pv`: accept (managers stay compatible with all
+///   protocol versions up to their own).
+/// - `worker_pv > manager_pv`: reject — the manager cannot guarantee it
+///   satisfies a contract newer than it knows about.
+pub fn protocol_compat(worker_pv: u32, manager_pv: u32) -> VersionCompat {
+    if worker_pv == 0 {
+        VersionCompat::AcceptWithWarn
+    } else if worker_pv > manager_pv {
+        VersionCompat::Reject
+    } else {
+        VersionCompat::Accept
     }
 }
 
@@ -216,6 +264,22 @@ fn map_raft_status(status: crate::storage::persistence::RaftStatus) -> RaftStatu
         election_epoch_ms: status.election_epoch_ms,
         join_token_ttl_seconds: status.join_token_ttl_seconds,
         raft_library: status.raft_library,
+        lanes: status
+            .lanes
+            .into_iter()
+            .map(|lane| crate::structs::RaftLaneStatus {
+                lane: lane.lane,
+                role: lane.role.as_str().to_string(),
+                leader_id: lane.leader_id,
+                term: lane.term,
+                commit_index: lane.commit_index,
+                applied_index: lane.applied_index,
+                voters: lane.voters,
+                quorum: lane.quorum,
+                survives: lane.survives,
+                warning: lane.warning,
+            })
+            .collect(),
     }
 }
 
@@ -236,7 +300,11 @@ fn map_raft_event(event: crate::storage::persistence::RaftHistoryEvent) -> RaftH
 /// `proto/legion.proto`), attaching the node-loss diagnostic when the
 /// instance is gated (see [`instance_loss_detail`]).
 fn map_instance_info(store: &Store, instance: Instance) -> InstanceInfo {
-    let detail = instance_loss_detail(store, &instance);
+    // Loss confirmation first: it explains an instance that is bound but
+    // waiting. A volume pin explains one that is UNBOUND and waiting — the two
+    // never apply at once, and both answer "why has this not come back".
+    let detail = instance_loss_detail(store, &instance)
+        .or_else(|| instance_volume_pin_detail(store, &instance));
     InstanceInfo {
         instance_id: instance.instance_id,
         job_id: instance.job_id,
@@ -277,6 +345,41 @@ fn instance_loss_detail(store: &Store, instance: &Instance) -> Option<String> {
          (stateful.onLost.replaceAfter) elapses, keeps it if the node returns first, or \
          replaces it immediately on operator override (`legion instance replace {}`)",
         node.id, instance.instance_id
+    ))
+}
+
+/// `volume-pinned` diagnostic for instance get/list: when an instance is
+/// awaiting placement and holds node-local storage, name the node it is waiting
+/// for. Without this, a replica stuck pending looks like a capacity problem
+/// when it is really a storage-locality one (see docs/volumes.md).
+fn instance_volume_pin_detail(store: &Store, instance: &Instance) -> Option<String> {
+    // Only instances the scheduler is actually trying to place. A stopped or
+    // terminated instance is not waiting for anything, so telling its reader
+    // "this can only be placed on node-a1" would be noise at best.
+    if instance.current_alloc_id.is_some()
+        || !matches!(
+            instance.state,
+            InstanceState::Pending | InstanceState::Rescheduling
+        )
+    {
+        return None;
+    }
+    let volume = store
+        .list_volumes(&crate::storage::store::VolumeFilter {
+            instance_id: Some(instance.instance_id.clone()),
+            ..Default::default()
+        })
+        .ok()?
+        .into_iter()
+        .find(|volume| volume.pins_placement())?;
+    let node_id = volume.node_id.clone()?;
+    let node_status = store
+        .get_node(&node_id)
+        .map(|node| node.status)
+        .unwrap_or_else(|_| "unknown".into());
+    Some(format!(
+        "volume-pinned: volume {} ({}) is node-local and lives on node {node_id} (status:          {node_status}), so this instance can only be placed there. It waits for that node          rather than starting on empty storage; `legion volume delete --force {}` abandons          the data and frees the instance to place elsewhere",
+        volume.volume_id, volume.driver, volume.volume_id
     ))
 }
 
@@ -1004,9 +1107,9 @@ impl ManagerDaemonService {
         let mut registry = crate::task_plugins::TaskPluginRegistry::new();
         for task in &mut config.tasks {
             if self.artifacts_config.container_image_desugar {
-                registry.load_plugin(&task.kind, false)?;
+                registry.load_plugin(&task.runtime, false)?;
                 let plugin = registry
-                    .plugin(&task.kind)
+                    .plugin(&task.runtime)
                     .context("task plugin loaded but missing")?;
                 if plugin.supports_artifacts() {
                     for implicit in plugin.implicit_artifacts(&task.config)? {
@@ -1062,6 +1165,148 @@ impl ManagerDaemonService {
             }
         }
         Ok(notes)
+    }
+
+    /// Admission check for volume declarations, against what the cluster
+    /// actually provides.
+    ///
+    /// The manager loads no storage drivers, so "does plugin X exist" is only
+    /// answerable from worker fingerprints — which is exactly why this lives at
+    /// admission rather than in `validate_job_config` (which is offline and
+    /// cluster-blind). Catching it here means a job with unavailable storage is
+    /// rejected at submit with an actionable message, instead of placing and
+    /// then failing at mount.
+    fn validate_job_volumes(&self, config: &JobConfig) -> R<()> {
+        let needs_check = config
+            .tasks
+            .iter()
+            .any(|task| !task.required_volume_drivers().is_empty());
+        if !needs_check {
+            return Ok(());
+        }
+        let cluster = self.store.cluster_volume_drivers()?;
+        if cluster.is_empty() {
+            // Nothing in the cluster advertises plugin metadata: either no
+            // worker has joined yet, or they predate fingerprinting. Either
+            // way there is nothing to validate against, and rejecting the job
+            // would be worse than letting placement decide.
+            debug!("No volume driver metadata advertised yet; skipping volume admission checks");
+            return Ok(());
+        }
+
+        let mut registry = crate::task_plugins::TaskPluginRegistry::new();
+        for task in &config.tasks {
+            let mut declarations: Vec<VolumeDeclaration> = Vec::new();
+            if let Some(storage) = task
+                .stateful
+                .as_ref()
+                .and_then(|stateful| stateful.storage.as_ref())
+            {
+                declarations.push(VolumeDeclaration {
+                    label: "stateful.storage".to_string(),
+                    driver: storage.driver_name().to_string(),
+                    mode: storage.volume_mode(),
+                    params: storage.param_map(),
+                    is_instance_volume: true,
+                });
+            }
+            for volume in &task.volumes {
+                declarations.push(VolumeDeclaration {
+                    label: format!("volume {:?}", volume.name),
+                    driver: volume.driver_name().to_string(),
+                    mode: volume.volume_mode(),
+                    params: volume.param_map(),
+                    is_instance_volume: false,
+                });
+            }
+            if declarations.is_empty() {
+                continue;
+            }
+
+            // What the task RUNTIME can consume. A microVM runtime takes a block
+            // device and cannot use a directory; exec and container are the
+            // reverse. Loaded lazily so jobs without volumes never pay for it.
+            let runtime_modes = match registry.load_plugin(&task.runtime, false) {
+                Ok(()) => registry
+                    .plugin(&task.runtime)
+                    .map(|plugin| plugin.supported_volume_modes().to_vec())
+                    .unwrap_or_else(|| vec![crate::volumes::VolumeMode::Filesystem]),
+                // An unknown runtime fails elsewhere with a better message; do not
+                // turn "no such task runtime" into a confusing volume error.
+                Err(_) => vec![crate::volumes::VolumeMode::Filesystem],
+            };
+
+            for VolumeDeclaration {
+                label,
+                driver,
+                mode,
+                params,
+                is_instance_volume,
+            } in declarations
+            {
+                if !runtime_modes.contains(&mode) {
+                    bail!(
+                        "task {} {label}: task runtime `{}` cannot consume a `{mode}` volume (it \
+                         supports: {}). Filesystem volumes are directories a process reads; \
+                         block volumes are devices a guest attaches",
+                        task.name,
+                        task.runtime,
+                        runtime_modes
+                            .iter()
+                            .map(|mode| mode.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                }
+                let Some(entry) = cluster.get(&driver) else {
+                    bail!(
+                        "task {} {label}: no node in the cluster provides volume driver `{driver}`.                          Install it under plugins/volumes/{driver}/ on a worker, or run                          `legion volume drivers` to see what is available",
+                        task.name
+                    );
+                };
+                if entry.available_nodes.is_empty() {
+                    bail!(
+                        "task {} {label}: volume driver `{driver}` is installed on {} but unusable                          everywhere: {}",
+                        task.name,
+                        entry.nodes.join(", "),
+                        entry.capabilities.detail
+                    );
+                }
+                if !entry.capabilities.serves_mode(mode) {
+                    bail!(
+                        "task {} {label}: volume driver `{driver}` cannot serve a `{mode}` volume \
+                         (it serves: {}). Pick a driver that does, or change the volume's `mode`",
+                        task.name,
+                        entry
+                            .capabilities
+                            .volume_modes
+                            .iter()
+                            .map(|mode| mode.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                }
+                let missing = entry.capabilities.missing_params(&params);
+                if !missing.is_empty() {
+                    bail!(
+                        "task {} {label}: volume driver `{driver}` requires params: {}",
+                        task.name,
+                        missing.join(", ")
+                    );
+                }
+                // An instance volume promises data survives reschedules; an
+                // ephemeral driver cannot keep that promise, and a job that
+                // silently loses its database on every restart is the worst
+                // possible failure mode.
+                if is_instance_volume && entry.capabilities.ephemeral {
+                    bail!(
+                        "task {} {label}: volume driver `{driver}` is ephemeral (its contents do                          not survive an unmount), so it cannot back stateful.storage — which                          promises an instance's data survives reschedules. Declare it under                          `volumes` instead if you want scratch space",
+                        task.name
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Resolves one mutable reference to its digest using the same auth chain
@@ -1554,6 +1799,14 @@ fn reconcile_kv_changes(store: &Store, changes: &[(String, bool)]) -> Result<(),
                 store
                     .clear_job_failed_status(&job_id)
                     .map_err(|e| map_store_error("Error clearing failed job status", e))?;
+                // Persist the restart intent in REPLICATED state before the
+                // ack: the job_update eval below is leader-local and dies
+                // with the leader, and an unchanged-config restart leaves no
+                // other replicated trace for the failover regeneration pass
+                // to find (see Store::request_job_restart).
+                store
+                    .request_job_restart(&job_id)
+                    .map_err(|e| map_store_error("Error recording restart intent", e))?;
                 store
                     .enqueue_eval(
                         "job_update",
@@ -1677,6 +1930,10 @@ impl Manager for ManagerDaemonService {
         validate_job_config(&config).map_err(|e| {
             error!("Error validating task configs: {:?}", e);
             Status::invalid_argument(format!("Error validating task configs: {e}"))
+        })?;
+        self.validate_job_volumes(&config).map_err(|e| {
+            error!("Error validating volumes: {:?}", e);
+            Status::invalid_argument(format!("Error validating volumes: {e:#}"))
         })?;
         // Artifact admission: desugar/auth/pin. Pin resolution can reach
         // registries, so it runs as blocking work.
@@ -2247,6 +2504,10 @@ impl Manager for ManagerDaemonService {
             error!("Error validating task configs: {:?}", e);
             Status::invalid_argument(format!("Error validating task configs: {e}"))
         })?;
+        self.validate_job_volumes(&config).map_err(|e| {
+            error!("Error validating volumes: {:?}", e);
+            Status::invalid_argument(format!("Error validating volumes: {e:#}"))
+        })?;
         // Artifact admission for plan mirrors run: pins resolve here too so
         // the plan shows the digests a submit would ship.
         let pin_notes = run_blocking_admission(|| self.normalize_job_artifacts(&mut config, true))
@@ -2274,68 +2535,74 @@ impl Manager for ManagerDaemonService {
             .map(|existing| artifact_pin_diffs(existing, &config))
             .unwrap_or_default();
 
-        let (plan, task_lookup, message, matches_existing, same_content) = match existing_config {
-            Some(existing) if existing.is_same_as(&config) => {
-                let plan = scheduler
-                    .plan_only(&existing.id(), PlanMode::Fresh)
-                    .map_err(|e| {
-                        error!("Error planning job {}: {:?}", existing.name, e);
-                        Status::invalid_argument(format!("Error planning job: {e}"))
-                    })?;
-                let task_configs = self
-                    .store
-                    .get_task_configs_for_job_config(&existing.id())
-                    .map_err(|e| map_store_error("Error getting task configs", e))?;
-                let task_lookup = task_configs
-                    .into_iter()
-                    .map(|(id, task)| (id, task.name))
-                    .collect::<HashMap<_, _>>();
+        let (plan, task_lookup, index_report, message, matches_existing, same_content) =
+            match existing_config {
+                Some(existing) if existing.is_same_as(&config) => {
+                    let (plan, index_report) = scheduler
+                        .plan_only_with_report(&existing.id(), PlanMode::Fresh)
+                        .map_err(|e| {
+                            error!("Error planning job {}: {:?}", existing.name, e);
+                            Status::invalid_argument(format!("Error planning job: {e}"))
+                        })?;
+                    let task_configs =
+                        self.store
+                            .get_task_configs_for_job_config(&existing.id())
+                            .map_err(|e| map_store_error("Error getting task configs", e))?;
+                    let task_lookup = task_configs
+                        .into_iter()
+                        .map(|(id, task)| (id, task.name))
+                        .collect::<HashMap<_, _>>();
 
-                (
-                    plan,
-                    task_lookup,
-                    "Job config unchanged; showing force-reschedule placements".to_string(),
-                    true,
-                    true,
-                )
-            }
-            Some(_existing) => {
-                let PlanConfigOutcome {
-                    allocations,
-                    task_lookup,
-                } = scheduler
-                    .plan_for_config(&config, PlanMode::Fresh, Some(&config.name))
-                    .map_err(|e| {
-                        error!("Error planning updated job {}: {:?}", config.name, e);
-                        Status::invalid_argument(format!("Error planning job: {e}"))
-                    })?;
-                (
-                    allocations,
-                    task_lookup,
-                    "Job config changed; showing updated placements".to_string(),
-                    true,
-                    false,
-                )
-            }
-            None => {
-                let PlanConfigOutcome {
-                    allocations,
-                    task_lookup,
-                } = scheduler
-                    .plan_for_config(&config, PlanMode::Fresh, None)
-                    .map_err(|e| {
-                        error!("Error planning new job {}: {:?}", config.name, e);
-                        Status::invalid_argument(format!("Error planning job: {e}"))
-                    })?;
-                (
-                    allocations,
-                    task_lookup,
-                    "Job config new; showing placements".to_string(),
-                    false,
-                    false,
-                )
-            }
-        };
+                    (
+                        plan,
+                        task_lookup,
+                        index_report,
+                        "Job config unchanged; showing force-reschedule placements".to_string(),
+                        true,
+                        true,
+                    )
+                }
+                Some(_existing) => {
+                    let PlanConfigOutcome {
+                        allocations,
+                        task_lookup,
+                        index_report,
+                    } = scheduler
+                        .plan_for_config(&config, PlanMode::Fresh, Some(&config.name))
+                        .map_err(|e| {
+                            error!("Error planning updated job {}: {:?}", config.name, e);
+                            Status::invalid_argument(format!("Error planning job: {e}"))
+                        })?;
+                    (
+                        allocations,
+                        task_lookup,
+                        index_report,
+                        "Job config changed; showing updated placements".to_string(),
+                        true,
+                        false,
+                    )
+                }
+                None => {
+                    let PlanConfigOutcome {
+                        allocations,
+                        task_lookup,
+                        index_report,
+                    } = scheduler
+                        .plan_for_config(&config, PlanMode::Fresh, None)
+                        .map_err(|e| {
+                            error!("Error planning new job {}: {:?}", config.name, e);
+                            Status::invalid_argument(format!("Error planning job: {e}"))
+                        })?;
+                    (
+                        allocations,
+                        task_lookup,
+                        index_report,
+                        "Job config new; showing placements".to_string(),
+                        false,
+                        false,
+                    )
+                }
+            };
 
         let allocations = plan
             .into_iter()
@@ -2359,11 +2626,27 @@ impl Manager for ManagerDaemonService {
             message.push_str(&note);
         }
 
+        let index_usage = index_report
+            .into_iter()
+            .map(|usage| crate::structs::TaskIndexUsage {
+                task_name: usage.task_name,
+                index: usage.index.unwrap_or_default(),
+                mode: usage.mode.unwrap_or_default().to_string(),
+                candidates: usage.candidates as u32,
+                truncated: usage.truncated,
+                refills: usage.refills,
+                fell_back: usage.fell_back,
+                shadow_agreement: usage.shadow_agreement,
+                reason: usage.reason.unwrap_or_default(),
+            })
+            .collect();
+
         let reply = PlanJobReply {
             allocations,
             message,
             matches_existing,
             same_content,
+            index_usage,
         };
 
         Ok(Response::new(reply))
@@ -3254,6 +3537,224 @@ impl Manager for ManagerDaemonService {
         }))
     }
 
+    /// List volumes, optionally filtered. See docs/volumes.md.
+    #[instrument(skip_all)]
+    async fn list_volumes(
+        &self,
+        request: Request<ListVolumesRequest>,
+    ) -> Result<Response<ListVolumesReply>, Status> {
+        // Volumes are job-scoped storage, so they read under the `job`
+        // resource. Listing gates coarsely and filters per-item below, like
+        // the other list endpoints.
+        let identity =
+            self.check_acl(&request, AclResource::Job, AclAction::Read, AclScope::any())?;
+        let inner = request.into_inner();
+        let filter = crate::storage::store::VolumeFilter {
+            job_id: non_empty(inner.job_id),
+            node_id: non_empty(inner.node_id),
+            driver: non_empty(inner.driver),
+            instance_id: non_empty(inner.instance_id),
+            state: inner
+                .state
+                .as_deref()
+                .filter(|state| !state.trim().is_empty())
+                .map(|state| {
+                    state.parse::<crate::structs::VolumeState>().map_err(|err| {
+                        Status::invalid_argument(format!("invalid volume state filter: {err}"))
+                    })
+                })
+                .transpose()?,
+        };
+
+        let volumes = self
+            .store
+            .list_volumes(&filter)
+            .map_err(|e| map_store_error("Error listing volumes", e))?
+            .into_iter()
+            .filter(|volume| match volume.job_id.as_deref() {
+                Some(job_id) => {
+                    identity.allows(AclResource::Job, AclAction::Read, &AclScope::job(job_id))
+                }
+                // Volumes with no owning job (operator-created, future) are
+                // only visible to callers who can read any job.
+                None => identity.allows(AclResource::Job, AclAction::Read, &AclScope::any()),
+            })
+            .map(volume_info)
+            .collect();
+
+        Ok(Response::new(ListVolumesReply { volumes }))
+    }
+
+    /// Fetch one volume by id.
+    #[instrument(skip_all)]
+    async fn get_volume(
+        &self,
+        request: Request<GetVolumeRequest>,
+    ) -> Result<Response<GetVolumeReply>, Status> {
+        // Coarse gate first, precise job scope after the lookup, so a
+        // credential-less caller cannot probe volume existence via
+        // NotFound-vs-PermissionDenied.
+        let identity =
+            self.check_acl(&request, AclResource::Job, AclAction::Read, AclScope::any())?;
+        let inner = request.into_inner();
+        let volume = self
+            .store
+            .get_volume(&inner.volume_id)
+            .map_err(|e| map_store_error("Error loading volume", e))?
+            .ok_or_else(|| Status::not_found(format!("volume {} not found", inner.volume_id)))?;
+        if let Some(job_id) = volume.job_id.as_deref() {
+            acl::enforce(
+                &identity,
+                AclResource::Job,
+                AclAction::Read,
+                &AclScope::job(job_id),
+            )?;
+        }
+
+        Ok(Response::new(GetVolumeReply {
+            volume: Some(volume_info(volume)),
+        }))
+    }
+
+    /// Delete a volume: detach it from its instance and queue its storage for
+    /// the owning worker's `destroy` (or, with `force`, tombstone it outright).
+    #[instrument(skip_all)]
+    async fn delete_volume(
+        &self,
+        request: Request<DeleteVolumeRequest>,
+    ) -> Result<Response<DeleteVolumeReply>, Status> {
+        let identity = self.check_acl(
+            &request,
+            AclResource::Job,
+            AclAction::Write,
+            AclScope::any(),
+        )?;
+        let inner = request.into_inner();
+        let idempotency_key = inner.idempotency_key.unwrap_or_default();
+
+        if let Some(message) = self
+            .store
+            .idempotency_lookup(&idempotency_key)
+            .map_err(|e| map_store_error("Error checking idempotency", e))?
+        {
+            let volume = self
+                .store
+                .get_volume(&inner.volume_id)
+                .map_err(|e| map_store_error("Error loading volume", e))?;
+            return Ok(Response::new(DeleteVolumeReply {
+                volume: volume.map(volume_info),
+                message,
+                deduplicated: true,
+            }));
+        }
+
+        let existing = self
+            .store
+            .get_volume(&inner.volume_id)
+            .map_err(|e| map_store_error("Error loading volume", e))?
+            .ok_or_else(|| Status::not_found(format!("volume {} not found", inner.volume_id)))?;
+        if let Some(job_id) = existing.job_id.as_deref() {
+            acl::enforce(
+                &identity,
+                AclResource::Job,
+                AclAction::Write,
+                &AclScope::job(job_id),
+            )?;
+        }
+
+        // In-use protection: deleting a volume a live workload is writing to
+        // would detach the handle and then reclaim storage under it. Stop the
+        // workload first (job stop / instance stop / scale in); --force remains
+        // the override for storage that is already unreachable.
+        if !inner.force {
+            if let Some(who) = self
+                .store
+                .volume_in_use(&existing)
+                .map_err(|e| map_store_error("Error checking volume usage", e))?
+            {
+                return Err(Status::failed_precondition(format!(
+                    "volume {} is in use: {who}. Stop the workload first, or pass --force to \
+                     abandon the volume record anyway (the worker will still refuse to reclaim \
+                     storage under a live mount)",
+                    inner.volume_id
+                )));
+            }
+        }
+
+        let volume = self
+            .store
+            .delete_volume(&inner.volume_id, inner.force)
+            .map_err(|e| map_store_error("Error deleting volume", e))?;
+        let message = if inner.force {
+            format!(
+                "Volume {} marked destroyed without driver confirmation; any data on its node \
+                 is left behind",
+                volume.volume_id
+            )
+        } else {
+            format!(
+                "Volume {} queued for reclamation by its {} driver",
+                volume.volume_id, volume.driver
+            )
+        };
+        if !idempotency_key.is_empty() {
+            if let Err(err) =
+                self.store
+                    .idempotency_record(&idempotency_key, "DeleteVolume", &message)
+            {
+                warn!(error = ?err, "Failed recording idempotency key for DeleteVolume");
+            }
+        }
+
+        Ok(Response::new(DeleteVolumeReply {
+            volume: Some(volume_info(volume)),
+            message,
+            deduplicated: false,
+        }))
+    }
+
+    /// The volume drivers installed across the cluster, aggregated from worker
+    /// fingerprints (the manager loads no drivers of its own).
+    #[instrument(skip_all)]
+    async fn list_volume_drivers(
+        &self,
+        request: Request<ListVolumeDriversRequest>,
+    ) -> Result<Response<ListVolumeDriversReply>, Status> {
+        // Cluster capability data, like node fingerprints: gated on node read.
+        self.check_acl(
+            &request,
+            AclResource::Node,
+            AclAction::Read,
+            AclScope::any(),
+        )?;
+        let drivers = self
+            .store
+            .cluster_volume_drivers()
+            .map_err(|e| map_store_error("Error listing volume drivers", e))?
+            .into_iter()
+            .map(|(name, entry)| crate::structs::VolumeDriverInfo {
+                name,
+                node_local: entry.capabilities.node_local,
+                ephemeral: entry.capabilities.ephemeral,
+                access_modes: entry.capabilities.access_modes,
+                volume_modes: entry
+                    .capabilities
+                    .volume_modes
+                    .iter()
+                    .map(|mode| mode.to_string())
+                    .collect(),
+                ops: entry.capabilities.ops,
+                required_params: entry.capabilities.required_params,
+                optional_params: entry.capabilities.optional_params,
+                detail: entry.capabilities.detail,
+                nodes: entry.nodes,
+                available_nodes: entry.available_nodes,
+            })
+            .collect();
+
+        Ok(Response::new(ListVolumeDriversReply { drivers }))
+    }
+
     #[instrument(skip_all, fields(alloc_id, identity_name, node_id))]
     async fn issue_workload_identity_token(
         &self,
@@ -3444,6 +3945,7 @@ impl Manager for ManagerDaemonService {
         // registration (or a management token) when ACLs are enforced.
         let identity = self.authenticate_acl(&request)?;
         acl::enforce_worker_plane(&identity)?;
+        crate::manager::telemetry::metrics().heartbeats_total.inc();
         let req = request.into_inner();
         let id = req.id;
 
@@ -3469,6 +3971,10 @@ impl Manager for ManagerDaemonService {
             );
         }
 
+        // Volume outcomes flow manager-ward here: workers own the drivers, the
+        // manager owns the state machine (see docs/volumes.md).
+        apply_volume_reports(&self.store, &id, &req.volume_reports);
+
         let desired_allocations = build_desired_allocations(&self.store, &id, &req.allocation_ids)
             .map_err(|e| map_store_error("Error building desired allocations", e))?;
         // Endpoint feed for the node-local upstream forwarders. Costs nothing
@@ -3476,11 +3982,15 @@ impl Manager for ManagerDaemonService {
         // is infallible by construction: a connect-layer problem must never
         // stop this node from reconciling its allocations.
         let upstream_endpoints = build_upstream_endpoints(&self.store, &desired_allocations);
+        // Reclaim work for this node. Re-sent every heartbeat until the worker
+        // confirms, so a worker that dies mid-destroy simply retries.
+        let volume_destroy = build_volume_destroy_requests(&self.store, &id);
 
         let reply = HeartbeatReply {
             message: "ack".into(),
             desired_allocations,
             upstream_endpoints,
+            volume_destroy,
         };
 
         Ok(Response::new(reply))
@@ -3538,6 +4048,7 @@ impl Manager for ManagerDaemonService {
             reserved_resources: worker_config.reserved_resources,
             max_allocations: worker_config.max_allocations,
             artifacts: worker_config.artifacts,
+            host_volumes: worker_config.host_volumes,
         };
 
         let reply = WorkerPreRegisterReply {
@@ -3557,8 +4068,45 @@ impl Manager for ManagerDaemonService {
         let identity = self.authenticate_acl(&request)?;
         self.verify_join_for_registration(&identity, request.get_ref().join_token.as_deref())?;
         let request = request.into_inner();
-        let dynamic_attrs = json!({}).to_string();
         let node_id = request.name.clone();
+
+        // Protocol-version handshake (see docs/upgrades.md): accept workers
+        // at or below our protocol version, warn on pre-versioning workers
+        // (proto3 decodes a missing field as 0), reject newer workers so the
+        // managers-first upgrade order is enforced.
+        match protocol_compat(request.protocol_version, PROTOCOL_VERSION) {
+            VersionCompat::Accept => {}
+            VersionCompat::AcceptWithWarn => {
+                warn!(
+                    node_id = %node_id,
+                    manager_protocol_version = PROTOCOL_VERSION,
+                    "Worker registered without a protocol version (pre-versioning build); \
+                     accepting for rolling-upgrade compatibility — upgrade this worker"
+                );
+            }
+            VersionCompat::Reject => {
+                return Err(Status::failed_precondition(format!(
+                    "worker {node_id} speaks protocol version {} but this manager only \
+                     supports up to {}: the worker was upgraded before the manager. \
+                     Upgrade all managers first, then re-join the worker \
+                     (see docs/upgrades.md)",
+                    request.protocol_version, PROTOCOL_VERSION
+                )));
+            }
+        }
+
+        // Seed the node's dynamic attrs with its versions so `legion node
+        // list` and the UI expose fleet skew. An empty build version means a
+        // worker built before version reporting existed.
+        let dynamic_attrs = json!({
+            "buildVersion": if request.build_version.is_empty() {
+                "unknown"
+            } else {
+                request.build_version.as_str()
+            },
+            "protocolVersion": request.protocol_version,
+        })
+        .to_string();
 
         let node_msg = NodeMsg {
             id: request.name,
@@ -3584,9 +4132,18 @@ impl Manager for ManagerDaemonService {
             None
         };
 
+        info!(
+            node_id = %node_id,
+            worker_build_version = %request.build_version,
+            worker_protocol_version = request.protocol_version,
+            "Worker registered"
+        );
+
         let reply = WorkerRegisterReply {
             message: "Worker registered".into(),
             node_token,
+            manager_build_version: env!("CARGO_PKG_VERSION").to_string(),
+            manager_protocol_version: PROTOCOL_VERSION,
         };
 
         Ok(Response::new(reply))
@@ -3720,6 +4277,91 @@ impl Manager for ManagerDaemonService {
         };
 
         Ok(Response::new(reply))
+    }
+
+    /// Cordon / drain / uncordon a node. See the proto comments on
+    /// `SetNodeAvailability` for the full contract.
+    #[instrument(skip_all)]
+    async fn set_node_availability(
+        &self,
+        request: Request<SetNodeAvailabilityRequest>,
+    ) -> Result<Response<SetNodeAvailabilityReply>, Status> {
+        // Coarse gate before the node lookup ("check before you fetch");
+        // the precise pool scope is enforced after the node is loaded.
+        let identity = self.check_acl(
+            &request,
+            AclResource::Node,
+            AclAction::Write,
+            AclScope::any(),
+        )?;
+        let inner = request.into_inner();
+        let node_id = inner.node_id;
+        let availability = inner.availability;
+        let evict = inner.evict;
+        let idempotency_key = inner.idempotency_key.unwrap_or_default();
+
+        if availability != "available" && availability != "drained" {
+            return Err(Status::invalid_argument(format!(
+                "invalid availability {availability:?}: expected \"available\" or \"drained\""
+            )));
+        }
+
+        if let Some(message) = self
+            .store
+            .idempotency_lookup(&idempotency_key)
+            .map_err(|e| map_store_error("Error checking idempotency", e))?
+        {
+            return Ok(Response::new(SetNodeAvailabilityReply {
+                node: None,
+                message,
+                deduplicated: true,
+            }));
+        }
+
+        let node = self
+            .store
+            .get_node(&node_id)
+            .map_err(|e| map_store_error("Error setting node availability", e))?;
+        acl::enforce(
+            &identity,
+            AclResource::Node,
+            AclAction::Write,
+            &AclScope::pool(&node.pool),
+        )?;
+
+        // The evict intent rides the replicated write so failover
+        // regeneration can tell an evicting drain from a plain cordon
+        // (Store::set_node_availability_with_evict).
+        let node = self
+            .store
+            .set_node_availability_with_evict(&node_id, &availability, evict)
+            .map_err(|e| map_store_error("Error setting node availability", e))?;
+
+        let draining = evict && availability == "drained";
+        if draining {
+            self.store
+                .enqueue_eval("node_drain", None, None, Some(&node_id), None)
+                .map_err(|e| map_store_error("Error enqueueing drain eval", e))?;
+        }
+
+        let message = if availability == "available" {
+            format!("Uncordoned node {node_id}")
+        } else if draining {
+            format!("Draining node {node_id}")
+        } else {
+            format!("Cordoned node {node_id}")
+        };
+        info!(%node_id, %availability, evict, "Node availability changed");
+
+        self.store
+            .idempotency_record(&idempotency_key, "set_node_availability", &message)
+            .map_err(|e| map_store_error("Error recording idempotency", e))?;
+
+        Ok(Response::new(SetNodeAvailabilityReply {
+            node: Some(node.into()),
+            message,
+            deduplicated: false,
+        }))
     }
 
     #[instrument(skip_all)]
@@ -3999,6 +4641,7 @@ impl Manager for ManagerDaemonService {
                 election_epoch_ms: 0,
                 join_token_ttl_seconds: 0,
                 raft_library: String::new(),
+                lanes: Vec::new(),
             });
         Ok(Response::new(GetRaftStatusReply {
             status: Some(status),
@@ -4039,10 +4682,9 @@ impl Manager for ManagerDaemonService {
         )?;
         let req = request.into_inner();
         let actor = req.actor.unwrap_or_else(|| "api".to_string());
-        let event = self
+        let outcome = self
             .store
             .issue_raft_command(&req.command, req.target_node_id.as_deref(), &actor)
-            .map(map_raft_event)
             .map_err(|e| map_store_error("Error issuing raft command", e))?;
         let status = self
             .store
@@ -4051,8 +4693,9 @@ impl Manager for ManagerDaemonService {
             .ok_or_else(|| Status::failed_precondition("raft backend is not enabled"))?;
         Ok(Response::new(IssueRaftCommandReply {
             command: req.command,
-            event: Some(event),
+            event: Some(map_raft_event(outcome.event)),
             status: Some(status),
+            warning: outcome.warning,
         }))
     }
 
@@ -4084,6 +4727,35 @@ impl Manager for ManagerDaemonService {
             token,
             expires_at,
             status: Some(status),
+        }))
+    }
+
+    #[instrument(skip_all)]
+    async fn get_state_backup(
+        &self,
+        request: Request<GetStateBackupRequest>,
+    ) -> Result<Response<GetStateBackupReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Operator,
+            AclAction::Write,
+            AclScope::none(),
+        )?;
+        let req = request.into_inner();
+        let out = req.out_path.as_ref().map(std::path::Path::new);
+        // All-lane-leader-only in raft mode (the image spans every lane's
+        // tables; JC-40 co-locates leadership so this is one node):
+        // `state_backup` returns the typed NotRaftLeader error, which
+        // map_store_error turns into FAILED_PRECONDITION with the leader
+        // hint (plan §A4/§A5).
+        let info = self
+            .store
+            .state_backup(out)
+            .map_err(|e| map_store_error("Error creating state backup", e))?;
+        Ok(Response::new(GetStateBackupReply {
+            path: info.path.display().to_string(),
+            bytes: info.bytes,
+            applied_index: info.applied_index,
         }))
     }
 
@@ -4168,6 +4840,7 @@ impl Manager for ManagerDaemonService {
                     // summary does, so `doctor` can explain a denied consumer
                     // with plain job:read.
                     allow: entry.allow,
+                    meta: entry.meta.into_iter().collect(),
                 });
         }
         for endpoint in endpoints {
@@ -4181,6 +4854,7 @@ impl Manager for ManagerDaemonService {
                     total_count: 0,
                     tags: endpoint.tags.clone(),
                     allow: endpoint.allow.clone(),
+                    meta: endpoint.meta.clone().into_iter().collect(),
                 });
             summary.total_count += 1;
             if endpoint.healthy {
@@ -4220,6 +4894,8 @@ impl Manager for ManagerDaemonService {
                 healthy: endpoint.healthy,
                 health_status: endpoint.health_status,
                 tags: endpoint.tags,
+                meta: endpoint.meta.into_iter().collect(),
+                port_label: endpoint.port_label.unwrap_or_default(),
             })
             .collect();
 
@@ -4279,7 +4955,7 @@ impl Manager for ManagerDaemonService {
     /// reference any KV path via auth.kv, so possession of job-submit access
     /// implies read access to every KV credential. Revisit when the ACL
     /// system lands — this credential read must become an early enforcement
-    /// point. Tracked in docs/TASK-LIST.md (ACL System).
+    /// point. Tracked in internal_docs/TODO.md (Auth, TLS & security).
     #[instrument(skip_all, fields(node_id = %request.get_ref().node_id, kv_path = %request.get_ref().kv_path, source = %request.get_ref().source))]
     async fn get_artifact_credential(
         &self,
@@ -5715,7 +6391,14 @@ fn build_desired_allocations(
             Some(instance_id) => store.get_instance(instance_id)?,
             None => None,
         };
-        allocations.push(build_task_allocation(task, &allocation, instance.as_ref())?);
+        let volumes =
+            store.volume_mounts_for_allocation(&allocation.job_id, task, instance.as_ref())?;
+        allocations.push(build_task_allocation(
+            task,
+            &allocation,
+            instance.as_ref(),
+            &volumes,
+        )?);
     }
 
     Ok(allocations)
@@ -5819,6 +6502,8 @@ fn build_upstream_endpoints(
                         healthy: row.healthy,
                         health_status: row.health_status,
                         tags: row.tags,
+                        meta: row.meta.into_iter().collect(),
+                        port_label: row.port_label.unwrap_or_default(),
                     })
                     .collect::<Vec<_>>();
                 resolved.insert(key.clone(), endpoints);
@@ -5839,6 +6524,178 @@ fn build_upstream_endpoints(
     }
 
     upstreams
+}
+
+/// Apply the volume operation outcomes a worker reported.
+///
+/// A successful mount pins the volume's node (and corrects the manager's
+/// mint-time node-local guess with what the driver actually said); a confirmed
+/// destroy is the only thing that advances `destroying -> destroyed`; a failure
+/// is recorded on the row so `legion volume list` explains a stuck volume.
+/// Failures here are logged, never fatal to the heartbeat — a wedged volume
+/// must not stop a node from reporting its allocations.
+///
+/// All three writes are SCHEDULER-lane replicated ops (`volume` is
+/// scheduler-owned, see `storage::raft::ownership`) called from a worker-plane
+/// RPC. On a follower they therefore return the typed `NotRaftLeader` error
+/// with that lane's leader hint; the warn-and-continue below is deliberately
+/// what handles it. Nothing is lost: the worker re-reports on its next
+/// heartbeat, and the reclaim reaper re-dispatches `destroying` volumes until
+/// a destroy is confirmed, so the state machine converges once the report
+/// reaches the lane's leader.
+fn apply_volume_reports(store: &Store, node_id: &str, reports: &[crate::structs::VolumeReport]) {
+    for report in reports {
+        if !report.ok {
+            let driver = store
+                .get_volume(&report.volume_id)
+                .ok()
+                .flatten()
+                .map(|volume| volume.driver)
+                .unwrap_or_else(|| "unknown".to_string());
+            warn!(
+                node_id,
+                volume_id = %report.volume_id,
+                op = %report.op,
+                error = %report.error,
+                "Volume operation failed on worker"
+            );
+            if let Err(err) = store.record_volume_error(&report.volume_id, &report.error) {
+                warn!(error = ?err, "Failed recording volume error");
+            }
+            store
+                .events()
+                .volume_failed(&report.volume_id, &driver, node_id, &report.error);
+            continue;
+        }
+
+        match report.op.as_str() {
+            "mount" => {
+                let attrs = serde_json::from_str(&report.attrs).unwrap_or_default();
+                if let Err(err) = store.record_volume_mounted(
+                    &report.volume_id,
+                    node_id,
+                    &report.mount_path,
+                    report.node_local,
+                    Some(report.fs.as_str()).filter(|fs| !fs.is_empty()),
+                    &attrs,
+                ) {
+                    warn!(error = ?err, "Failed recording volume mount");
+                    continue;
+                }
+                if let Ok(Some(volume)) = store.get_volume(&report.volume_id) {
+                    store
+                        .events()
+                        .volume_mounted(&volume, node_id, &report.mount_path);
+                }
+            }
+            "destroy" => {
+                let driver = store
+                    .get_volume(&report.volume_id)
+                    .ok()
+                    .flatten()
+                    .map(|volume| volume.driver)
+                    .unwrap_or_else(|| "unknown".to_string());
+                if let Err(err) = store.mark_volume_destroyed(&report.volume_id) {
+                    warn!(error = ?err, "Failed marking volume destroyed");
+                    continue;
+                }
+                store
+                    .events()
+                    .volume_destroyed(&report.volume_id, &driver, node_id);
+            }
+            // `unmount` needs no state change: the volume stays `created` and
+            // keeps its pin, which is exactly what makes a reschedule reattach.
+            _ => {}
+        }
+    }
+}
+
+/// Volumes this node should reclaim, filtered to plugins it actually has.
+///
+/// A node-local volume only ever goes to its own node. An unpinned or network
+/// volume can go to any node with the plugin, so we check this node advertises
+/// it before asking — otherwise a worker would fail the same destroy forever.
+fn build_volume_destroy_requests(
+    store: &Store,
+    node_id: &str,
+) -> Vec<crate::structs::VolumeDestroyRequest> {
+    let volumes = match store.volumes_to_destroy_for_node(node_id) {
+        Ok(volumes) => volumes,
+        Err(err) => {
+            warn!(node_id, error = ?err, "Failed listing volumes to destroy");
+            return Vec::new();
+        }
+    };
+    if volumes.is_empty() {
+        return Vec::new();
+    }
+    let node_drivers = store
+        .get_node(node_id)
+        .ok()
+        .and_then(|node| {
+            node.fingerprint_attrs
+                .get("volumeDrivers")
+                .and_then(Value::as_object)
+                .map(|drivers| {
+                    drivers
+                        .keys()
+                        .cloned()
+                        .collect::<std::collections::HashSet<_>>()
+                })
+        })
+        .unwrap_or_default();
+
+    volumes
+        .into_iter()
+        .filter(|volume| node_drivers.contains(&volume.driver))
+        .map(|volume| crate::structs::VolumeDestroyRequest {
+            volume_id: volume.volume_id,
+            driver: volume.driver,
+            name: volume.name,
+            params: serde_json::to_string(&volume.params).unwrap_or_else(|_| "{}".into()),
+            attrs: serde_json::to_string(&volume.attrs).unwrap_or_else(|_| "{}".into()),
+        })
+        .collect()
+}
+
+/// An optional proto string filter, treating empty/whitespace as absent —
+/// One volume declaration flattened for the admission check, from either
+/// `stateful.storage` or a `volumes[]` claim.
+struct VolumeDeclaration {
+    label: String,
+    driver: String,
+    mode: crate::volumes::VolumeMode,
+    params: std::collections::BTreeMap<String, Value>,
+    is_instance_volume: bool,
+}
+
+/// gRPC clients differ on whether an unset filter arrives as None or "".
+fn non_empty(value: Option<String>) -> Option<String> {
+    value.filter(|value| !value.trim().is_empty())
+}
+
+/// Wire form of a stored volume.
+fn volume_info(volume: crate::structs::Volume) -> crate::structs::VolumeInfo {
+    crate::structs::VolumeInfo {
+        volume_id: volume.volume_id,
+        name: volume.name,
+        driver: volume.driver,
+        job_id: volume.job_id,
+        instance_id: volume.instance_id,
+        task_name: volume.task_name,
+        state: volume.state.to_string(),
+        node_id: volume.node_id,
+        node_local: volume.node_local,
+        volume_mode: volume.volume_mode.to_string(),
+        fs: volume.fs,
+        read_only: volume.read_only,
+        params: serde_json::to_string(&volume.params).unwrap_or_else(|_| "{}".into()),
+        attrs: serde_json::to_string(&volume.attrs).unwrap_or_else(|_| "{}".into()),
+        mount_path: volume.mount_path,
+        last_error: volume.last_error,
+        created_at: volume.created_at,
+        updated_at: volume.updated_at,
+    }
 }
 
 #[cfg(test)]
@@ -5876,6 +6733,64 @@ mod tests {
         Ok(store)
     }
 
+    /// A raft non-leader rejection maps to FAILED_PRECONDITION with the
+    /// leader's name and address in the message (plan §A4, JC-4) — even
+    /// when the typed error is buried under pipeline context, as the raft
+    /// driver produces it.
+    #[test]
+    fn map_store_error_surfaces_raft_leader_hint() {
+        let err = anyhow::Error::new(crate::storage::raft::driver::NotRaftLeader {
+            lane: None,
+            leader_name: Some("mgr-b".to_string()),
+            leader_addr: Some("10.0.0.2:4747".to_string()),
+        })
+        .context("raft op stop_job must run on the leader");
+        let status = map_store_error("Error stopping job", err);
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert!(status.message().contains("not the raft leader"));
+        assert!(status.message().contains("mgr-b"));
+        assert!(status.message().contains("10.0.0.2:4747"));
+
+        // Under `lanes` topology the hint names WHICH lane's leader to
+        // contact — different lanes can have different leaders.
+        let err = anyhow::Error::new(crate::storage::raft::driver::NotRaftLeader {
+            lane: Some("status".to_string()),
+            leader_name: Some("mgr-c".to_string()),
+            leader_addr: Some("10.0.0.3:4747".to_string()),
+        })
+        .context("raft op mark_nodes_as_lost must run on the status lane's leader");
+        let status = map_store_error("Error marking nodes lost", err);
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert!(status.message().contains("for the status lane"));
+        assert!(status.message().contains("mgr-c"));
+        assert!(status.message().contains("10.0.0.3:4747"));
+    }
+
+    /// Table-test for the pure protocol-compat decision used by
+    /// `worker_register` (see docs/upgrades.md for the policy).
+    #[test]
+    fn protocol_compat_decision_table() {
+        use super::VersionCompat::*;
+        let cases = [
+            // (worker_pv, manager_pv, expected)
+            (0, 1, AcceptWithWarn), // pre-versioning worker: rolling upgrade
+            (0, 0, AcceptWithWarn), // both pre-versioning (unreachable today)
+            (1, 1, Accept),         // exact match
+            (1, 2, Accept),         // older worker, newer manager: fine
+            (1, u32::MAX, Accept),  // arbitrarily newer manager
+            (2, 1, Reject),         // worker upgraded before manager
+            (u32::MAX, 1, Reject),  // absurdly new worker
+            (1, 0, Reject),         // versioned worker, pre-versioning manager
+        ];
+        for (worker_pv, manager_pv, expected) in cases {
+            assert_eq!(
+                protocol_compat(worker_pv, manager_pv),
+                expected,
+                "protocol_compat({worker_pv}, {manager_pv})"
+            );
+        }
+    }
+
     #[test]
     fn kv_references_ignore_interpolation_tokens() {
         // Bare `$path/key` strings are KV references…
@@ -5895,7 +6810,7 @@ mod tests {
             availability: "available".into(),
             config_attrs: "{}".into(),
             fingerprint_attrs: json!({
-                "memory_total": "8388608",
+                "memory_total": "8589934592",
                 "cpus": {
                     "cpu-1": { "frequency": "2400" },
                     "cpu-2": { "frequency": "2400" },
@@ -6285,6 +7200,9 @@ mod tests {
                 initial_instances: None,
                 on_lost: None,
                 storage: Some(crate::structs::StatefulStorageConfig {
+                    driver: None,
+                    mode: None,
+                    params: None,
                     path: "/var/lib/db".into(),
                     retain_on_scale_in: None,
                     retain_on_stop: None,
@@ -6315,6 +7233,12 @@ mod tests {
         let allocation = submit_and_place_stateful_task(&store, "fence-job")?;
         let instance_id = allocation.instance_id.clone().context("instance bound")?;
         store.mark_nodes_as_lost(&["node-1".to_string()])?;
+        // Pump the C-2 eval-mediated reschedule tail so the gating below is
+        // exercised by the real lost-node pass, not by an unprocessed queue.
+        while let Some(eval) = store.claim_eval()? {
+            eval.handle(&store)?;
+            store.complete_eval(&eval.id, true)?;
+        }
         // Gated: still on the lost node.
         assert_eq!(store.allocs_for_node("node-1")?.len(), 1);
 
@@ -6400,6 +7324,12 @@ mod tests {
 
         // Lost node, gated allocation: the diagnostic explains the wait.
         store.mark_nodes_as_lost(&["node-1".to_string()])?;
+        // Pump the C-2 eval-mediated reschedule tail so the gating below is
+        // exercised by the real lost-node pass, not by an unprocessed queue.
+        while let Some(eval) = store.claim_eval()? {
+            eval.handle(&store)?;
+            store.complete_eval(&eval.id, true)?;
+        }
         let reply = manager
             .get_instance(tonic::Request::new(GetInstanceRequest {
                 instance_id: instance_id.clone(),
@@ -6638,7 +7568,7 @@ mod tests {
         let jobspec = json!({
             "name": "kv-job",
             "task": {
-                "kind": "exec",
+                "runtime": "exec",
                 "config": {
                     "command": ["echo", "hi"],
                     "env": {
@@ -6716,7 +7646,7 @@ mod tests {
         let jobspec = json!({
             "name": "kv-restart-policy-job",
             "task": {
-                "kind": "exec",
+                "runtime": "exec",
                 "kv": { "watch": true, "onChange": "restart", "onDelete": "fail" },
                 "env": [
                     {
@@ -6775,7 +7705,7 @@ mod tests {
         let jobspec = json!({
             "name": "kv-rollout-policy-job",
             "task": {
-                "kind": "exec",
+                "runtime": "exec",
                 "kv": { "watch": true, "onChange": "rollout", "onDelete": "fail" },
                 "files": [
                     {
@@ -6879,7 +7809,7 @@ mod tests {
         json!({
             "name": job,
             "task": {
-                "kind": "exec",
+                "runtime": "exec",
                 "kv": { "watch": true, "onChange": on_change, "onDelete": on_delete },
                 "env": [
                     {
@@ -7081,7 +8011,7 @@ mod tests {
             "tasks": [
                 {
                     "name": "task-a",
-                    "kind": "exec",
+                    "runtime": "exec",
                     "kv": { "watch": true, "onChange": "restart", "onDelete": "fail" },
                     "env": [
                         {
@@ -7093,7 +8023,7 @@ mod tests {
                 },
                 {
                     "name": "task-b",
-                    "kind": "exec",
+                    "runtime": "exec",
                     "kv": { "watch": true, "onChange": "restart", "onDelete": "fail" },
                     "env": [
                         {
@@ -7236,7 +8166,7 @@ mod tests {
         let jobspec = json!({
             "name": "kv-unwatched",
             "task": {
-                "kind": "exec",
+                "runtime": "exec",
                 // Defaults would watch, but the entry opts out explicitly.
                 "kv": { "watch": true, "onChange": "restart", "onDelete": "fail" },
                 "env": [
@@ -7281,7 +8211,7 @@ mod tests {
         let jobspec = json!({
             "name": "kv-precedence",
             "task": {
-                "kind": "exec",
+                "runtime": "exec",
                 "kv": { "watch": true, "onChange": "restart" },
                 "env": [
                     {
@@ -7329,7 +8259,7 @@ mod tests {
         let jobspec = json!({
             "name": "kv-template-kv",
             "task": {
-                "kind": "exec",
+                "runtime": "exec",
                 "kv": { "watch": true, "onChange": "restart", "onDelete": "fail" },
                 "env": [
                     {
@@ -7384,7 +8314,7 @@ mod tests {
             "tasks": [
                 {
                     "name": "watcher",
-                    "kind": "exec",
+                    "runtime": "exec",
                     "kv": { "watch": true, "onChange": "restart", "onDelete": "none" },
                     "env": [
                         { "name": "A", "value": { "template": "{{ kv \"iso/a\" }}" } }
@@ -7393,7 +8323,7 @@ mod tests {
                 },
                 {
                     "name": "bystander",
-                    "kind": "exec",
+                    "runtime": "exec",
                     "config": { "command": ["echo", "bye"], "env": { "STATIC": "fixed" } }
                 }
             ]
@@ -7441,7 +8371,7 @@ mod tests {
         let jobspec = json!({
             "name": "kv-file-rerender",
             "task": {
-                "kind": "exec",
+                "runtime": "exec",
                 "kv": { "watch": true, "onChange": "restart", "onDelete": "none" },
                 "files": [
                     {
@@ -7554,7 +8484,7 @@ mod tests {
         let jobspec = json!({
             "name": "kv-container-files",
             "task": {
-                "kind": "container",
+                "runtime": "container",
                 "files": [
                     {
                         "path": "/etc/app/conf",
@@ -7630,7 +8560,7 @@ mod tests {
         let jobspec = json!({
             "name": "replace-rollout",
             "task": {
-                "kind": "exec",
+                "runtime": "exec",
                 "group": "web",
                 "config": {
                     "command": ["echo", "v3"]
@@ -8768,6 +9698,9 @@ mod tests {
                 initial_instances: None,
                 on_lost: None,
                 storage: Some(crate::structs::StatefulStorageConfig {
+                    driver: None,
+                    mode: None,
+                    params: None,
                     path: "/workspace".into(),
                     retain_on_scale_in: None,
                     retain_on_stop: None,

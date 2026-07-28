@@ -26,7 +26,7 @@ use crate::structs::{
     exec_client_frame, worker_client::WorkerClient, ExecClientFrame, ExecServerFrame, ExecStart,
     ExecWinsize, Node,
 };
-use crate::task_plugins::kind_is_host_level;
+use crate::task_plugins::runtime_is_host_level;
 
 /// The response stream type for `Manager.ExecAllocation`.
 pub type ExecAllocationStream = ReceiverStream<Result<ExecServerFrame, Status>>;
@@ -109,7 +109,7 @@ fn resolve_exec_start(
         )));
     }
 
-    let host_level = kind_is_host_level(&task.kind);
+    let host_level = runtime_is_host_level(&task.runtime);
 
     let (command, tty, audit_subject, audit_params) = if is_action {
         let action = task

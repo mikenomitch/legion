@@ -21,6 +21,13 @@ fn store_path(prefix: &str) -> anyhow::Result<String> {
 }
 
 fn setup_store(policy: &str) -> anyhow::Result<Store> {
+    setup_store_with_settings(policy, None)
+}
+
+fn setup_store_with_settings(
+    policy: &str,
+    scheduler_settings: Option<serde_json::Value>,
+) -> anyhow::Result<Store> {
     let store_config = ManagerConfigFull {
         store_path: store_path("khepri-scheduler-bench-")?,
         scheduling_policy: policy.into(),
@@ -29,6 +36,7 @@ fn setup_store(policy: &str) -> anyhow::Result<Store> {
             "memory": 0,
             "allocations": 1
         })),
+        scheduler_settings,
         ..Default::default()
     };
 
@@ -39,7 +47,7 @@ fn setup_store(policy: &str) -> anyhow::Result<Store> {
 
 fn default_fingerprint() -> serde_json::Value {
     json!({
-        "memory_total": "8388608",
+        "memory_total": "8589934592",
         "cpus": {
             "cpu-1": { "frequency": "2400" },
             "cpu-2": { "frequency": "2400" },
@@ -143,5 +151,107 @@ fn scheduler_speed_benchmark(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, scheduler_speed_benchmark);
+// ---------------------------------------------------------------------------
+// Candidate construction (scheduling-index plan, Phase 0)
+// ---------------------------------------------------------------------------
+//
+// Isolates the cost this feature targets: building each task's candidate set
+// from constraints over a heterogeneous fleet. `indexes_off` pins the plain
+// scan (`index_min_nodes: 0`); `indexes_on` arms a partition index over the
+// same fleet. Constraint selectivity is 1/16 (one region of sixteen).
+
+const CANDIDATE_NODE_STEPS: &[usize] = &[1_000, 5_000, 10_000];
+const CANDIDATE_REGIONS: usize = 16;
+
+fn insert_regional_nodes(store: &Store, node_count: usize) -> anyhow::Result<()> {
+    for idx in 0..node_count {
+        let attrs = json!({
+            "region": format!("region-{}", idx % CANDIDATE_REGIONS),
+            "zone": format!("zone-{}", idx % 4),
+            "tier": "default",
+        });
+        let node = make_node_msg(&format!("node-{idx:06}"), attrs);
+        store.insert_node(node)?;
+    }
+    Ok(())
+}
+
+/// One job, `task_count` independently-placed tasks (distinct groups so the
+/// single-task candidate path runs per task — the default group would
+/// co-place them), each constrained to one region of sixteen. Candidate
+/// construction cost scales with tasks × nodes on the scan and with tasks ×
+/// shard on the index, while the per-plan snapshot cost stays constant — so
+/// more tasks isolates the cost this group exists to measure.
+fn make_constrained_job(task_count: usize, per_task: u32) -> JobConfig {
+    let tasks = (0..task_count)
+        .map(|idx| TaskConfig {
+            count: TaskCount::new(per_task),
+            constraints: json!({
+                "region": format!("region-{}", idx % CANDIDATE_REGIONS),
+                "tier": "default",
+            }),
+            group: format!("group-{idx}"),
+            ..TaskConfig::new(format!("task-{idx}"), "noop")
+        })
+        .collect();
+    JobConfig {
+        name: "bench-candidates".into(),
+        tasks,
+        rollout: None,
+        rollout_by_group: Default::default(),
+        version: None,
+    }
+}
+
+fn candidate_construction_benchmark(c: &mut Criterion) {
+    let mut group = c.benchmark_group("candidate_construction");
+    group.warm_up_time(Duration::from_millis(500));
+    group.measurement_time(Duration::from_secs(5));
+    group.sample_size(20);
+
+    for &node_count in CANDIDATE_NODE_STEPS {
+        for (label, settings) in [
+            ("indexes_off", json!({ "index_min_nodes": 0 })),
+            (
+                "indexes_on",
+                json!({
+                    "index_min_nodes": 1,
+                    "indexes": { "topo": ["pool", "region"] },
+                }),
+            ),
+        ] {
+            let bench_id = BenchmarkId::new(label, format!("nodes_{node_count}"));
+            group.bench_function(bench_id, |b| {
+                b.iter_batched(
+                    || {
+                        let store = setup_store_with_settings("bin_pack", Some(settings.clone()))
+                            .expect("store");
+                        insert_regional_nodes(&store, node_count).expect("nodes");
+                        let job = make_constrained_job(12, 2);
+                        let ids = submit_jobs(&store, std::slice::from_ref(&job)).expect("job");
+                        (store, ids)
+                    },
+                    |(store, job_ids)| {
+                        let scheduler = Scheduler::new(&store).expect("scheduler");
+                        for job_config_id in job_ids {
+                            let plan = scheduler
+                                .plan_only(&job_config_id, PlanMode::Fresh)
+                                .expect("plan");
+                            assert!(!plan.is_empty());
+                        }
+                    },
+                    criterion::BatchSize::LargeInput,
+                );
+            });
+        }
+    }
+
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    scheduler_speed_benchmark,
+    candidate_construction_benchmark
+);
 criterion_main!(benches);

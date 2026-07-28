@@ -8,7 +8,7 @@
   tasks: [
     {
       name: 'api',
-      kind: 'exec',
+      runtime: 'exec',
       config: {
         command: ['sleep', '3600'],
       },
@@ -52,7 +52,7 @@
       // and the subject survives reschedules (unlike alloc/node, which are
       // forbidden in sub for exactly that reason).
       name: 'replica',
-      kind: 'exec',
+      runtime: 'exec',
       count: 2,
       stateful: {
         mode: 'slot',

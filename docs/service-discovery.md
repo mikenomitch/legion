@@ -6,7 +6,7 @@ extra components. Then declare a `connect` block and the workload gets a fixed
 local address per upstream with load balancing behind it. Works the same on
 Linux and macOS.
 
-Design background lives in [docs/plans/service-discovery-final-plan.md](plans/service-discovery-final-plan.md)
+Design background lives in [internal_docs/plans/service-discovery-final-plan.md](../internal_docs/plans/service-discovery-final-plan.md)
 (and the docs it consolidates). This page documents what is implemented today.
 
 ## Quick start
@@ -18,7 +18,7 @@ The one-liner — a bare port number declares and advertises the port:
     name: "redis-job",
     tasks: [{
         name: "redis",
-        kind: "exec",
+        runtime: "exec",
         config: { command: ["redis-server", "--port", "6379"] },
         service: { port: 6379 },   // -> service "redis", static port 6379
     }],
@@ -261,7 +261,7 @@ does not stop a task that already knows a backend's `address:port` from dialing
 it directly, and nothing on that wire is authenticated or encrypted.
 Identity-backed enforcement (mTLS between forwarders, with `service.allow` as
 the policy input) is the mesh follow-on — see
-[the final plan](plans/service-discovery-final-plan.md) §8.
+[the final plan](../internal_docs/plans/service-discovery-final-plan.md) §8.
 
 ### Validation
 
@@ -325,7 +325,14 @@ curl "http://$(legion service resolve web --one)/health"
 
 The same data is available over gRPC: `ListServices` and `ResolveService` on
 the `Manager` service (see `proto/legion.proto`), and over MCP as
-`legion_service_list` / `legion_service_resolve`.
+`legion_service_list` / `legion_service_resolve`. Both RPCs carry the service's
+`meta` map; `meta.protocol` (`http`, `https`, …) is the convention clients use
+to turn `address:port` into a URL.
+
+The UI has a **Services** page with the same catalog, per-endpoint health, and
+a visual version of `doctor`. Endpoints link straight to the address when the
+service speaks HTTP, and job/task pages show their own services, assigned
+ports, declared checks, and per-allocation health.
 
 `doctor` checks, in order: service declared → allocations placed → nodes
 alive → port assigned → health checks passing — and prints a verdict, the
@@ -390,4 +397,4 @@ functions (`{{ range endpoints "db" }}`), the `datapath` plugin ABI
 (bridge/CNI), **mTLS** so intentions rest on cryptographic workload identity
 rather than the control plane alone, the opt-in L7 layer with WASM middleware,
 and the observability service graph. See the
-[final plan](plans/service-discovery-final-plan.md) §8.
+[final plan](../internal_docs/plans/service-discovery-final-plan.md) §8.

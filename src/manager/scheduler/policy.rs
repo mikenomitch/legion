@@ -2,13 +2,14 @@
 #![allow(clippy::too_many_arguments)]
 
 use crate::plugin_runtime::{plugin_paths, validate_manifest};
+use crate::storage::store::SharedNodeAllocations;
 use crate::util::plugin_root_dir;
 use std::collections::HashMap;
 
 use crate::constraints::AffinitySet;
 use crate::prelude::*;
 use crate::structs::config::DEF_SCHEDULER_AUTO_ANTI_AFFINITY_WEIGHT;
-use crate::structs::{Allocation, Node, TaskConfig};
+use crate::structs::{Node, TaskConfig};
 use libloading::{Library, Symbol};
 use rand::seq::SliceRandom;
 use rand::thread_rng;
@@ -55,7 +56,7 @@ pub struct SchedulingContext<'a> {
     pub task_id: i64,
     pub affinity_set: &'a AffinitySet,
     pub job_config_id: &'a str,
-    pub allocations: &'a HashMap<String, Vec<Allocation>>,
+    pub allocations: &'a SharedNodeAllocations,
     pub task_name_to_id: &'a HashMap<String, i64>,
     pub task_id_to_group: &'a HashMap<i64, String>,
     pub planned_task_allocations: &'a HashMap<String, Vec<i64>>,
@@ -71,7 +72,7 @@ impl<'a> SchedulingContext<'a> {
         task_id: i64,
         affinity_set: &'a AffinitySet,
         job_config_id: &'a str,
-        allocations: &'a HashMap<String, Vec<Allocation>>,
+        allocations: &'a SharedNodeAllocations,
         task_name_to_id: &'a HashMap<String, i64>,
         task_id_to_group: &'a HashMap<i64, String>,
         planned_task_allocations: &'a HashMap<String, Vec<i64>>,
@@ -403,6 +404,7 @@ pub fn load_policy(name: &str) -> R<(Option<Library>, Box<dyn SchedulingPolicy>)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::structs::Allocation;
     use serde_json::json;
     use std::collections::HashMap;
     use std::sync::OnceLock;
@@ -465,10 +467,10 @@ mod tests {
 
     #[test]
     fn bin_pack_prefers_more_loaded_node() {
-        let nodes = [node("node-a"), node("node-b")];
-        let allocations: HashMap<String, Vec<Allocation>> = HashMap::from([(
+        let nodes = vec![node("node-a"), node("node-b")];
+        let allocations = SharedNodeAllocations::from([(
             String::from("node-a"),
-            vec![alloc("node-a", 1, "other-job")],
+            Arc::new(vec![alloc("node-a", 1, "other-job")]),
         )]);
         let planned = HashMap::from([(String::from("node-b"), 2_usize)]);
 
@@ -487,7 +489,7 @@ mod tests {
             &planned,
             SchedulerWeights::for_policy("bin_pack"),
         );
-        let policy = BinPackPolicy;
+        let policy = BinPackPolicy::default();
 
         let choice = policy.select_node(ctx).expect("node expected");
         assert_eq!(choice.id, "node-b");
@@ -495,8 +497,8 @@ mod tests {
 
     #[test]
     fn bin_pack_picks_any_node_on_tie() {
-        let nodes = [node("node-a"), node("node-b")];
-        let allocations: HashMap<String, Vec<Allocation>> = HashMap::new();
+        let nodes = vec![node("node-a"), node("node-b")];
+        let allocations = SharedNodeAllocations::new();
         let planned = HashMap::from([
             (String::from("node-a"), 1_usize),
             (String::from("node-b"), 1_usize),
@@ -517,7 +519,7 @@ mod tests {
             &planned,
             SchedulerWeights::for_policy("bin_pack"),
         );
-        let policy = BinPackPolicy;
+        let policy = BinPackPolicy::default();
 
         let choice = policy.select_node(ctx).expect("node expected");
         assert!(["node-a", "node-b"].contains(&choice.id.as_str()));
@@ -525,18 +527,18 @@ mod tests {
 
     #[test]
     fn bin_pack_counts_planned_and_active_allocations() {
-        let nodes = [node("node-a"), node("node-b")];
-        let allocations: HashMap<String, Vec<Allocation>> = HashMap::from([
+        let nodes = vec![node("node-a"), node("node-b")];
+        let allocations = SharedNodeAllocations::from([
             (
                 String::from("node-a"),
-                vec![
+                Arc::new(vec![
                     alloc("node-a", 1, "other-job"),
                     alloc("node-a", 2, "other-job"),
-                ],
+                ]),
             ),
             (
                 String::from("node-b"),
-                vec![alloc("node-b", 3, "other-job")],
+                Arc::new(vec![alloc("node-b", 3, "other-job")]),
             ),
         ]);
         let planned = HashMap::from([(String::from("node-b"), 2_usize)]);
@@ -556,7 +558,7 @@ mod tests {
             &planned,
             SchedulerWeights::for_policy("bin_pack"),
         );
-        let policy = BinPackPolicy;
+        let policy = BinPackPolicy::default();
 
         let choice = policy.select_node(ctx).expect("node expected");
         assert_eq!(choice.id, "node-b");
@@ -565,7 +567,7 @@ mod tests {
     #[test]
     fn bin_pack_returns_none_without_nodes() {
         let nodes: Vec<Node> = vec![];
-        let allocations: HashMap<String, Vec<Allocation>> = HashMap::new();
+        let allocations = SharedNodeAllocations::new();
         let planned = HashMap::from([(String::from("node-b"), 1_usize)]);
 
         let task = task("web");
@@ -583,7 +585,7 @@ mod tests {
             &planned,
             SchedulerWeights::for_policy("bin_pack"),
         );
-        let policy = BinPackPolicy;
+        let policy = BinPackPolicy::default();
 
         let choice = policy.select_node(ctx);
         assert!(choice.is_none());
@@ -591,10 +593,10 @@ mod tests {
 
     #[test]
     fn spread_picks_any_node_on_equal_load() {
-        let nodes = [node("node-a"), node("node-b")];
-        let allocations: HashMap<String, Vec<Allocation>> = HashMap::from([(
+        let nodes = vec![node("node-a"), node("node-b")];
+        let allocations = SharedNodeAllocations::from([(
             String::from("node-a"),
-            vec![alloc("node-a", 1, "other-job")],
+            Arc::new(vec![alloc("node-a", 1, "other-job")]),
         )]);
         let planned = HashMap::from([(String::from("node-b"), 1_usize)]);
 
@@ -613,7 +615,7 @@ mod tests {
             &planned,
             SchedulerWeights::for_policy("spread"),
         );
-        let policy = SpreadPolicy;
+        let policy = SpreadPolicy::default();
 
         let choice = policy.select_node(ctx).expect("node expected");
         assert!(["node-a", "node-b"].contains(&choice.id.as_str()));
@@ -621,8 +623,8 @@ mod tests {
 
     #[test]
     fn spread_picks_any_node_on_tie() {
-        let nodes = [node("node-a"), node("node-b")];
-        let allocations: HashMap<String, Vec<Allocation>> = HashMap::new();
+        let nodes = vec![node("node-a"), node("node-b")];
+        let allocations = SharedNodeAllocations::new();
         let planned = HashMap::from([
             (String::from("node-a"), 1_usize),
             (String::from("node-b"), 1_usize),
@@ -643,7 +645,7 @@ mod tests {
             &planned,
             SchedulerWeights::for_policy("spread"),
         );
-        let policy = SpreadPolicy;
+        let policy = SpreadPolicy::default();
 
         let choice = policy.select_node(ctx).expect("node expected");
         assert!(["node-a", "node-b"].contains(&choice.id.as_str()));
@@ -651,16 +653,16 @@ mod tests {
 
     #[test]
     fn bin_pack_treats_near_equal_scores_as_tie() {
-        let nodes = [node("node-a"), node("node-b")];
-        let allocations: HashMap<String, Vec<Allocation>> = HashMap::from([(
+        let nodes = vec![node("node-a"), node("node-b")];
+        let allocations = SharedNodeAllocations::from([(
             String::from("node-a"),
-            vec![alloc("node-a", 1, "other-job")],
+            Arc::new(vec![alloc("node-a", 1, "other-job")]),
         )]);
         let planned = HashMap::new();
 
         let task = task("web");
         let affinity_set = AffinitySet::new(&task.affinities).expect("affinities");
-        let policy = BinPackPolicy;
+        let policy = BinPackPolicy::default();
 
         let mut seen = std::collections::HashSet::new();
         for _ in 0..64 {
@@ -695,10 +697,10 @@ mod tests {
 
     #[test]
     fn spread_prefers_node_with_same_node_as_affinity() {
-        let nodes = [node("node-a"), node("node-b")];
-        let allocations: HashMap<String, Vec<Allocation>> = HashMap::from([(
+        let nodes = vec![node("node-a"), node("node-b")];
+        let allocations = SharedNodeAllocations::from([(
             String::from("node-a"),
-            vec![alloc_for_task("node-a", 1, "job", 1)],
+            Arc::new(vec![alloc_for_task("node-a", 1, "job", 1)]),
         )]);
         let planned = HashMap::from([(String::from("node-b"), 1_usize)]);
         let task_name_to_id = HashMap::from([(String::from("api"), 1_i64)]);
@@ -720,7 +722,7 @@ mod tests {
             &planned,
             SchedulerWeights::for_policy("spread"),
         );
-        let policy = SpreadPolicy;
+        let policy = SpreadPolicy::default();
 
         let choice = policy.select_node(ctx).expect("node expected");
         assert_eq!(choice.id, "node-a");
@@ -729,7 +731,7 @@ mod tests {
     #[test]
     fn spread_returns_none_without_nodes() {
         let nodes: Vec<Node> = vec![];
-        let allocations: HashMap<String, Vec<Allocation>> = HashMap::new();
+        let allocations = SharedNodeAllocations::new();
         let planned: HashMap<String, usize> = HashMap::new();
 
         let task = task("api");
@@ -747,7 +749,7 @@ mod tests {
             &planned,
             SchedulerWeights::for_policy("spread"),
         );
-        let policy = SpreadPolicy;
+        let policy = SpreadPolicy::default();
 
         let choice = policy.select_node(ctx);
         assert!(choice.is_none());

@@ -41,16 +41,47 @@ export type ArtifactStateRow = {
   error?: string
 }
 
+// One declared health/readiness check (see docs/service-discovery.md). A
+// check's `port` may be a literal number or a `network.ports` label.
+export type JobTaskCheck = {
+  type: string
+  kind: string
+  name?: string
+  path?: string
+  port?: string
+  every?: string
+  timeout?: string
+  unhealthyAfterCount?: number
+}
+
+// A declared port from the task's `network.ports`.
+export type JobTaskPort = {
+  name: string
+  staticPort?: number
+  to?: number
+}
+
+// The task's `service` block: what it advertises to discovery.
+export type JobTaskService = {
+  name?: string
+  port: string
+  tags: string[]
+  meta: Record<string, string>
+}
+
 export type JobTask = {
   name: string
-  kind: string
+  runtime: string
   lifecycle: string
   group: string
   config?: Record<string, unknown>
-  checks?: unknown
+  checks: JobTaskCheck[]
   dependsOn: JobTaskDependency[]
   stateful?: JobTaskStateful
   artifacts: JobTaskArtifact[]
+  networkMode?: string
+  ports: JobTaskPort[]
+  service?: JobTaskService
 }
 
 export type JobSpecData = {
@@ -58,7 +89,7 @@ export type JobSpecData = {
   tasks: JobTask[]
 }
 
-export type TaskRuntimeSummary = {
+export type TaskInstanceSummary = {
   statuses: string[]
   health: string[]
   healthy?: boolean
@@ -184,6 +215,61 @@ export const shortenArtifactDigest = (digest: string): string => {
   return `${prefix}${hex.slice(0, 8)}…`
 }
 
+// Specs are hand-written jsonnet, so accept both the camelCase the manager
+// serializes and the snake_case people actually type.
+const readEither = (raw: Record<string, unknown>, camel: string, snake: string): unknown =>
+  raw[camel] ?? raw[snake]
+
+const normalizeCheck = (value: unknown): JobTaskCheck | null => {
+  if (!value || typeof value !== 'object') return null
+  const raw = value as Record<string, unknown>
+  const kind = readTaskString(raw.kind)
+  if (!kind) return null
+  const port = raw.port
+  const count = readEither(raw, 'unhealthyAfterCount', 'unhealthy_after_count')
+  return {
+    type: readTaskString(raw.type, 'health'),
+    kind,
+    name: readTaskString(raw.name) || undefined,
+    path: readTaskString(raw.path) || undefined,
+    port: typeof port === 'number' ? String(port) : readTaskString(port) || undefined,
+    every: readTaskString(raw.every) || undefined,
+    timeout: readTaskString(raw.timeout) || undefined,
+    unhealthyAfterCount: typeof count === 'number' ? count : undefined,
+  }
+}
+
+const normalizePort = (value: unknown): JobTaskPort | null => {
+  if (!value || typeof value !== 'object') return null
+  const raw = value as Record<string, unknown>
+  const name = readTaskString(raw.name)
+  if (!name) return null
+  const staticPort = readEither(raw, 'static', 'staticPort')
+  return {
+    name,
+    staticPort: typeof staticPort === 'number' ? staticPort : undefined,
+    to: typeof raw.to === 'number' ? raw.to : undefined,
+  }
+}
+
+const normalizeService = (value: unknown): JobTaskService | undefined => {
+  if (!value || typeof value !== 'object') return undefined
+  const raw = value as Record<string, unknown>
+  const port = typeof raw.port === 'number' ? String(raw.port) : readTaskString(raw.port)
+  const meta: Record<string, string> = {}
+  if (raw.meta && typeof raw.meta === 'object') {
+    for (const [key, item] of Object.entries(raw.meta as Record<string, unknown>)) {
+      meta[key] = typeof item === 'string' ? item : JSON.stringify(item)
+    }
+  }
+  return {
+    name: readTaskString(raw.name) || undefined,
+    port,
+    tags: Array.isArray(raw.tags) ? raw.tags.map((tag) => String(tag)) : [],
+    meta,
+  }
+}
+
 const normalizeTask = (value: unknown): JobTask | null => {
   if (!value || typeof value !== 'object') return null
   const raw = value as Record<string, unknown>
@@ -200,16 +286,30 @@ const normalizeTask = (value: unknown): JobTask | null => {
     .map((artifact) => normalizeArtifact(artifact))
     .filter((artifact): artifact is JobTaskArtifact => Boolean(artifact))
 
+  const checksInput = Array.isArray(raw.checks) ? raw.checks : []
+  const checks = checksInput
+    .map((check) => normalizeCheck(check))
+    .filter((check): check is JobTaskCheck => Boolean(check))
+
+  const network = raw.network && typeof raw.network === 'object' ? (raw.network as Record<string, unknown>) : undefined
+  const portsInput = network && Array.isArray(network.ports) ? network.ports : []
+  const ports = portsInput
+    .map((port) => normalizePort(port))
+    .filter((port): port is JobTaskPort => Boolean(port))
+
   return {
     name,
-    kind: readTaskString(raw.kind, 'unknown'),
+    runtime: readTaskString(raw.runtime, 'unknown'),
     lifecycle: readTaskString(raw.lifecycle, 'service'),
     group: readTaskString(raw.group, 'default'),
     config: raw.config && typeof raw.config === 'object' ? (raw.config as Record<string, unknown>) : undefined,
-    checks: raw.checks,
+    checks,
     dependsOn,
     stateful: normalizeStateful(raw.stateful),
     artifacts,
+    networkMode: network ? readTaskString(network.mode) || undefined : undefined,
+    ports,
+    service: normalizeService(raw.service),
   }
 }
 
@@ -240,16 +340,16 @@ export const extractJobSpecData = (submissions: readonly Submission[]): JobSpecD
   return null
 }
 
-export const buildTaskRuntimeByName = (
+export const buildTaskInstancesByName = (
   groups: readonly RolloutGroupStatus[],
-): Map<string, TaskRuntimeSummary> => {
-  const runtime = new Map<string, TaskRuntimeSummary>()
+): Map<string, TaskInstanceSummary> => {
+  const instances = new Map<string, TaskInstanceSummary>()
 
   for (const group of groups) {
     for (const allocation of group.allocations) {
-      const existing = runtime.get(allocation.taskName)
+      const existing = instances.get(allocation.taskName)
       if (!existing) {
-        runtime.set(allocation.taskName, {
+        instances.set(allocation.taskName, {
           statuses: allocation.status ? [allocation.status] : [],
           health: allocation.allocationHealth ? [allocation.allocationHealth] : [],
           healthy: allocation.allocationHealthy,
@@ -273,25 +373,25 @@ export const buildTaskRuntimeByName = (
     }
   }
 
-  return runtime
+  return instances
 }
 
-// Builds a runtime summary map from a plain task-name -> status map. Used to
+// Builds a per-task instance summary map from a plain task-name -> status map. Used to
 // drive live node coloring in the DAG from the manager state store, which is
 // authoritative even for jobs that were deployed without a rollout.
-export const buildTaskRuntimeFromStatuses = (
+export const buildTaskInstancesFromStatuses = (
   statusByName: ReadonlyMap<string, string>,
-): Map<string, TaskRuntimeSummary> => {
-  const runtime = new Map<string, TaskRuntimeSummary>()
+): Map<string, TaskInstanceSummary> => {
+  const instances = new Map<string, TaskInstanceSummary>()
   for (const [name, status] of statusByName) {
-    runtime.set(name, {
+    instances.set(name, {
       statuses: status ? [status] : [],
       health: [],
       healthy: undefined,
       allocations: [],
     })
   }
-  return runtime
+  return instances
 }
 
 export const topoSortTaskNames = (tasks: readonly JobTask[]): string[][] => {

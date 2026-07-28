@@ -1,6 +1,6 @@
 @import '@fontsource-variable/inter';
 @import '@fontsource-variable/space-grotesk';
-@import '@fontsource-variable/jetbrains-mono';
+@import '@fontsource-variable/fira-code';
 
 @tailwind base;
 @tailwind components;
@@ -95,5 +95,51 @@ a {
   /* Small-caps section label — the recurring Legion "inscription" motif. */
   .eyebrow {
     @apply font-display text-2xs font-semibold uppercase tracking-[0.16em] text-faint;
+  }
+
+  /* Placeholder block for content that has not arrived yet. A slow sweep
+     reads as "working" where a static grey block reads as "broken". */
+  .skeleton {
+    @apply relative overflow-hidden rounded-md bg-surface2;
+  }
+
+  .skeleton::after {
+    content: '';
+    @apply absolute inset-0;
+    background: linear-gradient(90deg, transparent, rgb(var(--c-line-strong) / 0.45), transparent);
+    animation: skeleton-sweep 1.6s ease-in-out infinite;
+  }
+}
+
+/* Collapsed-sidebar tooltip: a short slide-in so it reads as attached to the
+   icon it describes rather than appearing out of nowhere. */
+.tooltip-pop {
+  animation: tooltip-pop 120ms ease-out;
+}
+
+@keyframes tooltip-pop {
+  from {
+    opacity: 0;
+    transform: translate(-4px, -50%);
+  }
+  to {
+    opacity: 1;
+    transform: translate(0, -50%);
+  }
+}
+
+@keyframes skeleton-sweep {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(100%);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .skeleton::after,
+  .tooltip-pop {
+    animation: none;
   }
 }

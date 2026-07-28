@@ -34,7 +34,7 @@ fn insert_node(store: &Store, id: &str) -> R<()> {
         availability: "available".into(),
         config_attrs: "{}".into(),
         fingerprint_attrs: json!({
-            "memory_total": "8388608",
+            "memory_total": "8589934592",
             "cpus": {
                 "cpu-1": { "frequency": "2400" },
                 "cpu-2": { "frequency": "2400" },
@@ -136,7 +136,7 @@ fn rollout_auto_progresses_through_percent_steps() -> R<()> {
         "tasks": {
             "web": {
                 "group": "web",
-                "kind": "exec",
+                "runtime": "exec",
                 "count": 4,
                 "config": { "command": ["true"], "version": 1 },
                 "resources": { "memory": 64 }
@@ -152,7 +152,7 @@ fn rollout_auto_progresses_through_percent_steps() -> R<()> {
         "tasks": {
             "web": {
                 "group": "web",
-                "kind": "exec",
+                "runtime": "exec",
                 "count": 4,
                 "config": { "command": ["true"], "version": 2 },
                 "resources": { "memory": 64 }
@@ -213,14 +213,14 @@ fn rollout_manual_requires_explicit_stage_advances() -> R<()> {
         "tasks": {
             "web": {
                 "group": "web",
-                "kind": "exec",
+                "runtime": "exec",
                 "count": 2,
                 "config": { "command": ["true"], "version": 1 },
                 "resources": { "memory": 64 }
             },
             "api": {
                 "group": "api",
-                "kind": "exec",
+                "runtime": "exec",
                 "count": 2,
                 "config": { "command": ["true"], "version": 1 },
                 "resources": { "memory": 64 }
@@ -238,14 +238,14 @@ fn rollout_manual_requires_explicit_stage_advances() -> R<()> {
         "tasks": {
             "web": {
                 "group": "web",
-                "kind": "exec",
+                "runtime": "exec",
                 "count": 2,
                 "config": { "command": ["true"], "version": 2 },
                 "resources": { "memory": 64 }
             },
             "api": {
                 "group": "api",
-                "kind": "exec",
+                "runtime": "exec",
                 "count": 2,
                 "config": { "command": ["true"], "version": 2 },
                 "resources": { "memory": 64 }
@@ -349,7 +349,7 @@ fn stateful_jobspec(name: &str, count: u32, version: u32, rollout: Option<Value>
         "tasks": {
             "db": {
                 "group": "data",
-                "kind": "exec",
+                "runtime": "exec",
                 "count": count,
                 "config": { "command": ["true"], "version": version },
                 "resources": { "memory": 64 },
@@ -642,7 +642,7 @@ fn rollout_destroy_first_progresses_through_multiple_stages() -> R<()> {
         "tasks": {
             "web": {
                 "group": "web",
-                "kind": "exec",
+                "runtime": "exec",
                 "count": 3,
                 "config": { "command": ["true"], "version": 1 },
                 "resources": { "memory": 64 }
@@ -660,7 +660,7 @@ fn rollout_destroy_first_progresses_through_multiple_stages() -> R<()> {
         "tasks": {
             "web": {
                 "group": "web",
-                "kind": "exec",
+                "runtime": "exec",
                 "count": 3,
                 "config": { "command": ["true"], "version": 2 },
                 "resources": { "memory": 64 }

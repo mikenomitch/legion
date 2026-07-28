@@ -90,7 +90,7 @@ fn load_slo() -> anyhow::Result<SchedulerSlo> {
 
 fn default_fingerprint() -> serde_json::Value {
     json!({
-        "memory_total": "33554432",
+        "memory_total": "34359738368",
         "cpus": {
             "cpu-1": { "frequency": "3000" },
             "cpu-2": { "frequency": "3000" },

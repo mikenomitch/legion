@@ -193,6 +193,26 @@ export class WorkerConfig extends Message<WorkerConfig> {
    */
   artifacts = "";
 
+  /**
+   * JSON-encoded host volumes this worker offers to jobs (see
+   * docs/volumes.md). These are paths that already exist on the machine —
+   * a models directory, a dedicated NVMe mount — which jobs claim by name
+   * through the `host` volume driver.
+   *
+   * Shape: `{"models":{"path":"/mnt/models","readOnly":true},
+   *          "pgdata":{"path":"/mnt/nvme0/pg","create":true}}`.
+   * `readOnly` makes a read-write claim an error rather than silently
+   * downgrading it; `create` (default false) makes the worker create a
+   * missing directory, which is off by default so a typo cannot silently
+   * produce an empty volume where real data was meant to be.
+   *
+   * Default: empty string (the `host` driver reports itself unavailable on
+   * this node, and jobs claiming it are rejected at admission).
+   *
+   * @generated from field: string host_volumes = 10;
+   */
+  hostVolumes = "";
+
   constructor(data?: PartialMessage<WorkerConfig>) {
     super();
     proto3.util.initPartial(data, this);
@@ -210,6 +230,7 @@ export class WorkerConfig extends Message<WorkerConfig> {
     { no: 7, name: "reserved_resources", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 8, name: "max_allocations", kind: "scalar", T: 13 /* ScalarType.UINT32 */, opt: true },
     { no: 9, name: "artifacts", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 10, name: "host_volumes", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): WorkerConfig {
@@ -322,6 +343,40 @@ export class WorkerRegisterRequest extends Message<WorkerRegisterRequest> {
    */
   joinToken?: string;
 
+  /**
+   * Semantic build version of the worker binary (its Cargo package version,
+   * e.g. `"0.1.0"`). Informational: recorded into the node's `dynamic_attrs`
+   * (`buildVersion`) so `legion node list` and the UI can surface fleet
+   * version skew. Build-version differences never cause rejection; only
+   * `protocol_version` gates admission.
+   *
+   * Default: empty string (workers built before version reporting existed).
+   *
+   * @generated from field: string build_version = 7;
+   */
+  buildVersion = "";
+
+  /**
+   * Worker<->manager wire-protocol version this worker speaks. Bumped only
+   * for breaking wire-contract changes to worker-plane RPCs.
+   *
+   * Skew policy (rolling upgrades are managers-first, then workers):
+   * - `0` (unset — proto3 default, i.e. a worker built before versioning):
+   *   accepted; the manager logs a warning.
+   * - `1..=<manager's supported version>`: accepted.
+   * - greater than the manager's supported version: rejected with
+   *   `FAILED_PRECONDITION` — the worker was upgraded before the manager.
+   *   Upgrade all managers first, then retry the worker.
+   *
+   * Recorded into the node's `dynamic_attrs` (`protocolVersion`) for fleet
+   * observability.
+   *
+   * Default: `0` (see above).
+   *
+   * @generated from field: uint32 protocol_version = 8;
+   */
+  protocolVersion = 0;
+
   constructor(data?: PartialMessage<WorkerRegisterRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -336,6 +391,8 @@ export class WorkerRegisterRequest extends Message<WorkerRegisterRequest> {
     { no: 4, name: "fingerprint_attrs", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 5, name: "health_checks", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 6, name: "join_token", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 7, name: "build_version", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 8, name: "protocol_version", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): WorkerRegisterRequest {
@@ -380,6 +437,29 @@ export class WorkerRegisterReply extends Message<WorkerRegisterReply> {
    */
   nodeToken?: string;
 
+  /**
+   * Semantic build version of the manager binary that handled this
+   * registration (its Cargo package version, e.g. `"0.1.0"`).
+   * Informational: workers log it after registering and warn when it
+   * differs from their own build version, so operators can spot skew from
+   * worker logs as well as from `legion node list`.
+   *
+   * Empty when the manager predates version reporting.
+   *
+   * @generated from field: string manager_build_version = 3;
+   */
+  managerBuildVersion = "";
+
+  /**
+   * The worker<->manager wire-protocol version this manager supports (see
+   * `WorkerRegisterRequest.protocol_version` for the skew policy). Workers
+   * at or below this version are compatible. `0` means the manager predates
+   * version reporting.
+   *
+   * @generated from field: uint32 manager_protocol_version = 4;
+   */
+  managerProtocolVersion = 0;
+
   constructor(data?: PartialMessage<WorkerRegisterReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -390,6 +470,8 @@ export class WorkerRegisterReply extends Message<WorkerRegisterReply> {
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 2, name: "node_token", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 3, name: "manager_build_version", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "manager_protocol_version", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): WorkerRegisterReply {
@@ -2151,6 +2233,16 @@ export class PlanJobReply extends Message<PlanJobReply> {
    */
   sameContent = false;
 
+  /**
+   * Per-task scheduling-index usage for this plan: which declared index (if
+   * any) generated each task's placement candidates, and why not when none
+   * did. One entry per task the plan considered. See
+   * docs/scheduling-indexes.md for the model.
+   *
+   * @generated from field: repeated legion.TaskIndexUsage index_usage = 5;
+   */
+  indexUsage: TaskIndexUsage[] = [];
+
   constructor(data?: PartialMessage<PlanJobReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -2163,6 +2255,7 @@ export class PlanJobReply extends Message<PlanJobReply> {
     { no: 2, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 3, name: "matches_existing", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
     { no: 4, name: "same_content", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 5, name: "index_usage", kind: "message", T: TaskIndexUsage, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): PlanJobReply {
@@ -2179,6 +2272,122 @@ export class PlanJobReply extends Message<PlanJobReply> {
 
   static equals(a: PlanJobReply | PlainMessage<PlanJobReply> | undefined, b: PlanJobReply | PlainMessage<PlanJobReply> | undefined): boolean {
     return proto3.util.equals(PlanJobReply, a, b);
+  }
+}
+
+/**
+ * How candidate construction went for one planned task — the scheduling
+ * index's explain record. The scan (a full pass over every available node)
+ * remains the authoritative fallback; these fields describe whether and how
+ * an index short-circuited it.
+ *
+ * @generated from message legion.TaskIndexUsage
+ */
+export class TaskIndexUsage extends Message<TaskIndexUsage> {
+  /**
+   * Task the entry describes.
+   *
+   * @generated from field: string task_name = 1;
+   */
+  taskName = "";
+
+  /**
+   * Name of the index that served candidates (e.g. the built-in "fit"), or
+   * empty when the plain scan ran.
+   *
+   * @generated from field: string index = 2;
+   */
+  index = "";
+
+  /**
+   * "on" when the index generated the candidates, "shadow" when it ran
+   * alongside the authoritative scan for comparison. Empty when no index
+   * participated.
+   *
+   * @generated from field: string mode = 3;
+   */
+  mode = "";
+
+  /**
+   * Number of candidate nodes handed to placement scoring.
+   *
+   * @generated from field: uint32 candidates = 4;
+   */
+  candidates = 0;
+
+  /**
+   * True when the candidate list was cut to the per-task budget, keeping the
+   * index's nearest-fit-first order.
+   *
+   * @generated from field: bool truncated = 5;
+   */
+  truncated = false;
+
+  /**
+   * Times placement exhausted a truncated candidate list and widened back to
+   * the full scan mid-task.
+   *
+   * @generated from field: uint32 refills = 6;
+   */
+  refills = 0;
+
+  /**
+   * True when the scan ended up serving after the index came up short
+   * (empty coverage, or a truncated list that ran dry).
+   *
+   * @generated from field: bool fell_back = 7;
+   */
+  fellBack = false;
+
+  /**
+   * Shadow mode only: whether the index's candidate set matched the scan's
+   * exactly. Absent outside shadow mode.
+   *
+   * @generated from field: optional bool shadow_agreement = 8;
+   */
+  shadowAgreement?: boolean;
+
+  /**
+   * Why no index served when one might have been expected to — e.g.
+   * "no usable index: gpu needs [region]". Empty otherwise.
+   *
+   * @generated from field: string reason = 9;
+   */
+  reason = "";
+
+  constructor(data?: PartialMessage<TaskIndexUsage>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.TaskIndexUsage";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "task_name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "index", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "mode", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "candidates", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 5, name: "truncated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 6, name: "refills", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 7, name: "fell_back", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 8, name: "shadow_agreement", kind: "scalar", T: 8 /* ScalarType.BOOL */, opt: true },
+    { no: 9, name: "reason", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): TaskIndexUsage {
+    return new TaskIndexUsage().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): TaskIndexUsage {
+    return new TaskIndexUsage().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): TaskIndexUsage {
+    return new TaskIndexUsage().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: TaskIndexUsage | PlainMessage<TaskIndexUsage> | undefined, b: TaskIndexUsage | PlainMessage<TaskIndexUsage> | undefined): boolean {
+    return proto3.util.equals(TaskIndexUsage, a, b);
   }
 }
 
@@ -3264,14 +3473,20 @@ export class InstanceInfo extends Message<InstanceInfo> {
 
   /**
    * Diagnostic detail explaining a non-obvious lifecycle situation; unset in
-   * the common case. Currently the only producer is the node-loss
-   * confirmation gate (see docs/stateful-workloads.md "Node loss and
-   * fencing"): when the instance's current allocation sits on a `lost` node,
-   * this carries `pending-loss-confirmation: ...` describing why the
-   * instance has not been replaced yet (the manager is waiting out
-   * `stateful.onLost.replaceAfter`, or `replaceAfter: "never"` requires node
-   * recovery / ReplaceInstance). The instance stays `active` while gated —
-   * its workload may well still be running on the partitioned node.
+   * the common case. Two producers, and they never apply at once:
+   *
+   * - `pending-loss-confirmation: ...` — the instance's current allocation
+   *   sits on a `lost` node and the manager is waiting out
+   *   `stateful.onLost.replaceAfter` (or `replaceAfter: "never"` requires node
+   *   recovery / ReplaceInstance) before rebinding it. The instance stays
+   *   `active` while gated — its workload may well still be running on the
+   *   partitioned node. See docs/stateful-workloads.md "Node loss and fencing".
+   *
+   * - `volume-pinned: ...` — the instance is awaiting placement and holds
+   *   node-local storage, so it can only be placed on the node holding its
+   *   data. It waits for that node rather than starting on empty storage;
+   *   `legion volume delete --force <id>` abandons the data and frees the
+   *   instance to place elsewhere. See docs/volumes.md.
    *
    * @generated from field: optional string detail = 12;
    */
@@ -3487,6 +3702,727 @@ export class GetInstanceReply extends Message<GetInstanceReply> {
 
   static equals(a: GetInstanceReply | PlainMessage<GetInstanceReply> | undefined, b: GetInstanceReply | PlainMessage<GetInstanceReply> | undefined): boolean {
     return proto3.util.equals(GetInstanceReply, a, b);
+  }
+}
+
+/**
+ * One volume: the concrete storage behind an instance's opaque
+ * `{driver}/{volume_id}` storage handle.
+ *
+ * @generated from message legion.VolumeInfo
+ */
+export class VolumeInfo extends Message<VolumeInfo> {
+  /**
+   * Volume id — the second half of the storage handle.
+   *
+   * @generated from field: string volume_id = 1;
+   */
+  volumeId = "";
+
+  /**
+   * Declared name within its task. `data` for the per-instance volume that
+   * comes from `stateful.storage`; otherwise the name from `volumes[]`.
+   *
+   * @generated from field: string name = 2;
+   */
+  name = "";
+
+  /**
+   * Volume driver that materializes it (`local-dir`, `host`, `nfs`, `tmpfs`,
+   * or an installed exec driver).
+   *
+   * @generated from field: string driver = 3;
+   */
+  driver = "";
+
+  /**
+   * Owning job, when the volume belongs to one.
+   *
+   * @generated from field: optional string job_id = 4;
+   */
+  jobId?: string;
+
+  /**
+   * The instance whose lifecycle owns this volume. Unset for volumes that
+   * outlive any instance.
+   *
+   * @generated from field: optional string instance_id = 5;
+   */
+  instanceId?: string;
+
+  /**
+   * Task the volume was declared on.
+   *
+   * @generated from field: optional string task_name = 6;
+   */
+  taskName?: string;
+
+  /**
+   * Lifecycle state:
+   * - `pending`: the row and handle exist; no worker has materialized it yet
+   *   (provisioning is lazy — the first mount creates the storage);
+   * - `created`: a worker mounted it at least once, and `node_id` is set;
+   * - `destroying`: reclaim requested; a worker runs the driver's `destroy`
+   *   and confirms (re-dispatched every heartbeat until it does);
+   * - `destroyed`: reclaimed. The row is kept as a tombstone.
+   *
+   * @generated from field: string state = 7;
+   */
+  state = "";
+
+  /**
+   * Node the volume lives on. For node-local drivers this is a hard placement
+   * constraint on the owning instance from the moment it is set: a
+   * replacement allocation can only be placed on this node.
+   *
+   * @generated from field: optional string node_id = 8;
+   */
+  nodeId?: string;
+
+  /**
+   * True when the volume only exists on `node_id`, so its instance can only be
+   * replaced there. False for network storage (`nfs`), whose instances
+   * reschedule freely.
+   *
+   * @generated from field: bool node_local = 9;
+   */
+  nodeLocal = false;
+
+  /**
+   * True when the volume is mounted read-only.
+   *
+   * @generated from field: bool read_only = 10;
+   */
+  readOnly = false;
+
+  /**
+   * How the volume is handed to its consumer: `filesystem` (a host directory
+   * the task reads directly) or `block` (a raw device or disk image the task
+   * attaches — what a microVM runtime needs). The same split Kubernetes makes
+   * with `volumeMode`, for the same reason. See docs/volumes.md.
+   *
+   * @generated from field: string volume_mode = 17;
+   */
+  volumeMode = "";
+
+  /**
+   * Block mode: the filesystem the device carries (`ext4`). Unset for
+   * filesystem-mode volumes.
+   *
+   * @generated from field: optional string fs = 18;
+   */
+  fs?: string;
+
+  /**
+   * JSON object of the driver params the volume was created with.
+   *
+   * @generated from field: string params = 11;
+   */
+  params = "";
+
+  /**
+   * JSON object of driver-recorded metadata (an NFS source, a dataset name),
+   * handed back to the driver on every later operation.
+   *
+   * @generated from field: string attrs = 12;
+   */
+  attrs = "";
+
+  /**
+   * Host path from the most recent successful mount. Diagnostic only — the
+   * driver is always asked again rather than trusting this.
+   *
+   * @generated from field: optional string mount_path = 13;
+   */
+  mountPath?: string;
+
+  /**
+   * Last driver failure, so a stuck volume explains itself here rather than
+   * only in a worker log.
+   *
+   * @generated from field: optional string last_error = 14;
+   */
+  lastError?: string;
+
+  /**
+   * RFC3339 creation timestamp.
+   *
+   * @generated from field: string created_at = 15;
+   */
+  createdAt = "";
+
+  /**
+   * RFC3339 timestamp of the last state change.
+   *
+   * @generated from field: string updated_at = 16;
+   */
+  updatedAt = "";
+
+  constructor(data?: PartialMessage<VolumeInfo>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.VolumeInfo";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "volume_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "driver", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "job_id", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 5, name: "instance_id", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 6, name: "task_name", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 7, name: "state", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 8, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 9, name: "node_local", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 10, name: "read_only", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 17, name: "volume_mode", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 18, name: "fs", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 11, name: "params", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 12, name: "attrs", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 13, name: "mount_path", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 14, name: "last_error", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 15, name: "created_at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 16, name: "updated_at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): VolumeInfo {
+    return new VolumeInfo().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): VolumeInfo {
+    return new VolumeInfo().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): VolumeInfo {
+    return new VolumeInfo().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: VolumeInfo | PlainMessage<VolumeInfo> | undefined, b: VolumeInfo | PlainMessage<VolumeInfo> | undefined): boolean {
+    return proto3.util.equals(VolumeInfo, a, b);
+  }
+}
+
+/**
+ * Request payload for ListVolumes. Every filter is optional; omitting all of
+ * them lists the whole cluster.
+ *
+ * @generated from message legion.ListVolumesRequest
+ */
+export class ListVolumesRequest extends Message<ListVolumesRequest> {
+  /**
+   * Only volumes owned by this job.
+   *
+   * @generated from field: optional string job_id = 1;
+   */
+  jobId?: string;
+
+  /**
+   * Only volumes currently living on this node.
+   *
+   * @generated from field: optional string node_id = 2;
+   */
+  nodeId?: string;
+
+  /**
+   * Only volumes materialized by this driver.
+   *
+   * @generated from field: optional string driver = 3;
+   */
+  driver?: string;
+
+  /**
+   * Only volumes owned by this instance.
+   *
+   * @generated from field: optional string instance_id = 4;
+   */
+  instanceId?: string;
+
+  /**
+   * Only volumes in this state (`pending`, `created`, `destroying`,
+   * `destroyed`).
+   *
+   * @generated from field: optional string state = 5;
+   */
+  state?: string;
+
+  constructor(data?: PartialMessage<ListVolumesRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListVolumesRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "job_id", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 2, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 3, name: "driver", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 4, name: "instance_id", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 5, name: "state", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListVolumesRequest {
+    return new ListVolumesRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListVolumesRequest {
+    return new ListVolumesRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListVolumesRequest {
+    return new ListVolumesRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListVolumesRequest | PlainMessage<ListVolumesRequest> | undefined, b: ListVolumesRequest | PlainMessage<ListVolumesRequest> | undefined): boolean {
+    return proto3.util.equals(ListVolumesRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for ListVolumes.
+ *
+ * @generated from message legion.ListVolumesReply
+ */
+export class ListVolumesReply extends Message<ListVolumesReply> {
+  /**
+   * Matching volumes, newest first.
+   *
+   * @generated from field: repeated legion.VolumeInfo volumes = 1;
+   */
+  volumes: VolumeInfo[] = [];
+
+  constructor(data?: PartialMessage<ListVolumesReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListVolumesReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "volumes", kind: "message", T: VolumeInfo, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListVolumesReply {
+    return new ListVolumesReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListVolumesReply {
+    return new ListVolumesReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListVolumesReply {
+    return new ListVolumesReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListVolumesReply | PlainMessage<ListVolumesReply> | undefined, b: ListVolumesReply | PlainMessage<ListVolumesReply> | undefined): boolean {
+    return proto3.util.equals(ListVolumesReply, a, b);
+  }
+}
+
+/**
+ * Request payload for GetVolume.
+ *
+ * @generated from message legion.GetVolumeRequest
+ */
+export class GetVolumeRequest extends Message<GetVolumeRequest> {
+  /**
+   * Volume id to fetch.
+   *
+   * @generated from field: string volume_id = 1;
+   */
+  volumeId = "";
+
+  constructor(data?: PartialMessage<GetVolumeRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetVolumeRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "volume_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetVolumeRequest {
+    return new GetVolumeRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetVolumeRequest {
+    return new GetVolumeRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetVolumeRequest {
+    return new GetVolumeRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetVolumeRequest | PlainMessage<GetVolumeRequest> | undefined, b: GetVolumeRequest | PlainMessage<GetVolumeRequest> | undefined): boolean {
+    return proto3.util.equals(GetVolumeRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for GetVolume.
+ *
+ * @generated from message legion.GetVolumeReply
+ */
+export class GetVolumeReply extends Message<GetVolumeReply> {
+  /**
+   * The requested volume. Manager returns NotFound instead of returning this
+   * field unset.
+   *
+   * @generated from field: legion.VolumeInfo volume = 1;
+   */
+  volume?: VolumeInfo;
+
+  constructor(data?: PartialMessage<GetVolumeReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetVolumeReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "volume", kind: "message", T: VolumeInfo },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetVolumeReply {
+    return new GetVolumeReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetVolumeReply {
+    return new GetVolumeReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetVolumeReply {
+    return new GetVolumeReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetVolumeReply | PlainMessage<GetVolumeReply> | undefined, b: GetVolumeReply | PlainMessage<GetVolumeReply> | undefined): boolean {
+    return proto3.util.equals(GetVolumeReply, a, b);
+  }
+}
+
+/**
+ * Request payload for DeleteVolume.
+ *
+ * @generated from message legion.DeleteVolumeRequest
+ */
+export class DeleteVolumeRequest extends Message<DeleteVolumeRequest> {
+  /**
+   * Volume id to delete.
+   *
+   * @generated from field: string volume_id = 1;
+   */
+  volumeId = "";
+
+  /**
+   * Skip driver confirmation and mark the volume destroyed immediately. Use
+   * only when the owning node is gone for good: whatever bytes exist there are
+   * left behind.
+   *
+   * @generated from field: bool force = 2;
+   */
+  force = false;
+
+  /**
+   * Optional idempotency key; a repeat with the same key returns the first
+   * result and reports `deduplicated`.
+   *
+   * @generated from field: optional string idempotency_key = 3;
+   */
+  idempotencyKey?: string;
+
+  constructor(data?: PartialMessage<DeleteVolumeRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.DeleteVolumeRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "volume_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "force", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 3, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): DeleteVolumeRequest {
+    return new DeleteVolumeRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): DeleteVolumeRequest {
+    return new DeleteVolumeRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): DeleteVolumeRequest {
+    return new DeleteVolumeRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: DeleteVolumeRequest | PlainMessage<DeleteVolumeRequest> | undefined, b: DeleteVolumeRequest | PlainMessage<DeleteVolumeRequest> | undefined): boolean {
+    return proto3.util.equals(DeleteVolumeRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for DeleteVolume.
+ *
+ * @generated from message legion.DeleteVolumeReply
+ */
+export class DeleteVolumeReply extends Message<DeleteVolumeReply> {
+  /**
+   * The volume after the request, in `destroying` (queued for its driver) or
+   * `destroyed` (forced).
+   *
+   * @generated from field: legion.VolumeInfo volume = 1;
+   */
+  volume?: VolumeInfo;
+
+  /**
+   * Human-readable acknowledgement.
+   *
+   * @generated from field: string message = 2;
+   */
+  message = "";
+
+  /**
+   * True when an idempotency key replayed a previous call.
+   *
+   * @generated from field: bool deduplicated = 3;
+   */
+  deduplicated = false;
+
+  constructor(data?: PartialMessage<DeleteVolumeReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.DeleteVolumeReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "volume", kind: "message", T: VolumeInfo },
+    { no: 2, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "deduplicated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): DeleteVolumeReply {
+    return new DeleteVolumeReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): DeleteVolumeReply {
+    return new DeleteVolumeReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): DeleteVolumeReply {
+    return new DeleteVolumeReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: DeleteVolumeReply | PlainMessage<DeleteVolumeReply> | undefined, b: DeleteVolumeReply | PlainMessage<DeleteVolumeReply> | undefined): boolean {
+    return proto3.util.equals(DeleteVolumeReply, a, b);
+  }
+}
+
+/**
+ * Request payload for ListVolumeDrivers.
+ *
+ * @generated from message legion.ListVolumeDriversRequest
+ */
+export class ListVolumeDriversRequest extends Message<ListVolumeDriversRequest> {
+  constructor(data?: PartialMessage<ListVolumeDriversRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListVolumeDriversRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListVolumeDriversRequest {
+    return new ListVolumeDriversRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListVolumeDriversRequest {
+    return new ListVolumeDriversRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListVolumeDriversRequest {
+    return new ListVolumeDriversRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListVolumeDriversRequest | PlainMessage<ListVolumeDriversRequest> | undefined, b: ListVolumeDriversRequest | PlainMessage<ListVolumeDriversRequest> | undefined): boolean {
+    return proto3.util.equals(ListVolumeDriversRequest, a, b);
+  }
+}
+
+/**
+ * One volume driver as the cluster sees it, aggregated from worker
+ * fingerprints.
+ *
+ * @generated from message legion.VolumeDriverInfo
+ */
+export class VolumeDriverInfo extends Message<VolumeDriverInfo> {
+  /**
+   * Driver name, as used in `stateful.storage.driver` / `volumes[].driver`.
+   *
+   * @generated from field: string name = 1;
+   */
+  name = "";
+
+  /**
+   * True when the driver's volumes only exist on the node that created them,
+   * so instances holding one are pinned there.
+   *
+   * @generated from field: bool node_local = 2;
+   */
+  nodeLocal = false;
+
+  /**
+   * True when volume contents do NOT survive an unmount (`tmpfs`). Rejected
+   * for `stateful.storage`, which promises data survives reschedules.
+   *
+   * @generated from field: bool ephemeral = 3;
+   */
+  ephemeral = false;
+
+  /**
+   * Access modes the driver supports (`single-writer`, `multi-reader`).
+   *
+   * @generated from field: repeated string access_modes = 4;
+   */
+  accessModes: string[] = [];
+
+  /**
+   * Params a job MUST supply. Admission names any that are missing.
+   *
+   * @generated from field: repeated string required_params = 5;
+   */
+  requiredParams: string[] = [];
+
+  /**
+   * Params a job MAY supply.
+   *
+   * @generated from field: repeated string optional_params = 6;
+   */
+  optionalParams: string[] = [];
+
+  /**
+   * Volume modes this driver can serve (`filesystem`, `block`). Admission
+   * intersects this with the task runtime's supported modes and the job's
+   * requested mode, so a mismatch is a submit-time error rather than a task
+   * that starts and immediately fails.
+   *
+   * @generated from field: repeated string volume_modes = 10;
+   */
+  volumeModes: string[] = [];
+
+  /**
+   * Optional contract operations this driver implements beyond the required
+   * four (`snapshot`, `restore`, `clone`, `expand`). Empty for a driver that
+   * implements only the required set.
+   *
+   * @generated from field: repeated string ops = 11;
+   */
+  ops: string[] = [];
+
+  /**
+   * One line of human-readable context: what the driver does, or why it is
+   * unusable on the nodes that have it.
+   *
+   * @generated from field: string detail = 7;
+   */
+  detail = "";
+
+  /**
+   * Every node with the driver installed, including ones where it is unusable
+   * (no `mount` binary, wrong OS, no host volumes declared).
+   *
+   * @generated from field: repeated string nodes = 8;
+   */
+  nodes: string[] = [];
+
+  /**
+   * Nodes where the driver is installed AND usable — the set placement can
+   * actually use.
+   *
+   * @generated from field: repeated string available_nodes = 9;
+   */
+  availableNodes: string[] = [];
+
+  constructor(data?: PartialMessage<VolumeDriverInfo>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.VolumeDriverInfo";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "node_local", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 3, name: "ephemeral", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 4, name: "access_modes", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 5, name: "required_params", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 6, name: "optional_params", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 10, name: "volume_modes", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 11, name: "ops", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 7, name: "detail", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 8, name: "nodes", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 9, name: "available_nodes", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): VolumeDriverInfo {
+    return new VolumeDriverInfo().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): VolumeDriverInfo {
+    return new VolumeDriverInfo().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): VolumeDriverInfo {
+    return new VolumeDriverInfo().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: VolumeDriverInfo | PlainMessage<VolumeDriverInfo> | undefined, b: VolumeDriverInfo | PlainMessage<VolumeDriverInfo> | undefined): boolean {
+    return proto3.util.equals(VolumeDriverInfo, a, b);
+  }
+}
+
+/**
+ * Reply payload for ListVolumeDrivers.
+ *
+ * @generated from message legion.ListVolumeDriversReply
+ */
+export class ListVolumeDriversReply extends Message<ListVolumeDriversReply> {
+  /**
+   * Installed drivers, sorted by name.
+   *
+   * @generated from field: repeated legion.VolumeDriverInfo drivers = 1;
+   */
+  drivers: VolumeDriverInfo[] = [];
+
+  constructor(data?: PartialMessage<ListVolumeDriversReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListVolumeDriversReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "drivers", kind: "message", T: VolumeDriverInfo, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListVolumeDriversReply {
+    return new ListVolumeDriversReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListVolumeDriversReply {
+    return new ListVolumeDriversReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListVolumeDriversReply {
+    return new ListVolumeDriversReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListVolumeDriversReply | PlainMessage<ListVolumeDriversReply> | undefined, b: ListVolumeDriversReply | PlainMessage<ListVolumeDriversReply> | undefined): boolean {
+    return proto3.util.equals(ListVolumeDriversReply, a, b);
   }
 }
 
@@ -3827,6 +4763,114 @@ export class IssueWorkloadIdentityTokenReply extends Message<IssueWorkloadIdenti
 }
 
 /**
+ * Request payload for IssueNodeIdentityToken.
+ *
+ * @generated from message legion.IssueNodeIdentityTokenRequest
+ */
+export class IssueNodeIdentityTokenRequest extends Message<IssueNodeIdentityTokenRequest> {
+  /**
+   * The worker node the token is requested for. Must be registered and must
+   * match the caller's authenticated per-node credential.
+   *
+   * @generated from field: string node_id = 1;
+   */
+  nodeId = "";
+
+  /**
+   * Name of the node identity declared under `workloadIdentity.nodeIdentities`.
+   * Selects the audience, TTL, and subject template. Unknown names → NotFound.
+   *
+   * @generated from field: string identity_name = 2;
+   */
+  identityName = "";
+
+  constructor(data?: PartialMessage<IssueNodeIdentityTokenRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.IssueNodeIdentityTokenRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "identity_name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): IssueNodeIdentityTokenRequest {
+    return new IssueNodeIdentityTokenRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): IssueNodeIdentityTokenRequest {
+    return new IssueNodeIdentityTokenRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): IssueNodeIdentityTokenRequest {
+    return new IssueNodeIdentityTokenRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: IssueNodeIdentityTokenRequest | PlainMessage<IssueNodeIdentityTokenRequest> | undefined, b: IssueNodeIdentityTokenRequest | PlainMessage<IssueNodeIdentityTokenRequest> | undefined): boolean {
+    return proto3.util.equals(IssueNodeIdentityTokenRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for IssueNodeIdentityToken.
+ *
+ * @generated from message legion.IssueNodeIdentityTokenReply
+ */
+export class IssueNodeIdentityTokenReply extends Message<IssueNodeIdentityTokenReply> {
+  /**
+   * The signed JWT (ES256). Treat as a secret: never log it.
+   *
+   * @generated from field: string token = 1;
+   */
+  token = "";
+
+  /**
+   * Token expiry (`exp`) as Unix seconds.
+   *
+   * @generated from field: int64 expires_at = 2;
+   */
+  expiresAt = protoInt64.zero;
+
+  /**
+   * Echo of the node identity name the token was issued for.
+   *
+   * @generated from field: string name = 3;
+   */
+  name = "";
+
+  constructor(data?: PartialMessage<IssueNodeIdentityTokenReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.IssueNodeIdentityTokenReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "token", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "expires_at", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 3, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): IssueNodeIdentityTokenReply {
+    return new IssueNodeIdentityTokenReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): IssueNodeIdentityTokenReply {
+    return new IssueNodeIdentityTokenReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): IssueNodeIdentityTokenReply {
+    return new IssueNodeIdentityTokenReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: IssueNodeIdentityTokenReply | PlainMessage<IssueNodeIdentityTokenReply> | undefined, b: IssueNodeIdentityTokenReply | PlainMessage<IssueNodeIdentityTokenReply> | undefined): boolean {
+    return proto3.util.equals(IssueNodeIdentityTokenReply, a, b);
+  }
+}
+
+/**
  * Request payload for Heartbeat.
  *
  * @generated from message legion.HeartbeatRequest
@@ -3866,6 +4910,20 @@ export class HeartbeatRequest extends Message<HeartbeatRequest> {
    */
   allocationHealth: AllocationHealth[] = [];
 
+  /**
+   * Volume operation outcomes since the last heartbeat (see
+   * docs/volumes.md). Workers own the drivers; the manager owns the volume
+   * state machine, and this is how driver results get back to it: a
+   * successful mount pins the volume's node, a failure is recorded on the
+   * row (and surfaced by `legion volume list`), and a confirmed destroy is
+   * what advances a volume from `destroying` to `destroyed`.
+   *
+   * Default: empty list.
+   *
+   * @generated from field: repeated legion.VolumeReport volume_reports = 5;
+   */
+  volumeReports: VolumeReport[] = [];
+
   constructor(data?: PartialMessage<HeartbeatRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -3878,6 +4936,7 @@ export class HeartbeatRequest extends Message<HeartbeatRequest> {
     { no: 2, name: "allocation_ids", kind: "scalar", T: 3 /* ScalarType.INT64 */, repeated: true },
     { no: 3, name: "failed_allocations", kind: "message", T: FailedAllocation, repeated: true },
     { no: 4, name: "allocation_health", kind: "message", T: AllocationHealth, repeated: true },
+    { no: 5, name: "volume_reports", kind: "message", T: VolumeReport, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): HeartbeatRequest {
@@ -3921,6 +4980,20 @@ export class HeartbeatReply extends Message<HeartbeatReply> {
    */
   desiredAllocations: TaskAllocation[] = [];
 
+  /**
+   * Volumes this worker should reclaim by calling its driver's `destroy`
+   * (see docs/volumes.md). The manager re-sends a volume on every heartbeat
+   * until the worker confirms it in `HeartbeatRequest.volume_reports`, so a
+   * worker that dies mid-destroy simply retries and storage is never leaked.
+   *
+   * A node-local volume is only ever sent to the node it is pinned to.
+   *
+   * Default: empty list.
+   *
+   * @generated from field: repeated legion.VolumeDestroyRequest volume_destroy = 3;
+   */
+  volumeDestroy: VolumeDestroyRequest[] = [];
+
   constructor(data?: PartialMessage<HeartbeatReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -3931,6 +5004,7 @@ export class HeartbeatReply extends Message<HeartbeatReply> {
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 2, name: "desired_allocations", kind: "message", T: TaskAllocation, repeated: true },
+    { no: 3, name: "volume_destroy", kind: "message", T: VolumeDestroyRequest, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): HeartbeatReply {
@@ -3947,6 +5021,197 @@ export class HeartbeatReply extends Message<HeartbeatReply> {
 
   static equals(a: HeartbeatReply | PlainMessage<HeartbeatReply> | undefined, b: HeartbeatReply | PlainMessage<HeartbeatReply> | undefined): boolean {
     return proto3.util.equals(HeartbeatReply, a, b);
+  }
+}
+
+/**
+ * One volume operation outcome reported by a worker.
+ *
+ * @generated from message legion.VolumeReport
+ */
+export class VolumeReport extends Message<VolumeReport> {
+  /**
+   * Volume ID (the second half of an instance's `driver/volume_id` storage
+   * handle).
+   *
+   * @generated from field: string volume_id = 1;
+   */
+  volumeId = "";
+
+  /**
+   * Operation this reports on: `mount`, `unmount`, or `destroy`.
+   *
+   * @generated from field: string op = 2;
+   */
+  op = "";
+
+  /**
+   * True when the driver succeeded.
+   *
+   * @generated from field: bool ok = 3;
+   */
+  ok = false;
+
+  /**
+   * Host path the volume was mounted at. Set for successful mounts only.
+   *
+   * @generated from field: string mount_path = 4;
+   */
+  mountPath = "";
+
+  /**
+   * Whether the driver reports this volume as node-local. Authoritative: the
+   * worker asked the driver, so this overrides the manager's mint-time guess
+   * and determines whether the owning instance is pinned to this node.
+   *
+   * @generated from field: bool node_local = 5;
+   */
+  nodeLocal = false;
+
+  /**
+   * JSON object of driver metadata to persist on the volume row and hand back
+   * on the next operation (an NFS source, a ZFS dataset). Empty when the
+   * driver recorded nothing.
+   *
+   * @generated from field: string attrs = 6;
+   */
+  attrs = "";
+
+  /**
+   * Failure detail when `ok` is false. Recorded on the volume row so a stuck
+   * volume explains itself in `legion volume list` rather than only in a
+   * worker log.
+   *
+   * @generated from field: string error = 7;
+   */
+  error = "";
+
+  /**
+   * Block mode: the filesystem the driver reports the device carries
+   * (`ext4`), recorded on the volume row so a consumer knows what to mount
+   * inside a guest without probing. Empty for filesystem-mode mounts.
+   *
+   * @generated from field: string fs = 8;
+   */
+  fs = "";
+
+  /**
+   * True when this mount CREATED the storage rather than reattaching it. Lets
+   * a consumer tell first-boot-initialize from reattach without guessing from
+   * an empty directory.
+   *
+   * @generated from field: bool fresh = 9;
+   */
+  fresh = false;
+
+  constructor(data?: PartialMessage<VolumeReport>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.VolumeReport";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "volume_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "op", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "ok", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 4, name: "mount_path", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "node_local", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 6, name: "attrs", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 7, name: "error", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 8, name: "fs", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 9, name: "fresh", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): VolumeReport {
+    return new VolumeReport().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): VolumeReport {
+    return new VolumeReport().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): VolumeReport {
+    return new VolumeReport().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: VolumeReport | PlainMessage<VolumeReport> | undefined, b: VolumeReport | PlainMessage<VolumeReport> | undefined): boolean {
+    return proto3.util.equals(VolumeReport, a, b);
+  }
+}
+
+/**
+ * One volume the manager wants a worker to reclaim.
+ *
+ * @generated from message legion.VolumeDestroyRequest
+ */
+export class VolumeDestroyRequest extends Message<VolumeDestroyRequest> {
+  /**
+   * Volume ID to destroy.
+   *
+   * @generated from field: string volume_id = 1;
+   */
+  volumeId = "";
+
+  /**
+   * Driver that owns it.
+   *
+   * @generated from field: string driver = 2;
+   */
+  driver = "";
+
+  /**
+   * Volume name within its task (`data` for instance storage).
+   *
+   * @generated from field: string name = 3;
+   */
+  name = "";
+
+  /**
+   * JSON object of the driver params the volume was created with. Drivers
+   * that need them to find the storage (an NFS `server`/`export`) get them
+   * back here.
+   *
+   * @generated from field: string params = 4;
+   */
+  params = "";
+
+  /**
+   * JSON object of driver metadata recorded on previous operations.
+   *
+   * @generated from field: string attrs = 5;
+   */
+  attrs = "";
+
+  constructor(data?: PartialMessage<VolumeDestroyRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.VolumeDestroyRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "volume_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "driver", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "params", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "attrs", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): VolumeDestroyRequest {
+    return new VolumeDestroyRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): VolumeDestroyRequest {
+    return new VolumeDestroyRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): VolumeDestroyRequest {
+    return new VolumeDestroyRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: VolumeDestroyRequest | PlainMessage<VolumeDestroyRequest> | undefined, b: VolumeDestroyRequest | PlainMessage<VolumeDestroyRequest> | undefined): boolean {
+    return proto3.util.equals(VolumeDestroyRequest, a, b);
   }
 }
 
@@ -4610,6 +5875,146 @@ export class RestartWorkerReply extends Message<RestartWorkerReply> {
 }
 
 /**
+ * Request payload for SetNodeAvailability.
+ *
+ * @generated from message legion.SetNodeAvailabilityRequest
+ */
+export class SetNodeAvailabilityRequest extends Message<SetNodeAvailabilityRequest> {
+  /**
+   * Node ID whose availability to change.
+   *
+   * @generated from field: string node_id = 1;
+   */
+  nodeId = "";
+
+  /**
+   * Target availability. Supported values:
+   * - `"available"`: the node accepts new placements (uncordon).
+   * - `"drained"`: the node is excluded from all new placements
+   *   (cordon/drain).
+   *
+   * Any other value is rejected with InvalidArgument.
+   *
+   * @generated from field: string availability = 2;
+   */
+  availability = "";
+
+  /**
+   * Whether to evict the node's existing allocations.
+   *
+   * Only meaningful with `availability = "drained"`: `false` cordons the
+   * node (existing allocations keep running), `true` drains it (a
+   * `node_drain` evaluation evicts stateless allocations immediately and
+   * leaves stateful allocations protected by their `stateful.onLost`
+   * policy). Ignored when `availability = "available"`.
+   *
+   * @generated from field: bool evict = 3;
+   */
+  evict = false;
+
+  /**
+   * Optional idempotency key. See `RunJobRequest.idempotency_key`.
+   *
+   * @generated from field: optional string idempotency_key = 4;
+   */
+  idempotencyKey?: string;
+
+  constructor(data?: PartialMessage<SetNodeAvailabilityRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.SetNodeAvailabilityRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "availability", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "evict", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 4, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): SetNodeAvailabilityRequest {
+    return new SetNodeAvailabilityRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): SetNodeAvailabilityRequest {
+    return new SetNodeAvailabilityRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): SetNodeAvailabilityRequest {
+    return new SetNodeAvailabilityRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: SetNodeAvailabilityRequest | PlainMessage<SetNodeAvailabilityRequest> | undefined, b: SetNodeAvailabilityRequest | PlainMessage<SetNodeAvailabilityRequest> | undefined): boolean {
+    return proto3.util.equals(SetNodeAvailabilityRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for SetNodeAvailability.
+ *
+ * @generated from message legion.SetNodeAvailabilityReply
+ */
+export class SetNodeAvailabilityReply extends Message<SetNodeAvailabilityReply> {
+  /**
+   * The node record after the availability change.
+   *
+   * Unset when the reply was replayed from a recorded idempotent result
+   * (see `deduplicated`).
+   *
+   * @generated from field: optional legion.NodeMsg node = 1;
+   */
+  node?: NodeMsg;
+
+  /**
+   * Human-readable status message.
+   *
+   * Current manager reply formats: `"Cordoned node <id>"`,
+   * `"Draining node <id>"`, `"Uncordoned node <id>"`.
+   *
+   * @generated from field: string message = 2;
+   */
+  message = "";
+
+  /**
+   * True when replayed from a recorded result for the request's
+   * `idempotency_key` rather than applied fresh.
+   *
+   * @generated from field: bool deduplicated = 3;
+   */
+  deduplicated = false;
+
+  constructor(data?: PartialMessage<SetNodeAvailabilityReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.SetNodeAvailabilityReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "node", kind: "message", T: NodeMsg, opt: true },
+    { no: 2, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "deduplicated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): SetNodeAvailabilityReply {
+    return new SetNodeAvailabilityReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): SetNodeAvailabilityReply {
+    return new SetNodeAvailabilityReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): SetNodeAvailabilityReply {
+    return new SetNodeAvailabilityReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: SetNodeAvailabilityReply | PlainMessage<SetNodeAvailabilityReply> | undefined, b: SetNodeAvailabilityReply | PlainMessage<SetNodeAvailabilityReply> | undefined): boolean {
+    return proto3.util.equals(SetNodeAvailabilityReply, a, b);
+  }
+}
+
+/**
  * Request payload for GetLedger.
  *
  * Empty request; full ledger is returned.
@@ -5134,7 +6539,18 @@ export class RaftStatus extends Message<RaftStatus> {
   leaseHeld = false;
 
   /**
-   * Current voting members.
+   * Current voting members: managers that are SETTLED voters on every
+   * active lane.
+   *
+   * A raft membership change lands in two steps — a joint configuration
+   * holding the old and the new voter sets, then the uniform new one — and
+   * raft reports an incoming member as a voter from the joint step onwards.
+   * This field deliberately does not: a manager appears here only once every
+   * lane carries it in a UNIFORM membership, so the headline can never
+   * report a fault-tolerant cluster while one lane is still mid-join (a lane
+   * left joint still needs a majority of the OLD voter set). Under
+   * `topology = "lanes"` this is therefore stricter than any single lane's
+   * voter list; per-lane detail is in `lanes`.
    *
    * @generated from field: repeated string voters = 11;
    */
@@ -5177,6 +6593,16 @@ export class RaftStatus extends Message<RaftStatus> {
    */
   raftLibrary = "";
 
+  /**
+   * Per-lane status detail, one entry per active raft group. Topology
+   * `single` reports one entry (the `control` group carrying all tables);
+   * the experimental `lanes` topology reports three. Empty when the engine
+   * has not started.
+   *
+   * @generated from field: repeated legion.RaftLaneStatus lanes = 17;
+   */
+  lanes: RaftLaneStatus[] = [];
+
   constructor(data?: PartialMessage<RaftStatus>) {
     super();
     proto3.util.initPartial(data, this);
@@ -5201,6 +6627,7 @@ export class RaftStatus extends Message<RaftStatus> {
     { no: 14, name: "election_epoch_ms", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
     { no: 15, name: "join_token_ttl_seconds", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
     { no: 16, name: "raft_library", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 17, name: "lanes", kind: "message", T: RaftLaneStatus, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RaftStatus {
@@ -5217,6 +6644,140 @@ export class RaftStatus extends Message<RaftStatus> {
 
   static equals(a: RaftStatus | PlainMessage<RaftStatus> | undefined, b: RaftStatus | PlainMessage<RaftStatus> | undefined): boolean {
     return proto3.util.equals(RaftStatus, a, b);
+  }
+}
+
+/**
+ * Status of one raft group ("lane") on this manager.
+ *
+ * @generated from message legion.RaftLaneStatus
+ */
+export class RaftLaneStatus extends Message<RaftLaneStatus> {
+  /**
+   * Lane wire name: `control`, `scheduler`, or `status`.
+   *
+   * @generated from field: string lane = 1;
+   */
+  lane = "";
+
+  /**
+   * This node's role in the lane's group. Values: `primary`, `standby`,
+   * `candidate`.
+   *
+   * @generated from field: string role = 2;
+   */
+  role = "";
+
+  /**
+   * The lane's current leader, when known.
+   *
+   * @generated from field: optional string leader_id = 3;
+   */
+  leaderId?: string;
+
+  /**
+   * The lane's current raft term.
+   *
+   * @generated from field: uint64 term = 4;
+   */
+  term = protoInt64.zero;
+
+  /**
+   * Latest log index observed locally for this lane.
+   *
+   * @generated from field: uint64 commit_index = 5;
+   */
+  commitIndex = protoInt64.zero;
+
+  /**
+   * Latest applied log index for this lane.
+   *
+   * @generated from field: uint64 applied_index = 6;
+   */
+  appliedIndex = protoInt64.zero;
+
+  /**
+   * Number of voting members of this lane's raft group, as known locally.
+   * While a membership change is in flight this is the UNION across the
+   * joint configuration's voter sets, so read `quorum`/`survives` — not this
+   * count — for what the lane can actually tolerate.
+   *
+   * @generated from field: uint64 voters = 7;
+   */
+  voters = protoInt64.zero;
+
+  /**
+   * Majority (quorum) size required to commit on this lane:
+   * `voters / 2 + 1`. With quorum lost, writes stall but local reads keep
+   * serving. While the lane's membership is JOINT (a change in flight) this
+   * is the largest majority across the joint configuration's voter sets,
+   * because a joint configuration must be agreed by a majority of each.
+   *
+   * @generated from field: uint64 quorum = 8;
+   */
+  quorum = protoInt64.zero;
+
+  /**
+   * Voter failures this lane can survive while still committing:
+   * `(voters - 1) / 2`. Zero for one- and two-voter groups — an even voter
+   * count adds a manager without adding fault tolerance. While the lane's
+   * membership is JOINT this is the SMALLEST such number across the joint
+   * configuration's voter sets: growing `{a,b}` to `{a,b,c}` reports `0`
+   * while the change is in flight, because the lane still needs both `a` and
+   * `b`.
+   *
+   * @generated from field: uint64 survives = 9;
+   */
+  survives = protoInt64.zero;
+
+  /**
+   * Plain-language advisory when this lane's membership is unhealthy: a
+   * membership change still in its JOINT configuration (e.g. "membership
+   * change in flight: this lane is in a JOINT configuration [a, b] +
+   * [a, b, c] and needs a majority of EVERY listed config to commit or
+   * elect …"), even voter parity (e.g. "2 voters need both alive to commit —
+   * this cluster survives zero failures. Use 1, 3, or 5 voters; add one more
+   * manager or remove one.") and/or fewer voters than
+   * `persistence.raft.expectedVoters`. Absent when the lane is healthy.
+   *
+   * @generated from field: optional string warning = 10;
+   */
+  warning?: string;
+
+  constructor(data?: PartialMessage<RaftLaneStatus>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.RaftLaneStatus";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "lane", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "role", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "leader_id", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 4, name: "term", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 5, name: "commit_index", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 6, name: "applied_index", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 7, name: "voters", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 8, name: "quorum", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 9, name: "survives", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 10, name: "warning", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RaftLaneStatus {
+    return new RaftLaneStatus().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): RaftLaneStatus {
+    return new RaftLaneStatus().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): RaftLaneStatus {
+    return new RaftLaneStatus().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: RaftLaneStatus | PlainMessage<RaftLaneStatus> | undefined, b: RaftLaneStatus | PlainMessage<RaftLaneStatus> | undefined): boolean {
+    return proto3.util.equals(RaftLaneStatus, a, b);
   }
 }
 
@@ -5536,6 +7097,22 @@ export class IssueRaftCommandReply extends Message<IssueRaftCommandReply> {
    */
   status?: RaftStatus;
 
+  /**
+   * Plain-language advisory produced by a command that SUCCEEDED but left
+   * the cluster in an ergonomically unhealthy shape — today: a membership
+   * change (`add-voter`, `remove-member`) whose resulting voter count is
+   * even ("2 voters need both alive to commit — this cluster survives zero
+   * failures. Use 1, 3, or 5 voters; add one more manager or remove one.").
+   * The same advisory is WARN-logged on the manager and recorded as a
+   * `membership` event in the raft history. Absent when the command left a
+   * healthy shape. Genuinely unsafe operations (removing the last voter, or
+   * a removal that would leave a quorum the currently-alive members cannot
+   * form) are refused outright instead of warned about.
+   *
+   * @generated from field: optional string warning = 4;
+   */
+  warning?: string;
+
   constructor(data?: PartialMessage<IssueRaftCommandReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -5547,6 +7124,7 @@ export class IssueRaftCommandReply extends Message<IssueRaftCommandReply> {
     { no: 1, name: "command", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 2, name: "event", kind: "message", T: RaftHistoryEvent },
     { no: 3, name: "status", kind: "message", T: RaftStatus },
+    { no: 4, name: "warning", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): IssueRaftCommandReply {
@@ -5663,6 +7241,106 @@ export class GetRaftJoinTokenReply extends Message<GetRaftJoinTokenReply> {
 
   static equals(a: GetRaftJoinTokenReply | PlainMessage<GetRaftJoinTokenReply> | undefined, b: GetRaftJoinTokenReply | PlainMessage<GetRaftJoinTokenReply> | undefined): boolean {
     return proto3.util.equals(GetRaftJoinTokenReply, a, b);
+  }
+}
+
+/**
+ * Request payload for GetStateBackup.
+ *
+ * @generated from message legion.GetStateBackupRequest
+ */
+export class GetStateBackupRequest extends Message<GetStateBackupRequest> {
+  /**
+   * Optional server-side destination path for the backup file. Must not
+   * already exist (`VACUUM INTO` refuses to overwrite). Defaults to a
+   * timestamped file under `<storePath>/backups/`.
+   *
+   * @generated from field: optional string out_path = 1;
+   */
+  outPath?: string;
+
+  constructor(data?: PartialMessage<GetStateBackupRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetStateBackupRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "out_path", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetStateBackupRequest {
+    return new GetStateBackupRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetStateBackupRequest {
+    return new GetStateBackupRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetStateBackupRequest {
+    return new GetStateBackupRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetStateBackupRequest | PlainMessage<GetStateBackupRequest> | undefined, b: GetStateBackupRequest | PlainMessage<GetStateBackupRequest> | undefined): boolean {
+    return proto3.util.equals(GetStateBackupRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for GetStateBackup.
+ *
+ * @generated from message legion.GetStateBackupReply
+ */
+export class GetStateBackupReply extends Message<GetStateBackupReply> {
+  /**
+   * Server-side path of the written backup file.
+   *
+   * @generated from field: string path = 1;
+   */
+  path = "";
+
+  /**
+   * Size of the backup file in bytes.
+   *
+   * @generated from field: uint64 bytes = 2;
+   */
+  bytes = protoInt64.zero;
+
+  /**
+   * Raft applied log index captured in the backup (0 outside raft mode).
+   *
+   * @generated from field: uint64 applied_index = 3;
+   */
+  appliedIndex = protoInt64.zero;
+
+  constructor(data?: PartialMessage<GetStateBackupReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetStateBackupReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "path", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "bytes", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 3, name: "applied_index", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetStateBackupReply {
+    return new GetStateBackupReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetStateBackupReply {
+    return new GetStateBackupReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetStateBackupReply {
+    return new GetStateBackupReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetStateBackupReply | PlainMessage<GetStateBackupReply> | undefined, b: GetStateBackupReply | PlainMessage<GetStateBackupReply> | undefined): boolean {
+    return proto3.util.equals(GetStateBackupReply, a, b);
   }
 }
 
@@ -6756,6 +8434,406 @@ export class GetKvLockReply extends Message<GetKvLockReply> {
 }
 
 /**
+ * Request payload for ListServices. Currently no filters; all declared
+ * services are returned.
+ *
+ * @generated from message legion.ListServicesRequest
+ */
+export class ListServicesRequest extends Message<ListServicesRequest> {
+  constructor(data?: PartialMessage<ListServicesRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListServicesRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListServicesRequest {
+    return new ListServicesRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListServicesRequest {
+    return new ListServicesRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListServicesRequest {
+    return new ListServicesRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListServicesRequest | PlainMessage<ListServicesRequest> | undefined, b: ListServicesRequest | PlainMessage<ListServicesRequest> | undefined): boolean {
+    return proto3.util.equals(ListServicesRequest, a, b);
+  }
+}
+
+/**
+ * Aggregate view of one declared service.
+ *
+ * @generated from message legion.ServiceSummary
+ */
+export class ServiceSummary extends Message<ServiceSummary> {
+  /**
+   * Service name (from `service.name`, defaulting to the task name).
+   *
+   * @generated from field: string service = 1;
+   */
+  service = "";
+
+  /**
+   * Job ID whose task declares this service.
+   *
+   * @generated from field: string job_id = 2;
+   */
+  jobId = "";
+
+  /**
+   * Task name declaring this service.
+   *
+   * @generated from field: string task_name = 3;
+   */
+  taskName = "";
+
+  /**
+   * Count of endpoints currently passing health (see ResolveService for the
+   * healthy definition).
+   *
+   * @generated from field: uint32 healthy_count = 4;
+   */
+  healthyCount = 0;
+
+  /**
+   * Total endpoint (allocation) count for this service, healthy or not.
+   *
+   * @generated from field: uint32 total_count = 5;
+   */
+  totalCount = 0;
+
+  /**
+   * Service tags declared in the task's `service.tags`.
+   *
+   * @generated from field: repeated string tags = 6;
+   */
+  tags: string[] = [];
+
+  /**
+   * Service metadata declared in the task's `service.meta`, stringified.
+   *
+   * Free-form, but `protocol` is conventional (`http`, `https`, `grpc`, …) and
+   * is what clients use to turn an endpoint into a URL.
+   *
+   * @generated from field: map<string, string> meta = 7;
+   */
+  meta: { [key: string]: string } = {};
+
+  constructor(data?: PartialMessage<ServiceSummary>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ServiceSummary";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "service", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "job_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "task_name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "healthy_count", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 5, name: "total_count", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 6, name: "tags", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 7, name: "meta", kind: "map", K: 9 /* ScalarType.STRING */, V: {kind: "scalar", T: 9 /* ScalarType.STRING */} },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ServiceSummary {
+    return new ServiceSummary().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ServiceSummary {
+    return new ServiceSummary().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ServiceSummary {
+    return new ServiceSummary().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ServiceSummary | PlainMessage<ServiceSummary> | undefined, b: ServiceSummary | PlainMessage<ServiceSummary> | undefined): boolean {
+    return proto3.util.equals(ServiceSummary, a, b);
+  }
+}
+
+/**
+ * Reply payload for ListServices.
+ *
+ * @generated from message legion.ListServicesReply
+ */
+export class ListServicesReply extends Message<ListServicesReply> {
+  /**
+   * All declared services. Empty when no stored task config declares a
+   * `service` block.
+   *
+   * @generated from field: repeated legion.ServiceSummary services = 1;
+   */
+  services: ServiceSummary[] = [];
+
+  constructor(data?: PartialMessage<ListServicesReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListServicesReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "services", kind: "message", T: ServiceSummary, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListServicesReply {
+    return new ListServicesReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListServicesReply {
+    return new ListServicesReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListServicesReply {
+    return new ListServicesReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListServicesReply | PlainMessage<ListServicesReply> | undefined, b: ListServicesReply | PlainMessage<ListServicesReply> | undefined): boolean {
+    return proto3.util.equals(ListServicesReply, a, b);
+  }
+}
+
+/**
+ * Request payload for ResolveService.
+ *
+ * @generated from message legion.ResolveServiceRequest
+ */
+export class ResolveServiceRequest extends Message<ResolveServiceRequest> {
+  /**
+   * Service name to resolve. Matches `service.name` (defaulting to the task
+   * name) on stored task configs.
+   *
+   * @generated from field: string service = 1;
+   */
+  service = "";
+
+  /**
+   * When true, endpoints failing (or missing) health are also returned, with
+   * `healthy` set accordingly. Default false: only healthy endpoints.
+   *
+   * @generated from field: bool include_unhealthy = 2;
+   */
+  includeUnhealthy = false;
+
+  constructor(data?: PartialMessage<ResolveServiceRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ResolveServiceRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "service", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "include_unhealthy", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ResolveServiceRequest {
+    return new ResolveServiceRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ResolveServiceRequest {
+    return new ResolveServiceRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ResolveServiceRequest {
+    return new ResolveServiceRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ResolveServiceRequest | PlainMessage<ResolveServiceRequest> | undefined, b: ResolveServiceRequest | PlainMessage<ResolveServiceRequest> | undefined): boolean {
+    return proto3.util.equals(ResolveServiceRequest, a, b);
+  }
+}
+
+/**
+ * One resolvable endpoint of a service.
+ *
+ * @generated from message legion.ServiceEndpoint
+ */
+export class ServiceEndpoint extends Message<ServiceEndpoint> {
+  /**
+   * Service name this endpoint belongs to.
+   *
+   * @generated from field: string service = 1;
+   */
+  service = "";
+
+  /**
+   * Job ID whose task declares the service.
+   *
+   * @generated from field: string job_id = 2;
+   */
+  jobId = "";
+
+  /**
+   * Task name declaring the service.
+   *
+   * @generated from field: string task_name = 3;
+   */
+  taskName = "";
+
+  /**
+   * Allocation ID backing this endpoint.
+   *
+   * @generated from field: int64 allocation_id = 4;
+   */
+  allocationId = protoInt64.zero;
+
+  /**
+   * Node ID currently hosting the endpoint.
+   *
+   * @generated from field: string node_id = 5;
+   */
+  nodeId = "";
+
+  /**
+   * Routable address (host/IP) of the endpoint's node. Derived from the
+   * node's advertised worker address. Empty when the node has no advertised
+   * address.
+   *
+   * @generated from field: string address = 6;
+   */
+  address = "";
+
+  /**
+   * Host port assigned to the service's advertised port label.
+   *
+   * @generated from field: uint32 port = 7;
+   */
+  port = 0;
+
+  /**
+   * True when the endpoint's latest allocation health snapshot is healthy and
+   * its node is alive.
+   *
+   * @generated from field: bool healthy = 8;
+   */
+  healthy = false;
+
+  /**
+   * Human-readable health status detail from the latest snapshot (for
+   * example `healthy`, `starting`, or a check failure description). Empty
+   * when no snapshot has been reported yet.
+   *
+   * @generated from field: string health_status = 9;
+   */
+  healthStatus = "";
+
+  /**
+   * Service tags declared in the task's `service.tags`.
+   *
+   * @generated from field: repeated string tags = 10;
+   */
+  tags: string[] = [];
+
+  /**
+   * Service metadata declared in the task's `service.meta`, stringified.
+   *
+   * Free-form, but `protocol` is conventional (`http`, `https`, `grpc`, …) and
+   * is what clients use to turn `address:port` into a URL.
+   *
+   * @generated from field: map<string, string> meta = 11;
+   */
+  meta: { [key: string]: string } = {};
+
+  /**
+   * Name of the `network.ports` entry this endpoint advertises, when the
+   * service names a port label rather than a literal port number.
+   *
+   * @generated from field: string port_label = 12;
+   */
+  portLabel = "";
+
+  constructor(data?: PartialMessage<ServiceEndpoint>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ServiceEndpoint";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "service", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "job_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "task_name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "allocation_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 5, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "address", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 7, name: "port", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 8, name: "healthy", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 9, name: "health_status", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 10, name: "tags", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 11, name: "meta", kind: "map", K: 9 /* ScalarType.STRING */, V: {kind: "scalar", T: 9 /* ScalarType.STRING */} },
+    { no: 12, name: "port_label", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ServiceEndpoint {
+    return new ServiceEndpoint().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ServiceEndpoint {
+    return new ServiceEndpoint().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ServiceEndpoint {
+    return new ServiceEndpoint().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ServiceEndpoint | PlainMessage<ServiceEndpoint> | undefined, b: ServiceEndpoint | PlainMessage<ServiceEndpoint> | undefined): boolean {
+    return proto3.util.equals(ServiceEndpoint, a, b);
+  }
+}
+
+/**
+ * Reply payload for ResolveService.
+ *
+ * @generated from message legion.ResolveServiceReply
+ */
+export class ResolveServiceReply extends Message<ResolveServiceReply> {
+  /**
+   * Matching endpoints. Empty when the service is unknown or (by default) has
+   * no healthy endpoints — callers can distinguish the two via ListServices.
+   *
+   * @generated from field: repeated legion.ServiceEndpoint endpoints = 1;
+   */
+  endpoints: ServiceEndpoint[] = [];
+
+  constructor(data?: PartialMessage<ResolveServiceReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ResolveServiceReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "endpoints", kind: "message", T: ServiceEndpoint, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ResolveServiceReply {
+    return new ResolveServiceReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ResolveServiceReply {
+    return new ResolveServiceReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ResolveServiceReply {
+    return new ResolveServiceReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ResolveServiceReply | PlainMessage<ResolveServiceReply> | undefined, b: ResolveServiceReply | PlainMessage<ResolveServiceReply> | undefined): boolean {
+    return proto3.util.equals(ResolveServiceReply, a, b);
+  }
+}
+
+/**
  * Request payload for GetArtifactCredential.
  *
  * @generated from message legion.GetArtifactCredentialRequest
@@ -7666,6 +9744,15 @@ export class LedgerAllocation extends Message<LedgerAllocation> {
   jobId = "";
 
   /**
+   * JSON-encoded assigned network payload (address + ports) for this
+   * allocation, matching the `AllocNetwork` shape. Empty string when the
+   * task declares no network block.
+   *
+   * @generated from field: string network = 10;
+   */
+  network = "";
+
+  /**
    * Optional JSON-encoded per-artifact staging states from the latest worker
    * health snapshot. Same payload as `AllocationHealth.artifact_states`.
    *
@@ -7704,6 +9791,7 @@ export class LedgerAllocation extends Message<LedgerAllocation> {
     { no: 5, name: "job_config_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 6, name: "task_config_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
     { no: 7, name: "job_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 10, name: "network", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 8, name: "artifact_states", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
     { no: 9, name: "instance_id", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
   ]);
@@ -7831,10 +9919,16 @@ export class UpdateNodeDynamicReply extends Message<UpdateNodeDynamicReply> {
  */
 export class SchedulerEvent extends Message<SchedulerEvent> {
   /**
-   * Monotonically increasing event ID.
+   * Increasing event ID.
    *
    * IDs are assigned by the manager's state store and are never reused, so
    * they double as a resume cursor for `ListEvents`/`StreamEvents`.
+   *
+   * IDs are SPARSE, not consecutive: they are minted from a timestamp plus
+   * the manager's raft write lane (each lane mints in its own stride, so
+   * concurrent lanes can never collide), and pruning removes old ones.
+   * Treat an ID only as an opaque cursor — never as a count, an index, or
+   * something to increment.
    *
    * @generated from field: int64 id = 1;
    */
@@ -7968,7 +10062,8 @@ export class ListEventsRequest extends Message<ListEventsRequest> {
    * Exclusive lower-bound event ID cursor.
    *
    * When set, only events with `id > after_id` are returned (oldest first),
-   * which makes repeated polling gap-free. When omitted, the most recent
+   * so repeated polling never skips an event (IDs themselves are sparse —
+   * see `SchedulerEvent.id`). When omitted, the most recent
    * `limit` events are returned (still ordered oldest-to-newest).
    *
    * @generated from field: optional int64 after_id = 1;
@@ -9502,11 +11597,15 @@ export class TaskAllocation extends Message<TaskAllocation> {
   taskName = "";
 
   /**
-   * Task kind/plugin name.
+   * Name of the task runtime plugin that runs this task (`exec`, `container`,
+   * `noop`, or a third-party plugin under `plugins/tasks/<name>/`). The worker
+   * resolves this against its task-plugin registry and fails the allocation if
+   * no plugin with this name is loadable. Mirrors the jobspec's
+   * `tasks.<name>.runtime` field.
    *
-   * @generated from field: string task_kind = 7;
+   * @generated from field: string task_runtime = 7;
    */
-  taskKind = "";
+  taskRuntime = "";
 
   /**
    * JSON-encoded task config payload.
@@ -9530,9 +11629,19 @@ export class TaskAllocation extends Message<TaskAllocation> {
   taskOnUnhealthy = "";
 
   /**
+   * JSON-encoded assigned network payload (address + ports) for this
+   * allocation, matching the `AllocNetwork` shape. Workers use it to inject
+   * `LEGION_PORT_*` / `LEGION_ADDR_*` environment variables into the task.
+   * Empty string when the task declares no network block.
+   *
+   * @generated from field: string network = 14;
+   */
+  network = "";
+
+  /**
    * JSON-encoded list of normalized artifact specs for this task.
    *
-   * This is the post-admission form: kind-implicit artifacts (for example a
+   * This is the post-admission form: runtime-implicit artifacts (for example a
    * container `image`) are already desugared in, `resolve: "pin"` references
    * are already pinned to digests, and cluster-level auth matchers are
    * already applied. Workers stage exactly this list and never re-derive or
@@ -9579,6 +11688,49 @@ export class TaskAllocation extends Message<TaskAllocation> {
    */
   selfTerminateAfterSeconds = protoInt64.zero;
 
+  /**
+   * JSON-encoded list of volume mounts for this allocation (see
+   * docs/volumes.md). Array of objects matching the `VolumeMount` shape:
+   * `[{"volumeId":"…","name":"data","driver":"local-dir","params":{…},
+   *    "attrs":{…},"path":"/var/lib/db","readOnly":false,
+   *    "instanceVolume":true}]`.
+   *
+   * This is the post-admission form: the driver is resolved (the `local-dir`
+   * default is already applied), the volume id is known, and `attrs` carries
+   * whatever the driver recorded on a previous mount. The worker mounts
+   * exactly this list through its volume drivers before starting the task and
+   * unmounts on stop — it never re-derives a volume from the jobspec.
+   *
+   * Entries with `instanceVolume: true` come from `stateful.storage` and are
+   * additionally exported as `LEGION_STORAGE_DIR`; the rest come from the
+   * task's `volumes[]` claims. Every entry is exported as
+   * `LEGION_VOLUME_<NAME>` with the resolved host path.
+   *
+   * Empty string when the task declares no volumes (the mount step is skipped
+   * entirely).
+   *
+   * @generated from field: string task_volumes = 15;
+   */
+  taskVolumes = "";
+
+  /**
+   * JSON-encoded task `resources` block, exactly as declared in the jobspec
+   * (`{"memory": 256, "cores": 1}`). Scheduler-side defaults are NOT folded
+   * in: this is what the job asked for, so a runtime can tell "unset" from
+   * "explicitly requested" and leave its own defaults alone.
+   *
+   * Task runtimes that isolate a workload use this to size it — the `container`
+   * runtime maps `memory` (MiB) and `cores` onto the sandbox's memory/CPU
+   * limits, since a guest that ignores the reservation the scheduler made on
+   * its behalf can overcommit the node. Runtimes that run host processes
+   * (`exec`) ignore it; enforcement there needs cgroups/jobobjects.
+   *
+   * Empty string when the task declares no resources.
+   *
+   * @generated from field: string task_resources = 16;
+   */
+  taskResources = "";
+
   constructor(data?: PartialMessage<TaskAllocation>) {
     super();
     proto3.util.initPartial(data, this);
@@ -9593,13 +11745,16 @@ export class TaskAllocation extends Message<TaskAllocation> {
     { no: 4, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 5, name: "task_config_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
     { no: 6, name: "task_name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
-    { no: 7, name: "task_kind", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 7, name: "task_runtime", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 8, name: "task_config", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 9, name: "task_checks", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 10, name: "task_on_unhealthy", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 14, name: "network", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 11, name: "task_artifacts", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 12, name: "task_identities", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 13, name: "self_terminate_after_seconds", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 15, name: "task_volumes", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 16, name: "task_resources", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): TaskAllocation {
@@ -11657,6 +13812,357 @@ export class DeleteJoinTokenReply extends Message<DeleteJoinTokenReply> {
 
   static equals(a: DeleteJoinTokenReply | PlainMessage<DeleteJoinTokenReply> | undefined, b: DeleteJoinTokenReply | PlainMessage<DeleteJoinTokenReply> | undefined): boolean {
     return proto3.util.equals(DeleteJoinTokenReply, a, b);
+  }
+}
+
+/**
+ * Request envelope for the three openraft protocol RPCs (AppendEntries,
+ * Vote, InstallSnapshot).
+ *
+ * @generated from message legion.RaftLaneRequest
+ */
+export class RaftLaneRequest extends Message<RaftLaneRequest> {
+  /**
+   * Raft group ("lane") wire name: "control", "scheduler", or "status".
+   * Must name a group that is active on the receiving node.
+   *
+   * @generated from field: string group_id = 1;
+   */
+  groupId = "";
+
+  /**
+   * Opaque serde_json-encoded openraft request message. The concrete type
+   * depends on the RPC (see the service comments); the encoding is the
+   * openraft 0.9 serde representation, internal to the manager plane and
+   * versioned by PROTOCOL_VERSION. Binary fields inside it (the changeset
+   * in an entry, an install-snapshot chunk) are base64 strings, not JSON
+   * number arrays — see `storage::raft::types::wire_bytes`.
+   *
+   * @generated from field: bytes payload = 2;
+   */
+  payload = new Uint8Array(0);
+
+  constructor(data?: PartialMessage<RaftLaneRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.RaftLaneRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "group_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "payload", kind: "scalar", T: 12 /* ScalarType.BYTES */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RaftLaneRequest {
+    return new RaftLaneRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): RaftLaneRequest {
+    return new RaftLaneRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): RaftLaneRequest {
+    return new RaftLaneRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: RaftLaneRequest | PlainMessage<RaftLaneRequest> | undefined, b: RaftLaneRequest | PlainMessage<RaftLaneRequest> | undefined): boolean {
+    return proto3.util.equals(RaftLaneRequest, a, b);
+  }
+}
+
+/**
+ * Reply envelope for the three openraft protocol RPCs.
+ *
+ * @generated from message legion.RaftLaneReply
+ */
+export class RaftLaneReply extends Message<RaftLaneReply> {
+  /**
+   * Opaque serde_json-encoded `Result<Reply, RaftError>` (see the service
+   * comments for the concrete type per RPC). Application-level raft errors
+   * travel here; gRPC status codes are reserved for transport/auth/dispatch
+   * failures (unreachable group, bad secret, undecodable payload).
+   *
+   * @generated from field: bytes payload = 1;
+   */
+  payload = new Uint8Array(0);
+
+  constructor(data?: PartialMessage<RaftLaneReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.RaftLaneReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "payload", kind: "scalar", T: 12 /* ScalarType.BYTES */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RaftLaneReply {
+    return new RaftLaneReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): RaftLaneReply {
+    return new RaftLaneReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): RaftLaneReply {
+    return new RaftLaneReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: RaftLaneReply | PlainMessage<RaftLaneReply> | undefined, b: RaftLaneReply | PlainMessage<RaftLaneReply> | undefined): boolean {
+    return proto3.util.equals(RaftLaneReply, a, b);
+  }
+}
+
+/**
+ * Request payload for RaftTransport.Join.
+ *
+ * @generated from message legion.JoinRaftClusterRequest
+ */
+export class JoinRaftClusterRequest extends Message<JoinRaftClusterRequest> {
+  /**
+   * The signed join token minted by `legion raft join-token` on the leader.
+   * Carries cluster id, leader advertise address, and the cluster secret;
+   * the leader re-validates it here so a leaked advertise address alone is
+   * not enough to join.
+   *
+   * @generated from field: string join_token = 1;
+   */
+  joinToken = "";
+
+  /**
+   * The joining manager's string identity (its manager node id/name). The
+   * raft node id used in membership is derived from this deterministically:
+   * `fnv1a64(node_id)`.
+   *
+   * @generated from field: string node_id = 2;
+   */
+  nodeId = "";
+
+  /**
+   * "host:port" the cluster should dial to reach the joining manager's gRPC
+   * listener (the RaftTransport service shares the manager's tonic
+   * listener).
+   *
+   * @generated from field: string advertise_addr = 3;
+   */
+  advertiseAddr = "";
+
+  /**
+   * The joiner's configured raft topology ("single" or "lanes"), so the
+   * leader can refuse a mixed-topology cluster at enrollment (plan JC-43).
+   * A joiner configured differently would enroll into groups it does not
+   * run (or run groups nobody replicates to), which is unrecoverable once
+   * its log advances. Empty means a pre-JC-43 manager, which is only ever
+   * "single".
+   *
+   * @generated from field: string topology = 4;
+   */
+  topology = "";
+
+  constructor(data?: PartialMessage<JoinRaftClusterRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.JoinRaftClusterRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "join_token", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "advertise_addr", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "topology", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): JoinRaftClusterRequest {
+    return new JoinRaftClusterRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): JoinRaftClusterRequest {
+    return new JoinRaftClusterRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): JoinRaftClusterRequest {
+    return new JoinRaftClusterRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: JoinRaftClusterRequest | PlainMessage<JoinRaftClusterRequest> | undefined, b: JoinRaftClusterRequest | PlainMessage<JoinRaftClusterRequest> | undefined): boolean {
+    return proto3.util.equals(JoinRaftClusterRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for RaftTransport.Join.
+ *
+ * @generated from message legion.JoinRaftClusterReply
+ */
+export class JoinRaftClusterReply extends Message<JoinRaftClusterReply> {
+  /**
+   * The raft node id assigned to the joiner: `fnv1a64(request.node_id)`.
+   * Deterministic, so re-joins and restarts always map to the same id.
+   *
+   * @generated from field: uint64 assigned_raft_id = 1;
+   */
+  assignedRaftId = protoInt64.zero;
+
+  /**
+   * The cluster id this membership belongs to (from the join token).
+   *
+   * @generated from field: string cluster_id = 2;
+   */
+  clusterId = "";
+
+  /**
+   * Current membership of every active raft group, so the joiner can seed
+   * its peer table before its first snapshot install.
+   *
+   * @generated from field: repeated legion.RaftGroupMembership groups = 3;
+   */
+  groups: RaftGroupMembership[] = [];
+
+  constructor(data?: PartialMessage<JoinRaftClusterReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.JoinRaftClusterReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "assigned_raft_id", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 2, name: "cluster_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "groups", kind: "message", T: RaftGroupMembership, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): JoinRaftClusterReply {
+    return new JoinRaftClusterReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): JoinRaftClusterReply {
+    return new JoinRaftClusterReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): JoinRaftClusterReply {
+    return new JoinRaftClusterReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: JoinRaftClusterReply | PlainMessage<JoinRaftClusterReply> | undefined, b: JoinRaftClusterReply | PlainMessage<JoinRaftClusterReply> | undefined): boolean {
+    return proto3.util.equals(JoinRaftClusterReply, a, b);
+  }
+}
+
+/**
+ * Membership of one raft group ("lane").
+ *
+ * @generated from message legion.RaftGroupMembership
+ */
+export class RaftGroupMembership extends Message<RaftGroupMembership> {
+  /**
+   * Lane wire name: "control", "scheduler", or "status".
+   *
+   * @generated from field: string group_id = 1;
+   */
+  groupId = "";
+
+  /**
+   * All members currently known to this group (voters and learners).
+   *
+   * @generated from field: repeated legion.RaftMemberInfo members = 2;
+   */
+  members: RaftMemberInfo[] = [];
+
+  constructor(data?: PartialMessage<RaftGroupMembership>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.RaftGroupMembership";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "group_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "members", kind: "message", T: RaftMemberInfo, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RaftGroupMembership {
+    return new RaftGroupMembership().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): RaftGroupMembership {
+    return new RaftGroupMembership().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): RaftGroupMembership {
+    return new RaftGroupMembership().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: RaftGroupMembership | PlainMessage<RaftGroupMembership> | undefined, b: RaftGroupMembership | PlainMessage<RaftGroupMembership> | undefined): boolean {
+    return proto3.util.equals(RaftGroupMembership, a, b);
+  }
+}
+
+/**
+ * One raft group member.
+ *
+ * @generated from message legion.RaftMemberInfo
+ */
+export class RaftMemberInfo extends Message<RaftMemberInfo> {
+  /**
+   * The member's raft node id (`fnv1a64` of its manager string id).
+   *
+   * @generated from field: uint64 raft_id = 1;
+   */
+  raftId = protoInt64.zero;
+
+  /**
+   * The member's manager string id (decoded from the "name@host:port"
+   * openraft BasicNode address — see `src/storage/raft/types.rs`).
+   *
+   * @generated from field: string node_id = 2;
+   */
+  nodeId = "";
+
+  /**
+   * "host:port" of the member's gRPC listener.
+   *
+   * @generated from field: string advertise_addr = 3;
+   */
+  advertiseAddr = "";
+
+  /**
+   * True for voters, false for learners still catching up.
+   *
+   * @generated from field: bool voter = 4;
+   */
+  voter = false;
+
+  constructor(data?: PartialMessage<RaftMemberInfo>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.RaftMemberInfo";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "raft_id", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 2, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "advertise_addr", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "voter", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RaftMemberInfo {
+    return new RaftMemberInfo().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): RaftMemberInfo {
+    return new RaftMemberInfo().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): RaftMemberInfo {
+    return new RaftMemberInfo().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: RaftMemberInfo | PlainMessage<RaftMemberInfo> | undefined, b: RaftMemberInfo | PlainMessage<RaftMemberInfo> | undefined): boolean {
+    return proto3.util.equals(RaftMemberInfo, a, b);
   }
 }
 

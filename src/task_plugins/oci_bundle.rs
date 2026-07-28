@@ -4,7 +4,7 @@
 //! reference; they run a *bundle*: an extracted root filesystem plus a
 //! `config.json` runtime spec. This module turns the on-disk OCI **image**
 //! layout produced by the `oci://` artifact fetcher into that bundle so the
-//! container task kind can run it on Linux.
+//! container task runtime can run it on Linux.
 //!
 //! The conversion is deliberately self-contained (no external `umoci`/`skopeo`
 //! dependency): read the image manifest + config from the layout, extract each
@@ -19,48 +19,66 @@ use std::path::{Component, Path, PathBuf};
 
 /// Image config fields we carry from the OCI layout into the runtime spec,
 /// plus the ordered layer blob paths to extract.
-struct ImageConfig {
-    env: Vec<String>,
-    working_dir: Option<String>,
-    user: Option<String>,
+pub(crate) struct ImageConfig {
+    pub(crate) env: Vec<String>,
+    pub(crate) working_dir: Option<String>,
+    pub(crate) user: Option<String>,
     layers: Vec<PathBuf>,
+}
+
+/// Materializes an image's root filesystem at `rootfs` by extracting every
+/// layer in order, returning the image config so callers can honor its env,
+/// working dir, and user. Shared by the bundle path (container kind) and the
+/// microVM disk-image path (sandbox kind) — both need exactly this.
+///
+/// The directory is cleared first: a rootfs assembled over stale content
+/// would silently resurrect files a newer image deleted.
+pub(crate) fn materialize_rootfs(oci_layout: &Path, rootfs: &Path) -> R<ImageConfig> {
+    let image = read_image_config(oci_layout)?;
+    if rootfs.exists() {
+        std::fs::remove_dir_all(rootfs)
+            .with_context(|| format!("clear rootfs {}", rootfs.display()))?;
+    }
+    std::fs::create_dir_all(rootfs)
+        .with_context(|| format!("create rootfs {}", rootfs.display()))?;
+    for layer in &image.layers {
+        extract_layer(layer, rootfs)
+            .with_context(|| format!("extract layer {}", layer.display()))?;
+    }
+    Ok(image)
 }
 
 /// Builds an OCI runtime bundle at `bundle_dir` from the image `oci_layout`.
 ///
 /// `command` is the container's argv (Legion requires it on the task), `env`
-/// the task's env (merged over the image's, task wins), and `hostname` the
-/// container's hostname. The bundle is rebuilt from scratch each call.
+/// the task's env (merged over the image's, task wins), `hostname` the
+/// container's hostname, and `volumes` the mounted volumes to bind into the
+/// container (shared with the sandbox kind's dev mode, which runs an OCI
+/// bundle too). The bundle is rebuilt from scratch each call.
 pub(crate) fn build_bundle(
     oci_layout: &Path,
     bundle_dir: &Path,
     command: &[String],
     env: &std::collections::HashMap<String, String>,
     hostname: &str,
+    volumes: &[crate::task_plugins::MountedVolume],
 ) -> R<()> {
     if command.is_empty() {
         bail!("container command must include at least one entry");
     }
-    let image = read_image_config(oci_layout)?;
 
     if bundle_dir.exists() {
         std::fs::remove_dir_all(bundle_dir)
             .with_context(|| format!("clear bundle dir {}", bundle_dir.display()))?;
     }
     let rootfs = bundle_dir.join("rootfs");
-    std::fs::create_dir_all(&rootfs)
-        .with_context(|| format!("create rootfs {}", rootfs.display()))?;
-
-    for layer in &image.layers {
-        extract_layer(layer, &rootfs)
-            .with_context(|| format!("extract layer {}", layer.display()))?;
-    }
+    let image = materialize_rootfs(oci_layout, &rootfs)?;
 
     // Resolve the image user against the *extracted* rootfs so named users
     // (`postgres`, `nobody:nogroup`) map to their real uid/gid instead of
     // silently running as root.
     let user = resolve_user(&rootfs, image.user.as_deref());
-    let spec = build_spec(command, env, &image, &user, hostname);
+    let spec = build_spec(command, env, &image, &user, hostname, volumes);
     let config_path = bundle_dir.join("config.json");
     std::fs::write(&config_path, serde_json::to_vec_pretty(&spec)?)
         .with_context(|| format!("write {}", config_path.display()))?;
@@ -84,7 +102,7 @@ fn blob_path(layout: &Path, digest: &str) -> R<PathBuf> {
     Ok(layout.join("blobs").join(algorithm).join(hex))
 }
 
-fn read_image_config(layout: &Path) -> R<ImageConfig> {
+pub(crate) fn read_image_config(layout: &Path) -> R<ImageConfig> {
     let index = read_json(&layout.join("index.json"))?;
     let manifest_digest = index["manifests"][0]["digest"]
         .as_str()
@@ -231,10 +249,11 @@ fn clear_dir(dir: &Path) -> R<()> {
 }
 
 /// Merges image env with task env (task wins) and guarantees a `PATH`.
-fn merge_env(
+/// Shared by the bundle spec and the sandbox kind's guest env file.
+pub(crate) fn merge_env_map(
     image_env: &[String],
     task_env: &std::collections::HashMap<String, String>,
-) -> Vec<String> {
+) -> BTreeMap<String, String> {
     let mut merged: BTreeMap<String, String> = BTreeMap::new();
     for entry in image_env {
         if let Some((key, value)) = entry.split_once('=') {
@@ -248,6 +267,13 @@ fn merge_env(
         "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string()
     });
     merged
+}
+
+fn merge_env(
+    image_env: &[String],
+    task_env: &std::collections::HashMap<String, String>,
+) -> Vec<String> {
+    merge_env_map(image_env, task_env)
         .into_iter()
         .map(|(key, value)| format!("{key}={value}"))
         .collect()
@@ -373,12 +399,39 @@ fn dns_mounts() -> Vec<Value> {
 /// no private network namespace (the container shares host networking until
 /// network orchestration lands; host DNS files are bind-mounted in), and a
 /// writable root.
+/// Bind mounts for the allocation's volumes, in declaration order.
+///
+/// This is where `stateful.storage.path` and `volumes[].path` become real for a
+/// container: the driver produced a host path, and the container sees it at the
+/// declared destination. Volumes with no `path` are skipped — admission rejects
+/// that combination for container tasks, so reaching here means a jobspec
+/// changed kind after the fact.
+fn volume_mounts(volumes: &[crate::task_plugins::MountedVolume]) -> Vec<Value> {
+    volumes
+        .iter()
+        .filter_map(|volume| {
+            let destination = volume.path.as_deref()?;
+            // `rbind` (not plain `bind`) so a volume that is itself a mount
+            // point — an NFS export, a tmpfs — carries its submounts in.
+            let mut options = vec!["rbind".to_string(), "rprivate".to_string()];
+            options.push(if volume.read_only { "ro" } else { "rw" }.to_string());
+            Some(json!({
+                "destination": destination,
+                "type": "bind",
+                "source": volume.host_path.display().to_string(),
+                "options": options,
+            }))
+        })
+        .collect()
+}
+
 fn build_spec(
     command: &[String],
     task_env: &std::collections::HashMap<String, String>,
     image: &ImageConfig,
     user: &ResolvedUser,
     hostname: &str,
+    volumes: &[crate::task_plugins::MountedVolume],
 ) -> Value {
     let mut env = merge_env(&image.env, task_env);
     if let Some(home) = &user.home {
@@ -402,6 +455,8 @@ fn build_spec(
               "options": ["nosuid", "noexec", "nodev", "ro"] }),
     ];
     mounts.extend(dns_mounts());
+    // Volumes last so a job can deliberately shadow a default mount point.
+    mounts.extend(volume_mounts(volumes));
 
     json!({
         "ociVersion": "1.0.2",
@@ -589,6 +644,15 @@ mod tests {
             &image,
             &user,
             "legion-7",
+            &[crate::task_plugins::MountedVolume {
+                name: "state".to_string(),
+                mode: crate::volumes::VolumeMode::Filesystem,
+                host_path: PathBuf::from("/var/legion/state"),
+                path: Some("/workspace".to_string()),
+                fs: None,
+                fresh: false,
+                read_only: false,
+            }],
         );
 
         assert_eq!(spec["process"]["args"], json!(["/bin/echo", "hi"]));
@@ -608,6 +672,14 @@ mod tests {
         assert!(namespaces.iter().any(|n| n["type"] == "pid"));
         // Host DNS files are bind-mounted in when they exist on this host.
         let mounts = spec["mounts"].as_array().unwrap();
+        // Volumes land as read-write rbind mounts at their declared path.
+        let state = mounts
+            .iter()
+            .find(|mount| mount["destination"] == "/workspace")
+            .expect("volume mount present");
+        assert_eq!(state["source"], "/var/legion/state");
+        assert_eq!(state["type"], "bind");
+        assert_eq!(state["options"], json!(["rbind", "rprivate", "rw"]));
         for path in ["/etc/resolv.conf", "/etc/hosts"] {
             assert_eq!(
                 mounts.iter().any(|m| m["destination"] == path),
@@ -630,7 +702,14 @@ mod tests {
             gid: 70,
             home: Some("/var/lib/postgresql".to_string()),
         };
-        let spec = build_spec(&["true".to_string()], &HashMap::new(), &image, &user, "h");
+        let spec = build_spec(
+            &["true".to_string()],
+            &HashMap::new(),
+            &image,
+            &user,
+            "h",
+            &[],
+        );
         let env = spec["process"]["env"].as_array().unwrap();
         assert!(env.iter().any(|e| e == "HOME=/from-image"));
         assert!(!env.iter().any(|e| e == "HOME=/var/lib/postgresql"));

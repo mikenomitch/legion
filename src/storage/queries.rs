@@ -4,51 +4,57 @@ use lazy_static::lazy_static;
 // NODES
 //
 
-pub const NODE_ATTRS: &str = r#"
-id, pool, status, availability, config_attrs, fingerprint_attrs, dynamic_attrs, health_checks, last_heartbeat
+// The node/node_health split (plan §7-C2, phase C-1): `node` carries
+// identity/pool/attrs/`availability` (control lane); `node_health` carries
+// liveness — `status`, `last_heartbeat`, `lost_at`, `health_checks` (status
+// lane). Every place a `Node` struct is hydrated reads this LEFT JOIN so the
+// struct's public shape is unchanged for all callers.
+//
+// A node without a `node_health` row (registered but not yet heartbeated,
+// or a crash between registration's control and status ops) hydrates the
+// same liveness registration used to set before the split: status
+// `'active'`, empty `last_heartbeat`, no `lost_at`, `'{}'` health checks.
+pub const NODE_JOINED_ATTRS: &str = r#"
+node.id, node.pool, COALESCE(node_health.status, 'active'), node.availability, node.config_attrs, node.fingerprint_attrs, node.dynamic_attrs, COALESCE(node_health.health_checks, '{}'), COALESCE(node_health.last_heartbeat, '')
 "#;
 
-// `lost_at = NULL`: a (re-)registering node is by definition not lost, so the
-// stateful node-loss confirmation clock resets (see mark_node_lost).
-pub const NODE_PARAM_SET: &str = r#"
-pool = :pool, status = :status, availability = :availability, config_attrs = :config_attrs, fingerprint_attrs = :fingerprint_attrs, dynamic_attrs = :dynamic_attrs, health_checks = :health_checks, last_heartbeat = :last_heartbeat, lost_at = NULL
-"#;
-
-pub const NODE_ATTRS_VALS: &str = r#"
-:id, :pool, :status, :availability, :config_attrs, :fingerprint_attrs, :dynamic_attrs, :health_checks, :last_heartbeat
+pub const NODE_JOINED_FROM: &str = r#"
+FROM node LEFT JOIN node_health ON node_health.node_id = node.id
 "#;
 
 lazy_static! {
     pub static ref GET_NODE: String = format!(
         r#"
-    SELECT {NODE_ATTRS}
-    FROM node
-    WHERE id = ?
+    SELECT {NODE_JOINED_ATTRS}
+    {NODE_JOINED_FROM}
+    WHERE node.id = ?
     "#
     );
     pub static ref GET_NODES: String = format!(
         r#"
-    SELECT {NODE_ATTRS}
-    FROM node;
-    "#
-    );
-    pub static ref INSERT_NODE: String = format!(
-        r#"
-    INSERT INTO node ({NODE_ATTRS})
-    VALUES ({NODE_ATTRS_VALS})
-    ON CONFLICT(id) DO UPDATE SET {NODE_PARAM_SET}
-    RETURNING {NODE_ATTRS};
-    "#
-    );
-    pub static ref UPDATE_NODE_DYNAMIC: String = format!(
-        r#"
-    UPDATE node
-    SET dynamic_attrs = :dynamic_attrs
-    WHERE id IN (:id)
-    RETURNING {NODE_ATTRS};
+    SELECT {NODE_JOINED_ATTRS}
+    {NODE_JOINED_FROM};
     "#
     );
 }
+
+/// Control-lane registration upsert: identity/pool/attrs/availability only —
+/// liveness lives in `node_health`, seeded by the status lane (see
+/// `Store::insert_node`).
+pub const INSERT_NODE: &str = r#"
+INSERT INTO node (id, pool, availability, config_attrs, fingerprint_attrs, dynamic_attrs)
+VALUES (:id, :pool, :availability, :config_attrs, :fingerprint_attrs, :dynamic_attrs)
+ON CONFLICT(id) DO UPDATE SET pool = :pool, availability = :availability, config_attrs = :config_attrs, fingerprint_attrs = :fingerprint_attrs, dynamic_attrs = :dynamic_attrs;
+"#;
+
+/// Status-lane registration seed (INSERT OR REPLACE = wholesale reset of the
+/// liveness row): a (re-)registering node is by definition not lost, so
+/// `lost_at` resets to NULL and the stateful node-loss confirmation clock
+/// stops (see mark_node_lost).
+pub const SEED_NODE_HEALTH: &str = r#"
+INSERT OR REPLACE INTO node_health (node_id, status, last_heartbeat, lost_at, health_checks)
+VALUES (:id, :status, :last_heartbeat, NULL, :health_checks);
+"#;
 
 //
 // ALLOCATION
@@ -177,15 +183,15 @@ lazy_static! {
 //
 
 pub const WORKER_TYPE_ATTRS: &str = r#"
-name, pool, additional_node_checks, attributes, name_prefix, resources, reserved_resources, max_allocations, artifacts
+name, pool, additional_node_checks, attributes, name_prefix, resources, reserved_resources, max_allocations, artifacts, host_volumes
 "#;
 
 pub const WORKER_TYPE_PARAM_SET: &str = r#"
-pool = :pool, additional_node_checks = :additional_node_checks, attributes = :attributes, name_prefix = :name_prefix, resources = :resources, reserved_resources = :reserved_resources, max_allocations = :max_allocations, artifacts = :artifacts
+pool = :pool, additional_node_checks = :additional_node_checks, attributes = :attributes, name_prefix = :name_prefix, resources = :resources, reserved_resources = :reserved_resources, max_allocations = :max_allocations, artifacts = :artifacts, host_volumes = :host_volumes
 "#;
 
 pub const WORKER_TYPE_ATTRS_VALS: &str = r#"
-:name, :pool, :additional_node_checks, :attributes, :name_prefix, :resources, :reserved_resources, :max_allocations, :artifacts
+:name, :pool, :additional_node_checks, :attributes, :name_prefix, :resources, :reserved_resources, :max_allocations, :artifacts, :host_volumes
 "#;
 
 lazy_static! {
@@ -306,19 +312,19 @@ lazy_static! {
 //
 
 pub const TASK_CONFIG_ATTRS: &str = r#"
-id, name, kind, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_id, job_config_id, identities, stateful, artifacts, network, service, actions, connect
+id, name, runtime, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_id, job_config_id, identities, stateful, artifacts, network, service, actions, volumes, connect
 "#;
 
 pub const TASK_CONFIG_INSERT_ATTRS: &str = r#"
-name, kind, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_id, job_config_id, identities, stateful, artifacts, network, service, actions, connect
+name, runtime, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_id, job_config_id, identities, stateful, artifacts, network, service, actions, volumes, connect
 "#;
 
 // pub const TASK_CONFIG_PARAM_SET: &str = r#"
-// count = :count, name = :name, kind = :kind, config = :config, resources = :resources, constraints = :constraints, job_id = :job_id, job_config_id = :job_config_id
+// count = :count, name = :name, runtime = :runtime, config = :config, resources = :resources, constraints = :constraints, job_id = :job_id, job_config_id = :job_config_id
 // "#;
 
 pub const TASK_CONFIG_ATTRS_VALS: &str = r#"
-:name, :kind, :count, :count_per, :group_name, :lifecycle, :schedule, :depends_on, :config, :resources, :constraints, :permit, :affinities, :checks, :on_unhealthy, :kv_injections, :job_id, :job_config_id, :identities, :stateful, :artifacts, :network, :service, :actions, :connect
+:name, :runtime, :count, :count_per, :group_name, :lifecycle, :schedule, :depends_on, :config, :resources, :constraints, :permit, :affinities, :checks, :on_unhealthy, :kv_injections, :job_id, :job_config_id, :identities, :stateful, :artifacts, :network, :service, :actions, :volumes, :connect
 "#;
 
 lazy_static! {

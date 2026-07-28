@@ -630,6 +630,7 @@ mod tests {
             total_count: 0,
             tags: Vec::new(),
             allow: Vec::new(),
+            meta: Default::default(),
         }
     }
 
@@ -645,6 +646,8 @@ mod tests {
             healthy,
             health_status: health_status.to_string(),
             tags: Vec::new(),
+            meta: Default::default(),
+            port_label: String::new(),
         }
     }
 

@@ -83,6 +83,7 @@ fn endpoint_table() -> Vec<(&'static str, Plane)> {
         ("GetNodes", Plane::Protected("node:read")),
         ("GetNode", Plane::Protected("node:read")),
         ("RestartWorker", Plane::Protected("node:write")),
+        ("SetNodeAvailability", Plane::Protected("node:write")),
         ("GetLedger", Plane::Protected("node:read")),
         ("UpdateNodeDynamic", Plane::Protected("node:write")),
         ("GetManagerConfigs", Plane::Protected("operator:read")),
@@ -91,6 +92,7 @@ fn endpoint_table() -> Vec<(&'static str, Plane)> {
         ("ListRaftHistory", Plane::Protected("operator:read")),
         ("IssueRaftCommand", Plane::Protected("operator:write")),
         ("GetRaftJoinToken", Plane::Protected("operator:write")),
+        ("GetStateBackup", Plane::Protected("operator:write")),
         ("PutKv", Plane::Protected("kv:write")),
         ("GetKv", Plane::Protected("kv:read")),
         ("ListKv", Plane::Protected("kv:read")),
@@ -113,6 +115,12 @@ fn endpoint_table() -> Vec<(&'static str, Plane)> {
         ("ReplaceInstance", Plane::Protected("job:write")),
         ("ListInstances", Plane::Protected("job:read")),
         ("GetInstance", Plane::Protected("job:read")),
+        // Volumes are job-scoped storage, so they read/write under `job`.
+        // ListVolumePlugins is cluster capability data, like node fingerprints.
+        ("ListVolumes", Plane::Protected("job:read")),
+        ("GetVolume", Plane::Protected("job:read")),
+        ("DeleteVolume", Plane::Protected("job:write")),
+        ("ListVolumeDrivers", Plane::Protected("node:read")),
         ("IssueWorkloadIdentityToken", Plane::Worker),
         ("IssueNodeIdentityToken", Plane::Worker),
         ("GetAllocationLogs", Plane::Protected("job:read")),
@@ -164,7 +172,7 @@ fn jobspec(name: &str) -> String {
     serde_json::json!({
         "name": name,
         "tasks": [{
-            "kind": "noop",
+            "runtime": "noop",
             "count": 1,
             "config": {},
             "resources": {},
@@ -205,6 +213,7 @@ async fn call_endpoint(
                     fingerprint_attrs: "{}".into(),
                     health_checks: "[]".into(),
                     join_token: None,
+                    ..Default::default()
                 },
                 token,
             ))
@@ -376,6 +385,20 @@ async fn call_endpoint(
             ))
             .await
             .map(|_| ()),
+        "SetNodeAvailability" => svc
+            .set_node_availability(req(
+                SetNodeAvailabilityRequest {
+                    node_id: NODE_ID.into(),
+                    // Cordon-only (no evict) keeps the fixture node's
+                    // allocations untouched for the other endpoints.
+                    availability: "drained".into(),
+                    evict: false,
+                    idempotency_key: None,
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
         "GetLedger" => svc
             .get_ledger(req(GetLedgerRequest::default(), token))
             .await
@@ -418,6 +441,12 @@ async fn call_endpoint(
             .map(|_| ()),
         "GetRaftJoinToken" => svc
             .get_raft_join_token(req(GetRaftJoinTokenRequest::default(), token))
+            .await
+            .map(|_| ()),
+        // Default (None) out_path: the server picks a unique timestamped
+        // destination under the fixture store's directory each call.
+        "GetStateBackup" => svc
+            .get_state_backup(req(GetStateBackupRequest::default(), token))
             .await
             .map(|_| ()),
         "PutKv" => svc
@@ -616,6 +645,34 @@ async fn call_endpoint(
                 },
                 token,
             ))
+            .await
+            .map(|_| ()),
+        "ListVolumes" => svc
+            .list_volumes(req(ListVolumesRequest::default(), token))
+            .await
+            .map(|_| ()),
+        "GetVolume" => svc
+            .get_volume(req(
+                GetVolumeRequest {
+                    volume_id: "missing-volume".into(),
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "DeleteVolume" => svc
+            .delete_volume(req(
+                DeleteVolumeRequest {
+                    volume_id: "missing-volume".into(),
+                    force: false,
+                    idempotency_key: None,
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "ListVolumeDrivers" => svc
+            .list_volume_drivers(req(ListVolumeDriversRequest {}, token))
             .await
             .map(|_| ()),
         "IssueWorkloadIdentityToken" => svc
@@ -1093,6 +1150,7 @@ async fn worker_join_flow_with_acls_enabled() -> R<()> {
                 fingerprint_attrs: "{}".into(),
                 health_checks: "[]".into(),
                 join_token: Some(join_token.secret.clone()),
+                ..Default::default()
             },
             None,
         ))
@@ -1150,6 +1208,7 @@ async fn worker_join_flow_with_acls_enabled() -> R<()> {
                 fingerprint_attrs: "{}".into(),
                 health_checks: "[]".into(),
                 join_token: Some(join_token.secret.clone()),
+                ..Default::default()
             },
             None,
         ))
@@ -1195,6 +1254,7 @@ async fn worker_join_flow_with_acls_enabled() -> R<()> {
                 fingerprint_attrs: "{}".into(),
                 health_checks: "[]".into(),
                 join_token: Some(join_token.secret),
+                ..Default::default()
             },
             None,
         ))
@@ -1681,5 +1741,101 @@ async fn client_token_cannot_mint_management_tokens() -> R<()> {
     ))
     .await
     .expect("management tokens may mint management tokens");
+    Ok(())
+}
+
+/// Version handshake round-trip: registration stores the worker's build and
+/// protocol versions into the node's `dynamic_attrs` (so `legion node list`
+/// and the UI show fleet skew) and the reply carries the manager's versions.
+/// Workers reporting protocol version 0 (pre-versioning builds) are admitted;
+/// workers reporting a version newer than the manager's are rejected with
+/// FAILED_PRECONDITION (managers must be upgraded first).
+#[tokio::test]
+async fn worker_register_version_handshake_round_trip() -> R<()> {
+    use legion::constants::PROTOCOL_VERSION;
+
+    let store = setup_store()?;
+    seed_fixtures(&store)?;
+    let svc = ManagerDaemonService::new(store.clone());
+
+    // A current-version worker registers; the reply carries manager versions.
+    let reply = svc
+        .worker_register(req(
+            WorkerRegisterRequest {
+                name: "versioned-worker".into(),
+                pool: "default".into(),
+                config_attrs: "{}".into(),
+                fingerprint_attrs: "{}".into(),
+                health_checks: "[]".into(),
+                join_token: None,
+                build_version: "9.9.9-test".into(),
+                protocol_version: PROTOCOL_VERSION,
+            },
+            None,
+        ))
+        .await?
+        .into_inner();
+    assert_eq!(reply.manager_build_version, env!("CARGO_PKG_VERSION"));
+    assert_eq!(reply.manager_protocol_version, PROTOCOL_VERSION);
+
+    // The versions land in the node's dynamic attrs.
+    let node = store.get_node("versioned-worker")?;
+    assert_eq!(node.dynamic_attrs["buildVersion"], "9.9.9-test");
+    assert_eq!(
+        node.dynamic_attrs["protocolVersion"],
+        serde_json::json!(PROTOCOL_VERSION)
+    );
+
+    // A pre-versioning worker (proto3 defaults: "" / 0) is still admitted so
+    // rolling upgrades from older releases work; its attrs say "unknown".
+    svc.worker_register(req(
+        WorkerRegisterRequest {
+            name: "legacy-worker".into(),
+            pool: "default".into(),
+            config_attrs: "{}".into(),
+            fingerprint_attrs: "{}".into(),
+            health_checks: "[]".into(),
+            join_token: None,
+            ..Default::default()
+        },
+        None,
+    ))
+    .await
+    .expect("pre-versioning workers must be admitted");
+    let legacy = store.get_node("legacy-worker")?;
+    assert_eq!(legacy.dynamic_attrs["buildVersion"], "unknown");
+    assert_eq!(
+        legacy.dynamic_attrs["protocolVersion"],
+        serde_json::json!(0)
+    );
+
+    // A worker from the future (upgraded before the manager) is rejected
+    // with FAILED_PRECONDITION and an actionable upgrade-order message.
+    let status = svc
+        .worker_register(req(
+            WorkerRegisterRequest {
+                name: "future-worker".into(),
+                pool: "default".into(),
+                config_attrs: "{}".into(),
+                fingerprint_attrs: "{}".into(),
+                health_checks: "[]".into(),
+                join_token: None,
+                build_version: "99.0.0".into(),
+                protocol_version: PROTOCOL_VERSION + 1,
+            },
+            None,
+        ))
+        .await
+        .expect_err("newer-protocol workers must be rejected");
+    assert_eq!(status.code(), Code::FailedPrecondition);
+    assert!(
+        status.message().contains("Upgrade all managers first"),
+        "rejection must tell the operator the upgrade order, got: {}",
+        status.message()
+    );
+    assert!(
+        store.get_node("future-worker").is_err(),
+        "rejected workers must not be inserted into the node table"
+    );
     Ok(())
 }

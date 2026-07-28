@@ -167,6 +167,11 @@ pub fn friendly_status(action: &str, status: Status) -> anyhow::Error {
         Code::NotFound => Some("resource not found"),
         Code::AlreadyExists => Some("resource already exists"),
         Code::InvalidArgument => Some("request was invalid; check CLI arguments"),
+        // Raft non-leader rejections carry the leader's name+address in the
+        // message itself; the hint tells the operator what to do with it.
+        Code::FailedPrecondition if message.contains("not the raft leader") => Some(
+            "writes go to the raft leader; point LEGION_ADDR at the leader shown above and retry",
+        ),
         Code::FailedPrecondition => Some("request precondition failed"),
         Code::PermissionDenied | Code::Unauthenticated => Some("authentication failed"),
         _ => None,

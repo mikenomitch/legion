@@ -1,5 +1,5 @@
 {
   "kind": "tasks",
   "name": "noop",
-  "legionApiVersion": 1
+  "legionApiVersion": 2
 }

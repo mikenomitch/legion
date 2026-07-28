@@ -22,15 +22,23 @@ from the CLI, the MCP server, the UI, and raw gRPC.
 | `artifact.staged` | info | Every artifact for an allocation staged successfully (digests, bytes, durations in metadata). |
 | `artifact.failed` | warn | One artifact's fetch failed — per-artifact detail (redacted source, error, attempts) alongside the allocation-level `allocation.failed`. |
 | `artifact.pinned` | info | Mutable artifact references were pinned to digests at submit (one event per changing submit; pins in metadata). |
+| `volume.mounted` | info | A worker materialized a [volume](volumes.md) at a host path. For a node-local volume this is also when its instance becomes pinned to that node. |
+| `volume.failed` | warn | A driver operation failed (mount/unmount/destroy). The detail is also recorded on the volume row, so `legion volume get` explains a stuck volume. |
+| `volume.reclaiming` | info | A volume's instance no longer references it, so its storage is queued for the driver's `destroy`. |
+| `volume.destroyed` | info | A driver confirmed a volume's storage is gone. |
 | `node.registered` | info | A worker registered (or re-registered). |
 | `node.ready` | info | A known node rejoined and was marked ready. |
 | `node.lost` | warn | A node was marked lost (explicitly or via missed heartbeats). |
+| `node.cordoned` | info | A node's availability was set to `drained`: no new placements land on it (existing allocations untouched). |
+| `node.uncordoned` | info | A node's availability was restored to `available`: it re-entered the scheduling pool. |
+| `node.drained` | info | A drain pass evicted a drained node's allocations for replacement elsewhere (evicted/held counts in metadata; held = stateful allocations protected by `onLost`). |
 | `job.submitted` / `job.updated` | info | A job config was created / updated. |
 | `job.stopped` / `job.destroyed` | info | A job was stopped / destroyed. |
 | `job.failed` | error | A job was marked failed (e.g. move limit exceeded). |
 | `rollout.event` | passthrough | Mirror of every rollout event (created, advanced, completed, failed, …). |
 
-Each event carries: a monotonically increasing `id`, `kind`, `level`
+Each event carries: an increasing (but sparse — see
+[cursors](#cursor-based-polling-cli-and-mcp)) `id`, `kind`, `level`
 (`info`/`warn`/`error`), optional scope IDs (`job_id`, `node_id`, `eval_id`,
 `allocation_id`, `rollout_id`), a human-readable `message`, a JSON
 `metadata_json` object with kind-specific detail, and an RFC3339 `created_at`.
@@ -55,11 +63,18 @@ legion events follow --kind rollout --json   # NDJSON: one envelope per line
 ### Cursor-based polling (CLI and MCP)
 
 Event IDs are assigned by the state store and never reused, so `after_id` is a
-gap-free cursor:
+cursor — "give me everything above this ID", never an index or a count:
 
 1. `legion events list --json` → remember `latestId`.
 2. Poll `legion events list --after-id <latestId> --json`; update the cursor
    from the last event received (or the reply's `latestId`).
+
+**IDs are sparse, and always were.** They increase, but they do not run
+1, 2, 3: the journal is pruned (so old IDs vanish), and each raft write lane
+mints IDs in its own stride so two lanes can never mint the same ID (see
+["How it works"](#how-it-works)). Never treat a gap as a lost event, derive a
+count from `lastId - firstId`, or synthesize an ID by adding 1 — carry the
+cursor you were given.
 
 The `legion_events` MCP tool exposes the same arguments (`after_id`, `limit`,
 `kind`, `job_id`, `node_id`, `level`), which is the recommended way for MCP
@@ -98,6 +113,23 @@ See `proto/legion.proto` for the authoritative message documentation.
 - `StreamEvents` subscribers that lag behind the broadcast buffer are
   transparently backfilled from the journal using their last-sent event ID, so
   slow consumers degrade to catch-up reads instead of dropping events.
+- **Event IDs are minted, not counted.** An ID is a timestamp (unix
+  milliseconds) in its high bits, a per-process sequence in the middle, and
+  the raft write lane that minted it in the low 3 bits — every ID satisfies
+  `id % 8 == lane_index`. The lanes' ID spaces are therefore disjoint, which
+  is what lets any lane insert into the shared journal concurrently without
+  two lanes ever minting the same ID (a collision would silently drop one
+  node's event on some replicas and not others). IDs still sort
+  ~chronologically and still increase per lane, which is all the cursor
+  contract needs. In `single` topology (and in `local_disk` mode) every ID
+  comes from one lane and the low bits are constant.
+- Under `topology: lanes` the live tail is ordered per lane, not globally:
+  two lanes commit independently, so a subscriber can occasionally receive a
+  slightly newer lane's event before a slightly older one from another lane.
+  The stream only ever emits increasing IDs, so that older event is skipped
+  live — it is in the journal, and any cursor read (`--after-id`, a
+  reconnect, `ListEvents`) returns it. The journal, not the live tail, is the
+  complete record.
 - The journal is bounded: the newest ~10,000 events are retained and older rows
   are pruned opportunistically during inserts. The stream is an observability
   surface, not an audit log — durable history belongs to the state store
@@ -118,12 +150,15 @@ work as possible:
   Cold paths (node/job lifecycle, the rollout bridge) use the one-line
   `store.events()` recorder, which takes the lock itself.
 - **Index-free journal.** `scheduler_event` has no secondary indexes and no
-  `AUTOINCREMENT`, keeping the insert to a single b-tree append. Cursor reads
-  use the rowid PK; filtered reads scan the ≤10k-row table in about a
-  millisecond, which is fine for their human/agent-paced call rate.
+  `AUTOINCREMENT`, keeping the insert to a single b-tree append. The ID is
+  computed in memory (no `SELECT MAX(id)` round trip) and appended as the
+  rowid PK; cursor reads use that PK, and filtered reads scan the ≤10k-row
+  table in about a millisecond, which is fine for their human/agent-paced
+  call rate.
 - **Ordered publication.** Events are broadcast while the write guard is still
   held, so `StreamEvents` subscribers observe strictly increasing IDs and the
-  lag/backfill dedupe logic stays correct.
+  lag/backfill dedupe logic stays correct (per lane under `lanes` topology —
+  see above).
 
 Measured on `eval_critical_path_bench` (the worst case: tight multi-threaded
 enqueue→claim→apply→complete loops with no other work), A/B'd in the same

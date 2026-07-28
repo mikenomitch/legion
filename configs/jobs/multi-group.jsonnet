@@ -3,7 +3,7 @@
     tasks: [
         {
             name: "frontend",
-            kind: "exec",
+            runtime: "exec",
             lifecycle: "service",
             group: "web",
             config: {
@@ -12,7 +12,7 @@
         },
         {
             name: "worker",
-            kind: "exec",
+            runtime: "exec",
             lifecycle: "service",
             group: "worker",
             config: {
@@ -21,7 +21,7 @@
         },
         {
             name: "metrics",
-            kind: "exec",
+            runtime: "exec",
             lifecycle: "sidecar",
             group: "worker",
             config: {

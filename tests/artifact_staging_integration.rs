@@ -5,6 +5,7 @@
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -48,7 +49,7 @@ fn insert_node(store: &Store, id: &str) -> R<()> {
         availability: "available".into(),
         config_attrs: "{}".into(),
         fingerprint_attrs: json!({
-            "memory_total": "8388608",
+            "memory_total": "8589934592",
             "cpus": {
                 "cpu-1": { "frequency": "2400" },
             }
@@ -155,19 +156,21 @@ fn task_allocation(
     artifacts: serde_json::Value,
 ) -> TaskAllocation {
     TaskAllocation {
+        task_volumes: String::new(),
         allocation_id: id,
         job_id: "job".into(),
         job_config_id: "job-1".into(),
         node_id: "node-1".into(),
         task_config_id: 1,
         task_name: "tool-task".into(),
-        task_kind: "exec".into(),
+        task_runtime: "exec".into(),
         task_config: config.to_string(),
         task_checks: String::new(),
         task_on_unhealthy: String::new(),
         task_identities: String::new(),
         self_terminate_after_seconds: 0,
         task_artifacts: artifacts.to_string(),
+        task_resources: String::new(),
         network: String::new(),
         task_connect: String::new(),
     }
@@ -182,6 +185,15 @@ fn wait_until(timeout: Duration, mut check: impl FnMut() -> bool) -> bool {
         std::thread::sleep(Duration::from_millis(25));
     }
     false
+}
+
+/// The fixture script creates `marker` and then writes into it as separate
+/// steps, so waiting on existence alone can observe a still-empty file. Wait
+/// on the contents instead.
+fn marker_written(marker: &Path) -> bool {
+    std::fs::read_to_string(marker)
+        .map(|s| s.trim() == "staged-ok")
+        .unwrap_or(false)
 }
 
 /// S1 end to end: an exec task fetches a release tarball over HTTP, the
@@ -206,11 +218,10 @@ fn exec_task_stages_http_artifact_and_runs_from_task_dir() -> R<()> {
     // exec cwd defaults there.
     let marker = task_dir.join("marker");
     assert!(
-        wait_until(Duration::from_secs(15), || marker.is_file()),
+        wait_until(Duration::from_secs(15), || marker_written(&marker)),
         "marker not written; staging or start failed: {:?}",
         manager.lock().unwrap().allocation_health_snapshot()
     );
-    assert_eq!(std::fs::read_to_string(&marker)?.trim(), "staged-ok");
     assert!(task_dir.join("tool/run.sh").is_file(), "archive unpacked");
     assert!(!task_dir.join(".staging").exists(), "staging temp cleaned");
 
@@ -347,7 +358,7 @@ fn artifact_states_flow_through_store_to_rollout_status() -> R<()> {
         "name": "artifact-status-job",
         "tasks": [{
             "name": "tool",
-            "kind": "exec",
+            "runtime": "exec",
             "artifacts": ["https://releases.example.com/tool-v1.tar.gz"],
             "config": {"command": ["./tool"]},
         }],
@@ -446,7 +457,7 @@ async fn admission_normalizes_artifacts_and_preserves_plain_jobs() -> R<()> {
         "tasks": [
             {
                 "name": "with-artifacts",
-                "kind": "exec",
+                "runtime": "exec",
                 "artifacts": [
                     {"source": "https://private.example.com/build.tar.gz", "name": "build"},
                     {"source": "https://public.example.com/tool.tar.gz", "name": "tool",
@@ -456,7 +467,7 @@ async fn admission_normalizes_artifacts_and_preserves_plain_jobs() -> R<()> {
             },
             {
                 "name": "plain",
-                "kind": "exec",
+                "runtime": "exec",
                 "config": {"command": ["true"]},
             },
         ],
@@ -503,7 +514,7 @@ async fn admission_normalizes_artifacts_and_preserves_plain_jobs() -> R<()> {
         instance_id: None,
         network: None,
     };
-    let dispatched = build_task_allocation(with_artifacts, &allocation, None)?;
+    let dispatched = build_task_allocation(with_artifacts, &allocation, None, &[])?;
     assert!(dispatched.task_artifacts.contains("secrets/private-pull"));
 
     let plain = tasks
@@ -512,7 +523,7 @@ async fn admission_normalizes_artifacts_and_preserves_plain_jobs() -> R<()> {
         .find(|task| task.name == "plain")
         .context("plain task")?;
     assert!(plain.artifacts.is_empty());
-    let dispatched_plain = build_task_allocation(plain, &allocation, None)?;
+    let dispatched_plain = build_task_allocation(plain, &allocation, None, &[])?;
     assert_eq!(dispatched_plain.task_artifacts, "");
     Ok(())
 }
@@ -528,7 +539,7 @@ async fn plain_http_artifact_rejected_at_admission_by_default() -> R<()> {
         "name": "http-artifact-job",
         "tasks": [{
             "name": "tool",
-            "kind": "exec",
+            "runtime": "exec",
             "artifacts": ["http://insecure.example.com/tool.tar.gz"],
             "config": {"command": ["true"]},
         }],
@@ -585,7 +596,7 @@ async fn git_ref_pins_to_commit_sha_at_submit() -> R<()> {
         "name": "git-pin-job",
         "tasks": [{
             "name": "repo",
-            "kind": "exec",
+            "runtime": "exec",
             "artifacts": [{"source": source.clone(), "name": "repo"}],
             "config": {"command": ["true"]},
         }],
@@ -636,7 +647,7 @@ async fn git_ref_pins_to_commit_sha_at_submit() -> R<()> {
         "name": "git-pin-job",
         "tasks": [{
             "name": "repo",
-            "kind": "exec",
+            "runtime": "exec",
             "artifacts": [{"source": source, "name": "repo"}],
             "config": {"command": ["true"]},
         }],
@@ -666,7 +677,7 @@ async fn resolve_always_passes_reference_through() -> R<()> {
         "name": "resolve-always-job",
         "tasks": [{
             "name": "repo",
-            "kind": "exec",
+            "runtime": "exec",
             "artifacts": [{
                 "source": "git::https://example.invalid/repo?ref=main",
                 "resolve": "always",
@@ -710,7 +721,7 @@ fn worker_restart_reuses_staged_artifacts() -> R<()> {
         let manager = worker_manager(&temp_dir);
         launch_task_allocation(&manager, &allocation)?;
         assert!(
-            wait_until(Duration::from_secs(15), || marker.is_file()),
+            wait_until(Duration::from_secs(15), || marker_written(&marker)),
             "first launch failed: {:?}",
             manager.lock().unwrap().allocation_health_snapshot()
         );
@@ -730,7 +741,7 @@ fn worker_restart_reuses_staged_artifacts() -> R<()> {
     let restarted = worker_manager(&temp_dir);
     launch_task_allocation(&restarted, &allocation)?;
     assert!(
-        wait_until(Duration::from_secs(15), || marker.is_file()),
+        wait_until(Duration::from_secs(15), || marker_written(&marker)),
         "relaunch after restart failed (artifacts should be reused): {:?}",
         restarted.lock().unwrap().allocation_health_snapshot()
     );
@@ -766,7 +777,7 @@ fn redispatch_with_unchanged_artifacts_reuses_staging() -> R<()> {
 
     launch_task_allocation(&manager, &allocation)?;
     assert!(
-        wait_until(Duration::from_secs(15), || marker.is_file()),
+        wait_until(Duration::from_secs(15), || marker_written(&marker)),
         "first launch failed"
     );
     server.join().ok();
@@ -784,7 +795,7 @@ fn redispatch_with_unchanged_artifacts_reuses_staging() -> R<()> {
     );
     launch_task_allocation(&manager, &updated)?;
     assert!(
-        wait_until(Duration::from_secs(15), || marker.is_file()),
+        wait_until(Duration::from_secs(15), || marker_written(&marker)),
         "re-dispatch failed (artifacts should be reused): {:?}",
         manager.lock().unwrap().allocation_health_snapshot()
     );

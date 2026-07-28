@@ -62,6 +62,18 @@ impl WorkerCredentials {
     }
 }
 
+/// Port the worker's own gRPC server listens on, and the port it advertises to
+/// the manager as its `workerAddress`. Overridable via `LEGION_WORKER_PORT` so
+/// several workers can run on one host (local multi-node testing); the manager
+/// dispatches to the advertised address, so both uses must agree.
+fn worker_server_port() -> u64 {
+    std::env::var("LEGION_WORKER_PORT")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|port| *port > 0)
+        .unwrap_or(DEF_WORKER_SERVER_PORT)
+}
+
 /// Everything needed to (re-)register this worker with the manager.
 #[derive(Debug, Clone)]
 struct RegistrationPayload {
@@ -95,6 +107,20 @@ pub async fn run_worker_local(
     run_worker_with_manager(manager_addr, worker_type, name_override, join_secret).await
 }
 
+/// The worker config's `hostVolumes` map. A malformed value is logged and
+/// treated as empty rather than failing worker startup: the manager already
+/// validated it at load time, and a worker that refuses to start over one bad
+/// entry is worse than one whose `host` plugin reports itself unavailable.
+fn parse_host_volumes(raw: &str) -> HashMap<String, crate::volumes::HostVolumeConfig> {
+    if raw.trim().is_empty() {
+        return HashMap::new();
+    }
+    serde_json::from_str(raw).unwrap_or_else(|err| {
+        warn!(error = ?err, "Invalid hostVolumes in worker config; ignoring");
+        HashMap::new()
+    })
+}
+
 #[instrument(err, skip_all)]
 async fn run_worker_with_manager(
     manager_addr: String,
@@ -102,7 +128,8 @@ async fn run_worker_with_manager(
     name_override: Option<&str>,
     join_secret: Option<String>,
 ) -> R<()> {
-    let addr = format!("{DEF_MANAGER_HOSTNAME}:{DEF_WORKER_SERVER_PORT}").parse()?;
+    let server_port = worker_server_port();
+    let addr = format!("{DEF_MANAGER_HOSTNAME}:{server_port}").parse()?;
 
     info!(%manager_addr, %worker_type, "Worker connecting to manager");
 
@@ -125,9 +152,14 @@ async fn run_worker_with_manager(
             warn!(error = ?err, "Invalid worker artifacts config; using defaults");
             crate::structs::WorkerArtifactFetchConfigFull::default()
         });
+    // Volume drivers must be ready before any allocation can arrive, and they
+    // need the node id (it goes into every plugin request) plus the operator's
+    // hostVolumes declarations from the worker config.
+    let host_volumes = parse_host_volumes(&config.host_volumes);
     let restored_allocations = {
         let mut manager = task_manager.lock().expect("task manager");
         manager.load_builtin_plugins();
+        manager.configure_volumes(&name, host_volumes);
         manager.configure_artifacts(
             artifact_fetch_config,
             Box::new(ManagerCredentialSource::new(
@@ -173,7 +205,17 @@ async fn run_worker_with_manager(
         .add_service(WorkerServer::new(worker_node))
         .serve(addr);
 
-    let fingerprint_data = fingerprint_node(config.additional_node_checks.clone());
+    let mut fingerprint_data = fingerprint_node(config.additional_node_checks.clone());
+    // The manager loads no storage drivers of its own, so this is its only
+    // source of truth for what volume drivers exist in the cluster: it backs
+    // job admission, placement filtering, and `legion volume drivers`.
+    fingerprint_data.insert(
+        "volumeDrivers".into(),
+        task_manager
+            .lock()
+            .expect("task manager")
+            .volume_fingerprint(),
+    );
     let readiness = task_manager
         .lock()
         .expect("task manager")
@@ -194,10 +236,7 @@ async fn run_worker_with_manager(
     }
     config_attrs.insert(
         "workerAddress".into(),
-        Value::String(format!(
-            "http://{}:{}",
-            DEF_MANAGER_HOSTNAME, DEF_WORKER_SERVER_PORT
-        )),
+        Value::String(format!("http://{}:{}", DEF_MANAGER_HOSTNAME, server_port)),
     );
 
     let registration = RegistrationPayload {
@@ -442,7 +481,7 @@ async fn heartbeat_tick(
 
     {
         let start = std::time::Instant::now();
-        let (allocations, failures, allocation_health) = {
+        let (allocations, failures, allocation_health, volume_reports) = {
             let mut manager = task_manager.lock().expect("task manager");
             let failures = manager
                 .drain_failures()
@@ -454,16 +493,24 @@ async fn heartbeat_tick(
                 })
                 .collect::<Vec<_>>();
             let allocation_health = manager.allocation_health_snapshot();
-            (manager.allocations_snapshot(), failures, allocation_health)
+            let volume_reports = manager.drain_volume_reports();
+            (
+                manager.allocations_snapshot(),
+                failures,
+                allocation_health,
+                volume_reports,
+            )
         };
         let running = allocations.clone();
         let failures_for_redrive = failures.clone();
+        let volume_reports_for_redrive = volume_reports.clone();
 
         let req = credentials.attach(tonic::Request::new(HeartbeatRequest {
             id: name.to_string(),
             allocation_ids: allocations,
             failed_allocations: failures,
             allocation_health,
+            volume_reports,
         }));
 
         let response = match client_clone.heartbeat(req).await {
@@ -476,6 +523,10 @@ async fn heartbeat_tick(
                 for failure in failures_for_redrive {
                     manager.record_failure(failure.allocation_id, failure.reason);
                 }
+                // Same for volume outcomes: a destroy confirmation lost to a
+                // dead connection would leave the manager re-dispatching a
+                // reclaim forever.
+                manager.requeue_volume_reports(volume_reports_for_redrive);
                 return Err(err.into());
             }
         };
@@ -489,6 +540,23 @@ async fn heartbeat_tick(
         // them in the task manager, so they must be treated as live by the
         // retain() below or the reconcile-time snapshot could abort the loops
         // we just started and never respawn them.
+        // Reclaim work the manager asked for. Runs before allocation
+        // reconciliation so a destroy for a volume this node no longer uses
+        // does not wait behind a slow task start.
+        if !reply.volume_destroy.is_empty() {
+            let requests = reply.volume_destroy.clone();
+            // Take the Arc under a brief lock, then run the drivers with NO
+            // task-manager lock held: a destroy against a hung storage backend
+            // must stall that destroy, not the heartbeats this loop exists to
+            // send (a worker that cannot heartbeat self-fences its stateful
+            // allocations — one stuck volume must not become an outage).
+            // spawn_blocking because drivers shell out (umount, rm -rf).
+            let volumes = task_manager.lock().expect("task manager").volumes_handle();
+            tokio::task::spawn_blocking(move || {
+                volumes.destroy_requested(&requests);
+            });
+        }
+
         let mut launched_this_tick: Vec<i64> = Vec::new();
         if !reply.desired_allocations.is_empty() {
             // Deliver identity tokens for not-yet-running allocations BEFORE
@@ -740,6 +808,7 @@ async fn register_self(
 ) -> R<()> {
     let mut c2 = client.clone();
 
+    let build_version = env!("CARGO_PKG_VERSION");
     let req = tonic::Request::new(WorkerRegisterRequest {
         name: registration.name.clone(),
         config_attrs: registration.config_attrs.clone(),
@@ -747,6 +816,8 @@ async fn register_self(
         health_checks: registration.health_checks.clone(),
         pool: registration.pool.clone(),
         join_token: credentials.join_secret.clone(),
+        build_version: build_version.to_string(),
+        protocol_version: PROTOCOL_VERSION,
     });
 
     let response = c2.worker_register(req).await?;
@@ -755,6 +826,24 @@ async fn register_self(
         info!(worker = %registration.name, "Received node token from manager");
     }
     credentials.store_node_token(reply.node_token);
+
+    info!(
+        worker = %registration.name,
+        manager_build_version = %reply.manager_build_version,
+        manager_protocol_version = reply.manager_protocol_version,
+        worker_build_version = %build_version,
+        worker_protocol_version = PROTOCOL_VERSION,
+        "Registered with manager"
+    );
+    if reply.manager_build_version != build_version {
+        warn!(
+            worker = %registration.name,
+            manager_build_version = %reply.manager_build_version,
+            worker_build_version = %build_version,
+            "Manager and worker build versions differ; align versions when \
+             convenient (see docs/upgrades.md)"
+        );
+    }
 
     Ok(())
 }
@@ -1018,6 +1107,7 @@ mod tests {
         let reply = HeartbeatReply {
             message: "ack".into(),
             desired_allocations: vec![connect_allocation(11, "db", local_port)],
+            volume_destroy: Vec::new(),
             upstream_endpoints: vec![UpstreamEndpoints {
                 allocation_id: 11,
                 service: "db".into(),

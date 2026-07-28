@@ -1,6 +1,6 @@
 import { For, Show, createMemo, createResource, createSignal } from 'solid-js'
 import { managerClient } from '../grpcClient'
-import { Badge, Button, CodeBlock, ConfirmButton, DefList, EmptyState, Field, Note, SectionCard, Spinner, StatusBadge, cx, inputClass } from '../components/ui'
+import { Badge, Button, CodeBlock, ConfirmButton, DefList, EmptyState, Field, Icon, Note, SectionCard, Spinner, StatusBadge, cx, inputClass } from '../components/ui'
 
 const raftCommands = [
   { label: 'Trigger Election', command: 'trigger-election', destructive: false },
@@ -25,6 +25,8 @@ export default function Raft() {
   }
 
   const canRunCommands = createMemo(() => status()?.status?.enabled ?? false)
+  // Only claim "disabled" once the manager has actually answered.
+  const raftDisabled = createMemo(() => status() !== undefined && !status()?.status?.enabled)
 
   const runCommand = async (name: string, needsTarget = false) => {
     const targetNodeId = target().trim()
@@ -55,15 +57,33 @@ export default function Raft() {
         <Note tone="danger">Failed to load Raft status.</Note>
       </Show>
 
-      <Show when={status() && !status()?.status?.enabled}>
-        <Note tone="neutral">
-          Raft is disabled on this manager — it runs standalone. Enable raft in the manager config for
-          leader election and multi-manager failover.
+      <Show when={raftDisabled()}>
+        <Note tone="warn">
+          <div class="flex items-start gap-2.5">
+            <Icon name="alertTriangle" size={16} class="mt-0.5 shrink-0" />
+            <div>
+              <p class="font-semibold">Raft is disabled — this manager runs standalone.</p>
+              <p class="mt-1 text-sm opacity-90">
+                There is no leader election and no multi-manager failover: if this manager stops, the
+                cluster has no control plane. Everything below is read-only until raft is enabled.
+              </p>
+              <p class="mt-2 text-sm opacity-90">
+                Add a <code class="rounded bg-amber-500/15 px-1 font-mono text-xs">raft</code> block to the
+                manager config (<code class="rounded bg-amber-500/15 px-1 font-mono text-xs">nodeId</code>,{' '}
+                <code class="rounded bg-amber-500/15 px-1 font-mono text-xs">bootstrap</code>,{' '}
+                <code class="rounded bg-amber-500/15 px-1 font-mono text-xs">peers</code>) and restart it — see
+                docs/raft-operations.md.
+              </p>
+            </div>
+          </div>
         </Note>
       </Show>
 
       <div class="grid items-start gap-4 lg:grid-cols-2">
-        <SectionCard title="Consensus status">
+        <SectionCard
+          title="Consensus status"
+          actions={<StatusBadge status={canRunCommands() ? 'enabled' : 'disabled'} />}
+        >
           <Show when={status()?.status} fallback={<Spinner label="Loading status…" />}>
             {(raft) => (
               <DefList
@@ -84,57 +104,71 @@ export default function Raft() {
         </SectionCard>
 
         <SectionCard title="Operator commands" description="Election, failover, and membership operations.">
-          <Field label="Target node ID" hint="Required for transfer/add/remove commands." class="mb-3">
-            <input
-              value={target()}
-              onInput={(event) => setTarget(event.currentTarget.value)}
-              class={cx(inputClass, 'font-mono')}
-              placeholder="mgr-b"
-            />
-          </Field>
-          <div class="grid grid-cols-1 gap-2 sm:grid-cols-2">
-            <For each={raftCommands}>
-              {(entry) => (
-                <Show
-                  when={entry.destructive}
-                  fallback={
-                    <Button
+          {/* Disabled buttons still read as "this might work" — with no
+              consensus there is nothing to elect, transfer or add, so say so
+              instead of showing seven dead controls. */}
+          <Show
+            when={!raftDisabled()}
+            fallback={
+              <EmptyState
+                icon="gitBranch"
+                title="Nothing to operate on"
+                body="Elections, leadership transfer, and membership changes all need a raft cluster. Enable raft on this manager to use them."
+              />
+            }
+          >
+            <Field label="Target node ID" hint="Required for transfer/add/remove commands." class="mb-3">
+              <input
+                value={target()}
+                onInput={(event) => setTarget(event.currentTarget.value)}
+                class={cx(inputClass, 'font-mono')}
+                placeholder="mgr-b"
+              />
+            </Field>
+            <div class="grid grid-cols-1 gap-2 sm:grid-cols-2">
+              <For each={raftCommands}>
+                {(entry) => (
+                  <Show
+                    when={entry.destructive}
+                    fallback={
+                      <Button
+                        disabled={!canRunCommands()}
+                        onClick={() => void runCommand(entry.command, entry.requiresTarget)}
+                        class="justify-start"
+                      >
+                        {entry.label}
+                      </Button>
+                    }
+                  >
+                    <ConfirmButton
+                      label={entry.label}
+                      icon="alertTriangle"
                       disabled={!canRunCommands()}
-                      onClick={() => void runCommand(entry.command, entry.requiresTarget)}
+                      onConfirm={() => void runCommand(entry.command, entry.requiresTarget)}
                       class="justify-start"
-                    >
-                      {entry.label}
-                    </Button>
-                  }
-                >
-                  <ConfirmButton
-                    label={entry.label}
-                    icon="alertTriangle"
-                    disabled={!canRunCommands()}
-                    onConfirm={() => void runCommand(entry.command, entry.requiresTarget)}
-                    class="justify-start"
-                  />
-                </Show>
-              )}
-            </For>
-            <Button
-              variant="accent"
-              icon="keySquare"
-              disabled={!canRunCommands()}
-              onClick={() => void issueJoinToken()}
-              class="justify-start"
-            >
-              Issue Join Token
-            </Button>
-          </div>
-          <Show when={commandResult()}>
-            <Note tone="info" class="mt-3" onDismiss={() => setCommandResult('')}>{commandResult()}</Note>
-          </Show>
-          <Show when={joinToken()}>
-            <div class="mt-3 space-y-1.5">
-              <p class="eyebrow">Join token <span class="normal-case text-faint">· expires {joinTokenExpiry()}</span></p>
-              <CodeBlock code={joinToken()} maxHClass="max-h-24" />
+                    />
+                  </Show>
+                )}
+              </For>
+              <Button
+                variant="accent"
+                icon="keySquare"
+                disabled={!canRunCommands()}
+                onClick={() => void issueJoinToken()}
+                class="justify-start"
+              >
+                Issue Join Token
+              </Button>
             </div>
+            <Show when={commandResult()}>
+              <Note tone="info" class="mt-3" onDismiss={() => setCommandResult('')}>{commandResult()}</Note>
+            </Show>
+            <Show when={joinToken()}>
+              <div class="mt-3 space-y-1.5">
+                <p class="eyebrow">Join token <span class="normal-case text-faint">· expires {joinTokenExpiry()}</span></p>
+                <CodeBlock code={joinToken()} maxHClass="max-h-24" />
+              </div>
+            </Show>
           </Show>
         </SectionCard>
       </div>

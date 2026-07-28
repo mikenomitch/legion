@@ -9,7 +9,9 @@ The UI is a SolidJS single-page app in `ui/` and talks directly to manager gRPC 
 - TailwindCSS
 - Vite build
 - Self-hosted fonts via `@fontsource-variable` (Space Grotesk for display,
-  Inter for text, JetBrains Mono for data) — no CDN requests
+  Inter for text, Fira Code for data) — no CDN requests. The `font-mono`
+  utility disables Fira Code's `liga`/`calt` ligatures so IDs, hashes and log
+  lines render literally.
 
 ## Design System
 
@@ -53,6 +55,7 @@ Routes in `App.tsx`:
 - `/` overview dashboard (KPI stat cards, active rollouts, workers and
   allocations tables)
 - `/jobs` (+ `/jobs/:id`, `/jobs/:id/tasks/:taskName`, `/jobs/:id/specs/:configId`)
+- `/services` (+ `/services/:name`)
 - `/rollouts` (+ `/rollouts/:id`); `/deployments` redirects here
 - `/nodes` (+ `/nodes/:id`)
 - `/manager` (+ `/manager/:id`)
@@ -63,6 +66,65 @@ Routes in `App.tsx`:
 A shared layout provides the grouped sidebar nav, a slim topbar
 (breadcrumbs, ⌘K search, theme toggle), and page headers for top-level
 routes; detail pages render their own `PageHeader`.
+
+## Keyboard Navigation
+
+The UI is usable without a mouse. Everything below is global — no setting, no
+mode to enter.
+
+| Keys | What it does |
+| --- | --- |
+| `⌘K` / `Ctrl+K` | Command palette: every page, plus every row of the index you are on, searchable by name |
+| `j` / `k`, `↑` / `↓` | Move the selection down/up the current index |
+| `o` / `Enter` | Open the selected row |
+| `u` | Go up one level (`/jobs/api/tasks/web` → `/jobs/api`) |
+| *hold* `⌘` / `Ctrl` | **Jump hints** — label the rows and the sidebar with the key that opens them |
+| `⌘1` … `⌘9`, `⌘0` | Open the 1st … 10th row of the index |
+| `⌘⇧` + letter | Open the labelled sidebar item |
+
+`j`/`k`/`o` and `u` are ignored while you are typing in a field, and while a
+link or button has keyboard focus — Tab focus wins over the virtual selection.
+
+### Jump hints
+
+Hold `⌘` (`Ctrl` on Windows and Linux) and the UI labels what you can jump to:
+a digit on each of the first ten rows of the index, and a letter on each sidebar
+item. Press the labelled key with the modifier still held. Release it and the
+labels disappear.
+
+```
+Jobs                        ⇧B          ⌘⇧B  → Jobs
+Services                    ⇧S          ⌘⇧S  → Services
+
+1  svc-api      DONE                    ⌘1   → svc-api
+2  svc-web      DONE                    ⌘2   → svc-web
+```
+
+Sidebar hints carry `⇧` because plain `⌘`+letter belongs to the browser and the
+OS (`⌘S`, `⌘W`, `⌘R`). The badge always spells the full chord, so what you read
+is what you press.
+
+Known limitations:
+
+- **Ten rows.** Digits run out after the tenth row; on a 20- or 50-row page the
+  rest carry no hints. Use `⌘K` or the search box for those.
+- **Index pages only.** Jobs, Workers, Rollouts, Managers, Services and Volumes
+  label their rows. The Overview dashboard and the tables inside detail pages
+  do not, and neither do secondary tables (the driver table on Volumes).
+- **Sidebar letters are positional.** They are assigned from the sidebar as
+  rendered, so an item's letter can change when the nav does — most visibly when
+  the manager has observability enabled and an extra item appears.
+- **Collapsed sidebar shows no letters** (there is no room for the badge), but
+  the chords still work.
+- **A browser may keep a chord.** The letters skip the combinations browsers
+  reserve for tabs, windows and devtools, but a browser or extension with its
+  own bindings can still win one; that chord will do the browser's thing
+  instead.
+
+Implementation: `ui/src/utils/jumpHints.ts` holds the visibility signal, the
+letter assignment, and the registry of the current index's rows;
+`ui/src/App.tsx` owns the key handling; pages opt in with `useIndexJumpTargets`
+and the `<JumpHint>` primitive.
 
 ## Data Fetch Pattern
 
@@ -88,11 +150,56 @@ an `afterId` cursor so no events are missed across disconnects.
   Instances panel (id, mode, color-coded state, slot, current allocation,
   storage handle, created). Keyed instance create/destroy is CLI-only
   (`legion instance ...`); the UI does not mutate instances.
+- `Services.tsx`: the discovery catalog (`ListServices`) with healthy/total
+  counts; `pages/details/ServiceDetail.tsx` resolves endpoints
+  (`ResolveService`, unhealthy included) and renders the same layered
+  diagnosis as `legion service doctor` (`utils/services.ts`). Endpoint
+  addresses link out when the service's `meta.protocol` is web-reachable.
+- `Volumes.tsx`: the volume index (`ListVolumes`) plus a plugin table
+  (`ListVolumeDrivers`). Node-local volumes are marked with `*` because that is
+  the property deciding whether a stateful workload can move at all;
+  `pages/details/VolumeDetail.tsx` shows one volume's plugin params, driver
+  metadata, node pin, and last driver error. Deletion is CLI-only
+  (`legion volume delete`) — it destroys data, and a two-click confirm in a
+  dashboard is not the right gate for that.
 - `Rollouts.tsx`: rollout list, per-group status, event logs, manual advance action.
 - `Events.tsx`: live scheduler event feed with filtering and pause/resume.
 - `KeyValue.tsx`: key tree browser and CRUD/patch editor.
 - `Manager.tsx`: manager config snapshots.
 - `TestingUtils.tsx`: placeholder (not implemented yet).
+
+## Service Discovery
+
+Discovery is surfaced in three places, all reading the same projection:
+
+- **Services** (`/services`, `/services/:name`): the catalog, per-endpoint
+  health, and the doctor-style diagnosis.
+- **Job detail**: a Services card with each declared service's endpoints, and
+  Health/Ports columns on the allocation table.
+- **Task detail**: the declared `service`/`network.ports` blocks, live
+  endpoints for that task, the declared `checks` table, and the latest
+  per-allocation health snapshot.
+
+Allocation ports and health come from the state store
+(`utils/allocations.ts`): the ledger carries the assigned `network` blob but
+not the owning task name or the health snapshot, so one SQL query joins
+`allocation` → `task_config` → `allocation_health` per job.
+
+## Volumes
+
+Storage is surfaced wherever the question "where is my data" gets asked
+(`utils/volumes.ts` holds the shared state/scope vocabulary):
+
+- **Volumes** (`/volumes`, `/volumes/:id`): the index, with counts for pinned,
+  reclaiming, and driver-erroring volumes, plus a warning banner when a plugin
+  is installed but unusable everywhere (the reason jobs get rejected at submit).
+  Destroyed tombstones are filtered out by default.
+- **Job detail**: each instance's storage handle links to the volume holding
+  that replica's data.
+- **Task detail**: a Volumes card listing this task's live volumes with state,
+  owning instance, and node.
+- **Worker detail**: volumes materialized on that host, with an explicit note
+  that draining or losing the node strands the node-local ones.
 
 ## Stateful Workloads
 

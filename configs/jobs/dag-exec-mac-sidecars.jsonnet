@@ -3,7 +3,7 @@
     tasks: [
         {
             name: "root-bootstrap",
-            kind: "exec",
+            runtime: "exec",
             lifecycle: "batch",
             group: "bootstrap",
             config: {
@@ -15,7 +15,7 @@
         },
         {
             name: "bootstrap-sidecar",
-            kind: "exec",
+            runtime: "exec",
             lifecycle: "sidecar",
             group: "bootstrap",
             dependsOn: [
@@ -33,8 +33,11 @@
         },
         {
             name: "parser",
-            kind: "exec",
-            lifecycle: "service",
+            runtime: "exec",
+            // Batch: downstream stages gate on this task's success, and only
+            // batch tasks can satisfy a complete/success condition (services
+            // never exit).
+            lifecycle: "batch",
             group: "pipeline-a",
             dependsOn: [
                 {
@@ -51,7 +54,7 @@
         },
         {
             name: "parser-sidecar",
-            kind: "exec",
+            runtime: "exec",
             lifecycle: "sidecar",
             group: "pipeline-a",
             dependsOn: [
@@ -69,8 +72,8 @@
         },
         {
             name: "transformer",
-            kind: "exec",
-            lifecycle: "service",
+            runtime: "exec",
+            lifecycle: "batch",
             group: "pipeline-b",
             dependsOn: [
                 {
@@ -87,7 +90,7 @@
         },
         {
             name: "transformer-sidecar",
-            kind: "exec",
+            runtime: "exec",
             lifecycle: "sidecar",
             group: "pipeline-b",
             dependsOn: [
@@ -105,8 +108,8 @@
         },
         {
             name: "joiner",
-            kind: "exec",
-            lifecycle: "service",
+            runtime: "exec",
+            lifecycle: "batch",
             group: "join",
             dependsOn: [
                 {
@@ -127,7 +130,7 @@
         },
         {
             name: "joiner-sidecar",
-            kind: "exec",
+            runtime: "exec",
             lifecycle: "sidecar",
             group: "join",
             dependsOn: [
@@ -145,7 +148,7 @@
         },
         {
             name: "sink",
-            kind: "exec",
+            runtime: "exec",
             lifecycle: "service",
             group: "sink",
             dependsOn: [
@@ -163,7 +166,7 @@
         },
         {
             name: "sink-sidecar",
-            kind: "exec",
+            runtime: "exec",
             lifecycle: "sidecar",
             group: "sink",
             dependsOn: [

@@ -4,17 +4,24 @@ A distributed scheduler similar to Kubernetes or Nomad.
 
 ## Documentation
 
+Full index: [docs/README.md](docs/README.md).
+
 - [Managers and Workers](docs/architecture-managers-workers.md)
 - [Plugin System](docs/plugin-system.md)
 - [Scheduler and Eval Loop](docs/scheduler-and-eval-loop.md)
 - [Event Stream](docs/event-stream.md)
 - [Jobs, Tasks, and Scheduling](docs/jobs-tasks-and-scheduling.md)
-- [Task Kind Plugins](docs/task-kind-plugins.md)
-- [Task Kind: exec](docs/task-kind-exec.md)
-- [Task Kind: container](docs/task-kind-container.md)
-- [Task Kind: noop](docs/task-kind-noop.md)
+- [Task Runtime Plugins](docs/task-runtime-plugins.md)
+- [Task Runtime: exec](docs/task-runtime-exec.md)
+- [Task Runtime: container](docs/task-runtime-container.md)
+- [Task Runtime: sandbox (microVM)](docs/task-runtime-sandbox.md)
+- [Task Runtime: noop](docs/task-runtime-noop.md)
+- [Artifacts (images, files, git, S3, OCI/ORAS)](docs/artifacts.md)
+- [Stateful Workloads & Instance Identity](docs/stateful-workloads.md)
+- [Rollouts](docs/rollouts.md) and [Rollout Strategy Plugins](docs/rollout-strategy-plugins.md)
 - [Service Discovery](docs/service-discovery.md)
 - [State Store](docs/state-store.md)
+- [Streaming Persistence](docs/persistence-streaming.md) and [Running Raft](docs/raft-operations.md)
 - [Logging (task logs, tailing, rotation, shipping, OTLP traces)](docs/logging.md)
 - [Observability](docs/observability.md)
 - [UI Architecture](docs/ui-architecture.md)
@@ -25,6 +32,9 @@ A distributed scheduler similar to Kubernetes or Nomad.
 - [Testing and Benchmarks](docs/testing-and-benchmarks.md)
 - [Codebase Conventions](docs/codebase-conventions.md)
 - [Agent Readiness (MCP, structured output, agent workflow)](docs/agent-readiness.md)
+
+Plans, roadmaps, and development notes live in
+[internal_docs/](internal_docs/README.md).
 
 It aims to be differentiated from the above based on the following:
 - Ease:
@@ -38,7 +48,7 @@ It aims to be differentiated from the above based on the following:
   - It is a small binary that can run on edge devices.
 - Flexiblity:
   - It has a plugin system for:
-    - Workload kind (containers, WASM, binaries, VMs, etc)
+    - Workload runtime (containers, WASM, binaries, VMs, etc)
     - Scheduler logic (optimize for utilization, resilience, speed)
     - Networking
     - Volumes
@@ -49,5 +59,5 @@ It aims to be differentiated from the above based on the following:
   - OTEL compliant tracing, logs, and metrics
   - Well-documented GRPC interface
   - Jsonnet configuration language for simple and DRY job specifications
-  - Raft is optional. Making life simpler
+  - Raft is optional. Making life simpler — plain local SQLite by default, real quorum-replicated manager state (`persistence.type: raft`) when you need HA ([docs/multi-raft.md](docs/multi-raft.md))
   - Can easily be used as a library

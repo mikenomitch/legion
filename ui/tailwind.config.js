@@ -29,7 +29,13 @@ export default {
       fontFamily: {
         sans: ['"Inter Variable"', 'Inter', 'system-ui', '-apple-system', 'sans-serif'],
         display: ['"Space Grotesk Variable"', '"Space Grotesk"', '"Inter Variable"', 'system-ui', 'sans-serif'],
-        mono: ['"JetBrains Mono Variable"', '"JetBrains Mono"', 'ui-monospace', 'SFMono-Regular', 'Menlo', 'monospace'],
+        // Fira Code ships programming ligatures on by default; IDs, hashes and
+        // log lines read better without them, so `font-mono` turns off both the
+        // standard (liga) and contextual (calt) ligature features.
+        mono: [
+          ['"Fira Code Variable"', '"Fira Code"', 'ui-monospace', 'SFMono-Regular', 'Menlo', 'monospace'],
+          { fontFeatureSettings: '"liga" 0, "calt" 0' },
+        ],
       },
       fontSize: {
         '2xs': ['0.6875rem', { lineHeight: '1rem' }],

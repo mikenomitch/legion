@@ -21,6 +21,23 @@ pub fn config() -> Command {
                 .long("run-worker")
                 .action(ArgAction::SetTrue)
                 .help("Run a worker node alongside the manager"),
+        )
+        .arg(
+            Arg::new("restore-from")
+                .long("restore-from")
+                .value_name("BACKUP")
+                .value_hint(ValueHint::FilePath)
+                .help(
+                    "Restore the state store from a `legion state backup` file before starting \
+                     (only when no state exists yet, unless --force-restore)",
+                ),
+        )
+        .arg(
+            Arg::new("force-restore")
+                .long("force-restore")
+                .action(ArgAction::SetTrue)
+                .requires("restore-from")
+                .help("Allow --restore-from to overwrite an existing state store"),
         );
 
     let worker_cmd = Command::new("worker")
@@ -67,6 +84,23 @@ pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
                 .map_or(DEF_CONFIG_PATH, String::as_str);
             let run_worker = arg_matches.get_flag("run-worker");
             let config = parse_config(config_path)?;
+            // Restore runs BEFORE the store (and any raft engine) starts:
+            // the backup becomes the initial state the engine adopts (plan
+            // §A5; docs/upgrades.md "Backup and restore").
+            if let Some(backup) = arg_matches.get_one::<String>("restore-from") {
+                let force = arg_matches.get_flag("force-restore");
+                let store_path = config.with_defaults().store_path;
+                let restored = crate::storage::store::Store::restore_from_backup(
+                    &store_path,
+                    std::path::Path::new(backup),
+                    force,
+                )?;
+                info!(
+                    backup,
+                    path = %restored.display(),
+                    "Restored state store from backup; starting manager"
+                );
+            }
             run_manager(config, run_worker).await
         }
         _ => {

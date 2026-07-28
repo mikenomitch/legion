@@ -52,12 +52,15 @@ Even with `--allow-write`, `legion_state_query` is forced to read-only.
 | `legion_job_list` | no | List jobs. |
 | `legion_job_info` | no | Inspect one job. |
 | `legion_job_spec` | no | Fetch a job's source submissions. |
-| `legion_job_schema` | no | JSON Schema for jobspecs + task kinds. |
+| `legion_job_schema` | no | JSON Schema for jobspecs + task runtimes. |
 | `legion_job_validate` | no | Validate a rendered jobspec (JSON). |
 | `legion_rollout_list` | no | List rollouts. |
 | `legion_rollout_status` | no | Rollout progress + allocation health. |
 | `legion_instance_list` | no | List a job's stateful instances (slot + keyed). |
 | `legion_instance_get` | no | Inspect one stateful instance. |
+| `legion_volume_list` | no | List volumes — the storage behind stateful instances. Filters by job/node/plugin/instance/state. |
+| `legion_volume_get` | no | Inspect one volume: plugin, params, node pin, mount path, last driver error. |
+| `legion_volume_drivers` | no | Volume plugins installed across the cluster and which nodes can use them. Answers "why was my job rejected for plugin X". |
 | `legion_node_list` | no | List worker nodes. |
 | `legion_service_list` | no | List declared services with healthy/total endpoint counts — what a job can connect to. |
 | `legion_service_resolve` | no | Resolve a service to its endpoints (address, port, allocation, node, health). |
@@ -72,6 +75,7 @@ Even with `--allow-write`, `legion_state_query` is forced to read-only.
 | `legion_instance_create` | **yes** | Create a keyed-mode stateful instance (never-recycled id; supports `idempotency_key`). |
 | `legion_instance_destroy` | **yes** | Destroy a keyed instance, stop its allocation, drop its storage (supports `idempotency_key`). |
 | `legion_instance_replace` | **yes** | Force-replace an instance's allocation stuck on a LOST node (skips the `onLost.replaceAfter` loss-confirmation gate; split-brain risk if the node is only partitioned; supports `idempotency_key`). |
+| `legion_volume_delete` | **yes** | Delete a volume and reclaim its storage. DESTROYS DATA; `force: true` tombstones without driver confirmation for a node that is gone for good (supports `idempotency_key`). |
 
 Tool errors are returned in-band (`result.isError = true` with a text payload),
 following MCP convention; transport/protocol errors use JSON-RPC `error`.
@@ -81,7 +85,7 @@ all console logs to **stderr** so stdout stays a clean protocol stream.
 
 ## 2. Structured output envelope
 
-The agent-facing commands (`job`, `instance`, `state`, `node`, `kv`,
+The agent-facing commands (`job`, `instance`, `volume`, `state`, `node`, `kv`,
 `capabilities`) accept
 `--json` / `-j` and emit exactly one of two shapes (bootstrap/cluster-admin
 commands such as `start`, `join`, and `raft` are operator-oriented and are not
@@ -116,7 +120,7 @@ and the MCP `tools/list`; keep it in sync when adding operations
 Agents author far more reliably against a schema than against free-form Jsonnet.
 
 ```bash
-# Get the jobspec JSON Schema, including the live per-kind task config schemas:
+# Get the jobspec JSON Schema, including the live per-runtime task config schemas:
 legion job schema --json
 
 # Render and deeply validate a jobspec WITHOUT submitting it:
@@ -125,8 +129,8 @@ legion job validate ./configs/jobs/demo.jsonnet --json
 
 `job validate` runs the exact validation the manager applies on submit
 (`validate_job_config`), so an agent can self-correct before touching the cluster.
-The schema embeds the built-in task-kind config schemas (`exec`, `container`, …)
-under `taskKinds`, derived from the typed Rust structs.
+The schema embeds the built-in task-runtime config schemas (`exec`, `container`, …)
+under `taskRuntimes`, derived from the typed Rust structs.
 
 ## 4a. Wiring workloads together (service discovery + connect)
 
@@ -298,7 +302,7 @@ How it is wired (read-only, agent-safe):
 
 1. Workers redirect task stdout/stderr into `stdout.log` / `stderr.log` under a
    per-allocation log directory threaded through the `TaskPlugin` runtime
-   (`TaskRuntime.log_dir`); built-in `exec` and `container` tasks capture
+   (`TaskInstance.log_dir`); built-in `exec` and `container` tasks capture
    automatically.
 2. `Worker.GetTaskLogs` reads those files on the node (with the byte cap / tail).
 3. `Manager.GetAllocationLogs` resolves a job (or allocation id) to its
@@ -340,7 +344,10 @@ All client commands and the MCP server honour:
    `legion job list`, `legion node list`.
 3. **Author + check**: build a jobspec against `legion job schema`, then
    `legion job validate` it.
-4. **Preview**: `legion job plan` to see placements (dry-run).
+4. **Preview**: `legion job plan` to see placements (dry-run). The `--json`
+   envelope also carries `index_usage` — per task, which scheduling index
+   generated the candidates and why none did
+   ([scheduling-indexes.md](scheduling-indexes.md)).
 5. **Apply with a retry-safe key**: `legion job run … --idempotency-key … --wait`.
 6. **Verify**: inspect the `wait` result, `rollout events`, and `state query`.
 
@@ -358,6 +365,6 @@ list|resolve|doctor`, `legion_service_list` / `legion_service_resolve`) with the
 declarative wiring described in [§4a](#4a-wiring-workloads-together-service-discovery--connect).
 
 The task-log path captures task stdout/stderr to per-allocation files via the
-`TaskPlugin` runtime (`TaskRuntime.log_dir`), reads them on the node with
+`TaskPlugin` runtime (`TaskInstance.log_dir`), reads them on the node with
 `Worker.GetTaskLogs`, and proxies through `Manager.GetAllocationLogs`. See
 [§6a](#6a-task-log-retrieval-legion-job-logs).

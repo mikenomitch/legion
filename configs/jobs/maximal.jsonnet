@@ -59,16 +59,27 @@
         {
             name: "web",
             count: 2,
-            kind: "exec",
+            runtime: "exec",
             group: "frontend",
             lifecycle: "service",
+            // Cross-group dependency: service and batch tasks may depend on
+            // tasks in any group. web is not planned until the prep group's
+            // batch task has succeeded. (A service may only take a
+            // complete/success condition on a batch task — services never
+            // complete.)
+            dependsOn: [
+                {
+                    task: "batch",
+                    condition: "success",
+                },
+            ],
             // Stable instance identity (see docs/stateful-workloads.md):
             // slot mode gives each replica an ordinal slot 0..count-1 whose
             // instance id and storage handle survive reschedules. The task
             // sees LEGION_INSTANCE_ID / LEGION_INSTANCE_SLOT /
             // LEGION_INSTANCE_MODE (and LEGION_ALLOC_ID) in its env.
             stateful: {
-                mode: "slot",
+                mode: "slot",  // the default; shown for completeness
                 // Node-loss fencing (at-most-one; see docs/stateful-workloads.md
                 // "Node loss and fencing"): the worker self-fences this task
                 // after losing manager contact for selfTerminateAfter; the
@@ -80,8 +91,27 @@
                     selfTerminateAfter: "90s",
                     replaceAfter: "3m",
                 },
+                // Per-instance persistent storage, materialized by a volume
+                // driver on whatever node the instance lands on (see
+                // docs/volumes.md). Each slot gets its OWN volume, reattached
+                // on every reschedule — replica 2's disk is replica 2's disk.
                 storage: {
+                    // Where the task sees it. For `container` tasks this is a
+                    // real bind mount; `exec` tasks run in the host mount
+                    // namespace and read $LEGION_STORAGE_DIR instead.
                     path: "/var/lib/web",
+                    // Volume driver. Defaults to "local-dir" (a directory on
+                    // the worker's disk, node-local). "nfs" is the built-in
+                    // network option, which lets instances reschedule anywhere.
+                    driver: "local-dir",
+                    // How the task consumes it: "filesystem" (a directory —
+                    // the default, and what exec/container want) or "block" (a
+                    // raw device or disk image a microVM attaches). Admission
+                    // rejects a mode the task runtime or the plugin cannot serve.
+                    mode: "filesystem",
+                    // Passed to the driver verbatim; it declares which are
+                    // required (`legion volume drivers` lists them).
+                    params: { size: "10G" },
                     // K8s persistentVolumeClaimRetentionPolicy analogs (both
                     // default true = Retain). retainOnScaleIn ~ whenScaled;
                     // retainOnStop ~ whenDeleted and governs `job stop` only
@@ -90,6 +120,22 @@
                     retainOnStop: true,
                 },
             },
+            // Claims on storage that exists independently of any instance —
+            // an operator's host path, an NFS export, scratch space (see
+            // docs/volumes.md). Unlike stateful.storage these are shared, are
+            // never provisioned or reclaimed by instance churn, and are valid
+            // on STATELESS tasks too. Each becomes LEGION_VOLUME_<NAME>.
+            volumes: [
+                {
+                    name: "models",
+                    // The `host` driver claims a path the operator declared in
+                    // the worker config's `hostVolumes` map, by name.
+                    driver: "host",
+                    params: { name: "models" },
+                    path: "/models",
+                    readOnly: true,
+                },
+            ],
             config: {
                 command: ["sleep", "1"],
             },
@@ -253,7 +299,7 @@
                 num: 3,
                 per: "region",
             },
-            kind: "exec",
+            runtime: "exec",
             group: "prep",
             lifecycle: "batch",
             schedule: "every 15m",
@@ -328,13 +374,18 @@
         {
             name: "shell",
             count: 1,
-            kind: "exec",
+            runtime: "exec",
             group: "frontend",
             lifecycle: "sidecar",
+            // Sidecars are group-bound: they run alongside their group's
+            // primary task, so they may only depend on tasks in their own
+            // group (a cross-group dependency here is rejected at
+            // validation — put it on the group's primary instead, as web
+            // does above).
             dependsOn: [
                 {
-                    task: "batch",
-                    condition: "success",
+                    task: "web",
+                    condition: "start",
                 },
             ],
             config: {
@@ -365,7 +416,7 @@
         },
         {
             name: "sandbox",
-            kind: "exec",
+            runtime: "exec",
             group: "sandboxes",
             lifecycle: "service",
             // Keyed-mode stateful task (see docs/stateful-workloads.md):
@@ -402,9 +453,72 @@
             },
         },
         {
+            // microVM sandbox (see docs/task-kind-sandbox.md). Same shape as
+            // the container kind plus what a VM needs: guest size and a
+            // kernel. Persistent state is a *block-mode volume*: a guest
+            // kernel attaches a block device, not a host directory, so this
+            // is the one task kind that sets `mode: 'block'` on its storage.
+            name: "microvm",
+            runtime: "sandbox",
+            group: "microvms",
+            stateful: {
+                mode: "slot",
+                storage: {
+                    // Where the guest init mounts the volume. The local-dir
+                    // driver serves a formatted disk image; the worker hands
+                    // it to the kind; the VMM attaches it as /dev/vdb.
+                    path: "/workspace",
+                    mode: "block",
+                    params: { size: "1G", fs: "ext4" },
+                },
+            },
+            config: {
+                image: "alpine:latest",
+                command: ["/bin/sh", "-c", "echo hello from a microVM; sleep 600"],
+                env: {
+                    LEGION_TASK: "sandbox",
+                },
+                // Guest working directory (defaults to the image's).
+                cwd: "/workspace",
+                // Guest sizing; defaults are 1 vCPU / 512 MiB.
+                vcpus: 1,
+                memory_mib: 512,
+                // Writable scratch in the ephemeral root disk, on top of the
+                // image contents (default 256). Anything written outside the
+                // volume mount lives here and dies with the allocation.
+                rootfs_headroom_mib: 256,
+                // "auto" (default) = cloud-hypervisor then firecracker on
+                // Linux+KVM, Apple `container` on macOS. "dev" runs without a
+                // VM (namespaces only on Linux) for machines without KVM.
+                hypervisor: "auto",
+                // Uncompressed guest kernel; falls back to
+                // LEGION_SANDBOX_KERNEL, then /var/lib/legion/kernels/vmlinux.
+                // An ${artifact.<name>} reference works here too.
+                kernel: "/var/lib/legion/kernels/vmlinux",
+                kernel_args: "quiet",
+                network: {
+                    // "none" (default, loopback only) or "tap" with a
+                    // pre-created host TAP device.
+                    mode: "none",
+                },
+            },
+            resources: {
+                cpus: 1,
+                memory: 512,
+            },
+            constraints: {
+                // A microVM needs KVM, so keep these on a Linux pool. On macOS
+                // the kind falls back to Apple `container` dev mode.
+                os: "linux",
+            },
+            affinities: {
+                node_class: "sandbox",
+            },
+        },
+        {
             name: "container",
             count: 1,
-            kind: "container",
+            runtime: "container",
             config: {
                 image: "alpine:latest",
                 command: ["echo", "hello", "from", "container"],
@@ -413,8 +527,11 @@
                 },
             },
             resources: {
-                cpus: 0.2,
-                memory: 128,
+                // The container runtime applies these to the sandbox, not just to
+                // scheduling: memory (MiB) and cores size the guest. `cpu`/`cpus`
+                // (MHz) has no runtime analogue, so declare cores here.
+                cores: 1,
+                memory: 256,
             },
             constraints: {
                 os: "macos",

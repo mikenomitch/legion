@@ -3,7 +3,7 @@
     tasks: [
         {
             name: "seed",
-            kind: "exec",
+            runtime: "exec",
             lifecycle: "batch",
             group: "prep",
             config: {
@@ -12,7 +12,7 @@
         },
         {
             name: "web",
-            kind: "exec",
+            runtime: "exec",
             lifecycle: "service",
             group: "app",
             dependsOn: [

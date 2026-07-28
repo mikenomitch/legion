@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -130,6 +130,22 @@ impl ServiceConfig {
     /// behavior for services that declare no intentions.
     pub fn allows_job(&self, job_id: &str) -> bool {
         allow_permits(&self.allow, job_id)
+    }
+
+    /// `service.meta` flattened to strings for transport (the wire type is a
+    /// `map<string, string>`). String values pass through unchanged; anything
+    /// else is rendered as compact JSON so nothing is silently dropped.
+    pub fn meta_strings(&self) -> BTreeMap<String, String> {
+        self.meta
+            .iter()
+            .map(|(key, value)| {
+                let text = match value {
+                    Value::String(text) => text.clone(),
+                    other => other.to_string(),
+                };
+                (key.clone(), text)
+            })
+            .collect()
     }
 }
 
@@ -324,6 +340,9 @@ pub struct ServiceEndpointRow {
     /// connect datapath, not who may *look at* the catalog.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow: Vec<String>,
+    pub meta: BTreeMap<String, String>,
+    /// `network.ports` entry the service advertises, when it names a label.
+    pub port_label: Option<String>,
 }
 
 /// Uppercase a port label for env var use, mapping non-alphanumerics to `_`.

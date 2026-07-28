@@ -1,11 +1,16 @@
 import { A } from '@solidjs/router'
-import { For, Show, createMemo, createSignal, type JSX, type Resource } from 'solid-js'
-import { Badge, Icon, MonoBadge, Note, PageHeader, SectionCard, Spinner, StatusBadge, TableShell, cx, tableClass, tdClass, thClass, theadClass, trHoverClass } from './ui'
+import { For, Show, createMemo, createResource, createSignal, onCleanup, onMount, type JSX, type Resource } from 'solid-js'
+import { Badge, CodeBlock, Icon, MonoBadge, Note, PageHeader, SectionCard, Spinner, StatusBadge, TableShell, cx, tableClass, tdClass, thClass, theadClass, trHoverClass } from './ui'
+import { AllocationPorts } from './ServiceEndpoints'
 import type { LedgerAllocation, LedgerNode, NodeMsg } from '../gen/legion_pb'
-import { formatRelativeTime } from '../utils/format'
+import { parseAllocNetwork } from '../utils/allocations'
+import { formatBytes, formatRelativeTime } from '../utils/format'
 import { summarizeHealthChecks } from '../utils/health'
 import { parseArtifactStates } from '../utils/jobspec'
+import { managerClient } from '../grpcClient'
+import { POLL_INTERVAL_MS } from '../utils/polling'
 import type { Tone } from '../utils/status'
+import { shortVolumeId, volumePinsPlacement, volumeStateTone } from '../utils/volumes'
 
 export interface NodeDeepViewProps {
   nodes: Resource<readonly NodeMsg[] | undefined>
@@ -134,10 +139,11 @@ const buildResourceUsage = (
 ): ResourceUsageEntry[] => {
   const totals = new Map<string, { kind: 'amount' | 'items'; total: number }>()
 
-  const memoryTotalRaw = extractField(fingerprintData, 'memory_total')
-  const memoryTotalKiB = toNumber(memoryTotalRaw)
-  if (memoryTotalKiB !== null && Number.isFinite(memoryTotalKiB)) {
-    totals.set('memory', { kind: 'amount', total: memoryTotalKiB / 1024 })
+  // Allocation resources are declared in MiB, so the node total has to be MiB
+  // too for the bar to mean anything. The fingerprint reports bytes.
+  const memoryTotalBytes = toNumber(extractField(fingerprintData, 'memory_total'))
+  if (memoryTotalBytes !== null && Number.isFinite(memoryTotalBytes)) {
+    totals.set('memory', { kind: 'amount', total: memoryTotalBytes / (1024 * 1024) })
   }
 
   const cpuData = extractField(fingerprintData, 'cpus')
@@ -226,6 +232,103 @@ const titleize = (value: string): string =>
   value
     .replace(/[_-]+/g, ' ')
     .replace(/\b\w/g, (char) => char.toUpperCase())
+
+// --- Host facts -----------------------------------------------------------
+// The fingerprint is a flat bag of ~15 keys plus three deep nested objects
+// (cpus, disks, networks) and a 30-entry signals array. Dumping it verbatim
+// buries the handful of facts an operator actually reads, so pull those out
+// and leave the rest behind a disclosure.
+
+type HostFact = { label: string; value: string }
+
+const readFingerprintNumber = (data: unknown, key: string): number | undefined =>
+  toNumber(extractField(data, key)) ?? undefined
+
+// Interface name -> MAC, for the networks table.
+const buildNetworkRows = (networks: unknown): Array<{ name: string; mac: string }> => {
+  if (!isPlainObject(networks)) return []
+  return Object.entries(networks)
+    .map(([name, value]) => ({
+      name,
+      mac: isPlainObject(value) ? String(value.mac_address ?? value.macAddress ?? '') : '',
+    }))
+    .sort((a, b) => a.name.localeCompare(b.name))
+}
+
+const buildSignalList = (signals: unknown): string[] => {
+  if (Array.isArray(signals)) return signals.map((signal) => String(signal))
+  if (isPlainObject(signals)) return Object.keys(signals)
+  return []
+}
+
+const buildHostFacts = (fingerprintData: unknown, configData: unknown): HostFact[] => {
+  const facts: HostFact[] = []
+  const os = extractField(fingerprintData, 'os')
+  const arch = extractField(fingerprintData, 'arch')
+  if (typeof os === 'string' || typeof arch === 'string') {
+    facts.push({ label: 'Platform', value: [os, arch].filter(Boolean).join(' · ') })
+  }
+
+  const cpus = extractField(fingerprintData, 'cpus')
+  if (isPlainObject(cpus)) {
+    const vendor = Object.values(cpus).find(isPlainObject)?.vendor_id
+    const cores = Object.keys(cpus).length
+    facts.push({ label: 'CPU', value: `${cores} core${cores === 1 ? '' : 's'}${vendor ? ` · ${String(vendor)}` : ''}` })
+  }
+
+  // sysinfo reports these in bytes.
+  const memoryTotal = readFingerprintNumber(fingerprintData, 'memory_total')
+  const memoryUsed = readFingerprintNumber(fingerprintData, 'memory_used')
+  if (memoryTotal !== undefined) {
+    const used = memoryUsed === undefined ? '' : ` · ${formatBytes(memoryUsed)} used`
+    facts.push({ label: 'Memory', value: `${formatBytes(memoryTotal)}${used}` })
+  }
+
+  const swapTotal = readFingerprintNumber(fingerprintData, 'memory_swap_total')
+  const swapFree = readFingerprintNumber(fingerprintData, 'memory_swap_free')
+  if (swapTotal !== undefined && swapTotal > 0) {
+    const free = swapFree === undefined ? '' : ` · ${formatBytes(swapFree)} free`
+    facts.push({ label: 'Swap', value: `${formatBytes(swapTotal)}${free}` })
+  }
+
+  const diskTotal = readFingerprintNumber(fingerprintData, 'disk_total_space')
+  const diskFree = readFingerprintNumber(fingerprintData, 'disk_available_space')
+  if (diskTotal !== undefined) {
+    const free = diskFree === undefined ? '' : ` · ${formatBytes(diskFree)} free`
+    facts.push({ label: 'Disk', value: `${formatBytes(diskTotal)}${free}` })
+  }
+
+  const workerAddress = extractField(configData, 'workerAddress')
+  if (typeof workerAddress === 'string' && workerAddress) {
+    facts.push({ label: 'Worker address', value: workerAddress })
+  }
+
+  return facts
+}
+
+// Scheduling attributes only: the resource maps have their own card, and the
+// nested fingerprint blobs have their own disclosures.
+const OMITTED_ATTRIBUTE_KEYS = new Set([
+  'resources',
+  'reservedResources',
+  'reserved_resources',
+  'workerAddress',
+])
+
+const buildAttributeRows = (data: unknown): Array<{ key: string; value: string }> => {
+  if (!isPlainObject(data)) return []
+  return Object.entries(data)
+    .filter(([key, value]) => {
+      if (OMITTED_ATTRIBUTE_KEYS.has(key)) return false
+      if (isPlainObject(value) && Object.keys(value).length === 0) return false
+      return true
+    })
+    .map(([key, value]) => ({
+      key,
+      value: typeof value === 'string' ? value : JSON.stringify(value),
+    }))
+    .sort((a, b) => a.key.localeCompare(b.key))
+}
 
 const collectHealthStrings = (value: unknown, bucket: string[]) => {
   if (value === null || value === undefined) return
@@ -334,35 +437,20 @@ const renderValue = (value: unknown): JSX.Element => {
   return <span class="break-words font-mono text-xs">{String(value)}</span>
 }
 
-interface KeyValueGridProps {
-  data: unknown
-  emptyLabel: string
-}
-
-const KeyValueGrid = (props: KeyValueGridProps) => (
-  <Show
-    when={(() => {
-      if (props.data === undefined || props.data === null) return false
-      if (typeof props.data === 'string' && props.data.trim() === '') return false
-      if (isPlainObject(props.data)) return Object.keys(props.data).length > 0
-      return true
-    })()}
-    fallback={<p class="text-sm text-muted">{props.emptyLabel}</p>}
-  >
-    {isPlainObject(props.data) ? (
-      <div class="grid gap-2 sm:grid-cols-2">
-        <For each={Object.entries(props.data)}>
-          {([key, value]) => (
-            <div class="min-w-0 rounded-md border border-line bg-surface2/40 px-2.5 py-1.5 text-sm">
-              <div class="text-2xs uppercase tracking-wide text-faint">{key}</div>
-              <div class="mt-0.5 break-words">{renderValue(value)}</div>
-            </div>
-          )}
-        </For>
-      </div>
-    ) : (
-      <div class="break-words text-sm">{renderValue(props.data)}</div>
-    )}
+// Attributes are flat key/value pairs the scheduler matches on, so they read
+// best as aligned rows rather than the boxed grid used for arbitrary blobs.
+const AttributeList = (props: { rows: Array<{ key: string; value: string }>; emptyLabel: string }) => (
+  <Show when={props.rows.length > 0} fallback={<p class="text-sm text-muted">{props.emptyLabel}</p>}>
+    <dl class="divide-y divide-line rounded-md border border-line">
+      <For each={props.rows}>
+        {(row) => (
+          <div class="flex items-baseline justify-between gap-3 px-2.5 py-1.5">
+            <dt class="min-w-0 truncate font-mono text-xs text-muted" title={row.key}>{row.key}</dt>
+            <dd class="min-w-0 truncate text-right font-mono text-xs text-ink" title={row.value}>{row.value}</dd>
+          </div>
+        )}
+      </For>
+    </dl>
   </Show>
 )
 
@@ -417,6 +505,21 @@ const DEFAULT_SECTION_STATE: Record<NodeSectionKey, boolean> = {
 
 export default function NodeDeepView(props: NodeDeepViewProps) {
   const [sectionOpen, setSectionOpen] = createSignal(DEFAULT_SECTION_STATE)
+  const [volumeTick, setVolumeTick] = createSignal(0)
+  onMount(() => {
+    const timer = setInterval(() => setVolumeTick((value) => value + 1), POLL_INTERVAL_MS)
+    onCleanup(() => clearInterval(timer))
+  })
+  // Volumes living on this node. Losing the node means losing (or at least
+  // stranding) these, so they belong on the node page, not just the job's.
+  const [nodeVolumes] = createResource(
+    () => [props.nodes()?.[0]?.id, volumeTick()] as const,
+    async ([nodeId]) => {
+      if (!nodeId) return []
+      const reply = await managerClient.listVolumes({ nodeId })
+      return reply.volumes.filter((volume) => volume.state !== 'destroyed')
+    },
+  )
   const allocationsByNode = createMemo(() => {
     const map = new Map<string, readonly LedgerAllocation[]>()
     ;(props.ledger() ?? []).forEach((entry) => {
@@ -475,6 +578,22 @@ export default function NodeDeepView(props: NodeDeepViewProps) {
     return buildHealthEntries(parseAttributes(node()?.healthChecks))
   })
 
+  const hostFacts = createMemo(() => {
+    const parsed = parsedNodeData()
+    if (!parsed) return [] as HostFact[]
+    return buildHostFacts(parsed.fingerprintData, parsed.configData)
+  })
+
+  const staticAttributes = createMemo(() => buildAttributeRows(parsedNodeData()?.configData))
+  const dynamicAttributes = createMemo(() => buildAttributeRows(parsedNodeData()?.dynamicData))
+  const networkRows = createMemo(() => buildNetworkRows(parsedNodeData()?.networksData))
+  const signalList = createMemo(() => buildSignalList(parsedNodeData()?.signalsData))
+  const rawFingerprint = createMemo(() => {
+    const data = parsedNodeData()?.fingerprintData
+    if (data === undefined) return '{}'
+    return typeof data === 'string' ? data : JSON.stringify(data, null, 2)
+  })
+
   return (
     <Show when={!props.nodes.loading} fallback={<div class="py-6"><Spinner label="Loading worker…" /></div>}>
       <Show when={!props.nodes.error} fallback={<Note tone="danger">Failed to load worker.</Note>}>
@@ -512,6 +631,7 @@ export default function NodeDeepView(props: NodeDeepViewProps) {
                               <th class={thClass}>ID</th>
                               <th class={thClass}>Instance</th>
                               <th class={thClass}>Status</th>
+                              <th class={thClass}>Ports</th>
                               <th class={thClass}>Job</th>
                               <th class={thClass}>Spec</th>
                               <th class={thClass}>Task config</th>
@@ -539,6 +659,9 @@ export default function NodeDeepView(props: NodeDeepViewProps) {
                                           </Badge>
                                         </Show>
                                       </span>
+                                    </td>
+                                    <td class={tdClass}>
+                                      <AllocationPorts network={parseAllocNetwork(allocation.network)} />
                                     </td>
                                     <td class={tdClass}>
                                       <A class="font-medium hover:text-brass-strong" href={`/jobs/${encodeURIComponent(allocation.jobId || '')}`}>{allocation.jobId || '—'}</A>
@@ -616,44 +739,159 @@ export default function NodeDeepView(props: NodeDeepViewProps) {
                     </div>
                   </SectionCard>
 
-                  <SectionCard title="Metadata">
-                    <div class="grid gap-4 lg:grid-cols-2">
+                  <Show when={(nodeVolumes() ?? []).length > 0}>
+                    <SectionCard
+                      title="Volumes"
+                      description="Storage materialized on this host. Node-local volumes pin their instance here — if this node goes away, those instances wait for it."
+                      flush
+                    >
+                      <TableShell>
+                        <table class={tableClass}>
+                          <thead class={theadClass}>
+                            <tr>
+                              <th class={thClass}>Volume</th>
+                              <th class={thClass}>Driver</th>
+                              <th class={thClass}>State</th>
+                              <th class={thClass}>Owner</th>
+                            </tr>
+                          </thead>
+                          <tbody class="divide-y divide-line">
+                            <For each={nodeVolumes() ?? []}>
+                              {(volume) => (
+                                <tr class={trHoverClass}>
+                                  <td class={tdClass}>
+                                    <A
+                                      href={`/volumes/${encodeURIComponent(volume.volumeId)}`}
+                                      class="font-mono text-xs text-ink hover:text-brass-strong"
+                                      title={volume.volumeId}
+                                    >
+                                      {shortVolumeId(volume.volumeId)}
+                                    </A>
+                                    <div class="text-2xs text-faint">{volume.name}</div>
+                                  </td>
+                                  <td class={tdClass}>
+                                    <Badge tone={volume.nodeLocal ? 'neutral' : 'ok'}>{volume.driver}</Badge>
+                                  </td>
+                                  <td class={tdClass}>
+                                    <Badge tone={volumeStateTone(volume)} dot class="uppercase tracking-wide">
+                                      {volume.state}
+                                    </Badge>
+                                  </td>
+                                  <td class={tdClass}>
+                                    <Show when={volume.jobId} fallback={<span class="text-faint">—</span>}>
+                                      <A href={`/jobs/${encodeURIComponent(volume.jobId!)}`} class="text-muted hover:text-brass-strong">
+                                        {volume.jobId}
+                                      </A>
+                                    </Show>
+                                    <Show when={volume.instanceId}>
+                                      <div class="font-mono text-2xs text-faint">{volume.instanceId}</div>
+                                    </Show>
+                                  </td>
+                                </tr>
+                              )}
+                            </For>
+                          </tbody>
+                        </table>
+                      </TableShell>
+                      <Show when={(nodeVolumes() ?? []).some(volumePinsPlacement)}>
+                        <p class="border-t border-line px-4 py-2 text-2xs text-faint">
+                          Draining or losing this node will strand the node-local volumes above until it returns.
+                        </p>
+                      </Show>
+                    </SectionCard>
+                  </Show>
+
+                  <SectionCard
+                    title="Metadata"
+                    description="What this host is, and the attributes the scheduler matches against."
+                  >
+                    <Show when={hostFacts().length > 0}>
+                      <dl class="grid gap-x-6 gap-y-3 sm:grid-cols-2 lg:grid-cols-3">
+                        <For each={hostFacts()}>
+                          {(fact) => (
+                            <div class="min-w-0">
+                              <dt class="eyebrow">{fact.label}</dt>
+                              <dd class="mt-0.5 truncate text-sm text-ink" title={fact.value}>{fact.value}</dd>
+                            </div>
+                          )}
+                        </For>
+                      </dl>
+                    </Show>
+
+                    <div class="mt-5 grid gap-4 lg:grid-cols-2">
                       <div>
-                        <p class="eyebrow mb-2">Static config</p>
-                        <KeyValueGrid data={parsed.configData} emptyLabel="No static config provided." />
+                        <p class="eyebrow mb-2">
+                          Static attributes
+                          <span class="ml-2 normal-case tracking-normal text-faint">from the worker config</span>
+                        </p>
+                        <AttributeList
+                          rows={staticAttributes()}
+                          emptyLabel="None declared."
+                        />
                       </div>
                       <div>
-                        <p class="eyebrow mb-2">Dynamic config</p>
-                        <KeyValueGrid data={parsed.dynamicData} emptyLabel="No dynamic config provided." />
+                        <p class="eyebrow mb-2">
+                          Dynamic attributes
+                          <span class="ml-2 normal-case tracking-normal text-faint">via legion node update</span>
+                        </p>
+                        <AttributeList rows={dynamicAttributes()} emptyLabel="None set." />
                       </div>
                     </div>
 
                     <div class="mt-4 space-y-2.5">
                       <CollapsibleSection
-                        title="Fingerprint"
-                        defaultOpen={false}
-                        open={sectionOpen().fingerprint}
-                        onToggle={(open) => setSectionState('fingerprint', open)}
-                      >
-                        <KeyValueGrid data={parsed.fingerprintData} emptyLabel="No fingerprint data." />
-                      </CollapsibleSection>
-
-                      <CollapsibleSection
-                        title="Networks"
+                        title={`Network interfaces (${networkRows().length})`}
                         defaultOpen={false}
                         open={sectionOpen().networks}
                         onToggle={(open) => setSectionState('networks', open)}
                       >
-                        <KeyValueGrid data={parsed.networksData} emptyLabel="No network data." />
+                        <Show when={networkRows().length > 0} fallback={<p class="text-sm text-muted">No network data.</p>}>
+                          <TableShell>
+                            <table class={tableClass}>
+                              <thead class={theadClass}>
+                                <tr>
+                                  <th class={thClass}>Interface</th>
+                                  <th class={thClass}>MAC address</th>
+                                </tr>
+                              </thead>
+                              <tbody class="divide-y divide-line">
+                                <For each={networkRows()}>
+                                  {(row) => (
+                                    <tr class={trHoverClass}>
+                                      <td class={cx(tdClass, 'font-mono text-xs')}>{row.name}</td>
+                                      <td class={cx(tdClass, 'font-mono text-xs text-muted')}>{row.mac || '—'}</td>
+                                    </tr>
+                                  )}
+                                </For>
+                              </tbody>
+                            </table>
+                          </TableShell>
+                        </Show>
                       </CollapsibleSection>
 
                       <CollapsibleSection
-                        title="Signals"
+                        title={`Supported signals (${signalList().length})`}
                         defaultOpen={false}
                         open={sectionOpen().signals}
                         onToggle={(open) => setSectionState('signals', open)}
                       >
-                        <KeyValueGrid data={parsed.signalsData} emptyLabel="No signal data." />
+                        <Show when={signalList().length > 0} fallback={<p class="text-sm text-muted">No signal data.</p>}>
+                          <div class="flex flex-wrap gap-1.5">
+                            <For each={signalList()}>{(signal) => <Badge tone="neutral" mono>{signal}</Badge>}</For>
+                          </div>
+                        </Show>
+                      </CollapsibleSection>
+
+                      {/* Everything above is a curated view; this is the escape
+                          hatch for whatever the fingerprint reports that we do
+                          not model yet. */}
+                      <CollapsibleSection
+                        title="Raw fingerprint"
+                        defaultOpen={false}
+                        open={sectionOpen().fingerprint}
+                        onToggle={(open) => setSectionState('fingerprint', open)}
+                      >
+                        <CodeBlock code={rawFingerprint()} maxHClass="max-h-96" />
                       </CollapsibleSection>
                     </div>
                   </SectionCard>

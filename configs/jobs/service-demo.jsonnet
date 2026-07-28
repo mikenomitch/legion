@@ -11,7 +11,7 @@
     tasks: [
         {
             name: "web",
-            kind: "exec",
+            runtime: "exec",
             lifecycle: "service",
             config: {
                 command: ["sh", "-c", "exec python3 -m http.server $LEGION_PORT_HTTP"],

@@ -31,6 +31,8 @@ impl Eval {
         match self.kind.as_str() {
             "node_join" => self.handle_node_join(store),
             "node_drop" => self.handle_node_drop(store),
+            "node_drain" => self.handle_node_drain(store),
+            "node_lost_reschedule" => self.handle_node_lost_reschedule(store),
             "job_submit" => self.handle_job_submit(store),
             "job_update" => self.handle_job_update(store),
             "rollout_tick" => self.handle_rollout_tick(store),
@@ -87,6 +89,43 @@ impl Eval {
         Ok(format!("Node {node_id} dropped"))
     }
 
+    /// Drain eviction pass for a node whose availability was set to
+    /// `"drained"` with `evict = true` (SetNodeAvailability): evict the
+    /// node's stateless allocations for replacement elsewhere while stateful
+    /// allocations stay protected by their `onLost` policy. See
+    /// `Store::reschedule_allocations_for_drained_node`.
+    fn handle_node_drain(&self, store: &Store) -> R<String> {
+        let node_id = self.node_name.trim();
+
+        if node_id.is_empty() {
+            bail!("Eval node_drain missing node name");
+        }
+
+        store.reschedule_allocations_for_drained_node(node_id)?;
+
+        Ok(format!("Node {node_id} drained"))
+    }
+
+    /// Scheduler-lane reschedule pass for a node marked lost (plan §7-C2,
+    /// C-2): the status-lane node monitor marks liveness and enqueues this
+    /// eval instead of calling the scheduler-lane reschedule inline. The
+    /// pass itself owns all stateful-protection gates
+    /// (`Store::reschedule_allocations_for_lost_node`) and is idempotent;
+    /// the monitor re-enqueues every tick while the node stays lost, so
+    /// gated allocations are freed automatically once their
+    /// `onLost.replaceAfter` window elapses.
+    fn handle_node_lost_reschedule(&self, store: &Store) -> R<String> {
+        let node_id = self.node_name.trim();
+
+        if node_id.is_empty() {
+            bail!("Eval node_lost_reschedule missing node name");
+        }
+
+        store.reschedule_allocations_for_lost_node(node_id)?;
+
+        Ok(format!("Rescheduled allocations for lost node {node_id}"))
+    }
+
     fn handle_job_submit(&self, store: &Store) -> R<String> {
         let previous_config_id = store.previous_job_config_id(&self.job_config_id)?;
         if let Some(prev_id) = previous_config_id.as_ref() {
@@ -119,6 +158,14 @@ impl Eval {
         if self.job_id.trim().is_empty() {
             bail!("Eval job_update missing job id");
         }
+
+        // Consume the replicated restart marker BEFORE executing the
+        // restart (see `Store::request_job_restart`): once cleared, a later
+        // failover will not regenerate this restart; if clearing is
+        // rejected (foreign-lane leader under `lanes`), the eval fails
+        // before any churn and is released for retry. Clearing an unset
+        // marker is a no-op (this eval also runs for batch re-schedules).
+        store.clear_job_restart_request(&self.job_id)?;
 
         store.remove_allocs_for_job(&self.job_id)?;
         let outcome = self.schedule_job_allocations(store, PlanMode::Fresh)?;
@@ -405,7 +452,7 @@ impl Eval {
 
     fn default_fingerprint_attrs() -> serde_json::Value {
         json!({
-            "memory_total": "8388608",
+            "memory_total": "8589934592",
             "cpus": {
                 "cpu-1": { "frequency": "2400" },
                 "cpu-2": { "frequency": "2400" },
@@ -510,7 +557,7 @@ mod tests {
             last_heartbeat: "2023-01-01T00:00:00Z".into(),
             config_attrs: json!({ "node_id": id, "zone": zone }),
             fingerprint_attrs: json!({
-                "memory_total": "8388608",
+                "memory_total": "8589934592",
                 "cpus": {
                     "cpu-1": { "frequency": "2400" },
                     "cpu-2": { "frequency": "2400" },
@@ -702,6 +749,9 @@ mod tests {
                 initial_instances: None,
                 on_lost: None,
                 storage: Some(StatefulStorageConfig {
+                    driver: None,
+                    mode: None,
+                    params: None,
                     path: "/var/lib/data".into(),
                     retain_on_scale_in: None,
                     retain_on_stop: None,
@@ -782,6 +832,9 @@ mod tests {
                 initial_instances: None,
                 on_lost: None,
                 storage: Some(StatefulStorageConfig {
+                    driver: None,
+                    mode: None,
+                    params: None,
                     path: "/workspace".into(),
                     retain_on_scale_in: None,
                     retain_on_stop: None,

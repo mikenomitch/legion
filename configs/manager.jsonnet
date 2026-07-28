@@ -14,8 +14,36 @@
   // still per-caller default-deny once ACLs are on. Set enabled:false to turn
   // off ExecAllocation and the exec WebSocket bridge entirely.
   // exec: { enabled: true },
+  // Telemetry: Prometheus /metrics plus /healthz + /readyz probes
+  // (docs/metrics.md). Enabled by default; binds server.port + 2 (4749 here)
+  // unless `port` is set. Set enabled:false to turn the listener off.
+  // telemetry: { enabled: true, port: 4749 },
   schedulerSettings: {
     plan_conflict_max_retries: 3,
+    // Declarable scheduling indexes (docs/scheduling-indexes.md): ad-hoc
+    // candidate generation for the scheduler. A built-in `fit` index
+    // (nearest-fit over free cpu/memory/disk within the task's pool) is
+    // always declared and arms itself once the fleet reaches
+    // `index_min_nodes` available nodes (default 128); below that, planning
+    // uses the plain scan and indexes cost nothing.
+    // index_min_nodes: 128,      // 0 disables indexing entirely
+    // indexes: {
+    //   fit: false,              // kill switch for the built-in fit index
+    //   // Shorthand: `resources.*` entries are nearest-fit dims, everything
+    //   // else is an exact-match partition key (`pool` = the node's pool).
+    //   topo: ["pool", "region", "zone"],
+    //   gpu: ["pool", "region", "resources.gpu_vram", "resources.memory"],
+    //   // Full form when the defaults need overriding.
+    //   big_jobs: {
+    //     partition_by: ["pool"],
+    //     dims: [
+    //       { attr: "resources.memory", weight: 2 },           // scale: "log"
+    //       { attr: "gpu_count", scale: "linear", step: 1 },
+    //     ],
+    //     order: "tight",        // "tight" packs, "loose" spreads
+    //     mode: "on",            // "on" | "shadow" | "off"
+    //   },
+    // },
   },
   // Debounce window (ms) for KV-driven job updates (see docs/kv-store.md).
   // Rapid puts/deletes to watched keys within the window are coalesced into

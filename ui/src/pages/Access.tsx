@@ -1,6 +1,7 @@
 import { For, Show, createMemo, createResource, createSignal } from 'solid-js'
 import { getStoredToken, managerClient, setStoredToken } from '../grpcClient'
 import { beginOidcLogin, rememberClientId } from '../utils/oidc'
+import { identityError, managerIdentity, refreshManagerIdentity } from '../utils/connection'
 import { Badge, Button, DefList, Field, Note, SectionCard, Spinner, StatusBadge, Tabs, cx, inputClass, selectClass } from '../components/ui'
 import {
   JoinTokensPanel,
@@ -22,7 +23,10 @@ const TABS: { id: Tab; label: string }[] = [
 // Access: identity introspection, login (userpass / OIDC / JWT / raw token),
 // and the ACL admin panels.
 export default function Access() {
-  const [whoami, { refetch }] = createResource(async () => managerClient.whoAmI({}))
+  // Identity is shared with the ACL banner, so logging in or out here updates
+  // both. `refetch` re-reads it with whatever token is now stored.
+  const whoami = managerIdentity
+  const refetch = refreshManagerIdentity
   const [methods] = createResource(async () => (await managerClient.getAuthMethods({})).methods)
   const [tab, setTab] = createSignal<Tab>('identity')
   const [tokenInput, setTokenInput] = createSignal('')
@@ -122,7 +126,17 @@ export default function Access() {
               </Show>
             }
           >
-            <Show when={whoami()} fallback={<Spinner label="Loading identity…" />}>
+            <Show
+              when={whoami()}
+              fallback={
+                <Show when={identityError()} fallback={<Spinner label="Loading identity…" />}>
+                  <Note tone="danger">
+                    The manager rejected this browser's credential: {identityError()}. Log out to
+                    clear it, or paste a valid token below.
+                  </Note>
+                </Show>
+              }
+            >
               {(identity) => (
                 <DefList
                   cols={3}

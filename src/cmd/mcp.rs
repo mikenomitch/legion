@@ -26,12 +26,13 @@ use crate::cmd::output::CliError;
 use crate::prelude::*;
 use crate::structs::{
     exec_client_frame, exec_server_frame, CreateInstanceRequest, CreateInstancesRequest,
-    DestroyInstanceRequest, DestroyJobRequest, ExecClientFrame, ExecInput, ExecStart,
-    GetAllocationLogsRequest, GetInstanceRequest, GetJobInfoRequest, GetJobSpecRequest,
+    DeleteVolumeRequest, DestroyInstanceRequest, DestroyJobRequest, ExecClientFrame, ExecInput,
+    ExecStart, GetAllocationLogsRequest, GetInstanceRequest, GetJobInfoRequest, GetJobSpecRequest,
     GetLedgerRequest, GetNodesRequest, GetRolloutStatusRequest, GetStateStoreSchemaRequest,
-    JobConfig, ListEventsRequest, ListInstancesRequest, ListJobActionsRequest, ListJobsRequest,
-    ListRolloutsRequest, ListServicesRequest, QueryStateStoreRequest, ReplaceInstanceRequest,
-    ResolveServiceRequest, RunJobRequest, StartInstanceRequest, StopInstanceRequest,
+    GetVolumeRequest, JobConfig, ListEventsRequest, ListInstancesRequest, ListJobActionsRequest,
+    ListJobsRequest, ListRolloutsRequest, ListServicesRequest, ListVolumeDriversRequest,
+    ListVolumesRequest, QueryStateStoreRequest, ReplaceInstanceRequest, ResolveServiceRequest,
+    RunJobRequest, SetNodeAvailabilityRequest, StartInstanceRequest, StopInstanceRequest,
     StopJobRequest,
 };
 use crate::task_plugins::validate_job_config;
@@ -120,7 +121,7 @@ fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_job_schema",
-            description: "Get the JSON Schema for jobspecs and built-in task kinds. Use this before authoring a jobspec.",
+            description: "Get the JSON Schema for jobspecs and built-in task runtimes. Use this before authoring a jobspec.",
             input_schema: empty_schema,
             mutates: false,
         },
@@ -185,10 +186,73 @@ fn tool_defs() -> Vec<ToolDef> {
             mutates: false,
         },
         ToolDef {
+            name: "legion_volume_list",
+            description: "List volumes — the persistent storage behind stateful instances (see docs/volumes.md). Every filter is optional. `nodeLocal: true` with a `nodeId` means the owning instance can ONLY be replaced on that node; `lastError` explains a volume stuck in pending or destroying.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "job_id": { "type": "string", "description": "Filter by owning job." },
+                    "node_id": { "type": "string", "description": "Filter by the node the volume lives on." },
+                    "driver": { "type": "string", "description": "Filter by volume driver (local-dir, host, nfs, tmpfs, ...)." },
+                    "instance_id": { "type": "string", "description": "Filter by owning stateful instance." },
+                    "state": { "type": "string", "description": "Filter by state: pending, created, destroying, destroyed." }
+                },
+                "additionalProperties": false
+            }),
+            mutates: false,
+        },
+        ToolDef {
+            name: "legion_volume_get",
+            description: "Inspect one volume: driver, params, driver metadata, node pin, mount path, and last driver error.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": { "volume_id": { "type": "string", "description": "Volume id (the second half of an instance's driver/volume_id storage handle)." } },
+                "required": ["volume_id"],
+                "additionalProperties": false
+            }),
+            mutates: false,
+        },
+        ToolDef {
+            name: "legion_volume_drivers",
+            description: "List the volume drivers installed across the cluster with their capabilities and which nodes can actually use them. Use this to answer why a job was rejected for an unknown or unusable volume driver.",
+            input_schema: empty_schema,
+            mutates: false,
+        },
+        ToolDef {
+            name: "legion_volume_delete",
+            description: "Delete a volume and reclaim its storage. DESTROYS DATA: the owning instance mints a fresh, empty volume on its next placement. Reclaim is confirmed asynchronously by the owning worker; `force: true` tombstones it immediately WITHOUT driver confirmation, leaving any bytes behind — only for a node that is gone for good. Mutating.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "volume_id": { "type": "string", "description": "Volume id." },
+                    "force": { "type": "boolean", "description": "Skip driver confirmation (node is permanently gone). Default false." },
+                    "idempotency_key": { "type": "string", "description": "Retry-safe key; a repeat returns the first result." }
+                },
+                "required": ["volume_id"],
+                "additionalProperties": false
+            }),
+            mutates: true,
+        },
+        ToolDef {
             name: "legion_node_list",
             description: "List worker nodes and their health.",
             input_schema: empty_schema,
             mutates: false,
+        },
+        ToolDef {
+            name: "legion_node_drain",
+            description: "Cordon, drain, or uncordon a worker node. cordon = stop new placements (existing allocations keep running); drain = cordon + evict allocations (stateless move immediately, stateful stay protected by their stateful.onLost policy); uncordon = make the node schedulable again. Mutating.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "string", "description": "Node ID." },
+                    "mode": { "type": "string", "enum": ["cordon", "drain", "uncordon"], "description": "cordon: unschedulable, keep allocations. drain: unschedulable + evict. uncordon: schedulable again." },
+                    "idempotency_key": { "type": "string", "description": "Optional key to dedupe retries." }
+                },
+                "required": ["node_id", "mode"],
+                "additionalProperties": false
+            }),
+            mutates: true,
         },
         ToolDef {
             name: "legion_acl_whoami",
@@ -592,6 +656,29 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             let mut client = connect().await?;
             grpc(client.get_nodes(GetNodesRequest::default())).await
         }
+        "legion_node_drain" => {
+            let node_id = str_arg(&args, "node_id")?;
+            let mode = str_arg(&args, "mode")?;
+            let (availability, evict) = match mode.as_str() {
+                "cordon" => ("drained", false),
+                "drain" => ("drained", true),
+                "uncordon" => ("available", false),
+                other => {
+                    return Err(format!(
+                        "invalid mode {other:?}: expected cordon, drain, or uncordon"
+                    ))
+                }
+            };
+            let idempotency_key = opt_str_arg(&args, "idempotency_key");
+            let mut client = connect().await?;
+            grpc(client.set_node_availability(SetNodeAvailabilityRequest {
+                node_id,
+                availability: availability.to_string(),
+                evict,
+                idempotency_key,
+            }))
+            .await
+        }
         "legion_acl_whoami" => {
             let mut client = connect().await?;
             grpc(client.who_am_i(crate::structs::WhoAmIRequest {})).await
@@ -670,6 +757,37 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             let instance_id = str_arg(&args, "instance_id")?;
             let mut client = connect().await?;
             grpc(client.get_instance(GetInstanceRequest { instance_id })).await
+        }
+        "legion_volume_list" => {
+            let mut client = connect().await?;
+            grpc(client.list_volumes(ListVolumesRequest {
+                job_id: opt_str_arg(&args, "job_id"),
+                node_id: opt_str_arg(&args, "node_id"),
+                driver: opt_str_arg(&args, "driver"),
+                instance_id: opt_str_arg(&args, "instance_id"),
+                state: opt_str_arg(&args, "state"),
+            }))
+            .await
+        }
+        "legion_volume_get" => {
+            let volume_id = str_arg(&args, "volume_id")?;
+            let mut client = connect().await?;
+            grpc(client.get_volume(GetVolumeRequest { volume_id })).await
+        }
+        "legion_volume_drivers" => {
+            let mut client = connect().await?;
+            grpc(client.list_volume_drivers(ListVolumeDriversRequest {})).await
+        }
+        "legion_volume_delete" => {
+            let volume_id = str_arg(&args, "volume_id")?;
+            let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
+            let mut client = connect().await?;
+            grpc(client.delete_volume(DeleteVolumeRequest {
+                volume_id,
+                force,
+                idempotency_key: opt_str_arg(&args, "idempotency_key"),
+            }))
+            .await
         }
         "legion_instance_create" => {
             let job_id = str_arg(&args, "job_id")?;

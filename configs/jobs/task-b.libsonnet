@@ -1,6 +1,6 @@
 {
     name: "task-b",
-    kind: "exec",
+    runtime: "exec",
     config: {
         command: ["echo", "Hello from task B"],
     },

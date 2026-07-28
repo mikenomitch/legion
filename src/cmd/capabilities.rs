@@ -84,7 +84,7 @@ pub fn catalog() -> Vec<Capability> {
             name: "job.schema",
             cli: "legion job schema",
             grpc: None,
-            summary: "Emit the JSON Schema for jobspecs and built-in task kinds.",
+            summary: "Emit the JSON Schema for jobspecs and built-in task runtimes.",
             mutates: false,
             read_only_safe: true,
         },
@@ -202,6 +202,51 @@ pub fn catalog() -> Vec<Capability> {
             mutates: true,
             read_only_safe: false,
         },
+        // --- Volumes (see docs/volumes.md) ---
+        Capability {
+            name: "volume.list",
+            cli: "legion volume list [--job <J>] [--node <N>] [--driver <D>]",
+            grpc: Some("Manager/ListVolumes"),
+            summary: "List volumes (storage behind stateful instances), with state and node pin.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "volume.get",
+            cli: "legion volume get <ID>",
+            grpc: Some("Manager/GetVolume"),
+            summary: "Inspect one volume: driver, params, node pin, mount path, last error.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "volume.delete",
+            cli: "legion volume delete <ID> [--force]",
+            grpc: Some("Manager/DeleteVolume"),
+            summary: "Delete a volume and reclaim its storage (DESTROYS DATA). --force \
+                 tombstones without driver confirmation for a node that is gone for good. \
+                 Supports --idempotency-key.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "volume.drivers",
+            cli: "legion volume drivers",
+            grpc: Some("Manager/ListVolumeDrivers"),
+            summary: "List volume drivers installed across the cluster, with capabilities and \
+                 which nodes can actually use them.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "volume.driver.test",
+            cli: "legion volume driver test <NAME>",
+            grpc: None,
+            summary: "Run the volume contract conformance suite against a driver locally \
+                 (mount/write/unmount/remount/read/destroy plus idempotency). No manager needed.",
+            mutates: false,
+            read_only_safe: true,
+        },
         // --- Rollouts ---
         Capability {
             name: "rollout.list",
@@ -243,6 +288,34 @@ pub fn catalog() -> Vec<Capability> {
             summary: "List worker nodes and their health.",
             mutates: false,
             read_only_safe: true,
+        },
+        Capability {
+            name: "node.cordon",
+            cli: "legion node cordon <ID>",
+            grpc: Some("Manager/SetNodeAvailability"),
+            summary: "Mark a node unschedulable; existing allocations keep running. \
+                 Supports --idempotency-key.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "node.drain",
+            cli: "legion node drain <ID>",
+            grpc: Some("Manager/SetNodeAvailability"),
+            summary: "Mark a node unschedulable and evict its allocations (stateless move \
+                 immediately; stateful stay protected by their onLost policy). Supports \
+                 --idempotency-key.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "node.uncordon",
+            cli: "legion node uncordon <ID>",
+            grpc: Some("Manager/SetNodeAvailability"),
+            summary: "Restore a cordoned/drained node to the scheduling pool. \
+                 Supports --idempotency-key.",
+            mutates: true,
+            read_only_safe: false,
         },
         Capability {
             name: "node.join-token.create",
@@ -307,6 +380,17 @@ pub fn catalog() -> Vec<Capability> {
             cli: "legion state seed-queries",
             grpc: Some("Manager/UpsertSavedStateQuery"),
             summary: "Install the curated library of agent introspection queries.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "state.backup",
+            cli: "legion state backup [--out <PATH>]",
+            grpc: Some("Manager/GetStateBackup"),
+            summary: "Write a consistent server-side backup file of the state store: a \
+                 point-in-time image of that node's applied state (VACUUM INTO; runs only on \
+                 the node leading every raft lane, not a cluster-wide snapshot at one index). \
+                 Restore via `legion start manager --restore-from <path>`.",
             mutates: true,
             read_only_safe: false,
         },

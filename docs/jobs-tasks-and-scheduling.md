@@ -23,7 +23,7 @@ Important `TaskConfig` fields:
   - integer count
   - or `{ num, per }` for per-attribute placement
 - `group`: task grouping for rollout + automatic anti-affinity behavior
-- `kind`: task-kind plugin (`exec`, `container`, etc)
+- `runtime`: task-runtime plugin (`exec`, `container`, etc)
 - `resources`: normalized by manager `ResourcePolicy`
 - `constraints`: hard placement filter
 - `permit`: hard node restriction policy
@@ -42,7 +42,7 @@ Important `TaskConfig` fields:
   files with per-reference `watch`/`onChange`/`onDelete` policies that can
   restart, roll out, or fail the job when watched keys change or are
   deleted. Full semantics (policy precedence, debounce, fail/recovery,
-  per-kind capability matrix) live in the
+  per-runtime capability matrix) live in the
   ["Reactive updates" section of the KV store doc](kv-store.md#reactive-updates-kv-driven-task-updates).
 - `identities`: named workload identities (OIDC). The manager mints a
   short-lived, asymmetrically-signed JWT per allocation for each declared
@@ -69,6 +69,23 @@ Dependency conditions:
 - `success`: dependency must not be failed and must be success (or batch being placed now).
 
 Only ready tasks enter the current planning pass.
+
+Lifecycle rules, enforced at submit and by `legion job validate`:
+
+- Dependencies may cross groups for `service` and `batch` tasks (e.g. a
+  service in one group waiting on a batch prep task in another).
+- `sidecar` tasks are group-bound: they run alongside their group's primary
+  task, so they may only depend on tasks in their own group. Rejected as
+  `Sidecar task <x> depends on task <y> outside group <g>`. To gate the whole
+  group on another group's task, put the dependency on the group's primary
+  task instead. A sidecar also requires a non-sidecar primary task in its
+  group.
+- A `service` task cannot take a `complete` or `success` condition on
+  another service, because services never exit. Those conditions are only
+  satisfiable by `batch` targets.
+
+See `configs/jobs/maximal.jsonnet` and `configs/jobs/dag-exec-mac-sidecars.jsonnet`
+for validating examples of both the cross-group and sidecar shapes.
 
 ## Constraints, Permits, and Affinities
 
@@ -151,7 +168,50 @@ Two paths exist:
 
 - Manager heartbeat checker marks stale nodes as lost.
 - Lost-node allocations are removed and affected job configs reconciled.
+- Reconciliation runs the scheduler in `Reschedule` mode, so replacements
+  honor node capacity, constraints, group co-location and the configured
+  policy exactly like any other placement. A job with nowhere to go is logged
+  and retried on the next tick rather than force-placed.
 - `node_drop` eval path does equivalent reconciliation.
+
+## Cordon and Drain
+
+Nodes have two independent axes: `status` (ready/active/lost — health) and
+`availability` (available/drained — schedulability). The scheduler's single
+placement chokepoint (`Scheduler::available_nodes`) and the store's reconcile
+path only consider nodes with `availability == "available"`, so flipping
+availability excludes a node from **all** new placements without touching its
+health, heartbeats, or running allocations.
+
+The `SetNodeAvailability` RPC (CLI: `legion node cordon|drain|uncordon <ID>`,
+MCP: `legion_node_drain`) drives three operator flows:
+
+- **Cordon** (`availability: "drained"`, `evict: false`): the node stops
+  receiving new placements; existing allocations keep running. Emits
+  `node.cordoned`.
+- **Drain** (`availability: "drained"`, `evict: true`): cordon plus a
+  `node_drain` eval that evicts the node's existing allocations
+  (`Store::reschedule_allocations_for_drained_node`):
+  - Stateless allocations are removed immediately and the affected job
+    configs reconciled onto the remaining available nodes. Because the node
+    is alive and heartbeating, the next heartbeat reply shrinks its desired
+    set and the worker stops the tasks cleanly — none of the lost-node
+    loss-confirmation delay applies.
+  - Stateful allocations run through the same protection gate as node loss
+    (`stateful.onLost`). A drained-but-alive node has no `lost_at`, so its
+    loss duration is unknown and every stateful allocation is **held**: a
+    drain never force-moves protected state. Held allocations keep running
+    on the drained node until the node is actually lost (the lost-node
+    recheck sweep then applies `onLost.replaceAfter` as usual) or an
+    operator moves them explicitly with `legion instance replace`.
+  - Emits `node.drained` with evicted/held counts.
+- **Uncordon** (`availability: "available"`): the node re-enters the
+  scheduling pool. Existing allocations elsewhere are not moved back
+  automatically; the next reschedule/reconcile may use the node. Emits
+  `node.uncordoned`.
+
+The RPC is idempotent (optional `idempotency_key`), returns NotFound for
+unknown nodes, and requires `node:write` on the node's pool.
 
 ## Dynamic Node Attr Update
 

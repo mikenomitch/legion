@@ -3,7 +3,7 @@
     tasks: [
         {
             name: "build",
-            kind: "exec",
+            runtime: "exec",
             lifecycle: "batch",
             group: "app",
             config: {
@@ -12,7 +12,7 @@
         },
         {
             name: "api",
-            kind: "exec",
+            runtime: "exec",
             lifecycle: "service",
             group: "app",
             dependsOn: [

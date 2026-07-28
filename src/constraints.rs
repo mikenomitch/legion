@@ -79,6 +79,28 @@ impl ConstraintSet {
             .collect()
     }
 
+    /// Keys this constraint set pins to an exact value: every `=` rule with a
+    /// concrete value. Used by scheduling-index selection to decide which
+    /// `partition_by` keys a task binds; the full rule set is always
+    /// re-verified on candidates, so this only has to be sound, not complete.
+    /// When the same key carries several `=` rules the first wins here —
+    /// conflicting values make every candidate fail re-verification anyway.
+    pub fn equality_bindings(&self) -> HashMap<String, Value> {
+        let mut bindings = HashMap::new();
+        for rule in &self.rules {
+            if rule.operator != Operator::Eq {
+                continue;
+            }
+            let Some(value) = rule.value.as_ref() else {
+                continue;
+            };
+            bindings
+                .entry(rule.key.clone())
+                .or_insert_with(|| value.clone());
+        }
+        bindings
+    }
+
     pub fn is_empty(&self) -> bool {
         self.rules.is_empty()
     }
@@ -114,6 +136,17 @@ impl PermitSet {
                 .iter()
                 .any(|rule| rule.key == *key && rule.matches_value(value, None))
         })
+    }
+
+    /// The exact pool this permit requires, when it requires one with a plain
+    /// `=` rule (which includes the implicit `pool=default`). `None` when the
+    /// pool rule uses a non-equality operator — scheduling-index selection
+    /// then treats `pool` as unbound and falls back to the scan.
+    pub fn pool_binding(&self) -> Option<&Value> {
+        self.rules
+            .iter()
+            .find(|rule| rule.key == "pool" && rule.operator == Operator::Eq)
+            .and_then(|rule| rule.value.as_ref())
     }
 }
 
@@ -393,7 +426,10 @@ fn value_contains_any(haystack: &Value, needle: &Value) -> bool {
     }
 }
 
-fn node_attr<'a>(node: &'a Node, key: &str) -> Option<&'a Value> {
+/// Node attribute lookup in the documented precedence order:
+/// `config_attrs`, then `fingerprint_attrs`, then `dynamic_attrs`. Shared
+/// with the scheduling index so both agree on what a key resolves to.
+pub(crate) fn node_attr<'a>(node: &'a Node, key: &str) -> Option<&'a Value> {
     node.config_attrs
         .as_object()
         .and_then(|attrs| attrs.get(key))
@@ -409,7 +445,9 @@ fn node_attr<'a>(node: &'a Node, key: &str) -> Option<&'a Value> {
         })
 }
 
-fn value_token(value: &Value) -> String {
+/// Canonical string token for a JSON value, shared with the scheduling
+/// index's partition keys so token equality tracks constraint `=` equality.
+pub(crate) fn value_token(value: &Value) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| String::new())
 }
 
