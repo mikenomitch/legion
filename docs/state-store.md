@@ -115,12 +115,14 @@ Server-side backups exist in every mode: `legion state backup` (a
 
 ## What Is Not Implemented Yet
 
-- Raft `topology: 'lanes'` (independent per-domain raft groups) is built
-  and tested as scaffolding but **refused at engine start**. The
-  `node`/`node_health` split (the table-ownership prerequisite) has landed;
-  the remaining work is the composite-op lane split and per-lane
-  table-scoped snapshots (plan §7, phases C-2/C-3).
-- Non-leader writes are rejected with a leader hint, not auto-forwarded.
+- Raft `topology: 'lanes'` (independent per-domain raft groups) is
+  runnable and measured but stays **opt-in** — `single` remains the
+  recommended default. See `docs/multi-raft.md` § "Topology: `single` vs
+  `lanes`".
+- Non-leader **client** writes are rejected with a leader hint, not
+  auto-forwarded; worker-plane writes (heartbeats, reports) forward to the
+  owning lane's leader (`docs/multi-raft.md` § "Non-leader write redirects
+  and forwarding").
 - Raft transport auth is a shared cluster secret (mTLS pending); of the
   `legion_raft_*` metrics series only the voters/quorum gauges are emitted,
   the rest is reserved but not yet emitted.

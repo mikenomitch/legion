@@ -117,6 +117,16 @@ fn map_store_error(action: &str, err: anyhow::Error) -> Status {
     }
 }
 
+/// Whether a mapped store error was the typed raft not-the-leader rejection
+/// (`map_store_error` renders it as `FAILED_PRECONDITION` carrying the
+/// `NotRaftLeader` display text, which this crate owns). Used by RPC tails
+/// that treat exactly that rejection as "deferred to the lane's reconciler"
+/// (plan §8, D1) while every other failure stays an error.
+fn status_is_not_raft_leader(status: &Status) -> bool {
+    status.code() == tonic::Code::FailedPrecondition
+        && status.message().contains("not the raft leader")
+}
+
 /// Outcome of the worker<->manager protocol-version handshake performed at
 /// registration. See [`protocol_compat`] and `docs/upgrades.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1479,6 +1489,62 @@ fn remove_stale_allocations_for_new_rollout(
     Ok(())
 }
 
+/// Create the rollouts that acknowledged updates never got (plan §8, D1).
+///
+/// An `Updated` submit whose scheduler-lane rollout creation was rejected
+/// (divergent lane leadership) or lost to a crash leaves a job whose latest
+/// config is acknowledged but will never deploy: the client's retry returns
+/// `Unchanged` — which creates no rollout — and eval regeneration's
+/// `job_submit` fallback would place the new config at FULL count,
+/// bypassing canary/staged gating and `waiting_manual_start`. This pass
+/// runs on the scheduler-lane leader (node-status-checker cadence, and
+/// immediately before every `regenerate_scheduling_evals` call so the
+/// fallback can never outrun it), finds the acknowledged-update signature
+/// via `Store::jobs_with_unrolled_latest_config`, and creates each missing
+/// rollout exactly as `run_job` would have — manual strategies wait for
+/// their operator, automatic ones are armed by the regeneration pass's
+/// rollout branch on the same tick. Returns how many rollouts were created.
+pub(crate) fn reconcile_missing_rollouts(store: &Store) -> anyhow::Result<u64> {
+    let candidates = store.jobs_with_unrolled_latest_config()?;
+    let mut created = 0u64;
+    for (job_id, latest_config_id, previous_config_id) in candidates {
+        let Some(config) = store.get_job_config_optional(&job_id)? else {
+            continue;
+        };
+        // The candidate query keys on each job's latest config; re-check
+        // against the loaded config so a submit racing this pass cannot
+        // create a rollout for a superseded config.
+        if config.id() != latest_config_id {
+            continue;
+        }
+        match create_rollout_for_update(
+            store,
+            &job_id,
+            previous_config_id.as_deref(),
+            &latest_config_id,
+            &config,
+            "Error creating reconciled rollout",
+        ) {
+            Ok(is_manual) => {
+                created += 1;
+                info!(
+                    job_id,
+                    job_config_id = %latest_config_id,
+                    manual = is_manual,
+                    "Created the rollout an acknowledged update was missing"
+                );
+            }
+            Err(status) => warn!(
+                job_id,
+                job_config_id = %latest_config_id,
+                error = %status,
+                "Failed creating missing rollout; will retry next pass"
+            ),
+        }
+    }
+    Ok(created)
+}
+
 fn create_rollout_for_update(
     store: &Store,
     job_id: &str,
@@ -2030,25 +2096,51 @@ impl Manager for ManagerDaemonService {
                     .store
                     .previous_job_config_id(&job_config_id)
                     .map_err(|e| map_store_error("Error loading previous job config", e))?;
-                let is_manual = create_rollout_for_update(
+                match create_rollout_for_update(
                     &self.store,
                     &config.name,
                     previous_job_config_id.as_deref(),
                     &job_config_id,
                     &config,
                     "Error creating rollout",
-                )?;
-
-                if is_manual {
-                    (None, "Rollout created; waiting for manual start")
-                } else {
-                    (Some("rollout_tick"), "Rollout started")
+                ) {
+                    Ok(true) => (None, "Rollout created; waiting for manual start"),
+                    Ok(false) => (Some("rollout_tick"), "Rollout started"),
+                    // Standing-split tolerance (plan §8, D1): the update is
+                    // acknowledged (control half committed); the rollout is
+                    // a scheduler-lane projection the scheduler leader's
+                    // `reconcile_missing_rollouts` pass derives from
+                    // replicated state — with full canary/manual gating —
+                    // once the config replicates to it. Failing the RPC
+                    // here would strand the update: the client's retry
+                    // returns `Unchanged`, which never creates a rollout.
+                    Err(status) if status_is_not_raft_leader(&status) => {
+                        warn!(
+                            job = %config.name,
+                            job_config_id,
+                            "rollout creation deferred: this node does not lead the \
+                             scheduler lane; its reconciler will create the rollout"
+                        );
+                        (
+                            None,
+                            "Job update accepted; rollout deferred until raft lane \
+                             leadership converges",
+                        )
+                    }
+                    Err(status) => return Err(status),
                 }
             }
         };
 
+        // The enqueue forwards to the scheduler-lane leader when this node
+        // does not lead that lane (plan §8, D2); a residual typed rejection
+        // (leader unknown/unreachable) is tolerated because the eval is
+        // exactly what `regenerate_scheduling_evals` re-derives — the job is
+        // accepted either way, so failing the RPC after the control-lane
+        // commit would only mislead the client into resubmitting.
         if let Some(kind) = eval_kind {
-            self.store
+            if let Err(e) = self
+                .store
                 .enqueue_eval(
                     kind,
                     Some(&config.name),
@@ -2056,12 +2148,24 @@ impl Manager for ManagerDaemonService {
                     None,
                     Some(priority),
                 )
-                .map_err(|e| map_store_error("Error running job", e))?;
+                .map_err(|e| map_store_error("Error running job", e))
+            {
+                if !status_is_not_raft_leader(&e) {
+                    return Err(e);
+                }
+                warn!(
+                    job = %config.name,
+                    job_config_id,
+                    "submit eval enqueue deferred: the scheduler leader's regeneration \
+                     pass will re-derive it"
+                );
+            }
         } else if seeded > 0 {
             // An unchanged resubmit normally needs no eval, but if it seeded
             // rows (possible when a previous submit failed between persisting
             // the config and seeding), the new instances still need placing.
-            self.store
+            if let Err(e) = self
+                .store
                 .enqueue_eval(
                     "job_reschedule",
                     Some(&config.name),
@@ -2069,7 +2173,18 @@ impl Manager for ManagerDaemonService {
                     None,
                     Some(priority),
                 )
-                .map_err(|e| map_store_error("Error scheduling seeded instance placement", e))?;
+                .map_err(|e| map_store_error("Error scheduling seeded instance placement", e))
+            {
+                if !status_is_not_raft_leader(&e) {
+                    return Err(e);
+                }
+                warn!(
+                    job = %config.name,
+                    job_config_id,
+                    "seeded-instance eval enqueue deferred: the scheduler leader's \
+                     regeneration pass will re-derive it"
+                );
+            }
         }
 
         self.store

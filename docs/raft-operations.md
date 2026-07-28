@@ -63,10 +63,11 @@ Minimal shape:
 - `advertiseAddr`: `host:port` peers dial for this manager's transport.
 - `peers`: informational/name-resolution list (`name=host:port`); real
   membership is driven by joins and operator commands.
-- `topology`: `single` (one raft group carries all state — recommended).
-  `lanes` (independent control/scheduler/status groups) is experimental
-  and currently **refused at engine start** — per-lane table ownership is
-  not yet disjoint, so it could diverge replicas (see `docs/multi-raft.md`).
+- `topology`: `single` (one raft group carries all state — the recommended
+  default) or `lanes` (independent control/scheduler/status groups, for
+  write loads that bottleneck one group's log). Fixed at first engine
+  start per data dir; see `docs/multi-raft.md` § "Topology: `single` vs
+  `lanes`".
 - `snapshotEntries`: applied entries between whole-DB snapshots (default
   10000); the raft log is compacted behind each snapshot.
 
@@ -178,12 +179,34 @@ warn loudly, block rarely):
   command's own output (`⚠ …`, threaded through
   `IssueRaftCommandReply.warning`). Join promotion is never withheld to
   preserve parity.
-- The **only hard block**: a `remove-member` that would leave **zero
-  voters**, or a resulting quorum that the currently-known-alive members
-  could not form (best-effort liveness from the leader's replication
-  streams) — such a change could itself never commit and would wedge the
-  cluster. The refusal message names the fix (add a voter first / remove
-  the dead member instead).
+- Hard blocks on `remove-member`, each with the fix in the refusal
+  message:
+  - a removal that would leave **zero voters**;
+  - a resulting quorum the remaining voters could not form **right now** —
+    liveness is an active probe of each remaining voter's transport
+    listener (fresh dial, 2s timeout), because a membership change whose
+    new voter set cannot ack can never commit and would wedge the lane in
+    a joint configuration;
+  - **self-removal**: the manager currently leading every lane cannot
+    remove itself (committing a self-excluding config deposes it
+    mid-removal, half-applying across lanes). Decommission in two steps —
+    see below.
+- Each lane's membership change is bounded (30s): if a remaining voter
+  dies between the probe and the commit, the command errors with the
+  recovery path (restore a remaining voter; the change then commits on
+  its own, and re-running the command is safe) instead of hanging.
+
+**Decommissioning the current leader** is a two-step operation:
+
+```bash
+legion raft command trigger-election --target <another-manager>
+```
+
+then, once `legion raft status` shows that manager leading every lane:
+
+```bash
+legion raft command remove-member --target <old-leader>
+```
 
 `step-down` / `transfer-leader` are **not supported** by the current
 engine (openraft 0.9 has no leader-transfer API); they return an error
@@ -234,13 +257,45 @@ backed by the same real engine state as the CLI.
   live under `raft.dataDir` (per lane). Both must survive restarts
   together (and see `forceNewCluster` in `docs/multi-raft.md` for what
   happens when they part ways).
+- **Workers and failover:** workers dial one fixed manager. A manager that
+  cannot propose a worker's write (it is a follower after a failover, or
+  does not lead the owning lane under `topology: lanes`) FORWARDS the
+  write to the leader over the authenticated raft transport and answers
+  the worker after the forwarded write commits — worker liveness,
+  failure reports, and volume reports keep working without the worker
+  redialing. See `docs/multi-raft.md`, "Non-leader write redirects and
+  forwarding".
+
+### Recovering a replica that stopped a lane on an apply conflict
+
+Replicas apply row changesets with a conflict-ABORT policy: any conflict
+means the replica's table diverged from the leader's history, and the lane
+STOPS on that node — loudly, with a changeset-conflict error in the log —
+rather than silently diverging. Restarting the manager replays into the
+same conflict. The recovery paths, best first:
+
+1. **Snapshot the leader past the poisoned entry.** The node catches up by
+   snapshot install (which replaces the diverged tables wholesale) once
+   the leader's log is compacted beyond the entry it cannot apply. A
+   snapshot happens automatically every `raft.snapshotEntries` applied
+   writes; on a quiet cluster, generate write traffic or lower
+   `snapshotEntries` temporarily on the leader and restart it.
+2. **Rebuild the member.** Remove it (`remove-member`), wipe its
+   `raft.dataDir` AND `store.sqlite`, and re-join it with a fresh token —
+   it comes back via snapshot install.
+
+If the SAME conflict appears on a majority of replicas, stop and treat it
+as a bug (the leader and replicas disagree about history): take
+`legion state backup` where possible and file the changeset-conflict log
+lines.
 
 ## Not yet done
 
-- Auto-forwarding writes from followers to the leader (today: reject +
-  hint).
-- `topology: 'lanes'` is refused at engine start until the node/liveness
-  table split makes per-lane table ownership disjoint.
+- Auto-forwarding of **client** writes from followers (today: reject +
+  leader hint; the worker plane and internal lane halves forward — see
+  above).
+- `topology: 'lanes'` is runnable and measured but stays opt-in;
+  see `docs/multi-raft.md` ("Topology: `single` vs `lanes`").
 - `step-down` / `transfer-leader` (no leader-transfer API in openraft 0.9).
 - Raft `/metrics` series; transport mTLS (today: shared cluster secret).
 

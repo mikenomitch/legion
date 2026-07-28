@@ -581,6 +581,22 @@ fn test_job(name: &str, count: u32) -> JobConfig {
     }
 }
 
+/// Like [`test_job`], but the task declares one volume claim, so the
+/// submit composite has a real scheduler-lane half (the volume-claim sync)
+/// to defer under a standing split.
+fn test_job_with_volume(name: &str, count: u32) -> JobConfig {
+    let mut config = test_job(name, count);
+    config.tasks[0].volumes = vec![legion::structs::job::VolumeSpec {
+        name: "data".to_string(),
+        driver: None,
+        mode: None,
+        params: None,
+        path: Some("/data".to_string()),
+        read_only: None,
+    }];
+    config
+}
+
 fn submission(name: &str, content: &str) -> Submission {
     Submission {
         path: format!("{name}.jsonnet"),
@@ -841,21 +857,10 @@ fn killing_a_single_lane_leader_disturbs_only_that_lane() -> R<()> {
     );
 
     // Status-lane writes now belong on mgr-b; proposing one on mgr-a is
-    // rejected with a hint naming the LANE and ITS leader.
-    let err = a
-        .store()
-        .update_node_heartbeat("elect-node".to_string())
-        .expect_err("status write on a non-status-leader must be rejected");
-    let rendered = format!("{err:#}");
-    assert!(
-        rendered.contains("status lane"),
-        "rejection must name the lane: {rendered}"
-    );
-    assert!(
-        rendered.contains("mgr-b"),
-        "rejection must name that lane's leader: {rendered}"
-    );
-    // And the write commits on the status lane's actual leader.
+    // FORWARDED to that lane's leader (plan §8, D2) and succeeds — worker
+    // liveness must not depend on which manager a worker happens to dial.
+    a.store().update_node_heartbeat("elect-node".to_string())?;
+    // And the write commits on the status lane's actual leader directly.
     b.store().update_node_heartbeat("elect-node".to_string())?;
 
     // Record the undisturbed lanes' terms, then kill the node that leads
@@ -1546,10 +1551,10 @@ fn lanes_that_settle_on_different_leaders_stay_correct() -> R<()> {
         || every_lane_has_a_live_leader(&all),
     );
 
-    // (1) The scheduler-lane half of the submit path — the eval enqueue the
-    // RPC tail issues — is rejected BEFORE its capture, with the typed hint
-    // naming the lane and that lane's leader, and enqueues nothing.
-    let err = a
+    // (1) A scheduler-lane write issued on the control leader is FORWARDED
+    // to the scheduler lane's leader (plan §8, D2) instead of failing: the
+    // enqueue lands on mgr-b's lane and replicates from there.
+    let eval = a
         .store()
         .enqueue_eval(
             "job_submit",
@@ -1558,26 +1563,17 @@ fn lanes_that_settle_on_different_leaders_stay_correct() -> R<()> {
             None,
             None,
         )
-        .expect_err("a scheduler-lane write on a non-scheduler leader must be rejected");
-    let rendered = format!("{err:#}");
-    assert!(
-        rendered.contains("not the raft leader"),
-        "the rejection must be the typed leader-hint error: {rendered}"
-    );
-    assert!(
-        rendered.contains("scheduler lane"),
-        "the rejection must name the lane: {rendered}"
-    );
-    assert!(
-        rendered.contains("mgr-b"),
-        "the rejection must name that lane's leader: {rendered}"
-    );
-    assert!(
-        a.store()
-            .get_evals()?
-            .iter()
-            .all(|eval| eval.job_id != "split-job"),
-        "a rejected scheduler half must not have enqueued anything"
+        .expect("a scheduler-lane enqueue on the control leader must forward to mgr-b");
+    assert_eq!(eval.job_id, "split-job");
+    wait_for(
+        Duration::from_secs(60),
+        "the forwarded eval is committed on the scheduler lane's leader",
+        || {
+            b.store()
+                .get_evals()
+                .map(|evals| evals.iter().any(|eval| eval.job_id == "split-job"))
+                .unwrap_or(false)
+        },
     );
 
     // (2) A composite confined to the lanes this node DOES lead still
@@ -1591,63 +1587,75 @@ fn lanes_that_settle_on_different_leaders_stay_correct() -> R<()> {
         "the status half carried the registration-supplied liveness"
     );
 
-    // (3) A composite that SPANS the split has no home until leadership
-    // converges — the honest cost of best-effort convergence. What must hold
-    // is that it says so, actionably, from BOTH sides rather than silently
-    // half-applying. `handle_job_submit` is control → status → scheduler
-    // (the scheduler op syncs the tasks' volume claims).
-    let from_control = a
+    // (3) A submit that SPANS the split is ACCEPTED on the control leader
+    // (plan §8, D1): the control half — the operator's intent — commits,
+    // the deferred scheduler half (the volume-claim sync) is completed by
+    // the scheduler leader's reconciler, and nothing half-applies silently.
+    // On the scheduler leader the submit still fails typed and actionably:
+    // its control half is the operation, and that lane is led elsewhere.
+    let accepted = a
         .store()
-        .handle_job_submit(&test_job("split-job", 2), &[submission("split-job", "v2")])
-        .expect_err("a submit that spans the split must not report success");
-    let from_control = format!("{from_control:#}");
-    assert!(
-        from_control.contains("scheduler lane") && from_control.contains("mgr-b"),
-        "the control leader's rejection must name the scheduler lane and its leader: \
-         {from_control}"
-    );
+        .handle_job_submit(
+            &test_job_with_volume("split-job", 2),
+            &[submission("split-job", "v2")],
+        )
+        .expect("a submit on the control leader must be accepted under a standing split");
+    let v2_config_id = accepted.job_config_id().to_string();
+    assert_ne!(v2_config_id, job_config_id, "v2 must be a new config");
     let from_scheduler = b
         .store()
-        .handle_job_submit(&test_job("split-job", 2), &[submission("split-job", "v2")])
-        .expect_err("the submit has no home while the lanes are split");
+        .handle_job_submit(
+            &test_job_with_volume("split-job", 2),
+            &[submission("split-job", "v2")],
+        )
+        .expect_err("the submit's control half has no home on the scheduler leader");
     let from_scheduler = format!("{from_scheduler:#}");
     assert!(
         from_scheduler.contains("control lane") && from_scheduler.contains("mgr-a"),
         "the mirror rejection must name the control lane and its leader: {from_scheduler}"
     );
 
-    // (4) The scheduling work the rejected enqueue never recorded is
-    // recoverable from replicated state on the SCHEDULER lane's leader.
-    // This is the pass `manager::daemon` runs every node-status-checker tick
-    // while a node leads the scheduler lane but not every lane, and it is
-    // what keeps acknowledged control-plane state from sitting unscheduled
-    // forever under a standing split.
+    // (4) The deferred halves are completed by the lane leaders'
+    // reconcilers — the passes `manager::daemon` runs every checker tick —
+    // once the control rows replicate to them.
     wait_for(
         Duration::from_secs(90),
         "the submit's control-lane rows reach the scheduler-lane leader",
         || {
             b.store()
-                .get_task_configs_for_job_config(&job_config_id)
+                .get_task_configs_for_job_config(&v2_config_id)
                 .map(|configs| !configs.is_empty())
                 .unwrap_or(false)
         },
     );
-    let regenerated = b.store().regenerate_scheduling_evals()?;
+    let synced = b.store().sync_missing_task_volume_claims()?;
     assert!(
-        regenerated > 0,
-        "the divergent-leadership safety net must re-derive the lost scheduling work"
+        synced > 0,
+        "the scheduler leader's reconciler must sync the deferred volume claims"
     );
+    let claims = b.store().list_volumes(&Default::default())?;
+    assert!(
+        claims
+            .iter()
+            .any(|volume| volume.volume_id.contains("split-job")),
+        "the reconciled claim rows must exist on the scheduler leader: {claims:?}"
+    );
+    // The scheduling work for the job is already queued — the forwarded
+    // enqueue from (1) landed on this leader — so the safety net correctly
+    // regenerates nothing new; what must hold is that the queue has work
+    // for the job after the pass either way.
+    let _ = b.store().regenerate_scheduling_evals()?;
     assert!(
         b.store()
             .get_evals()?
             .iter()
             .any(|eval| eval.job_id == "split-job"),
-        "the job the control leader could not schedule for is scheduled again"
+        "scheduling work for the accepted submit must be queued on the scheduler leader"
     );
 
-    // (5) And once leadership converges, the client-style retry finishes the
-    // composite the split had no home for — the first halves were idempotent,
-    // so nothing was lost and nothing double-applied.
+    // (5) Once leadership converges, a client-style retry is a clean
+    // `Unchanged` no-op — the composite was already completed by the
+    // reconcilers, nothing was lost and nothing double-applied.
     set_convergence(&all, true)?;
     wait_for_co_location(
         &all,
@@ -1659,10 +1667,17 @@ fn lanes_that_settle_on_different_leaders_stay_correct() -> R<()> {
         "the submit that spanned the split",
         Duration::from_secs(120),
         |store| {
-            store.handle_job_submit(&test_job("split-job", 2), &[submission("split-job", "v2")])
+            store.handle_job_submit(
+                &test_job_with_volume("split-job", 2),
+                &[submission("split-job", "v2")],
+            )
         },
     );
     let healed_id = healed.job_config_id().to_string();
+    assert_eq!(
+        healed_id, v2_config_id,
+        "the retry must land on the already-accepted config, not mint a new one"
+    );
     assert!(
         !a.store()
             .task_statuses_for_job_config(&healed_id)?
@@ -1679,12 +1694,99 @@ fn lanes_that_settle_on_different_leaders_stay_correct() -> R<()> {
     Ok(())
 }
 
+/// (e6) Worker liveness survives a standing STATUS-lane split (plan §8,
+/// D2): a heartbeat arriving at the manager the workers dial — the control
+/// leader — is FORWARDED to the status lane's leader instead of being
+/// rejected. Pre-fix, that rejection cascade marked every healthy worker
+/// lost within seconds and self-fenced their stateful allocations; this
+/// pins the fix end to end over the real transport, including the reverse
+/// direction (the status leader's mark-lost forwarding its control-lane
+/// availability half back to the anchor).
+#[test]
+fn worker_heartbeats_forward_across_a_status_lane_split() -> R<()> {
+    let _serial = cluster_gate();
+    init_trace();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?;
+    let dir = tempfile::tempdir()?;
+    let (a, b, c) = start_cluster(&rt, dir.path(), 10_000)?;
+    let all = [&a, &b, &c];
+    wait_for_co_location(
+        &all,
+        Duration::from_secs(90),
+        "bring-up leaves one manager leading all three lanes",
+    );
+
+    // Register while co-located, then split the STATUS lane away from the
+    // anchor and hold it there.
+    a.store().insert_node(test_node_msg("hb-node"))?;
+    set_convergence(&all, false)?;
+    move_lane_leadership(&b, "status", Duration::from_secs(60));
+    wait_for(
+        Duration::from_secs(60),
+        "mgr-b leads the status lane while mgr-a keeps control",
+        || b.leads_lane("status") && a.leads_lane("control"),
+    );
+
+    // The worker's heartbeat lands on mgr-a (workers dial ONE manager) and
+    // must succeed by forwarding to mgr-b.
+    a.store().update_node_heartbeat("hb-node".to_string())?;
+    wait_for(
+        Duration::from_secs(60),
+        "the forwarded heartbeat is committed on the status lane and replicates",
+        || {
+            [&a, &b].iter().all(|node| {
+                node.store()
+                    .get_node("hb-node")
+                    .map(|node| {
+                        node.status == "active" && node.last_heartbeat != "2023-01-01T00:00:00Z"
+                    })
+                    .unwrap_or(false)
+            })
+        },
+    );
+    // Health-check reports forward the same way.
+    a.store().update_node_health_checks("hb-node", "[]")?;
+
+    // Reverse direction: the status leader marks a node lost — its status
+    // half is local, and its control half (`sync_node_availability`) must
+    // forward to the anchor so the lost node cannot keep receiving
+    // placements.
+    b.store().mark_node_lost("hb-node")?;
+    wait_for(
+        Duration::from_secs(60),
+        "the lost mark's forwarded control half lands on the anchor and replicates",
+        || {
+            [&a, &b].iter().all(|node| {
+                node.store()
+                    .get_node("hb-node")
+                    .map(|node| node.status == "lost" && node.availability == "unavailable")
+                    .unwrap_or(false)
+            })
+        },
+    );
+
+    // The split never cost the cluster consistency.
+    set_convergence(&all, true)?;
+    wait_for(
+        Duration::from_secs(120),
+        "replicas converge after the forwarded writes",
+        || hashes_converged(&all),
+    );
+    Ok(())
+}
+
 /// (e3) A composite op survives a leadership change with a client-style
 /// retry and never half-applies: registration (control identity + status
 /// liveness) and job submit (control tables + status seed + a scheduler
-/// eval) are retried against the surviving nodes, every rejection is the
-/// actionable leader-hint error, and the end state has BOTH halves of each
-/// composite.
+/// eval) are retried against the surviving nodes, and the end state has
+/// BOTH halves of each composite. Registration rejections are the
+/// actionable leader-hint error; the submit may instead be ACCEPTED with a
+/// deferred status half (plan §8, D1), which the status leader's
+/// reconciler completes — the test drives that reconciler like the daemon
+/// does.
 #[test]
 fn composites_survive_a_leadership_change_without_half_applying() -> R<()> {
     let _serial = cluster_gate();
@@ -1733,11 +1835,19 @@ fn composites_survive_a_leadership_change_without_half_applying() -> R<()> {
 
     // Both composites landed on whichever survivor served them; mgr-b is a
     // replica, so wait for the effects to reach it before asserting on its
-    // view (the halves are asserted individually right below).
+    // view (the halves are asserted individually right below). The submit's
+    // status seed may have been DEFERRED (plan §8, D1 — the accepting node
+    // did not lead the status lane at that moment), so the wait also drives
+    // the status leader's reconciler the way the daemon's checker tick
+    // does; only the status leader's call does anything, the others reject
+    // and are ignored.
     wait_for(
         Duration::from_secs(90),
         "the retried composites' effects reach mgr-b",
         || {
+            for node in &survivors {
+                let _ = node.store().seed_missing_task_statuses();
+            }
             b.store()
                 .get_node("retry-node")
                 .map(|node| node.status == "ready")

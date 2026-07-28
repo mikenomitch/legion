@@ -146,8 +146,10 @@ impl ChannelPool {
     }
 
     /// Returns the pooled channel for `host_port`, creating it lazily.
-    /// Fails only on a malformed address.
-    fn get(&self, host_port: &str) -> Result<Channel, tonic::transport::Error> {
+    /// Fails only on a malformed address. Crate-visible: the driver's
+    /// lane-write forwarding (plan §8, D2) dials the lane leader through
+    /// the same pool.
+    pub(crate) fn get(&self, host_port: &str) -> Result<Channel, tonic::transport::Error> {
         let mut channels = self
             .channels
             .lock()

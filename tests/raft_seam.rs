@@ -154,6 +154,7 @@ const CLASSIFIED_MUTATIONS: &[&str] = &[
     "mark_nodes_as_lost",
     "prune_allocation_health_orphans",
     "prune_node_health_orphans",
+    "seed_missing_task_statuses",
     "seed_node_health",
     "seed_task_statuses",
     "set_node_lost_at",
@@ -179,6 +180,9 @@ const DELEGATED_BODIES: &[&str] = &[
     "complete_eval",
     "complete_eval_with_event",
     "request_job_restart",
+    // Plan §8 D1 reconciler: inlines its INSERT..SELECT closure and shares
+    // seed_task_statuses_apply's semantics (ON CONFLICT DO NOTHING seed).
+    "seed_missing_task_statuses",
 ];
 
 /// Public mutating methods that are deliberately NOT replicated — they route
@@ -296,6 +300,7 @@ fn lane_for(method: &str) -> Lane {
         | "mark_nodes_as_lost"
         | "prune_allocation_health_orphans"
         | "prune_node_health_orphans"
+        | "seed_missing_task_statuses"
         | "seed_node_health"
         | "seed_task_statuses"
         | "set_node_lost_at"
@@ -416,14 +421,26 @@ fn local_write_call_sites_match_the_exemption_list() {
     }
 }
 
+/// Ops proposed with a RUNTIME-chosen lane instead of a literal `Lane::…`.
+/// Legal only for writes confined to JC-28 commutative tables (any lane may
+/// carry the insert): `emit_event` picks a lane this node currently leads
+/// so standalone events are not silently dropped under divergent lane
+/// leadership (plan §8). An entry here must justify itself the same way —
+/// the capture-time ownership guard still rejects a non-commutative write
+/// proposed on the wrong lane, so this list is about classification
+/// coverage, not safety.
+const DYNAMIC_LANE_OPS: &[&str] = &["emit_event"];
+
 /// Every `replicated(Lane::…, "op", …)` call site agrees with the hardcoded
 /// lane classification, and every classified method has exactly such a call
 /// site — i.e. the classification is total over the replication seam.
+/// `DYNAMIC_LANE_OPS` are matched by op name with the lane check skipped.
 #[test]
 fn replicated_call_sites_match_classification() {
     let source = store_sources();
     let call_re =
         Regex::new(r#"replicated\(\s*Lane::(\w+),\s*"([a-z0-9_]+)""#).expect("valid regex");
+    let dynamic_re = Regex::new(r#"replicated\(\s*lane,\s*"([a-z0-9_]+)""#).expect("valid regex");
 
     let mut ops: BTreeMap<String, String> = BTreeMap::new();
     for caps in call_re.captures_iter(&source) {
@@ -446,7 +463,22 @@ fn replicated_call_sites_match_classification() {
         );
     }
 
-    let found: BTreeSet<&str> = ops.keys().map(String::as_str).collect();
+    let mut found: BTreeSet<&str> = ops.keys().map(String::as_str).collect();
+    for caps in dynamic_re.captures_iter(&source) {
+        let op = caps[1].to_string();
+        let known = DYNAMIC_LANE_OPS
+            .iter()
+            .find(|name| **name == op)
+            .copied()
+            .unwrap_or_else(|| {
+                panic!(
+                    "op `{op}` is proposed with a runtime lane but is not in \
+                     DYNAMIC_LANE_OPS; dynamic lanes are legal only for JC-28 \
+                     commutative writes"
+                )
+            });
+        found.insert(known);
+    }
     let expected: BTreeSet<&str> = CLASSIFIED_MUTATIONS.iter().copied().collect();
     let missing: BTreeSet<&str> = expected.difference(&found).copied().collect();
     let extra: BTreeSet<&str> = found.difference(&expected).copied().collect();

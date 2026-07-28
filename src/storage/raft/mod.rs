@@ -14,6 +14,7 @@
 
 pub(crate) mod capture;
 pub(crate) mod driver;
+pub(crate) mod forward;
 pub(crate) mod log_store;
 pub(crate) mod network;
 pub(crate) mod ownership;
@@ -138,6 +139,10 @@ pub(crate) struct RaftTransportRegistry {
     pub(crate) cluster_secret: String,
     pub(crate) lanes: HashMap<Lane, openraft::Raft<types::TypeConfig>>,
     pub(crate) join_handler: Option<Arc<dyn RaftJoinHandler>>,
+    /// Store handle for executing forwarded lane writes
+    /// (`ForwardLaneWrite`, plan §8 D2). `None` in transport-only bring-ups
+    /// (tests), where forwarding answers `Unimplemented`.
+    pub(crate) forward_store: Option<Store>,
 }
 
 impl RaftTransportRegistry {

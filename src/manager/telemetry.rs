@@ -736,6 +736,15 @@ pub struct TelemetryState {
     /// True when persistence runs in raft mode: readiness then additionally
     /// requires `raft_status()` to report a known leader.
     pub raft_required: bool,
+    /// When this node first observed the current lane-leadership divergence
+    /// (unix ms), or `0` while converged. Owned by the readiness probe: the
+    /// divergence grace window is measured from this timestamp, so it is
+    /// "how long has THIS split stood continuously" — immune to an
+    /// unrelated lane flapping its leader (which used to refresh the old
+    /// `election_epoch_ms`-based grace forever and mask a standing split as
+    /// ready), and it grants a full grace window after a manager restart
+    /// (where `election_epoch_ms` started at 0 and denied any grace).
+    pub diverged_since_ms: std::sync::Arc<std::sync::atomic::AtomicI64>,
 }
 
 /// Content type for the Prometheus text exposition format.
@@ -846,7 +855,9 @@ fn readiness(state: &TelemetryState) -> Result<Vec<String>, String> {
         match state.store.raft_status() {
             Some(status) => {
                 let now_ms = (OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64;
-                if let Some(reason) = raft_readiness_failure(&status, now_ms) {
+                let diverged_for_ms =
+                    observe_lane_divergence(&state.diverged_since_ms, &status, now_ms);
+                if let Some(reason) = raft_readiness_failure(&status, diverged_for_ms) {
                     return Err(with_lane_detail(reason, &status));
                 }
                 // Per-lane detail in the body on the healthy path too: an
@@ -878,16 +889,64 @@ fn readiness(state: &TelemetryState) -> Result<Vec<String>, String> {
 /// failover legitimately leaves the lanes split for a moment while the
 /// anchor leader's convergence loop reacquires them; that window must stay
 /// 200 or every failover would flap every load balancer. Beyond it, the
-/// split is not transient and cross-lane composites (registration, submit,
-/// destroy, node remove, joins) genuinely cannot complete on any node.
+/// split is standing, which is an abnormal leadership shape an operator
+/// should look at — even though the write path now degrades rather than
+/// dies (plan §8: submits are accepted by the control leader and completed
+/// by lane reconcilers, worker liveness is forwarded to the status leader).
 ///
 /// Note that convergence is BEST EFFORT (JC-40 correction, 2026-07-28): the
 /// anchor leader's campaign is a race raft's election safety can refuse
-/// forever, so this probe can legitimately stay `503` indefinitely. That is
-/// the intended signal — a standing split really does leave cross-lane
-/// operations with no home — not a transient to be waited out. See
+/// forever, so this probe can legitimately stay `503` indefinitely. See
 /// `docs/multi-raft.md`, "Lane leadership: co-located, best effort".
 const LANE_LEADER_DIVERGENCE_GRACE_MS: i64 = 10_000;
+
+/// Track how long the current lane-leadership divergence has stood, from
+/// this probe's own observations. Returns `Some(ms)` while diverged, `None`
+/// while converged (resetting the tracker).
+///
+/// "Diverged" is any not-fully-converged multi-lane shape: lanes led by
+/// different managers, or some lane leaderless while others are led. Both
+/// keep the timer running so a lane that flaps its leader (through elected
+/// and leaderless states) cannot re-grant the grace window to a standing
+/// split of the OTHER lanes — the defect in the previous
+/// `election_epoch_ms`-based grace, which any leader change refreshed. Only
+/// genuine convergence resets the clock. A restarted manager starts
+/// converged (tracker 0), so its first observed divergence gets the full
+/// grace window — the old scheme started at "no grace" after every restart
+/// and failed rolling restarts straight into 503.
+fn observe_lane_divergence(
+    diverged_since_ms: &std::sync::atomic::AtomicI64,
+    status: &crate::storage::persistence::RaftStatus,
+    now_ms: i64,
+) -> Option<i64> {
+    use std::sync::atomic::Ordering;
+    let converged = status.lanes.len() < 2 || {
+        let mut leaders = std::collections::BTreeSet::new();
+        let mut all_led = true;
+        for lane in &status.lanes {
+            match lane.leader_id.as_deref() {
+                Some(leader) => {
+                    leaders.insert(leader);
+                }
+                None => all_led = false,
+            }
+        }
+        all_led && leaders.len() == 1
+    };
+    if converged {
+        diverged_since_ms.store(0, Ordering::Relaxed);
+        return None;
+    }
+    let mut since = diverged_since_ms.load(Ordering::Relaxed);
+    if since == 0 {
+        // First observation of this divergence: the clock starts now. On a
+        // race between two probes the earlier store wins; either way the
+        // value is within one probe interval of the truth.
+        let _ = diverged_since_ms.compare_exchange(0, now_ms, Ordering::Relaxed, Ordering::Relaxed);
+        since = diverged_since_ms.load(Ordering::Relaxed);
+    }
+    Some(now_ms.saturating_sub(since))
+}
 
 /// Why raft state makes this manager NOT ready, if anything.
 ///
@@ -901,19 +960,13 @@ const LANE_LEADER_DIVERGENCE_GRACE_MS: i64 = 10_000;
 ///    lane's quorum (and with it all placement) was down (adversarial
 ///    finding, 2026-07-24);
 /// 3. every lane has a leader but they are DIFFERENT nodes, and have been
-///    for longer than [`LANE_LEADER_DIVERGENCE_GRACE_MS`] (JC-40). The
-///    aggregate summary string is non-empty in that state, so without this
-///    check `/readyz` read as healthy on every node of a cluster where no
-///    node could complete a cross-lane composite.
+///    for longer than [`LANE_LEADER_DIVERGENCE_GRACE_MS`] (JC-40).
 ///
-/// The grace window is measured from `election_epoch_ms` — the timestamp of
-/// the most recent per-lane leader change this node observed — so it is
-/// exactly "how long the current split has been standing still". A cluster
-/// that has never recorded a leader change (`0`) and is nevertheless split
-/// gets no grace: there is no in-flight election to wait for.
+/// `diverged_for_ms` comes from [`observe_lane_divergence`]: how long the
+/// current divergence has stood continuously, by this probe's own clock.
 fn raft_readiness_failure(
     status: &crate::storage::persistence::RaftStatus,
-    now_ms: i64,
+    diverged_for_ms: Option<i64>,
 ) -> Option<String> {
     if status.leader_id.is_none() {
         return Some("raft leader unknown".to_string());
@@ -936,15 +989,18 @@ fn raft_readiness_failure(
         .filter_map(|lane| lane.leader_id.as_deref())
         .collect();
     if status.lanes.len() > 1 && distinct.len() > 1 {
-        let split_for_ms = now_ms.saturating_sub(status.election_epoch_ms);
-        if status.election_epoch_ms > 0 && split_for_ms < LANE_LEADER_DIVERGENCE_GRACE_MS {
+        let split_for_ms = diverged_for_ms.unwrap_or(0);
+        if split_for_ms < LANE_LEADER_DIVERGENCE_GRACE_MS {
             // Brief post-election convergence: still ready.
             return None;
         }
         return Some(format!(
             "raft lane leadership has not converged for {}s: lanes are led by different \
-             managers ({}), so operations spanning lanes (worker registration, job submit, \
-             job destroy, node removal, cluster joins) cannot complete on any node",
+             managers ({}). Single-lane operations and reads are unaffected; job submits \
+             are accepted by the control leader and completed by lane reconcilers; worker \
+             liveness is forwarded — but scheduling latency is degraded and state backup \
+             is unavailable until leadership converges. Check `legion raft status` and \
+             restart the stray lane's leader if it is unhealthy",
             split_for_ms.max(0) / 1000,
             lane_leader_summary(status)
         ));
@@ -1039,16 +1095,17 @@ mod tests {
                 lane("status", Some("mgr-a")),
             ],
         };
-        let reason = raft_readiness_failure(&status, NOW_MS).expect("a leaderless lane must fail");
+        let reason =
+            raft_readiness_failure(&status, Some(NOW_MS)).expect("a leaderless lane must fail");
         assert!(reason.contains("scheduler"), "{reason}");
 
         // Every lane led by the SAME node (JC-40 steady state): ready.
         status.lanes[1].leader_id = Some("mgr-a".into());
         status.leader_id = Some("mgr-a".into());
-        assert_eq!(raft_readiness_failure(&status, NOW_MS), None);
+        assert_eq!(raft_readiness_failure(&status, None), None);
 
         status.leader_id = None;
-        assert!(raft_readiness_failure(&status, NOW_MS).is_some());
+        assert!(raft_readiness_failure(&status, None).is_some());
     }
 
     /// JC-40: lanes led by DIFFERENT managers are ready during the brief
@@ -1058,7 +1115,6 @@ mod tests {
     #[test]
     fn readiness_fails_when_lane_leadership_stays_diverged() {
         use crate::storage::persistence::{PersistenceRole, RaftLaneStatus, RaftStatus};
-        const NOW_MS: i64 = 1_000_000;
         let lane = |name: &str, leader: &str| RaftLaneStatus {
             lane: name.to_string(),
             role: PersistenceRole::Standby,
@@ -1085,8 +1141,7 @@ mod tests {
             voters: Vec::new(),
             learners: Vec::new(),
             peers: Vec::new(),
-            // An election one second ago: convergence is still in flight.
-            election_epoch_ms: NOW_MS - 1_000,
+            election_epoch_ms: 0,
             join_token_ttl_seconds: 0,
             raft_library: "openraft-0.9".into(),
             lanes: vec![
@@ -1095,15 +1150,15 @@ mod tests {
                 lane("status", "mgr-a"),
             ],
         };
+        // A split observed one second ago: convergence is still in flight.
         assert_eq!(
-            raft_readiness_failure(&status, NOW_MS),
+            raft_readiness_failure(&status, Some(1_000)),
             None,
             "a split within the grace window must stay ready"
         );
 
-        // The same split, standing still well past the grace window.
-        status.election_epoch_ms = NOW_MS - (LANE_LEADER_DIVERGENCE_GRACE_MS + 5_000);
-        let reason = raft_readiness_failure(&status, NOW_MS)
+        // The same split, standing continuously past the grace window.
+        let reason = raft_readiness_failure(&status, Some(LANE_LEADER_DIVERGENCE_GRACE_MS + 5_000))
             .expect("a persistent lane-leadership split must fail readiness");
         assert!(
             reason.contains("scheduler=mgr-b") && reason.contains("control=mgr-a"),
@@ -1112,7 +1167,7 @@ mod tests {
 
         // Converged onto one manager: ready again, regardless of age.
         status.lanes[1].leader_id = Some("mgr-a".into());
-        assert_eq!(raft_readiness_failure(&status, NOW_MS), None);
+        assert_eq!(raft_readiness_failure(&status, None), None);
 
         // Per-lane detail rides the body in both directions.
         let detail = lane_detail_lines(&status);
@@ -1121,6 +1176,91 @@ mod tests {
             detail[0].contains("lane control: leader mgr-a"),
             "{detail:?}"
         );
+    }
+
+    /// The divergence tracker measures how long the CURRENT divergence has
+    /// stood continuously, by this probe's own observations:
+    ///
+    /// - a fresh (restarted) manager grants the full grace window to the
+    ///   first divergence it sees (the old `election_epoch_ms` scheme
+    ///   started at "no grace" and failed rolling restarts straight into
+    ///   503);
+    /// - an unrelated lane flapping its leader — including through
+    ///   leaderless moments — must NOT reset the clock on a standing split
+    ///   (the old scheme refreshed the grace on any leader change, masking
+    ///   the split forever);
+    /// - genuine convergence resets it.
+    #[test]
+    fn divergence_tracker_measures_continuous_divergence() {
+        use crate::storage::persistence::{PersistenceRole, RaftLaneStatus, RaftStatus};
+        use std::sync::atomic::AtomicI64;
+        let lane = |name: &str, leader: Option<&str>| RaftLaneStatus {
+            lane: name.to_string(),
+            role: PersistenceRole::Standby,
+            leader_id: leader.map(str::to_string),
+            term: 1,
+            commit_index: 0,
+            applied_index: 0,
+            voters: 3,
+            quorum: 2,
+            survives: 1,
+            warning: None,
+        };
+        let mut status = RaftStatus {
+            enabled: true,
+            backend: "raft".into(),
+            node_id: "mgr-a".into(),
+            cluster_id: "legion-raft-test".into(),
+            role: PersistenceRole::Primary,
+            leader_id: Some("control=mgr-a,scheduler=mgr-b,status=mgr-a".into()),
+            term: 1,
+            commit_index: 0,
+            applied_index: 0,
+            lease_held: true,
+            voters: Vec::new(),
+            learners: Vec::new(),
+            peers: Vec::new(),
+            election_epoch_ms: 0,
+            join_token_ttl_seconds: 0,
+            raft_library: "openraft-0.9".into(),
+            lanes: vec![
+                lane("control", Some("mgr-a")),
+                lane("scheduler", Some("mgr-b")),
+                lane("status", Some("mgr-a")),
+            ],
+        };
+        let tracker = AtomicI64::new(0);
+        // Restart-fresh tracker: the first observation starts the clock at 0.
+        assert_eq!(
+            observe_lane_divergence(&tracker, &status, 100_000),
+            Some(0),
+            "the first observed divergence gets the full grace window"
+        );
+        // The split stands: the clock runs.
+        assert_eq!(
+            observe_lane_divergence(&tracker, &status, 108_000),
+            Some(8_000)
+        );
+        // The status lane flaps through a leaderless moment: still diverged,
+        // clock keeps running.
+        status.lanes[2].leader_id = None;
+        assert_eq!(
+            observe_lane_divergence(&tracker, &status, 111_000),
+            Some(11_000)
+        );
+        // It re-elects a DIFFERENT leader: still diverged, clock still runs.
+        status.lanes[2].leader_id = Some("mgr-c".into());
+        assert_eq!(
+            observe_lane_divergence(&tracker, &status, 115_000),
+            Some(15_000)
+        );
+        // Genuine convergence resets.
+        status.lanes[1].leader_id = Some("mgr-a".into());
+        status.lanes[2].leader_id = Some("mgr-a".into());
+        assert_eq!(observe_lane_divergence(&tracker, &status, 120_000), None);
+        // A later, new split starts a fresh clock.
+        status.lanes[1].leader_id = Some("mgr-b".into());
+        assert_eq!(observe_lane_divergence(&tracker, &status, 130_000), Some(0));
     }
 
     /// `single` topology reports one lane; a co-location check must never
@@ -1158,7 +1298,7 @@ mod tests {
                 warning: None,
             }],
         };
-        assert_eq!(raft_readiness_failure(&status, 1_000_000), None);
+        assert_eq!(raft_readiness_failure(&status, None), None);
         assert!(lane_detail_lines(&status).is_empty());
     }
 

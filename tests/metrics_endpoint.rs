@@ -206,6 +206,7 @@ async fn healthz_readyz_and_metrics_serve_on_ephemeral_port() -> R<()> {
     let addr = start_listener(TelemetryState {
         store,
         raft_required: false,
+        diverged_since_ms: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
     })
     .await?;
 
@@ -295,6 +296,7 @@ async fn readyz_returns_503_when_raft_leader_is_unknown() -> R<()> {
     let addr = start_listener(TelemetryState {
         store,
         raft_required: true,
+        diverged_since_ms: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
     })
     .await?;
 
