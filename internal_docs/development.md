@@ -46,6 +46,45 @@ mise run join --linux --count 3
 
 By default Linux workers connect to `http://192.168.64.1:4748` (the default `container` host gateway for the default network). If your setup differs, pass `--manager-addr`. Run `mise run join --help` for additional options (platform, custom manager address, container name prefix, startup log tail behavior, and forwarded join args).
 
+### Building a shipping binary (`--profile dist`)
+
+Use `--release` for local work and `--profile dist` for anything you hand to
+someone else:
+
+```bash
+cargo build --profile dist
+```
+
+The binary lands in `target/dist/legion` rather than `target/release/legion`.
+
+Legion ships as one binary that is manager, worker, CLI, and MCP server, and it
+is meant to run on small and edge machines, so size counts. The `dist` profile
+adds fat LTO, a single codegen unit, and symbol stripping on top of `release`,
+which is worth about 18 MB (measured on macOS arm64, ~520 crates in the
+lockfile):
+
+| Build | Size |
+| --- | --- |
+| `cargo build --release` | 43.7 MB |
+| `cargo build --profile dist` | **26.0 MB** |
+
+About half the saving is `strip` removing symbol tables and half is LTO
+collapsing dead code and duplicated generics across the dependency tree. For
+context, the same measurement run against other orchestrators: k3s is 81.5 MB,
+Nomad 150 MB, and a Kubernetes control-plane node (apiserver, controller
+manager, scheduler, kubelet, kube-proxy, etcd) is 341 MB.
+
+Two things to know before reaching for it:
+
+- **It is slow.** Fat LTO with `codegen-units = 1` cannot parallelize the final
+  link, so expect several minutes where `--release` takes about one. Don't put
+  it in an edit-compile-test loop.
+- **Stripped binaries don't symbolize.** Backtraces from a `dist` build lose
+  function names. Keep the unstripped artifact around if you need to debug a
+  crash report from a shipped build.
+
+The profile and the reasoning behind each setting live in `Cargo.toml`.
+
 ### Testing GRPC endpoints
 
 Can use this command to inspect them/test:

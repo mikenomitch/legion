@@ -355,6 +355,17 @@ this" work:
 - [ ] **Audit every name decision in depth.** Important, and gets harder the
       longer it waits.
 - [ ] Performance and scale: prove Legion scales better than K8s, and than Nomad
+- [x] **Binary size: ship a `dist` profile.** `cargo build --profile dist` (LTO +
+      `codegen-units = 1` + strip) takes the binary from 43.7 MB to 26.0 MB. See
+      "Building a shipping binary" in [development.md](development.md).
+- [ ] **Re-measure binary size on linux/amd64.** The 26 MB figure is macOS arm64;
+      Go binaries run 7-9% larger on amd64 and Legion has no cross-compile
+      target set up, so the shipping number is probably a bit higher.
+- [ ] **Decide whether the UI ships inside the binary.** `ui/` is served from
+      disk today, so the 26 MB is not comparable to Nomad (150 MB) or k3s
+      (81.5 MB), both of which embed their web assets. Embedding it is the
+      simpler operator story; it costs binary size on workers that never serve
+      a UI.
 
 ---
 
