@@ -880,6 +880,13 @@ fn readiness(state: &TelemetryState) -> Result<Vec<String>, String> {
 /// 200 or every failover would flap every load balancer. Beyond it, the
 /// split is not transient and cross-lane composites (registration, submit,
 /// destroy, node remove, joins) genuinely cannot complete on any node.
+///
+/// Note that convergence is BEST EFFORT (JC-40 correction, 2026-07-28): the
+/// anchor leader's campaign is a race raft's election safety can refuse
+/// forever, so this probe can legitimately stay `503` indefinitely. That is
+/// the intended signal — a standing split really does leave cross-lane
+/// operations with no home — not a transient to be waited out. See
+/// `docs/multi-raft.md`, "Lane leadership: co-located, best effort".
 const LANE_LEADER_DIVERGENCE_GRACE_MS: i64 = 10_000;
 
 /// Why raft state makes this manager NOT ready, if anything.

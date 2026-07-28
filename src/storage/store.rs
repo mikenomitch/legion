@@ -641,6 +641,27 @@ impl Store {
         Ok(())
     }
 
+    /// Test hook (lanes battery): how many JC-40 convergence campaigns this
+    /// node has issued for `lane` since its engine started.
+    ///
+    /// Convergence is best-effort and its campaigns bump raft terms, so the
+    /// battery asserts the BOUND on them directly (a handful per cooldown
+    /// window, per lane) rather than inferring it from term numbers, which
+    /// also move for reasons convergence does not control. Errors on
+    /// non-raft backends and for an unknown lane name; always `0` under
+    /// `single` topology and for the anchor lane, which is never campaigned
+    /// for.
+    pub fn raft_lane_campaigns(&self, lane: &str) -> R<u64> {
+        let lane = crate::storage::Lane::from_wire_name(lane)
+            .with_context(|| format!("unknown raft lane `{lane}`"))?;
+        Ok(self
+            .persistence_driver
+            .as_any()
+            .downcast_ref::<crate::storage::raft::driver::MultiRaftDriver>()
+            .context("raft_lane_campaigns requires the raft persistence backend")?
+            .lane_campaigns(lane))
+    }
+
     /// Test hook (lanes durability battery): process-global count of
     /// capture-time single-writer ownership-guard violations (JC-26) since
     /// process start — every changeset the guard found touching a table

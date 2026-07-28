@@ -184,8 +184,8 @@ pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
 /// The per-lane quorum lines of `legion raft status` (plan §7-C3): one line
 /// per active raft group — `voters N (quorum Q) — survives F failure(s)` —
 /// with a `⚠` + the plain-language advisory appended when the manager
-/// reports one (even voter count, or fewer voters than
-/// `raft.expectedVoters`). Under `single` topology the one control group's
+/// reports one (a membership change still in its joint configuration, an
+/// even voter count, or fewer voters than `raft.expectedVoters`). Under `single` topology the one control group's
 /// line carries no lane prefix; under `lanes` each line names its lane.
 fn quorum_lines(status: &crate::structs::RaftStatus) -> Vec<String> {
     status

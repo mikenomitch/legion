@@ -129,6 +129,23 @@ below `persistence.raft.expectedVoters`. The same fields ride the
 `GetRaftStatus` reply (`lanes[].voters/quorum/survives/warning`). See
 docs/multi-raft.md, "How many managers?".
 
+**Membership changes in flight.** A raft membership change lands in two
+steps — a *joint* configuration holding the old and the new voter sets,
+then the uniform new one — and a joint configuration needs a majority of
+**each** set to commit or elect. A lane caught in that window therefore
+reports the strictest set's `quorum`/`survives` (growing `{a,b}` to
+`{a,b,c}` says it survives **zero** failures, because it still needs both
+`a` and `b`) plus the advisory `membership change in flight: this lane is
+in a JOINT configuration …`. Do not remove or restart a manager while a
+lane shows it; if it does not clear, re-issue the join — membership
+changes are idempotent.
+
+The top-level `voters` list means **settled voter on every lane**: a
+manager appears there only once every lane carries it in a uniform
+membership. Under `topology: 'lanes'` that is deliberately stricter than
+any single lane's list, so the headline can never report a fault-tolerant
+cluster while one lane is still mid-join.
+
 ### History
 
 ```bash

@@ -259,11 +259,73 @@ an exhaustiveness test, and the transport multiplexes groups by
   whose rows leave its lane's ownership is rejected before proposal), plus
   a small commutative class of insert-only tables with globally unique
   keys. Snapshots are per-lane and table-scoped (below). Lane leadership
-  is deliberately **co-located**, not spread: the control lane is the
-  anchor and its leader campaigns for the other lanes, because composite
-  operations write two lanes and would half-fail under divergent
-  leadership. Divergence is safe but transient — composite halves are
-  rejected before capture with a leader hint and retried.
+  is deliberately **co-located**, not spread — see below.
+
+### Lane leadership: co-located, best effort
+
+Under `lanes`, Legion tries to keep **one manager leading all three lanes**.
+The reason is composite operations: registration writes control identity and
+status liveness, job submit writes control tables, a status seed *and* a
+scheduler-lane volume-claim sync. Each half is proposed from the node the
+client is talking to, so under divergent leadership a composite half-fails on
+whichever lane that node does not lead.
+
+The mechanism: the **control lane is the anchor**, and whichever node leads it
+campaigns for the lanes it does not lead. That is the only lever available —
+openraft 0.9 has no leader-transfer API, so a leader cannot be *handed* a lane,
+only *won*.
+
+**Convergence is therefore best effort, not an invariant.** A campaign is a
+race, and raft's election safety can refuse it forever — a node whose log for
+that lane is behind cannot win, and does not deserve to. What Legion
+guarantees instead:
+
+- **A lane always elects.** Convergence never campaigns for a lane that has
+  no leader. A leaderless lane is already holding an election on every
+  voter's own randomized timer, run by raft's real policy (leader lease,
+  and a deliberate extra delay for a node that has seen a longer log
+  elsewhere); an external campaign bypasses all of it, restarts this node's
+  own candidacy at a higher term, and — openraft 0.9 has no pre-vote — drags
+  every other voter's term up with it. Two campaigners on a three-voter
+  group with one member down never reach a quorum, so the term climbs and
+  nobody wins. A dead write path always outranks co-location, so
+  convergence stands aside.
+- **Disruption is bounded.** Campaigns for a strayed lane are per-lane,
+  spaced exponentially (2 → 16 election windows), and stop entirely after
+  three consecutive failures for a cooldown of 60 election windows, doubling
+  up to 480 for a lane this node keeps failing to take. Any win resets it.
+  A lane this node cannot take therefore costs the cluster a handful of raft
+  terms per cooldown rather than an unbounded climb, and raft's own
+  elections get long uninterrupted stretches. The stand-down is logged at
+  `warn` naming the lane and the cooldown.
+- **A campaign is skipped when it cannot win.** Before campaigning, the node
+  checks that the lane's log is not still streaming into it: a log that grew
+  since the previous check means this node is behind whoever it replicates
+  from. That is the only log-currency signal openraft exposes to a
+  non-leader — the authoritative test is the election itself, which is what
+  the backoff above scores.
+
+**What divergent leadership costs you.** It is safe, not free:
+
+- Composite operations that span the split cannot complete on **any** node
+  until leadership converges. Each half is rejected *before* its capture with
+  the typed non-leader error naming the lane and that lane's leader, so
+  nothing half-applies silently and every retry is idempotent — but a job
+  submit issued while the scheduler lane is led elsewhere fails on the
+  control leader (scheduler half) *and* on the scheduler leader (control
+  half). `/readyz` reports a standing split for exactly this reason: it
+  tolerates ~10s of post-election divergence and then returns `503`.
+- Scheduling work an acknowledged control-plane write would have enqueued is
+  re-derived from replicated state by the scheduler lane's leader on the
+  node-status-checker cadence, so it is delayed rather than lost.
+- Single-lane operations are unaffected: a lane keeps serving under its own
+  leader throughout.
+
+If a cluster sits split, the fix is the same as for any leadership problem:
+check `legion raft status` per lane, and if one lane's leader is unhealthy,
+restart it so its lane re-elects. Raising `electionTimeoutMinMs` /
+`electionTimeoutMaxMs` on loaded or WAN clusters also stretches the whole
+convergence schedule, which is derived from `electionTimeoutMaxMs`.
 
 ### Table ownership is a cluster-wide agreement
 
@@ -328,8 +390,10 @@ fresh-cluster operation.
   manager host** (default `<storePath>/backups/legion-state-backup-<ts>.sqlite`)
   and reports path, bytes, and the raft applied index it captures. Works
   in every persistence mode; in raft mode it runs only on the node that
-  **leads every lane** (leadership is co-located — anywhere else answers
-  `FAILED_PRECONDITION` naming that lane's leader).
+  **leads every lane** — anywhere else answers `FAILED_PRECONDITION` naming
+  that lane's leader. Under a standing lane split (convergence is best
+  effort, above) no node satisfies that, so back up after leadership has
+  converged.
 - **What the backup is, exactly.** A point-in-time image of *that node's*
   applied state — the whole database file, all lanes' tables, as of one
   wall-clock moment under an exclusive hold that excludes captures and
@@ -453,6 +517,10 @@ In priority order (plan §6):
    default and add per-lane snapshots.
 2. Lane-isolation benchmark, tuning profiles, diagnostics, UI verdict
    layer.
+2b. **Lane leadership convergence is best effort** (above): a lane whose
+   incumbent this node cannot beat stays where it is, and cross-lane
+   composites are unavailable while that lasts. A real fix needs a
+   leader-transfer API openraft 0.9 does not have.
 3. **Transport auth is a shared cluster secret**, not mTLS (JC-7 stopgap,
    consistent with the worker plane's tracked authn gap). Upgrades with
    the worker-mTLS work.

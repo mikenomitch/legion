@@ -1,10 +1,16 @@
 # Execution Plan: Real Durability + Operational Table Stakes
 
+> **Judgement calls:** [`calls/durability-and-ops-execution-plan_calls.md`](../calls/durability-and-ops-execution-plan_calls.md)
+
 > **Status:** EXECUTED (2026-07-23) — all phase-table rows (A-0..A-4,
 > B-0..B-3) are complete; execution-time judgment calls are logged in
 > §JC-16+. Remaining work is the §6 follow-ups (tracked in
-> `docs/NEXT_UP.md`). This document was the working plan for two
-> workstreams executed together on branch `claude/todos-xv56bj`:
+> `docs/NEXT_UP.md`). **Amended 2026-07-28:** §JC-40's co-located lane
+> leadership is corrected from an invariant to a best-effort property; see
+> the "CORRECTION (2026-07-28)" block in that section.
+>
+> This document was the working plan for two workstreams executed together on
+> branch `claude/todos-xv56bj`:
 >
 > - **Workstream A — Real durability:** make `persistence.type = raft` actually
 >   replicate manager state, executing the core of
@@ -613,72 +619,146 @@ tables + scheduler eval), and under divergent per-lane leadership each
 half-fails on the node that does not lead the other lane. Joins, `/readyz`,
 remove-member feasibility, and startup writes break the same way.
 **Decision:** the control lane is the anchor; whichever node leads it
-campaigns to acquire the other lanes, so one node leads all three in steady
-state. *This keeps the entire multi-raft win* — the isolation benefit comes
+campaigns to acquire the other lanes, so one node leads all three in the
+common case. *(See the 2026-07-28 correction below: this is BEST EFFORT, not
+an invariant — a campaign is a race raft may refuse forever, and convergence
+now stands aside entirely rather than disrupt an election.)*
+*This keeps the entire multi-raft win* — the isolation benefit comes
 from **independent logs, apply loops, and replication pipelines per write
 class** (a control-write burst cannot stall the scheduler's log), not from
 where leaders sit. Leader spreading was always the secondary benefit; it is
 the one that is incompatible with a shared SQLite state machine, so it goes.
-Divergent leadership remains *safe* (transiently, after an election) — it is
-merely converged away, and composite ops retry against the anchor.
+Divergent leadership remains *safe* — it is converged away where it can be,
+and composite ops retry against the anchor. Divergence that does NOT converge
+is a supported steady state whose cost is documented in
+`docs/multi-raft.md`.
 
 *As built:* `driver::ANCHOR_LANE` is `Lane::Control`, and
 `driver::lane_convergence_loop` is an ENGINE lifecycle task — one per node,
 spawned by `start_engine` only when the topology runs more than one group,
 so every store that runs lanes converges (embedded uses and the raft test
-batteries included, not just processes that start the manager daemon; the
-daemon's earlier convergence pass was removed in favour of it, and with it
-the tie between convergence latency and the node-status-checker cadence).
-The loop campaigns (`raft.trigger().elect()`) for every lane it does not
-already lead while this node leads the anchor, with exponential jittered
-backoff (500ms → 3s), stops campaigning the moment it is converged, and logs
-acquisitions at info once each (never per iteration). It deliberately does
-NOT force a remote lane leader to step down: openraft 0.9 has no
-leader-transfer API, so "forcing" would mean a side channel telling the
-remote leader to abdicate — two nodes acting on one lane, which under a
-stale anchor view degenerates into ping-pong or livelock, for zero gain
-(raft election safety already decides the race, and a campaigner whose log
-for that lane is behind *cannot* win, which is the outcome we want).
-Composite resilience while converging: every wrapper-sequential composite's
-second half is rejected BEFORE its capture with the typed `NotRaftLeader`
-leader hint (`execute_replicated`'s pre-capture leadership check), so a
-composite never half-applies silently, and every first half is idempotent on
-retry — `insert_node` (upsert + `INSERT OR REPLACE`), mark-ready/lost
-(upserts with `COALESCE`d `lost_at`) + `sync_node_availability` (UPDATE by
-id), `destroy_job` (three DELETE passes), `remove_node`
-(`remove_allocs_for_node` then DELETE). One gap was found and closed:
-`handle_job_submit` skipped its status-lane `seed_task_statuses` on the
-`Unchanged` outcome, so a client retry after a rejected status half (the
-retry re-submits the identical config, which reports `Unchanged`) left the
-composite half-applied *forever* — no later submit of that config ever
-reports Created/Updated again. The seed now runs for every outcome; it is
-`ON CONFLICT DO NOTHING`, and JC-26's empty-changeset skip keeps a
-steady-state resubmit off the raft log entirely
-(`store::tests::an_unchanged_resubmit_reseeds_missing_task_statuses`). The
-RPC-level submit tail (`run_job`'s eval enqueue) keeps
-`regenerate_scheduling_evals` as its safety net per JC-41. `/readyz`
-(`telemetry::raft_readiness_failure`) now fails while per-lane leaders
-DISAGREE for longer than a 10s grace measured from `election_epoch_ms` —
-brief post-election convergence stays 200, a standing split does not, and
-the body carries a `lane <name>: leader <node> (this node: <role>)` line per
-lane on both paths (the aggregate leader summary is a non-empty split string
-in that state, so it could never be what readiness reads). The Join handler
-requires anchor-lane leadership up front and rejects otherwise with the
-control leader's hint (the joiner's retry loop treats
-`FailedPrecondition` as retryable), then retries each lane's
-learner-add/promotion inside a 20s convergence window and verifies the
-joiner is a VOTER on every lane before reporting success — membership can no
-longer half-apply across lanes. `remove-member`'s quorum-feasibility guard
-evaluates EVERY lane (per-lane membership legitimately differs mid-join or
-after a partial removal) and refuses outright if the removing node does not
-lead every lane. Proofs: `tests/raft_lanes.rs` (e1) co-location after
-bring-up and reconvergence after a deliberate split, (e2) reconvergence onto
-a survivor after the all-lane leader is killed, (e3) registration and job
-submit driven through a leadership change with client-style retry with both
-halves asserted present, (e4) a fourth node joining mid-convergence becoming
-a voter on all three lanes; the leadership-INDEPENDENCE test suspends
-convergence through the `Store::raft_set_lane_convergence` test hook, since
-divergence is exactly what it needs to observe.
+batteries included, not just processes that start the manager daemon).
+
+**CORRECTION (2026-07-28): co-location is BEST EFFORT, not an invariant.**
+The paragraph this replaces said the anchor leader "campaigns … until one
+node leads all three", which reads as a state the cluster always reaches. It
+is not one, and it cannot be: openraft 0.9 has no leader-transfer API, so the
+only lever is `Raft::trigger().elect()`, and a campaign is a *race* raft's
+election safety may refuse forever. Worse, the original loop's campaigns were
+actively harmful in the one case that matters. Evidence, from a 2-core runner
+reproduction with openraft tracing on
+(`killing_the_all_lane_leader_reconverges_onto_one_survivor`): the status lane
+sat leaderless for the full 210s timeout at term 132, applied index frozen at
+5, with the two survivors' logs IDENTICAL — the campaigns were not losing on
+log currency, they were restarting the node's own candidacy faster than the
+election could finish and dragging the other survivor's term along.
+
+Three facts from the openraft 0.9 source drove the redesign:
+
+1. `RaftCore::handle_tick_election` already campaigns on **every** non-leader
+   voter, candidates included, once its randomized timer expires. A
+   leaderless lane therefore needs no help from convergence — this node is
+   already campaigning for it.
+2. That tick applies raft's real policy: it defers behind a committed leader
+   lease, and adds `smaller_log_timeout` (2x `election_timeout_max`) whenever
+   a vote response revealed a longer log elsewhere (`Engine::set_greater_log`).
+3. `ExternalCommand::Elect` — what `trigger().elect()` sends — calls
+   `Engine::elect()` **directly**, bypassing all of it. No log check, no lease
+   check, no deference to an election in flight.
+
+So the loop was strictly more aggressive than any natural election, on the
+exact lane that could least afford it. What ships instead is a per-lane
+governor (`LaneConvergeGovernor`, a pure state machine over sampled metrics
+so the properties are unit-testable against a fake clock):
+
+- **Never campaign for a leaderless lane.** This is the invariant that makes
+  convergence unable to break a lane: an unreachable lane is a dead write
+  path, which always outranks co-location. Only a lane with a settled leader
+  ELSEWHERE is campaigned for, where a campaign is an optimization and losing
+  it costs nothing the cluster did not already have.
+- **Bounded disruption.** Per-lane exponential backoff (2 → 16 election
+  windows), a verdict window before the next attempt so a campaign is never
+  re-issued before the previous one is decided, a stand-down after three
+  consecutive losses for 60 election windows, and that stand-down doubling up
+  to 480 windows for a lane this node keeps failing to take. Any win resets
+  everything. Every duration is a multiple of `raft.electionTimeoutMaxMs`, so
+  raising the documented remedy for loaded/WAN/CI clusters stretches the
+  whole schedule with it.
+- **Skip a campaign that cannot win.** A lane whose log is still streaming
+  into this node means this node is behind whoever it replicates from; hold.
+  That is the only log-currency signal openraft 0.9 gives a non-leader
+  (`RaftMetrics` carries this node's own `last_log_index`; the replication
+  match view exists only on that group's leader). The authoritative test is
+  the election itself, which the backoff scores.
+- **Campaigns are counted** per lane and exposed as `Store::raft_lane_campaigns`
+  so the battery asserts the bound directly instead of inferring it from raft
+  terms.
+
+*Root cause of the reproduction, which was NOT the convergence loop:* the
+harness's `start_cluster` declared bring-up complete off
+`raft_status().voters`, which read the **anchor lane's** voter list, and then
+killed the leader — while the third node's join was still promoting it on the
+status lane. openraft applies a membership change as joint-then-uniform and
+`voter_ids()` reports the incoming member from the joint step onwards, so both
+the readiness gate and the join's own `wait_until_voter_on_every_lane` check
+passed on a lane still in `[{a,b},{a,b,c}]`. That joint config needs a majority
+of **each** config, i.e. both `a` and `b`; killing `a` cost the status lane its
+write path permanently, and the 132 terms were two survivors and a convergence
+loop failing at an election that was arithmetically impossible. Three fixes:
+`lane_membership_settled` requires a UNIFORM membership, `wait_until_voter_on_every_lane`
+uses it, `raft_status().voters` now means "settled voter on EVERY lane", and a
+lane in a joint config reports the strictest config's `quorum`/`survives` plus
+a plain-language advisory instead of the union's flattering numbers.
+
+The loop still deliberately does NOT force a remote lane leader to step down:
+openraft 0.9 has no leader-transfer API, so "forcing" would mean a side channel
+telling the remote leader to abdicate — two nodes acting on one lane, which
+under a stale anchor view degenerates into ping-pong, for zero gain (the
+campaign that follows the abdication is the same campaign we already issue).
+
+Composite resilience while lanes diverge — unchanged, and now the load-bearing
+half of the design rather than a transient nicety: every wrapper-sequential
+composite's second half is rejected BEFORE its capture with the typed
+`NotRaftLeader` leader hint (`execute_replicated`'s pre-capture leadership
+check), so a composite never half-applies silently, and every first half is
+idempotent on retry — `insert_node` (upsert + `INSERT OR REPLACE`),
+mark-ready/lost (upserts with `COALESCE`d `lost_at`) + `sync_node_availability`
+(UPDATE by id), `destroy_job` (three DELETE passes), `remove_node`
+(`remove_allocs_for_node` then DELETE). `handle_job_submit` runs its status
+seed and its scheduler-lane volume-claim sync for EVERY outcome, `Unchanged`
+included, so a client retry after a rejected half can still complete the
+composite. The honest cost, now documented publicly: a composite that spans a
+split has no home on ANY node until leadership converges — a submit fails on
+the control leader (scheduler half) and on the scheduler leader (control half)
+— and the RPC-level submit tail's eval enqueue is recovered by
+`regenerate_scheduling_evals` on the scheduler lane's leader (JC-41's safety
+net, exercised by `tests/raft_lanes.rs::lanes_that_settle_on_different_leaders_stay_correct`).
+`/readyz` (`telemetry::raft_readiness_failure`) fails while per-lane leaders
+DISAGREE for longer than a 10s grace measured from `election_epoch_ms` — brief
+post-election convergence stays 200, a standing split does not, and the body
+carries a `lane <name>: leader <node> (this node: <role>)` line per lane on
+both paths. The Join handler requires anchor-lane leadership up front and
+rejects otherwise with the control leader's hint, then retries each lane's
+learner-add/promotion inside a 20s convergence window and verifies the joiner
+is a SETTLED voter on every lane before reporting success. `remove-member`'s
+quorum-feasibility guard evaluates EVERY lane and refuses outright if the
+removing node does not lead every lane.
+
+Proofs: `tests/raft_lanes.rs` (e1) convergence after a deliberate split, where
+the anchor demonstrably CAN win, plus a bound on the campaigns it took; (e2)
+after the all-lane leader is killed, every lane elects a surviving leader
+(required) and co-location is accepted either way (best effort) with the
+cross-lane composites asserted to complete without half-applying and the
+campaign count asserted bounded; (e3) composites driven through a leadership
+change with client-style retry with both halves asserted present; (e4) a
+fourth node joining mid-convergence becoming a voter on all three lanes;
+(e5) `lanes_that_settle_on_different_leaders_stay_correct` holds a permanent
+split and pins the typed rejections from both sides, the intact halves, the
+eval safety net, and the healed retry. The leadership-INDEPENDENCE test
+suspends convergence through the `Store::raft_set_lane_convergence` test hook,
+since divergence is exactly what it needs to observe. The governor's own
+properties (never campaign into an election; bounded, escalating stand-downs;
+the catching-up hold) are unit tests in `driver.rs` against a fake clock.
 
 **JC-41 — Evals go back into Raft (reverses JC-27).** JC-27 made the eval
 queue leader-local, reasoning that evals are regenerable. The skeptics

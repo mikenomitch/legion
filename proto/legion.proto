@@ -2443,7 +2443,18 @@ message RaftStatus {
   // True when this manager currently owns write leadership/fencing.
   bool lease_held = 10;
 
-  // Current voting members.
+  // Current voting members: managers that are SETTLED voters on every
+  // active lane.
+  //
+  // A raft membership change lands in two steps — a joint configuration
+  // holding the old and the new voter sets, then the uniform new one — and
+  // raft reports an incoming member as a voter from the joint step onwards.
+  // This field deliberately does not: a manager appears here only once every
+  // lane carries it in a UNIFORM membership, so the headline can never
+  // report a fault-tolerant cluster while one lane is still mid-join (a lane
+  // left joint still needs a majority of the OLD voter set). Under
+  // `topology = "lanes"` this is therefore stricter than any single lane's
+  // voter list; per-lane detail is in `lanes`.
   repeated string voters = 11;
 
   // Current learner/non-voting members.
@@ -2492,23 +2503,35 @@ message RaftLaneStatus {
   uint64 applied_index = 6;
 
   // Number of voting members of this lane's raft group, as known locally.
+  // While a membership change is in flight this is the UNION across the
+  // joint configuration's voter sets, so read `quorum`/`survives` — not this
+  // count — for what the lane can actually tolerate.
   uint64 voters = 7;
 
   // Majority (quorum) size required to commit on this lane:
   // `voters / 2 + 1`. With quorum lost, writes stall but local reads keep
-  // serving.
+  // serving. While the lane's membership is JOINT (a change in flight) this
+  // is the largest majority across the joint configuration's voter sets,
+  // because a joint configuration must be agreed by a majority of each.
   uint64 quorum = 8;
 
   // Voter failures this lane can survive while still committing:
   // `(voters - 1) / 2`. Zero for one- and two-voter groups — an even voter
-  // count adds a manager without adding fault tolerance.
+  // count adds a manager without adding fault tolerance. While the lane's
+  // membership is JOINT this is the SMALLEST such number across the joint
+  // configuration's voter sets: growing `{a,b}` to `{a,b,c}` reports `0`
+  // while the change is in flight, because the lane still needs both `a` and
+  // `b`.
   uint64 survives = 9;
 
-  // Plain-language advisory when the voter count is unhealthy: even parity
-  // (e.g. "2 voters need both alive to commit — this cluster survives zero
-  // failures. Use 1, 3, or 5 voters; add one more manager or remove one.")
-  // and/or fewer voters than `persistence.raft.expectedVoters`. Absent when
-  // the count is healthy.
+  // Plain-language advisory when this lane's membership is unhealthy: a
+  // membership change still in its JOINT configuration (e.g. "membership
+  // change in flight: this lane is in a JOINT configuration [a, b] +
+  // [a, b, c] and needs a majority of EVERY listed config to commit or
+  // elect …"), even voter parity (e.g. "2 voters need both alive to commit —
+  // this cluster survives zero failures. Use 1, 3, or 5 voters; add one more
+  // manager or remove one.") and/or fewer voters than
+  // `persistence.raft.expectedVoters`. Absent when the lane is healthy.
   optional string warning = 10;
 }
 

@@ -87,7 +87,8 @@ writes — `docs/multi-raft.md`), the engine's live metrics stream backs:
 - `/readyz`: in raft mode readiness additionally requires a known leader —
   under `topology = "lanes"`, on every lane, and the same manager on all of
   them once a ~10s post-election grace window has passed (lane leadership is
-  co-located; see docs/metrics.md).
+  co-located, best effort; see docs/metrics.md and
+  docs/multi-raft.md § "Lane leadership").
 
 Of the `legion_raft_*` Prometheus prefix, `legion_raft_voters{lane}` and
 `legion_raft_quorum{lane}` are emitted (voter-count checks); the rest

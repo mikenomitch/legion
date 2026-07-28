@@ -160,46 +160,44 @@ const MAX_PAYLOAD_ENTRIES: u64 = 32;
 /// node remove) and the lane the Join handler must run on.
 pub(crate) const ANCHOR_LANE: Lane = Lane::Control;
 
-/// Convergence campaign backoff (JC-40): the first campaign for a stray
-/// lane fires ~immediately, then backs off exponentially (jittered) to
-/// [`lane_converge_backoff_max`]. The jitter matters even though only ONE
-/// node campaigns: it decorrelates the campaign from the incumbent's own
-/// election timer, so a campaigner that keeps losing (its log for that lane
-/// is behind) does not resonate with the lane's election timeout.
-const LANE_CONVERGE_BACKOFF_MIN: Duration = Duration::from_millis(500);
-/// Floor for the convergence backoff ceiling — the historical value, which
-/// is what [`lane_converge_backoff_max`] yields at the default election
-/// timing.
-const LANE_CONVERGE_BACKOFF_MAX_FLOOR: Duration = Duration::from_secs(3);
-/// The convergence backoff ceiling must stay comfortably ABOVE the follower
-/// leader lease, which openraft derives from `election_timeout_max`.
+/// Convergence campaign timing (JC-40), expressed in **election windows** —
+/// multiples of the configured `raft.electionTimeoutMaxMs`, which is also
+/// openraft's follower leader lease and the unit every natural election is
+/// measured in. Scaling with that knob is deliberate: raising it is the
+/// documented remedy for loaded managers, WAN links and CI, and a schedule
+/// in fixed milliseconds would silently start campaigning *inside* the lease
+/// the moment an operator applied that remedy.
 ///
-/// A campaign issued while the incumbent's lease is still live cannot win —
-/// followers will not grant their votes — but it is NOT free: openraft 0.9
-/// has no pre-vote, so the campaign's higher term makes the incumbent step
-/// down anyway. Campaigning faster than the lease therefore produces
-/// exactly the leadership flapping convergence exists to remove, and the
-/// lane never settles. 2.5x is the ratio the hardcoded 3s ceiling had
-/// against the default 1200 ms lease.
-const LANE_CONVERGE_BACKOFF_LEASE_MULTIPLE: u32 = 5;
+/// Spacing before the FIRST campaign for a lane that has strayed, and the
+/// floor the per-lane exponential backoff starts from.
+const LANE_CONVERGE_BACKOFF_MIN_WINDOWS: u32 = 2;
+/// Ceiling on the per-lane campaign backoff: 2 → 4 → 8 → 16 windows.
+const LANE_CONVERGE_BACKOFF_MAX_WINDOWS: u32 = 16;
+/// How long a campaign has to make this node the lane's leader before it is
+/// scored as LOST. One full election window plus slack: a campaign that has
+/// not won by then lost the race (or the incumbent refused to yield), and
+/// re-issuing it before the verdict would only discard the votes the first
+/// one collected.
+const LANE_CONVERGE_VERDICT_WINDOWS: u32 = 2;
+/// Consecutive lost campaigns before this node stands DOWN from converging
+/// the lane at all for [`LANE_CONVERGE_COOLDOWN_WINDOWS`].
+const LANE_CONVERGE_MAX_CAMPAIGNS: u32 = 3;
+/// The stand-down window. Deliberately enormous next to an election window
+/// (60x) — the point is that a lane whose convergence keeps failing gets
+/// long, *uninterrupted* stretches in which raft's own randomized elections
+/// run without a single foreign term bump, on hardware far slower than the
+/// box the timings were chosen on.
+const LANE_CONVERGE_COOLDOWN_WINDOWS: u32 = 60;
+/// How many times the stand-down window may DOUBLE for a lane this node
+/// keeps failing to take (60 → 480 election windows). A lane that refuses
+/// convergence three times over is telling us its incumbent is the better
+/// leader; further campaigns are pure term inflation on a lane that serves
+/// fine, so they get rarer and rarer. Any win resets it.
+const LANE_CONVERGE_COOLDOWN_MAX_DOUBLINGS: u32 = 3;
 
-/// The convergence backoff ceiling for a given configured
-/// `election_timeout_max`.
-///
-/// This MUST scale with the configured election timing rather than stay a
-/// constant: raising `raft.electionTimeoutMaxMs` is the documented remedy
-/// for loaded managers, WAN links and CI, and against a fixed 3s ceiling
-/// that remedy would silently break lane convergence — the campaigns would
-/// start landing inside the (now longer) lease. See
-/// [`LANE_CONVERGE_BACKOFF_LEASE_MULTIPLE`].
-fn lane_converge_backoff_max(election_timeout_max_ms: u64) -> Duration {
-    let scaled =
-        Duration::from_millis(election_timeout_max_ms) * LANE_CONVERGE_BACKOFF_LEASE_MULTIPLE / 2;
-    scaled.max(LANE_CONVERGE_BACKOFF_MAX_FLOOR)
-}
-/// Poll cadence while there is nothing to converge (this node does not lead
-/// the anchor, or it already leads every lane). Cheap: one metrics-watch
-/// borrow per lane, no I/O.
+/// Poll cadence of the convergence loop. Cheap: one metrics-watch borrow per
+/// lane, no I/O. The campaign SCHEDULE lives in the per-lane governor, not in
+/// this interval.
 const LANE_CONVERGE_IDLE_POLL: Duration = Duration::from_millis(500);
 
 /// How long a join's per-lane membership change waits for the anchor
@@ -697,6 +695,11 @@ pub(crate) struct MultiRaftDriver {
     /// `true`). Only the lanes battery's leadership-independence test flips
     /// it — see [`MultiRaftDriver::set_lane_convergence`].
     lane_convergence: Arc<std::sync::atomic::AtomicBool>,
+    /// Convergence campaigns this node has issued per lane since the engine
+    /// started (JC-40). Exposed through `Store::raft_lane_campaigns` so the
+    /// lanes battery can assert the bound on term inflation directly rather
+    /// than inferring it from raft terms.
+    lane_campaigns: Arc<StdMutex<HashMap<Lane, u64>>>,
 }
 
 impl std::fmt::Debug for MultiRaftDriver {
@@ -732,6 +735,7 @@ impl MultiRaftDriver {
             history: Arc::new(StdMutex::new(HistoryState::new())),
             election_epoch_ms: Arc::new(AtomicI64::new(0)),
             lane_convergence: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            lane_campaigns: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
 
@@ -939,6 +943,17 @@ impl MultiRaftDriver {
     pub(crate) fn set_lane_convergence(&self, enabled: bool) {
         self.lane_convergence
             .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Convergence campaigns issued for `lane` since the engine started
+    /// (see `Store::raft_lane_campaigns`). `0` under `single` topology and
+    /// for the anchor lane, which is never campaigned for.
+    pub(crate) fn lane_campaigns(&self, lane: Lane) -> u64 {
+        self.lane_campaigns
+            .lock()
+            .ok()
+            .and_then(|counts| counts.get(&lane).copied())
+            .unwrap_or(0)
     }
 
     /// Test hook (see `Store::raft_trigger_lane_election`): trigger an
@@ -1434,85 +1449,287 @@ fn leads(raft: &Raft) -> bool {
     raft.metrics().borrow().state == ServerState::Leader
 }
 
-/// Whether this lane currently has a settled leader (anywhere in the
-/// cluster). `false` means an election is in progress — see
-/// [`lanes_needing_convergence`] for why that must not be campaigned into.
-fn has_leader(raft: &Raft) -> bool {
-    raft.metrics().borrow().current_leader.is_some()
+/// The campaign schedule, derived from the configured election window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LaneConvergeTiming {
+    /// Backoff floor / spacing before the first campaign.
+    min_backoff: Duration,
+    /// Backoff ceiling.
+    max_backoff: Duration,
+    /// How long a campaign has to win before it is scored as lost.
+    verdict: Duration,
+    /// Stand-down window after [`Self::max_campaigns`] lost campaigns.
+    cooldown: Duration,
+    /// Consecutive lost campaigns before standing down.
+    max_campaigns: u32,
 }
 
-/// Which lanes this node should campaign for, given whether it leads the
-/// anchor lane and the current per-lane leadership of every OTHER lane.
-///
-/// Only the anchor-lane leader acts (one convergence authority — two nodes
-/// campaigning for the same lane would ping-pong it), and it never
-/// campaigns for a lane it already leads.
-///
-/// # Why a LEADERLESS lane is DEFERRED rather than campaigned for at once
-///
-/// A lane is leaderless exactly when an election is already under way,
-/// which means another node is already campaigning on its own randomized
-/// election timer. Raft breaks split votes by decorrelating those timers;
-/// the convergence loop campaigns on its own backoff schedule instead, so
-/// campaigning immediately defeats that decorrelation. With three voters
-/// and one dead, quorum is both survivors: if both campaign, each votes
-/// for itself, NEITHER reaches quorum, the term increments, and it repeats.
-/// openraft 0.9 has no pre-vote, so every doomed campaign also disrupts the
-/// other node's in-flight election. That is an outright livelock — observed
-/// in `killing_the_all_lane_leader_reconverges_onto_one_survivor` as two
-/// survivors stuck at scheduler term 223 / status term 277 with applied
-/// indices frozen for the full 210s timeout.
-///
-/// The fix is to give raft's own election FIRST refusal, not to abandon the
-/// lane: `leaderless_grace_elapsed` says the lane has been leaderless for
-/// longer than a full election window, so the natural election has had its
-/// chance and did not settle. Skipping such a lane forever is also wrong —
-/// when the anchor leader is the node with the up-to-date log for that
-/// lane, its campaign is the only thing that CAN restore the lane, and
-/// declining to run it deadlocks just as hard (one node campaigning
-/// endlessly while the only viable winner sits out).
-///
-/// So: a strayed lane (settled leader elsewhere) is pulled immediately; a
-/// leaderless one is pulled only after the grace window.
-fn lanes_needing_convergence(leads_anchor: bool, lanes: &[LaneConvergenceState]) -> Vec<Lane> {
-    if !leads_anchor {
-        return Vec::new();
+impl LaneConvergeTiming {
+    fn for_election_timeout(election_timeout_max_ms: u64) -> Self {
+        let window = Duration::from_millis(election_timeout_max_ms.max(1));
+        Self {
+            min_backoff: window * LANE_CONVERGE_BACKOFF_MIN_WINDOWS,
+            max_backoff: window * LANE_CONVERGE_BACKOFF_MAX_WINDOWS,
+            verdict: window * LANE_CONVERGE_VERDICT_WINDOWS,
+            cooldown: window * LANE_CONVERGE_COOLDOWN_WINDOWS,
+            max_campaigns: LANE_CONVERGE_MAX_CAMPAIGNS,
+        }
     }
-    lanes
-        .iter()
-        .filter(|state| !state.led_here && (state.has_leader || state.leaderless_grace_elapsed))
-        .map(|state| state.lane)
-        .collect()
 }
 
-/// One lane's convergence-relevant state, as seen by the anchor leader.
-#[derive(Debug, Clone, Copy)]
-struct LaneConvergenceState {
-    lane: Lane,
-    /// This node currently leads the lane.
+/// `base` scaled by `factor`, floored at 1ms.
+fn scaled(base: Duration, factor: f64) -> Duration {
+    Duration::from_secs_f64((base.as_secs_f64() * factor).max(0.001))
+}
+
+/// ±25% jitter for the campaign schedule. A free function (never inlined
+/// into the async loop) so no `ThreadRng` lives across an await point.
+fn campaign_jitter() -> f64 {
+    rand::thread_rng().gen_range(0.75..=1.25)
+}
+
+/// One lane's convergence-relevant state, sampled from openraft metrics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LaneObservation {
+    /// This node leads the lane.
     led_here: bool,
-    /// The lane has a settled leader somewhere in the cluster.
+    /// SOME node — possibly this one — currently leads the lane. `false`
+    /// means an election is in flight somewhere in the cluster.
     has_leader: bool,
-    /// The lane has been leaderless for longer than a full election window,
-    /// so raft's own randomized election has had its chance to settle it.
-    leaderless_grace_elapsed: bool,
+    /// This node's last log index on the lane. Used only to notice that the
+    /// lane's log is still streaming in.
+    last_log_index: u64,
 }
 
-/// How long a lane must sit leaderless before the convergence loop will
-/// campaign for it — long enough that a natural, randomized election would
-/// normally have completed. See [`lanes_needing_convergence`].
-fn leaderless_grace(election_timeout_max_ms: u64) -> Duration {
-    Duration::from_millis(election_timeout_max_ms) * 2
+impl LaneObservation {
+    fn sample(raft: &Raft) -> Self {
+        let watch = raft.metrics();
+        let metrics = watch.borrow();
+        Self {
+            led_here: metrics.state == ServerState::Leader,
+            has_leader: metrics.current_leader.is_some(),
+            last_log_index: metrics.last_log_index.unwrap_or(0),
+        }
+    }
 }
 
-/// `base` ± up to 50%, floored at 1ms. Kept a free function (not inlined
-/// into the async loop) so no `ThreadRng` ever lives across an await point.
-fn jittered(base: Duration) -> Duration {
-    let base_ms = (base.as_millis() as u64).max(1);
-    let spread = base_ms / 2;
-    let low = base_ms.saturating_sub(spread).max(1);
-    let high = base_ms.saturating_add(spread);
-    Duration::from_millis(rand::thread_rng().gen_range(low..=high))
+/// What the governor decided about one lane this tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LaneConvergeAction {
+    /// Issue a campaign for the lane now.
+    Campaign,
+    /// Leave the lane alone, and why.
+    Hold(LaneConvergeHold),
+}
+
+/// Why a lane was left alone. Carried so the reason can be logged and, more
+/// importantly, asserted in unit tests — "did not campaign" is only useful
+/// evidence when the reason is pinned down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LaneConvergeHold {
+    /// This node does not lead the anchor lane, so it is not the
+    /// convergence authority (two campaigners would ping-pong the lane).
+    NotAnchorLeader,
+    /// Nothing to do — this node already leads the lane.
+    Converged,
+    /// A campaign this node issued has not been decided yet.
+    CampaignInFlight,
+    /// The lane has NO leader. See [`LaneConvergeGovernor::decide`].
+    NaturalElection,
+    /// The lane's log is still streaming into this node, so this node is
+    /// demonstrably behind whoever it replicates from and cannot win.
+    CatchingUp,
+    /// Waiting out the per-lane exponential backoff.
+    Backoff,
+    /// Stood down after repeated lost campaigns.
+    CoolingDown,
+}
+
+/// The per-lane campaign governor: the whole convergence policy, as a pure
+/// state machine over sampled metrics so it can be unit-tested against a
+/// fake clock.
+#[derive(Debug)]
+struct LaneConvergeGovernor {
+    /// Consecutive campaigns that did not take the lane.
+    lost: u32,
+    /// Current spacing between campaigns.
+    backoff: Duration,
+    /// Earliest instant the next campaign may be issued.
+    next_campaign_at: Option<Instant>,
+    /// While set and unexpired: no campaign is issued for this lane at all.
+    cooldown_until: Option<Instant>,
+    /// Deadline by which the campaign this node last issued must have made
+    /// it the lane's leader, or the campaign is scored as lost.
+    verdict_due: Option<Instant>,
+    /// The previous tick's log index, to notice a log still catching up.
+    prev_log_index: Option<u64>,
+    /// Consecutive stand-downs, which lengthen the next cooldown. A lane
+    /// this node keeps failing to take should be tried ever more rarely:
+    /// the cluster is telling us the incumbent is the better leader, and
+    /// every further campaign is pure term inflation on a lane that is
+    /// serving fine.
+    stand_downs: u32,
+    /// Campaigns issued for this lane since the engine started.
+    campaigns: u64,
+    /// Latched for one tick when the lane just stood down, so the loop logs
+    /// it once at warn instead of once per iteration.
+    stood_down: bool,
+}
+
+impl LaneConvergeGovernor {
+    fn new(timing: LaneConvergeTiming) -> Self {
+        Self {
+            lost: 0,
+            backoff: timing.min_backoff,
+            next_campaign_at: None,
+            cooldown_until: None,
+            verdict_due: None,
+            prev_log_index: None,
+            stand_downs: 0,
+            campaigns: 0,
+            stood_down: false,
+        }
+    }
+
+    /// The lane is held (or was taken): clear the whole schedule.
+    fn settle(&mut self, timing: LaneConvergeTiming) {
+        self.lost = 0;
+        self.backoff = timing.min_backoff;
+        self.next_campaign_at = None;
+        self.cooldown_until = None;
+        self.verdict_due = None;
+        self.stand_downs = 0;
+    }
+
+    /// The stand-down window, doubling per consecutive stand-down up to
+    /// [`LANE_CONVERGE_COOLDOWN_MAX_DOUBLINGS`].
+    fn cooldown(&self, timing: LaneConvergeTiming) -> Duration {
+        timing.cooldown * (1 << self.stand_downs.min(LANE_CONVERGE_COOLDOWN_MAX_DOUBLINGS))
+    }
+
+    /// Score the campaign this node issued as lost: grow the backoff, and
+    /// stand the lane down entirely once too many in a row have failed.
+    fn score_lost(&mut self, now: Instant, timing: LaneConvergeTiming, jitter: f64) {
+        self.verdict_due = None;
+        self.lost += 1;
+        if self.lost >= timing.max_campaigns {
+            self.lost = 0;
+            self.backoff = timing.min_backoff;
+            self.next_campaign_at = None;
+            self.cooldown_until = Some(now + scaled(self.cooldown(timing), jitter));
+            self.stand_downs = self.stand_downs.saturating_add(1);
+            self.stood_down = true;
+        } else {
+            self.next_campaign_at = Some(now + scaled(self.backoff, jitter));
+            self.backoff = (self.backoff * 2).min(timing.max_backoff);
+        }
+    }
+
+    fn take_stood_down(&mut self) -> bool {
+        std::mem::take(&mut self.stood_down)
+    }
+
+    /// Decide what to do about this lane, given a fresh observation.
+    ///
+    /// # Why a LEADERLESS lane is NEVER campaigned for
+    ///
+    /// This is the invariant that makes convergence unable to break a lane
+    /// (requirement: a lane must ALWAYS be able to elect). A lane without a
+    /// leader is already holding an election: openraft's tick
+    /// (`RaftCore::handle_tick_election`) campaigns on EVERY non-leader
+    /// voter — this node included — once its randomized election timer
+    /// expires, and it applies raft's own election policy while doing so:
+    /// it defers behind the leader lease, and it delays by an extra
+    /// `smaller_log_timeout` whenever a vote response revealed that some
+    /// other voter has a longer log (openraft 0.9 `Engine::set_greater_log`).
+    ///
+    /// `Raft::trigger().elect()` — the only lever convergence has — bypasses
+    /// ALL of that: it calls `Engine::elect()` directly, with no log check,
+    /// no lease check, and no deference to an election already running. So
+    /// on a leaderless lane a convergence campaign can only do harm: it
+    /// re-arms this node's own candidacy at a higher term, discarding the
+    /// votes the in-flight election had already collected, and (openraft 0.9
+    /// has no pre-vote) drags every other voter's term up with it. Two
+    /// campaigners on a 3-voter group with one member dead is a livelock:
+    /// each holds its own vote at the same term, neither reaches quorum, and
+    /// the term climbs forever. That is exactly what was observed on a
+    /// 2-core CI runner — 132 terms in 210s on the status lane with the
+    /// applied index frozen — and it is why the lane is now simply left to
+    /// raft.
+    ///
+    /// Convergence therefore acts ONLY on a lane that already has a settled
+    /// leader elsewhere, where a campaign is an optimization (co-locate the
+    /// leader) rather than a repair, and where losing it costs the cluster
+    /// nothing it did not already have.
+    fn decide(
+        &mut self,
+        observation: LaneObservation,
+        leads_anchor: bool,
+        now: Instant,
+        timing: LaneConvergeTiming,
+        jitter: f64,
+    ) -> LaneConvergeAction {
+        // "Still catching up": the lane's log grew between two ticks, so
+        // this node is receiving entries it did not have — it is behind
+        // whoever it replicates from and cannot be the most up-to-date
+        // voter. This is the only log-currency signal openraft 0.9 exposes
+        // to a NON-leader (`RaftMetrics` carries this node's own
+        // `last_log_index`; the replication/match view exists only on the
+        // leader of that same group). The authoritative test is the
+        // election itself, which is why a lost campaign also feeds the
+        // backoff below.
+        let catching_up = self
+            .prev_log_index
+            .is_some_and(|previous| observation.last_log_index > previous);
+        self.prev_log_index = Some(observation.last_log_index);
+
+        // Score the previous campaign first: winning clears the schedule,
+        // losing grows the backoff and eventually stands the lane down.
+        if self.verdict_due.is_some() {
+            if observation.led_here {
+                self.settle(timing);
+            } else if self.verdict_due.is_some_and(|due| now >= due) {
+                self.score_lost(now, timing, jitter);
+            }
+        }
+
+        if !leads_anchor {
+            // Not the convergence authority. Drop the in-flight campaign and
+            // the backoff, but KEEP any cooldown: an anchor that flaps is
+            // itself a disruption source, and re-arming on every flap is how
+            // unbounded term inflation comes back.
+            self.verdict_due = None;
+            self.lost = 0;
+            self.backoff = timing.min_backoff;
+            self.next_campaign_at = None;
+            return LaneConvergeAction::Hold(LaneConvergeHold::NotAnchorLeader);
+        }
+        if observation.led_here {
+            self.settle(timing);
+            return LaneConvergeAction::Hold(LaneConvergeHold::Converged);
+        }
+        if self.verdict_due.is_some() {
+            return LaneConvergeAction::Hold(LaneConvergeHold::CampaignInFlight);
+        }
+        if !observation.has_leader {
+            return LaneConvergeAction::Hold(LaneConvergeHold::NaturalElection);
+        }
+        if let Some(until) = self.cooldown_until {
+            if now < until {
+                return LaneConvergeAction::Hold(LaneConvergeHold::CoolingDown);
+            }
+            self.cooldown_until = None;
+        }
+        if self.next_campaign_at.is_some_and(|at| now < at) {
+            return LaneConvergeAction::Hold(LaneConvergeHold::Backoff);
+        }
+        if catching_up {
+            return LaneConvergeAction::Hold(LaneConvergeHold::CatchingUp);
+        }
+        self.campaigns += 1;
+        self.verdict_due = Some(now + timing.verdict);
+        LaneConvergeAction::Campaign
+    }
 }
 
 /// Anchor-lane convergence loop (JC-40) — one per node, `lanes` topology
@@ -1521,40 +1738,55 @@ fn jittered(base: Duration) -> Duration {
 /// Legion has composite operations that write two lanes (registration =
 /// control identity + status liveness; job submit = control tables + a
 /// scheduler-lane eval enqueue). Every half is proposed from the calling
-/// node, so under divergent per-lane leadership each composite half-fails
-/// on the node that does not lead the other lane — and joins, `/readyz`,
-/// remove-member feasibility and startup writes break the same way. The
-/// fix is to converge leadership: whichever node leads [`ANCHOR_LANE`]
-/// campaigns (`Raft::trigger().elect()`) for every other lane it does not
-/// already lead, with jittered backoff, until one node leads all of them.
+/// node, so under divergent per-lane leadership each composite half-fails on
+/// the node that does not lead the other lane — and joins, `/readyz` and
+/// remove-member feasibility want one node leading everything too. So
+/// whichever node leads [`ANCHOR_LANE`] campaigns (`Raft::trigger().elect()`)
+/// for the other lanes until one node leads them all.
 ///
 /// This keeps the ENTIRE multi-raft win — the isolation comes from
 /// independent logs, apply loops and replication pipelines per write class
 /// (a control-write burst cannot stall the scheduler's log), not from where
-/// the leaders sit. Only leader *spreading* is given up, and that is what
-/// is incompatible with a shared SQLite state machine.
+/// the leaders sit.
+///
+/// # Convergence is BEST EFFORT, not an invariant
+///
+/// It used to be documented as a steady state the cluster always reaches.
+/// It is not, and it cannot be: openraft 0.9 has no leader-transfer API, so
+/// the only lever is a campaign, and a campaign is a *race* that this node
+/// can lose — permanently, if its log for that lane is behind the incumbent
+/// or the incumbent is simply healthier. What the loop guarantees instead:
+///
+/// 1. It NEVER campaigns for a leaderless lane, so it can never prevent or
+///    disrupt an election (see [`LaneConvergeGovernor::decide`]). An
+///    unreachable lane is a dead write path; that always outranks
+///    co-location.
+/// 2. Campaigns are per-lane, exponentially backed off, and stop entirely
+///    for [`LANE_CONVERGE_COOLDOWN_WINDOWS`] election windows after
+///    [`LANE_CONVERGE_MAX_CAMPAIGNS`] consecutive losses — so term
+///    inflation from convergence is bounded (a handful of terms per
+///    cooldown, per lane) and natural elections get uninterrupted stretches
+///    far longer than any election timeout.
+/// 3. Divergent leadership stays CORRECT: every cross-lane composite's
+///    second half is rejected BEFORE its capture with the typed
+///    `NotRaftLeader` leader hint, every first half is idempotent on retry,
+///    and the daemon regenerates scheduling evals while lanes diverge.
 ///
 /// # Why we do NOT force a step-down of the remote lane leader
 ///
-/// Deliberate (JC-40): campaigning is sufficient and strictly less
-/// disruptive. Raft's election safety already resolves the race — at most
-/// one leader per term, and a campaigner whose log for that lane is behind
-/// *cannot* win, which is exactly the outcome we want (the lane keeps
-/// serving under its current leader until this node has caught up).
-/// openraft 0.9 has no leader-transfer API, so "forcing" a step-down would
-/// mean a side-channel telling the remote leader to abdicate: two nodes
-/// then act on the same lane at once, and a stale anchor view (this node
-/// believes it still leads control while another node has taken it) turns
-/// that into leadership ping-pong or an outright livelock — for zero gain,
-/// since the campaign that follows the abdication is the same campaign we
-/// already issue.
+/// openraft 0.9 has no leader-transfer API, so "forcing" would mean a side
+/// channel telling the remote leader to abdicate: two nodes then act on the
+/// same lane at once, and a stale anchor view turns that into leadership
+/// ping-pong — for zero gain, since the campaign that follows the abdication
+/// is the same campaign we already issue.
 async fn lane_convergence_loop(
     node_id: String,
     lanes: HashMap<Lane, Raft>,
     enabled: Arc<std::sync::atomic::AtomicBool>,
+    campaign_counts: Arc<StdMutex<HashMap<Lane, u64>>>,
     election_timeout_max_ms: u64,
 ) {
-    let backoff_max = lane_converge_backoff_max(election_timeout_max_ms);
+    let timing = LaneConvergeTiming::for_election_timeout(election_timeout_max_ms);
     let Some(anchor) = lanes.get(&ANCHOR_LANE).cloned() else {
         return;
     };
@@ -1576,45 +1808,24 @@ async fn lane_convergence_loop(
         .filter(|(_, raft)| leads(raft))
         .map(|(lane, _)| *lane)
         .collect();
-    let mut backoff = LANE_CONVERGE_BACKOFF_MIN;
-    let grace = leaderless_grace(election_timeout_max_ms);
-    // When each lane was first observed leaderless (cleared as soon as it
-    // has a leader again), so a natural election gets first refusal.
-    let mut leaderless_since: HashMap<Lane, Instant> = HashMap::new();
+    let mut governors: Vec<LaneConvergeGovernor> = others
+        .iter()
+        .map(|_| LaneConvergeGovernor::new(timing))
+        .collect();
     loop {
         if !enabled.load(Ordering::Relaxed) {
             tokio::time::sleep(LANE_CONVERGE_IDLE_POLL).await;
             continue;
         }
         let leads_anchor = leads(&anchor);
-        let now = Instant::now();
-        let states: Vec<LaneConvergenceState> = others
-            .iter()
-            .map(|(lane, raft)| {
-                let has_leader = has_leader(raft);
-                if has_leader {
-                    leaderless_since.remove(lane);
-                } else {
-                    leaderless_since.entry(*lane).or_insert(now);
-                }
-                LaneConvergenceState {
-                    lane: *lane,
-                    led_here: leads(raft),
-                    has_leader,
-                    leaderless_grace_elapsed: leaderless_since
-                        .get(lane)
-                        .is_some_and(|since| now.duration_since(*since) >= grace),
-                }
-            })
-            .collect();
-        for LaneConvergenceState { lane, led_here, .. } in &states {
+        for (index, (lane, raft)) in others.iter().enumerate() {
+            let observation = LaneObservation::sample(raft);
             let known = acquired.contains(lane);
-            if *led_here && !known {
+            if observation.led_here && !known {
                 acquired.push(*lane);
                 // Only the anchor leader's acquisitions are convergence
                 // events; a node that happens to lead one lane and not the
-                // anchor is the state being converged AWAY, not a
-                // milestone.
+                // anchor is the state being converged AWAY, not a milestone.
                 if leads_anchor {
                     info!(
                         node_id = %node_id,
@@ -1625,23 +1836,39 @@ async fn lane_convergence_loop(
                         ANCHOR_LANE.wire_name()
                     );
                 }
-            } else if !*led_here && known {
+            } else if !observation.led_here && known {
                 acquired.retain(|held| held != lane);
             }
-        }
 
-        let stray = lanes_needing_convergence(leads_anchor, &states);
-        if stray.is_empty() {
-            // Converged (or not the anchor leader): stop campaigning and
-            // reset the backoff so the next divergence is acted on fast.
-            backoff = LANE_CONVERGE_BACKOFF_MIN;
-            tokio::time::sleep(LANE_CONVERGE_IDLE_POLL).await;
-            continue;
-        }
-        for lane in &stray {
-            let Some((_, raft)) = others.iter().find(|(candidate, _)| candidate == lane) else {
+            let action = governors[index].decide(
+                observation,
+                leads_anchor,
+                Instant::now(),
+                timing,
+                campaign_jitter(),
+            );
+            if governors[index].take_stood_down() {
+                warn!(
+                    node_id = %node_id,
+                    lane = lane.wire_name(),
+                    cooldown_seconds = governors[index]
+                        .cooldown_until
+                        .map(|until| until.saturating_duration_since(Instant::now()).as_secs())
+                        .unwrap_or_default(),
+                    "Lane leadership convergence is standing down for the {} lane after {} \
+                     campaigns that did not take it; the lane keeps serving under its own \
+                     leader and cross-lane operations retry against it (see \
+                     docs/multi-raft.md)",
+                    lane.wire_name(),
+                    timing.max_campaigns
+                );
+            }
+            let LaneConvergeAction::Campaign = action else {
                 continue;
             };
+            if let Ok(mut counts) = campaign_counts.lock() {
+                counts.insert(*lane, governors[index].campaigns);
+            }
             debug!(
                 node_id = %node_id,
                 lane = lane.wire_name(),
@@ -1655,9 +1882,7 @@ async fn lane_convergence_loop(
                 );
             }
         }
-        let wait = jittered(backoff);
-        backoff = (backoff * 2).min(backoff_max);
-        tokio::time::sleep(wait).await;
+        tokio::time::sleep(LANE_CONVERGE_IDLE_POLL).await;
     }
 }
 
@@ -1863,12 +2088,20 @@ impl EngineJoinHandler {
         }
     }
 
-    /// Post-promotion verification (JC-40): the joiner must be a VOTER on
-    /// every lane before the join is reported successful. `change_membership`
-    /// returning `Ok` means the change committed on that lane's leader; this
-    /// re-reads each lane's membership so a join can never report success
-    /// while some lane still carries the joiner as a learner (leaving it
-    /// silently outside that lane's quorum).
+    /// Post-promotion verification (JC-40): the joiner must be a SETTLED
+    /// voter on every lane before the join is reported successful.
+    /// `change_membership` returning `Ok` means the change committed on that
+    /// lane's leader; this re-reads each lane's membership so a join can
+    /// never report success while some lane still carries the joiner as a
+    /// learner (leaving it silently outside that lane's quorum).
+    ///
+    /// "Settled" means [`lane_membership_settled`]: the joiner is a voter
+    /// AND the lane's membership is uniform rather than joint. A joint
+    /// config already reports the joiner through `voter_ids()`, so the
+    /// weaker check passed while a lane was still mid-change — and a lane
+    /// left joint keeps requiring a quorum of the OLD configuration, which
+    /// is how a 2-voter → 3-voter growth can look complete and yet be
+    /// unable to elect the moment one of the two original voters dies.
     async fn wait_until_voter_on_every_lane(
         &self,
         member_id: NodeId,
@@ -1878,13 +2111,10 @@ impl EngineJoinHandler {
             let missing: Vec<&'static str> = lanes_in_order(&self.lanes)
                 .into_iter()
                 .filter(|(_, raft)| {
-                    !raft
-                        .metrics()
-                        .borrow()
-                        .membership_config
-                        .membership()
-                        .voter_ids()
-                        .any(|id| id == member_id)
+                    !lane_membership_settled(
+                        raft.metrics().borrow().membership_config.membership(),
+                        member_id,
+                    )
                 })
                 .map(|(lane, _)| lane.wire_name())
                 .collect();
@@ -1893,14 +2123,32 @@ impl EngineJoinHandler {
             }
             if std::time::Instant::now() >= deadline {
                 return Err(tonic::Status::failed_precondition(format!(
-                    "join promoted the member but lane(s) [{}] still do not carry it as a \
-                     voter; retry the join (membership changes are idempotent)",
+                    "join promoted the member but lane(s) [{}] have not settled it as a \
+                     voter (still a learner, or the membership change is still joint); \
+                     retry the join (membership changes are idempotent)",
                     missing.join(", ")
                 )));
             }
             tokio::time::sleep(JOIN_LANE_RETRY_INTERVAL).await;
         }
     }
+}
+
+/// Whether `membership` carries `member_id` as a voter in a SETTLED
+/// (uniform, single-config) membership.
+///
+/// openraft applies a membership change in two steps — a joint config
+/// holding the old and the new voter sets, then the uniform new config —
+/// and `voter_ids()` returns the union across both, so it reports the
+/// incoming member as a voter from the first step onwards. A lane stuck in
+/// the joint step still needs a quorum of the OLD config to commit or elect,
+/// which is a materially weaker cluster than the voter list suggests. Every
+/// "is this member really in?" check therefore goes through here.
+fn lane_membership_settled(
+    membership: &openraft::Membership<NodeId, BasicNode>,
+    member_id: NodeId,
+) -> bool {
+    membership.get_joint_config().len() == 1 && membership.voter_ids().any(|id| id == member_id)
 }
 
 #[tonic::async_trait]
@@ -2414,6 +2662,7 @@ impl PersistenceDriver for MultiRaftDriver {
                 self.node_id.clone(),
                 lanes.clone(),
                 self.lane_convergence.clone(),
+                self.lane_campaigns.clone(),
                 self.cfg.election_timeout_max_ms,
             ));
         }
@@ -2595,7 +2844,37 @@ impl PersistenceDriver for MultiRaftDriver {
                 let m = raft.metrics().borrow().clone();
                 // Quorum math + advisory (plan §7-C3): one wording source for
                 // every surface, see `quorum.rs`.
-                let voters = m.membership_config.membership().voter_ids().count() as u64;
+                let membership = m.membership_config.membership();
+                let voters = membership.voter_ids().count() as u64;
+                // A JOINT membership (change in flight) needs a majority of
+                // EVERY config, so the honest numbers are the strictest
+                // config's, not the union's: a joint {a,b} + {a,b,c} needs 2
+                // and survives 0, while the union of three would claim it
+                // survives 1.
+                let configs: Vec<Vec<String>> = membership
+                    .get_joint_config()
+                    .iter()
+                    .map(|config| config.iter().map(|id| member_name(&m, *id)).collect())
+                    .collect();
+                let (quorum, survives) = if configs.len() > 1 {
+                    (
+                        configs
+                            .iter()
+                            .map(|config| quorum::quorum_size(config.len() as u64))
+                            .max()
+                            .unwrap_or(0),
+                        configs
+                            .iter()
+                            .map(|config| quorum::failures_survivable(config.len() as u64))
+                            .min()
+                            .unwrap_or(0),
+                    )
+                } else {
+                    (
+                        quorum::quorum_size(voters),
+                        quorum::failures_survivable(voters),
+                    )
+                };
                 RaftLaneStatus {
                     lane: lane.wire_name().to_string(),
                     role: map_server_state(m.state),
@@ -2604,9 +2883,10 @@ impl PersistenceDriver for MultiRaftDriver {
                     commit_index: m.last_log_index.unwrap_or(0),
                     applied_index: m.last_applied.map(|l| l.index).unwrap_or(0),
                     voters,
-                    quorum: quorum::quorum_size(voters),
-                    survives: quorum::failures_survivable(voters),
-                    warning: quorum::voter_count_warning(voters, self.cfg.expected_voters),
+                    quorum,
+                    survives,
+                    warning: quorum::joint_membership_advisory(&configs)
+                        .or_else(|| quorum::voter_count_warning(voters, self.cfg.expected_voters)),
                 }
             })
             .collect();
@@ -2631,11 +2911,29 @@ impl PersistenceDriver for MultiRaftDriver {
             });
         let metrics = Self::control_metrics(engine)?;
         let membership = metrics.membership_config.membership().clone();
+        // The aggregate voter list means "settled voter on EVERY lane", not
+        // "voter on the anchor lane". Under `lanes` the two differ exactly
+        // while a join is in flight or half-applied, and that is the case
+        // the headline must not paper over: reading the anchor lane alone
+        // reports a full 3-voter cluster while another lane is still a
+        // 2-voter (or joint) group that survives zero failures. Per-lane
+        // detail stays in `lanes`.
+        let voter_set: std::collections::HashSet<NodeId> = membership
+            .voter_ids()
+            .filter(|id| {
+                engine.lanes.values().all(|raft| {
+                    lane_membership_settled(
+                        raft.metrics().borrow().membership_config.membership(),
+                        *id,
+                    )
+                })
+            })
+            .collect();
         let voters: Vec<String> = membership
             .voter_ids()
+            .filter(|id| voter_set.contains(id))
             .map(|id| member_name(&metrics, id))
             .collect();
-        let voter_set: std::collections::HashSet<NodeId> = membership.voter_ids().collect();
         let learners: Vec<String> = membership
             .nodes()
             .filter(|(id, _)| !voter_set.contains(id))
@@ -2967,178 +3265,300 @@ mod tests {
         assert!(lanes_for_topology("sharded").is_err());
     }
 
-    /// JC-40: the anchor-lane leader — and only it — campaigns for the
-    /// STRAYED lanes it does not lead; it never campaigns for one it
-    /// already leads, and never for a leaderless one. (Moved here from the
-    /// daemon with the convergence loop itself: convergence is an engine
-    /// lifecycle property now, so it also runs for embedded/test stores
-    /// that never start the manager daemon.)
-    ///
-    /// Helper: a lane with a settled leader elsewhere.
+    // ── JC-40 convergence governor ───────────────────────────────────────
+    //
+    // The governor is a pure state machine over sampled metrics precisely so
+    // these can drive it against a fake clock: the properties that matter
+    // (never disturb an election, bounded term inflation) are impossible to
+    // pin down from a live cluster without waiting minutes per assertion.
+
+    /// Test timing: one election "window" is 1s, so the schedule is
+    /// min/verdict 2s, ceiling 16s, cooldown 60s, 3 campaigns.
     #[cfg(test)]
-    fn strayed(lane: Lane) -> LaneConvergenceState {
-        LaneConvergenceState {
-            lane,
+    fn test_timing() -> LaneConvergeTiming {
+        LaneConvergeTiming::for_election_timeout(1_000)
+    }
+
+    /// A lane with a settled leader ELSEWHERE — the only shape convergence
+    /// ever acts on.
+    #[cfg(test)]
+    fn strayed(last_log_index: u64) -> LaneObservation {
+        LaneObservation {
             led_here: false,
             has_leader: true,
-            leaderless_grace_elapsed: false,
+            last_log_index,
         }
     }
 
-    /// Helper: a lane this node already leads.
+    /// A lane this node leads.
     #[cfg(test)]
-    fn led(lane: Lane) -> LaneConvergenceState {
-        LaneConvergenceState {
-            lane,
+    fn led(last_log_index: u64) -> LaneObservation {
+        LaneObservation {
             led_here: true,
             has_leader: true,
-            leaderless_grace_elapsed: false,
+            last_log_index,
         }
     }
 
-    /// Helper: a lane mid-election, `grace_elapsed` = the natural election
-    /// has already had its full window to settle.
+    /// A lane with NO leader anywhere: an election is in flight.
     #[cfg(test)]
-    fn leaderless(lane: Lane, grace_elapsed: bool) -> LaneConvergenceState {
-        LaneConvergenceState {
-            lane,
+    fn leaderless(last_log_index: u64) -> LaneObservation {
+        LaneObservation {
             led_here: false,
             has_leader: false,
-            leaderless_grace_elapsed: grace_elapsed,
+            last_log_index,
         }
     }
 
-    #[test]
-    fn convergence_targets_stray_lanes_from_the_anchor_leader_only() {
-        // Anchor leader with two lanes led elsewhere: both are pulled.
-        assert_eq!(
-            lanes_needing_convergence(true, &[strayed(Lane::Scheduler), strayed(Lane::Status)]),
-            vec![Lane::Scheduler, Lane::Status]
-        );
-        // Already leading a lane: never campaign for it (a campaign would
-        // needlessly bump the term and drop the lane's own leadership).
-        assert_eq!(
-            lanes_needing_convergence(true, &[led(Lane::Scheduler), strayed(Lane::Status)]),
-            vec![Lane::Status]
-        );
-        // Converged: nothing to do.
-        assert!(
-            lanes_needing_convergence(true, &[led(Lane::Scheduler), led(Lane::Status)]).is_empty()
-        );
-        // Not the anchor leader: never act — one convergence authority, or
-        // two nodes ping-pong the same lane.
-        assert!(
-            lanes_needing_convergence(false, &[led(Lane::Scheduler), strayed(Lane::Status)])
-                .is_empty()
-        );
-        // Single-lane topology (no other lanes at all): nothing to converge.
-        assert!(lanes_needing_convergence(true, &[]).is_empty());
+    /// Drive the governor once with no jitter, at `now`.
+    #[cfg(test)]
+    fn tick(
+        governor: &mut LaneConvergeGovernor,
+        observation: LaneObservation,
+        now: Instant,
+    ) -> LaneConvergeAction {
+        governor.decide(observation, true, now, test_timing(), 1.0)
     }
 
-    /// A lane whose election is still in flight must not be campaigned for:
-    /// joining it from the convergence loop's own schedule defeats the
-    /// randomized-timer decorrelation raft relies on to break split votes.
-    /// With one node of three dead, quorum is both survivors, so two
-    /// simultaneous candidates can NEVER elect anyone — the livelock
-    /// (scheduler term 223 / status term 277, applied indices frozen)
-    /// behind the `killing_the_all_lane_leader_reconverges_onto_one_survivor`
-    /// flake.
+    /// Only the anchor-lane leader converges, and it never campaigns for a
+    /// lane it already leads.
+    #[test]
+    fn convergence_acts_only_as_the_anchor_leader_and_only_on_a_strayed_lane() {
+        let timing = test_timing();
+        let now = Instant::now();
+        let mut governor = LaneConvergeGovernor::new(timing);
+        assert_eq!(
+            governor.decide(strayed(9), false, now, timing, 1.0),
+            LaneConvergeAction::Hold(LaneConvergeHold::NotAnchorLeader)
+        );
+        let mut governor = LaneConvergeGovernor::new(timing);
+        assert_eq!(
+            tick(&mut governor, led(9), now),
+            LaneConvergeAction::Hold(LaneConvergeHold::Converged)
+        );
+        // A lane led elsewhere, log quiescent: this is the one case that
+        // campaigns.
+        let mut governor = LaneConvergeGovernor::new(timing);
+        assert_eq!(
+            tick(&mut governor, strayed(9), now),
+            LaneConvergeAction::Campaign
+        );
+    }
+
+    /// THE invariant: convergence never campaigns into a leaderless lane,
+    /// no matter how long it stays leaderless.
     ///
-    /// But once the grace window has passed without the natural election
-    /// settling, the anchor leader MUST campaign: it may be the only node
-    /// with an up-to-date log for that lane, and sitting out deadlocks the
-    /// lane just as hard.
+    /// A leaderless lane is already holding an election on every voter's own
+    /// randomized timer — including this node's, run by openraft's tick with
+    /// raft's real policy (leader lease, `smaller_log_timeout` deference to a
+    /// greater log). `trigger().elect()` bypasses all of it, re-arms this
+    /// node's candidacy at a higher term and discards the votes already
+    /// collected. Two campaigners on a 3-voter group with one member dead
+    /// never reach quorum, and the term climbs forever — 132 terms in 210s
+    /// on a 2-core runner, applied index frozen. So: never.
     #[test]
-    fn convergence_defers_but_does_not_abandon_a_leaderless_lane() {
-        // Election in flight, inside the grace window: leave it alone.
-        assert!(lanes_needing_convergence(
-            true,
-            &[
-                leaderless(Lane::Scheduler, false),
-                leaderless(Lane::Status, false)
-            ]
-        )
-        .is_empty());
-
-        // Mixed: the strayed lane is pulled, the in-flight election is not.
-        assert_eq!(
-            lanes_needing_convergence(
-                true,
-                &[strayed(Lane::Scheduler), leaderless(Lane::Status, false)]
-            ),
-            vec![Lane::Scheduler]
-        );
-
-        // Grace elapsed and still no leader: campaign, or nobody will.
-        assert_eq!(
-            lanes_needing_convergence(true, &[leaderless(Lane::Status, true)]),
-            vec![Lane::Status]
-        );
-
-        // Grace elapsed is irrelevant for a lane this node already leads.
-        assert!(lanes_needing_convergence(true, &[led(Lane::Status)]).is_empty());
-    }
-
-    /// The grace window has to outlast a natural election, and scales with
-    /// the configured election timing.
-    #[test]
-    fn leaderless_grace_outlasts_a_natural_election() {
-        for election_max in [1_200u64, 2_000, 8_000] {
-            assert!(leaderless_grace(election_max) > Duration::from_millis(election_max));
+    fn convergence_never_campaigns_for_a_leaderless_lane() {
+        let timing = test_timing();
+        let start = Instant::now();
+        let mut governor = LaneConvergeGovernor::new(timing);
+        // Ten minutes of a leaderless lane, at every cadence the loop polls.
+        for step in 0..1_200u64 {
+            let now = start + Duration::from_millis(500 * step);
+            assert_eq!(
+                tick(&mut governor, leaderless(9), now),
+                LaneConvergeAction::Hold(LaneConvergeHold::NaturalElection),
+                "campaigned into an in-flight election at step {step}"
+            );
         }
-        assert_eq!(leaderless_grace(1_200), Duration::from_millis(2_400));
+        assert_eq!(governor.campaigns, 0);
     }
 
-    /// The campaign backoff stays inside its documented window and always
-    /// advances (a zero-length sleep would spin the convergence loop).
+    /// A lane whose log is still streaming into this node cannot be won —
+    /// this node is behind whoever it replicates from — so no campaign is
+    /// issued until the log goes quiet. This is the only log-currency signal
+    /// openraft 0.9 gives a non-leader.
     #[test]
-    fn convergence_backoff_jitter_stays_in_window() {
-        for base in [
-            LANE_CONVERGE_BACKOFF_MIN,
-            LANE_CONVERGE_BACKOFF_MAX_FLOOR,
-            lane_converge_backoff_max(3_000),
-        ] {
-            for _ in 0..64 {
-                let picked = jittered(base);
-                assert!(picked >= base / 2, "{picked:?} below half of {base:?}");
-                assert!(
-                    picked <= base + base / 2,
-                    "{picked:?} above 1.5x of {base:?}"
-                );
-                assert!(picked > Duration::ZERO);
+    fn convergence_holds_off_while_this_nodes_lane_log_is_catching_up() {
+        let timing = test_timing();
+        let start = Instant::now();
+        let mut governor = LaneConvergeGovernor::new(timing);
+        // First observation has no predecessor to compare against.
+        assert_eq!(
+            tick(&mut governor, strayed(10), start),
+            LaneConvergeAction::Campaign
+        );
+        let mut governor = LaneConvergeGovernor::new(timing);
+        assert_eq!(
+            tick(&mut governor, strayed(10), start),
+            LaneConvergeAction::Campaign
+        );
+        // Win it, then lose it while catching up: the growing log holds the
+        // campaign off, and a quiescent log releases it.
+        assert_eq!(
+            tick(&mut governor, led(11), start + Duration::from_secs(1)),
+            LaneConvergeAction::Hold(LaneConvergeHold::Converged)
+        );
+        assert_eq!(
+            tick(&mut governor, strayed(12), start + Duration::from_secs(2)),
+            LaneConvergeAction::Hold(LaneConvergeHold::CatchingUp)
+        );
+        assert_eq!(
+            tick(&mut governor, strayed(13), start + Duration::from_secs(3)),
+            LaneConvergeAction::Hold(LaneConvergeHold::CatchingUp)
+        );
+        assert_eq!(
+            tick(&mut governor, strayed(13), start + Duration::from_secs(4)),
+            LaneConvergeAction::Campaign
+        );
+    }
+
+    /// Bounded term inflation: campaigns back off exponentially and then
+    /// stop entirely for a cooldown far longer than any election timeout, so
+    /// a lane convergence can never take gets long, UNINTERRUPTED windows in
+    /// which raft's own elections run without a foreign term bump.
+    #[test]
+    fn convergence_backs_off_and_then_stands_down_for_a_long_cooldown() {
+        let timing = test_timing();
+        let start = Instant::now();
+        let mut governor = LaneConvergeGovernor::new(timing);
+        let mut campaign_times: Vec<Duration> = Vec::new();
+        let mut longest_quiet = Duration::ZERO;
+        let mut last_campaign = Duration::ZERO;
+        // 30 minutes of a lane this node can never take, polled at the
+        // loop's real cadence.
+        for step in 0..3_600u64 {
+            let elapsed = Duration::from_millis(500 * step);
+            if tick(&mut governor, strayed(9), start + elapsed) == LaneConvergeAction::Campaign {
+                longest_quiet = longest_quiet.max(elapsed - last_campaign);
+                last_campaign = elapsed;
+                campaign_times.push(elapsed);
             }
         }
+        // Term inflation from convergence is a handful of terms per half
+        // hour, not hundreds — and it thins out as the stand-downs escalate.
+        // (The pre-fix loop produced 132 terms in 210 SECONDS on the same
+        // shape of failure.)
+        assert!(
+            campaign_times.len() <= 20,
+            "unbounded campaigning: {} campaigns in 30 minutes ({campaign_times:?})",
+            campaign_times.len()
+        );
+        // Campaigns arrive in bursts of at most `max_campaigns` separated by
+        // stand-downs, and each stand-down is longer than the one before it
+        // until the doubling cap — so a lane that keeps refusing convergence
+        // is tried ever more rarely instead of forever at a fixed rate.
+        let stand_downs: Vec<Duration> = campaign_times
+            .windows(2)
+            .map(|pair| pair[1] - pair[0])
+            .filter(|gap| *gap >= timing.cooldown)
+            .collect();
+        assert!(
+            stand_downs.len() >= 3,
+            "expected several stand-downs, saw {stand_downs:?}"
+        );
+        for pair in stand_downs.windows(2) {
+            assert!(
+                pair[1] >= pair[0],
+                "stand-down {:?} is shorter than the previous {:?}",
+                pair[1],
+                pair[0]
+            );
+        }
+        assert!(
+            stand_downs.last().copied().unwrap_or_default() > stand_downs[0],
+            "stand-downs never escalated: {stand_downs:?}"
+        );
+        assert_eq!(campaign_times.len() as u64, governor.campaigns);
+        // And natural elections get windows an order of magnitude longer
+        // than the election timeout they need.
+        assert!(
+            longest_quiet >= timing.cooldown,
+            "longest uninterrupted window {longest_quiet:?} is shorter than the {:?} cooldown",
+            timing.cooldown
+        );
+        // Campaigns are spaced by at least the verdict window: a campaign is
+        // never re-issued before the previous one has been decided (that
+        // would discard the votes it collected).
+        for pair in campaign_times.windows(2) {
+            assert!(
+                pair[1] - pair[0] >= timing.verdict,
+                "campaigns {:?} and {:?} are closer than the verdict window",
+                pair[0],
+                pair[1]
+            );
+        }
     }
 
-    /// The convergence backoff ceiling must track the configured election
-    /// timing. If it stays constant, raising `raft.electionTimeoutMaxMs` —
-    /// the documented remedy for loaded/WAN/CI clusters — pushes the leader
-    /// lease past the campaign interval, campaigns start landing inside a
-    /// live lease, and lane convergence stalls while terms churn.
+    /// Winning clears the whole schedule, so a lane that strays again later
+    /// is reacquired promptly rather than serving out an old cooldown.
     #[test]
-    fn convergence_backoff_ceiling_scales_past_the_leader_lease() {
-        // At the shipped default the historical 3s ceiling is preserved
-        // exactly, so default behavior is unchanged.
-        assert_eq!(
-            lane_converge_backoff_max(crate::structs::config::DEF_RAFT_ELECTION_TIMEOUT_MAX_MS),
-            LANE_CONVERGE_BACKOFF_MAX_FLOOR
-        );
-
-        // Above the default, the ceiling must stay clear of the lease.
-        for election_max in [1_200u64, 2_000, 3_000, 8_000] {
-            let ceiling = lane_converge_backoff_max(election_max);
-            let lease = Duration::from_millis(election_max);
-            assert!(
-                ceiling > lease,
-                "backoff ceiling {ceiling:?} must exceed the {lease:?} leader lease"
+    fn taking_the_lane_resets_the_campaign_schedule() {
+        let timing = test_timing();
+        let start = Instant::now();
+        let mut governor = LaneConvergeGovernor::new(timing);
+        // Burn through to the stand-down.
+        for step in 0..200u64 {
+            tick(
+                &mut governor,
+                strayed(9),
+                start + Duration::from_millis(500 * step),
             );
-            assert!(ceiling >= LANE_CONVERGE_BACKOFF_MAX_FLOOR);
         }
-        // Tiny election timeouts still get the floor, never a spin.
+        assert!(governor.cooldown_until.is_some(), "expected a stand-down");
+        let cooled = start + Duration::from_secs(100);
         assert_eq!(
-            lane_converge_backoff_max(100),
-            LANE_CONVERGE_BACKOFF_MAX_FLOOR
+            tick(&mut governor, led(9), cooled),
+            LaneConvergeAction::Hold(LaneConvergeHold::Converged)
         );
+        assert!(governor.cooldown_until.is_none());
+        assert_eq!(governor.backoff, timing.min_backoff);
+        // Straying again campaigns at once (the log is quiescent).
+        assert_eq!(
+            tick(
+                &mut governor,
+                strayed(9),
+                cooled + Duration::from_millis(500)
+            ),
+            LaneConvergeAction::Campaign
+        );
+    }
+
+    /// The whole schedule scales with `raft.electionTimeoutMaxMs` — raising
+    /// it is the documented remedy for loaded managers, WAN links and CI,
+    /// and a schedule in fixed milliseconds would start campaigning inside
+    /// the (now longer) leader lease the moment an operator applied it.
+    #[test]
+    fn convergence_timing_scales_with_the_configured_election_window() {
+        for election_max in [
+            crate::structs::config::DEF_RAFT_ELECTION_TIMEOUT_MAX_MS,
+            2_000,
+            8_000,
+        ] {
+            let timing = LaneConvergeTiming::for_election_timeout(election_max);
+            let window = Duration::from_millis(election_max);
+            assert!(
+                timing.min_backoff > window,
+                "the first campaign must land outside the {window:?} leader lease"
+            );
+            assert!(timing.verdict > window);
+            assert!(timing.max_backoff >= timing.min_backoff);
+            assert!(
+                timing.cooldown >= window * 30,
+                "the stand-down must dwarf an election timeout"
+            );
+        }
+    }
+
+    /// Jitter decorrelates the campaign from the incumbent's own election
+    /// timer without ever collapsing to a zero-length wait.
+    #[test]
+    fn campaign_jitter_stays_in_window() {
+        for _ in 0..256 {
+            let factor = campaign_jitter();
+            assert!((0.75..=1.25).contains(&factor), "{factor} out of window");
+        }
+        assert!(scaled(Duration::from_secs(2), 0.75) >= Duration::from_millis(1_500));
+        assert!(scaled(Duration::ZERO, 1.0) > Duration::ZERO);
     }
 
     #[test]

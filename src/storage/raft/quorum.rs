@@ -60,6 +60,33 @@ pub(crate) fn parity_advisory(voters: u64) -> Option<String> {
     })
 }
 
+/// The plain-language advisory for a lane whose membership change is still
+/// JOINT — openraft's two-step change has appended the joint configuration
+/// but has not yet committed the uniform one.
+///
+/// This matters because a joint configuration needs a quorum of **each**
+/// config to commit or elect: growing `{a,b}` to `{a,b,c}` leaves a lane
+/// that still needs BOTH `a` and `b`, even though its voter list already
+/// reads as three. Losing `a` there costs the lane its write path
+/// permanently, so the state is worth naming on every status surface until
+/// it clears.
+pub(crate) fn joint_membership_advisory(configs: &[Vec<String>]) -> Option<String> {
+    if configs.len() < 2 {
+        return None;
+    }
+    let rendered: Vec<String> = configs
+        .iter()
+        .map(|config| format!("[{}]", config.join(", ")))
+        .collect();
+    Some(format!(
+        "membership change in flight: this lane is in a JOINT configuration {} and needs a \
+         majority of EVERY listed config to commit or elect — it is less fault-tolerant than \
+         its voter count suggests until the change settles. Re-issue the join (membership \
+         changes are idempotent) if it does not clear.",
+        rendered.join(" + ")
+    ))
+}
+
 /// Advisory for a voter count below the operator's declared
 /// `raft.expectedVoters`. `None` when no expectation is set or it is met.
 pub(crate) fn below_expected_advisory(voters: u64, expected: Option<u32>) -> Option<String> {

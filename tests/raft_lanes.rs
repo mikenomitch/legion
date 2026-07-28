@@ -23,10 +23,15 @@
 //!     equality at quiesce);
 //! (e) CO-LOCATED leadership (JC-40): the control lane is the anchor, and
 //!     the engine's convergence loop pulls the other lanes onto whichever
-//!     node leads it — after bring-up, after a deliberate split, and after
-//!     the all-lane leader is killed. Cross-lane composites survive a
-//!     leadership change with a client-style retry without half-applying,
-//!     and a node joining mid-convergence becomes a voter on every lane.
+//!     node leads it. Convergence is BEST EFFORT — openraft 0.9 has no
+//!     leader-transfer API, so the only lever is a campaign, which raft's
+//!     election safety may refuse — so these tests assert the contract
+//!     underneath it: every lane always elects a leader, convergence happens
+//!     where the anchor is able to win, its campaigns stay bounded, and a
+//!     standing split stays CORRECT (composites reject cleanly with a
+//!     lane-named leader hint, never half-apply, and the scheduler-lane
+//!     safety net re-derives the work). A node joining mid-convergence
+//!     becomes a settled voter on every lane.
 //!
 //! # Networking exception
 //!
@@ -72,6 +77,29 @@ const RETRIGGER_INTERVAL: Duration = Duration::from_millis(TEST_ELECTION_MAX_MS 
 /// stays leader until the test says otherwise) valid; each test is fast
 /// in isolation, so the serialized wall time stays small.
 static CLUSTER_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Opt-in tracing for the whole battery: `LEGION_TEST_TRACE=1` with a
+/// `RUST_LOG` filter installs a stderr subscriber, so openraft's own
+/// election/vote/membership logs are visible alongside Legion's.
+///
+/// Worth keeping wired: the two hardest bugs this battery has caught (a
+/// convergence loop campaigning into its own lane's election, and a lane
+/// left in a joint membership by a join that raced a kill) were both
+/// invisible from Legion's logs alone and obvious from openraft's. Run e.g.
+/// `LEGION_TEST_TRACE=1 RUST_LOG=openraft=info,legion=debug cargo test
+/// --test raft_lanes -- --nocapture <name>`.
+fn init_trace() {
+    if std::env::var("LEGION_TEST_TRACE").is_err() {
+        return;
+    }
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_writer(std::io::stderr)
+            .try_init();
+    });
+}
 
 fn cluster_gate() -> std::sync::MutexGuard<'static, ()> {
     CLUSTER_GATE
@@ -307,28 +335,88 @@ fn start_cluster(
 
     // One token enrolls all lanes: the join RPC adds the joiner as learner
     // and promotes it to voter on every lane before replying.
+    //
+    // The gate is `raft_status().voters`, which means "SETTLED voter on
+    // every lane" — a voter in a uniform, non-joint membership on all three
+    // groups. That distinction is the difference between a cluster that
+    // tolerates a failure and one that only looks like it does: openraft
+    // applies a membership change as joint-then-uniform, `voter_ids()`
+    // reports the incoming member from the joint step onwards, and a lane
+    // left joint still needs a quorum of the OLD config. A 3-node bring-up
+    // passes through `{a,b}` on its way to `{a,b,c}`, so a lane stuck joint
+    // there needs BOTH a and b — killing a then costs that lane its write
+    // path forever. Gating on the weaker signal is what let this harness
+    // declare bring-up complete mid-join and kill the leader into exactly
+    // that state.
     wait_for(
         Duration::from_secs(120),
-        "both joiners promoted to voter and every lane led on every node",
+        "every node settled as a voter on every lane, and every lane led on every node",
         || {
-            let voters_ok = a
-                .store()
-                .raft_status()
-                .map(|s| {
-                    s.voters.contains(&"mgr-b".to_string())
-                        && s.voters.contains(&"mgr-c".to_string())
-                })
-                .unwrap_or(false);
-            voters_ok
-                && [&a, &b, &c].iter().all(|node| {
-                    LANES.iter().all(|lane| {
+            [&a, &b, &c].iter().all(|node| {
+                let voters_ok = node
+                    .store()
+                    .raft_status()
+                    .map(|status| {
+                        ["mgr-a", "mgr-b", "mgr-c"]
+                            .iter()
+                            .all(|name| status.voters.iter().any(|voter| voter == name))
+                    })
+                    .unwrap_or(false);
+                voters_ok
+                    && LANES.iter().all(|lane| {
                         node.lane_status(lane)
                             .is_some_and(|(_, leader, _, _)| leader.is_some())
                     })
-                })
+            })
         },
     );
+    // Every lane must genuinely survive one failure before any test kills a
+    // node — that is the property the gate above exists to establish.
+    for node in [&a, &b, &c] {
+        let status = node.store().raft_status().context("raft status")?;
+        for lane in status.lanes {
+            assert_eq!(
+                lane.voters, 3,
+                "{}: lane {} has {} voters, not 3 ({:?})",
+                node.name, lane.lane, lane.voters, lane.warning
+            );
+            assert_eq!(
+                lane.survives, 1,
+                "{}: lane {} survives {} failures, not 1 ({:?})",
+                node.name, lane.lane, lane.survives, lane.warning
+            );
+        }
+    }
     Ok((a, b, c))
+}
+
+/// Every lane, on every listed node, reports SOME leader — and that leader
+/// is one of the listed (i.e. still live) managers.
+///
+/// This is the contract that outranks co-location: an unreachable lane is a
+/// dead write path, whereas lanes led by different managers still serve (see
+/// `docs/multi-raft.md`).
+fn every_lane_has_a_live_leader(nodes: &[&TestNode]) -> bool {
+    nodes.iter().all(|node| {
+        LANES.iter().all(|lane| {
+            node.lane_status(lane)
+                .and_then(|(_, leader, _, _)| leader)
+                .is_some_and(|leader| nodes.iter().any(|candidate| candidate.name == leader))
+        })
+    })
+}
+
+/// Convergence campaigns issued by `node` for the non-anchor lanes.
+///
+/// Campaigns bump raft terms, so this is the direct measure of the
+/// disruption convergence is allowed to cause. Before the JC-40 governor a
+/// lane convergence could not take burned 132 terms in 210s; the governor
+/// caps campaigns at three per (escalating) cooldown per lane.
+fn convergence_campaigns(node: &TestNode) -> u64 {
+    ["scheduler", "status"]
+        .iter()
+        .map(|lane| node.store().raft_lane_campaigns(lane).unwrap_or(0))
+        .sum()
 }
 
 /// The single manager leading EVERY lane in `node`'s view (JC-40's steady
@@ -546,6 +634,7 @@ fn log_state(log_db: &Path) -> Option<(i64, Option<u64>)> {
 #[test]
 fn lanes_bring_up_and_per_lane_writes_converge() -> R<()> {
     let _serial = cluster_gate();
+    init_trace();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -677,6 +766,7 @@ fn lanes_bring_up_and_per_lane_writes_converge() -> R<()> {
 #[test]
 fn killing_a_single_lane_leader_disturbs_only_that_lane() -> R<()> {
     let _serial = cluster_gate();
+    init_trace();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -699,16 +789,55 @@ fn killing_a_single_lane_leader_disturbs_only_that_lane() -> R<()> {
         || b.leads_lane("status") && a.leads_lane("control") && a.leads_lane("scheduler"),
     );
 
-    // The aggregate status line now summarizes per-lane leaders instead of
-    // pretending one leader holds everything.
-    let split = a
-        .store()
-        .raft_status()
-        .and_then(|s| s.leader_id)
+    // The split is real and readable PER LANE — that is the property, not
+    // the shape of any summary string. Every lane still has a leader, and
+    // the lanes name different ones.
+    //
+    // Read it from mgr-a, the node whose view the assertions below are
+    // about, and wait for that view to catch up first: mgr-b winning the
+    // status lane and mgr-a learning about it are separate events, one
+    // heartbeat apart.
+    wait_for(
+        Duration::from_secs(60),
+        "the control leader's own view shows the status lane led by mgr-b",
+        || {
+            a.lane_status("status")
+                .and_then(|(_, leader, _, _)| leader)
+                .as_deref()
+                == Some("mgr-b")
+        },
+    );
+    let status = a.store().raft_status().context("raft status")?;
+    let leaders: BTreeMap<String, Option<String>> = status
+        .lanes
+        .iter()
+        .map(|lane| (lane.lane.clone(), lane.leader_id.clone()))
+        .collect();
+    assert_eq!(
+        leaders.get("status").cloned().flatten().as_deref(),
+        Some("mgr-b"),
+        "the status lane's leader moved: {leaders:?}"
+    );
+    assert_eq!(
+        leaders.get("control").cloned().flatten().as_deref(),
+        Some("mgr-a"),
+        "the control lane kept its leader: {leaders:?}"
+    );
+    wait_for(
+        Duration::from_secs(60),
+        "a split still leaves every lane with a live leader on every node",
+        || every_lane_has_a_live_leader(&[&a, &b, &c]),
+    );
+    // And the aggregate headline refuses to name a single leader while the
+    // lanes disagree — whatever wording it uses, it must not read as one
+    // healthy leader holding everything.
+    let split = status
+        .leader_id
+        .clone()
         .context("aggregate leader line present")?;
     assert!(
-        split.contains("status=mgr-b") && split.contains("control=mgr-a"),
-        "aggregate leader must summarize per-lane leaders when they differ: {split}"
+        !["mgr-a", "mgr-b", "mgr-c"].contains(&split.as_str()),
+        "the aggregate leader claimed a single leader while the lanes were split: {split}"
     );
 
     // Status-lane writes now belong on mgr-b; proposing one on mgr-a is
@@ -794,6 +923,7 @@ const CONTROL_WRITES: usize = 60;
 #[test]
 fn laggard_converges_via_lane_scoped_install_snapshot() -> R<()> {
     let _serial = cluster_gate();
+    init_trace();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -946,6 +1076,7 @@ fn laggard_converges_via_lane_scoped_install_snapshot() -> R<()> {
 #[test]
 fn cross_lane_config_update_racing_placement_never_diverges() -> R<()> {
     let _serial = cluster_gate();
+    init_trace();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -1089,6 +1220,7 @@ fn cross_lane_config_update_racing_placement_never_diverges() -> R<()> {
 #[test]
 fn lane_leadership_co_locates_on_the_control_anchor() -> R<()> {
     let _serial = cluster_gate();
+    init_trace();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -1097,7 +1229,8 @@ fn lane_leadership_co_locates_on_the_control_anchor() -> R<()> {
     let (a, b, c) = start_cluster(&rt, dir.path(), 10_000)?;
     let all = [&a, &b, &c];
 
-    // Bring-up: every lane already agrees on the bootstrap node.
+    // Bring-up: every lane already agrees on the bootstrap node (it is the
+    // only voter when each group initializes, so this one is not a race).
     let leader = wait_for_co_location(
         &all,
         Duration::from_secs(90),
@@ -1131,13 +1264,28 @@ fn lane_leadership_co_locates_on_the_control_anchor() -> R<()> {
         "the aggregate leader must summarize per-lane leaders while split: {split}"
     );
 
-    // Re-enable: the control leader campaigns for the lanes it lost until
-    // one node leads all three again.
+    // Whatever else is true while the lanes are split, EVERY lane still has
+    // a leader — that is the contract co-location is subordinate to.
+    // A split is not an outage: every lane still has a leader, and every
+    // node learns who it is within a bounded time.
+    wait_for(
+        Duration::from_secs(60),
+        "a split still leaves every lane with a live leader on every node",
+        || every_lane_has_a_live_leader(&all),
+    );
+
+    // Re-enable convergence. Convergence is BEST EFFORT — a campaign is a
+    // race the anchor leader can lose — so this asserts it in the one shape
+    // where the anchor demonstrably CAN win: mgr-a leads the control anchor
+    // and its logs on the strayed lanes are caught up (it replicated every
+    // entry mgr-b and mgr-c appended after taking them), so its campaign is
+    // at least as up-to-date as any voter's and raft's election safety
+    // cannot refuse it.
     set_convergence(&all, true)?;
     let converged = wait_for_co_location(
         &all,
         Duration::from_secs(120),
-        "the anchor-lane leader reacquires the stray lanes",
+        "the anchor-lane leader reacquires the stray lanes it is able to win",
     );
 
     // Whoever ended up leading every lane also leads the control anchor,
@@ -1173,16 +1321,33 @@ fn lane_leadership_co_locates_on_the_control_anchor() -> R<()> {
         "replicas converge after the leadership convergence",
         || hashes_converged(&all),
     );
+
+    // Convergence must reach that state CHEAPLY. Every campaign bumps a raft
+    // term, and the failure this governor exists to prevent is a campaign
+    // loop that burns terms without ever settling; three lanes reacquired
+    // from a deliberate split is a handful of campaigns, not dozens.
+    let campaigns: u64 = all.iter().map(|node| convergence_campaigns(node)).sum();
+    assert!(
+        campaigns <= 12,
+        "converging a two-lane split took {campaigns} campaigns; convergence must be \
+         bounded, not a campaign loop"
+    );
     Ok(())
 }
 
-/// (e2) Kill the node leading all three lanes: the survivors re-converge on
-/// a single node leading every lane (each lane elects independently, then
-/// the new control leader pulls the rest onto itself), and cross-lane
-/// composites work again on that node.
+/// (e2) Kill the node leading all three lanes.
+///
+/// The REQUIRED outcome is that every lane elects a surviving leader — each
+/// lane's 2-of-3 quorum survives one loss, and a lane with no leader is a
+/// dead write path. Re-converging those leaders onto one survivor is best
+/// effort on top of that (a campaign is a race the new anchor leader can
+/// lose), so the test accepts either outcome and pins what must hold in
+/// both: cross-lane composites complete without half-applying, and
+/// convergence does not burn raft terms trying.
 #[test]
 fn killing_the_all_lane_leader_reconverges_onto_one_survivor() -> R<()> {
     let _serial = cluster_gate();
+    init_trace();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -1199,57 +1364,317 @@ fn killing_the_all_lane_leader_reconverges_onto_one_survivor() -> R<()> {
     a.kill();
 
     let survivors = [&b, &c];
-    let converged = wait_for_co_location(
-        &survivors,
-        Duration::from_secs(210),
-        "the survivors re-converge onto one manager leading all three lanes",
+
+    // FIRST and non-negotiable: every lane elects a leader from the
+    // survivors. Each lane's 2-of-3 quorum survives the loss, so this is a
+    // hard requirement, not a best-effort one — a lane with no leader is a
+    // dead write path.
+    wait_for(
+        Duration::from_secs(120),
+        "every lane elects a surviving leader after the all-lane leader dies",
+        || every_lane_has_a_live_leader(&survivors),
     );
-    assert!(
-        converged == "mgr-b" || converged == "mgr-c",
-        "a survivor must lead every lane, not the dead node: {converged}"
-    );
-    let converged_node = survivors
-        .iter()
-        .find(|node| node.name == converged)
-        .copied()
-        .context("the converged leader must be a surviving node")?;
-    for lane in LANES {
+
+    // THEN, best effort: the new control-anchor leader pulls the other lanes
+    // onto itself. It may not be able to — a campaign is a race it can lose
+    // — so a standing split is an ACCEPTED outcome here, and what must hold
+    // in that case is that cross-lane composites still complete cleanly.
+    let agreed = || {
+        co_located_leader(&b).filter(|leader| {
+            Some(leader.as_str()) == co_located_leader(&c).as_deref()
+                && survivors.iter().any(|node| node.name == leader.as_str())
+        })
+    };
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let mut converged = agreed();
+    while converged.is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+        converged = agreed();
+    }
+    if let Some(leader) = &converged {
+        let converged_node = survivors
+            .iter()
+            .find(|node| node.name == leader.as_str())
+            .copied()
+            .context("the converged leader must be a surviving node")?;
         assert!(
-            converged_node.leads_lane(lane),
-            "{converged} must lead the {lane} lane"
+            converged_node.leads_lane("control"),
+            "co-located leadership must settle on the control anchor, not some other lane"
+        );
+        for lane in LANES {
+            assert!(
+                converged_node.leads_lane(lane),
+                "{leader} must lead the {lane} lane"
+            );
+        }
+    }
+
+    // Composites that span all three lanes complete either way: on the
+    // co-located leader in one go, or — under a standing split — through the
+    // client-style retry the leader hint tells a client to do. Neither may
+    // half-apply.
+    retry_composite(
+        &survivors,
+        "register a node after the all-lane failover",
+        Duration::from_secs(120),
+        |store| store.insert_node(test_node_msg("failover-node")),
+    );
+    let outcome = retry_composite(
+        &survivors,
+        "submit a job after the all-lane failover",
+        Duration::from_secs(120),
+        |store| {
+            store.handle_job_submit(
+                &test_job("failover-job", 1),
+                &[submission("failover-job", "v1")],
+            )
+        },
+    );
+    let job_config_id = outcome.job_config_id().to_string();
+    retry_composite(
+        &survivors,
+        "enqueue the submit's scheduler-lane eval",
+        Duration::from_secs(120),
+        |store| {
+            store.enqueue_eval(
+                "job_submit",
+                Some("failover-job"),
+                Some(&job_config_id),
+                None,
+                None,
+            )
+        },
+    );
+    // Both halves are present on every survivor: the control half (the job
+    // config) and the status half (its seeded task_status rows).
+    for node in survivors {
+        assert!(
+            node.store().get_node("failover-node").is_ok(),
+            "{}: the control half of registration is missing",
+            node.name
+        );
+        assert!(
+            !node
+                .store()
+                .task_statuses_for_job_config(&job_config_id)?
+                .is_empty(),
+            "{}: the status half of the submit composite must have applied",
+            node.name
         );
     }
 
-    // A composite that spans all three lanes (submit writes control tables,
-    // seeds status task_status rows, and enqueues a scheduler-lane eval)
-    // completes on the new all-lane leader.
-    converged_node
-        .store()
-        .insert_node(test_node_msg("failover-node"))?;
-    let outcome = converged_node.store().handle_job_submit(
-        &test_job("failover-job", 1),
-        &[submission("failover-job", "v1")],
-    )?;
-    let job_config_id = outcome.job_config_id().to_string();
-    converged_node.store().enqueue_eval(
-        "job_submit",
-        Some("failover-job"),
-        Some(&job_config_id),
-        None,
-        None,
-    )?;
+    // And convergence stayed cheap whether or not it succeeded. This is the
+    // regression the governor exists for: the pre-fix loop campaigned into
+    // the status lane's own election until the terms ran to 132 in 210s with
+    // the applied index frozen, and the lane never elected at all.
+    let campaigns: u64 = survivors
+        .iter()
+        .map(|node| convergence_campaigns(node))
+        .sum();
     assert!(
-        !converged_node
-            .store()
-            .task_statuses_for_job_config(&job_config_id)?
-            .is_empty(),
-        "the status half of the submit composite must have applied"
+        campaigns <= 12,
+        "convergence issued {campaigns} campaigns after the failover; campaigns bump raft \
+         terms and must stay bounded\n{}",
+        lane_state_dump(&survivors)
     );
 
     wait_for(
         Duration::from_secs(120),
         "survivors converge after the all-lane failover",
         || hashes_converged(&survivors),
+    );
+    Ok(())
+}
+
+/// (e5) Lanes that settle on DIFFERENT leaders permanently stay correct.
+///
+/// Convergence is best effort (JC-40), so a standing split is a state
+/// production can reach and stay in. This test holds one deliberately —
+/// convergence suspended, so it cannot be raced away — and pins the three
+/// promises that make it merely *suboptimal* rather than lossy:
+///
+/// 1. The half of a composite that belongs to a foreign lane is rejected
+///    BEFORE it is captured, with the typed leader hint naming the lane and
+///    that lane's leader. It never half-applies silently.
+/// 2. The halves that DID belong to this node's lanes are all present, and
+///    the foreign half left no partial trace.
+/// 3. The scheduler work the rejected half would have enqueued is
+///    recoverable from replicated state on the scheduler lane's leader —
+///    the divergent-leadership safety net `manager::daemon` runs on its
+///    node-status-checker cadence (`store.regenerate_scheduling_evals`).
+#[test]
+fn lanes_that_settle_on_different_leaders_stay_correct() -> R<()> {
+    let _serial = cluster_gate();
+    init_trace();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?;
+    let dir = tempfile::tempdir()?;
+    let (a, b, c) = start_cluster(&rt, dir.path(), 10_000)?;
+    let all = [&a, &b, &c];
+    wait_for_co_location(
+        &all,
+        Duration::from_secs(90),
+        "bring-up leaves one manager leading all three lanes",
+    );
+
+    // Submit a job while one node still leads everything, so the cluster
+    // carries acknowledged control-plane state whose scheduling work has not
+    // been enqueued yet (the enqueue is the RPC tail's own scheduler-lane
+    // op).
+    let outcome = a
+        .store()
+        .handle_job_submit(&test_job("split-job", 1), &[submission("split-job", "v1")])?;
+    let job_config_id = outcome.job_config_id().to_string();
+
+    // Split the SCHEDULER lane away from the control anchor and keep it
+    // split: this is the shape a permanently unconverged cluster is in.
+    set_convergence(&all, false)?;
+    move_lane_leadership(&b, "scheduler", Duration::from_secs(60));
+    wait_for(
+        Duration::from_secs(60),
+        "mgr-b leads the scheduler lane while mgr-a keeps control and status",
+        || b.leads_lane("scheduler") && a.leads_lane("control") && a.leads_lane("status"),
+    );
+    // A split is not an outage: every lane still elects, and every node
+    // learns who leads it. (Bounded, not instantaneous — a node learns a new
+    // lane leader on that lane's next heartbeat.)
+    wait_for(
+        Duration::from_secs(60),
+        "every lane still has a live leader on every node while the lanes are split",
+        || every_lane_has_a_live_leader(&all),
+    );
+
+    // (1) The scheduler-lane half of the submit path — the eval enqueue the
+    // RPC tail issues — is rejected BEFORE its capture, with the typed hint
+    // naming the lane and that lane's leader, and enqueues nothing.
+    let err = a
+        .store()
+        .enqueue_eval(
+            "job_submit",
+            Some("split-job"),
+            Some(&job_config_id),
+            None,
+            None,
+        )
+        .expect_err("a scheduler-lane write on a non-scheduler leader must be rejected");
+    let rendered = format!("{err:#}");
+    assert!(
+        rendered.contains("not the raft leader"),
+        "the rejection must be the typed leader-hint error: {rendered}"
+    );
+    assert!(
+        rendered.contains("scheduler lane"),
+        "the rejection must name the lane: {rendered}"
+    );
+    assert!(
+        rendered.contains("mgr-b"),
+        "the rejection must name that lane's leader: {rendered}"
+    );
+    assert!(
+        a.store()
+            .get_evals()?
+            .iter()
+            .all(|eval| eval.job_id != "split-job"),
+        "a rejected scheduler half must not have enqueued anything"
+    );
+
+    // (2) A composite confined to the lanes this node DOES lead still
+    // completes in one go: registration is control identity + status
+    // liveness, both on mgr-a.
+    a.store().insert_node(test_node_msg("split-node"))?;
+    let registered = a.store().get_node("split-node")?;
+    assert_eq!(registered.status, "ready", "the status half applied");
+    assert_eq!(
+        registered.last_heartbeat, "2023-01-01T00:00:00Z",
+        "the status half carried the registration-supplied liveness"
+    );
+
+    // (3) A composite that SPANS the split has no home until leadership
+    // converges — the honest cost of best-effort convergence. What must hold
+    // is that it says so, actionably, from BOTH sides rather than silently
+    // half-applying. `handle_job_submit` is control → status → scheduler
+    // (the scheduler op syncs the tasks' volume claims).
+    let from_control = a
+        .store()
+        .handle_job_submit(&test_job("split-job", 2), &[submission("split-job", "v2")])
+        .expect_err("a submit that spans the split must not report success");
+    let from_control = format!("{from_control:#}");
+    assert!(
+        from_control.contains("scheduler lane") && from_control.contains("mgr-b"),
+        "the control leader's rejection must name the scheduler lane and its leader: \
+         {from_control}"
+    );
+    let from_scheduler = b
+        .store()
+        .handle_job_submit(&test_job("split-job", 2), &[submission("split-job", "v2")])
+        .expect_err("the submit has no home while the lanes are split");
+    let from_scheduler = format!("{from_scheduler:#}");
+    assert!(
+        from_scheduler.contains("control lane") && from_scheduler.contains("mgr-a"),
+        "the mirror rejection must name the control lane and its leader: {from_scheduler}"
+    );
+
+    // (4) The scheduling work the rejected enqueue never recorded is
+    // recoverable from replicated state on the SCHEDULER lane's leader.
+    // This is the pass `manager::daemon` runs every node-status-checker tick
+    // while a node leads the scheduler lane but not every lane, and it is
+    // what keeps acknowledged control-plane state from sitting unscheduled
+    // forever under a standing split.
+    wait_for(
+        Duration::from_secs(90),
+        "the submit's control-lane rows reach the scheduler-lane leader",
+        || {
+            b.store()
+                .get_task_configs_for_job_config(&job_config_id)
+                .map(|configs| !configs.is_empty())
+                .unwrap_or(false)
+        },
+    );
+    let regenerated = b.store().regenerate_scheduling_evals()?;
+    assert!(
+        regenerated > 0,
+        "the divergent-leadership safety net must re-derive the lost scheduling work"
+    );
+    assert!(
+        b.store()
+            .get_evals()?
+            .iter()
+            .any(|eval| eval.job_id == "split-job"),
+        "the job the control leader could not schedule for is scheduled again"
+    );
+
+    // (5) And once leadership converges, the client-style retry finishes the
+    // composite the split had no home for — the first halves were idempotent,
+    // so nothing was lost and nothing double-applied.
+    set_convergence(&all, true)?;
+    wait_for_co_location(
+        &all,
+        Duration::from_secs(120),
+        "the anchor leader reacquires the scheduler lane once convergence resumes",
+    );
+    let healed = retry_composite(
+        &all,
+        "the submit that spanned the split",
+        Duration::from_secs(120),
+        |store| {
+            store.handle_job_submit(&test_job("split-job", 2), &[submission("split-job", "v2")])
+        },
+    );
+    let healed_id = healed.job_config_id().to_string();
+    assert!(
+        !a.store()
+            .task_statuses_for_job_config(&healed_id)?
+            .is_empty(),
+        "every half of the healed submit applied"
+    );
+
+    // The split never cost the cluster consistency.
+    wait_for(
+        Duration::from_secs(120),
+        "replicas converge under standing divergent leadership",
+        || hashes_converged(&all),
     );
     Ok(())
 }
@@ -1263,6 +1688,7 @@ fn killing_the_all_lane_leader_reconverges_onto_one_survivor() -> R<()> {
 #[test]
 fn composites_survive_a_leadership_change_without_half_applying() -> R<()> {
     let _serial = cluster_gate();
+    init_trace();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -1393,6 +1819,7 @@ fn composites_survive_a_leadership_change_without_half_applying() -> R<()> {
 #[test]
 fn a_node_joining_during_convergence_becomes_a_voter_in_every_lane() -> R<()> {
     let _serial = cluster_gate();
+    init_trace();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()

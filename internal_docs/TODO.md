@@ -183,6 +183,27 @@ Plans: [persistence-plan.md](plans/persistence-plan.md), [multi-raft-persistence
   - [x] Multi-raft lanes (control / scheduler / status) + lane routing —
         single-writer table ownership enforced at capture time, co-located
         lane leadership, per-lane snapshots
+  - [x] **Lane-leadership convergence is bounded and cannot break a lane**
+        (2026-07-28). The JC-40 loop campaigned for LEADERLESS lanes, which
+        bypasses openraft's own election policy and restarts the node's
+        candidacy faster than an election can finish — 132 terms in 210s on a
+        2-core runner with the lane never electing. It now campaigns only for
+        a lane led elsewhere, with per-lane exponential backoff and escalating
+        stand-downs, and co-location is documented as BEST EFFORT rather than
+        an invariant. Also fixed the root cause the livelock was hiding: a
+        joiner counted as a voter while its lane membership was still JOINT,
+        so bring-up looked complete mid-join.
+        [Plan §JC-40 correction](plans/durability-and-ops-execution-plan.md) ·
+        [calls](calls/durability-and-ops-execution-plan_calls.md) ·
+        [docs/multi-raft.md](../docs/multi-raft.md)
+  - [ ] **Cross-lane composites have no home while lane leadership is split.**
+        Convergence is best effort, so a cluster can sit with lanes led by
+        different managers; a job submit then fails on the control leader (its
+        scheduler half) and on the scheduler leader (its control half), and
+        `/readyz` returns 503 until it converges. A real fix needs a
+        leader-transfer API openraft 0.9 does not have — the alternative is a
+        cross-lane write forwarder. See
+        [docs/multi-raft.md](../docs/multi-raft.md) § "Lane leadership".
   - [ ] Per-lane tuning knobs, bottleneck tracing, Raft health UI
   - [ ] The 12× lane-isolation benchmark
   - [ ] Speculative: Raft autopilot
