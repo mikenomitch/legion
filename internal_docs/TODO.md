@@ -287,7 +287,22 @@ The Pack/Helm equivalent. Job templates are in flight on
 Each of these should run inside the core binary *and* be splittable into its own
 job, so day 1 is simple and day N is performant. Each needs its own plan.
 
-- [ ] Autoscaler
+- [ ] **Autoscaler** — [plan](plans/autoscaler-plan.md) (PLANNED) ·
+      [calls](calls/autoscaler-plan_calls.md)
+  - [ ] Phase 1 — `legion job scale`: count overrides outside the job version,
+        `job_scale` eval, `scale` ACL resource, resubmit-ownership rules
+  - [ ] Phase 2 — per-allocation CPU/memory usage collection (heartbeat →
+        `allocation_health`), request-vs-usage in CLI/UI
+  - [ ] Phase 3 — task autoscaler MVP: `scaling { min, max, target }` block,
+        in-manager leader-gated evaluator, damping, scale-status surface
+  - [ ] Phase 4 — full `checks` form, Prometheus source, `per-replica`
+        strategy, activation-gated `min: 0`, `headroom`
+  - [ ] Phase 5 — escape-to-job: `legion autoscaler agent`, control-plane
+        identity policy, KV-lock leadership, `LEGION_MANAGER_ADDR` injection
+  - [ ] Phase 6 — node autoscaling: placement-shortfall signal, node groups,
+        exec-ABI providers, drain-based scale-in, `ForgetNode` RPC
+  - [ ] Phase 7 — dylib `metrics`/`strategies` plugin kinds, `ui.link` Apps
+        sidebar section
 - [ ] Ingress proxy / load balancer (also listed under *Networking*)
 - [ ] GitOps helper — deploy to git, job updates automatically
 - [ ] Cert manager (also listed under *Auth, TLS & security*)
