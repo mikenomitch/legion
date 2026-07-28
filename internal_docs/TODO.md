@@ -53,8 +53,11 @@ How to use it:
       [docs/testing-and-benchmarks.md](../docs/testing-and-benchmarks.md).
       Candidate construction is now index-served
       ([docs/scheduling-indexes.md](../docs/scheduling-indexes.md)); the
-      next known bit is the per-plan full clone of nodes +
-      `allocations_by_node` out of the read model.
+      `candidate_construction` bench group proves the dominant remaining
+      cost is the per-plan snapshot — `available_nodes()` cloning every
+      node and `ResourceLedger::new` re-parsing every node's capacity per
+      plan (~75 ms of a ~83 ms 12-task plan at 5k nodes; numbers in
+      [benchmarks/scheduler/README.md](../benchmarks/scheduler/README.md)).
 - [ ] Scheduling-index follow-ups deferred from
       [plan](plans/scheduling-index-plan.md) (see its calls doc):
       index-served candidates for multi-task **group** co-placement (v1

@@ -173,6 +173,18 @@ using it, the `reason` string says which partition key the task fails to
 bind. Prometheus counters cover the same ground fleet-wide — see
 [metrics.md](metrics.md#scheduling-indexes).
 
+## Performance expectations
+
+Indexes remove the **per-task constraint scan** — the component that scales
+with tasks × nodes. What they deliberately do not touch is the per-plan
+snapshot (cloning the node set and building the resource ledger), which
+today dominates single-task plans; measured on a 5,000-node fleet, a
+12-task plan drops ~11% wall-clock with the default partition index while a
+1-task plan is unchanged within noise (numbers and method:
+`benchmarks/scheduler/README.md`). Expect wins to grow with task count,
+constraint count, and shard selectivity — and expect none on small fleets,
+where indexes intentionally never arm.
+
 ## Maintenance and consistency
 
 Indexes live inside the scheduler's read model and are maintained by the

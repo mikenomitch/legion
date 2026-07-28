@@ -14,6 +14,17 @@ through a production shadow soak (calls entry 3), and the equivalence
 property is asserted at candidate-*set* level because placement tie-breaking
 is deliberately random (calls entry 4).
 
+**Measured outcome** (Phase 0/3 evidence, recorded in
+`benchmarks/scheduler/README.md`): the index removes the per-task scan —
+a 12-task plan over 5k nodes drops ~11% wall-clock, a 1-task plan is
+unchanged within noise — and the benchmarks show whole-plan time is
+dominated by the per-plan snapshot (`available_nodes()` clones +
+`ResourceLedger::new` over every node), which this plan deliberately did
+not touch and which is now the named next target in `TODO.md`. The
+Phase 1 acceptance target ("≥10× candidate-construction time") holds for
+the component, not for whole-plan wall-clock at these shapes; no measured
+shape regressed outside noise.
+
 ## Problem Statement
 
 Candidate construction in the scheduler is a full linear scan. Every plan

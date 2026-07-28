@@ -176,15 +176,27 @@ fn insert_regional_nodes(store: &Store, node_count: usize) -> anyhow::Result<()>
     Ok(())
 }
 
-fn make_constrained_job(count: u32) -> JobConfig {
-    let task = TaskConfig {
-        count: TaskCount::new(count),
-        constraints: json!({ "region": "region-0", "tier": "default" }),
-        ..TaskConfig::new("web".to_string(), "noop")
-    };
+/// One job, `task_count` independently-placed tasks (distinct groups so the
+/// single-task candidate path runs per task — the default group would
+/// co-place them), each constrained to one region of sixteen. Candidate
+/// construction cost scales with tasks × nodes on the scan and with tasks ×
+/// shard on the index, while the per-plan snapshot cost stays constant — so
+/// more tasks isolates the cost this group exists to measure.
+fn make_constrained_job(task_count: usize, per_task: u32) -> JobConfig {
+    let tasks = (0..task_count)
+        .map(|idx| TaskConfig {
+            count: TaskCount::new(per_task),
+            constraints: json!({
+                "region": format!("region-{}", idx % CANDIDATE_REGIONS),
+                "tier": "default",
+            }),
+            group: format!("group-{idx}"),
+            ..TaskConfig::new(format!("task-{idx}"), "noop")
+        })
+        .collect();
     JobConfig {
         name: "bench-candidates".into(),
-        tasks: vec![task],
+        tasks,
         rollout: None,
         rollout_by_group: Default::default(),
         version: None,
@@ -215,7 +227,7 @@ fn candidate_construction_benchmark(c: &mut Criterion) {
                         let store = setup_store_with_settings("bin_pack", Some(settings.clone()))
                             .expect("store");
                         insert_regional_nodes(&store, node_count).expect("nodes");
-                        let job = make_constrained_job(50);
+                        let job = make_constrained_job(12, 2);
                         let ids = submit_jobs(&store, std::slice::from_ref(&job)).expect("job");
                         (store, ids)
                     },
