@@ -12,7 +12,7 @@
 //! | `nfs` | **no** | Mounts an NFS export; instances reschedule anywhere. |
 //! | `tmpfs` | yes | RAM-backed scratch, wiped on unmount. Linux only. |
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::prelude::*;
 use crate::volumes::{
@@ -601,8 +601,13 @@ impl VolumeDriver for TmpfsDriver {
 
 /// The `mkfs.<fs>` binary for a filesystem, if this node has one. Drives both
 /// the block-mode capability probe and the format itself, so what a driver
-/// advertises and what it can actually do never diverge.
-fn mkfs_binary(fs: &str) -> Option<PathBuf> {
+/// advertises and what it can actually do never diverge. Also the lookup the
+/// sandbox kind uses to build its root disks, so "can this node format ext4"
+/// has exactly one answer.
+///
+/// `mkfs.*` commonly lives in `/sbin` or `/usr/sbin`, which are not on a
+/// non-root PATH — the well-known locations are probed too.
+pub(crate) fn mkfs_binary(fs: &str) -> Option<PathBuf> {
     // A jobspec-supplied `fs` becomes part of a binary name, so constrain it
     // rather than letting `fs: "../../bin/sh"` pick the program.
     if fs.is_empty()
@@ -612,17 +617,19 @@ fn mkfs_binary(fs: &str) -> Option<PathBuf> {
     {
         return None;
     }
-    which(&format!("mkfs.{fs}"))
+    let name = format!("mkfs.{fs}");
+    which(&name).or_else(|| {
+        ["/sbin", "/usr/sbin"]
+            .iter()
+            .map(|dir| Path::new(dir).join(&name))
+            .find(|candidate| candidate.is_file())
+    })
 }
 
 /// First match for `name` on `PATH`. Used by capability probes so a driver
 /// reports itself unavailable up front instead of failing at task start.
 fn which(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path).find_map(|dir| {
-        let candidate = dir.join(name);
-        candidate.is_file().then_some(candidate)
-    })
+    crate::util::find_on_path(name)
 }
 
 #[cfg(test)]

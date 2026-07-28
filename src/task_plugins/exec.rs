@@ -1,8 +1,8 @@
 use crate::prelude::*;
 use crate::structs::{Allocation, TaskConfig};
 use crate::task_plugins::{
-    configure_task_log_capture, derived_schema, spawn_pipe, spawn_pty, spawn_task_process,
-    ExecOptions, ExecSession, ExecSupport, TaskInstance, TaskPlugin,
+    configure_task_log_capture, derived_schema, reap_task_process, spawn_pipe, spawn_pty,
+    spawn_task_process, ExecOptions, ExecSession, ExecSupport, TaskInstance, TaskPlugin,
 };
 #[cfg(target_os = "linux")]
 use landlock::{AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr, ABI};
@@ -430,28 +430,7 @@ impl TaskPlugin for ExecTaskPlugin {
         task: &TaskConfig,
         instance: &mut TaskInstance,
     ) -> R<()> {
-        if let Some(mut child) = instance.child.take() {
-            info!(
-                allocation_id = allocation.id,
-                task_name = %task.name,
-                "Stopping exec task"
-            );
-            let _ = child.kill();
-            let _ = child.wait();
-            instance.pid = None;
-        } else if let Some(pid) = instance.pid.take() {
-            info!(
-                allocation_id = allocation.id,
-                task_name = %task.name,
-                pid,
-                "Stopping exec task by pid"
-            );
-            let mut system = sysinfo::System::new();
-            system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
-            if let Some(process) = system.process(sysinfo::Pid::from_u32(pid)) {
-                process.kill();
-            }
-        }
+        reap_task_process(allocation.id, &task.name, instance, "exec");
         Ok(())
     }
 

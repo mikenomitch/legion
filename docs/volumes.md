@@ -112,8 +112,9 @@ Every volume is handed over one of two ways, declared with `mode`:
 - **`filesystem`** (the default) — a host directory the task reads and writes.
   What `exec` and `container` tasks want.
 - **`block`** — a raw block device or disk image the task *attaches*. A guest
-  kernel consumes a virtio-blk device, not a host directory, so a microVM task
-  runtime cannot use a filesystem volume at all.
+  kernel consumes a virtio-blk device, not a host directory, so a
+  [`sandbox`](task-runtime-sandbox.md) microVM cannot use a filesystem volume
+  at all.
 
 This is the same split Kubernetes makes with `volumeMode`, for the same reason.
 
@@ -131,7 +132,9 @@ stateful: {
 
 Three things have to agree, and admission checks all three at submit:
 
-1. the **task runtime's** supported modes (`exec`/`container` → filesystem);
+1. the **task runtime's** supported modes (`exec`/`container` → filesystem;
+   `sandbox` → both, split by backend — block on microVMs, filesystem in its
+   dev modes);
 2. the **driver's** supported modes (`legion volume drivers` shows them);
 3. the mode the **job** asked for.
 
@@ -158,13 +161,14 @@ local.
 
 ## How `path` works per task runtime
 
-`path` is where the *task* sees the volume, and the two task runtimes see different
-filesystems. Legion does not pretend otherwise:
+`path` is where the *task* sees the volume, and different task runtimes see
+different filesystems. Legion does not pretend otherwise:
 
-| Kind | What `path` does | What the task should read |
+| Runtime | What `path` does | What the task should read |
 | --- | --- | --- |
 | `container` | A real bind mount at that destination inside the container. **Required.** | `path` — or `$LEGION_VOLUME_<NAME>`, which carries the same value |
 | `exec` | Nothing. An exec task runs in the **host** mount namespace: there is no filesystem view to mount into, and creating a mount at `/var/lib/db` on the operator's machine is not something a jobspec should be able to do. `path` is recorded and shown in the UI/CLI as intent. | `$LEGION_VOLUME_<NAME>` (or `$LEGION_STORAGE_DIR`), which carries the real host path |
+| `sandbox` | Block mode: the guest init mounts the attached virtio-blk device there. Dev modes: a bind mount, like `container`. Omitted on a block volume = attach-only (the guest gets the raw device). | `path` — or `$LEGION_VOLUME_<NAME>`, which carries the guest path |
 
 Every volume is exported as `LEGION_VOLUME_<NAME>` (name upper-cased,
 non-alphanumerics folded to `_`). The instance volume from `stateful.storage` is
@@ -561,14 +565,17 @@ volume (workload stopped), let the instance mint under the new driver, restore.
 ### A block device for a VM or sandbox runtime
 
 ```jsonnet
-stateful: { storage: { driver: 'local-dir', mode: 'block',
+stateful: { storage: { path: '/workspace', driver: 'local-dir', mode: 'block',
                        params: { size: '10G', fs: 'ext4' } } },
 ```
 
 The driver creates and formats a disk image and hands the task a device path
 instead of a mount path — the shape microVM runtimes want to attach as a
-virtio disk. Filesystem tasks and block volumes are cross-checked at admission
-(a plain container asking for `mode: 'block'` is rejected with the reason).
+virtio disk. This is exactly how the [`sandbox` runtime](task-runtime-sandbox.md)
+persists a workspace: the device becomes `/dev/vdb` in the guest and the
+generated init mounts it at `path`. Filesystem tasks and block volumes are
+cross-checked at admission (a plain container asking for `mode: 'block'` is
+rejected with the reason).
 
 ## Writing a volume driver
 
