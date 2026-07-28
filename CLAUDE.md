@@ -9,9 +9,9 @@ Three rules are easy to miss and are not optional.
 ## Non-trivial features get a plan, before the code
 
 Write it as `internal_docs/plans/<feature>-plan.md`: the problem, the prior art
-(how Nomad/K8s/Consul solve it), goals and non-goals, the surface as the user
-will type it, phases that each ship on their own, and the testing and rollout
-story. Required for any new user-facing surface, subsystem, default, security
+(how Nomad/K8s/Consul solve it), the jobs to be done broken out per persona in
+plain language, goals and non-goals, the surface as the user will type it,
+phases that each ship on their own, and the testing and rollout story. Required for any new user-facing surface, subsystem, default, security
 boundary, format change, or migration — not for bug fixes and refactors.
 
 **→ How to write one: [`internal_docs/plans/README.md`](internal_docs/plans/README.md)**
