@@ -880,7 +880,35 @@ pub fn get_migrations() -> Migrations<'static> {
         // evicted EVERY drained node. Set by `set_node_availability` when
         // the operator asked for eviction; cleared whenever availability
         // leaves 'drained'.
-        M::up("ALTER TABLE node ADD COLUMN drain_evict INTEGER NOT NULL DEFAULT 0;").down(""),    ])
+        M::up("ALTER TABLE node ADD COLUMN drain_evict INTEGER NOT NULL DEFAULT 0;").down(""),
+        // Job templates (job-templates plan): name + latest-version pointer,
+        // with immutable versions in job_template_version. variables is the
+        // JSON-encoded Vec<JobTemplateVariableRecord> parsed from the
+        // manifest at upsert time so list/get never re-evaluate Jsonnet.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS job_template (
+            name STRING PRIMARY KEY,
+            latest_version INTEGER NOT NULL,
+            created_at TIMESTAMP NOT NULL,
+            updated_at TIMESTAMP NOT NULL
+        )",
+        )
+        .down("DROP TABLE IF EXISTS job_template;"),
+        M::up(
+            "CREATE TABLE IF NOT EXISTS job_template_version (
+            template_name STRING NOT NULL,
+            version INTEGER NOT NULL,
+            description STRING,
+            source_jsonnet TEXT NOT NULL,
+            variables JSONB NOT NULL DEFAULT '[]',
+            created_by STRING NOT NULL DEFAULT '',
+            created_at TIMESTAMP NOT NULL,
+            PRIMARY KEY(template_name, version),
+            FOREIGN KEY(template_name) REFERENCES job_template(name) ON DELETE CASCADE
+        )",
+        )
+        .down("DROP TABLE IF EXISTS job_template_version;"),
+    ])
 }
 
 #[cfg(test)]

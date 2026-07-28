@@ -1,10 +1,11 @@
 import { createEffect, createResource, createSignal } from 'solid-js'
+import { AccessGate } from '../components/AccessGate'
 import SharedIndex from '../components/SharedIndex'
 import { managerClient } from '../grpcClient'
 import { debounced } from '../utils/debounce'
 import { formatRelativeTime } from '../utils/format'
 
-export default function Manager() {
+function ManagerContent() {
   const [search, setSearch] = createSignal('')
   const [sort, setSort] = createSignal('updated_at:desc')
   const [page, setPage] = createSignal(1)
@@ -64,5 +65,15 @@ export default function Manager() {
       emptyLabel="No manager configs recorded"
       emptyHint="Manager nodes publish a config snapshot when they start."
     />
+  )
+}
+
+// Permission gate lives here at the page level — never around the router
+// outlet in the layout (see AccessGate).
+export default function Manager() {
+  return (
+    <AccessGate resource="operator">
+      <ManagerContent />
+    </AccessGate>
   )
 }

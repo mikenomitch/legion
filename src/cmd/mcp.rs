@@ -26,13 +26,15 @@ use crate::cmd::output::CliError;
 use crate::prelude::*;
 use crate::structs::{
     exec_client_frame, exec_server_frame, CreateInstanceRequest, CreateInstancesRequest,
-    DeleteVolumeRequest, DestroyInstanceRequest, DestroyJobRequest, ExecClientFrame, ExecInput,
-    ExecStart, GetAllocationLogsRequest, GetInstanceRequest, GetJobInfoRequest, GetJobSpecRequest,
-    GetLedgerRequest, GetNodesRequest, GetRolloutStatusRequest, GetStateStoreSchemaRequest,
-    GetVolumeRequest, JobConfig, ListEventsRequest, ListInstancesRequest, ListJobActionsRequest,
+    DeleteJobTemplateRequest, DeleteVolumeRequest, DestroyInstanceRequest, DestroyJobRequest,
+    ExecClientFrame, ExecInput, ExecStart, GetAllocationLogsRequest, GetInstanceRequest,
+    GetJobInfoRequest, GetJobSpecRequest, GetJobTemplateRequest, GetLedgerRequest, GetNodesRequest,
+    GetRolloutStatusRequest, GetStateStoreSchemaRequest, GetVolumeRequest, JobConfig,
+    ListEventsRequest, ListInstancesRequest, ListJobActionsRequest, ListJobTemplatesRequest,
     ListJobsRequest, ListRolloutsRequest, ListVolumeDriversRequest, ListVolumesRequest,
-    QueryStateStoreRequest, ReplaceInstanceRequest, RunJobRequest, SetNodeAvailabilityRequest,
-    StartInstanceRequest, StopInstanceRequest, StopJobRequest,
+    QueryStateStoreRequest, RenderJobTemplateRequest, ReplaceInstanceRequest, RunJobRequest,
+    RunJobTemplateRequest, SetNodeAvailabilityRequest, StartInstanceRequest, StopInstanceRequest,
+    StopJobRequest, UpsertJobTemplateRequest,
 };
 use crate::task_plugins::validate_job_config;
 use serde::Serialize;
@@ -310,6 +312,47 @@ fn tool_defs() -> Vec<ToolDef> {
             mutates: false,
         },
         ToolDef {
+            name: "legion_template_list",
+            description: "List cluster-resident job templates (name, latest version, variables).",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Optional name/description substring filter." }
+                },
+                "additionalProperties": false
+            }),
+            mutates: false,
+        },
+        ToolDef {
+            name: "legion_template_get",
+            description: "Show one job template version: declared variables, source, and version history.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "Template name." },
+                    "version": { "type": "integer", "description": "Version to fetch (default: latest)." }
+                },
+                "required": ["name"],
+                "additionalProperties": false
+            }),
+            mutates: false,
+        },
+        ToolDef {
+            name: "legion_template_render",
+            description: "Dry-run a job template: validate variables and return the rendered jobspec without submitting.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "Template name." },
+                    "version": { "type": "integer", "description": "Version to render (default: latest)." },
+                    "variables": { "type": "object", "description": "Variable values keyed by variable key." }
+                },
+                "required": ["name"],
+                "additionalProperties": false
+            }),
+            mutates: false,
+        },
+        ToolDef {
             name: "legion_job_run",
             description: "Submit or update a job from a rendered jobspec (JSON). Mutating.",
             input_schema: || json!({
@@ -350,6 +393,43 @@ fn tool_defs() -> Vec<ToolDef> {
                 "required": ["name"],
                 "additionalProperties": false
             }),
+            mutates: true,
+        },
+        ToolDef {
+            name: "legion_template_run",
+            description: "Render a job template with variables and submit the resulting job. Mutating.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "Template name." },
+                    "version": { "type": "integer", "description": "Version to render (default: latest)." },
+                    "variables": { "type": "object", "description": "Variable values keyed by variable key." },
+                    "idempotency_key": { "type": "string", "description": "Optional key to dedupe retries." },
+                    "force_reschedule": { "type": "boolean", "description": "Reschedule even if unchanged." }
+                },
+                "required": ["name"],
+                "additionalProperties": false
+            }),
+            mutates: true,
+        },
+        ToolDef {
+            name: "legion_template_upsert",
+            description: "Store Jsonnet source as the next immutable version of a job template. Mutating.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "Template name (lowercase, digits, dashes)." },
+                    "source_jsonnet": { "type": "string", "description": "Self-contained template source with a hidden job(vars):: function." }
+                },
+                "required": ["name", "source_jsonnet"],
+                "additionalProperties": false
+            }),
+            mutates: true,
+        },
+        ToolDef {
+            name: "legion_template_delete",
+            description: "Delete a job template and all of its versions. Mutating.",
+            input_schema: name_arg_schema,
             mutates: true,
         },
         ToolDef {
@@ -907,6 +987,65 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             let mut client = connect().await?;
             grpc(client.get_state_store_schema(GetStateStoreSchemaRequest {})).await
         }
+        "legion_template_list" => {
+            let mut client = connect().await?;
+            grpc(client.list_job_templates(ListJobTemplatesRequest {
+                query: opt_str_arg(&args, "query"),
+            }))
+            .await
+        }
+        "legion_template_get" => {
+            let name = str_arg(&args, "name")?;
+            let mut client = connect().await?;
+            grpc(client.get_job_template(GetJobTemplateRequest {
+                name,
+                version: opt_u32_arg(&args, "version"),
+            }))
+            .await
+        }
+        "legion_template_render" => {
+            let name = str_arg(&args, "name")?;
+            let mut client = connect().await?;
+            grpc(client.render_job_template(RenderJobTemplateRequest {
+                name,
+                version: opt_u32_arg(&args, "version"),
+                variables_json: variables_arg(&args),
+            }))
+            .await
+        }
+        "legion_template_run" => {
+            let name = str_arg(&args, "name")?;
+            let idempotency_key = opt_str_arg(&args, "idempotency_key");
+            let force_reschedule = args
+                .get("force_reschedule")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let mut client = connect().await?;
+            grpc(client.run_job_template(RunJobTemplateRequest {
+                name,
+                version: opt_u32_arg(&args, "version"),
+                variables_json: variables_arg(&args),
+                priority: None,
+                force_reschedule,
+                idempotency_key,
+            }))
+            .await
+        }
+        "legion_template_upsert" => {
+            let name = str_arg(&args, "name")?;
+            let source_jsonnet = str_arg(&args, "source_jsonnet")?;
+            let mut client = connect().await?;
+            grpc(client.upsert_job_template(UpsertJobTemplateRequest {
+                name,
+                source_jsonnet,
+            }))
+            .await
+        }
+        "legion_template_delete" => {
+            let name = str_arg(&args, "name")?;
+            let mut client = connect().await?;
+            grpc(client.delete_job_template(DeleteJobTemplateRequest { name })).await
+        }
         "legion_job_run" => {
             let spec_json = str_arg(&args, "spec_json")?;
             let idempotency_key = opt_str_arg(&args, "idempotency_key");
@@ -1078,6 +1217,20 @@ fn opt_str_arg(args: &Value, key: &str) -> Option<String> {
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
+}
+
+fn opt_u32_arg(args: &Value, key: &str) -> Option<u32> {
+    args.get(key)
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+}
+
+/// The `variables` object argument serialized for `variables_json` fields.
+fn variables_arg(args: &Value) -> String {
+    args.get("variables")
+        .filter(|value| value.is_object())
+        .map(Value::to_string)
+        .unwrap_or_else(|| "{}".to_string())
 }
 
 fn tool_success(data: &Value) -> Value {

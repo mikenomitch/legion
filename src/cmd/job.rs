@@ -268,7 +268,7 @@ pub fn config() -> Command {
 /// Optional idempotency key for mutating job operations. When supplied, the
 /// manager deduplicates retried requests carrying the same key, so an agent
 /// can safely retry on timeout without risking a double-apply.
-fn idempotency_arg() -> Arg {
+pub(crate) fn idempotency_arg() -> Arg {
     Arg::new("idempotency-key")
         .long("idempotency-key")
         .value_name("KEY")
@@ -276,7 +276,7 @@ fn idempotency_arg() -> Arg {
 }
 
 /// Flag requesting that `job run` block until the resulting rollout converges.
-fn wait_flag() -> Arg {
+pub(crate) fn wait_flag() -> Arg {
     Arg::new("wait")
         .long("wait")
         .help("Block until the job's rollout converges to a terminal state")
@@ -284,7 +284,7 @@ fn wait_flag() -> Arg {
 }
 
 /// Timeout (seconds) for convergence waits.
-fn timeout_arg() -> Arg {
+pub(crate) fn timeout_arg() -> Arg {
     Arg::new("timeout")
         .long("timeout")
         .value_name("SECONDS")
@@ -295,7 +295,7 @@ fn timeout_arg() -> Arg {
 /// Default convergence-wait timeout when `--timeout` is not supplied.
 const DEFAULT_WAIT_SECS: u64 = 120;
 
-fn wait_timeout(matches: &ArgMatches) -> std::time::Duration {
+pub(crate) fn wait_timeout(matches: &ArgMatches) -> std::time::Duration {
     let secs = matches
         .get_one::<u64>("timeout")
         .copied()
@@ -351,7 +351,7 @@ fn is_settled_rollout_status(status: &str) -> bool {
 }
 
 /// Poll the job's most recent rollout until it settles or the timeout elapses.
-async fn wait_for_convergence(
+pub(crate) async fn wait_for_convergence(
     client: &mut crate::cmd::helpers::AuthedManagerClient,
     job_name: &str,
     timeout: std::time::Duration,
@@ -599,7 +599,7 @@ pub(crate) fn build_jobspec_schema() -> Value {
     })
 }
 
-fn priority_arg() -> Arg {
+pub(crate) fn priority_arg() -> Arg {
     Arg::new("priority")
         .long("priority")
         .value_name("PRIORITY")
@@ -608,7 +608,7 @@ fn priority_arg() -> Arg {
         .conflicts_with("asap")
 }
 
-fn asap_flag() -> Arg {
+pub(crate) fn asap_flag() -> Arg {
     Arg::new("asap")
         .long("asap")
         .help("Force the request to run ASAP by setting priority to 100")
@@ -616,7 +616,7 @@ fn asap_flag() -> Arg {
         .conflicts_with("priority")
 }
 
-fn priority_from_matches(matches: &ArgMatches) -> Option<i64> {
+pub(crate) fn priority_from_matches(matches: &ArgMatches) -> Option<i64> {
     if matches.get_flag("asap") {
         Some(100)
     } else {

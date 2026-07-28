@@ -47,6 +47,7 @@ legion acl whoami
 | `acl` | tokens, policies, users | list/get | create/update/delete |
 | `exec` | exec into a running allocation | — | open a session (`host: true` for host-level runtimes) |
 | `action` | run declared actions on an allocation | — | run an action (scope with `action_names`) |
+| `template` | job templates | list/inspect | publish versions, delete (scope with `templates`) |
 
 Actions are `read` and `write` (`write` does not imply `read`; grant both).
 `state:read` is powerful — it can read every table in the state store —
@@ -70,10 +71,28 @@ A policy is a named JSON array of rules:
 - `effect` is `allow` (default) or `deny`.
 - Scope selectors narrow a rule with `*`-globs: `names` (job names),
   `namespaces` (jobs live in `default` until namespaces land), `pools`
-  (node pools), `paths` (KV keys). A rule with a selector only matches
+  (node pools), `paths` (KV keys), `actionNames` (declared actions), and
+  `templates` (job-template names). A rule with a selector only matches
   requests carrying that attribute.
 - List endpoints filter to what the caller can read: a token scoped to
   `paths: ["team-a/*"]` sees only `team-a/` keys in `legion kv list`.
+
+**Restricting an account to specific job templates.** Because a rule with a
+selector never matches a request lacking that attribute, a `job` rule
+carrying `templates` grants submission *only through* those templates —
+raw `legion job run` stays denied:
+
+```jsonnet
+[
+  { resources: ["template"], actions: ["read"], templates: ["render"] },
+  { resources: ["job"], actions: ["read", "write"], templates: ["render"] },
+]
+```
+
+The account can run `render`, and see and stop the jobs that template
+created, but cannot submit an arbitrary spec. See
+[Job Templates](job-templates.md) for the full model, including the
+collision guard and which endpoints carry the template attribute.
 
 Manage with `legion acl policy apply|list|get|delete`. Files can be JSON or
 Jsonnet (either a bare rules array or `{description, rules}`).

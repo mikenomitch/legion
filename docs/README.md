@@ -28,6 +28,8 @@ Plans, roadmaps, to-do lists, and development notes live in
 - [Task Runtime: sandbox](task-runtime-sandbox.md) — OCI images in microVMs for
   untrusted code and agent workspaces.
 - [Task Runtime: noop](task-runtime-noop.md)
+- [Job Templates](job-templates.md) — reusable, versioned job specs with typed
+  variables, guided submission, and template-scoped delegation.
 - [Artifacts](artifacts.md) — declaring, fetching, verifying, and staging inputs.
 - [Stateful Workloads & Instance Identity](stateful-workloads.md) — slot and
   keyed instances, storage handles, fencing.

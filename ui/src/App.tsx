@@ -1,10 +1,11 @@
 import { A, Navigate, Route, Router, useLocation, useNavigate, type RouteSectionProps } from '@solidjs/router'
-import { For, Show, createEffect, createMemo, createResource, createSignal, on, onCleanup, onMount } from 'solid-js'
+import { ErrorBoundary, For, Show, createEffect, createMemo, createResource, createSignal, on, onCleanup, onMount, type JSX } from 'solid-js'
 import Breadcrumbs from './components/Breadcrumbs'
 import { AclBanner } from './components/AclBanner'
 import { ConnectionGate } from './components/ConnectionGate'
 import { Icon, JumpHint, PageHeader, cx, type IconName } from './components/ui'
 import { managerClient } from './grpcClient'
+import { ROUTE_RESOURCE, canRead, isAnonymous } from './utils/acl'
 import { commandPaletteIndexItems } from './utils/commandPalette'
 import { connectionStatus, managerAddress } from './utils/connection'
 import {
@@ -40,6 +41,8 @@ import Observability from './pages/Observability'
 import TestingUtils from './pages/TestingUtils'
 import StateExplorer from './pages/StateExplorer'
 import Raft from './pages/Raft'
+import Templates from './pages/Templates'
+import TemplateDetail from './pages/details/TemplateDetail'
 
 type SidebarItem = {
   kind: 'item'
@@ -67,7 +70,18 @@ type CommandPaletteItem = {
 
 type SidebarNode = SidebarItem | SidebarSection
 
-const detailRoutes = new Set(['jobs', 'nodes', 'manager', 'rollouts', 'services', 'volumes'])
+const detailRoutes = new Set(['jobs', 'nodes', 'manager', 'rollouts', 'services', 'templates', 'volumes'])
+
+// Anonymous callers keep the whole sidebar: they have not had a chance to
+// authenticate, and an app that hides every destination looks broken rather
+// than locked. Clicking through lands on AccessDenied, which says why and
+// links to login. A caller who IS authenticated only sees what their rules
+// allow. Cosmetic — the manager enforces regardless.
+const isNavVisible = (path: string): boolean => {
+  const resource = ROUTE_RESOURCE[path]
+  if (!resource) return true
+  return canRead(resource) || isAnonymous()
+}
 
 const decodePathSegment = (value: string) => {
   try {
@@ -99,6 +113,46 @@ const BrandMark = (props: { class?: string }) => (
   </svg>
 )
 
+// Last line of defense for the page area: a page that throws (most often an
+// unguarded read of an errored resource) must never take the app down with
+// it — before this existed, one rejected RPC could freeze navigation while
+// the URL kept changing. Renders its children normally (no conditional
+// capture of the outlet) and swaps to the card only when something throws;
+// navigating elsewhere resets it.
+const RouteErrorBoundary = (props: { children: JSX.Element }) => {
+  const location = useLocation()
+  return (
+    <ErrorBoundary
+      fallback={(err, reset) => {
+        createEffect(on(() => location.pathname, reset, { defer: true }))
+        return (
+          <div class="flex justify-center py-12">
+            <div class="w-full max-w-md rounded-lg border border-line bg-surface p-6 text-center shadow-card">
+              <span class="mx-auto flex h-10 w-10 items-center justify-center rounded-full bg-red-500/10 text-red-600 dark:text-red-400">
+                <Icon name="alertTriangle" size={19} />
+              </span>
+              <h2 class="mt-3 font-display text-lg font-semibold text-ink">This page hit an error</h2>
+              <p class="mx-auto mt-1.5 max-w-sm break-words font-mono text-xs text-muted">
+                {err instanceof Error ? err.message : String(err)}
+              </p>
+              <button
+                type="button"
+                class="mt-5 inline-flex items-center gap-2 rounded-md border border-transparent bg-brass px-3.5 py-2 text-sm font-semibold text-canvas transition-colors hover:bg-brass-strong"
+                onClick={reset}
+              >
+                <Icon name="refresh" size={15} />
+                Try again
+              </button>
+            </div>
+          </div>
+        )
+      }}
+    >
+      {props.children}
+    </ErrorBoundary>
+  )
+}
+
 const Layout = (props: RouteSectionProps) => {
   const location = useLocation()
   const navigate = useNavigate()
@@ -111,9 +165,22 @@ const Layout = (props: RouteSectionProps) => {
   const [theme, setTheme] = createSignal<'light' | 'dark'>(resolveInitialTheme())
   // Waits for the connection probe: firing this before we know the manager is
   // reachable just produces a second failure to ignore.
+  // The probe MUST swallow its own failure. GetObservability needs
+  // operator:read; for any identity without it the RPC rejects, and reading
+  // an errored resource THROWS at the read site — which is the navItems()
+  // memo. An exception there takes down the layout's whole reactive graph:
+  // the URL keeps changing while the nav, header, and page freeze. (This is
+  // exactly what restricted tokens hit before ACL-aware rendering existed;
+  // treat "can't ask" the same as "o11y off".)
   const [o11yStatus] = createResource(
     () => connectionStatus() === 'connected',
-    async () => managerClient.getObservability({ maxLines: 1 }),
+    async () => {
+      try {
+        return await managerClient.getObservability({ maxLines: 1 })
+      } catch {
+        return undefined
+      }
+    },
   )
   const [commandPaletteOpen, setCommandPaletteOpen] = createSignal(false)
   const [commandPaletteQuery, setCommandPaletteQuery] = createSignal('')
@@ -130,6 +197,7 @@ const Layout = (props: RouteSectionProps) => {
         heading: 'Workloads',
         items: [
           { kind: 'item', label: 'Jobs', path: '/jobs', title: 'Jobs', copy: 'Every job on the cluster and its health.', icon: 'layers' },
+          { kind: 'item', label: 'Templates', path: '/templates', title: 'Templates', copy: 'Reusable job templates with guided parameters.', icon: 'layoutTemplate' },
           { kind: 'item', label: 'Services', path: '/services', title: 'Services', copy: 'Discoverable endpoints and their health.', icon: 'radio' },
           { kind: 'item', label: 'Rollouts', path: '/rollouts', title: 'Rollouts', copy: 'Version rollouts and their progress.', icon: 'rocket' },
           { kind: 'item', label: 'Volumes', path: '/volumes', title: 'Volumes', copy: 'Persistent storage behind stateful tasks.', icon: 'hardDrive' },
@@ -175,7 +243,15 @@ const Layout = (props: RouteSectionProps) => {
       })
     }
 
-    return base
+    // Hide destinations the identity's ACL rules cannot read; drop sections
+    // that end up empty. Direct navigation still works (and fails loudly) —
+    // this only trims what the UI offers.
+    const isVisible = (item: SidebarItem) => isNavVisible(item.path)
+    return base.flatMap<SidebarNode>((entry) => {
+      if (entry.kind === 'item') return isVisible(entry) ? [entry] : []
+      const items = entry.items.filter(isVisible)
+      return items.length > 0 ? [{ ...entry, items }] : []
+    })
   })
 
   const flattenedNavItems = createMemo(() =>
@@ -790,7 +866,9 @@ const Layout = (props: RouteSectionProps) => {
             <Show when={!isDetailRoute()}>
               <PageHeader title={pageMeta().title} subtitle={pageMeta().subtitle} />
             </Show>
-            <ConnectionGate>{props.children}</ConnectionGate>
+            <ConnectionGate>
+              <RouteErrorBoundary>{props.children}</RouteErrorBoundary>
+            </ConnectionGate>
           </main>
         </div>
       </div>
@@ -808,6 +886,8 @@ const AppRoutes = () => {
       <Route path="/raft" component={Raft} />
       <Route path="/manager/:id" component={ManagerNodeDetail} />
       <Route path="/jobs" component={Jobs} />
+      <Route path="/templates" component={Templates} />
+      <Route path="/templates/:name" component={TemplateDetail} />
       <Route path="/jobs/:id" component={JobDetail} />
       <Route path="/jobs/:id/tasks/:taskName" component={TaskDetail} />
       <Route path="/jobs/:id/specs/:configId" component={JobSpecDetail} />

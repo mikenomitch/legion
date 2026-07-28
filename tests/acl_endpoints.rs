@@ -32,6 +32,8 @@ type R<T> = anyhow::Result<T>;
 
 const NODE_ID: &str = "acl-node";
 const JOB_NAME: &str = "acl-job";
+const TEMPLATE_NAME: &str = "acl-template";
+const TEMPLATE_JOB_NAME: &str = "acl-template-job";
 const KV_KEY: &str = "team/config";
 const FIXTURE_POLICY: &str = "fixture-policy";
 const DELETABLE_POLICY: &str = "deletable-policy";
@@ -78,6 +80,12 @@ fn endpoint_table() -> Vec<(&'static str, Plane)> {
         ("StopJob", Plane::Protected("job:write")),
         ("DestroyJob", Plane::Protected("job:write")),
         ("ListJobs", Plane::Protected("job:read")),
+        ("UpsertJobTemplate", Plane::Protected("template:write")),
+        ("ListJobTemplates", Plane::Protected("template:read")),
+        ("GetJobTemplate", Plane::Protected("template:read")),
+        ("RenderJobTemplate", Plane::Protected("job:write")),
+        ("RunJobTemplate", Plane::Protected("job:write")),
+        ("DeleteJobTemplate", Plane::Protected("template:write")),
         ("ListServices", Plane::Protected("job:read")),
         ("ResolveService", Plane::Protected("job:read")),
         ("GetNodes", Plane::Protected("node:read")),
@@ -168,6 +176,29 @@ fn req<T>(inner: T, token: Option<&str>) -> Request<T> {
     request
 }
 
+/// A valid, variable-free template so render/run builders exercise the full
+/// path under a management token. Uses the built-in `exec` kind so
+/// validation does not depend on locally built plugin dylibs.
+fn template_source(job_name: &str) -> String {
+    format!(
+        r#"{{
+  description: 'acl fixture template',
+  variables: [],
+  job(vars):: {{
+    name: '{job_name}',
+    tasks: [{{
+      name: 'main',
+      runtime: 'exec',
+      count: 1,
+      config: {{ command: ['echo', 'ok'] }},
+      resources: {{}},
+      constraints: {{}},
+    }}],
+  }},
+}}"#
+    )
+}
+
 fn jobspec(name: &str) -> String {
     serde_json::json!({
         "name": name,
@@ -244,6 +275,64 @@ async fn call_endpoint(
                 RunJobRequest {
                     parsed_jobspec: jobspec("acl-job-2"),
                     ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "UpsertJobTemplate" => svc
+            .upsert_job_template(req(
+                UpsertJobTemplateRequest {
+                    name: TEMPLATE_NAME.into(),
+                    source_jsonnet: template_source(TEMPLATE_JOB_NAME),
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "ListJobTemplates" => svc
+            .list_job_templates(req(ListJobTemplatesRequest::default(), token))
+            .await
+            .map(|_| ()),
+        "GetJobTemplate" => svc
+            .get_job_template(req(
+                GetJobTemplateRequest {
+                    name: TEMPLATE_NAME.into(),
+                    version: None,
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "RenderJobTemplate" => svc
+            .render_job_template(req(
+                RenderJobTemplateRequest {
+                    name: TEMPLATE_NAME.into(),
+                    version: None,
+                    variables_json: "{}".into(),
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "RunJobTemplate" => svc
+            .run_job_template(req(
+                RunJobTemplateRequest {
+                    name: TEMPLATE_NAME.into(),
+                    version: None,
+                    variables_json: "{}".into(),
+                    priority: None,
+                    force_reschedule: false,
+                    idempotency_key: None,
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "DeleteJobTemplate" => svc
+            .delete_job_template(req(
+                DeleteJobTemplateRequest {
+                    name: TEMPLATE_NAME.into(),
                 },
                 token,
             ))
@@ -913,6 +1002,14 @@ fn seed_fixtures(store: &Store) -> R<Fixtures> {
     )?;
     let job_config_id = store.get_job_config(JOB_NAME)?.id();
 
+    store.upsert_job_template_version(
+        TEMPLATE_NAME,
+        Some("acl fixture template"),
+        &template_source(TEMPLATE_JOB_NAME),
+        &[],
+        "fixture",
+    )?;
+
     store.put_kv(KV_KEY, "v1", KvValueType::String, None, None)?;
     store.put_kv("team/deletable", "v1", KvValueType::String, None, None)?;
     store.put_kv("secret/hidden", "v1", KvValueType::String, None, None)?;
@@ -1408,6 +1505,114 @@ async fn job_name_scoped_policy_limits_job_access() -> R<()> {
         "list must only contain the scoped job, got {:?}",
         reply.jobs.iter().map(|job| &job.name).collect::<Vec<_>>(),
     );
+    Ok(())
+}
+
+/// Template-scoped delegation: a token whose only `job:write` comes from a
+/// `templates` selector can submit through the template (and see and stop
+/// the job it creates) but not through raw RunJob, cannot author templates,
+/// and the collision guard stops it from hijacking unrelated jobs through a
+/// template that renders their names.
+#[tokio::test]
+async fn template_scoped_policy_gates_submission_channel() -> R<()> {
+    let (svc, fixtures, _) = setup_enabled()?;
+    let authenticator = svc.auth.clone();
+
+    svc.store.upsert_acl_policy(
+        "template-runner",
+        "",
+        &format!(
+            r#"[
+                {{"resources": ["template"], "actions": ["read"],
+                  "templates": ["{TEMPLATE_NAME}", "acl-hijack"]}},
+                {{"resources": ["job"], "actions": ["read", "write"],
+                  "templates": ["{TEMPLATE_NAME}", "acl-hijack"]}}
+            ]"#
+        ),
+    )?;
+    let (_, secret) = authenticator
+        .mint_token(
+            &svc.store,
+            "template-runner",
+            "client",
+            &["template-runner".into()],
+            None,
+        )
+        .map_err(|s| anyhow!(s.to_string()))?;
+
+    // Allowed: browsing and running the granted template.
+    call_endpoint(&svc, &fixtures, "GetJobTemplate", Some(&secret))
+        .await
+        .expect("scoped token reads its template");
+    call_endpoint(&svc, &fixtures, "RenderJobTemplate", Some(&secret))
+        .await
+        .expect("scoped token previews its template");
+    call_endpoint(&svc, &fixtures, "RunJobTemplate", Some(&secret))
+        .await
+        .expect("scoped token submits through its template");
+
+    // Denied: raw RunJob carries no template attribute, so the
+    // templates-scoped job rule never matches it.
+    let status = call_endpoint(&svc, &fixtures, "RunJob", Some(&secret))
+        .await
+        .expect_err("template-scoped token must not submit raw specs");
+    assert_eq!(status.code(), Code::PermissionDenied);
+    // Denied: read+run does not grant template authoring.
+    let status = call_endpoint(&svc, &fixtures, "UpsertJobTemplate", Some(&secret))
+        .await
+        .expect_err("template-scoped token must not author templates");
+    assert_eq!(status.code(), Code::PermissionDenied);
+
+    // The job created through the template is visible (provenance feeds the
+    // templates selector on reads); the unrelated fixture job is filtered.
+    let reply = svc
+        .list_jobs(req(ListJobsRequest::default(), Some(&secret)))
+        .await?
+        .into_inner();
+    assert!(
+        reply.jobs.iter().any(|job| job.name == TEMPLATE_JOB_NAME),
+        "template-created job must be visible, got {:?}",
+        reply.jobs.iter().map(|job| &job.name).collect::<Vec<_>>(),
+    );
+    assert!(
+        reply.jobs.iter().all(|job| job.name != JOB_NAME),
+        "unrelated jobs must stay filtered"
+    );
+    // Lifecycle write on the template's job is allowed.
+    svc.stop_job(req(
+        StopJobRequest {
+            name: TEMPLATE_JOB_NAME.into(),
+            ..Default::default()
+        },
+        Some(&secret),
+    ))
+    .await
+    .expect("template-scoped token stops its template's job");
+
+    // Collision guard: a granted template that renders an existing raw
+    // job's name must not let this token overwrite it.
+    svc.store.upsert_job_template_version(
+        "acl-hijack",
+        None,
+        &template_source(JOB_NAME),
+        &[],
+        "fixture",
+    )?;
+    let status = svc
+        .run_job_template(req(
+            RunJobTemplateRequest {
+                name: "acl-hijack".into(),
+                version: None,
+                variables_json: "{}".into(),
+                priority: None,
+                force_reschedule: false,
+                idempotency_key: None,
+            },
+            Some(&secret),
+        ))
+        .await
+        .expect_err("collision guard must block hijacking unrelated jobs");
+    assert_eq!(status.code(), Code::FailedPrecondition);
     Ok(())
 }
 

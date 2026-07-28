@@ -11,6 +11,7 @@ Full index: [docs/README.md](docs/README.md).
 - [Scheduler and Eval Loop](docs/scheduler-and-eval-loop.md)
 - [Event Stream](docs/event-stream.md)
 - [Jobs, Tasks, and Scheduling](docs/jobs-tasks-and-scheduling.md)
+- [Job Templates (reusable specs, typed variables, delegated submission)](docs/job-templates.md)
 - [Task Runtime Plugins](docs/task-runtime-plugins.md)
 - [Task Runtime: exec](docs/task-runtime-exec.md)
 - [Task Runtime: container](docs/task-runtime-container.md)

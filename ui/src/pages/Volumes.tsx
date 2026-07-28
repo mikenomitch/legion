@@ -1,4 +1,5 @@
 import { A } from '@solidjs/router'
+import { AccessGate } from '../components/AccessGate'
 import { For, Show, createEffect, createMemo, createResource, createSignal, onCleanup, onMount } from 'solid-js'
 import {
   Badge,
@@ -33,7 +34,7 @@ import {
   volumeStateTone,
 } from '../utils/volumes'
 
-export default function Volumes() {
+function VolumesContent() {
   const [search, setSearch] = createSignal('')
   const [stateFilter, setStateFilter] = createSignal('live')
   const [tick, setTick] = createSignal(0)
@@ -320,5 +321,15 @@ export default function Volumes() {
         </Show>
       </SectionCard>
     </div>
+  )
+}
+
+// Permission gate lives here at the page level — never around the router
+// outlet in the layout (see AccessGate).
+export default function Volumes() {
+  return (
+    <AccessGate resource="job">
+      <VolumesContent />
+    </AccessGate>
   )
 }

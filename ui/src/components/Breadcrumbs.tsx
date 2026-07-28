@@ -11,6 +11,7 @@ const sectionLabels: Record<string, string> = {
   nodes: 'Workers',
   manager: 'Managers',
   jobs: 'Jobs',
+  templates: 'Templates',
   rollouts: 'Rollouts',
   raft: 'Raft',
   events: 'Events',
@@ -43,6 +44,7 @@ const labelForSegment = (segments: readonly string[], index: number): string => 
   if (index === 0 && sectionLabels[current]) return sectionLabels[current]
 
   if (previous === 'jobs') return decoded
+  if (previous === 'templates') return decoded
   if (previous === 'nodes') return decoded
   if (previous === 'manager') return decoded
   if (previous === 'rollouts') return decoded

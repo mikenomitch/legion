@@ -1,5 +1,7 @@
 import { For, Show, createMemo, createResource, createSignal } from 'solid-js'
+import { AccessGate } from '../components/AccessGate'
 import { managerClient } from '../grpcClient'
+import { allows } from '../utils/acl'
 import { Badge, Button, CodeBlock, ConfirmButton, DefList, EmptyState, Field, Icon, Note, SectionCard, Spinner, StatusBadge, cx, inputClass } from '../components/ui'
 
 const raftCommands = [
@@ -11,7 +13,7 @@ const raftCommands = [
   { label: 'Remove Member', command: 'remove-member', requiresTarget: true, destructive: true },
 ]
 
-export default function Raft() {
+function RaftContent() {
   const [target, setTarget] = createSignal('')
   const [commandResult, setCommandResult] = createSignal('')
   const [joinToken, setJoinToken] = createSignal('')
@@ -24,7 +26,7 @@ export default function Raft() {
     await Promise.all([statusActions.refetch(), historyActions.refetch()])
   }
 
-  const canRunCommands = createMemo(() => status()?.status?.enabled ?? false)
+  const canRunCommands = createMemo(() => (status()?.status?.enabled ?? false) && allows('operator', 'write'))
   // Only claim "disabled" once the manager has actually answered.
   const raftDisabled = createMemo(() => status() !== undefined && !status()?.status?.enabled)
 
@@ -201,5 +203,15 @@ export default function Raft() {
         </Show>
       </SectionCard>
     </div>
+  )
+}
+
+// Permission gate lives here at the page level — never around the router
+// outlet in the layout (see AccessGate).
+export default function Raft() {
+  return (
+    <AccessGate resource="operator">
+      <RaftContent />
+    </AccessGate>
   )
 }

@@ -634,6 +634,7 @@ pub fn enforce(
         name = scope.name.as_deref().unwrap_or("-"),
         pool = scope.pool.as_deref().unwrap_or("-"),
         path = scope.path.as_deref().unwrap_or("-"),
+        template = scope.template.as_deref().unwrap_or("-"),
         enforced = !identity.audit_only,
         "ACL denial"
     );

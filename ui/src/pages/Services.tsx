@@ -1,4 +1,5 @@
 import { A } from '@solidjs/router'
+import { AccessGate } from '../components/AccessGate'
 import { For, Show, createEffect, createMemo, createResource, createSignal, onCleanup, onMount } from 'solid-js'
 import { ServiceTags } from '../components/ServiceEndpoints'
 import {
@@ -38,7 +39,7 @@ const serviceStatus = (healthy: number, total: number) => {
   return healthy === total ? 'healthy' : 'degraded'
 }
 
-export default function Services() {
+function ServicesContent() {
   const [search, setSearch] = createSignal('')
   const [tick, setTick] = createSignal(0)
 
@@ -194,5 +195,15 @@ export default function Services() {
         </Show>
       </SectionCard>
     </div>
+  )
+}
+
+// Permission gate lives here at the page level — never around the router
+// outlet in the layout (see AccessGate).
+export default function Services() {
+  return (
+    <AccessGate resource="job">
+      <ServicesContent />
+    </AccessGate>
   )
 }
