@@ -39,6 +39,14 @@ How to use it:
         prior art + non-goals: the 80/20 is priority bands now, per-namespace
         band caps later (phase 4); fair-share/hierarchical queues explicitly
         deferred (Kueue's policy-matrix issue history is the argument against).
+- [ ] Gang scheduling — `gang` on a task makes its replicas place
+      all-or-nothing, with capacity failures becoming blocked-and-retried
+      evals (woken on `node_join`) instead of terminal eval failures —
+      [plan](plans/gang-scheduling-plan.md) (PLANNED: gang contract + blocked
+      evals → `min` quorum + `placementTimeout` → whole-gang recovery →
+      blue-green updates; reservation/backfill anti-starvation and
+      gang-grained preemption deliberately deferred, the latter coordinated
+      with the preemption plan)
 - [ ] Schedule onto the same node as an *existing job*. Soft `same_node_as`
       colocation works within one job spec
       ([scheduler/policy.rs](../src/manager/scheduler/policy.rs)); cross-job

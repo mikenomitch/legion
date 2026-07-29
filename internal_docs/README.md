@@ -57,6 +57,7 @@ When one is required and what goes in it:
 | [auth-acl-plan.md](plans/auth-acl-plan.md) | phases 1–4 executed |
 | [exec-and-actions-plan.md](plans/exec-and-actions-plan.md) | shipped (all five phases) |
 | [durability-and-ops-execution-plan.md](plans/durability-and-ops-execution-plan.md) | executed (workstreams A/B/C/D + adversarial verification, 2026-07-28); lanes topology opt-in |
+| [gang-scheduling-plan.md](plans/gang-scheduling-plan.md) | planned |
 | [job-templates-plan.md](plans/job-templates-plan.md) | in execution |
 | [kv-reactive-task-updates-plan.md](plans/kv-reactive-task-updates-plan.md) | shipped |
 | [persistence-plan.md](plans/persistence-plan.md) | phases 0–1, 3 done |
@@ -96,6 +97,7 @@ by project impact. The full template and a worked example:
 - [auth-acl-plan_calls.md](calls/auth-acl-plan_calls.md)
 - [container-task-kind-macos_calls.md](calls/container-task-kind-macos_calls.md)
 - [exec-and-actions-plan_calls.md](calls/exec-and-actions-plan_calls.md)
+- [gang-scheduling-plan_calls.md](calls/gang-scheduling-plan_calls.md)
 - [job-templates-plan_calls.md](calls/job-templates-plan_calls.md)
 - [kv-reactive-task-updates-plan_calls.md](calls/kv-reactive-task-updates-plan_calls.md)
 - [multi-cluster-federation-plan_calls.md](calls/multi-cluster-federation-plan_calls.md)
