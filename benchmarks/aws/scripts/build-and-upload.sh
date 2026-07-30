@@ -18,11 +18,6 @@ fi
     echo "no dist binary at $BIN — run without --skip-build" >&2
     exit 1
 }
-[[ -f "$REPO_ROOT/plugins/tasks/noop/target/release/libnoop.so" ]] || {
-    echo "noop plugin dylib missing — build with LEGION_BUILD_PLUGINS=1" >&2
-    exit 1
-}
-
 REV=$(git -C "$REPO_ROOT" rev-parse HEAD)
 SHA=$(sha256sum "$BIN" | cut -d' ' -f1)
 
@@ -30,13 +25,39 @@ log "uploading legion ($REV) to s3://$BUCKET/bin/"
 aws s3 cp --region "$REGION" "$BIN" "s3://$BUCKET/bin/legion"
 
 # The manager validates task runtimes against their plugin dylibs, so
-# the campaign boxes need the plugins tree (layout:
-# <root>/<kind>/<name>/{plugin.json,target/release/lib<name>.so},
-# resolved via LEGION_PLUGIN_DIR). Ship manifests + built dylibs only.
-log "uploading plugins bundle"
-(cd "$REPO_ROOT" &&
-    find plugins -name plugin.json -o -path '*/target/release/*.so' -o -path '*/target/release/*.dylib' |
-    tar -czf - -T -) |
+# the campaign boxes need the plugins tree in the canonical deployed
+# layout: <root>/<kind>/<name>/{plugin.json,target/release/lib<name>.so},
+# resolved via LEGION_PLUGIN_DIR. The workspace build (build.rs with
+# LEGION_BUILD_PLUGINS=1) lands dylibs under target/plugin-build/, so
+# stage a bundle that flattens either build layout into the canonical one.
+log "staging plugins bundle"
+PLUGIN_STAGE=$(mktemp -d)
+trap 'rm -rf "$PLUGIN_STAGE"' EXIT
+found_any=false
+for manifest in "$REPO_ROOT"/plugins/*/*/plugin.json; do
+    plugin_dir=$(dirname "$manifest")
+    plugin=$(basename "$plugin_dir")
+    kind=$(basename "$(dirname "$plugin_dir")")
+    dylib=""
+    for candidate in \
+        "$plugin_dir/target/release/lib$plugin.so" \
+        "$REPO_ROOT/target/plugin-build/$kind/$plugin/release/lib$plugin.so"; do
+        [[ -f "$candidate" ]] && dylib="$candidate" && break
+    done
+    [[ -n "$dylib" ]] || {
+        log "  skipping $kind/$plugin (no built dylib)"
+        continue
+    }
+    mkdir -p "$PLUGIN_STAGE/plugins/$kind/$plugin/target/release"
+    cp "$manifest" "$PLUGIN_STAGE/plugins/$kind/$plugin/plugin.json"
+    cp "$dylib" "$PLUGIN_STAGE/plugins/$kind/$plugin/target/release/lib$plugin.so"
+    found_any=true
+done
+$found_any || {
+    echo "no built plugin dylibs found — build with LEGION_BUILD_PLUGINS=1" >&2
+    exit 1
+}
+tar -C "$PLUGIN_STAGE" -czf - plugins |
     aws s3 cp --region "$REGION" - "s3://$BUCKET/bin/legion-plugins.tar.gz"
 
 printf '{"git_rev":"%s","sha256":"%s","built_at":"%s"}\n' \

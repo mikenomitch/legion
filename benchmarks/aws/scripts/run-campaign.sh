@@ -22,7 +22,11 @@ source "$(dirname "$0")/env.sh"
 load_rig
 
 SYSTEM="" STEPS="1000 2000 5000 10000" SCENARIOS="web_fleet batch_burst mixed_heterogeneous"
-WARMUP=30 SMOKE=false STORM_STEP=5000 NODES_PER_INSTANCE=1250
+# Storm granularity is one sim process (= one instance slice), so the
+# drill runs at the 10k step where a slice is 12.5% of the fleet — the
+# closest process-granular approximation of the plan's "kill 10%"; the
+# exact fraction lands in the fairness record.
+WARMUP=30 SMOKE=false STORM_STEP=10000 NODES_PER_INSTANCE=1250
 while [ $# -gt 0 ]; do
     case "$1" in
     --system)

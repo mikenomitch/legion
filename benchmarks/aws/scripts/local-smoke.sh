@@ -72,7 +72,9 @@ cat >"$WORK/manager/config.jsonnet" <<EOF
   taskResourceDefaults: { cpu: 0, memory: 0, allocations: 1000 },
 }
 EOF
-(cd "$WORK/manager" && "$LEGION" start manager -c config.jsonnet >"$WORK/manager.log" 2>&1) &
+# exec so $! is the manager itself, not a wrapper subshell — cleanup
+# must kill the real process or failed runs leak a manager on :4747.
+(cd "$WORK/manager" && exec "$LEGION" start manager -c config.jsonnet) >"$WORK/manager.log" 2>&1 &
 MANAGER_PID=$!
 export LEGION_ADDR="http://127.0.0.1:4747"
 
