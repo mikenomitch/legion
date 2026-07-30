@@ -453,10 +453,11 @@ impl RenderMetric for Histogram {
 /// Every metric family the manager exports. Obtained via [`metrics`]; fields
 /// are updated directly at the instrumented call sites.
 ///
-/// Naming note: the `legion_raft_*` prefix is reserved for the raft engine.
-/// The first two engine series (`legion_raft_voters{lane}`,
-/// `legion_raft_quorum{lane}` — plan §7-C3) live here; the rest of the
-/// prefix (term, indexes, apply lag, ...) stays reserved (docs/metrics.md).
+/// Naming note: the `legion_raft_*` prefix belongs to the raft engine and
+/// no other subsystem may claim it. The quorum-shape gauges
+/// (`voters`/`quorum`, plan §7-C3) and the engine series (term, indexes,
+/// apply lag, leadership, capture/propose latency, op outcomes) all live
+/// here; see docs/metrics.md for the full list.
 pub struct Metrics {
     /// `legion_grpc_requests_total{method,code}`
     pub grpc_requests_total: Arc<CounterVec>,
@@ -480,6 +481,22 @@ pub struct Metrics {
     pub raft_voters: Arc<GaugeVec>,
     /// `legion_raft_quorum{lane}`
     pub raft_quorum: Arc<GaugeVec>,
+    /// `legion_raft_term{lane}`
+    pub raft_term: Arc<GaugeVec>,
+    /// `legion_raft_commit_index{lane}`
+    pub raft_commit_index: Arc<GaugeVec>,
+    /// `legion_raft_applied_index{lane}`
+    pub raft_applied_index: Arc<GaugeVec>,
+    /// `legion_raft_apply_lag{lane}`
+    pub raft_apply_lag: Arc<GaugeVec>,
+    /// `legion_raft_is_leader{lane}`
+    pub raft_is_leader: Arc<GaugeVec>,
+    /// `legion_raft_capture_seconds{lane}`
+    pub raft_capture_seconds: Arc<HistogramVec>,
+    /// `legion_raft_propose_apply_seconds{lane}`
+    pub raft_propose_apply_seconds: Arc<HistogramVec>,
+    /// `legion_raft_ops_total{lane,outcome}`
+    pub raft_ops_total: Arc<CounterVec>,
     /// `legion_scheduler_index_queries_total{index,outcome}`
     pub scheduler_index_queries_total: Arc<CounterVec>,
     /// `legion_scheduler_index_candidates{index}`
@@ -587,6 +604,72 @@ impl Metrics {
             },
             series: Series::new(),
         });
+        let raft_term = Arc::new(GaugeVec {
+            meta: FamilyMeta {
+                name: "legion_raft_term",
+                help: "Current raft term of each lane, as this manager sees it. A climbing term means elections (leadership churn).",
+                labels: &["lane"],
+            },
+            series: Series::new(),
+        });
+        let raft_commit_index = Arc::new(GaugeVec {
+            meta: FamilyMeta {
+                name: "legion_raft_commit_index",
+                help: "Highest quorum-committed log index of each lane, as this manager sees it.",
+                labels: &["lane"],
+            },
+            series: Series::new(),
+        });
+        let raft_applied_index = Arc::new(GaugeVec {
+            meta: FamilyMeta {
+                name: "legion_raft_applied_index",
+                help: "Highest log index this manager's state machine has applied, per lane.",
+                labels: &["lane"],
+            },
+            series: Series::new(),
+        });
+        let raft_apply_lag = Arc::new(GaugeVec {
+            meta: FamilyMeta {
+                name: "legion_raft_apply_lag",
+                help: "Committed-but-not-yet-applied log entries per lane (commit_index - applied_index). Sustained growth means the state machine cannot keep up.",
+                labels: &["lane"],
+            },
+            series: Series::new(),
+        });
+        let raft_is_leader = Arc::new(GaugeVec {
+            meta: FamilyMeta {
+                name: "legion_raft_is_leader",
+                help: "1 when this manager leads the lane, else 0. Sum across managers should be 1 per lane; flapping means leadership churn.",
+                labels: &["lane"],
+            },
+            series: Series::new(),
+        });
+        let raft_capture_seconds = Arc::new(HistogramVec {
+            meta: FamilyMeta {
+                name: "legion_raft_capture_seconds",
+                help: "Local capture phase of a replicated op (run the mutation, collect its changeset, roll back), per lane.",
+                labels: &["lane"],
+            },
+            bounds: DURATION_BUCKETS,
+            series: Series::new(),
+        });
+        let raft_propose_apply_seconds = Arc::new(HistogramVec {
+            meta: FamilyMeta {
+                name: "legion_raft_propose_apply_seconds",
+                help: "Propose -> quorum commit -> local apply round-trip of a replicated op, per lane. Compare against legion_raft_capture_seconds to attribute write latency to the local store vs the replication pipeline.",
+                labels: &["lane"],
+            },
+            bounds: DURATION_BUCKETS,
+            series: Series::new(),
+        });
+        let raft_ops_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_raft_ops_total",
+                help: "Replicated store ops by lane and outcome (applied|empty|not_leader|error). empty = the mutation touched no rows and skipped the raft entry.",
+                labels: &["lane", "outcome"],
+            },
+            series: Series::new(),
+        });
 
         let scheduler_index_queries_total = Arc::new(CounterVec {
             meta: FamilyMeta {
@@ -649,7 +732,15 @@ impl Metrics {
             Arc::clone(&heartbeats_total) as Arc<dyn RenderMetric>,
             Arc::clone(&nodes) as Arc<dyn RenderMetric>,
             Arc::clone(&plan_apply_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&raft_applied_index) as Arc<dyn RenderMetric>,
+            Arc::clone(&raft_apply_lag) as Arc<dyn RenderMetric>,
+            Arc::clone(&raft_capture_seconds) as Arc<dyn RenderMetric>,
+            Arc::clone(&raft_commit_index) as Arc<dyn RenderMetric>,
+            Arc::clone(&raft_is_leader) as Arc<dyn RenderMetric>,
+            Arc::clone(&raft_ops_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&raft_propose_apply_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&raft_quorum) as Arc<dyn RenderMetric>,
+            Arc::clone(&raft_term) as Arc<dyn RenderMetric>,
             Arc::clone(&raft_voters) as Arc<dyn RenderMetric>,
             Arc::clone(&scheduler_index_candidates) as Arc<dyn RenderMetric>,
             Arc::clone(&scheduler_index_maintenance_seconds) as Arc<dyn RenderMetric>,
@@ -672,6 +763,14 @@ impl Metrics {
             store_write_lock_wait_seconds,
             raft_voters,
             raft_quorum,
+            raft_term,
+            raft_commit_index,
+            raft_applied_index,
+            raft_apply_lag,
+            raft_is_leader,
+            raft_capture_seconds,
+            raft_propose_apply_seconds,
+            raft_ops_total,
             scheduler_index_queries_total,
             scheduler_index_candidates,
             scheduler_index_shadow_total,

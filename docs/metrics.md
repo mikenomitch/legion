@@ -141,11 +141,45 @@ instrument.
 - **`legion_raft_quorum{lane}`** (gauge) — majority size required to commit
   on each lane (`voters / 2 + 1`). `voters - quorum` is the number of
   manager failures the lane survives while still committing.
+- **`legion_raft_term{lane}`** (gauge) — the lane's current raft term as
+  this manager sees it. A climbing term means elections; a term that climbs
+  without settling is leadership churn (see docs/multi-raft.md on the
+  election governor).
+- **`legion_raft_commit_index{lane}`** (gauge) — highest quorum-committed
+  log index of the lane, as this manager sees it.
+- **`legion_raft_applied_index{lane}`** (gauge) — highest log index this
+  manager's state machine has applied on the lane. Compare across managers
+  to spot a lagging follower.
+- **`legion_raft_apply_lag{lane}`** (gauge) — `commit_index -
+  applied_index` on this manager. Sustained growth means the local state
+  machine (SQLite apply + read-model projection) cannot keep up with the
+  commit rate.
+- **`legion_raft_is_leader{lane}`** (gauge) — `1` when this manager leads
+  the lane, else `0`. Summed across managers each lane should be exactly 1;
+  a flapping series is leadership churn made visible.
+- **`legion_raft_capture_seconds{lane}`** (histogram) — the local capture
+  phase of a replicated op: run the mutation, collect its changeset, roll
+  back. This is pure local store work.
+- **`legion_raft_propose_apply_seconds{lane}`** (histogram) — the
+  propose → quorum-commit → local-apply round-trip of a replicated op.
+  **Bottleneck attribution**: compare against `legion_raft_capture_seconds`
+  — when write latency moves, whichever histogram moved names the culprit
+  (local SQLite/capture vs the replication pipeline: network, fsync,
+  follower lag).
+- **`legion_raft_ops_total{lane,outcome}`** (counter) — replicated store
+  ops by outcome: `applied`, `empty` (the mutation touched no rows and
+  skipped the raft entry), `not_leader` (proposal rejected before capture —
+  normal on followers under divergent lane leadership), `error`.
 
-The rest of the `legion_raft_*` prefix (term, commit/applied index,
-leadership changes, replication lag, ...) remains **reserved** for the raft
-persistence engine work — nothing else emits it yet, and no other subsystem
-may claim the prefix.
+The gauge series refresh on the node-status-checker tick, on leaders and
+followers alike; the histograms and the op counter are recorded at the
+replication call site (leaders only — followers reject before capture).
+Under `single` topology every lane rides the one `control` raft group, so
+the latency histograms and op counters carry `lane="control"`.
+
+Anything else under the `legion_raft_*` prefix (snapshot timings,
+per-peer replication lag, ...) remains **reserved** for the raft engine —
+no other subsystem may claim the prefix.
 
 ## Scrape configuration example
 

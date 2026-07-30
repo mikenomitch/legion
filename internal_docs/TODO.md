@@ -384,7 +384,16 @@ Plans: [persistence-plan.md](plans/persistence-plan.md), [multi-raft-persistence
         in [tests/raft_perf_smoke.rs](../tests/raft_perf_smoke.rs);
         numbers in [docs/multi-raft.md](../docs/multi-raft.md) § "Lane
         isolation A/B".
-  - [ ] Per-lane tuning knobs, bottleneck tracing, Raft health UI
+  - [x] Raft engine metrics + per-lane bottleneck tracing (2026-07-30):
+        the full `legion_raft_*` series — per-lane term / commit_index /
+        applied_index / apply_lag / is_leader gauges on the checker tick,
+        plus `capture_seconds` vs `propose_apply_seconds` histograms and
+        `ops_total{lane,outcome}` at the replication call site, with a
+        per-op debug trace of the capture/propose phase split
+        ([docs/metrics.md](../docs/metrics.md)). Snapshot timings and
+        per-peer replication lag stay reserved.
+  - [ ] Per-lane tuning knobs and a Raft health UI page (the remaining
+        two-thirds of the old "knobs, tracing, UI" item)
   - [ ] Speculative: Raft autopilot
   - [ ] Idempotency records are not atomic with their mutation: an RPC that
         errors after its mutation but before `idempotency_record` (control

@@ -383,6 +383,32 @@ fn concurrent_plan_applies_group_commit_with_isolation() -> R<()> {
     Ok(())
 }
 
+/// The raft engine's Prometheus series are recorded at the replication
+/// call site: any committed replicated op must land in the per-lane
+/// capture/propose histograms and the op-outcome counter
+/// (docs/metrics.md, Raft). Under `single` topology every lane rides the
+/// one `control` group, so that is the label the series carry.
+#[test]
+fn replicated_ops_record_raft_engine_metrics() -> R<()> {
+    let dir = tempfile::tempdir()?;
+    let store = Store::start_storage(&raft_config(dir.path(), "single")?)?;
+
+    store.put_kv("metrics/probe", "1", KvValueType::String, None, None)?;
+
+    let rendered = legion::manager::telemetry::render();
+    for needle in [
+        "legion_raft_capture_seconds_bucket{lane=\"control\",le=\"+Inf\"}",
+        "legion_raft_propose_apply_seconds_bucket{lane=\"control\",le=\"+Inf\"}",
+        "legion_raft_ops_total{lane=\"control\",outcome=\"applied\"}",
+    ] {
+        assert!(
+            rendered.contains(needle),
+            "missing {needle} in rendered metrics"
+        );
+    }
+    Ok(())
+}
+
 #[test]
 fn concurrent_planners_cannot_oversubscribe_under_raft() -> R<()> {
     concurrent_planners_cannot_oversubscribe("single")

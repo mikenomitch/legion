@@ -901,23 +901,44 @@ fn refresh_cluster_gauges(store: &Store) {
         Ok(count) => telemetry.allocations.set(count),
         Err(err) => debug!(error = ?err, "Failed refreshing allocation gauge"),
     }
-    // Raft quorum shape (plan §7-C3): `legion_raft_voters{lane}` /
-    // `legion_raft_quorum{lane}` from the local metrics view — cheap watch
-    // borrows, present on leaders and followers alike. Non-raft backends
+    // Raft engine series from the local metrics view — cheap watch borrows,
+    // present on leaders and followers alike. Quorum shape (plan §7-C3:
+    // voters/quorum) plus the per-lane progress series (term, commit and
+    // applied indexes, apply lag, local leadership) that make failover
+    // drills and bottleneck attribution observable. Non-raft backends
     // report no status and leave the families empty.
     if let Some(status) = store.raft_status() {
-        let voters: Vec<(Vec<String>, i64)> = status
-            .lanes
-            .iter()
-            .map(|lane| (vec![lane.lane.clone()], lane.voters as i64))
-            .collect();
-        let quorum: Vec<(Vec<String>, i64)> = status
-            .lanes
-            .iter()
-            .map(|lane| (vec![lane.lane.clone()], lane.quorum as i64))
-            .collect();
-        telemetry.raft_voters.set_all(&voters);
-        telemetry.raft_quorum.set_all(&quorum);
+        let lane_series = |value: fn(&crate::storage::persistence::RaftLaneStatus) -> i64| {
+            status
+                .lanes
+                .iter()
+                .map(|lane| (vec![lane.lane.clone()], value(lane)))
+                .collect::<Vec<(Vec<String>, i64)>>()
+        };
+        telemetry
+            .raft_voters
+            .set_all(&lane_series(|lane| lane.voters as i64));
+        telemetry
+            .raft_quorum
+            .set_all(&lane_series(|lane| lane.quorum as i64));
+        telemetry
+            .raft_term
+            .set_all(&lane_series(|lane| lane.term as i64));
+        telemetry
+            .raft_commit_index
+            .set_all(&lane_series(|lane| lane.commit_index as i64));
+        telemetry
+            .raft_applied_index
+            .set_all(&lane_series(|lane| lane.applied_index as i64));
+        telemetry.raft_apply_lag.set_all(&lane_series(|lane| {
+            lane.commit_index.saturating_sub(lane.applied_index) as i64
+        }));
+        telemetry.raft_is_leader.set_all(&lane_series(|lane| {
+            i64::from(matches!(
+                lane.role,
+                crate::storage::persistence::PersistenceRole::Primary
+            ))
+        }));
     }
 }
 
