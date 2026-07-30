@@ -926,17 +926,34 @@ fn refresh_cluster_gauges(store: &Store) {
 /// manager has been up for a full lost-node window; live workers heartbeat
 /// every `WORKER_HEARTBEAT_DURATION_SEC` and retry with a capped backoff, so
 /// they re-establish contact well within it.
-fn nodes_to_mark_lost(
-    nodes_with_heartbeats: Vec<(String, String)>,
+/// Public for the heartbeat scale benchmark
+/// (`tests/heartbeat_scale_benchmark.rs`), which times one liveness pass;
+/// not part of any stable API.
+///
+/// Nodes whose row carries the integer heartbeat clock compare against one
+/// precomputed cutoff — no per-node timestamp parsing (heartbeat-scale
+/// plan §4; at 10k nodes the old per-tick RFC3339 parse storm was 5,000
+/// parses/second). Rows without it (written before the column existed)
+/// fall back to parsing the text, with unparseable-means-lost preserved.
+pub fn nodes_to_mark_lost(
+    nodes_with_heartbeats: Vec<(String, String, Option<i64>)>,
     manager_uptime: Duration,
 ) -> Vec<String> {
     if manager_uptime < Duration::from_secs(DEF_LOST_NODE_AT_SEC as u64) {
         return Vec::new();
     }
+    let unix_cutoff = OffsetDateTime::now_utc().unix_timestamp() - DEF_LOST_NODE_AT_SEC;
     nodes_with_heartbeats
         .into_iter()
-        .filter(
-            |(id, heartbeat)| match Node::last_heartbeat_too_slow(heartbeat) {
+        .filter(|(id, heartbeat, heartbeat_unix)| {
+            if let Some(heartbeat_unix) = heartbeat_unix {
+                let too_slow = *heartbeat_unix < unix_cutoff;
+                if too_slow {
+                    warn!("Node {} heartbeat too slow - marking as lost", id);
+                }
+                return too_slow;
+            }
+            match Node::last_heartbeat_too_slow(heartbeat) {
                 Ok(too_slow) => {
                     if too_slow {
                         warn!("Node {} heartbeat too slow - marking as lost", id);
@@ -950,9 +967,9 @@ fn nodes_to_mark_lost(
                     );
                     true
                 }
-            },
-        )
-        .map(|(id, _heartbeat)| id)
+            }
+        })
+        .map(|(id, _heartbeat, _unix)| id)
         .collect()
 }
 
@@ -1359,9 +1376,10 @@ mod tests {
     #[test]
     fn nodes_to_mark_lost_waits_for_startup_heartbeat_grace() -> R<()> {
         let lost_window = DEF_LOST_NODE_AT_SEC as u64;
+        // No unix clock on these rows: exercises the text-parse fallback.
         let nodes = vec![
-            ("stale-node".to_string(), rfc3339_seconds_ago(120)?),
-            ("fresh-node".to_string(), rfc3339_seconds_ago(0)?),
+            ("stale-node".to_string(), rfc3339_seconds_ago(120)?, None),
+            ("fresh-node".to_string(), rfc3339_seconds_ago(0)?, None),
         ];
 
         // Right after a manager restart every persisted heartbeat looks
@@ -1745,6 +1763,23 @@ async fn load_initial_data(store: &Store, config: &ManagerConfig) -> R<()> {
             }
         };
 
+        if let Some(seconds) = wcp.heartbeat_seconds {
+            if !(1..=30).contains(&seconds) {
+                bail!(
+                    "worker config {path_str}: heartbeatSeconds must be between 1 and 30, \
+                     got {seconds}"
+                );
+            }
+            if seconds > 3 {
+                warn!(
+                    worker_type = %wcp.worker_type,
+                    heartbeat_seconds = seconds,
+                    "heartbeatSeconds above 3: the 10s lost-node window leaves fewer than \
+                     three missed beats before workers are marked lost"
+                );
+            }
+        }
+
         let wc = WorkerConfigMsg {
             name: wcp.worker_type.clone(),
             pool: wcp.pool.unwrap_or("default".into()),
@@ -1756,6 +1791,7 @@ async fn load_initial_data(store: &Store, config: &ManagerConfig) -> R<()> {
             max_allocations: wcp.max_allocations,
             artifacts,
             host_volumes,
+            heartbeat_seconds: wcp.heartbeat_seconds,
             resource_enforcement,
         };
 

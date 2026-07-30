@@ -3226,6 +3226,7 @@ impl Manager for ManagerDaemonService {
                 fell_back: usage.fell_back,
                 shadow_agreement: usage.shadow_agreement,
                 reason: usage.reason.unwrap_or_default(),
+                score_sampled: usage.score_sampled.unwrap_or_default() as u32,
             })
             .collect();
 
@@ -3335,7 +3336,7 @@ impl Manager for ManagerDaemonService {
             self.check_acl(&request, AclResource::Job, AclAction::Read, AclScope::any())?;
         let request = request.into_inner();
         let query = normalize_query(request.query);
-        let sort_by = request.sort_by.unwrap_or_else(|| "created_at".to_string());
+        let sort_by = request.sort_by.unwrap_or_else(|| "updated_at".to_string());
         let sort_desc = request
             .sort_order
             .as_deref()
@@ -3378,13 +3379,19 @@ impl Manager for ManagerDaemonService {
             let ordering = match sort_by.as_str() {
                 "name" => a.name.cmp(&b.name),
                 "status" => a.status.cmp(&b.status),
-                _ => a.created_at.cmp(&b.created_at),
+                "created_at" => a.created_at.cmp(&b.created_at),
+                _ => a.updated_at.cmp(&b.updated_at),
             };
-            if sort_desc {
+            let ordering = if sort_desc {
                 ordering.reverse()
             } else {
                 ordering
-            }
+            };
+            // Break ties on the name, always ascending and never reversed:
+            // the mtime is whole seconds, so a batch submitted together ties
+            // on it, and an arbitrary order there makes paging drop and
+            // duplicate rows between pages.
+            ordering.then_with(|| a.name.cmp(&b.name))
         });
 
         let (jobs, total_count) = paginate(jobs, page, page_size);
@@ -4662,6 +4669,7 @@ impl Manager for ManagerDaemonService {
             max_allocations: worker_config.max_allocations,
             artifacts: worker_config.artifacts,
             host_volumes: worker_config.host_volumes,
+            heartbeat_seconds: worker_config.heartbeat_seconds,
             resource_enforcement: worker_config.resource_enforcement,
         };
 

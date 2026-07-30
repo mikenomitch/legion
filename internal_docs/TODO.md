@@ -75,18 +75,19 @@ How to use it:
 - [ ] Fix the slowest bits of the scheduler using the benchmarks in
       [docs/testing-and-benchmarks.md](../docs/testing-and-benchmarks.md).
       Candidate construction is index-served
-      ([docs/scheduling-indexes.md](../docs/scheduling-indexes.md)) and the
-      per-plan snapshot is fixed (Arc'd nodes + cached free pools —
-      [plan](plans/scheduler-plan-snapshot-plan.md), numbers in
-      [benchmarks/scheduler/README.md](../benchmarks/scheduler/README.md)).
-      The allocations map is shared per node the same way
-      (`SharedNodeAllocations`, copy-on-write). Phase timings now say where
-      the rest goes ([plan](plans/scheduler-performance-plan.md)): the
+      ([docs/scheduling-indexes.md](../docs/scheduling-indexes.md)); the
+      per-plan snapshot is fixed twice over (Arc'd nodes + cached free
+      pools — [plan](plans/scheduler-plan-snapshot-plan.md) — then the
+      cached sorted node list + Arc'd pool values, 2026-07-30); the
       plan-submission insert is fused into the apply (one quorum commit,
-      2026-07-29); the remaining measured items are the O(fleet)
-      `version_sample` and per-plan snapshot rebuild — both proposed as
-      D4/D6 in the
-      [architecture review](plans/scheduler-architecture-review-plan.md).
+      2026-07-29); the O(fleet) `version_sample` is lazy (D4) and plan
+      applies group-commit (D5), 2026-07-30. Remaining measured candidates:
+      per-task duplicated `ConstraintSet`/`PermitSet` parsing
+      (`build_plan` group filters vs `build_task_plan`), per-plan
+      `scheduler_settings` JSON walks (`weights`/`nodes_considered`), the
+      index shard-sort under `budget: None`, and the blocking
+      `thread::sleep` in `plan_with_conflict_retries` on the async eval
+      path.
 - [x] Scheduler performance measurement stack
       ([plan](plans/scheduler-performance-plan.md),
       [calls](calls/scheduler-performance-plan_calls.md),
@@ -100,13 +101,65 @@ How to use it:
       ([docs/metrics.md](../docs/metrics.md)), and the fused
       `submit_and_apply_plan` (before/after in
       [benchmarks/scheduler/README.md](../benchmarks/scheduler/README.md)).
-- [ ] Architecture review proposals for scale
-      ([plan](plans/scheduler-architecture-review-plan.md)): D4 lazy
-      version sample, D5 apply group commit, D1 bounded candidate scoring,
-      D6 eval-batch snapshot reuse — ranked, none started.
+- [x] Architecture review proposals for scale
+      ([plan](plans/scheduler-architecture-review-plan.md)) — all four
+      accepted proposals shipped 2026-07-30 via
+      [plan-path-scale-levers](plans/plan-path-scale-levers-plan.md)
+      ([calls](calls/plan-path-scale-levers-plan_calls.md)) and
+      [bounded-candidate-scoring](plans/bounded-candidate-scoring-plan.md)
+      ([calls](calls/bounded-candidate-scoring-plan_calls.md)): D4 lazy
+      version sample + read-model generation fence, D5 plan-apply group
+      commit (leader-elect coalescer), D6 as cheap snapshots (cached
+      sorted node list, Arc'd pools), D1 opt-in `score_sample` with the
+      packing-quality gate. Docs in
+      [scheduler-and-eval-loop.md](../docs/scheduler-and-eval-loop.md);
+      before/after in
+      [benchmarks/scheduler/README.md](../benchmarks/scheduler/README.md).
+      D2 (cross-manager scheduling) and D3 (in-memory state) remain
+      recorded keep/defer decisions; D8's architecture choice still waits
+      on AWS-test data.
+- [x] Heartbeat path at scale
+      ([plan](plans/heartbeat-scale-plan.md),
+      [calls](calls/heartbeat-scale-plan_calls.md),
+      [docs](../docs/architecture-managers-workers.md)) — heartbeat scale
+      benchmark (`tests/heartbeat_scale_benchmark.rs`), status-lane
+      heartbeat group commit with per-id verdicts, skip-reprojection for
+      bare refreshes (leader + follower projection), integer liveness
+      clock (`last_heartbeat_unix`), batched lost-node recheck, partial
+      index for the volume-destroy feed, worker heartbeat jitter and
+      `heartbeatSeconds` worker-type config. Numbers in
+      [benchmarks/scheduler/README.md](../benchmarks/scheduler/README.md).
+      Deferred (noted in plan): per-node lost windows negotiated at
+      registration; batching `mark_nodes_as_lost`'s per-node
+      availability-sync + eval enqueues after a mass failure; an ACL
+      token-identity cache for worker-plane RPC rates.
 - [ ] AWS comparative benchmark vs Nomad/K8s
-      ([plan](plans/aws-comparative-benchmark-plan.md)): phase 0 is the
-      `legion start worker --simulate N` gap; nothing built yet.
+      ([plan](plans/aws-comparative-benchmark-plan.md),
+      [calls](calls/aws-comparative-benchmark-plan_calls.md)) — phases
+      0-1 built and locally validated 2026-07-30; campaigns (phases 2-5)
+      await an AWS account:
+  - [x] Phase 0: `legion start worker --simulate N`
+        ([mini-plan](plans/worker-simulation-plan.md),
+        [docs](../docs/worker-simulation.md)) — one process, N wire-real
+        nodes from a `node_profiles` file, real cadences, stub dispatch
+        server; end-to-end test `tests/worker_simulation.rs`.
+  - [x] Phase 1 rig, everything short of the cloud:
+        [`benchmarks/aws/`](../benchmarks/aws/README.md) — Terraform
+        (validate-clean; system-agnostic boxes + spot sim fleet + S3),
+        per-system configs (Legion A lanes / Legion B streaming+S3 lease
+        / Nomad / kubeadm+KWOK), scenario→jobs translator, measuring
+        driver with fixture-tested counting math and a `watch`
+        fault-drill mode, campaign runner + collect/fairness-record
+        scripts, piggyback experiment scripts (storm, failover,
+        streaming-RPO, 24h soak, upgrade-under-load), Grafana boards,
+        projection fitting (`analysis/fit_curves.py`), CI gate
+        (fixture tests + terraform validate), and the local no-AWS smoke
+        (`scripts/local-smoke.sh`).
+  - [ ] Phase 1 exit on real AWS: `bringup.sh` + 1k-node
+        `run-campaign.sh --system legion-a --smoke` (needs an account).
+  - [ ] Phases 2-5: Legion A/B campaigns, Nomad (verify nodesim `mock`
+        driver + install script), K8s (verify kubeadm/KWOK install +
+        watch parsing), 20k validation burst, analysis + REPORT.md.
 - [ ] Scheduling-index follow-ups deferred from
       [plan](plans/scheduling-index-plan.md) (see its calls doc):
       index-served candidates for multi-task **group** co-placement (v1
@@ -312,6 +365,14 @@ No plan yet — this needs one before any code.
 ## Persistence & cluster operations
 
 Plans: [persistence-plan.md](plans/persistence-plan.md), [multi-raft-persistence-plan.md](plans/multi-raft-persistence-plan.md) · docs: [state-store.md](../docs/state-store.md), [raft-operations.md](../docs/raft-operations.md), [persistence-streaming.md](../docs/persistence-streaming.md)
+
+- [ ] `raft_lanes::killing_the_all_lane_leader_reconverges_onto_one_survivor`
+      is timing-sensitive under parallel test load: green in isolation
+      (9/9 on a 4-vCPU container, 2026-07-30) but failed once during a full
+      `cargo test --all` where ~20 test binaries starve its election
+      timers. The test already accepts split outcomes by design; consider a
+      longer election budget when `cargo test` runs the whole workspace, or
+      serializing the cluster-gated suites.
 
 - [x] **Real Raft persistence** — quorum-committed writes, per-lane log stores,
       snapshots/compaction, real membership
@@ -556,6 +617,24 @@ Deferred from [ui-jump-hints-plan.md](plans/ui-jump-hints-plan.md):
       Chromium's reserved set, but "the page wins `⌘`+digit" is asserted from
       the reserved-key list, not measured
       ([calls entry 1](calls/ui-jump-hints-plan_calls.md))
+
+- [ ] `ui/src/gen/legion_pb.ts` has drifted from `proto/legion.proto` — it is
+      missing `WorkerConfig.heartbeat_seconds`, `TaskAllocation.task_connect`,
+      `HeartbeatReply.upstream_endpoints` + the whole `UpstreamEndpoints`
+      message, `ServiceSummary.allow`, and `PlannedAllocation.score_sampled`.
+      Nothing in the UI reads them yet, so it typechecks; regenerate with
+      `protoc -I proto --es_out=ui/src/gen --es_opt=target=ts proto/legion.proto`
+      (needs `ui/node_modules/.bin` on PATH) and add it to CI, or the next
+      person to need one of those fields will hand-write it too
+
+Deferred from [job-updated-at-plan.md](plans/job-updated-at-plan.md):
+
+- [ ] Per-page label for `SharedIndex`'s last column. It is hard-coded to
+      "Updated", but Nodes puts `last_heartbeat` under it — a different signal
+      wearing the same name ([calls entry 2](calls/job-updated-at-plan_calls.md))
+- [ ] Show created/updated on the job detail page header. The index was where
+      the wrong value was being read, so the header was left alone; it is a
+      layout change with its own design surface
 
 ## Cross-cutting
 
@@ -821,3 +900,10 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
       ([plan](plans/ui-jump-hints-plan.md),
       [calls](calls/ui-jump-hints-plan_calls.md)). Rows past the tenth, the
       Overview dashboard, and detail-page tables are open items above.
+- [x] Job mtime — the Jobs index "Updated" column showed `created_at`, because
+      jobs had no `updated_at` anywhere in the system. Real column, stamped on
+      spec submissions and status transitions but not on allocation churn;
+      `ListJobs` sorts by it by default and `job list` renders both timestamps
+      readably ([plan](plans/job-updated-at-plan.md),
+      [calls](calls/job-updated-at-plan_calls.md),
+      [docs](../docs/jobs-tasks-and-scheduling.md#job-timestamps-created_at-and-updated_at)).

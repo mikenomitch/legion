@@ -1375,6 +1375,12 @@ pub struct WorkerConfigAlt {
     /// (see docs/volumes.md), keyed by the name jobs claim.
     #[serde(default)]
     pub host_volumes: Option<HashMap<String, crate::volumes::HostVolumeConfig>>,
+    /// Heartbeat cadence in seconds (default 2, clamped by workers to
+    /// 1..=30). The manager's lost-node window is 10s, so values above ~3
+    /// trade detection margin for manager load; the manager warns when
+    /// loading such a config (heartbeat-scale plan §5).
+    #[serde(default)]
+    pub heartbeat_seconds: Option<u32>,
     /// Whether this worker turns a task's declared `resources` into real
     /// kernel limits for host processes (see docs/task-supervision.md). Off
     /// unless declared.

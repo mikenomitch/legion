@@ -183,15 +183,15 @@ lazy_static! {
 //
 
 pub const WORKER_TYPE_ATTRS: &str = r#"
-name, pool, additional_node_checks, attributes, name_prefix, resources, reserved_resources, max_allocations, artifacts, host_volumes, resource_enforcement
+name, pool, additional_node_checks, attributes, name_prefix, resources, reserved_resources, max_allocations, artifacts, host_volumes, heartbeat_seconds, resource_enforcement
 "#;
 
 pub const WORKER_TYPE_PARAM_SET: &str = r#"
-pool = :pool, additional_node_checks = :additional_node_checks, attributes = :attributes, name_prefix = :name_prefix, resources = :resources, reserved_resources = :reserved_resources, max_allocations = :max_allocations, artifacts = :artifacts, host_volumes = :host_volumes, resource_enforcement = :resource_enforcement
+pool = :pool, additional_node_checks = :additional_node_checks, attributes = :attributes, name_prefix = :name_prefix, resources = :resources, reserved_resources = :reserved_resources, max_allocations = :max_allocations, artifacts = :artifacts, host_volumes = :host_volumes, heartbeat_seconds = :heartbeat_seconds, resource_enforcement = :resource_enforcement
 "#;
 
 pub const WORKER_TYPE_ATTRS_VALS: &str = r#"
-:name, :pool, :additional_node_checks, :attributes, :name_prefix, :resources, :reserved_resources, :max_allocations, :artifacts, :host_volumes, :resource_enforcement
+:name, :pool, :additional_node_checks, :attributes, :name_prefix, :resources, :reserved_resources, :max_allocations, :artifacts, :host_volumes, :heartbeat_seconds, :resource_enforcement
 "#;
 
 lazy_static! {
@@ -223,15 +223,19 @@ lazy_static! {
 //
 
 pub const JOB_ATTRS: &str = r#"
-id, name, status, created_at
+id, name, status, created_at, updated_at
 "#;
 
+// Upsert path only. `created_at` is deliberately absent: it is the job's
+// birth time and an upsert against an existing row must not move it (the
+// insert below is only reached when the row is missing, but a concurrent
+// submit can still land on the conflict branch).
 pub const JOB_PARAM_SET: &str = r#"
-name = :name, status = :status, created_at = :created_at
+name = :name, status = :status, updated_at = :updated_at
 "#;
 
 pub const JOB_ATTRS_VALS: &str = r#"
-:id, :name, :status, :created_at
+:id, :name, :status, :created_at, :updated_at
 "#;
 
 lazy_static! {

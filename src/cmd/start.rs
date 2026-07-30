@@ -3,6 +3,7 @@ use crate::prelude::*;
 use crate::manager::daemon::run_manager;
 use crate::structs::ManagerConfig;
 use crate::worker::daemon::run_worker;
+use crate::worker::simulate::{run_simulated_workers, SimulateOptions};
 
 use jsonnet::JsonnetVm;
 
@@ -52,6 +53,7 @@ pub fn config() -> Command {
             Arg::new("name")
                 .long("name")
                 .value_name("NAME")
+                .conflicts_with("simulate")
                 .help("Override the worker name/ID"),
         )
         .arg(
@@ -59,6 +61,62 @@ pub fn config() -> Command {
                 .long("o11y")
                 .action(ArgAction::SetTrue)
                 .help("Enable tracing export for observability UI"),
+        )
+        .arg(
+            Arg::new("simulate")
+                .long("simulate")
+                .value_name("N")
+                .value_parser(clap::value_parser!(usize))
+                .help(
+                    "Run N simulated nodes in this process instead of one real worker \
+                     (benchmarking/load testing; see docs/worker-simulation.md)",
+                ),
+        )
+        .arg(
+            Arg::new("profiles")
+                .long("profiles")
+                .value_name("FILE")
+                .value_hint(ValueHint::FilePath)
+                .requires("simulate")
+                .help(
+                    "JSON file with a `node_profiles` array (benchmark scenario schema); \
+                     N is split across profiles by their `count` weights",
+                ),
+        )
+        .arg(
+            Arg::new("name-prefix")
+                .long("name-prefix")
+                .value_name("PREFIX")
+                .requires("simulate")
+                .help("Simulated node id prefix (ids are <prefix>-<profile>-<idx>; default: sim)"),
+        )
+        .arg(
+            Arg::new("ready-after")
+                .long("ready-after")
+                .value_name("DURATION")
+                .requires("simulate")
+                .help(
+                    "Delay before a dispatched allocation is reported running \
+                     (e.g. 500ms, 2s; default: 0s)",
+                ),
+        )
+        .arg(
+            Arg::new("register-rate")
+                .long("register-rate")
+                .value_name("N_PER_SEC")
+                .value_parser(clap::value_parser!(f64))
+                .requires("simulate")
+                .help("Registration ramp in nodes/second (default: 100)"),
+        )
+        .arg(
+            Arg::new("advertise-host")
+                .long("advertise-host")
+                .value_name("HOST")
+                .requires("simulate")
+                .help(
+                    "Host the manager should dial for task dispatch to this fleet \
+                     (default: 127.0.0.1)",
+                ),
         );
 
     Command::new("start")
@@ -75,6 +133,10 @@ pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
             let token = arg_matches
                 .get_one::<String>("token")
                 .context("Must provide token")?;
+            if let Some(count) = arg_matches.get_one::<usize>("simulate") {
+                let opts = simulate_options(*count, arg_matches)?;
+                return run_simulated_workers(token, opts).await;
+            }
             let name = arg_matches.get_one::<String>("name").map(String::as_str);
             run_worker(token, name).await
         }
@@ -126,6 +188,33 @@ fn parse_config(config_path: &str) -> R<ManagerConfig> {
         .with_context(|| format!("failed to deserialize manager config from {config_path}"))?;
 
     Ok(config)
+}
+
+/// Builds `SimulateOptions` from the `start worker --simulate` flag set.
+fn simulate_options(count: usize, arg_matches: &ArgMatches) -> R<SimulateOptions> {
+    let defaults = SimulateOptions::default();
+    let ready_after = match arg_matches.get_one::<String>("ready-after") {
+        Some(raw) => humantime::parse_duration(raw.trim())
+            .with_context(|| format!("invalid --ready-after duration: {raw}"))?,
+        None => defaults.ready_after,
+    };
+    Ok(SimulateOptions {
+        count,
+        profiles_path: arg_matches.get_one::<String>("profiles").cloned(),
+        name_prefix: arg_matches
+            .get_one::<String>("name-prefix")
+            .cloned()
+            .unwrap_or(defaults.name_prefix),
+        ready_after,
+        register_rate: arg_matches
+            .get_one::<f64>("register-rate")
+            .copied()
+            .unwrap_or(defaults.register_rate),
+        advertise_host: arg_matches
+            .get_one::<String>("advertise-host")
+            .cloned()
+            .unwrap_or(defaults.advertise_host),
+    })
 }
 
 fn config_path_arg() -> Arg {

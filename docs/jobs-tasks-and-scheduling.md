@@ -282,3 +282,69 @@ Batch tasks can set `schedule` (`every` or cron). After submit/update/reschedule
 
 `task.schedule` is rejected for non-batch lifecycle.
 
+## Job Timestamps: `created_at` and `updated_at`
+
+Every job carries two timestamps, both unix seconds on the wire (`Job.created_at`,
+`Job.updated_at`), exposed by `GetJobInfo`, `ListJobs`, `legion job list`,
+`legion job info`, and the `job` table in the state store.
+
+- **`created_at`** is the job's birth time — the moment its first spec version
+  was accepted. It is immutable. Resubmitting a new version, stopping the job,
+  and failing it all leave it alone.
+- **`updated_at`** is the job's *mtime*: when the job record last changed. It is
+  the value the UI's **Updated** column shows and the default sort key for
+  `ListJobs` and the Jobs page.
+
+A job that has not changed since submission reports the two as equal.
+
+### What moves `updated_at`
+
+The mtime describes **the job record**, not the workload running underneath it:
+
+| Event | Moves `updated_at` |
+| --- | --- |
+| First submission | yes (set equal to `created_at`) |
+| A new spec version is submitted | yes |
+| A byte-identical spec is resubmitted | no — nothing changed |
+| `legion job stop` (status → `stopped`) | yes |
+| Job marked `failed`, including a failed KV dependency | yes |
+| Job recovered to `done` from `stopped` or `failed` | yes |
+| A restart request is acknowledged | yes |
+| An allocation is placed, replaced, or removed | **no** |
+| Health checks, task-status writes, node heartbeats | **no** |
+
+Allocation churn is deliberately excluded. Allocations are rescheduled, health
+checked, and replaced continuously on a healthy cluster; if they moved the job's
+mtime, every job would permanently read as "updated seconds ago" and the column
+would carry no information. Use the Allocations count on the Jobs page, the job
+detail page, or the [event stream](event-stream.md) to see workload activity.
+
+So: **`updated_at` answers "when did someone last change this job", not "is this
+job healthy right now".**
+
+### Sorting
+
+```
+legion job list                      # newest change first
+```
+
+`ListJobs.sort_by` accepts `updated_at` (default), `created_at`, `name`, and
+`status`, with `sort_order` of `asc` or `desc`. Jobs with the same mtime — a
+batch submitted within one second — break ties on name so paging stays stable.
+
+### Known limitations
+
+- **Whole-second resolution.** Two changes to the same job inside one second are
+  indistinguishable, and a job changed twice in a second sorts as if changed
+  once.
+- **Clusters upgraded from a manager that predates the column** backfill every
+  existing job's `updated_at` to its `created_at`. That understates the mtime of
+  a job that was changed before the upgrade: it reads as "not changed since
+  submission" until the next thing that touches it. There is no way to recover
+  the real value — it was never recorded.
+- **`legion job list -j` reports both timestamps as unix seconds**, matching the
+  proto. The human-readable table renders them as RFC3339.
+- **Other entities differ.** Nodes have no mtime; their Updated column shows
+  `last_heartbeat`, which moves every couple of seconds by design. Rollouts, KV
+  entries, job templates, ACL policies, instances, and volumes each carry their
+  own `updated_at` with entity-specific semantics.

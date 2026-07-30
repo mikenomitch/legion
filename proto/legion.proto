@@ -842,6 +842,17 @@ message WorkerConfig {
   // this node, and jobs claiming it are rejected at admission).
   string host_volumes = 10;
 
+  // How often this worker heartbeats the manager, in seconds (worker-type
+  // config `heartbeatSeconds`). Workers clamp the value to 1..=30 and add
+  // ±10% jitter per beat. The manager marks a node lost after 10s without
+  // a heartbeat, so values above ~3 trade detection margin for load; the
+  // manager logs a warning when serving such a config. At large fleets the
+  // cadence is the manager-load knob: 10k workers at the default 2s is
+  // 5,000 heartbeats/second.
+  //
+  // Default: unset (workers use the built-in 2s default).
+  optional uint32 heartbeat_seconds = 11;
+
   // JSON-encoded resource-enforcement settings for this worker (see
   // docs/task-supervision.md). Shape:
   // `{"enabled":true,"cgroupParent":"legion"}`.
@@ -855,7 +866,7 @@ message WorkerConfig {
   //
   // Default: empty string (enforcement off; `resources` stays advisory for
   // `exec` tasks).
-  string resource_enforcement = 11;
+  string resource_enforcement = 12;
 }
 
 // Reply payload for WorkerPreRegister.
@@ -1660,6 +1671,16 @@ message TaskIndexUsage {
   // Why no index served when one might have been expected to — e.g.
   // "no usable index: gpu needs [region]". Empty otherwise.
   string reason = 9;
+
+  // When bounded candidate scoring engaged for any of this task's
+  // placements (the fleet-size threshold in the manager's
+  // `schedulerSettings.score_sample` was met), the number of eligible
+  // nodes actually scored per placement: the placement is the best of
+  // this many uniformly drawn feasible candidates rather than of every
+  // feasible node. 0 means every placement was scored exactly.
+  // Feasibility (constraints, permits, resources) is never sampled — a
+  // sampled placement is always a valid one.
+  uint32 score_sampled = 10;
 }
 
 // Planned allocation display item.
@@ -2220,9 +2241,9 @@ message ListJobsRequest {
   // Free-text search against job name, ID, and status.
   optional string query = 1;
 
-  // Sort key. Supported values: `name`, `status`, `created_at`.
+  // Sort key. Supported values: `name`, `status`, `created_at`, `updated_at`.
   //
-  // Default: `created_at`.
+  // Default: `updated_at`.
   optional string sort_by = 2;
 
   // Sort direction. Supported values: `asc`, `desc`.
@@ -2254,8 +2275,20 @@ message Job {
   // Current values written by manager include: done, stopped, failed.
   string status = 3;
 
-  // Unix timestamp (seconds) when job was created.
+  // Unix timestamp (seconds) when job was created. Immutable for the life of
+  // the job — resubmitting a new spec version does not move it.
   int64 created_at = 4;
+
+  // Unix timestamp (seconds) of the last change to the job, and the value the
+  // UI's "Updated" column shows. Stamped when a new spec version is submitted
+  // and on every status transition the manager records (`stopped`, `failed`,
+  // recovery back to `done`, and an acknowledged restart request). Never
+  // moved by allocation churn, heartbeats, or reads.
+  //
+  // Equals `created_at` for a job that has not changed since submission, and
+  // for rows written by a manager older than the column (backfilled once at
+  // migration time).
+  int64 updated_at = 5;
 }
 
 // Reply payload for ListJobs.

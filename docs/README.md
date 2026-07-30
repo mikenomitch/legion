@@ -68,5 +68,7 @@ Plans, roadmaps, to-do lists, and development notes live in
   the trade-offs.
 - [Codebase Conventions](codebase-conventions.md)
 - [Testing and Benchmarks](testing-and-benchmarks.md)
+- [Worker Simulation](worker-simulation.md) — `--simulate N`: thousands of
+  wire-real fake nodes from one process, for benchmarking and load testing.
 - [Agent Readiness](agent-readiness.md) — MCP, structured output, capabilities,
   and the recommended agent workflow.

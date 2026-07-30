@@ -23,6 +23,18 @@ pub struct JobPrint {
     pub name: String,
     pub status: String,
     pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Render a job timestamp (unix seconds on the wire) for the human table.
+///
+/// The table used to print the raw epoch integer, which is not a timestamp
+/// anyone can read at 3am. `--json` is unaffected: it serializes the proto
+/// message, which still carries the integer.
+fn format_job_timestamp(unix_seconds: i64) -> String {
+    chrono::DateTime::from_timestamp(unix_seconds, 0)
+        .map(|at| at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+        .unwrap_or_else(|| unix_seconds.to_string())
 }
 
 impl From<Job> for JobPrint {
@@ -30,7 +42,8 @@ impl From<Job> for JobPrint {
         JobPrint {
             name: job.name,
             status: job.status,
-            created_at: job.created_at.to_string(),
+            created_at: format_job_timestamp(job.created_at),
+            updated_at: format_job_timestamp(job.updated_at),
         }
     }
 }

@@ -305,3 +305,80 @@ fn write_connection_bypass_guard_rejects_direct_writes() -> R<()> {
     );
     Ok(())
 }
+
+/// Group commit (plan-path scale levers, D5): concurrent plan submitters on
+/// a raft store coalesce into batched replicated ops — one capture → one
+/// propose per batch — with per-plan savepoint isolation. The correctness
+/// assertions hold whether or not batches form on any given run (that is
+/// timing), but this concurrency reliably forms them; the poisoned plan
+/// exercises the isolation savepoint (its failure must not take down
+/// batch-mates or the capture).
+#[test]
+fn concurrent_plan_applies_group_commit_with_isolation() -> R<()> {
+    use std::collections::HashSet;
+
+    let dir = tempfile::tempdir()?;
+    let store = Store::start_storage(&raft_config(dir.path(), "single")?)?;
+
+    let mut requests = Vec::new();
+    for index in 0..8 {
+        let node_id = format!("gc-node-{index}");
+        store.insert_node(NodeMsg::from(test_node(&node_id)))?;
+        let job_name = format!("gc-job-{index}");
+        let outcome = store.handle_job_submit(&test_job(&job_name), &[submission(&job_name)])?;
+        let job_config_id = outcome.job_config_id().to_string();
+        let tasks = store.get_task_configs_for_job_config(&job_config_id)?;
+        let (task_id, _) = *tasks.first().context("job must have a task config")?;
+        let versions =
+            store.allocation_version_vector(&job_config_id, &HashSet::from([node_id.clone()]))?;
+        // Request 3 is poisoned: a placement naming a task that does not
+        // exist, which fails during apply (not a CAS rejection).
+        let task_id = if index == 3 { 999_999 } else { task_id };
+        requests.push((index, job_config_id, node_id, task_id, versions));
+    }
+
+    let handles: Vec<_> = requests
+        .into_iter()
+        .map(|(index, job_config_id, node_id, task_id, versions)| {
+            let store = store.clone();
+            std::thread::spawn(move || {
+                (
+                    index,
+                    node_id.clone(),
+                    store.submit_and_apply_plan(
+                        &job_config_id,
+                        "fresh",
+                        &[(node_id, task_id)],
+                        &versions,
+                    ),
+                )
+            })
+        })
+        .collect();
+
+    for handle in handles {
+        let (index, node_id, result) = handle.join().expect("submitter panicked");
+        if index == 3 {
+            assert!(result.is_err(), "poisoned plan must fail alone");
+            assert!(
+                store.allocs_for_node(&node_id)?.is_empty(),
+                "poisoned plan must not place anything"
+            );
+        } else {
+            let (_, outcome) = result?;
+            assert!(
+                matches!(
+                    outcome,
+                    legion::storage::store::PlanApplyOutcome::Applied(_)
+                ),
+                "plan {index} must apply: {outcome:?}"
+            );
+            assert_eq!(
+                store.allocs_for_node(&node_id)?.len(),
+                1,
+                "exactly one allocation on {node_id}"
+            );
+        }
+    }
+    Ok(())
+}
