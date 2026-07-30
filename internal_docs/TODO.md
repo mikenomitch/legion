@@ -169,7 +169,34 @@ How to use it:
 
 Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
 
+- [ ] **Nothing observes a task process exiting.** There is no reaper: no
+      `waitpid`/`try_wait` on task children, `reconcile_allocations` compares id
+      sets only, a task with no `checks` is reported `healthy (no checks
+      configured)` forever (`src/worker/task_health.rs`), and a batch task's
+      `Success` is derived from its *lifecycle* at planning time
+      (`task_status_for_lifecycle`, `src/storage/store.rs`) rather than from an
+      exit code — so `dependsOn: {condition: "success"}` means "was placed". Wants
+      a worker-side reaper, exit status in the heartbeat, real batch completion,
+      and a task-level `restart` policy (`always | onFailure | never`, backoff,
+      `successExitStatus`) independent of health checks. Needs a plan (behavior +
+      wire change). Uncovered by
+      [systemd-and-chef-analysis.md](systemd-and-chef-analysis.md) §3.1.
+- [ ] **`exec` resources are not enforced.** `resources` is scheduling
+      arithmetic; `config.cgroup` only *joins* an already-existing cgroup v2 path
+      and never writes a limit. Legion should create a per-allocation cgroup and
+      apply `memory.max`/`cpu.max`/`io.weight` so `resources` means the same
+      thing across `exec`, `container`, and `sandbox` — see
+      [systemd-and-chef-analysis.md](systemd-and-chef-analysis.md) §3.2.
+- [ ] `exec` hardening block beyond Landlock: namespaces, `privateTmp`,
+      capabilities, seccomp, `noNewPrivileges`, `nice`, `umask` (security
+      boundary → needs a plan; coordinate with the root-privilege split below)
 - [ ] A **WASM** runtime
+- [ ] A **`converge`** runtime — idempotent host resources (package, file,
+      template, directory, user, service, mount) with per-resource
+      `unchanged | changed | failed` reporting, i.e. the Chef-replacement shape.
+      Depends on the reaper above and on node-configuration jobs; needs a plan,
+      including a host-mutation ACL scope. Rationale and the proposed surface:
+      [systemd-and-chef-analysis.md](systemd-and-chef-analysis.md) §6.4.
 - [ ] `exec`: unveil support
 - [ ] `exec`: network namespaces (netavark? CNI?) — see *Networking* below
 - [ ] **Sandbox snapshots, fast start, and forking** —
@@ -374,7 +401,9 @@ Plans: [persistence-plan.md](plans/persistence-plan.md), [multi-raft-persistence
       ([#137](https://github.com/mikenomitch/legion/pull/137))
 - [ ] **Node configuration jobs** — like sysbatch, but also runs on join and can
       add dynamic node metadata (CNI setup, volumes, artifacts, Ansible-shaped
-      work). Needs a plan.
+      work). Needs a plan. This plus a `converge` runtime is the
+      Chef-replacement path —
+      [systemd-and-chef-analysis.md](systemd-and-chef-analysis.md) §6.
 - [ ] Reconfigure a worker from the manager with CRUD commands
   - [ ] Existing nodes of a changed type need the update pushed to them, which
         implies nodes store a reference to their type
@@ -385,7 +414,8 @@ Plans: [persistence-plan.md](plans/persistence-plan.md), [multi-raft-persistence
 
 - [ ] **Sysbatch** — run once on every node
 - [ ] **System job** — N per X (1 per metal, 2 per region, …). Is this really a
-      job type, or just a richer `count`?
+      job type, or just a richer `count`? (`count: {num: 1, per: "id"}`
+      approximates it today but does not converge newly joined nodes.)
 
 ## Auth, TLS & security
 

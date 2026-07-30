@@ -28,6 +28,9 @@ architecture and behavior docs are public.
   Legion different from K8s and Nomad (part idea list, part roadmap).
 - [stateful-vs-nomad-k8s.md](stateful-vs-nomad-k8s.md) — honest gap analysis of
   the stateful primitives against StatefulSets and Nomad.
+- [systemd-and-chef-analysis.md](systemd-and-chef-analysis.md) — could Legion
+  replace systemd and/or Chef? What works today, the four gaps that block the
+  service-supervisor claim, and the `converge`-runtime shape for host config.
 
 ## Notes
 
