@@ -199,6 +199,19 @@ How to use it:
 Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
 
 - [ ] A **WASM** runtime
+- [ ] **`container`: exec on Linux, signal delivery, graceful stop** —
+      [plan](plans/container-runtime-exec-and-signals-plan.md) (PLANNED).
+      Today `legion exec`/actions/UI/MCP fail against container tasks on Linux
+      (exec was deferred for the OCI runtimes), no platform can signal a
+      container task (`changeMode: signal` rejected at admission), and Linux
+      teardown is `delete --force` (SIGKILL) with no grace window.
+  - [ ] Phase 1 — exec via `<runtime> exec` for youki/runc/crun
+  - [ ] Phase 2 — `TaskPlugin::signal()` seam + `container kill`/`<runtime> kill`
+  - [ ] Phase 3 — graceful Linux stop (SIGTERM → 10 s → `delete --force`)
+  - Deliberately out of scope there (still open, see the plan's non-goals):
+    Linux cgroup limits, mounting the task dir into the container (KV/identity
+    *file* delivery, file/tree artifacts), `stopSignal`/`stopGracePeriod`
+    jobspec knobs
 - [ ] `exec`: unveil support
 - [ ] `exec`: network namespaces (netavark? CNI?) — see *Networking* below
 - [ ] **Sandbox snapshots, fast start, and forking** —
